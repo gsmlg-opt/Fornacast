@@ -1,0 +1,12 @@
+.git
+.trees
+_build
+deps
+tmp
+log
+*.ez
+*.beam
+
+apps/*/tmp
+apps/*/priv/native
+apps/git_core/native/fornacast_git_core/target

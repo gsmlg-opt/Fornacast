@@ -1,0 +1,28 @@
+# The directory Mix will write compiled artifacts to.
+/_build/
+
+# If you run "mix test --cover", coverage assets end up here.
+/cover/
+
+# The directory Mix downloads dependencies sources to.
+/deps/
+
+# Generated docs.
+/doc/
+
+# Mix archives.
+*.ez
+
+# Erlang crash dumps.
+erl_crash.dump
+
+# Temporary files.
+/tmp/
+apps/*/tmp/
+*.db
+*.db-shm
+*.db-wal
+
+# Native build artifacts.
+apps/git_core/native/fornacast_git_core/target/
+apps/*/priv/native/

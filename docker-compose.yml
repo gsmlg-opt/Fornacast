@@ -1,0 +1,46 @@
+services:
+  app:
+    build:
+      context: .
+      args:
+        FORNACAST_DATABASE_ADAPTER: ${FORNACAST_DATABASE_ADAPTER:-turso}
+    environment:
+      FORNACAST_DATABASE_ADAPTER: ${FORNACAST_DATABASE_ADAPTER:-turso}
+      FORNACAST_DATABASE_PATH: ${FORNACAST_DATABASE_PATH:-/data/fornacast.db}
+      FORNACAST_CONFIG_DATABASE_PATH: ${FORNACAST_CONFIG_DATABASE_PATH:-/data/fornacast_config.db}
+      TURSO_DATABASE_URL: ${TURSO_DATABASE_URL:-}
+      TURSO_AUTH_TOKEN: ${TURSO_AUTH_TOKEN:-}
+      FORNACAST_CONFIG_TURSO_DATABASE_URL: ${FORNACAST_CONFIG_TURSO_DATABASE_URL:-}
+      FORNACAST_CONFIG_TURSO_AUTH_TOKEN: ${FORNACAST_CONFIG_TURSO_AUTH_TOKEN:-}
+      DATABASE_URL: ${DATABASE_URL:-}
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set SECRET_KEY_BASE}
+      FORNACAST_BASE_URL: ${FORNACAST_BASE_URL:-http://localhost:4000}
+      FORNACAST_REPO_STORAGE_ROOT: /data/repos
+      FORNACAST_SSH_HOST: ${FORNACAST_SSH_HOST:-localhost}
+      FORNACAST_SSH_PORT: ${FORNACAST_SSH_PORT:-2222}
+      FORNACAST_SSH_SYSTEM_DIR: /data/ssh
+      PORT: 4000
+    ports:
+      - "4000:4000"
+      - "2222:2222"
+    volumes:
+      - fornacast-data:/data
+
+  db:
+    profiles: ["postgres"]
+    image: postgres:17
+    environment:
+      POSTGRES_DB: fornacast_prod
+      POSTGRES_USER: fornacast
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fornacast -d fornacast_prod"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  fornacast-data:
+  postgres-data:

@@ -1,0 +1,109 @@
+defmodule ForgeReposTest do
+  use ExUnit.Case, async: false
+
+  alias ForgeAccounts.User
+  alias Fornacast.Repo
+  alias ForgeRepos.Repository
+
+  setup do
+    reset_database!()
+  end
+
+  test "repository slugs are normalized and validated" do
+    assert Repository.normalize_slug("Demo Repo.git") == "demo-repo"
+
+    changeset =
+      Repository.create_changeset(
+        %Repository{owner_user_id: 1, storage_path: "@hashed/aa/bb/demo.git"},
+        %{name: "Demo", slug: "Demo Repo", visibility: :private, default_branch: "main"}
+      )
+
+    assert changeset.valid?
+    assert Ecto.Changeset.get_change(changeset, :slug) == "demo-repo"
+  end
+
+  test "git path parser accepts only friendly owner/repo git paths" do
+    assert ForgeRepos.parse_git_path("alice/demo.git") == {:ok, "alice", "demo"}
+    assert ForgeRepos.parse_git_path("/alice/demo.git") == {:error, :invalid_path}
+    assert ForgeRepos.parse_git_path("alice/../../demo.git") == {:error, :invalid_path}
+    assert ForgeRepos.parse_git_path("alice/demo.git; rm -rf /") == {:error, :invalid_path}
+  end
+
+  test "repository authorization permits owner and admin" do
+    repo = %Repository{id: 10, owner_user_id: 1, visibility: :private}
+
+    assert :ok =
+             Fornacast.Access.authorize(
+               %User{id: 1, role: :user, state: :active},
+               :repository_admin,
+               repo
+             )
+
+    assert :ok =
+             Fornacast.Access.authorize(
+               %User{id: 2, role: :admin, state: :active},
+               :repository_write,
+               repo
+             )
+
+    assert {:error, :unauthorized} = Fornacast.Access.authorize(nil, :repository_read, repo)
+  end
+
+  test "public repositories are readable anonymously" do
+    repo = %Repository{id: 10, owner_user_id: 1, visibility: :public}
+
+    assert :ok = Fornacast.Access.authorize(nil, :repository_read, repo)
+    assert {:error, :unauthorized} = Fornacast.Access.authorize(nil, :repository_write, repo)
+  end
+
+  @tag :tmp_dir
+  test "creates a repository record and bare Git storage", %{tmp_dir: tmp_dir} do
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
+
+    on_exit(fn ->
+      Application.put_env(:fornacast, :repo_storage_root, original_root)
+    end)
+
+    assert {:ok, owner} =
+             ForgeAccounts.create_user(%{
+               username: "Alice",
+               email: "alice@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, repo} =
+             ForgeRepos.create_repository(owner, %{
+               name: "Demo",
+               slug: "demo",
+               description: "test repository"
+             })
+
+    assert repo.owner_user_id == owner.id
+    assert repo.slug == "demo"
+    assert repo.visibility == :private
+    assert String.ends_with?(repo.storage_path, ".git")
+    refute String.contains?(repo.storage_path, "demo")
+
+    path = ForgeRepos.absolute_storage_path(repo)
+    assert File.dir?(path)
+    assert {:ok, true} = GitCore.is_bare_repository?(path)
+    assert {:ok, true} = GitCore.empty?(path)
+    assert {:ok, resolved} = ForgeRepos.resolve_git_path("alice/demo.git")
+    assert resolved.id == repo.id
+  end
+
+  defp reset_database! do
+    case Application.get_env(:fornacast, :database_adapter) do
+      value when value in ["postgres", "postgresql"] ->
+        :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+
+      value when value in ["libsql", "turso"] ->
+        Enum.each(reset_tables(), &Ecto.Adapters.SQL.query!(Repo, "delete from #{&1}", []))
+    end
+  end
+
+  defp reset_tables do
+    ["audit_events", "repository_collaborators", "repositories", "ssh_keys", "users"]
+  end
+end

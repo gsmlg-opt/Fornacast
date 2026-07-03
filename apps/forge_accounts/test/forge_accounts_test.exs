@@ -1,0 +1,134 @@
+defmodule ForgeAccountsTest do
+  use ExUnit.Case, async: false
+
+  import ExUnit.CaptureIO
+
+  alias ForgeAccounts.{SSHKey, User}
+  alias Fornacast.Repo
+
+  @ed25519_public_key "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINUKfpNn72l8H0YnXfbkh6s4aAcrMmVsBWPfyPppa1i8 gao@mac-mini"
+
+  setup do
+    reset_database!()
+  end
+
+  test "registration changeset hashes passwords" do
+    changeset =
+      User.registration_changeset(%User{}, %{
+        username: "Alice",
+        email: "Alice@example.com",
+        password: "correct horse battery staple",
+        role: :admin,
+        state: :active
+      })
+
+    assert changeset.valid?
+    assert Ecto.Changeset.get_change(changeset, :username) == "alice"
+    password_hash = Ecto.Changeset.get_change(changeset, :password_hash)
+    assert is_binary(password_hash)
+    assert password_hash != "correct horse battery staple"
+  end
+
+  test "registration changeset rejects short passwords" do
+    changeset =
+      User.registration_changeset(%User{}, %{
+        username: "alice",
+        email: "alice@example.com",
+        password: "short",
+        role: :user,
+        state: :active
+      })
+
+    refute changeset.valid?
+    assert [password: {"should be at least %{count} character(s)", _meta}] = changeset.errors
+  end
+
+  test "ssh key changeset stores a SHA256 fingerprint" do
+    changeset =
+      SSHKey.changeset(%SSHKey{user_id: 1}, %{
+        title: "laptop",
+        public_key: @ed25519_public_key
+      })
+
+    assert changeset.valid?
+    assert "SHA256:" <> _ = Ecto.Changeset.get_change(changeset, :fingerprint_sha256)
+  end
+
+  test "ssh key changeset rejects unsupported algorithms" do
+    public_key = String.replace(@ed25519_public_key, "ssh-ed25519", "ssh-rsa", global: false)
+    changeset = SSHKey.changeset(%SSHKey{user_id: 1}, %{title: "legacy", public_key: public_key})
+
+    refute changeset.valid?
+
+    assert [public_key: {"must use ssh-ed25519, rsa-sha2-256, or rsa-sha2-512", _meta}] =
+             changeset.errors
+  end
+
+  test "first admin bootstrap refuses to create a second admin" do
+    attrs = %{
+      username: "alice",
+      email: "alice@example.com",
+      password: "correct horse battery staple"
+    }
+
+    assert {:ok, %User{role: :admin} = user} = ForgeAccounts.create_first_admin(attrs)
+    assert user.password_hash != attrs.password
+
+    assert {:error, :admin_exists} =
+             ForgeAccounts.create_first_admin(%{
+               username: "bob",
+               email: "bob@example.com",
+               password: "correct horse battery staple"
+             })
+  end
+
+  test "admin create mix task creates the first admin" do
+    Mix.Task.clear()
+
+    output =
+      capture_io(fn ->
+        Mix.Tasks.Fornacast.Admin.Create.run([
+          "--username",
+          "admin",
+          "--email",
+          "admin@example.com",
+          "--password",
+          "correct horse battery staple"
+        ])
+      end)
+
+    assert output =~ "Created admin user admin"
+    assert %User{role: :admin} = ForgeAccounts.get_user_by_username("admin")
+  end
+
+  test "disabled users cannot authenticate with a valid password" do
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "disabled",
+               email: "disabled@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, _user} =
+             user
+             |> User.state_changeset(%{state: :disabled})
+             |> Repo.update()
+
+    assert {:error, :invalid_credentials} =
+             ForgeAccounts.authenticate_password("disabled", "correct horse battery staple")
+  end
+
+  defp reset_database! do
+    case Application.get_env(:fornacast, :database_adapter) do
+      value when value in ["postgres", "postgresql"] ->
+        :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+
+      value when value in ["libsql", "turso"] ->
+        Enum.each(reset_tables(), &Ecto.Adapters.SQL.query!(Repo, "delete from #{&1}", []))
+    end
+  end
+
+  defp reset_tables do
+    ["audit_events", "repository_collaborators", "repositories", "ssh_keys", "users"]
+  end
+end
