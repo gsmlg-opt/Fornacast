@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Elixir `~> 1.20`, Erlang/OTP 29. Match existing style: plain functions, tagged tuples, pattern matching; no new processes.
-- Init state lives in `Fornacast.ConfigStore` (Concord); admin existence is authoritative for the initialized decision.
+- Init state lives in `Fornacast.ConfigStore` (Concord). The durable `initialized_at` flag (cached by a persistent_term latch) is authoritative for the initialized decision; `Fornacast.Setup` does NOT reference `ForgeAccounts` (umbrella graph: `forge_accounts` depends on `fornacast`, not the reverse). Boot-time self-heal ties the flag to admin existence for pre-feature installs.
 - Init scope = migrations + directories + admin creation + initialized flag. No site-settings wizard; do not gate Git SSH/HTTP transports on init state.
 - Setup wizard fields are exactly `username`, `email`, `password` (the `ForgeAccounts.User.registration_changeset` inputs). First-come-first-served trust model, like Gitea's install page.
 - `mix fornacast.admin.create` and `Fornacast.Release.migrate/0` remain as-is for scripted/manual use.
