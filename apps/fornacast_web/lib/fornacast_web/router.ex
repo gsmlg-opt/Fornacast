@@ -6,7 +6,15 @@ defmodule FornacastWeb.Router do
     plug :fetch_session
     plug :protect_from_forgery
     plug :put_secure_browser_headers
+    plug FornacastWeb.Plugs.RequireSetup
     plug FornacastWeb.Plugs.CurrentUser
+  end
+
+  pipeline :setup do
+    plug :accepts, ["html"]
+    plug :fetch_session
+    plug :protect_from_forgery
+    plug :put_secure_browser_headers
   end
 
   pipeline :authenticated do
@@ -18,7 +26,16 @@ defmodule FornacastWeb.Router do
 
     get "/:owner/:repo_dot_git/info/refs", GitHTTPController, :info_refs
     post "/:owner/:repo_dot_git/git-upload-pack", GitHTTPController, :upload_pack
+  end
 
+  scope "/", FornacastWeb do
+    pipe_through :setup
+
+    get "/setup", SetupController, :new
+    post "/setup", SetupController, :create
+  end
+
+  scope "/", FornacastWeb do
     pipe_through :browser
 
     get "/login", SessionController, :new
