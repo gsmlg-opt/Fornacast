@@ -32,3 +32,6 @@ apps/*/tmp/
 # Native build artifacts.
 apps/git_core/native/fornacast_git_core/target/
 apps/*/priv/native/
+
+# Superpowers workflow scratch (task briefs, review diffs, reports, ledger)
+/.superpowers/
