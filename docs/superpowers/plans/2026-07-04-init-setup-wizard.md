@@ -571,6 +571,8 @@ git commit -m "feat(fornacast_web): add setup wizard gated by init state"
 
 **Why the existing file changes:** the new `RequireSetup` plug redirects every browser route to `/setup` when uninitialized. Existing web tests create a regular (non-admin) user and browse repos, so they must declare the instance initialized. A module-level `setup` block that calls `Fornacast.Setup.force_initialized!/0` (latch only, no DB writes) unblocks all tests in that file; `on_exit` resets it.
 
+**CSRF (important):** the `:setup` pipeline includes `protect_from_forgery`, and this repo has NO existing POST-through-pipeline test to copy. A bare `post("/setup", ...)` raises `Plug.CSRFProtection.InvalidCSRFTokenError`. The POST tests therefore GET `/setup` first (which stores a CSRF token in the session and renders the masked token into the form via `csrf_input/0`), extract the token from the form, then `recycle/1` (carries the session cookie) and POST with the token. This exercises the real CSRF path. A private `post_setup/2` helper encapsulates it.
+
 - [ ] **Step 1: Write the wizard test**
 
 ```elixir
@@ -579,7 +581,6 @@ defmodule FornacastWeb.SetupWizardTest do
   use ExUnit.Case, async: false
 
   import Phoenix.ConnTest
-  import Plug.Conn
 
   @endpoint FornacastWeb.Endpoint
 
@@ -604,14 +605,10 @@ defmodule FornacastWeb.SetupWizardTest do
 
   test "POST /setup creates the admin, marks initialized, and unlocks routes" do
     conn =
-      build_conn()
-      |> init_test_session(%{})
-      |> post("/setup", %{
-        "admin" => %{
-          "username" => "root",
-          "email" => "root@example.com",
-          "password" => "correct horse battery staple"
-        }
+      post_setup(%{
+        "username" => "root",
+        "email" => "root@example.com",
+        "password" => "correct horse battery staple"
       })
 
     assert redirected_to(conn) == "/login"
@@ -629,12 +626,24 @@ defmodule FornacastWeb.SetupWizardTest do
   end
 
   test "invalid submission re-renders the form with errors" do
-    conn =
-      build_conn()
-      |> init_test_session(%{})
-      |> post("/setup", %{"admin" => %{"username" => "", "email" => "", "password" => "short"}})
-
+    conn = post_setup(%{"username" => "", "email" => "", "password" => "short"})
     assert html_response(conn, 422) =~ "admin[username]"
+  end
+
+  # GET /setup to obtain a CSRF token, then POST it back with the session
+  # cookie carried by recycle/1. protect_from_forgery is active on /setup.
+  defp post_setup(admin_attrs) do
+    get_conn = get(build_conn(), "/setup")
+    token = extract_csrf_token(get_conn.resp_body)
+
+    get_conn
+    |> recycle()
+    |> post("/setup", %{"_csrf_token" => token, "admin" => admin_attrs})
+  end
+
+  defp extract_csrf_token(html) do
+    [_full, token] = Regex.run(~r/name="_csrf_token"\s+value="([^"]+)"/, html)
+    token
   end
 
   defp reset_database! do
@@ -652,10 +661,13 @@ defmodule FornacastWeb.SetupWizardTest do
 end
 ```
 
-- [ ] **Step 2: Run the wizard test to verify it fails**
+Note on the CSRF regex: it must match the markup `FornacastWeb.HTML.csrf_input/0` produces —
+`<input type="hidden" name="_csrf_token" value="...">`. The regex above matches `name="_csrf_token"` followed by `value="..."`. If `csrf_input/0`'s attribute order differs, adjust the regex to match the actual output (verify against `apps/fornacast_web/lib/fornacast_web/html.ex`).
+
+- [ ] **Step 2: Run the wizard test to verify it passes**
 
 Run: `mix test apps/fornacast_web/test/setup_wizard_test.exs`
-Expected: PASS (Task 3 already implemented the behavior). If the CSRF plug rejects the POST, add `Plug.Test.init_test_session` (already present) and ensure `protect_from_forgery` is satisfied — in ConnTest, `post/3` without a CSRF token is allowed because the `:setup` pipeline uses the same `protect_from_forgery` as the working session tests, which post without tokens in this suite. Confirm parity with existing `POST /login` tests in `fornacast_web_test.exs`.
+Expected: PASS — 5 tests. (Task 3 already implemented the behavior; this task only adds tests.) If a POST still raises `InvalidCSRFTokenError`, confirm the GET response actually contains the `_csrf_token` input and that `recycle/1` carried the session cookie.
 
 - [ ] **Step 3: Guard existing web tests**
 
@@ -812,4 +824,4 @@ git commit -m "docs: document setup wizard, mix fornacast.run, and auto-migratio
 
 - **Umbrella dependency direction:** `forge_accounts` depends on `fornacast` (for `Fornacast.Repo`), so nothing in `fornacast` may reference `ForgeAccounts` at compile time. `Fornacast.Setup` decides initialization from the flag/latch only; the one place `fornacast` needs admin existence (boot self-heal in `Fornacast.Application.maybe_self_heal/0`) uses `apply(ForgeAccounts, :admin_exists?, [])` at runtime.
 - **Init decision anchor vs. spec:** the spec described "flag present but no admin → uninitialized." This plan instead makes the durable flag authoritative and guarantees via boot self-heal that the flag is present whenever an admin exists. The observable behavior matches intent: a fresh install (no flag, no admin) shows the wizard; a pre-feature install (admin, no flag) self-heals at boot; a config DB restored without its users keeps the flag but this is a recognized backup-mismatch case the README already warns must be restored together. If strict "no admin ⇒ show wizard" is required later, add an admin-existence check in `RequireSetup` (web layer, where depending on `ForgeAccounts` is legal).
-- **CSRF in tests:** wizard POST tests mirror the existing `POST /login` tests, which post without explicit tokens under the same `protect_from_forgery` plug.
+- **CSRF in tests:** the repo has no existing POST-through-pipeline test, so wizard POST tests cannot copy one. They GET `/setup` to obtain a CSRF token, then `recycle/1` + POST it back (see Task 4). This exercises the real `protect_from_forgery` path rather than bypassing it.
