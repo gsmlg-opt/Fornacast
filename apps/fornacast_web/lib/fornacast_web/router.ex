@@ -16,6 +16,9 @@ defmodule FornacastWeb.Router do
   scope "/", FornacastWeb do
     get "/health", HealthController, :show
 
+    get "/:owner/:repo_dot_git/info/refs", GitHTTPController, :info_refs
+    post "/:owner/:repo_dot_git/git-upload-pack", GitHTTPController, :upload_pack
+
     pipe_through :browser
 
     get "/login", SessionController, :new

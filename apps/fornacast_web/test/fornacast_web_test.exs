@@ -296,6 +296,113 @@ defmodule FornacastWebTest do
     assert html_response(detail, 200) =~ "diff --git a/README.md b/README.md"
   end
 
+  @tag :tmp_dir
+  test "git clone works over smart HTTP upload-pack for a public repository", %{tmp_dir: tmp_dir} do
+    reset_database!()
+    share_database!()
+
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, Path.join(tmp_dir, "repos"))
+
+    on_exit(fn ->
+      Application.put_env(:fornacast, :repo_storage_root, original_root)
+    end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-web-http@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, repo} =
+             ForgeRepos.create_repository(user, %{
+               name: "Demo",
+               slug: "demo",
+               description: "http clone repository",
+               visibility: :public
+             })
+
+    work_path = Path.join(tmp_dir, "work")
+    clone_path = Path.join(tmp_dir, "clone")
+    repo_path = ForgeRepos.absolute_storage_path(repo)
+
+    git!(["init", work_path])
+    File.write!(Path.join(work_path, "README.md"), "# Demo\n")
+    git!(["-C", work_path, "add", "README.md"])
+    git!(["-C", work_path, "commit", "-m", "Initial commit"])
+    git!(["-C", work_path, "branch", "-M", "main"])
+    git!(["-C", work_path, "remote", "add", "origin", repo_path])
+    git!(["-C", work_path, "push", "origin", "main"])
+
+    http_pid =
+      start_supervised!(
+        {Bandit,
+         plug: FornacastWeb.Endpoint,
+         scheme: :http,
+         ip: {127, 0, 0, 1},
+         port: 0,
+         startup_log: false}
+      )
+
+    {:ok, {_address, port}} = ThousandIsland.listener_info(http_pid)
+
+    {output, status} =
+      git([
+        "clone",
+        "http://127.0.0.1:#{port}/alice/demo.git",
+        clone_path
+      ])
+
+    assert status == 0, output
+    assert File.read!(Path.join(clone_path, "README.md")) == "# Demo\n"
+  end
+
+  @tag :tmp_dir
+  test "smart HTTP upload-pack uses Basic auth for private repositories", %{tmp_dir: tmp_dir} do
+    reset_database!()
+
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
+
+    on_exit(fn ->
+      Application.put_env(:fornacast, :repo_storage_root, original_root)
+    end)
+
+    password = "correct horse battery staple"
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-web-http-private@example.com",
+               password: password
+             })
+
+    assert {:ok, _repo} =
+             ForgeRepos.create_repository(user, %{
+               name: "Demo",
+               slug: "demo",
+               description: "private http repository"
+             })
+
+    challenged = get(build_conn(), "/alice/demo.git/info/refs?service=git-upload-pack")
+
+    assert response(challenged, 401) == "Authentication required.\n"
+
+    assert ["Basic realm=\"Fornacast Git\""] =
+             Plug.Conn.get_resp_header(challenged, "www-authenticate")
+
+    authorized =
+      build_conn()
+      |> Plug.Conn.put_req_header("authorization", "Basic " <> Base.encode64("alice:#{password}"))
+      |> get("/alice/demo.git/info/refs?service=git-upload-pack")
+
+    assert response(authorized, 200) =~ "# service=git-upload-pack"
+
+    assert ["application/x-git-upload-pack-advertisement"] =
+             Plug.Conn.get_resp_header(authorized, "content-type")
+  end
+
   defp git!(args), do: git!(args, [])
 
   defp reset_database! do
@@ -334,6 +441,18 @@ defmodule FornacastWebTest do
       {output, 0} -> String.trim_trailing(output)
       {output, code} -> flunk("git #{Enum.join(args, " ")} failed with #{code}:\n#{output}")
     end
+  end
+
+  defp git(args) do
+    env = [
+      {"GIT_AUTHOR_NAME", "Fornacast Test"},
+      {"GIT_AUTHOR_EMAIL", "test@example.com"},
+      {"GIT_COMMITTER_NAME", "Fornacast Test"},
+      {"GIT_COMMITTER_EMAIL", "test@example.com"},
+      {"GIT_TERMINAL_PROMPT", "0"}
+    ]
+
+    System.cmd("git", args, stderr_to_stdout: true, env: env)
   end
 
   defp git_ssh_env(tmp_dir, key_path) do
