@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version (e.g. 1.2.3)
+        required: true
+        type: string
+      git_ref:
+        description: Git ref to release from
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ELIXIR_VERSION: 1.20.1
+  OTP_VERSION: "29.0"
+  RUST_VERSION: 1.96.0
+  MIX_ENV: prod
+  FORNACAST_DATABASE_ADAPTER: turso
+
+jobs:
+  release:
+    name: Build Release
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential git libssl-dev pkg-config
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Setup BEAM
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Cache release dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+            ~/.hex
+            ~/.cache/rebar3
+            ~/.cargo/git
+            ~/.cargo/registry
+          key: ${{ runner.os }}-release-${{ env.MIX_ENV }}-${{ hashFiles('mix.lock', 'apps/git_core/native/fornacast_git_core/Cargo.lock', 'bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-${{ env.MIX_ENV }}-
+
+      - name: Install Hex and Rebar
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+
+      - name: Update project versions
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          find mix.exs apps -name mix.exs -print0 |
+            xargs -0 perl -0pi -e 's/version: "[^"]+"/version: "$ENV{VERSION}"/g'
+
+      - name: Fetch dependencies
+        run: mix deps.get --only prod
+
+      - name: Compile dependencies
+        run: mix deps.compile
+
+      - name: Install frontend dependencies
+        run: |
+          mix bun.install --if-missing
+          ./_build/bun install --frozen-lockfile
+
+      - name: Build static assets
+        run: mix assets.deploy
+
+      - name: Compile application
+        run: mix compile
+
+      - name: Build release artifact
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          mix release fornacast --overwrite
+          mkdir -p artifacts
+          tar -C _build/prod/rel -czf "artifacts/fornacast-${VERSION}-linux-x86_64.tar.gz" fornacast
+
+      - name: Commit release version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add mix.exs apps/*/mix.exs
+          git commit -m "chore(release): v${VERSION}"
+
+      - name: Tag release
+        env:
+          VERSION: ${{ inputs.version }}
+        run: git tag "v${VERSION}"
+
+      - name: Push release commit and tag
+        env:
+          VERSION: ${{ inputs.version }}
+          GIT_REF: ${{ inputs.git_ref }}
+        run: |
+          git push origin "HEAD:${GIT_REF}"
+          git push origin "v${VERSION}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release create "v${VERSION}" \
+            "artifacts/fornacast-${VERSION}-linux-x86_64.tar.gz#fornacast-${VERSION}-linux-x86_64.tar.gz" \
+            --title "v${VERSION}" \
+            --generate-notes

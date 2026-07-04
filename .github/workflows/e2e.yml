@@ -1,0 +1,163 @@
+name: E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version to test
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORNACAST_DATABASE_ADAPTER: turso
+  FORNACAST_SSH_PORT: "22222"
+  PORT: "4100"
+
+jobs:
+  release-smoke:
+    name: Release Smoke
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl git openssh-client openssl
+
+      - name: Download release artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          mkdir -p artifacts
+          gh release download "v${VERSION}" \
+            --pattern "fornacast-${VERSION}-linux-x86_64.tar.gz" \
+            --dir artifacts \
+            --clobber
+
+      - name: Extract release artifact
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          mkdir -p release
+          tar -xzf "artifacts/fornacast-${VERSION}-linux-x86_64.tar.gz" -C release
+
+      - name: Prepare e2e environment
+        run: |
+          mkdir -p e2e-data/repos e2e-data/ssh e2e-work
+          ssh-keygen -t ed25519 -f e2e-data/id_ed25519 -N "" -C e2e@example.com
+          {
+            echo "SECRET_KEY_BASE=$(openssl rand -base64 48)"
+            echo "FORNACAST_BASE_URL=http://127.0.0.1:${PORT}"
+            echo "FORNACAST_DATABASE_PATH=${GITHUB_WORKSPACE}/e2e-data/fornacast.db"
+            echo "FORNACAST_CONFIG_DATABASE_PATH=${GITHUB_WORKSPACE}/e2e-data/fornacast_config.db"
+            echo "FORNACAST_REPO_STORAGE_ROOT=${GITHUB_WORKSPACE}/e2e-data/repos"
+            echo "FORNACAST_SSH_BIND_IP=127.0.0.1"
+            echo "FORNACAST_SSH_HOST=127.0.0.1"
+            echo "FORNACAST_SSH_SYSTEM_DIR=${GITHUB_WORKSPACE}/e2e-data/ssh"
+            echo "E2E_PUBLIC_KEY_PATH=${GITHUB_WORKSPACE}/e2e-data/id_ed25519.pub"
+          } >> "$GITHUB_ENV"
+
+      - name: Seed release data
+        run: |
+          release/fornacast/bin/fornacast eval '
+          Enum.each([:git_core, :fornacast, :forge_accounts, :forge_repos], fn app ->
+            {:ok, _started} = Application.ensure_all_started(app)
+          end)
+
+          public_key = File.read!(System.fetch_env!("E2E_PUBLIC_KEY_PATH"))
+
+          {:ok, user} =
+            ForgeAccounts.create_first_admin(%{
+              username: "alice",
+              email: "alice@example.com",
+              password: "correct horse battery staple"
+            })
+
+          Fornacast.Setup.mark_initialized!(user)
+
+          {:ok, _key} =
+            ForgeAccounts.create_ssh_key(user, %{
+              title: "github-actions",
+              public_key: public_key
+            })
+
+          {:ok, _repo} =
+            ForgeRepos.create_repository(user, %{
+              name: "Demo",
+              slug: "demo",
+              description: "e2e release smoke"
+            })
+          '
+
+      - name: Start release
+        run: |
+          release/fornacast/bin/fornacast start > fornacast.log 2>&1 &
+          echo "$!" > fornacast.pid
+
+      - name: Wait for health
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:${PORT}/health"; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          cat fornacast.log
+          exit 1
+
+      - name: Push repository over SSH
+        run: |
+          git init e2e-work/demo
+          git -C e2e-work/demo config user.name "Fornacast E2E"
+          git -C e2e-work/demo config user.email "e2e@example.com"
+          printf '# Demo\n\nE2E release smoke.\n' > e2e-work/demo/README.md
+          git -C e2e-work/demo add README.md
+          git -C e2e-work/demo commit -m "Initial e2e commit"
+          git -C e2e-work/demo branch -M main
+          git -C e2e-work/demo remote add origin "ssh://alice@127.0.0.1:${FORNACAST_SSH_PORT}/alice/demo.git"
+          GIT_SSH_COMMAND="ssh -F /dev/null -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=${GITHUB_WORKSPACE}/e2e-data/known_hosts -i ${GITHUB_WORKSPACE}/e2e-data/id_ed25519" \
+            git -C e2e-work/demo push -u origin main
+
+      - name: Verify web repository browser
+        run: |
+          curl -fsS -c e2e-data/cookies.txt "http://127.0.0.1:${PORT}/login" > e2e-data/login.html
+          CSRF_TOKEN="$(sed -n 's/.*name="_csrf_token" value="\([^"]*\)".*/\1/p' e2e-data/login.html | head -n 1)"
+          test -n "$CSRF_TOKEN"
+
+          curl -fsS \
+            -b e2e-data/cookies.txt \
+            -c e2e-data/cookies.txt \
+            -o /dev/null \
+            -X POST "http://127.0.0.1:${PORT}/login" \
+            --data-urlencode "_csrf_token=${CSRF_TOKEN}" \
+            --data-urlencode "session[username]=alice" \
+            --data-urlencode "session[password]=correct horse battery staple"
+
+          curl -fsS -b e2e-data/cookies.txt "http://127.0.0.1:${PORT}/alice/demo" | grep "E2E release smoke"
+          curl -fsS -b e2e-data/cookies.txt "http://127.0.0.1:${PORT}/alice/demo/raw/main/README.md" | grep "E2E release smoke"
+
+      - name: Stop release
+        if: always()
+        run: |
+          if [ -f fornacast.pid ]; then
+            kill "$(cat fornacast.pid)" || true
+          fi
+
+      - name: Upload release logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fornacast-e2e-logs
+          path: fornacast.log
