@@ -19,7 +19,7 @@ defmodule FornacastWeb.SetupController do
           redirect(conn, to: "/login")
 
         {:error, :admin_exists} ->
-          Fornacast.Setup.force_initialized!()
+          Fornacast.Setup.mark_initialized!(%{id: nil})
           already_initialized(conn)
 
         {:error, %Ecto.Changeset{} = changeset} ->
