@@ -14,6 +14,17 @@ defmodule FornacastWeb do
     end
   end
 
+  def html do
+    quote do
+      use Phoenix.Component
+      use PhoenixDuskmoon.Component
+      use PhoenixDuskmoon.ArtComponent
+
+      import Phoenix.HTML
+      import FornacastWeb.HTML
+    end
+  end
+
   def router do
     quote do
       use Phoenix.Router, helpers: true

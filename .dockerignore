@@ -2,11 +2,13 @@
 .trees
 _build
 deps
+node_modules
 tmp
 log
 *.ez
 *.beam
 
 apps/*/tmp
+apps/*/node_modules
 apps/*/priv/native
 apps/git_core/native/fornacast_git_core/target

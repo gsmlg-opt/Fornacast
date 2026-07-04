@@ -1,0 +1,11 @@
+{
+  "name": "fornacast-web",
+  "private": true,
+  "dependencies": {
+    "@duskmoon-dev/art-elements": "latest",
+    "@duskmoon-dev/core": "latest",
+    "@duskmoon-dev/css-art": "latest",
+    "@duskmoon-dev/elements": "latest",
+    "tailwindcss": "^4.1.11"
+  }
+}

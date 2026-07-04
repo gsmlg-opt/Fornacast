@@ -36,6 +36,12 @@ defmodule FornacastUmbrella.MixProject do
       setup: ["deps.get", "ecto.setup"],
       "ecto.setup": ["ecto.create", "ecto.migrate"],
       "ecto.reset": ["ecto.drop", "ecto.setup"],
+      "assets.deploy": [
+        "phx.digest.clean",
+        "tailwind fornacast_web --minify",
+        "bun fornacast_web --minify",
+        "phx.digest"
+      ],
       test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"]
     ]
   end

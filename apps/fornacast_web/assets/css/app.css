@@ -1,0 +1,96 @@
+@import "tailwindcss";
+@plugin "@duskmoon-dev/core/plugin";
+@import "@duskmoon-dev/core/themes/sunshine";
+@import "@duskmoon-dev/core/themes/moonlight";
+@import "@duskmoon-dev/core/components";
+@import "@duskmoon-dev/css-art";
+
+@layer base {
+  body {
+    color: #182026;
+    font-family: system-ui, sans-serif;
+    line-height: 1.5;
+    margin: 0;
+    background: #f6f7f8;
+  }
+
+  header,
+  main {
+    margin: 0 auto;
+    max-width: 980px;
+    padding: 20px;
+  }
+
+  header {
+    align-items: center;
+    display: flex;
+    justify-content: space-between;
+  }
+
+  nav {
+    align-items: center;
+    display: flex;
+    gap: 12px;
+  }
+
+  a {
+    color: #2459a6;
+  }
+
+  input,
+  textarea,
+  select {
+    border: 1px solid #b9c2cc;
+    border-radius: 4px;
+    box-sizing: border-box;
+    display: block;
+    margin: 4px 0 12px;
+    max-width: 540px;
+    padding: 8px;
+    width: 100%;
+  }
+
+  button {
+    background: #2459a6;
+    border: 0;
+    border-radius: 4px;
+    color: white;
+    cursor: pointer;
+    padding: 8px 12px;
+  }
+
+  pre {
+    background: #101820;
+    color: #e9eef2;
+    overflow-x: auto;
+    padding: 14px;
+  }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+  }
+
+  th,
+  td {
+    border-bottom: 1px solid #d8dde3;
+    padding: 8px;
+    text-align: left;
+  }
+}
+
+@layer components {
+  form.inline {
+    display: inline;
+  }
+
+  .muted {
+    color: #596773;
+  }
+
+  .error {
+    background: #ffe8e8;
+    border: 1px solid #e2a3a3;
+    padding: 10px;
+  }
+}

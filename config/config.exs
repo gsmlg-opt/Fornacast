@@ -86,4 +86,20 @@ config :logger, :console,
 
 config :phoenix, :json_library, JSON
 
+config :bun,
+  version: "1.3.4",
+  fornacast_web: [
+    args:
+      ~w(build assets/js/app.js --outdir=priv/static/assets --external /fonts/* --external /images/*),
+    cd: Path.expand("../apps/fornacast_web", __DIR__),
+    env: %{"NODE_PATH" => Path.expand("../deps", __DIR__)}
+  ]
+
+config :tailwind,
+  version: "4.1.11",
+  fornacast_web: [
+    args: ~w(--input=assets/css/app.css --output=priv/static/assets/app.css),
+    cd: Path.expand("../apps/fornacast_web", __DIR__)
+  ]
+
 import_config "#{config_env()}.exs"

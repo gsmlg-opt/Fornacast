@@ -32,8 +32,11 @@ defmodule FornacastWeb.MixProject do
       {:git_core, in_umbrella: true},
       {:git_transport, in_umbrella: true},
       {:phoenix, "~> 1.8"},
+      {:phoenix_duskmoon, "~> 9.4"},
       {:phoenix_ecto, "~> 4.7"},
       {:phoenix_html, "~> 4.3"},
+      {:bun, "~> 1.4", runtime: Mix.env() == :dev},
+      {:tailwind, "~> 0.2", runtime: Mix.env() == :dev},
       {:bandit, "~> 1.12"},
       {:mdex, "~> 0.13.2"},
       {:html_sanitize_ex, "~> 1.5"}

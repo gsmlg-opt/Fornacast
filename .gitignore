@@ -10,6 +10,12 @@
 # Generated docs.
 /doc/
 
+# JavaScript dependencies and compiled Phoenix assets.
+/node_modules/
+apps/*/node_modules/
+apps/*/priv/static/assets/
+apps/*/priv/static/cache_manifest.json
+
 # Mix archives.
 *.ez
 

@@ -30,11 +30,16 @@ WORKDIR /app
 RUN mix local.hex --force && mix local.rebar --force
 
 COPY mix.exs mix.lock ./
+COPY package.json bun.lock bunfig.toml ./
 COPY config config
+COPY apps/fornacast_web/package.json apps/fornacast_web/package.json
 COPY apps apps
 
 RUN mix deps.get --only prod && \
     mix deps.compile && \
+    mix bun.install --if-missing && \
+    ./_build/bun install --frozen-lockfile && \
+    mix assets.deploy && \
     mix compile && \
     mix release fornacast
 
