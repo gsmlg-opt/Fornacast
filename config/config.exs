@@ -63,7 +63,7 @@ config :concord,
   ]
 
 config :fornacast,
-  base_url: System.get_env("FORNACAST_BASE_URL", "http://localhost:4000"),
+  base_url: System.get_env("FORNACAST_BASE_URL", "http://localhost:4890"),
   repo_storage_root: System.get_env("FORNACAST_REPO_STORAGE_ROOT", "tmp/repos"),
   ssh_host: System.get_env("FORNACAST_SSH_HOST", "localhost"),
   ssh_bind_ip: System.get_env("FORNACAST_SSH_BIND_IP", "0.0.0.0"),

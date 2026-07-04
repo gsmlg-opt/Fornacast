@@ -91,6 +91,6 @@ if config_env() == :prod do
     ssh_system_dir: System.fetch_env!("FORNACAST_SSH_SYSTEM_DIR")
 
   config :fornacast_web, FornacastWeb.Endpoint,
-    http: [ip: {0, 0, 0, 0}, port: String.to_integer(System.get_env("PORT") || "4000")],
+    http: [ip: {0, 0, 0, 0}, port: String.to_integer(System.get_env("PORT") || "4890")],
     secret_key_base: secret_key_base
 end
