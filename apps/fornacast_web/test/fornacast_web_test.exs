@@ -6,6 +6,12 @@ defmodule FornacastWebTest do
   @endpoint FornacastWeb.Endpoint
   @ed25519_public_key "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINUKfpNn72l8H0YnXfbkh6s4aAcrMmVsBWPfyPppa1i8 gao@mac-mini"
 
+  setup do
+    Fornacast.Setup.force_initialized!()
+    on_exit(&Fornacast.Setup.reset!/0)
+    :ok
+  end
+
   test "HTML escaping protects repository content in inline pages" do
     assert FornacastWeb.HTML.escape(~s|<script>alert("x")</script>|) ==
              "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;"
