@@ -184,10 +184,16 @@ git commit -m "feat(fornacast): add durable initialization state"
 - Test: `apps/fornacast/test/fornacast_boot_test.exs` (create)
 
 **Interfaces:**
-- Consumes: `Fornacast.Release`-style migration via `Ecto.Migrator.with_repo/2`; `Fornacast.Storage.ensure_root!/0`; `ForgeAccounts.admin_exists?/0`; `Fornacast.Setup.mark_initialized!/1`.
-- Produces: `Fornacast.Application.prepare_boot/0 :: :ok` — public so it is directly testable; runs migrations (when `:auto_migrate` is true), ensures the storage root, and self-heals the init flag when an admin already exists but the flag is missing.
+- Consumes: `Fornacast.Release`-style migration via `Ecto.Migrator.with_repo/2`; `Fornacast.Storage.ensure_root!/0`; `ForgeAccounts.admin_exists?/0` (via `apply/3`); `Fornacast.Setup.{initialized?/0, mark_initialized!/1}`.
+- Produces:
+  - `Fornacast.Application.prepare_boot/0 :: :ok` — runs migrations (when `:auto_migrate` is true) and ensures the storage root. Depends on NO supervised process (migration uses `Ecto.Migrator.with_repo/2`'s own temporary repo; directory creation is filesystem-only), so it is safe to call before the supervision tree starts.
+  - `Fornacast.Application.heal_initialization/0 :: :ok` — self-heals the init flag when an admin already exists but the flag is missing. Requires the supervised `Fornacast.Repo` to be running (it queries `ForgeAccounts.admin_exists?`), so it runs AFTER `Supervisor.start_link` at real boot.
 
-**Self-heal actor:** pass a synthetic actor `%{id: nil}` so the audit event records a system action (`Fornacast.Audit.actor_id/1` already maps a nil id).
+**Ordering (critical):** `heal_initialization/0` queries the supervised `Fornacast.Repo`, which is only alive after `Supervisor.start_link`. It must NOT be folded into `prepare_boot/0` (which runs before the supervisor). `start/2` calls `prepare_boot/0`, starts the supervisor, then calls `heal_initialization/0`.
+
+**Self-heal actor:** pass a synthetic actor `%{id: nil}` so the audit event records a system action (`Fornacast.Audit.actor_id/1` maps a nil id to `nil`, avoiding any user FK).
+
+**Test isolation (Turso adapter):** the default test adapter (Turso/libsql) runs the sandbox in `:auto` mode — queries hit the real test DB and are NOT rolled back per test (this repo's other Turso tests clean up with `delete from <table>`, see `apps/fornacast_web/test/fornacast_web_test.exs`). Do NOT use `Sandbox.mode(Repo, {:shared, self()})` — it durably rebinds the pool's global mode to a dying pid and breaks other test files (confirmed in Task 1). The boot test checks out a connection and deletes its own rows in `on_exit`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -200,13 +206,22 @@ defmodule Fornacast.BootTest do
 
   setup do
     Ecto.Adapters.SQL.Sandbox.checkout(Fornacast.Repo)
-    Ecto.Adapters.SQL.Sandbox.mode(Fornacast.Repo, {:shared, self()})
     Setup.reset!()
-    on_exit(&Setup.reset!/0)
+
+    on_exit(fn ->
+      # Turso :auto mode does not roll back; remove rows this test inserted
+      # so reruns start clean (unique username/email would otherwise clash).
+      Enum.each(["audit_events", "users"], fn table ->
+        Ecto.Adapters.SQL.query!(Fornacast.Repo, "delete from #{table}", [])
+      end)
+
+      Setup.reset!()
+    end)
+
     :ok
   end
 
-  test "prepare_boot self-heals when an admin already exists without the flag" do
+  test "heal_initialization self-heals when an admin already exists without the flag" do
     {:ok, _admin} =
       ForgeAccounts.create_admin(%{
         username: "root",
@@ -215,13 +230,22 @@ defmodule Fornacast.BootTest do
       })
 
     refute Setup.initialized?()
-    assert :ok = Fornacast.Application.prepare_boot()
+    assert :ok = Fornacast.Application.heal_initialization()
     assert Setup.initialized?()
   end
 
-  test "prepare_boot leaves a truly fresh install uninitialized" do
-    assert :ok = Fornacast.Application.prepare_boot()
+  test "heal_initialization leaves a truly fresh install uninitialized" do
+    assert :ok = Fornacast.Application.heal_initialization()
     refute Setup.initialized?()
+  end
+
+  test "prepare_boot ensures the repository storage root exists" do
+    root = Fornacast.Config.repo_storage_root()
+    File.rm_rf!(root)
+    refute File.dir?(root)
+
+    assert :ok = Fornacast.Application.prepare_boot()
+    assert File.dir?(root)
   end
 end
 ```
@@ -229,7 +253,7 @@ end
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `mix test apps/fornacast/test/fornacast_boot_test.exs`
-Expected: FAIL — `Fornacast.Application.prepare_boot/0` is undefined.
+Expected: FAIL — `Fornacast.Application.heal_initialization/0` (and `prepare_boot/0`) undefined.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -253,18 +277,45 @@ defmodule Fornacast.Application do
     ]
 
     opts = [strategy: :one_for_one, name: Fornacast.Supervisor]
-    Supervisor.start_link(children, opts)
+
+    case Supervisor.start_link(children, opts) do
+      {:ok, pid} ->
+        heal_initialization()
+        {:ok, pid}
+
+      other ->
+        other
+    end
   end
 
   @doc """
-  Runs pending migrations (when enabled), ensures repository storage exists,
-  and self-heals initialization state for installs that already have an admin.
+  Runs pending migrations (when enabled) and ensures repository storage exists.
+
+  Safe to call before the supervision tree starts: migration runs in
+  `Ecto.Migrator.with_repo/2`'s own temporary repo, and directory creation is
+  filesystem-only.
   """
   @spec prepare_boot() :: :ok
   def prepare_boot do
     maybe_migrate()
     _ = Fornacast.Storage.ensure_root!()
-    maybe_self_heal()
+    :ok
+  end
+
+  @doc """
+  Self-heals initialization state for installs that already have an admin but
+  no `initialized_at` flag (pre-feature upgrades).
+
+  Requires the supervised `Fornacast.Repo` to be running.
+  """
+  @spec heal_initialization() :: :ok
+  def heal_initialization do
+    # apply/3 keeps the compile-time umbrella graph clean: forge_accounts
+    # depends on fornacast, not the reverse. At runtime ForgeAccounts is loaded.
+    if not Fornacast.Setup.initialized?() and apply(ForgeAccounts, :admin_exists?, []) do
+      Fornacast.Setup.mark_initialized!(%{id: nil})
+    end
+
     :ok
   end
 
@@ -282,16 +333,6 @@ defmodule Fornacast.Application do
       Logger.error("Boot migration failed: #{Exception.message(error)}")
       reraise error, __STACKTRACE__
   end
-
-  defp maybe_self_heal do
-    # apply/3 keeps the compile-time umbrella graph clean: forge_accounts
-    # depends on fornacast, not the reverse. At runtime ForgeAccounts is loaded.
-    if not Fornacast.Setup.initialized?() and apply(ForgeAccounts, :admin_exists?, []) do
-      Fornacast.Setup.mark_initialized!(%{id: nil})
-    end
-
-    :ok
-  end
 end
 ```
 
@@ -301,7 +342,7 @@ Add to `config/config.exs` (near the other `config :fornacast,` lines, e.g. afte
 config :fornacast, :auto_migrate, true
 ```
 
-Add to `config/test.exs` inside the existing `config :fornacast,` block (the one with `repo_storage_root`, `ssh_bind_ip`, ...):
+Add to `config/test.exs` inside the existing `config :fornacast,` block (the one with `repo_storage_root`, `ssh_bind_ip`, ...) — add this line among those keys:
 
 ```elixir
   auto_migrate: false,
@@ -310,15 +351,19 @@ Add to `config/test.exs` inside the existing `config :fornacast,` block (the one
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `mix test apps/fornacast/test/fornacast_boot_test.exs`
-Expected: PASS (2 tests).
+Expected: PASS (3 tests).
 
-Note: `maybe_migrate` is a no-op under test (`auto_migrate: false`); the sandbox provides the schema. `prepare_boot` runs at real boot for dev/prod.
+Then run the whole suite to confirm the changed `start/2` and config don't break app boot:
+Run: `mix test`
+Expected: all green.
+
+Note: `maybe_migrate` is a no-op under test (`auto_migrate: false`); the umbrella `test` alias already runs `ecto.create`/`ecto.migrate` before the suite. At real boot for dev/prod, `prepare_boot` migrates and `heal_initialization` runs after the repo starts.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add apps/fornacast/lib/fornacast/application.ex config/config.exs config/test.exs apps/fornacast/test/fornacast_boot_test.exs
-git commit -m "feat(fornacast): migrate and self-heal init state at boot"
+git commit -m "feat(fornacast): migrate at boot and self-heal init state after startup"
 ```
 
 ---
