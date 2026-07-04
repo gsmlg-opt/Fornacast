@@ -9,6 +9,19 @@ if System.get_env("MIX_TAILWIND_PATH") do
 end
 
 if config_env() == :prod do
+  # Mix evaluates runtime.exs for prod build tasks; require these only in releases.
+  release_command = System.get_env("RELEASE_COMMAND")
+  require_runtime_env? = is_binary(release_command) and release_command != ""
+
+  fetch_runtime_env! = fn name, build_default ->
+    System.get_env(name) ||
+      if require_runtime_env? do
+        raise "environment variable #{name} is missing"
+      else
+        build_default
+      end
+  end
+
   database_adapter =
     System.get_env("FORNACAST_DATABASE_ADAPTER", "turso")
     |> String.downcase()
@@ -44,8 +57,7 @@ if config_env() == :prod do
     end
 
   secret_key_base =
-    System.get_env("SECRET_KEY_BASE") ||
-      raise "environment variable SECRET_KEY_BASE is missing"
+    fetch_runtime_env!.("SECRET_KEY_BASE", String.duplicate("0", 64))
 
   config :fornacast, :database_adapter, database_adapter
 
@@ -84,11 +96,11 @@ if config_env() == :prod do
     ]
 
   config :fornacast,
-    base_url: System.fetch_env!("FORNACAST_BASE_URL"),
-    repo_storage_root: System.fetch_env!("FORNACAST_REPO_STORAGE_ROOT"),
-    ssh_host: System.fetch_env!("FORNACAST_SSH_HOST"),
-    ssh_port: String.to_integer(System.fetch_env!("FORNACAST_SSH_PORT")),
-    ssh_system_dir: System.fetch_env!("FORNACAST_SSH_SYSTEM_DIR")
+    base_url: fetch_runtime_env!.("FORNACAST_BASE_URL", "http://localhost:4890"),
+    repo_storage_root: fetch_runtime_env!.("FORNACAST_REPO_STORAGE_ROOT", "/data/repos"),
+    ssh_host: fetch_runtime_env!.("FORNACAST_SSH_HOST", "localhost"),
+    ssh_port: String.to_integer(fetch_runtime_env!.("FORNACAST_SSH_PORT", "2222")),
+    ssh_system_dir: fetch_runtime_env!.("FORNACAST_SSH_SYSTEM_DIR", "/data/ssh")
 
   config :fornacast_web, FornacastWeb.Endpoint,
     http: [ip: {0, 0, 0, 0}, port: String.to_integer(System.get_env("PORT") || "4890")],
