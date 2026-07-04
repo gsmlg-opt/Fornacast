@@ -14,6 +14,7 @@ repo_adapter =
 config :fornacast, ecto_repos: [Fornacast.Repo]
 config :fornacast, :database_adapter, database_adapter
 config :fornacast, :repo_adapter, repo_adapter
+config :fornacast, :auto_migrate, true
 
 repo_config =
   case database_adapter do

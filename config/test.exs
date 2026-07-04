@@ -23,6 +23,7 @@ repo_config =
 config :fornacast, Fornacast.Repo, [pool: Ecto.Adapters.SQL.Sandbox, pool_size: 10] ++ repo_config
 
 config :fornacast,
+  auto_migrate: false,
   repo_storage_root: "tmp/test/repos",
   ssh_bind_ip: "127.0.0.1",
   ssh_port: 0,
