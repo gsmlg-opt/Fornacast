@@ -1,10 +1,14 @@
 defmodule GitCore.Native do
   @moduledoc false
 
+  @darwin_target :erlang.system_info(:system_architecture) |> to_string()
+  @target if String.ends_with?(@darwin_target, "-apple-darwin"), do: @darwin_target
+
   use Rustler,
     otp_app: :git_core,
     crate: "fornacast_git_core",
-    mode: if(Mix.env() == :prod, do: :release, else: :debug)
+    mode: if(Mix.env() == :prod, do: :release, else: :debug),
+    target: @target
 
   def init_bare(_path), do: :erlang.nif_error(:nif_not_loaded)
   def is_bare_repository(_path), do: :erlang.nif_error(:nif_not_loaded)
