@@ -18,6 +18,7 @@ Implemented first-release paths:
 - Initial branch push, fast-forward branch update, new branch push, tag creation, and force-push rejection.
 - Repository overview, README rendering, source tree, file view, raw file, commits, commit detail, diffs, branches, and tags.
 - `/health` endpoint.
+- First-admin setup wizard and automatic boot migrations.
 
 Out of scope for this release: issues, pull requests, CI, packages, LFS, mirrors, forks, smart HTTP Git transport, and Forgejo/Gitea API compatibility.
 
@@ -40,15 +41,17 @@ mix test
 Run locally:
 
 ```sh
-mix phx.server
+mix fornacast.run
 ```
+
+On a fresh install this prints a setup URL. Open `http://localhost:4000/setup` to create the first admin account, then log in.
 
 Default local endpoints:
 
 - Web: `http://localhost:4000`
 - SSH: `ssh://USER@localhost:2222/USER/REPO.git`
 
-Create the first admin:
+Alternatively, create the first admin headlessly without the web wizard:
 
 ```sh
 mix fornacast.admin.create \
@@ -84,20 +87,16 @@ DATABASE_URL=ecto://fornacast:$POSTGRES_PASSWORD@db/fornacast_prod \
 docker compose --profile postgres up --build -d
 ```
 
-Run migrations:
+Migrations run automatically on container start. Open `http://localhost:4000/setup` to create the first admin account.
 
-```sh
-docker compose exec app /app/bin/fornacast eval "Fornacast.Release.migrate()"
-```
-
-Create the first admin in the running container:
+Alternatively, create the first admin headlessly in the running container without the web wizard:
 
 ```sh
 docker compose exec app /app/bin/fornacast eval \
   'ForgeAccounts.create_first_admin(%{username: "alice", email: "alice@example.com", password: "correct horse battery staple"})'
 ```
 
-Open `http://localhost:4000`, log in, add an SSH key, and create a repository.
+Then log in, add an SSH key, and create a repository.
 
 ## Git Usage
 
@@ -154,6 +153,10 @@ Development and test also honor:
 - `FORNACAST_SSH_ENABLED`
 
 The Ecto adapter is selected at compile time. Build or recompile with `FORNACAST_DATABASE_ADAPTER=postgres` to use PostgreSQL; omit it for the default ExTurso/Turso-compatible backend. Concord is used separately for app-level key/value config through `Fornacast.ConfigStore`.
+
+### Initialization
+
+The first visit to a fresh instance serves an unauthenticated setup page that creates the first administrator. Do not expose an un-set-up instance to untrusted networks; complete setup immediately after first boot.
 
 ## Storage And Backup
 
