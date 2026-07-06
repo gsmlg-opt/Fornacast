@@ -100,7 +100,7 @@ defmodule FornacastWeb.HTML do
 
   defp rail(active, _current_user) do
     """
-    <aside class="app-rail bg-secondary text-secondary-content" aria-label="Main navigation">
+    <aside class="app-rail" aria-label="Main navigation">
       <nav class="rail-nav">
         #{rail_link("/", "Dashboard", active == :dashboard)}
         #{rail_link("/repos/new", "New repository", active == :new_repository)}

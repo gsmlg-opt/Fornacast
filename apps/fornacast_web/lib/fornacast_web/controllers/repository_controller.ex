@@ -6,21 +6,11 @@ defmodule FornacastWeb.RepositoryController do
   @inline_blob_limit 1_048_576
 
   def new(conn, _params) do
-    page(conn, "New repository", """
-    <form action="/repos" method="post">
-      #{csrf_input()}
-      <label>Name <input name="repository[name]"></label>
-      <label>Slug <input name="repository[slug]"></label>
-      <label>Description <textarea name="repository[description]" rows="3"></textarea></label>
-      <label>Visibility
-        <select name="repository[visibility]">
-          <option value="private">Private</option>
-          <option value="public">Public</option>
-        </select>
-      </label>
-      <button type="submit">Create repository</button>
-    </form>
-    """)
+    page(
+      conn,
+      "New repository",
+      section_header("New repository", "Create a local Git repository.", "") <> repository_form()
+    )
   end
 
   def create(%Plug.Conn{assigns: %{current_user: user}} = conn, %{"repository" => attrs}) do
@@ -31,12 +21,12 @@ defmodule FornacastWeb.RepositoryController do
       {:error, %Ecto.Changeset{} = changeset} ->
         conn
         |> put_status(:unprocessable_entity)
-        |> page("New repository", ~s(<p class="error">#{escape(inspect(changeset.errors))}</p>))
+        |> page("New repository", error_panel(inspect(changeset.errors)) <> repository_form())
 
       {:error, reason} ->
         conn
         |> put_status(:unprocessable_entity)
-        |> page("New repository", ~s(<p class="error">#{escape(reason)}</p>))
+        |> page("New repository", error_panel(reason) <> repository_form())
     end
   end
 
@@ -224,6 +214,28 @@ defmodule FornacastWeb.RepositoryController do
 
         {:error, conn}
     end
+  end
+
+  defp repository_form do
+    form_panel(
+      "Repository details",
+      "Choose a short slug and default visibility for the repository.",
+      """
+      <form action="/repos" method="post">
+        #{csrf_input()}
+        <label>Name <input name="repository[name]"></label>
+        <label>Slug <input name="repository[slug]"></label>
+        <label>Description <textarea name="repository[description]" rows="3"></textarea></label>
+        <label>Visibility
+          <select name="repository[visibility]">
+            <option value="private">Private</option>
+            <option value="public">Public</option>
+          </select>
+        </label>
+        <button class="btn btn-primary" type="submit">Create repository</button>
+      </form>
+      """
+    )
   end
 
   defp empty_repository_body(owner, repo) do

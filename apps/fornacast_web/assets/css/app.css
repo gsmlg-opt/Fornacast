@@ -127,6 +127,7 @@
   }
 
   .app-rail {
+    @apply bg-secondary text-secondary-content;
     padding: 20px 16px;
   }
 

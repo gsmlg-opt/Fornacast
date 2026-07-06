@@ -7,18 +7,38 @@ defmodule FornacastWeb.DashboardController do
     rows =
       repos
       |> Enum.map(fn repo ->
-        ~s(<tr><td><a href="/#{escape(user.username)}/#{escape(repo.slug)}">#{escape(repo.name)}</a></td><td>#{escape(repo.visibility)}</td><td>#{escape(repo.default_branch)}</td></tr>)
+        """
+        <tr>
+          <td><a href="/#{escape(user.username)}/#{escape(repo.slug)}">#{escape(repo.name)}</a></td>
+          <td>#{badge(repo.visibility, to_string(repo.visibility))}</td>
+          <td><code>#{escape(repo.default_branch)}</code></td>
+        </tr>
+        """
       end)
       |> Enum.join("\n")
 
     body =
-      """
-      <p><a href="/repos/new">Create a repository</a></p>
-      <table>
-        <thead><tr><th>Repository</th><th>Visibility</th><th>Default branch</th></tr></thead>
-        <tbody>#{rows}</tbody>
-      </table>
-      """
+      section_header(
+        "Repositories",
+        "Browse repositories owned by #{user.username}.",
+        primary_link("/repos/new", "New repository")
+      ) <>
+        if rows == "" do
+          empty_state(
+            "No repositories yet",
+            "Create the first repository for this Fornacast instance.",
+            primary_link("/repos/new", "Create repository")
+          )
+        else
+          """
+          <section class="content-panel">
+            <table class="data-table repo-table">
+              <thead><tr><th>Repository</th><th>Visibility</th><th>Default branch</th></tr></thead>
+              <tbody>#{rows}</tbody>
+            </table>
+          </section>
+          """
+        end
 
     page(conn, "Dashboard", body)
   end
