@@ -2,14 +2,15 @@ defmodule FornacastWeb.SessionController do
   use FornacastWeb, :controller
 
   def new(conn, _params) do
-    page(conn, "Login", """
-    <form action="/login" method="post">
-      #{csrf_input()}
-      <label>Username <input name="session[username]" autocomplete="username"></label>
-      <label>Password <input name="session[password]" type="password" autocomplete="current-password"></label>
-      <button type="submit">Login</button>
-    </form>
-    """)
+    page(
+      conn,
+      "Login",
+      form_panel(
+        "Sign in",
+        "Use your local Fornacast account to access repositories.",
+        login_form()
+      )
+    )
   end
 
   def create(conn, %{"session" => %{"username" => username, "password" => password}}) do
@@ -23,7 +24,15 @@ defmodule FornacastWeb.SessionController do
       {:error, :invalid_credentials} ->
         conn
         |> put_status(:unauthorized)
-        |> page("Login", ~s(<p class="error">Invalid username or password.</p>))
+        |> page(
+          "Login",
+          error_panel("Invalid username or password.") <>
+            form_panel(
+              "Sign in",
+              "Use your local Fornacast account to access repositories.",
+              login_form()
+            )
+        )
     end
   end
 
@@ -33,5 +42,16 @@ defmodule FornacastWeb.SessionController do
     conn
     |> configure_session(drop: true)
     |> redirect(to: "/login")
+  end
+
+  defp login_form do
+    """
+    <form action="/login" method="post">
+      #{csrf_input()}
+      <label>Username <input name="session[username]" autocomplete="username"></label>
+      <label>Password <input name="session[password]" type="password" autocomplete="current-password"></label>
+      <button class="btn btn-primary" type="submit">Sign in</button>
+    </form>
+    """
   end
 end
