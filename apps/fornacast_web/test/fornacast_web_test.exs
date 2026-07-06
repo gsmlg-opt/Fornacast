@@ -73,6 +73,7 @@ defmodule FornacastWebTest do
     File.mkdir_p!(Path.join(work_path, "docs"))
     File.write!(Path.join(work_path, "README.md"), "# Demo\n\n<script>alert('x')</script>\n")
     File.write!(Path.join([work_path, "docs", "guide.txt"]), "hello\n")
+    File.write!(Path.join([work_path, "docs", "with#hash.txt"]), "hash path\n")
     File.write!(Path.join(work_path, "asset.bin"), <<0, 1, 2, 3>>)
     File.write!(Path.join(work_path, "large.txt"), String.duplicate("x", 1_048_577))
     git!(["-C", work_path, "add", "."])
@@ -107,12 +108,19 @@ defmodule FornacastWebTest do
     assert source_body =~ ~s(class="path-bar")
     assert source_body =~ ~s(class="data-table source-table")
     assert source_body =~ "guide.txt"
+    assert source_body =~ "with#hash.txt"
+    assert source_body =~ ~s(href="/alice/demo/src/main/docs/with%23hash.txt")
 
     file = get(conn, "/alice/demo/src/main/docs/guide.txt")
     file_body = html_response(file, 200)
     assert file_body =~ ~s(class="file-panel")
     assert file_body =~ ~s(class="code-block")
     assert file_body =~ "hello"
+
+    hash_file = get(conn, "/alice/demo/src/main/docs/with%23hash.txt")
+    hash_file_body = html_response(hash_file, 200)
+    assert hash_file_body =~ "hash path"
+    assert hash_file_body =~ ~s(href="/alice/demo/raw/main/docs/with%23hash.txt")
 
     binary = get(conn, "/alice/demo/src/main/asset.bin")
     assert html_response(binary, 200) =~ "Binary or non-UTF-8 files are not rendered inline."

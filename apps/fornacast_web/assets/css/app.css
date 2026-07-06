@@ -287,7 +287,14 @@
     border-width: 1px;
     border-radius: 8px;
     margin-bottom: 12px;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-wrap: anywhere;
     padding: 10px 12px;
+  }
+
+  .path-bar code {
+    overflow-wrap: anywhere;
   }
 
   .tab-link.is-active {

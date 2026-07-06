@@ -278,21 +278,21 @@ defmodule FornacastWeb.RepositoryController do
   end
 
   defp repo_tabs(owner, repo, active) do
-    base = "/#{escape(owner.username)}/#{escape(repo.slug)}"
+    base = repo_href(owner, repo)
 
     """
     <nav class="repo-tabs" aria-label="Repository navigation">
       #{repo_tab(base, "Code", active == :code)}
-      #{repo_tab("#{base}/commits/#{escape(repo.default_branch)}", "Commits", active == :commits)}
-      #{repo_tab("#{base}/branches", "Branches", active == :branches)}
-      #{repo_tab("#{base}/tags", "Tags", active == :tags)}
+      #{repo_tab(repo_href(owner, repo, ["commits", repo.default_branch]), "Commits", active == :commits)}
+      #{repo_tab(repo_href(owner, repo, "branches"), "Branches", active == :branches)}
+      #{repo_tab(repo_href(owner, repo, "tags"), "Tags", active == :tags)}
     </nav>
     """
   end
 
   defp repo_tab(href, label, active?) do
     active_class = if active?, do: " is-active", else: ""
-    ~s(<a class="tab-link#{active_class}" href="#{href}">#{escape(label)}</a>)
+    ~s(<a class="tab-link#{active_class}" href="#{escape(href)}">#{escape(label)}</a>)
   end
 
   defp empty_repository_body(owner, repo) do
@@ -418,7 +418,7 @@ defmodule FornacastWeb.RepositoryController do
       |> Enum.map(fn commit ->
         """
         <tr>
-          <td><a href="/#{escape(owner.username)}/#{escape(repo.slug)}/commit/#{escape(commit.oid)}"><code>#{escape(String.slice(commit.oid, 0, 12))}</code></a></td>
+          <td><a href="#{escape(repo_href(owner, repo, ["commit", commit.oid]))}"><code>#{escape(String.slice(commit.oid, 0, 12))}</code></a></td>
           <td>#{escape(commit.title)}</td>
           <td>#{escape(commit.author_name)}</td>
           <td>#{escape(format_unix(commit.author_time))}</td>
@@ -441,7 +441,7 @@ defmodule FornacastWeb.RepositoryController do
     parents =
       commit.parents
       |> Enum.map(fn parent ->
-        ~s(<a href="/#{escape(owner.username)}/#{escape(repo.slug)}/commit/#{escape(parent)}"><code>#{escape(String.slice(parent, 0, 12))}</code></a>)
+        ~s(<a href="#{escape(repo_href(owner, repo, ["commit", parent]))}"><code>#{escape(String.slice(parent, 0, 12))}</code></a>)
       end)
       |> Enum.join(" ")
 
@@ -515,10 +515,11 @@ defmodule FornacastWeb.RepositoryController do
       |> Enum.map(fn entry ->
         child_path = join_path(browse_path, entry.name)
         route = if entry.kind == :tree, do: "src", else: "src"
+        href = repo_href(owner, repo, [route, ref, child_path])
 
         """
         <tr>
-          <td><a href="/#{escape(owner.username)}/#{escape(repo.slug)}/#{route}/#{escape(ref)}/#{escape(child_path)}">#{escape(entry.name)}</a></td>
+          <td><a href="#{escape(href)}">#{escape(entry.name)}</a></td>
           <td>#{escape(entry.kind)}</td>
           <td><code>#{escape(String.slice(entry.oid, 0, 12))}</code></td>
         </tr>
@@ -532,7 +533,8 @@ defmodule FornacastWeb.RepositoryController do
           ""
 
         parent ->
-          ~s(<p><a href="/#{escape(owner.username)}/#{escape(repo.slug)}/src/#{escape(ref)}/#{escape(parent)}">..</a></p>)
+          href = repo_href(owner, repo, ["src", ref, parent])
+          ~s(<p><a href="#{escape(href)}">..</a></p>)
       end
 
     """
@@ -548,8 +550,7 @@ defmodule FornacastWeb.RepositoryController do
   end
 
   defp blob_view(owner, repo, ref, blob_path, blob) do
-    raw_url =
-      "/#{escape(owner.username)}/#{escape(repo.slug)}/raw/#{escape(ref)}/#{escape(blob_path)}"
+    raw_url = repo_href(owner, repo, ["raw", ref, blob_path])
 
     body =
       cond do
@@ -569,7 +570,7 @@ defmodule FornacastWeb.RepositoryController do
     """
     <section class="file-panel">
       <div class="path-bar">
-        <code>#{escape(ref)}</code> / #{escape(blob_path)} · #{blob.size} bytes · <a href="#{raw_url}">Raw</a>
+        <code>#{escape(ref)}</code> / #{escape(blob_path)} · #{blob.size} bytes · <a href="#{escape(raw_url)}">Raw</a>
       </div>
       #{body}
     </section>
@@ -615,6 +616,21 @@ defmodule FornacastWeb.RepositoryController do
 
   defp join_path("", child), do: child
   defp join_path(parent, child), do: parent <> "/" <> child
+
+  defp repo_href(owner, repo, segments \\ []) do
+    "/" <> encoded_path_segments([owner.username, repo.slug] ++ List.wrap(segments))
+  end
+
+  defp encoded_path_segments(segments) do
+    segments
+    |> Enum.flat_map(fn segment ->
+      segment
+      |> to_string()
+      |> String.split("/", trim: true)
+    end)
+    |> Enum.map(fn segment -> URI.encode(segment, &URI.char_unreserved?/1) end)
+    |> Enum.join("/")
+  end
 
   defp parent_path(""), do: nil
 
