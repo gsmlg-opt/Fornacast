@@ -40,7 +40,11 @@ defmodule FornacastWeb.RepositoryController do
             {:error, reason} -> ~s(<p class="error">#{escape(reason)}</p>)
           end
 
-        page(conn, "#{owner.username}/#{repo.slug}", body)
+        page(
+          conn,
+          "#{owner.username}/#{repo.slug}",
+          repo_header(owner, repo) <> repo_tabs(owner, repo, :code) <> body
+        )
 
       {:error, conn} ->
         conn
@@ -55,7 +59,12 @@ defmodule FornacastWeb.RepositoryController do
           |> ForgeRepos.absolute_storage_path()
           |> GitCore.branches()
 
-        page(conn, "Branches: #{owner.username}/#{repo.slug}", refs_table(refs, "Branch"))
+        page(
+          conn,
+          "Branches: #{owner.username}/#{repo.slug}",
+          repo_header(owner, repo) <>
+            repo_tabs(owner, repo, :branches) <> refs_table(refs, "Branch")
+        )
 
       {:error, conn} ->
         conn
@@ -70,7 +79,11 @@ defmodule FornacastWeb.RepositoryController do
           |> ForgeRepos.absolute_storage_path()
           |> GitCore.tags()
 
-        page(conn, "Tags: #{owner.username}/#{repo.slug}", refs_table(refs, "Tag"))
+        page(
+          conn,
+          "Tags: #{owner.username}/#{repo.slug}",
+          repo_header(owner, repo) <> repo_tabs(owner, repo, :tags) <> refs_table(refs, "Tag")
+        )
 
       {:error, conn} ->
         conn
@@ -90,7 +103,8 @@ defmodule FornacastWeb.RepositoryController do
             page(
               conn,
               "Commits: #{owner.username}/#{repo.slug}",
-              commits_table(owner, repo, commits)
+              repo_header(owner, repo) <>
+                repo_tabs(owner, repo, :commits) <> commits_table(owner, repo, commits)
             )
 
           {:error, reason} ->
@@ -116,7 +130,8 @@ defmodule FornacastWeb.RepositoryController do
             page(
               conn,
               "Commit #{String.slice(commit.oid, 0, 12)}",
-              commit_detail(owner, repo, commit, diff)
+              repo_header(owner, repo) <>
+                repo_tabs(owner, repo, :commits) <> commit_detail(owner, repo, commit, diff)
             )
 
           {:error, reason} ->
@@ -238,33 +253,76 @@ defmodule FornacastWeb.RepositoryController do
     )
   end
 
-  defp empty_repository_body(owner, repo) do
-    clone_url = ForgeRepos.ssh_clone_url(repo, owner)
+  defp repo_header(owner, repo) do
+    description =
+      repo.description
+      |> to_string()
+      |> case do
+        "" -> "No description provided."
+        value -> value
+      end
 
     """
-    <p class="muted">Private #{escape(repo.visibility)} repository. Default branch: #{escape(repo.default_branch)}</p>
-    <h3>Clone URL</h3>
-    <pre>#{escape(clone_url)}</pre>
-    <h3>Push an existing project</h3>
-    <pre>git init
-    git remote add origin #{escape(clone_url)}
-    git branch -M #{escape(repo.default_branch)}
-    git push -u origin #{escape(repo.default_branch)}</pre>
+    <section class="repo-header">
+      <div>
+        <p class="eyebrow">Repository</p>
+        <h2>#{escape(owner.username)} / #{escape(repo.slug)}</h2>
+        <p class="muted">#{escape(description)}</p>
+      </div>
+      <div class="repo-meta">
+        #{badge(repo.visibility, to_string(repo.visibility))}
+        <span class="badge"><code>#{escape(repo.default_branch)}</code></span>
+      </div>
+    </section>
     """
   end
 
-  defp repository_overview_body(owner, repo) do
-    readme = readme_preview(repo)
+  defp repo_tabs(owner, repo, active) do
+    base = "/#{escape(owner.username)}/#{escape(repo.slug)}"
 
     """
-    <p class="muted">#{escape(repo.description || "")}</p>
-    <nav>
-      <a href="/#{escape(owner.username)}/#{escape(repo.slug)}/src/#{escape(repo.default_branch)}">Code</a>
-      <a href="/#{escape(owner.username)}/#{escape(repo.slug)}/commits/#{escape(repo.default_branch)}">Commits</a>
-      <a href="/#{escape(owner.username)}/#{escape(repo.slug)}/branches">Branches</a>
-      <a href="/#{escape(owner.username)}/#{escape(repo.slug)}/tags">Tags</a>
+    <nav class="repo-tabs" aria-label="Repository navigation">
+      #{repo_tab(base, "Code", active == :code)}
+      #{repo_tab("#{base}/commits/#{escape(repo.default_branch)}", "Commits", active == :commits)}
+      #{repo_tab("#{base}/branches", "Branches", active == :branches)}
+      #{repo_tab("#{base}/tags", "Tags", active == :tags)}
     </nav>
-    #{readme}
+    """
+  end
+
+  defp repo_tab(href, label, active?) do
+    active_class = if active?, do: " is-active", else: ""
+    ~s(<a class="tab-link#{active_class}" href="#{href}">#{escape(label)}</a>)
+  end
+
+  defp empty_repository_body(owner, repo) do
+    clone_url = ForgeRepos.ssh_clone_url(repo, owner)
+
+    commands = """
+    git init
+    git remote add origin #{clone_url}
+    git branch -M #{repo.default_branch}
+    git push -u origin #{repo.default_branch}
+    """
+
+    empty_state(
+      "Quick setup",
+      "This repository is empty. Push an existing project to start browsing code.",
+      """
+      <h3>Clone URL</h3>
+      #{command_block(clone_url)}
+      <h3>Push an existing project</h3>
+      #{command_block(String.trim(commands))}
+      """
+    )
+  end
+
+  defp repository_overview_body(_owner, repo) do
+    """
+    <section class="content-panel">
+      <p class="muted">Default branch <code>#{escape(repo.default_branch)}</code></p>
+    </section>
+    #{readme_preview(repo)}
     """
   end
 
@@ -282,10 +340,12 @@ defmodule FornacastWeb.RepositoryController do
       |> Enum.join("\n")
 
     """
-    <table>
-      <thead><tr><th>#{escape(label)}</th><th>Target</th></tr></thead>
-      <tbody>#{rows}</tbody>
-    </table>
+    <section class="content-panel">
+      <table class="data-table refs-table">
+        <thead><tr><th>#{escape(label)}</th><th>Target</th></tr></thead>
+        <tbody>#{rows}</tbody>
+      </table>
+    </section>
     """
   end
 
@@ -299,13 +359,19 @@ defmodule FornacastWeb.RepositoryController do
         page(
           conn,
           "Source: #{owner.username}/#{repo.slug}",
-          tree_view(owner, repo, ref, browse_path, entries)
+          repo_header(owner, repo) <>
+            repo_tabs(owner, repo, :code) <> tree_view(owner, repo, ref, browse_path, entries)
         )
 
       {:error, _reason} ->
         case GitCore.read_blob(storage_path, ref, browse_path, limit: @inline_blob_limit) do
           {:ok, blob} ->
-            page(conn, "File: #{blob.name}", blob_view(owner, repo, ref, browse_path, blob))
+            page(
+              conn,
+              "File: #{blob.name}",
+              repo_header(owner, repo) <>
+                repo_tabs(owner, repo, :code) <> blob_view(owner, repo, ref, browse_path, blob)
+            )
 
           {:error, reason} ->
             conn
@@ -362,10 +428,12 @@ defmodule FornacastWeb.RepositoryController do
       |> Enum.join("\n")
 
     """
-    <table>
-      <thead><tr><th>Commit</th><th>Title</th><th>Author</th><th>Date</th></tr></thead>
-      <tbody>#{rows}</tbody>
-    </table>
+    <section class="content-panel">
+      <table class="data-table commits-table">
+        <thead><tr><th>Commit</th><th>Title</th><th>Author</th><th>Date</th></tr></thead>
+        <tbody>#{rows}</tbody>
+      </table>
+    </section>
     """
   end
 
@@ -378,15 +446,17 @@ defmodule FornacastWeb.RepositoryController do
       |> Enum.join(" ")
 
     """
-    <p><code>#{escape(commit.oid)}</code></p>
-    <pre>#{escape(commit.message)}</pre>
-    <table>
-      <tbody>
-        <tr><th>Author</th><td>#{escape(commit.author_name)} &lt;#{escape(commit.author_email)}&gt; #{escape(format_unix(commit.author_time))}</td></tr>
-        <tr><th>Committer</th><td>#{escape(commit.committer_name)} &lt;#{escape(commit.committer_email)}&gt; #{escape(format_unix(commit.committer_time))}</td></tr>
-        <tr><th>Parents</th><td>#{parents}</td></tr>
-      </tbody>
-    </table>
+    <section class="content-panel">
+      <p><code>#{escape(commit.oid)}</code></p>
+      #{code_block(commit.message)}
+      <table class="data-table commit-meta-table">
+        <tbody>
+          <tr><th>Author</th><td>#{escape(commit.author_name)} &lt;#{escape(commit.author_email)}&gt; #{escape(format_unix(commit.author_time))}</td></tr>
+          <tr><th>Committer</th><td>#{escape(commit.committer_name)} &lt;#{escape(commit.committer_email)}&gt; #{escape(format_unix(commit.committer_time))}</td></tr>
+          <tr><th>Parents</th><td>#{parents}</td></tr>
+        </tbody>
+      </table>
+    </section>
     #{commit_diff(diff)}
     """
   end
@@ -416,18 +486,22 @@ defmodule FornacastWeb.RepositoryController do
       if diff.patch == "" do
         ~s(<p class="muted">No file changes were found for this commit.</p>)
       else
-        ~s(<pre>#{escape(diff.patch)}</pre>)
+        code_block(diff.patch)
       end
 
     """
-    <h3>Changed files</h3>
-    <table>
-      <thead><tr><th>Status</th><th>Path</th><th>Content</th></tr></thead>
-      <tbody>#{rows}</tbody>
-    </table>
-    <h3>Unified diff</h3>
-    #{warning}
-    #{patch}
+    <section class="content-panel">
+      <h3>Changed files</h3>
+      <table class="data-table commit-files-table">
+        <thead><tr><th>Status</th><th>Path</th><th>Content</th></tr></thead>
+        <tbody>#{rows}</tbody>
+      </table>
+    </section>
+    <section class="content-panel">
+      <h3>Unified diff</h3>
+      #{warning}
+      #{patch}
+    </section>
     """
   end
 
@@ -462,12 +536,14 @@ defmodule FornacastWeb.RepositoryController do
       end
 
     """
-    <p class="muted">#{escape(ref)} / #{escape(browse_path)}</p>
+    <div class="path-bar"><code>#{escape(ref)}</code> / #{escape(browse_path)}</div>
     #{up_link}
-    <table>
-      <thead><tr><th>Name</th><th>Kind</th><th>Object</th></tr></thead>
-      <tbody>#{rows}</tbody>
-    </table>
+    <section class="content-panel">
+      <table class="data-table source-table">
+        <thead><tr><th>Name</th><th>Kind</th><th>Object</th></tr></thead>
+        <tbody>#{rows}</tbody>
+      </table>
+    </section>
     """
   end
 
@@ -483,16 +559,20 @@ defmodule FornacastWeb.RepositoryController do
         blob.truncated ->
           """
           <p class="muted">This file is larger than #{@inline_blob_limit} bytes and was truncated.</p>
-          <pre>#{escape(blob.data)}</pre>
+          #{code_block(blob.data)}
           """
 
         true ->
-          ~s(<pre>#{escape(blob.data)}</pre>)
+          code_block(blob.data)
       end
 
     """
-    <p class="muted">#{escape(blob_path)} · #{blob.size} bytes · <a href="#{raw_url}">Raw</a></p>
-    #{body}
+    <section class="file-panel">
+      <div class="path-bar">
+        <code>#{escape(ref)}</code> / #{escape(blob_path)} · #{blob.size} bytes · <a href="#{raw_url}">Raw</a>
+      </div>
+      #{body}
+    </section>
     """
   end
 
@@ -522,11 +602,11 @@ defmodule FornacastWeb.RepositoryController do
       if String.ends_with?(String.downcase(path), ".md") do
         MDEx.to_html!(content, sanitize: MDEx.Document.default_sanitize_options())
       else
-        ~s(<pre>#{escape(content)}</pre>)
+        code_block(content)
       end
 
     """
-    <section>
+    <section class="readme-panel">
       <h3>#{escape(path)}</h3>
       #{body}
     </section>
