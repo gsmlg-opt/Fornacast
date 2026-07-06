@@ -94,14 +94,25 @@ defmodule FornacastWebTest do
       |> Plug.Test.init_test_session(user_id: user.id)
 
     overview = get(conn, "/alice/demo")
-    assert html_response(overview, 200) =~ "<h1>Demo</h1>"
-    refute html_response(overview, 200) =~ "<script>"
+    overview_body = html_response(overview, 200)
+    assert overview_body =~ ~s(class="repo-header")
+    assert overview_body =~ "alice / demo"
+    assert overview_body =~ ~s(class="repo-tabs")
+    assert overview_body =~ ~s(class="readme-panel")
+    assert overview_body =~ "<h1>Demo</h1>"
+    refute overview_body =~ "<script>"
 
     source = get(conn, "/alice/demo/src/main/docs")
-    assert html_response(source, 200) =~ "guide.txt"
+    source_body = html_response(source, 200)
+    assert source_body =~ ~s(class="path-bar")
+    assert source_body =~ ~s(class="data-table source-table")
+    assert source_body =~ "guide.txt"
 
     file = get(conn, "/alice/demo/src/main/docs/guide.txt")
-    assert html_response(file, 200) =~ "hello"
+    file_body = html_response(file, 200)
+    assert file_body =~ ~s(class="file-panel")
+    assert file_body =~ ~s(class="code-block")
+    assert file_body =~ "hello"
 
     binary = get(conn, "/alice/demo/src/main/asset.bin")
     assert html_response(binary, 200) =~ "Binary or non-UTF-8 files are not rendered inline."
@@ -162,7 +173,11 @@ defmodule FornacastWebTest do
              })
 
     login_form = get(build_conn(), "/login")
-    assert html_response(login_form, 200) =~ "Login"
+    login_body = html_response(login_form, 200)
+    assert login_body =~ ~s(class="auth-shell")
+    assert login_body =~ ~s(class="form-panel")
+    assert login_body =~ "Sign in"
+    assert login_body =~ ~s(name="session[username]")
 
     login =
       post(build_conn(), "/login", %{
@@ -173,6 +188,17 @@ defmodule FornacastWebTest do
       })
 
     assert redirected_to(login) == "/"
+
+    dashboard =
+      login
+      |> recycle()
+      |> get("/")
+
+    dashboard_body = html_response(dashboard, 200)
+    assert dashboard_body =~ ~s(class="app-shell")
+    assert dashboard_body =~ ~s(class="app-rail")
+    assert dashboard_body =~ ~s(class="section-header")
+    assert dashboard_body =~ "Repositories"
 
     key =
       login
@@ -186,6 +212,17 @@ defmodule FornacastWebTest do
 
     assert redirected_to(key) == "/ssh-keys"
     assert [%{fingerprint_sha256: "SHA256:" <> _}] = ForgeAccounts.list_user_ssh_keys(user)
+
+    ssh_keys =
+      key
+      |> recycle()
+      |> get("/ssh-keys")
+
+    ssh_keys_body = html_response(ssh_keys, 200)
+    assert ssh_keys_body =~ ~s(class="settings-grid")
+    assert ssh_keys_body =~ ~s(class="form-panel")
+    assert ssh_keys_body =~ ~s(class="data-table key-table")
+    assert ssh_keys_body =~ "SHA256:"
 
     created =
       key
@@ -205,8 +242,14 @@ defmodule FornacastWebTest do
       |> recycle()
       |> get("/alice/empty")
 
-    assert html_response(empty, 200) =~ "git push -u origin main"
-    assert html_response(empty, 200) =~ "ssh://alice@"
+    empty_body = html_response(empty, 200)
+    assert empty_body =~ ~s(class="repo-header")
+    assert empty_body =~ "alice / empty"
+    assert empty_body =~ ~s(class="repo-tabs")
+    assert empty_body =~ ~s(class="empty-state")
+    assert empty_body =~ ~s(class="command-block")
+    assert empty_body =~ "git push -u origin main"
+    assert empty_body =~ "ssh://alice@"
 
     forbidden =
       build_conn()
