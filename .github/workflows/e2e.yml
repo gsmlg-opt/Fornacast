@@ -1,6 +1,9 @@
 name: E2E
 
 on:
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       version:
@@ -16,6 +19,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  ELIXIR_VERSION: 1.20.1
+  OTP_VERSION: "29.0"
+  RUST_VERSION: 1.96.0
+  MIX_ENV: prod
   FORNACAST_DATABASE_ADAPTER: turso
   FORNACAST_SSH_PORT: "22222"
   PORT: "4100"
@@ -32,9 +39,71 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends curl git openssh-client openssl
+          sudo apt-get install -y --no-install-recommends build-essential curl git libssl-dev openssh-client openssl pkg-config
+
+      - name: Setup Rust
+        if: github.event_name == 'pull_request'
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Setup BEAM
+        if: github.event_name == 'pull_request'
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Cache release dependencies
+        if: github.event_name == 'pull_request'
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+            ~/.hex
+            ~/.cache/rebar3
+            ~/.cargo/git
+            ~/.cargo/registry
+          key: ${{ runner.os }}-e2e-release-${{ env.MIX_ENV }}-${{ hashFiles('mix.lock', 'apps/git_core/native/fornacast_git_core/Cargo.lock', 'bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-e2e-release-${{ env.MIX_ENV }}-
+
+      - name: Install Hex and Rebar
+        if: github.event_name == 'pull_request'
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+
+      - name: Fetch dependencies
+        if: github.event_name == 'pull_request'
+        run: mix deps.get --only prod
+
+      - name: Compile dependencies
+        if: github.event_name == 'pull_request'
+        run: mix deps.compile
+
+      - name: Install frontend dependencies
+        if: github.event_name == 'pull_request'
+        run: |
+          mix bun.install --if-missing
+          ./_build/bun install --frozen-lockfile
+
+      - name: Build static assets
+        if: github.event_name == 'pull_request'
+        run: mix assets.deploy
+
+      - name: Compile application
+        if: github.event_name == 'pull_request'
+        run: mix compile
+
+      - name: Build pull request release
+        if: github.event_name == 'pull_request'
+        run: |
+          mix release fornacast --overwrite
+          mkdir -p release
+          cp -a _build/prod/rel/fornacast release/fornacast
 
       - name: Download release artifact
+        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
@@ -46,6 +115,7 @@ jobs:
             --clobber
 
       - name: Extract release artifact
+        if: github.event_name == 'workflow_dispatch'
         env:
           VERSION: ${{ inputs.version }}
         run: |
