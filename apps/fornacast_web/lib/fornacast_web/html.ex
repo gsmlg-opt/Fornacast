@@ -6,26 +6,19 @@ defmodule FornacastWeb.HTML do
 
   def page(conn, title, body) do
     current_user = conn.assigns[:current_user]
-    css_path = FornacastWeb.Endpoint.static_path("/assets/app.css")
-    js_path = FornacastWeb.Endpoint.static_path("/assets/app.js")
 
-    nav =
-      if current_user do
-        """
-        <nav>
-          <a href="/">Dashboard</a>
-          <a href="/repos/new">New repository</a>
-          <a href="/ssh-keys">SSH keys</a>
-          <form action="/logout" method="post" class="inline">
-            #{csrf_input()}
-            <input type="hidden" name="_method" value="delete">
-            <button type="submit">Logout</button>
-          </form>
-        </nav>
-        """
-      else
-        ~s(<nav><a href="/login">Login</a></nav>)
-      end
+    css_path =
+      DuskmoonBundler.static_path(FornacastWeb.Endpoint, "/assets/css/app.css",
+        profile: :fornacast_web
+      )
+
+    js_path =
+      DuskmoonBundler.static_path(FornacastWeb.Endpoint, "/assets/js/app.js",
+        profile: :fornacast_web
+      )
+
+    preload_tags = preload_tags()
+    escaped_title = escape(title)
 
     html =
       """
@@ -35,13 +28,13 @@ defmodule FornacastWeb.HTML do
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="csrf-token" content="#{Plug.CSRFProtection.get_csrf_token()}">
-        <title>#{escape(title)} - Fornacast</title>
+        <title>#{escaped_title} - Fornacast</title>
+        #{preload_tags}
         <link rel="stylesheet" href="#{escape(css_path)}">
-        <script defer type="text/javascript" src="#{escape(js_path)}"></script>
+        <script type="module" src="#{escape(js_path)}"></script>
       </head>
-      <body>
-        <header><h1>Fornacast</h1>#{nav}</header>
-        <main><h2>#{escape(title)}</h2>#{body}</main>
+      <body class="app-body bg-surface text-on-surface">
+        #{app_shell(current_user, escaped_title, body)}
       </body>
       </html>
       """
@@ -60,5 +53,176 @@ defmodule FornacastWeb.HTML do
 
   def csrf_input do
     ~s(<input type="hidden" name="_csrf_token" value="#{Plug.CSRFProtection.get_csrf_token()}">)
+  end
+
+  defp app_shell(current_user, title, body) do
+    if current_user do
+      """
+      <div class="app-shell">
+        <header class="appbar appbar-primary appbar-sticky">
+          <div class="appbar-left">
+            <a class="brand-mark" href="/" aria-label="Fornacast dashboard">Fornacast</a>
+            <nav class="appbar-nav" aria-label="Workspace">
+              <a class="nav-link" href="/issues">Issues</a>
+              <a class="nav-link" href="/pulls">Pull Requests</a>
+              #{repository_menu(current_user)}
+            </nav>
+          </div>
+          <div class="appbar-actions">
+            #{create_menu()}
+            #{account_menu(current_user)}
+            #{theme_menu()}
+          </div>
+        </header>
+        <main class="app-main">
+          <div class="page-heading">
+            <p class="eyebrow">Repository workbench</p>
+            <h1>#{title}</h1>
+          </div>
+          <section class="content-panel">#{body}</section>
+        </main>
+      </div>
+      """
+    else
+      """
+      <div class="auth-shell">
+        <header class="appbar auth-appbar">
+          <a class="brand-mark" href="/" aria-label="Fornacast home">Fornacast</a>
+          <nav class="app-nav" aria-label="Primary">
+            <a class="nav-link" href="/login">Login</a>
+            #{theme_menu()}
+          </nav>
+        </header>
+        <main class="auth-main">
+          <section class="content-panel auth-panel">
+            <div class="page-heading">
+              <p class="eyebrow">Self-hosted forge</p>
+              <h1>#{title}</h1>
+            </div>
+            #{body}
+          </section>
+        </main>
+      </div>
+      """
+    end
+  end
+
+  defp create_menu do
+    """
+    <details class="appbar-create-menu">
+      <summary class="create-menu-trigger" aria-label="Create new" title="Create new">
+        <span class="create-menu-plus" aria-hidden="true"></span>
+        <span class="create-menu-caret" aria-hidden="true"></span>
+      </summary>
+      <div class="create-menu" role="menu">
+        <a class="create-menu-item" href="/repos/new">
+          <span class="create-menu-icon create-menu-icon-repo" aria-hidden="true"></span>
+          <span>New repository</span>
+        </a>
+        <a class="create-menu-item" href="/repos/import">
+          <span class="create-menu-icon create-menu-icon-import" aria-hidden="true"></span>
+          <span>Import repository</span>
+        </a>
+        <a class="create-menu-item" href="/organizations/new">
+          <span class="create-menu-icon create-menu-icon-org" aria-hidden="true"></span>
+          <span>New organization</span>
+        </a>
+      </div>
+    </details>
+    """
+  end
+
+  defp repository_menu(current_user) do
+    items =
+      current_user
+      |> ForgeAccounts.list_repository_owners()
+      |> Enum.map(&repository_owner_menu_item/1)
+      |> Enum.join("\n")
+
+    """
+    <details class="repo-menu">
+      <summary class="repo-menu-trigger" aria-label="User repositories" title="User repositories">
+        <span>User Repos</span>
+        <span class="appbar-menu-caret" aria-hidden="true"></span>
+      </summary>
+      <div class="repo-menu-list" role="menu">
+        #{items}
+      </div>
+    </details>
+    """
+  end
+
+  defp repository_owner_menu_item(owner) do
+    ~s(<a class="repo-menu-item" href="/#{escape(owner.username)}">#{escape(owner_label(owner))}</a>)
+  end
+
+  defp theme_menu do
+    """
+    <details class="theme-menu">
+      <summary class="theme-menu-trigger" aria-label="Theme" title="Theme">
+        <span data-theme-label>Theme</span>
+        <span class="appbar-menu-caret" aria-hidden="true"></span>
+      </summary>
+      <div class="theme-menu-list" role="menu">
+        <button type="button" class="theme-menu-item" data-theme-choice="auto" role="menuitemradio" aria-checked="false">Auto</button>
+        <button type="button" class="theme-menu-item" data-theme-choice="sunshine" role="menuitemradio" aria-checked="false">Sunshine</button>
+        <button type="button" class="theme-menu-item" data-theme-choice="moonlight" role="menuitemradio" aria-checked="false">Moonlight</button>
+      </div>
+    </details>
+    """
+  end
+
+  defp account_menu(current_user) do
+    """
+    <details class="account-menu">
+      <summary class="account-menu-trigger" aria-label="Account menu" title="Account menu">
+        <span>@#{escape(account_label(current_user))}</span>
+        <span class="appbar-menu-caret" aria-hidden="true"></span>
+      </summary>
+      <div class="account-menu-list" role="menu">
+        <a class="account-menu-item" href="#{escape(account_profile_path(current_user))}">Profile</a>
+        <a class="account-menu-item" href="/settings/ssh-keys">Settings</a>
+        <form action="/logout" method="post" class="account-menu-logout">
+          #{csrf_input()}
+          <input type="hidden" name="_method" value="delete">
+          <button type="submit" class="account-menu-item account-menu-button">Logout</button>
+        </form>
+      </div>
+    </details>
+    """
+  end
+
+  defp account_label(current_user) do
+    current_user.display_name || current_user.username || current_user.email || "account"
+  end
+
+  defp owner_label(%{kind: :organization, display_name: display_name, username: username}) do
+    display_name || username
+  end
+
+  defp owner_label(%{username: username}), do: username
+
+  defp account_profile_path(%{username: username}) when is_binary(username) and username != "" do
+    "/" <> username
+  end
+
+  defp account_profile_path(_current_user), do: "/"
+
+  defp preload_tags do
+    manifest_path =
+      :fornacast_web
+      |> :code.priv_dir()
+      |> to_string()
+      |> Path.join("static/assets/js/manifest.json")
+
+    if File.exists?(manifest_path) do
+      DuskmoonBundler.Preload.tags(FornacastWeb.Endpoint, "/assets/js/app.js",
+        profile: :fornacast_web
+      )
+    else
+      ""
+    end
+  rescue
+    _error -> ""
   end
 end

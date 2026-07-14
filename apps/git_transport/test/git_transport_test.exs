@@ -591,7 +591,14 @@ defmodule GitTransportTest do
   end
 
   defp reset_tables do
-    ["audit_events", "repository_collaborators", "repositories", "ssh_keys", "users"]
+    [
+      "audit_events",
+      "repository_collaborators",
+      "repositories",
+      "organization_members",
+      "ssh_keys",
+      "users"
+    ]
   end
 
   defp populate_bare_repository!(tmp_dir, repo_path) do

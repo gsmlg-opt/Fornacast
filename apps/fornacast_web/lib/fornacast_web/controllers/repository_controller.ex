@@ -5,10 +5,15 @@ defmodule FornacastWeb.RepositoryController do
 
   @inline_blob_limit 1_048_576
 
-  def new(conn, _params) do
+  def new(%Plug.Conn{assigns: %{current_user: user}} = conn, _params) do
     page(conn, "New repository", """
     <form action="/repos" method="post">
       #{csrf_input()}
+      <label>Owner
+        <select name="repository[owner]">
+          #{owner_options(user)}
+        </select>
+      </label>
       <label>Name <input name="repository[name]"></label>
       <label>Slug <input name="repository[slug]"></label>
       <label>Description <textarea name="repository[description]" rows="3"></textarea></label>
@@ -23,15 +28,38 @@ defmodule FornacastWeb.RepositoryController do
     """)
   end
 
-  def create(%Plug.Conn{assigns: %{current_user: user}} = conn, %{"repository" => attrs}) do
-    case ForgeRepos.create_repository(user, attrs) do
-      {:ok, repo} ->
-        redirect(conn, to: "/#{user.username}/#{repo.slug}")
+  def import_new(conn, _params) do
+    page(conn, "Import repository", """
+    <p class="muted">Import an existing Git repository into this Fornacast demo.</p>
+    <form>
+      <label>Clone URL <input name="import[url]" placeholder="https://example.com/owner/repository.git"></label>
+      <label>Owner
+        <select name="import[owner]">
+          #{owner_options(conn.assigns.current_user)}
+        </select>
+      </label>
+      <label>Name <input name="import[name]"></label>
+      <button type="button" disabled>Import repository</button>
+    </form>
+    """)
+  end
 
+  def create(%Plug.Conn{assigns: %{current_user: user}} = conn, %{"repository" => attrs}) do
+    owner_slug = Map.get(attrs, "owner") || user.username
+
+    with {:ok, owner} <- ForgeAccounts.repository_owner_by_slug_for(user, owner_slug),
+         {:ok, repo} <- ForgeRepos.create_repository(owner, attrs) do
+      redirect(conn, to: "/#{owner.username}/#{repo.slug}")
+    else
       {:error, %Ecto.Changeset{} = changeset} ->
         conn
         |> put_status(:unprocessable_entity)
         |> page("New repository", ~s(<p class="error">#{escape(inspect(changeset.errors))}</p>))
+
+      {:error, :unauthorized} ->
+        conn
+        |> put_status(:forbidden)
+        |> page("New repository", ~s(<p class="error">You cannot create repositories there.</p>))
 
       {:error, reason} ->
         conn
@@ -40,12 +68,18 @@ defmodule FornacastWeb.RepositoryController do
     end
   end
 
+  def create(conn, _params) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> page("New repository", ~s(<p class="error">Repository parameters are required.</p>))
+  end
+
   def show(conn, %{"owner" => owner_slug, "repo" => repo_slug}) do
     case load_readable_repository(conn, owner_slug, repo_slug) do
       {:ok, owner, repo} ->
         body =
           case ForgeRepos.empty?(repo) do
-            {:ok, true} -> empty_repository_body(owner, repo)
+            {:ok, true} -> empty_repository_body(owner, repo, conn.assigns[:current_user])
             {:ok, false} -> repository_overview_body(owner, repo)
             {:error, reason} -> ~s(<p class="error">#{escape(reason)}</p>)
           end
@@ -200,7 +234,7 @@ defmodule FornacastWeb.RepositoryController do
   defp load_readable_repository(conn, owner_slug, repo_slug) do
     current_user = conn.assigns[:current_user]
 
-    with owner when not is_nil(owner) <- ForgeAccounts.get_user_by_username(owner_slug),
+    with owner when not is_nil(owner) <- ForgeAccounts.get_account_by_username(owner_slug),
          %Repository{} = repo <- ForgeRepos.get_repository(owner_slug, repo_slug),
          :ok <- Fornacast.Access.authorize(current_user, :repository_read, repo) do
       {:ok, owner, repo}
@@ -226,10 +260,11 @@ defmodule FornacastWeb.RepositoryController do
     end
   end
 
-  defp empty_repository_body(owner, repo) do
-    clone_url = ForgeRepos.ssh_clone_url(repo, owner)
+  defp empty_repository_body(owner, repo, current_user) do
+    clone_url = ForgeRepos.ssh_clone_url(repo, owner, current_user)
 
     """
+    <p class="muted">Owner: #{escape(owner_label(owner))}</p>
     <p class="muted">Private #{escape(repo.visibility)} repository. Default branch: #{escape(repo.default_branch)}</p>
     <h3>Clone URL</h3>
     <pre>#{escape(clone_url)}</pre>
@@ -245,6 +280,7 @@ defmodule FornacastWeb.RepositoryController do
     readme = readme_preview(repo)
 
     """
+    <p class="muted">Owner: #{escape(owner_label(owner))}</p>
     <p class="muted">#{escape(repo.description || "")}</p>
     <nav>
       <a href="/#{escape(owner.username)}/#{escape(repo.slug)}/src/#{escape(repo.default_branch)}">Code</a>
@@ -255,6 +291,22 @@ defmodule FornacastWeb.RepositoryController do
     #{readme}
     """
   end
+
+  defp owner_options(user) do
+    user
+    |> ForgeAccounts.list_repository_owners()
+    |> Enum.map(fn owner ->
+      label = "#{owner_label(owner)} (#{owner.username})"
+      ~s(<option value="#{escape(owner.username)}">#{escape(label)}</option>)
+    end)
+    |> Enum.join("\n")
+  end
+
+  defp owner_label(%{kind: :organization, display_name: display_name, username: username}) do
+    display_name || username
+  end
+
+  defp owner_label(%{username: username}), do: username
 
   defp refs_table({:ok, refs}, label) do
     rows =

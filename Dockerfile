@@ -35,6 +35,7 @@ COPY config config
 COPY apps/fornacast_web/package.json apps/fornacast_web/package.json
 COPY apps apps
 
+# WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#76
 RUN mix deps.get --only prod && \
     mix deps.compile && \
     mix bun.install --if-missing && \

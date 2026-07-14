@@ -20,6 +20,7 @@ defmodule Fornacast.Application do
 
     case Supervisor.start_link(children, opts) do
       {:ok, pid} ->
+        ensure_development_admin()
         heal_initialization()
         {:ok, pid}
 
@@ -57,6 +58,37 @@ defmodule Fornacast.Application do
     end
 
     :ok
+  end
+
+  @doc """
+  Ensures the configured development admin account exists and can log in.
+
+  This is inert unless `:fornacast, :development_admin` is configured. It uses
+  `apply/3` for the same runtime-only ForgeAccounts boundary as
+  `heal_initialization/0`.
+  """
+  @spec ensure_development_admin() :: :ok
+  def ensure_development_admin do
+    case Application.get_env(:fornacast, :development_admin) do
+      attrs when is_map(attrs) or is_list(attrs) ->
+        attrs
+        |> Map.new()
+        |> create_development_admin()
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp create_development_admin(attrs) do
+    case apply(ForgeAccounts, :ensure_development_admin, [attrs]) do
+      {:ok, user} ->
+        Logger.warning("Ensured development admin account #{user.username}")
+        Fornacast.Setup.mark_initialized!(user)
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        raise "Could not create development admin: #{inspect(changeset.errors)}"
+    end
   end
 
   defp maybe_migrate do

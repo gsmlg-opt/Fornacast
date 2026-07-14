@@ -87,20 +87,30 @@ config :logger, :console,
 
 config :phoenix, :json_library, JSON
 
-config :bun,
-  version: "1.3.4",
-  fornacast_web: [
-    args:
-      ~w(build assets/js/app.js --outdir=priv/static/assets --external /fonts/* --external /images/*),
-    cd: Path.expand("../apps/fornacast_web", __DIR__),
-    env: %{"NODE_PATH" => Path.expand("../deps", __DIR__)}
-  ]
+config :bun, version: "1.3.4"
 
-config :tailwind,
-  version: "4.1.11",
-  fornacast_web: [
-    args: ~w(--input=assets/css/app.css --output=priv/static/assets/app.css),
-    cd: Path.expand("../apps/fornacast_web", __DIR__)
+fornacast_web_path = Path.expand("../apps/fornacast_web", __DIR__)
+
+config :duskmoon_bundler, :fornacast_web,
+  entry: Path.join(fornacast_web_path, "assets/js/app.js"),
+  outdir: Path.join(fornacast_web_path, "priv/static/assets"),
+  root: Path.join(fornacast_web_path, "assets"),
+  format: :esm,
+  target: :es2020,
+  sourcemap: :hidden,
+  resolve_dirs: [Path.expand("../deps", __DIR__)],
+  tailwind: [
+    css: Path.join(fornacast_web_path, "assets/css/app.css"),
+    sources: [
+      %{base: Path.join(fornacast_web_path, "lib"), pattern: "**/*.{ex,heex,eex}"},
+      %{base: Path.join(fornacast_web_path, "assets"), pattern: "**/*.{js,ts,jsx,tsx}"}
+    ]
+  ],
+  server: [
+    watch_dirs: [
+      Path.join(fornacast_web_path, "lib"),
+      Path.join(fornacast_web_path, "assets")
+    ]
   ]
 
 import_config "#{config_env()}.exs"

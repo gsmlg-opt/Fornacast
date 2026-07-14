@@ -11,6 +11,15 @@ defmodule FornacastWeb.Endpoint do
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
 
   plug Plug.Static,
+    at: "/assets/css",
+    from: {:fornacast_web, "priv/static/assets/css"},
+    gzip: false
+
+  if code_reloading? do
+    plug DuskmoonBundler.DevServer, profile: :fornacast_web
+  end
+
+  plug Plug.Static,
     at: "/",
     from: :fornacast_web,
     gzip: false,

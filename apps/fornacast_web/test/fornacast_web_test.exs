@@ -18,6 +18,144 @@ defmodule FornacastWebTest do
   end
 
   @tag :tmp_dir
+  test "authenticated shell renders workspace navigation in the appbar", %{tmp_dir: tmp_dir} do
+    reset_database!()
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
+
+    on_exit(fn ->
+      Application.put_env(:fornacast, :repo_storage_root, original_root)
+    end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-shell@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, organization} =
+             ForgeAccounts.create_organization(user, %{
+               username: "acme",
+               display_name: "ACME Engineering"
+             })
+
+    assert {:ok, _repo} =
+             ForgeRepos.create_repository(user, %{
+               name: "Personal app",
+               slug: "personal-app"
+             })
+
+    assert {:ok, _org_repo} =
+             ForgeRepos.create_repository(organization, %{
+               name: "Org service",
+               slug: "org-service"
+             })
+
+    conn =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+      |> get("/")
+
+    html = html_response(conn, 200)
+
+    assert html =~
+             ~s(<a class="brand-mark" href="/" aria-label="Fornacast dashboard">Fornacast</a>)
+
+    assert html =~ ~s(<nav class="appbar-nav" aria-label="Workspace">)
+    assert html =~ ~s(<a class="nav-link" href="/issues">Issues</a>)
+    assert html =~ ~s(<a class="nav-link" href="/pulls">Pull Requests</a>)
+    assert html =~ ~s(<details class="repo-menu">)
+    assert html =~ ~s(<summary class="repo-menu-trigger" aria-label="User repositories")
+    assert html =~ ~s(<span>User Repos</span>)
+    assert html =~ ~s(<a class="repo-menu-item" href="/alice">alice</a>)
+    assert html =~ ~s(<a class="repo-menu-item" href="/acme">ACME Engineering</a>)
+    assert html =~ ~s(<details class="appbar-create-menu">)
+
+    assert html =~
+             ~s(<summary class="create-menu-trigger" aria-label="Create new" title="Create new">)
+
+    assert html =~ ~s(<a class="create-menu-item" href="/repos/new">)
+    assert html =~ ~s(<a class="create-menu-item" href="/repos/import">)
+    assert html =~ ~s(<a class="create-menu-item" href="/organizations/new">)
+    assert html =~ ~s(<details class="theme-menu">)
+    assert html =~ ~s(<button type="button" class="theme-menu-item" data-theme-choice="auto")
+    assert html =~ ~s(<button type="button" class="theme-menu-item" data-theme-choice="sunshine")
+    assert html =~ ~s(<button type="button" class="theme-menu-item" data-theme-choice="moonlight")
+    assert html =~ ~s(<details class="account-menu">)
+    assert html =~ ~s(<a class="account-menu-item" href="/alice">Profile</a>)
+    assert html =~ ~s(<a class="account-menu-item" href="/settings/ssh-keys">Settings</a>)
+    assert html =~ ~s(<form action="/logout" method="post" class="account-menu-logout">)
+    refute html =~ ~s(<a class="nav-link" href="/">Dashboard</a>)
+    refute html =~ ~s(<a class="nav-link" href="/repos/new">New repository</a>)
+    refute html =~ ~s(<a class="nav-link" href="/organizations/new">New organization</a>)
+    refute html =~ ~s(<a class="nav-link" href="/ssh-keys">SSH keys</a>)
+    refute html =~ ~s(<p class="repo-menu-owner">)
+    refute html =~ ~s(<a class="repo-menu-item" href="/alice/personal-app")
+    refute html =~ ~s(<a class="repo-menu-item" href="/acme/org-service")
+    refute html =~ ~s(data-theme-toggle)
+    refute html =~ ~s(class="account-pill")
+    refute html =~ ~s(class="appbar-logout")
+    refute html =~ ~s(<aside class="app-rail)
+  end
+
+  test "SSH keys are available from settings" do
+    reset_database!()
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-settings@example.com",
+               password: "correct horse battery staple"
+             })
+
+    conn =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+      |> get("/settings/ssh-keys")
+
+    html = html_response(conn, 200)
+    assert html =~ "<h1>SSH keys</h1>"
+    assert html =~ ~s(<form action="/settings/ssh-keys" method="post">)
+  end
+
+  test "appbar issue and pull request routes render demo pages" do
+    reset_database!()
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-workbench@example.com",
+               password: "correct horse battery staple"
+             })
+
+    conn =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+
+    assert html_response(get(conn, "/issues"), 200) =~ "<h1>Issues</h1>"
+    assert html_response(get(conn, "/pulls"), 200) =~ "<h1>Pull Requests</h1>"
+  end
+
+  test "authenticated import repository page is reachable from the create menu" do
+    reset_database!()
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-import@example.com",
+               password: "correct horse battery staple"
+             })
+
+    conn =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+      |> get("/repos/import")
+
+    assert html_response(conn, 200) =~ "<h1>Import repository</h1>"
+  end
+
+  @tag :tmp_dir
   test "health endpoint reports database, storage, and SSH daemon status", %{tmp_dir: tmp_dir} do
     reset_database!()
     original_root = Application.get_env(:fornacast, :repo_storage_root)
@@ -212,6 +350,77 @@ defmodule FornacastWebTest do
       build_conn()
       |> Plug.Test.init_test_session(user_id: bob.id)
       |> get("/alice/empty")
+
+    assert html_response(forbidden, 403) =~ "You do not have access"
+  end
+
+  @tag :tmp_dir
+  test "repository creation supports organization namespaces", %{tmp_dir: tmp_dir} do
+    reset_database!()
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
+
+    on_exit(fn ->
+      Application.put_env(:fornacast, :repo_storage_root, original_root)
+    end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-org-web@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, bob} =
+             ForgeAccounts.create_user(%{
+               username: "bob",
+               email: "bob-org-web@example.com",
+               password: "correct horse battery staple"
+             })
+
+    conn =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+
+    created_org =
+      post(conn, "/organizations", %{
+        "organization" => %{
+          "username" => "Acme",
+          "display_name" => "ACME Engineering"
+        }
+      })
+
+    assert redirected_to(created_org) == "/acme"
+
+    created_repo =
+      created_org
+      |> recycle()
+      |> post("/repos", %{
+        "repository" => %{
+          "owner" => "acme",
+          "name" => "Empty",
+          "slug" => "empty",
+          "description" => "organization repository"
+        }
+      })
+
+    assert redirected_to(created_repo) == "/acme/empty"
+
+    empty =
+      created_repo
+      |> recycle()
+      |> get("/acme/empty")
+
+    body = html_response(empty, 200)
+    assert body =~ "ACME Engineering"
+    assert body =~ "ssh://alice@"
+    assert body =~ "/acme/empty.git"
+    refute body =~ "ssh://acme@"
+
+    forbidden =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: bob.id)
+      |> get("/acme/empty")
 
     assert html_response(forbidden, 403) =~ "You do not have access"
   end
@@ -431,7 +640,14 @@ defmodule FornacastWebTest do
   end
 
   defp reset_tables do
-    ["audit_events", "repository_collaborators", "repositories", "ssh_keys", "users"]
+    [
+      "audit_events",
+      "repository_collaborators",
+      "repositories",
+      "organization_members",
+      "ssh_keys",
+      "users"
+    ]
   end
 
   defp git!(args, extra_env) do

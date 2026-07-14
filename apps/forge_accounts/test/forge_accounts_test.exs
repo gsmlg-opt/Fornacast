@@ -3,7 +3,7 @@ defmodule ForgeAccountsTest do
 
   import ExUnit.CaptureIO
 
-  alias ForgeAccounts.{SSHKey, User}
+  alias ForgeAccounts.{Organization, SSHKey, User}
   alias Fornacast.Repo
 
   @ed25519_public_key "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINUKfpNn72l8H0YnXfbkh6s4aAcrMmVsBWPfyPppa1i8 gao@mac-mini"
@@ -82,6 +82,44 @@ defmodule ForgeAccountsTest do
              })
   end
 
+  test "organizations share the account namespace and grant owner membership" do
+    assert {:ok, owner} =
+             ForgeAccounts.create_user(%{
+               username: "Alice",
+               email: "alice-org-owner@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, %Organization{} = organization} =
+             ForgeAccounts.create_organization(owner, %{
+               username: "Acme",
+               display_name: "ACME Engineering",
+               description: "compiler tools"
+             })
+
+    assert organization.username == "acme"
+    assert organization.display_name == "ACME Engineering"
+    assert organization.kind == :organization
+    assert organization.email == "organization+acme@fornacast.invalid"
+
+    refute ForgeAccounts.get_user_by_username("acme")
+
+    assert %{id: organization_id, kind: :organization} =
+             ForgeAccounts.get_account_by_username("acme")
+
+    assert organization_id == organization.id
+    assert [^organization] = ForgeAccounts.list_user_organizations(owner)
+    assert ForgeAccounts.organization_role(owner, organization) == :owner
+
+    assert {:error, %Ecto.Changeset{} = changeset} =
+             ForgeAccounts.create_organization(owner, %{
+               username: "alice",
+               display_name: "Duplicate"
+             })
+
+    refute changeset.valid?
+  end
+
   test "admin create mix task creates the first admin" do
     Mix.Task.clear()
 
@@ -129,6 +167,13 @@ defmodule ForgeAccountsTest do
   end
 
   defp reset_tables do
-    ["audit_events", "repository_collaborators", "repositories", "ssh_keys", "users"]
+    [
+      "audit_events",
+      "repository_collaborators",
+      "repositories",
+      "organization_members",
+      "ssh_keys",
+      "users"
+    ]
   end
 end

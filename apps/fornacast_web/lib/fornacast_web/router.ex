@@ -45,13 +45,23 @@ defmodule FornacastWeb.Router do
     pipe_through :authenticated
 
     get "/", DashboardController, :index
+    get "/issues", WorkbenchController, :issues
+    get "/pulls", WorkbenchController, :pull_requests
     get "/ssh-keys", SSHKeyController, :index
     post "/ssh-keys", SSHKeyController, :create
     delete "/ssh-keys/:id", SSHKeyController, :delete
+    get "/settings/ssh-keys", SSHKeyController, :index
+    post "/settings/ssh-keys", SSHKeyController, :create
+    delete "/settings/ssh-keys/:id", SSHKeyController, :delete
+
+    get "/organizations/new", OrganizationController, :new
+    post "/organizations", OrganizationController, :create
 
     get "/repos/new", RepositoryController, :new
+    get "/repos/import", RepositoryController, :import_new
     post "/repos", RepositoryController, :create
 
+    get "/:owner", OrganizationController, :show
     get "/:owner/:repo", RepositoryController, :show
     get "/:owner/:repo/branches", RepositoryController, :branches
     get "/:owner/:repo/tags", RepositoryController, :tags

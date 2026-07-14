@@ -3,6 +3,7 @@ defmodule FornacastWeb.SSHKeyController do
 
   def index(%Plug.Conn{assigns: %{current_user: user}} = conn, _params) do
     keys = ForgeAccounts.list_user_ssh_keys(user)
+    path = ssh_keys_path(conn)
 
     rows =
       keys
@@ -12,7 +13,7 @@ defmodule FornacastWeb.SSHKeyController do
           <td>#{escape(key.title)}</td>
           <td>#{escape(key.fingerprint_sha256)}</td>
           <td>
-            <form action="/ssh-keys/#{key.id}" method="post">
+            <form action="#{path}/#{key.id}" method="post">
               #{csrf_input()}
               <input type="hidden" name="_method" value="delete">
               <button type="submit">Delete</button>
@@ -24,7 +25,7 @@ defmodule FornacastWeb.SSHKeyController do
       |> Enum.join("\n")
 
     page(conn, "SSH keys", """
-    <form action="/ssh-keys" method="post">
+    <form action="#{path}" method="post">
       #{csrf_input()}
       <label>Title <input name="ssh_key[title]"></label>
       <label>Public key <textarea name="ssh_key[public_key]" rows="5"></textarea></label>
@@ -40,7 +41,7 @@ defmodule FornacastWeb.SSHKeyController do
   def create(%Plug.Conn{assigns: %{current_user: user}} = conn, %{"ssh_key" => attrs}) do
     case ForgeAccounts.create_ssh_key(user, attrs) do
       {:ok, _key} ->
-        redirect(conn, to: "/ssh-keys")
+        redirect(conn, to: ssh_keys_path(conn))
 
       {:error, changeset} ->
         conn
@@ -51,6 +52,9 @@ defmodule FornacastWeb.SSHKeyController do
 
   def delete(%Plug.Conn{assigns: %{current_user: user}} = conn, %{"id" => id}) do
     _ = ForgeAccounts.delete_ssh_key(user, id)
-    redirect(conn, to: "/ssh-keys")
+    redirect(conn, to: ssh_keys_path(conn))
   end
+
+  defp ssh_keys_path(%Plug.Conn{request_path: "/settings" <> _}), do: "/settings/ssh-keys"
+  defp ssh_keys_path(_conn), do: "/ssh-keys"
 end

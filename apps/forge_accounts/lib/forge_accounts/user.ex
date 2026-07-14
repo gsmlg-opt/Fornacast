@@ -3,29 +3,37 @@ defmodule ForgeAccounts.User do
 
   import Ecto.Changeset
 
+  @kinds [:user, :organization]
   @roles [:admin, :user]
   @states [:active, :disabled]
 
   schema "users" do
     field :username, :string
     field :email, :string
+    field :display_name, :string
+    field :description, :string
     field :password, :string, virtual: true, redact: true
     field :password_hash, :string, redact: true
+    field :kind, Ecto.Enum, values: @kinds, default: :user
     field :role, Ecto.Enum, values: @roles, default: :user
     field :state, Ecto.Enum, values: @states, default: :active
 
     timestamps(type: :utc_datetime)
   end
 
-  def registration_changeset(user, attrs) do
+  def registration_changeset(user, attrs, opts \\ []) do
+    password_min_length = Keyword.get(opts, :password_min_length, 8)
+
     user
     |> cast(attrs, [:username, :email, :password, :role, :state])
     |> normalize_username()
     |> normalize_email()
-    |> validate_required([:username, :email, :password, :role, :state])
+    |> put_change(:kind, :user)
+    |> validate_required([:username, :email, :password, :kind, :role, :state])
     |> validate_format(:username, ~r/^[a-z0-9][a-z0-9_-]{1,38}[a-z0-9]$/)
     |> validate_format(:email, ~r/^[^\s]+@[^\s]+$/)
-    |> validate_length(:password, min: 8, max: 256)
+    |> validate_length(:password, min: password_min_length, max: 256)
+    |> validate_inclusion(:kind, @kinds)
     |> validate_inclusion(:role, @roles)
     |> validate_inclusion(:state, @states)
     |> unique_constraint(:username)

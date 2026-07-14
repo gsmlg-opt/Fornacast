@@ -7,23 +7,35 @@ defmodule ForgeRepos do
   import Ecto.Changeset, only: [change: 2]
 
   alias Ecto.Multi
-  alias ForgeAccounts.User
+  alias ForgeAccounts.{Organization, User}
   alias ForgeRepos.Repository
   alias Fornacast.{Repo, Storage}
 
-  def list_owner_repositories(%User{id: owner_user_id}) do
+  def list_owner_repositories(%{id: owner_user_id}) do
     Repository
     |> where([repo], repo.owner_user_id == ^owner_user_id and is_nil(repo.deleted_at))
     |> order_by([repo], asc: repo.slug)
     |> Repo.all()
   end
 
-  def create_repository(%User{} = owner, attrs) when is_map(attrs) do
+  def list_accessible_repositories(%User{} = user) do
+    owner_ids =
+      [user | ForgeAccounts.list_user_organizations(user)]
+      |> Enum.map(& &1.id)
+
+    Repository
+    |> where([repo], repo.owner_user_id in ^owner_ids and is_nil(repo.deleted_at))
+    |> order_by([repo], asc: repo.slug)
+    |> Repo.all()
+  end
+
+  def create_repository(owner, attrs) when is_map(attrs) do
     attrs = normalize_create_attrs(attrs)
-    storage_path = generate_storage_path(owner.id, attrs.slug)
+    owner_id = owner_account_id!(owner)
+    storage_path = generate_storage_path(owner_id, attrs.slug)
 
     changeset =
-      %Repository{owner_user_id: owner.id, storage_path: storage_path}
+      %Repository{owner_user_id: owner_id, storage_path: storage_path}
       |> Repository.create_changeset(attrs)
 
     Multi.new()
@@ -40,13 +52,17 @@ defmodule ForgeRepos do
   end
 
   def get_repository(owner_slug, repo_slug) when is_binary(owner_slug) and is_binary(repo_slug) do
-    with %User{id: owner_user_id} <- ForgeAccounts.get_user_by_username(owner_slug) do
+    with %User{id: owner_user_id} <- ForgeAccounts.get_account_by_username(owner_slug) do
       Repository
       |> where([repo], repo.owner_user_id == ^owner_user_id)
       |> where([repo], repo.slug == ^Repository.normalize_slug(repo_slug))
       |> where([repo], is_nil(repo.deleted_at))
       |> Repo.one()
     end
+  end
+
+  def repository_owner(%Repository{owner_user_id: owner_user_id}) do
+    ForgeAccounts.get_account(owner_user_id)
   end
 
   def resolve_git_path(path) when is_binary(path) do
@@ -79,12 +95,13 @@ defmodule ForgeRepos do
     |> Repo.update()
   end
 
-  def ssh_clone_url(%Repository{} = repository, %User{} = owner) do
+  def ssh_clone_url(%Repository{} = repository, owner, actor \\ nil) do
     port = Fornacast.Config.ssh_port()
     host = Fornacast.Config.ssh_host()
     port_segment = if port == 22, do: "", else: ":#{port}"
+    ssh_username = ssh_username(owner, actor)
 
-    "ssh://#{owner.username}@#{host}#{port_segment}/#{owner.username}/#{repository.slug}.git"
+    "ssh://#{ssh_username}@#{host}#{port_segment}/#{owner.username}/#{repository.slug}.git"
   end
 
   def parse_git_path(path) do
@@ -133,6 +150,14 @@ defmodule ForgeRepos do
   defp get_attr(attrs, key) do
     Map.get(attrs, key) || Map.get(attrs, Atom.to_string(key))
   end
+
+  defp owner_account_id!(%User{kind: kind, id: id}) when kind in [:user, :organization], do: id
+  defp owner_account_id!(%Organization{id: id}), do: id
+
+  defp ssh_username(%User{kind: :organization}, %User{kind: :user} = actor), do: actor.username
+  defp ssh_username(%Organization{}, %User{kind: :user} = actor), do: actor.username
+  defp ssh_username(%User{} = owner, _actor), do: owner.username
+  defp ssh_username(%Organization{} = owner, _actor), do: owner.username
 
   defp generate_storage_path(owner_user_id, slug) do
     nonce = :crypto.strong_rand_bytes(24)

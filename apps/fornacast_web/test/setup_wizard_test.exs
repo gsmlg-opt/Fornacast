@@ -74,7 +74,14 @@ defmodule FornacastWeb.SetupWizardTest do
 
       value when value in ["libsql", "turso"] ->
         Enum.each(
-          ["audit_events", "repository_collaborators", "repositories", "ssh_keys", "users"],
+          [
+            "audit_events",
+            "repository_collaborators",
+            "repositories",
+            "organization_members",
+            "ssh_keys",
+            "users"
+          ],
           &Ecto.Adapters.SQL.query!(Fornacast.Repo, "delete from #{&1}", [])
         )
     end

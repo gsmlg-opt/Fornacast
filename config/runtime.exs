@@ -1,13 +1,5 @@
 import Config
 
-if System.get_env("MIX_BUN_PATH") do
-  config :bun, path: System.get_env("MIX_BUN_PATH")
-end
-
-if System.get_env("MIX_TAILWIND_PATH") do
-  config :tailwind, path: System.get_env("MIX_TAILWIND_PATH")
-end
-
 if config_env() == :prod do
   # Mix evaluates runtime.exs for prod build tasks; require these only in releases.
   release_command = System.get_env("RELEASE_COMMAND")

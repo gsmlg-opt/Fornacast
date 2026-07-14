@@ -6,11 +6,12 @@
     "apps/fornacast_web": {
       "name": "fornacast-web",
       "dependencies": {
-        "@duskmoon-dev/art-elements": "latest",
-        "@duskmoon-dev/core": "latest",
-        "@duskmoon-dev/css-art": "latest",
-        "@duskmoon-dev/elements": "latest",
-        "tailwindcss": "^4.1.11",
+        "@duskmoon-dev/art-elements": "1.5.5",
+        "@duskmoon-dev/core": "1.17.0",
+        "@duskmoon-dev/css-art": "1.17.0",
+        "@duskmoon-dev/elements": "1.5.5",
+        "marked": "18.0.4",
+        "tailwindcss": "4.3.2",
       },
     },
   },

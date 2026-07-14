@@ -1,7 +1,7 @@
 defmodule ForgeReposTest do
   use ExUnit.Case, async: false
 
-  alias ForgeAccounts.User
+  alias ForgeAccounts.{Organization, User}
   alias Fornacast.Repo
   alias ForgeRepos.Repository
 
@@ -56,6 +56,50 @@ defmodule ForgeReposTest do
     assert {:error, :unauthorized} = Fornacast.Access.authorize(nil, :repository_write, repo)
   end
 
+  test "organization-owned repositories resolve by namespace and authorize owners" do
+    assert {:ok, owner} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-org-repo@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, member} =
+             ForgeAccounts.create_user(%{
+               username: "bob",
+               email: "bob-org-repo@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, %Organization{} = organization} =
+             ForgeAccounts.create_organization(owner, %{
+               username: "Acme",
+               display_name: "ACME"
+             })
+
+    assert {:ok, repo} =
+             ForgeRepos.create_repository(organization, %{
+               name: "Demo",
+               slug: "demo"
+             })
+
+    assert repo.owner_user_id == organization.id
+    assert {:ok, resolved} = ForgeRepos.resolve_git_path("acme/demo.git")
+    assert resolved.id == repo.id
+    assert ForgeRepos.get_repository("acme", "demo").id == repo.id
+
+    clone_url = ForgeRepos.ssh_clone_url(repo, organization, owner)
+    assert clone_url =~ "ssh://alice@"
+    assert clone_url =~ "/acme/demo.git"
+
+    assert :ok = Fornacast.Access.authorize(owner, :repository_admin, repo)
+    assert {:error, :unauthorized} = Fornacast.Access.authorize(member, :repository_read, repo)
+
+    assert {:ok, _membership} = ForgeAccounts.add_organization_member(organization, member)
+    assert :ok = Fornacast.Access.authorize(member, :repository_read, repo)
+    assert {:error, :unauthorized} = Fornacast.Access.authorize(member, :repository_write, repo)
+  end
+
   @tag :tmp_dir
   test "creates a repository record and bare Git storage", %{tmp_dir: tmp_dir} do
     original_root = Application.get_env(:fornacast, :repo_storage_root)
@@ -104,6 +148,13 @@ defmodule ForgeReposTest do
   end
 
   defp reset_tables do
-    ["audit_events", "repository_collaborators", "repositories", "ssh_keys", "users"]
+    [
+      "audit_events",
+      "repository_collaborators",
+      "repositories",
+      "organization_members",
+      "ssh_keys",
+      "users"
+    ]
   end
 end
