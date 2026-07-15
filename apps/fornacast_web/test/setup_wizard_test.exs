@@ -20,6 +20,10 @@ defmodule FornacastWeb.SetupWizardTest do
   test "GET /setup renders the admin form" do
     conn = get(build_conn(), "/setup")
     body = html_response(conn, 200)
+
+    assert body =~ ~s(class="auth-shell")
+    assert body =~ ~s(class="form-panel")
+    assert body =~ "First administrator"
     assert body =~ "Create the first administrator"
     assert body =~ ~s(name="admin[username]")
   end

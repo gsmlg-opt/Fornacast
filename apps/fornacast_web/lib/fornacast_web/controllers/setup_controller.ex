@@ -43,23 +43,26 @@ defmodule FornacastWeb.SetupController do
   defp already_initialized(conn) do
     conn
     |> put_status(:not_found)
-    |> page("Not found", ~s(<p class="error">Fornacast is already set up.</p>))
+    |> page("Not found", error_panel("Fornacast is already set up."))
   end
 
   defp form_body do
-    """
-    <p class="muted">Create the first administrator account to finish setting up this Fornacast instance.</p>
-    <form action="/setup" method="post">
-      #{csrf_input()}
-      <label>Username <input name="admin[username]" autocomplete="username"></label>
-      <label>Email <input name="admin[email]" type="email" autocomplete="email"></label>
-      <label>Password <input name="admin[password]" type="password" autocomplete="new-password"></label>
-      <button type="submit">Create admin</button>
-    </form>
-    """
+    form_panel(
+      "First administrator",
+      "Create the first administrator account to finish setting up this Fornacast instance.",
+      """
+      <form action="/setup" method="post">
+        #{csrf_input()}
+        <label>Username <input name="admin[username]" autocomplete="username"></label>
+        <label>Email <input name="admin[email]" type="email" autocomplete="email"></label>
+        <label>Password <input name="admin[password]" type="password" autocomplete="new-password"></label>
+        <button class="btn btn-primary" type="submit">Create admin</button>
+      </form>
+      """
+    )
   end
 
   defp error_body(changeset) do
-    form_body() <> ~s(<p class="error">#{escape(inspect(changeset.errors))}</p>)
+    error_panel(inspect(changeset.errors)) <> form_body()
   end
 end

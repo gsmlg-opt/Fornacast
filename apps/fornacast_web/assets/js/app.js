@@ -11,6 +11,22 @@ const systemThemeQuery = window.matchMedia
   ? window.matchMedia("(prefers-color-scheme: dark)")
   : null;
 
+const readStoredTheme = () => {
+  try {
+    return window.localStorage.getItem(themeStorageKey);
+  } catch {
+    return null;
+  }
+};
+
+const storeTheme = (theme) => {
+  try {
+    window.localStorage.setItem(themeStorageKey, theme);
+  } catch {
+    return;
+  }
+};
+
 const resolveTheme = (mode) => {
   if (concreteThemes.includes(mode)) {
     return mode;
@@ -40,12 +56,12 @@ const setTheme = (mode, options = {}) => {
   });
 
   if (options.persist) {
-    window.localStorage.setItem(themeStorageKey, nextMode);
+    storeTheme(nextMode);
   }
 };
 
 const initThemeMenu = () => {
-  const savedThemeMode = window.localStorage.getItem(themeStorageKey);
+  const savedThemeMode = readStoredTheme();
   setTheme(savedThemeMode || "auto");
 
   document.querySelectorAll("[data-theme-choice]").forEach((button) => {

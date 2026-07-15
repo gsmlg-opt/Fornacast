@@ -225,4 +225,66 @@ defmodule FornacastWeb.HTML do
   rescue
     _error -> ""
   end
+
+  def section_header(title, subtitle, action_html \\ "") do
+    """
+    <section class="section-header">
+      <div>
+        <p class="eyebrow">Fornacast</p>
+        <h2>#{escape(title)}</h2>
+        <p class="muted">#{escape(subtitle)}</p>
+      </div>
+      <div class="section-actions">#{action_html}</div>
+    </section>
+    """
+  end
+
+  def primary_link(href, label),
+    do: ~s(<a class="btn btn-primary" href="#{escape(href)}">#{escape(label)}</a>)
+
+  def ghost_link(href, label),
+    do: ~s(<a class="btn btn-ghost" href="#{escape(href)}">#{escape(label)}</a>)
+
+  def badge(label, tone \\ nil) do
+    variant =
+      case to_string(tone) do
+        "public" -> "success"
+        "private" -> "secondary"
+        tone when tone in ~w(primary secondary tertiary info success warning error) -> tone
+        _tone -> nil
+      end
+
+    classes = if variant, do: "badge badge-#{variant}", else: "badge"
+    ~s(<span class="#{classes}">#{escape(label)}</span>)
+  end
+
+  def form_panel(title, description, form_html) do
+    """
+    <section class="form-panel">
+      <div class="panel-heading">
+        <h2>#{escape(title)}</h2>
+        <p class="muted">#{escape(description)}</p>
+      </div>
+      #{form_html}
+    </section>
+    """
+  end
+
+  def empty_state(title, description, action_html \\ "") do
+    """
+    <section class="empty-state">
+      <h2>#{escape(title)}</h2>
+      <p class="muted">#{escape(description)}</p>
+      #{action_html}
+    </section>
+    """
+  end
+
+  def error_panel(message),
+    do: ~s(<section class="error-panel" role="alert">#{escape(message)}</section>)
+
+  def command_block(commands),
+    do: ~s(<pre class="command-block"><code>#{escape(commands)}</code></pre>)
+
+  def code_block(content), do: ~s(<pre class="code-block"><code>#{escape(content)}</code></pre>)
 end

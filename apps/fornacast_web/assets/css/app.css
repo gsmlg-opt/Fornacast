@@ -22,6 +22,7 @@
 
   html {
     min-height: 100%;
+    color-scheme: light dark;
     background-color: var(--color-surface);
   }
 
@@ -166,6 +167,7 @@
 
   table {
     width: 100%;
+    max-width: 100%;
     border-collapse: collapse;
     border: 1px solid var(--color-outline-variant);
     border-radius: 8px;
@@ -176,6 +178,7 @@
   td {
     border-bottom: 1px solid var(--color-outline-variant);
     padding: 0.72rem 0.8rem;
+    overflow-wrap: anywhere;
     text-align: left;
     vertical-align: top;
   }
@@ -193,6 +196,18 @@
 }
 
 @layer components {
+  .inline {
+    display: inline;
+  }
+
+  .sr-only {
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    position: absolute;
+    width: 1px;
+  }
+
   .app-body {
     color: var(--color-on-surface);
   }
@@ -269,6 +284,13 @@
 
   .appbar-actions {
     flex: 0 1 auto;
+  }
+
+  .section-actions,
+  .repo-tabs {
+    display: flex;
+    align-items: center;
+    gap: 10px;
   }
 
   .repo-menu,
@@ -607,11 +629,8 @@
   }
 
   .auth-main {
-    min-width: 0;
-  }
-
-  .auth-main {
     width: min(42rem, calc(100% - 2rem));
+    min-width: 0;
     margin: 3rem auto;
   }
 
@@ -632,6 +651,83 @@
     background-color: color-mix(in oklab, var(--color-surface-container-lowest) 90%, var(--color-surface-container));
     box-shadow: var(--shadow-md);
     padding: 1rem;
+  }
+
+  .section-header,
+  .repo-header,
+  .form-panel,
+  .empty-state,
+  .readme-panel,
+  .file-panel {
+    @apply bg-surface-container text-on-surface border-outline-variant;
+    border-width: 1px;
+    border-radius: 8px;
+    margin-bottom: 18px;
+    padding: 18px;
+  }
+
+  .section-header,
+  .repo-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+    justify-content: space-between;
+  }
+
+  .user-chip {
+    @apply bg-surface-container-high text-on-surface;
+    border-radius: 999px;
+    padding: 6px 10px;
+  }
+
+  .error-panel {
+    @apply bg-error-container text-on-error-container border-error;
+    border-width: 1px;
+    border-radius: 8px;
+    margin-bottom: 14px;
+    padding: 12px 14px;
+  }
+
+  .data-table {
+    @apply bg-surface-container border-outline-variant;
+    border-width: 1px;
+    border-radius: 8px;
+    display: block;
+    overflow-x: auto;
+  }
+
+  .path-bar,
+  .repo-tabs {
+    @apply bg-surface-container-high text-on-surface border-outline-variant;
+    border-width: 1px;
+    border-radius: 8px;
+    margin-bottom: 12px;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-wrap: anywhere;
+    padding: 10px 12px;
+  }
+
+  .path-bar code {
+    overflow-wrap: anywhere;
+  }
+
+  .tab-link.is-active {
+    font-weight: 800;
+  }
+
+  .command-block,
+  .code-block {
+    @apply bg-surface-container-highest text-on-surface;
+    border-radius: 8px;
+    overflow-x: auto;
+    padding: 14px;
+  }
+
+  .settings-grid {
+    display: grid;
+    gap: 18px;
+    grid-template-columns: minmax(260px, 380px) minmax(0, 1fr);
   }
 
   .auth-panel {
@@ -656,6 +752,16 @@
 }
 
 @media (max-width: 760px) {
+  .settings-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .section-header,
+  .repo-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
   .appbar {
     min-height: auto;
     align-items: flex-start;

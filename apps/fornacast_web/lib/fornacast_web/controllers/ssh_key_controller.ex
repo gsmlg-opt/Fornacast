@@ -11,12 +11,12 @@ defmodule FornacastWeb.SSHKeyController do
         """
         <tr>
           <td>#{escape(key.title)}</td>
-          <td>#{escape(key.fingerprint_sha256)}</td>
+          <td><code>#{escape(key.fingerprint_sha256)}</code></td>
           <td>
             <form action="#{path}/#{key.id}" method="post">
               #{csrf_input()}
               <input type="hidden" name="_method" value="delete">
-              <button type="submit">Delete</button>
+              <button class="btn btn-error btn-sm" type="submit">Delete</button>
             </form>
           </td>
         </tr>
@@ -24,17 +24,26 @@ defmodule FornacastWeb.SSHKeyController do
       end)
       |> Enum.join("\n")
 
+    key_table =
+      if rows == "" do
+        empty_state("No SSH keys", "Add a public key to push repositories over SSH.")
+      else
+        """
+        <section class="content-panel">
+          <table class="data-table key-table">
+            <thead><tr><th>Title</th><th>Fingerprint</th><th>Action</th></tr></thead>
+            <tbody>#{rows}</tbody>
+          </table>
+        </section>
+        """
+      end
+
     page(conn, "SSH keys", """
-    <form action="#{path}" method="post">
-      #{csrf_input()}
-      <label>Title <input name="ssh_key[title]"></label>
-      <label>Public key <textarea name="ssh_key[public_key]" rows="5"></textarea></label>
-      <button type="submit">Add key</button>
-    </form>
-    <table>
-      <thead><tr><th>Title</th><th>Fingerprint</th><th></th></tr></thead>
-      <tbody>#{rows}</tbody>
-    </table>
+    #{section_header("SSH keys", "Manage SSH keys for Git transport.", "")}
+    <div class="settings-grid">
+      #{ssh_key_form(path)}
+      #{key_table}
+    </div>
     """)
   end
 
@@ -46,7 +55,10 @@ defmodule FornacastWeb.SSHKeyController do
       {:error, changeset} ->
         conn
         |> put_status(:unprocessable_entity)
-        |> page("SSH keys", ~s(<p class="error">#{escape(inspect(changeset.errors))}</p>))
+        |> page(
+          "SSH keys",
+          error_panel(inspect(changeset.errors)) <> ssh_key_form(ssh_keys_path(conn))
+        )
     end
   end
 
@@ -57,4 +69,19 @@ defmodule FornacastWeb.SSHKeyController do
 
   defp ssh_keys_path(%Plug.Conn{request_path: "/settings" <> _}), do: "/settings/ssh-keys"
   defp ssh_keys_path(_conn), do: "/ssh-keys"
+
+  defp ssh_key_form(path) do
+    form_panel(
+      "Add SSH key",
+      "Paste an OpenSSH public key from your workstation.",
+      """
+      <form action="#{path}" method="post">
+        #{csrf_input()}
+        <label>Title <input name="ssh_key[title]"></label>
+        <label>Public key <textarea name="ssh_key[public_key]" rows="5"></textarea></label>
+        <button class="btn btn-primary" type="submit">Add key</button>
+      </form>
+      """
+    )
+  end
 end
