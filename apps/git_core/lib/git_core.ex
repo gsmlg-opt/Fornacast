@@ -3,133 +3,53 @@ defmodule GitCore do
   Fornacast-owned API for low-level Git repository operations.
   """
 
-  defmodule Ref do
-    @moduledoc """
-    A Git reference as exposed by Fornacast.
-    """
-
-    @enforce_keys [:name, :kind, :target]
-    defstruct [:name, :kind, :target]
-  end
-
-  defmodule Commit do
-    @moduledoc """
-    A commit summary or detail as exposed by Fornacast.
-    """
-
-    @enforce_keys [
-      :oid,
-      :title,
-      :message,
-      :author_name,
-      :author_email,
-      :author_time,
-      :committer_name,
-      :committer_email,
-      :committer_time,
-      :parents
-    ]
-    defstruct [
-      :oid,
-      :title,
-      :message,
-      :author_name,
-      :author_email,
-      :author_time,
-      :committer_name,
-      :committer_email,
-      :committer_time,
-      :parents
-    ]
-  end
-
-  defmodule TreeEntry do
-    @moduledoc """
-    A directory entry in a Git tree.
-    """
-
-    @enforce_keys [:name, :kind, :mode, :oid]
-    defstruct [:name, :kind, :mode, :oid]
-  end
-
-  defmodule Blob do
-    @moduledoc """
-    Bounded blob data read from a repository.
-    """
-
-    @enforce_keys [:name, :oid, :size, :data, :truncated, :binary]
-    defstruct [:name, :oid, :size, :data, :truncated, :binary]
-  end
-
-  defmodule DiffFile do
-    @moduledoc """
-    A file changed by a commit.
-    """
-
-    @enforce_keys [:path, :status, :old_oid, :new_oid, :binary]
-    defstruct [:path, :status, :old_oid, :new_oid, :binary]
-  end
-
-  defmodule CommitDiff do
-    @moduledoc """
-    Bounded unified diff data for a commit.
-    """
-
-    @enforce_keys [:files, :patch, :truncated]
-    defstruct [:files, :patch, :truncated]
-  end
-
   def init_bare(path) when is_binary(path) do
     GitCore.Native.init_bare(path)
   end
 
   def is_bare_repository?(path) when is_binary(path) do
     GitCore.Native.is_bare_repository(path)
+    |> wrap_read(:is_bare_repository?)
   end
 
   def empty?(path) when is_binary(path) do
     GitCore.Native.empty(path)
+    |> wrap_read(:empty?)
   end
 
   def list_refs(path) when is_binary(path) do
-    with {:ok, refs} <- GitCore.Native.list_refs(path) do
-      refs =
-        Enum.map(refs, fn {name, kind, target} ->
-          %Ref{name: name, kind: ref_kind(kind), target: target}
-        end)
-
-      {:ok, refs}
-    end
+    read_refs(path, :list_refs)
   end
 
   def branches(path) when is_binary(path) do
-    filter_refs(path, :branch)
+    filter_refs(path, :branch, :branches)
   end
 
   def tags(path) when is_binary(path) do
-    filter_refs(path, :tag)
+    filter_refs(path, :tag, :tags)
   end
 
   def commit_history(path, ref, opts \\ []) when is_binary(path) and is_binary(ref) do
     limit = Keyword.get(opts, :limit, 50)
 
-    with {:ok, commits} <- GitCore.Native.commit_history(path, ref, limit) do
+    with {:ok, commits} <-
+           wrap_read(GitCore.Native.commit_history(path, ref, limit), :commit_history) do
       {:ok, Enum.map(commits, &commit_from_native/1)}
     end
   end
 
   def commit(path, oid) when is_binary(path) and is_binary(oid) do
-    with {:ok, commit} <- GitCore.Native.commit(path, oid) do
+    with {:ok, commit} <- wrap_read(GitCore.Native.commit(path, oid), :commit) do
       {:ok, commit_from_native(commit)}
     end
   end
 
   def read_tree(path, ref, tree_path \\ "")
       when is_binary(path) and is_binary(ref) and is_binary(tree_path) do
-    with {:ok, entries} <- GitCore.Native.read_tree(path, ref, tree_path) do
+    with {:ok, entries} <- wrap_read(GitCore.Native.read_tree(path, ref, tree_path), :read_tree) do
       entries =
         Enum.map(entries, fn {name, kind, mode, oid} ->
-          %TreeEntry{name: name, kind: tree_entry_kind(kind), mode: mode, oid: oid}
+          %GitCore.TreeEntry{name: name, kind: tree_entry_kind(kind), mode: mode, oid: oid}
         end)
 
       {:ok, entries}
@@ -141,17 +61,19 @@ defmodule GitCore do
     limit = Keyword.get(opts, :limit, 1_048_576)
 
     with {:ok, {name, oid, size, data, truncated, binary}} <-
-           GitCore.Native.read_blob(path, ref, blob_path, limit) do
+           wrap_read(GitCore.Native.read_blob(path, ref, blob_path, limit), :read_blob) do
       data = IO.iodata_to_binary(data)
 
       {:ok,
-       %Blob{
+       %GitCore.Blob{
          name: name,
          oid: oid,
          size: size,
          data: data,
          truncated: truncated,
-         binary: binary
+         binary: binary,
+         non_utf8: not String.valid?(data),
+         lease: nil
        }}
     end
   end
@@ -159,9 +81,19 @@ defmodule GitCore do
   def diff_commit(path, oid, opts \\ []) when is_binary(path) and is_binary(oid) do
     limit = Keyword.get(opts, :limit, 200_000)
 
-    with {:ok, {files, patch, truncated}} <- GitCore.Native.diff_commit(path, oid, limit) do
+    with {:ok, {files, patch, truncated}} <-
+           wrap_read(GitCore.Native.diff_commit(path, oid, limit), :diff_commit) do
       files = Enum.map(files, &diff_file_from_native/1)
-      {:ok, %CommitDiff{files: files, patch: patch, truncated: truncated}}
+
+      {:ok,
+       %GitCore.CommitDiff{
+         files: files,
+         patch: patch,
+         truncated: truncated,
+         changed_files: length(files),
+         additions: nil,
+         deletions: nil
+       }}
     end
   end
 
@@ -174,14 +106,35 @@ defmodule GitCore do
     GitCore.Native.receive_pack(path, pack, commands)
   end
 
-  defp filter_refs(path, kind) do
-    with {:ok, refs} <- list_refs(path) do
+  defp read_refs(path, operation) do
+    with {:ok, refs} <- wrap_read(GitCore.Native.list_refs(path), operation) do
+      refs =
+        Enum.map(refs, fn {name, kind, target} ->
+          kind = ref_kind(kind)
+
+          %GitCore.Ref{
+            name: name,
+            kind: kind,
+            target: target,
+            display_name: ref_display_name(name, kind)
+          }
+        end)
+
+      {:ok, refs}
+    end
+  end
+
+  defp filter_refs(path, kind, operation) do
+    with {:ok, refs} <- read_refs(path, operation) do
       {:ok, Enum.filter(refs, &(&1.kind == kind))}
     end
   end
 
   defp ref_kind("branch"), do: :branch
   defp ref_kind("tag"), do: :tag
+
+  defp ref_display_name(name, :branch), do: String.replace_prefix(name, "refs/heads/", "")
+  defp ref_display_name(name, :tag), do: String.replace_prefix(name, "refs/tags/", "")
 
   defp tree_entry_kind("tree"), do: :tree
   defp tree_entry_kind("blob"), do: :blob
@@ -192,12 +145,16 @@ defmodule GitCore do
   defp diff_status("deleted"), do: :deleted
 
   defp diff_file_from_native({path, status, old_oid, new_oid, binary}) do
-    %DiffFile{
+    %GitCore.DiffFile{
       path: path,
       status: diff_status(status),
       old_oid: old_oid,
       new_oid: new_oid,
-      binary: binary
+      binary: binary,
+      additions: nil,
+      deletions: nil,
+      truncated: false,
+      lines: []
     }
   end
 
@@ -205,7 +162,7 @@ defmodule GitCore do
          {oid, title, message, {author_name, author_email, author_time},
           {committer_name, committer_email, committer_time}, parents}
        ) do
-    %Commit{
+    %GitCore.Commit{
       oid: oid,
       title: title,
       message: message,
@@ -218,4 +175,22 @@ defmodule GitCore do
       parents: parents
     }
   end
+
+  defp wrap_read({:ok, value}, _operation), do: {:ok, value}
+
+  defp wrap_read({:error, {kind, detail}}, operation) do
+    {:error, %GitCore.Error{kind: native_error_kind(kind), operation: operation, detail: detail}}
+  end
+
+  defp native_error_kind("empty_repository"), do: :empty_repository
+  defp native_error_kind("ref_not_found"), do: :ref_not_found
+  defp native_error_kind("commit_not_found"), do: :commit_not_found
+  defp native_error_kind("path_not_found"), do: :path_not_found
+  defp native_error_kind("blob_too_large"), do: :blob_too_large
+  defp native_error_kind("blob_busy"), do: :blob_busy
+  defp native_error_kind("invalid_repository"), do: :invalid_repository
+  defp native_error_kind("storage_unavailable"), do: :storage_unavailable
+  defp native_error_kind("corrupt_repository"), do: :corrupt_repository
+  defp native_error_kind("scan_timeout"), do: :scan_timeout
+  defp native_error_kind("scan_busy"), do: :scan_busy
 end

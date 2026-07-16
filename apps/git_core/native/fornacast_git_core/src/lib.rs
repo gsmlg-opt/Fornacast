@@ -18,6 +18,7 @@ type NativeDiffFile = (String, String, Option<String>, Option<String>, bool);
 type NativeCommitDiff = (Vec<NativeDiffFile>, String, bool);
 type NativeReceiveCommand = (String, String, String);
 type NativeReceiveStatus = (String, String, String);
+type NativeError = (String, String);
 
 struct PackObject {
     kind: gix_object::Kind,
@@ -41,6 +42,35 @@ fn to_error<E: std::fmt::Display>(error: E) -> String {
     error.to_string()
 }
 
+fn native_error(kind: &'static str, detail: impl std::fmt::Display) -> NativeError {
+    (kind.to_string(), detail.to_string())
+}
+
+fn open_repository(path: &str) -> Result<gix::Repository, NativeError> {
+    std::fs::metadata(path).map_err(|error| native_error("storage_unavailable", error))?;
+    gix::open(Path::new(path)).map_err(open_error)
+}
+
+fn open_error(error: gix::open::Error) -> NativeError {
+    let kind = match &error {
+        gix::open::Error::Io(_) => "storage_unavailable",
+        gix::open::Error::Config(gix::config::Error::Io { .. }) => "storage_unavailable",
+        _ => "invalid_repository",
+    };
+
+    native_error(kind, error)
+}
+
+fn open_bare_repository(path: &str) -> Result<gix::Repository, NativeError> {
+    let repo = open_repository(path)?;
+
+    if repo.is_bare() {
+        Ok(repo)
+    } else {
+        Err(native_error("invalid_repository", "repository is not bare"))
+    }
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
 fn init_bare(path: String) -> Result<String, String> {
     let repo = gix::init_bare(Path::new(&path)).map_err(to_error)?;
@@ -48,29 +78,41 @@ fn init_bare(path: String) -> Result<String, String> {
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
-fn is_bare_repository(path: String) -> Result<bool, String> {
-    let repo = gix::open(Path::new(&path)).map_err(to_error)?;
-    Ok(repo.is_bare())
+fn is_bare_repository(path: String) -> Result<bool, NativeError> {
+    open_bare_repository(&path)?;
+    Ok(true)
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
-fn empty(path: String) -> Result<bool, String> {
-    let repo = gix::open(Path::new(&path)).map_err(to_error)?;
-    let references = repo.references().map_err(to_error)?;
-    let mut refs = references.all().map_err(to_error)?;
+fn empty(path: String) -> Result<bool, NativeError> {
+    let repo = open_bare_repository(&path)?;
+    let references = repo
+        .references()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let mut refs = references
+        .all()
+        .map_err(|error| native_error("corrupt_repository", error))?;
 
-    Ok(refs.next().is_none())
+    match refs.next() {
+        None => Ok(true),
+        Some(Ok(_reference)) => Ok(false),
+        Some(Err(error)) => Err(native_error("corrupt_repository", error)),
+    }
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
-fn list_refs(path: String) -> Result<Vec<(String, String, String)>, String> {
-    let repo = gix::open(Path::new(&path)).map_err(to_error)?;
-    let references = repo.references().map_err(to_error)?;
-    let refs = references.all().map_err(to_error)?;
+fn list_refs(path: String) -> Result<Vec<(String, String, String)>, NativeError> {
+    let repo = open_bare_repository(&path)?;
+    let references = repo
+        .references()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let refs = references
+        .all()
+        .map_err(|error| native_error("corrupt_repository", error))?;
     let mut result = Vec::new();
 
     for reference in refs {
-        let reference = reference.map_err(to_error)?;
+        let reference = reference.map_err(|error| native_error("corrupt_repository", error))?;
         let name = reference.name().as_bstr().to_string();
 
         if let Some(kind) = ref_kind(&name) {
@@ -94,15 +136,25 @@ fn ref_kind(name: &str) -> Option<&'static str> {
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
-fn commit_history(path: String, rev: String, limit: usize) -> Result<Vec<NativeCommit>, String> {
-    let repo = gix::open(Path::new(&path)).map_err(to_error)?;
-    let tip = resolve_commit(&repo, &rev)?;
+fn commit_history(
+    path: String,
+    rev: String,
+    limit: usize,
+) -> Result<Vec<NativeCommit>, NativeError> {
+    let repo = open_bare_repository(&path)?;
+    let tip = resolve_ref_commit(&repo, &rev)?;
     let limit = limit.clamp(1, 200);
     let mut commits = Vec::new();
-    let walk = repo.rev_walk([tip.id().detach()]).all().map_err(to_error)?;
+    let walk = repo
+        .rev_walk([tip.id().detach()])
+        .all()
+        .map_err(|error| native_error("corrupt_repository", error))?;
 
     for info in walk.take(limit) {
-        let commit = info.map_err(to_error)?.object().map_err(to_error)?;
+        let commit = info
+            .map_err(|error| native_error("corrupt_repository", error))?
+            .object()
+            .map_err(|error| native_error("corrupt_repository", error))?;
         commits.push(commit_to_tuple(&commit)?);
     }
 
@@ -110,22 +162,28 @@ fn commit_history(path: String, rev: String, limit: usize) -> Result<Vec<NativeC
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
-fn commit(path: String, oid: String) -> Result<NativeCommit, String> {
-    let repo = gix::open(Path::new(&path)).map_err(to_error)?;
-    let commit = resolve_commit(&repo, &oid)?;
+fn commit(path: String, oid: String) -> Result<NativeCommit, NativeError> {
+    let repo = open_bare_repository(&path)?;
+    let commit = resolve_commit_oid(&repo, &oid)?;
     commit_to_tuple(&commit)
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
-fn read_tree(path: String, rev: String, tree_path: String) -> Result<Vec<NativeTreeEntry>, String> {
-    let repo = gix::open(Path::new(&path)).map_err(to_error)?;
+fn read_tree(
+    path: String,
+    rev: String,
+    tree_path: String,
+) -> Result<Vec<NativeTreeEntry>, NativeError> {
+    let repo = open_bare_repository(&path)?;
     let relative_path = safe_relative_path(&tree_path)?;
-    let root = resolve_tree(&repo, &rev)?;
+    let root = resolve_ref_commit(&repo, &rev)?
+        .tree()
+        .map_err(|error| native_error("corrupt_repository", error))?;
     let tree = tree_at_path(root, &relative_path)?;
     let mut entries = Vec::new();
 
     for entry in tree.iter() {
-        let entry = entry.map_err(to_error)?;
+        let entry = entry.map_err(|error| native_error("corrupt_repository", error))?;
         entries.push((
             entry.filename().to_string(),
             entry_kind(entry.kind()).to_string(),
@@ -151,29 +209,37 @@ fn read_blob(
     rev: String,
     blob_path: String,
     limit: usize,
-) -> Result<NativeBlob, String> {
-    let repo = gix::open(Path::new(&path)).map_err(to_error)?;
+) -> Result<NativeBlob, NativeError> {
+    let repo = open_bare_repository(&path)?;
     let relative_path = safe_relative_path(&blob_path)?;
 
     if relative_path.as_os_str().is_empty() {
-        return Err("path does not point to a blob".to_string());
+        return Err(native_error(
+            "path_not_found",
+            "path does not point to a blob",
+        ));
     }
 
-    let root = resolve_tree(&repo, &rev)?;
+    let root = resolve_ref_commit(&repo, &rev)?
+        .tree()
+        .map_err(|error| native_error("corrupt_repository", error))?;
     let entry = root
         .lookup_entry_by_path(&relative_path)
-        .map_err(to_error)?
-        .ok_or_else(|| "path not found".to_string())?;
+        .map_err(|error| native_error("corrupt_repository", error))?
+        .ok_or_else(|| native_error("path_not_found", "path not found"))?;
 
     if !entry.mode().is_blob_or_symlink() {
-        return Err("path does not point to a blob".to_string());
+        return Err(native_error(
+            "path_not_found",
+            "path does not point to a blob",
+        ));
     }
 
     let blob = entry
         .object()
-        .map_err(to_error)?
+        .map_err(|error| native_error("corrupt_repository", error))?
         .try_into_blob()
-        .map_err(to_error)?;
+        .map_err(|error| native_error("corrupt_repository", error))?;
     let size = blob.data.len() as u64;
     let read_limit = limit.clamp(1, 100_000_000);
     let truncated = blob.data.len() > read_limit;
@@ -196,9 +262,9 @@ fn read_blob(
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
-fn diff_commit(path: String, oid: String, limit: usize) -> Result<NativeCommitDiff, String> {
-    let repo = gix::open(Path::new(&path)).map_err(to_error)?;
-    let commit = resolve_commit(&repo, &oid)?;
+fn diff_commit(path: String, oid: String, limit: usize) -> Result<NativeCommitDiff, NativeError> {
+    let repo = open_bare_repository(&path)?;
+    let commit = resolve_commit_oid(&repo, &oid)?;
     let diff_limit = limit.clamp(1, 5_000_000);
     let mut old_entries = BTreeMap::new();
     let mut new_entries = BTreeMap::new();
@@ -206,13 +272,25 @@ fn diff_commit(path: String, oid: String, limit: usize) -> Result<NativeCommitDi
     if let Some(parent_id) = commit.parent_ids().next() {
         let parent = parent_id
             .object()
-            .map_err(to_error)?
+            .map_err(|error| native_error("corrupt_repository", error))?
             .peel_to_commit()
-            .map_err(to_error)?;
-        collect_tree_entries(parent.tree().map_err(to_error)?, "", &mut old_entries)?;
+            .map_err(|error| native_error("corrupt_repository", error))?;
+        collect_tree_entries(
+            parent
+                .tree()
+                .map_err(|error| native_error("corrupt_repository", error))?,
+            "",
+            &mut old_entries,
+        )?;
     }
 
-    collect_tree_entries(commit.tree().map_err(to_error)?, "", &mut new_entries)?;
+    collect_tree_entries(
+        commit
+            .tree()
+            .map_err(|error| native_error("corrupt_repository", error))?,
+        "",
+        &mut new_entries,
+    )?;
 
     let paths: BTreeSet<String> = old_entries
         .keys()
@@ -277,8 +355,8 @@ fn pack_objects<'env>(
 
     let objects = collect_reachable_objects(&repo, queue)?;
     let pack = encode_pack(objects)?;
-    let mut binary =
-        rustler::OwnedBinary::new(pack.len()).ok_or_else(|| "failed to allocate pack binary".to_string())?;
+    let mut binary = rustler::OwnedBinary::new(pack.len())
+        .ok_or_else(|| "failed to allocate pack binary".to_string())?;
 
     binary.as_mut_slice().copy_from_slice(&pack);
     Ok(binary.release(env))
@@ -317,7 +395,9 @@ fn receive_pack(
     }
 }
 
-fn parse_receive_commands(commands: Vec<NativeReceiveCommand>) -> Result<Vec<ReceiveCommand>, String> {
+fn parse_receive_commands(
+    commands: Vec<NativeReceiveCommand>,
+) -> Result<Vec<ReceiveCommand>, String> {
     commands
         .into_iter()
         .map(|(old, new, ref_name)| {
@@ -625,7 +705,8 @@ fn enqueue_children(
 }
 
 fn encode_pack(objects: Vec<PackObject>) -> Result<Vec<u8>, String> {
-    let count = u32::try_from(objects.len()).map_err(|_| "too many objects for pack".to_string())?;
+    let count =
+        u32::try_from(objects.len()).map_err(|_| "too many objects for pack".to_string())?;
     let mut pack = Vec::new();
 
     pack.extend_from_slice(b"PACK");
@@ -633,7 +714,11 @@ fn encode_pack(objects: Vec<PackObject>) -> Result<Vec<u8>, String> {
     pack.extend_from_slice(&count.to_be_bytes());
 
     for object in objects {
-        write_pack_object_header(&mut pack, object_type_id(object.kind)?, object.data.len() as u64);
+        write_pack_object_header(
+            &mut pack,
+            object_type_id(object.kind)?,
+            object.data.len() as u64,
+        );
         pack.extend(compress_pack_object(&object.data)?);
     }
 
@@ -691,57 +776,99 @@ fn parse_object_id(oid: &str) -> Result<gix_hash::ObjectId, String> {
     gix_hash::ObjectId::from_hex(oid.as_bytes()).map_err(to_error)
 }
 
-fn resolve_commit<'repo>(
+fn resolve_commit_oid<'repo>(
     repo: &'repo gix::Repository,
-    rev: &str,
-) -> Result<gix::Commit<'repo>, String> {
-    repo.rev_parse_single(rev)
-        .map_err(to_error)?
-        .object()
-        .map_err(to_error)?
-        .peel_to_commit()
-        .map_err(to_error)
+    oid: &str,
+) -> Result<gix::Commit<'repo>, NativeError> {
+    let oid = gix_hash::ObjectId::from_hex(oid.as_bytes())
+        .map_err(|error| native_error("commit_not_found", error))?;
+    let object = match repo.find_object(oid) {
+        Ok(object) => object,
+        Err(error @ gix_object::find::existing::Error::NotFound { .. }) => {
+            return Err(native_error("commit_not_found", error));
+        }
+        Err(error @ gix_object::find::existing::Error::Find(_)) => {
+            return Err(native_error("corrupt_repository", error));
+        }
+    };
+
+    object
+        .try_into_commit()
+        .map_err(|error| native_error("commit_not_found", error))
 }
 
-fn resolve_tree<'repo>(
+fn resolve_ref_commit<'repo>(
     repo: &'repo gix::Repository,
     rev: &str,
-) -> Result<gix::Tree<'repo>, String> {
-    repo.rev_parse_single(rev)
-        .map_err(to_error)?
-        .object()
-        .map_err(to_error)?
-        .peel_to_tree()
-        .map_err(to_error)
+) -> Result<gix::Commit<'repo>, NativeError> {
+    let resolved = repo
+        .rev_parse_single(rev)
+        .map_err(|error| native_error("ref_not_found", error))?;
+    let mut object = resolved.object().map_err(|error| match error {
+        error @ gix_object::find::existing::Error::NotFound { .. } => {
+            native_error("corrupt_repository", error)
+        }
+        error @ gix_object::find::existing::Error::Find(_) => {
+            native_error("corrupt_repository", error)
+        }
+    })?;
+
+    loop {
+        match object.kind {
+            gix_object::Kind::Commit => return Ok(object.into_commit()),
+            gix_object::Kind::Tag => {
+                let target = object
+                    .to_tag_ref_iter()
+                    .target_id()
+                    .map_err(|error| native_error("corrupt_repository", error))?;
+                object = repo
+                    .find_object(target)
+                    .map_err(|error| native_error("corrupt_repository", error))?;
+            }
+            gix_object::Kind::Tree | gix_object::Kind::Blob => {
+                return Err(native_error(
+                    "ref_not_found",
+                    format!("reference {rev:?} does not resolve to a commit"),
+                ));
+            }
+        }
+    }
 }
 
 fn tree_at_path<'repo>(
     root: gix::Tree<'repo>,
     relative_path: &Path,
-) -> Result<gix::Tree<'repo>, String> {
+) -> Result<gix::Tree<'repo>, NativeError> {
     if relative_path.as_os_str().is_empty() {
         return Ok(root);
     }
 
     let entry = root
         .lookup_entry_by_path(relative_path)
-        .map_err(to_error)?
-        .ok_or_else(|| "path not found".to_string())?;
+        .map_err(|error| native_error("corrupt_repository", error))?
+        .ok_or_else(|| native_error("path_not_found", "path not found"))?;
+
+    if !entry.mode().is_tree() {
+        return Err(native_error(
+            "path_not_found",
+            "path does not point to a tree",
+        ));
+    }
 
     entry
         .object()
-        .map_err(to_error)?
+        .map_err(|error| native_error("corrupt_repository", error))?
         .try_into_tree()
-        .map_err(to_error)
+        .map_err(|error| native_error("corrupt_repository", error))
 }
 
 fn collect_tree_entries(
     tree: gix::Tree<'_>,
     prefix: &str,
     entries: &mut BTreeMap<String, FileSnapshot>,
-) -> Result<(), String> {
+) -> Result<(), NativeError> {
     for entry in tree.iter() {
-        let entry = entry.map_err(to_error)?;
+        let entry = entry.map_err(|error| native_error("corrupt_repository", error))?;
         let filename = entry.filename().to_string();
         let path = if prefix.is_empty() {
             filename
@@ -753,9 +880,9 @@ fn collect_tree_entries(
             gix::object::tree::EntryKind::Tree => {
                 let child = entry
                     .object()
-                    .map_err(to_error)?
+                    .map_err(|error| native_error("corrupt_repository", error))?
                     .try_into_tree()
-                    .map_err(to_error)?;
+                    .map_err(|error| native_error("corrupt_repository", error))?;
                 collect_tree_entries(child, &path, entries)?;
             }
             gix::object::tree::EntryKind::Blob
@@ -763,9 +890,9 @@ fn collect_tree_entries(
             | gix::object::tree::EntryKind::Link => {
                 let blob = entry
                     .object()
-                    .map_err(to_error)?
+                    .map_err(|error| native_error("corrupt_repository", error))?
                     .try_into_blob()
-                    .map_err(to_error)?;
+                    .map_err(|error| native_error("corrupt_repository", error))?;
 
                 entries.insert(
                     path,
@@ -931,31 +1058,47 @@ fn push_limited(output: &mut String, truncated: &mut bool, limit: usize, text: &
     *truncated = true;
 }
 
-fn safe_relative_path(path: &str) -> Result<PathBuf, String> {
+fn safe_relative_path(path: &str) -> Result<PathBuf, NativeError> {
     let path = path.trim_matches('/');
     let relative_path = PathBuf::from(path);
 
     if relative_path.is_absolute() {
-        return Err("path must be relative".to_string());
+        return Err(native_error("path_not_found", "path must be relative"));
     }
 
     for component in relative_path.components() {
         match component {
             Component::Normal(_) => {}
             Component::CurDir if path.is_empty() => {}
-            _ => return Err("path contains unsafe segments".to_string()),
+            _ => {
+                return Err(native_error(
+                    "path_not_found",
+                    "path contains unsafe segments",
+                ));
+            }
         }
     }
 
     Ok(relative_path)
 }
 
-fn commit_to_tuple(commit: &gix::Commit<'_>) -> Result<NativeCommit, String> {
-    let author = commit.author().map_err(to_error)?;
-    let committer = commit.committer().map_err(to_error)?;
-    let author_time = author.time().map_err(to_error)?;
-    let committer_time = committer.time().map_err(to_error)?;
-    let message = commit.message_raw().map_err(to_error)?.to_string();
+fn commit_to_tuple(commit: &gix::Commit<'_>) -> Result<NativeCommit, NativeError> {
+    let author = commit
+        .author()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let committer = commit
+        .committer()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let author_time = author
+        .time()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let committer_time = committer
+        .time()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let message = commit
+        .message_raw()
+        .map_err(|error| native_error("corrupt_repository", error))?
+        .to_string();
     let title = message.lines().next().unwrap_or_default().to_string();
     let parents = commit.parent_ids().map(|id| id.to_string()).collect();
 

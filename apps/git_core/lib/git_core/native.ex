@@ -1,6 +1,8 @@
 defmodule GitCore.Native do
   @moduledoc false
 
+  @type read_error :: {String.t(), String.t()}
+
   @darwin_target :erlang.system_info(:system_architecture) |> to_string()
   @target if String.ends_with?(@darwin_target, "-apple-darwin"), do: @darwin_target
 
