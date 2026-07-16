@@ -199,6 +199,23 @@ defmodule GitCore.RepositoryReadModelTest do
     end
   end
 
+  describe "bounded blob prefixes" do
+    @describetag :prefix_blob
+    @describetag :tmp_dir
+
+    test "reads an exact prefix from a verified loose blob", %{tmp_dir: tmp_dir} do
+      assert_prefix_blob_contract(prefix_blob_fixture!(tmp_dir, :loose))
+    end
+
+    test "reads an exact prefix from a verified packed-base blob", %{tmp_dir: tmp_dir} do
+      assert_prefix_blob_contract(prefix_blob_fixture!(tmp_dir, :packed_base))
+    end
+
+    test "reads an exact prefix from a verified packed-delta blob", %{tmp_dir: tmp_dir} do
+      assert_prefix_blob_contract(prefix_blob_fixture!(tmp_dir, :packed_delta))
+    end
+  end
+
   defp assert_error(result, expected_kind, expected_operation) do
     assert {:error,
             %{
@@ -246,6 +263,194 @@ defmodule GitCore.RepositoryReadModelTest do
        do: :ok
 
   defp normalize_legacy_read(result, _operation, _commit_oid), do: result
+
+  defp assert_prefix_blob_contract(fixture) do
+    limit = 64 * 1024
+
+    assert {:ok,
+            %GitCore.Blob{
+              oid: oid,
+              size: size,
+              data: data,
+              truncated: true,
+              binary: true,
+              non_utf8: true
+            }} =
+             GitCore.read_blob(
+               fixture.repo_path,
+               fixture.commit_oid,
+               fixture.blob_path,
+               limit: limit
+             )
+
+    assert oid == fixture.oid
+    assert size == byte_size(fixture.original)
+    assert data == binary_part(fixture.original, 0, limit)
+    assert byte_size(data) <= limit
+
+    assert {:ok,
+            %GitCore.Blob{
+              oid: ^oid,
+              size: ^size,
+              data: complete,
+              truncated: false,
+              binary: true,
+              non_utf8: true
+            }} =
+             GitCore.read_blob(
+               fixture.repo_path,
+               fixture.commit_oid,
+               fixture.blob_path,
+               limit: size + 1
+             )
+
+    assert complete == fixture.original
+  end
+
+  defp prefix_blob_fixture!(tmp_dir, storage) do
+    suffix = System.unique_integer([:positive])
+    fixture_dir = Path.join(tmp_dir, "prefix-#{storage}-#{suffix}")
+    repo_path = Path.join(fixture_dir, "repo.git")
+    File.mkdir_p!(fixture_dir)
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+
+    first = deterministic_large_blob(0x3C6EF372)
+    second = mutate_large_blob(first)
+
+    blobs =
+      case storage do
+        :packed_delta -> [{"first.bin", first}, {"second.bin", second}]
+        _ -> [{"blob.bin", first}]
+      end
+
+    objects =
+      Enum.map(blobs, fn {name, data} ->
+        path = Path.join(fixture_dir, name)
+        File.write!(path, data)
+        {name, git!(["--git-dir", repo_path, "hash-object", "-w", path]), data}
+      end)
+
+    tree_data =
+      objects
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map(fn {name, oid, _data} -> ["100644 ", name, <<0>>, oid_bytes(oid)] end)
+      |> IO.iodata_to_binary()
+
+    tree_path = Path.join(fixture_dir, "tree")
+    File.write!(tree_path, tree_data)
+    tree_oid = git!(["--git-dir", repo_path, "hash-object", "-t", "tree", "-w", tree_path])
+    commit_oid = git!(["--git-dir", repo_path, "commit-tree", tree_oid, "-m", "prefix blob"])
+    git!(["--git-dir", repo_path, "update-ref", "refs/heads/main", commit_oid])
+
+    case storage do
+      :loose ->
+        [{name, oid, original}] = objects
+        assert File.regular?(loose_object_path(repo_path, oid))
+        assert Path.wildcard(Path.join(repo_path, "objects/pack/*.idx")) == []
+        fixture_result(repo_path, commit_oid, name, oid, original)
+
+      :packed_base ->
+        git!([
+          "--git-dir",
+          repo_path,
+          "repack",
+          "-a",
+          "-d",
+          "-f",
+          "--window=0",
+          "--depth=0"
+        ])
+
+        [{name, oid, original}] = objects
+        evidence = verify_pack_line!(repo_path, oid)
+        fields = String.split(evidence)
+        assert Enum.at(fields, 1) == "blob", evidence
+        assert Enum.at(fields, 2) == Integer.to_string(byte_size(original)), evidence
+        assert length(fields) == 5, evidence
+        refute File.exists?(loose_object_path(repo_path, oid))
+        fixture_result(repo_path, commit_oid, name, oid, original)
+
+      :packed_delta ->
+        git!([
+          "--git-dir",
+          repo_path,
+          "repack",
+          "-a",
+          "-d",
+          "-f",
+          "--window=50",
+          "--depth=50"
+        ])
+
+        {name, oid, original, evidence} =
+          Enum.find_value(objects, fn {name, oid, original} ->
+            evidence = verify_pack_line!(repo_path, oid)
+            fields = String.split(evidence)
+
+            if length(fields) >= 7 and String.to_integer(Enum.at(fields, 5)) >= 1 do
+              {name, oid, original, evidence}
+            end
+          end) || flunk("expected verify-pack to report a packed delta")
+
+        fields = String.split(evidence)
+        assert Enum.at(fields, 1) == "blob", evidence
+        assert byte_size(Enum.at(fields, 6)) == 40, evidence
+        refute File.exists?(loose_object_path(repo_path, oid))
+        fixture_result(repo_path, commit_oid, name, oid, original)
+    end
+  end
+
+  defp fixture_result(repo_path, commit_oid, name, oid, original) do
+    %{
+      repo_path: repo_path,
+      commit_oid: commit_oid,
+      blob_path: name,
+      oid: oid,
+      original: original
+    }
+  end
+
+  defp deterministic_large_blob(seed) do
+    block_size = 64 * 1024
+
+    {bytes, _state} =
+      Enum.map_reduce(1..(block_size - 2), seed, fn _, state ->
+        state = Bitwise.band(state * 1_664_525 + 1_013_904_223, 0xFFFF_FFFF)
+        {Bitwise.band(Bitwise.bsr(state, 16), 0xFF), state}
+      end)
+
+    block = :erlang.list_to_binary([0, 255 | bytes])
+    size = 3 * 1024 * 1024 + 257
+    copies = div(size + block_size - 1, block_size)
+    binary_part(:binary.copy(block, copies), 0, size)
+  end
+
+  defp mutate_large_blob(blob) do
+    Enum.reduce([17, 181, 503, 701], blob, fn block, data ->
+      start = block * 4096
+      <<before::binary-size(start), segment::binary-size(4096), after_segment::binary>> = data
+
+      mutated =
+        segment
+        |> :binary.bin_to_list()
+        |> Enum.with_index()
+        |> Enum.map(fn {byte, index} ->
+          Bitwise.bxor(byte, Bitwise.band(index * 31 + block, 0xFF))
+        end)
+        |> :erlang.list_to_binary()
+
+      before <> mutated <> after_segment
+    end)
+  end
+
+  defp verify_pack_line!(repo_path, oid) do
+    [index_path] = Path.wildcard(Path.join(repo_path, "objects/pack/*.idx"))
+    output = git!(["verify-pack", "-v", index_path])
+
+    Enum.find(String.split(output, "\n"), fn line ->
+      List.first(String.split(line)) == oid
+    end) || flunk("verify-pack output has no line for #{oid}:\n#{output}")
+  end
 
   defp populated_bare_repository!(tmp_dir) do
     suffix = System.unique_integer([:positive])
@@ -331,7 +536,9 @@ defmodule GitCore.RepositoryReadModelTest do
       {"GIT_AUTHOR_NAME", "Fornacast Test"},
       {"GIT_AUTHOR_EMAIL", "test@example.com"},
       {"GIT_COMMITTER_NAME", "Fornacast Test"},
-      {"GIT_COMMITTER_EMAIL", "test@example.com"}
+      {"GIT_COMMITTER_EMAIL", "test@example.com"},
+      {"GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z"},
+      {"GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z"}
     ]
 
     case System.cmd("git", args, stderr_to_stdout: true, env: env) do

@@ -3,6 +3,8 @@ use std::io::{Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
+mod bounded_blob;
+
 type NativeCommit = (
     String,
     String,
@@ -235,15 +237,13 @@ fn read_blob(
         ));
     }
 
-    let blob = entry
-        .object()
-        .map_err(|error| native_error("corrupt_repository", error))?
-        .try_into_blob()
-        .map_err(|error| native_error("corrupt_repository", error))?;
-    let size = blob.data.len() as u64;
     let read_limit = limit.clamp(1, 100_000_000);
-    let truncated = blob.data.len() > read_limit;
-    let data = blob.data[..std::cmp::min(blob.data.len(), read_limit)].to_vec();
+    let oid = entry.object_id();
+    let prefix = bounded_blob::read_prefix(&repo, oid, read_limit)
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let size = prefix.size;
+    let truncated = prefix.truncated;
+    let data = prefix.data;
     let binary = data.contains(&0);
     let name = relative_path
         .file_name()
@@ -251,14 +251,7 @@ fn read_blob(
         .unwrap_or_default()
         .to_string();
 
-    Ok((
-        name,
-        entry.object_id().to_string(),
-        size,
-        data,
-        truncated,
-        binary,
-    ))
+    Ok((name, oid.to_string(), size, data, truncated, binary))
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
