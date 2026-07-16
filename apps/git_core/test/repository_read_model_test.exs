@@ -224,6 +224,483 @@ defmodule GitCore.RepositoryReadModelTest do
     end
   end
 
+  describe "canonical refs and immutable snapshots" do
+    @describetag :refs
+    @describetag :tmp_dir
+
+    test "summarizes exact byte-sorted refs with bounded samples and direct targets", %{
+      tmp_dir: tmp_dir
+    } do
+      fixture = ref_fixture!(tmp_dir)
+
+      assert {:ok, summary} =
+               GitCore.ref_summary(fixture.repo_path, selected_ref: fixture.selected_branch)
+
+      assert %GitCore.RefSummary{
+               branch_count: branch_count,
+               tag_count: tag_count,
+               branches: branches,
+               tags: tags,
+               refs_truncated: true
+             } = summary
+
+      assert branch_count == length(fixture.branch_names)
+      assert tag_count == length(fixture.tag_names)
+
+      expected_branches =
+        fixture.branch_names
+        |> Enum.sort()
+        |> Enum.take(100)
+        |> Kernel.++([fixture.selected_branch])
+        |> Enum.uniq()
+        |> Enum.sort()
+
+      assert Enum.map(branches, & &1.name) == expected_branches
+
+      assert Enum.map(tags, & &1.name) ==
+               fixture.tag_names |> Enum.sort() |> Enum.take(100)
+
+      refute fixture.selected_branch in Enum.take(Enum.sort(fixture.branch_names), 100)
+      assert Enum.all?(branches, &(&1.kind == :branch))
+      assert Enum.all?(tags, &(&1.kind == :tag))
+
+      assert Enum.map(branches, & &1.display_name) ==
+               Enum.map(expected_branches, &String.replace_prefix(&1, "refs/heads/", ""))
+
+      annotated = find_ref!(summary.tags, "refs/tags/annotated")
+      nested = find_ref!(summary.tags, "refs/tags/nested")
+      same_tag = find_ref!(summary.tags, "refs/tags/same")
+
+      assert annotated.target == fixture.annotated_tag_oid
+      assert nested.target == fixture.nested_tag_oid
+      assert same_tag.target == fixture.second_commit_oid
+
+      assert {:ok,
+              %GitCore.RefSummary{
+                branch_count: 0,
+                tag_count: 0,
+                branches: [],
+                tags: [],
+                refs_truncated: false
+              }} = GitCore.ref_summary(empty_bare_repository!(tmp_dir))
+    end
+
+    test "paginates exact refs with a hard 100-row cap and typed empty pages", %{
+      tmp_dir: tmp_dir
+    } do
+      fixture = ref_fixture!(tmp_dir)
+      expected = Enum.sort(fixture.branch_names)
+      total = length(expected)
+      total_pages = div(total + 99, 100)
+
+      assert {:ok,
+              %GitCore.RefPage{
+                refs: first,
+                total: ^total,
+                page: 1,
+                per_page: 100,
+                total_pages: ^total_pages
+              }} = GitCore.ref_page(fixture.repo_path, :branch, 1, per_page: 500)
+
+      assert Enum.map(first, & &1.name) == Enum.take(expected, 100)
+
+      assert {:ok,
+              %GitCore.RefPage{
+                refs: second,
+                total: ^total,
+                page: 2,
+                per_page: 100,
+                total_pages: ^total_pages
+              }} = GitCore.ref_page(fixture.repo_path, :branch, 2)
+
+      assert Enum.map(second, & &1.name) == Enum.drop(expected, 100)
+
+      expected_tags = Enum.sort(fixture.tag_names)
+      tag_total = length(expected_tags)
+      tag_total_pages = div(tag_total + 6, 7)
+
+      assert {:ok,
+              %GitCore.RefPage{
+                refs: tag_refs,
+                total: ^tag_total,
+                page: 1,
+                per_page: 7,
+                total_pages: ^tag_total_pages
+              }} = GitCore.ref_page(fixture.repo_path, :tag, 1, per_page: 7)
+
+      assert Enum.map(tag_refs, & &1.name) == Enum.take(expected_tags, 7)
+      assert find_ref!(tag_refs, "refs/tags/annotated").target == fixture.annotated_tag_oid
+
+      assert {:ok,
+              %GitCore.RefPage{
+                refs: [],
+                total: ^total,
+                page: 3,
+                per_page: 100,
+                total_pages: ^total_pages
+              }} = GitCore.ref_page(fixture.repo_path, :branch, 3)
+
+      huge_page = Bitwise.bsl(1, 200)
+
+      assert {:ok,
+              %GitCore.RefPage{
+                refs: [],
+                total: ^total,
+                page: ^huge_page,
+                per_page: 100,
+                total_pages: ^total_pages
+              }} = GitCore.ref_page(fixture.repo_path, :branch, huge_page)
+
+      empty_repo = empty_bare_repository!(tmp_dir)
+
+      for page <- [1, 2] do
+        assert {:ok,
+                %GitCore.RefPage{
+                  refs: [],
+                  total: 0,
+                  page: ^page,
+                  per_page: 100,
+                  total_pages: 1
+                }} = GitCore.ref_page(empty_repo, :tag, page)
+      end
+    end
+
+    test "resolves canonical refs exactly and legacy refs branch-first", %{tmp_dir: tmp_dir} do
+      fixture = ref_fixture!(tmp_dir)
+
+      assert {:ok,
+              %GitCore.Snapshot{
+                kind: :branch,
+                ref: "refs/heads/same",
+                oid: branch_oid
+              }} =
+               GitCore.resolve_snapshot(fixture.repo_path, %GitCore.RefSelector{
+                 kind: :branch,
+                 full_name: "refs/heads/same"
+               })
+
+      assert branch_oid == fixture.commit_oid
+
+      assert {:ok,
+              %GitCore.Snapshot{
+                kind: :tag,
+                ref: "refs/tags/same",
+                oid: tag_oid
+              }} =
+               GitCore.resolve_snapshot(fixture.repo_path, %GitCore.RefSelector{
+                 kind: :tag,
+                 full_name: "refs/tags/same"
+               })
+
+      assert tag_oid == fixture.second_commit_oid
+
+      for tag <- ["annotated", "nested"] do
+        assert {:ok,
+                %GitCore.Snapshot{
+                  kind: :tag,
+                  ref: "refs/tags/" <> ^tag,
+                  oid: oid
+                }} =
+                 GitCore.resolve_snapshot(fixture.repo_path, %GitCore.RefSelector{
+                   kind: :tag,
+                   full_name: "refs/tags/#{tag}"
+                 })
+
+        assert oid == fixture.commit_oid
+      end
+
+      assert {:ok,
+              %GitCore.Snapshot{
+                kind: :branch,
+                ref: "refs/heads/same",
+                oid: legacy_oid
+              }} =
+               GitCore.resolve_snapshot(fixture.repo_path, %GitCore.RefSelector{
+                 kind: :legacy,
+                 full_name: "same"
+               })
+
+      assert legacy_oid == fixture.commit_oid
+
+      assert_error(
+        GitCore.resolve_snapshot(fixture.repo_path, %GitCore.RefSelector{
+          kind: :tag,
+          full_name: "refs/tags/blob-target"
+        }),
+        :ref_not_found,
+        :resolve_snapshot
+      )
+
+      cycle_repo = symbolic_ref_cycle_repository!(tmp_dir)
+
+      assert_error(
+        GitCore.resolve_snapshot(cycle_repo, %GitCore.RefSelector{
+          kind: :tag,
+          full_name: "refs/tags/cycle-a"
+        }),
+        :ref_not_found,
+        :resolve_snapshot
+      )
+
+      assert_error(
+        GitCore.resolve_snapshot(fixture.repo_path, %GitCore.RefSelector{
+          kind: :branch,
+          full_name: "refs/tags/same"
+        }),
+        :ref_not_found,
+        :resolve_snapshot
+      )
+
+      assert_error(
+        GitCore.resolve_snapshot(fixture.repo_path, %GitCore.RefSelector{
+          kind: :branch,
+          full_name: "refs/heads/tag-object"
+        }),
+        :ref_not_found,
+        :resolve_snapshot
+      )
+
+      assert_error(
+        GitCore.resolve_snapshot(fixture.repo_path, %GitCore.RefSelector{
+          kind: :tag,
+          full_name: "refs/tags/missing"
+        }),
+        :ref_not_found,
+        :resolve_snapshot
+      )
+    end
+
+    test "rejects malformed canonical and legacy selectors as missing refs", %{tmp_dir: tmp_dir} do
+      fixture = ref_fixture!(tmp_dir)
+
+      for {kind, full_name} <- [
+            {:branch, "refs/heads/../escape"},
+            {:tag, "refs/tags/bad\0name"},
+            {:legacy, "../escape"},
+            {:legacy, "bad\0name"}
+          ] do
+        assert_error(
+          GitCore.resolve_snapshot(fixture.repo_path, %GitCore.RefSelector{
+            kind: kind,
+            full_name: full_name
+          }),
+          :ref_not_found,
+          :resolve_snapshot
+        )
+      end
+    end
+
+    test "rejects an annotated tag whose declared target kind is false", %{tmp_dir: tmp_dir} do
+      fixture = ref_fixture!(tmp_dir)
+
+      assert_error(
+        GitCore.resolve_snapshot(fixture.repo_path, %GitCore.RefSelector{
+          kind: :tag,
+          full_name: "refs/tags/type-mismatch"
+        }),
+        :corrupt_repository,
+        :resolve_snapshot
+      )
+    end
+
+    test "rejects an annotated tag without its mandatory tag header", %{tmp_dir: tmp_dir} do
+      fixture = ref_fixture!(tmp_dir)
+
+      assert_error(
+        GitCore.resolve_snapshot(fixture.repo_path, %GitCore.RefSelector{
+          kind: :tag,
+          full_name: "refs/tags/missing-tag-header"
+        }),
+        :corrupt_repository,
+        :resolve_snapshot
+      )
+    end
+
+    test "resolves large annotated tags and commits through bounded prefixes", %{tmp_dir: tmp_dir} do
+      large = large_snapshot_repository!(tmp_dir)
+
+      assert {:ok,
+              %GitCore.Snapshot{
+                kind: :tag,
+                ref: "refs/tags/large",
+                oid: large_oid
+              }} =
+               GitCore.resolve_snapshot(large.repo_path, %GitCore.RefSelector{
+                 kind: :tag,
+                 full_name: "refs/tags/large"
+               })
+
+      assert large_oid == large.commit_oid
+
+      assert {:ok,
+              %GitCore.Snapshot{
+                kind: :tag,
+                ref: "refs/tags/long-header",
+                oid: long_header_oid
+              }} =
+               GitCore.resolve_snapshot(large.repo_path, %GitCore.RefSelector{
+                 kind: :tag,
+                 full_name: "refs/tags/long-header"
+               })
+
+      assert long_header_oid == large.commit_oid
+    end
+
+    test "preserves valid non-UTF-8 ref names byte-for-byte", %{tmp_dir: tmp_dir} do
+      fixture = raw_ref_repository!(tmp_dir)
+
+      assert {:ok,
+              %GitCore.RefSummary{
+                branch_count: 2,
+                tag_count: 0,
+                branches: branches,
+                tags: [],
+                refs_truncated: false
+              }} = GitCore.ref_summary(fixture.repo_path, selected_ref: fixture.selected_ref)
+
+      assert Enum.map(branches, & &1.name) == fixture.full_names
+      assert Enum.map(branches, & &1.display_name) == fixture.short_names
+      assert Enum.all?(branches, &(&1.target == fixture.commit_oid))
+
+      assert {:ok,
+              %GitCore.RefPage{
+                refs: page_refs,
+                total: 2,
+                page: 1,
+                per_page: 100,
+                total_pages: 1
+              }} = GitCore.ref_page(fixture.repo_path, :branch, 1)
+
+      assert Enum.map(page_refs, & &1.name) == fixture.full_names
+
+      assert {:ok,
+              %GitCore.Snapshot{
+                kind: :branch,
+                ref: selected_ref,
+                oid: selected_oid
+              }} =
+               GitCore.resolve_snapshot(fixture.repo_path, %GitCore.RefSelector{
+                 kind: :branch,
+                 full_name: fixture.selected_ref
+               })
+
+      assert selected_ref == fixture.selected_ref
+      assert selected_oid == fixture.commit_oid
+
+      assert {:ok,
+              {_summary, %GitCore.RefSelector{kind: :branch, full_name: route_ref}, "raw/path"}} =
+               GitCore.ref_summary_for_route(fixture.repo_path, [
+                 "refs",
+                 "heads",
+                 fixture.selected_short_name,
+                 "raw",
+                 "path"
+               ])
+
+      assert route_ref == fixture.selected_ref
+    end
+
+    test "matches wildcard refs and paths in the same summary scan", %{tmp_dir: tmp_dir} do
+      fixture = ref_fixture!(tmp_dir)
+
+      assert {:ok, {summary, selector, repository_path}} =
+               GitCore.ref_summary_for_route(fixture.repo_path, [
+                 "refs",
+                 "heads",
+                 "zz-selected",
+                 "deep",
+                 "lib",
+                 "demo.ex"
+               ])
+
+      assert %GitCore.RefSelector{kind: :branch, full_name: full_name} = selector
+      assert full_name == fixture.selected_branch
+      assert repository_path == "lib/demo.ex"
+      assert Enum.any?(summary.branches, &(&1.name == fixture.selected_branch))
+      assert length(summary.branches) == 101
+
+      assert {:ok,
+              {_summary, %GitCore.RefSelector{kind: :tag, full_name: "refs/tags/release/deep"},
+               "docs/guide.md"}} =
+               GitCore.ref_summary_for_route(fixture.repo_path, [
+                 "refs",
+                 "tags",
+                 "release",
+                 "deep",
+                 "docs",
+                 "guide.md"
+               ])
+
+      assert {:ok,
+              {_summary, %GitCore.RefSelector{kind: :legacy, full_name: "feature/deep"},
+               "README.md"}} =
+               GitCore.ref_summary_for_route(fixture.repo_path, [
+                 "feature",
+                 "deep",
+                 "README.md"
+               ])
+
+      long_path = for index <- 1..512, do: "segment-#{index}"
+
+      assert {:ok,
+              {_summary, %GitCore.RefSelector{kind: :legacy, full_name: "feature/deep"},
+               long_repository_path}} =
+               GitCore.ref_summary_for_route(
+                 fixture.repo_path,
+                 ["feature", "deep" | long_path]
+               )
+
+      assert long_repository_path == Enum.join(long_path, "/")
+
+      assert {:ok,
+              {_summary, %GitCore.RefSelector{kind: :legacy, full_name: "release/deep"},
+               "docs/guide.md"}} =
+               GitCore.ref_summary_for_route(fixture.repo_path, [
+                 "release",
+                 "deep",
+                 "docs",
+                 "guide.md"
+               ])
+
+      assert {:ok,
+              {_summary, %GitCore.RefSelector{kind: :legacy, full_name: "topic"},
+               "deep/README.md"}} =
+               GitCore.ref_summary_for_route(fixture.repo_path, [
+                 "topic",
+                 "deep",
+                 "README.md"
+               ])
+
+      assert {:ok,
+              {_summary, %GitCore.RefSelector{kind: :tag, full_name: "refs/tags/blob-target"},
+               "not-probed.txt"}} =
+               GitCore.ref_summary_for_route(fixture.repo_path, [
+                 "refs",
+                 "tags",
+                 "blob-target",
+                 "not-probed.txt"
+               ])
+
+      assert_error(
+        GitCore.ref_summary_for_route(fixture.repo_path, ["missing", "path"]),
+        :ref_not_found,
+        :ref_summary_for_route
+      )
+
+      collision_repo = same_kind_route_repository!(tmp_dir)
+
+      assert {:ok,
+              {_summary, %GitCore.RefSelector{kind: :legacy, full_name: "feature/deep"},
+               "src/file.ex"}} =
+               GitCore.ref_summary_for_route(collision_repo, [
+                 "feature",
+                 "deep",
+                 "src",
+                 "file.ex"
+               ])
+    end
+  end
+
   describe "scan limiter" do
     @describetag :limiter
 
@@ -1041,6 +1518,291 @@ defmodule GitCore.RepositoryReadModelTest do
     git!(["-C", work_path, "push", "origin", "main"])
 
     %{repo_path: repo_path, commit_oid: git!(["-C", work_path, "rev-parse", "HEAD"])}
+  end
+
+  defp ref_fixture!(tmp_dir) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "refs-#{suffix}.git")
+    empty_tree_path = Path.join(tmp_dir, "empty-tree-#{suffix}")
+    blob_path = Path.join(tmp_dir, "tag-blob-#{suffix}")
+
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    File.write!(empty_tree_path, "")
+    File.write!(blob_path, "not a commit\n")
+
+    tree_oid =
+      git!(["--git-dir", repo_path, "hash-object", "-t", "tree", "-w", empty_tree_path])
+
+    blob_oid = git!(["--git-dir", repo_path, "hash-object", "-w", blob_path])
+    commit_oid = git!(["--git-dir", repo_path, "commit-tree", tree_oid, "-m", "first"])
+
+    second_commit_oid =
+      git!([
+        "--git-dir",
+        repo_path,
+        "commit-tree",
+        tree_oid,
+        "-p",
+        commit_oid,
+        "-m",
+        "second"
+      ])
+
+    generated_branches =
+      for index <- 0..104 do
+        "refs/heads/branch/#{String.pad_leading(Integer.to_string(index), 3, "0")}"
+      end
+
+    selected_branch = "refs/heads/zz-selected/deep"
+
+    branch_names =
+      generated_branches ++
+        [
+          "refs/heads/feature/deep",
+          "refs/heads/same",
+          "refs/heads/tag-object",
+          "refs/heads/topic",
+          selected_branch
+        ]
+
+    Enum.each(branch_names, fn name ->
+      git!(["--git-dir", repo_path, "update-ref", name, commit_oid])
+    end)
+
+    git!(["--git-dir", repo_path, "update-ref", "refs/tags/same", second_commit_oid])
+    git!(["--git-dir", repo_path, "update-ref", "refs/tags/release/deep", commit_oid])
+    git!(["--git-dir", repo_path, "update-ref", "refs/tags/topic/deep", second_commit_oid])
+    git!(["--git-dir", repo_path, "update-ref", "refs/tags/blob-target", blob_oid])
+    git!(["--git-dir", repo_path, "tag", "-a", "annotated", commit_oid, "-m", "annotated"])
+    annotated_tag_oid = git!(["--git-dir", repo_path, "rev-parse", "refs/tags/annotated"])
+
+    File.write!(
+      Path.join([repo_path, "refs", "heads", "tag-object"]),
+      annotated_tag_oid <> "\n"
+    )
+
+    git!(["--git-dir", repo_path, "tag", "-a", "nested", annotated_tag_oid, "-m", "nested"])
+    nested_tag_oid = git!(["--git-dir", repo_path, "rev-parse", "refs/tags/nested"])
+
+    mismatched_tag_path = Path.join(tmp_dir, "mismatched-tag-#{suffix}")
+
+    File.write!(
+      mismatched_tag_path,
+      "object #{commit_oid}\ntype blob\ntag type-mismatch\n" <>
+        "tagger Fornacast Test <test@example.com> 946684800 +0000\n\ninvalid type\n"
+    )
+
+    mismatched_tag_oid =
+      git!([
+        "--git-dir",
+        repo_path,
+        "hash-object",
+        "--literally",
+        "-t",
+        "tag",
+        "-w",
+        mismatched_tag_path
+      ])
+
+    git!([
+      "--git-dir",
+      repo_path,
+      "update-ref",
+      "refs/tags/type-mismatch",
+      mismatched_tag_oid
+    ])
+
+    missing_tag_header_path = Path.join(tmp_dir, "missing-tag-header-#{suffix}")
+    File.write!(missing_tag_header_path, "object #{commit_oid}\ntype commit\n")
+
+    missing_tag_header_oid =
+      git!([
+        "--git-dir",
+        repo_path,
+        "hash-object",
+        "--literally",
+        "-t",
+        "tag",
+        "-w",
+        missing_tag_header_path
+      ])
+
+    File.write!(
+      Path.join([repo_path, "refs", "tags", "missing-tag-header"]),
+      missing_tag_header_oid <> "\n"
+    )
+
+    generated_tags =
+      for index <- 0..104 do
+        "refs/tags/tag/#{String.pad_leading(Integer.to_string(index), 3, "0")}"
+      end
+
+    Enum.each(generated_tags, fn name ->
+      git!(["--git-dir", repo_path, "update-ref", name, commit_oid])
+    end)
+
+    tag_names =
+      generated_tags ++
+        [
+          "refs/tags/annotated",
+          "refs/tags/blob-target",
+          "refs/tags/missing-tag-header",
+          "refs/tags/nested",
+          "refs/tags/release/deep",
+          "refs/tags/same",
+          "refs/tags/topic/deep",
+          "refs/tags/type-mismatch"
+        ]
+
+    %{
+      repo_path: repo_path,
+      commit_oid: commit_oid,
+      second_commit_oid: second_commit_oid,
+      selected_branch: selected_branch,
+      branch_names: branch_names,
+      tag_names: tag_names,
+      annotated_tag_oid: annotated_tag_oid,
+      nested_tag_oid: nested_tag_oid
+    }
+  end
+
+  defp empty_bare_repository!(tmp_dir) do
+    path = Path.join(tmp_dir, "empty-#{System.unique_integer([:positive])}.git")
+    git!(["init", "--bare", "--object-format=sha1", path])
+    path
+  end
+
+  defp symbolic_ref_cycle_repository!(tmp_dir) do
+    path = empty_bare_repository!(tmp_dir)
+    tags_path = Path.join([path, "refs", "tags"])
+    File.mkdir_p!(tags_path)
+    File.write!(Path.join(tags_path, "cycle-a"), "ref: refs/tags/cycle-b\n")
+    File.write!(Path.join(tags_path, "cycle-b"), "ref: refs/tags/cycle-a\n")
+    path
+  end
+
+  defp raw_ref_repository!(tmp_dir) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "raw-refs-#{suffix}.git")
+    empty_tree_path = Path.join(tmp_dir, "raw-empty-tree-#{suffix}")
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    File.write!(empty_tree_path, "")
+
+    tree_oid =
+      git!(["--git-dir", repo_path, "hash-object", "-t", "tree", "-w", empty_tree_path])
+
+    commit_oid = git!(["--git-dir", repo_path, "commit-tree", tree_oid, "-m", "raw refs"])
+    short_names = [<<"raw-", 0xFE>>, <<"raw-", 0xFF>>]
+    full_names = Enum.map(short_names, &(<<"refs/heads/">> <> &1))
+    heads_path = Path.join([repo_path, "refs", "heads"])
+
+    Enum.each(short_names, fn short_name ->
+      File.write!(Path.join(heads_path, short_name), commit_oid <> "\n")
+    end)
+
+    %{
+      repo_path: repo_path,
+      commit_oid: commit_oid,
+      short_names: short_names,
+      full_names: full_names,
+      selected_short_name: List.last(short_names),
+      selected_ref: List.last(full_names)
+    }
+  end
+
+  defp large_snapshot_repository!(tmp_dir) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "large-snapshot-#{suffix}.git")
+    empty_tree_path = Path.join(tmp_dir, "large-empty-tree-#{suffix}")
+    commit_message_path = Path.join(tmp_dir, "large-commit-message-#{suffix}")
+    tag_message_path = Path.join(tmp_dir, "large-tag-message-#{suffix}")
+    long_header_tag_path = Path.join(tmp_dir, "long-header-tag-#{suffix}")
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    File.write!(empty_tree_path, "")
+    File.write!(commit_message_path, :binary.copy("commit message\n", 200_000))
+    File.write!(tag_message_path, :binary.copy("tag message\n", 250_000))
+
+    tree_oid =
+      git!(["--git-dir", repo_path, "hash-object", "-t", "tree", "-w", empty_tree_path])
+
+    commit_oid =
+      git!([
+        "--git-dir",
+        repo_path,
+        "commit-tree",
+        tree_oid,
+        "-F",
+        commit_message_path
+      ])
+
+    git!([
+      "--git-dir",
+      repo_path,
+      "tag",
+      "-a",
+      "large",
+      commit_oid,
+      "-F",
+      tag_message_path
+    ])
+
+    long_internal_name = :binary.copy("long-internal-name-", 1_024)
+
+    File.write!(
+      long_header_tag_path,
+      "object #{commit_oid}\ntype commit\ntag #{long_internal_name}\n" <>
+        "tagger Fornacast Test <test@example.com> 946684800 +0000\n\nvalid long header\n"
+    )
+
+    long_header_tag_oid =
+      git!([
+        "--git-dir",
+        repo_path,
+        "hash-object",
+        "--literally",
+        "-t",
+        "tag",
+        "-w",
+        long_header_tag_path
+      ])
+
+    git!([
+      "--git-dir",
+      repo_path,
+      "update-ref",
+      "refs/tags/long-header",
+      long_header_tag_oid
+    ])
+
+    %{repo_path: repo_path, commit_oid: commit_oid}
+  end
+
+  defp same_kind_route_repository!(tmp_dir) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "same-kind-route-#{suffix}.git")
+    empty_tree_path = Path.join(tmp_dir, "same-kind-empty-tree-#{suffix}")
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    File.write!(empty_tree_path, "")
+
+    tree_oid =
+      git!(["--git-dir", repo_path, "hash-object", "-t", "tree", "-w", empty_tree_path])
+
+    commit_oid = git!(["--git-dir", repo_path, "commit-tree", tree_oid, "-m", "same kind"])
+
+    # Git's loose ref namespace cannot contain both a file and a directory at this boundary.
+    # A packed-only fixture still exercises deterministic longest-match behavior defensively.
+    File.write!(
+      Path.join(repo_path, "packed-refs"),
+      "# pack-refs with: sorted\n" <>
+        "#{commit_oid} refs/heads/feature\n" <>
+        "#{commit_oid} refs/heads/feature/deep\n"
+    )
+
+    repo_path
+  end
+
+  defp find_ref!(refs, name) do
+    Enum.find(refs, &(&1.name == name)) || flunk("expected ref #{name}")
   end
 
   defp inconsistent_tree_repository!(tmp_dir) do

@@ -21,6 +21,87 @@ defmodule GitCore do
     read_refs(path, :list_refs)
   end
 
+  def ref_summary(path, opts \\ []) when is_binary(path) and is_list(opts) do
+    selected_ref = opts |> Keyword.get(:selected_ref) |> ref_name_to_native()
+
+    GitCore.ScanLimiter.with_permit(:ref_summary, fn ->
+      with {:ok, summary} <-
+             wrap_read(GitCore.Native.ref_summary(path, selected_ref), :ref_summary) do
+        {:ok, ref_summary_from_native(summary)}
+      end
+    end)
+  end
+
+  def ref_summary_for_route(path, route_segments)
+      when is_binary(path) and is_list(route_segments) do
+    native_route_segments = Enum.map(route_segments, &:binary.bin_to_list/1)
+
+    GitCore.ScanLimiter.with_permit(:ref_summary_for_route, fn ->
+      with {:ok, {summary, selector_kind, selector_full_name, repository_path}} <-
+             wrap_read(
+               GitCore.Native.ref_summary_for_route(path, native_route_segments),
+               :ref_summary_for_route
+             ) do
+        {:ok,
+         {ref_summary_from_native(summary),
+          %GitCore.RefSelector{
+            kind: selector_kind(selector_kind),
+            full_name: ref_name_from_native(selector_full_name)
+          }, ref_name_from_native(repository_path)}}
+      end
+    end)
+  end
+
+  def ref_page(path, kind, page, opts \\ [])
+      when is_binary(path) and kind in [:branch, :tag] and is_integer(page) and page > 0 and
+             is_list(opts) do
+    per_page = opts |> Keyword.get(:per_page, 100) |> bounded_ref_page_size()
+
+    GitCore.ScanLimiter.with_permit(:ref_page, fn ->
+      with {:ok, {refs, total}} <-
+             wrap_read(
+               GitCore.Native.ref_page(
+                 path,
+                 Atom.to_string(kind),
+                 Integer.to_string(page),
+                 per_page
+               ),
+               :ref_page
+             ) do
+        total_pages = if total == 0, do: 1, else: div(total + per_page - 1, per_page)
+
+        {:ok,
+         %GitCore.RefPage{
+           refs: Enum.map(refs, &ref_from_native/1),
+           total: total,
+           page: page,
+           per_page: per_page,
+           total_pages: total_pages
+         }}
+      end
+    end)
+  end
+
+  def resolve_snapshot(path, %GitCore.RefSelector{kind: kind, full_name: full_name})
+      when is_binary(path) and kind in [:branch, :tag, :legacy] and is_binary(full_name) do
+    with {:ok, {resolved_kind, resolved_ref, oid}} <-
+           wrap_read(
+             GitCore.Native.resolve_snapshot(
+               path,
+               Atom.to_string(kind),
+               :binary.bin_to_list(full_name)
+             ),
+             :resolve_snapshot
+           ) do
+      {:ok,
+       %GitCore.Snapshot{
+         kind: ref_kind(resolved_kind),
+         ref: ref_name_from_native(resolved_ref),
+         oid: oid
+       }}
+    end
+  end
+
   def branches(path) when is_binary(path) do
     filter_refs(path, :branch, :branches)
   end
@@ -130,11 +211,48 @@ defmodule GitCore do
     end
   end
 
+  defp ref_summary_from_native({branch_count, tag_count, branches, tags, refs_truncated}) do
+    %GitCore.RefSummary{
+      branch_count: branch_count,
+      tag_count: tag_count,
+      branches: Enum.map(branches, &ref_from_native/1),
+      tags: Enum.map(tags, &ref_from_native/1),
+      refs_truncated: refs_truncated
+    }
+  end
+
+  defp ref_from_native({name, kind, target}) do
+    name = ref_name_from_native(name)
+    kind = ref_kind(kind)
+
+    %GitCore.Ref{
+      name: name,
+      kind: kind,
+      target: target,
+      display_name: ref_display_name(name, kind)
+    }
+  end
+
+  defp selector_kind("branch"), do: :branch
+  defp selector_kind("tag"), do: :tag
+  defp selector_kind("legacy"), do: :legacy
+
+  defp bounded_ref_page_size(per_page) when is_integer(per_page) do
+    per_page
+    |> max(1)
+    |> min(100)
+  end
+
+  defp ref_name_to_native(nil), do: nil
+  defp ref_name_to_native(name) when is_binary(name), do: :binary.bin_to_list(name)
+
+  defp ref_name_from_native(name) when is_list(name), do: IO.iodata_to_binary(name)
+
   defp ref_kind("branch"), do: :branch
   defp ref_kind("tag"), do: :tag
 
-  defp ref_display_name(name, :branch), do: String.replace_prefix(name, "refs/heads/", "")
-  defp ref_display_name(name, :tag), do: String.replace_prefix(name, "refs/tags/", "")
+  defp ref_display_name(<<"refs/heads/", display_name::binary>>, :branch), do: display_name
+  defp ref_display_name(<<"refs/tags/", display_name::binary>>, :tag), do: display_name
 
   defp tree_entry_kind("tree"), do: :tree
   defp tree_entry_kind("blob"), do: :blob

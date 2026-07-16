@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
+
+use gix_object::bstr::ByteSlice;
 
 mod bounded_blob;
 
@@ -18,6 +21,8 @@ type NativeTreeEntry = (String, String, String, String);
 type NativeBlob = (String, String, u64, Vec<u8>, bool, bool);
 type NativeDiffFile = (String, String, Option<String>, Option<String>, bool);
 type NativeCommitDiff = (Vec<NativeDiffFile>, String, bool);
+type NativeRef = (Vec<u8>, String, String);
+type NativeRefSummary = (usize, usize, Vec<NativeRef>, Vec<NativeRef>, bool);
 type NativeReceiveCommand = (String, String, String);
 type NativeReceiveStatus = (String, String, String);
 type NativeError = (String, String);
@@ -32,6 +37,39 @@ struct ReceiveCommand {
     new: String,
     ref_name: String,
 }
+
+#[derive(Clone)]
+struct ScannedRef {
+    name: Vec<u8>,
+    kind: &'static str,
+    target: String,
+}
+
+struct RefSummaryBuilder {
+    branch_count: usize,
+    tag_count: usize,
+    branches: Vec<ScannedRef>,
+    tags: Vec<ScannedRef>,
+}
+
+struct RouteMatch {
+    reference: ScannedRef,
+    selector_full_name: Vec<u8>,
+    repository_path: Vec<u8>,
+}
+
+enum DirectRefTarget {
+    Missing,
+    Symbolic,
+    Object(gix_hash::ObjectId),
+}
+
+const REF_SAMPLE_LIMIT: usize = 100;
+const REF_PAGE_LIMIT: usize = 100;
+const REF_SCAN_DEADLINE: Duration = Duration::from_secs(5);
+// This remains independent of object size while leaving room for the complete mandatory tag
+// header, including long ref-derived tag names, before an arbitrarily large message body.
+const SNAPSHOT_OBJECT_PREFIX_LIMIT: usize = 64 * 1024;
 
 #[derive(Clone)]
 struct FileSnapshot {
@@ -143,6 +181,545 @@ fn ref_kind(name: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn ref_kind_bytes(name: &[u8]) -> Option<&'static str> {
+    if name.starts_with(b"refs/heads/") {
+        Some("branch")
+    } else if name.starts_with(b"refs/tags/") {
+        Some("tag")
+    } else {
+        None
+    }
+}
+
+impl ScannedRef {
+    fn into_native(self) -> NativeRef {
+        (self.name, self.kind.to_string(), self.target)
+    }
+}
+
+impl RefSummaryBuilder {
+    fn new() -> Self {
+        Self {
+            branch_count: 0,
+            tag_count: 0,
+            branches: Vec::with_capacity(REF_SAMPLE_LIMIT),
+            tags: Vec::with_capacity(REF_SAMPLE_LIMIT),
+        }
+    }
+
+    fn record(&mut self, reference: &ScannedRef) {
+        match reference.kind {
+            "branch" => {
+                self.branch_count += 1;
+
+                if self.branches.len() < REF_SAMPLE_LIMIT {
+                    self.branches.push(reference.clone());
+                }
+            }
+            "tag" => {
+                self.tag_count += 1;
+
+                if self.tags.len() < REF_SAMPLE_LIMIT {
+                    self.tags.push(reference.clone());
+                }
+            }
+            _ => unreachable!("only branch and tag refs reach the summary builder"),
+        }
+    }
+
+    fn finish(mut self, selected: Option<ScannedRef>) -> NativeRefSummary {
+        if let Some(selected) = selected {
+            let sample = match selected.kind {
+                "branch" => &mut self.branches,
+                "tag" => &mut self.tags,
+                _ => unreachable!("only branch and tag refs can be selected"),
+            };
+
+            if !sample
+                .iter()
+                .any(|reference| reference.name == selected.name)
+            {
+                sample.push(selected);
+                sample.sort_by(|left, right| left.name.cmp(&right.name));
+            }
+        }
+
+        let refs_truncated =
+            self.branch_count > REF_SAMPLE_LIMIT || self.tag_count > REF_SAMPLE_LIMIT;
+
+        (
+            self.branch_count,
+            self.tag_count,
+            self.branches
+                .into_iter()
+                .map(ScannedRef::into_native)
+                .collect(),
+            self.tags.into_iter().map(ScannedRef::into_native).collect(),
+            refs_truncated,
+        )
+    }
+}
+
+fn check_ref_deadline(deadline: Instant) -> Result<(), NativeError> {
+    if Instant::now() >= deadline {
+        Err(native_error(
+            "scan_timeout",
+            "reference scan exceeded the five-second deadline",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn scan_direct_refs(
+    path: &str,
+    deadline: Instant,
+    mut visit: impl FnMut(ScannedRef),
+) -> Result<(), NativeError> {
+    let repo = open_bare_repository(path)?;
+    check_ref_deadline(deadline)?;
+
+    let references = repo
+        .references()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let refs = references
+        .all()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+
+    // gix's loose-then-packed overlay iterator yields refs sorted by full-name bytes. Keeping
+    // only a prefix or one requested page is therefore bounded without collecting all refs.
+    for reference in refs {
+        check_ref_deadline(deadline)?;
+        let reference = reference.map_err(|error| native_error("corrupt_repository", error))?;
+        let name = reference.name().as_bstr().to_vec();
+
+        if let (Some(kind), Some(target)) = (ref_kind_bytes(&name), reference.try_id()) {
+            visit(ScannedRef {
+                name,
+                kind,
+                target: target.to_string(),
+            });
+        }
+    }
+
+    check_ref_deadline(deadline)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn ref_summary(
+    path: String,
+    selected_ref: Option<Vec<u8>>,
+) -> Result<NativeRefSummary, NativeError> {
+    let deadline = Instant::now() + REF_SCAN_DEADLINE;
+    let mut summary = RefSummaryBuilder::new();
+    let mut selected = None;
+
+    scan_direct_refs(&path, deadline, |reference| {
+        if selected_ref.as_deref() == Some(reference.name.as_slice()) {
+            selected = Some(reference.clone());
+        }
+
+        summary.record(&reference);
+    })?;
+
+    Ok(summary.finish(selected))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn ref_page(
+    path: String,
+    kind: String,
+    page: String,
+    per_page: usize,
+) -> Result<(Vec<NativeRef>, usize), NativeError> {
+    if !matches!(kind.as_str(), "branch" | "tag") {
+        return Err(native_error("ref_not_found", "invalid reference page"));
+    }
+
+    let page = page.parse::<usize>().unwrap_or(usize::MAX);
+    if page == 0 {
+        return Err(native_error("ref_not_found", "invalid reference page"));
+    }
+
+    let per_page = per_page.clamp(1, REF_PAGE_LIMIT);
+    let start = page.saturating_sub(1).saturating_mul(per_page);
+    let end = start.saturating_add(per_page);
+    let mut total = 0usize;
+    let mut page_refs = Vec::with_capacity(per_page);
+    let deadline = Instant::now() + REF_SCAN_DEADLINE;
+
+    scan_direct_refs(&path, deadline, |reference| {
+        if reference.kind == kind {
+            if total >= start && total < end {
+                page_refs.push(reference.into_native());
+            }
+
+            total += 1;
+        }
+    })?;
+
+    Ok((page_refs, total))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn ref_summary_for_route(
+    path: String,
+    route_segments: Vec<Vec<u8>>,
+) -> Result<(NativeRefSummary, String, Vec<u8>, Vec<u8>), NativeError> {
+    let deadline = Instant::now() + REF_SCAN_DEADLINE;
+    let route_path = join_route_segments(&route_segments);
+    check_ref_deadline(deadline)?;
+    let declared_kind = declared_route_kind(&route_segments);
+    let mut canonical_match = None;
+    let mut branch_match = None;
+    let mut tag_match = None;
+    let mut summary = RefSummaryBuilder::new();
+
+    scan_direct_refs(&path, deadline, |reference| {
+        summary.record(&reference);
+
+        match declared_kind {
+            Some(kind) if kind == reference.kind => {
+                maybe_record_route_match(
+                    &mut canonical_match,
+                    &route_path,
+                    reference.name.clone(),
+                    reference,
+                );
+            }
+            Some(_) => {}
+            None => {
+                let selector_full_name = match reference.kind {
+                    "branch" => reference
+                        .name
+                        .strip_prefix(b"refs/heads/")
+                        .expect("branch refs have the branch prefix")
+                        .to_vec(),
+                    "tag" => reference
+                        .name
+                        .strip_prefix(b"refs/tags/")
+                        .expect("tag refs have the tag prefix")
+                        .to_vec(),
+                    _ => unreachable!("only branch and tag refs reach route matching"),
+                };
+                let destination = if reference.kind == "branch" {
+                    &mut branch_match
+                } else {
+                    &mut tag_match
+                };
+
+                maybe_record_route_match(destination, &route_path, selector_full_name, reference);
+            }
+        }
+    })?;
+
+    let (selector_kind, matched) = match declared_kind {
+        Some(kind) => (kind, canonical_match),
+        None => ("legacy", branch_match.or(tag_match)),
+    };
+    let matched = matched
+        .ok_or_else(|| native_error("ref_not_found", "route does not contain an existing ref"))?;
+
+    Ok((
+        summary.finish(Some(matched.reference)),
+        selector_kind.to_string(),
+        matched.selector_full_name,
+        matched.repository_path,
+    ))
+}
+
+fn declared_route_kind(route_segments: &[Vec<u8>]) -> Option<&'static str> {
+    match route_segments {
+        [refs, declared_kind, ..]
+            if refs.as_slice() == b"refs" && declared_kind.as_slice() == b"heads" =>
+        {
+            Some("branch")
+        }
+        [refs, declared_kind, ..]
+            if refs.as_slice() == b"refs" && declared_kind.as_slice() == b"tags" =>
+        {
+            Some("tag")
+        }
+        _ => None,
+    }
+}
+
+fn join_route_segments(route_segments: &[Vec<u8>]) -> Vec<u8> {
+    let byte_count = route_segments.iter().map(Vec::len).sum::<usize>();
+    let mut route_path =
+        Vec::with_capacity(byte_count.saturating_add(route_segments.len().saturating_sub(1)));
+
+    for (index, segment) in route_segments.iter().enumerate() {
+        if index != 0 {
+            route_path.push(b'/');
+        }
+        route_path.extend_from_slice(segment);
+    }
+
+    route_path
+}
+
+fn maybe_record_route_match(
+    matched: &mut Option<RouteMatch>,
+    route_path: &[u8],
+    selector_full_name: Vec<u8>,
+    reference: ScannedRef,
+) {
+    let repository_path = if route_path == selector_full_name.as_slice() {
+        Some(&[][..])
+    } else {
+        route_path
+            .strip_prefix(selector_full_name.as_slice())
+            .and_then(|suffix| suffix.strip_prefix(b"/"))
+    };
+
+    if let Some(repository_path) = repository_path {
+        let replace = matched
+            .as_ref()
+            .is_none_or(|current| selector_full_name.len() > current.selector_full_name.len());
+
+        if replace {
+            *matched = Some(RouteMatch {
+                reference,
+                selector_full_name,
+                repository_path: repository_path.to_vec(),
+            });
+        }
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn resolve_snapshot(
+    path: String,
+    selector_kind: String,
+    full_name: Vec<u8>,
+) -> Result<(String, Vec<u8>, String), NativeError> {
+    let deadline = Instant::now() + REF_SCAN_DEADLINE;
+    let repo = open_bare_repository(&path)?;
+    check_ref_deadline(deadline)?;
+
+    let (resolved_kind, resolved_ref, target) = match selector_kind.as_str() {
+        "branch" if valid_canonical_ref(&full_name, b"refs/heads/") => (
+            "branch",
+            full_name.clone(),
+            require_direct_ref_target(&repo, &full_name)?,
+        ),
+        "tag" if valid_canonical_ref(&full_name, b"refs/tags/") => (
+            "tag",
+            full_name.clone(),
+            require_direct_ref_target(&repo, &full_name)?,
+        ),
+        "legacy" if !full_name.is_empty() => resolve_legacy_ref(&repo, &full_name)?,
+        _ => {
+            return Err(native_error(
+                "ref_not_found",
+                "reference selector is not canonical",
+            ));
+        }
+    };
+
+    let oid = resolve_snapshot_target(
+        &repo,
+        target,
+        resolved_kind == "tag",
+        &resolved_ref,
+        deadline,
+    )?;
+
+    Ok((resolved_kind.to_string(), resolved_ref, oid))
+}
+
+fn resolve_legacy_ref(
+    repo: &gix::Repository,
+    full_name: &[u8],
+) -> Result<(&'static str, Vec<u8>, gix_hash::ObjectId), NativeError> {
+    let branch_ref = prefixed_ref(b"refs/heads/", full_name);
+
+    if !valid_full_ref_name(&branch_ref) {
+        return Err(native_error(
+            "ref_not_found",
+            "legacy reference selector is malformed",
+        ));
+    }
+
+    match direct_ref_target(repo, &branch_ref)? {
+        DirectRefTarget::Object(target) => return Ok(("branch", branch_ref, target)),
+        DirectRefTarget::Symbolic => {
+            return Err(native_error(
+                "ref_not_found",
+                format!(
+                    "reference {:?} has no direct object target",
+                    display_ref(&branch_ref)
+                ),
+            ));
+        }
+        DirectRefTarget::Missing => {}
+    }
+
+    let tag_ref = prefixed_ref(b"refs/tags/", full_name);
+    let target = require_direct_ref_target(repo, &tag_ref)?;
+    Ok(("tag", tag_ref, target))
+}
+
+fn valid_canonical_ref(full_name: &[u8], prefix: &[u8]) -> bool {
+    full_name
+        .strip_prefix(prefix)
+        .is_some_and(|short_name| !short_name.is_empty())
+        && valid_full_ref_name(full_name)
+}
+
+fn valid_full_ref_name(full_name: &[u8]) -> bool {
+    <&gix_ref::FullNameRef>::try_from(full_name.as_bstr()).is_ok()
+}
+
+fn prefixed_ref(prefix: &[u8], full_name: &[u8]) -> Vec<u8> {
+    let mut reference = Vec::with_capacity(prefix.len().saturating_add(full_name.len()));
+    reference.extend_from_slice(prefix);
+    reference.extend_from_slice(full_name);
+    reference
+}
+
+fn display_ref(full_name: &[u8]) -> String {
+    String::from_utf8_lossy(full_name).into_owned()
+}
+
+fn require_direct_ref_target(
+    repo: &gix::Repository,
+    full_name: &[u8],
+) -> Result<gix_hash::ObjectId, NativeError> {
+    match direct_ref_target(repo, full_name)? {
+        DirectRefTarget::Object(target) => Ok(target),
+        DirectRefTarget::Missing => Err(native_error(
+            "ref_not_found",
+            format!("reference {:?} was not found", display_ref(full_name)),
+        )),
+        DirectRefTarget::Symbolic => Err(native_error(
+            "ref_not_found",
+            format!(
+                "reference {:?} has no direct object target",
+                display_ref(full_name)
+            ),
+        )),
+    }
+}
+
+fn direct_ref_target(
+    repo: &gix::Repository,
+    full_name: &[u8],
+) -> Result<DirectRefTarget, NativeError> {
+    match repo
+        .try_find_reference(full_name.as_bstr())
+        .map_err(|error| native_error("corrupt_repository", error))?
+    {
+        None => Ok(DirectRefTarget::Missing),
+        Some(reference) => match reference.try_id() {
+            Some(target) => Ok(DirectRefTarget::Object(target.detach())),
+            None => Ok(DirectRefTarget::Symbolic),
+        },
+    }
+}
+
+fn resolve_snapshot_target(
+    repo: &gix::Repository,
+    target: gix_hash::ObjectId,
+    peel_tags: bool,
+    full_name: &[u8],
+    deadline: Instant,
+) -> Result<String, NativeError> {
+    let mut next = target;
+    let mut seen = BTreeSet::new();
+    let mut expected_kind = None;
+
+    loop {
+        check_ref_deadline(deadline)?;
+        let oid = next.to_string();
+
+        if !seen.insert(oid.clone()) {
+            return Err(native_error(
+                "ref_not_found",
+                format!(
+                    "reference {:?} contains a tag cycle",
+                    display_ref(full_name)
+                ),
+            ));
+        }
+
+        let prefix = bounded_blob::read_object_prefix(repo, next, SNAPSHOT_OBJECT_PREFIX_LIMIT)
+            .map_err(bounded_blob_native_error)?;
+        check_ref_deadline(deadline)?;
+
+        if expected_kind.is_some_and(|expected_kind| prefix.kind != expected_kind) {
+            return Err(native_error(
+                "corrupt_repository",
+                format!(
+                    "tag target {oid} declares {}, found {}",
+                    expected_kind.expect("checked above"),
+                    prefix.kind
+                ),
+            ));
+        }
+
+        match prefix.kind {
+            gix_object::Kind::Commit => return Ok(oid),
+            gix_object::Kind::Tag if peel_tags => {
+                let (target, target_kind) = tag_target_from_prefix(&prefix.data, next.kind())?;
+                next = target;
+                expected_kind = Some(target_kind);
+            }
+            gix_object::Kind::Tag | gix_object::Kind::Tree | gix_object::Kind::Blob => {
+                return Err(native_error(
+                    "ref_not_found",
+                    format!(
+                        "reference {:?} does not resolve directly to a commit",
+                        display_ref(full_name)
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+fn tag_target_from_prefix(
+    data: &[u8],
+    hash_kind: gix_hash::Kind,
+) -> Result<(gix_hash::ObjectId, gix_object::Kind), NativeError> {
+    use gix_object::tag::ref_iter::Token;
+
+    let mut tokens = gix_object::TagRefIter::from_bytes(data, hash_kind);
+    let target = match tokens.next() {
+        Some(Ok(Token::Target { id })) => id,
+        Some(Ok(_)) | None => {
+            return Err(native_error(
+                "corrupt_repository",
+                "annotated tag is missing its target",
+            ));
+        }
+        Some(Err(error)) => return Err(native_error("corrupt_repository", error)),
+    };
+    let target_kind = match tokens.next() {
+        Some(Ok(Token::TargetKind(kind))) => kind,
+        Some(Ok(_)) | None => {
+            return Err(native_error(
+                "corrupt_repository",
+                "annotated tag is missing its target kind",
+            ));
+        }
+        Some(Err(error)) => return Err(native_error("corrupt_repository", error)),
+    };
+    match tokens.next() {
+        Some(Ok(Token::Name(_))) => {}
+        Some(Ok(_)) | None => {
+            return Err(native_error(
+                "corrupt_repository",
+                "annotated tag is missing its tag name",
+            ));
+        }
+        Some(Err(error)) => return Err(native_error("corrupt_repository", error)),
+    }
+
+    Ok((target, target_kind))
 }
 
 #[rustler::nif(schedule = "DirtyIo")]

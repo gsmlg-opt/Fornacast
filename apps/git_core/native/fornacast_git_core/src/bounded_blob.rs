@@ -217,6 +217,7 @@ fn overlapping_base_range(
 
 #[derive(Debug)]
 pub(crate) struct PrefixBlob {
+    pub(crate) kind: gix_object::Kind,
     pub(crate) size: u64,
     pub(crate) data: Vec<u8>,
     pub(crate) truncated: bool,
@@ -1065,6 +1066,23 @@ pub(crate) fn read_prefix(
     id: gix_hash::ObjectId,
     limit: usize,
 ) -> DecodeResult<PrefixBlob> {
+    read_prefix_impl(repo, id, limit, Some(gix_object::Kind::Blob))
+}
+
+pub(crate) fn read_object_prefix(
+    repo: &gix::Repository,
+    id: gix_hash::ObjectId,
+    limit: usize,
+) -> DecodeResult<PrefixBlob> {
+    read_prefix_impl(repo, id, limit, None)
+}
+
+fn read_prefix_impl(
+    repo: &gix::Repository,
+    id: gix_hash::ObjectId,
+    limit: usize,
+    expected_kind: Option<gix_object::Kind>,
+) -> DecodeResult<PrefixBlob> {
     let mut tracker = AllocationTracker::new(limit);
     let budget = DecodeWorkBudget::new(limit)?;
     let source = locate_source(repo, id, None, &budget)?;
@@ -1073,12 +1091,14 @@ pub(crate) fn read_prefix(
         |guarded| public_metadata_for_source(repo, &source, guarded, &budget),
     )?;
     let metadata = guarded.object;
-    if metadata.kind != gix_object::Kind::Blob {
+    if expected_kind.is_some_and(|expected_kind| metadata.kind != expected_kind) {
         return Err(Error::corrupt(format!(
-            "expected blob, found {}",
-            metadata.kind
+            "expected {}, found {}",
+            expected_kind.expect("checked above"),
+            metadata.kind,
         )));
     }
+    let kind = metadata.kind;
     let size = metadata.size;
     tracker.mark_header_known();
 
@@ -1086,6 +1106,7 @@ pub(crate) fn read_prefix(
         #[cfg(test)]
         tracker.record_work(&budget);
         return Ok(PrefixBlob {
+            kind,
             size,
             data: Vec::new(),
             truncated: size != 0,
@@ -1123,6 +1144,7 @@ pub(crate) fn read_prefix(
     }
 
     Ok(PrefixBlob {
+        kind,
         size,
         truncated: size > read_limit as u64,
         data,
@@ -2145,8 +2167,8 @@ mod tests {
         PUBLIC_HEADER_OUTPUT_LIMIT, VerifiedDeltaBase, VerifiedPackEntry, append_source_range,
         decode_delta_instruction, decode_delta_varint, enter_source, locate_source,
         opened_pack_from_parts, overlapping_base_range, pack_index_paths, parse_alternate_paths,
-        probe_guarded_source, public_metadata_for_opened_pack, read_prefix, resolve_alternate_path,
-        validate_local_metadata_before_public_header,
+        probe_guarded_source, public_metadata_for_opened_pack, read_object_prefix, read_prefix,
+        resolve_alternate_path, validate_local_metadata_before_public_header,
     };
 
     const PREFIX_LIMIT: usize = 64 * 1024;
@@ -2200,6 +2222,48 @@ mod tests {
     #[test]
     fn prefix_blob_alternate_loose_obeys_the_bounded_contract() {
         assert_bounded_contract(alternate_loose_fixture());
+    }
+
+    #[test]
+    fn prefix_object_reads_a_large_non_blob_without_materializing_it() {
+        let temp = TempDirectory::new("large-tag-object");
+        let repo_path = temp.0.join("large-tag.git");
+        git(
+            &[
+                "init",
+                "--bare",
+                "--object-format=sha1",
+                path_str(&repo_path),
+            ],
+            None,
+        );
+
+        let mut original =
+            b"object 0000000000000000000000000000000000000000\ntype commit\ntag large\n\n".to_vec();
+        original.extend(std::iter::repeat_n(b'x', 3 * 1024 * 1024));
+        let oid_text = git(
+            &[
+                "--git-dir",
+                path_str(&repo_path),
+                "hash-object",
+                "--literally",
+                "-t",
+                "tag",
+                "-w",
+                "--stdin",
+            ],
+            Some(&original),
+        );
+        let repo = gix::open(&repo_path).expect("open large tag fixture");
+        let prefix = read_object_prefix(&repo, parse_oid(&oid_text), 128)
+            .expect("read bounded non-blob prefix");
+
+        assert_eq!(prefix.kind, gix_object::Kind::Tag);
+        assert_eq!(prefix.size, original.len() as u64);
+        assert_eq!(prefix.data, original[..128]);
+        assert!(prefix.truncated);
+        assert!(prefix.allocations.max_decoded_object_buffer <= 128);
+        assert!(prefix.allocations.max_intermediate_object_buffer < original.len());
     }
 
     #[test]
