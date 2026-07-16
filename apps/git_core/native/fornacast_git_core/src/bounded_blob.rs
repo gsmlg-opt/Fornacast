@@ -40,18 +40,6 @@ impl Error {
         }
     }
 
-    fn from_external(error: impl std::error::Error + 'static) -> Self {
-        let kind = if error_chain_contains_io(&error) {
-            ErrorKind::StorageUnavailable
-        } else {
-            ErrorKind::CorruptRepository
-        };
-        Self {
-            kind,
-            detail: error.to_string(),
-        }
-    }
-
     fn from_bundle(error: gix_pack::bundle::init::Error) -> Self {
         let kind = match &error {
             gix_pack::bundle::init::Error::Pack(gix_pack::data::header::decode::Error::Io {
@@ -78,6 +66,17 @@ impl Error {
             ErrorKind::StorageUnavailable
         } else {
             ErrorKind::CorruptRepository
+        };
+        Self {
+            kind,
+            detail: error.to_string(),
+        }
+    }
+
+    fn from_loose_header(error: gix::odb::loose::find::Error) -> Self {
+        let kind = match &error {
+            gix::odb::loose::find::Error::Io { .. } => ErrorKind::StorageUnavailable,
+            _ => ErrorKind::CorruptRepository,
         };
         Self {
             kind,
@@ -371,6 +370,39 @@ enum ObjectSource {
 struct ObjectMetadata {
     kind: gix_object::Kind,
     size: u64,
+}
+
+#[derive(Debug)]
+struct GuardedMetadata {
+    object: ObjectMetadata,
+    delta_bases: Vec<VerifiedDeltaBase>,
+}
+
+#[derive(Debug)]
+struct VerifiedDeltaBase {
+    delta: ObjectSource,
+    base: ObjectSource,
+    metadata: ObjectMetadata,
+    external_ref: Option<gix_hash::ObjectId>,
+}
+
+impl GuardedMetadata {
+    fn delta_base(&self, source: &ObjectSource) -> DecodeResult<&VerifiedDeltaBase> {
+        self.delta_bases
+            .iter()
+            .find(|candidate| candidate.delta == *source)
+            .ok_or_else(|| Error::corrupt("guarded delta chain has no base for source"))
+    }
+
+    fn external_base_kind(&self, id: &gix_hash::oid) -> Option<gix_object::Kind> {
+        self.delta_bases.iter().find_map(|candidate| {
+            candidate
+                .external_ref
+                .as_ref()
+                .filter(|candidate_id| candidate_id.as_ref() == id)
+                .map(|_| candidate.metadata.kind)
+        })
+    }
 }
 
 struct OpenedPack {
@@ -726,16 +758,11 @@ pub(crate) fn read_prefix(
 ) -> DecodeResult<PrefixBlob> {
     let mut tracker = AllocationTracker::new(limit);
     let source = locate_source(repo, id, None)?;
-    let metadata = validate_local_metadata_before_public_header(
-        || probe_source(repo, &source, &mut tracker, &mut Vec::new()),
-        || {
-            let header = repo.find_header(id).map_err(Error::from_external)?;
-            Ok(ObjectMetadata {
-                kind: header.kind(),
-                size: header.size(),
-            })
-        },
+    let guarded = validate_local_metadata_before_public_header(
+        || probe_guarded_source(repo, &source, &mut tracker),
+        |guarded| public_metadata_for_source(repo, &source, guarded),
     )?;
+    let metadata = guarded.object;
     if metadata.kind != gix_object::Kind::Blob {
         return Err(Error::corrupt(format!(
             "expected blob, found {}",
@@ -767,6 +794,7 @@ pub(crate) fn read_prefix(
         &mut data,
         &mut tracker,
         &mut Vec::new(),
+        &guarded,
     )?;
     if data.len() != read_limit || data.capacity() > limit {
         return Err(Error::corrupt(format!(
@@ -788,18 +816,78 @@ pub(crate) fn read_prefix(
 }
 
 fn validate_local_metadata_before_public_header(
-    local_probe: impl FnOnce() -> DecodeResult<ObjectMetadata>,
-    public_header: impl FnOnce() -> DecodeResult<ObjectMetadata>,
-) -> DecodeResult<ObjectMetadata> {
+    local_probe: impl FnOnce() -> DecodeResult<GuardedMetadata>,
+    public_header: impl FnOnce(&GuardedMetadata) -> DecodeResult<ObjectMetadata>,
+) -> DecodeResult<GuardedMetadata> {
     let local = local_probe()?;
-    let public = public_header()?;
-    if local != public {
+    let public = public_header(&local)?;
+    if local.object != public {
         return Err(Error::corrupt(format!(
             "object metadata mismatch: public header {}/{}, storage {}/{}",
-            public.kind, public.size, local.kind, local.size
+            public.kind, public.size, local.object.kind, local.object.size
         )));
     }
     Ok(local)
+}
+
+fn public_metadata_for_source(
+    repo: &gix::Repository,
+    source: &ObjectSource,
+    guarded: &GuardedMetadata,
+) -> DecodeResult<ObjectMetadata> {
+    match source {
+        ObjectSource::Loose { object_db, id } => {
+            let store = gix::odb::loose::Store::at(
+                object_db.clone(),
+                repo.object_hash(),
+                Some(METADATA_BUFFER_LIMIT),
+            );
+            let (size, kind) = store
+                .try_header(id.as_ref())
+                .map_err(Error::from_loose_header)?
+                .ok_or_else(|| Error::corrupt("guarded loose source disappeared"))?;
+            Ok(ObjectMetadata { kind, size })
+        }
+        ObjectSource::Packed { .. } => {
+            let opened = open_packed(repo, source)?;
+            let resolver_error = std::cell::RefCell::new(None);
+            let resolve = |base_id: &gix_hash::oid| {
+                if let Some(index) = opened.bundle.index.lookup(base_id) {
+                    let pack_offset = opened.bundle.index.pack_offset_at_index(index);
+                    return match opened.bundle.pack.entry(pack_offset) {
+                        Ok(entry) => {
+                            Some(gix_pack::data::decode::header::ResolvedBase::InPack(entry))
+                        }
+                        Err(error) => {
+                            *resolver_error.borrow_mut() = Some(Error::corrupt(error));
+                            None
+                        }
+                    };
+                }
+
+                guarded.external_base_kind(base_id).map(|kind| {
+                    gix_pack::data::decode::header::ResolvedBase::OutOfPack {
+                        kind,
+                        num_deltas: None,
+                    }
+                })
+            };
+            let mut inflate = gix_features::zlib::Inflate::default();
+            let outcome =
+                opened
+                    .bundle
+                    .pack
+                    .decode_header(opened.entry.clone(), &mut inflate, &resolve);
+            if let Some(error) = resolver_error.into_inner() {
+                return Err(error);
+            }
+            let outcome = outcome.map_err(Error::corrupt)?;
+            Ok(ObjectMetadata {
+                kind: outcome.kind,
+                size: outcome.object_size,
+            })
+        }
+    }
 }
 
 fn locate_source(
@@ -940,11 +1028,25 @@ fn open_packed(repo: &gix::Repository, source: &ObjectSource) -> DecodeResult<Op
     })
 }
 
+fn probe_guarded_source(
+    repo: &gix::Repository,
+    source: &ObjectSource,
+    tracker: &mut AllocationTracker,
+) -> DecodeResult<GuardedMetadata> {
+    let mut delta_bases = Vec::new();
+    let object = probe_source(repo, source, tracker, &mut Vec::new(), &mut delta_bases)?;
+    Ok(GuardedMetadata {
+        object,
+        delta_bases,
+    })
+}
+
 fn probe_source(
     repo: &gix::Repository,
     source: &ObjectSource,
     tracker: &mut AllocationTracker,
     stack: &mut Vec<ObjectSource>,
+    delta_bases: &mut Vec<VerifiedDeltaBase>,
 ) -> DecodeResult<ObjectMetadata> {
     enter_source(source, stack)?;
     let result = match source {
@@ -964,8 +1066,16 @@ fn probe_source(
                     size: opened.entry.decompressed_size,
                 })
             } else {
+                let external_ref = match opened.entry.header {
+                    gix_pack::data::entry::Header::RefDelta { base_id }
+                        if opened.bundle.index.lookup(base_id).is_none() =>
+                    {
+                        Some(base_id)
+                    }
+                    _ => None,
+                };
                 let base = resolve_delta_base(repo, source, &opened)?;
-                let base_metadata = probe_source(repo, &base, tracker, stack)?;
+                let base_metadata = probe_source(repo, &base, tracker, stack, delta_bases)?;
                 let compressed = opened.compressed()?;
                 let mut stream = InflatedStream::from_slice(
                     compressed,
@@ -983,6 +1093,12 @@ fn probe_source(
                         ))),
                     );
                 }
+                delta_bases.push(VerifiedDeltaBase {
+                    delta: source.clone(),
+                    base,
+                    metadata: base_metadata,
+                    external_ref,
+                });
                 Ok(ObjectMetadata {
                     kind: base_metadata.kind,
                     size: result_size,
@@ -1003,6 +1119,7 @@ fn append_source_range(
     output: &mut Vec<u8>,
     tracker: &mut AllocationTracker,
     stack: &mut Vec<ObjectSource>,
+    guarded: &GuardedMetadata,
 ) -> DecodeResult<()> {
     let end = start
         .checked_add(length as u64)
@@ -1060,7 +1177,7 @@ fn append_source_range(
                 Ok(())
             } else {
                 append_delta_range(
-                    repo, source, &opened, expected, start, end, output, tracker, stack,
+                    repo, source, &opened, expected, start, end, output, tracker, stack, guarded,
                 )
             }
         }
@@ -1090,10 +1207,11 @@ fn append_delta_range(
     output: &mut Vec<u8>,
     tracker: &mut AllocationTracker,
     stack: &mut Vec<ObjectSource>,
+    guarded: &GuardedMetadata,
 ) -> DecodeResult<()> {
-    let base = resolve_delta_base(repo, source, opened)?;
-    let mut probe_stack = stack.clone();
-    let base_metadata = probe_source(repo, &base, tracker, &mut probe_stack)?;
+    let verified_base = guarded.delta_base(source)?;
+    let base = &verified_base.base;
+    let base_metadata = verified_base.metadata;
     let compressed = opened.compressed()?;
     let mut stream = InflatedStream::from_slice(
         compressed,
@@ -1161,13 +1279,14 @@ fn append_delta_range(
                         .map_err(|_| Error::corrupt("delta copy length does not fit usize"))?;
                     append_source_range(
                         repo,
-                        &base,
+                        base,
                         base_metadata,
                         base_range.start,
                         length,
                         output,
                         tracker,
                         stack,
+                        guarded,
                     )?;
                 }
             }
@@ -1345,10 +1464,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        DeltaInstruction, Error, ErrorKind, MAX_CHAIN_DEPTH, METADATA_BUFFER_LIMIT, ObjectMetadata,
-        ObjectSource, decode_delta_instruction, decode_delta_varint, enter_source,
-        overlapping_base_range, pack_index_paths, read_prefix,
-        validate_local_metadata_before_public_header,
+        DeltaInstruction, Error, ErrorKind, GuardedMetadata, MAX_CHAIN_DEPTH,
+        METADATA_BUFFER_LIMIT, ObjectMetadata, ObjectSource, VerifiedDeltaBase,
+        decode_delta_instruction, decode_delta_varint, enter_source, overlapping_base_range,
+        pack_index_paths, read_prefix, validate_local_metadata_before_public_header,
     };
 
     const PREFIX_LIMIT: usize = 64 * 1024;
@@ -1566,12 +1685,15 @@ mod tests {
         let error = validate_local_metadata_before_public_header(
             || {
                 enter_source(&source, &mut stack)?;
-                Ok(ObjectMetadata {
-                    kind: gix_object::Kind::Blob,
-                    size: 1,
+                Ok(GuardedMetadata {
+                    object: ObjectMetadata {
+                        kind: gix_object::Kind::Blob,
+                        size: 1,
+                    },
+                    delta_bases: Vec::new(),
                 })
             },
-            || {
+            |_| {
                 public_header_called.set(true);
                 Ok(ObjectMetadata {
                     kind: gix_object::Kind::Blob,
@@ -1583,6 +1705,41 @@ mod tests {
 
         assert_eq!(error.to_string(), "delta chain contains a cycle");
         assert!(!public_header_called.get());
+    }
+
+    #[test]
+    fn prefix_blob_guarded_chain_reuses_the_exact_physical_base_source() {
+        let delta = ObjectSource::Packed {
+            index_path: PathBuf::from("selected.idx"),
+            pack_offset: 100,
+        };
+        let selected_base = ObjectSource::Packed {
+            index_path: PathBuf::from("selected.idx"),
+            pack_offset: 20,
+        };
+        let duplicate_base = ObjectSource::Packed {
+            index_path: PathBuf::from("newer-duplicate.idx"),
+            pack_offset: 30,
+        };
+        let guarded = GuardedMetadata {
+            object: ObjectMetadata {
+                kind: gix_object::Kind::Blob,
+                size: 1,
+            },
+            delta_bases: vec![VerifiedDeltaBase {
+                delta: delta.clone(),
+                base: selected_base.clone(),
+                metadata: ObjectMetadata {
+                    kind: gix_object::Kind::Blob,
+                    size: 1,
+                },
+                external_ref: None,
+            }],
+        };
+
+        let resolved = guarded.delta_base(&delta).expect("guarded exact base");
+        assert_eq!(resolved.base, selected_base);
+        assert_ne!(resolved.base, duplicate_base);
     }
 
     #[test]

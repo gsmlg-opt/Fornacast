@@ -214,6 +214,10 @@ defmodule GitCore.RepositoryReadModelTest do
     test "reads an exact prefix from a verified packed-delta blob", %{tmp_dir: tmp_dir} do
       assert_prefix_blob_contract(prefix_blob_fixture!(tmp_dir, :packed_delta))
     end
+
+    test "reads the physical tree-entry blob instead of its replacement ref", %{tmp_dir: tmp_dir} do
+      assert_prefix_blob_contract(replaced_prefix_blob_fixture!(tmp_dir))
+    end
   end
 
   defp assert_error(result, expected_kind, expected_operation) do
@@ -398,6 +402,40 @@ defmodule GitCore.RepositoryReadModelTest do
         refute File.exists?(loose_object_path(repo_path, oid))
         fixture_result(repo_path, commit_oid, name, oid, original)
     end
+  end
+
+  defp replaced_prefix_blob_fixture!(tmp_dir) do
+    fixture = prefix_blob_fixture!(tmp_dir, :loose)
+    replacement_path = Path.join(tmp_dir, "replacement-#{System.unique_integer([:positive])}")
+    File.write!(replacement_path, "replacement metadata must not affect the tree entry")
+
+    replacement_oid =
+      git!([
+        "--git-dir",
+        fixture.repo_path,
+        "hash-object",
+        "-w",
+        replacement_path
+      ])
+
+    git!([
+      "--git-dir",
+      fixture.repo_path,
+      "update-ref",
+      "refs/replace/#{fixture.oid}",
+      replacement_oid
+    ])
+
+    # gix 0.85's repository-open path treats false here as enabling replacement loading.
+    git!([
+      "--git-dir",
+      fixture.repo_path,
+      "config",
+      "core.useReplaceRefs",
+      "false"
+    ])
+
+    fixture
   end
 
   defp fixture_result(repo_path, commit_oid, name, oid, original) do
