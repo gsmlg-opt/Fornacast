@@ -224,6 +224,268 @@ defmodule GitCore.RepositoryReadModelTest do
     end
   end
 
+  describe "scan limiter" do
+    @describetag :limiter
+
+    test "admits four production permits and expires the next waiter" do
+      server = start_scan_limiter!(wait_timeout: 20)
+      owners = start_scan_owners(server, 4)
+
+      assert_scan_owners_entered(owners)
+
+      assert_error(
+        GitCore.ScanLimiter.with_permit(:ref_summary, fn -> :unexpected end, server: server),
+        :scan_busy,
+        :ref_summary
+      )
+
+      release_scan_owners(owners)
+    end
+
+    test "admits queued waiters in FIFO order" do
+      server = start_scan_limiter!(capacity: 1, wait_timeout: 200)
+      [holder] = start_scan_owners(server, 1)
+      assert_scan_owners_entered([holder])
+
+      first = start_scan_owner(server)
+      wait_for_waiter_count(server, 1)
+      second = start_scan_owner(server)
+      wait_for_waiter_count(server, 2)
+
+      send(holder, :release)
+      assert_receive {:scan_entered, ^first}
+      refute_receive {:scan_entered, ^second}, 20
+
+      send(first, :release)
+      assert_receive {:scan_entered, ^second}
+      send(second, :release)
+
+      assert_scan_owners_finished([holder, first, second])
+    end
+
+    test "releases a permit in after when the protected operation raises, throws, or exits" do
+      server = start_scan_limiter!(capacity: 1)
+
+      assert_raise RuntimeError, "boom", fn ->
+        GitCore.ScanLimiter.with_permit(:commit_page, fn -> raise "boom" end, server: server)
+      end
+
+      assert :after_raise ==
+               GitCore.ScanLimiter.with_permit(:commit_page, fn -> :after_raise end,
+                 server: server
+               )
+
+      assert catch_throw(
+               GitCore.ScanLimiter.with_permit(:commit_page, fn -> throw(:boom) end,
+                 server: server
+               )
+             ) == :boom
+
+      assert :after_throw ==
+               GitCore.ScanLimiter.with_permit(:commit_page, fn -> :after_throw end,
+                 server: server
+               )
+
+      assert catch_exit(
+               GitCore.ScanLimiter.with_permit(:commit_page, fn -> exit(:boom) end,
+                 server: server
+               )
+             ) == :boom
+
+      assert :available ==
+               GitCore.ScanLimiter.with_permit(:commit_page, fn -> :available end, server: server)
+    end
+
+    test "removes queued and granted permits when their owners die" do
+      server = start_scan_limiter!(capacity: 1, wait_timeout: 200)
+      granted = start_scan_owner(server)
+      assert_receive {:scan_entered, ^granted}
+
+      queued = start_scan_owner(server)
+      wait_for_waiter_count(server, 1)
+
+      Process.exit(queued, :kill)
+      wait_for_waiter_count(server, 0)
+      Process.exit(granted, :kill)
+
+      assert :recovered ==
+               GitCore.ScanLimiter.with_permit(:tree_history, fn -> :recovered end,
+                 server: server
+               )
+    end
+
+    test "fails closed when the limiter process is unavailable" do
+      server = spawn(fn -> receive do: (:stop -> :ok) end)
+      monitor = Process.monitor(server)
+      send(server, :stop)
+      assert_receive {:DOWN, ^monitor, :process, ^server, _reason}
+
+      assert_error(
+        GitCore.ScanLimiter.with_permit(:repository_analysis, fn -> :unexpected end,
+          server: server
+        ),
+        :scan_busy,
+        :repository_analysis
+      )
+    end
+  end
+
+  describe "weighted blob limiter" do
+    @describetag :limiter
+
+    test "admits eight production leases and counts a zero-byte body as a slot" do
+      server = start_blob_limiter!(wait_timeout: 20)
+
+      leases =
+        for _ <- 1..8 do
+          assert {:ok, lease} = GitCore.BlobLimiter.acquire(0, server: server)
+          lease
+        end
+
+      assert_error(
+        GitCore.BlobLimiter.acquire(0, server: server, operation: :read_blob_complete),
+        :blob_busy,
+        :read_blob_complete
+      )
+
+      Enum.each(leases, &assert(:ok == GitCore.BlobLimiter.release(&1)))
+    end
+
+    test "enforces and exactly releases the 128 MiB production byte limit" do
+      server = start_blob_limiter!(wait_timeout: 20)
+      byte_limit = 128 * 1024 * 1024
+
+      assert {:ok, lease} = GitCore.BlobLimiter.acquire(byte_limit, server: server)
+
+      assert_error(
+        GitCore.BlobLimiter.acquire(1, server: server, operation: :read_blob_complete),
+        :blob_busy,
+        :read_blob_complete
+      )
+
+      assert :ok = GitCore.BlobLimiter.release(lease)
+      assert {:ok, replacement} = GitCore.BlobLimiter.acquire(byte_limit, server: server)
+      assert :ok = GitCore.BlobLimiter.release(replacement)
+    end
+
+    test "rejects one overweight request before contacting the limiter" do
+      server = spawn(fn -> receive do: (:stop -> :ok) end)
+      monitor = Process.monitor(server)
+      send(server, :stop)
+      assert_receive {:DOWN, ^monitor, :process, ^server, _reason}
+
+      assert_error(
+        GitCore.BlobLimiter.acquire(128 * 1024 * 1024 + 1,
+          server: server,
+          operation: :read_blob_complete
+        ),
+        :blob_too_large,
+        :read_blob_complete
+      )
+    end
+
+    test "keeps weighted waiters FIFO when a lighter request could bypass the head" do
+      server = start_blob_limiter!(capacity: 4, byte_capacity: 10, wait_timeout: 200)
+      assert {:ok, four_byte_lease} = GitCore.BlobLimiter.acquire(4, server: server)
+      assert {:ok, two_byte_lease} = GitCore.BlobLimiter.acquire(2, server: server)
+
+      first = start_blob_owner(server, 5)
+      wait_for_waiter_count(server, 1)
+      second = start_blob_owner(server, 4)
+      wait_for_waiter_count(server, 2)
+      refute_receive {:blob_acquired, ^second, _lease}, 20
+
+      assert :ok = GitCore.BlobLimiter.release(two_byte_lease)
+      assert_receive {:blob_acquired, ^first, _first_lease}
+      refute_receive {:blob_acquired, ^second, _lease}, 20
+
+      assert :ok = GitCore.BlobLimiter.release(four_byte_lease)
+      assert_receive {:blob_acquired, ^second, _second_lease}
+
+      release_blob_owners([first, second])
+    end
+
+    test "uses the production 250 ms waiter timeout" do
+      server = start_blob_limiter!(capacity: 1)
+      assert {:ok, lease} = GitCore.BlobLimiter.acquire(0, server: server)
+      started_at = System.monotonic_time(:millisecond)
+
+      assert_error(
+        GitCore.BlobLimiter.acquire(0, server: server, operation: :read_blob),
+        :blob_busy,
+        :read_blob
+      )
+
+      elapsed = System.monotonic_time(:millisecond) - started_at
+      assert elapsed >= 200
+      assert elapsed < 1_000
+      assert :ok = GitCore.BlobLimiter.release(lease)
+    end
+
+    test "removes queued and granted blob leases when their owners die" do
+      server = start_blob_limiter!(capacity: 1, byte_capacity: 10, wait_timeout: 200)
+      granted = start_blob_owner(server, 10)
+      assert_receive {:blob_acquired, ^granted, _lease}
+
+      queued = start_blob_owner(server, 1)
+      wait_for_waiter_count(server, 1)
+
+      Process.exit(queued, :kill)
+      wait_for_waiter_count(server, 0)
+      Process.exit(granted, :kill)
+
+      assert {:ok, recovered} = GitCore.BlobLimiter.acquire(10, server: server)
+      assert :ok = GitCore.BlobLimiter.release(recovered)
+    end
+
+    test "routes opaque leases to the right server and releases idempotently" do
+      first_server = start_blob_limiter!(capacity: 1, wait_timeout: 20)
+      second_server = start_blob_limiter!(capacity: 1, wait_timeout: 20)
+      assert {:ok, first_lease} = GitCore.BlobLimiter.acquire(0, server: first_server)
+      assert {:ok, second_lease} = GitCore.BlobLimiter.acquire(0, server: second_server)
+
+      assert :ok = GitCore.BlobLimiter.release(first_lease)
+      assert :ok = GitCore.BlobLimiter.release(first_lease)
+      assert {:ok, replacement} = GitCore.BlobLimiter.acquire(0, server: first_server)
+
+      assert_error(
+        GitCore.BlobLimiter.acquire(0, server: second_server, operation: :read_blob),
+        :blob_busy,
+        :read_blob
+      )
+
+      assert :ok = GitCore.BlobLimiter.release(replacement)
+      assert :ok = GitCore.BlobLimiter.release(second_lease)
+    end
+
+    test "fails closed when the blob limiter process is unavailable" do
+      server = spawn(fn -> receive do: (:stop -> :ok) end)
+      monitor = Process.monitor(server)
+      send(server, :stop)
+      assert_receive {:DOWN, ^monitor, :process, ^server, _reason}
+
+      assert_error(
+        GitCore.BlobLimiter.acquire(1, server: server, operation: :read_blob),
+        :blob_busy,
+        :read_blob
+      )
+    end
+
+    test "supervises both production limiters with independent children" do
+      children = Supervisor.which_children(GitCore.Supervisor)
+
+      assert {GitCore.ScanLimiter, scan_pid, :worker, [GitCore.ScanLimiter]} =
+               List.keyfind(children, GitCore.ScanLimiter, 0)
+
+      assert {GitCore.BlobLimiter, blob_pid, :worker, [GitCore.BlobLimiter]} =
+               List.keyfind(children, GitCore.BlobLimiter, 0)
+
+      assert is_pid(scan_pid)
+      assert is_pid(blob_pid)
+      refute scan_pid == blob_pid
+    end
+  end
+
   defp assert_error(result, expected_kind, expected_operation) do
     assert {:error,
             %{
@@ -236,6 +498,108 @@ defmodule GitCore.RepositoryReadModelTest do
     assert is_binary(detail)
     refute detail == ""
   end
+
+  defp start_scan_limiter!(opts) do
+    start_supervised!({GitCore.ScanLimiter, Keyword.put(opts, :server, nil)})
+  end
+
+  defp start_blob_limiter!(opts) do
+    start_supervised!({GitCore.BlobLimiter, Keyword.put(opts, :server, nil)},
+      id: make_ref()
+    )
+  end
+
+  defp start_scan_owners(server, count) do
+    for _ <- 1..count, do: start_scan_owner(server)
+  end
+
+  defp start_scan_owner(server) do
+    parent = self()
+
+    spawn(fn ->
+      result =
+        GitCore.ScanLimiter.with_permit(
+          :test_scan,
+          fn ->
+            send(parent, {:scan_entered, self()})
+
+            receive do
+              :release -> :finished
+            end
+          end,
+          server: server
+        )
+
+      send(parent, {:scan_finished, self(), result})
+    end)
+  end
+
+  defp assert_scan_owners_entered(owners) do
+    Enum.each(owners, fn owner ->
+      assert_receive {:scan_entered, ^owner}
+    end)
+  end
+
+  defp release_scan_owners(owners) do
+    Enum.each(owners, &send(&1, :release))
+    assert_scan_owners_finished(owners)
+  end
+
+  defp assert_scan_owners_finished(owners) do
+    Enum.each(owners, fn owner ->
+      assert_receive {:scan_finished, ^owner, :finished}
+    end)
+  end
+
+  defp start_blob_owner(server, weight) do
+    parent = self()
+
+    spawn(fn ->
+      case GitCore.BlobLimiter.acquire(weight, server: server) do
+        {:ok, lease} ->
+          send(parent, {:blob_acquired, self(), lease})
+
+          receive do
+            :release ->
+              result = GitCore.BlobLimiter.release(lease)
+              send(parent, {:blob_released, self(), result})
+          end
+
+        error ->
+          send(parent, {:blob_acquire_failed, self(), error})
+      end
+    end)
+  end
+
+  defp release_blob_owners(owners) do
+    Enum.each(owners, &send(&1, :release))
+
+    Enum.each(owners, fn owner ->
+      assert_receive {:blob_released, ^owner, :ok}
+    end)
+  end
+
+  defp wait_for_waiter_count(server, count) do
+    wait_until(fn ->
+      server
+      |> :sys.get_state()
+      |> Map.fetch!(:waiters)
+      |> map_size() == count
+    end)
+  end
+
+  defp wait_until(predicate, attempts \\ 100)
+
+  defp wait_until(predicate, attempts) when attempts > 0 do
+    if predicate.() do
+      :ok
+    else
+      Process.sleep(5)
+      wait_until(predicate, attempts - 1)
+    end
+  end
+
+  defp wait_until(_predicate, 0), do: flunk("condition did not become true")
 
   defp normalize_legacy_read(
          {:ok, [%GitCore.Commit{oid: oid, title: "Initial commit"}]},
