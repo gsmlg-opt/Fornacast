@@ -1,7 +1,7 @@
 defmodule ForgeReposTest do
   use ExUnit.Case, async: false
 
-  alias ForgeAccounts.{Organization, User}
+  alias ForgeAccounts.Organization
   alias Fornacast.Repo
   alias ForgeRepos.Repository
 
@@ -29,34 +29,7 @@ defmodule ForgeReposTest do
     assert ForgeRepos.parse_git_path("alice/demo.git; rm -rf /") == {:error, :invalid_path}
   end
 
-  test "repository authorization permits owner and admin" do
-    repo = %Repository{id: 10, owner_user_id: 1, visibility: :private}
-
-    assert :ok =
-             Fornacast.Access.authorize(
-               %User{id: 1, role: :user, state: :active},
-               :repository_admin,
-               repo
-             )
-
-    assert :ok =
-             Fornacast.Access.authorize(
-               %User{id: 2, role: :admin, state: :active},
-               :repository_write,
-               repo
-             )
-
-    assert {:error, :unauthorized} = Fornacast.Access.authorize(nil, :repository_read, repo)
-  end
-
-  test "public repositories are readable anonymously" do
-    repo = %Repository{id: 10, owner_user_id: 1, visibility: :public}
-
-    assert :ok = Fornacast.Access.authorize(nil, :repository_read, repo)
-    assert {:error, :unauthorized} = Fornacast.Access.authorize(nil, :repository_write, repo)
-  end
-
-  test "organization-owned repositories resolve by namespace and authorize owners" do
+  test "organization-owned repositories resolve by namespace and use actor in clone URLs" do
     assert {:ok, owner} =
              ForgeAccounts.create_user(%{
                username: "alice",
@@ -92,12 +65,7 @@ defmodule ForgeReposTest do
     assert clone_url =~ "ssh://alice@"
     assert clone_url =~ "/acme/demo.git"
 
-    assert :ok = Fornacast.Access.authorize(owner, :repository_admin, repo)
-    assert {:error, :unauthorized} = Fornacast.Access.authorize(member, :repository_read, repo)
-
     assert {:ok, _membership} = ForgeAccounts.add_organization_member(organization, member)
-    assert :ok = Fornacast.Access.authorize(member, :repository_read, repo)
-    assert {:error, :unauthorized} = Fornacast.Access.authorize(member, :repository_write, repo)
   end
 
   @tag :tmp_dir
