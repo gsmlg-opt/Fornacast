@@ -122,11 +122,11 @@ The fallback inspects the first shebang line only when the filename is not class
 - Add: apps/forge_repos/test/access_test.exs
 - Read only unless a characterization fails: apps/forge_repos/lib/fornacast/access.ex
 
-- [ ] **Step 1: Move repository access cases into the scoped test file**
+- [x] **Step 1: Move repository access cases into the scoped test file**
 
 Create fixture helpers for active and disabled users, one personal repository, one organization repository, organization owner/member records, and read/write/admin collaborator rows. Keep database reset logic local to the new file.
 
-- [ ] **Step 2: Assert the complete read/write/admin matrix**
+- [x] **Step 2: Assert the complete read/write/admin matrix**
 
 Cover:
 
@@ -142,7 +142,7 @@ Cover:
 - unrelated active-user private denial;
 - disabled actors retain anonymous public read only, but are denied private, write, and admin access regardless of ownership, collaboration, or site role.
 
-- [ ] **Step 3: Run the characterization**
+- [x] **Step 3: Run the characterization**
 
 ~~~sh
 mix test apps/forge_repos/test/access_test.exs --trace
@@ -150,7 +150,7 @@ mix test apps/forge_repos/test/access_test.exs --trace
 
 Expected: all cases pass against the existing centralized access module. If one fails, change only Fornacast.Access to match the approved matrix and rerun this file.
 
-- [ ] **Step 4: Commit the access contract**
+- [x] **Step 4: Commit the access contract**
 
 ~~~sh
 git add apps/forge_repos/test/access_test.exs apps/forge_repos/lib/fornacast/access.ex
