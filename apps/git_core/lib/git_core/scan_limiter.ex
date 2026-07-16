@@ -12,8 +12,21 @@ defmodule GitCore.ScanLimiter do
               wait_timeout: nil,
               grants: %{},
               waiters: %{},
-              queue: :queue.new(),
+              queue: :gb_trees.empty(),
+              next_sequence: 0,
               monitors: %{}
+  end
+
+  @doc false
+  def child_spec(opts) do
+    %{
+      id: __MODULE__,
+      start: {__MODULE__, :start_link, [opts]},
+      restart: :temporary,
+      shutdown: 5_000,
+      type: :worker,
+      modules: [__MODULE__]
+    }
   end
 
   def start_link(opts \\ []) do
@@ -80,14 +93,14 @@ defmodule GitCore.ScanLimiter do
       {nil, _waiters} ->
         {:noreply, state}
 
-      {%{from: from, monitor: monitor}, waiters} ->
+      {%{from: from, monitor: monitor, sequence: sequence}, waiters} ->
         Process.demonitor(monitor, [:flush])
         GenServer.reply(from, {:error, :busy})
 
         state = %{
           state
           | waiters: waiters,
-            queue: remove_from_queue(state.queue, waiter_id),
+            queue: :gb_trees.delete_any(sequence, state.queue),
             monitors: Map.delete(state.monitors, monitor)
         }
 
@@ -107,14 +120,18 @@ defmodule GitCore.ScanLimiter do
       {{:waiter, waiter_id}, monitors} ->
         {waiter, waiters} = Map.pop(state.waiters, waiter_id)
 
-        if waiter do
-          Process.cancel_timer(waiter.timer)
-        end
+        queue =
+          if waiter do
+            Process.cancel_timer(waiter.timer)
+            :gb_trees.delete_any(waiter.sequence, state.queue)
+          else
+            state.queue
+          end
 
         state = %{
           state
           | waiters: waiters,
-            queue: remove_from_queue(state.queue, waiter_id),
+            queue: queue,
             monitors: monitors
         }
 
@@ -155,12 +172,21 @@ defmodule GitCore.ScanLimiter do
     waiter_id = make_ref()
     monitor = Process.monitor(owner)
     timer = Process.send_after(self(), {:wait_timeout, waiter_id}, state.wait_timeout)
-    waiter = %{from: from, owner: owner, monitor: monitor, timer: timer}
+    sequence = state.next_sequence
+
+    waiter = %{
+      from: from,
+      owner: owner,
+      monitor: monitor,
+      timer: timer,
+      sequence: sequence
+    }
 
     %{
       state
       | waiters: Map.put(state.waiters, waiter_id, waiter),
-        queue: :queue.in(waiter_id, state.queue),
+        queue: :gb_trees.insert(sequence, waiter_id, state.queue),
+        next_sequence: sequence + 1,
         monitors: Map.put(state.monitors, monitor, {:waiter, waiter_id})
     }
   end
@@ -186,41 +212,34 @@ defmodule GitCore.ScanLimiter do
   defp drain_waiters(state) when map_size(state.grants) >= state.capacity, do: state
 
   defp drain_waiters(state) do
-    case :queue.out(state.queue) do
-      {:empty, _queue} ->
-        state
+    if :gb_trees.is_empty(state.queue) do
+      state
+    else
+      {_sequence, waiter_id, queue} = :gb_trees.take_smallest(state.queue)
 
-      {{:value, waiter_id}, queue} ->
-        case Map.pop(state.waiters, waiter_id) do
-          {nil, waiters} ->
-            drain_waiters(%{state | queue: queue, waiters: waiters})
+      case Map.pop(state.waiters, waiter_id) do
+        {nil, waiters} ->
+          drain_waiters(%{state | queue: queue, waiters: waiters})
 
-          {waiter, waiters} ->
-            Process.cancel_timer(waiter.timer)
-            lease = make_ref()
+        {waiter, waiters} ->
+          Process.cancel_timer(waiter.timer)
+          lease = make_ref()
 
-            grants =
-              Map.put(state.grants, lease, %{owner: waiter.owner, monitor: waiter.monitor})
+          grants =
+            Map.put(state.grants, lease, %{owner: waiter.owner, monitor: waiter.monitor})
 
-            monitors = Map.put(state.monitors, waiter.monitor, {:grant, lease})
-            GenServer.reply(waiter.from, {:ok, lease})
+          monitors = Map.put(state.monitors, waiter.monitor, {:grant, lease})
+          GenServer.reply(waiter.from, {:ok, lease})
 
-            drain_waiters(%{
-              state
-              | queue: queue,
-                waiters: waiters,
-                grants: grants,
-                monitors: monitors
-            })
-        end
+          drain_waiters(%{
+            state
+            | queue: queue,
+              waiters: waiters,
+              grants: grants,
+              monitors: monitors
+          })
+      end
     end
-  end
-
-  defp remove_from_queue(queue, waiter_id) do
-    queue
-    |> :queue.to_list()
-    |> Enum.reject(&(&1 == waiter_id))
-    |> :queue.from_list()
   end
 
   defp busy_error(operation, detail) do

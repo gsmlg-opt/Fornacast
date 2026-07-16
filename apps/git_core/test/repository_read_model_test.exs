@@ -227,11 +227,12 @@ defmodule GitCore.RepositoryReadModelTest do
   describe "scan limiter" do
     @describetag :limiter
 
-    test "admits four production permits and expires the next waiter" do
+    test "admits four production permits and expires the next waiter without a ghost" do
       server = start_scan_limiter!(wait_timeout: 20)
       owners = start_scan_owners(server, 4)
 
       assert_scan_owners_entered(owners)
+      started_at = System.monotonic_time(:millisecond)
 
       assert_error(
         GitCore.ScanLimiter.with_permit(:ref_summary, fn -> :unexpected end, server: server),
@@ -239,7 +240,17 @@ defmodule GitCore.RepositoryReadModelTest do
         :ref_summary
       )
 
+      elapsed = System.monotonic_time(:millisecond) - started_at
+      assert elapsed >= 15
+      assert elapsed < 500
+      assert_waiter_index_size(server, 0)
+
       release_scan_owners(owners)
+
+      assert :reacquired ==
+               GitCore.ScanLimiter.with_permit(:ref_summary, fn -> :reacquired end,
+                 server: server
+               )
     end
 
     test "admits queued waiters in FIFO order" do
@@ -251,6 +262,7 @@ defmodule GitCore.RepositoryReadModelTest do
       wait_for_waiter_count(server, 1)
       second = start_scan_owner(server)
       wait_for_waiter_count(server, 2)
+      assert_waiter_index_size(server, 2)
 
       send(holder, :release)
       assert_receive {:scan_entered, ^first}
@@ -328,6 +340,62 @@ defmodule GitCore.RepositoryReadModelTest do
         :repository_analysis
       )
     end
+
+    test "stays unavailable after its supervised process crashes while permits are held" do
+      server = {:global, {__MODULE__, :scan_crash, make_ref()}}
+      supervisor = start_limiter_supervisor!(GitCore.ScanLimiter, server)
+      limiter = GenServer.whereis(server)
+      owners = start_scan_owners(server, 4)
+      assert_scan_owners_entered(owners)
+      on_exit(fn -> Enum.each(owners, &send(&1, :release)) end)
+
+      monitor = Process.monitor(limiter)
+      Process.exit(limiter, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^limiter, :killed}
+      wait_for_supervisor_settle(supervisor, server, limiter)
+
+      assert_error(
+        GitCore.ScanLimiter.with_permit(:ref_summary, fn -> :unexpected end, server: server),
+        :scan_busy,
+        :ref_summary
+      )
+
+      release_scan_owners(owners)
+    end
+
+    test "prunes many arbitrary waiter deaths without rebuilding or retaining ghosts" do
+      server = start_scan_limiter!(capacity: 1)
+      holder = start_scan_owner(server)
+      assert_receive {:scan_entered, ^holder}
+
+      waiters = start_scan_owners(server, 128)
+      wait_for_waiter_count(server, 128)
+      assert_waiter_index_size(server, 128)
+
+      {victims, survivors} =
+        waiters
+        |> Enum.with_index()
+        |> Enum.split_with(fn {_pid, index} -> rem(index, 2) == 0 end)
+        |> then(fn {victims, survivors} ->
+          {Enum.map(victims, &elem(&1, 0)), Enum.map(survivors, &elem(&1, 0))}
+        end)
+
+      Enum.each(victims, &Process.exit(&1, :kill))
+      wait_for_waiter_count(server, 64)
+      assert_waiter_index_size(server, 64)
+
+      Enum.each(survivors, fn waiter ->
+        assert_receive {:scan_finished, ^waiter, result}, 1_000
+        assert_error(result, :scan_busy, :test_scan)
+      end)
+
+      assert_waiter_index_size(server, 0)
+      send(holder, :release)
+      assert_scan_owners_finished([holder])
+
+      assert :reacquired ==
+               GitCore.ScanLimiter.with_permit(:test_scan, fn -> :reacquired end, server: server)
+    end
   end
 
   describe "weighted blob limiter" do
@@ -393,6 +461,7 @@ defmodule GitCore.RepositoryReadModelTest do
       wait_for_waiter_count(server, 1)
       second = start_blob_owner(server, 4)
       wait_for_waiter_count(server, 2)
+      assert_waiter_index_size(server, 2)
       refute_receive {:blob_acquired, ^second, _lease}, 20
 
       assert :ok = GitCore.BlobLimiter.release(two_byte_lease)
@@ -471,6 +540,40 @@ defmodule GitCore.RepositoryReadModelTest do
       )
     end
 
+    test "stays unavailable after its supervised process crashes with full weight held" do
+      server = {:global, {__MODULE__, :blob_crash, make_ref()}}
+      supervisor = start_limiter_supervisor!(GitCore.BlobLimiter, server)
+      limiter = GenServer.whereis(server)
+      assert {:ok, old_lease} = GitCore.BlobLimiter.acquire(128 * 1024 * 1024, server: server)
+      on_exit(fn -> GitCore.BlobLimiter.release(old_lease) end)
+
+      monitor = Process.monitor(limiter)
+      Process.exit(limiter, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^limiter, :killed}
+      wait_for_supervisor_settle(supervisor, server, limiter)
+
+      assert_error(
+        GitCore.BlobLimiter.acquire(1, server: server, operation: :read_blob_complete),
+        :blob_busy,
+        :read_blob_complete
+      )
+
+      assert :ok = GitCore.BlobLimiter.release(old_lease)
+      assert :ok = GitCore.BlobLimiter.release(old_lease)
+    end
+
+    test "keeps test overrides inside hard production bounds" do
+      assert_raise ArgumentError, fn -> GitCore.ScanLimiter.init(capacity: 5) end
+      assert_raise ArgumentError, fn -> GitCore.ScanLimiter.init(wait_timeout: 251) end
+      assert_raise ArgumentError, fn -> GitCore.BlobLimiter.init(capacity: 9) end
+
+      assert_raise ArgumentError, fn ->
+        GitCore.BlobLimiter.init(byte_capacity: 128 * 1024 * 1024 + 1)
+      end
+
+      assert_raise ArgumentError, fn -> GitCore.BlobLimiter.init(wait_timeout: 251) end
+    end
+
     test "supervises both production limiters with independent children" do
       children = Supervisor.which_children(GitCore.Supervisor)
 
@@ -507,6 +610,21 @@ defmodule GitCore.RepositoryReadModelTest do
     start_supervised!({GitCore.BlobLimiter, Keyword.put(opts, :server, nil)},
       id: make_ref()
     )
+  end
+
+  defp start_limiter_supervisor!(module, server) do
+    {:ok, supervisor} =
+      Supervisor.start_link([{module, server: server}], strategy: :one_for_one)
+
+    on_exit(fn ->
+      try do
+        Supervisor.stop(supervisor)
+      catch
+        :exit, _reason -> :ok
+      end
+    end)
+
+    supervisor
   end
 
   defp start_scan_owners(server, count) do
@@ -585,6 +703,22 @@ defmodule GitCore.RepositoryReadModelTest do
       |> :sys.get_state()
       |> Map.fetch!(:waiters)
       |> map_size() == count
+    end)
+  end
+
+  defp assert_waiter_index_size(server, count) do
+    state = :sys.get_state(server)
+    assert map_size(state.waiters) == count
+    assert :gb_trees.size(state.queue) == count
+  end
+
+  defp wait_for_supervisor_settle(supervisor, server, old_limiter) do
+    wait_until(fn ->
+      registered = GenServer.whereis(server)
+      counts = Supervisor.count_children(supervisor)
+
+      (is_nil(registered) and counts.active == 0) or
+        (is_pid(registered) and registered != old_limiter and counts.active == 1)
     end)
   end
 

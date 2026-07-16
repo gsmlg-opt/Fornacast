@@ -18,8 +18,21 @@ defmodule GitCore.BlobLimiter do
               used_bytes: 0,
               grants: %{},
               waiters: %{},
-              queue: :queue.new(),
+              queue: :gb_trees.empty(),
+              next_sequence: 0,
               monitors: %{}
+  end
+
+  @doc false
+  def child_spec(opts) do
+    %{
+      id: __MODULE__,
+      start: {__MODULE__, :start_link, [opts]},
+      restart: :temporary,
+      shutdown: 5_000,
+      type: :worker,
+      modules: [__MODULE__]
+    }
   end
 
   def start_link(opts \\ []) do
@@ -114,14 +127,14 @@ defmodule GitCore.BlobLimiter do
       {nil, _waiters} ->
         {:noreply, state}
 
-      {%{from: from, monitor: monitor}, waiters} ->
+      {%{from: from, monitor: monitor, sequence: sequence}, waiters} ->
         Process.demonitor(monitor, [:flush])
         GenServer.reply(from, {:error, :busy})
 
         state = %{
           state
           | waiters: waiters,
-            queue: remove_from_queue(state.queue, waiter_id),
+            queue: :gb_trees.delete_any(sequence, state.queue),
             monitors: Map.delete(state.monitors, monitor)
         }
 
@@ -149,14 +162,18 @@ defmodule GitCore.BlobLimiter do
       {{:waiter, waiter_id}, monitors} ->
         {waiter, waiters} = Map.pop(state.waiters, waiter_id)
 
-        if waiter do
-          Process.cancel_timer(waiter.timer)
-        end
+        queue =
+          if waiter do
+            Process.cancel_timer(waiter.timer)
+            :gb_trees.delete_any(waiter.sequence, state.queue)
+          else
+            state.queue
+          end
 
         state = %{
           state
           | waiters: waiters,
-            queue: remove_from_queue(state.queue, waiter_id),
+            queue: queue,
             monitors: monitors
         }
 
@@ -197,12 +214,22 @@ defmodule GitCore.BlobLimiter do
     waiter_id = make_ref()
     monitor = Process.monitor(owner)
     timer = Process.send_after(self(), {:wait_timeout, waiter_id}, state.wait_timeout)
-    waiter = %{from: from, owner: owner, monitor: monitor, timer: timer, weight: weight}
+    sequence = state.next_sequence
+
+    waiter = %{
+      from: from,
+      owner: owner,
+      monitor: monitor,
+      timer: timer,
+      weight: weight,
+      sequence: sequence
+    }
 
     %{
       state
       | waiters: Map.put(state.waiters, waiter_id, waiter),
-        queue: :queue.in(waiter_id, state.queue),
+        queue: :gb_trees.insert(sequence, waiter_id, state.queue),
+        next_sequence: sequence + 1,
         monitors: Map.put(state.monitors, monitor, {:waiter, waiter_id})
     }
   end
@@ -227,47 +254,39 @@ defmodule GitCore.BlobLimiter do
   end
 
   defp drain_waiters(state) do
-    case :queue.peek(state.queue) do
-      :empty ->
-        state
+    if :gb_trees.is_empty(state.queue) do
+      state
+    else
+      {sequence, waiter_id} = :gb_trees.smallest(state.queue)
 
-      {:value, waiter_id} ->
-        case Map.fetch(state.waiters, waiter_id) do
-          :error ->
-            {{:value, ^waiter_id}, queue} = :queue.out(state.queue)
-            drain_waiters(%{state | queue: queue})
+      case Map.fetch(state.waiters, waiter_id) do
+        :error ->
+          drain_waiters(%{state | queue: :gb_trees.delete(sequence, state.queue)})
 
-          {:ok, waiter} ->
-            if available?(state, waiter.weight) do
-              {{:value, ^waiter_id}, queue} = :queue.out(state.queue)
-              Process.cancel_timer(waiter.timer)
-              lease = make_ref()
+        {:ok, waiter} ->
+          if available?(state, waiter.weight) do
+            {^sequence, ^waiter_id, queue} = :gb_trees.take_smallest(state.queue)
+            Process.cancel_timer(waiter.timer)
+            lease = make_ref()
 
-              grant = %{owner: waiter.owner, monitor: waiter.monitor, weight: waiter.weight}
+            grant = %{owner: waiter.owner, monitor: waiter.monitor, weight: waiter.weight}
 
-              state = %{
-                state
-                | queue: queue,
-                  waiters: Map.delete(state.waiters, waiter_id),
-                  grants: Map.put(state.grants, lease, grant),
-                  monitors: Map.put(state.monitors, waiter.monitor, {:grant, lease}),
-                  used_bytes: state.used_bytes + waiter.weight
-              }
-
-              GenServer.reply(waiter.from, {:ok, lease})
-              drain_waiters(state)
-            else
+            state = %{
               state
-            end
-        end
-    end
-  end
+              | queue: queue,
+                waiters: Map.delete(state.waiters, waiter_id),
+                grants: Map.put(state.grants, lease, grant),
+                monitors: Map.put(state.monitors, waiter.monitor, {:grant, lease}),
+                used_bytes: state.used_bytes + waiter.weight
+            }
 
-  defp remove_from_queue(queue, waiter_id) do
-    queue
-    |> :queue.to_list()
-    |> Enum.reject(&(&1 == waiter_id))
-    |> :queue.from_list()
+            GenServer.reply(waiter.from, {:ok, lease})
+            drain_waiters(state)
+          else
+            state
+          end
+      end
+    end
   end
 
   defp error(kind, operation, detail) do
