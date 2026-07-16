@@ -48,6 +48,14 @@ fn native_error(kind: &'static str, detail: impl std::fmt::Display) -> NativeErr
     (kind.to_string(), detail.to_string())
 }
 
+fn bounded_blob_native_error(error: bounded_blob::Error) -> NativeError {
+    let kind = match error.kind() {
+        bounded_blob::ErrorKind::StorageUnavailable => "storage_unavailable",
+        bounded_blob::ErrorKind::CorruptRepository => "corrupt_repository",
+    };
+    native_error(kind, error)
+}
+
 fn open_repository(path: &str) -> Result<gix::Repository, NativeError> {
     std::fs::metadata(path).map_err(|error| native_error("storage_unavailable", error))?;
     gix::open(Path::new(path)).map_err(open_error)
@@ -239,8 +247,8 @@ fn read_blob(
 
     let read_limit = limit.clamp(1, 100_000_000);
     let oid = entry.object_id();
-    let prefix = bounded_blob::read_prefix(&repo, oid, read_limit)
-        .map_err(|error| native_error("corrupt_repository", error))?;
+    let prefix =
+        bounded_blob::read_prefix(&repo, oid, read_limit).map_err(bounded_blob_native_error)?;
     let size = prefix.size;
     let truncated = prefix.truncated;
     let data = prefix.data;

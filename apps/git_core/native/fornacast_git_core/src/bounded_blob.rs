@@ -10,7 +10,112 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 const STREAM_BUFFER_TARGET: usize = 8 * 1024;
+const METADATA_BUFFER_LIMIT: usize = 32;
 const MAX_CHAIN_DEPTH: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ErrorKind {
+    StorageUnavailable,
+    CorruptRepository,
+}
+
+#[derive(Debug)]
+pub(crate) struct Error {
+    kind: ErrorKind,
+    detail: String,
+}
+
+impl Error {
+    fn corrupt(detail: impl std::fmt::Display) -> Self {
+        Self {
+            kind: ErrorKind::CorruptRepository,
+            detail: detail.to_string(),
+        }
+    }
+
+    fn storage(detail: impl std::fmt::Display) -> Self {
+        Self {
+            kind: ErrorKind::StorageUnavailable,
+            detail: detail.to_string(),
+        }
+    }
+
+    fn from_external(error: impl std::error::Error + 'static) -> Self {
+        let kind = if error_chain_contains_io(&error) {
+            ErrorKind::StorageUnavailable
+        } else {
+            ErrorKind::CorruptRepository
+        };
+        Self {
+            kind,
+            detail: error.to_string(),
+        }
+    }
+
+    fn from_bundle(error: gix_pack::bundle::init::Error) -> Self {
+        let kind = match &error {
+            gix_pack::bundle::init::Error::Pack(gix_pack::data::header::decode::Error::Io {
+                ..
+            })
+            | gix_pack::bundle::init::Error::Index(gix_pack::index::init::Error::Io { .. }) => {
+                ErrorKind::StorageUnavailable
+            }
+            _ => ErrorKind::CorruptRepository,
+        };
+        Self {
+            kind,
+            detail: error.to_string(),
+        }
+    }
+
+    fn from_store(error: gix::odb::store::load_index::Error) -> Self {
+        let kind = if matches!(
+            &error,
+            gix::odb::store::load_index::Error::Inaccessible(_)
+                | gix::odb::store::load_index::Error::Io(_)
+        ) || error_chain_contains_io(&error)
+        {
+            ErrorKind::StorageUnavailable
+        } else {
+            ErrorKind::CorruptRepository
+        };
+        Self {
+            kind,
+            detail: error.to_string(),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<String> for Error {
+    fn from(detail: String) -> Self {
+        Self::corrupt(detail)
+    }
+}
+
+type DecodeResult<T> = Result<T, Error>;
+
+fn error_chain_contains_io(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.downcast_ref::<std::io::Error>().is_some() {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum DeltaInstruction {
@@ -18,7 +123,9 @@ enum DeltaInstruction {
     Copy { offset: u64, size: u64 },
 }
 
-fn decode_delta_varint(read_byte: &mut impl FnMut() -> Result<u8, String>) -> Result<u64, String> {
+fn decode_delta_varint<E: From<String>>(
+    read_byte: &mut impl FnMut() -> Result<u8, E>,
+) -> Result<u64, E> {
     let mut value = 0_u64;
 
     for index in 0..10_u32 {
@@ -26,7 +133,7 @@ fn decode_delta_varint(read_byte: &mut impl FnMut() -> Result<u8, String>) -> Re
         let shift = index * 7;
         let component = u64::from(byte & 0x7f);
         if component > (u64::MAX >> shift) {
-            return Err("delta varint overflow".to_string());
+            return Err("delta varint overflow".to_string().into());
         }
         value |= component << shift;
 
@@ -35,15 +142,15 @@ fn decode_delta_varint(read_byte: &mut impl FnMut() -> Result<u8, String>) -> Re
         }
     }
 
-    Err("delta varint exceeds 64 bits".to_string())
+    Err("delta varint exceeds 64 bits".to_string().into())
 }
 
-fn decode_delta_instruction(
+fn decode_delta_instruction<E: From<String>>(
     opcode: u8,
-    read_byte: &mut impl FnMut() -> Result<u8, String>,
-) -> Result<DeltaInstruction, String> {
+    read_byte: &mut impl FnMut() -> Result<u8, E>,
+) -> Result<DeltaInstruction, E> {
     if opcode == 0 {
-        return Err("delta opcode zero is reserved".to_string());
+        return Err("delta opcode zero is reserved".to_string().into());
     }
     if opcode & 0x80 == 0 {
         return Ok(DeltaInstruction::Insert {
@@ -113,6 +220,7 @@ pub(crate) struct PrefixBlob {
 #[derive(Debug, Default)]
 pub(crate) struct AllocationInstrumentation {
     pub(crate) content_bytes_allocated_before_header: usize,
+    pub(crate) max_metadata_buffer: usize,
     pub(crate) max_intermediate_object_buffer: usize,
     pub(crate) max_decoded_object_buffer: usize,
     pub(crate) max_decoded_base_buffer: usize,
@@ -122,6 +230,7 @@ pub(crate) struct AllocationInstrumentation {
 
 #[derive(Clone, Copy)]
 enum BufferRole {
+    Metadata,
     ReturnedObject,
     DecodedObject,
     DecodedBase,
@@ -160,7 +269,10 @@ impl AllocationTracker {
     }
 
     fn stream_buffer(&mut self, role: BufferRole) -> Result<Vec<u8>, String> {
-        let capacity = self.caller_limit.min(STREAM_BUFFER_TARGET);
+        let capacity = match role {
+            BufferRole::Metadata => METADATA_BUFFER_LIMIT,
+            _ => self.caller_limit.min(STREAM_BUFFER_TARGET),
+        };
         if capacity == 0 {
             return Err("cannot allocate a decode buffer for a zero-byte limit".to_string());
         }
@@ -173,10 +285,13 @@ impl AllocationTracker {
         zeroed: bool,
         role: BufferRole,
     ) -> Result<Vec<u8>, String> {
-        if capacity > self.caller_limit {
+        let allocation_limit = match role {
+            BufferRole::Metadata => METADATA_BUFFER_LIMIT,
+            _ => self.caller_limit,
+        };
+        if capacity > allocation_limit {
             return Err(format!(
-                "bounded decoder requested a {capacity}-byte buffer for a {}-byte limit",
-                self.caller_limit
+                "bounded decoder requested a {capacity}-byte buffer for a {allocation_limit}-byte limit"
             ));
         }
 
@@ -185,15 +300,14 @@ impl AllocationTracker {
             buffer.resize(capacity, 0);
         }
         let actual = buffer.capacity();
-        if actual > self.caller_limit {
+        if actual > allocation_limit {
             return Err(format!(
-                "allocator returned a {actual}-byte buffer for a {}-byte limit",
-                self.caller_limit
+                "allocator returned a {actual}-byte buffer for a {allocation_limit}-byte limit"
             ));
         }
         #[cfg(test)]
         {
-            if !self.header_known {
+            if !self.header_known && !matches!(role, BufferRole::Metadata) {
                 self.instrumentation.content_bytes_allocated_before_header = self
                     .instrumentation
                     .content_bytes_allocated_before_header
@@ -209,6 +323,10 @@ impl AllocationTracker {
     #[cfg(test)]
     fn record_capacity(&mut self, role: BufferRole, actual: usize) {
         match role {
+            BufferRole::Metadata => {
+                self.instrumentation.max_metadata_buffer =
+                    self.instrumentation.max_metadata_buffer.max(actual);
+            }
             BufferRole::ReturnedObject => {
                 self.instrumentation.max_decoded_object_buffer =
                     self.instrumentation.max_decoded_object_buffer.max(actual);
@@ -296,7 +414,7 @@ impl CompressedSource<'_> {
         &mut self,
         inflate: &mut gix_features::zlib::Decompress,
         output: &mut [u8],
-    ) -> Result<(gix_features::zlib::Status, usize, usize, bool), String> {
+    ) -> DecodeResult<(gix_features::zlib::Status, usize, usize, bool)> {
         match self {
             CompressedSource::Slice { bytes, position } => {
                 let input = &bytes[*position..];
@@ -313,12 +431,12 @@ impl CompressedSource<'_> {
                             gix_features::zlib::FlushDecompress::None
                         },
                     )
-                    .map_err(|error| format!("inflate pack entry: {error}"))?;
+                    .map_err(|error| Error::corrupt(format!("inflate pack entry: {error}")))?;
                 let consumed = (inflate.total_in() - before_in) as usize;
                 let written = (inflate.total_out() - before_out) as usize;
                 *position = position
                     .checked_add(consumed)
-                    .ok_or_else(|| "compressed input position overflow".to_string())?;
+                    .ok_or_else(|| Error::corrupt("compressed input position overflow"))?;
                 Ok((status, consumed, written, eof))
             }
             CompressedSource::File {
@@ -331,7 +449,7 @@ impl CompressedSource<'_> {
                 if *position == *length && !*eof {
                     *length = file
                         .read(buffer)
-                        .map_err(|error| format!("read loose object: {error}"))?;
+                        .map_err(|error| Error::storage(format!("read loose object: {error}")))?;
                     *position = 0;
                     *eof = *length == 0;
                 }
@@ -350,18 +468,18 @@ impl CompressedSource<'_> {
                             gix_features::zlib::FlushDecompress::None
                         },
                     )
-                    .map_err(|error| format!("inflate loose object: {error}"))?;
+                    .map_err(|error| Error::corrupt(format!("inflate loose object: {error}")))?;
                 let consumed = (inflate.total_in() - before_in) as usize;
                 let written = (inflate.total_out() - before_out) as usize;
                 *position = position
                     .checked_add(consumed)
-                    .ok_or_else(|| "compressed input position overflow".to_string())?;
+                    .ok_or_else(|| Error::corrupt("compressed input position overflow"))?;
                 Ok((status, consumed, written, input_eof))
             }
         }
     }
 
-    fn is_exactly_exhausted(&mut self) -> Result<bool, String> {
+    fn is_exactly_exhausted(&mut self) -> DecodeResult<bool> {
         match self {
             CompressedSource::Slice { bytes, position } => Ok(*position == bytes.len()),
             CompressedSource::File {
@@ -377,9 +495,9 @@ impl CompressedSource<'_> {
                 if *eof {
                     return Ok(true);
                 }
-                let read = file
-                    .read(&mut buffer[..1])
-                    .map_err(|error| format!("read loose object trailer: {error}"))?;
+                let read = file.read(&mut buffer[..1]).map_err(|error| {
+                    Error::storage(format!("read loose object trailer: {error}"))
+                })?;
                 *position = 0;
                 *length = read;
                 *eof = read == 0;
@@ -405,7 +523,7 @@ impl<'a> InflatedStream<'a> {
         declared_size: u64,
         tracker: &mut AllocationTracker,
         role: BufferRole,
-    ) -> Result<Self, String> {
+    ) -> DecodeResult<Self> {
         Ok(Self {
             source: CompressedSource::Slice { bytes, position: 0 },
             inflate: gix_features::zlib::Decompress::new(),
@@ -421,8 +539,12 @@ impl<'a> InflatedStream<'a> {
         file: File,
         tracker: &mut AllocationTracker,
         role: BufferRole,
-    ) -> Result<Self, String> {
-        let input = tracker.stream_buffer(BufferRole::Work)?;
+    ) -> DecodeResult<Self> {
+        let input_role = match role {
+            BufferRole::Metadata => BufferRole::Metadata,
+            _ => BufferRole::Work,
+        };
+        let input = tracker.stream_buffer(input_role)?;
         let output = tracker.stream_buffer(role)?;
         Ok(Self {
             source: CompressedSource::File {
@@ -441,30 +563,30 @@ impl<'a> InflatedStream<'a> {
         })
     }
 
-    fn set_declared_size(&mut self, declared_size: u64) -> Result<(), String> {
+    fn set_declared_size(&mut self, declared_size: u64) -> DecodeResult<()> {
         let produced = self.inflate.total_out();
         if produced > declared_size || (self.ended && produced != declared_size) {
-            return Err(format!(
+            return Err(Error::corrupt(format!(
                 "zlib stream produced {produced} bytes for declared size {declared_size}"
-            ));
+            )));
         }
         self.declared_size = Some(declared_size);
         Ok(())
     }
 
-    fn read_required_byte(&mut self) -> Result<u8, String> {
+    fn read_required_byte(&mut self) -> DecodeResult<u8> {
         if self.available() == 0 {
             self.refill(1)?;
         }
         if self.available() == 0 {
-            return Err("zlib stream ended before requested data".to_string());
+            return Err(Error::corrupt("zlib stream ended before requested data"));
         }
         let byte = self.output[self.output_position];
         self.output_position += 1;
         Ok(byte)
     }
 
-    fn skip_exact(&mut self, mut count: u64) -> Result<(), String> {
+    fn skip_exact(&mut self, mut count: u64) -> DecodeResult<()> {
         while count != 0 {
             if self.available() == 0 {
                 let request = count.min(self.output.len() as u64) as usize;
@@ -472,7 +594,7 @@ impl<'a> InflatedStream<'a> {
             }
             let available = self.available();
             if available == 0 {
-                return Err("zlib stream ended before requested data".to_string());
+                return Err(Error::corrupt("zlib stream ended before requested data"));
             }
             let consumed = available.min(count.min(usize::MAX as u64) as usize);
             self.output_position += consumed;
@@ -481,7 +603,7 @@ impl<'a> InflatedStream<'a> {
         Ok(())
     }
 
-    fn append_exact(&mut self, mut count: u64, output: &mut Vec<u8>) -> Result<(), String> {
+    fn append_exact(&mut self, mut count: u64, output: &mut Vec<u8>) -> DecodeResult<()> {
         while count != 0 {
             if self.available() == 0 {
                 let request = count.min(self.output.len() as u64) as usize;
@@ -489,18 +611,18 @@ impl<'a> InflatedStream<'a> {
             }
             let available = self.available();
             if available == 0 {
-                return Err("zlib stream ended before requested data".to_string());
+                return Err(Error::corrupt("zlib stream ended before requested data"));
             }
             let consumed = available.min(count.min(usize::MAX as u64) as usize);
             let new_length = output
                 .len()
                 .checked_add(consumed)
-                .ok_or_else(|| "bounded output length overflow".to_string())?;
+                .ok_or_else(|| Error::corrupt("bounded output length overflow"))?;
             if new_length > output.capacity() {
-                return Err(format!(
+                return Err(Error::corrupt(format!(
                     "bounded output would grow beyond its {}-byte allocation",
                     output.capacity()
-                ));
+                )));
             }
             output.extend_from_slice(
                 &self.output[self.output_position..self.output_position + consumed],
@@ -511,16 +633,20 @@ impl<'a> InflatedStream<'a> {
         Ok(())
     }
 
-    fn finish_exact(&mut self) -> Result<(), String> {
+    fn finish_exact(&mut self) -> DecodeResult<()> {
         if self.available() != 0 {
-            return Err("zlib stream produced unconsumed decoded bytes".to_string());
+            return Err(Error::corrupt(
+                "zlib stream produced unconsumed decoded bytes",
+            ));
         }
         self.refill(1)?;
         if self.available() != 0 {
-            return Err("zlib stream produced more bytes than declared".to_string());
+            return Err(Error::corrupt(
+                "zlib stream produced more bytes than declared",
+            ));
         }
         if !self.ended {
-            return Err("zlib stream did not reach StreamEnd".to_string());
+            return Err(Error::corrupt("zlib stream did not reach StreamEnd"));
         }
         Ok(())
     }
@@ -533,14 +659,16 @@ impl<'a> InflatedStream<'a> {
         self.output_length - self.output_position
     }
 
-    fn refill(&mut self, requested: usize) -> Result<(), String> {
+    fn refill(&mut self, requested: usize) -> DecodeResult<()> {
         if requested == 0 || self.ended {
             self.output_position = 0;
             self.output_length = 0;
             return Ok(());
         }
         if self.available() != 0 {
-            return Err("attempted to refill with decoded bytes still buffered".to_string());
+            return Err(Error::corrupt(
+                "attempted to refill with decoded bytes still buffered",
+            ));
         }
 
         let output_len = requested.min(self.output.len());
@@ -554,9 +682,9 @@ impl<'a> InflatedStream<'a> {
             if let Some(declared_size) = self.declared_size {
                 let produced = self.inflate.total_out();
                 if produced > declared_size {
-                    return Err(format!(
+                    return Err(Error::corrupt(format!(
                         "zlib stream produced {produced} bytes beyond declared size {declared_size}"
-                    ));
+                    )));
                 }
             }
 
@@ -565,15 +693,15 @@ impl<'a> InflatedStream<'a> {
                 if let Some(declared_size) = self.declared_size {
                     let produced = self.inflate.total_out();
                     if produced != declared_size {
-                        return Err(format!(
+                        return Err(Error::corrupt(format!(
                             "zlib StreamEnd at {produced} bytes, expected {declared_size}"
-                        ));
+                        )));
                     }
                 }
                 if !self.source.is_exactly_exhausted()? {
-                    return Err(
-                        "zlib stream ended before the compressed entry boundary".to_string()
-                    );
+                    return Err(Error::corrupt(
+                        "zlib stream ended before the compressed entry boundary",
+                    ));
                 }
             }
 
@@ -581,11 +709,11 @@ impl<'a> InflatedStream<'a> {
                 return Ok(());
             }
             if consumed == 0 {
-                return Err(if input_was_eof {
-                    "zlib stream ended without StreamEnd".to_string()
+                return Err(Error::corrupt(if input_was_eof {
+                    "zlib stream ended without StreamEnd"
                 } else {
-                    "zlib stream made no progress".to_string()
-                });
+                    "zlib stream made no progress"
+                }));
             }
         }
     }
@@ -595,13 +723,26 @@ pub(crate) fn read_prefix(
     repo: &gix::Repository,
     id: gix_hash::ObjectId,
     limit: usize,
-) -> Result<PrefixBlob, String> {
+) -> DecodeResult<PrefixBlob> {
     let mut tracker = AllocationTracker::new(limit);
-    let header = repo.find_header(id).map_err(|error| error.to_string())?;
-    if header.kind() != gix_object::Kind::Blob {
-        return Err(format!("expected blob, found {}", header.kind()));
+    let source = locate_source(repo, id, None)?;
+    let metadata = validate_local_metadata_before_public_header(
+        || probe_source(repo, &source, &mut tracker, &mut Vec::new()),
+        || {
+            let header = repo.find_header(id).map_err(Error::from_external)?;
+            Ok(ObjectMetadata {
+                kind: header.kind(),
+                size: header.size(),
+            })
+        },
+    )?;
+    if metadata.kind != gix_object::Kind::Blob {
+        return Err(Error::corrupt(format!(
+            "expected blob, found {}",
+            metadata.kind
+        )));
     }
-    let size = header.size();
+    let size = metadata.size;
     tracker.mark_header_known();
 
     if limit == 0 {
@@ -614,17 +755,8 @@ pub(crate) fn read_prefix(
         });
     }
 
-    let source = locate_source(repo, id, None)?;
-    let metadata = probe_source(repo, &source, &mut tracker, &mut Vec::new())?;
-    if metadata.kind != gix_object::Kind::Blob || metadata.size != size {
-        return Err(format!(
-            "blob metadata mismatch: public header blob/{size}, storage {}/{}",
-            metadata.kind, metadata.size
-        ));
-    }
-
     let read_limit = usize::try_from(size.min(limit as u64))
-        .map_err(|_| "blob prefix does not fit usize".to_string())?;
+        .map_err(|_| Error::corrupt("blob prefix does not fit usize"))?;
     let mut data = tracker.returned_object(read_limit)?;
     append_source_range(
         repo,
@@ -637,11 +769,11 @@ pub(crate) fn read_prefix(
         &mut Vec::new(),
     )?;
     if data.len() != read_limit || data.capacity() > limit {
-        return Err(format!(
+        return Err(Error::corrupt(format!(
             "bounded decoder returned len={} capacity={} for limit={limit}",
             data.len(),
             data.capacity()
-        ));
+        )));
     }
     #[cfg(test)]
     tracker.record_capacity(BufferRole::ReturnedObject, data.capacity());
@@ -655,11 +787,26 @@ pub(crate) fn read_prefix(
     })
 }
 
+fn validate_local_metadata_before_public_header(
+    local_probe: impl FnOnce() -> DecodeResult<ObjectMetadata>,
+    public_header: impl FnOnce() -> DecodeResult<ObjectMetadata>,
+) -> DecodeResult<ObjectMetadata> {
+    let local = local_probe()?;
+    let public = public_header()?;
+    if local != public {
+        return Err(Error::corrupt(format!(
+            "object metadata mismatch: public header {}/{}, storage {}/{}",
+            public.kind, public.size, local.kind, local.size
+        )));
+    }
+    Ok(local)
+}
+
 fn locate_source(
     repo: &gix::Repository,
     id: gix_hash::ObjectId,
     preferred_index: Option<&Path>,
-) -> Result<ObjectSource, String> {
+) -> DecodeResult<ObjectSource> {
     if let Some(path) = preferred_index
         && let Some(source) = packed_source_at(repo, path, id)?
     {
@@ -671,7 +818,7 @@ fn locate_source(
         repo.objects
             .store_ref()
             .alternate_db_paths()
-            .map_err(|error| format!("load alternate object databases: {error}"))?,
+            .map_err(Error::from_store)?,
     );
 
     for object_db in &object_dbs {
@@ -687,26 +834,46 @@ fn locate_source(
 
     for object_db in object_dbs {
         let loose_path = loose_object_path_at(&object_db, id);
-        if loose_path.is_file() {
-            return Ok(ObjectSource::Loose { object_db, id });
+        match std::fs::metadata(&loose_path) {
+            Ok(metadata) if metadata.is_file() => {
+                return Ok(ObjectSource::Loose { object_db, id });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::storage(format!(
+                    "inspect loose object {}: {error}",
+                    loose_path.display()
+                )));
+            }
         }
     }
 
-    Err(format!(
+    Err(Error::corrupt(format!(
         "unable to resolve object {id} from loose objects or public pack indexes"
-    ))
+    )))
 }
 
-fn pack_index_paths(object_db: &Path) -> Result<Vec<PathBuf>, String> {
+fn pack_index_paths(object_db: &Path) -> DecodeResult<Vec<PathBuf>> {
     let pack_dir = object_db.join("pack");
     let entries = match std::fs::read_dir(&pack_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("read {}: {error}", pack_dir.display())),
+        Err(error) => {
+            return Err(Error::storage(format!(
+                "read {}: {error}",
+                pack_dir.display()
+            )));
+        }
     };
     let mut paths: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| Error::storage(format!("read {}: {error}", pack_dir.display())))
+        })
+        .collect::<DecodeResult<Vec<_>>>()?
+        .into_iter()
         .filter(|path| path.extension().is_some_and(|extension| extension == "idx"))
         .collect();
     paths.sort();
@@ -717,25 +884,27 @@ fn packed_source_at(
     repo: &gix::Repository,
     index_path: &Path,
     id: gix_hash::ObjectId,
-) -> Result<Option<ObjectSource>, String> {
-    let bundle = gix_pack::Bundle::at(index_path, repo.object_hash())
-        .map_err(|error| format!("open {}: {error}", index_path.display()))?;
+) -> DecodeResult<Option<ObjectSource>> {
+    let bundle =
+        gix_pack::Bundle::at(index_path, repo.object_hash()).map_err(Error::from_bundle)?;
     Ok(bundle.index.lookup(id).map(|index| ObjectSource::Packed {
         index_path: index_path.to_path_buf(),
         pack_offset: bundle.index.pack_offset_at_index(index),
     }))
 }
 
-fn open_packed(repo: &gix::Repository, source: &ObjectSource) -> Result<OpenedPack, String> {
+fn open_packed(repo: &gix::Repository, source: &ObjectSource) -> DecodeResult<OpenedPack> {
     let ObjectSource::Packed {
         index_path,
         pack_offset,
     } = source
     else {
-        return Err("attempted to open a loose object as a pack entry".to_string());
+        return Err(Error::corrupt(
+            "attempted to open a loose object as a pack entry",
+        ));
     };
-    let bundle = gix_pack::Bundle::at(index_path, repo.object_hash())
-        .map_err(|error| format!("open {}: {error}", index_path.display()))?;
+    let bundle =
+        gix_pack::Bundle::at(index_path, repo.object_hash()).map_err(Error::from_bundle)?;
     let mut offset_occurrences = 0_usize;
     let mut next_offset = None;
     for candidate in bundle.index.iter() {
@@ -748,24 +917,21 @@ fn open_packed(repo: &gix::Repository, source: &ObjectSource) -> Result<OpenedPa
         }
     }
     if offset_occurrences != 1 {
-        return Err(format!(
+        return Err(Error::corrupt(format!(
             "pack offset {pack_offset} occurs {offset_occurrences} times in {}",
             index_path.display(),
-        ));
+        )));
     }
-    let entry = bundle
-        .pack
-        .entry(*pack_offset)
-        .map_err(|error| format!("read public pack entry at {pack_offset}: {error}"))?;
+    let entry = bundle.pack.entry(*pack_offset).map_err(Error::corrupt)?;
     let entry_end = next_offset.unwrap_or(bundle.pack.pack_end() as u64);
     if *pack_offset >= entry.data_offset
         || entry.data_offset >= entry_end
         || entry_end > bundle.pack.pack_end() as u64
     {
-        return Err(format!(
+        return Err(Error::corrupt(format!(
             "invalid pack entry range {}..{entry_end} at offset {pack_offset}",
             entry.data_offset
-        ));
+        )));
     }
     Ok(OpenedPack {
         bundle,
@@ -779,19 +945,15 @@ fn probe_source(
     source: &ObjectSource,
     tracker: &mut AllocationTracker,
     stack: &mut Vec<ObjectSource>,
-) -> Result<ObjectMetadata, String> {
+) -> DecodeResult<ObjectMetadata> {
     enter_source(source, stack)?;
-    let role = if stack.len() == 1 {
-        BufferRole::DecodedObject
-    } else {
-        BufferRole::DecodedBase
-    };
     let result = match source {
         ObjectSource::Loose { object_db, id } => {
             let path = loose_object_path_at(object_db, *id);
-            let file = File::open(&path)
-                .map_err(|error| format!("open loose object {}: {error}", path.display()))?;
-            let mut stream = InflatedStream::from_file(file, tracker, role)?;
+            let file = File::open(&path).map_err(|error| {
+                Error::storage(format!("open loose object {}: {error}", path.display()))
+            })?;
+            let mut stream = InflatedStream::from_file(file, tracker, BufferRole::Metadata)?;
             read_loose_header(&mut stream)
         }
         ObjectSource::Packed { .. } => {
@@ -809,16 +971,16 @@ fn probe_source(
                     compressed,
                     opened.entry.decompressed_size,
                     tracker,
-                    BufferRole::Delta,
+                    BufferRole::Metadata,
                 )?;
                 let (declared_base_size, result_size) = read_delta_header(&mut stream)?;
                 if declared_base_size != base_metadata.size {
                     return pop_result(
                         stack,
-                        Err(format!(
+                        Err(Error::corrupt(format!(
                             "delta declares base size {declared_base_size}, resolved base has size {}",
                             base_metadata.size
-                        )),
+                        ))),
                     );
                 }
                 Ok(ObjectMetadata {
@@ -841,15 +1003,15 @@ fn append_source_range(
     output: &mut Vec<u8>,
     tracker: &mut AllocationTracker,
     stack: &mut Vec<ObjectSource>,
-) -> Result<(), String> {
+) -> DecodeResult<()> {
     let end = start
         .checked_add(length as u64)
-        .ok_or_else(|| "requested object range overflow".to_string())?;
+        .ok_or_else(|| Error::corrupt("requested object range overflow"))?;
     if end > expected.size {
-        return Err(format!(
+        return Err(Error::corrupt(format!(
             "requested object range {start}..{end} exceeds size {}",
             expected.size
-        ));
+        )));
     }
 
     enter_source(source, stack)?;
@@ -862,8 +1024,9 @@ fn append_source_range(
     let result = match source {
         ObjectSource::Loose { object_db, id } => {
             let path = loose_object_path_at(object_db, *id);
-            let file = File::open(&path)
-                .map_err(|error| format!("open loose object {}: {error}", path.display()))?;
+            let file = File::open(&path).map_err(|error| {
+                Error::storage(format!("open loose object {}: {error}", path.display()))
+            })?;
             let mut stream = InflatedStream::from_file(file, tracker, role)?;
             let actual = read_loose_header(&mut stream)?;
             ensure_metadata(expected, actual)?;
@@ -906,9 +1069,9 @@ fn append_source_range(
     let result = result.and_then(|()| {
         let appended = output.len() - output_start;
         if appended != length {
-            Err(format!(
+            Err(Error::corrupt(format!(
                 "decoder appended {appended} bytes for a {length}-byte request"
-            ))
+            )))
         } else {
             Ok(())
         }
@@ -927,7 +1090,7 @@ fn append_delta_range(
     output: &mut Vec<u8>,
     tracker: &mut AllocationTracker,
     stack: &mut Vec<ObjectSource>,
-) -> Result<(), String> {
+) -> DecodeResult<()> {
     let base = resolve_delta_base(repo, source, opened)?;
     let mut probe_stack = stack.clone();
     let base_metadata = probe_source(repo, &base, tracker, &mut probe_stack)?;
@@ -940,10 +1103,10 @@ fn append_delta_range(
     )?;
     let (declared_base_size, result_size) = read_delta_header(&mut stream)?;
     if declared_base_size != base_metadata.size {
-        return Err(format!(
+        return Err(Error::corrupt(format!(
             "delta declares base size {declared_base_size}, resolved base has size {}",
             base_metadata.size
-        ));
+        )));
     }
     ensure_metadata(
         expected,
@@ -963,11 +1126,11 @@ fn append_delta_range(
         };
         let instruction_end = result_position
             .checked_add(instruction_size)
-            .ok_or_else(|| "delta result position overflow".to_string())?;
+            .ok_or_else(|| Error::corrupt("delta result position overflow"))?;
         if instruction_end > result_size {
-            return Err(format!(
+            return Err(Error::corrupt(format!(
                 "delta command ends at {instruction_end}, beyond result size {result_size}"
-            ));
+            )));
         }
 
         match &instruction {
@@ -984,18 +1147,18 @@ fn append_delta_range(
             DeltaInstruction::Copy { offset, size } => {
                 let base_end = offset
                     .checked_add(*size)
-                    .ok_or_else(|| "delta base copy range overflow".to_string())?;
+                    .ok_or_else(|| Error::corrupt("delta base copy range overflow"))?;
                 if base_end > base_metadata.size {
-                    return Err(format!(
+                    return Err(Error::corrupt(format!(
                         "delta copy range {offset}..{base_end} exceeds base size {}",
                         base_metadata.size
-                    ));
+                    )));
                 }
                 if let Some(base_range) =
                     overlapping_base_range(&instruction, result_position, requested.clone())?
                 {
                     let length = usize::try_from(base_range.end - base_range.start)
-                        .map_err(|_| "delta copy length does not fit usize".to_string())?;
+                        .map_err(|_| Error::corrupt("delta copy length does not fit usize"))?;
                     append_source_range(
                         repo,
                         &base,
@@ -1013,15 +1176,15 @@ fn append_delta_range(
     }
 
     if stream.is_ended() && result_position < result_size {
-        return Err(format!(
+        return Err(Error::corrupt(format!(
             "delta stream reached StreamEnd at result offset {result_position}, expected {result_size}"
-        ));
+        )));
     }
     if end == result_size {
         if result_position != result_size {
-            return Err(format!(
+            return Err(Error::corrupt(format!(
                 "delta result ended at {result_position}, expected {result_size}"
-            ));
+            )));
         }
         stream.finish_exact()?;
     }
@@ -1032,13 +1195,15 @@ fn resolve_delta_base(
     repo: &gix::Repository,
     source: &ObjectSource,
     opened: &OpenedPack,
-) -> Result<ObjectSource, String> {
+) -> DecodeResult<ObjectSource> {
     let ObjectSource::Packed {
         index_path,
         pack_offset,
     } = source
     else {
-        return Err("a loose object cannot have a pack delta base".to_string());
+        return Err(Error::corrupt(
+            "a loose object cannot have a pack delta base",
+        ));
     };
     match opened.entry.header {
         gix_pack::data::entry::Header::OfsDelta { base_distance } => {
@@ -1047,7 +1212,9 @@ fn resolve_delta_base(
                 base_distance,
             )
             .ok_or_else(|| {
-                format!("invalid OFS_DELTA distance {base_distance} from pack offset {pack_offset}")
+                Error::corrupt(format!(
+                    "invalid OFS_DELTA distance {base_distance} from pack offset {pack_offset}"
+                ))
             })?;
             Ok(ObjectSource::Packed {
                 index_path: index_path.clone(),
@@ -1063,17 +1230,19 @@ fn resolve_delta_base(
             }
             locate_source(repo, base_id, Some(index_path))
         }
-        _ => Err("attempted to resolve a base for a non-delta pack entry".to_string()),
+        _ => Err(Error::corrupt(
+            "attempted to resolve a base for a non-delta pack entry",
+        )),
     }
 }
 
-fn read_delta_header(stream: &mut InflatedStream<'_>) -> Result<(u64, u64), String> {
+fn read_delta_header(stream: &mut InflatedStream<'_>) -> DecodeResult<(u64, u64)> {
     let base_size = decode_delta_varint(&mut || stream.read_required_byte())?;
     let result_size = decode_delta_varint(&mut || stream.read_required_byte())?;
     Ok((base_size, result_size))
 }
 
-fn read_loose_header(stream: &mut InflatedStream<'_>) -> Result<ObjectMetadata, String> {
+fn read_loose_header(stream: &mut InflatedStream<'_>) -> DecodeResult<ObjectMetadata> {
     let mut kind_code = 0_u64;
     let mut kind_length = 0_usize;
     loop {
@@ -1082,7 +1251,7 @@ fn read_loose_header(stream: &mut InflatedStream<'_>) -> Result<ObjectMetadata, 
             break;
         }
         if kind_length == 6 || !byte.is_ascii_lowercase() {
-            return Err("invalid loose object kind".to_string());
+            return Err(Error::corrupt("invalid loose object kind"));
         }
         kind_code = (kind_code << 8) | u64::from(byte);
         kind_length += 1;
@@ -1092,7 +1261,7 @@ fn read_loose_header(stream: &mut InflatedStream<'_>) -> Result<ObjectMetadata, 
         (4, 0x7472_6565) => gix_object::Kind::Tree,
         (6, 0x636f_6d6d_6974) => gix_object::Kind::Commit,
         (3, 0x0074_6167) => gix_object::Kind::Tag,
-        _ => return Err("unsupported loose object kind".to_string()),
+        _ => return Err(Error::corrupt("unsupported loose object kind")),
     };
 
     let mut size = 0_u64;
@@ -1104,7 +1273,7 @@ fn read_loose_header(stream: &mut InflatedStream<'_>) -> Result<ObjectMetadata, 
             break;
         }
         if !byte.is_ascii_digit() || digit_count == 20 {
-            return Err("invalid loose object size".to_string());
+            return Err(Error::corrupt("invalid loose object size"));
         }
         if digit_count == 0 {
             first_digit = byte;
@@ -1112,22 +1281,22 @@ fn read_loose_header(stream: &mut InflatedStream<'_>) -> Result<ObjectMetadata, 
         size = size
             .checked_mul(10)
             .and_then(|value| value.checked_add(u64::from(byte - b'0')))
-            .ok_or_else(|| "loose object size overflow".to_string())?;
+            .ok_or_else(|| Error::corrupt("loose object size overflow"))?;
         digit_count += 1;
     }
     if digit_count == 0 || (digit_count > 1 && first_digit == b'0') {
-        return Err("loose object size is not canonical".to_string());
+        return Err(Error::corrupt("loose object size is not canonical"));
     }
 
     let header_size = kind_length
         .checked_add(digit_count)
         .and_then(|value| value.checked_add(2))
-        .ok_or_else(|| "loose object header size overflow".to_string())?
+        .ok_or_else(|| Error::corrupt("loose object header size overflow"))?
         as u64;
     stream.set_declared_size(
         header_size
             .checked_add(size)
-            .ok_or_else(|| "loose object total size overflow".to_string())?,
+            .ok_or_else(|| Error::corrupt("loose object total size overflow"))?,
     )?;
     Ok(ObjectMetadata { kind, size })
 }
@@ -1156,7 +1325,7 @@ fn enter_source(source: &ObjectSource, stack: &mut Vec<ObjectSource>) -> Result<
     Ok(())
 }
 
-fn pop_result<T>(stack: &mut Vec<ObjectSource>, result: Result<T, String>) -> Result<T, String> {
+fn pop_result<T, E>(stack: &mut Vec<ObjectSource>, result: Result<T, E>) -> Result<T, E> {
     stack.pop();
     result
 }
@@ -1168,6 +1337,7 @@ fn loose_object_path_at(object_db: &Path, id: gix_hash::ObjectId) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -1175,8 +1345,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        DeltaInstruction, MAX_CHAIN_DEPTH, ObjectSource, decode_delta_instruction,
-        decode_delta_varint, enter_source, overlapping_base_range, read_prefix,
+        DeltaInstruction, Error, ErrorKind, MAX_CHAIN_DEPTH, METADATA_BUFFER_LIMIT, ObjectMetadata,
+        ObjectSource, decode_delta_instruction, decode_delta_varint, enter_source,
+        overlapping_base_range, pack_index_paths, read_prefix,
+        validate_local_metadata_before_public_header,
     };
 
     const PREFIX_LIMIT: usize = 64 * 1024;
@@ -1260,6 +1432,8 @@ mod tests {
         assert_eq!(prefix.data.capacity(), 0);
         assert_eq!(prefix.allocations.max_decoded_object_buffer, 0);
         assert_eq!(prefix.allocations.max_decoded_base_buffer, 0);
+        assert!(prefix.allocations.max_metadata_buffer > 0);
+        assert!(prefix.allocations.max_metadata_buffer <= METADATA_BUFFER_LIMIT);
     }
 
     #[test]
@@ -1380,6 +1554,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prefix_blob_local_cycle_guard_runs_before_public_header_traversal() {
+        let source = ObjectSource::Packed {
+            index_path: PathBuf::from("fixture.idx"),
+            pack_offset: 1,
+        };
+        let mut stack = vec![source.clone()];
+        let public_header_called = Cell::new(false);
+
+        let error = validate_local_metadata_before_public_header(
+            || {
+                enter_source(&source, &mut stack)?;
+                Ok(ObjectMetadata {
+                    kind: gix_object::Kind::Blob,
+                    size: 1,
+                })
+            },
+            || {
+                public_header_called.set(true);
+                Ok(ObjectMetadata {
+                    kind: gix_object::Kind::Blob,
+                    size: 1,
+                })
+            },
+        )
+        .expect_err("the repeated local source must fail before the public header stage");
+
+        assert_eq!(error.to_string(), "delta chain contains a cycle");
+        assert!(!public_header_called.get());
+    }
+
+    #[test]
+    fn prefix_blob_direct_filesystem_failures_map_to_storage_unavailable() {
+        let temp = TempDirectory::new("storage-error");
+        let object_db = temp.0.join("objects");
+        std::fs::create_dir(&object_db).expect("create object database");
+        std::fs::write(object_db.join("pack"), b"not a directory")
+            .expect("replace pack directory with a file");
+
+        let error = pack_index_paths(&object_db).expect_err("read_dir must fail");
+        assert_eq!(error.kind(), ErrorKind::StorageUnavailable);
+        let native_error = crate::bounded_blob_native_error(error);
+        assert_eq!(native_error.0, "storage_unavailable");
+    }
+
+    #[test]
+    fn prefix_blob_structural_pack_failures_map_to_corrupt_repository() {
+        let temp = TempDirectory::new("corrupt-pack-error");
+        let index_path = temp.0.join("broken.idx");
+        std::fs::write(&index_path, b"not a pack index").expect("write malformed pack index");
+
+        let external = match gix_pack::Bundle::at(&index_path, gix_hash::Kind::Sha1) {
+            Ok(_) => panic!("malformed pack index must fail"),
+            Err(error) => error,
+        };
+        let error = Error::from_bundle(external);
+        assert_eq!(error.kind(), ErrorKind::CorruptRepository);
+        let native_error = crate::bounded_blob_native_error(error);
+        assert_eq!(native_error.0, "corrupt_repository");
+    }
+
     fn assert_bounded_contract(fixture: Fixture) {
         eprintln!(
             "prefix_blob fixture {:?}: oid={} size={} evidence={}",
@@ -1413,6 +1648,13 @@ mod tests {
             prefix.allocations.content_bytes_allocated_before_header, 0,
             "metadata must be known before allocating content"
         );
+        assert!(prefix.allocations.max_metadata_buffer <= METADATA_BUFFER_LIMIT);
+        if !matches!(fixture.storage, StorageForm::PackedBase) {
+            assert!(
+                prefix.allocations.max_metadata_buffer > 0,
+                "loose and delta metadata probes must use the dedicated metadata buffer"
+            );
+        }
         assert!(
             prefix.allocations.max_intermediate_object_buffer < fixture.original.len(),
             "the largest actual intermediate object allocation must be smaller than the complete object"
@@ -1451,9 +1693,10 @@ mod tests {
             "work buffer exceeded the requested prefix"
         );
         eprintln!(
-            "bounded allocation evidence: returned={} pre_header={} intermediate_object={} decoded_object={} decoded_base={} delta={} work={} max_actual={}",
+            "bounded allocation evidence: returned={} pre_header={} metadata={} intermediate_object={} decoded_object={} decoded_base={} delta={} work={} max_actual={}",
             prefix.data.len(),
             prefix.allocations.content_bytes_allocated_before_header,
+            prefix.allocations.max_metadata_buffer,
             prefix.allocations.max_intermediate_object_buffer,
             prefix.allocations.max_decoded_object_buffer,
             prefix.allocations.max_decoded_base_buffer,
@@ -1473,6 +1716,7 @@ mod tests {
             complete.allocations.content_bytes_allocated_before_header,
             0
         );
+        assert!(complete.allocations.max_metadata_buffer <= METADATA_BUFFER_LIMIT);
         assert!(complete.allocations.max_intermediate_object_buffer < fixture.original.len());
         assert!(complete.allocations.max_decoded_object_buffer <= complete_limit);
         assert!(complete.allocations.max_decoded_base_buffer <= complete_limit);
