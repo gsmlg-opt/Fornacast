@@ -303,11 +303,11 @@ This is a hard feasibility gate. Do not begin Tasks 4 through 16 until the Go co
 - Modify only if a public API is used directly: apps/git_core/native/fornacast_git_core/Cargo.toml
 - Add tests: apps/git_core/test/repository_read_model_test.exs
 
-- [ ] **Step 1: Build verified loose, packed-base, and packed-delta fixtures**
+- [x] **Step 1: Build verified loose, packed-base, and packed-delta fixtures**
 
 In Rust unit-test helpers, create multi-megabyte deterministic blobs. Keep one loose, repack one with delta compression disabled, and create two highly similar large objects for the delta case. Run git verify-pack -v from the fixture helper and fail setup unless the expected base or delta storage form is confirmed.
 
-- [ ] **Step 2: Add failing bounded-reader tests**
+- [x] **Step 2: Add failing bounded-reader tests**
 
 Use a 64 KiB prefix limit. For all three storage forms assert:
 
@@ -318,15 +318,15 @@ Use a 64 KiB prefix limit. For all three storage forms assert:
 - a limit at or above object size returns the complete body with truncated false;
 - test instrumentation records no complete final-object buffer and no decoded object buffer larger than the requested prefix limit.
 
-- [ ] **Step 3: Implement the minimum public-API prototype**
+- [x] **Step 3: Implement the minimum public-API prototype**
 
 Use gix header metadata for kind and size. Do not assume gix 0.85 has a public prefix stream. The bounded path must not call entry.object(), try_into_blob(), a repository lookup that fills a complete object buffer, private crate internals, or an external git cat-file process. Implement only against stable public gix, gix-odb, or gix-pack primitives.
 
-- [ ] **Step 4: Add an Elixir integration tag**
+- [x] **Step 4: Add an Elixir integration tag**
 
 Route GitCore.read_blob/4 through the bounded prototype for immutable commit OIDs. Under an ExUnit prefix_blob tag, assert exact size, data, truncated, binary, and non_utf8 values for all three verified storage forms.
 
-- [ ] **Step 5: Run the gate**
+- [x] **Step 5: Run the gate**
 
 ~~~sh
 cargo test --manifest-path apps/git_core/native/fornacast_git_core/Cargo.toml prefix_blob -- --nocapture
@@ -337,7 +337,7 @@ mix test apps/git_core/test/repository_read_model_test.exs --only prefix_blob --
 
 **Stop condition:** if packed-base or packed-delta decoding requires a complete final/base object buffer, non-public gix internals, a fork, or an external Git process, stop repository-foundation implementation. Report the exact failing storage form and request one design choice: change the dependency/version, build a dedicated bounded pack/delta decoder, or revise the contract. Do not retain the existing full-read-and-slice behavior.
 
-- [ ] **Step 6: Commit only after the Go condition passes**
+- [x] **Step 6: Commit only after the Go condition passes**
 
 ~~~sh
 git add apps/git_core/native/fornacast_git_core/src/bounded_blob.rs apps/git_core/native/fornacast_git_core/src/lib.rs apps/git_core/native/fornacast_git_core/Cargo.toml apps/git_core/native/fornacast_git_core/Cargo.lock apps/git_core/lib/git_core.ex apps/git_core/test/repository_read_model_test.exs
