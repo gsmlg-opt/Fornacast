@@ -21,8 +21,17 @@ type NativeCommit = (
 type NativeTreeEntry = (String, String, String, String);
 type NativeBlobMetadata = (Vec<u8>, String, u64);
 type NativeBlobBody<'env> = (u64, rustler::Binary<'env>, bool, bool);
-type NativeDiffFile = (String, String, Option<String>, Option<String>, bool);
-type NativeCommitDiff = (Vec<NativeDiffFile>, String, bool);
+type NativeDiffLine = (String, Option<u32>, Option<u32>, Vec<u8>);
+type NativeDiffStats = (u64, u64, bool, Vec<NativeDiffLine>);
+type NativeDiffFile = (
+    Vec<u8>,
+    String,
+    Option<String>,
+    Option<String>,
+    bool,
+    NativeDiffStats,
+);
+type NativeCommitDiff = (Vec<NativeDiffFile>, Vec<u8>, bool, u64, u64, u64);
 type NativeRef = (Vec<u8>, String, String);
 type NativeRefSummary = (usize, usize, Vec<NativeRef>, Vec<NativeRef>, bool);
 type NativeTreeCommit = (String, String, String, i64);
@@ -122,6 +131,10 @@ const COMMIT_PAGE_LIMIT: usize = 50;
 const TREE_PAGE_LIMIT: usize = 200;
 const INLINE_BLOB_LIMIT: usize = 1_048_576;
 const COMPLETE_BLOB_LIMIT: u64 = 100_000_000;
+const DIFF_SOURCE_LIMIT: usize = 200_000;
+const DIFF_FILE_LIMIT: usize = 1_000;
+const DIFF_SCAN_DEADLINE: Duration = Duration::from_secs(5);
+const NO_FINAL_NEWLINE_MARKER: &[u8] = b"\\ No newline at end of file\n";
 // This remains independent of object size while leaving room for the complete mandatory tag
 // header, including long ref-derived tag names, before an arbitrarily large message body.
 const SNAPSHOT_OBJECT_PREFIX_LIMIT: usize = 64 * 1024;
@@ -130,11 +143,30 @@ const SNAPSHOT_OBJECT_PREFIX_LIMIT: usize = 64 * 1024;
 static TREE_HISTORY_GRAPH_WALKS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-#[derive(Clone)]
-struct FileSnapshot {
-    oid: String,
-    mode: String,
-    data: Option<Vec<u8>>,
+struct RetainedDiffSource {
+    patch: Vec<u8>,
+    limit: usize,
+    truncated: bool,
+}
+
+struct DiffFileMetadata {
+    path: Vec<u8>,
+    status: &'static str,
+    old_oid: Option<gix_hash::ObjectId>,
+    new_oid: Option<gix_hash::ObjectId>,
+    old_mode: Option<gix_object::tree::EntryMode>,
+    new_mode: Option<gix_object::tree::EntryMode>,
+}
+
+#[derive(Clone, Copy)]
+struct VerifiedDiffResource {
+    binary: bool,
+    missing_final_newline_at: Option<u32>,
+}
+
+struct VerifiedDiffResources {
+    old: Option<VerifiedDiffResource>,
+    new: Option<VerifiedDiffResource>,
 }
 
 fn to_error<E: std::fmt::Display>(error: E) -> String {
@@ -143,6 +175,18 @@ fn to_error<E: std::fmt::Display>(error: E) -> String {
 
 fn native_error(kind: &'static str, detail: impl std::fmt::Display) -> NativeError {
     (kind.to_string(), detail.to_string())
+}
+
+fn diff_read_error<E>(error: E) -> NativeError
+where
+    E: std::error::Error + 'static,
+{
+    let kind = if error_chain_contains_storage_io(&error) {
+        "storage_unavailable"
+    } else {
+        "corrupt_repository"
+    };
+    native_error(kind, error)
 }
 
 fn error_chain_contains_storage_io(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -1979,82 +2023,101 @@ fn blob_body_to_native<'env>(
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
-fn diff_commit(path: String, oid: String, limit: usize) -> Result<NativeCommitDiff, NativeError> {
-    let repo = open_bare_repository(&path)?;
-    let commit = resolve_commit_oid(&repo, &oid)?;
-    let diff_limit = limit.clamp(1, 5_000_000);
-    let mut old_entries = BTreeMap::new();
-    let mut new_entries = BTreeMap::new();
+fn diff_commit(
+    path: String,
+    oid: String,
+    limit: usize,
+    deadline_ms: u64,
+) -> Result<NativeCommitDiff, NativeError> {
+    let deadline = Instant::now() + diff_scan_duration(deadline_ms);
+    check_diff_deadline(deadline)?;
+    let repo = open_physical_bare_repository(&path)?;
+    let commit_oid = gix_hash::ObjectId::from_hex(oid.as_bytes())
+        .map_err(|error| native_error("commit_not_found", error))?;
+    let commit = find_graph_commit(&repo, commit_oid, CommitPosition::Tip)?;
+    let decoded = commit
+        .decode()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let new_tree_oid = decoded.tree();
+    let first_parent = decoded.parents().next();
+    drop(decoded);
+    drop(commit);
+    check_diff_deadline(deadline)?;
 
-    if let Some(parent_id) = commit.parent_ids().next() {
-        let parent = parent_id
-            .object()
-            .map_err(|error| native_error("corrupt_repository", error))?
-            .peel_to_commit()
-            .map_err(|error| native_error("corrupt_repository", error))?;
-        collect_tree_entries(
-            parent
-                .tree()
-                .map_err(|error| native_error("corrupt_repository", error))?,
-            "",
-            &mut old_entries,
-        )?;
-    }
-
-    collect_tree_entries(
-        commit
-            .tree()
-            .map_err(|error| native_error("corrupt_repository", error))?,
-        "",
-        &mut new_entries,
-    )?;
-
-    let paths: BTreeSet<String> = old_entries
-        .keys()
-        .chain(new_entries.keys())
-        .cloned()
-        .collect();
-    let mut files = Vec::new();
-    let mut patch = String::new();
-    let mut truncated = false;
-
-    for path in paths {
-        let old = old_entries.get(&path);
-        let new = new_entries.get(&path);
-
-        if old.map(|entry| &entry.oid) == new.map(|entry| &entry.oid) {
-            continue;
+    let new_tree = load_diff_tree(&repo, new_tree_oid, deadline)?;
+    let old_tree = match first_parent {
+        Some(parent_oid) => {
+            let parent = find_graph_commit(&repo, parent_oid, CommitPosition::Ancestor)?;
+            let parent_tree_oid = parent
+                .decode()
+                .map_err(|error| native_error("corrupt_repository", error))?
+                .tree();
+            load_diff_tree(&repo, parent_tree_oid, deadline)?
         }
+        None => repo.empty_tree(),
+    };
 
-        let status = match (old, new) {
-            (None, Some(_)) => "added",
-            (Some(_), None) => "deleted",
-            (Some(_), Some(_)) => "modified",
-            (None, None) => continue,
-        };
-        let binary = snapshot_is_binary(old) || snapshot_is_binary(new);
+    validate_diff_tree(&repo, &new_tree, deadline)?;
+    validate_diff_tree(&repo, &old_tree, deadline)?;
 
-        files.push((
-            path.clone(),
-            status.to_string(),
-            old.map(|entry| entry.oid.clone()),
-            new.map(|entry| entry.oid.clone()),
-            binary,
-        ));
+    let mut changes = old_tree.changes().map_err(diff_read_error)?;
+    changes.options(|options| {
+        options.track_path().track_rewrites(None);
+    });
+    let mut blob_cache = repo
+        .diff_resource_cache(
+            gix::diff::blob::pipeline::Mode::ToGit,
+            gix::diff::blob::pipeline::WorktreeRoots::default(),
+        )
+        .map_err(diff_read_error)?;
+    blob_cache
+        .options
+        .skip_internal_diff_if_external_is_configured = false;
 
-        append_file_patch(
-            &mut patch,
-            &mut truncated,
-            diff_limit,
-            &path,
-            status,
-            old,
-            new,
-            binary,
+    let mut source = RetainedDiffSource::new(limit.clamp(1, DIFF_SOURCE_LIMIT));
+    let mut files = Vec::with_capacity(DIFF_FILE_LIMIT);
+    let mut changed_files = 0_u64;
+    let mut additions = 0_u64;
+    let mut deletions = 0_u64;
+    let mut callback_error = None;
+
+    let walk_result = changes.for_each_to_obtain_tree(&new_tree, |change| {
+        let result = process_diff_change(
+            change,
+            &repo,
+            &mut blob_cache,
+            &mut source,
+            &mut files,
+            &mut changed_files,
+            &mut additions,
+            &mut deletions,
+            deadline,
         );
-    }
+        blob_cache.clear_resource_cache();
 
-    Ok((files, patch, truncated))
+        match result {
+            Ok(()) => Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(())),
+            Err(error) => {
+                callback_error = Some(error);
+                Ok(std::ops::ControlFlow::Break(()))
+            }
+        }
+    });
+
+    if let Some(error) = callback_error {
+        return Err(error);
+    }
+    walk_result.map_err(diff_read_error)?;
+    check_diff_deadline(deadline)?;
+
+    Ok((
+        files,
+        source.patch,
+        source.truncated,
+        changed_files,
+        additions,
+        deletions,
+    ))
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -2579,200 +2642,665 @@ fn tree_at_path<'repo>(
         .map_err(|error| native_error("corrupt_repository", error))
 }
 
-fn collect_tree_entries(
-    tree: gix::Tree<'_>,
-    prefix: &str,
-    entries: &mut BTreeMap<String, FileSnapshot>,
+fn load_diff_tree<'repo>(
+    repo: &'repo gix::Repository,
+    oid: gix_hash::ObjectId,
+    deadline: Instant,
+) -> Result<gix::Tree<'repo>, NativeError> {
+    check_diff_deadline(deadline)?;
+    let object = match repo.find_object(oid) {
+        Ok(object) => object,
+        Err(error @ gix_object::find::existing::Error::NotFound { .. }) => {
+            return Err(native_error("corrupt_repository", error));
+        }
+        Err(gix_object::find::existing::Error::Find(error)) => {
+            let kind = if error_chain_contains_storage_io(error.as_ref()) {
+                "storage_unavailable"
+            } else {
+                "corrupt_repository"
+            };
+            return Err(native_error(kind, error));
+        }
+    };
+    check_diff_deadline(deadline)?;
+    object
+        .try_into_tree()
+        .map_err(|error| native_error("corrupt_repository", error))
+}
+
+fn validate_diff_tree(
+    repo: &gix::Repository,
+    root: &gix::Tree<'_>,
+    deadline: Instant,
 ) -> Result<(), NativeError> {
-    for entry in tree.iter() {
+    let mut pending = Vec::new();
+    let mut validated = BTreeSet::new();
+    validated.insert(root.id);
+    validate_diff_tree_object(repo, root, &mut pending, deadline)?;
+
+    while let Some(oid) = pending.pop() {
+        check_diff_deadline(deadline)?;
+        if !validated.insert(oid) {
+            continue;
+        }
+        let tree = load_diff_tree(repo, oid, deadline)?;
+        validate_diff_tree_object(repo, &tree, &mut pending, deadline)?;
+    }
+
+    check_diff_deadline(deadline)
+}
+
+fn validate_diff_tree_object(
+    repo: &gix::Repository,
+    tree: &gix::Tree<'_>,
+    pending: &mut Vec<gix_hash::ObjectId>,
+    deadline: Instant,
+) -> Result<(), NativeError> {
+    check_diff_deadline(deadline)?;
+    let actual = gix_object::compute_hash(repo.object_hash(), gix_object::Kind::Tree, &tree.data)
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    if actual != tree.id {
+        return Err(native_error(
+            "corrupt_repository",
+            format_args!(
+                "tree checksum mismatch: expected {}, computed {actual}",
+                tree.id
+            ),
+        ));
+    }
+
+    let mut previous = None;
+    for entry in gix_object::TreeRefIter::from_bytes(&tree.data, tree.id.kind()) {
+        check_diff_deadline(deadline)?;
         let entry = entry.map_err(|error| native_error("corrupt_repository", error))?;
-        let filename = entry.filename().to_string();
-        let path = if prefix.is_empty() {
-            filename
-        } else {
-            format!("{prefix}/{filename}")
-        };
+        validate_tree_entry(&mut previous, entry.filename.as_ref(), entry.mode.value())?;
+        if entry.mode.is_tree() {
+            pending.push(entry.oid.to_owned());
+        }
+    }
 
-        match entry.kind() {
-            gix::object::tree::EntryKind::Tree => {
-                let child = entry
-                    .object()
-                    .map_err(|error| native_error("corrupt_repository", error))?
-                    .try_into_tree()
-                    .map_err(|error| native_error("corrupt_repository", error))?;
-                collect_tree_entries(child, &path, entries)?;
-            }
-            gix::object::tree::EntryKind::Blob
-            | gix::object::tree::EntryKind::BlobExecutable
-            | gix::object::tree::EntryKind::Link => {
-                let blob = entry
-                    .object()
-                    .map_err(|error| native_error("corrupt_repository", error))?
-                    .try_into_blob()
-                    .map_err(|error| native_error("corrupt_repository", error))?;
+    check_diff_deadline(deadline)
+}
 
-                entries.insert(
-                    path,
-                    FileSnapshot {
-                        oid: entry.object_id().to_string(),
-                        mode: format!("{:06o}", entry.mode().value()),
-                        data: Some(blob.data.clone()),
-                    },
+fn process_diff_change(
+    change: gix::object::tree::diff::Change<'_, '_, '_>,
+    repo: &gix::Repository,
+    blob_cache: &mut gix::diff::blob::Platform,
+    source: &mut RetainedDiffSource,
+    files: &mut Vec<NativeDiffFile>,
+    changed_files: &mut u64,
+    total_additions: &mut u64,
+    total_deletions: &mut u64,
+    deadline: Instant,
+) -> Result<(), NativeError> {
+    check_diff_deadline(deadline)?;
+    let Some(metadata) = diff_file_metadata(&change)? else {
+        return Ok(());
+    };
+
+    *changed_files = changed_files
+        .checked_add(1)
+        .ok_or_else(|| native_error("corrupt_repository", "changed-file total overflow"))?;
+    let retain_file = files.len() < DIFF_FILE_LIMIT;
+    if !retain_file {
+        source.truncated = true;
+    }
+
+    let verified = verify_diff_resources(repo, &metadata, deadline)?;
+    let content_changed = metadata.old_oid != metadata.new_oid;
+    let mut binary = !diff_modes_are_diffable(&metadata)
+        || verified.old.is_some_and(|resource| resource.binary)
+        || verified.new.is_some_and(|resource| resource.binary);
+    let mut additions = 0_u64;
+    let mut deletions = 0_u64;
+    let mut lines = Vec::new();
+    let mut file_truncated = false;
+
+    if !content_changed {
+        if retain_file {
+            file_truncated |= append_diff_file_header(source, &metadata, binary, false);
+        }
+    } else if binary {
+        if retain_file {
+            file_truncated |= append_diff_file_header(source, &metadata, true, true);
+        }
+    } else {
+        let platform = change.diff(blob_cache).map_err(diff_read_error)?;
+        platform
+            .resource_cache
+            .options
+            .skip_internal_diff_if_external_is_configured = false;
+        let prepared = platform
+            .resource_cache
+            .prepare_diff()
+            .map_err(diff_read_error)?;
+
+        match prepared.operation {
+            gix::diff::blob::platform::prepare_diff::Operation::InternalDiff { algorithm } => {
+                let input = gix::diff::blob::InternedInput::new(
+                    prepared.old.data.as_slice().unwrap_or_default(),
+                    prepared.new.data.as_slice().unwrap_or_default(),
                 );
+                let diff = gix::diff::blob::diff_with_slider_heuristics(algorithm, &input);
+                additions = u64::from(diff.count_additions());
+                deletions = u64::from(diff.count_removals());
+                check_diff_deadline(deadline)?;
+
+                if retain_file {
+                    file_truncated |= append_diff_file_header(source, &metadata, false, true);
+
+                    if !source.truncated {
+                        let consumer = StructuredDiffConsumer {
+                            source,
+                            lines: &mut lines,
+                            file_truncated: &mut file_truncated,
+                            deadline,
+                            old_missing_final_newline_at: verified
+                                .old
+                                .and_then(|resource| resource.missing_final_newline_at),
+                            new_missing_final_newline_at: verified
+                                .new
+                                .and_then(|resource| resource.missing_final_newline_at),
+                        };
+                        gix::diff::blob::UnifiedDiff::new(
+                            &diff,
+                            &input,
+                            consumer,
+                            gix::diff::blob::unified_diff::ContextSize::default(),
+                        )
+                        .consume()
+                        .map_err(|error| {
+                            if error.kind() == std::io::ErrorKind::TimedOut {
+                                native_error(
+                                    "scan_timeout",
+                                    "commit diff exceeded the five-second deadline",
+                                )
+                            } else {
+                                native_error("corrupt_repository", error)
+                            }
+                        })?;
+                    } else {
+                        file_truncated = true;
+                    }
+
+                    file_truncated |= !source.append_parts(&[b"\n"]);
+                }
             }
-            gix::object::tree::EntryKind::Commit => {
-                entries.insert(
-                    path,
-                    FileSnapshot {
-                        oid: entry.object_id().to_string(),
-                        mode: format!("{:06o}", entry.mode().value()),
-                        data: None,
-                    },
-                );
+            gix::diff::blob::platform::prepare_diff::Operation::SourceOrDestinationIsBinary => {
+                binary = true;
+                if retain_file {
+                    file_truncated |= append_diff_file_header(source, &metadata, true, true);
+                }
+            }
+            gix::diff::blob::platform::prepare_diff::Operation::ExternalCommand { .. } => {
+                return Err(native_error(
+                    "corrupt_repository",
+                    "repository-configured external diff command was not disabled",
+                ));
             }
         }
     }
 
-    Ok(())
+    *total_additions = total_additions
+        .checked_add(additions)
+        .ok_or_else(|| native_error("corrupt_repository", "addition total overflow"))?;
+    *total_deletions = total_deletions
+        .checked_add(deletions)
+        .ok_or_else(|| native_error("corrupt_repository", "deletion total overflow"))?;
+
+    if retain_file {
+        files.push((
+            metadata.path,
+            metadata.status.to_string(),
+            metadata.old_oid.map(|oid| oid.to_string()),
+            metadata.new_oid.map(|oid| oid.to_string()),
+            binary,
+            (
+                additions,
+                deletions,
+                file_truncated,
+                if binary { Vec::new() } else { lines },
+            ),
+        ));
+    }
+
+    check_diff_deadline(deadline)
 }
 
-fn append_file_patch(
-    patch: &mut String,
-    truncated: &mut bool,
-    limit: usize,
-    path: &str,
-    status: &str,
-    old: Option<&FileSnapshot>,
-    new: Option<&FileSnapshot>,
+fn diff_file_metadata(
+    change: &gix::object::tree::diff::Change<'_, '_, '_>,
+) -> Result<Option<DiffFileMetadata>, NativeError> {
+    use gix::object::tree::diff::Change;
+
+    let metadata = match change {
+        Change::Addition {
+            location,
+            entry_mode,
+            id,
+            ..
+        } => {
+            if entry_mode.is_tree() {
+                return Ok(None);
+            }
+            DiffFileMetadata {
+                path: location.to_vec(),
+                status: "added",
+                old_oid: None,
+                new_oid: Some(id.detach()),
+                old_mode: None,
+                new_mode: Some(*entry_mode),
+            }
+        }
+        Change::Deletion {
+            location,
+            entry_mode,
+            id,
+            ..
+        } => {
+            if entry_mode.is_tree() {
+                return Ok(None);
+            }
+            DiffFileMetadata {
+                path: location.to_vec(),
+                status: "deleted",
+                old_oid: Some(id.detach()),
+                new_oid: None,
+                old_mode: Some(*entry_mode),
+                new_mode: None,
+            }
+        }
+        Change::Modification {
+            location,
+            previous_entry_mode,
+            previous_id,
+            entry_mode,
+            id,
+        } => {
+            if previous_entry_mode.is_tree() && entry_mode.is_tree() {
+                return Ok(None);
+            }
+            DiffFileMetadata {
+                path: location.to_vec(),
+                status: "modified",
+                old_oid: Some(previous_id.detach()),
+                new_oid: Some(id.detach()),
+                old_mode: Some(*previous_entry_mode),
+                new_mode: Some(*entry_mode),
+            }
+        }
+        Change::Rewrite { .. } => {
+            return Err(native_error(
+                "corrupt_repository",
+                "rewrite detection was not disabled",
+            ));
+        }
+    };
+
+    Ok(Some(metadata))
+}
+
+fn verify_diff_resources(
+    repo: &gix::Repository,
+    metadata: &DiffFileMetadata,
+    deadline: Instant,
+) -> Result<VerifiedDiffResources, NativeError> {
+    let old = verify_diff_resource(repo, metadata.old_mode, metadata.old_oid, deadline)?;
+    let new = if old.is_some()
+        && metadata.old_oid == metadata.new_oid
+        && diff_mode_has_blob_resource(metadata.new_mode)
+    {
+        old
+    } else {
+        verify_diff_resource(repo, metadata.new_mode, metadata.new_oid, deadline)?
+    };
+
+    Ok(VerifiedDiffResources { old, new })
+}
+
+fn verify_diff_resource(
+    repo: &gix::Repository,
+    mode: Option<gix_object::tree::EntryMode>,
+    oid: Option<gix_hash::ObjectId>,
+    deadline: Instant,
+) -> Result<Option<VerifiedDiffResource>, NativeError> {
+    if !diff_mode_has_blob_resource(mode) {
+        return Ok(None);
+    }
+    let oid = oid.ok_or_else(|| {
+        native_error(
+            "corrupt_repository",
+            "diff blob mode is missing its object ID",
+        )
+    })?;
+
+    check_diff_deadline(deadline)?;
+    let object = repo.find_object(oid).map_err(diff_read_error)?;
+    check_diff_deadline(deadline)?;
+    if object.kind != gix_object::Kind::Blob {
+        return Err(native_error(
+            "corrupt_repository",
+            format_args!("diff entry expected blob object, found {}", object.kind),
+        ));
+    }
+
+    let actual = gix_object::compute_hash(repo.object_hash(), object.kind, &object.data)
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    if actual != oid {
+        return Err(native_error(
+            "corrupt_repository",
+            format_args!("object checksum mismatch: expected {oid}, computed {actual}"),
+        ));
+    }
+    check_diff_deadline(deadline)?;
+
+    let mut binary = false;
+    let mut newline_count = 0_usize;
+    for byte in &object.data {
+        binary |= *byte == 0;
+        newline_count = newline_count
+            .checked_add(usize::from(*byte == b'\n'))
+            .ok_or_else(|| native_error("corrupt_repository", "diff line count overflow"))?;
+    }
+    let missing_final_newline = !object.data.is_empty() && !object.data.ends_with(b"\n");
+    let line_count = newline_count
+        .checked_add(usize::from(missing_final_newline))
+        .ok_or_else(|| native_error("corrupt_repository", "diff line count overflow"))?;
+    let line_count = u32::try_from(line_count)
+        .map_err(|_| native_error("corrupt_repository", "diff line count exceeds u32"))?;
+    check_diff_deadline(deadline)?;
+
+    Ok(Some(VerifiedDiffResource {
+        binary,
+        missing_final_newline_at: missing_final_newline.then_some(line_count),
+    }))
+}
+
+fn diff_mode_has_blob_resource(mode: Option<gix_object::tree::EntryMode>) -> bool {
+    mode.is_some_and(|mode| {
+        matches!(
+            mode.kind(),
+            gix_object::tree::EntryKind::Blob
+                | gix_object::tree::EntryKind::BlobExecutable
+                | gix_object::tree::EntryKind::Link
+        )
+    })
+}
+
+fn diff_modes_are_diffable(metadata: &DiffFileMetadata) -> bool {
+    metadata
+        .old_mode
+        .into_iter()
+        .chain(metadata.new_mode)
+        .all(|mode| {
+            matches!(
+                mode.kind(),
+                gix_object::tree::EntryKind::Blob
+                    | gix_object::tree::EntryKind::BlobExecutable
+                    | gix_object::tree::EntryKind::Link
+            )
+        })
+}
+
+fn append_diff_file_header(
+    source: &mut RetainedDiffSource,
+    metadata: &DiffFileMetadata,
     binary: bool,
-) {
-    let old_path = if status == "added" {
-        "/dev/null".to_string()
-    } else {
-        format!("a/{path}")
-    };
-    let new_path = if status == "deleted" {
-        "/dev/null".to_string()
-    } else {
-        format!("b/{path}")
-    };
+    content_changed: bool,
+) -> bool {
+    let path = metadata.path.as_slice();
+    let mut complete = source.append_parts(&[b"diff --git a/", path, b" b/", path, b"\n"]);
 
-    push_line_limited(
-        patch,
-        truncated,
-        limit,
-        &format!("diff --git a/{path} b/{path}"),
-    );
-
-    match (status, old, new) {
-        ("added", _, Some(new)) => {
-            push_line_limited(
-                patch,
-                truncated,
-                limit,
-                &format!("new file mode {}", new.mode),
-            );
+    match (metadata.status, metadata.old_mode, metadata.new_mode) {
+        ("added", _, Some(new_mode)) => {
+            complete &= append_mode_line(source, b"new file mode ", new_mode);
         }
-        ("deleted", Some(old), _) => {
-            push_line_limited(
-                patch,
-                truncated,
-                limit,
-                &format!("deleted file mode {}", old.mode),
-            );
+        ("deleted", Some(old_mode), _) => {
+            complete &= append_mode_line(source, b"deleted file mode ", old_mode);
         }
-        ("modified", Some(old), Some(new)) if old.mode != new.mode => {
-            push_line_limited(patch, truncated, limit, &format!("old mode {}", old.mode));
-            push_line_limited(patch, truncated, limit, &format!("new mode {}", new.mode));
+        ("modified", Some(old_mode), Some(new_mode)) if old_mode != new_mode => {
+            complete &= append_mode_line(source, b"old mode ", old_mode);
+            complete &= append_mode_line(source, b"new mode ", new_mode);
         }
         _ => {}
     }
 
+    if !content_changed {
+        return !complete;
+    }
+
     if binary {
-        push_line_limited(
-            patch,
-            truncated,
+        complete &= append_binary_diff_line(source, metadata.status, path);
+        complete &= source.append_parts(&[b"\n"]);
+    } else {
+        complete &= append_old_diff_header(source, metadata.status, path);
+        complete &= append_new_diff_header(source, metadata.status, path);
+    }
+
+    !complete
+}
+
+fn append_mode_line(
+    source: &mut RetainedDiffSource,
+    prefix: &[u8],
+    mode: gix_object::tree::EntryMode,
+) -> bool {
+    let mode = format!("{:06o}", mode.value());
+    source.append_parts(&[prefix, mode.as_bytes(), b"\n"])
+}
+
+fn append_old_diff_header(source: &mut RetainedDiffSource, status: &str, path: &[u8]) -> bool {
+    if status == "added" {
+        source.append_parts(&[b"--- /dev/null\n"])
+    } else {
+        source.append_parts(&[b"--- a/", path, b"\n"])
+    }
+}
+
+fn append_new_diff_header(source: &mut RetainedDiffSource, status: &str, path: &[u8]) -> bool {
+    if status == "deleted" {
+        source.append_parts(&[b"+++ /dev/null\n"])
+    } else {
+        source.append_parts(&[b"+++ b/", path, b"\n"])
+    }
+}
+
+fn append_binary_diff_line(source: &mut RetainedDiffSource, status: &str, path: &[u8]) -> bool {
+    match status {
+        "added" => source.append_parts(&[b"Binary files /dev/null and b/", path, b" differ\n"]),
+        "deleted" => source.append_parts(&[b"Binary files a/", path, b" and /dev/null differ\n"]),
+        _ => source.append_parts(&[b"Binary files a/", path, b" and b/", path, b" differ\n"]),
+    }
+}
+
+impl RetainedDiffSource {
+    fn new(limit: usize) -> Self {
+        Self {
+            patch: Vec::with_capacity(limit),
             limit,
-            &format!("Binary files {old_path} and {new_path} differ"),
-        );
-        push_line_limited(patch, truncated, limit, "");
-        return;
+            truncated: false,
+        }
     }
 
-    let old_text = snapshot_text(old).unwrap_or_default();
-    let new_text = snapshot_text(new).unwrap_or_default();
-    let old_lines: Vec<&str> = old_text.lines().collect();
-    let new_lines: Vec<&str> = new_text.lines().collect();
-    let old_start = if old_lines.is_empty() { 0 } else { 1 };
-    let new_start = if new_lines.is_empty() { 0 } else { 1 };
-
-    push_line_limited(patch, truncated, limit, &format!("--- {old_path}"));
-    push_line_limited(patch, truncated, limit, &format!("+++ {new_path}"));
-    push_line_limited(
-        patch,
-        truncated,
-        limit,
-        &format!(
-            "@@ -{},{} +{},{} @@",
-            old_start,
-            old_lines.len(),
-            new_start,
-            new_lines.len()
-        ),
-    );
-
-    for line in old_lines {
-        push_line_limited(patch, truncated, limit, &format!("-{line}"));
-    }
-
-    for line in new_lines {
-        push_line_limited(patch, truncated, limit, &format!("+{line}"));
-    }
-
-    push_line_limited(patch, truncated, limit, "");
-}
-
-fn snapshot_is_binary(snapshot: Option<&FileSnapshot>) -> bool {
-    match snapshot.and_then(|entry| entry.data.as_ref()) {
-        Some(data) => data.contains(&0) || std::str::from_utf8(data).is_err(),
-        None => snapshot.is_some(),
-    }
-}
-
-fn snapshot_text(snapshot: Option<&FileSnapshot>) -> Option<&str> {
-    snapshot
-        .and_then(|entry| entry.data.as_ref())
-        .and_then(|data| std::str::from_utf8(data).ok())
-}
-
-fn push_line_limited(output: &mut String, truncated: &mut bool, limit: usize, line: &str) {
-    push_limited(output, truncated, limit, line);
-    push_limited(output, truncated, limit, "\n");
-}
-
-fn push_limited(output: &mut String, truncated: &mut bool, limit: usize, text: &str) {
-    if *truncated {
-        return;
-    }
-
-    if output.len() + text.len() <= limit {
-        output.push_str(text);
-        return;
-    }
-
-    let remaining = limit.saturating_sub(output.len());
-
-    if remaining > 0 {
-        let mut end = remaining.min(text.len());
-
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
+    fn append_parts(&mut self, parts: &[&[u8]]) -> bool {
+        if self.truncated {
+            return false;
         }
 
-        output.push_str(&text[..end]);
+        let size = match parts
+            .iter()
+            .try_fold(0_usize, |size, part| size.checked_add(part.len()))
+        {
+            Some(size) => size,
+            None => {
+                self.truncated = true;
+                return false;
+            }
+        };
+        let remaining = self.limit.saturating_sub(self.patch.len());
+
+        if size <= remaining {
+            for part in parts {
+                self.patch.extend_from_slice(part);
+            }
+            return true;
+        }
+
+        self.truncated = true;
+        false
+    }
+}
+
+struct StructuredDiffConsumer<'a> {
+    source: &'a mut RetainedDiffSource,
+    lines: &'a mut Vec<NativeDiffLine>,
+    file_truncated: &'a mut bool,
+    deadline: Instant,
+    old_missing_final_newline_at: Option<u32>,
+    new_missing_final_newline_at: Option<u32>,
+}
+
+impl gix::diff::blob::unified_diff::ConsumeHunk for StructuredDiffConsumer<'_> {
+    type Out = ();
+
+    fn consume_hunk(
+        &mut self,
+        header: gix::diff::blob::unified_diff::HunkHeader,
+        lines: &[(gix::diff::blob::unified_diff::DiffLineKind, &[u8])],
+    ) -> std::io::Result<()> {
+        self.check_deadline()?;
+        let displayed_old_start = if header.before_hunk_len == 0 {
+            header.before_hunk_start.saturating_sub(1)
+        } else {
+            header.before_hunk_start
+        };
+        let displayed_new_start = if header.after_hunk_len == 0 {
+            header.after_hunk_start.saturating_sub(1)
+        } else {
+            header.after_hunk_start
+        };
+        let header_content = format!(
+            "@@ -{},{} +{},{} @@",
+            displayed_old_start, header.before_hunk_len, displayed_new_start, header.after_hunk_len
+        )
+        .into_bytes();
+        self.append_line(
+            "hunk",
+            Some(displayed_old_start),
+            Some(displayed_new_start),
+            &header_content,
+            b"",
+        );
+
+        let mut old_line = header.before_hunk_start;
+        let mut new_line = header.after_hunk_start;
+        for (kind, content) in lines {
+            self.check_deadline()?;
+            match kind {
+                gix::diff::blob::unified_diff::DiffLineKind::Context => {
+                    self.append_line("context", Some(old_line), Some(new_line), content, b" ");
+                    old_line = old_line.saturating_add(1);
+                    new_line = new_line.saturating_add(1);
+                }
+                gix::diff::blob::unified_diff::DiffLineKind::Add => {
+                    self.append_line("added", None, Some(new_line), content, b"+");
+                    new_line = new_line.saturating_add(1);
+                }
+                gix::diff::blob::unified_diff::DiffLineKind::Remove => {
+                    self.append_line("deleted", Some(old_line), None, content, b"-");
+                    old_line = old_line.saturating_add(1);
+                }
+            }
+        }
+        Ok(())
     }
 
-    *truncated = true;
+    fn finish(self) -> Self::Out {}
+}
+
+impl StructuredDiffConsumer<'_> {
+    fn append_line(
+        &mut self,
+        kind: &'static str,
+        old_line: Option<u32>,
+        new_line: Option<u32>,
+        content: &[u8],
+        prefix: &[u8],
+    ) {
+        let needs_missing_newline_marker = match kind {
+            "deleted" => self
+                .old_missing_final_newline_at
+                .is_some_and(|line| old_line == Some(line)),
+            "added" => self
+                .new_missing_final_newline_at
+                .is_some_and(|line| new_line == Some(line)),
+            "context" => {
+                self.old_missing_final_newline_at
+                    .is_some_and(|line| old_line == Some(line))
+                    || self
+                        .new_missing_final_newline_at
+                        .is_some_and(|line| new_line == Some(line))
+            }
+            _ => false,
+        };
+        let has_line_terminator = content.ends_with(b"\n");
+        let retained = if needs_missing_newline_marker {
+            let separator = if has_line_terminator {
+                b"".as_slice()
+            } else {
+                b"\n".as_slice()
+            };
+            self.source
+                .append_parts(&[prefix, content, separator, NO_FINAL_NEWLINE_MARKER])
+        } else if has_line_terminator {
+            self.source.append_parts(&[prefix, content])
+        } else {
+            self.source.append_parts(&[prefix, content, b"\n"])
+        };
+
+        if retained {
+            self.lines.push((
+                kind.to_string(),
+                old_line,
+                new_line,
+                diff_line_content(content).to_vec(),
+            ));
+        } else {
+            *self.file_truncated = true;
+        }
+    }
+
+    fn check_deadline(&self) -> std::io::Result<()> {
+        if Instant::now() >= self.deadline {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "commit diff exceeded the five-second deadline",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn diff_line_content(content: &[u8]) -> &[u8] {
+    let Some(without_lf) = content.strip_suffix(b"\n") else {
+        return content;
+    };
+    without_lf.strip_suffix(b"\r").unwrap_or(without_lf)
+}
+
+fn diff_scan_duration(deadline_ms: u64) -> Duration {
+    Duration::from_millis(deadline_ms.min(DIFF_SCAN_DEADLINE.as_millis() as u64))
+}
+
+fn check_diff_deadline(deadline: Instant) -> Result<(), NativeError> {
+    if Instant::now() >= deadline {
+        Err(native_error(
+            "scan_timeout",
+            "commit diff exceeded the five-second deadline",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn safe_relative_path(path: &str) -> Result<PathBuf, NativeError> {

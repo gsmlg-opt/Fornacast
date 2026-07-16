@@ -3078,6 +3078,867 @@ defmodule GitCore.RepositoryReadModelTest do
   end
 end
 
+defmodule GitCore.StructuredDiffTest do
+  use ExUnit.Case, async: false
+
+  @moduletag :diffs
+  @diff_source_limit 200_000
+
+  @tag :tmp_dir
+  test "returns real structured hunks and exact stats for root and first-parent diffs", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = structured_diff_fixture!(tmp_dir)
+
+    assert {:ok,
+            %GitCore.CommitDiff{
+              changed_files: 4,
+              additions: 4,
+              deletions: 3,
+              truncated: false,
+              files: files,
+              patch: patch
+            }} = GitCore.diff_commit(fixture.repo_path, fixture.commit_oid)
+
+    assert ["added.txt", "asset.bin", "deleted.txt", "multi.txt"] ==
+             Enum.map(files, & &1.path)
+
+    assert %GitCore.DiffFile{
+             status: :added,
+             old_oid: nil,
+             new_oid: added_oid,
+             binary: false,
+             additions: 2,
+             deletions: 0,
+             truncated: false,
+             lines: added_lines
+           } = diff_file!(files, "added.txt")
+
+    assert is_binary(added_oid)
+    assert Enum.any?(added_lines, &match?(%GitCore.DiffLine{type: :added}, &1))
+
+    assert Enum.any?(
+             added_lines,
+             &match?(%GitCore.DiffLine{type: :hunk, old_line: 0, new_line: 1}, &1)
+           )
+
+    assert patch =~ "@@ -0,0 +1,2 @@"
+
+    assert %GitCore.DiffFile{
+             status: :deleted,
+             old_oid: deleted_oid,
+             new_oid: nil,
+             binary: false,
+             additions: 0,
+             deletions: 1,
+             truncated: false
+           } = diff_file!(files, "deleted.txt")
+
+    assert is_binary(deleted_oid)
+    assert patch =~ "@@ -1,1 +0,0 @@"
+
+    assert %GitCore.DiffFile{
+             status: :added,
+             binary: true,
+             additions: 0,
+             deletions: 0,
+             truncated: false,
+             lines: []
+           } = diff_file!(files, "asset.bin")
+
+    assert %GitCore.DiffFile{
+             status: :modified,
+             binary: false,
+             additions: 2,
+             deletions: 2,
+             truncated: false,
+             lines: multi_lines
+           } = diff_file!(files, "multi.txt")
+
+    assert [
+             %GitCore.DiffLine{type: :hunk, old_line: 1, new_line: 1},
+             %GitCore.DiffLine{type: :hunk}
+           ] = Enum.filter(multi_lines, &(&1.type == :hunk))
+
+    assert %GitCore.DiffLine{type: :context, old_line: 1, new_line: 1, content: "line 01"} in multi_lines
+
+    assert %GitCore.DiffLine{type: :deleted, old_line: 2, new_line: nil, content: "line 02"} in multi_lines
+
+    assert %GitCore.DiffLine{type: :added, old_line: nil, new_line: 2, content: "changed 02"} in multi_lines
+
+    assert patch =~ "diff --git a/multi.txt b/multi.txt"
+    assert patch =~ "-line 02"
+    assert patch =~ "+changed 02"
+    refute File.exists?(fixture.external_filter_marker)
+
+    assert {:ok,
+            %GitCore.CommitDiff{
+              changed_files: 3,
+              additions: 23,
+              deletions: 0,
+              truncated: false,
+              files: root_files,
+              patch: root_patch
+            }} = GitCore.diff_commit(fixture.repo_path, fixture.root_oid)
+
+    assert Enum.all?(root_files, &(&1.status == :added))
+    assert root_patch =~ "diff --git a/multi.txt b/multi.txt"
+
+    assert {:ok,
+            %GitCore.CommitDiff{
+              changed_files: 1,
+              additions: 1,
+              deletions: 0,
+              files: [
+                %GitCore.DiffFile{
+                  path: "side-only.txt",
+                  status: :added,
+                  additions: 1,
+                  deletions: 0
+                }
+              ]
+            }} = GitCore.diff_commit(fixture.repo_path, fixture.merge_oid)
+  end
+
+  @tag :tmp_dir
+  test "preserves storage I/O classification while diffing blob resources", %{tmp_dir: tmp_dir} do
+    fixture = structured_diff_fixture!(tmp_dir)
+
+    blob_oid =
+      git!(["--git-dir", fixture.repo_path, "rev-parse", "#{fixture.commit_oid}:multi.txt"])
+
+    object_path = loose_object_path(fixture.repo_path, blob_oid)
+    assert File.regular?(object_path)
+    File.chmod!(object_path, 0o000)
+
+    assert_error(
+      GitCore.diff_commit(fixture.repo_path, fixture.commit_oid),
+      :storage_unavailable,
+      :diff_commit
+    )
+  end
+
+  @tag :tmp_dir
+  test "rejects diff bodies stored under a false blob OID", %{tmp_dir: tmp_dir} do
+    fixture = aliased_diff_blob_fixture!(tmp_dir, "forged diff body\n")
+
+    refute fixture.canonical_oid == fixture.fake_oid
+    assert File.regular?(loose_object_path(fixture.repo_path, fixture.fake_oid))
+
+    assert_error(
+      GitCore.diff_commit(fixture.repo_path, fixture.commit_oid),
+      :corrupt_repository,
+      :diff_commit
+    )
+  end
+
+  @tag :tmp_dir
+  test "rejects duplicate names in the new diff tree", %{tmp_dir: tmp_dir} do
+    fixture = malformed_diff_tree_fixture!(tmp_dir, :duplicate_new)
+
+    assert_error(
+      GitCore.diff_commit(fixture.repo_path, fixture.commit_oid),
+      :corrupt_repository,
+      :diff_commit
+    )
+  end
+
+  @tag :tmp_dir
+  test "rejects noncanonical entry order in the parent diff tree", %{tmp_dir: tmp_dir} do
+    fixture = malformed_diff_tree_fixture!(tmp_dir, :unsorted_parent)
+
+    assert_error(
+      GitCore.diff_commit(fixture.repo_path, fixture.commit_oid),
+      :corrupt_repository,
+      :diff_commit
+    )
+  end
+
+  @tag :tmp_dir
+  test "retains at most one thousand sections while finishing exact totals", %{tmp_dir: tmp_dir} do
+    fixture = many_file_diff_fixture!(tmp_dir, 1_001)
+
+    assert {:ok,
+            %GitCore.CommitDiff{
+              changed_files: 1_001,
+              additions: 1_001,
+              deletions: 0,
+              truncated: true,
+              files: files,
+              patch: patch
+            }} = GitCore.diff_commit(fixture.repo_path, fixture.commit_oid)
+
+    assert length(files) == 1_000
+    assert Enum.all?(files, &match?(%GitCore.DiffFile{status: :added, additions: 1}, &1))
+    assert Enum.all?(files, &(&1.truncated == false))
+    assert Enum.map(files, & &1.path) == Enum.map(1..1_000, &file_name/1)
+    assert files |> Enum.map(& &1.path) |> Enum.uniq() |> length() == 1_000
+    assert byte_size(patch) <= @diff_source_limit
+  end
+
+  @tag :tmp_dir
+  test "shares one bounded source budget between compatibility patch and structured lines", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = large_diff_fixture!(tmp_dir, 30_000)
+
+    assert {:ok,
+            %GitCore.CommitDiff{
+              changed_files: 1,
+              additions: 30_000,
+              deletions: 30_000,
+              truncated: true,
+              files: [file],
+              patch: patch
+            }} =
+             GitCore.diff_commit(
+               fixture.repo_path,
+               fixture.commit_oid,
+               limit: @diff_source_limit * 3
+             )
+
+    assert %GitCore.DiffFile{
+             status: :modified,
+             additions: 30_000,
+             deletions: 30_000,
+             truncated: true,
+             binary: false,
+             lines: [_ | _] = lines
+           } = file
+
+    assert byte_size(patch) in 199_000..@diff_source_limit
+    assert retained_line_source_bytes(lines) <= byte_size(patch)
+
+    assert structured_patch_lines(lines) ==
+             patch |> retained_patch_lines() |> Enum.take(length(lines))
+
+    assert length(lines) < 60_001
+  end
+
+  @tag :tmp_dir
+  test "retains only complete shared diff records at the source boundary", %{tmp_dir: tmp_dir} do
+    fixture = boundary_diff_fixture!(tmp_dir)
+
+    assert {:ok, %GitCore.CommitDiff{patch: full_patch}} =
+             GitCore.diff_commit(fixture.repo_path, fixture.commit_oid)
+
+    limit = byte_size(full_patch) - 3
+
+    assert {:ok,
+            %GitCore.CommitDiff{
+              truncated: true,
+              patch: patch,
+              files: [%GitCore.DiffFile{truncated: true, lines: lines}]
+            }} = GitCore.diff_commit(fixture.repo_path, fixture.commit_oid, limit: limit)
+
+    assert byte_size(patch) < limit
+    assert binary_part(full_patch, 0, byte_size(patch)) == patch
+    assert String.ends_with?(patch, "-old\n")
+    assert Enum.map(lines, & &1.type) == [:hunk, :deleted]
+    assert structured_patch_lines(lines) == retained_patch_lines(patch)
+  end
+
+  @tag :tmp_dir
+  test "emits and atomically budgets missing-final-newline markers", %{tmp_dir: tmp_dir} do
+    fixture = missing_newline_diff_fixture!(tmp_dir)
+
+    assert {:ok,
+            %GitCore.CommitDiff{
+              truncated: false,
+              patch: full_patch,
+              files: [%GitCore.DiffFile{lines: full_lines}]
+            }} = GitCore.diff_commit(fixture.repo_path, fixture.commit_oid)
+
+    marker = "\\ No newline at end of file\n"
+    assert full_patch =~ "-old\n#{marker}+new\n#{marker}"
+
+    assert Enum.map(full_lines, &{&1.type, &1.content}) == [
+             {:hunk, "@@ -1,1 +1,1 @@"},
+             {:deleted, "old"},
+             {:added, "new"}
+           ]
+
+    {added_offset, _length} = :binary.match(full_patch, "+new\n")
+    limit = added_offset + byte_size("+new\n") + 2
+
+    assert {:ok,
+            %GitCore.CommitDiff{
+              truncated: true,
+              patch: patch,
+              files: [%GitCore.DiffFile{truncated: true, lines: lines}]
+            }} = GitCore.diff_commit(fixture.repo_path, fixture.commit_oid, limit: limit)
+
+    assert patch == binary_part(full_patch, 0, added_offset)
+    assert String.ends_with?(patch, marker)
+    assert Enum.map(lines, & &1.type) == [:hunk, :deleted]
+  end
+
+  @tag :tmp_dir
+  test "counts and renders adding only a final LF", %{tmp_dir: tmp_dir} do
+    fixture = newline_exactness_fixture!(tmp_dir, "line", "line\n", "add-final-lf")
+
+    assert {:ok,
+            %GitCore.CommitDiff{
+              changed_files: 1,
+              additions: 1,
+              deletions: 1,
+              patch: patch,
+              files: [%GitCore.DiffFile{additions: 1, deletions: 1, lines: lines}]
+            }} = GitCore.diff_commit(fixture.repo_path, fixture.commit_oid)
+
+    marker = "\\ No newline at end of file\n"
+    assert patch =~ "-line\n#{marker}+line\n"
+    refute String.ends_with?(patch, marker <> "\n")
+
+    assert Enum.map(lines, &{&1.type, &1.content}) == [
+             {:hunk, "@@ -1,1 +1,1 @@"},
+             {:deleted, "line"},
+             {:added, "line"}
+           ]
+  end
+
+  @tag :tmp_dir
+  test "counts and renders removing only a final LF", %{tmp_dir: tmp_dir} do
+    fixture = newline_exactness_fixture!(tmp_dir, "line\n", "line", "remove-final-lf")
+
+    assert {:ok,
+            %GitCore.CommitDiff{
+              changed_files: 1,
+              additions: 1,
+              deletions: 1,
+              patch: patch,
+              files: [%GitCore.DiffFile{additions: 1, deletions: 1, lines: lines}]
+            }} = GitCore.diff_commit(fixture.repo_path, fixture.commit_oid)
+
+    marker = "\\ No newline at end of file\n"
+    assert patch =~ "-line\n+line\n#{marker}"
+
+    assert Enum.map(lines, &{&1.type, &1.content}) == [
+             {:hunk, "@@ -1,1 +1,1 @@"},
+             {:deleted, "line"},
+             {:added, "line"}
+           ]
+  end
+
+  @tag :tmp_dir
+  test "counts an earlier edit and one-sided EOF LF independently", %{tmp_dir: tmp_dir} do
+    fixture =
+      newline_exactness_fixture!(
+        tmp_dir,
+        "first\nlast",
+        "changed\nlast\n",
+        "edit-and-final-lf"
+      )
+
+    assert {:ok,
+            %GitCore.CommitDiff{
+              changed_files: 1,
+              additions: 2,
+              deletions: 2,
+              patch: patch,
+              files: [%GitCore.DiffFile{additions: 2, deletions: 2, lines: lines}]
+            }} = GitCore.diff_commit(fixture.repo_path, fixture.commit_oid)
+
+    assert patch =~ "-first\n"
+    assert patch =~ "-last\n\\ No newline at end of file\n"
+    assert patch =~ "+changed\n"
+    assert patch =~ "+last\n"
+
+    assert Enum.map(lines, &{&1.type, &1.content}) == [
+             {:hunk, "@@ -1,2 +1,2 @@"},
+             {:deleted, "first"},
+             {:deleted, "last"},
+             {:added, "changed"},
+             {:added, "last"}
+           ]
+  end
+
+  @tag :tmp_dir
+  test "emits metadata only for a mode-only binary diff", %{tmp_dir: tmp_dir} do
+    fixture = mode_only_binary_diff_fixture!(tmp_dir)
+
+    assert {:ok,
+            %GitCore.CommitDiff{
+              changed_files: 1,
+              additions: 0,
+              deletions: 0,
+              truncated: false,
+              patch: patch,
+              files: [
+                %GitCore.DiffFile{
+                  status: :modified,
+                  old_oid: oid,
+                  new_oid: oid,
+                  binary: true,
+                  additions: 0,
+                  deletions: 0,
+                  lines: []
+                }
+              ]
+            }} = GitCore.diff_commit(fixture.repo_path, fixture.commit_oid)
+
+    assert patch =~ "old mode 100644\nnew mode 100755\n"
+    refute patch =~ "Binary files"
+    refute patch =~ "--- "
+    refute patch =~ "+++ "
+  end
+
+  @tag :tmp_dir
+  test "returns a typed timeout instead of partial exact totals", %{tmp_dir: tmp_dir} do
+    fixture = many_file_diff_fixture!(tmp_dir, 2)
+
+    assert_error(
+      GitCore.diff_commit(fixture.repo_path, fixture.commit_oid, deadline_ms: 0),
+      :scan_timeout,
+      :diff_commit
+    )
+  end
+
+  test "cannot bypass the supervised global scan limiter" do
+    isolated_limiter =
+      start_supervised!({GitCore.ScanLimiter, server: nil}, id: make_ref())
+
+    holders = for _ <- 1..4, do: start_global_scan_holder()
+
+    Enum.each(holders, fn holder ->
+      assert_receive {:global_diff_scan_entered, ^holder}, 1_000
+    end)
+
+    missing_path =
+      Path.join(System.tmp_dir!(), "missing-diff-scan-#{System.unique_integer([:positive])}.git")
+
+    try do
+      assert_error(
+        GitCore.diff_commit(
+          missing_path,
+          String.duplicate("f", 40),
+          scan_limiter: isolated_limiter
+        ),
+        :scan_busy,
+        :diff_commit
+      )
+    after
+      Enum.each(holders, &send(&1, :release))
+
+      Enum.each(holders, fn holder ->
+        assert_receive {:global_diff_scan_finished, ^holder, :released}, 1_000
+      end)
+    end
+  end
+
+  defp structured_diff_fixture!(tmp_dir) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "structured-diff-#{suffix}.git")
+    work_path = Path.join(tmp_dir, "structured-diff-work-#{suffix}")
+    external_filter_marker = Path.join(tmp_dir, "external-diff-ran-#{suffix}")
+
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    git!(["init", "--object-format=sha1", work_path])
+
+    File.write!(
+      Path.join(work_path, ".gitattributes"),
+      "*.txt diff=external\n*.bin diff=external\n"
+    )
+
+    File.write!(Path.join(work_path, "deleted.txt"), "remove me\n")
+
+    File.write!(
+      Path.join(work_path, "multi.txt"),
+      Enum.map_join(1..20, "", &"line #{String.pad_leading(Integer.to_string(&1), 2, "0")}\n")
+    )
+
+    git!(["-C", work_path, "add", "."])
+    git!(["-C", work_path, "commit", "-m", "root diff fixture"])
+    root_oid = git!(["-C", work_path, "rev-parse", "HEAD"])
+    git!(["-C", work_path, "branch", "-M", "main"])
+
+    updated_lines =
+      1..20
+      |> Enum.map(fn
+        2 -> "changed 02\n"
+        18 -> "changed 18\n"
+        index -> "line #{String.pad_leading(Integer.to_string(index), 2, "0")}\n"
+      end)
+      |> IO.iodata_to_binary()
+
+    File.write!(Path.join(work_path, "multi.txt"), updated_lines)
+    File.write!(Path.join(work_path, "added.txt"), "first added\nsecond added\n")
+    File.write!(Path.join(work_path, "asset.bin"), <<0, 1, 2, 3, 4>>)
+    File.rm!(Path.join(work_path, "deleted.txt"))
+    git!(["-C", work_path, "add", "-A"])
+    git!(["-C", work_path, "commit", "-m", "structured diff fixture"])
+    commit_oid = git!(["-C", work_path, "rev-parse", "HEAD"])
+
+    git!(["-C", work_path, "switch", "-c", "side", root_oid])
+    File.write!(Path.join(work_path, "side-only.txt"), "side branch\n")
+    git!(["-C", work_path, "add", "side-only.txt"])
+    git!(["-C", work_path, "commit", "-m", "side branch"])
+    git!(["-C", work_path, "switch", "main"])
+    git!(["-C", work_path, "merge", "--no-ff", "side", "-m", "merge side"])
+    merge_oid = git!(["-C", work_path, "rev-parse", "HEAD"])
+    git!(["-C", work_path, "remote", "add", "origin", repo_path])
+    git!(["-C", work_path, "push", "origin", "HEAD:refs/heads/main"])
+    git!(["--git-dir", repo_path, "symbolic-ref", "HEAD", "refs/heads/main"])
+
+    git!([
+      "--git-dir",
+      repo_path,
+      "config",
+      "diff.external.command",
+      "touch #{external_filter_marker}"
+    ])
+
+    git!([
+      "--git-dir",
+      repo_path,
+      "config",
+      "diff.external.textconv",
+      "touch #{external_filter_marker}"
+    ])
+
+    %{
+      repo_path: repo_path,
+      root_oid: root_oid,
+      commit_oid: commit_oid,
+      merge_oid: merge_oid,
+      external_filter_marker: external_filter_marker
+    }
+  end
+
+  defp many_file_diff_fixture!(tmp_dir, count) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "many-file-diff-#{suffix}.git")
+    work_path = Path.join(tmp_dir, "many-file-diff-work-#{suffix}")
+
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    git!(["init", "--object-format=sha1", work_path])
+
+    for index <- 1..count do
+      File.write!(Path.join(work_path, file_name(index)), "x\n")
+    end
+
+    git!(["-C", work_path, "add", "."])
+    git!(["-C", work_path, "commit", "-m", "many file diff"])
+    commit_oid = git!(["-C", work_path, "rev-parse", "HEAD"])
+    git!(["-C", work_path, "remote", "add", "origin", repo_path])
+    git!(["-C", work_path, "push", "origin", "HEAD:refs/heads/main"])
+
+    %{repo_path: repo_path, commit_oid: commit_oid}
+  end
+
+  defp aliased_diff_blob_fixture!(tmp_dir, data) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "aliased-diff-#{suffix}.git")
+    tree_path = Path.join(tmp_dir, "aliased-diff-tree-#{suffix}")
+    fake_oid = String.duplicate("2", 40)
+
+    canonical_oid =
+      :crypto.hash(:sha, "blob #{byte_size(data)}\0" <> data)
+      |> Base.encode16(case: :lower)
+
+    loose_path = loose_object_path(repo_path, fake_oid)
+
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    File.mkdir_p!(Path.dirname(loose_path))
+    File.write!(loose_path, :zlib.compress("blob #{byte_size(data)}\0" <> data))
+    File.write!(tree_path, "100644 aliased.txt\0" <> oid_bytes(fake_oid))
+
+    tree_oid =
+      git!([
+        "--git-dir",
+        repo_path,
+        "hash-object",
+        "--literally",
+        "-t",
+        "tree",
+        "-w",
+        tree_path
+      ])
+
+    commit_oid = git!(["--git-dir", repo_path, "commit-tree", tree_oid, "-m", "aliased diff"])
+
+    %{
+      repo_path: repo_path,
+      commit_oid: commit_oid,
+      fake_oid: fake_oid,
+      canonical_oid: canonical_oid
+    }
+  end
+
+  defp malformed_diff_tree_fixture!(tmp_dir, kind) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "malformed-diff-tree-#{kind}-#{suffix}.git")
+    blob_path = Path.join(tmp_dir, "malformed-diff-blob-#{suffix}")
+
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    File.write!(blob_path, "tree validation body\n")
+    blob_oid = git!(["--git-dir", repo_path, "hash-object", "-w", blob_path])
+
+    commit_oid =
+      case kind do
+        :duplicate_new ->
+          tree_oid =
+            write_raw_diff_tree!(tmp_dir, repo_path, "duplicate-new-#{suffix}", [
+              {"100644", "duplicate.txt", blob_oid},
+              {"100644", "duplicate.txt", blob_oid}
+            ])
+
+          git!(["--git-dir", repo_path, "commit-tree", tree_oid, "-m", "duplicate new tree"])
+
+        :unsorted_parent ->
+          parent_tree_oid =
+            write_raw_diff_tree!(tmp_dir, repo_path, "unsorted-parent-#{suffix}", [
+              {"100644", "z-last.txt", blob_oid},
+              {"100644", "a-first.txt", blob_oid}
+            ])
+
+          parent_oid =
+            git!([
+              "--git-dir",
+              repo_path,
+              "commit-tree",
+              parent_tree_oid,
+              "-m",
+              "unsorted parent tree"
+            ])
+
+          new_tree_oid =
+            write_raw_diff_tree!(tmp_dir, repo_path, "canonical-new-#{suffix}", [
+              {"100644", "replacement.txt", blob_oid}
+            ])
+
+          git!([
+            "--git-dir",
+            repo_path,
+            "commit-tree",
+            new_tree_oid,
+            "-p",
+            parent_oid,
+            "-m",
+            "canonical child tree"
+          ])
+      end
+
+    %{repo_path: repo_path, commit_oid: commit_oid}
+  end
+
+  defp write_raw_diff_tree!(tmp_dir, repo_path, name, entries) do
+    path = Path.join(tmp_dir, name)
+
+    contents =
+      entries
+      |> Enum.map(fn {mode, entry_name, oid} ->
+        [mode, " ", entry_name, <<0>>, oid_bytes(oid)]
+      end)
+      |> IO.iodata_to_binary()
+
+    File.write!(path, contents)
+    git!(["--git-dir", repo_path, "hash-object", "--literally", "-t", "tree", "-w", path])
+  end
+
+  defp large_diff_fixture!(tmp_dir, line_count) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "large-diff-#{suffix}.git")
+    work_path = Path.join(tmp_dir, "large-diff-work-#{suffix}")
+
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    git!(["init", "--object-format=sha1", work_path])
+
+    old_payload =
+      Enum.map_join(1..line_count, "", fn index ->
+        "old-value-#{String.pad_leading("#{index}", 5, "0")}\n"
+      end)
+
+    payload =
+      Enum.map_join(1..line_count, "", fn index ->
+        "payload-#{String.pad_leading("#{index}", 5, "0")}\n"
+      end)
+
+    assert byte_size(payload) > @diff_source_limit
+    File.write!(Path.join(work_path, "large.txt"), old_payload)
+    git!(["-C", work_path, "add", "."])
+    git!(["-C", work_path, "commit", "-m", "large diff base"])
+    File.write!(Path.join(work_path, "large.txt"), payload)
+    git!(["-C", work_path, "add", "large.txt"])
+    git!(["-C", work_path, "commit", "-m", "large diff replacement"])
+    commit_oid = git!(["-C", work_path, "rev-parse", "HEAD"])
+    git!(["-C", work_path, "remote", "add", "origin", repo_path])
+    git!(["-C", work_path, "push", "origin", "HEAD:refs/heads/main"])
+
+    %{repo_path: repo_path, commit_oid: commit_oid}
+  end
+
+  defp boundary_diff_fixture!(tmp_dir) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "boundary-diff-#{suffix}.git")
+    work_path = Path.join(tmp_dir, "boundary-diff-work-#{suffix}")
+
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    git!(["init", "--object-format=sha1", work_path])
+    File.write!(Path.join(work_path, "boundary.txt"), "old\n")
+    git!(["-C", work_path, "add", "boundary.txt"])
+    git!(["-C", work_path, "commit", "-m", "boundary diff base"])
+    File.write!(Path.join(work_path, "boundary.txt"), "new\n")
+    git!(["-C", work_path, "add", "boundary.txt"])
+    git!(["-C", work_path, "commit", "-m", "boundary diff replacement"])
+    commit_oid = git!(["-C", work_path, "rev-parse", "HEAD"])
+    git!(["-C", work_path, "remote", "add", "origin", repo_path])
+    git!(["-C", work_path, "push", "origin", "HEAD:refs/heads/main"])
+
+    %{repo_path: repo_path, commit_oid: commit_oid}
+  end
+
+  defp missing_newline_diff_fixture!(tmp_dir) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "missing-newline-diff-#{suffix}.git")
+    work_path = Path.join(tmp_dir, "missing-newline-diff-work-#{suffix}")
+
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    git!(["init", "--object-format=sha1", work_path])
+    File.write!(Path.join(work_path, "no-newline.txt"), "old")
+    git!(["-C", work_path, "add", "no-newline.txt"])
+    git!(["-C", work_path, "commit", "-m", "missing newline base"])
+    File.write!(Path.join(work_path, "no-newline.txt"), "new")
+    git!(["-C", work_path, "add", "no-newline.txt"])
+    git!(["-C", work_path, "commit", "-m", "missing newline replacement"])
+    commit_oid = git!(["-C", work_path, "rev-parse", "HEAD"])
+    git!(["-C", work_path, "remote", "add", "origin", repo_path])
+    git!(["-C", work_path, "push", "origin", "HEAD:refs/heads/main"])
+
+    %{repo_path: repo_path, commit_oid: commit_oid}
+  end
+
+  defp newline_exactness_fixture!(tmp_dir, old, new, name) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "newline-exactness-#{name}-#{suffix}.git")
+    work_path = Path.join(tmp_dir, "newline-exactness-work-#{name}-#{suffix}")
+    file_path = Path.join(work_path, "newline.txt")
+
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    git!(["init", "--object-format=sha1", work_path])
+    File.write!(file_path, old)
+    git!(["-C", work_path, "add", "newline.txt"])
+    git!(["-C", work_path, "commit", "-m", "newline exactness base"])
+    File.write!(file_path, new)
+    git!(["-C", work_path, "add", "newline.txt"])
+    git!(["-C", work_path, "commit", "-m", "newline exactness change"])
+    commit_oid = git!(["-C", work_path, "rev-parse", "HEAD"])
+    git!(["-C", work_path, "remote", "add", "origin", repo_path])
+    git!(["-C", work_path, "push", "origin", "HEAD:refs/heads/main"])
+
+    %{repo_path: repo_path, commit_oid: commit_oid}
+  end
+
+  defp mode_only_binary_diff_fixture!(tmp_dir) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "mode-only-binary-diff-#{suffix}.git")
+    work_path = Path.join(tmp_dir, "mode-only-binary-diff-work-#{suffix}")
+    file_path = Path.join(work_path, "mode.bin")
+
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    git!(["init", "--object-format=sha1", work_path])
+    File.write!(file_path, <<0, 1, 2, 3>>)
+    File.chmod!(file_path, 0o644)
+    git!(["-C", work_path, "add", "mode.bin"])
+    git!(["-C", work_path, "commit", "-m", "binary mode base"])
+    File.chmod!(file_path, 0o755)
+    git!(["-C", work_path, "add", "mode.bin"])
+    git!(["-C", work_path, "commit", "-m", "binary mode change"])
+    commit_oid = git!(["-C", work_path, "rev-parse", "HEAD"])
+    git!(["-C", work_path, "remote", "add", "origin", repo_path])
+    git!(["-C", work_path, "push", "origin", "HEAD:refs/heads/main"])
+
+    %{repo_path: repo_path, commit_oid: commit_oid}
+  end
+
+  defp diff_file!(files, path) do
+    Enum.find(files, &(&1.path == path)) || flunk("missing diff file #{inspect(path)}")
+  end
+
+  defp retained_line_source_bytes(lines) do
+    Enum.reduce(lines, 0, fn line, total ->
+      prefix_size = if line.type == :hunk, do: 0, else: 1
+      total + prefix_size + byte_size(line.content) + 1
+    end)
+  end
+
+  defp structured_patch_lines(lines) do
+    Enum.map(lines, fn
+      %GitCore.DiffLine{type: :hunk, content: content} -> content
+      %GitCore.DiffLine{type: type, content: content} -> diff_prefix(type) <> content
+    end)
+  end
+
+  defp retained_patch_lines(patch) do
+    patch
+    |> String.split("\n")
+    |> Enum.filter(fn line ->
+      String.starts_with?(line, "@@") or
+        (String.starts_with?(line, "+") and not String.starts_with?(line, "+++")) or
+        (String.starts_with?(line, "-") and not String.starts_with?(line, "---")) or
+        String.starts_with?(line, " ")
+    end)
+  end
+
+  defp diff_prefix(:added), do: "+"
+  defp diff_prefix(:deleted), do: "-"
+  defp diff_prefix(:context), do: " "
+
+  defp file_name(index), do: "file-#{String.pad_leading("#{index}", 4, "0")}.txt"
+
+  defp loose_object_path(repo_path, oid) do
+    {directory, filename} = String.split_at(oid, 2)
+    Path.join([repo_path, "objects", directory, filename])
+  end
+
+  defp start_global_scan_holder do
+    parent = self()
+
+    spawn(fn ->
+      result =
+        GitCore.ScanLimiter.with_permit(:diff_busy_contract, fn ->
+          send(parent, {:global_diff_scan_entered, self()})
+
+          receive do
+            :release -> :released
+          end
+        end)
+
+      send(parent, {:global_diff_scan_finished, self(), result})
+    end)
+  end
+
+  defp assert_error(result, expected_kind, expected_operation) do
+    assert {:error,
+            %GitCore.Error{
+              kind: ^expected_kind,
+              operation: ^expected_operation,
+              detail: detail
+            }} = result
+
+    assert is_binary(detail)
+    refute detail == ""
+  end
+
+  defp oid_bytes(oid), do: oid |> String.upcase() |> Base.decode16!()
+
+  defp git!(args) do
+    env = [
+      {"GIT_AUTHOR_NAME", "Fornacast Diff Test"},
+      {"GIT_AUTHOR_EMAIL", "diff@example.com"},
+      {"GIT_COMMITTER_NAME", "Fornacast Diff Test"},
+      {"GIT_COMMITTER_EMAIL", "diff@example.com"},
+      {"GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z"},
+      {"GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z"}
+    ]
+
+    case System.cmd("git", args, stderr_to_stdout: true, env: env) do
+      {output, 0} -> String.trim_trailing(output)
+      {output, code} -> flunk("git #{Enum.join(args, " ")} failed with #{code}:\n#{output}")
+    end
+  end
+end
+
 defmodule GitCore.CommitScanBusyTest do
   use ExUnit.Case, async: false
 

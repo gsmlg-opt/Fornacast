@@ -49,7 +49,7 @@ defmodule GitCore.Native do
   def read_blob_complete(_path, _oid, _expected_size),
     do: :erlang.nif_error(:nif_not_loaded)
 
-  def diff_commit(_path, _oid, _limit), do: :erlang.nif_error(:nif_not_loaded)
+  def diff_commit(_path, _oid, _limit, _deadline_ms), do: :erlang.nif_error(:nif_not_loaded)
   def pack_objects(_path, _wants), do: :erlang.nif_error(:nif_not_loaded)
   def receive_pack(_path, _pack, _commands), do: :erlang.nif_error(:nif_not_loaded)
 end

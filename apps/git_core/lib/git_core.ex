@@ -8,6 +8,8 @@ defmodule GitCore do
   @tree_page_limit 200
   @inline_blob_limit 1_048_576
   @complete_blob_limit 100_000_000
+  @diff_source_limit 200_000
+  @diff_scan_deadline_ms 5_000
 
   def init_bare(path) when is_binary(path) do
     GitCore.Native.init_bare(path)
@@ -293,23 +295,30 @@ defmodule GitCore do
     GitCore.BlobLimiter.release(lease)
   end
 
-  def diff_commit(path, oid, opts \\ []) when is_binary(path) and is_binary(oid) do
-    limit = Keyword.get(opts, :limit, 200_000)
+  def diff_commit(path, oid, opts \\ [])
+      when is_binary(path) and is_binary(oid) and is_list(opts) do
+    limit = opts |> Keyword.get(:limit, @diff_source_limit) |> bounded_diff_source_size()
 
-    with {:ok, {files, patch, truncated}} <-
-           wrap_read(GitCore.Native.diff_commit(path, oid, limit), :diff_commit) do
-      files = Enum.map(files, &diff_file_from_native/1)
+    deadline_ms =
+      opts |> Keyword.get(:deadline_ms, @diff_scan_deadline_ms) |> diff_deadline_ms()
 
-      {:ok,
-       %GitCore.CommitDiff{
-         files: files,
-         patch: patch,
-         truncated: truncated,
-         changed_files: length(files),
-         additions: nil,
-         deletions: nil
-       }}
-    end
+    GitCore.ScanLimiter.with_permit(:diff_commit, fn ->
+      with {:ok, {files, patch, truncated, changed_files, additions, deletions}} <-
+             wrap_read(
+               GitCore.Native.diff_commit(path, oid, limit, deadline_ms),
+               :diff_commit
+             ) do
+        {:ok,
+         %GitCore.CommitDiff{
+           files: Enum.map(files, &diff_file_from_native/1),
+           patch: IO.iodata_to_binary(patch),
+           truncated: truncated,
+           changed_files: changed_files,
+           additions: additions,
+           deletions: deletions
+         }}
+      end
+    end)
   end
 
   def pack_objects(path, wants) when is_binary(path) and is_list(wants) do
@@ -399,6 +408,18 @@ defmodule GitCore do
     limit
     |> max(1)
     |> min(@complete_blob_limit)
+  end
+
+  defp bounded_diff_source_size(limit) when is_integer(limit) do
+    limit
+    |> max(1)
+    |> min(@diff_source_limit)
+  end
+
+  defp diff_deadline_ms(deadline_ms) when is_integer(deadline_ms) do
+    deadline_ms
+    |> max(0)
+    |> min(@diff_scan_deadline_ms)
   end
 
   defp blob_metadata(path, snapshot_oid, blob_path, operation) do
@@ -518,19 +539,35 @@ defmodule GitCore do
   defp diff_status("modified"), do: :modified
   defp diff_status("deleted"), do: :deleted
 
-  defp diff_file_from_native({path, status, old_oid, new_oid, binary}) do
+  defp diff_file_from_native(
+         {path, status, old_oid, new_oid, binary, {additions, deletions, truncated, lines}}
+       ) do
     %GitCore.DiffFile{
-      path: path,
+      path: ref_name_from_native(path),
       status: diff_status(status),
       old_oid: old_oid,
       new_oid: new_oid,
       binary: binary,
-      additions: nil,
-      deletions: nil,
-      truncated: false,
-      lines: []
+      additions: additions,
+      deletions: deletions,
+      truncated: truncated,
+      lines: Enum.map(lines, &diff_line_from_native/1)
     }
   end
+
+  defp diff_line_from_native({type, old_line, new_line, content}) do
+    %GitCore.DiffLine{
+      type: diff_line_type(type),
+      old_line: old_line,
+      new_line: new_line,
+      content: ref_name_from_native(content)
+    }
+  end
+
+  defp diff_line_type("context"), do: :context
+  defp diff_line_type("added"), do: :added
+  defp diff_line_type("deleted"), do: :deleted
+  defp diff_line_type("hunk"), do: :hunk
 
   defp commit_from_native(
          {oid, title, message, {author_name, author_email, author_time},
