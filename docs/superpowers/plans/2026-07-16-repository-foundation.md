@@ -508,19 +508,19 @@ git commit -m "feat(git): add exact commit pagination"
 - Modify: apps/git_core/native/fornacast_git_core/src/lib.rs
 - Add tests: apps/git_core/test/repository_read_model_test.exs
 
-- [ ] **Step 1: Add failing tree-history tests**
+- [x] **Step 1: Add failing tree-history tests**
 
 Build a directory with more than 200 direct children. Change files beneath directories across multiple commits and a merge. Assert directories-first bytewise name ordering, exact totals/pages, 200-row cap, first-parent attribution, root comparison against an empty tree, directory descendant touches, current-path-only behavior after a rename, slash refs through their resolved OID, and out-of-range pages.
 
-- [ ] **Step 2: Prove one native history walk**
+- [x] **Step 2: Prove one native history walk**
 
 Add a test-only call log or native counter around read_tree_with_history. One page request must make one native call and one commit traversal, regardless of row count.
 
-- [ ] **Step 3: Implement page-first attribution**
+- [x] **Step 3: Implement page-first attribution**
 
 Resolve the selected tree from snapshot_oid, list direct children, sort directories first, calculate exact page metadata, and retain only the requested 200 rows. Traverse commits once in the Task 6 order. For each unresolved current row, compare its OID and mode with the first parent at the same path; compare roots with absence. A directory tree OID change counts as a descendant touch. Stop when every retained row has metadata.
 
-- [ ] **Step 4: Expose and limit the API**
+- [x] **Step 4: Expose and limit the API**
 
 ~~~elixir
 GitCore.read_tree_with_history(path, snapshot_oid, tree_path, page, per_page: 200)
@@ -528,7 +528,7 @@ GitCore.read_tree_with_history(path, snapshot_oid, tree_path, page, per_page: 20
 
 Use safe Git tree lookup, never filesystem path joining. Run through ScanLimiter with the five-second deadline.
 
-- [ ] **Step 5: Run and commit**
+- [x] **Step 5: Run and commit**
 
 ~~~sh
 mix test apps/git_core/test/repository_read_model_test.exs --only tree_history --trace
