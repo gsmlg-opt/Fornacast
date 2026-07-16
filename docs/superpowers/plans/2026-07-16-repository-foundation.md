@@ -588,23 +588,23 @@ git commit -m "feat(git): enforce complete and bounded blob reads"
 - Modify: apps/git_core/native/fornacast_git_core/src/lib.rs
 - Add tests: apps/git_core/test/repository_read_model_test.exs
 
-- [ ] **Step 1: Add failing diff fixtures**
+- [x] **Step 1: Add failing diff fixtures**
 
 Cover added, modified, deleted, binary, root commit, context lines, multiple hunks, line numbers, more than 1,000 files, a retained payload beyond 200,000 bytes, and a lower deadline.
 
-- [ ] **Step 2: Assert exact and retained data separately**
+- [x] **Step 2: Assert exact and retained data separately**
 
 Assert complete changed-file/addition/deletion totals even when only 1,000 sections or 200,000 source bytes are retained. Assert per-file truncation, global truncation, binary metadata without text lines, and one shared retained source budget from which both patch and structured lines are derived.
 
-- [ ] **Step 3: Replace delete-all/add-all output**
+- [x] **Step 3: Replace delete-all/add-all output**
 
 Use the public gix diff callbacks to obtain real hunks and line statistics. Disable rewrite detection and repository-configured external filters. Convert output directly to NativeDiffLine tuples carrying type, old line, new line, and content. Process one file at a time and retain no prior file bodies beyond the shared output material.
 
-- [ ] **Step 4: Preserve compatibility**
+- [x] **Step 4: Preserve compatibility**
 
 Continue populating CommitDiff.patch from the same retained source material and keep existing success callers working. Run the whole operation through ScanLimiter with the five-second deadline; return :scan_timeout if exact totals cannot finish.
 
-- [ ] **Step 5: Run and commit**
+- [x] **Step 5: Run and commit**
 
 ~~~sh
 mix test apps/git_core/test/repository_read_model_test.exs --only diffs --trace
