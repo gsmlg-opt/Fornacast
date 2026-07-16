@@ -19,7 +19,8 @@ type NativeCommit = (
 );
 
 type NativeTreeEntry = (String, String, String, String);
-type NativeBlob = (String, String, u64, Vec<u8>, bool, bool);
+type NativeBlobMetadata = (Vec<u8>, String, u64);
+type NativeBlobBody<'env> = (u64, rustler::Binary<'env>, bool, bool);
 type NativeDiffFile = (String, String, Option<String>, Option<String>, bool);
 type NativeCommitDiff = (Vec<NativeDiffFile>, String, bool);
 type NativeRef = (Vec<u8>, String, String);
@@ -119,6 +120,8 @@ const REF_SCAN_DEADLINE: Duration = Duration::from_secs(5);
 const COMMIT_SCAN_DEADLINE: Duration = Duration::from_secs(5);
 const COMMIT_PAGE_LIMIT: usize = 50;
 const TREE_PAGE_LIMIT: usize = 200;
+const INLINE_BLOB_LIMIT: usize = 1_048_576;
+const COMPLETE_BLOB_LIMIT: u64 = 100_000_000;
 // This remains independent of object size while leaving room for the complete mandatory tag
 // header, including long ref-derived tag names, before an arbitrarily large message body.
 const SNAPSHOT_OBJECT_PREFIX_LIMIT: usize = 64 * 1024;
@@ -1795,52 +1798,184 @@ fn read_tree(
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
-fn read_blob(
+fn blob_metadata(
     path: String,
-    rev: String,
-    blob_path: String,
+    snapshot_oid: String,
+    blob_path: Vec<u8>,
+) -> Result<NativeBlobMetadata, NativeError> {
+    let repo = open_physical_bare_repository(&path)?;
+    let components = safe_git_path_components(&blob_path)?;
+    let (name, parent_components) = components
+        .split_last()
+        .ok_or_else(|| native_error("path_not_found", "path does not point to a blob"))?;
+    let root_tree = blob_snapshot_tree(&repo, &snapshot_oid)?;
+    let mut tree = load_blob_tree(&repo, root_tree)?;
+
+    for component in parent_components {
+        let entry = find_blob_tree_entry(&tree, component)?
+            .ok_or_else(|| native_error("path_not_found", "blob path was not found"))?;
+        if !entry.is_tree {
+            return Err(native_error(
+                "path_not_found",
+                "blob path traverses a non-tree entry",
+            ));
+        }
+        tree = load_blob_tree(&repo, entry.oid)?;
+    }
+
+    let entry = find_blob_tree_entry(&tree, name)?
+        .ok_or_else(|| native_error("path_not_found", "blob path was not found"))?;
+    if !matches!(entry.mode, 0o100644 | 0o100755 | 0o120000) {
+        return Err(native_error(
+            "path_not_found",
+            "path does not point to a blob",
+        ));
+    }
+
+    let metadata =
+        bounded_blob::read_blob_metadata(&repo, entry.oid).map_err(bounded_blob_native_error)?;
+    if metadata.kind != gix_object::Kind::Blob {
+        return Err(native_error(
+            "corrupt_repository",
+            "blob-mode tree entry does not identify a blob object",
+        ));
+    }
+
+    Ok((name.to_vec(), entry.oid.to_string(), metadata.size))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn read_blob_prefix<'env>(
+    env: rustler::Env<'env>,
+    path: String,
+    oid: String,
+    expected_size: u64,
     limit: usize,
-) -> Result<NativeBlob, NativeError> {
-    let repo = open_bare_repository(&path)?;
-    let relative_path = safe_relative_path(&blob_path)?;
+) -> Result<NativeBlobBody<'env>, NativeError> {
+    let repo = open_physical_bare_repository(&path)?;
+    let oid = verified_blob_oid(&oid)?;
+    let prefix = bounded_blob::read_verified_prefix(
+        &repo,
+        oid,
+        expected_size,
+        limit.clamp(1, INLINE_BLOB_LIMIT),
+    )
+    .map_err(bounded_blob_native_error)?;
+    blob_body_to_native(env, prefix)
+}
 
-    if relative_path.as_os_str().is_empty() {
+#[rustler::nif(schedule = "DirtyIo")]
+fn read_blob_complete<'env>(
+    env: rustler::Env<'env>,
+    path: String,
+    oid: String,
+    expected_size: u64,
+) -> Result<NativeBlobBody<'env>, NativeError> {
+    if expected_size > COMPLETE_BLOB_LIMIT {
         return Err(native_error(
-            "path_not_found",
-            "path does not point to a blob",
+            "blob_too_large",
+            "blob exceeds the complete-read limit",
         ));
     }
+    let read_limit = usize::try_from(expected_size)
+        .map_err(|_| native_error("blob_too_large", "blob size does not fit this platform"))?;
+    let repo = open_physical_bare_repository(&path)?;
+    let oid = verified_blob_oid(&oid)?;
+    let complete = bounded_blob::read_verified_prefix(&repo, oid, expected_size, read_limit)
+        .map_err(bounded_blob_native_error)?;
+    if complete.truncated || complete.data.len() as u64 != expected_size {
+        return Err(native_error(
+            "corrupt_repository",
+            "complete blob read did not return the declared body",
+        ));
+    }
+    blob_body_to_native(env, complete)
+}
 
-    let root = resolve_ref_commit(&repo, &rev)?
-        .tree()
+fn blob_snapshot_tree(
+    repo: &gix::Repository,
+    snapshot_oid: &str,
+) -> Result<gix_hash::ObjectId, NativeError> {
+    let oid = gix_hash::ObjectId::from_hex(snapshot_oid.as_bytes())
+        .map_err(|error| native_error("commit_not_found", error))?;
+    let commit = find_graph_commit(repo, oid, CommitPosition::Tip)?;
+    let decoded = commit
+        .decode()
         .map_err(|error| native_error("corrupt_repository", error))?;
-    let entry = root
-        .lookup_entry_by_path(&relative_path)
-        .map_err(|error| native_error("corrupt_repository", error))?
-        .ok_or_else(|| native_error("path_not_found", "path not found"))?;
+    Ok(decoded.tree())
+}
 
-    if !entry.mode().is_blob_or_symlink() {
-        return Err(native_error(
-            "path_not_found",
-            "path does not point to a blob",
-        ));
+fn load_blob_tree<'repo>(
+    repo: &'repo gix::Repository,
+    oid: gix_hash::ObjectId,
+) -> Result<gix::Tree<'repo>, NativeError> {
+    let object = match repo.find_object(oid) {
+        Ok(object) => object,
+        Err(error @ gix_object::find::existing::Error::NotFound { .. }) => {
+            return Err(native_error("corrupt_repository", error));
+        }
+        Err(gix_object::find::existing::Error::Find(error)) => {
+            let kind = if error_chain_contains_storage_io(error.as_ref()) {
+                "storage_unavailable"
+            } else {
+                "corrupt_repository"
+            };
+            return Err(native_error(kind, error));
+        }
+    };
+    object
+        .try_into_tree()
+        .map_err(|error| native_error("corrupt_repository", error))
+}
+
+fn find_blob_tree_entry(
+    tree: &gix::Tree<'_>,
+    name: &[u8],
+) -> Result<Option<TreeEntryState>, NativeError> {
+    let mut previous = None;
+    let mut found = None;
+
+    for entry in gix_object::TreeRefIter::from_bytes(&tree.data, tree.id.kind()) {
+        let entry = entry.map_err(|error| native_error("corrupt_repository", error))?;
+        let filename: &[u8] = entry.filename.as_ref();
+        validate_tree_entry(&mut previous, filename, entry.mode.value())?;
+        if filename == name {
+            let state = TreeEntryState {
+                mode: entry.mode.value(),
+                oid: entry.oid.to_owned(),
+                is_tree: entry.mode.is_tree(),
+            };
+            if found.replace(state).is_some() {
+                return Err(native_error(
+                    "corrupt_repository",
+                    "tree contains a duplicate selected entry name",
+                ));
+            }
+        }
     }
 
-    let read_limit = limit.clamp(1, 100_000_000);
-    let oid = entry.object_id();
-    let prefix =
-        bounded_blob::read_prefix(&repo, oid, read_limit).map_err(bounded_blob_native_error)?;
-    let size = prefix.size;
-    let truncated = prefix.truncated;
-    let data = prefix.data;
-    let binary = data.contains(&0);
-    let name = relative_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_string();
+    Ok(found)
+}
 
-    Ok((name, oid.to_string(), size, data, truncated, binary))
+fn verified_blob_oid(oid: &str) -> Result<gix_hash::ObjectId, NativeError> {
+    gix_hash::ObjectId::from_hex(oid.as_bytes())
+        .map_err(|error| native_error("corrupt_repository", error))
+}
+
+fn blob_body_to_native<'env>(
+    env: rustler::Env<'env>,
+    body: bounded_blob::PrefixBlob,
+) -> Result<NativeBlobBody<'env>, NativeError> {
+    let binary_state = body.data.contains(&0);
+    let mut binary = rustler::OwnedBinary::new(body.data.len()).ok_or_else(|| {
+        native_error(
+            "storage_unavailable",
+            "unable to allocate the requested blob binary",
+        )
+    })?;
+    binary.as_mut_slice().copy_from_slice(&body.data);
+
+    Ok((body.size, binary.release(env), body.truncated, binary_state))
 }
 
 #[rustler::nif(schedule = "DirtyIo")]

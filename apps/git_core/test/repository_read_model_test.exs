@@ -116,7 +116,7 @@ defmodule GitCore.RepositoryReadModelTest do
     test "classifies unknown refs, commits, missing paths, and wrong path kinds", %{
       tmp_dir: tmp_dir
     } do
-      %{repo_path: repo_path} = populated_bare_repository!(tmp_dir)
+      %{repo_path: repo_path, commit_oid: commit_oid} = populated_bare_repository!(tmp_dir)
 
       assert_error(GitCore.commit_history(repo_path, "missing"), :ref_not_found, :commit_history)
 
@@ -128,7 +128,7 @@ defmodule GitCore.RepositoryReadModelTest do
 
       assert_error(GitCore.read_tree(repo_path, "main", "missing"), :path_not_found, :read_tree)
       assert_error(GitCore.read_tree(repo_path, "main", "README.md"), :path_not_found, :read_tree)
-      assert_error(GitCore.read_blob(repo_path, "main", "lib"), :path_not_found, :read_blob)
+      assert_error(GitCore.read_blob(repo_path, commit_oid, "lib"), :path_not_found, :read_blob)
     end
 
     @tag :tmp_dir
@@ -140,8 +140,7 @@ defmodule GitCore.RepositoryReadModelTest do
 
       operations = [
         {:commit_history, &GitCore.commit_history(repo_path, &1, limit: 1)},
-        {:read_tree, &GitCore.read_tree(repo_path, &1, "")},
-        {:read_blob, &GitCore.read_blob(repo_path, &1, "README.md")}
+        {:read_tree, &GitCore.read_tree(repo_path, &1, "")}
       ]
 
       actual =
@@ -163,9 +162,10 @@ defmodule GitCore.RepositoryReadModelTest do
       tmp_dir: tmp_dir
     } do
       repo_path = inconsistent_tree_repository!(tmp_dir)
+      commit_oid = git!(["--git-dir", repo_path, "rev-parse", "refs/heads/main"])
 
       assert_error(
-        GitCore.read_blob(repo_path, "main", "blob-mode-tree-object"),
+        GitCore.read_blob(repo_path, commit_oid, "blob-mode-tree-object"),
         :corrupt_repository,
         :read_blob
       )
@@ -2050,20 +2050,6 @@ defmodule GitCore.RepositoryReadModelTest do
        ),
        do: :ok
 
-  defp normalize_legacy_read(
-         {:ok,
-          %GitCore.Blob{
-            name: "README.md",
-            size: 7,
-            data: "# Demo\n",
-            truncated: false,
-            binary: false
-          }},
-         :read_blob,
-         _commit_oid
-       ),
-       do: :ok
-
   defp normalize_legacy_read(result, _operation, _commit_oid), do: result
 
   defp assert_prefix_blob_contract(fixture) do
@@ -2077,7 +2063,7 @@ defmodule GitCore.RepositoryReadModelTest do
               truncated: true,
               binary: true,
               non_utf8: true
-            }} =
+            } = prefix_blob} =
              GitCore.read_blob(
                fixture.repo_path,
                fixture.commit_oid,
@@ -2089,6 +2075,7 @@ defmodule GitCore.RepositoryReadModelTest do
     assert size == byte_size(fixture.original)
     assert data == binary_part(fixture.original, 0, limit)
     assert byte_size(data) <= limit
+    assert :ok = GitCore.release_blob(prefix_blob)
 
     assert {:ok,
             %GitCore.Blob{
@@ -2098,15 +2085,15 @@ defmodule GitCore.RepositoryReadModelTest do
               truncated: false,
               binary: true,
               non_utf8: true
-            }} =
-             GitCore.read_blob(
+            } = complete_blob} =
+             GitCore.read_blob_complete(
                fixture.repo_path,
                fixture.commit_oid,
-               fixture.blob_path,
-               limit: size + 1
+               fixture.blob_path
              )
 
     assert complete == fixture.original
+    assert :ok = GitCore.release_blob(complete_blob)
   end
 
   defp prefix_blob_fixture!(tmp_dir, storage) do
@@ -3199,5 +3186,612 @@ defmodule GitCore.CommitScanBusyTest do
 
     assert is_binary(detail)
     refute detail == ""
+  end
+end
+
+defmodule GitCore.BlobReadLifecycleTest do
+  use ExUnit.Case, async: false
+
+  @moduletag :blobs
+  @inline_limit 1_048_576
+  @complete_limit 100_000_000
+
+  setup do
+    wait_for_blob_limiter(0, 0)
+    :ok
+  end
+
+  @tag :tmp_dir
+  test "inline reads clamp and retain exactly one MiB of blob capacity", %{tmp_dir: tmp_dir} do
+    data = :binary.copy("a", @inline_limit + 17)
+    fixture = blob_fixture!(tmp_dir, data)
+
+    assert {:ok,
+            %GitCore.Blob{
+              oid: oid,
+              size: size,
+              data: prefix,
+              truncated: true,
+              binary: false,
+              non_utf8: false,
+              lease: lease
+            } = blob} =
+             GitCore.read_blob(
+               fixture.repo_path,
+               fixture.commit_oid,
+               fixture.blob_path,
+               limit: @complete_limit
+             )
+
+    assert oid == fixture.blob_oid
+    assert size == byte_size(data)
+    assert prefix == binary_part(data, 0, @inline_limit)
+    assert lease != nil
+    assert_blob_limiter(1, @inline_limit, [@inline_limit])
+
+    assert :ok = GitCore.release_blob(blob)
+    assert :ok = GitCore.release_blob(blob)
+    assert :ok = GitCore.release_blob(%{blob | lease: nil})
+    assert_blob_limiter(0, 0, [])
+  end
+
+  @tag :tmp_dir
+  test "complete reads reserve the exact declared size and never truncate", %{tmp_dir: tmp_dir} do
+    data = :binary.copy(<<0, 255, 65>>, 171)
+    fixture = blob_fixture!(tmp_dir, data)
+
+    assert {:ok,
+            %GitCore.Blob{
+              oid: oid,
+              size: size,
+              data: ^data,
+              truncated: false,
+              binary: true,
+              non_utf8: true,
+              lease: lease
+            } = blob} =
+             GitCore.read_blob_complete(
+               fixture.repo_path,
+               fixture.commit_oid,
+               fixture.blob_path
+             )
+
+    assert oid == fixture.blob_oid
+    assert size == byte_size(data)
+    assert lease != nil
+    assert_blob_limiter(1, byte_size(data), [byte_size(data)])
+
+    assert :ok = GitCore.release_blob(blob)
+    assert_blob_limiter(0, 0, [])
+  end
+
+  @tag :tmp_dir
+  test "native body reads recheck declared size before returning a BEAM binary", %{
+    tmp_dir: tmp_dir
+  } do
+    data = "native binary body"
+    fixture = blob_fixture!(tmp_dir, data)
+
+    assert {:ok, {name, oid, size}} =
+             GitCore.Native.blob_metadata(
+               fixture.repo_path,
+               fixture.commit_oid,
+               :binary.bin_to_list(fixture.blob_path)
+             )
+
+    assert IO.iodata_to_binary(name) == fixture.blob_path
+    assert oid == fixture.blob_oid
+    assert size == byte_size(data)
+
+    assert {:ok, {^size, native_data, false, false}} =
+             GitCore.Native.read_blob_prefix(fixture.repo_path, oid, size, @inline_limit)
+
+    assert is_binary(native_data)
+    assert native_data == data
+
+    assert {:error, {"corrupt_repository", detail}} =
+             GitCore.Native.read_blob_prefix(fixture.repo_path, oid, size + 1, @inline_limit)
+
+    assert detail =~ "size changed between metadata and body reads"
+  end
+
+  @tag :tmp_dir
+  test "a complete zero-byte blob retains one exact zero-weight read slot", %{tmp_dir: tmp_dir} do
+    fixture = blob_fixture!(tmp_dir, "")
+
+    assert {:ok,
+            %GitCore.Blob{
+              size: 0,
+              data: "",
+              truncated: false,
+              binary: false,
+              non_utf8: false,
+              lease: lease
+            } = blob} =
+             GitCore.read_blob_complete(
+               fixture.repo_path,
+               fixture.commit_oid,
+               fixture.blob_path
+             )
+
+    assert lease != nil
+    assert_blob_limiter(1, 0, [0])
+    assert :ok = GitCore.release_blob(blob)
+    assert_blob_limiter(0, 0, [])
+  end
+
+  @tag :tmp_dir
+  test "complete and untruncated inline reads reject a valid body stored under a false OID", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = aliased_blob_fixture!(tmp_dir, "body stored under the wrong object name")
+
+    complete =
+      GitCore.read_blob_complete(
+        fixture.repo_path,
+        fixture.commit_oid,
+        fixture.blob_path
+      )
+
+    inline = GitCore.read_blob(fixture.repo_path, fixture.commit_oid, fixture.blob_path)
+    release_successful_blob(complete)
+    release_successful_blob(inline)
+
+    assert_error(complete, :corrupt_repository, :read_blob_complete)
+    assert_error(inline, :corrupt_repository, :read_blob)
+    assert_blob_limiter(0, 0, [])
+  end
+
+  @tag :tmp_dir
+  test "complete zero-byte reads reject a trailing body and release their slot", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = malformed_zero_blob_fixture!(tmp_dir)
+
+    result =
+      GitCore.read_blob_complete(
+        fixture.repo_path,
+        fixture.commit_oid,
+        fixture.blob_path
+      )
+
+    release_successful_blob(result)
+    assert_error(result, :corrupt_repository, :read_blob_complete)
+    assert_blob_limiter(0, 0, [])
+  end
+
+  @tag :tmp_dir
+  test "oversized complete reads reject metadata before body allocation or lease acquisition", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = declared_blob_fixture!(tmp_dir, @complete_limit + 1)
+
+    assert_error(
+      GitCore.read_blob_complete(
+        fixture.repo_path,
+        fixture.commit_oid,
+        fixture.blob_path,
+        limit: @complete_limit * 2
+      ),
+      :blob_too_large,
+      :read_blob_complete
+    )
+
+    assert_blob_limiter(0, 0, [])
+  end
+
+  @tag :tmp_dir
+  test "a body failure after metadata releases the exact-size lease", %{tmp_dir: tmp_dir} do
+    fixture = declared_blob_fixture!(tmp_dir, 17)
+
+    assert_error(
+      GitCore.read_blob_complete(
+        fixture.repo_path,
+        fixture.commit_oid,
+        fixture.blob_path
+      ),
+      :corrupt_repository,
+      :read_blob_complete
+    )
+
+    assert_blob_limiter(0, 0, [])
+  end
+
+  @tag :tmp_dir
+  test "inline reads preserve invalid UTF-8 without misclassifying it as NUL-binary", %{
+    tmp_dir: tmp_dir
+  } do
+    data = <<255, 254, "plain">>
+    fixture = blob_fixture!(tmp_dir, data)
+
+    assert {:ok,
+            %GitCore.Blob{
+              data: ^data,
+              truncated: false,
+              binary: false,
+              non_utf8: true
+            } = blob} =
+             GitCore.read_blob(fixture.repo_path, fixture.commit_oid, fixture.blob_path)
+
+    assert :ok = GitCore.release_blob(blob)
+  end
+
+  @tag :tmp_dir
+  test "inline reads detect NUL bytes independently of UTF-8 validity", %{tmp_dir: tmp_dir} do
+    data = "valid\0utf8"
+    fixture = blob_fixture!(tmp_dir, data)
+
+    assert {:ok,
+            %GitCore.Blob{
+              data: ^data,
+              truncated: false,
+              binary: true,
+              non_utf8: false
+            } = blob} =
+             GitCore.read_blob(fixture.repo_path, fixture.commit_oid, fixture.blob_path)
+
+    assert :ok = GitCore.release_blob(blob)
+  end
+
+  @tag :tmp_dir
+  test "the supervised limiter releases a retained blob lease when its owner dies", %{
+    tmp_dir: tmp_dir
+  } do
+    data = "owner-held bytes"
+    fixture = blob_fixture!(tmp_dir, data)
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        result =
+          GitCore.read_blob_complete(
+            fixture.repo_path,
+            fixture.commit_oid,
+            fixture.blob_path
+          )
+
+        send(parent, {:owner_blob, self(), result})
+        Process.sleep(:infinity)
+      end)
+
+    monitor = Process.monitor(owner)
+
+    assert_receive {:owner_blob, ^owner, {:ok, %GitCore.Blob{lease: lease} = blob}}, 2_000
+    assert lease != nil
+    assert_blob_limiter(1, byte_size(data), [byte_size(data)])
+
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^owner, :killed}, 1_000
+    wait_for_blob_limiter(0, 0)
+    assert :ok = GitCore.release_blob(blob)
+  end
+
+  @tag :tmp_dir
+  test "public blob reads fail closed with blob_busy and cannot redirect the limiter", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = blob_fixture!(tmp_dir, "busy")
+    isolated = start_supervised!({GitCore.BlobLimiter, server: nil}, id: make_ref())
+
+    leases =
+      for _ <- 1..8 do
+        assert {:ok, lease} = GitCore.BlobLimiter.acquire(0)
+        lease
+      end
+
+    try do
+      assert_error(
+        GitCore.read_blob(
+          fixture.repo_path,
+          fixture.commit_oid,
+          fixture.blob_path,
+          blob_limiter: isolated
+        ),
+        :blob_busy,
+        :read_blob
+      )
+
+      assert_error(
+        GitCore.read_blob_complete(
+          fixture.repo_path,
+          fixture.commit_oid,
+          fixture.blob_path,
+          blob_limiter: isolated
+        ),
+        :blob_busy,
+        :read_blob_complete
+      )
+    after
+      Enum.each(leases, &GitCore.BlobLimiter.release/1)
+    end
+
+    assert_blob_limiter(0, 0, [])
+  end
+
+  @tag :tmp_dir
+  test "snapshot and blob OIDs bypass physical replacement refs", %{tmp_dir: tmp_dir} do
+    original = "physical snapshot body"
+    fixture = replaced_blob_fixture!(tmp_dir, original, "replacement body")
+
+    assert {:ok, %GitCore.Blob{oid: oid, data: ^original} = inline} =
+             GitCore.read_blob(fixture.repo_path, fixture.commit_oid, fixture.blob_path)
+
+    assert oid == fixture.blob_oid
+    assert :ok = GitCore.release_blob(inline)
+
+    assert {:ok, %GitCore.Blob{oid: ^oid, data: ^original, truncated: false} = complete} =
+             GitCore.read_blob_complete(
+               fixture.repo_path,
+               fixture.commit_oid,
+               fixture.blob_path
+             )
+
+    assert :ok = GitCore.release_blob(complete)
+  end
+
+  defp blob_fixture!(tmp_dir, data, blob_path \\ "blob.bin") do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "blob-lifecycle-#{suffix}.git")
+    source_path = Path.join(tmp_dir, "blob-lifecycle-source-#{suffix}")
+    tree_path = Path.join(tmp_dir, "blob-lifecycle-tree-#{suffix}")
+
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    File.write!(source_path, data)
+    blob_oid = git!(["--git-dir", repo_path, "hash-object", "-w", source_path])
+    File.write!(tree_path, "100644 #{blob_path}\0" <> oid_bytes(blob_oid))
+
+    tree_oid =
+      git!([
+        "--git-dir",
+        repo_path,
+        "hash-object",
+        "--literally",
+        "-t",
+        "tree",
+        "-w",
+        tree_path
+      ])
+
+    commit_oid = git!(["--git-dir", repo_path, "commit-tree", tree_oid, "-m", "blob fixture"])
+    git!(["--git-dir", repo_path, "update-ref", "refs/heads/main", commit_oid])
+
+    %{
+      repo_path: repo_path,
+      commit_oid: commit_oid,
+      blob_path: blob_path,
+      blob_oid: blob_oid,
+      tree_oid: tree_oid
+    }
+  end
+
+  defp declared_blob_fixture!(tmp_dir, declared_size) do
+    fixture = blob_fixture!(tmp_dir, "placeholder", "declared.bin")
+    fake_oid = String.duplicate("1", 40)
+    loose_path = loose_object_path(fixture.repo_path, fake_oid)
+    File.mkdir_p!(Path.dirname(loose_path))
+    zlib = :zlib.open()
+    :ok = :zlib.deflateInit(zlib)
+
+    compressed_header =
+      zlib
+      |> :zlib.deflate("blob #{declared_size}\0", :sync)
+      |> IO.iodata_to_binary()
+
+    :ok = :zlib.close(zlib)
+    File.write!(loose_path, compressed_header)
+
+    tree_path = Path.join(tmp_dir, "declared-tree-#{System.unique_integer([:positive])}")
+    File.write!(tree_path, "100644 declared.bin\0" <> oid_bytes(fake_oid))
+
+    tree_oid =
+      git!([
+        "--git-dir",
+        fixture.repo_path,
+        "hash-object",
+        "--literally",
+        "-t",
+        "tree",
+        "-w",
+        tree_path
+      ])
+
+    commit_oid =
+      git!(["--git-dir", fixture.repo_path, "commit-tree", tree_oid, "-m", "declared blob"])
+
+    %{fixture | commit_oid: commit_oid, blob_oid: fake_oid}
+  end
+
+  defp aliased_blob_fixture!(tmp_dir, data) do
+    fixture = blob_fixture!(tmp_dir, "placeholder", "aliased.bin")
+    fake_oid = String.duplicate("2", 40)
+    loose_path = loose_object_path(fixture.repo_path, fake_oid)
+    File.mkdir_p!(Path.dirname(loose_path))
+    File.write!(loose_path, :zlib.compress("blob #{byte_size(data)}\0" <> data))
+    retarget_blob_fixture!(tmp_dir, fixture, fake_oid, "aliased.bin", "aliased blob")
+  end
+
+  defp malformed_zero_blob_fixture!(tmp_dir) do
+    fixture = blob_fixture!(tmp_dir, "", "zero.bin")
+    loose_path = loose_object_path(fixture.repo_path, fixture.blob_oid)
+    File.chmod!(loose_path, 0o644)
+    File.write!(loose_path, :zlib.compress("blob 0\0X"))
+    fixture
+  end
+
+  defp retarget_blob_fixture!(tmp_dir, fixture, blob_oid, blob_path, message) do
+    tree_path = Path.join(tmp_dir, "retarget-tree-#{System.unique_integer([:positive])}")
+    File.write!(tree_path, "100644 #{blob_path}\0" <> oid_bytes(blob_oid))
+
+    tree_oid =
+      git!([
+        "--git-dir",
+        fixture.repo_path,
+        "hash-object",
+        "--literally",
+        "-t",
+        "tree",
+        "-w",
+        tree_path
+      ])
+
+    commit_oid =
+      git!(["--git-dir", fixture.repo_path, "commit-tree", tree_oid, "-m", message])
+
+    %{
+      fixture
+      | commit_oid: commit_oid,
+        blob_oid: blob_oid,
+        blob_path: blob_path,
+        tree_oid: tree_oid
+    }
+  end
+
+  defp replaced_blob_fixture!(tmp_dir, original, replacement) do
+    fixture = blob_fixture!(tmp_dir, original)
+    suffix = System.unique_integer([:positive])
+    replacement_path = Path.join(tmp_dir, "replacement-blob-#{suffix}")
+    replacement_tree_path = Path.join(tmp_dir, "replacement-tree-#{suffix}")
+
+    File.write!(replacement_path, replacement)
+
+    replacement_oid =
+      git!(["--git-dir", fixture.repo_path, "hash-object", "-w", replacement_path])
+
+    File.write!(
+      replacement_tree_path,
+      "100644 #{fixture.blob_path}\0" <> oid_bytes(replacement_oid)
+    )
+
+    replacement_tree_oid =
+      git!([
+        "--git-dir",
+        fixture.repo_path,
+        "hash-object",
+        "--literally",
+        "-t",
+        "tree",
+        "-w",
+        replacement_tree_path
+      ])
+
+    replacement_commit_oid =
+      git!([
+        "--git-dir",
+        fixture.repo_path,
+        "commit-tree",
+        replacement_tree_oid,
+        "-m",
+        "replacement commit"
+      ])
+
+    git!([
+      "--git-dir",
+      fixture.repo_path,
+      "update-ref",
+      "refs/replace/#{fixture.blob_oid}",
+      replacement_oid
+    ])
+
+    git!([
+      "--git-dir",
+      fixture.repo_path,
+      "update-ref",
+      "refs/replace/#{fixture.commit_oid}",
+      replacement_commit_oid
+    ])
+
+    assert git!(["--git-dir", fixture.repo_path, "cat-file", "-p", fixture.blob_oid]) ==
+             replacement
+
+    assert git!([
+             "--no-replace-objects",
+             "--git-dir",
+             fixture.repo_path,
+             "cat-file",
+             "-p",
+             fixture.blob_oid
+           ]) == original
+
+    assert git!(["--git-dir", fixture.repo_path, "cat-file", "-p", fixture.commit_oid]) =~
+             "tree #{replacement_tree_oid}"
+
+    assert git!([
+             "--no-replace-objects",
+             "--git-dir",
+             fixture.repo_path,
+             "cat-file",
+             "-p",
+             fixture.commit_oid
+           ]) =~ "tree #{fixture.tree_oid}"
+
+    fixture
+  end
+
+  defp assert_blob_limiter(grant_count, used_bytes, weights) do
+    state = :sys.get_state(GitCore.BlobLimiter)
+    assert map_size(state.grants) == grant_count
+    assert state.used_bytes == used_bytes
+
+    assert state.grants |> Map.values() |> Enum.map(& &1.weight) |> Enum.sort() ==
+             Enum.sort(weights)
+  end
+
+  defp wait_for_blob_limiter(grant_count, used_bytes, attempts \\ 100)
+
+  defp wait_for_blob_limiter(grant_count, used_bytes, attempts) when attempts > 0 do
+    state = :sys.get_state(GitCore.BlobLimiter)
+
+    if map_size(state.grants) == grant_count and state.used_bytes == used_bytes do
+      :ok
+    else
+      Process.sleep(5)
+      wait_for_blob_limiter(grant_count, used_bytes, attempts - 1)
+    end
+  end
+
+  defp wait_for_blob_limiter(grant_count, used_bytes, 0) do
+    state = :sys.get_state(GitCore.BlobLimiter)
+
+    flunk(
+      "blob limiter did not settle to #{grant_count} grants/#{used_bytes} bytes: #{inspect(state)}"
+    )
+  end
+
+  defp assert_error(result, expected_kind, expected_operation) do
+    assert {:error,
+            %GitCore.Error{
+              kind: ^expected_kind,
+              operation: ^expected_operation,
+              detail: detail
+            }} = result
+
+    assert is_binary(detail)
+    refute detail == ""
+  end
+
+  defp release_successful_blob({:ok, %GitCore.Blob{} = blob}), do: GitCore.release_blob(blob)
+  defp release_successful_blob(_result), do: :ok
+
+  defp oid_bytes(oid), do: Base.decode16!(oid, case: :mixed)
+
+  defp loose_object_path(repo_path, oid) do
+    {directory, filename} = String.split_at(oid, 2)
+    Path.join([repo_path, "objects", directory, filename])
+  end
+
+  defp git!(args) do
+    env = [
+      {"GIT_AUTHOR_NAME", "Fornacast Blob Test"},
+      {"GIT_AUTHOR_EMAIL", "blob@example.com"},
+      {"GIT_COMMITTER_NAME", "Fornacast Blob Test"},
+      {"GIT_COMMITTER_EMAIL", "blob@example.com"},
+      {"GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z"},
+      {"GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z"}
+    ]
+
+    case System.cmd("git", args, stderr_to_stdout: true, env: env) do
+      {output, 0} -> String.trim_trailing(output)
+      {output, code} -> flunk("git #{Enum.join(args, " ")} failed with #{code}:\n#{output}")
+    end
   end
 end

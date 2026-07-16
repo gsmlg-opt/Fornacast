@@ -6,6 +6,8 @@ defmodule GitCore do
   @commit_page_limit 50
   @commit_scan_deadline_ms 5_000
   @tree_page_limit 200
+  @inline_blob_limit 1_048_576
+  @complete_blob_limit 100_000_000
 
   def init_bare(path) when is_binary(path) do
     GitCore.Native.init_bare(path)
@@ -242,26 +244,53 @@ defmodule GitCore do
     end
   end
 
-  def read_blob(path, ref, blob_path, opts \\ [])
-      when is_binary(path) and is_binary(ref) and is_binary(blob_path) do
-    limit = Keyword.get(opts, :limit, 1_048_576)
+  def read_blob(path, snapshot_oid, blob_path, opts \\ [])
+      when is_binary(path) and is_binary(snapshot_oid) and is_binary(blob_path) and
+             is_list(opts) do
+    limit = opts |> Keyword.get(:limit, @inline_blob_limit) |> bounded_inline_blob_size()
 
-    with {:ok, {name, oid, size, data, truncated, binary}} <-
-           wrap_read(GitCore.Native.read_blob(path, ref, blob_path, limit), :read_blob) do
-      data = IO.iodata_to_binary(data)
-
-      {:ok,
-       %GitCore.Blob{
-         name: name,
-         oid: oid,
-         size: size,
-         data: data,
-         truncated: truncated,
-         binary: binary,
-         non_utf8: not String.valid?(data),
-         lease: nil
-       }}
+    with {:ok, metadata} <- blob_metadata(path, snapshot_oid, blob_path, :read_blob),
+         {:ok, lease} <-
+           GitCore.BlobLimiter.acquire(@inline_blob_limit, operation: :read_blob) do
+      materialize_blob(
+        metadata,
+        lease,
+        :read_blob,
+        fn ->
+          GitCore.Native.read_blob_prefix(
+            path,
+            metadata.oid,
+            metadata.size,
+            limit
+          )
+        end
+      )
     end
+  end
+
+  def read_blob_complete(path, snapshot_oid, blob_path, opts \\ [])
+      when is_binary(path) and is_binary(snapshot_oid) and is_binary(blob_path) and
+             is_list(opts) do
+    limit = opts |> Keyword.get(:limit, @complete_blob_limit) |> bounded_complete_blob_size()
+
+    with {:ok, metadata} <-
+           blob_metadata(path, snapshot_oid, blob_path, :read_blob_complete),
+         :ok <- complete_blob_fits(metadata.size, limit),
+         {:ok, lease} <-
+           GitCore.BlobLimiter.acquire(metadata.size, operation: :read_blob_complete) do
+      materialize_blob(
+        metadata,
+        lease,
+        :read_blob_complete,
+        fn -> GitCore.Native.read_blob_complete(path, metadata.oid, metadata.size) end
+      )
+    end
+  end
+
+  def release_blob(%GitCore.Blob{lease: nil}), do: :ok
+
+  def release_blob(%GitCore.Blob{lease: lease}) do
+    GitCore.BlobLimiter.release(lease)
   end
 
   def diff_commit(path, oid, opts \\ []) when is_binary(path) and is_binary(oid) do
@@ -358,6 +387,87 @@ defmodule GitCore do
     per_page
     |> max(1)
     |> min(@tree_page_limit)
+  end
+
+  defp bounded_inline_blob_size(limit) when is_integer(limit) do
+    limit
+    |> max(1)
+    |> min(@inline_blob_limit)
+  end
+
+  defp bounded_complete_blob_size(limit) when is_integer(limit) do
+    limit
+    |> max(1)
+    |> min(@complete_blob_limit)
+  end
+
+  defp blob_metadata(path, snapshot_oid, blob_path, operation) do
+    with {:ok, {name, oid, size}} <-
+           wrap_read(
+             GitCore.Native.blob_metadata(
+               path,
+               snapshot_oid,
+               :binary.bin_to_list(blob_path)
+             ),
+             operation
+           ) do
+      {:ok, %{name: ref_name_from_native(name), oid: oid, size: size}}
+    end
+  end
+
+  defp complete_blob_fits(size, limit) when size <= limit, do: :ok
+
+  defp complete_blob_fits(_size, _limit) do
+    {:error,
+     %GitCore.Error{
+       kind: :blob_too_large,
+       operation: :read_blob_complete,
+       detail: "blob exceeds the complete-read limit"
+     }}
+  end
+
+  defp materialize_blob(metadata, lease, operation, native_read)
+       when is_function(native_read, 0) do
+    try do
+      case wrap_read(native_read.(), operation) do
+        {:ok, {size, data, truncated, binary}} when size == metadata.size ->
+          data = IO.iodata_to_binary(data)
+
+          {:ok,
+           %GitCore.Blob{
+             name: metadata.name,
+             oid: metadata.oid,
+             size: size,
+             data: data,
+             truncated: truncated,
+             binary: binary,
+             non_utf8: not String.valid?(data),
+             lease: lease
+           }}
+
+        {:ok, _mismatched_body} ->
+          GitCore.BlobLimiter.release(lease)
+
+          {:error,
+           %GitCore.Error{
+             kind: :corrupt_repository,
+             operation: operation,
+             detail: "blob declared size changed between metadata and body reads"
+           }}
+
+        {:error, %GitCore.Error{}} = error ->
+          GitCore.BlobLimiter.release(lease)
+          error
+      end
+    rescue
+      exception ->
+        GitCore.BlobLimiter.release(lease)
+        reraise exception, __STACKTRACE__
+    catch
+      kind, reason ->
+        GitCore.BlobLimiter.release(lease)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
   end
 
   defp commit_deadline_ms(deadline_ms) when is_integer(deadline_ms) and deadline_ms >= 0 do

@@ -41,7 +41,14 @@ defmodule GitCore.Native do
   def commit_history(_path, _ref, _limit), do: :erlang.nif_error(:nif_not_loaded)
   def commit(_path, _oid), do: :erlang.nif_error(:nif_not_loaded)
   def read_tree(_path, _ref, _tree_path), do: :erlang.nif_error(:nif_not_loaded)
-  def read_blob(_path, _ref, _blob_path, _limit), do: :erlang.nif_error(:nif_not_loaded)
+  def blob_metadata(_path, _snapshot_oid, _blob_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  def read_blob_prefix(_path, _oid, _expected_size, _limit),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def read_blob_complete(_path, _oid, _expected_size),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def diff_commit(_path, _oid, _limit), do: :erlang.nif_error(:nif_not_loaded)
   def pack_objects(_path, _wants), do: :erlang.nif_error(:nif_not_loaded)
   def receive_pack(_path, _pack, _commands), do: :erlang.nif_error(:nif_not_loaded)

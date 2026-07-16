@@ -24,6 +24,7 @@ const MAX_COMPRESSED_INPUT_BYTES: u64 = 256 * MIB;
 const MAX_INFLATED_OUTPUT_BYTES: u64 = 512 * MIB;
 const MAX_DISCOVERY_BYTES: u64 = 8 * MIB;
 const MIN_PACK_INDEX_BYTES_PER_ENTRY: u64 = 24;
+const BLOB_METADATA_WORK_LIMIT: usize = 100_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ErrorKind {
@@ -223,6 +224,12 @@ pub(crate) struct PrefixBlob {
     pub(crate) truncated: bool,
     #[cfg(test)]
     pub(crate) allocations: AllocationInstrumentation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlobMetadata {
+    pub(crate) kind: gix_object::Kind,
+    pub(crate) size: u64,
 }
 
 #[cfg(test)]
@@ -1061,12 +1068,13 @@ impl<'a> InflatedStream<'a> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn read_prefix(
     repo: &gix::Repository,
     id: gix_hash::ObjectId,
     limit: usize,
 ) -> DecodeResult<PrefixBlob> {
-    read_prefix_impl(repo, id, limit, Some(gix_object::Kind::Blob))
+    read_prefix_impl(repo, id, limit, Some(gix_object::Kind::Blob), None)
 }
 
 pub(crate) fn read_object_prefix(
@@ -1074,7 +1082,44 @@ pub(crate) fn read_object_prefix(
     id: gix_hash::ObjectId,
     limit: usize,
 ) -> DecodeResult<PrefixBlob> {
-    read_prefix_impl(repo, id, limit, None)
+    read_prefix_impl(repo, id, limit, None, None)
+}
+
+pub(crate) fn read_blob_metadata(
+    repo: &gix::Repository,
+    id: gix_hash::ObjectId,
+) -> DecodeResult<BlobMetadata> {
+    let mut tracker = AllocationTracker::new(0);
+    let budget = DecodeWorkBudget::new(BLOB_METADATA_WORK_LIMIT)?;
+    let (_source, guarded) = inspect_object_metadata(repo, id, &mut tracker, &budget)?;
+    let metadata = guarded.object;
+    if metadata.kind != gix_object::Kind::Blob {
+        return Err(Error::corrupt(format!(
+            "expected {}, found {}",
+            gix_object::Kind::Blob,
+            metadata.kind,
+        )));
+    }
+
+    Ok(BlobMetadata {
+        kind: metadata.kind,
+        size: metadata.size,
+    })
+}
+
+pub(crate) fn read_verified_prefix(
+    repo: &gix::Repository,
+    id: gix_hash::ObjectId,
+    expected_size: u64,
+    limit: usize,
+) -> DecodeResult<PrefixBlob> {
+    read_prefix_impl(
+        repo,
+        id,
+        limit,
+        Some(gix_object::Kind::Blob),
+        Some(expected_size),
+    )
 }
 
 fn read_prefix_impl(
@@ -1082,14 +1127,13 @@ fn read_prefix_impl(
     id: gix_hash::ObjectId,
     limit: usize,
     expected_kind: Option<gix_object::Kind>,
+    expected_size: Option<u64>,
 ) -> DecodeResult<PrefixBlob> {
-    let mut tracker = AllocationTracker::new(limit);
-    let budget = DecodeWorkBudget::new(limit)?;
-    let source = locate_source(repo, id, None, &budget)?;
-    let guarded = validate_local_metadata_before_public_header(
-        || probe_guarded_source(repo, &source, &mut tracker, &budget),
-        |guarded| public_metadata_for_source(repo, &source, guarded, &budget),
-    )?;
+    let verifies_zero_body = limit == 0 && expected_size == Some(0);
+    let decode_limit = if verifies_zero_body { 1 } else { limit };
+    let mut tracker = AllocationTracker::new(decode_limit);
+    let budget = DecodeWorkBudget::new(decode_limit)?;
+    let (source, guarded) = inspect_object_metadata(repo, id, &mut tracker, &budget)?;
     let metadata = guarded.object;
     if expected_kind.is_some_and(|expected_kind| metadata.kind != expected_kind) {
         return Err(Error::corrupt(format!(
@@ -1098,11 +1142,34 @@ fn read_prefix_impl(
             metadata.kind,
         )));
     }
+    if expected_size.is_some_and(|expected_size| metadata.size != expected_size) {
+        return Err(Error::corrupt(format!(
+            "blob size changed between metadata and body reads: expected {}, found {}",
+            expected_size.expect("checked above"),
+            metadata.size,
+        )));
+    }
     let kind = metadata.kind;
     let size = metadata.size;
     tracker.mark_header_known();
 
     if limit == 0 {
+        if verifies_zero_body {
+            let mut data = Vec::new();
+            append_source_range(
+                repo,
+                &source,
+                metadata,
+                0,
+                0,
+                &mut data,
+                &mut tracker,
+                &mut Vec::new(),
+                &guarded,
+                &budget,
+            )?;
+            verify_complete_object_hash(repo, id, metadata, &data)?;
+        }
         #[cfg(test)]
         tracker.record_work(&budget);
         return Ok(PrefixBlob {
@@ -1143,6 +1210,10 @@ fn read_prefix_impl(
         tracker.record_work(&budget);
     }
 
+    if expected_size.is_some() && size == read_limit as u64 {
+        verify_complete_object_hash(repo, id, metadata, &data)?;
+    }
+
     Ok(PrefixBlob {
         kind,
         size,
@@ -1151,6 +1222,36 @@ fn read_prefix_impl(
         #[cfg(test)]
         allocations: tracker.instrumentation,
     })
+}
+
+fn verify_complete_object_hash(
+    repo: &gix::Repository,
+    expected_id: gix_hash::ObjectId,
+    metadata: ObjectMetadata,
+    data: &[u8],
+) -> DecodeResult<()> {
+    let actual = gix_object::compute_hash(repo.object_hash(), metadata.kind, data)
+        .map_err(|error| Error::corrupt(format!("hash complete object: {error}")))?;
+    if actual != expected_id {
+        return Err(Error::corrupt(format!(
+            "object checksum mismatch: expected {expected_id}, computed {actual}"
+        )));
+    }
+    Ok(())
+}
+
+fn inspect_object_metadata(
+    repo: &gix::Repository,
+    id: gix_hash::ObjectId,
+    tracker: &mut AllocationTracker,
+    budget: &DecodeWorkBudget,
+) -> DecodeResult<(ObjectSource, GuardedMetadata)> {
+    let source = locate_source(repo, id, None, budget)?;
+    let guarded = validate_local_metadata_before_public_header(
+        || probe_guarded_source(repo, &source, tracker, budget),
+        |guarded| public_metadata_for_source(repo, &source, guarded, budget),
+    )?;
+    Ok((source, guarded))
 }
 
 fn validate_local_metadata_before_public_header(
