@@ -4,14 +4,26 @@
 //! Instead, it borrows public pack entry slices, parses delta programs locally,
 //! and recursively requests only copy ranges that overlap the caller's range.
 
+use std::cell::Cell;
 use std::fs::File;
 use std::io::Read;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use gix_object::bstr::ByteSlice;
+
 const STREAM_BUFFER_TARGET: usize = 8 * 1024;
 const METADATA_BUFFER_LIMIT: usize = 32;
+const PUBLIC_HEADER_OUTPUT_LIMIT: u64 = 64;
 const MAX_CHAIN_DEPTH: usize = 64;
+const MIB: u64 = 1024 * 1024;
+const MAX_DELTA_INSTRUCTIONS: u64 = 65_536;
+const MAX_SOURCE_OPENS: u64 = 4_096;
+const MAX_INDEX_ENTRIES_SCANNED: u64 = 1_000_000;
+const MAX_COMPRESSED_INPUT_BYTES: u64 = 256 * MIB;
+const MAX_INFLATED_OUTPUT_BYTES: u64 = 512 * MIB;
+const MAX_DISCOVERY_BYTES: u64 = 8 * MIB;
+const MIN_PACK_INDEX_BYTES_PER_ENTRY: u64 = 24;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ErrorKind {
@@ -40,6 +52,7 @@ impl Error {
         }
     }
 
+    #[cfg(test)]
     fn from_bundle(error: gix_pack::bundle::init::Error) -> Self {
         let kind = match &error {
             gix_pack::bundle::init::Error::Pack(gix_pack::data::header::decode::Error::Io {
@@ -56,13 +69,20 @@ impl Error {
         }
     }
 
-    fn from_store(error: gix::odb::store::load_index::Error) -> Self {
-        let kind = if matches!(
-            &error,
-            gix::odb::store::load_index::Error::Inaccessible(_)
-                | gix::odb::store::load_index::Error::Io(_)
-        ) || error_chain_contains_io(&error)
-        {
+    fn from_index(error: gix_pack::index::init::Error) -> Self {
+        let kind = if matches!(&error, gix_pack::index::init::Error::Io { .. }) {
+            ErrorKind::StorageUnavailable
+        } else {
+            ErrorKind::CorruptRepository
+        };
+        Self {
+            kind,
+            detail: error.to_string(),
+        }
+    }
+
+    fn from_pack(error: gix_pack::data::header::decode::Error) -> Self {
+        let kind = if matches!(&error, gix_pack::data::header::decode::Error::Io { .. }) {
             ErrorKind::StorageUnavailable
         } else {
             ErrorKind::CorruptRepository
@@ -104,17 +124,6 @@ impl From<String> for Error {
 }
 
 type DecodeResult<T> = Result<T, Error>;
-
-fn error_chain_contains_io(error: &(dyn std::error::Error + 'static)) -> bool {
-    let mut current = Some(error);
-    while let Some(error) = current {
-        if error.downcast_ref::<std::io::Error>().is_some() {
-            return true;
-        }
-        current = error.source();
-    }
-    false
-}
 
 #[derive(Debug, PartialEq, Eq)]
 enum DeltaInstruction {
@@ -225,6 +234,255 @@ pub(crate) struct AllocationInstrumentation {
     pub(crate) max_decoded_base_buffer: usize,
     pub(crate) max_delta_buffer: usize,
     pub(crate) max_work_buffer: usize,
+    pub(crate) delta_instructions: u64,
+    pub(crate) source_opens: u64,
+    pub(crate) index_entries_scanned: u64,
+    pub(crate) compressed_input_bytes: u64,
+    pub(crate) inflated_output_bytes: u64,
+    pub(crate) skipped_output_bytes: u64,
+    pub(crate) discovery_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DecodeWorkLimits {
+    delta_instructions: u64,
+    source_opens: u64,
+    index_entries_scanned: u64,
+    compressed_input_bytes: u64,
+    inflated_output_bytes: u64,
+    skipped_output_bytes: u64,
+    discovery_bytes: u64,
+}
+
+#[derive(Debug)]
+struct DecodeWorkBudget {
+    limits: DecodeWorkLimits,
+    delta_instructions: Cell<u64>,
+    source_opens: Cell<u64>,
+    index_entries_scanned: Cell<u64>,
+    compressed_input_bytes: Cell<u64>,
+    inflated_output_bytes: Cell<u64>,
+    skipped_output_bytes: Cell<u64>,
+    discovery_bytes: Cell<u64>,
+}
+
+impl DecodeWorkBudget {
+    fn new(caller_limit: usize) -> DecodeResult<Self> {
+        let caller_limit = u64::try_from(caller_limit)
+            .map_err(|_| Error::corrupt("caller limit does not fit the decode work counter"))?;
+        let limits = DecodeWorkLimits {
+            // Tiny instructions are the cheapest possible valid delta commands. Requiring
+            // sixteen requested bytes per command, with a small baseline, keeps normal Git
+            // deltas valid while bounding adversarial one-byte COPY programs.
+            delta_instructions: scaled_work_limit(
+                caller_limit,
+                128,
+                1,
+                16,
+                MAX_DELTA_INSTRUCTIONS,
+            )?,
+            // Source opens remain bounded independently because a COPY can otherwise reopen
+            // and reinflate the same base even when its output overlaps by only one byte.
+            source_opens: scaled_work_limit(caller_limit, 512, 1, 4 * 1024, MAX_SOURCE_OPENS)?,
+            // Linear directory/index scans are charged per entry. The larger baseline keeps
+            // ordinary repositories usable without permitting an unbounded pack walk.
+            index_entries_scanned: scaled_work_limit(
+                caller_limit,
+                65_536,
+                1,
+                16,
+                MAX_INDEX_ENTRIES_SCANNED,
+            )?,
+            compressed_input_bytes: scaled_work_limit(
+                caller_limit,
+                16 * MIB,
+                32,
+                1,
+                MAX_COMPRESSED_INPUT_BYTES,
+            )?,
+            inflated_output_bytes: scaled_work_limit(
+                caller_limit,
+                32 * MIB,
+                32,
+                1,
+                MAX_INFLATED_OUTPUT_BYTES,
+            )?,
+            skipped_output_bytes: scaled_work_limit(
+                caller_limit,
+                32 * MIB,
+                32,
+                1,
+                MAX_INFLATED_OUTPUT_BYTES,
+            )?,
+            discovery_bytes: scaled_work_limit(caller_limit, 64 * 1024, 1, 1, MAX_DISCOVERY_BYTES)?,
+        };
+        Ok(Self {
+            limits,
+            delta_instructions: Cell::new(0),
+            source_opens: Cell::new(0),
+            index_entries_scanned: Cell::new(0),
+            compressed_input_bytes: Cell::new(0),
+            inflated_output_bytes: Cell::new(0),
+            skipped_output_bytes: Cell::new(0),
+            discovery_bytes: Cell::new(0),
+        })
+    }
+
+    fn charge_delta_instruction(&self) -> DecodeResult<()> {
+        self.charge(
+            &self.delta_instructions,
+            1,
+            self.limits.delta_instructions,
+            "delta instructions",
+        )
+    }
+
+    fn charge_source_open(&self, count: u64) -> DecodeResult<()> {
+        self.charge(
+            &self.source_opens,
+            count,
+            self.limits.source_opens,
+            "source opens",
+        )
+    }
+
+    fn charge_index_entries(&self, count: u64) -> DecodeResult<()> {
+        self.charge(
+            &self.index_entries_scanned,
+            count,
+            self.limits.index_entries_scanned,
+            "index entries scanned",
+        )
+    }
+
+    fn charge_compressed_input(&self, count: u64) -> DecodeResult<()> {
+        self.charge(
+            &self.compressed_input_bytes,
+            count,
+            self.limits.compressed_input_bytes,
+            "compressed input bytes",
+        )
+    }
+
+    fn charge_inflated_output(&self, count: u64) -> DecodeResult<()> {
+        self.charge(
+            &self.inflated_output_bytes,
+            count,
+            self.limits.inflated_output_bytes,
+            "inflated output bytes",
+        )
+    }
+
+    fn charge_skipped_output(&self, count: u64) -> DecodeResult<()> {
+        self.charge(
+            &self.skipped_output_bytes,
+            count,
+            self.limits.skipped_output_bytes,
+            "skipped output bytes",
+        )
+    }
+
+    fn charge_discovery_bytes(&self, count: u64) -> DecodeResult<()> {
+        self.charge(
+            &self.discovery_bytes,
+            count,
+            self.limits.discovery_bytes,
+            "discovery bytes",
+        )
+    }
+
+    fn compressed_chunk(&self, requested: usize) -> DecodeResult<usize> {
+        self.remaining_chunk(
+            &self.compressed_input_bytes,
+            self.limits.compressed_input_bytes,
+            requested.min(STREAM_BUFFER_TARGET),
+            "compressed input bytes",
+        )
+    }
+
+    fn inflated_chunk(&self, requested: usize) -> DecodeResult<usize> {
+        self.remaining_chunk(
+            &self.inflated_output_bytes,
+            self.limits.inflated_output_bytes,
+            requested,
+            "inflated output bytes",
+        )
+    }
+
+    fn charge(&self, counter: &Cell<u64>, count: u64, limit: u64, label: &str) -> DecodeResult<()> {
+        let next = counter
+            .get()
+            .checked_add(count)
+            .ok_or_else(|| Error::corrupt(format!("decode work counter overflow: {label}")))?;
+        counter.set(next);
+        if next > limit {
+            return Err(Error::corrupt(format!(
+                "decode work budget exhausted: {label} {next} exceed limit {limit}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn remaining_chunk(
+        &self,
+        counter: &Cell<u64>,
+        limit: u64,
+        requested: usize,
+        label: &str,
+    ) -> DecodeResult<usize> {
+        if requested == 0 {
+            return Ok(0);
+        }
+        let remaining = limit.saturating_sub(counter.get());
+        if remaining == 0 {
+            self.charge(counter, 1, limit, label)?;
+            unreachable!("charging past an exhausted budget must fail")
+        }
+        Ok(requested.min(remaining.min(usize::MAX as u64) as usize))
+    }
+
+    #[cfg(test)]
+    fn instrumentation(&self) -> DecodeWorkInstrumentation {
+        DecodeWorkInstrumentation {
+            delta_instructions: self.delta_instructions.get(),
+            source_opens: self.source_opens.get(),
+            index_entries_scanned: self.index_entries_scanned.get(),
+            compressed_input_bytes: self.compressed_input_bytes.get(),
+            inflated_output_bytes: self.inflated_output_bytes.get(),
+            skipped_output_bytes: self.skipped_output_bytes.get(),
+            discovery_bytes: self.discovery_bytes.get(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct DecodeWorkInstrumentation {
+    delta_instructions: u64,
+    source_opens: u64,
+    index_entries_scanned: u64,
+    compressed_input_bytes: u64,
+    inflated_output_bytes: u64,
+    skipped_output_bytes: u64,
+    discovery_bytes: u64,
+}
+
+fn scaled_work_limit(
+    caller_limit: u64,
+    baseline: u64,
+    numerator: u64,
+    denominator: u64,
+    hard_cap: u64,
+) -> DecodeResult<u64> {
+    let scaled = caller_limit
+        .checked_mul(numerator)
+        .and_then(|value| value.checked_add(denominator - 1))
+        .ok_or_else(|| Error::corrupt("decode work limit overflow"))?
+        / denominator;
+    baseline
+        .checked_add(scaled)
+        .map(|limit| limit.min(hard_cap))
+        .ok_or_else(|| Error::corrupt("decode work limit overflow"))
 }
 
 #[derive(Clone, Copy)]
@@ -352,6 +610,18 @@ impl AllocationTracker {
             }
         }
     }
+
+    #[cfg(test)]
+    fn record_work(&mut self, budget: &DecodeWorkBudget) {
+        let work = budget.instrumentation();
+        self.instrumentation.delta_instructions = work.delta_instructions;
+        self.instrumentation.source_opens = work.source_opens;
+        self.instrumentation.index_entries_scanned = work.index_entries_scanned;
+        self.instrumentation.compressed_input_bytes = work.compressed_input_bytes;
+        self.instrumentation.inflated_output_bytes = work.inflated_output_bytes;
+        self.instrumentation.skipped_output_bytes = work.skipped_output_bytes;
+        self.instrumentation.discovery_bytes = work.discovery_bytes;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -376,6 +646,7 @@ struct ObjectMetadata {
 struct GuardedMetadata {
     object: ObjectMetadata,
     delta_bases: Vec<VerifiedDeltaBase>,
+    pack_entries: Vec<VerifiedPackEntry>,
 }
 
 #[derive(Debug)]
@@ -383,7 +654,13 @@ struct VerifiedDeltaBase {
     delta: ObjectSource,
     base: ObjectSource,
     metadata: ObjectMetadata,
-    external_ref: Option<gix_hash::ObjectId>,
+    ref_base_id: Option<gix_hash::ObjectId>,
+}
+
+#[derive(Debug)]
+struct VerifiedPackEntry {
+    source: ObjectSource,
+    entry_end: gix_pack::data::Offset,
 }
 
 impl GuardedMetadata {
@@ -394,36 +671,50 @@ impl GuardedMetadata {
             .ok_or_else(|| Error::corrupt("guarded delta chain has no base for source"))
     }
 
-    fn external_base_kind(&self, id: &gix_hash::oid) -> Option<gix_object::Kind> {
+    fn ref_base_kind(&self, id: &gix_hash::oid) -> Option<gix_object::Kind> {
         self.delta_bases.iter().find_map(|candidate| {
             candidate
-                .external_ref
+                .ref_base_id
                 .as_ref()
                 .filter(|candidate_id| candidate_id.as_ref() == id)
                 .map(|_| candidate.metadata.kind)
         })
     }
+
+    fn pack_entry_end(&self, source: &ObjectSource) -> DecodeResult<gix_pack::data::Offset> {
+        self.pack_entries
+            .iter()
+            .find(|candidate| candidate.source == *source)
+            .map(|candidate| candidate.entry_end)
+            .ok_or_else(|| Error::corrupt("guarded pack metadata has no entry for source"))
+    }
 }
 
 struct OpenedPack {
-    bundle: gix_pack::Bundle,
+    pack: gix_pack::data::File,
+    index: Option<gix_pack::index::File>,
     entry: gix_pack::data::Entry,
     entry_end: gix_pack::data::Offset,
 }
 
 impl OpenedPack {
     fn compressed(&self) -> Result<&[u8], String> {
-        self.bundle
-            .pack
+        self.pack
             .entry_slice(self.entry.data_offset..self.entry_end)
             .ok_or_else(|| {
                 format!(
                     "pack entry compressed range {}..{} is outside {}",
                     self.entry.data_offset,
                     self.entry_end,
-                    self.bundle.pack.path().display()
+                    self.pack.path().display()
                 )
             })
+    }
+
+    fn index(&self) -> DecodeResult<&gix_pack::index::File> {
+        self.index
+            .as_ref()
+            .ok_or_else(|| Error::corrupt("guarded pack reopen has no index"))
     }
 }
 
@@ -446,11 +737,14 @@ impl CompressedSource<'_> {
         &mut self,
         inflate: &mut gix_features::zlib::Decompress,
         output: &mut [u8],
+        budget: &DecodeWorkBudget,
     ) -> DecodeResult<(gix_features::zlib::Status, usize, usize, bool)> {
         match self {
             CompressedSource::Slice { bytes, position } => {
-                let input = &bytes[*position..];
-                let eof = input.is_empty();
+                let remaining = &bytes[*position..];
+                let input_len = budget.compressed_chunk(remaining.len())?;
+                let input = &remaining[..input_len];
+                let eof = remaining.is_empty();
                 let before_in = inflate.total_in();
                 let before_out = inflate.total_out();
                 let status = inflate
@@ -466,6 +760,8 @@ impl CompressedSource<'_> {
                     .map_err(|error| Error::corrupt(format!("inflate pack entry: {error}")))?;
                 let consumed = (inflate.total_in() - before_in) as usize;
                 let written = (inflate.total_out() - before_out) as usize;
+                budget.charge_compressed_input(consumed as u64)?;
+                budget.charge_inflated_output(written as u64)?;
                 *position = position
                     .checked_add(consumed)
                     .ok_or_else(|| Error::corrupt("compressed input position overflow"))?;
@@ -479,8 +775,9 @@ impl CompressedSource<'_> {
                 eof,
             } => {
                 if *position == *length && !*eof {
+                    let read_limit = budget.compressed_chunk(buffer.len())?;
                     *length = file
-                        .read(buffer)
+                        .read(&mut buffer[..read_limit])
                         .map_err(|error| Error::storage(format!("read loose object: {error}")))?;
                     *position = 0;
                     *eof = *length == 0;
@@ -503,6 +800,8 @@ impl CompressedSource<'_> {
                     .map_err(|error| Error::corrupt(format!("inflate loose object: {error}")))?;
                 let consumed = (inflate.total_in() - before_in) as usize;
                 let written = (inflate.total_out() - before_out) as usize;
+                budget.charge_compressed_input(consumed as u64)?;
+                budget.charge_inflated_output(written as u64)?;
                 *position = position
                     .checked_add(consumed)
                     .ok_or_else(|| Error::corrupt("compressed input position overflow"))?;
@@ -511,7 +810,7 @@ impl CompressedSource<'_> {
         }
     }
 
-    fn is_exactly_exhausted(&mut self) -> DecodeResult<bool> {
+    fn is_exactly_exhausted(&mut self, budget: &DecodeWorkBudget) -> DecodeResult<bool> {
         match self {
             CompressedSource::Slice { bytes, position } => Ok(*position == bytes.len()),
             CompressedSource::File {
@@ -527,9 +826,11 @@ impl CompressedSource<'_> {
                 if *eof {
                     return Ok(true);
                 }
-                let read = file.read(&mut buffer[..1]).map_err(|error| {
+                let read_limit = budget.compressed_chunk(1)?;
+                let read = file.read(&mut buffer[..read_limit]).map_err(|error| {
                     Error::storage(format!("read loose object trailer: {error}"))
                 })?;
+                budget.charge_compressed_input(read as u64)?;
                 *position = 0;
                 *length = read;
                 *eof = read == 0;
@@ -606,9 +907,9 @@ impl<'a> InflatedStream<'a> {
         Ok(())
     }
 
-    fn read_required_byte(&mut self) -> DecodeResult<u8> {
+    fn read_required_byte(&mut self, budget: &DecodeWorkBudget) -> DecodeResult<u8> {
         if self.available() == 0 {
-            self.refill(1)?;
+            self.refill(1, budget)?;
         }
         if self.available() == 0 {
             return Err(Error::corrupt("zlib stream ended before requested data"));
@@ -618,28 +919,34 @@ impl<'a> InflatedStream<'a> {
         Ok(byte)
     }
 
-    fn skip_exact(&mut self, mut count: u64) -> DecodeResult<()> {
+    fn skip_exact(&mut self, mut count: u64, budget: &DecodeWorkBudget) -> DecodeResult<()> {
         while count != 0 {
             if self.available() == 0 {
                 let request = count.min(self.output.len() as u64) as usize;
-                self.refill(request)?;
+                self.refill(request, budget)?;
             }
             let available = self.available();
             if available == 0 {
                 return Err(Error::corrupt("zlib stream ended before requested data"));
             }
             let consumed = available.min(count.min(usize::MAX as u64) as usize);
+            budget.charge_skipped_output(consumed as u64)?;
             self.output_position += consumed;
             count -= consumed as u64;
         }
         Ok(())
     }
 
-    fn append_exact(&mut self, mut count: u64, output: &mut Vec<u8>) -> DecodeResult<()> {
+    fn append_exact(
+        &mut self,
+        mut count: u64,
+        output: &mut Vec<u8>,
+        budget: &DecodeWorkBudget,
+    ) -> DecodeResult<()> {
         while count != 0 {
             if self.available() == 0 {
                 let request = count.min(self.output.len() as u64) as usize;
-                self.refill(request)?;
+                self.refill(request, budget)?;
             }
             let available = self.available();
             if available == 0 {
@@ -665,13 +972,13 @@ impl<'a> InflatedStream<'a> {
         Ok(())
     }
 
-    fn finish_exact(&mut self) -> DecodeResult<()> {
+    fn finish_exact(&mut self, budget: &DecodeWorkBudget) -> DecodeResult<()> {
         if self.available() != 0 {
             return Err(Error::corrupt(
                 "zlib stream produced unconsumed decoded bytes",
             ));
         }
-        self.refill(1)?;
+        self.refill(1, budget)?;
         if self.available() != 0 {
             return Err(Error::corrupt(
                 "zlib stream produced more bytes than declared",
@@ -691,7 +998,7 @@ impl<'a> InflatedStream<'a> {
         self.output_length - self.output_position
     }
 
-    fn refill(&mut self, requested: usize) -> DecodeResult<()> {
+    fn refill(&mut self, requested: usize, budget: &DecodeWorkBudget) -> DecodeResult<()> {
         if requested == 0 || self.ended {
             self.output_position = 0;
             self.output_length = 0;
@@ -703,11 +1010,13 @@ impl<'a> InflatedStream<'a> {
             ));
         }
 
-        let output_len = requested.min(self.output.len());
+        let output_len = budget.inflated_chunk(requested.min(self.output.len()))?;
         loop {
-            let (status, consumed, written, input_was_eof) = self
-                .source
-                .decompress_once(&mut self.inflate, &mut self.output[..output_len])?;
+            let (status, consumed, written, input_was_eof) = self.source.decompress_once(
+                &mut self.inflate,
+                &mut self.output[..output_len],
+                budget,
+            )?;
             self.output_position = 0;
             self.output_length = written;
 
@@ -730,7 +1039,7 @@ impl<'a> InflatedStream<'a> {
                         )));
                     }
                 }
-                if !self.source.is_exactly_exhausted()? {
+                if !self.source.is_exactly_exhausted(budget)? {
                     return Err(Error::corrupt(
                         "zlib stream ended before the compressed entry boundary",
                     ));
@@ -757,10 +1066,11 @@ pub(crate) fn read_prefix(
     limit: usize,
 ) -> DecodeResult<PrefixBlob> {
     let mut tracker = AllocationTracker::new(limit);
-    let source = locate_source(repo, id, None)?;
+    let budget = DecodeWorkBudget::new(limit)?;
+    let source = locate_source(repo, id, None, &budget)?;
     let guarded = validate_local_metadata_before_public_header(
-        || probe_guarded_source(repo, &source, &mut tracker),
-        |guarded| public_metadata_for_source(repo, &source, guarded),
+        || probe_guarded_source(repo, &source, &mut tracker, &budget),
+        |guarded| public_metadata_for_source(repo, &source, guarded, &budget),
     )?;
     let metadata = guarded.object;
     if metadata.kind != gix_object::Kind::Blob {
@@ -773,6 +1083,8 @@ pub(crate) fn read_prefix(
     tracker.mark_header_known();
 
     if limit == 0 {
+        #[cfg(test)]
+        tracker.record_work(&budget);
         return Ok(PrefixBlob {
             size,
             data: Vec::new(),
@@ -795,6 +1107,7 @@ pub(crate) fn read_prefix(
         &mut tracker,
         &mut Vec::new(),
         &guarded,
+        &budget,
     )?;
     if data.len() != read_limit || data.capacity() > limit {
         return Err(Error::corrupt(format!(
@@ -804,7 +1117,10 @@ pub(crate) fn read_prefix(
         )));
     }
     #[cfg(test)]
-    tracker.record_capacity(BufferRole::ReturnedObject, data.capacity());
+    {
+        tracker.record_capacity(BufferRole::ReturnedObject, data.capacity());
+        tracker.record_work(&budget);
+    }
 
     Ok(PrefixBlob {
         size,
@@ -834,9 +1150,26 @@ fn public_metadata_for_source(
     repo: &gix::Repository,
     source: &ObjectSource,
     guarded: &GuardedMetadata,
+    budget: &DecodeWorkBudget,
 ) -> DecodeResult<ObjectMetadata> {
     match source {
         ObjectSource::Loose { object_db, id } => {
+            let path = loose_object_path_at(object_db, *id);
+            budget.charge_source_open(1)?;
+            let compressed_len = std::fs::metadata(&path)
+                .map_err(|error| {
+                    Error::storage(format!(
+                        "inspect guarded loose object {}: {error}",
+                        path.display()
+                    ))
+                })?
+                .len();
+            // The exact loose-store API mmaps the object and gives the whole mapping to a
+            // single bounded-output inflate call. Reserve the complete compressed file so
+            // that call cannot bypass the request-wide input budget.
+            budget.charge_compressed_input(compressed_len)?;
+            budget.charge_inflated_output(PUBLIC_HEADER_OUTPUT_LIMIT)?;
+            budget.charge_source_open(1)?;
             let store = gix::odb::loose::Store::at(
                 object_db.clone(),
                 repo.object_hash(),
@@ -849,79 +1182,132 @@ fn public_metadata_for_source(
             Ok(ObjectMetadata { kind, size })
         }
         ObjectSource::Packed { .. } => {
-            let opened = open_packed(repo, source)?;
-            let resolver_error = std::cell::RefCell::new(None);
-            let resolve = |base_id: &gix_hash::oid| {
-                if let Some(index) = opened.bundle.index.lookup(base_id) {
-                    let pack_offset = opened.bundle.index.pack_offset_at_index(index);
-                    return match opened.bundle.pack.entry(pack_offset) {
-                        Ok(entry) => {
-                            Some(gix_pack::data::decode::header::ResolvedBase::InPack(entry))
-                        }
-                        Err(error) => {
-                            *resolver_error.borrow_mut() = Some(Error::corrupt(error));
-                            None
-                        }
-                    };
-                }
-
-                guarded.external_base_kind(base_id).map(|kind| {
-                    gix_pack::data::decode::header::ResolvedBase::OutOfPack {
-                        kind,
-                        num_deltas: None,
-                    }
-                })
-            };
-            let mut inflate = gix_features::zlib::Inflate::default();
-            let outcome =
-                opened
-                    .bundle
-                    .pack
-                    .decode_header(opened.entry.clone(), &mut inflate, &resolve);
-            if let Some(error) = resolver_error.into_inner() {
-                return Err(error);
-            }
-            let outcome = outcome.map_err(Error::corrupt)?;
-            Ok(ObjectMetadata {
-                kind: outcome.kind,
-                size: outcome.object_size,
-            })
+            let opened = open_guarded_packed(repo, source, guarded, budget)?;
+            public_metadata_for_opened_pack(&opened, guarded, budget)
         }
     }
+}
+
+fn public_metadata_for_opened_pack(
+    opened: &OpenedPack,
+    guarded: &GuardedMetadata,
+    budget: &DecodeWorkBudget,
+) -> DecodeResult<ObjectMetadata> {
+    let resolver_error = std::cell::RefCell::new(None);
+    let resolve = |base_id: &gix_hash::oid| {
+        if let Err(error) = budget.charge_index_entries(1) {
+            *resolver_error.borrow_mut() = Some(error);
+            return None;
+        }
+        guarded.ref_base_kind(base_id).map(|kind| {
+            gix_pack::data::decode::header::ResolvedBase::OutOfPack {
+                kind,
+                num_deltas: None,
+            }
+        })
+    };
+    let mut inflate = gix_features::zlib::Inflate::default();
+    let outcome = if opened.entry.header.as_kind().is_some() {
+        // Base-object headers do not touch compressed input, so the original public
+        // data file is safe and also supports packs too small for a truncated view.
+        opened
+            .pack
+            .decode_header(opened.entry.clone(), &mut inflate, &resolve)
+    } else {
+        let public_pack = bounded_public_header_pack(opened, budget)?;
+        public_pack.decode_header(opened.entry.clone(), &mut inflate, &resolve)
+    };
+    if let Some(error) = resolver_error.into_inner() {
+        return Err(error);
+    }
+    let outcome = outcome.map_err(Error::corrupt)?;
+    Ok(ObjectMetadata {
+        kind: outcome.kind,
+        size: outcome.object_size,
+    })
+}
+
+fn bounded_public_header_pack<'a>(
+    opened: &'a OpenedPack,
+    budget: &DecodeWorkBudget,
+) -> DecodeResult<gix_pack::data::File<&'a [u8]>> {
+    let object_hash = opened.pack.object_hash();
+    let view_end = opened.entry_end;
+    let data = opened.pack.entry_slice(0..view_end).ok_or_else(|| {
+        Error::corrupt(format!(
+            "bounded public pack view 0..{view_end} is outside {}",
+            opened.pack.path().display()
+        ))
+    })?;
+
+    let accepted_input = view_end
+        .checked_sub(opened.entry.data_offset)
+        .ok_or_else(|| Error::corrupt("bounded public pack input range underflow"))?;
+    // gix's public delta-header probe passes its complete backing suffix to one
+    // inflate call. The constructor accepts this borrowed prefix even though its
+    // synthetic pack_end excludes a hash-sized trailer; decode_header reads backing
+    // data directly, so ending the slice at entry_end is the exact input boundary.
+    budget.charge_compressed_input(accepted_input)?;
+    budget.charge_inflated_output(PUBLIC_HEADER_OUTPUT_LIMIT)?;
+
+    let bounded =
+        gix_pack::data::File::from_data(data, opened.pack.path().to_path_buf(), object_hash)
+            .map_err(Error::from_pack)?;
+    if bounded.data_len() as u64 != opened.entry_end {
+        return Err(Error::corrupt(format!(
+            "bounded public pack data ends at {}, expected {}",
+            bounded.data_len(),
+            opened.entry_end
+        )));
+    }
+    Ok(bounded)
 }
 
 fn locate_source(
     repo: &gix::Repository,
     id: gix_hash::ObjectId,
     preferred_index: Option<&Path>,
+    budget: &DecodeWorkBudget,
 ) -> DecodeResult<ObjectSource> {
-    if let Some(path) = preferred_index
-        && let Some(source) = packed_source_at(repo, path, id)?
-    {
-        return Ok(source);
+    let mut deferred_storage_error = None;
+    if let Some(path) = preferred_index {
+        match packed_source_at(repo, path, id, budget) {
+            Ok(Some(source)) => return Ok(source),
+            Ok(None) => {}
+            Err(error) if error.kind() == ErrorKind::StorageUnavailable => {
+                deferred_storage_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
     }
 
-    let mut object_dbs = vec![repo.objects.store_ref().path().to_path_buf()];
-    object_dbs.extend(
-        repo.objects
-            .store_ref()
-            .alternate_db_paths()
-            .map_err(Error::from_store)?,
-    );
+    let primary_object_db = repo.objects.store_ref().path().to_path_buf();
+    let mut object_dbs = vec![primary_object_db.clone()];
+    object_dbs.extend(alternate_object_dbs(
+        &primary_object_db,
+        repo.current_dir(),
+        budget,
+    )?);
 
     for object_db in &object_dbs {
-        for path in pack_index_paths(object_db)? {
+        for path in pack_index_paths(object_db, budget)? {
             if preferred_index.is_some_and(|preferred| preferred == path) {
                 continue;
             }
-            if let Some(source) = packed_source_at(repo, &path, id)? {
-                return Ok(source);
+            match packed_source_at(repo, &path, id, budget) {
+                Ok(Some(source)) => return Ok(source),
+                Ok(None) => {}
+                Err(error) if error.kind() == ErrorKind::StorageUnavailable => {
+                    deferred_storage_error.get_or_insert(error);
+                }
+                Err(error) => return Err(error),
             }
         }
     }
 
     for object_db in object_dbs {
         let loose_path = loose_object_path_at(&object_db, id);
+        budget.charge_source_open(1)?;
         match std::fs::metadata(&loose_path) {
             Ok(metadata) if metadata.is_file() => {
                 return Ok(ObjectSource::Loose { object_db, id });
@@ -937,13 +1323,158 @@ fn locate_source(
         }
     }
 
-    Err(Error::corrupt(format!(
-        "unable to resolve object {id} from loose objects or public pack indexes"
-    )))
+    Err(deferred_storage_error.unwrap_or_else(|| {
+        Error::corrupt(format!(
+            "unable to resolve object {id} from loose objects or public pack indexes"
+        ))
+    }))
 }
 
-fn pack_index_paths(object_db: &Path) -> DecodeResult<Vec<PathBuf>> {
+fn alternate_object_dbs(
+    primary_object_db: &Path,
+    current_dir: &Path,
+    budget: &DecodeWorkBudget,
+) -> DecodeResult<Vec<PathBuf>> {
+    budget.charge_source_open(1)?;
+    let primary_canonical = resolve_alternate_path(primary_object_db, current_dir)?;
+    let mut pending = vec![(0_usize, primary_object_db.to_path_buf())];
+    let mut object_dbs = Vec::new();
+    let mut seen = vec![primary_canonical];
+
+    // Match gix's DFS/LIFO alternate ordering while putting all discovery I/O,
+    // input bytes, path visits, recursion, and cycles under this request's budget.
+    while let Some((depth, object_db)) = pending.pop() {
+        if depth > MAX_CHAIN_DEPTH {
+            return Err(Error::corrupt(format!(
+                "alternate recursion exceeds the safe depth bound of {MAX_CHAIN_DEPTH}"
+            )));
+        }
+
+        let alternates_path = object_db.join("info/alternates");
+        budget.charge_source_open(1)?;
+        let mut file = match File::open(&alternates_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if depth != 0 {
+                    object_dbs.push(object_db);
+                }
+                continue;
+            }
+            Err(error) => {
+                return Err(Error::storage(format!(
+                    "open alternate object databases {}: {error}",
+                    alternates_path.display()
+                )));
+            }
+        };
+
+        let input_len = file
+            .metadata()
+            .map_err(|error| {
+                Error::storage(format!(
+                    "inspect alternate object databases {}: {error}",
+                    alternates_path.display()
+                ))
+            })?
+            .len();
+        budget.charge_discovery_bytes(input_len)?;
+        let input_len = usize::try_from(input_len)
+            .map_err(|_| Error::corrupt("alternate discovery input does not fit usize"))?;
+        let mut input = Vec::with_capacity(input_len);
+        file.by_ref()
+            .take(input_len as u64)
+            .read_to_end(&mut input)
+            .map_err(|error| {
+                Error::storage(format!(
+                    "read alternate object databases {}: {error}",
+                    alternates_path.display()
+                ))
+            })?;
+        let mut extra = [0_u8; 1];
+        if file.read(&mut extra).map_err(|error| {
+            Error::storage(format!(
+                "finish reading alternate object databases {}: {error}",
+                alternates_path.display()
+            ))
+        })? != 0
+        {
+            return Err(Error::corrupt(format!(
+                "alternate object database list {} grew while reading",
+                alternates_path.display()
+            )));
+        }
+
+        for alternate in parse_alternate_paths(&input, budget)? {
+            let alternate = primary_object_db.join(alternate);
+            budget.charge_source_open(1)?;
+            let alternate_canonical = resolve_alternate_path(&alternate, current_dir)?;
+            if seen.contains(&alternate_canonical) {
+                return Err(Error::corrupt(format!(
+                    "alternate object databases form a cycle through {}",
+                    alternate.display()
+                )));
+            }
+            seen.push(alternate_canonical);
+            pending.push((depth + 1, alternate));
+        }
+
+        if depth != 0 {
+            object_dbs.push(object_db);
+        }
+    }
+    Ok(object_dbs)
+}
+
+fn resolve_alternate_path(path: &Path, current_dir: &Path) -> DecodeResult<PathBuf> {
+    gix::path::realpath_opts(path, current_dir, gix::path::realpath::MAX_SYMLINKS).map_err(
+        |error| {
+            let detail = format!(
+                "resolve alternate object database {}: {error}",
+                path.display()
+            );
+            match error {
+                gix::path::realpath::Error::ReadLink(_)
+                | gix::path::realpath::Error::CurrentWorkingDir(_) => Error::storage(detail),
+                gix::path::realpath::Error::MaxSymlinksExceeded { .. }
+                | gix::path::realpath::Error::ExcessiveComponentCount { .. }
+                | gix::path::realpath::Error::EmptyPath
+                | gix::path::realpath::Error::MissingParent => Error::corrupt(detail),
+            }
+        },
+    )
+}
+
+fn parse_alternate_paths(input: &[u8], budget: &DecodeWorkBudget) -> DecodeResult<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for line in input.split(|byte| *byte == b'\n') {
+        let line = line.as_bstr();
+        if line.is_empty() || line.starts_with(b"#") {
+            continue;
+        }
+        // Charge each non-comment path before unquoting or allocating it, so a tiny
+        // many-line file cannot amplify into an unbounded Vec<PathBuf> first.
+        budget.charge_source_open(1)?;
+        let unquoted = gix_quote::ansi_c::undo(line)
+            .map_err(|error| {
+                Error::corrupt(format!("parse alternate object database path: {error}"))
+            })?
+            .0;
+        let path = gix::path::try_from_bstr(unquoted)
+            .map_err(|_| {
+                Error::corrupt(format!(
+                    "alternate object database path is not representable: {}",
+                    String::from_utf8_lossy(line)
+                ))
+            })?
+            .into_owned();
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+fn pack_index_paths(object_db: &Path, budget: &DecodeWorkBudget) -> DecodeResult<Vec<PathBuf>> {
     let pack_dir = object_db.join("pack");
+    budget.charge_source_open(1)?;
     let entries = match std::fs::read_dir(&pack_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -954,16 +1485,16 @@ fn pack_index_paths(object_db: &Path) -> DecodeResult<Vec<PathBuf>> {
             )));
         }
     };
-    let mut paths: Vec<PathBuf> = entries
-        .map(|entry| {
-            entry
-                .map(|entry| entry.path())
-                .map_err(|error| Error::storage(format!("read {}: {error}", pack_dir.display())))
-        })
-        .collect::<DecodeResult<Vec<_>>>()?
-        .into_iter()
-        .filter(|path| path.extension().is_some_and(|extension| extension == "idx"))
-        .collect();
+    let mut paths = Vec::new();
+    for entry in entries {
+        budget.charge_index_entries(1)?;
+        let path = entry
+            .map(|entry| entry.path())
+            .map_err(|error| Error::storage(format!("read {}: {error}", pack_dir.display())))?;
+        if path.extension().is_some_and(|extension| extension == "idx") {
+            paths.push(path);
+        }
+    }
     paths.sort();
     Ok(paths)
 }
@@ -972,16 +1503,87 @@ fn packed_source_at(
     repo: &gix::Repository,
     index_path: &Path,
     id: gix_hash::ObjectId,
+    budget: &DecodeWorkBudget,
 ) -> DecodeResult<Option<ObjectSource>> {
-    let bundle =
-        gix_pack::Bundle::at(index_path, repo.object_hash()).map_err(Error::from_bundle)?;
-    Ok(bundle.index.lookup(id).map(|index| ObjectSource::Packed {
+    let index = open_pack_index(repo, index_path, budget)?;
+    let Some(entry_index) = index.lookup(id) else {
+        return Ok(None);
+    };
+    let pack_offset = index.pack_offset_at_index(entry_index);
+    open_pack_data(repo, index_path, budget)?;
+    Ok(Some(ObjectSource::Packed {
         index_path: index_path.to_path_buf(),
-        pack_offset: bundle.index.pack_offset_at_index(index),
+        pack_offset,
     }))
 }
 
-fn open_packed(repo: &gix::Repository, source: &ObjectSource) -> DecodeResult<OpenedPack> {
+fn open_pack_index(
+    repo: &gix::Repository,
+    index_path: &Path,
+    budget: &DecodeWorkBudget,
+) -> DecodeResult<gix_pack::index::File> {
+    budget.charge_source_open(1)?;
+    let index_bytes = std::fs::metadata(index_path)
+        .map_err(|error| {
+            Error::storage(format!(
+                "inspect pack index {}: {error}",
+                index_path.display()
+            ))
+        })?
+        .len();
+
+    // A SHA-1 v1 entry is the smallest valid pack-index entry: four offset bytes
+    // plus twenty object-id bytes. Charging ceil(file_size / 24) is therefore a
+    // conservative upper bound on the number of entries that gix can scan while
+    // validating any supported valid index. The path-based mmap API assumes pack
+    // indexes are immutable; the length check below catches replacement around the
+    // open, but cannot make mutation of an already-mapped index safe.
+    let validation_entries = index_bytes.div_ceil(MIN_PACK_INDEX_BYTES_PER_ENTRY);
+    budget.charge_index_entries(validation_entries)?;
+    budget.charge_source_open(1)?;
+    let index =
+        gix_pack::index::File::at(index_path, repo.object_hash()).map_err(Error::from_index)?;
+
+    budget.charge_source_open(1)?;
+    let observed_bytes = std::fs::metadata(index_path)
+        .map_err(|error| {
+            Error::storage(format!(
+                "reinspect pack index {}: {error}",
+                index_path.display()
+            ))
+        })?
+        .len();
+    if observed_bytes != index_bytes {
+        return Err(Error::corrupt(format!(
+            "pack index {} changed size while opening: {index_bytes} to {observed_bytes}",
+            index_path.display()
+        )));
+    }
+    if u64::from(index.num_objects()) > validation_entries {
+        return Err(Error::corrupt(format!(
+            "pack index {} declared {} objects beyond the charged validation bound {validation_entries}",
+            index_path.display(),
+            index.num_objects()
+        )));
+    }
+    Ok(index)
+}
+
+fn open_pack_data(
+    repo: &gix::Repository,
+    index_path: &Path,
+    budget: &DecodeWorkBudget,
+) -> DecodeResult<gix_pack::data::File> {
+    budget.charge_source_open(1)?;
+    gix_pack::data::File::at(index_path.with_extension("pack"), repo.object_hash())
+        .map_err(Error::from_pack)
+}
+
+fn open_packed(
+    repo: &gix::Repository,
+    source: &ObjectSource,
+    budget: &DecodeWorkBudget,
+) -> DecodeResult<OpenedPack> {
     let ObjectSource::Packed {
         index_path,
         pack_offset,
@@ -991,11 +1593,12 @@ fn open_packed(repo: &gix::Repository, source: &ObjectSource) -> DecodeResult<Op
             "attempted to open a loose object as a pack entry",
         ));
     };
-    let bundle =
-        gix_pack::Bundle::at(index_path, repo.object_hash()).map_err(Error::from_bundle)?;
+    let index = open_pack_index(repo, index_path, budget)?;
+    let pack = open_pack_data(repo, index_path, budget)?;
     let mut offset_occurrences = 0_usize;
     let mut next_offset = None;
-    for candidate in bundle.index.iter() {
+    for candidate in index.iter() {
+        budget.charge_index_entries(1)?;
         if candidate.pack_offset == *pack_offset {
             offset_occurrences += 1;
         } else if candidate.pack_offset > *pack_offset {
@@ -1010,11 +1613,41 @@ fn open_packed(repo: &gix::Repository, source: &ObjectSource) -> DecodeResult<Op
             index_path.display(),
         )));
     }
-    let entry = bundle.pack.entry(*pack_offset).map_err(Error::corrupt)?;
-    let entry_end = next_offset.unwrap_or(bundle.pack.pack_end() as u64);
+    let entry_end = next_offset.unwrap_or(pack.pack_end() as u64);
+    opened_pack_from_parts(source, pack, Some(index), entry_end)
+}
+
+fn open_guarded_packed(
+    repo: &gix::Repository,
+    source: &ObjectSource,
+    guarded: &GuardedMetadata,
+    budget: &DecodeWorkBudget,
+) -> DecodeResult<OpenedPack> {
+    let ObjectSource::Packed { index_path, .. } = source else {
+        return Err(Error::corrupt(
+            "attempted to open a loose object as a guarded pack entry",
+        ));
+    };
+    let entry_end = guarded.pack_entry_end(source)?;
+    let pack = open_pack_data(repo, index_path, budget)?;
+    opened_pack_from_parts(source, pack, None, entry_end)
+}
+
+fn opened_pack_from_parts(
+    source: &ObjectSource,
+    pack: gix_pack::data::File,
+    index: Option<gix_pack::index::File>,
+    entry_end: gix_pack::data::Offset,
+) -> DecodeResult<OpenedPack> {
+    let ObjectSource::Packed { pack_offset, .. } = source else {
+        return Err(Error::corrupt(
+            "attempted to validate a loose object as a pack entry",
+        ));
+    };
+    let entry = pack.entry(*pack_offset).map_err(Error::corrupt)?;
     if *pack_offset >= entry.data_offset
         || entry.data_offset >= entry_end
-        || entry_end > bundle.pack.pack_end() as u64
+        || entry_end > pack.pack_end() as u64
     {
         return Err(Error::corrupt(format!(
             "invalid pack entry range {}..{entry_end} at offset {pack_offset}",
@@ -1022,7 +1655,8 @@ fn open_packed(repo: &gix::Repository, source: &ObjectSource) -> DecodeResult<Op
         )));
     }
     Ok(OpenedPack {
-        bundle,
+        pack,
+        index,
         entry,
         entry_end,
     })
@@ -1032,12 +1666,23 @@ fn probe_guarded_source(
     repo: &gix::Repository,
     source: &ObjectSource,
     tracker: &mut AllocationTracker,
+    budget: &DecodeWorkBudget,
 ) -> DecodeResult<GuardedMetadata> {
     let mut delta_bases = Vec::new();
-    let object = probe_source(repo, source, tracker, &mut Vec::new(), &mut delta_bases)?;
+    let mut pack_entries = Vec::new();
+    let object = probe_source(
+        repo,
+        source,
+        tracker,
+        &mut Vec::new(),
+        &mut delta_bases,
+        &mut pack_entries,
+        budget,
+    )?;
     Ok(GuardedMetadata {
         object,
         delta_bases,
+        pack_entries,
     })
 }
 
@@ -1047,35 +1692,43 @@ fn probe_source(
     tracker: &mut AllocationTracker,
     stack: &mut Vec<ObjectSource>,
     delta_bases: &mut Vec<VerifiedDeltaBase>,
+    pack_entries: &mut Vec<VerifiedPackEntry>,
+    budget: &DecodeWorkBudget,
 ) -> DecodeResult<ObjectMetadata> {
     enter_source(source, stack)?;
     let result = match source {
         ObjectSource::Loose { object_db, id } => {
             let path = loose_object_path_at(object_db, *id);
+            budget.charge_source_open(1)?;
             let file = File::open(&path).map_err(|error| {
                 Error::storage(format!("open loose object {}: {error}", path.display()))
             })?;
             let mut stream = InflatedStream::from_file(file, tracker, BufferRole::Metadata)?;
-            read_loose_header(&mut stream)
+            read_loose_header(&mut stream, budget)
         }
         ObjectSource::Packed { .. } => {
-            let opened = open_packed(repo, source)?;
-            if let Some(kind) = opened.entry.header.as_kind() {
+            let opened = open_packed(repo, source, budget)?;
+            let entry_end = opened.entry_end;
+            let packed_result = if let Some(kind) = opened.entry.header.as_kind() {
                 Ok(ObjectMetadata {
                     kind,
                     size: opened.entry.decompressed_size,
                 })
             } else {
-                let external_ref = match opened.entry.header {
-                    gix_pack::data::entry::Header::RefDelta { base_id }
-                        if opened.bundle.index.lookup(base_id).is_none() =>
-                    {
-                        Some(base_id)
-                    }
+                let ref_base_id = match opened.entry.header {
+                    gix_pack::data::entry::Header::RefDelta { base_id } => Some(base_id),
                     _ => None,
                 };
-                let base = resolve_delta_base(repo, source, &opened)?;
-                let base_metadata = probe_source(repo, &base, tracker, stack, delta_bases)?;
+                let base = resolve_delta_base(repo, source, &opened, budget)?;
+                let base_metadata = probe_source(
+                    repo,
+                    &base,
+                    tracker,
+                    stack,
+                    delta_bases,
+                    pack_entries,
+                    budget,
+                )?;
                 let compressed = opened.compressed()?;
                 let mut stream = InflatedStream::from_slice(
                     compressed,
@@ -1083,7 +1736,7 @@ fn probe_source(
                     tracker,
                     BufferRole::Metadata,
                 )?;
-                let (declared_base_size, result_size) = read_delta_header(&mut stream)?;
+                let (declared_base_size, result_size) = read_delta_header(&mut stream, budget)?;
                 if declared_base_size != base_metadata.size {
                     return pop_result(
                         stack,
@@ -1097,13 +1750,20 @@ fn probe_source(
                     delta: source.clone(),
                     base,
                     metadata: base_metadata,
-                    external_ref,
+                    ref_base_id,
                 });
                 Ok(ObjectMetadata {
                     kind: base_metadata.kind,
                     size: result_size,
                 })
+            };
+            if packed_result.is_ok() {
+                pack_entries.push(VerifiedPackEntry {
+                    source: source.clone(),
+                    entry_end,
+                });
             }
+            packed_result
         }
     };
     pop_result(stack, result)
@@ -1120,6 +1780,7 @@ fn append_source_range(
     tracker: &mut AllocationTracker,
     stack: &mut Vec<ObjectSource>,
     guarded: &GuardedMetadata,
+    budget: &DecodeWorkBudget,
 ) -> DecodeResult<()> {
     let end = start
         .checked_add(length as u64)
@@ -1141,21 +1802,22 @@ fn append_source_range(
     let result = match source {
         ObjectSource::Loose { object_db, id } => {
             let path = loose_object_path_at(object_db, *id);
+            budget.charge_source_open(1)?;
             let file = File::open(&path).map_err(|error| {
                 Error::storage(format!("open loose object {}: {error}", path.display()))
             })?;
             let mut stream = InflatedStream::from_file(file, tracker, role)?;
-            let actual = read_loose_header(&mut stream)?;
+            let actual = read_loose_header(&mut stream, budget)?;
             ensure_metadata(expected, actual)?;
-            stream.skip_exact(start)?;
-            stream.append_exact(length as u64, output)?;
+            stream.skip_exact(start, budget)?;
+            stream.append_exact(length as u64, output, budget)?;
             if end == expected.size {
-                stream.finish_exact()?;
+                stream.finish_exact(budget)?;
             }
             Ok(())
         }
         ObjectSource::Packed { .. } => {
-            let opened = open_packed(repo, source)?;
+            let opened = open_guarded_packed(repo, source, guarded, budget)?;
             if let Some(kind) = opened.entry.header.as_kind() {
                 let actual = ObjectMetadata {
                     kind,
@@ -1169,15 +1831,16 @@ fn append_source_range(
                     tracker,
                     role,
                 )?;
-                stream.skip_exact(start)?;
-                stream.append_exact(length as u64, output)?;
+                stream.skip_exact(start, budget)?;
+                stream.append_exact(length as u64, output, budget)?;
                 if end == expected.size {
-                    stream.finish_exact()?;
+                    stream.finish_exact(budget)?;
                 }
                 Ok(())
             } else {
                 append_delta_range(
                     repo, source, &opened, expected, start, end, output, tracker, stack, guarded,
+                    budget,
                 )
             }
         }
@@ -1208,6 +1871,7 @@ fn append_delta_range(
     tracker: &mut AllocationTracker,
     stack: &mut Vec<ObjectSource>,
     guarded: &GuardedMetadata,
+    budget: &DecodeWorkBudget,
 ) -> DecodeResult<()> {
     let verified_base = guarded.delta_base(source)?;
     let base = &verified_base.base;
@@ -1219,7 +1883,7 @@ fn append_delta_range(
         tracker,
         BufferRole::Delta,
     )?;
-    let (declared_base_size, result_size) = read_delta_header(&mut stream)?;
+    let (declared_base_size, result_size) = read_delta_header(&mut stream, budget)?;
     if declared_base_size != base_metadata.size {
         return Err(Error::corrupt(format!(
             "delta declares base size {declared_base_size}, resolved base has size {}",
@@ -1237,8 +1901,10 @@ fn append_delta_range(
     let requested = start..end;
     let mut result_position = 0_u64;
     while result_position < end {
-        let opcode = stream.read_required_byte()?;
-        let instruction = decode_delta_instruction(opcode, &mut || stream.read_required_byte())?;
+        budget.charge_delta_instruction()?;
+        let opcode = stream.read_required_byte(budget)?;
+        let instruction =
+            decode_delta_instruction(opcode, &mut || stream.read_required_byte(budget))?;
         let instruction_size = match instruction {
             DeltaInstruction::Insert { size } | DeltaInstruction::Copy { size, .. } => size,
         };
@@ -1254,12 +1920,12 @@ fn append_delta_range(
         match &instruction {
             DeltaInstruction::Insert { size } => {
                 if instruction_end <= start {
-                    stream.skip_exact(*size)?;
+                    stream.skip_exact(*size, budget)?;
                 } else {
                     let overlap_start = result_position.max(start);
                     let overlap_end = instruction_end.min(end);
-                    stream.skip_exact(overlap_start - result_position)?;
-                    stream.append_exact(overlap_end - overlap_start, output)?;
+                    stream.skip_exact(overlap_start - result_position, budget)?;
+                    stream.append_exact(overlap_end - overlap_start, output, budget)?;
                 }
             }
             DeltaInstruction::Copy { offset, size } => {
@@ -1287,6 +1953,7 @@ fn append_delta_range(
                         tracker,
                         stack,
                         guarded,
+                        budget,
                     )?;
                 }
             }
@@ -1305,7 +1972,7 @@ fn append_delta_range(
                 "delta result ended at {result_position}, expected {result_size}"
             )));
         }
-        stream.finish_exact()?;
+        stream.finish_exact(budget)?;
     }
     Ok(())
 }
@@ -1314,6 +1981,7 @@ fn resolve_delta_base(
     repo: &gix::Repository,
     source: &ObjectSource,
     opened: &OpenedPack,
+    budget: &DecodeWorkBudget,
 ) -> DecodeResult<ObjectSource> {
     let ObjectSource::Packed {
         index_path,
@@ -1341,13 +2009,15 @@ fn resolve_delta_base(
             })
         }
         gix_pack::data::entry::Header::RefDelta { base_id } => {
-            if let Some(index) = opened.bundle.index.lookup(base_id) {
+            budget.charge_index_entries(1)?;
+            let index = opened.index()?;
+            if let Some(entry_index) = index.lookup(base_id) {
                 return Ok(ObjectSource::Packed {
                     index_path: index_path.clone(),
-                    pack_offset: opened.bundle.index.pack_offset_at_index(index),
+                    pack_offset: index.pack_offset_at_index(entry_index),
                 });
             }
-            locate_source(repo, base_id, Some(index_path))
+            locate_source(repo, base_id, Some(index_path), budget)
         }
         _ => Err(Error::corrupt(
             "attempted to resolve a base for a non-delta pack entry",
@@ -1355,17 +2025,23 @@ fn resolve_delta_base(
     }
 }
 
-fn read_delta_header(stream: &mut InflatedStream<'_>) -> DecodeResult<(u64, u64)> {
-    let base_size = decode_delta_varint(&mut || stream.read_required_byte())?;
-    let result_size = decode_delta_varint(&mut || stream.read_required_byte())?;
+fn read_delta_header(
+    stream: &mut InflatedStream<'_>,
+    budget: &DecodeWorkBudget,
+) -> DecodeResult<(u64, u64)> {
+    let base_size = decode_delta_varint(&mut || stream.read_required_byte(budget))?;
+    let result_size = decode_delta_varint(&mut || stream.read_required_byte(budget))?;
     Ok((base_size, result_size))
 }
 
-fn read_loose_header(stream: &mut InflatedStream<'_>) -> DecodeResult<ObjectMetadata> {
+fn read_loose_header(
+    stream: &mut InflatedStream<'_>,
+    budget: &DecodeWorkBudget,
+) -> DecodeResult<ObjectMetadata> {
     let mut kind_code = 0_u64;
     let mut kind_length = 0_usize;
     loop {
-        let byte = stream.read_required_byte()?;
+        let byte = stream.read_required_byte(budget)?;
         if byte == b' ' {
             break;
         }
@@ -1387,7 +2063,7 @@ fn read_loose_header(stream: &mut InflatedStream<'_>) -> DecodeResult<ObjectMeta
     let mut digit_count = 0_usize;
     let mut first_digit = 0_u8;
     loop {
-        let byte = stream.read_required_byte()?;
+        let byte = stream.read_required_byte(budget)?;
         if byte == 0 {
             break;
         }
@@ -1464,10 +2140,13 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        DeltaInstruction, Error, ErrorKind, GuardedMetadata, MAX_CHAIN_DEPTH,
-        METADATA_BUFFER_LIMIT, ObjectMetadata, ObjectSource, VerifiedDeltaBase,
-        decode_delta_instruction, decode_delta_varint, enter_source, overlapping_base_range,
-        pack_index_paths, read_prefix, validate_local_metadata_before_public_header,
+        AllocationTracker, DecodeWorkBudget, DecodeWorkLimits, DeltaInstruction, Error, ErrorKind,
+        GuardedMetadata, MAX_CHAIN_DEPTH, METADATA_BUFFER_LIMIT, ObjectMetadata, ObjectSource,
+        PUBLIC_HEADER_OUTPUT_LIMIT, VerifiedDeltaBase, VerifiedPackEntry, append_source_range,
+        decode_delta_instruction, decode_delta_varint, enter_source, locate_source,
+        opened_pack_from_parts, overlapping_base_range, pack_index_paths, parse_alternate_paths,
+        probe_guarded_source, public_metadata_for_opened_pack, read_prefix, resolve_alternate_path,
+        validate_local_metadata_before_public_header,
     };
 
     const PREFIX_LIMIT: usize = 64 * 1024;
@@ -1521,6 +2200,44 @@ mod tests {
     #[test]
     fn prefix_blob_alternate_loose_obeys_the_bounded_contract() {
         assert_bounded_contract(alternate_loose_fixture());
+    }
+
+    #[test]
+    fn prefix_blob_dangling_unrelated_alternate_does_not_block_primary_loose_object() {
+        let fixture = loose_fixture();
+        let alternates_path = fixture.repo_path.join("objects/info/alternates");
+        let missing_object_db = fixture.repo_path.join("missing.git/objects");
+        std::fs::write(
+            &alternates_path,
+            format!("{}\n", missing_object_db.display()),
+        )
+        .expect("write dangling alternate");
+        let repo = gix::open(&fixture.repo_path).expect("open fixture repository");
+
+        let prefix = read_prefix(&repo, fixture.oid, PREFIX_LIMIT)
+            .expect("a dangling unrelated alternate must not block a primary loose object");
+
+        assert_eq!(prefix.size, fixture.original.len() as u64);
+        assert_eq!(prefix.data, fixture.original[..PREFIX_LIMIT]);
+        assert!(prefix.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prefix_blob_alternate_symlink_loop_is_corruption() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDirectory::new("alternate-symlink-loop");
+        let first = temp.0.join("first");
+        let second = temp.0.join("second");
+        symlink(&second, &first).expect("create first symlink");
+        symlink(&first, &second).expect("create second symlink");
+
+        let error = resolve_alternate_path(&first, &temp.0)
+            .expect_err("a symlink loop must fail alternate resolution");
+
+        assert_eq!(error.kind(), ErrorKind::CorruptRepository);
+        assert!(error.to_string().contains("maximum allowed number"));
     }
 
     #[test]
@@ -1645,6 +2362,242 @@ mod tests {
     }
 
     #[test]
+    fn prefix_blob_repeated_high_offset_copies_stop_at_the_cumulative_work_budget() {
+        let fixture = repeated_high_offset_copy_fixture(256);
+        let repo = gix::open(&fixture.repo_path).expect("open fixture repository");
+
+        let error = read_prefix(&repo, fixture.oid, fixture.original.len())
+            .expect_err("repeated high-offset copies must exhaust bounded decode work");
+
+        assert_eq!(error.kind(), ErrorKind::CorruptRepository);
+        assert_eq!(
+            error.to_string(),
+            "decode work budget exhausted: delta instructions 145 exceed limit 144"
+        );
+    }
+
+    #[test]
+    fn prefix_blob_index_validation_work_is_counted_without_copy_rescans() {
+        let counts = [1, 64].map(|copy_count| {
+            let fixture = repeated_high_offset_copy_fixture(copy_count);
+            let repo = gix::open(&fixture.repo_path).expect("open fixture repository");
+            let prefix = read_prefix(&repo, fixture.oid, fixture.original.len())
+                .expect("bounded repeated-copy prefix");
+            let index_paths = pack_index_paths_for_test(&fixture.repo_path);
+            let [index_path] = index_paths.as_slice() else {
+                panic!("expected one synthetic pack index");
+            };
+            let index_bytes = std::fs::metadata(index_path)
+                .expect("synthetic pack index metadata")
+                .len();
+            let conservative_validation_charge = index_bytes.div_ceil(24);
+
+            assert!(
+                prefix.allocations.index_entries_scanned >= conservative_validation_charge * 3,
+                "every locate and preflight index validation must be charged"
+            );
+            prefix.allocations.index_entries_scanned
+        });
+
+        assert_eq!(
+            counts[0], counts[1],
+            "repeated COPY content reads must not reopen or rescan the pack index"
+        );
+    }
+
+    #[test]
+    fn prefix_blob_guarded_content_does_not_reopen_index_after_preflight() {
+        let fixture = repeated_high_offset_copy_fixture(4);
+        let repo = gix::open(&fixture.repo_path).expect("open fixture repository");
+        let budget = DecodeWorkBudget::new(fixture.original.len()).expect("work budget");
+        let source = locate_source(&repo, fixture.oid, None, &budget).expect("locate source");
+        let mut tracker = AllocationTracker::new(fixture.original.len());
+        let guarded = probe_guarded_source(&repo, &source, &mut tracker, &budget)
+            .expect("preflight physical pack sources");
+        let index_paths = pack_index_paths_for_test(&fixture.repo_path);
+        let [index_path] = index_paths.as_slice() else {
+            panic!("expected one synthetic pack index");
+        };
+        std::fs::rename(index_path, index_path.with_extension("idx.hidden"))
+            .expect("hide index after preflight");
+        let mut output = Vec::with_capacity(fixture.original.len());
+
+        append_source_range(
+            &repo,
+            &source,
+            guarded.object,
+            0,
+            fixture.original.len(),
+            &mut output,
+            &mut tracker,
+            &mut Vec::new(),
+            &guarded,
+            &budget,
+        )
+        .expect("guarded content reads must use only the already-bound pack data");
+
+        assert_eq!(output, fixture.original);
+    }
+
+    #[test]
+    fn prefix_blob_public_header_does_not_inflate_past_guarded_entry() {
+        let temp = TempDirectory::new("cross-entry-public-header");
+        let index_path = temp.0.join("malformed.idx");
+        let pack_path = index_path.with_extension("pack");
+        let base_id = gix_hash::ObjectId::from_bytes_or_panic(&[0x42; 20]);
+        let decoded_delta: Vec<u8> = [1_u8, 1]
+            .into_iter()
+            .chain(std::iter::repeat_n(0, 18))
+            .collect();
+
+        // One non-final stored block produces the two delta-header varints and seven
+        // payload bytes inside the guarded entry. The remaining eleven bytes, final
+        // block header, and checksum fit exactly in the SHA-1-sized following region.
+        let mut compressed = vec![0x78, 0x01, 0x00, 0x09, 0x00, 0xf6, 0xff];
+        compressed.extend(&decoded_delta[..9]);
+        let guarded_compressed_len = compressed.len();
+        compressed.extend([0x01, 0x0b, 0x00, 0xf4, 0xff]);
+        compressed.extend(&decoded_delta[9..]);
+        compressed.extend(adler32(&decoded_delta).to_be_bytes());
+
+        let mut pack = b"PACK".to_vec();
+        pack.extend(2_u32.to_be_bytes());
+        pack.extend(2_u32.to_be_bytes());
+        let pack_offset = pack.len() as u64;
+        pack.extend(encode_pack_entry_header(7, decoded_delta.len()));
+        pack.extend(base_id.as_slice());
+        let data_offset = pack.len() as u64;
+        pack.extend(compressed);
+        pack.extend([0_u8; 20]);
+        std::fs::write(&pack_path, pack).expect("write malformed cross-entry pack");
+
+        let source = ObjectSource::Packed {
+            index_path,
+            pack_offset,
+        };
+        let entry_end = data_offset + guarded_compressed_len as u64;
+        let pack = gix_pack::data::File::at(&pack_path, gix_hash::Kind::Sha1)
+            .expect("open malformed fixture pack");
+        let opened = opened_pack_from_parts(&source, pack, None, entry_end)
+            .expect("open guarded malformed entry");
+        let base = ObjectSource::Loose {
+            object_db: temp.0.join("unused-base"),
+            id: base_id,
+        };
+        let guarded = GuardedMetadata {
+            object: ObjectMetadata {
+                kind: gix_object::Kind::Blob,
+                size: 1,
+            },
+            delta_bases: vec![VerifiedDeltaBase {
+                delta: source.clone(),
+                base,
+                metadata: ObjectMetadata {
+                    kind: gix_object::Kind::Blob,
+                    size: 1,
+                },
+                ref_base_id: Some(base_id),
+            }],
+            pack_entries: vec![VerifiedPackEntry { source, entry_end }],
+        };
+
+        let resolve = |_base_id: &gix_hash::oid| {
+            Some(gix_pack::data::decode::header::ResolvedBase::OutOfPack {
+                kind: gix_object::Kind::Blob,
+                num_deltas: None,
+            })
+        };
+        let unbounded = opened
+            .pack
+            .decode_header(
+                opened.entry.clone(),
+                &mut gix_features::zlib::Inflate::default(),
+                &resolve,
+            )
+            .expect("the unbounded gix suffix crosses the forged entry boundary");
+        assert_eq!(unbounded.object_size, 1);
+        let budget = DecodeWorkBudget::new(PREFIX_LIMIT).expect("work budget");
+
+        let error = public_metadata_for_opened_pack(&opened, &guarded, &budget)
+            .expect_err("public corroboration must reject cross-entry deflate continuation");
+
+        assert_eq!(error.kind(), ErrorKind::CorruptRepository);
+        assert!(
+            error
+                .to_string()
+                .contains("pack entry decompressed to more bytes than declared"),
+            "the bounded public view must reach the gix truncated-stream rejection: {error}"
+        );
+        let work = budget.instrumentation();
+        assert_eq!(
+            work.compressed_input_bytes, guarded_compressed_len as u64,
+            "public gix input must be capped and charged exactly at entry_end"
+        );
+        assert_eq!(work.inflated_output_bytes, PUBLIC_HEADER_OUTPUT_LIMIT);
+    }
+
+    #[test]
+    fn prefix_blob_alternate_discovery_rejects_excessive_recursion() {
+        let temp = TempDirectory::new("bounded-alternates");
+        let repo_path = temp.0.join("primary.git");
+        git(
+            &[
+                "init",
+                "--bare",
+                "--object-format=sha1",
+                path_str(&repo_path),
+            ],
+            None,
+        );
+
+        let alternates: Vec<_> = (0..=MAX_CHAIN_DEPTH)
+            .map(|index| temp.0.join(format!("alternate-{index}/objects")))
+            .collect();
+        for object_db in &alternates {
+            std::fs::create_dir_all(object_db.join("info"))
+                .expect("create alternate object database");
+        }
+        std::fs::write(
+            repo_path.join("objects/info/alternates"),
+            format!("{}\n", alternates[0].display()),
+        )
+        .expect("write primary alternates fixture");
+        for (index, object_db) in alternates.iter().enumerate().take(MAX_CHAIN_DEPTH) {
+            std::fs::write(
+                object_db.join("info/alternates"),
+                format!("{}\n", alternates[index + 1].display()),
+            )
+            .expect("write recursive alternates fixture");
+        }
+
+        let repo = gix::open(&repo_path).expect("open fixture repository");
+        let budget = test_work_budget_with_source_limit(u64::MAX);
+        let missing = parse_oid("1111111111111111111111111111111111111111");
+        let error = locate_source(&repo, missing, None, &budget)
+            .expect_err("alternate discovery must reject excessive recursion");
+
+        assert_eq!(error.kind(), ErrorKind::CorruptRepository);
+        assert_eq!(
+            error.to_string(),
+            format!("alternate recursion exceeds the safe depth bound of {MAX_CHAIN_DEPTH}")
+        );
+    }
+
+    #[test]
+    fn prefix_blob_alternate_paths_charge_before_path_allocation() {
+        let budget = test_work_budget_with_source_limit(0);
+
+        let error = parse_alternate_paths(b"relative-object-database\n", &budget)
+            .expect_err("the path budget must be charged before parsing the first path");
+
+        assert_eq!(error.kind(), ErrorKind::CorruptRepository);
+        assert_eq!(
+            error.to_string(),
+            "decode work budget exhausted: source opens 1 exceed limit 0"
+        );
+    }
+
+    #[test]
     fn prefix_blob_delta_stack_rejects_cycles_and_excessive_depth() {
         let source = ObjectSource::Packed {
             index_path: PathBuf::from("fixture.idx"),
@@ -1691,6 +2644,7 @@ mod tests {
                         size: 1,
                     },
                     delta_bases: Vec::new(),
+                    pack_entries: Vec::new(),
                 })
             },
             |_| {
@@ -1733,8 +2687,9 @@ mod tests {
                     kind: gix_object::Kind::Blob,
                     size: 1,
                 },
-                external_ref: None,
+                ref_base_id: None,
             }],
+            pack_entries: Vec::new(),
         };
 
         let resolved = guarded.delta_base(&delta).expect("guarded exact base");
@@ -1750,7 +2705,8 @@ mod tests {
         std::fs::write(object_db.join("pack"), b"not a directory")
             .expect("replace pack directory with a file");
 
-        let error = pack_index_paths(&object_db).expect_err("read_dir must fail");
+        let budget = DecodeWorkBudget::new(PREFIX_LIMIT).expect("work budget");
+        let error = pack_index_paths(&object_db, &budget).expect_err("read_dir must fail");
         assert_eq!(error.kind(), ErrorKind::StorageUnavailable);
         let native_error = crate::bounded_blob_native_error(error);
         assert_eq!(native_error.0, "storage_unavailable");
@@ -1849,8 +2805,19 @@ mod tests {
             prefix.allocations.max_work_buffer <= PREFIX_LIMIT,
             "work buffer exceeded the requested prefix"
         );
+        assert!(prefix.allocations.source_opens > 0);
+        assert!(prefix.allocations.compressed_input_bytes > 0);
+        assert!(prefix.allocations.inflated_output_bytes > 0);
+        if matches!(
+            fixture.storage,
+            StorageForm::PackedDelta | StorageForm::PackedRefDelta
+        ) {
+            assert!(prefix.allocations.delta_instructions > 0);
+            assert!(prefix.allocations.index_entries_scanned > 0);
+        }
+        assert_work_within_limits(&prefix.allocations, PREFIX_LIMIT);
         eprintln!(
-            "bounded allocation evidence: returned={} pre_header={} metadata={} intermediate_object={} decoded_object={} decoded_base={} delta={} work={} max_actual={}",
+            "bounded allocation/work evidence: returned={} pre_header={} metadata={} intermediate_object={} decoded_object={} decoded_base={} delta={} work={} max_actual={} instructions={} source_opens={} index_entries={} compressed={} inflated={} skipped={}",
             prefix.data.len(),
             prefix.allocations.content_bytes_allocated_before_header,
             prefix.allocations.max_metadata_buffer,
@@ -1859,7 +2826,13 @@ mod tests {
             prefix.allocations.max_decoded_base_buffer,
             prefix.allocations.max_delta_buffer,
             prefix.allocations.max_work_buffer,
-            max_actual_content_buffer
+            max_actual_content_buffer,
+            prefix.allocations.delta_instructions,
+            prefix.allocations.source_opens,
+            prefix.allocations.index_entries_scanned,
+            prefix.allocations.compressed_input_bytes,
+            prefix.allocations.inflated_output_bytes,
+            prefix.allocations.skipped_output_bytes
         );
 
         let complete_limit = fixture.original.len() + 1;
@@ -1879,6 +2852,7 @@ mod tests {
         assert!(complete.allocations.max_decoded_base_buffer <= complete_limit);
         assert!(complete.allocations.max_delta_buffer <= complete_limit);
         assert!(complete.allocations.max_work_buffer <= complete_limit);
+        assert_work_within_limits(&complete.allocations, complete_limit);
         eprintln!(
             "complete-limit allocation evidence: requested={} returned={} pre_header={} intermediate_object={} decoded_object={} decoded_base={} delta={} work={}",
             complete_limit,
@@ -1890,6 +2864,22 @@ mod tests {
             complete.allocations.max_delta_buffer,
             complete.allocations.max_work_buffer
         );
+    }
+
+    fn assert_work_within_limits(
+        instrumentation: &super::AllocationInstrumentation,
+        caller_limit: usize,
+    ) {
+        let limits = DecodeWorkBudget::new(caller_limit)
+            .expect("work limits")
+            .limits;
+        assert!(instrumentation.delta_instructions <= limits.delta_instructions);
+        assert!(instrumentation.source_opens <= limits.source_opens);
+        assert!(instrumentation.index_entries_scanned <= limits.index_entries_scanned);
+        assert!(instrumentation.compressed_input_bytes <= limits.compressed_input_bytes);
+        assert!(instrumentation.inflated_output_bytes <= limits.inflated_output_bytes);
+        assert!(instrumentation.skipped_output_bytes <= limits.skipped_output_bytes);
+        assert!(instrumentation.discovery_bytes <= limits.discovery_bytes);
     }
 
     fn loose_fixture() -> Fixture {
@@ -2207,6 +3197,116 @@ mod tests {
         }
     }
 
+    fn repeated_high_offset_copy_fixture(copy_count: usize) -> Fixture {
+        let temp = TempDirectory::new("repeated-high-offset-copy");
+        let repo_path = temp.0.join("repeated-high-offset-copy.git");
+        git(
+            &[
+                "init",
+                "--bare",
+                "--object-format=sha1",
+                path_str(&repo_path),
+            ],
+            None,
+        );
+
+        let base: Vec<u8> = (0..4096).map(|index| (index % 251) as u8).collect();
+        let original = vec![*base.last().expect("non-empty base"); copy_count];
+        let base_oid = git(&["hash-object", "--stdin"], Some(&base));
+        let result_oid = git(&["hash-object", "--stdin"], Some(&original));
+
+        let mut delta = encode_delta_varint(base.len() as u64);
+        delta.extend(encode_delta_varint(original.len() as u64));
+        for _ in 0..copy_count {
+            delta.extend([0x93, 0xff, 0x0f, 0x01]);
+        }
+
+        let mut pack = b"PACK".to_vec();
+        pack.extend(2_u32.to_be_bytes());
+        pack.extend(2_u32.to_be_bytes());
+        pack.extend(encode_pack_entry_header(3, base.len()));
+        pack.extend(zlib(&base));
+        pack.extend(encode_pack_entry_header(7, delta.len()));
+        pack.extend(parse_oid(&base_oid).as_slice());
+        pack.extend(zlib(&delta));
+
+        let mut hasher = gix_hash::hasher(gix_hash::Kind::Sha1);
+        hasher.update(&pack);
+        let pack_id = hasher.try_finalize().expect("hash synthetic pack");
+        pack.extend(pack_id.as_slice());
+
+        let pack_path = repo_path
+            .join("objects/pack")
+            .join(format!("pack-{pack_id}.pack"));
+        std::fs::write(&pack_path, pack).expect("write synthetic pack");
+        git(&["index-pack", path_str(&pack_path)], None);
+
+        let verify = verify_pack(&repo_path);
+        let evidence = verify_line(&verify, &result_oid);
+        assert!(
+            evidence.split_whitespace().count() >= 7,
+            "expected a verified delta entry: {evidence}"
+        );
+
+        Fixture {
+            _temp: temp,
+            repo_path,
+            oid: parse_oid(&result_oid),
+            original,
+            evidence,
+            storage: StorageForm::PackedRefDelta,
+        }
+    }
+
+    fn encode_delta_varint(mut value: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            bytes.push(byte);
+            if value == 0 {
+                return bytes;
+            }
+        }
+    }
+
+    fn encode_pack_entry_header(kind: u8, size: usize) -> Vec<u8> {
+        let mut remaining = size >> 4;
+        let mut first = (kind << 4) | (size as u8 & 0x0f);
+        if remaining != 0 {
+            first |= 0x80;
+        }
+        let mut bytes = vec![first];
+        while remaining != 0 {
+            let mut byte = (remaining & 0x7f) as u8;
+            remaining >>= 7;
+            if remaining != 0 {
+                byte |= 0x80;
+            }
+            bytes.push(byte);
+        }
+        bytes
+    }
+
+    fn zlib(data: &[u8]) -> Vec<u8> {
+        let mut encoder = gix_features::zlib::stream::deflate::Write::new(Vec::new());
+        encoder.write_all(data).expect("compress fixture data");
+        encoder.flush().expect("finish fixture zlib stream");
+        encoder.into_inner()
+    }
+
+    fn adler32(data: &[u8]) -> u32 {
+        const MODULUS: u32 = 65_521;
+        let (a, b) = data.iter().fold((1_u32, 0_u32), |(a, b), byte| {
+            let a = (a + u32::from(*byte)) % MODULUS;
+            (a, (b + a) % MODULUS)
+        });
+        (b << 16) | a
+    }
+
     fn assert_delta_header(repo_path: &Path, oid: &str, expected_ref: bool) {
         let pack_dir = repo_path.join("objects/pack");
         let mut indexes: Vec<_> = std::fs::read_dir(&pack_dir)
@@ -2297,6 +3397,16 @@ mod tests {
     }
 
     fn verify_pack(repo_path: &Path) -> String {
+        let indexes = pack_index_paths_for_test(repo_path);
+        assert_eq!(
+            indexes.len(),
+            1,
+            "expected exactly one pack index: {indexes:?}"
+        );
+        git(&["verify-pack", "-v", path_str(&indexes[0])], None)
+    }
+
+    fn pack_index_paths_for_test(repo_path: &Path) -> Vec<PathBuf> {
         let pack_dir = repo_path.join("objects/pack");
         let mut indexes: Vec<_> = std::fs::read_dir(&pack_dir)
             .expect("read pack directory")
@@ -2304,12 +3414,28 @@ mod tests {
             .filter(|path| path.extension().is_some_and(|extension| extension == "idx"))
             .collect();
         indexes.sort();
-        assert_eq!(
-            indexes.len(),
-            1,
-            "expected exactly one pack index: {indexes:?}"
-        );
-        git(&["verify-pack", "-v", path_str(&indexes[0])], None)
+        indexes
+    }
+
+    fn test_work_budget_with_source_limit(source_opens: u64) -> DecodeWorkBudget {
+        DecodeWorkBudget {
+            limits: DecodeWorkLimits {
+                delta_instructions: u64::MAX,
+                source_opens,
+                index_entries_scanned: u64::MAX,
+                compressed_input_bytes: u64::MAX,
+                inflated_output_bytes: u64::MAX,
+                skipped_output_bytes: u64::MAX,
+                discovery_bytes: u64::MAX,
+            },
+            delta_instructions: Cell::new(0),
+            source_opens: Cell::new(0),
+            index_entries_scanned: Cell::new(0),
+            compressed_input_bytes: Cell::new(0),
+            inflated_output_bytes: Cell::new(0),
+            skipped_output_bytes: Cell::new(0),
+            discovery_bytes: Cell::new(0),
+        }
     }
 
     fn verify_line(output: &str, oid: &str) -> String {

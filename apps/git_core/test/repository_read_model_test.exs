@@ -218,6 +218,10 @@ defmodule GitCore.RepositoryReadModelTest do
     test "reads the physical tree-entry blob instead of its replacement ref", %{tmp_dir: tmp_dir} do
       assert_prefix_blob_contract(replaced_prefix_blob_fixture!(tmp_dir))
     end
+
+    test "ignores an unrelated pack index whose pack file is absent", %{tmp_dir: tmp_dir} do
+      assert_prefix_blob_contract(stale_unrelated_index_prefix_blob_fixture!(tmp_dir))
+    end
   end
 
   defp assert_error(result, expected_kind, expected_operation) do
@@ -434,6 +438,37 @@ defmodule GitCore.RepositoryReadModelTest do
       "core.useReplaceRefs",
       "false"
     ])
+
+    fixture
+  end
+
+  defp stale_unrelated_index_prefix_blob_fixture!(tmp_dir) do
+    fixture = prefix_blob_fixture!(tmp_dir, :loose)
+    unrelated = populated_bare_repository!(tmp_dir)
+
+    git!([
+      "--git-dir",
+      unrelated.repo_path,
+      "repack",
+      "-a",
+      "-d",
+      "-f",
+      "--window=0",
+      "--depth=0"
+    ])
+
+    [unrelated_index] =
+      Path.wildcard(Path.join(unrelated.repo_path, "objects/pack/*.idx"))
+
+    refute git!(["verify-pack", "-v", unrelated_index])
+           |> String.split("\n")
+           |> Enum.any?(fn line -> List.first(String.split(line)) == fixture.oid end)
+
+    target_pack_dir = Path.join(fixture.repo_path, "objects/pack")
+    File.mkdir_p!(target_pack_dir)
+    stale_index = Path.join(target_pack_dir, Path.basename(unrelated_index))
+    File.cp!(unrelated_index, stale_index)
+    refute File.exists?(Path.rootname(stale_index) <> ".pack")
 
     fixture
   end
