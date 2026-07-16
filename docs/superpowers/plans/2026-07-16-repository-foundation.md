@@ -546,11 +546,11 @@ git commit -m "feat(git): add commit-aware tree pages"
 - Modify: apps/git_core/native/fornacast_git_core/src/lib.rs
 - Add tests: apps/git_core/test/repository_read_model_test.exs
 
-- [ ] **Step 1: Add failing metadata and lease tests**
+- [x] **Step 1: Add failing metadata and lease tests**
 
 Cover inline reservation of exactly 1 MiB, metadata-before-allocation, complete read reservation by exact size, 100_000_000-byte rejection before allocation, invalid UTF-8, binary NUL detection, successful lease retention, explicit release, owner death, and :blob_busy.
 
-- [ ] **Step 2: Split native blob operations**
+- [x] **Step 2: Split native blob operations**
 
 Add immutable-snapshot operations for:
 
@@ -560,7 +560,7 @@ Add immutable-snapshot operations for:
 
 Recheck the OID and declared size between metadata and body operations. Complete reads allocate only after the exact-size permit is granted.
 
-- [ ] **Step 3: Expose inline and complete APIs**
+- [x] **Step 3: Expose inline and complete APIs**
 
 ~~~elixir
 GitCore.read_blob(path, snapshot_oid, blob_path, limit: 1_048_576)
@@ -570,7 +570,7 @@ GitCore.release_blob(%GitCore.Blob{})
 
 Clamp limits to their production maxima. Inline returns a prefix with 200-compatible truncated state. Complete returns either the entire body or :blob_too_large and never returns a truncated success.
 
-- [ ] **Step 4: Run and commit**
+- [x] **Step 4: Run and commit**
 
 ~~~sh
 mix test apps/git_core/test/repository_read_model_test.exs --only blobs --trace
