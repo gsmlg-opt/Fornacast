@@ -3,6 +3,9 @@ defmodule GitCore do
   Fornacast-owned API for low-level Git repository operations.
   """
 
+  @commit_page_limit 50
+  @commit_scan_deadline_ms 5_000
+
   def init_bare(path) when is_binary(path) do
     GitCore.Native.init_bare(path)
   end
@@ -100,6 +103,56 @@ defmodule GitCore do
          oid: oid
        }}
     end
+  end
+
+  def commit_summary(path, snapshot_oid, opts \\ [])
+      when is_binary(path) and is_binary(snapshot_oid) and is_list(opts) do
+    deadline_ms =
+      opts |> Keyword.get(:deadline_ms, @commit_scan_deadline_ms) |> commit_deadline_ms()
+
+    GitCore.ScanLimiter.with_permit(:commit_summary, fn ->
+      with {:ok, {count, latest}} <-
+             wrap_read(
+               GitCore.Native.commit_summary(path, snapshot_oid, deadline_ms),
+               :commit_summary
+             ) do
+        {:ok, %GitCore.CommitSummary{count: count, latest: commit_from_native(latest)}}
+      end
+    end)
+  end
+
+  def commit_page(path, snapshot_oid, page, opts \\ [])
+      when is_binary(path) and is_binary(snapshot_oid) and is_integer(page) and page > 0 and
+             is_list(opts) do
+    per_page = opts |> Keyword.get(:per_page, @commit_page_limit) |> bounded_commit_page_size()
+
+    deadline_ms =
+      opts |> Keyword.get(:deadline_ms, @commit_scan_deadline_ms) |> commit_deadline_ms()
+
+    GitCore.ScanLimiter.with_permit(:commit_page, fn ->
+      with {:ok, {commits, total}} <-
+             wrap_read(
+               GitCore.Native.commit_page(
+                 path,
+                 snapshot_oid,
+                 Integer.to_string(page),
+                 per_page,
+                 deadline_ms
+               ),
+               :commit_page
+             ) do
+        total_pages = if total == 0, do: 1, else: div(total + per_page - 1, per_page)
+
+        {:ok,
+         %GitCore.CommitPage{
+           commits: Enum.map(commits, &commit_from_native/1),
+           total: total,
+           page: page,
+           per_page: per_page,
+           total_pages: total_pages
+         }}
+      end
+    end)
   end
 
   def branches(path) when is_binary(path) do
@@ -241,6 +294,16 @@ defmodule GitCore do
     per_page
     |> max(1)
     |> min(100)
+  end
+
+  defp bounded_commit_page_size(per_page) when is_integer(per_page) do
+    per_page
+    |> max(1)
+    |> min(@commit_page_limit)
+  end
+
+  defp commit_deadline_ms(deadline_ms) when is_integer(deadline_ms) and deadline_ms >= 0 do
+    min(deadline_ms, @commit_scan_deadline_ms)
   end
 
   defp ref_name_to_native(nil), do: nil

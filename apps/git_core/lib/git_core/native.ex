@@ -23,6 +23,11 @@ defmodule GitCore.Native do
 
   def ref_page(_path, _kind, _page, _per_page), do: :erlang.nif_error(:nif_not_loaded)
   def resolve_snapshot(_path, _kind, _full_name), do: :erlang.nif_error(:nif_not_loaded)
+  def commit_summary(_path, _snapshot_oid, _deadline_ms), do: :erlang.nif_error(:nif_not_loaded)
+
+  def commit_page(_path, _snapshot_oid, _page, _per_page, _deadline_ms),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def commit_history(_path, _ref, _limit), do: :erlang.nif_error(:nif_not_loaded)
   def commit(_path, _oid), do: :erlang.nif_error(:nif_not_loaded)
   def read_tree(_path, _ref, _tree_path), do: :erlang.nif_error(:nif_not_loaded)

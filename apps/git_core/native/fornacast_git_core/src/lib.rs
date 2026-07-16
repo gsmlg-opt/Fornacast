@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Write};
 use std::path::{Component, Path, PathBuf};
@@ -64,9 +65,34 @@ enum DirectRefTarget {
     Object(gix_hash::ObjectId),
 }
 
+struct CommitNode {
+    parents: Vec<gix_hash::ObjectId>,
+    committer_time: i64,
+}
+
+struct OrderedCommitGraph {
+    tip: gix_hash::ObjectId,
+    ordered: Vec<gix_hash::ObjectId>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CommitPageWindow {
+    start: usize,
+    end: usize,
+    total_pages: usize,
+}
+
+#[derive(Clone, Copy)]
+enum CommitPosition {
+    Tip,
+    Ancestor,
+}
+
 const REF_SAMPLE_LIMIT: usize = 100;
 const REF_PAGE_LIMIT: usize = 100;
 const REF_SCAN_DEADLINE: Duration = Duration::from_secs(5);
+const COMMIT_SCAN_DEADLINE: Duration = Duration::from_secs(5);
+const COMMIT_PAGE_LIMIT: usize = 50;
 // This remains independent of object size while leaving room for the complete mandatory tag
 // header, including long ref-derived tag names, before an arbitrarily large message body.
 const SNAPSHOT_OBJECT_PREFIX_LIMIT: usize = 64 * 1024;
@@ -84,6 +110,47 @@ fn to_error<E: std::fmt::Display>(error: E) -> String {
 
 fn native_error(kind: &'static str, detail: impl std::fmt::Display) -> NativeError {
     (kind.to_string(), detail.to_string())
+}
+
+fn error_chain_contains_storage_io(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+
+    while let Some(error) = current {
+        if let Some(loose_error) = error.downcast_ref::<gix::odb::loose::find::Error>() {
+            match loose_error {
+                gix::odb::loose::find::Error::Io { action, .. } if *action == "inflate" => {
+                    return false;
+                }
+                gix::odb::loose::find::Error::Io { source, action, .. }
+                    if *action == "open or map" =>
+                {
+                    current = Some(source);
+                    continue;
+                }
+                _ => return false,
+            }
+        }
+
+        if matches!(
+            error.downcast_ref::<gix::odb::store::load_index::Error>(),
+            Some(gix::odb::store::load_index::Error::Inaccessible(_))
+        ) {
+            return true;
+        }
+
+        if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
+            match io_error.get_ref() {
+                Some(inner) => {
+                    current = Some(inner);
+                    continue;
+                }
+                None => return true,
+            }
+        }
+        current = error.source();
+    }
+
+    false
 }
 
 fn bounded_blob_native_error(error: bounded_blob::Error) -> NativeError {
@@ -117,6 +184,12 @@ fn open_bare_repository(path: &str) -> Result<gix::Repository, NativeError> {
     } else {
         Err(native_error("invalid_repository", "repository is not bare"))
     }
+}
+
+fn open_physical_bare_repository(path: &str) -> Result<gix::Repository, NativeError> {
+    let mut repo = open_bare_repository(path)?;
+    repo.objects.ignore_replacements = true;
+    Ok(repo)
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -720,6 +793,279 @@ fn tag_target_from_prefix(
     }
 
     Ok((target, target_kind))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn commit_summary(
+    path: String,
+    snapshot_oid: String,
+    deadline_ms: u64,
+) -> Result<(usize, NativeCommit), NativeError> {
+    let deadline = Instant::now() + commit_scan_duration(deadline_ms);
+    let repo = open_physical_bare_repository(&path)?;
+    let graph = walk_commit_graph(&repo, &snapshot_oid, deadline)?;
+    let latest = hydrate_commit(&repo, graph.tip, deadline)?;
+
+    Ok((graph.ordered.len(), latest))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn commit_page(
+    path: String,
+    snapshot_oid: String,
+    page: String,
+    per_page: usize,
+    deadline_ms: u64,
+) -> Result<(Vec<NativeCommit>, usize), NativeError> {
+    let page = page.parse::<usize>().unwrap_or(usize::MAX);
+    if page == 0 {
+        return Err(native_error("commit_not_found", "invalid commit page"));
+    }
+
+    let deadline = Instant::now() + commit_scan_duration(deadline_ms);
+    let repo = open_physical_bare_repository(&path)?;
+    let graph = walk_commit_graph(&repo, &snapshot_oid, deadline)?;
+    let total = graph.ordered.len();
+    let window = commit_page_window(total, page, per_page);
+    let mut commits = Vec::with_capacity(window.end - window.start);
+
+    for oid in &graph.ordered[window.start..window.end] {
+        check_commit_deadline(deadline)?;
+        commits.push(hydrate_commit(&repo, *oid, deadline)?);
+    }
+
+    check_commit_deadline(deadline)?;
+    Ok((commits, total))
+}
+
+fn commit_scan_duration(deadline_ms: u64) -> Duration {
+    Duration::from_millis(deadline_ms.min(COMMIT_SCAN_DEADLINE.as_millis() as u64))
+}
+
+fn check_commit_deadline(deadline: Instant) -> Result<(), NativeError> {
+    if Instant::now() >= deadline {
+        Err(native_error(
+            "scan_timeout",
+            "commit scan exceeded the five-second deadline",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn walk_commit_graph(
+    repo: &gix::Repository,
+    snapshot_oid: &str,
+    deadline: Instant,
+) -> Result<OrderedCommitGraph, NativeError> {
+    check_commit_deadline(deadline)?;
+    let tip = gix_hash::ObjectId::from_hex(snapshot_oid.as_bytes())
+        .map_err(|error| native_error("commit_not_found", error))?;
+    let mut pending = vec![tip];
+    let mut visited = BTreeSet::new();
+    let mut nodes = BTreeMap::new();
+    let mut child_counts = BTreeMap::<gix_hash::ObjectId, usize>::new();
+
+    while let Some(oid) = pending.pop() {
+        check_commit_deadline(deadline)?;
+        if !visited.insert(oid) {
+            continue;
+        }
+
+        let position = if oid == tip {
+            CommitPosition::Tip
+        } else {
+            CommitPosition::Ancestor
+        };
+        let node = load_commit_node(repo, oid, position, deadline)?;
+        child_counts.entry(oid).or_default();
+
+        for parent in &node.parents {
+            check_commit_deadline(deadline)?;
+            let child_count = child_counts.entry(*parent).or_default();
+            *child_count = child_count.checked_add(1).ok_or_else(|| {
+                native_error("corrupt_repository", "commit graph child count overflow")
+            })?;
+            pending.push(*parent);
+        }
+
+        nodes.insert(oid, node);
+    }
+
+    let mut eligible = BTreeSet::new();
+    for (oid, node) in &nodes {
+        check_commit_deadline(deadline)?;
+        if child_counts.get(oid).copied().unwrap_or_default() == 0 {
+            eligible.insert((Reverse(node.committer_time), *oid));
+        }
+    }
+
+    let mut ordered = Vec::with_capacity(nodes.len());
+    while let Some((Reverse(_committer_time), oid)) = eligible.pop_first() {
+        check_commit_deadline(deadline)?;
+        ordered.push(oid);
+
+        for parent in &nodes
+            .get(&oid)
+            .expect("eligible commit must be present in the loaded graph")
+            .parents
+        {
+            check_commit_deadline(deadline)?;
+            let child_count = child_counts.get_mut(parent).ok_or_else(|| {
+                native_error("corrupt_repository", "commit graph parent is missing")
+            })?;
+            *child_count = child_count.checked_sub(1).ok_or_else(|| {
+                native_error("corrupt_repository", "invalid commit graph child count")
+            })?;
+
+            if *child_count == 0 {
+                let parent_node = nodes.get(parent).ok_or_else(|| {
+                    native_error("corrupt_repository", "commit graph parent is missing")
+                })?;
+                eligible.insert((Reverse(parent_node.committer_time), *parent));
+            }
+        }
+    }
+
+    check_commit_deadline(deadline)?;
+    if ordered.len() != nodes.len() {
+        return Err(native_error(
+            "corrupt_repository",
+            "commit graph is not acyclic",
+        ));
+    }
+
+    Ok(OrderedCommitGraph { tip, ordered })
+}
+
+fn load_commit_node(
+    repo: &gix::Repository,
+    oid: gix_hash::ObjectId,
+    position: CommitPosition,
+    deadline: Instant,
+) -> Result<CommitNode, NativeError> {
+    check_commit_deadline(deadline)?;
+    let commit = find_graph_commit(repo, oid, position)?;
+    check_commit_deadline(deadline)?;
+    let decoded = commit
+        .decode()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let author = decoded
+        .author()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    author
+        .time()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let committer = decoded
+        .committer()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let committer_time = committer
+        .time()
+        .map_err(|error| native_error("corrupt_repository", error))?
+        .seconds;
+    let parents = decoded.parents().collect();
+    check_commit_deadline(deadline)?;
+
+    Ok(CommitNode {
+        parents,
+        committer_time,
+    })
+}
+
+fn find_graph_commit<'repo>(
+    repo: &'repo gix::Repository,
+    oid: gix_hash::ObjectId,
+    position: CommitPosition,
+) -> Result<gix::Commit<'repo>, NativeError> {
+    let missing_kind = match position {
+        CommitPosition::Tip => "commit_not_found",
+        CommitPosition::Ancestor => "corrupt_repository",
+    };
+
+    let object = match repo.find_object(oid) {
+        Ok(object) => object,
+        Err(error @ gix_object::find::existing::Error::NotFound { .. }) => {
+            return Err(native_error(missing_kind, error));
+        }
+        Err(gix_object::find::existing::Error::Find(error)) => {
+            let kind = if error_chain_contains_storage_io(error.as_ref()) {
+                "storage_unavailable"
+            } else {
+                "corrupt_repository"
+            };
+            return Err(native_error(kind, error));
+        }
+    };
+
+    object
+        .try_into_commit()
+        .map_err(|error| native_error(missing_kind, error))
+}
+
+fn hydrate_commit(
+    repo: &gix::Repository,
+    oid: gix_hash::ObjectId,
+    deadline: Instant,
+) -> Result<NativeCommit, NativeError> {
+    check_commit_deadline(deadline)?;
+    let commit = find_graph_commit(repo, oid, CommitPosition::Ancestor)?;
+    check_commit_deadline(deadline)?;
+    let decoded = commit
+        .decode()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    check_commit_deadline(deadline)?;
+    let author = decoded
+        .author()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let author_time = author
+        .time()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let committer = decoded
+        .committer()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let committer_time = committer
+        .time()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let message = decoded.message.to_string();
+    let title = message.lines().next().unwrap_or_default().to_string();
+    let parents = decoded.parents().map(|parent| parent.to_string()).collect();
+    let commit = (
+        oid.to_string(),
+        title,
+        message,
+        (
+            author.name.to_string(),
+            author.email.to_string(),
+            author_time.seconds,
+        ),
+        (
+            committer.name.to_string(),
+            committer.email.to_string(),
+            committer_time.seconds,
+        ),
+        parents,
+    );
+    check_commit_deadline(deadline)?;
+
+    Ok(commit)
+}
+
+fn commit_page_window(total: usize, page: usize, per_page: usize) -> CommitPageWindow {
+    let per_page = per_page.clamp(1, COMMIT_PAGE_LIMIT);
+    let total_pages = if total == 0 {
+        1
+    } else {
+        total.saturating_add(per_page - 1) / per_page
+    };
+    let requested_start = page.saturating_sub(1).saturating_mul(per_page);
+    let start = requested_start.min(total);
+    let end = requested_start.saturating_add(per_page).min(total);
+
+    CommitPageWindow {
+        start,
+        end,
+        total_pages,
+    }
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -1709,3 +2055,81 @@ fn entry_kind(kind: gix::object::tree::EntryKind) -> &'static str {
 }
 
 rustler::init!("Elixir.GitCore.Native");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_commit_graph_has_one_valid_empty_page() {
+        assert_eq!(
+            commit_page_window(0, 1, COMMIT_PAGE_LIMIT),
+            CommitPageWindow {
+                start: 0,
+                end: 0,
+                total_pages: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn huge_commit_page_saturates_to_an_empty_window() {
+        assert_eq!(
+            commit_page_window(58, usize::MAX, COMMIT_PAGE_LIMIT),
+            CommitPageWindow {
+                start: 58,
+                end: 58,
+                total_pages: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn commit_deadline_override_cannot_raise_the_production_ceiling() {
+        assert_eq!(commit_scan_duration(60_000), COMMIT_SCAN_DEADLINE);
+        assert_eq!(commit_scan_duration(17), Duration::from_millis(17));
+    }
+
+    #[test]
+    fn loose_object_error_only_treats_filesystem_io_as_storage_unavailable() {
+        let open_error = gix::odb::loose::find::Error::Io {
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            action: "open or map",
+            path: PathBuf::from("objects/00/object"),
+        };
+        assert!(error_chain_contains_storage_io(&open_error));
+
+        let empty_file_error = gix::odb::loose::find::Error::Io {
+            source: std::io::Error::other("empty loose object file"),
+            action: "open or map",
+            path: PathBuf::from("objects/00/object"),
+        };
+        assert!(!error_chain_contains_storage_io(&empty_file_error));
+
+        let inflate_error = gix::odb::loose::find::Error::Io {
+            source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
+            action: "inflate",
+            path: PathBuf::from("objects/00/object"),
+        };
+        assert!(!error_chain_contains_storage_io(&inflate_error));
+    }
+
+    #[test]
+    fn object_error_only_treats_terminal_os_io_as_storage_unavailable() {
+        let inaccessible_index =
+            gix::odb::store::load_index::Error::Inaccessible(PathBuf::from("objects/pack"));
+        assert!(error_chain_contains_storage_io(&inaccessible_index));
+
+        let structural_index = gix::odb::store::load_index::Error::InsufficientSlots {
+            current: 1,
+            needed: 1,
+        };
+        assert!(!error_chain_contains_storage_io(&structural_index));
+
+        let terminal_os_error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(error_chain_contains_storage_io(&terminal_os_error));
+
+        let wrapped_structural_error = std::io::Error::other(std::fmt::Error);
+        assert!(!error_chain_contains_storage_io(&wrapped_structural_error));
+    }
+}

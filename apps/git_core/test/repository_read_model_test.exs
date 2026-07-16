@@ -701,6 +701,385 @@ defmodule GitCore.RepositoryReadModelTest do
     end
   end
 
+  describe "exact deterministic commit summary and pages" do
+    @describetag :commits
+    @describetag :tmp_dir
+
+    test "counts every unique merge ancestor and orders child-before-parent deterministically", %{
+      tmp_dir: tmp_dir
+    } do
+      fixture = commit_dag_fixture!(tmp_dir)
+
+      assert {:ok,
+              %GitCore.CommitSummary{
+                count: count,
+                latest: %GitCore.Commit{} = latest
+              }} = GitCore.commit_summary(fixture.repo_path, fixture.tip_oid)
+
+      assert count == length(fixture.expected_order)
+
+      assert latest == %GitCore.Commit{
+               oid: fixture.tip_oid,
+               title: fixture.tip_title,
+               message: fixture.tip_title <> "\n",
+               author_name: "Fornacast Test",
+               author_email: "test@example.com",
+               author_time: fixture.tip_time,
+               committer_name: "Fornacast Test",
+               committer_email: "test@example.com",
+               committer_time: fixture.tip_time,
+               parents: [fixture.tip_parent_oid]
+             }
+
+      assert {:ok,
+              %GitCore.CommitPage{
+                commits: first_page,
+                total: ^count,
+                page: 1,
+                per_page: 50,
+                total_pages: 2
+              }} = GitCore.commit_page(fixture.repo_path, fixture.tip_oid, 1, per_page: 500)
+
+      assert Enum.map(first_page, & &1.oid) == Enum.take(fixture.expected_order, 50)
+
+      assert {:ok,
+              %GitCore.CommitPage{
+                commits: second_page,
+                total: ^count,
+                page: 2,
+                per_page: 50,
+                total_pages: 2
+              }} = GitCore.commit_page(fixture.repo_path, fixture.tip_oid, 2)
+
+      assert Enum.map(second_page, & &1.oid) == Enum.drop(fixture.expected_order, 50)
+
+      assert Enum.find(second_page, &(&1.oid == fixture.merge_oid)).parents ==
+               [fixture.left_tip_oid, fixture.right_tip_oid]
+
+      assert {:ok,
+              %GitCore.CommitPage{
+                commits: seven_commits,
+                total: ^count,
+                page: 1,
+                per_page: 7,
+                total_pages: 9
+              }} = GitCore.commit_page(fixture.repo_path, fixture.tip_oid, 1, per_page: 7)
+
+      assert length(seven_commits) == 7
+
+      assert {:ok,
+              %GitCore.CommitPage{
+                commits: [_only_commit],
+                total: ^count,
+                page: 1,
+                per_page: 1,
+                total_pages: ^count
+              }} = GitCore.commit_page(fixture.repo_path, fixture.tip_oid, 1, per_page: 0)
+
+      assert Enum.slice(fixture.expected_order, 53, 2) ==
+               Enum.sort([fixture.left_tip_oid, fixture.right_tip_oid])
+
+      assert Enum.slice(fixture.expected_order, 55, 2) ==
+               [fixture.left_base_oid, fixture.right_base_oid]
+
+      assert List.last(fixture.expected_order) == fixture.root_oid
+
+      assert {:ok,
+              %GitCore.CommitPage{
+                commits: [],
+                total: ^count,
+                page: 3,
+                per_page: 50,
+                total_pages: 2
+              }} = GitCore.commit_page(fixture.repo_path, fixture.tip_oid, 3)
+
+      huge_page = Bitwise.bsl(1, 200)
+
+      assert {:ok,
+              %GitCore.CommitPage{
+                commits: [],
+                total: ^count,
+                page: ^huge_page,
+                per_page: 50,
+                total_pages: 2
+              }} = GitCore.commit_page(fixture.repo_path, fixture.tip_oid, huge_page)
+    end
+
+    test "uses the immutable snapshot OID after the branch advances", %{tmp_dir: tmp_dir} do
+      fixture = commit_dag_fixture!(tmp_dir)
+
+      new_tip_oid =
+        commit_tree!(
+          fixture.repo_path,
+          fixture.tree_oid,
+          "advanced branch",
+          [fixture.tip_oid],
+          fixture.tip_time + 1
+        )
+
+      git!([
+        "--git-dir",
+        fixture.repo_path,
+        "update-ref",
+        "refs/heads/main",
+        new_tip_oid
+      ])
+
+      assert {:ok, %GitCore.CommitSummary{count: old_count, latest: old_latest}} =
+               GitCore.commit_summary(fixture.repo_path, fixture.tip_oid)
+
+      assert old_count == length(fixture.expected_order)
+      assert old_latest.oid == fixture.tip_oid
+
+      assert {:ok, %GitCore.CommitSummary{count: new_count, latest: new_latest}} =
+               GitCore.commit_summary(fixture.repo_path, new_tip_oid)
+
+      assert new_count == old_count + 1
+      assert new_latest.oid == new_tip_oid
+
+      replacement_oid =
+        commit_tree!(
+          fixture.repo_path,
+          fixture.tree_oid,
+          "replacement must be ignored",
+          [],
+          fixture.tip_time + 2
+        )
+
+      # Pinned gix currently loads replacement refs when this switch is false. Exercise that
+      # configuration so immutable snapshot reads prove they bypass the replacement map.
+      git!(["--git-dir", fixture.repo_path, "config", "core.useReplaceRefs", "false"])
+      git!(["--git-dir", fixture.repo_path, "replace", fixture.tip_oid, replacement_oid])
+
+      assert {:ok, %GitCore.CommitSummary{count: physical_count, latest: physical_latest}} =
+               GitCore.commit_summary(fixture.repo_path, fixture.tip_oid)
+
+      assert physical_count == old_count
+      assert physical_latest.oid == fixture.tip_oid
+      assert physical_latest.title == fixture.tip_title
+
+      assert {:ok,
+              %GitCore.CommitPage{
+                commits: [physical_page_tip | _],
+                total: ^old_count,
+                page: 1,
+                per_page: 50,
+                total_pages: 2
+              }} = GitCore.commit_page(fixture.repo_path, fixture.tip_oid, 1)
+
+      assert physical_page_tip.oid == fixture.tip_oid
+      assert physical_page_tip.title == fixture.tip_title
+    end
+
+    test "returns typed timeout errors instead of partial exact results", %{tmp_dir: tmp_dir} do
+      fixture = commit_dag_fixture!(tmp_dir)
+
+      assert_error(
+        GitCore.commit_summary(fixture.repo_path, fixture.tip_oid, deadline_ms: 0),
+        :scan_timeout,
+        :commit_summary
+      )
+
+      assert_error(
+        GitCore.commit_page(fixture.repo_path, fixture.tip_oid, 1, deadline_ms: 0),
+        :scan_timeout,
+        :commit_page
+      )
+    end
+
+    @tag :typed_errors
+    test "classifies unreadable loose commit storage as unavailable", %{tmp_dir: tmp_dir} do
+      fixture = commit_dag_fixture!(tmp_dir)
+      object_path = loose_object_path(fixture.repo_path, fixture.tip_oid)
+      original_mode = Bitwise.band(File.stat!(object_path).mode, 0o777)
+
+      try do
+        File.chmod!(object_path, 0o000)
+        assert {:error, :eacces} = File.read(object_path)
+
+        assert_error(
+          GitCore.commit_summary(fixture.repo_path, fixture.tip_oid),
+          :storage_unavailable,
+          :commit_summary
+        )
+
+        assert_error(
+          GitCore.commit_page(fixture.repo_path, fixture.tip_oid, 1),
+          :storage_unavailable,
+          :commit_page
+        )
+      after
+        File.chmod!(object_path, original_mode)
+      end
+    end
+
+    @tag :typed_errors
+    test "classifies an empty loose commit object as repository corruption", %{tmp_dir: tmp_dir} do
+      fixture = commit_dag_fixture!(tmp_dir)
+      object_path = loose_object_path(fixture.repo_path, fixture.tip_oid)
+      File.chmod!(object_path, 0o600)
+      File.write!(object_path, "")
+
+      assert_error(
+        GitCore.commit_summary(fixture.repo_path, fixture.tip_oid),
+        :corrupt_repository,
+        :commit_summary
+      )
+
+      assert_error(
+        GitCore.commit_page(fixture.repo_path, fixture.tip_oid, 1),
+        :corrupt_repository,
+        :commit_page
+      )
+    end
+
+    test "classifies malformed reachable commit objects as repository corruption", %{
+      tmp_dir: tmp_dir
+    } do
+      fixture = commit_dag_fixture!(tmp_dir)
+
+      malformed_oid =
+        literal_object!(
+          tmp_dir,
+          fixture.repo_path,
+          "malformed-commit",
+          :commit,
+          "tree not-an-object-id\n\nmalformed commit\n"
+        )
+
+      assert_error(
+        GitCore.commit_summary(fixture.repo_path, malformed_oid),
+        :corrupt_repository,
+        :commit_summary
+      )
+
+      assert_error(
+        GitCore.commit_page(fixture.repo_path, malformed_oid, 1),
+        :corrupt_repository,
+        :commit_page
+      )
+
+      missing_parent_oid = String.duplicate("f", 40)
+
+      missing_parent_tip_oid =
+        literal_object!(
+          tmp_dir,
+          fixture.repo_path,
+          "missing-parent-commit",
+          :commit,
+          "tree #{fixture.tree_oid}\n" <>
+            "parent #{missing_parent_oid}\n" <>
+            "author Fornacast Test <test@example.com> 946684800 +0000\n" <>
+            "committer Fornacast Test <test@example.com> 946684800 +0000\n\n" <>
+            "missing reachable parent\n"
+        )
+
+      assert_error(
+        GitCore.commit_summary(fixture.repo_path, missing_parent_tip_oid),
+        :corrupt_repository,
+        :commit_summary
+      )
+
+      wrong_kind_parent_tip_oid =
+        literal_object!(
+          tmp_dir,
+          fixture.repo_path,
+          "wrong-kind-parent-commit",
+          :commit,
+          "tree #{fixture.tree_oid}\n" <>
+            "parent #{fixture.tree_oid}\n" <>
+            "author Fornacast Test <test@example.com> 946684800 +0000\n" <>
+            "committer Fornacast Test <test@example.com> 946684800 +0000\n\n" <>
+            "wrong-kind reachable parent\n"
+        )
+
+      assert_error(
+        GitCore.commit_page(fixture.repo_path, wrong_kind_parent_tip_oid, 1),
+        :corrupt_repository,
+        :commit_page
+      )
+
+      malformed_parent_tip_oid =
+        literal_object!(
+          tmp_dir,
+          fixture.repo_path,
+          "malformed-parent-header-commit",
+          :commit,
+          "tree #{fixture.tree_oid}\n" <>
+            "parent not-an-object-id\n" <>
+            "author Fornacast Test <test@example.com> 946684800 +0000\n" <>
+            "committer Fornacast Test <test@example.com> 946684800 +0000\n\n" <>
+            "malformed parent header\n"
+        )
+
+      assert_error(
+        GitCore.commit_summary(fixture.repo_path, malformed_parent_tip_oid),
+        :corrupt_repository,
+        :commit_summary
+      )
+
+      malformed_time_tip_oid =
+        literal_object!(
+          tmp_dir,
+          fixture.repo_path,
+          "malformed-committer-time-commit",
+          :commit,
+          "tree #{fixture.tree_oid}\n" <>
+            "author Fornacast Test <test@example.com> 946684800 +0000\n" <>
+            "committer Fornacast Test <test@example.com> not-a-time +0000\n\n" <>
+            "malformed committer time\n"
+        )
+
+      assert_error(
+        GitCore.commit_page(fixture.repo_path, malformed_time_tip_oid, 1),
+        :corrupt_repository,
+        :commit_page
+      )
+    end
+
+    test "requires an immutable commit OID rather than resolving a ref name", %{tmp_dir: tmp_dir} do
+      fixture = commit_dag_fixture!(tmp_dir)
+
+      assert_error(
+        GitCore.commit_summary(fixture.repo_path, "refs/heads/main"),
+        :commit_not_found,
+        :commit_summary
+      )
+
+      assert_error(
+        GitCore.commit_page(fixture.repo_path, "main", 1),
+        :commit_not_found,
+        :commit_page
+      )
+
+      blob_path = Path.join(tmp_dir, "snapshot-blob")
+      File.write!(blob_path, "not a commit\n")
+      blob_oid = git!(["--git-dir", fixture.repo_path, "hash-object", "-w", blob_path])
+
+      git!([
+        "--git-dir",
+        fixture.repo_path,
+        "tag",
+        "-a",
+        "snapshot-tag-object",
+        fixture.tip_oid,
+        "-m",
+        "tag object"
+      ])
+
+      tag_oid =
+        git!(["--git-dir", fixture.repo_path, "rev-parse", "refs/tags/snapshot-tag-object"])
+
+      for oid <- [fixture.tree_oid, blob_oid, tag_oid, String.duplicate("0", 40)] do
+        assert_error(
+          GitCore.commit_summary(fixture.repo_path, oid),
+          :commit_not_found,
+          :commit_summary
+        )
+      end
+    end
+  end
+
   describe "scan limiter" do
     @describetag :limiter
 
@@ -1672,6 +2051,115 @@ defmodule GitCore.RepositoryReadModelTest do
     path
   end
 
+  defp commit_dag_fixture!(tmp_dir) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "commit-dag-#{suffix}.git")
+    empty_tree_path = Path.join(tmp_dir, "commit-dag-tree-#{suffix}")
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    File.write!(empty_tree_path, "")
+
+    tree_oid =
+      git!(["--git-dir", repo_path, "hash-object", "-t", "tree", "-w", empty_tree_path])
+
+    base_time = 946_684_800
+    # The root is deliberately newer than every descendant. A global timestamp sort would put it
+    # first; the required Kahn walk cannot emit it until both merge branches have been emitted.
+    root_oid = commit_tree!(repo_path, tree_oid, "root", [], base_time + 900)
+    left_base_oid = commit_tree!(repo_path, tree_oid, "left base", [root_oid], base_time + 300)
+    right_base_oid = commit_tree!(repo_path, tree_oid, "right base", [root_oid], base_time + 200)
+
+    left_tip_oid =
+      commit_tree!(repo_path, tree_oid, "left tip", [left_base_oid], base_time + 400)
+
+    right_tip_oid =
+      commit_tree!(repo_path, tree_oid, "right tip", [right_base_oid], base_time + 400)
+
+    merge_oid =
+      commit_tree!(
+        repo_path,
+        tree_oid,
+        "merge",
+        [left_tip_oid, right_tip_oid],
+        base_time + 500
+      )
+
+    {tip_oid, chain_order} =
+      Enum.reduce(1..52, {merge_oid, []}, fn index, {parent_oid, order} ->
+        oid =
+          commit_tree!(
+            repo_path,
+            tree_oid,
+            "chain #{index}",
+            [parent_oid],
+            base_time + 500 + index
+          )
+
+        {oid, [oid | order]}
+      end)
+
+    git!(["--git-dir", repo_path, "update-ref", "refs/heads/main", tip_oid])
+
+    expected_order =
+      chain_order ++
+        [merge_oid] ++
+        Enum.sort([left_tip_oid, right_tip_oid]) ++
+        [left_base_oid, right_base_oid, root_oid]
+
+    %{
+      repo_path: repo_path,
+      tree_oid: tree_oid,
+      tip_oid: tip_oid,
+      tip_parent_oid: Enum.at(chain_order, 1),
+      tip_title: "chain 52",
+      tip_time: base_time + 552,
+      expected_order: expected_order,
+      root_oid: root_oid,
+      left_base_oid: left_base_oid,
+      right_base_oid: right_base_oid,
+      left_tip_oid: left_tip_oid,
+      right_tip_oid: right_tip_oid,
+      merge_oid: merge_oid
+    }
+  end
+
+  defp commit_tree!(repo_path, tree_oid, message, parents, timestamp) do
+    args =
+      ["--git-dir", repo_path, "commit-tree", tree_oid] ++
+        Enum.flat_map(parents, &["-p", &1]) ++ ["-m", message]
+
+    date = "#{timestamp} +0000"
+
+    env = [
+      {"GIT_AUTHOR_NAME", "Fornacast Test"},
+      {"GIT_AUTHOR_EMAIL", "test@example.com"},
+      {"GIT_COMMITTER_NAME", "Fornacast Test"},
+      {"GIT_COMMITTER_EMAIL", "test@example.com"},
+      {"GIT_AUTHOR_DATE", date},
+      {"GIT_COMMITTER_DATE", date}
+    ]
+
+    case System.cmd("git", args, stderr_to_stdout: true, env: env) do
+      {output, 0} -> String.trim_trailing(output)
+      {output, code} -> flunk("git #{Enum.join(args, " ")} failed with #{code}:\n#{output}")
+    end
+  end
+
+  defp literal_object!(tmp_dir, repo_path, name, kind, data) do
+    object_path = Path.join(tmp_dir, "#{name}-#{System.unique_integer([:positive])}")
+    File.write!(object_path, data)
+
+    git!([
+      "--git-dir",
+      repo_path,
+      "hash-object",
+      "--literally",
+      "-t",
+      Atom.to_string(kind),
+      "-w",
+      object_path
+    ])
+  end
+
   defp symbolic_ref_cycle_repository!(tmp_dir) do
     path = empty_bare_repository!(tmp_dir)
     tags_path = Path.join([path, "refs", "tags"])
@@ -1878,5 +2366,78 @@ defmodule GitCore.RepositoryReadModelTest do
       {output, 0} -> String.trim_trailing(output)
       {output, code} -> flunk("git #{Enum.join(args, " ")} failed with #{code}:\n#{output}")
     end
+  end
+end
+
+defmodule GitCore.CommitScanBusyTest do
+  use ExUnit.Case, async: false
+
+  @moduletag :commits
+
+  test "commit APIs cannot bypass the supervised global scan limit" do
+    isolated_limiter =
+      start_supervised!({GitCore.ScanLimiter, server: nil}, id: make_ref())
+
+    holders = for _ <- 1..4, do: start_global_scan_holder()
+
+    Enum.each(holders, fn holder ->
+      assert_receive {:global_scan_entered, ^holder}, 1_000
+    end)
+
+    missing_path =
+      Path.join(
+        System.tmp_dir!(),
+        "missing-commit-scan-#{System.unique_integer([:positive])}.git"
+      )
+
+    try do
+      # Unknown caller options cannot redirect either public API around the global limiter.
+      assert_error(
+        GitCore.commit_summary(missing_path, "not-an-object-id", scan_limiter: isolated_limiter),
+        :scan_busy,
+        :commit_summary
+      )
+
+      assert_error(
+        GitCore.commit_page(missing_path, "not-an-object-id", 1, scan_limiter: isolated_limiter),
+        :scan_busy,
+        :commit_page
+      )
+    after
+      Enum.each(holders, &send(&1, :release))
+
+      Enum.each(holders, fn holder ->
+        assert_receive {:global_scan_finished, ^holder, :released}, 1_000
+      end)
+    end
+  end
+
+  defp start_global_scan_holder do
+    parent = self()
+
+    spawn(fn ->
+      result =
+        GitCore.ScanLimiter.with_permit(:commit_busy_contract, fn ->
+          send(parent, {:global_scan_entered, self()})
+
+          receive do
+            :release -> :released
+          end
+        end)
+
+      send(parent, {:global_scan_finished, self(), result})
+    end)
+  end
+
+  defp assert_error(result, expected_kind, expected_operation) do
+    assert {:error,
+            %GitCore.Error{
+              kind: ^expected_kind,
+              operation: ^expected_operation,
+              detail: detail
+            }} = result
+
+    assert is_binary(detail)
+    refute detail == ""
   end
 end
