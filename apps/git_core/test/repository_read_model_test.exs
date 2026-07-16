@@ -1080,6 +1080,446 @@ defmodule GitCore.RepositoryReadModelTest do
     end
   end
 
+  describe "commit-aware bounded tree pages" do
+    @describetag :tree_history
+    @describetag :tmp_dir
+
+    test "sorts directories first by raw name bytes and caps one page at 200 rows", %{
+      tmp_dir: tmp_dir
+    } do
+      fixture = tree_history_fixture!(tmp_dir)
+
+      assert {:ok,
+              %GitCore.TreePage{
+                entries: entries,
+                total_entries: 205,
+                page: 1,
+                per_page: 200,
+                total_pages: 2
+              }} =
+               GitCore.read_tree_with_history(
+                 fixture.repo_path,
+                 fixture.tip_oid,
+                 "",
+                 1,
+                 per_page: 500
+               )
+
+      assert length(entries) == 200
+
+      assert Enum.map(entries, & &1.name) ==
+               ["alpha-dir", "empty-dir", "zeta-dir"] ++
+                 for(
+                   index <- 0..196,
+                   do: "file-#{String.pad_leading(Integer.to_string(index), 3, "0")}.txt"
+                 )
+
+      assert Enum.all?(entries, &match?(%GitCore.TreeHistoryEntry{}, &1))
+
+      assert %GitCore.TreeHistoryEntry{
+               kind: :tree,
+               latest_commit: %GitCore.Commit{oid: alpha_oid, title: "left descendant change"}
+             } = find_tree_entry!(entries, "alpha-dir")
+
+      assert alpha_oid == fixture.left_oid
+
+      assert %GitCore.TreeHistoryEntry{
+               kind: :tree,
+               latest_commit: %GitCore.Commit{oid: zeta_oid, title: "merge first-parent delta"}
+             } = find_tree_entry!(entries, "zeta-dir")
+
+      assert zeta_oid == fixture.merge_oid
+
+      assert %GitCore.TreeHistoryEntry{
+               kind: :blob,
+               latest_commit: %GitCore.Commit{oid: tip_oid, title: "tip file change"}
+             } = find_tree_entry!(entries, "file-000.txt")
+
+      assert tip_oid == fixture.tip_oid
+
+      assert %GitCore.TreeHistoryEntry{
+               latest_commit: %GitCore.Commit{
+                 oid: root_oid,
+                 title: "root tree",
+                 author_name: "Fornacast Test",
+                 author_time: root_time
+               }
+             } = find_tree_entry!(entries, "file-001.txt")
+
+      assert root_oid == fixture.root_oid
+      assert root_time == fixture.root_time
+    end
+
+    test "orders prefix-related directories by raw bytes instead of Git slash sentinels", %{
+      tmp_dir: tmp_dir
+    } do
+      fixture = prefix_directory_tree_fixture!(tmp_dir)
+
+      assert {:ok, %GitCore.TreePage{entries: entries, total_entries: 2}} =
+               GitCore.read_tree_with_history(fixture.repo_path, fixture.tip_oid, "", 1)
+
+      assert Enum.map(entries, & &1.name) == ["foo", "foo.bar"]
+      assert Enum.all?(entries, &(&1.kind == :tree))
+    end
+
+    test "returns exact later, small, out-of-range, and huge pages", %{tmp_dir: tmp_dir} do
+      fixture = tree_history_fixture!(tmp_dir)
+
+      assert {:ok,
+              %GitCore.TreePage{
+                entries: last_entries,
+                total_entries: 205,
+                page: 2,
+                per_page: 200,
+                total_pages: 2
+              }} =
+               GitCore.read_tree_with_history(fixture.repo_path, fixture.tip_oid, "", 2)
+
+      assert Enum.map(last_entries, & &1.name) == [
+               "file-197.txt",
+               "file-198.txt",
+               <<"raw-", 0xFE>>,
+               <<"raw-", 0xFF>>,
+               "renamed.txt"
+             ]
+
+      assert %GitCore.TreeHistoryEntry{
+               latest_commit: %GitCore.Commit{oid: merge_oid, title: "merge first-parent delta"}
+             } = find_tree_entry!(last_entries, "file-198.txt")
+
+      assert merge_oid == fixture.merge_oid
+
+      assert %GitCore.TreeHistoryEntry{
+               mode: "100755",
+               latest_commit: %GitCore.Commit{oid: mode_oid, title: "left descendant change"}
+             } = find_tree_entry!(last_entries, "file-197.txt")
+
+      assert mode_oid == fixture.left_oid
+
+      raw_names = Enum.slice(Enum.map(last_entries, & &1.name), 2, 2)
+      assert raw_names == [<<"raw-", 0xFE>>, <<"raw-", 0xFF>>]
+      assert Enum.all?(raw_names, &(not String.valid?(&1)))
+
+      assert %GitCore.TreeHistoryEntry{
+               latest_commit: %GitCore.Commit{oid: rename_oid, title: "left descendant change"}
+             } = find_tree_entry!(last_entries, "renamed.txt")
+
+      assert rename_oid == fixture.left_oid
+
+      assert {:ok,
+              %GitCore.TreePage{
+                entries: [single_entry],
+                total_entries: 205,
+                page: 1,
+                per_page: 1,
+                total_pages: 205
+              }} =
+               GitCore.read_tree_with_history(
+                 fixture.repo_path,
+                 fixture.tip_oid,
+                 "",
+                 1,
+                 per_page: 0
+               )
+
+      assert single_entry.name == "alpha-dir"
+
+      assert {:ok, %GitCore.TreePage{entries: [], page: 3, total_pages: 2}} =
+               GitCore.read_tree_with_history(fixture.repo_path, fixture.tip_oid, "", 3)
+
+      huge_page = Bitwise.bsl(1, 200)
+
+      assert {:ok,
+              %GitCore.TreePage{entries: [], page: ^huge_page, total_entries: 205, total_pages: 2}} =
+               GitCore.read_tree_with_history(
+                 fixture.repo_path,
+                 fixture.tip_oid,
+                 "",
+                 huge_page
+               )
+    end
+
+    test "attributes nested descendants using the first declared merge parent", %{
+      tmp_dir: tmp_dir
+    } do
+      fixture = tree_history_fixture!(tmp_dir)
+
+      assert {:ok,
+              %GitCore.TreePage{
+                entries: [
+                  %GitCore.TreeHistoryEntry{
+                    name: "nested.txt",
+                    latest_commit: %GitCore.Commit{
+                      oid: latest_oid,
+                      title: "left descendant change"
+                    }
+                  }
+                ],
+                total_entries: 1,
+                page: 1,
+                per_page: 200,
+                total_pages: 1
+              }} =
+               GitCore.read_tree_with_history(
+                 fixture.repo_path,
+                 fixture.tip_oid,
+                 "alpha-dir",
+                 1
+               )
+
+      assert latest_oid == fixture.left_oid
+      refute latest_oid == fixture.merge_oid
+    end
+
+    test "returns exact empty directory pages for page one and later pages", %{tmp_dir: tmp_dir} do
+      fixture = tree_history_fixture!(tmp_dir)
+
+      for page <- [1, 2] do
+        assert {:ok,
+                %GitCore.TreePage{
+                  entries: [],
+                  total_entries: 0,
+                  page: ^page,
+                  per_page: 200,
+                  total_pages: 1
+                }} =
+                 GitCore.read_tree_with_history(
+                   fixture.repo_path,
+                   fixture.tip_oid,
+                   "empty-dir",
+                   page
+                 )
+      end
+    end
+
+    test "uses an already-resolved slash ref OID after the branch advances", %{tmp_dir: tmp_dir} do
+      fixture = tree_history_fixture!(tmp_dir)
+
+      assert {:ok, %GitCore.Snapshot{oid: snapshot_oid}} =
+               GitCore.resolve_snapshot(fixture.repo_path, %GitCore.RefSelector{
+                 kind: :branch,
+                 full_name: "refs/heads/feature/slash"
+               })
+
+      assert snapshot_oid == fixture.tip_oid
+
+      git!([
+        "--git-dir",
+        fixture.repo_path,
+        "update-ref",
+        "refs/heads/feature/slash",
+        fixture.root_oid
+      ])
+
+      assert {:ok, %GitCore.TreePage{entries: entries}} =
+               GitCore.read_tree_with_history(fixture.repo_path, snapshot_oid, "", 1)
+
+      assert %GitCore.TreeHistoryEntry{
+               latest_commit: %GitCore.Commit{oid: latest_oid, title: "tip file change"}
+             } = find_tree_entry!(entries, "file-000.txt")
+
+      assert latest_oid == fixture.tip_oid
+    end
+
+    test "ignores replacement refs and reads the physical snapshot", %{tmp_dir: tmp_dir} do
+      fixture = tree_history_fixture!(tmp_dir)
+
+      git!(["--git-dir", fixture.repo_path, "config", "core.useReplaceRefs", "false"])
+      git!(["--git-dir", fixture.repo_path, "replace", fixture.tip_oid, fixture.root_oid])
+
+      assert {:ok, %GitCore.TreePage{entries: entries, total_entries: 205}} =
+               GitCore.read_tree_with_history(fixture.repo_path, fixture.tip_oid, "", 2)
+
+      assert %GitCore.TreeHistoryEntry{
+               name: "renamed.txt",
+               latest_commit: %GitCore.Commit{oid: latest_oid}
+             } = find_tree_entry!(entries, "renamed.txt")
+
+      assert latest_oid == fixture.left_oid
+    end
+
+    test "rejects unsafe or missing Git paths and enforces a lower deadline", %{tmp_dir: tmp_dir} do
+      fixture = tree_history_fixture!(tmp_dir)
+
+      for tree_path <- [
+            "../alpha-dir",
+            "alpha-dir/../zeta-dir",
+            "/alpha-dir",
+            "alpha-dir/",
+            "alpha-dir//nested",
+            "alpha-dir\0nested",
+            "missing",
+            "file-000.txt"
+          ] do
+        assert_error(
+          GitCore.read_tree_with_history(fixture.repo_path, fixture.tip_oid, tree_path, 1),
+          :path_not_found,
+          :tree_history
+        )
+      end
+
+      assert_error(
+        GitCore.read_tree_with_history(fixture.repo_path, "refs/heads/main", "", 1),
+        :commit_not_found,
+        :tree_history
+      )
+
+      assert_error(
+        GitCore.read_tree_with_history(
+          fixture.repo_path,
+          fixture.tip_oid,
+          "",
+          1,
+          deadline_ms: 0
+        ),
+        :scan_timeout,
+        :tree_history
+      )
+    end
+
+    test "validates the selected tip path before walking ancestor history", %{tmp_dir: tmp_dir} do
+      fixture = tree_history_fixture!(tmp_dir)
+      File.rm!(loose_object_path(fixture.repo_path, fixture.root_oid))
+
+      assert_error(
+        GitCore.read_tree_with_history(fixture.repo_path, fixture.tip_oid, "missing", 1),
+        :path_not_found,
+        :tree_history
+      )
+    end
+
+    test "rejects cross-kind duplicate names before paginating any direct tree page", %{
+      tmp_dir: tmp_dir
+    } do
+      fixture = tree_history_cross_kind_duplicate_fixture!(tmp_dir)
+
+      for page <- [1, 2, 1_000] do
+        assert_error(
+          GitCore.read_tree_with_history(fixture.repo_path, fixture.tip_oid, "", page,
+            per_page: 1
+          ),
+          :corrupt_repository,
+          :tree_history
+        )
+      end
+    end
+
+    test "rejects unsupported tree modes before pagination", %{tmp_dir: tmp_dir} do
+      fixture = tree_history_invalid_mode_fixture!(tmp_dir)
+
+      for page <- [1, 2] do
+        assert_error(
+          GitCore.read_tree_with_history(fixture.repo_path, fixture.tip_oid, "", page),
+          :corrupt_repository,
+          :tree_history
+        )
+      end
+    end
+
+    @tag :typed_errors
+    test "distinguishes unavailable commit storage from corrupt tree storage", %{tmp_dir: tmp_dir} do
+      unavailable = tree_history_fixture!(tmp_dir)
+      commit_path = loose_object_path(unavailable.repo_path, unavailable.tip_oid)
+      original_mode = Bitwise.band(File.stat!(commit_path).mode, 0o777)
+
+      try do
+        File.chmod!(commit_path, 0o000)
+        assert {:error, :eacces} = File.read(commit_path)
+
+        assert_error(
+          GitCore.read_tree_with_history(unavailable.repo_path, unavailable.tip_oid, "", 1),
+          :storage_unavailable,
+          :tree_history
+        )
+      after
+        File.chmod!(commit_path, original_mode)
+      end
+
+      unavailable_tree = tree_history_fixture!(tmp_dir)
+
+      unavailable_tree_path =
+        loose_object_path(unavailable_tree.repo_path, unavailable_tree.tip_tree_oid)
+
+      original_tree_mode = Bitwise.band(File.stat!(unavailable_tree_path).mode, 0o777)
+
+      try do
+        File.chmod!(unavailable_tree_path, 0o000)
+        assert {:error, :eacces} = File.read(unavailable_tree_path)
+
+        assert_error(
+          GitCore.read_tree_with_history(
+            unavailable_tree.repo_path,
+            unavailable_tree.tip_oid,
+            "",
+            1
+          ),
+          :storage_unavailable,
+          :tree_history
+        )
+      after
+        File.chmod!(unavailable_tree_path, original_tree_mode)
+      end
+
+      corrupt = tree_history_fixture!(tmp_dir)
+      tree_path = loose_object_path(corrupt.repo_path, corrupt.tip_tree_oid)
+      File.chmod!(tree_path, 0o600)
+      File.write!(tree_path, "")
+
+      assert_error(
+        GitCore.read_tree_with_history(corrupt.repo_path, corrupt.tip_oid, "", 1),
+        :corrupt_repository,
+        :tree_history
+      )
+
+      wrong_kind = tree_history_wrong_kind_fixture!(tmp_dir)
+
+      assert_error(
+        GitCore.read_tree_with_history(wrong_kind.repo_path, wrong_kind.tip_oid, "bad-tree", 1),
+        :corrupt_repository,
+        :tree_history
+      )
+    end
+
+    test "makes exactly one native call for zero, one, or 200 retained rows", %{tmp_dir: tmp_dir} do
+      fixture = tree_history_fixture!(tmp_dir)
+      mfa = {GitCore, :native_tree_history_call, 6}
+      tracee = self()
+      tracer = spawn_link(fn -> tree_history_trace_counter(0) end)
+      assert {:module, GitCore} = Code.ensure_loaded(GitCore)
+      assert 1 == :erlang.trace(tracee, true, [:call, {:tracer, tracer}])
+      assert 1 == :erlang.trace_pattern(mfa, true, [:local])
+      assert_tree_history_trace_count(tracee, tracer, 0)
+
+      try do
+        assert {:ok, %GitCore.TreePage{entries: [_]}} =
+                 GitCore.read_tree_with_history(
+                   fixture.repo_path,
+                   fixture.tip_oid,
+                   "",
+                   1,
+                   per_page: 1
+                 )
+
+        assert_tree_history_trace_count(tracee, tracer, 1)
+
+        assert {:ok, %GitCore.TreePage{entries: entries}} =
+                 GitCore.read_tree_with_history(fixture.repo_path, fixture.tip_oid, "", 1)
+
+        assert length(entries) == 200
+        assert_tree_history_trace_count(tracee, tracer, 2)
+
+        assert {:ok, %GitCore.TreePage{entries: []}} =
+                 GitCore.read_tree_with_history(fixture.repo_path, fixture.tip_oid, "", 3)
+
+        assert_tree_history_trace_count(tracee, tracer, 3)
+      after
+        :erlang.trace_pattern(mfa, false, [:local])
+        :erlang.trace(tracee, false, [:call])
+        send(tracer, :stop)
+      end
+    end
+  end
+
   describe "scan limiter" do
     @describetag :limiter
 
@@ -2051,6 +2491,288 @@ defmodule GitCore.RepositoryReadModelTest do
     path
   end
 
+  defp tree_history_fixture!(tmp_dir) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "tree-history-#{suffix}.git")
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+
+    base_blob = blob_object!(tmp_dir, repo_path, "tree-base-#{suffix}", "base\n")
+    rename_blob = blob_object!(tmp_dir, repo_path, "tree-rename-#{suffix}", "renamed\n")
+    nested_root_blob = blob_object!(tmp_dir, repo_path, "nested-root-#{suffix}", "root\n")
+    nested_left_blob = blob_object!(tmp_dir, repo_path, "nested-left-#{suffix}", "left\n")
+    zeta_right_blob = blob_object!(tmp_dir, repo_path, "zeta-right-#{suffix}", "right\n")
+    file_right_blob = blob_object!(tmp_dir, repo_path, "file-right-#{suffix}", "right\n")
+    file_tip_blob = blob_object!(tmp_dir, repo_path, "file-tip-#{suffix}", "tip\n")
+
+    alpha_root_tree =
+      tree_object!(tmp_dir, repo_path, "alpha-root-#{suffix}", [
+        {"100644", "nested.txt", nested_root_blob}
+      ])
+
+    alpha_left_tree =
+      tree_object!(tmp_dir, repo_path, "alpha-left-#{suffix}", [
+        {"100644", "nested.txt", nested_left_blob}
+      ])
+
+    zeta_root_tree =
+      tree_object!(tmp_dir, repo_path, "zeta-root-#{suffix}", [
+        {"100644", "stable.txt", base_blob}
+      ])
+
+    zeta_right_tree =
+      tree_object!(tmp_dir, repo_path, "zeta-right-#{suffix}", [
+        {"100644", "stable.txt", zeta_right_blob}
+      ])
+
+    empty_tree = tree_object!(tmp_dir, repo_path, "empty-dir-#{suffix}", [])
+
+    generated_names =
+      for index <- 0..198,
+          do: "file-#{String.pad_leading(Integer.to_string(index), 3, "0")}.txt"
+
+    generated_root_entries = Enum.map(generated_names, &{"100644", &1, base_blob})
+
+    raw_name_entries = [
+      {"100644", <<"raw-", 0xFE>>, base_blob},
+      {"100644", <<"raw-", 0xFF>>, base_blob}
+    ]
+
+    root_entries =
+      [
+        {"40000", "alpha-dir", alpha_root_tree},
+        {"40000", "empty-dir", empty_tree},
+        {"40000", "zeta-dir", zeta_root_tree},
+        {"100644", "legacy-name.txt", rename_blob}
+      ] ++ generated_root_entries ++ raw_name_entries
+
+    left_entries =
+      [
+        {"40000", "alpha-dir", alpha_left_tree},
+        {"40000", "empty-dir", empty_tree},
+        {"40000", "zeta-dir", zeta_root_tree},
+        {"100644", "renamed.txt", rename_blob}
+      ] ++
+        replace_tree_mode(generated_root_entries, "file-197.txt", "100755") ++
+        raw_name_entries
+
+    right_entries =
+      [
+        {"40000", "alpha-dir", alpha_root_tree},
+        {"40000", "empty-dir", empty_tree},
+        {"40000", "zeta-dir", zeta_right_tree},
+        {"100644", "legacy-name.txt", rename_blob}
+      ] ++
+        replace_tree_blob(generated_root_entries, "file-198.txt", file_right_blob) ++
+        raw_name_entries
+
+    merge_entries =
+      [
+        {"40000", "alpha-dir", alpha_left_tree},
+        {"40000", "empty-dir", empty_tree},
+        {"40000", "zeta-dir", zeta_right_tree},
+        {"100644", "renamed.txt", rename_blob}
+      ] ++
+        (generated_root_entries
+         |> replace_tree_mode("file-197.txt", "100755")
+         |> replace_tree_blob("file-198.txt", file_right_blob)) ++ raw_name_entries
+
+    tip_entries = replace_tree_blob(merge_entries, "file-000.txt", file_tip_blob)
+
+    root_tree_oid = tree_object!(tmp_dir, repo_path, "root-#{suffix}", root_entries)
+    left_tree_oid = tree_object!(tmp_dir, repo_path, "left-#{suffix}", left_entries)
+    right_tree_oid = tree_object!(tmp_dir, repo_path, "right-#{suffix}", right_entries)
+    merge_tree_oid = tree_object!(tmp_dir, repo_path, "merge-#{suffix}", merge_entries)
+    tip_tree_oid = tree_object!(tmp_dir, repo_path, "tip-#{suffix}", tip_entries)
+
+    root_time = 946_684_800
+    root_oid = commit_tree!(repo_path, root_tree_oid, "root tree", [], root_time)
+
+    left_oid =
+      commit_tree!(
+        repo_path,
+        left_tree_oid,
+        "left descendant change",
+        [root_oid],
+        root_time + 100
+      )
+
+    right_oid =
+      commit_tree!(
+        repo_path,
+        right_tree_oid,
+        "right descendant change",
+        [root_oid],
+        root_time + 200
+      )
+
+    merge_oid =
+      commit_tree!(
+        repo_path,
+        merge_tree_oid,
+        "merge first-parent delta",
+        [left_oid, right_oid],
+        root_time + 300
+      )
+
+    tip_oid =
+      commit_tree!(repo_path, tip_tree_oid, "tip file change", [merge_oid], root_time + 400)
+
+    git!(["--git-dir", repo_path, "update-ref", "refs/heads/main", tip_oid])
+    git!(["--git-dir", repo_path, "update-ref", "refs/heads/feature/slash", tip_oid])
+
+    %{
+      repo_path: repo_path,
+      root_oid: root_oid,
+      left_oid: left_oid,
+      right_oid: right_oid,
+      merge_oid: merge_oid,
+      tip_oid: tip_oid,
+      tip_tree_oid: tip_tree_oid,
+      root_time: root_time
+    }
+  end
+
+  defp blob_object!(tmp_dir, repo_path, name, data) do
+    path = Path.join(tmp_dir, name)
+    File.write!(path, data)
+    git!(["--git-dir", repo_path, "hash-object", "-w", path])
+  end
+
+  defp tree_object!(tmp_dir, repo_path, name, entries) do
+    path = Path.join(tmp_dir, name)
+
+    contents =
+      entries
+      |> Enum.sort_by(fn {_mode, entry_name, _oid} -> entry_name end)
+      |> Enum.map(fn {mode, entry_name, oid} ->
+        [mode, " ", entry_name, <<0>>, oid_bytes(oid)]
+      end)
+      |> IO.iodata_to_binary()
+
+    File.write!(path, contents)
+    git!(["--git-dir", repo_path, "hash-object", "-t", "tree", "-w", path])
+  end
+
+  defp replace_tree_blob(entries, name, oid) do
+    Enum.map(entries, fn
+      {mode, ^name, _old_oid} -> {mode, name, oid}
+      entry -> entry
+    end)
+  end
+
+  defp replace_tree_mode(entries, name, mode) do
+    Enum.map(entries, fn
+      {_old_mode, ^name, oid} -> {mode, name, oid}
+      entry -> entry
+    end)
+  end
+
+  defp tree_history_wrong_kind_fixture!(tmp_dir) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "tree-history-wrong-kind-#{suffix}.git")
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    blob_oid = blob_object!(tmp_dir, repo_path, "wrong-kind-blob-#{suffix}", "blob\n")
+
+    root_tree_oid =
+      tree_object!(tmp_dir, repo_path, "wrong-kind-tree-#{suffix}", [
+        {"40000", "bad-tree", blob_oid}
+      ])
+
+    tip_oid = commit_tree!(repo_path, root_tree_oid, "wrong kind tree", [], 946_684_800)
+    %{repo_path: repo_path, tip_oid: tip_oid}
+  end
+
+  defp tree_history_cross_kind_duplicate_fixture!(tmp_dir) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "tree-history-duplicate-#{suffix}.git")
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    blob_oid = blob_object!(tmp_dir, repo_path, "duplicate-blob-#{suffix}", "blob\n")
+    empty_tree_oid = tree_object!(tmp_dir, repo_path, "duplicate-empty-#{suffix}", [])
+
+    root_tree_oid =
+      tree_object_in_order!(tmp_dir, repo_path, "duplicate-root-#{suffix}", [
+        {"100644", "foo", blob_oid},
+        {"40000", "foo.bar", empty_tree_oid},
+        {"40000", "foo", empty_tree_oid}
+      ])
+
+    tip_oid = commit_tree!(repo_path, root_tree_oid, "duplicate tree names", [], 946_684_800)
+    %{repo_path: repo_path, tip_oid: tip_oid}
+  end
+
+  defp tree_history_invalid_mode_fixture!(tmp_dir) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "tree-history-invalid-mode-#{suffix}.git")
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    blob_oid = blob_object!(tmp_dir, repo_path, "invalid-mode-blob-#{suffix}", "blob\n")
+
+    root_tree_oid =
+      tree_object_in_order!(tmp_dir, repo_path, "invalid-mode-root-#{suffix}", [
+        {"100600", "invalid.txt", blob_oid}
+      ])
+
+    tip_oid = commit_tree!(repo_path, root_tree_oid, "invalid tree mode", [], 946_684_800)
+    %{repo_path: repo_path, tip_oid: tip_oid}
+  end
+
+  defp prefix_directory_tree_fixture!(tmp_dir) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "tree-history-prefix-dirs-#{suffix}.git")
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    empty_tree_oid = tree_object!(tmp_dir, repo_path, "prefix-empty-#{suffix}", [])
+
+    # Git's canonical slash-sentinel order is foo.bar/ then foo/. The public contract is raw
+    # filename-byte order, which deliberately reverses these two direct children.
+    root_tree_oid =
+      tree_object_in_order!(tmp_dir, repo_path, "prefix-root-#{suffix}", [
+        {"40000", "foo.bar", empty_tree_oid},
+        {"40000", "foo", empty_tree_oid}
+      ])
+
+    tip_oid = commit_tree!(repo_path, root_tree_oid, "prefix directories", [], 946_684_800)
+    %{repo_path: repo_path, tip_oid: tip_oid}
+  end
+
+  defp tree_object_in_order!(tmp_dir, repo_path, name, entries) do
+    path = Path.join(tmp_dir, name)
+
+    contents =
+      entries
+      |> Enum.map(fn {mode, entry_name, oid} ->
+        [mode, " ", entry_name, <<0>>, oid_bytes(oid)]
+      end)
+      |> IO.iodata_to_binary()
+
+    File.write!(path, contents)
+    git!(["--git-dir", repo_path, "hash-object", "--literally", "-t", "tree", "-w", path])
+  end
+
+  defp find_tree_entry!(entries, name) do
+    Enum.find(entries, &(&1.name == name)) || flunk("expected tree entry #{inspect(name)}")
+  end
+
+  defp tree_history_trace_counter(count) do
+    receive do
+      {:trace, _pid, :call, {GitCore, :native_tree_history_call, _args}} ->
+        tree_history_trace_counter(count + 1)
+
+      {:read_tree_history_trace_count, from, ref} ->
+        send(from, {:tree_history_trace_count, ref, count})
+        tree_history_trace_counter(count)
+
+      :stop ->
+        :ok
+    end
+  end
+
+  defp assert_tree_history_trace_count(tracee, tracer, expected) do
+    barrier = :erlang.trace_delivered(tracee)
+    assert_receive {:trace_delivered, ^tracee, ^barrier}, 1_000
+    query = make_ref()
+    send(tracer, {:read_tree_history_trace_count, self(), query})
+    assert_receive {:tree_history_trace_count, ^query, ^expected}, 1_000
+  end
+
   defp commit_dag_fixture!(tmp_dir) do
     suffix = System.unique_integer([:positive])
     repo_path = Path.join(tmp_dir, "commit-dag-#{suffix}.git")
@@ -2402,6 +3124,44 @@ defmodule GitCore.CommitScanBusyTest do
         GitCore.commit_page(missing_path, "not-an-object-id", 1, scan_limiter: isolated_limiter),
         :scan_busy,
         :commit_page
+      )
+    after
+      Enum.each(holders, &send(&1, :release))
+
+      Enum.each(holders, fn holder ->
+        assert_receive {:global_scan_finished, ^holder, :released}, 1_000
+      end)
+    end
+  end
+
+  @tag :tree_history
+  test "tree history cannot bypass the supervised global scan limit" do
+    isolated_limiter =
+      start_supervised!({GitCore.ScanLimiter, server: nil}, id: make_ref())
+
+    holders = for _ <- 1..4, do: start_global_scan_holder()
+
+    Enum.each(holders, fn holder ->
+      assert_receive {:global_scan_entered, ^holder}, 1_000
+    end)
+
+    missing_path =
+      Path.join(
+        System.tmp_dir!(),
+        "missing-tree-scan-#{System.unique_integer([:positive])}.git"
+      )
+
+    try do
+      assert_error(
+        GitCore.read_tree_with_history(
+          missing_path,
+          "not-an-object-id",
+          "",
+          1,
+          scan_limiter: isolated_limiter
+        ),
+        :scan_busy,
+        :tree_history
       )
     after
       Enum.each(holders, &send(&1, :release))

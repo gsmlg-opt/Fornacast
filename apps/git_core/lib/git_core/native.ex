@@ -28,6 +28,16 @@ defmodule GitCore.Native do
   def commit_page(_path, _snapshot_oid, _page, _per_page, _deadline_ms),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  def read_tree_with_history(
+        _path,
+        _snapshot_oid,
+        _tree_path,
+        _page,
+        _per_page,
+        _deadline_ms
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   def commit_history(_path, _ref, _limit), do: :erlang.nif_error(:nif_not_loaded)
   def commit(_path, _oid), do: :erlang.nif_error(:nif_not_loaded)
   def read_tree(_path, _ref, _tree_path), do: :erlang.nif_error(:nif_not_loaded)

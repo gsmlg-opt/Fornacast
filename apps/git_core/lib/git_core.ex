@@ -5,6 +5,7 @@ defmodule GitCore do
 
   @commit_page_limit 50
   @commit_scan_deadline_ms 5_000
+  @tree_page_limit 200
 
   def init_bare(path) when is_binary(path) do
     GitCore.Native.init_bare(path)
@@ -155,6 +156,57 @@ defmodule GitCore do
     end)
   end
 
+  def read_tree_with_history(path, snapshot_oid, tree_path, page, opts \\ [])
+      when is_binary(path) and is_binary(snapshot_oid) and is_binary(tree_path) and
+             is_integer(page) and page > 0 and is_list(opts) do
+    per_page = opts |> Keyword.get(:per_page, @tree_page_limit) |> bounded_tree_page_size()
+
+    deadline_ms =
+      opts |> Keyword.get(:deadline_ms, @commit_scan_deadline_ms) |> commit_deadline_ms()
+
+    GitCore.ScanLimiter.with_permit(:tree_history, fn ->
+      with {:ok, {entries, total_entries}} <-
+             wrap_read(
+               native_tree_history_call(
+                 path,
+                 snapshot_oid,
+                 :binary.bin_to_list(tree_path),
+                 Integer.to_string(page),
+                 per_page,
+                 deadline_ms
+               ),
+               :tree_history
+             ) do
+        total_pages =
+          if total_entries == 0,
+            do: 1,
+            else: div(total_entries + per_page - 1, per_page)
+
+        {:ok,
+         %GitCore.TreePage{
+           entries: Enum.map(entries, &tree_history_entry_from_native/1),
+           total_entries: total_entries,
+           page: page,
+           per_page: per_page,
+           total_pages: total_pages
+         }}
+      end
+    end)
+  end
+
+  # Kept as one private BEAM call boundary so tests can prove every page performs exactly one
+  # native operation without exposing an injectable adapter or limiter bypass.
+  defp native_tree_history_call(path, snapshot_oid, tree_path, page, per_page, deadline_ms) do
+    GitCore.Native.read_tree_with_history(
+      path,
+      snapshot_oid,
+      tree_path,
+      page,
+      per_page,
+      deadline_ms
+    )
+  end
+
   def branches(path) when is_binary(path) do
     filter_refs(path, :branch, :branches)
   end
@@ -302,6 +354,12 @@ defmodule GitCore do
     |> min(@commit_page_limit)
   end
 
+  defp bounded_tree_page_size(per_page) when is_integer(per_page) do
+    per_page
+    |> max(1)
+    |> min(@tree_page_limit)
+  end
+
   defp commit_deadline_ms(deadline_ms) when is_integer(deadline_ms) and deadline_ms >= 0 do
     min(deadline_ms, @commit_scan_deadline_ms)
   end
@@ -320,6 +378,31 @@ defmodule GitCore do
   defp tree_entry_kind("tree"), do: :tree
   defp tree_entry_kind("blob"), do: :blob
   defp tree_entry_kind("commit"), do: :commit
+
+  defp tree_history_entry_from_native({name, kind, mode, oid, latest_commit}) do
+    %GitCore.TreeHistoryEntry{
+      name: ref_name_from_native(name),
+      kind: tree_entry_kind(kind),
+      mode: mode,
+      oid: oid,
+      latest_commit: tree_commit_from_native(latest_commit)
+    }
+  end
+
+  defp tree_commit_from_native({oid, title, author_name, author_time}) do
+    %GitCore.Commit{
+      oid: oid,
+      title: title,
+      message: nil,
+      author_name: author_name,
+      author_email: nil,
+      author_time: author_time,
+      committer_name: nil,
+      committer_email: nil,
+      committer_time: nil,
+      parents: nil
+    }
+  end
 
   defp diff_status("added"), do: :added
   defp diff_status("modified"), do: :modified
