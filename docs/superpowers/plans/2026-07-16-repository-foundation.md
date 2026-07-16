@@ -167,13 +167,13 @@ git commit -m "test(repos): lock repository access matrix"
 - Modify: apps/git_core/lib/git_core/native.ex
 - Modify: apps/git_core/native/fornacast_git_core/src/lib.rs
 
-- [ ] **Step 1: Add failing struct and typed-error tests**
+- [x] **Step 1: Add failing struct and typed-error tests**
 
 Assert fixed fields, stable error kinds, and operation names. Cover missing repository, non-bare repository, missing ref, missing commit, missing path, and corrupt object data. Assert diagnostic detail is present for logs but never needed to determine kind.
 
 Tag the grouped repository-read tests with :typed_errors, :prefix_blob, :limiter, :refs, :commits, :tree_history, :blobs, :diffs, :search, :analysis, or :cache so every scoped command in this plan selects an explicit group.
 
-- [ ] **Step 2: Define the public read-model types**
+- [x] **Step 2: Define the public read-model types**
 
 Move the existing Ref, Commit, TreeEntry, Blob, DiffFile, and CommitDiff modules out of GitCore into read_model.ex without changing their public module names. Extend them and add these types:
 
@@ -251,7 +251,7 @@ end
 
 Extend GitCore.Ref with display_name. Extend GitCore.Blob with non_utf8 and lease. Extend GitCore.DiffFile with additions, deletions, truncated, and lines. Extend GitCore.CommitDiff with changed_files, additions, and deletions while retaining files, patch, and truncated.
 
-- [ ] **Step 3: Return tagged native errors**
+- [x] **Step 3: Return tagged native errors**
 
 Use a fixed native tuple shape:
 
@@ -265,7 +265,7 @@ fn native_error(kind: &'static str, detail: impl std::fmt::Display) -> NativeErr
 
 Classify errors where context is known rather than parsing gix display strings later. Return only the approved kind strings. In Elixir, map those strings with explicit function clauses; never call String.to_atom/1.
 
-- [ ] **Step 4: Wrap every repository read with its operation**
+- [x] **Step 4: Wrap every repository read with its operation**
 
 Use a single helper that converts native tagged errors to:
 
@@ -275,7 +275,7 @@ Use a single helper that converts native tagged errors to:
 
 Keep init_bare/1, pack_objects/2, receive_pack/3, and the successful legacy read return shapes compatible with existing Git transport callers.
 
-- [ ] **Step 5: Run typed and compatibility tests**
+- [x] **Step 5: Run typed and compatibility tests**
 
 ~~~sh
 mix test apps/git_core/test/repository_read_model_test.exs --only typed_errors --trace
@@ -285,7 +285,7 @@ mix test apps/git_transport/test/git_transport_test.exs
 
 Expected: stable typed read failures and no successful transport regression.
 
-- [ ] **Step 6: Commit the read boundary**
+- [x] **Step 6: Commit the read boundary**
 
 ~~~sh
 git add apps/git_core/lib/git_core/read_model.ex apps/git_core/lib/git_core.ex apps/git_core/lib/git_core/native.ex apps/git_core/native/fornacast_git_core/src/lib.rs apps/git_core/test/repository_read_model_test.exs
