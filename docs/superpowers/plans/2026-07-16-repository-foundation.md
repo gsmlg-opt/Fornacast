@@ -408,16 +408,17 @@ git commit -m "feat(git): bound repository read concurrency"
 
 - Modify: apps/git_core/lib/git_core.ex
 - Modify: apps/git_core/lib/git_core/native.ex
+- Modify: apps/git_core/native/fornacast_git_core/src/bounded_blob.rs
 - Modify: apps/git_core/native/fornacast_git_core/src/lib.rs
 - Add tests: apps/git_core/test/repository_read_model_test.exs
 
-- [ ] **Step 1: Add deterministic ref fixtures and failing tests**
+- [x] **Step 1: Add deterministic ref fixtures and failing tests**
 
 Create more than 100 branch refs and more than 100 tags with Git plumbing. Include branch and tag with the same short name, refs containing slashes, an annotated tag, a nested annotated tag, and a tag targeting a non-commit object.
 
 Assert exact counts, bytewise full-name ordering, first-100 samples, selected-ref inclusion outside the sample, refs_truncated, exact page totals, valid empty page 1, empty out-of-range pages, direct ref target OIDs, canonical resolution, recursive tag peeling, and legacy branch-first behavior.
 
-- [ ] **Step 2: Add the public ref APIs**
+- [x] **Step 2: Add the public ref APIs**
 
 ~~~elixir
 GitCore.ref_summary(path, selected_ref: full_ref)
@@ -428,7 +429,7 @@ GitCore.resolve_snapshot(path, %GitCore.RefSelector{})
 
 Clamp per_page to 100. The web boundary validates positive pages; GitCore still returns typed page metadata for every positive page.
 
-- [ ] **Step 3: Implement one bounded native ref scan**
+- [x] **Step 3: Implement one bounded native ref scan**
 
 For summary and page operations:
 
@@ -442,20 +443,20 @@ For summary and page operations:
 
 Keep list_refs/1 complete and independent for Git transport.
 
-- [ ] **Step 4: Resolve snapshots without probing trees**
+- [x] **Step 4: Resolve snapshots without probing trees**
 
 Canonical selectors attempt only their exact full ref. Legacy selectors construct refs/heads/value first and refs/tags/value second. Peel annotated tags until a commit or failure. Return :ref_not_found for a missing ref, a cycle, or a final non-commit object.
 
-- [ ] **Step 5: Fold wildcard matching into the first bounded ref scan**
+- [x] **Step 5: Fold wildcard matching into the first bounded ref scan**
 
 For source and raw wildcard routes, ref_summary_for_route/2 performs the request's first GitCore operation. In the same five-second, ScanLimiter-protected native ref scan, compute the exact summary and match route segments from longest to shortest against exact ref names. A refs/heads or refs/tags prefix fixes the declared kind. Legacy segments test every branch candidate before tag candidates. Return {ref_summary, typed_selector, untouched_repository_path} without peeling or returning an OID. Include the matched selected ref outside the first-100 sample when required. RepositoryPage then resolves that selector exactly once. Do not call read_tree while finding the split and do not run a second ref scan.
 
-- [ ] **Step 6: Run and commit**
+- [x] **Step 6: Run and commit**
 
 ~~~sh
 mix test apps/git_core/test/repository_read_model_test.exs --only refs --trace
 mix test apps/git_transport/test/git_transport_test.exs
-git add apps/git_core/lib/git_core.ex apps/git_core/lib/git_core/native.ex apps/git_core/native/fornacast_git_core/src/lib.rs apps/git_core/test/repository_read_model_test.exs
+git add apps/git_core/lib/git_core.ex apps/git_core/lib/git_core/native.ex apps/git_core/native/fornacast_git_core/src/bounded_blob.rs apps/git_core/native/fornacast_git_core/src/lib.rs apps/git_core/test/repository_read_model_test.exs
 git commit -m "feat(git): add canonical repository snapshots"
 ~~~
 
