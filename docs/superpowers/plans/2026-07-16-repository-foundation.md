@@ -469,19 +469,19 @@ git commit -m "feat(git): add canonical repository snapshots"
 - Modify: apps/git_core/native/fornacast_git_core/src/lib.rs
 - Add tests: apps/git_core/test/repository_read_model_test.exs
 
-- [ ] **Step 1: Add a merge-DAG fixture**
+- [x] **Step 1: Add a merge-DAG fixture**
 
 Use git commit-tree and update-ref to build roots, two branches, a merge, and equal committer timestamps. Assert all-parent unique counting and deterministic OID tie ordering.
 
-- [ ] **Step 2: Add failing summary/page tests**
+- [x] **Step 2: Add failing summary/page tests**
 
 Cover exact total, latest tip metadata, 50-row cap, exact total_pages, valid empty page 1, out-of-range typed empty page, five-second timeout via a lower test deadline, scan busy, corrupt commits, and immutable-OID input.
 
-- [ ] **Step 3: Implement one shared commit walker**
+- [x] **Step 3: Implement one shared commit walker**
 
 Load the reachable graph with a visited OID set while checking the deadline. Build child counts, then emit child-before-parent topological order from a priority queue keyed by committer time descending and OID ascending. Use the same ordered graph for count, summary, pagination, and later tree attribution.
 
-- [ ] **Step 4: Expose the APIs**
+- [x] **Step 4: Expose the APIs**
 
 ~~~elixir
 GitCore.commit_summary(path, snapshot_oid)
@@ -490,7 +490,7 @@ GitCore.commit_page(path, snapshot_oid, page, per_page: 50)
 
 Clamp per_page to 50 and run both through ScanLimiter. Return :scan_timeout rather than partial exact totals.
 
-- [ ] **Step 5: Run and commit**
+- [x] **Step 5: Run and commit**
 
 ~~~sh
 mix test apps/git_core/test/repository_read_model_test.exs --only commits --trace
