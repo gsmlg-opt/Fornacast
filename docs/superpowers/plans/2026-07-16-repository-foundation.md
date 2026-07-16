@@ -353,11 +353,11 @@ git commit -m "feat(git): prove bounded blob prefix reads"
 - Modify: apps/git_core/lib/git_core/application.ex
 - Add tests: apps/git_core/test/repository_read_model_test.exs
 
-- [ ] **Step 1: Add failing scan-limiter tests**
+- [x] **Step 1: Add failing scan-limiter tests**
 
 Start disposable limiter processes with lower capacities. Prove four production permits, FIFO waiter admission, a lower test wait timeout, :scan_busy on expiration, release in after, monitor cleanup when an owner dies, and fail-closed behavior when the limiter process is unavailable.
 
-- [ ] **Step 2: Implement the scan lease**
+- [x] **Step 2: Implement the scan lease**
 
 Expose:
 
@@ -367,11 +367,11 @@ GitCore.ScanLimiter.with_permit(operation, fn -> result end, opts)
 
 The GenServer owns the 250 ms waiter timer, monitors queued and granted owners, removes either state on DOWN, and replies with a unique lease reference. The public call waits indefinitely for that server-owned reply so a client timeout cannot leave a ghost waiter. The caller executes the function and releases in after. Production capacity is four. Test options may supply a different server and lower capacity or wait timeout.
 
-- [ ] **Step 3: Add failing weighted blob-limiter tests**
+- [x] **Step 3: Add failing weighted blob-limiter tests**
 
 Prove both independent limits: at most eight leases and at most 128 MiB declared bytes. Cover a zero-byte raw body still consuming one read slot, queueing, a request heavier than remaining capacity, exact-weight release, owner death, idempotent release, 250 ms :blob_busy, and fail-closed process failure.
 
-- [ ] **Step 4: Implement opaque blob leases**
+- [x] **Step 4: Implement opaque blob leases**
 
 Expose:
 
@@ -382,7 +382,7 @@ Expose:
 
 Reject a single weight above 128 MiB without allocation. Inline callers reserve 1_048_576 bytes. Complete callers reserve exact header size. Never release inside the native wrapper before the response owns or discards the body.
 
-- [ ] **Step 5: Supervise both processes**
+- [x] **Step 5: Supervise both processes**
 
 Use a one_for_one child list:
 
@@ -393,7 +393,7 @@ children = [
 ]
 ~~~
 
-- [ ] **Step 6: Run and commit**
+- [x] **Step 6: Run and commit**
 
 ~~~sh
 mix test apps/git_core/test/repository_read_model_test.exs --only limiter --trace
