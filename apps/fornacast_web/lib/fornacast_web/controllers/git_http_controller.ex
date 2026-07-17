@@ -5,6 +5,8 @@ defmodule FornacastWeb.GitHTTPController do
 
   @upload_pack_advertisement_type "application/x-git-upload-pack-advertisement"
   @upload_pack_result_type "application/x-git-upload-pack-result"
+  @receive_pack_advertisement_type "application/x-git-receive-pack-advertisement"
+  @receive_pack_result_type "application/x-git-receive-pack-result"
 
   def info_refs(conn, %{
         "owner" => owner_slug,
@@ -18,6 +20,26 @@ defmodule FornacastWeb.GitHTTPController do
       conn
       |> send_git_response(@upload_pack_advertisement_type, [
         GitTransport.PktLine.encode("# service=git-upload-pack\n"),
+        GitTransport.PktLine.flush(),
+        advertisement
+      ])
+    else
+      {:error, reason} -> send_git_error(conn, reason)
+    end
+  end
+
+  def info_refs(conn, %{
+        "owner" => owner_slug,
+        "repo_dot_git" => repo_dot_git,
+        "service" => "git-receive-pack"
+      }) do
+    with {:ok, repo_slug} <- git_repo_slug(repo_dot_git),
+         {:ok, _actor, %Repository{} = repository} <-
+           load_writable_repository(conn, owner_slug, repo_slug),
+         {:ok, advertisement} <- GitTransport.ReceivePack.advertise_refs(repository) do
+      conn
+      |> send_git_response(@receive_pack_advertisement_type, [
+        GitTransport.PktLine.encode("# service=git-receive-pack\n"),
         GitTransport.PktLine.flush(),
         advertisement
       ])
@@ -41,10 +63,36 @@ defmodule FornacastWeb.GitHTTPController do
     end
   end
 
+  def receive_pack(conn, %{"owner" => owner_slug, "repo_dot_git" => repo_dot_git}) do
+    with {:ok, repo_slug} <- git_repo_slug(repo_dot_git),
+         {:ok, actor, %Repository{} = repository} <-
+           load_writable_repository(conn, owner_slug, repo_slug),
+         {:ok, body, conn} <- read_full_body(conn),
+         {:ok, request, pack} <- parse_receive_pack_request(body),
+         {:ok, response, statuses} <-
+           GitTransport.ReceivePack.response(repository, request, pack),
+         :ok <- GitTransport.ReceivePack.record_push(actor, repository, statuses) do
+      send_git_response(conn, @receive_pack_result_type, response)
+    else
+      {:error, reason} -> send_git_error(conn, reason)
+    end
+  end
+
   defp load_readable_repository(conn, owner_slug, repo_slug) do
     with %Repository{} = repository <- ForgeRepos.get_repository(owner_slug, repo_slug),
          {:ok, actor} <- authenticate_actor(conn),
          :ok <- Fornacast.Access.authorize(actor, :repository_read, repository) do
+      {:ok, actor, repository}
+    else
+      nil -> {:error, :not_found}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp load_writable_repository(conn, owner_slug, repo_slug) do
+    with %Repository{} = repository <- ForgeRepos.get_repository(owner_slug, repo_slug),
+         {:ok, actor} <- authenticate_actor(conn, "repo:write"),
+         :ok <- Fornacast.Access.authorize(actor, :repository_write, repository) do
       {:ok, actor, repository}
     else
       nil -> {:error, :not_found}
@@ -60,26 +108,29 @@ defmodule FornacastWeb.GitHTTPController do
     end
   end
 
-  defp authenticate_actor(conn) do
+  defp authenticate_actor(conn), do: authenticate_actor(conn, "repo:read")
+
+  defp authenticate_actor(conn, scope) do
     case get_req_header(conn, "authorization") do
-      [] -> {:ok, nil}
-      [authorization] -> authenticate_authorization(authorization)
+      [] when scope == "repo:read" -> {:ok, nil}
+      [] -> {:error, :invalid_credentials}
+      [authorization] -> authenticate_authorization(authorization, scope)
       _ -> {:error, :invalid_credentials}
     end
   end
 
-  defp authenticate_authorization(authorization) do
+  defp authenticate_authorization(authorization, scope) do
     case Regex.run(~r/^[ \t]*basic[ \t]+(\S+)[ \t]*$/i, authorization, capture: :all_but_first) do
-      [encoded] -> authenticate_basic(encoded)
+      [encoded] -> authenticate_basic(encoded, scope)
       _ -> {:error, :invalid_credentials}
     end
   end
 
-  defp authenticate_basic(encoded) do
+  defp authenticate_basic(encoded, scope) do
     with {:ok, decoded} <- Base.decode64(encoded),
          [username, personal_api_key] <- String.split(decoded, ":", parts: 2),
          {:ok, user, _api_key} <-
-           ForgeAccounts.authenticate_api_key(username, personal_api_key, "repo:read") do
+           ForgeAccounts.authenticate_api_key(username, personal_api_key, scope) do
       {:ok, user}
     else
       _ -> {:error, :invalid_credentials}
@@ -102,6 +153,15 @@ defmodule FornacastWeb.GitHTTPController do
   defp parse_upload_pack_request(body) do
     case GitTransport.UploadPack.parse_request_data(body) do
       {:done, _rest, request} -> {:ok, request}
+      {:cont, _buffer, _request} -> {:error, :incomplete_request}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp parse_receive_pack_request(body) do
+    case GitTransport.ReceivePack.parse_request_data(body) do
+      {:pack, pack, request} when pack != "" -> {:ok, request, pack}
+      {:pack, _pack, _request} -> {:error, :incomplete_request}
       {:cont, _buffer, _request} -> {:error, :incomplete_request}
       {:error, reason} -> {:error, reason}
     end

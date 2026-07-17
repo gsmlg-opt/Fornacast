@@ -201,7 +201,7 @@ defmodule GitTransport.Channel do
     with {:ok, response, statuses} <-
            GitTransport.ReceivePack.response(state.repository, request, pack),
          :ok <- send_data(cm, channel_id, response),
-         :ok <- record_receive_pack(state.actor, state.repository, statuses) do
+         :ok <- GitTransport.ReceivePack.record_push(state.actor, state.repository, statuses) do
       exit_success(cm, channel_id, state)
     else
       {:error, _reason} -> fail_started(cm, channel_id, state)
@@ -235,39 +235,6 @@ defmodule GitTransport.Channel do
     :ssh_connection.exit_status(cm, channel_id, 0)
     :ssh_connection.send_eof(cm, channel_id)
     {:stop, channel_id, %{state | cm: cm, channel_id: channel_id}}
-  end
-
-  defp record_receive_pack(actor, repository, statuses) do
-    if accepted_push?(statuses) do
-      refs = Enum.map(statuses, fn {ref, "ok", _message} -> ref end)
-
-      with {:ok, _repository} <- ForgeRepos.mark_pushed(repository),
-           {:ok, _event} <-
-             Fornacast.Audit.record(
-               actor,
-               "repository.pushed",
-               "repository",
-               repository.id,
-               %{"refs" => refs}
-             ) do
-        :ok
-      else
-        {:error, reason} ->
-          Logger.error("Git receive-pack audit update failed: #{inspect(reason)}")
-          :ok
-      end
-    else
-      :ok
-    end
-  end
-
-  defp accepted_push?([]), do: false
-
-  defp accepted_push?(statuses) do
-    Enum.all?(statuses, fn
-      {_ref, "ok", _message} -> true
-      _status -> false
-    end)
   end
 
   defp send_data(cm, channel_id, data) do

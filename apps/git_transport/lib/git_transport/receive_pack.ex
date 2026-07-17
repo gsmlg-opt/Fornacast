@@ -67,6 +67,30 @@ defmodule GitTransport.ReceivePack do
     end
   end
 
+  def record_push(actor, %Repository{} = repository, statuses) when is_list(statuses) do
+    if accepted_push?(statuses) do
+      refs = Enum.map(statuses, fn {ref, "ok", _message} -> ref end)
+
+      with {:ok, _repository} <- ForgeRepos.mark_pushed(repository),
+           {:ok, _event} <-
+             Fornacast.Audit.record(
+               actor,
+               "repository.pushed",
+               "repository",
+               repository.id,
+               %{"refs" => refs}
+             ) do
+        :ok
+      else
+        {:error, reason} ->
+          Logger.error("Git receive-pack audit update failed: #{inspect(reason)}")
+          :ok
+      end
+    else
+      :ok
+    end
+  end
+
   defp render_advertisement([]) do
     [
       GitTransport.PktLine.encode("#{@zero_oid} capabilities^{}\0#{capabilities()}\n"),
@@ -229,4 +253,13 @@ defmodule GitTransport.ReceivePack do
   end
 
   defp sanitize_status(reason), do: reason |> inspect() |> sanitize_status()
+
+  defp accepted_push?([]), do: false
+
+  defp accepted_push?(statuses) do
+    Enum.all?(statuses, fn
+      {_ref, "ok", _message} -> true
+      _status -> false
+    end)
+  end
 end
