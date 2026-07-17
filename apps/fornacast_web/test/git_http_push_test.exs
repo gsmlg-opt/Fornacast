@@ -88,7 +88,6 @@ defmodule FornacastWeb.GitHTTPPushTest do
 
     credentials = [
       {"missing", nil},
-      {"password", {"alice", "correct horse battery staple"}},
       {"read only", {"alice", read_secret}},
       {"revoked", {"alice", revoked_secret}}
     ]
@@ -99,6 +98,35 @@ defmodule FornacastWeb.GitHTTPPushTest do
       assert response(response, 401) == "Authentication required.\n", name
       assert Plug.Conn.get_resp_header(response, "www-authenticate") == [@challenge], name
     end
+  end
+
+  @tag :tmp_dir
+  test "an account password pushes over smart HTTP", %{tmp_dir: tmp_dir} do
+    with_storage_root(tmp_dir)
+    share_database!()
+    {_user, repository} = create_user_and_repository("alice")
+
+    work_path = Path.join(tmp_dir, "password-work")
+    git!(["init", work_path])
+    File.write!(Path.join(work_path, "README.md"), "# Password push\n")
+    git!(["-C", work_path, "add", "README.md"])
+    git!(["-C", work_path, "commit", "-m", "Password push"])
+    git!(["-C", work_path, "branch", "-M", "main"])
+
+    port = start_http_server()
+    remote_url = "http://127.0.0.1:#{port}/alice/demo.git"
+    git!(["-C", work_path, "remote", "add", "origin", remote_url])
+    askpass_path = write_askpass!(tmp_dir)
+
+    git!(["-C", work_path, "push", "-u", "origin", "main"], [
+      {"GIT_ASKPASS", askpass_path},
+      {"GIT_ASKPASS_REQUIRE", "force"},
+      {"FORNACAST_GIT_USERNAME", "alice"},
+      {"FORNACAST_GIT_API_KEY", "correct horse battery staple"}
+    ])
+
+    assert {:ok, [%GitCore.Ref{name: "refs/heads/main"}]} =
+             repository |> ForgeRepos.absolute_storage_path() |> GitCore.branches()
   end
 
   test "receive-pack POST requires authentication and returns the smart HTTP result type" do

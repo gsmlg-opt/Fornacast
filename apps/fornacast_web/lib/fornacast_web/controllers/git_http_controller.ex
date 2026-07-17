@@ -152,13 +152,23 @@ defmodule FornacastWeb.GitHTTPController do
 
   defp authenticate_basic(encoded, scope) do
     with {:ok, decoded} <- Base.decode64(encoded),
-         [username, personal_api_key] <- String.split(decoded, ":", parts: 2),
-         {:ok, user, _api_key} <-
-           ForgeAccounts.authenticate_api_key(username, personal_api_key, scope) do
+         [username, credential] <- String.split(decoded, ":", parts: 2),
+         {:ok, user} <- authenticate_credential(username, credential, scope) do
       {:ok, user}
     else
       _ -> {:error, :invalid_credentials}
     end
+  end
+
+  defp authenticate_credential(username, "fc_pat_" <> _ = personal_api_key, scope) do
+    case ForgeAccounts.authenticate_api_key(username, personal_api_key, scope) do
+      {:ok, user, _api_key} -> {:ok, user}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp authenticate_credential(username, password, _scope) do
+    ForgeAccounts.authenticate_password(username, password)
   end
 
   defp read_full_body(conn, max_bytes), do: read_full_body(conn, max_bytes, 0, [])

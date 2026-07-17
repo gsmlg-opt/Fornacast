@@ -108,7 +108,15 @@ esac
     assert File.read!(Path.join(clone_path, "README.md")) == "# Demo\n"
   end
 
-  test "private fetch rejects passwords and invalid API keys with a Basic challenge" do
+  test "private fetch accepts account passwords" do
+    create_user_and_repository(:private)
+
+    response = request_info_refs("alice", "correct horse battery staple")
+
+    assert response(response, 200) =~ "# service=git-upload-pack"
+  end
+
+  test "private fetch rejects invalid API keys with a Basic challenge" do
     {user, _repository} = create_user_and_repository(:private)
 
     assert {:ok, _api_key, secret} =
@@ -118,7 +126,6 @@ esac
              })
 
     credentials = [
-      {"account password", "alice", "correct horse battery staple"},
       {"invalid API key", "alice", "fc_pat_invalid"},
       {"wrong username", "bob", secret}
     ]
@@ -179,7 +186,7 @@ esac
   test "public fetch validates an Authorization header when one is provided" do
     create_user_and_repository(:public)
 
-    response = request_info_refs("alice", "correct horse battery staple")
+    response = request_info_refs("alice", "incorrect password")
 
     assert response(response, 401) == "Authentication required.\n"
     assert Plug.Conn.get_resp_header(response, "www-authenticate") == [@challenge]
