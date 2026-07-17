@@ -3659,6 +3659,890 @@ defmodule GitCore.RepositorySearchTest do
   end
 end
 
+defmodule GitCore.RepositoryAnalysisTest do
+  use ExUnit.Case, async: true
+
+  @moduletag :analysis
+  @moduletag :tmp_dir
+
+  test "classifies the complete table and counts every non-gitlink candidate", %{
+    tmp_dir: tmp_dir
+  } do
+    extension_cases = [
+      {"extensions/elixir.EX", "Elixir"},
+      {"extensions/elixir-script.exs", "Elixir"},
+      {"extensions/erlang.ERL", "Erlang"},
+      {"extensions/erlang-header.hrl", "Erlang"},
+      {"extensions/rust.RS", "Rust"},
+      {"extensions/javascript.JS", "JavaScript"},
+      {"extensions/javascript-module.mjs", "JavaScript"},
+      {"extensions/javascript-common.cjs", "JavaScript"},
+      {"extensions/javascript-react.jsx", "JavaScript"},
+      {"extensions/typescript.TS", "TypeScript"},
+      {"extensions/typescript-react.tsx", "TypeScript"},
+      {"extensions/typescript-module.mts", "TypeScript"},
+      {"extensions/typescript-common.cts", "TypeScript"},
+      {"extensions/styles.CSS", "CSS"},
+      {"extensions/page.HTML", "HTML"},
+      {"extensions/legacy.htm", "HTML"},
+      {"extensions/component.heex", "HTML"},
+      {"extensions/readme.MD", "Markdown"},
+      {"extensions/notes.markdown", "Markdown"},
+      {"extensions/data.JSON", "JSON"},
+      {"extensions/config.TOML", "TOML"},
+      {"extensions/config.YML", "YAML"},
+      {"extensions/config.yaml", "YAML"},
+      {"extensions/script.SH", "Shell"},
+      {"extensions/script.bash", "Shell"},
+      {"extensions/script.zsh", "Shell"},
+      {"extensions/program.PY", "Python"},
+      {"extensions/program.RB", "Ruby"},
+      {"extensions/program.GO", "Go"},
+      {"extensions/program.JAVA", "Java"},
+      {"extensions/program.C", "C"},
+      {"extensions/program.h", "C"},
+      {"extensions/program.CC", "C++"},
+      {"extensions/program.cpp", "C++"},
+      {"extensions/program.cxx", "C++"},
+      {"extensions/program.hpp", "C++"},
+      {"extensions/program.hh", "C++"},
+      {"extensions/program.hxx", "C++"},
+      {"extensions/query.SQL", "SQL"},
+      {"containers/Dockerfile", "Dockerfile"},
+      {"containers/Dockerfile.dev", "Dockerfile"},
+      {"containers/dockerfile", "Other"},
+      {"containers/DOCKERFILE.test", "Other"}
+    ]
+
+    extension_entries =
+      extension_cases
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{path, language}, index} ->
+        {path, String.duplicate("x", index) <> "\n", language}
+      end)
+
+    shebang_entries = [
+      {"shebang/elixir", "#!/usr/bin/env elixir\nx\n", "Elixir"},
+      {"shebang/escript", "#!/usr/bin/env escript\nx\n", "Elixir"},
+      {"shebang/python", "#!/usr/bin/python\nx\n", "Python"},
+      {"shebang/python3", "#!/usr/bin/env python3\nx\n", "Python"},
+      {"shebang/node", "#!/usr/bin/env node\nx\n", "JavaScript"},
+      {"shebang/deno", "#!/usr/bin/env deno\nx\n", "JavaScript"},
+      {"shebang/bun", "#!/usr/bin/env bun\nx\n", "JavaScript"},
+      {"shebang/bash", "#!/bin/bash\nx\n", "Shell"},
+      {"shebang/sh", "#!/bin/sh\nx\n", "Shell"},
+      {"shebang/zsh", "#!/usr/bin/env zsh\nx\n", "Shell"},
+      {"shebang/ruby", "#!/usr/bin/env ruby\nx\n", "Ruby"},
+      {"shebang/env-option", "#!/usr/bin/env -S python3\nx\n", "Python"},
+      {"shebang/env-assignment", "#!/usr/bin/env MODE=test ruby\nx\n", "Ruby"},
+      {"shebang/exact-token", "#!/usr/bin/python-wrapper\nx\n", "Other"},
+      {"shebang/direct-first", "#!/bin/echo ruby\nx\n", "Other"},
+      {"shebang/env-first", "#!/usr/bin/env unknown python3\nx\n", "Other"}
+    ]
+
+    classified =
+      extension_entries ++
+        shebang_entries ++
+        [
+          {"unknown/plain", "unknown text\n", "Other"},
+          {"filename-wins.py", "#!/usr/bin/env node\nx\n", "Python"},
+          {"streaming/split.rs", String.duplicate("x", 8_191) <> "😀", "Rust"},
+          {:executable, "executable/tool.rb", "puts :ok\n", "Ruby"},
+          {:symlink, "links/script.sh", "../target", "Shell"}
+        ]
+
+    excluded = [
+      {"excluded/invalid.rs", <<0xFF, 0xFE>>},
+      {"excluded/split-invalid.ex", String.duplicate("x", 8_191) <> <<0xE2, 0x28, 0xA1>>},
+      {"excluded/incomplete.py", String.duplicate("x", 9_000) <> <<0xF0, 0x9F>>},
+      {"excluded/late-nul.rs", String.duplicate("x", 9_000) <> <<0>>}
+    ]
+
+    fixture =
+      analysis_fixture!(
+        tmp_dir,
+        Enum.map(classified, &fixture_entry/1) ++ excluded,
+        gitlink: true
+      )
+
+    assert {:ok,
+            %GitCore.RepositoryAnalysis{
+              languages: languages,
+              total_bytes: total_bytes,
+              files_scanned: files_scanned,
+              bytes_scanned: bytes_scanned,
+              truncated: false
+            }} = GitCore.repository_analysis(fixture.repo_path, fixture.commit_oid)
+
+    assert languages == expected_languages(classified)
+    assert total_bytes == Enum.sum(Enum.map(classified, &(entry_body(&1) |> byte_size())))
+    assert files_scanned == length(classified) + length(excluded)
+
+    assert bytes_scanned ==
+             total_bytes + Enum.sum(Enum.map(excluded, fn {_path, body} -> byte_size(body) end))
+  end
+
+  test "sorts byte ties alphabetically and returns stable repeated results", %{tmp_dir: tmp_dir} do
+    fixture =
+      analysis_fixture!(tmp_dir, [
+        {"a.c", "same"},
+        {"b.go", "same"},
+        {"c.rs", "longer"}
+      ])
+
+    assert {:ok,
+            %GitCore.RepositoryAnalysis{
+              languages: [
+                %GitCore.LanguageStat{language: "Rust", bytes: 6},
+                %GitCore.LanguageStat{language: "C", bytes: 4},
+                %GitCore.LanguageStat{language: "Go", bytes: 4}
+              ],
+              total_bytes: 14,
+              files_scanned: 3,
+              bytes_scanned: 14,
+              truncated: false
+            } = first} = GitCore.repository_analysis(fixture.repo_path, fixture.commit_oid)
+
+    assert {:ok, ^first} = GitCore.repository_analysis(fixture.repo_path, fixture.commit_oid)
+  end
+
+  test "preserves zero and marks only actually omitted file work as truncated", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture =
+      analysis_fixture!(tmp_dir, [
+        {"a.py", "aaa"},
+        {"b.rb", "bbbb"},
+        {"c.go", "ccccc"}
+      ])
+
+    assert_analysis(fixture, [file_limit: 0], 0, 0, true, [])
+    assert_analysis(fixture, [file_limit: -1], 0, 0, true, [])
+
+    assert_analysis(
+      fixture,
+      [file_limit: 2],
+      2,
+      7,
+      true,
+      [{"Python", 3}, {"Ruby", 4}]
+    )
+
+    assert_analysis(
+      fixture,
+      [file_limit: 3],
+      3,
+      12,
+      false,
+      [{"Go", 5}, {"Python", 3}, {"Ruby", 4}]
+    )
+
+    assert_analysis(
+      fixture,
+      [file_limit: 100_001],
+      3,
+      12,
+      false,
+      [{"Go", 5}, {"Python", 3}, {"Ruby", 4}]
+    )
+  end
+
+  @tag timeout: 30_000
+  test "clamps a 100,001-entry raw tree at the production file maximum", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = repeated_empty_blob_analysis_fixture!(tmp_dir, 100_001)
+
+    assert {:ok,
+            %GitCore.RepositoryAnalysis{
+              languages: [%GitCore.LanguageStat{language: "Other", bytes: 0}],
+              total_bytes: 0,
+              files_scanned: 100_000,
+              bytes_scanned: 0,
+              truncated: true
+            }} =
+             GitCore.repository_analysis(
+               fixture.repo_path,
+               fixture.commit_oid,
+               file_limit: 100_001
+             )
+  end
+
+  test "applies file bounds to canonical byte-order depth-first traversal", %{tmp_dir: tmp_dir} do
+    fixture =
+      analysis_fixture!(tmp_dir, [
+        {"a-directory/z.py", "aaa"},
+        {"b-root.rb", "bbbb"}
+      ])
+
+    assert_analysis(
+      fixture,
+      [file_limit: 1],
+      1,
+      3,
+      true,
+      [{"Python", 3}]
+    )
+  end
+
+  test "preflights bytes and does not begin or count a body that exceeds the remainder", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture =
+      analysis_fixture!(tmp_dir, [
+        {"a.py", "aaa"},
+        {"b.rb", "bbbb"},
+        {"c.go", "ccccc"}
+      ])
+
+    assert_analysis(fixture, [byte_limit: 0], 0, 0, true, [])
+    assert_analysis(fixture, [byte_limit: -1], 0, 0, true, [])
+    assert_analysis(fixture, [byte_limit: 3], 1, 3, true, [{"Python", 3}])
+
+    assert_analysis(
+      fixture,
+      [byte_limit: 7],
+      2,
+      7,
+      true,
+      [{"Python", 3}, {"Ruby", 4}]
+    )
+
+    assert_analysis(
+      fixture,
+      [byte_limit: 12],
+      3,
+      12,
+      false,
+      [{"Go", 5}, {"Python", 3}, {"Ruby", 4}]
+    )
+
+    assert_analysis(
+      fixture,
+      [byte_limit: 536_870_913],
+      3,
+      12,
+      false,
+      [{"Go", 5}, {"Python", 3}, {"Ruby", 4}]
+    )
+
+    oversized = declared_size_analysis_fixture!(tmp_dir, 536_870_913)
+    assert_analysis(oversized, [byte_limit: 536_870_913], 0, 0, true, [])
+  end
+
+  test "does not finalize a corrupt N+1 body after an exact lowered bound", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = post_bound_false_blob_fixture!(tmp_dir)
+
+    assert_analysis(fixture, [file_limit: 1], 1, 3, true, [{"Python", 3}])
+    assert_analysis(fixture, [byte_limit: 3], 1, 3, true, [{"Python", 3}])
+  end
+
+  test "zero limits remain complete for empty work and allow an exact empty body", %{
+    tmp_dir: tmp_dir
+  } do
+    empty = analysis_fixture!(tmp_dir, [])
+
+    assert_analysis(
+      empty,
+      [file_limit: 0, byte_limit: 0],
+      0,
+      0,
+      false,
+      []
+    )
+
+    assert_analysis(
+      empty,
+      [deadline_ms: 0],
+      0,
+      0,
+      false,
+      []
+    )
+
+    empty_file = analysis_fixture!(tmp_dir, [{"empty.txt", ""}])
+
+    assert_analysis(
+      empty_file,
+      [file_limit: 1, byte_limit: 0],
+      1,
+      0,
+      false,
+      [{"Other", 0}]
+    )
+  end
+
+  test "a lowered cooperative deadline returns partial success rather than scan_timeout", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = analysis_fixture!(tmp_dir, [{"source.ex", String.duplicate("x", 32_768)}])
+
+    assert {:ok,
+            %GitCore.RepositoryAnalysis{
+              languages: [],
+              total_bytes: 0,
+              files_scanned: 0,
+              bytes_scanned: 0,
+              truncated: true
+            }} =
+             GitCore.repository_analysis(fixture.repo_path, fixture.commit_oid, deadline_ms: 0)
+  end
+
+  test "verifies physical commit tree and blob identities and ignores every replacement", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = analysis_fixture!(tmp_dir, [{"physical.ex", "physical\n"}])
+    replaced = replace_analysis_objects!(tmp_dir, fixture, "replacement payload\n")
+
+    assert_analysis(
+      replaced,
+      [],
+      1,
+      9,
+      false,
+      [{"Elixir", 9}]
+    )
+
+    for kind <- [:commit, :tree, :blob] do
+      false_fixture = false_analysis_object_fixture!(tmp_dir, kind)
+
+      assert_error(
+        GitCore.repository_analysis(false_fixture.repo_path, false_fixture.commit_oid),
+        :corrupt_repository,
+        :repository_analysis
+      )
+    end
+  end
+
+  test "disk usage sums logical non-directory sizes without following any symlink", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = analysis_fixture!(tmp_dir, [{"source.ex", "source\n"}])
+    baseline = logical_disk_usage!(fixture.repo_path)
+    nested = Path.join([fixture.repo_path, "analysis-extra", "nested"])
+    outside = Path.join(tmp_dir, "outside")
+    File.mkdir_p!(nested)
+    File.mkdir_p!(outside)
+    File.write!(Path.join(nested, "payload"), "inside")
+    File.write!(Path.join(outside, "large"), String.duplicate("x", 128_000))
+    File.ln_s!(outside, Path.join(fixture.repo_path, "outside-link"))
+    File.ln_s!("missing-target", Path.join(fixture.repo_path, "broken-link"))
+    File.ln_s!("loop-b", Path.join(fixture.repo_path, "loop-a"))
+    File.ln_s!("loop-a", Path.join(fixture.repo_path, "loop-b"))
+
+    link_bytes =
+      byte_size(outside) +
+        byte_size("missing-target") +
+        byte_size("loop-b") +
+        byte_size("loop-a")
+
+    expected = baseline + byte_size("inside") + link_bytes
+    outside_target_bytes = File.stat!(Path.join(outside, "large")).size
+
+    assert {:ok, actual} = GitCore.repository_disk_usage(fixture.repo_path)
+    assert actual == expected
+    assert actual - baseline == byte_size("inside") + link_bytes
+    refute actual == expected + outside_target_bytes
+    assert {:ok, ^expected} = GitCore.repository_disk_usage(fixture.repo_path, deadline_ms: 2_001)
+  end
+
+  test "disk usage returns a typed timeout and surfaces storage failures", %{tmp_dir: tmp_dir} do
+    fixture = analysis_fixture!(tmp_dir, [{"source.ex", "source\n"}])
+
+    assert_error(
+      GitCore.repository_disk_usage(fixture.repo_path, deadline_ms: 0),
+      :scan_timeout,
+      :repository_disk_usage
+    )
+
+    assert_error(
+      GitCore.repository_disk_usage(Path.join(tmp_dir, "missing.git")),
+      :storage_unavailable,
+      :repository_disk_usage
+    )
+  end
+
+  test "disk usage is uncached and changes after gc repacks the same repository", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = analysis_fixture!(tmp_dir, [{"history.txt", "root\n"}])
+    history_path = Path.join(fixture.work_path, "history.txt")
+
+    for index <- 1..24 do
+      File.write!(history_path, String.duplicate("#{index}\n", 256))
+      git!(["-C", fixture.work_path, "add", "history.txt"])
+      git!(["-C", fixture.work_path, "commit", "-m", "history #{index}"])
+    end
+
+    git!(["-C", fixture.work_path, "push", "origin", "HEAD:refs/heads/main"])
+    assert {:ok, before_gc} = GitCore.repository_disk_usage(fixture.repo_path)
+    git!(["--git-dir", fixture.repo_path, "gc", "--prune=now"])
+    assert {:ok, after_gc} = GitCore.repository_disk_usage(fixture.repo_path)
+    refute after_gc == before_gc
+  end
+
+  defp analysis_fixture!(tmp_dir, files, opts \\ []) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "analysis-#{suffix}.git")
+    work_path = Path.join(tmp_dir, "analysis-work-#{suffix}")
+
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    git!(["init", "--object-format=sha1", work_path])
+
+    Enum.each(files, fn
+      {path, body} ->
+        full_path = Path.join(work_path, path)
+        File.mkdir_p!(Path.dirname(full_path))
+        File.write!(full_path, body)
+
+      {:executable, path, body} ->
+        full_path = Path.join(work_path, path)
+        File.mkdir_p!(Path.dirname(full_path))
+        File.write!(full_path, body)
+        File.chmod!(full_path, 0o755)
+
+      {:symlink, path, target} ->
+        full_path = Path.join(work_path, path)
+        File.mkdir_p!(Path.dirname(full_path))
+        File.ln_s!(target, full_path)
+    end)
+
+    git!(["-C", work_path, "add", "."])
+
+    if Keyword.get(opts, :gitlink, false) do
+      git!(["-C", work_path, "commit", "--allow-empty", "-m", "analysis base"])
+      gitlink_oid = git!(["-C", work_path, "rev-parse", "HEAD"])
+
+      git!([
+        "-C",
+        work_path,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        "160000,#{gitlink_oid},vendor/submodule"
+      ])
+
+      git!(["-C", work_path, "commit", "-m", "analysis gitlink"])
+    else
+      git!(["-C", work_path, "commit", "--allow-empty", "-m", "analysis fixture"])
+    end
+
+    commit_oid = git!(["-C", work_path, "rev-parse", "HEAD"])
+    git!(["-C", work_path, "remote", "add", "origin", repo_path])
+    git!(["-C", work_path, "push", "origin", "HEAD:refs/heads/main"])
+
+    %{repo_path: repo_path, commit_oid: commit_oid, work_path: work_path}
+  end
+
+  defp repeated_empty_blob_analysis_fixture!(tmp_dir, entry_count) do
+    fixture = analysis_fixture!(tmp_dir, [])
+    empty_path = Path.join(tmp_dir, "analysis-empty-#{System.unique_integer([:positive])}")
+    File.write!(empty_path, "")
+    empty_blob = git!(["--git-dir", fixture.repo_path, "hash-object", "-w", empty_path])
+
+    tree =
+      0..(entry_count - 1)
+      |> Enum.map(fn index ->
+        [
+          "100644 file-",
+          Integer.to_string(index) |> String.pad_leading(6, "0"),
+          ".txt",
+          0,
+          oid_bytes(empty_blob)
+        ]
+      end)
+
+    tree_oid = write_raw_tree!(tmp_dir, fixture.repo_path, tree, "large-analysis-tree")
+    commit_oid = write_commit_for_tree!(tmp_dir, fixture.repo_path, tree_oid, "large analysis")
+    %{fixture | commit_oid: commit_oid}
+  end
+
+  defp declared_size_analysis_fixture!(tmp_dir, declared_size) do
+    fixture = analysis_fixture!(tmp_dir, [])
+    fake_blob = String.duplicate("4", 40)
+    fake_path = loose_object_path(fixture.repo_path, fake_blob)
+    File.mkdir_p!(Path.dirname(fake_path))
+    File.write!(fake_path, :zlib.compress("blob #{declared_size}\0x"))
+
+    tree_oid =
+      write_raw_tree!(
+        tmp_dir,
+        fixture.repo_path,
+        [["100644 oversized.rs", 0, oid_bytes(fake_blob)]],
+        "oversized-analysis-tree"
+      )
+
+    commit_oid =
+      write_commit_for_tree!(tmp_dir, fixture.repo_path, tree_oid, "oversized analysis")
+
+    %{fixture | commit_oid: commit_oid}
+  end
+
+  defp post_bound_false_blob_fixture!(tmp_dir) do
+    fixture = analysis_fixture!(tmp_dir, [{"a.py", "aaa"}, {"b.rs", "bbbb"}])
+    valid_blob = git!(["--git-dir", fixture.repo_path, "rev-parse", "#{fixture.commit_oid}:b.rs"])
+    fake_blob = String.duplicate("5", 40)
+    alias_loose_object!(fixture.repo_path, valid_blob, fake_blob)
+
+    first_blob =
+      git!(["--git-dir", fixture.repo_path, "rev-parse", "#{fixture.commit_oid}:a.py"])
+
+    tree_oid =
+      write_raw_tree!(
+        tmp_dir,
+        fixture.repo_path,
+        [
+          ["100644 a.py", 0, oid_bytes(first_blob)],
+          ["100644 b.rs", 0, oid_bytes(fake_blob)]
+        ],
+        "post-bound-analysis-tree"
+      )
+
+    commit_oid =
+      write_commit_for_tree!(tmp_dir, fixture.repo_path, tree_oid, "post-bound analysis")
+
+    %{fixture | commit_oid: commit_oid}
+  end
+
+  defp write_raw_tree!(tmp_dir, repo_path, tree_iodata, label) do
+    tree_path = Path.join(tmp_dir, "#{label}-#{System.unique_integer([:positive])}")
+    File.write!(tree_path, tree_iodata)
+
+    git!([
+      "--git-dir",
+      repo_path,
+      "hash-object",
+      "--literally",
+      "-t",
+      "tree",
+      "-w",
+      tree_path
+    ])
+  end
+
+  defp fixture_entry({:executable, path, body, _language}), do: {:executable, path, body}
+  defp fixture_entry({:symlink, path, target, _language}), do: {:symlink, path, target}
+  defp fixture_entry({path, body, _language}), do: {path, body}
+
+  defp entry_body({:executable, _path, body, _language}), do: body
+  defp entry_body({:symlink, _path, target, _language}), do: target
+  defp entry_body({_path, body, _language}), do: body
+
+  defp expected_languages(entries) do
+    entries
+    |> Enum.group_by(
+      fn
+        {:executable, _path, _body, language} -> language
+        {:symlink, _path, _target, language} -> language
+        {_path, _body, language} -> language
+      end,
+      &entry_body/1
+    )
+    |> Enum.map(fn {language, bodies} ->
+      %GitCore.LanguageStat{
+        language: language,
+        bytes: Enum.sum(Enum.map(bodies, &byte_size/1))
+      }
+    end)
+    |> Enum.sort_by(&{-&1.bytes, &1.language})
+  end
+
+  defp assert_analysis(fixture, opts, files_scanned, bytes_scanned, truncated, languages) do
+    expected_languages =
+      languages
+      |> Enum.map(fn {language, bytes} ->
+        %GitCore.LanguageStat{language: language, bytes: bytes}
+      end)
+      |> Enum.sort_by(&{-&1.bytes, &1.language})
+
+    assert {:ok,
+            %GitCore.RepositoryAnalysis{
+              languages: ^expected_languages,
+              total_bytes: total_bytes,
+              files_scanned: ^files_scanned,
+              bytes_scanned: ^bytes_scanned,
+              truncated: ^truncated
+            }} = GitCore.repository_analysis(fixture.repo_path, fixture.commit_oid, opts)
+
+    assert total_bytes == Enum.sum(Enum.map(expected_languages, & &1.bytes))
+  end
+
+  defp replace_analysis_objects!(tmp_dir, fixture, replacement_body) do
+    original_commit = fixture.commit_oid
+
+    original_tree =
+      git!(["--git-dir", fixture.repo_path, "rev-parse", "#{original_commit}^{tree}"])
+
+    original_blob =
+      git!([
+        "--git-dir",
+        fixture.repo_path,
+        "rev-parse",
+        "#{original_commit}:physical.ex"
+      ])
+
+    replacement_path =
+      Path.join(tmp_dir, "analysis-replacement-#{System.unique_integer([:positive])}")
+
+    replacement_tree_path =
+      Path.join(tmp_dir, "analysis-replacement-tree-#{System.unique_integer([:positive])}")
+
+    File.write!(replacement_path, replacement_body)
+
+    replacement_blob =
+      git!(["--git-dir", fixture.repo_path, "hash-object", "-w", replacement_path])
+
+    File.write!(
+      replacement_tree_path,
+      "100644 physical.ex\0" <> oid_bytes(replacement_blob)
+    )
+
+    replacement_tree =
+      git!([
+        "--git-dir",
+        fixture.repo_path,
+        "hash-object",
+        "--literally",
+        "-t",
+        "tree",
+        "-w",
+        replacement_tree_path
+      ])
+
+    replacement_commit =
+      git!([
+        "--git-dir",
+        fixture.repo_path,
+        "commit-tree",
+        replacement_tree,
+        "-m",
+        "replacement analysis"
+      ])
+
+    for {original, replacement} <- [
+          {original_blob, replacement_blob},
+          {original_tree, replacement_tree},
+          {original_commit, replacement_commit}
+        ] do
+      git!([
+        "--git-dir",
+        fixture.repo_path,
+        "update-ref",
+        "refs/replace/#{original}",
+        replacement
+      ])
+    end
+
+    fixture
+  end
+
+  defp false_analysis_object_fixture!(tmp_dir, kind) do
+    fixture = analysis_fixture!(tmp_dir, [{"source.ex", "physical\n"}])
+    original_commit = fixture.commit_oid
+
+    original_tree =
+      git!(["--git-dir", fixture.repo_path, "rev-parse", "#{original_commit}^{tree}"])
+
+    original_blob =
+      git!(["--git-dir", fixture.repo_path, "rev-parse", "#{original_commit}:source.ex"])
+
+    case kind do
+      :commit ->
+        fake_commit = String.duplicate("1", 40)
+        alias_loose_object!(fixture.repo_path, original_commit, fake_commit)
+        %{fixture | commit_oid: fake_commit}
+
+      :tree ->
+        fake_tree = String.duplicate("2", 40)
+        alias_loose_object!(fixture.repo_path, original_tree, fake_tree)
+        commit_oid = write_commit_for_tree!(tmp_dir, fixture.repo_path, fake_tree, "false tree")
+        %{fixture | commit_oid: commit_oid}
+
+      :blob ->
+        fake_blob = String.duplicate("3", 40)
+        alias_loose_object!(fixture.repo_path, original_blob, fake_blob)
+
+        tree_path =
+          Path.join(tmp_dir, "false-blob-tree-#{System.unique_integer([:positive])}")
+
+        File.write!(tree_path, "100644 source.ex\0" <> oid_bytes(fake_blob))
+
+        tree_oid =
+          git!([
+            "--git-dir",
+            fixture.repo_path,
+            "hash-object",
+            "--literally",
+            "-t",
+            "tree",
+            "-w",
+            tree_path
+          ])
+
+        commit_oid = write_commit_for_tree!(tmp_dir, fixture.repo_path, tree_oid, "false blob")
+        %{fixture | commit_oid: commit_oid}
+    end
+  end
+
+  defp alias_loose_object!(repo_path, source_oid, target_oid) do
+    source = loose_object_path(repo_path, source_oid)
+    target = loose_object_path(repo_path, target_oid)
+    File.mkdir_p!(Path.dirname(target))
+    File.cp!(source, target)
+  end
+
+  defp write_commit_for_tree!(tmp_dir, repo_path, tree_oid, message) do
+    commit_path = Path.join(tmp_dir, "analysis-commit-#{System.unique_integer([:positive])}")
+
+    File.write!(
+      commit_path,
+      "tree #{tree_oid}\n" <>
+        "author Fornacast Analysis Test <analysis@example.com> 946684800 +0000\n" <>
+        "committer Fornacast Analysis Test <analysis@example.com> 946684800 +0000\n\n" <>
+        "#{message}\n"
+    )
+
+    git!([
+      "--git-dir",
+      repo_path,
+      "hash-object",
+      "--literally",
+      "-t",
+      "commit",
+      "-w",
+      commit_path
+    ])
+  end
+
+  defp logical_disk_usage!(path) do
+    path
+    |> File.ls!()
+    |> Enum.reduce(0, fn name, total ->
+      entry_path = Path.join(path, name)
+      stat = File.lstat!(entry_path)
+
+      if stat.type == :directory do
+        total + logical_disk_usage!(entry_path)
+      else
+        total + stat.size
+      end
+    end)
+  end
+
+  defp assert_error(result, expected_kind, expected_operation) do
+    assert {:error,
+            %GitCore.Error{
+              kind: ^expected_kind,
+              operation: ^expected_operation,
+              detail: detail
+            }} = result
+
+    assert is_binary(detail)
+    refute detail == ""
+  end
+
+  defp oid_bytes(oid), do: Base.decode16!(oid, case: :mixed)
+
+  defp loose_object_path(repo_path, oid) do
+    {directory, filename} = String.split_at(oid, 2)
+    Path.join([repo_path, "objects", directory, filename])
+  end
+
+  defp git!(args) do
+    env = [
+      {"GIT_AUTHOR_NAME", "Fornacast Analysis Test"},
+      {"GIT_AUTHOR_EMAIL", "analysis@example.com"},
+      {"GIT_COMMITTER_NAME", "Fornacast Analysis Test"},
+      {"GIT_COMMITTER_EMAIL", "analysis@example.com"},
+      {"GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z"},
+      {"GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z"}
+    ]
+
+    case System.cmd("git", args, stderr_to_stdout: true, env: env) do
+      {output, 0} -> String.trim_trailing(output)
+      {output, code} -> flunk("git #{Enum.join(args, " ")} failed with #{code}:\n#{output}")
+    end
+  end
+end
+
+defmodule GitCore.RepositoryAnalysisBusyTest do
+  use ExUnit.Case, async: false
+
+  @moduletag :analysis
+
+  test "analysis APIs cannot redirect around the supervised global scan limiter" do
+    isolated_limiter =
+      start_supervised!({GitCore.ScanLimiter, server: nil}, id: make_ref())
+
+    holders = for _ <- 1..4, do: start_global_scan_holder()
+
+    Enum.each(holders, fn holder ->
+      assert_receive {:analysis_global_scan_entered, ^holder}, 1_000
+    end)
+
+    missing_path =
+      Path.join(
+        System.tmp_dir!(),
+        "missing-analysis-scan-#{System.unique_integer([:positive])}.git"
+      )
+
+    try do
+      assert_error(
+        GitCore.repository_analysis(
+          missing_path,
+          String.duplicate("f", 40),
+          scan_limiter: isolated_limiter
+        ),
+        :scan_busy,
+        :repository_analysis
+      )
+
+      assert_error(
+        GitCore.repository_disk_usage(missing_path, scan_limiter: isolated_limiter),
+        :scan_busy,
+        :repository_disk_usage
+      )
+    after
+      Enum.each(holders, &send(&1, :release))
+
+      Enum.each(holders, fn holder ->
+        assert_receive {:analysis_global_scan_finished, ^holder, :released}, 1_000
+      end)
+    end
+  end
+
+  defp start_global_scan_holder do
+    parent = self()
+
+    spawn(fn ->
+      result =
+        GitCore.ScanLimiter.with_permit(:analysis_busy_contract, fn ->
+          send(parent, {:analysis_global_scan_entered, self()})
+
+          receive do
+            :release -> :released
+          end
+        end)
+
+      send(parent, {:analysis_global_scan_finished, self(), result})
+    end)
+  end
+
+  defp assert_error(result, expected_kind, expected_operation) do
+    assert {:error,
+            %GitCore.Error{
+              kind: ^expected_kind,
+              operation: ^expected_operation,
+              detail: detail
+            }} = result
+
+    assert is_binary(detail)
+    refute detail == ""
+  end
+end
+
 defmodule GitCore.StructuredDiffTest do
   use ExUnit.Case, async: false
 

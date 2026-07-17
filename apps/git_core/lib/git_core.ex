@@ -14,6 +14,10 @@ defmodule GitCore do
   @search_byte_limit 67_108_864
   @search_result_limit 100
   @search_deadline_ms 2_000
+  @analysis_file_limit 100_000
+  @analysis_byte_limit 536_870_912
+  @analysis_deadline_ms 2_000
+  @disk_usage_deadline_ms 2_000
 
   def init_bare(path) when is_binary(path) do
     GitCore.Native.init_bare(path)
@@ -363,6 +367,62 @@ defmodule GitCore do
     end)
   end
 
+  def repository_analysis(path, snapshot_oid, opts \\ [])
+      when is_binary(path) and is_binary(snapshot_oid) and is_list(opts) do
+    file_limit =
+      opts
+      |> Keyword.get(:file_limit, @analysis_file_limit)
+      |> analysis_file_limit()
+
+    byte_limit =
+      opts
+      |> Keyword.get(:byte_limit, @analysis_byte_limit)
+      |> analysis_byte_limit()
+
+    deadline_ms =
+      opts
+      |> Keyword.get(:deadline_ms, @analysis_deadline_ms)
+      |> analysis_deadline_ms()
+
+    GitCore.ScanLimiter.with_permit(:repository_analysis, fn ->
+      with {:ok, {languages, total_bytes, files_scanned, bytes_scanned, truncated}} <-
+             wrap_read(
+               GitCore.Native.repository_analysis(
+                 path,
+                 snapshot_oid,
+                 file_limit,
+                 byte_limit,
+                 deadline_ms
+               ),
+               :repository_analysis
+             ) do
+        {:ok,
+         %GitCore.RepositoryAnalysis{
+           languages:
+             Enum.map(languages, fn {language, bytes} ->
+               %GitCore.LanguageStat{language: language, bytes: bytes}
+             end),
+           total_bytes: total_bytes,
+           files_scanned: files_scanned,
+           bytes_scanned: bytes_scanned,
+           truncated: truncated
+         }}
+      end
+    end)
+  end
+
+  def repository_disk_usage(path, opts \\ []) when is_binary(path) and is_list(opts) do
+    deadline_ms =
+      opts
+      |> Keyword.get(:deadline_ms, @disk_usage_deadline_ms)
+      |> disk_usage_deadline_ms()
+
+    GitCore.ScanLimiter.with_permit(:repository_disk_usage, fn ->
+      GitCore.Native.repository_disk_usage(path, deadline_ms)
+      |> wrap_read(:repository_disk_usage)
+    end)
+  end
+
   def pack_objects(path, wants) when is_binary(path) and is_list(wants) do
     GitCore.Native.pack_objects(path, wants)
   end
@@ -484,6 +544,18 @@ defmodule GitCore do
 
   defp search_deadline_ms(deadline_ms) when is_integer(deadline_ms),
     do: deadline_ms |> max(0) |> min(@search_deadline_ms)
+
+  defp analysis_file_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@analysis_file_limit)
+
+  defp analysis_byte_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@analysis_byte_limit)
+
+  defp analysis_deadline_ms(deadline_ms) when is_integer(deadline_ms),
+    do: deadline_ms |> max(0) |> min(@analysis_deadline_ms)
+
+  defp disk_usage_deadline_ms(deadline_ms) when is_integer(deadline_ms),
+    do: deadline_ms |> max(0) |> min(@disk_usage_deadline_ms)
 
   defp blob_metadata(path, snapshot_oid, blob_path, operation) do
     with {:ok, {name, oid, size}} <-

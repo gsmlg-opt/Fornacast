@@ -63,6 +63,17 @@ defmodule GitCore.Native do
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
+  def repository_analysis(
+        _path,
+        _snapshot_oid,
+        _file_limit,
+        _byte_limit,
+        _deadline_ms
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  def repository_disk_usage(_path, _deadline_ms), do: :erlang.nif_error(:nif_not_loaded)
+
   def pack_objects(_path, _wants), do: :erlang.nif_error(:nif_not_loaded)
   def receive_pack(_path, _pack, _commands), do: :erlang.nif_error(:nif_not_loaded)
 end

@@ -1,7 +1,9 @@
+use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Cursor, Write};
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
@@ -34,6 +36,8 @@ type NativeDiffFile = (
 type NativeCommitDiff = (Vec<NativeDiffFile>, Vec<u8>, bool, u64, u64, u64);
 type NativeSearchResult = (Vec<u8>, Option<u64>, Option<Vec<u8>>);
 type NativeSearchResults = (Vec<NativeSearchResult>, u64, u64, Vec<String>);
+type NativeLanguageStat = (String, u64);
+type NativeRepositoryAnalysis = (Vec<NativeLanguageStat>, u64, u64, u64, bool);
 type NativeRef = (Vec<u8>, String, String);
 type NativeRefSummary = (usize, usize, Vec<NativeRef>, Vec<NativeRef>, bool);
 type NativeTreeCommit = (String, String, String, i64);
@@ -142,6 +146,10 @@ const SEARCH_RESULT_LIMIT: usize = 100;
 const SEARCH_BLOB_LIMIT: u64 = 1024 * 1024;
 const SEARCH_SCAN_DEADLINE: Duration = Duration::from_secs(2);
 const SEARCH_SNIPPET_LIMIT: usize = 240;
+const ANALYSIS_FILE_LIMIT: u64 = 100_000;
+const ANALYSIS_BYTE_LIMIT: u64 = 512 * 1024 * 1024;
+const ANALYSIS_SCAN_DEADLINE: Duration = Duration::from_secs(2);
+const DISK_USAGE_SCAN_DEADLINE: Duration = Duration::from_secs(2);
 const NO_FINAL_NEWLINE_MARKER: &[u8] = b"\\ No newline at end of file\n";
 // This remains independent of object size while leaving room for the complete mandatory tag
 // header, including long ref-derived tag names, before an arbitrarily large message body.
@@ -192,12 +200,352 @@ struct SearchTreeFrame {
     previous: Option<(Vec<u8>, bool)>,
 }
 
+struct Utf8Validator {
+    remaining: u8,
+    next_min: u8,
+    next_max: u8,
+    valid: bool,
+}
+
+struct ShebangClassifier {
+    position: u64,
+    active: bool,
+    mode: ShebangMode,
+    skip_env_argument: bool,
+    token: [u8; 128],
+    token_len: usize,
+    token_overflow: bool,
+    language: Option<&'static str>,
+}
+
+#[derive(Clone, Copy)]
+enum ShebangMode {
+    Interpreter,
+    EnvCommand,
+}
+
+struct LanguageScanner {
+    utf8: Utf8Validator,
+    shebang: ShebangClassifier,
+    contains_nul: bool,
+}
+
+#[derive(Clone, Copy)]
+enum VerifiedBlobContent {
+    Binary,
+    Text {
+        shebang_language: Option<&'static str>,
+    },
+}
+
 #[derive(Default)]
 struct SearchStopFlags {
     file_limit: bool,
     byte_limit: bool,
     deadline: bool,
     result_limit: bool,
+}
+
+impl Utf8Validator {
+    fn new() -> Self {
+        Self {
+            remaining: 0,
+            next_min: 0x80,
+            next_max: 0xbf,
+            valid: true,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            if !self.valid {
+                return;
+            }
+            if self.remaining != 0 {
+                if *byte < self.next_min || *byte > self.next_max {
+                    self.valid = false;
+                    return;
+                }
+                self.remaining -= 1;
+                self.next_min = 0x80;
+                self.next_max = 0xbf;
+                continue;
+            }
+
+            match *byte {
+                0x00..=0x7f => {}
+                0xc2..=0xdf => self.remaining = 1,
+                0xe0 => {
+                    self.remaining = 2;
+                    self.next_min = 0xa0;
+                }
+                0xe1..=0xec | 0xee..=0xef => self.remaining = 2,
+                0xed => {
+                    self.remaining = 2;
+                    self.next_max = 0x9f;
+                }
+                0xf0 => {
+                    self.remaining = 3;
+                    self.next_min = 0x90;
+                }
+                0xf1..=0xf3 => self.remaining = 3,
+                0xf4 => {
+                    self.remaining = 3;
+                    self.next_max = 0x8f;
+                }
+                _ => {
+                    self.valid = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.valid && self.remaining == 0
+    }
+}
+
+impl ShebangClassifier {
+    fn new() -> Self {
+        Self {
+            position: 0,
+            active: true,
+            mode: ShebangMode::Interpreter,
+            skip_env_argument: false,
+            token: [0; 128],
+            token_len: 0,
+            token_overflow: false,
+            language: None,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            if !self.active {
+                return;
+            }
+
+            match self.position {
+                0 => self.active = *byte == b'#',
+                1 => self.active = *byte == b'!',
+                _ if *byte == b'\n' || *byte == b'\r' => {
+                    self.finish_token();
+                    self.active = false;
+                }
+                _ if byte.is_ascii_whitespace() => self.finish_token(),
+                _ => {
+                    if self.token_len < self.token.len() {
+                        self.token[self.token_len] = *byte;
+                        self.token_len += 1;
+                    } else {
+                        self.token_overflow = true;
+                    }
+                }
+            }
+            self.position = self.position.saturating_add(1);
+        }
+    }
+
+    fn finish(mut self) -> Option<&'static str> {
+        if self.active {
+            self.finish_token();
+        }
+        self.language
+    }
+
+    fn finish_token(&mut self) {
+        if self.token_len == 0 && !self.token_overflow {
+            return;
+        }
+        if self.token_overflow {
+            self.active = false;
+            self.token_len = 0;
+            self.token_overflow = false;
+            return;
+        }
+
+        let token = &self.token[..self.token_len];
+        match self.mode {
+            ShebangMode::Interpreter => {
+                let interpreter = shebang_basename(token);
+                if interpreter == b"env" {
+                    self.mode = ShebangMode::EnvCommand;
+                } else {
+                    self.language = shebang_token_language(interpreter);
+                    self.active = false;
+                }
+            }
+            ShebangMode::EnvCommand => {
+                if self.skip_env_argument {
+                    self.skip_env_argument = false;
+                } else if shebang_env_assignment(token) {
+                } else if let Some(skip_argument) = shebang_env_option(token) {
+                    self.skip_env_argument = skip_argument;
+                } else {
+                    self.language = shebang_token_language(shebang_basename(token));
+                    self.active = false;
+                }
+            }
+        }
+        self.token_len = 0;
+        self.token_overflow = false;
+    }
+}
+
+impl LanguageScanner {
+    fn new() -> Self {
+        Self {
+            utf8: Utf8Validator::new(),
+            shebang: ShebangClassifier::new(),
+            contains_nul: false,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.contains_nul |= bytes.contains(&0);
+        self.utf8.push(bytes);
+        self.shebang.push(bytes);
+    }
+
+    fn finish(self) -> VerifiedBlobContent {
+        if self.contains_nul || !self.utf8.complete() {
+            return VerifiedBlobContent::Binary;
+        }
+        VerifiedBlobContent::Text {
+            shebang_language: self.shebang.finish(),
+        }
+    }
+}
+
+impl VerifiedBlobContent {
+    fn language(self, path: &[u8]) -> Option<&'static str> {
+        match self {
+            Self::Binary => None,
+            Self::Text { shebang_language } => Some(
+                filename_language(path)
+                    .or(shebang_language)
+                    .unwrap_or("Other"),
+            ),
+        }
+    }
+}
+
+fn filename_language(path: &[u8]) -> Option<&'static str> {
+    let filename = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
+    if filename == b"Dockerfile" || filename.starts_with(b"Dockerfile.") {
+        return Some("Dockerfile");
+    }
+    let dot = filename.iter().rposition(|byte| *byte == b'.')?;
+    let extension = &filename[dot + 1..];
+
+    for (language, extensions) in [
+        ("Elixir", &[b"ex".as_slice(), b"exs".as_slice()][..]),
+        ("Erlang", &[b"erl".as_slice(), b"hrl".as_slice()][..]),
+        ("Rust", &[b"rs".as_slice()][..]),
+        (
+            "JavaScript",
+            &[
+                b"js".as_slice(),
+                b"mjs".as_slice(),
+                b"cjs".as_slice(),
+                b"jsx".as_slice(),
+            ][..],
+        ),
+        (
+            "TypeScript",
+            &[
+                b"ts".as_slice(),
+                b"tsx".as_slice(),
+                b"mts".as_slice(),
+                b"cts".as_slice(),
+            ][..],
+        ),
+        ("CSS", &[b"css".as_slice()][..]),
+        (
+            "HTML",
+            &[b"html".as_slice(), b"htm".as_slice(), b"heex".as_slice()][..],
+        ),
+        ("Markdown", &[b"md".as_slice(), b"markdown".as_slice()][..]),
+        ("JSON", &[b"json".as_slice()][..]),
+        ("TOML", &[b"toml".as_slice()][..]),
+        ("YAML", &[b"yml".as_slice(), b"yaml".as_slice()][..]),
+        (
+            "Shell",
+            &[b"sh".as_slice(), b"bash".as_slice(), b"zsh".as_slice()][..],
+        ),
+        ("Python", &[b"py".as_slice()][..]),
+        ("Ruby", &[b"rb".as_slice()][..]),
+        ("Go", &[b"go".as_slice()][..]),
+        ("Java", &[b"java".as_slice()][..]),
+        ("C", &[b"c".as_slice(), b"h".as_slice()][..]),
+        (
+            "C++",
+            &[
+                b"cc".as_slice(),
+                b"cpp".as_slice(),
+                b"cxx".as_slice(),
+                b"hpp".as_slice(),
+                b"hh".as_slice(),
+                b"hxx".as_slice(),
+            ][..],
+        ),
+        ("SQL", &[b"sql".as_slice()][..]),
+    ] {
+        if extensions
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        {
+            return Some(language);
+        }
+    }
+    None
+}
+
+fn shebang_token_language(token: &[u8]) -> Option<&'static str> {
+    match token {
+        b"elixir" | b"escript" => Some("Elixir"),
+        b"python" | b"python3" => Some("Python"),
+        b"node" | b"deno" | b"bun" => Some("JavaScript"),
+        b"bash" | b"sh" | b"zsh" => Some("Shell"),
+        b"ruby" => Some("Ruby"),
+        _ => None,
+    }
+}
+
+fn shebang_basename(token: &[u8]) -> &[u8] {
+    token.rsplit(|byte| *byte == b'/').next().unwrap_or(token)
+}
+
+fn shebang_env_assignment(token: &[u8]) -> bool {
+    let Some(equals) = token.iter().position(|byte| *byte == b'=') else {
+        return false;
+    };
+    let name = &token[..equals];
+    name.first()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        && name
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
+
+fn shebang_env_option(token: &[u8]) -> Option<bool> {
+    match token {
+        b"-i"
+        | b"--ignore-environment"
+        | b"-0"
+        | b"--null"
+        | b"-v"
+        | b"--debug"
+        | b"--"
+        | b"-S"
+        | b"--split-string" => Some(false),
+        b"-u" | b"--unset" | b"-C" | b"--chdir" => Some(true),
+        _ if token.starts_with(b"-u") && token.len() > 2 => Some(false),
+        _ if token.starts_with(b"-C") && token.len() > 2 => Some(false),
+        _ if token.starts_with(b"--unset=") || token.starts_with(b"--chdir=") => Some(false),
+        _ => None,
+    }
 }
 
 fn to_error<E: std::fmt::Display>(error: E) -> String {
@@ -265,6 +613,7 @@ fn bounded_blob_native_error(error: bounded_blob::Error) -> NativeError {
     let kind = match error.kind() {
         bounded_blob::ErrorKind::StorageUnavailable => "storage_unavailable",
         bounded_blob::ErrorKind::CorruptRepository => "corrupt_repository",
+        bounded_blob::ErrorKind::Stopped => "scan_timeout",
     };
     native_error(kind, error)
 }
@@ -2489,6 +2838,284 @@ fn search_byte_limit(byte_limit: u64) -> u64 {
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
+fn repository_analysis(
+    path: String,
+    snapshot_oid: String,
+    file_limit: u64,
+    byte_limit: u64,
+    deadline_ms: u64,
+) -> Result<NativeRepositoryAnalysis, NativeError> {
+    let file_limit = analysis_file_limit(file_limit);
+    let byte_limit = analysis_byte_limit(byte_limit);
+    let deadline = Instant::now() + analysis_scan_duration(deadline_ms);
+    let repo = open_physical_bare_repository(&path)?;
+    let stop_policy: Rc<RefCell<dyn FnMut(u64) -> bool>> =
+        Rc::new(RefCell::new(move |_| Instant::now() >= deadline));
+    let _ = (stop_policy.borrow_mut())(0);
+    let tree_oid = verified_analysis_snapshot_tree(&repo, &snapshot_oid)?;
+    let _ = (stop_policy.borrow_mut())(0);
+    repository_analysis_from_tree(&repo, tree_oid, file_limit, byte_limit, stop_policy)
+}
+
+fn repository_analysis_from_tree(
+    repo: &gix::Repository,
+    tree_oid: gix_hash::ObjectId,
+    file_limit: u64,
+    byte_limit: u64,
+    stop_policy: Rc<RefCell<dyn FnMut(u64) -> bool>>,
+) -> Result<NativeRepositoryAnalysis, NativeError> {
+    let stopped_before_root = (stop_policy.borrow_mut())(0);
+    let root = load_search_tree_frame(repo, tree_oid, Vec::new())?;
+    let stopped_after_root = (stop_policy.borrow_mut())(0);
+    let root_is_empty = root.data.is_empty();
+    let mut frames = vec![root];
+    let mut languages = BTreeMap::<&'static str, u64>::new();
+    let mut total_bytes = 0_u64;
+    let mut files_scanned = 0_u64;
+    let mut bytes_scanned = 0_u64;
+    let mut truncated = !root_is_empty && (stopped_before_root || stopped_after_root);
+    let mut verified_blobs = HashMap::<gix_hash::ObjectId, (u64, VerifiedBlobContent)>::new();
+
+    while !truncated {
+        let Some((entry, full_path)) = next_search_entry(&mut frames)? else {
+            break;
+        };
+        if (stop_policy.borrow_mut())(0) {
+            truncated = true;
+            break;
+        }
+
+        match entry.mode {
+            0o040000 => {
+                let child = load_search_tree_frame(repo, entry.oid, full_path)?;
+                if (stop_policy.borrow_mut())(0) {
+                    truncated = true;
+                    break;
+                }
+                frames.push(child);
+            }
+            0o100644 | 0o100755 | 0o120000 => {
+                if files_scanned >= file_limit {
+                    truncated = true;
+                    break;
+                }
+                let remaining = byte_limit.checked_sub(bytes_scanned).ok_or_else(|| {
+                    native_error(
+                        "corrupt_repository",
+                        "analysis byte counter exceeded its bounded limit",
+                    )
+                })?;
+                if let Some((size, content)) = verified_blobs.get(&entry.oid).copied() {
+                    if size > remaining {
+                        truncated = true;
+                        break;
+                    }
+                    record_completed_analysis_blob(
+                        &mut languages,
+                        &mut total_bytes,
+                        &mut files_scanned,
+                        &mut bytes_scanned,
+                        &full_path,
+                        size,
+                        content,
+                    )?;
+                    continue;
+                }
+
+                let mut scanner = LanguageScanner::new();
+                let active_blob_bytes = Rc::new(Cell::new(0_u64));
+                let outcome = {
+                    let visitor_bytes = Rc::clone(&active_blob_bytes);
+                    let mut visitor = |chunk: &[u8]| {
+                        scanner.push(chunk);
+                        visitor_bytes.set(visitor_bytes.get().saturating_add(chunk.len() as u64));
+                    };
+                    let stop_bytes = Rc::clone(&active_blob_bytes);
+                    let blob_stop_policy = Rc::clone(&stop_policy);
+                    bounded_blob::visit_verified_blob(
+                        repo,
+                        entry.oid,
+                        remaining,
+                        move || (blob_stop_policy.borrow_mut())(stop_bytes.get()),
+                        &mut visitor,
+                    )
+                    .map_err(bounded_blob_native_error)?
+                };
+
+                match outcome {
+                    bounded_blob::VisitOutcome::Complete { size } => {
+                        let content = scanner.finish();
+                        verified_blobs.insert(entry.oid, (size, content));
+                        record_completed_analysis_blob(
+                            &mut languages,
+                            &mut total_bytes,
+                            &mut files_scanned,
+                            &mut bytes_scanned,
+                            &full_path,
+                            size,
+                            content,
+                        )?;
+                    }
+                    bounded_blob::VisitOutcome::TooLarge { .. } => {
+                        truncated = true;
+                        break;
+                    }
+                    bounded_blob::VisitOutcome::Stopped { bytes, started } => {
+                        if started {
+                            files_scanned = files_scanned.checked_add(1).ok_or_else(|| {
+                                native_error("corrupt_repository", "analysis file count overflow")
+                            })?;
+                            bytes_scanned = bytes_scanned.checked_add(bytes).ok_or_else(|| {
+                                native_error("corrupt_repository", "analysis byte count overflow")
+                            })?;
+                        }
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
+            0o160000 => {}
+            _ => unreachable!("tree modes are validated before traversal"),
+        }
+    }
+
+    let mut languages = languages
+        .into_iter()
+        .map(|(language, bytes)| (language.to_string(), bytes))
+        .collect::<Vec<_>>();
+    languages.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+    Ok((
+        languages,
+        total_bytes,
+        files_scanned,
+        bytes_scanned,
+        truncated,
+    ))
+}
+
+fn record_completed_analysis_blob(
+    languages: &mut BTreeMap<&'static str, u64>,
+    total_bytes: &mut u64,
+    files_scanned: &mut u64,
+    bytes_scanned: &mut u64,
+    path: &[u8],
+    size: u64,
+    content: VerifiedBlobContent,
+) -> Result<(), NativeError> {
+    *files_scanned = files_scanned
+        .checked_add(1)
+        .ok_or_else(|| native_error("corrupt_repository", "analysis file count overflow"))?;
+    *bytes_scanned = bytes_scanned
+        .checked_add(size)
+        .ok_or_else(|| native_error("corrupt_repository", "analysis byte count overflow"))?;
+    if let Some(language) = content.language(path) {
+        let language_bytes = languages.entry(language).or_default();
+        *language_bytes = language_bytes
+            .checked_add(size)
+            .ok_or_else(|| native_error("corrupt_repository", "analysis language byte overflow"))?;
+        *total_bytes = total_bytes
+            .checked_add(size)
+            .ok_or_else(|| native_error("corrupt_repository", "analysis total byte overflow"))?;
+    }
+    Ok(())
+}
+
+fn verified_analysis_snapshot_tree(
+    repo: &gix::Repository,
+    snapshot_oid: &str,
+) -> Result<gix_hash::ObjectId, NativeError> {
+    let commit_oid = gix_hash::ObjectId::from_hex(snapshot_oid.as_bytes())
+        .map_err(|error| native_error("commit_not_found", error))?;
+    let commit = find_graph_commit(repo, commit_oid, CommitPosition::Tip)?;
+    let actual =
+        gix_object::compute_hash(repo.object_hash(), gix_object::Kind::Commit, &commit.data)
+            .map_err(|error| native_error("corrupt_repository", error))?;
+    if actual != commit.id {
+        return Err(native_error(
+            "corrupt_repository",
+            format_args!(
+                "commit checksum mismatch: expected {}, computed {actual}",
+                commit.id
+            ),
+        ));
+    }
+    commit
+        .decode()
+        .map(|commit| commit.tree())
+        .map_err(|error| native_error("corrupt_repository", error))
+}
+
+fn analysis_file_limit(file_limit: u64) -> u64 {
+    file_limit.min(ANALYSIS_FILE_LIMIT)
+}
+
+fn analysis_byte_limit(byte_limit: u64) -> u64 {
+    byte_limit.min(ANALYSIS_BYTE_LIMIT)
+}
+
+fn analysis_scan_duration(deadline_ms: u64) -> Duration {
+    Duration::from_millis(deadline_ms.min(ANALYSIS_SCAN_DEADLINE.as_millis() as u64))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn repository_disk_usage(path: String, deadline_ms: u64) -> Result<u64, NativeError> {
+    let deadline = Instant::now() + disk_usage_scan_duration(deadline_ms);
+    let repo = open_physical_bare_repository(&path)?;
+    let root = std::fs::canonicalize(repo.path())
+        .map_err(|error| native_error("storage_unavailable", error))?;
+    let root_metadata = std::fs::symlink_metadata(&root)
+        .map_err(|error| native_error("storage_unavailable", error))?;
+    if !root_metadata.file_type().is_dir() {
+        return Err(native_error(
+            "invalid_repository",
+            "canonical repository root is not a directory",
+        ));
+    }
+    check_disk_usage_deadline(deadline)?;
+
+    let mut pending = vec![root];
+    let mut total = 0_u64;
+    while let Some(directory) = pending.pop() {
+        check_disk_usage_deadline(deadline)?;
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|error| native_error("storage_unavailable", error))?;
+
+        for entry in entries {
+            check_disk_usage_deadline(deadline)?;
+            let entry = entry.map_err(|error| native_error("storage_unavailable", error))?;
+            let entry_path = entry.path();
+            let metadata = std::fs::symlink_metadata(&entry_path)
+                .map_err(|error| native_error("storage_unavailable", error))?;
+            if metadata.file_type().is_dir() {
+                pending.push(entry_path);
+            } else {
+                total = total.checked_add(metadata.len()).ok_or_else(|| {
+                    native_error("corrupt_repository", "repository disk usage overflow")
+                })?;
+            }
+        }
+    }
+    check_disk_usage_deadline(deadline)?;
+    Ok(total)
+}
+
+fn check_disk_usage_deadline(deadline: Instant) -> Result<(), NativeError> {
+    if Instant::now() >= deadline {
+        Err(native_error(
+            "scan_timeout",
+            "repository disk usage exceeded its deadline",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn disk_usage_scan_duration(deadline_ms: u64) -> Duration {
+    Duration::from_millis(deadline_ms.min(DISK_USAGE_SCAN_DEADLINE.as_millis() as u64))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
 fn pack_objects<'env>(
     env: rustler::Env<'env>,
     path: String,
@@ -3783,10 +4410,157 @@ mod tests {
         assert_eq!(search_byte_limit(u64::MAX), 67_108_864);
     }
 
+    #[test]
+    fn analysis_overrides_preserve_zero_and_cannot_raise_production_maxima() {
+        assert_eq!(analysis_file_limit(0), 0);
+        assert_eq!(analysis_file_limit(17), 17);
+        assert_eq!(analysis_file_limit(u64::MAX), ANALYSIS_FILE_LIMIT);
+        assert_eq!(analysis_byte_limit(0), 0);
+        assert_eq!(analysis_byte_limit(17), 17);
+        assert_eq!(analysis_byte_limit(u64::MAX), ANALYSIS_BYTE_LIMIT);
+        assert_eq!(analysis_scan_duration(0), Duration::ZERO);
+        assert_eq!(analysis_scan_duration(1_250), Duration::from_millis(1_250));
+        assert_eq!(analysis_scan_duration(u64::MAX), ANALYSIS_SCAN_DEADLINE);
+    }
+
+    #[test]
+    fn analysis_started_stop_counts_only_the_visited_prefix_and_skips_finalization() {
+        let fixture = AnalysisStopFixture::new();
+        let repo = gix::open(&fixture.repo_path).expect("open analysis-stop fixture");
+        let stop_after_first_chunk: Rc<RefCell<dyn FnMut(u64) -> bool>> =
+            Rc::new(RefCell::new(|active_bytes| active_bytes != 0));
+
+        let (languages, total_bytes, files_scanned, bytes_scanned, truncated) =
+            repository_analysis_from_tree(
+                &repo,
+                fixture.tree_oid,
+                ANALYSIS_FILE_LIMIT,
+                ANALYSIS_BYTE_LIMIT,
+                stop_after_first_chunk,
+            )
+            .expect("an incomplete false-oid visit must remain partial success");
+
+        assert!(languages.is_empty());
+        assert_eq!(total_bytes, 0);
+        assert_eq!(files_scanned, 1);
+        assert!(bytes_scanned > 0);
+        assert!(bytes_scanned < fixture.body_size);
+        assert!(truncated);
+
+        let never_stop: Rc<RefCell<dyn FnMut(u64) -> bool>> = Rc::new(RefCell::new(|_| false));
+        let error = repository_analysis_from_tree(
+            &repo,
+            fixture.tree_oid,
+            ANALYSIS_FILE_LIMIT,
+            ANALYSIS_BYTE_LIMIT,
+            never_stop,
+        )
+        .expect_err("a complete visit must finalize the false physical oid");
+        assert_eq!(error.0, "corrupt_repository");
+        assert!(error.1.contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn disk_usage_deadline_override_cannot_raise_the_two_second_ceiling() {
+        assert_eq!(disk_usage_scan_duration(0), Duration::ZERO);
+        assert_eq!(
+            disk_usage_scan_duration(1_250),
+            Duration::from_millis(1_250)
+        );
+        assert_eq!(disk_usage_scan_duration(u64::MAX), DISK_USAGE_SCAN_DEADLINE);
+    }
+
+    #[test]
+    fn streaming_utf8_validation_handles_chunk_boundaries_and_rejects_false_sequences() {
+        let mut valid = Utf8Validator::new();
+        valid.push(&[0xf0, 0x9f]);
+        valid.push(&[0x98, 0x80]);
+        assert!(valid.complete());
+
+        for bytes in [
+            &[0xc0, 0x80][..],
+            &[0xe0, 0x80, 0x80][..],
+            &[0xed, 0xa0, 0x80][..],
+            &[0xf4, 0x90, 0x80, 0x80][..],
+            &[0xf0, 0x9f, 0x98][..],
+        ] {
+            let mut invalid = Utf8Validator::new();
+            invalid.push(bytes);
+            assert!(!invalid.complete(), "{bytes:?} must be invalid UTF-8");
+        }
+    }
+
     struct TreeHistoryFixture {
         temp_path: PathBuf,
         repo_path: PathBuf,
         tip_oid: String,
+    }
+
+    struct AnalysisStopFixture {
+        temp_path: PathBuf,
+        repo_path: PathBuf,
+        tree_oid: gix_hash::ObjectId,
+        body_size: u64,
+    }
+
+    impl AnalysisStopFixture {
+        fn new() -> Self {
+            let sequence = TREE_HISTORY_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+            let temp_path = std::env::temp_dir().join(format!(
+                "fornacast-analysis-stop-{}-{sequence}",
+                std::process::id()
+            ));
+            let repo_path = temp_path.join("repo.git");
+            let _ = std::fs::remove_dir_all(&temp_path);
+            std::fs::create_dir_all(&temp_path).expect("create analysis-stop fixture");
+            tree_history_git(
+                &[
+                    "init",
+                    "--bare",
+                    "--object-format=sha1",
+                    tree_history_path(&repo_path),
+                ],
+                None,
+            );
+
+            let body = vec![b'x'; 3 * 1024 * 1024 + 257];
+            let real_oid = tree_history_git(
+                &[
+                    "--git-dir",
+                    tree_history_path(&repo_path),
+                    "hash-object",
+                    "-w",
+                    "--stdin",
+                ],
+                Some(&body),
+            );
+            let false_oid = "1111111111111111111111111111111111111111";
+            let objects = repo_path.join("objects");
+            let real_path = objects.join(&real_oid[..2]).join(&real_oid[2..]);
+            let false_path = objects.join(&false_oid[..2]).join(&false_oid[2..]);
+            std::fs::create_dir_all(false_path.parent().expect("false object parent"))
+                .expect("create false object parent");
+            std::fs::copy(real_path, false_path).expect("alias blob under false oid");
+
+            let tree_oid = tree_history_git(
+                &["--git-dir", tree_history_path(&repo_path), "mktree"],
+                Some(format!("100644 blob {false_oid}\tsource.rs\n").as_bytes()),
+            );
+
+            Self {
+                temp_path,
+                repo_path,
+                tree_oid: gix_hash::ObjectId::from_hex(tree_oid.as_bytes())
+                    .expect("parse analysis tree oid"),
+                body_size: body.len() as u64,
+            }
+        }
+    }
+
+    impl Drop for AnalysisStopFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.temp_path);
+        }
     }
 
     impl TreeHistoryFixture {

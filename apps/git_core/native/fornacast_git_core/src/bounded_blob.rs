@@ -4,7 +4,7 @@
 //! Instead, it borrows public pack entry slices, parses delta programs locally,
 //! and recursively requests only copy ranges that overlap the caller's range.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::io::Read;
 use std::ops::Range;
@@ -22,6 +22,10 @@ const MAX_SOURCE_OPENS: u64 = 4_096;
 const MAX_INDEX_ENTRIES_SCANNED: u64 = 1_000_000;
 const MAX_COMPRESSED_INPUT_BYTES: u64 = 256 * MIB;
 const MAX_INFLATED_OUTPUT_BYTES: u64 = 512 * MIB;
+const MAX_VISITOR_COMPRESSED_INPUT_BYTES: u64 =
+    MAX_COMPRESSED_INPUT_BYTES + 2 * MAX_INFLATED_OUTPUT_BYTES;
+const MAX_VISITOR_INFLATED_OUTPUT_BYTES: u64 =
+    MAX_INFLATED_OUTPUT_BYTES + MAX_INFLATED_OUTPUT_BYTES;
 const MAX_DISCOVERY_BYTES: u64 = 8 * MIB;
 const MIN_PACK_INDEX_BYTES_PER_ENTRY: u64 = 24;
 const BLOB_METADATA_WORK_LIMIT: usize = 100_000_000;
@@ -30,6 +34,7 @@ const BLOB_METADATA_WORK_LIMIT: usize = 100_000_000;
 pub(crate) enum ErrorKind {
     StorageUnavailable,
     CorruptRepository,
+    Stopped,
 }
 
 #[derive(Debug)]
@@ -50,6 +55,13 @@ impl Error {
         Self {
             kind: ErrorKind::StorageUnavailable,
             detail: detail.to_string(),
+        }
+    }
+
+    fn stopped() -> Self {
+        Self {
+            kind: ErrorKind::Stopped,
+            detail: "blob visit stopped cooperatively".to_string(),
         }
     }
 
@@ -227,6 +239,13 @@ pub(crate) struct PrefixBlob {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VisitOutcome {
+    Complete { size: u64 },
+    TooLarge { size: u64 },
+    Stopped { bytes: u64, started: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BlobMetadata {
     pub(crate) kind: gix_object::Kind,
     pub(crate) size: u64,
@@ -262,7 +281,6 @@ struct DecodeWorkLimits {
     discovery_bytes: u64,
 }
 
-#[derive(Debug)]
 struct DecodeWorkBudget {
     limits: DecodeWorkLimits,
     delta_instructions: Cell<u64>,
@@ -272,10 +290,49 @@ struct DecodeWorkBudget {
     inflated_output_bytes: Cell<u64>,
     skipped_output_bytes: Cell<u64>,
     discovery_bytes: Cell<u64>,
+    stop: Option<RefCell<Box<dyn FnMut() -> bool>>>,
 }
 
 impl DecodeWorkBudget {
     fn new(caller_limit: usize) -> DecodeResult<Self> {
+        Self::new_with_stop(caller_limit, None)
+    }
+
+    fn with_stop_hook(
+        caller_limit: usize,
+        output_allowance: u64,
+        stop: impl FnMut() -> bool + 'static,
+    ) -> DecodeResult<Self> {
+        let mut budget = Self::new_with_stop(caller_limit, Some(Box::new(stop)))?;
+        let output_allowance = output_allowance.min(MAX_INFLATED_OUTPUT_BYTES);
+        budget.limits.inflated_output_bytes = budget
+            .limits
+            .inflated_output_bytes
+            .checked_add(output_allowance)
+            .map(|limit| limit.min(MAX_VISITOR_INFLATED_OUTPUT_BYTES))
+            .ok_or_else(|| Error::corrupt("visitor inflated work limit overflow"))?;
+        budget.limits.skipped_output_bytes = budget
+            .limits
+            .skipped_output_bytes
+            .checked_add(output_allowance)
+            .map(|limit| limit.min(MAX_VISITOR_INFLATED_OUTPUT_BYTES))
+            .ok_or_else(|| Error::corrupt("visitor skipped work limit overflow"))?;
+        let compressed_allowance = output_allowance
+            .checked_mul(2)
+            .ok_or_else(|| Error::corrupt("visitor compressed work allowance overflow"))?;
+        budget.limits.compressed_input_bytes = budget
+            .limits
+            .compressed_input_bytes
+            .checked_add(compressed_allowance)
+            .map(|limit| limit.min(MAX_VISITOR_COMPRESSED_INPUT_BYTES))
+            .ok_or_else(|| Error::corrupt("visitor compressed work limit overflow"))?;
+        Ok(budget)
+    }
+
+    fn new_with_stop(
+        caller_limit: usize,
+        stop: Option<Box<dyn FnMut() -> bool>>,
+    ) -> DecodeResult<Self> {
         let caller_limit = u64::try_from(caller_limit)
             .map_err(|_| Error::corrupt("caller limit does not fit the decode work counter"))?;
         let limits = DecodeWorkLimits {
@@ -333,7 +390,16 @@ impl DecodeWorkBudget {
             inflated_output_bytes: Cell::new(0),
             skipped_output_bytes: Cell::new(0),
             discovery_bytes: Cell::new(0),
+            stop: stop.map(RefCell::new),
         })
+    }
+
+    fn check_stop(&self) -> DecodeResult<()> {
+        if self.stop.as_ref().is_some_and(|stop| (stop.borrow_mut())()) {
+            Err(Error::stopped())
+        } else {
+            Ok(())
+        }
     }
 
     fn charge_delta_instruction(&self) -> DecodeResult<()> {
@@ -418,6 +484,7 @@ impl DecodeWorkBudget {
     }
 
     fn charge(&self, counter: &Cell<u64>, count: u64, limit: u64, label: &str) -> DecodeResult<()> {
+        self.check_stop()?;
         let next = counter
             .get()
             .checked_add(count)
@@ -438,6 +505,7 @@ impl DecodeWorkBudget {
         requested: usize,
         label: &str,
     ) -> DecodeResult<usize> {
+        self.check_stop()?;
         if requested == 0 {
             return Ok(0);
         }
@@ -848,6 +916,98 @@ impl CompressedSource<'_> {
     }
 }
 
+trait DecodeSink {
+    fn position(&self) -> u64;
+    fn append(&mut self, bytes: &[u8]) -> DecodeResult<()>;
+}
+
+struct RetainedSink<'a> {
+    output: &'a mut Vec<u8>,
+}
+
+impl DecodeSink for RetainedSink<'_> {
+    fn position(&self) -> u64 {
+        self.output.len() as u64
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> DecodeResult<()> {
+        let new_length = self
+            .output
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| Error::corrupt("bounded output length overflow"))?;
+        if new_length > self.output.capacity() {
+            return Err(Error::corrupt(format!(
+                "bounded output would grow beyond its {}-byte allocation",
+                self.output.capacity()
+            )));
+        }
+        self.output.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+struct VerifiedVisitorSink<'a, F> {
+    hasher: Option<gix_hash::Hasher>,
+    visitor: &'a mut F,
+    bytes: u64,
+}
+
+impl<F> VerifiedVisitorSink<'_, F>
+where
+    F: FnMut(&[u8]),
+{
+    fn new(
+        hash_kind: gix_hash::Kind,
+        size: u64,
+        visitor: &mut F,
+    ) -> DecodeResult<VerifiedVisitorSink<'_, F>> {
+        let mut hasher = gix_hash::hasher(hash_kind);
+        hasher.update(format!("blob {size}\0").as_bytes());
+        Ok(VerifiedVisitorSink {
+            hasher: Some(hasher),
+            visitor,
+            bytes: 0,
+        })
+    }
+
+    fn finalize(mut self) -> DecodeResult<gix_hash::ObjectId> {
+        self.hasher
+            .take()
+            .expect("verified visitor hasher is present until completion")
+            .try_finalize()
+            .map_err(Error::corrupt)
+    }
+}
+
+impl<F> DecodeSink for VerifiedVisitorSink<'_, F>
+where
+    F: FnMut(&[u8]),
+{
+    fn position(&self) -> u64 {
+        self.bytes
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> DecodeResult<()> {
+        if bytes.len() > STREAM_BUFFER_TARGET {
+            return Err(Error::corrupt(format!(
+                "streaming blob visitor received a {}-byte chunk",
+                bytes.len()
+            )));
+        }
+        self.hasher
+            .as_mut()
+            .expect("verified visitor hasher is present while decoding")
+            .update(bytes);
+        (self.visitor)(bytes);
+        self.bytes = self
+            .bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| Error::corrupt("streaming blob byte count overflow"))?;
+        Ok(())
+    }
+}
+
 struct InflatedStream<'a> {
     source: CompressedSource<'a>,
     inflate: gix_features::zlib::Decompress,
@@ -916,6 +1076,7 @@ impl<'a> InflatedStream<'a> {
     }
 
     fn read_required_byte(&mut self, budget: &DecodeWorkBudget) -> DecodeResult<u8> {
+        budget.check_stop()?;
         if self.available() == 0 {
             self.refill(1, budget)?;
         }
@@ -929,6 +1090,7 @@ impl<'a> InflatedStream<'a> {
 
     fn skip_exact(&mut self, mut count: u64, budget: &DecodeWorkBudget) -> DecodeResult<()> {
         while count != 0 {
+            budget.check_stop()?;
             if self.available() == 0 {
                 let request = count.min(self.output.len() as u64) as usize;
                 self.refill(request, budget)?;
@@ -945,13 +1107,17 @@ impl<'a> InflatedStream<'a> {
         Ok(())
     }
 
-    fn append_exact(
+    fn append_exact<S>(
         &mut self,
         mut count: u64,
-        output: &mut Vec<u8>,
+        output: &mut S,
         budget: &DecodeWorkBudget,
-    ) -> DecodeResult<()> {
+    ) -> DecodeResult<()>
+    where
+        S: DecodeSink + ?Sized,
+    {
         while count != 0 {
+            budget.check_stop()?;
             if self.available() == 0 {
                 let request = count.min(self.output.len() as u64) as usize;
                 self.refill(request, budget)?;
@@ -961,19 +1127,7 @@ impl<'a> InflatedStream<'a> {
                 return Err(Error::corrupt("zlib stream ended before requested data"));
             }
             let consumed = available.min(count.min(usize::MAX as u64) as usize);
-            let new_length = output
-                .len()
-                .checked_add(consumed)
-                .ok_or_else(|| Error::corrupt("bounded output length overflow"))?;
-            if new_length > output.capacity() {
-                return Err(Error::corrupt(format!(
-                    "bounded output would grow beyond its {}-byte allocation",
-                    output.capacity()
-                )));
-            }
-            output.extend_from_slice(
-                &self.output[self.output_position..self.output_position + consumed],
-            );
+            output.append(&self.output[self.output_position..self.output_position + consumed])?;
             self.output_position += consumed;
             count -= consumed as u64;
         }
@@ -1020,6 +1174,7 @@ impl<'a> InflatedStream<'a> {
 
         let output_len = budget.inflated_chunk(requested.min(self.output.len()))?;
         loop {
+            budget.check_stop()?;
             let (status, consumed, written, input_was_eof) = self.source.decompress_once(
                 &mut self.inflate,
                 &mut self.output[..output_len],
@@ -1120,6 +1275,162 @@ pub(crate) fn read_verified_prefix(
         Some(gix_object::Kind::Blob),
         Some(expected_size),
     )
+}
+
+pub(crate) fn visit_verified_blob<F, S>(
+    repo: &gix::Repository,
+    id: gix_hash::ObjectId,
+    max_size: u64,
+    should_stop: S,
+    visitor: &mut F,
+) -> DecodeResult<VisitOutcome>
+where
+    F: FnMut(&[u8]),
+    S: FnMut() -> bool + 'static,
+{
+    visit_verified_blob_impl(repo, id, max_size, should_stop, visitor).map(|(outcome, _)| outcome)
+}
+
+#[cfg(test)]
+fn visit_verified_blob_instrumented<F, S>(
+    repo: &gix::Repository,
+    id: gix_hash::ObjectId,
+    max_size: u64,
+    should_stop: S,
+    visitor: &mut F,
+) -> DecodeResult<(VisitOutcome, AllocationInstrumentation)>
+where
+    F: FnMut(&[u8]),
+    S: FnMut() -> bool + 'static,
+{
+    visit_verified_blob_impl(repo, id, max_size, should_stop, visitor)
+        .map(|(outcome, tracker)| (outcome, tracker.instrumentation))
+}
+
+fn visit_verified_blob_impl<F, S>(
+    repo: &gix::Repository,
+    id: gix_hash::ObjectId,
+    max_size: u64,
+    should_stop: S,
+    visitor: &mut F,
+) -> DecodeResult<(VisitOutcome, AllocationTracker)>
+where
+    F: FnMut(&[u8]),
+    S: FnMut() -> bool + 'static,
+{
+    let work_limit = usize::try_from(max_size.max(BLOB_METADATA_WORK_LIMIT as u64))
+        .map_err(|_| Error::corrupt("streaming blob limit does not fit usize"))?;
+    let mut tracker = AllocationTracker::new(STREAM_BUFFER_TARGET);
+    let budget = DecodeWorkBudget::with_stop_hook(work_limit, max_size, should_stop)?;
+    let (source, guarded) = match inspect_local_object_metadata(repo, id, &mut tracker, &budget) {
+        Ok(inspected) => inspected,
+        Err(error) if error.kind() == ErrorKind::Stopped => {
+            #[cfg(test)]
+            tracker.record_work(&budget);
+            return Ok((
+                VisitOutcome::Stopped {
+                    bytes: 0,
+                    started: false,
+                },
+                tracker,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let metadata = guarded.object;
+    if metadata.kind != gix_object::Kind::Blob {
+        return Err(Error::corrupt(format!(
+            "expected {}, found {}",
+            gix_object::Kind::Blob,
+            metadata.kind,
+        )));
+    }
+    if metadata.size > max_size {
+        #[cfg(test)]
+        tracker.record_work(&budget);
+        return Ok((
+            VisitOutcome::TooLarge {
+                size: metadata.size,
+            },
+            tracker,
+        ));
+    }
+    let public = match public_metadata_for_source(repo, &source, &guarded, &budget) {
+        Ok(public) => public,
+        Err(error) if error.kind() == ErrorKind::Stopped => {
+            #[cfg(test)]
+            tracker.record_work(&budget);
+            return Ok((
+                VisitOutcome::Stopped {
+                    bytes: 0,
+                    started: false,
+                },
+                tracker,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    ensure_local_public_metadata(metadata, public)?;
+    match budget.check_stop() {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::Stopped => {
+            #[cfg(test)]
+            tracker.record_work(&budget);
+            return Ok((
+                VisitOutcome::Stopped {
+                    bytes: 0,
+                    started: false,
+                },
+                tracker,
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+
+    let length = usize::try_from(metadata.size)
+        .map_err(|_| Error::corrupt("streaming blob size does not fit usize"))?;
+    tracker.mark_header_known();
+    let mut sink = VerifiedVisitorSink::new(id.kind(), metadata.size, visitor)?;
+    let result = append_source_range_to_sink(
+        repo,
+        &source,
+        metadata,
+        0,
+        length,
+        &mut sink,
+        &mut tracker,
+        &mut Vec::new(),
+        &guarded,
+        &budget,
+    );
+
+    let outcome = match result {
+        Ok(()) => {
+            if sink.bytes != metadata.size {
+                return Err(Error::corrupt(format!(
+                    "streaming blob decoder returned {} bytes for declared size {}",
+                    sink.bytes, metadata.size
+                )));
+            }
+            let actual = sink.finalize()?;
+            if actual != id {
+                return Err(Error::corrupt(format!(
+                    "object checksum mismatch: expected {id}, computed {actual}"
+                )));
+            }
+            Ok(VisitOutcome::Complete {
+                size: metadata.size,
+            })
+        }
+        Err(error) if error.kind() == ErrorKind::Stopped => Ok(VisitOutcome::Stopped {
+            bytes: sink.bytes,
+            started: sink.bytes != 0,
+        }),
+        Err(error) => Err(error),
+    }?;
+    #[cfg(test)]
+    tracker.record_work(&budget);
+    Ok((outcome, tracker))
 }
 
 fn read_prefix_impl(
@@ -1254,19 +1565,35 @@ fn inspect_object_metadata(
     Ok((source, guarded))
 }
 
+fn inspect_local_object_metadata(
+    repo: &gix::Repository,
+    id: gix_hash::ObjectId,
+    tracker: &mut AllocationTracker,
+    budget: &DecodeWorkBudget,
+) -> DecodeResult<(ObjectSource, GuardedMetadata)> {
+    let source = locate_source(repo, id, None, budget)?;
+    let guarded = probe_guarded_source(repo, &source, tracker, budget)?;
+    Ok((source, guarded))
+}
+
 fn validate_local_metadata_before_public_header(
     local_probe: impl FnOnce() -> DecodeResult<GuardedMetadata>,
     public_header: impl FnOnce(&GuardedMetadata) -> DecodeResult<ObjectMetadata>,
 ) -> DecodeResult<GuardedMetadata> {
     let local = local_probe()?;
     let public = public_header(&local)?;
-    if local.object != public {
+    ensure_local_public_metadata(local.object, public)?;
+    Ok(local)
+}
+
+fn ensure_local_public_metadata(local: ObjectMetadata, public: ObjectMetadata) -> DecodeResult<()> {
+    if local != public {
         return Err(Error::corrupt(format!(
             "object metadata mismatch: public header {}/{}, storage {}/{}",
-            public.kind, public.size, local.object.kind, local.object.size
+            public.kind, public.size, local.kind, local.size
         )));
     }
-    Ok(local)
+    Ok(())
 }
 
 fn public_metadata_for_source(
@@ -1905,6 +2232,28 @@ fn append_source_range(
     guarded: &GuardedMetadata,
     budget: &DecodeWorkBudget,
 ) -> DecodeResult<()> {
+    let mut sink = RetainedSink { output };
+    append_source_range_to_sink(
+        repo, source, expected, start, length, &mut sink, tracker, stack, guarded, budget,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_source_range_to_sink<S>(
+    repo: &gix::Repository,
+    source: &ObjectSource,
+    expected: ObjectMetadata,
+    start: u64,
+    length: usize,
+    output: &mut S,
+    tracker: &mut AllocationTracker,
+    stack: &mut Vec<ObjectSource>,
+    guarded: &GuardedMetadata,
+    budget: &DecodeWorkBudget,
+) -> DecodeResult<()>
+where
+    S: DecodeSink + ?Sized,
+{
     let end = start
         .checked_add(length as u64)
         .ok_or_else(|| Error::corrupt("requested object range overflow"))?;
@@ -1916,7 +2265,7 @@ fn append_source_range(
     }
 
     enter_source(source, stack)?;
-    let output_start = output.len();
+    let output_start = output.position();
     let role = if stack.len() == 1 {
         BufferRole::DecodedObject
     } else {
@@ -1970,8 +2319,11 @@ fn append_source_range(
     };
 
     let result = result.and_then(|()| {
-        let appended = output.len() - output_start;
-        if appended != length {
+        let appended = output
+            .position()
+            .checked_sub(output_start)
+            .ok_or_else(|| Error::corrupt("decoder output position moved backwards"))?;
+        if appended != length as u64 {
             Err(Error::corrupt(format!(
                 "decoder appended {appended} bytes for a {length}-byte request"
             )))
@@ -1983,19 +2335,22 @@ fn append_source_range(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn append_delta_range(
+fn append_delta_range<S>(
     repo: &gix::Repository,
     source: &ObjectSource,
     opened: &OpenedPack,
     expected: ObjectMetadata,
     start: u64,
     end: u64,
-    output: &mut Vec<u8>,
+    output: &mut S,
     tracker: &mut AllocationTracker,
     stack: &mut Vec<ObjectSource>,
     guarded: &GuardedMetadata,
     budget: &DecodeWorkBudget,
-) -> DecodeResult<()> {
+) -> DecodeResult<()>
+where
+    S: DecodeSink + ?Sized,
+{
     let verified_base = guarded.delta_base(source)?;
     let base = &verified_base.base;
     let base_metadata = verified_base.metadata;
@@ -2066,7 +2421,7 @@ fn append_delta_range(
                 {
                     let length = usize::try_from(base_range.end - base_range.start)
                         .map_err(|_| Error::corrupt("delta copy length does not fit usize"))?;
-                    append_source_range(
+                    append_source_range_to_sink(
                         repo,
                         base,
                         base_metadata,
@@ -2260,16 +2615,21 @@ mod tests {
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
         AllocationTracker, DecodeWorkBudget, DecodeWorkLimits, DeltaInstruction, Error, ErrorKind,
-        GuardedMetadata, MAX_CHAIN_DEPTH, METADATA_BUFFER_LIMIT, ObjectMetadata, ObjectSource,
-        PUBLIC_HEADER_OUTPUT_LIMIT, VerifiedDeltaBase, VerifiedPackEntry, append_source_range,
-        decode_delta_instruction, decode_delta_varint, enter_source, locate_source,
-        opened_pack_from_parts, overlapping_base_range, pack_index_paths, parse_alternate_paths,
-        probe_guarded_source, public_metadata_for_opened_pack, read_object_prefix, read_prefix,
-        resolve_alternate_path, validate_local_metadata_before_public_header,
+        GuardedMetadata, MAX_CHAIN_DEPTH, MAX_INFLATED_OUTPUT_BYTES,
+        MAX_VISITOR_COMPRESSED_INPUT_BYTES, MAX_VISITOR_INFLATED_OUTPUT_BYTES,
+        METADATA_BUFFER_LIMIT, MIB, ObjectMetadata, ObjectSource, PUBLIC_HEADER_OUTPUT_LIMIT,
+        STREAM_BUFFER_TARGET, VerifiedDeltaBase, VerifiedPackEntry, VisitOutcome,
+        append_source_range, decode_delta_instruction, decode_delta_varint, enter_source,
+        locate_source, loose_object_path_at, opened_pack_from_parts, overlapping_base_range,
+        pack_index_paths, parse_alternate_paths, probe_guarded_source,
+        public_metadata_for_opened_pack, read_object_prefix, read_prefix, resolve_alternate_path,
+        validate_local_metadata_before_public_header, visit_verified_blob,
+        visit_verified_blob_instrumented,
     };
 
     const PREFIX_LIMIT: usize = 64 * 1024;
@@ -2418,6 +2778,336 @@ mod tests {
     #[test]
     fn prefix_blob_packed_ref_delta_obeys_the_bounded_contract() {
         assert_bounded_contract(packed_ref_delta_fixture());
+    }
+
+    #[test]
+    fn verified_blob_visitor_streams_every_storage_form_in_eight_kib_chunks() {
+        for fixture in [
+            loose_fixture(),
+            alternate_loose_fixture(),
+            packed_base_fixture(),
+            packed_delta_fixture(),
+            packed_ref_delta_fixture(),
+        ] {
+            let repo = gix::open(&fixture.repo_path).expect("open streaming fixture");
+            let mut visited = 0_u64;
+            let mut max_chunk = 0_usize;
+            let mut visitor = |chunk: &[u8]| {
+                assert!(!chunk.is_empty());
+                visited += chunk.len() as u64;
+                max_chunk = max_chunk.max(chunk.len());
+            };
+
+            let outcome = visit_verified_blob(
+                &repo,
+                fixture.oid,
+                fixture.original.len() as u64,
+                || false,
+                &mut visitor,
+            )
+            .expect("stream and verify complete blob");
+
+            assert_eq!(
+                outcome,
+                VisitOutcome::Complete {
+                    size: fixture.original.len() as u64
+                },
+                "{}",
+                fixture.evidence
+            );
+            assert_eq!(visited, fixture.original.len() as u64);
+            assert!(max_chunk <= STREAM_BUFFER_TARGET);
+        }
+    }
+
+    #[test]
+    fn verified_blob_visitor_preflights_size_and_retains_only_bounded_buffers() {
+        let fixture = packed_delta_fixture();
+        let repo = gix::open(&fixture.repo_path).expect("open streaming fixture");
+        let mut too_large_calls = 0_usize;
+        let too_large = visit_verified_blob(
+            &repo,
+            fixture.oid,
+            fixture.original.len() as u64 - 1,
+            || false,
+            &mut |_| too_large_calls += 1,
+        )
+        .expect("preflight oversized blob");
+
+        assert_eq!(
+            too_large,
+            VisitOutcome::TooLarge {
+                size: fixture.original.len() as u64
+            }
+        );
+        assert_eq!(too_large_calls, 0, "oversized bodies must not be visited");
+
+        let mut visited = 0_u64;
+        let (complete, allocations) = visit_verified_blob_instrumented(
+            &repo,
+            fixture.oid,
+            fixture.original.len() as u64,
+            || false,
+            &mut |chunk: &[u8]| visited += chunk.len() as u64,
+        )
+        .expect("visit exact-size packed delta");
+
+        assert_eq!(
+            complete,
+            VisitOutcome::Complete {
+                size: fixture.original.len() as u64
+            }
+        );
+        assert_eq!(visited, fixture.original.len() as u64);
+        assert_eq!(allocations.content_bytes_allocated_before_header, 0);
+        assert!(allocations.max_metadata_buffer <= METADATA_BUFFER_LIMIT);
+        for allocation in [
+            allocations.max_intermediate_object_buffer,
+            allocations.max_decoded_object_buffer,
+            allocations.max_decoded_base_buffer,
+            allocations.max_delta_buffer,
+            allocations.max_work_buffer,
+        ] {
+            assert!(
+                allocation <= STREAM_BUFFER_TARGET,
+                "streaming visitor retained a {allocation}-byte content buffer"
+            );
+            assert!(allocation < fixture.original.len());
+        }
+        assert!(allocations.source_opens > 0);
+        assert!(allocations.index_entries_scanned > 0);
+        assert!(allocations.delta_instructions > 0);
+        assert!(allocations.compressed_input_bytes > 0);
+        assert!(allocations.inflated_output_bytes > 0);
+    }
+
+    #[test]
+    fn verified_blob_visitor_rejects_large_loose_size_before_public_file_charge() {
+        let temp = TempDirectory::new("sparse-oversized-loose");
+        let repo_path = temp.0.join("sparse-oversized-loose.git");
+        git(
+            &[
+                "init",
+                "--bare",
+                "--object-format=sha1",
+                path_str(&repo_path),
+            ],
+            None,
+        );
+        let fake_oid = parse_oid("2222222222222222222222222222222222222222");
+        let object_path = loose_object_path_at(&repo_path.join("objects"), fake_oid);
+        std::fs::create_dir_all(object_path.parent().expect("fake loose parent"))
+            .expect("create fake loose parent");
+        let mut object = std::fs::File::create(&object_path).expect("create sparse loose object");
+        object
+            .write_all(&zlib(b"blob 10\0x"))
+            .expect("write loose object prefix");
+        let sparse_size = super::MAX_COMPRESSED_INPUT_BYTES + 1;
+        object
+            .set_len(sparse_size)
+            .expect("extend sparse loose object");
+        drop(object);
+        let repo = gix::open(&repo_path).expect("open sparse loose repository");
+
+        for max_size in [0, 1] {
+            let mut visitor_calls = 0_usize;
+            let (outcome, allocations) =
+                visit_verified_blob_instrumented(&repo, fake_oid, max_size, || false, &mut |_| {
+                    visitor_calls += 1
+                })
+                .expect("declared size must stop before whole-file public-header work");
+
+            assert_eq!(outcome, VisitOutcome::TooLarge { size: 10 });
+            assert_eq!(visitor_calls, 0);
+            assert!(
+                allocations.compressed_input_bytes < sparse_size,
+                "oversized preflight charged the complete sparse loose file"
+            );
+        }
+    }
+
+    #[test]
+    fn verified_blob_visitor_honors_an_immediate_stop_before_body_work() {
+        for fixture in [
+            loose_fixture(),
+            alternate_loose_fixture(),
+            packed_base_fixture(),
+            packed_delta_fixture(),
+            packed_ref_delta_fixture(),
+        ] {
+            let repo = gix::open(&fixture.repo_path).expect("open immediate-stop fixture");
+            let mut visitor_calls = 0_usize;
+            let outcome = visit_verified_blob(
+                &repo,
+                fixture.oid,
+                fixture.original.len() as u64,
+                || true,
+                &mut |_| visitor_calls += 1,
+            )
+            .expect("immediate cooperative stop");
+
+            assert_eq!(
+                outcome,
+                VisitOutcome::Stopped {
+                    bytes: 0,
+                    started: false
+                }
+            );
+            assert_eq!(visitor_calls, 0);
+        }
+    }
+
+    #[test]
+    fn verified_blob_visitor_never_marks_zero_emitted_bytes_as_started() {
+        let fixture = loose_fixture();
+        let repo = gix::open(&fixture.repo_path).expect("open call-count stop fixture");
+        let stop_calls = Rc::new(Cell::new(0_usize));
+        let stop_counter = Rc::clone(&stop_calls);
+        let mut visitor_calls = 0_usize;
+
+        let outcome = visit_verified_blob(
+            &repo,
+            fixture.oid,
+            fixture.original.len() as u64,
+            move || {
+                let call = stop_counter.get() + 1;
+                stop_counter.set(call);
+                call == 2
+            },
+            &mut |_| visitor_calls += 1,
+        )
+        .expect("second cooperative checkpoint stops cleanly");
+
+        assert_eq!(stop_calls.get(), 2);
+        assert_eq!(visitor_calls, 0);
+        assert_eq!(
+            outcome,
+            VisitOutcome::Stopped {
+                bytes: 0,
+                started: false
+            }
+        );
+    }
+
+    #[test]
+    fn verified_blob_visitor_stops_inside_repeated_high_offset_delta_copies() {
+        let fixture = repeated_high_offset_copy_fixture(4);
+        let repo = gix::open(&fixture.repo_path).expect("open high-offset fixture");
+        let visited = Rc::new(Cell::new(0_u64));
+        let stop_at = Rc::clone(&visited);
+        let visitor_count = Rc::clone(&visited);
+
+        let outcome = visit_verified_blob(
+            &repo,
+            fixture.oid,
+            fixture.original.len() as u64,
+            move || stop_at.get() != 0,
+            &mut move |chunk: &[u8]| {
+                visitor_count.set(visitor_count.get() + chunk.len() as u64);
+            },
+        )
+        .expect("stop cooperatively during a high-offset COPY program");
+
+        assert_eq!(
+            outcome,
+            VisitOutcome::Stopped {
+                bytes: 1,
+                started: true
+            }
+        );
+        assert_eq!(visited.get(), 1);
+        assert!(visited.get() < fixture.original.len() as u64);
+    }
+
+    #[test]
+    fn streaming_budget_accepts_the_exact_analysis_maximum_and_remains_finite() {
+        let body = 512 * MIB;
+        let header = b"blob 536870912\0".len() as u64;
+        let budget =
+            DecodeWorkBudget::with_stop_hook(super::BLOB_METADATA_WORK_LIMIT, body, || false)
+                .expect("visitor work budget");
+
+        budget
+            .charge_inflated_output(header)
+            .expect("local metadata header");
+        budget
+            .charge_inflated_output(PUBLIC_HEADER_OUTPUT_LIMIT)
+            .expect("public metadata header");
+        budget
+            .charge_inflated_output(header)
+            .expect("body reopen header");
+        budget
+            .charge_inflated_output(body)
+            .expect("exact 512 MiB body");
+        assert!(budget.inflated_output_bytes.get() > MAX_INFLATED_OUTPUT_BYTES);
+        let inflated_remainder =
+            MAX_VISITOR_INFLATED_OUTPUT_BYTES - budget.inflated_output_bytes.get();
+        budget
+            .charge_inflated_output(inflated_remainder)
+            .expect("finite inflated visitor reserve");
+        assert!(budget.charge_inflated_output(1).is_err());
+
+        budget
+            .charge_compressed_input(body)
+            .expect("guarded compressed object");
+        budget
+            .charge_compressed_input(body)
+            .expect("streamed compressed object");
+        let compressed_remainder =
+            MAX_VISITOR_COMPRESSED_INPUT_BYTES - budget.compressed_input_bytes.get();
+        budget
+            .charge_compressed_input(compressed_remainder)
+            .expect("finite compressed visitor reserve");
+        assert!(budget.charge_compressed_input(1).is_err());
+    }
+
+    #[test]
+    fn verified_blob_visitor_stops_mid_file_without_finalizing_a_false_oid() {
+        let fixture = loose_fixture();
+        let fake_oid = parse_oid("1111111111111111111111111111111111111111");
+        let object_db = fixture.repo_path.join("objects");
+        let source = loose_object_path_at(&object_db, fixture.oid);
+        let target = loose_object_path_at(&object_db, fake_oid);
+        std::fs::create_dir_all(target.parent().expect("fake loose parent"))
+            .expect("create fake loose parent");
+        std::fs::copy(source, target).expect("alias loose blob under false oid");
+        let repo = gix::open(&fixture.repo_path).expect("open false-oid fixture");
+        let visited = Rc::new(Cell::new(0_u64));
+        let stop_at = Rc::clone(&visited);
+        let visitor_count = Rc::clone(&visited);
+        let mut visitor = move |chunk: &[u8]| {
+            visitor_count.set(visitor_count.get() + chunk.len() as u64);
+        };
+
+        let outcome = visit_verified_blob(
+            &repo,
+            fake_oid,
+            fixture.original.len() as u64,
+            move || stop_at.get() != 0,
+            &mut visitor,
+        )
+        .expect("cooperative stop is not corruption");
+
+        assert_eq!(
+            outcome,
+            VisitOutcome::Stopped {
+                bytes: visited.get(),
+                started: true
+            }
+        );
+        assert!(visited.get() > 0);
+        assert!(visited.get() < fixture.original.len() as u64);
+
+        let error = visit_verified_blob(
+            &repo,
+            fake_oid,
+            fixture.original.len() as u64,
+            || false,
+            &mut |_| {},
+        )
+        .expect_err("a complete visit must compare the physical blob oid");
+        assert_eq!(error.kind(), ErrorKind::CorruptRepository);
+        assert!(error.to_string().contains("checksum mismatch"));
     }
 
     #[test]
@@ -3600,6 +4290,7 @@ mod tests {
             inflated_output_bytes: Cell::new(0),
             skipped_output_bytes: Cell::new(0),
             discovery_bytes: Cell::new(0),
+            stop: None,
         }
     }
 
