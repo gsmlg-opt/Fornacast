@@ -1,0 +1,43 @@
+<.repository_frame result={@result} active={:commits}>
+  <section class="repository-collection-page min-w-0" data-commits-page>
+    <header class="repository-collection-heading">
+      <div>
+        <p class="repository-kicker">History</p>
+        <h2>Commits</h2>
+      </div>
+      <span>{@result.content.page.total} total</span>
+    </header>
+
+    <div class="repository-table-wrap" data-repository-table>
+      <.dm_table
+        id="repository-commits-table"
+        data={@result.content.page.commits}
+        compact
+        hover
+        class="repository-component repository-table"
+      >
+        <:col :let={commit} label="Commit">
+          <.dm_link href={commit_path(@result.chrome, commit.oid)}>{commit.title}</.dm_link>
+          <p class="repository-meta">{commit.author_name}</p>
+        </:col>
+        <:col :let={commit} label="Committed">{format_time(commit.author_time)}</:col>
+        <:col :let={commit} label="SHA">
+          <code class="repository-inline-hash" data-repository-hash>{short_oid(commit.oid)}</code>
+        </:col>
+      </.dm_table>
+    </div>
+
+    <.optional_panel
+      :if={@result.content.page.commits == []}
+      title="No commits"
+      message="No commits were found on this ref."
+      kind="empty"
+    />
+
+    <.server_pagination
+      page={@result.content.page.page}
+      total_pages={@result.content.page.total_pages}
+      base_href={commits_path(@result.chrome)}
+    />
+  </section>
+</.repository_frame>

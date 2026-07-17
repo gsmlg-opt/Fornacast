@@ -44,6 +44,46 @@ defmodule FornacastWeb.HTML do
     |> send_resp(conn.status || 200, html)
   end
 
+  def repository_page(conn, title, safe_body) do
+    current_user = conn.assigns[:current_user]
+
+    css_path =
+      DuskmoonBundler.static_path(FornacastWeb.Endpoint, "/assets/css/app.css",
+        profile: :fornacast_web
+      )
+
+    js_path =
+      DuskmoonBundler.static_path(FornacastWeb.Endpoint, "/assets/js/app.js",
+        profile: :fornacast_web
+      )
+
+    html = [
+      "<!doctype html><html lang=\"en\" data-theme=\"sunshine\"><head>",
+      "<meta charset=\"utf-8\">",
+      "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+      "<meta name=\"csrf-token\" content=\"",
+      escape(Plug.CSRFProtection.get_csrf_token()),
+      "\">",
+      "<title>",
+      escape(title),
+      " - Fornacast</title>",
+      preload_tags(),
+      "<link rel=\"stylesheet\" href=\"",
+      escape(css_path),
+      "\">",
+      "<script type=\"module\" src=\"",
+      escape(js_path),
+      "\"></script>",
+      "</head><body class=\"app-body bg-surface text-on-surface\">",
+      repository_shell(current_user, repository_safe_iodata(safe_body)),
+      "</body></html>"
+    ]
+
+    conn
+    |> put_resp_content_type("text/html")
+    |> send_resp(conn.status || 200, html)
+  end
+
   def escape(value) do
     value
     |> to_string()
@@ -106,6 +146,53 @@ defmodule FornacastWeb.HTML do
       """
     end
   end
+
+  defp repository_shell(current_user, safe_body) do
+    if current_user do
+      [
+        "<div class=\"app-shell repository-shell\" data-repository-shell=\"authenticated\">",
+        "<header class=\"appbar appbar-primary appbar-sticky\">",
+        "<div class=\"appbar-left\">",
+        "<a class=\"brand-mark\" href=\"/\" aria-label=\"Fornacast dashboard\">Fornacast</a>",
+        "<nav class=\"appbar-nav\" aria-label=\"Workspace\">",
+        "<a class=\"nav-link\" href=\"/issues\">Issues</a>",
+        "<a class=\"nav-link\" href=\"/pulls\">Pull Requests</a>",
+        repository_menu(current_user),
+        "</nav></div>",
+        "<div class=\"appbar-actions\">",
+        create_menu(),
+        account_menu(current_user),
+        theme_menu(),
+        "</div></header>",
+        "<main class=\"repository-main\" data-repository-main>",
+        safe_body,
+        "</main></div>"
+      ]
+    else
+      [
+        "<div class=\"repository-shell\" data-repository-shell=\"anonymous\">",
+        "<header class=\"appbar appbar-primary appbar-sticky\">",
+        "<a class=\"brand-mark\" href=\"/\" aria-label=\"Fornacast home\">Fornacast</a>",
+        "<nav class=\"app-nav\" aria-label=\"Repository actions\">",
+        "<a class=\"nav-link\" href=\"/login\">Login</a>",
+        theme_menu(),
+        "</nav></header>",
+        "<main class=\"repository-main\" data-repository-main>",
+        safe_body,
+        "</main></div>"
+      ]
+    end
+  end
+
+  defp repository_safe_iodata({:safe, data}), do: repository_safe_iodata(data)
+
+  defp repository_safe_iodata([]), do: []
+
+  defp repository_safe_iodata([head | tail]),
+    do: [repository_safe_iodata(head) | repository_safe_iodata(tail)]
+
+  defp repository_safe_iodata(item) when is_binary(item), do: item
+  defp repository_safe_iodata(item) when is_integer(item), do: <<item>>
 
   defp create_menu do
     """

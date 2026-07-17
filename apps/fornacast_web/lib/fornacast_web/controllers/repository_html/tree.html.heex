@@ -1,0 +1,27 @@
+<.repository_frame result={@result} active={:code}>
+  <section class="repository-tree-page min-w-0" data-tree-page>
+    <.server_breadcrumbs result={@result} path={@result.content.path} />
+    <div class="repository-file-tree-wrap" data-file-tree>
+      <.dm_git_file_tree
+        id="repository-file-tree"
+        class="repository-component repository-file-tree"
+        label={"Files in #{@result.content.path}"}
+      >
+        <:row
+          :for={row <- tree_rows(@result, @result.content.path, @result.content.tree.entries)}
+          kind={row.kind}
+          name={row.name}
+          path={row.path}
+          meta={row.meta}
+          href={row.href}
+          aria_label={row.aria_label}
+        />
+      </.dm_git_file_tree>
+    </div>
+    <.server_pagination
+      page={@result.content.tree.page}
+      total_pages={@result.content.tree.total_pages}
+      base_href={source_path(@result.chrome, @result.content.path)}
+    />
+  </section>
+</.repository_frame>

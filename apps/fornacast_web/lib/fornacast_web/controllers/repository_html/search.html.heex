@@ -1,0 +1,105 @@
+<.repository_frame result={@result} active={:code}>
+  <section class="repository-search-page min-w-0" data-search-page>
+    <header class="repository-collection-heading">
+      <div>
+        <p class="repository-kicker">Snapshot search</p>
+        <h2>Search repository</h2>
+      </div>
+    </header>
+
+    <form
+      action={search_path(@result.chrome)}
+      method="get"
+      class="repository-search-form"
+      role="search"
+      aria-label="Repository search"
+      data-search-form
+    >
+      <input
+        :if={selected_full_ref(@result)}
+        type="hidden"
+        name="ref"
+        value={selected_full_ref(@result)}
+      />
+      <.dm_input
+        id="repository-search-query"
+        name="q"
+        type="search"
+        label="Search query"
+        value={@result.content.query}
+        maxlength="200"
+        required
+      />
+      <.dm_select
+        id="repository-search-scope"
+        name="scope"
+        label="Search scope"
+        value={to_string(@result.content.scope)}
+        options={[{"path", "File paths"}, {"content", "File contents"}]}
+      />
+      <button type="submit" class="btn btn-primary">Search</button>
+    </form>
+
+    <.optional_panel
+      :if={validation_message(@result.content.validation_error)}
+      title="Search request"
+      message={validation_message(@result.content.validation_error)}
+      kind="warning"
+    />
+
+    <.optional_panel
+      :if={
+        is_nil(@result.content.validation_error) and @result.content.query == "" and
+          is_nil(@result.content.results)
+      }
+      title="Search repository"
+      message="Enter a query to search this snapshot."
+      kind="empty"
+    />
+
+    <%= if @result.content.results do %>
+      <div class="repository-search-summary">
+        <span>{@result.content.results.files_scanned} files scanned</span>
+        <span>{format_bytes(@result.content.results.bytes_scanned)} inspected</span>
+      </div>
+
+      <ul
+        :if={search_truncation_labels(@result.content.results) != []}
+        class="repository-search-limits"
+        role="list"
+        data-search-limits
+      >
+        <li :for={label <- search_truncation_labels(@result.content.results)}>{label}</li>
+      </ul>
+
+      <div
+        :if={@result.content.results.results != []}
+        class="repository-table-wrap"
+        data-repository-table
+      >
+        <.dm_table
+          id="repository-search-results"
+          data={@result.content.results.results}
+          compact
+          hover
+          class="repository-component repository-table"
+        >
+          <:col :let={result} label="Path">
+            <.dm_link href={source_path(@result.chrome, result.path)}>{result.path}</.dm_link>
+          </:col>
+          <:col :let={result} label="Line">{result.line || "—"}</:col>
+          <:col :let={result} label="Match">
+            <code class="repository-search-snippet" data-repository-snippet>{result.snippet}</code>
+          </:col>
+        </.dm_table>
+      </div>
+
+      <.optional_panel
+        :if={@result.content.results.results == []}
+        title="No results"
+        message="No results found."
+        kind="empty"
+      />
+    <% end %>
+  </section>
+</.repository_frame>

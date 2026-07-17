@@ -1,0 +1,35 @@
+<.repository_frame result={@result} active={:commits}>
+  <section class="repository-commit-page min-w-0" data-commit-page>
+    <.optional_panel
+      :if={@result.content.diff.truncated}
+      title="Commit diff truncated."
+      message="This commit diff exceeded the configured display limit."
+      kind="warning"
+      data-diff-truncated
+    />
+    <.dm_git_commit_diff
+      id="repository-commit-diff"
+      class="repository-component repository-commit-diff"
+      title={@result.content.commit.title}
+      sha={@result.content.commit.oid}
+      author={@result.content.commit.author_name}
+      committed_at={format_time(@result.content.commit.author_time)}
+      message={@result.content.commit.message}
+      changed_files={@result.content.diff.changed_files}
+      additions={@result.content.diff.additions}
+      deletions={@result.content.diff.deletions}
+      data-commit-diff
+    >
+      <:file
+        :for={file <- @result.content.diff.files}
+        path={file.path}
+        status={to_string(file.status)}
+        additions={file.additions}
+        deletions={file.deletions}
+        binary={file.binary}
+        truncated={file.truncated}
+        lines={Enum.map(file.lines || [], &diff_line_map/1)}
+      />
+    </.dm_git_commit_diff>
+  </section>
+</.repository_frame>

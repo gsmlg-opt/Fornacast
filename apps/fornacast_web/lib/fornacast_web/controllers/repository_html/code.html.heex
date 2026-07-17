@@ -1,0 +1,262 @@
+<.repository_frame result={@result} active={:code}>
+  <%= if @result.kind == :code do %>
+    <div class="repository-code-layout" data-repository-grid>
+      <div class="repository-code-main min-w-0">
+        <section
+          class="repository-component repository-summary-strip"
+          aria-label="Repository summary"
+          data-repository-summary
+        >
+          <.dm_link href={commits_path(@result.chrome)}>
+            {@result.content.commit_summary.count} commits
+          </.dm_link>
+          <.dm_link href={refs_path(@result.chrome, :branch)}>
+            {@result.chrome.ref_summary.branch_count} branches
+          </.dm_link>
+          <.dm_link href={refs_path(@result.chrome, :tag)}>
+            {@result.chrome.ref_summary.tag_count} tags
+          </.dm_link>
+        </section>
+
+        <.ref_controls result={@result} />
+
+        <section
+          :if={@result.content.commit_summary.latest}
+          class="repository-component repository-latest-commit"
+          aria-label="Latest commit"
+          data-latest-commit
+        >
+          <div class="min-w-0">
+            <p class="repository-kicker">Latest commit</p>
+            <.dm_link
+              href={commit_path(@result.chrome, @result.content.commit_summary.latest.oid)}
+              class="repository-latest-title"
+            >
+              {@result.content.commit_summary.latest.title}
+            </.dm_link>
+            <p class="repository-meta">
+              {@result.content.commit_summary.latest.author_name} · {relative_time(
+                @result.content.commit_summary.latest.author_time
+              )}
+            </p>
+          </div>
+          <code class="repository-inline-hash" data-repository-hash>
+            {short_oid(@result.content.commit_summary.latest.oid)}
+          </code>
+        </section>
+
+        <div id="repository-files" class="repository-file-tree-wrap" data-file-tree>
+          <.dm_git_file_tree
+            id="repository-file-tree"
+            class="repository-component repository-file-tree"
+            label="Repository files"
+          >
+            <:row
+              :for={row <- tree_rows(@result, "", @result.content.tree.entries)}
+              kind={row.kind}
+              name={row.name}
+              path={row.path}
+              meta={row.meta}
+              href={row.href}
+              aria_label={row.aria_label}
+            />
+          </.dm_git_file_tree>
+          <.server_pagination
+            page={@result.content.tree.page}
+            total_pages={@result.content.tree.total_pages}
+            base_href={source_path(@result.chrome)}
+          />
+        </div>
+
+        <section
+          :if={match?({:ok, _}, @result.content.readme)}
+          id="repository-readme"
+          class="repository-component repository-readme"
+          data-readme
+        >
+          <header class="repository-section-header">
+            <h2>README</h2>
+            <code>{elem(@result.content.readme, 1).path}</code>
+          </header>
+          <div class="repository-readme-content">
+            {elem(@result.content.readme, 1).html}
+          </div>
+        </section>
+
+        <.optional_panel
+          :if={match?({:unavailable, _}, @result.content.readme)}
+          title="README"
+          message="README temporarily unavailable"
+          kind="unavailable"
+        />
+      </div>
+
+      <aside class="repository-sidebar" aria-label="Repository details" data-repository-sidebar>
+        <section class="repository-component repository-sidebar-panel repository-sidebar-search">
+          <h2>Search repository</h2>
+          <form
+            action={search_path(@result.chrome)}
+            method="get"
+            class="repository-quick-search"
+            role="search"
+            aria-label="Quick repository search"
+          >
+            <input type="hidden" name="ref" value={selected_full_ref(@result)} />
+            <input type="hidden" name="scope" value="content" />
+            <%!-- TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#88 --%>
+            <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#88 --%>
+            <.dm_input
+              id="repository-quick-search-query"
+              name="q"
+              type="search"
+              label="Search code"
+              value=""
+              placeholder="Path or content"
+              class="repository-quick-search-input"
+            />
+            <button type="submit" class="btn btn-sm">Search</button>
+          </form>
+        </section>
+
+        <section class="repository-component repository-sidebar-panel">
+          <h2>Description</h2>
+          <p>{@result.chrome.repository.description || "No description provided."}</p>
+          <.dm_link
+            :if={match?({:ok, _}, @result.content.readme)}
+            href="#repository-readme"
+            data-readme-jump
+          >
+            README
+          </.dm_link>
+        </section>
+
+        <section class="repository-component repository-sidebar-panel" data-repository-size>
+          <h2>Repository size</h2>
+          <%= case @result.content.disk_usage do %>
+            <% {:ok, bytes} -> %>
+              <p>{format_bytes(bytes)}</p>
+            <% {:unavailable, _reason} -> %>
+              <p>Size temporarily unavailable</p>
+          <% end %>
+        </section>
+
+        <section class="repository-component repository-sidebar-panel" data-repository-languages>
+          <%= case @result.content.analysis do %>
+            <% {:ok, analysis} -> %>
+              <h2>
+                {if analysis.truncated, do: "Partial language analysis", else: "Languages"}
+              </h2>
+              <p :if={analysis.truncated} class="repository-meta">
+                {analysis.files_scanned} files / {analysis.bytes_scanned} bytes scanned
+              </p>
+              <div
+                :if={analysis.languages != []}
+                class="repository-language-bar"
+                role="img"
+                aria-label={
+                  if analysis.truncated,
+                    do: "Partial language breakdown by scanned bytes",
+                    else: "Languages by bytes"
+                }
+                data-language-bar
+              >
+                <span
+                  :for={{language, index} <- Enum.with_index(analysis.languages)}
+                  class={[
+                    "repository-language-segment",
+                    language_segment_class(index)
+                  ]}
+                  style={"flex-grow: #{max(language.bytes, 1)}"}
+                  title={"#{language.language}: #{format_bytes(language.bytes)}"}
+                ></span>
+              </div>
+              <ul class="repository-language-list" role="list">
+                <li :for={{language, index} <- Enum.with_index(analysis.languages)}>
+                  <span class="repository-language-name">
+                    <span
+                      class={[
+                        "repository-language-dot",
+                        language_segment_class(index)
+                      ]}
+                      aria-hidden="true"
+                    ></span>
+                    {language.language}
+                  </span>
+                  <span>
+                    <%= if analysis.truncated do %>
+                      {format_bytes(language.bytes)}
+                    <% else %>
+                      {analysis_percentage(language.bytes, analysis.total_bytes)}%
+                    <% end %>
+                  </span>
+                </li>
+              </ul>
+            <% {:unavailable, _reason} -> %>
+              <h2>Languages</h2>
+              <p>Analysis temporarily unavailable</p>
+          <% end %>
+        </section>
+      </aside>
+    </div>
+  <% end %>
+
+  <%= if @result.kind == :empty do %>
+    <section class="repository-empty-layout" data-empty-repository>
+      <.optional_panel
+        title="Empty repository"
+        message="This repository does not have any branches or tags yet."
+        kind="empty"
+      />
+      <.dm_git_clone_box
+        id="repository-empty-setup"
+        title={if @result.content.write_access, do: "Push the first branch", else: "Clone URL"}
+        class="repository-component repository-empty-setup"
+        data-empty-setup
+      >
+        <:url label="HTTPS" value={@result.chrome.clone.https_url} />
+        <:url
+          :if={@result.chrome.clone.ssh_url}
+          label="SSH"
+          value={@result.chrome.clone.ssh_url}
+        />
+        <:command
+          :for={{label, value} <- clone_commands(@result)}
+          label={label}
+          value={value}
+        />
+      </.dm_git_clone_box>
+      <section class="repository-component repository-sidebar-panel" data-repository-size>
+        <h2>Repository size</h2>
+        <p>
+          <%= case @result.content.disk_usage do %>
+            <% {:ok, bytes} -> %>
+              {format_bytes(bytes)}
+            <% {:unavailable, _reason} -> %>
+              Size temporarily unavailable
+          <% end %>
+        </p>
+      </section>
+    </section>
+  <% end %>
+
+  <%= if @result.kind == :missing_default do %>
+    <section class="repository-missing-default" data-missing-default>
+      <.optional_panel
+        title="Configured default ref is unavailable"
+        message={"Fornacast is configured to use #{@result.content.configured_ref}, but that ref does not exist."}
+        kind="warning"
+      />
+      <section class="repository-component repository-ref-list">
+        <h2>Available refs</h2>
+        <ul role="list">
+          <li :for={ref <- @result.chrome.ref_summary.branches ++ @result.chrome.ref_summary.tags}>
+            <.dm_link href={ref_code_path(@result.chrome, ref.name)}>
+              {ref_label(ref)}
+              <code>{ref.name}</code>
+            </.dm_link>
+          </li>
+        </ul>
+      </section>
+    </section>
+  <% end %>
+</.repository_frame>

@@ -106,6 +106,67 @@ const initAppbarMenus = () => {
     });
 };
 
+// WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#80
+const writeClipboard = async (value, button) => {
+  if (window.isSecureContext && typeof navigator.clipboard?.writeText === "function") {
+    return navigator.clipboard.writeText(value);
+  }
+
+  const active = document.activeElement;
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.readOnly = true;
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.append(textarea);
+  textarea.select();
+
+  try {
+    if (!document.execCommand("copy")) {
+      throw new Error("copy command rejected");
+    }
+  } finally {
+    textarea.remove();
+
+    if (active instanceof HTMLElement && active.isConnected) {
+      active.focus();
+    } else {
+      button.focus();
+    }
+  }
+};
+
+document.addEventListener("click", async (event) => {
+  if (!(event.target instanceof Element)) {
+    return;
+  }
+
+  const button = event.target.closest("[data-copy-value]");
+
+  if (!(button instanceof HTMLElement)) {
+    return;
+  }
+
+  const page = button.closest("[data-repository-page]");
+  const status = page?.querySelector("[data-copy-status]");
+
+  if (status) {
+    status.textContent = "";
+  }
+
+  try {
+    await writeClipboard(button.dataset.copyValue || "", button);
+
+    if (status) {
+      status.textContent = "Copied to clipboard.";
+    }
+  } catch (_error) {
+    if (status) {
+      status.textContent = "Copy failed. Select and copy the value manually.";
+    }
+  }
+});
+
 if (document.readyState === "loading") {
   document.addEventListener(
     "DOMContentLoaded",

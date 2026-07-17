@@ -1,0 +1,19 @@
+<.repository_frame result={@result} active={:code}>
+  <section class="repository-blob-page min-w-0" data-blob-page>
+    <.server_breadcrumbs result={@result} path={@result.content.path} />
+    <div class="repository-blob-wrap" data-blob-viewer>
+      <.dm_git_blob_viewer
+        id="repository-blob"
+        class="repository-component repository-blob"
+        filename={@result.content.path}
+        size={format_bytes(@result.content.blob.size)}
+        language={language_hint(@result.content.path)}
+        content={@result.content.blob.data || ""}
+        raw_href={raw_path(@result.chrome, @result.content.path)}
+        truncated={@result.content.blob.truncated}
+        binary={@result.content.blob.binary}
+        non_utf8={@result.content.blob.non_utf8 == true}
+      />
+    </div>
+  </section>
+</.repository_frame>

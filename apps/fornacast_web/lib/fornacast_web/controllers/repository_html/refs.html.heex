@@ -1,0 +1,46 @@
+<.repository_frame
+  result={@result}
+  active={if @result.content.kind == :branch, do: :branches, else: :tags}
+>
+  <section class="repository-collection-page min-w-0" data-refs-page>
+    <header class="repository-collection-heading">
+      <div>
+        <p class="repository-kicker">Repository refs</p>
+        <h2>{if @result.content.kind == :branch, do: "Branches", else: "Tags"}</h2>
+      </div>
+      <span>{@result.content.page.total} total</span>
+    </header>
+
+    <div class="repository-table-wrap" data-repository-table>
+      <.dm_table
+        id="repository-refs-table"
+        data={@result.content.page.refs}
+        compact
+        hover
+        class="repository-component repository-table"
+      >
+        <:col :let={ref} label="Name">
+          <.dm_link href={ref_code_path(@result.chrome, ref.name)}>{ref_label(ref)}</.dm_link>
+          <code class="repository-full-ref">{ref.name}</code>
+        </:col>
+        <:col :let={ref} label="Kind">{ref.kind}</:col>
+        <:col :let={ref} label="Target">
+          <code class="repository-inline-hash" data-repository-hash>{short_oid(ref.target)}</code>
+        </:col>
+      </.dm_table>
+    </div>
+
+    <.optional_panel
+      :if={@result.content.page.refs == []}
+      title="No refs"
+      message={"No #{if @result.content.kind == :branch, do: "branches", else: "tags"} found."}
+      kind="empty"
+    />
+
+    <.server_pagination
+      page={@result.content.page.page}
+      total_pages={@result.content.page.total_pages}
+      base_href={refs_path(@result.chrome, @result.content.kind)}
+    />
+  </section>
+</.repository_frame>

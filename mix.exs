@@ -13,7 +13,9 @@ defmodule FornacastUmbrella.MixProject do
   end
 
   defp deps do
-    []
+    [
+      {:phoenix_live_view, "~> 1.2", runtime: false}
+    ]
   end
 
   defp releases do
