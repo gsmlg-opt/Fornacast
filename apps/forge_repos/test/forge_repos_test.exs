@@ -29,6 +29,26 @@ defmodule ForgeReposTest do
     assert ForgeRepos.parse_git_path("alice/demo.git; rm -rf /") == {:error, :invalid_path}
   end
 
+  test "HTTP clone URLs preserve the owner and repository path without credentials" do
+    original_base_url = Application.fetch_env!(:fornacast, :base_url)
+
+    Application.put_env(
+      :fornacast,
+      :base_url,
+      "https://embedded:secret@forge.example.test:8443/ignored?token=secret#fragment"
+    )
+
+    on_exit(fn ->
+      Application.put_env(:fornacast, :base_url, original_base_url)
+    end)
+
+    repository = %Repository{slug: "demo"}
+    owner = %User{username: "alice"}
+
+    assert ForgeRepos.http_clone_url(repository, owner) ==
+             "https://forge.example.test:8443/alice/demo.git"
+  end
+
   test "repository authorization permits owner and admin" do
     repo = %Repository{id: 10, owner_user_id: 1, visibility: :private}
 

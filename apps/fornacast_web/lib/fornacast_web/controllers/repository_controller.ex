@@ -69,7 +69,7 @@ defmodule FornacastWeb.RepositoryController do
         body =
           case ForgeRepos.empty?(repo) do
             {:ok, true} -> empty_repository_body(owner, repo, conn.assigns[:current_user])
-            {:ok, false} -> repository_overview_body(owner, repo)
+            {:ok, false} -> repository_overview_body(owner, repo, conn.assigns[:current_user])
             {:error, reason} -> ~s(<p class="error">#{escape(reason)}</p>)
           end
 
@@ -350,20 +350,38 @@ defmodule FornacastWeb.RepositoryController do
       "Quick setup",
       "This repository is empty. Push an existing project to start browsing code.",
       """
-      <h3>Clone URL</h3>
-      #{command_block(clone_url)}
+      #{clone_instructions(owner, repo, current_user)}
       <h3>Push an existing project</h3>
       #{command_block(String.trim(commands))}
       """
     )
   end
 
-  defp repository_overview_body(_owner, repo) do
+  defp repository_overview_body(owner, repo, current_user) do
     """
+    #{clone_instructions(owner, repo, current_user)}
     <section class="content-panel">
       <p class="muted">Default branch <code>#{escape(repo.default_branch)}</code></p>
     </section>
     #{readme_preview(repo)}
+    """
+  end
+
+  defp clone_instructions(owner, repo, current_user) do
+    ssh_url = ForgeRepos.ssh_clone_url(repo, owner, current_user)
+    http_url = ForgeRepos.http_clone_url(repo, owner)
+
+    """
+    <section class="content-panel" aria-label="Clone repository">
+      <h3>Clone with SSH</h3>
+      #{command_block("git clone #{ssh_url}")}
+      <h3>Clone with HTTP</h3>
+      #{command_block("git clone #{http_url}")}
+      <p class="muted">
+        When Git prompts for a password, enter a personal API key.
+        <a href="/settings/api-keys">Manage personal API keys</a>.
+      </p>
+    </section>
     """
   end
 

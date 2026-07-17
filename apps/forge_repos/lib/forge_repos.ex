@@ -104,6 +104,19 @@ defmodule ForgeRepos do
     "ssh://#{ssh_username}@#{host}#{port_segment}/#{owner.username}/#{repository.slug}.git"
   end
 
+  def http_clone_url(%Repository{} = repository, owner) do
+    base_uri = URI.parse(Fornacast.Config.base_url())
+
+    %URI{
+      base_uri
+      | path: "/#{owner.username}/#{repository.slug}.git",
+        query: nil,
+        fragment: nil,
+        userinfo: nil
+    }
+    |> URI.to_string()
+  end
+
   def parse_git_path(path) do
     path = String.trim(path)
 

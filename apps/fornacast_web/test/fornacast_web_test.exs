@@ -723,6 +723,12 @@ defmodule FornacastWebTest do
     assert empty_body =~ ~s(class="command-block")
     assert empty_body =~ "git push -u origin main"
     assert empty_body =~ "ssh://alice@"
+    assert empty_body =~ "http://localhost:4890/alice/empty.git"
+    assert empty_body =~ "SSH"
+    assert empty_body =~ "HTTP"
+    assert empty_body =~ "personal API key"
+    assert empty_body =~ ~s(href="/settings/api-keys")
+    refute empty_body =~ "http://alice@"
 
     forbidden =
       build_conn()
