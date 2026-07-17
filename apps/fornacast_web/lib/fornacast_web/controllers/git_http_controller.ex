@@ -9,7 +9,6 @@ defmodule FornacastWeb.GitHTTPController do
   @receive_pack_request_type "application/x-git-receive-pack-request"
   @receive_pack_result_type "application/x-git-receive-pack-result"
   @default_upload_pack_max_bytes 1024 * 1024
-  @default_receive_pack_max_bytes 100 * 1024 * 1024
 
   def info_refs(conn, %{
         "owner" => owner_slug,
@@ -71,7 +70,8 @@ defmodule FornacastWeb.GitHTTPController do
          {:ok, actor, %Repository{} = repository} <-
            load_writable_repository(conn, owner_slug, repo_slug),
          :ok <- validate_receive_pack_content_type(conn),
-         {:ok, body, conn} <- read_full_body(conn, receive_pack_max_bytes()),
+         {:ok, body, conn} <-
+           read_full_body(conn, GitTransport.ReceivePack.max_request_bytes()),
          {:ok, request, pack} <- parse_receive_pack_request(body),
          {:ok, response, statuses} <-
            GitTransport.ReceivePack.response(repository, request, pack),
@@ -185,13 +185,6 @@ defmodule FornacastWeb.GitHTTPController do
       {:error, :request_too_large}
     else
       read_full_body(conn, max_bytes, bytes_read, [chunk | acc])
-    end
-  end
-
-  defp receive_pack_max_bytes do
-    case Application.get_env(:fornacast_web, :git_receive_pack_max_bytes) do
-      max when is_integer(max) and max > 0 -> max
-      _ -> @default_receive_pack_max_bytes
     end
   end
 

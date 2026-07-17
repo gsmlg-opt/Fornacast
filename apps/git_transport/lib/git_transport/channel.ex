@@ -11,7 +11,8 @@ defmodule GitTransport.Channel do
             actor: nil,
             repository: nil,
             buffer: "",
-            request: nil
+            request: nil,
+            receive_pack_bytes: 0
 
   @impl :ssh_server_channel
   def init(_args) do
@@ -138,7 +139,8 @@ defmodule GitTransport.Channel do
                actor: actor,
                repository: repository,
                buffer: "",
-               request: GitTransport.ReceivePack.new_request()
+               request: GitTransport.ReceivePack.new_request(),
+               receive_pack_bytes: 0
            }}
         else
           {:error, _reason} -> fail_started(cm, channel_id, state)
@@ -166,14 +168,40 @@ defmodule GitTransport.Channel do
   end
 
   defp continue_receive_pack(cm, channel_id, data, state) do
+    if byte_size(data) > GitTransport.ReceivePack.max_request_bytes() - state.receive_pack_bytes do
+      fail_started(
+        cm,
+        channel_id,
+        "ERROR: Git receive-pack request is too large.\n",
+        state
+      )
+    else
+      continue_receive_pack_within_limit(cm, channel_id, data, state)
+    end
+  end
+
+  defp continue_receive_pack_within_limit(cm, channel_id, data, state) do
     buffer = state.buffer <> data
+    receive_pack_bytes = state.receive_pack_bytes + byte_size(data)
 
     case GitTransport.ReceivePack.parse_request_data(buffer, state.request) do
       {:cont, buffer, request} ->
-        {:ok, %{state | buffer: buffer, request: request}}
+        {:ok,
+         %{
+           state
+           | buffer: buffer,
+             request: request,
+             receive_pack_bytes: receive_pack_bytes
+         }}
 
       {:pack, pack, request} ->
-        {:ok, %{state | buffer: pack, request: request}}
+        {:ok,
+         %{
+           state
+           | buffer: pack,
+             request: request,
+             receive_pack_bytes: receive_pack_bytes
+         }}
 
       {:error, message} ->
         fail_started(cm, channel_id, message, state)

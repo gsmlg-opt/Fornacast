@@ -12,6 +12,7 @@ defmodule GitTransport.ReceivePack do
   @zero_oid String.duplicate("0", 40)
   @object_id_pattern ~r/\A[0-9a-fA-F]{40}\z/
   @sideband_payload_size 65_515
+  @default_max_request_bytes 100 * 1024 * 1024
   @capabilities [
     "report-status",
     "side-band-64k",
@@ -35,6 +36,13 @@ defmodule GitTransport.ReceivePack do
 
   def new_request do
     %{commands: [], capabilities: MapSet.new(), phase: :commands}
+  end
+
+  def max_request_bytes do
+    case Application.get_env(:git_transport, :receive_pack_max_bytes) do
+      max when is_integer(max) and max > 0 -> max
+      _ -> @default_max_request_bytes
+    end
   end
 
   def parse_request_data(buffer, request \\ new_request())

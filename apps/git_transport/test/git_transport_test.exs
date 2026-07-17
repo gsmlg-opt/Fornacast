@@ -514,6 +514,37 @@ defmodule GitTransportTest do
     assert {:ok, %GitCore.Blob{data: "# Demo\n"}} =
              GitCore.read_blob(repo_path, "main", "README.md")
 
+    initial_oid = git!(["-C", work_path, "rev-parse", "HEAD"])
+    original_limit = Application.get_env(:git_transport, :receive_pack_max_bytes)
+    Application.put_env(:git_transport, :receive_pack_max_bytes, 8)
+
+    on_exit(fn ->
+      if original_limit == nil,
+        do: Application.delete_env(:git_transport, :receive_pack_max_bytes),
+        else: Application.put_env(:git_transport, :receive_pack_max_bytes, original_limit)
+    end)
+
+    File.write!(Path.join(work_path, "README.md"), "# Rejected oversized push\n")
+    git!(["-C", work_path, "add", "README.md"])
+    git!(["-C", work_path, "commit", "-m", "Rejected oversized push"])
+
+    {oversized_output, oversized_status} =
+      git(["-C", work_path, "push", "origin", "main"], ssh_env)
+
+    assert oversized_status != 0
+    assert oversized_output =~ "Git receive-pack request is too large"
+
+    assert {:ok, [%GitCore.Commit{oid: ^initial_oid} | _]} =
+             GitCore.commit_history(repo_path, "main")
+
+    assert 1 == Repo.aggregate(AuditEvent, :count)
+
+    if original_limit == nil,
+      do: Application.delete_env(:git_transport, :receive_pack_max_bytes),
+      else: Application.put_env(:git_transport, :receive_pack_max_bytes, original_limit)
+
+    git!(["-C", work_path, "reset", "--hard", "origin/main"])
+
     File.write!(Path.join(work_path, "README.md"), "# Demo\n\nSecond line\n")
     git!(["-C", work_path, "add", "README.md"])
     git!(["-C", work_path, "commit", "-m", "Second commit"])

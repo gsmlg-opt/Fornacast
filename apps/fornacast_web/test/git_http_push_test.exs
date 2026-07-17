@@ -180,13 +180,13 @@ defmodule FornacastWeb.GitHTTPPushTest do
     assert {:ok, _key, secret} =
              ForgeAccounts.create_api_key(user, %{"name" => "write", "scopes" => ["repo:write"]})
 
-    original = Application.get_env(:fornacast_web, :git_receive_pack_max_bytes)
-    Application.put_env(:fornacast_web, :git_receive_pack_max_bytes, 8)
+    original = Application.get_env(:git_transport, :receive_pack_max_bytes)
+    Application.put_env(:git_transport, :receive_pack_max_bytes, 8)
 
     on_exit(fn ->
       if original == nil,
-        do: Application.delete_env(:fornacast_web, :git_receive_pack_max_bytes),
-        else: Application.put_env(:fornacast_web, :git_receive_pack_max_bytes, original)
+        do: Application.delete_env(:git_transport, :receive_pack_max_bytes),
+        else: Application.put_env(:git_transport, :receive_pack_max_bytes, original)
     end)
 
     response =
