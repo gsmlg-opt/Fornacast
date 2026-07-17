@@ -152,6 +152,50 @@ defmodule FornacastWebTest do
     refute html =~ "validation:"
   end
 
+  test "malformed decoded SSH key blobs return validation errors" do
+    reset_database!()
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-malformed-ssh@example.com",
+               password: "correct horse battery staple"
+             })
+
+    conn =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+      |> post("/settings/ssh-keys", %{
+        "ssh_key" => %{"title" => "malformed", "public_key" => "ssh-rsa Z2FyYmFnZQ=="}
+      })
+
+    assert html_response(conn, 422) =~ "Public key is not a valid OpenSSH public key"
+  end
+
+  test "multiple SSH key errors are escaped once and rendered as readable text" do
+    reset_database!()
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-multiple-ssh-errors@example.com",
+               password: "correct horse battery staple"
+             })
+
+    conn =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+      |> post("/settings/ssh-keys", %{
+        "ssh_key" => %{"title" => "", "public_key" => "ssh-rsa <script>alert(1)</script>"}
+      })
+
+    html = html_response(conn, 422)
+    assert html =~ "Title can&#39;t be blank; Public key is not a valid OpenSSH public key"
+    refute html =~ "&lt;br&gt;"
+    refute html =~ "can&amp;#39;t"
+    refute html =~ "<script>alert(1)</script>"
+  end
+
   test "appbar issue and pull request routes render demo pages" do
     reset_database!()
 

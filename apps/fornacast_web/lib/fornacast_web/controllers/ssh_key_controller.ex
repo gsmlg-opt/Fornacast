@@ -79,9 +79,9 @@ defmodule FornacastWeb.SSHKeyController do
     end)
     |> Enum.flat_map(fn {field, messages} ->
       label = field |> Atom.to_string() |> String.replace("_", " ") |> String.capitalize()
-      Enum.map(messages, &escape("#{label} #{&1}"))
+      Enum.map(messages, &"#{label} #{&1}")
     end)
-    |> Enum.join("<br>")
+    |> Enum.join("; ")
   end
 
   defp ssh_key_form(path) do

@@ -66,11 +66,52 @@ defmodule ForgeAccountsTest do
     assert "SHA256:" <> _ = Ecto.Changeset.get_change(changeset, :fingerprint_sha256)
   end
 
+  test "ssh key changeset rejects RSA moduli smaller than 2048 bits" do
+    for bits <- [512, 1024] do
+      changeset =
+        SSHKey.changeset(%SSHKey{user_id: 1}, %{
+          title: "weak-#{bits}",
+          public_key: rsa_public_key(bits, 65_537)
+        })
+
+      refute changeset.valid?
+      assert Keyword.has_key?(changeset.errors, :public_key)
+    end
+  end
+
+  test "ssh key changeset rejects unsafe RSA public exponents" do
+    [{{:RSAPublicKey, modulus, _exponent}, _attrs}] =
+      :ssh_file.decode(@ssh_rsa_public_key, :auth_keys)
+
+    for exponent <- [3, 65_536] do
+      blob = :ssh_message.ssh2_pubkey_encode({:RSAPublicKey, modulus, exponent})
+
+      changeset =
+        SSHKey.changeset(%SSHKey{user_id: 1}, %{
+          title: "unsafe-exponent-#{exponent}",
+          public_key: "ssh-rsa " <> Base.encode64(blob)
+        })
+
+      refute changeset.valid?
+    end
+  end
+
   test "ssh key changeset rejects a key whose label does not match its blob" do
     public_key = String.replace(@ed25519_public_key, "ssh-ed25519", "ssh-rsa", global: false)
 
     changeset =
       SSHKey.changeset(%SSHKey{user_id: 1}, %{title: "mislabeled", public_key: public_key})
+
+    refute changeset.valid?
+    assert [public_key: {"is not a valid OpenSSH public key", _meta}] = changeset.errors
+  end
+
+  test "ssh key changeset rejects malformed decoded key blobs" do
+    changeset =
+      SSHKey.changeset(%SSHKey{user_id: 1}, %{
+        title: "malformed",
+        public_key: "ssh-rsa Z2FyYmFnZQ=="
+      })
 
     refute changeset.valid?
     assert [public_key: {"is not a valid OpenSSH public key", _meta}] = changeset.errors
@@ -176,6 +217,14 @@ defmodule ForgeAccountsTest do
 
     assert {:error, :invalid_credentials} =
              ForgeAccounts.authenticate_password("disabled", "correct horse battery staple")
+  end
+
+  defp rsa_public_key(bits, exponent) do
+    {:RSAPrivateKey, _, modulus, ^exponent, _, _, _, _, _, _, _} =
+      :public_key.generate_key({:rsa, bits, exponent})
+
+    blob = :ssh_message.ssh2_pubkey_encode({:RSAPublicKey, modulus, exponent})
+    "ssh-rsa " <> Base.encode64(blob)
   end
 
   defp reset_database! do

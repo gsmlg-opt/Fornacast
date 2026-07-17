@@ -4,6 +4,7 @@ defmodule ForgeAccounts.SSHKey do
   import Ecto.Changeset
 
   @accepted_algorithms ~w(ssh-ed25519 ssh-rsa)
+  @minimum_rsa_modulus Integer.pow(2, 2047)
 
   schema "ssh_keys" do
     field :title, :string
@@ -86,7 +87,9 @@ defmodule ForgeAccounts.SSHKey do
 
   defp parse_public_key(_), do: {:error, :invalid_public_key}
 
-  defp validate_decoded_algorithm("ssh-rsa", {:RSAPublicKey, _modulus, _exponent}), do: :ok
+  defp validate_decoded_algorithm("ssh-rsa", {:RSAPublicKey, modulus, exponent})
+       when modulus >= @minimum_rsa_modulus and exponent >= 65_537 and rem(exponent, 2) == 1,
+       do: :ok
 
   defp validate_decoded_algorithm(
          "ssh-ed25519",
@@ -103,7 +106,8 @@ defmodule ForgeAccounts.SSHKey do
       _ -> {:error, :invalid_public_key}
     end
   rescue
-    ArgumentError -> {:error, :invalid_public_key}
+    _error in [ArgumentError, FunctionClauseError, ErlangError] ->
+      {:error, :invalid_public_key}
   end
 
   defp public_key_error(:unsupported_algorithm) do
