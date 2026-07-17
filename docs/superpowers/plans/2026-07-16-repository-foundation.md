@@ -670,31 +670,31 @@ git commit -m "feat(git): add bounded repository search"
 - Modify: apps/git_core/native/fornacast_git_core/src/lib.rs
 - Add tests: apps/git_core/test/repository_read_model_test.exs
 
-- [ ] **Step 1: Add classification tests**
+- [x] **Step 1: Add classification tests**
 
 Create one file for every extension group, Dockerfile variants, every shebang group, unknown text, invalid UTF-8, NUL binary, and a submodule. Assert byte-weighted totals, alphabetical tie ordering, binary/submodule exclusion, and Other.
 
-- [ ] **Step 2: Add cooperative-bound tests**
+- [x] **Step 2: Add cooperative-bound tests**
 
 Lower file, byte, and deadline values. Assert partial results include files_scanned and bytes_scanned, truncated is true, and complete percentages are not inferred from partial data.
 
-- [ ] **Step 3: Implement language analysis**
+- [x] **Step 3: Implement language analysis**
 
 Traverse snapshot_oid deterministically through ScanLimiter. Apply the fixed table above. Stream eligible content through bounded buffers to validate UTF-8 and binary status; retain no file body. Stop at 100,000 files, 536_870_912 eligible bytes, or two seconds. Return a partial success on a cooperative bound and a typed failure only for unexpected read errors.
 
-- [ ] **Step 4: Add safe disk-size tests**
+- [x] **Step 4: Add safe disk-size tests**
 
 Create files, nested directories, and a symlink pointing outside the bare repository. Assert logical file-byte sum, no symlink traversal, a lower two-second timeout, and changed size after git gc or repack.
 
-- [ ] **Step 5: Implement uncached disk usage**
+- [x] **Step 5: Implement uncached disk usage**
 
 Walk the canonical trusted repository root using symlink_metadata. Do not follow symlink directories. Check the monotonic deadline between entries. Run through ScanLimiter and return the byte integer. Never cache this operation.
 
-- [ ] **Step 6: Run and commit**
+- [x] **Step 6: Run and commit**
 
 ~~~sh
 mix test apps/git_core/test/repository_read_model_test.exs --only analysis --trace
-git add apps/git_core/lib/git_core.ex apps/git_core/lib/git_core/native.ex apps/git_core/native/fornacast_git_core/src/lib.rs apps/git_core/test/repository_read_model_test.exs
+git add apps/git_core/lib/git_core.ex apps/git_core/lib/git_core/native.ex apps/git_core/native/fornacast_git_core/src/bounded_blob.rs apps/git_core/native/fornacast_git_core/src/lib.rs apps/git_core/test/repository_read_model_test.exs
 git commit -m "feat(git): analyze repository languages and size"
 ~~~
 
