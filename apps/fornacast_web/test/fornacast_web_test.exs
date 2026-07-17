@@ -560,37 +560,42 @@ defmodule FornacastWebTest do
 
     overview = get(conn, "/alice/demo")
     overview_body = html_response(overview, 200)
-    assert overview_body =~ ~s(class="repo-header")
-    assert overview_body =~ "alice / demo"
-    assert overview_body =~ ~s(class="repo-tabs")
-    assert overview_body =~ ~s(class="readme-panel")
+    assert overview_body =~ ~s(data-repository-kind="code")
+    assert overview_body =~ ~s(id="repository-identity")
+    assert overview_body =~ "alice/"
+    assert overview_body =~ ~s(id="repository-navigation")
+    assert overview_body =~ ~s(data-readme)
     assert overview_body =~ "<h1>Demo</h1>"
     refute overview_body =~ "<script>"
 
     source = get(conn, "/alice/demo/src/main/docs")
     source_body = html_response(source, 200)
-    assert source_body =~ ~s(class="path-bar")
-    assert source_body =~ ~s(class="data-table source-table")
+    assert source_body =~ ~s(data-tree-page)
+    assert source_body =~ ~s(id="repository-file-tree")
     assert source_body =~ "guide.txt"
     assert source_body =~ "with#hash.txt"
-    assert source_body =~ ~s(href="/alice/demo/src/main/docs/with%23hash.txt")
+
+    assert source_body =~
+             ~s(href="/alice/demo/src/refs/heads/main/docs/with%23hash.txt")
 
     file = get(conn, "/alice/demo/src/main/docs/guide.txt")
     file_body = html_response(file, 200)
-    assert file_body =~ ~s(class="file-panel")
-    assert file_body =~ ~s(class="code-block")
+    assert file_body =~ ~s(data-blob-page)
+    assert file_body =~ ~s(id="repository-blob")
     assert file_body =~ "hello"
 
     hash_file = get(conn, "/alice/demo/src/main/docs/with%23hash.txt")
     hash_file_body = html_response(hash_file, 200)
     assert hash_file_body =~ "hash path"
-    assert hash_file_body =~ ~s(href="/alice/demo/raw/main/docs/with%23hash.txt")
+
+    assert hash_file_body =~
+             ~s(href="/alice/demo/raw/refs/heads/main/docs/with%23hash.txt")
 
     binary = get(conn, "/alice/demo/src/main/asset.bin")
-    assert html_response(binary, 200) =~ "Binary or non-UTF-8 files are not rendered inline."
+    assert html_response(binary, 200) =~ "Binary file not shown."
 
     large = get(conn, "/alice/demo/src/main/large.txt")
-    assert html_response(large, 200) =~ "larger than 1048576 bytes"
+    assert html_response(large, 200) =~ "This file is truncated."
 
     raw = get(conn, "/alice/demo/raw/main/docs/guide.txt")
     assert response(raw, 200) == "hello\n"
@@ -611,11 +616,12 @@ defmodule FornacastWebTest do
     assert html_response(feature_commits, 200) =~ "Feature branch"
 
     detail = get(conn, "/alice/demo/commit/#{commit_oid}")
-    assert html_response(detail, 200) =~ commit_oid
-    assert html_response(detail, 200) =~ "Fornacast Test"
-    assert html_response(detail, 200) =~ "Changed files"
-    assert html_response(detail, 200) =~ "README.md"
-    assert html_response(detail, 200) =~ "diff --git a/README.md b/README.md"
+    detail_body = html_response(detail, 200)
+    assert detail_body =~ String.slice(commit_oid, 0, 12)
+    assert detail_body =~ "Fornacast Test"
+    assert detail_body =~ ~s(data-commit-diff)
+    assert detail_body =~ "README.md"
+    assert detail_body =~ "# Demo"
   end
 
   @tag :tmp_dir
@@ -716,26 +722,40 @@ defmodule FornacastWebTest do
       |> get("/alice/empty")
 
     empty_body = html_response(empty, 200)
-    assert empty_body =~ ~s(class="repo-header")
-    assert empty_body =~ "alice / empty"
-    assert empty_body =~ ~s(class="repo-tabs")
-    assert empty_body =~ ~s(class="empty-state")
-    assert empty_body =~ ~s(class="command-block")
+    assert empty_body =~ ~s(data-repository-kind="empty")
+    assert empty_body =~ ~s(id="repository-identity")
+    assert empty_body =~ "alice/"
+    assert empty_body =~ ~s(id="repository-navigation")
+    assert empty_body =~ ~s(data-empty-repository)
+    assert empty_body =~ ~s(id="repository-empty-setup")
     assert empty_body =~ "git push -u origin main"
     assert empty_body =~ "ssh://alice@"
     assert empty_body =~ "http://localhost:4890/alice/empty.git"
     assert empty_body =~ "SSH"
-    assert empty_body =~ "HTTP"
-    assert empty_body =~ "personal API key"
-    assert empty_body =~ ~s(href="/settings/api-keys")
+    assert empty_body =~ "HTTPS"
     refute empty_body =~ "http://alice@"
+
+    assert html_response(empty |> recycle() |> get("/alice/empty/branches?page=1"), 200) =~
+             ~s(data-repository-kind="empty")
+
+    assert html_response(empty |> recycle() |> get("/alice/empty/tags?page=1"), 200) =~
+             ~s(data-repository-kind="empty")
+
+    assert html_response(empty |> recycle() |> get("/alice/empty/branches?page=2"), 404) =~
+             "Page not found"
+
+    assert html_response(empty |> recycle() |> get("/alice/empty/tags?page=2"), 404) =~
+             "Page not found"
+
+    assert html_response(empty |> recycle() |> get("/alice/empty/commit/deadbeef"), 404) =~
+             "Repository content not found"
 
     forbidden =
       build_conn()
       |> Plug.Test.init_test_session(user_id: bob.id)
       |> get("/alice/empty")
 
-    assert html_response(forbidden, 403) =~ "You do not have access"
+    assert html_response(forbidden, 404) =~ "Repository not found"
   end
 
   @tag :tmp_dir
@@ -825,7 +845,7 @@ defmodule FornacastWebTest do
       |> Plug.Test.init_test_session(user_id: bob.id)
       |> get("/acme/empty")
 
-    assert html_response(forbidden, 403) =~ "You do not have access"
+    assert html_response(forbidden, 404) =~ "Repository not found"
   end
 
   @tag :tmp_dir
@@ -911,7 +931,10 @@ defmodule FornacastWebTest do
     assert html_response(commits, 200) =~ "Initial SSH push"
 
     detail = get(conn, "/alice/demo/commit/#{commit_oid}")
-    assert html_response(detail, 200) =~ "diff --git a/README.md b/README.md"
+    detail_body = html_response(detail, 200)
+    assert detail_body =~ ~s(data-commit-diff)
+    assert detail_body =~ "README.md"
+    assert detail_body =~ "Pushed README"
   end
 
   @tag :tmp_dir

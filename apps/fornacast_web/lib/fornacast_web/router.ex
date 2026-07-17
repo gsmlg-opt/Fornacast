@@ -42,8 +42,10 @@ defmodule FornacastWeb.Router do
     get "/login", SessionController, :new
     post "/login", SessionController, :create
     delete "/logout", SessionController, :delete
+  end
 
-    pipe_through :authenticated
+  scope "/", FornacastWeb do
+    pipe_through [:browser, :authenticated]
 
     get "/", DashboardController, :index
     get "/issues", WorkbenchController, :issues
@@ -66,12 +68,18 @@ defmodule FornacastWeb.Router do
     post "/repos", RepositoryController, :create
 
     get "/:owner", OrganizationController, :show
+  end
+
+  scope "/", FornacastWeb do
+    pipe_through :browser
+
     get "/:owner/:repo", RepositoryController, :show
     get "/:owner/:repo/branches", RepositoryController, :branches
     get "/:owner/:repo/tags", RepositoryController, :tags
     get "/:owner/:repo/commits/:ref", RepositoryController, :commits
     get "/:owner/:repo/commits/*ref", RepositoryController, :commits
     get "/:owner/:repo/commit/:sha", RepositoryController, :commit
+    get "/:owner/:repo/search", RepositoryController, :search
     get "/:owner/:repo/src/*segments", RepositoryController, :src
     get "/:owner/:repo/raw/*segments", RepositoryController, :raw
   end
