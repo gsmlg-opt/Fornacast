@@ -39,6 +39,7 @@ defmodule FornacastWeb.SSHKeyController do
       end
 
     page(conn, "SSH keys", """
+    #{settings_navigation()}
     #{section_header("SSH keys", "Manage SSH keys for Git transport.", "")}
     <div class="settings-grid">
       #{ssh_key_form(path)}
@@ -57,7 +58,8 @@ defmodule FornacastWeb.SSHKeyController do
         |> put_status(:unprocessable_entity)
         |> page(
           "SSH keys",
-          error_panel(validation_errors(changeset)) <> ssh_key_form(ssh_keys_path(conn))
+          settings_navigation() <>
+            error_panel(validation_errors(changeset)) <> ssh_key_form(ssh_keys_path(conn))
         )
     end
   end
@@ -97,5 +99,9 @@ defmodule FornacastWeb.SSHKeyController do
       </form>
       """
     )
+  end
+
+  defp settings_navigation do
+    ~s(<nav aria-label="Settings"><a href="/settings/ssh-keys">SSH keys</a> <a href="/settings/api-keys">API keys</a></nav>)
   end
 end

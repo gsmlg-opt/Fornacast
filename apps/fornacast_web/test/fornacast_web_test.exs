@@ -127,6 +127,120 @@ defmodule FornacastWebTest do
     html = html_response(conn, 200)
     assert html =~ "<h1>SSH keys</h1>"
     assert html =~ ~s(<form action="/settings/ssh-keys" method="post">)
+    assert html =~ ~s(<a href="/settings/api-keys">API keys</a>)
+  end
+
+  test "API key settings create named scoped keys and reveal the secret once" do
+    reset_database!()
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-api-keys@example.com",
+               password: "correct horse battery staple"
+             })
+
+    conn =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+      |> post("/settings/api-keys", %{
+        "api_key" => %{
+          "name" => "deploy & release",
+          "scopes" => %{"repo:read" => "true", "repo:write" => "true"},
+          "expires_at" => "2030-01-02T03:04:05"
+        }
+      })
+
+    html = html_response(conn, 201)
+    [secret] = Regex.run(~r/fc_pat_[A-Za-z0-9_-]+/, html)
+
+    assert Enum.count(Regex.scan(~r/#{Regex.escape(secret)}/, html)) == 1
+    assert html =~ "deploy &amp; release"
+    assert html =~ "repo:read"
+    assert html =~ "repo:write"
+    assert html =~ "2030-01-02 03:04:05Z"
+    assert Plug.Conn.get_resp_header(conn, "location") == []
+    refute inspect(Plug.Conn.get_session(conn)) =~ secret
+    refute html =~ "token_hash"
+
+    assert [%{name: "deploy & release", scopes: scopes, token_hash: nil}] =
+             ForgeAccounts.list_user_api_keys(user)
+
+    assert scopes == %{"repo:read" => true, "repo:write" => true}
+  end
+
+  test "API key settings list multiple keys with metadata and allow owner revocation" do
+    reset_database!()
+
+    assert {:ok, alice} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-api-list@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, bob} =
+             ForgeAccounts.create_user(%{
+               username: "bob",
+               email: "bob-api-list@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, first, _secret} =
+             ForgeAccounts.create_api_key(alice, %{name: "laptop", scopes: ["repo:read"]})
+
+    assert {:ok, second, _secret} =
+             ForgeAccounts.create_api_key(alice, %{
+               name: "automation",
+               scopes: ["repo:write"],
+               expires_at: "2031-04-05T06:07:08Z"
+             })
+
+    alice_conn = build_conn() |> Plug.Test.init_test_session(user_id: alice.id)
+    html = alice_conn |> get("/settings/api-keys") |> html_response(200)
+
+    assert html =~ "laptop"
+    assert html =~ "automation"
+    assert html =~ first.token_prefix
+    assert html =~ second.token_prefix
+    assert html =~ "repo:read"
+    assert html =~ "repo:write"
+    assert html =~ DateTime.to_string(second.inserted_at)
+    assert html =~ "2031-04-05 06:07:08Z"
+    assert html =~ ~s(action="/settings/api-keys/#{first.id}")
+
+    bob_conn = build_conn() |> Plug.Test.init_test_session(user_id: bob.id)
+    denied = delete(bob_conn, "/settings/api-keys/#{first.id}")
+    assert redirected_to(denied) == "/settings/api-keys"
+    assert is_nil(Fornacast.Repo.get!(ForgeAccounts.APIKey, first.id).revoked_at)
+
+    revoked = delete(alice_conn, "/settings/api-keys/#{first.id}")
+    assert redirected_to(revoked) == "/settings/api-keys"
+    refute is_nil(Fornacast.Repo.get!(ForgeAccounts.APIKey, first.id).revoked_at)
+  end
+
+  test "API key validation errors are human-readable and escaped" do
+    reset_database!()
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-api-errors@example.com",
+               password: "correct horse battery staple"
+             })
+
+    conn =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+      |> post("/settings/api-keys", %{
+        "api_key" => %{"name" => "<script>alert(1)</script>", "scopes" => %{}}
+      })
+
+    html = html_response(conn, 422)
+    assert html =~ "Scopes must contain repo:read or repo:write"
+    assert html =~ "&lt;script&gt;alert(1)&lt;/script&gt;"
+    refute html =~ "<script>alert(1)</script>"
+    refute html =~ "scopes: {"
   end
 
   test "invalid SSH keys render human-readable validation errors" do
@@ -793,6 +907,7 @@ defmodule FornacastWebTest do
       "repository_collaborators",
       "repositories",
       "organization_members",
+      "api_keys",
       "ssh_keys",
       "users"
     ]
