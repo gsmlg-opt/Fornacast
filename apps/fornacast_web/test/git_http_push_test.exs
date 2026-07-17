@@ -2,6 +2,7 @@ defmodule FornacastWeb.GitHTTPPushTest do
   use ExUnit.Case, async: false
 
   import Phoenix.ConnTest
+  import ExUnit.CaptureLog
   alias Fornacast.{AuditEvent, Repo}
 
   @endpoint FornacastWeb.Endpoint
@@ -125,6 +126,73 @@ defmodule FornacastWeb.GitHTTPPushTest do
       |> post("/alice/demo.git/git-receive-pack", "0000")
 
     assert response(authenticated, 400) == "Incomplete Git request.\n"
+  end
+
+  test "unauthenticated receive-pack does not reveal whether a repository exists" do
+    create_user_and_repository("alice")
+    existing = get(build_conn(), "/alice/demo.git/info/refs?service=git-receive-pack")
+    missing = get(build_conn(), "/nobody/missing.git/info/refs?service=git-receive-pack")
+
+    assert response(existing, 401) == "Authentication required.\n"
+    assert response(missing, 401) == "Authentication required.\n"
+    assert Plug.Conn.get_resp_header(missing, "www-authenticate") == [@challenge]
+  end
+
+  test "receive-pack POST rejects unsupported content types" do
+    {user, _repository} = create_user_and_repository("alice")
+
+    assert {:ok, _key, secret} =
+             ForgeAccounts.create_api_key(user, %{"name" => "write", "scopes" => ["repo:write"]})
+
+    response =
+      build_conn()
+      |> maybe_authorize({"alice", secret})
+      |> Plug.Conn.put_req_header("content-type", "application/octet-stream")
+      |> post("/alice/demo.git/git-receive-pack", "0000")
+
+    assert response(response, 415) == "Unsupported Git content type.\n"
+  end
+
+  test "receive-pack POST rejects a request larger than the configured limit" do
+    {user, _repository} = create_user_and_repository("alice")
+
+    assert {:ok, _key, secret} =
+             ForgeAccounts.create_api_key(user, %{"name" => "write", "scopes" => ["repo:write"]})
+
+    original = Application.get_env(:fornacast_web, :git_receive_pack_max_bytes)
+    Application.put_env(:fornacast_web, :git_receive_pack_max_bytes, 8)
+
+    on_exit(fn ->
+      if original == nil,
+        do: Application.delete_env(:fornacast_web, :git_receive_pack_max_bytes),
+        else: Application.put_env(:fornacast_web, :git_receive_pack_max_bytes, original)
+    end)
+
+    response =
+      build_conn()
+      |> maybe_authorize({"alice", secret})
+      |> Plug.Conn.put_req_header("content-type", "application/x-git-receive-pack-request")
+      |> post("/alice/demo.git/git-receive-pack", "123456789")
+
+    assert response(response, 413) == "Git request is too large.\n"
+  end
+
+  test "push bookkeeping rolls back when its audit event cannot be written" do
+    {_user, repository} = create_user_and_repository("alice")
+
+    log =
+      capture_log(fn ->
+        assert :ok =
+                 GitTransport.ReceivePack.record_push(
+                   %{id: "not-an-integer"},
+                   repository,
+                   [{"refs/heads/main", "ok", nil}]
+                 )
+      end)
+
+    assert Repo.get!(ForgeRepos.Repository, repository.id).last_pushed_at == nil
+    assert Repo.all(AuditEvent) == []
+    assert log =~ "Git receive-pack audit update failed"
   end
 
   defp create_user_and_repository(username, repo_slug \\ "demo") do
