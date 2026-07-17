@@ -1468,6 +1468,11 @@
     flex-wrap: wrap;
   }
 
+  [data-repository-page] .repository-ref-form,
+  [data-repository-page] .repository-ref-form .form-group {
+    flex-basis: auto;
+  }
+
   [data-repository-page] .repository-ref-form .form-group,
   [data-repository-page] .repository-quick-search .form-group,
   [data-repository-page] .repository-toolbar-actions,

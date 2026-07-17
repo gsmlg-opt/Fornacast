@@ -154,8 +154,9 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     assert html =~ "93 commits"
     assert html =~ "3 branches"
     assert html =~ "2 tags"
-    assert html =~ "aria-current=\"page\""
-    assert length(Regex.scan(~r/aria-current="page"/, html)) == 1
+
+    [navigation] = Regex.run(~r/<nav\b[^>]*id="repository-navigation".*?<\/nav>/s, html)
+    assert length(Regex.scan(~r/aria-current="page"/, navigation)) == 1
 
     assert html =~ "href=\"/alice/demo?ref=refs%2Fheads%2Ffeature%2Fforge"
     assert html =~ "href=\"/alice/demo/commits/refs/heads/feature/forge"
@@ -540,14 +541,16 @@ defmodule FornacastWeb.RepositoryHTMLTest do
       |> put_in([Access.key(:content), Access.key(:tree)], tree_page("demo/a+b space"))
 
     html = render_result(result)
-    [breadcrumbs] = Regex.run(~r/<nav\b.*?data-server-breadcrumbs.*?<\/nav>/s, html)
+
+    [breadcrumbs] =
+      Regex.run(~r/<nav\b[^>]*data-server-breadcrumbs[^>]*>.*?<\/nav>/s, html)
 
     assert length(Regex.scan(~r/aria-hidden="true">\s*\/\s*<\/span>/, breadcrumbs)) == 2
 
     assert breadcrumbs =~
              "href=\"/alice/demo/src/refs/heads/feature/forge/demo"
 
-    assert breadcrumbs =~ "aria-current=\"page\">a+b space"
+    assert breadcrumbs =~ ~r/aria-current="page">\s*a\+b space\s*</
 
     assert html =~
              "href=\"/alice/demo/src/refs/heads/feature/forge/demo/a%2Bb%20space?page=2"
@@ -643,17 +646,20 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     refute anonymous =~ "Logout"
   end
 
-  test "server-side navigation workarounds retain upstream references without broken wrappers" do
+  test "released server-side navigation components replace local workarounds" do
     source =
       File.read!(Path.expand("../lib/fornacast_web/controllers/repository_html.ex", __DIR__))
 
-    assert source =~ "WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#82"
-    assert source =~ "WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#83"
-    refute source =~ "<.dm_breadcrumb"
-    refute source =~ "<.dm_pagination"
+    lock = File.read!(Path.expand("../../../mix.lock", __DIR__))
+
+    assert lock =~ ~r/"phoenix_duskmoon".*"9\.9\.0"/
+    assert source =~ "<.dm_breadcrumb"
+    assert source =~ "<.dm_pagination"
+    refute source =~ "WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#82"
+    refute source =~ "WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#83"
   end
 
-  test "repository assets retain responsive containment and one guarded clipboard bridge" do
+  test "repository assets retain responsive containment and load the package clipboard runtime" do
     css = File.read!(Path.expand("../assets/css/app.css", __DIR__))
     js = File.read!(Path.expand("../assets/js/app.js", __DIR__))
 
@@ -678,19 +684,29 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     refute css =~
              ~r/(?:#(?:[0-9a-fA-F]{3}){1,2}|(?:bg|text|border)-(?:slate|gray|red|blue|green|purple)-\d{2,3})/
 
-    assert js =~ "WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#80"
-    assert js =~ "event.target instanceof Element"
+    assert js =~ ~s(import "phoenix_duskmoon";)
+    refute js =~ "WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#80"
+    refute js =~ "const writeClipboard"
+    refute js =~ "document.createElement(\"textarea\")"
+    refute js =~ "Copied to clipboard."
+  end
 
-    assert js =~
-             ~r/window\.isSecureContext\s*&&\s*typeof navigator\.clipboard\?\.writeText === "function"/
+  test "mobile repository ref controls reset desktop flex bases" do
+    css = File.read!(Path.expand("../assets/css/app.css", __DIR__))
 
-    assert js =~ "document.createElement(\"textarea\")"
-    assert js =~ "textarea.remove()"
-    assert js =~ "active instanceof HTMLElement"
-    assert js =~ "status.textContent = \"\""
-    assert js =~ "Copied to clipboard."
-    assert js =~ "Copy failed. Select and copy the value manually."
-    assert length(Regex.scan(~r/document\.addEventListener\(\"click\"/, js)) == 1
+    assert css =~
+             ~r/@media \(max-width: 639px\) \{.*?\[data-repository-page\] \.repository-ref-form,\s+\[data-repository-page\] \.repository-ref-form \.form-group \{\s+flex-basis: auto;\s+\}/s
+  end
+
+  test "clone popover restores trigger focus after Escape" do
+    js = File.read!(Path.expand("../assets/js/app.js", __DIR__))
+
+    assert js =~ "TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#92"
+    assert js =~ "WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#92"
+    assert js =~ ~s(event.key !== "Escape")
+    assert js =~ ~s([data-clone-popover][open])
+    assert js =~ "window.requestAnimationFrame"
+    assert js =~ "trigger.focus()"
   end
 
   test "repository metadata and search snippets are escaped at the component boundary" do

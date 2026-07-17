@@ -40,7 +40,6 @@ defmodule FornacastWeb.RepositoryHTML do
       <div class="repository-page-content min-w-0">
         {render_slot(@inner_block)}
       </div>
-      <.copy_status />
     </article>
     """
   end
@@ -230,20 +229,6 @@ defmodule FornacastWeb.RepositoryHTML do
     """
   end
 
-  def copy_status(assigns) do
-    ~H"""
-    <p
-      id="repository-copy-status"
-      class="repository-copy-status"
-      role="status"
-      aria-live="polite"
-      aria-atomic="true"
-      data-copy-status
-    >
-    </p>
-    """
-  end
-
   attr :title, :string, required: true
   attr :message, :string, required: true
   attr :kind, :string, default: "info"
@@ -269,21 +254,22 @@ defmodule FornacastWeb.RepositoryHTML do
     crumbs =
       assigns.result.chrome
       |> breadcrumb_items(assigns.path)
-      |> Enum.with_index()
 
     assigns = assign(assigns, :crumbs, crumbs)
 
     ~H"""
-    <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#82 --%>
-    <nav class="repository-breadcrumbs" aria-label="File path" data-server-breadcrumbs>
-      <ol role="list">
-        <li :for={{{label, href, current?}, index} <- @crumbs}>
-          <span :if={index > 0} aria-hidden="true">/</span>
-          <span :if={current?} aria-current="page">{label}</span>
-          <.dm_link :if={!current?} href={href}>{label}</.dm_link>
-        </li>
-      </ol>
-    </nav>
+    <.dm_breadcrumb
+      class="repository-breadcrumbs"
+      nav_label="File path"
+      data-server-breadcrumbs
+    >
+      <:crumb
+        :for={{label, href, current?} <- @crumbs}
+        to={if current?, do: nil, else: href}
+      >
+        {label}
+      </:crumb>
+    </.dm_breadcrumb>
     """
   end
 
@@ -293,31 +279,18 @@ defmodule FornacastWeb.RepositoryHTML do
 
   def server_pagination(assigns) do
     ~H"""
-    <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#83 --%>
-    <nav
+    <.dm_pagination
       :if={@total_pages > 1}
+      page_num={@page}
+      page_size={1}
+      total={@total_pages}
+      page_url={page_href(@base_href, "{page}")}
+      page_link_type="href"
+      el_size="sm"
       class="repository-pagination"
-      aria-label="Pagination"
+      pagination_label="Pagination"
       data-server-pagination
-    >
-      <.dm_link
-        :if={@page > 1}
-        href={page_href(@base_href, @page - 1)}
-        rel="prev"
-        class="btn btn-sm"
-      >
-        Previous
-      </.dm_link>
-      <span>Page {@page} of {@total_pages}</span>
-      <.dm_link
-        :if={@page < @total_pages}
-        href={page_href(@base_href, @page + 1)}
-        rel="next"
-        class="btn btn-sm"
-      >
-        Next
-      </.dm_link>
-    </nav>
+    />
     """
   end
 

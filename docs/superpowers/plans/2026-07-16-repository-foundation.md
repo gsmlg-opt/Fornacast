@@ -1028,11 +1028,11 @@ git commit -m "feat(web): render DuskMoon repository pages"
 - Modify: apps/fornacast_web/lib/fornacast_web/controllers/repository_controller.ex
 - Modify: apps/fornacast_web/test/fornacast_web_test.exs
 
-- [ ] **Step 1: Add the public route matrix tests**
+- [x] **Step 1: Add the public route matrix tests**
 
 Cover anonymous public Code, branches, tags, both commit-history forms, commit, source, raw, and search. Cover permitted private reads. For the same viewer, assert missing and inaccessible private repositories have identical 404 status, body, and normalized content/security/cache/auth headers, and trigger no storage, cache, or Git call. Exclude request-specific x-request-id, date, and server headers from that header comparison.
 
-- [ ] **Step 2: Split router scopes in safe declaration order**
+- [x] **Step 2: Split router scopes in safe declaration order**
 
 Declare login first, authenticated static/create/import/dashboard routes second, and dynamic repository-read routes last. Keep /repos/new, /repos/import, and POST /repos behind :authenticated. Put repository reads through :browser only and add:
 
@@ -1042,35 +1042,35 @@ get "/:owner/:repo/search", RepositoryController, :search
 
 Leave smart HTTP routes unchanged.
 
-- [ ] **Step 3: Add parameter and state tests**
+- [x] **Step 3: Add parameter and state tests**
 
 Cover canonical and legacy refs, slash refs, selected-ref preservation, directories, blobs, README, commits, exact pages, non-positive page 422, out-of-range 404, empty collection page 1, missing default/ref/commit/path, empty reader/writer differences, absent-query search 200, one-to-200-character validation, trimmed queries, retained ref/query/scope on invalid search 422, unsupported scope, no results, and sanitized required 503. For search truncation, assert File scan limit reached, Content byte limit reached, Search time limit reached, and Result limit reached for their corresponding atoms, with multiple reasons rendered once in fixed file/byte/deadline/result order. Do not add blob line anchors or search highlighting in this slice.
 
-- [ ] **Step 4: Replace wildcard tree probing with the first ref-summary scan**
+- [x] **Step 4: Replace wildcard tree probing with the first ref-summary scan**
 
 Normalize unambiguous canonical query refs into RefSelector values. Pass source/raw route segments and legacy or slash-containing route refs to RepositoryPage without touching storage in the controller. RepositoryPage calls GitCore.ref_summary_for_route/2 as its first Git operation; that one bounded scan returns the summary, longest exact typed selector, and remaining Git path. It then resolves the selector exactly once. Remove the current progressively shorter read_tree/3 probes.
 
-- [ ] **Step 5: Centralize controller mapping**
+- [x] **Step 5: Centralize controller mapping**
 
 The controller owns parsing, positive-page validation, authorization, status/headers, redirects, raw sending, and RepositoryHTML template selection. RepositoryPage owns orchestration. Map only GitCore.Error.kind. Log only the stable kind and operation plus repository ID and request ID; do not log detail at this HTTP boundary. Never render detail, absolute paths, inspected terms, or native strings. Use ExUnit.CaptureLog to assert repository ID/request context remain while the storage root, native reason text, stack traces, and inspected internal terms are absent.
 
-- [ ] **Step 6: Implement uniform repository 404**
+- [x] **Step 6: Implement uniform repository 404**
 
 Use one title, body, and repository-shell state for not found and unauthorized. Authorization must complete before ForgeRepos.absolute_storage_path/1. Missing ref/commit/path uses a repository-scoped 404 with a link to the current default Code page.
 
-- [ ] **Step 7: Add safe raw headers**
+- [x] **Step 7: Add safe raw headers**
 
 In RepositoryRaw, remove control characters, escape quoted-string backslash and quote, create an ASCII fallback, and append RFC 5987 UTF-8 filename*. Allow only png, jpg/jpeg, gif, webp, and avif raster MIME types case-insensitively. Use application/octet-stream for HTML, SVG, and all other extensions. Always send X-Content-Type-Options: nosniff.
 
 Add controller assertions for CR/LF and other controls, quote, backslash, non-ASCII UTF-8 filename*, ASCII fallback, every allowlisted raster extension including mixed case, HTML/SVG fallback, and nosniff.
 
-- [ ] **Step 8: Hold raw and rendered leases through response completion**
+- [x] **Step 8: Hold raw and rendered leases through response completion**
 
 Wrap RepositoryPage rendering and GitCore.read_blob_complete/4 responses in try/after. Release after HTML.repository_page/3 or send_resp/3 returns, and on every error branch. Map oversized raw to 413 and blob-busy raw to 429 with Retry-After: 1. Never send a truncated complete read as 200.
 
 Assert byte-for-byte complete 200 bodies, oversized 413 without a prefix body, raw-busy Retry-After, and exactly one release for every acquired lease after successful send, send failure, render failure, or discarded body. Assert zero acquisitions and releases for :blob_too_large and every failure that occurs before acquisition.
 
-- [ ] **Step 9: Add failure and race tests**
+- [x] **Step 9: Add failure and race tests**
 
 Cover:
 
@@ -1085,11 +1085,11 @@ Cover:
 - a later request resolves the new OID and cache key;
 - commit detail diffs URL SHA despite another ref context.
 
-- [ ] **Step 10: Retire repository string renderers**
+- [x] **Step 10: Retire repository string renderers**
 
 Remove repo_header, repo_tabs, refs_table, commits_table, commit_detail, tree_view, blob_view, readme_preview, and mutable resolve_ref_and_path probing after every read route uses RepositoryPage/RepositoryHTML. Keep repository create/import form helpers on the existing HTML path.
 
-- [ ] **Step 11: Run and commit**
+- [x] **Step 11: Run and commit**
 
 ~~~sh
 mix test apps/fornacast_web/test/repository_controller_test.exs --trace
@@ -1109,7 +1109,7 @@ git commit -m "feat(web): expose public repository reads"
 - Add: scripts/repository_qa_fixture.exs
 - Modify: this plan only to check completed boxes
 
-- [ ] **Step 1: Make the development listener explicitly IPv4-remote**
+- [x] **Step 1: Make the development listener explicitly IPv4-remote**
 
 Change only the development endpoint IP from the IPv6 unspecified tuple to:
 
@@ -1119,7 +1119,7 @@ http: [ip: {0, 0, 0, 0}, port: String.to_integer(System.get_env("PORT", "4890"))
 
 Do not change the production endpoint bind contract.
 
-- [ ] **Step 2: Add an idempotent browser-QA fixture**
+- [x] **Step 2: Add an idempotent browser-QA fixture**
 
 Create scripts/repository_qa_fixture.exs and run it with mix run. Using existing account/repository contexts plus fixture-local collaborator insertion, idempotently create:
 
@@ -1136,7 +1136,7 @@ mix run scripts/repository_qa_fixture.exs
 mix run scripts/repository_qa_fixture.exs
 ~~~
 
-- [ ] **Step 3: Format and inspect the scoped diff**
+- [x] **Step 3: Format and inspect the scoped diff**
 
 ~~~sh
 mix format \
@@ -1176,7 +1176,7 @@ git status --short
 
 Confirm every changed line belongs to this specification and no unrelated dirty file is staged.
 
-- [ ] **Step 4: Run the focused acceptance suite**
+- [x] **Step 4: Run the focused acceptance suite**
 
 ~~~sh
 cargo test --manifest-path apps/git_core/native/fornacast_git_core/Cargo.toml
@@ -1194,7 +1194,7 @@ mix assets.build
 
 Expected: every in-scope test and the asset build pass. If an out-of-scope suite later fails, report it and stop.
 
-- [ ] **Step 5: Start the remote-reachable development server**
+- [x] **Step 5: Start the remote-reachable development server**
 
 Verify port 58211 is unused. Set QA_ORIGIN to the exact origin the in-app browser will use; in the current Codex browser routing that is localhost, while a directly addressed remote browser must use its reachable host. The bind address remains 0.0.0.0 and must never be used as a generated URL.
 
@@ -1205,7 +1205,7 @@ FORNACAST_BASE_URL="$QA_ORIGIN" PORT=58211 mix fornacast.run
 
 Confirm the startup endpoint is listening on 0.0.0.0:58211 and curl the health and one public repository route before browser work.
 
-- [ ] **Step 6: Use the Chrome DevTools browser skill**
+- [x] **Step 6: Use the Chrome DevTools browser skill**
 
 Verify sunshine and moonlight at:
 
@@ -1215,17 +1215,17 @@ Verify sunshine and moonlight at:
 
 Use fresh anonymous, qa-reader, qa-owner, and qa-denied sessions against the generated populated and empty repositories.
 
-- [ ] **Step 7: Exercise every working surface**
+- [x] **Step 7: Exercise every working surface**
 
 Verify public/private behavior, missing/private non-disclosure, canonical and slash refs, root/nested trees, branch/tag/history pages, URL-authoritative commit diff, path/content search, no results, truncation, README rewrites, blob states, raw MIME/download behavior, empty reader/writer guidance, clone URLs matching QA_ORIGIN, secure Clipboard API success when available, fallback copy success, and forced copy failure.
 
-- [ ] **Step 8: Inspect actual layout and interaction**
+- [x] **Step 8: Inspect actual layout and interaction**
 
 Assert documentElement.scrollWidth is no greater than clientWidth. Verify tabs scroll without wrapping, long paths/diffs remain in local scrollers, clone popover hit-testing works, focus returns sensibly, keyboard focus remains visible, and reduced motion is respected.
 
 Inspect computed border, background, layout, and overflow styles on DuskMoon Git components to prove phoenix_duskmoon/components is present in the generated CSS. Check network and console for failed assets or errors.
 
-- [ ] **Step 9: Recheck upstream workaround state**
+- [x] **Step 9: Recheck upstream workaround state**
 
 ~~~sh
 gh issue view 80 --repo duskmoon-dev/phoenix-duskmoon-ui
@@ -1235,7 +1235,7 @@ gh issue view 83 --repo duskmoon-dev/phoenix-duskmoon-ui
 
 If an installed dependency release fixes a gap, upgrade within the existing 9.x constraint, remove only that workaround, rerun its focused tests and assets, and verify the browser behavior. Otherwise retain the issue-linked callsite.
 
-- [ ] **Step 10: Record the teardown command**
+- [x] **Step 10: Record the teardown command**
 
 After browser evidence is captured, keep the fixture and server available for user preview. When that preview is no longer needed, stop the server and remove only the generated QA data with:
 
@@ -1243,7 +1243,7 @@ After browser evidence is captured, keep the fixture and server available for us
 mix run scripts/repository_qa_fixture.exs -- --cleanup
 ~~~
 
-- [ ] **Step 11: Commit verification configuration**
+- [x] **Step 11: Commit verification configuration**
 
 ~~~sh
 git add config/dev.exs apps/fornacast_web/test/fornacast_run_task_test.exs scripts/repository_qa_fixture.exs docs/superpowers/plans/2026-07-16-repository-foundation.md
@@ -1252,18 +1252,18 @@ git commit -m "test(repo): verify repository foundation"
 
 ## Final acceptance checklist
 
-- [ ] Only Code, Commits, Branches, and Tags are visible repository tabs.
-- [ ] Every visible control performs a real server or clipboard action.
-- [ ] Public reads work anonymously across Code, refs, commits, source, raw, and search.
-- [ ] Missing and inaccessible private repositories are indistinguishable.
-- [ ] Every ref-backed response uses one immutable snapshot OID.
-- [ ] Commit detail resolves and diffs the URL SHA.
-- [ ] Commit-aware rows use one bounded native history walk.
-- [ ] Counts, pages, search, languages, and disk size match deterministic fixtures.
-- [ ] Structured diff values map directly to dm_git_commit_diff.
-- [ ] Inline blobs are prefix-bounded and complete raw reads are never truncated successes.
-- [ ] Scan, blob, search, analysis, cache, and failure states are tested.
-- [ ] DuskMoon Git components are the primary surface and their CSS is loaded.
-- [ ] Upstream workarounds are issue-linked and present only while needed.
-- [ ] Focused tests, Git transport regression, assets, both themes, and all three viewports pass.
-- [ ] The verification server listens on 0.0.0.0 without changing production bind behavior.
+- [x] Only Code, Commits, Branches, and Tags are visible repository tabs.
+- [x] Every visible control performs a real server or clipboard action.
+- [x] Public reads work anonymously across Code, refs, commits, source, raw, and search.
+- [x] Missing and inaccessible private repositories are indistinguishable.
+- [x] Every ref-backed response uses one immutable snapshot OID.
+- [x] Commit detail resolves and diffs the URL SHA.
+- [x] Commit-aware rows use one bounded native history walk.
+- [x] Counts, pages, search, languages, and disk size match deterministic fixtures.
+- [x] Structured diff values map directly to dm_git_commit_diff.
+- [x] Inline blobs are prefix-bounded and complete raw reads are never truncated successes.
+- [x] Scan, blob, search, analysis, cache, and failure states are tested.
+- [x] DuskMoon Git components are the primary surface and their CSS is loaded.
+- [x] Upstream workarounds are issue-linked and present only while needed.
+- [x] Focused tests, Git transport regression, assets, both themes, and all three viewports pass.
+- [x] The verification server listens on 0.0.0.0 without changing production bind behavior.
