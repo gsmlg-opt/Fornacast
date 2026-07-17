@@ -622,11 +622,11 @@ git commit -m "feat(git): return structured commit diffs"
 - Modify: apps/git_core/native/fornacast_git_core/src/lib.rs
 - Add tests: apps/git_core/test/repository_read_model_test.exs
 
-- [ ] **Step 1: Add failing path-search tests**
+- [x] **Step 1: Add failing path-search tests**
 
 Assert case-insensitive literal matching, bytewise path ordering, at most 100 results, the 10,000-file limit, two-second deadline, stable repeated results, and ordered truncated_reasons.
 
-- [ ] **Step 2: Add failing content-search tests**
+- [x] **Step 2: Add failing content-search tests**
 
 Assert valid UTF-8 only, binary exclusion, blobs over 1 MiB skipped, at most one result per matching line, one-based line numbers, 240-character snippets, path-then-line ordering, 64 MiB eligible-byte bound, result bound, and combined reason display order:
 
@@ -634,11 +634,11 @@ Assert valid UTF-8 only, binary exclusion, blobs over 1 MiB skipped, at most one
 [:file_limit, :byte_limit, :deadline, :result_limit]
 ~~~
 
-- [ ] **Step 3: Implement one sorted snapshot traversal**
+- [x] **Step 3: Implement one sorted snapshot traversal**
 
 Walk only snapshot_oid. Sort paths before applying result caps. For content scope, inspect declared size before reading, skip sizes over 1 MiB, and scan line data without retaining unrelated blob content. Use Unicode lowercase comparison for the literal query. Check file, byte, result, and monotonic time bounds cooperatively.
 
-- [ ] **Step 4: Expose the API**
+- [x] **Step 4: Expose the API**
 
 ~~~elixir
 GitCore.search_tree(path, snapshot_oid, query,
@@ -652,7 +652,7 @@ GitCore.search_tree(path, snapshot_oid, query,
 
 Normalize scope in Elixir, lower-only clamp every bound, run through ScanLimiter, and do not cache queries.
 
-- [ ] **Step 5: Run and commit**
+- [x] **Step 5: Run and commit**
 
 ~~~sh
 mix test apps/git_core/test/repository_read_model_test.exs --only search --trace
