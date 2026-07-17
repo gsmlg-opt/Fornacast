@@ -167,8 +167,7 @@ defmodule ForgeRepos do
   defp owner_account_id!(%User{kind: kind, id: id}) when kind in [:user, :organization], do: id
   defp owner_account_id!(%Organization{id: id}), do: id
 
-  defp ssh_username(%User{kind: :organization}, %User{kind: :user} = actor), do: actor.username
-  defp ssh_username(%Organization{}, %User{kind: :user} = actor), do: actor.username
+  defp ssh_username(_owner, %User{kind: :user} = actor), do: actor.username
   defp ssh_username(%User{} = owner, _actor), do: owner.username
   defp ssh_username(%Organization{} = owner, _actor), do: owner.username
 
