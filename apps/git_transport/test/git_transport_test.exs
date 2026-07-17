@@ -648,6 +648,7 @@ defmodule GitTransportTest do
            "-o LogLevel=ERROR",
            "-o PasswordAuthentication=no",
            "-o PreferredAuthentications=publickey",
+           "-o PubkeyAcceptedAlgorithms=rsa-sha2-512,rsa-sha2-256",
            "-o StrictHostKeyChecking=no",
            "-o UserKnownHostsFile=#{Path.join(tmp_dir, "known_hosts")}",
            "-i #{key_path}"
@@ -673,7 +674,6 @@ defmodule GitTransportTest do
       |> Enum.map(&{&1, [comment: ~c"test"]})
       |> :ssh_file.encode(:auth_keys)
       |> to_string()
-      |> String.replace_prefix("ssh-rsa", "rsa-sha2-256")
       |> String.trim()
 
     {private_key_pem, public_key}

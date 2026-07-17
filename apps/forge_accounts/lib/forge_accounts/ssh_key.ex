@@ -3,7 +3,7 @@ defmodule ForgeAccounts.SSHKey do
 
   import Ecto.Changeset
 
-  @accepted_algorithms ~w(ssh-ed25519 rsa-sha2-256 rsa-sha2-512)
+  @accepted_algorithms ~w(ssh-ed25519 ssh-rsa)
 
   schema "ssh_keys" do
     field :title, :string
@@ -95,7 +95,7 @@ defmodule ForgeAccounts.SSHKey do
   end
 
   defp public_key_error(:unsupported_algorithm) do
-    "must use ssh-ed25519, rsa-sha2-256, or rsa-sha2-512"
+    "must use ssh-ed25519 or ssh-rsa"
   end
 
   defp public_key_error(_), do: "is not a valid OpenSSH public key"

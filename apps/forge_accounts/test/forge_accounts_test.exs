@@ -7,6 +7,7 @@ defmodule ForgeAccountsTest do
   alias Fornacast.Repo
 
   @ed25519_public_key "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINUKfpNn72l8H0YnXfbkh6s4aAcrMmVsBWPfyPppa1i8 gao@mac-mini"
+  @ssh_rsa_public_key "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDV1NesYIP9xVEoK4BnP7t9fTJYErDo2dz1jYLogURcVP0a0WoxcxMZf4TjBKGnC6BMvbuCAuNkRqmiKZow+GlSn2wl0hssXTz6cwwYYFM6ohTdUrAdJAilQbWWrWqscl19IBDYPG3D0bQaJG9wEqlF2CxE+2x99Rdc8uVQh4ATYRraJc1vTOJzi0mVWbzH3LIDhDRewDhL3djdtQ9vAsROYplRPzWgB0XcEXfwDXFycHGkUI+aGLI8+PnKaFGkP8jB3SyQZRTPi62XopkOCIiUEteaRMQvn7AcccAc/+LwKYWu+NDtegnBbHFlRMnAr0gInrVnHIg7R0wlGIOqhJt9 rsa@example.test"
 
   setup do
     reset_database!()
@@ -54,13 +55,24 @@ defmodule ForgeAccountsTest do
     assert "SHA256:" <> _ = Ecto.Changeset.get_change(changeset, :fingerprint_sha256)
   end
 
+  test "ssh key changeset accepts a standard OpenSSH RSA public key" do
+    changeset =
+      SSHKey.changeset(%SSHKey{user_id: 1}, %{
+        title: "servers",
+        public_key: @ssh_rsa_public_key
+      })
+
+    assert changeset.valid?
+    assert "SHA256:" <> _ = Ecto.Changeset.get_change(changeset, :fingerprint_sha256)
+  end
+
   test "ssh key changeset rejects unsupported algorithms" do
-    public_key = String.replace(@ed25519_public_key, "ssh-ed25519", "ssh-rsa", global: false)
+    public_key = String.replace(@ed25519_public_key, "ssh-ed25519", "ssh-dss", global: false)
     changeset = SSHKey.changeset(%SSHKey{user_id: 1}, %{title: "legacy", public_key: public_key})
 
     refute changeset.valid?
 
-    assert [public_key: {"must use ssh-ed25519, rsa-sha2-256, or rsa-sha2-512", _meta}] =
+    assert [public_key: {"must use ssh-ed25519 or ssh-rsa", _meta}] =
              changeset.errors
   end
 

@@ -129,6 +129,29 @@ defmodule FornacastWebTest do
     assert html =~ ~s(<form action="/settings/ssh-keys" method="post">)
   end
 
+  test "invalid SSH keys render human-readable validation errors" do
+    reset_database!()
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-ssh-errors@example.com",
+               password: "correct horse battery staple"
+             })
+
+    conn =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+      |> post("/settings/ssh-keys", %{
+        "ssh_key" => %{"title" => "invalid", "public_key" => "ssh-dss not-a-key"}
+      })
+
+    html = html_response(conn, 422)
+    assert html =~ "Public key must use ssh-ed25519 or ssh-rsa"
+    refute html =~ "public_key: {"
+    refute html =~ "validation:"
+  end
+
   test "appbar issue and pull request routes render demo pages" do
     reset_database!()
 
@@ -770,6 +793,7 @@ defmodule FornacastWebTest do
            "-o LogLevel=ERROR",
            "-o PasswordAuthentication=no",
            "-o PreferredAuthentications=publickey",
+           "-o PubkeyAcceptedAlgorithms=rsa-sha2-512,rsa-sha2-256",
            "-o StrictHostKeyChecking=no",
            "-o UserKnownHostsFile=#{Path.join(tmp_dir, "known_hosts")}",
            "-i #{key_path}"
@@ -795,7 +819,6 @@ defmodule FornacastWebTest do
       |> Enum.map(&{&1, [comment: ~c"test"]})
       |> :ssh_file.encode(:auth_keys)
       |> to_string()
-      |> String.replace_prefix("ssh-rsa", "rsa-sha2-256")
       |> String.trim()
 
     {private_key_pem, public_key}

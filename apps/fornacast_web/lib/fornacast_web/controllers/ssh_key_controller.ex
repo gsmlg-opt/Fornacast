@@ -57,7 +57,7 @@ defmodule FornacastWeb.SSHKeyController do
         |> put_status(:unprocessable_entity)
         |> page(
           "SSH keys",
-          error_panel(inspect(changeset.errors)) <> ssh_key_form(ssh_keys_path(conn))
+          error_panel(validation_errors(changeset)) <> ssh_key_form(ssh_keys_path(conn))
         )
     end
   end
@@ -69,6 +69,20 @@ defmodule FornacastWeb.SSHKeyController do
 
   defp ssh_keys_path(%Plug.Conn{request_path: "/settings" <> _}), do: "/settings/ssh-keys"
   defp ssh_keys_path(_conn), do: "/ssh-keys"
+
+  defp validation_errors(changeset) do
+    changeset
+    |> Ecto.Changeset.traverse_errors(fn {message, options} ->
+      Enum.reduce(options, message, fn {key, value}, rendered ->
+        String.replace(rendered, "%{#{key}}", to_string(value))
+      end)
+    end)
+    |> Enum.flat_map(fn {field, messages} ->
+      label = field |> Atom.to_string() |> String.replace("_", " ") |> String.capitalize()
+      Enum.map(messages, &escape("#{label} #{&1}"))
+    end)
+    |> Enum.join("<br>")
+  end
 
   defp ssh_key_form(path) do
     form_panel(
