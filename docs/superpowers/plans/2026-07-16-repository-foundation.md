@@ -707,17 +707,17 @@ git commit -m "feat(git): analyze repository languages and size"
 - Modify: apps/git_core/lib/git_core.ex
 - Add tests: apps/git_core/test/repository_read_model_test.exs
 
-- [ ] **Step 1: Add failing cache-unit tests**
+- [x] **Step 1: Add failing cache-unit tests**
 
 Use a disposable process and an injected monotonic clock. Cover hit/miss, storage-path isolation, every semantic key argument, 512-entry LRU, 64 MiB total accounting, value-over-1-MiB bypass, 15-minute idle expiration, access refreshing LRU/idle state, process/table failure, and concurrent callers.
 
-- [ ] **Step 2: Implement the supervised ETS cache**
+- [x] **Step 2: Implement the supervised ETS cache**
 
 Serialize get/put through a GenServer so access order is exact. Store key, value, key-and-value byte size, last-access sequence, and last-access monotonic time. Remove expired entries before every lookup and admission, and evict least-recently-accessed entries until both limits hold.
 
 Add GitCore.Cache after ScanLimiter and BlobLimiter in GitCore.Application's one_for_one child list.
 
-- [ ] **Step 3: Expose a fallback-safe fetch**
+- [x] **Step 3: Expose a fallback-safe fetch**
 
 ~~~elixir
 GitCore.Cache.fetch(key, fn -> limited_computation end)
@@ -725,7 +725,7 @@ GitCore.Cache.fetch(key, fn -> limited_computation end)
 
 Treat a lookup exception/exit as a miss, then call limited_computation exactly once outside the cache-error catch. If it returns a cacheable {:ok, value}, attempt a best-effort put in a separate catch and return the original result even when that put fails. Never retry or swallow an exit from limited_computation itself. Cache only {:ok, value} results whose external_size(value) is at most 1_048_576.
 
-- [ ] **Step 4: Integrate exact immutable keys**
+- [x] **Step 4: Integrate exact immutable keys**
 
 Use these key families:
 
@@ -738,11 +738,11 @@ Use these key families:
 
 Do not cache ref summary/page, commit page, blobs/README, search, disk usage, list_refs, pack, or receive operations. Put Cache.fetch outside ScanLimiter so hits acquire no permit.
 
-- [ ] **Step 5: Prove push and GC behavior**
+- [x] **Step 5: Prove push and GC behavior**
 
 Resolve one OID, cache its immutable result, push a new OID, and assert the next request uses a new key. Repack the same repository and assert disk usage changes are visible because size is uncached.
 
-- [ ] **Step 6: Run and commit**
+- [x] **Step 6: Run and commit**
 
 ~~~sh
 mix test apps/git_core/test/repository_read_model_test.exs --only cache --trace
