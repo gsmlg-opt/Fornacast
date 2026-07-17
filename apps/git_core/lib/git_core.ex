@@ -10,6 +10,10 @@ defmodule GitCore do
   @complete_blob_limit 100_000_000
   @diff_source_limit 200_000
   @diff_scan_deadline_ms 5_000
+  @search_file_limit 10_000
+  @search_byte_limit 67_108_864
+  @search_result_limit 100
+  @search_deadline_ms 2_000
 
   def init_bare(path) when is_binary(path) do
     GitCore.Native.init_bare(path)
@@ -321,6 +325,44 @@ defmodule GitCore do
     end)
   end
 
+  def search_tree(path, snapshot_oid, query, opts \\ [])
+      when is_binary(path) and is_binary(snapshot_oid) and is_binary(query) and is_list(opts) do
+    scope = opts |> Keyword.get(:scope, :path) |> search_scope()
+    file_limit = opts |> Keyword.get(:file_limit, @search_file_limit) |> search_file_limit()
+    byte_limit = opts |> Keyword.get(:byte_limit, @search_byte_limit) |> search_byte_limit()
+
+    result_limit =
+      opts |> Keyword.get(:result_limit, @search_result_limit) |> search_result_limit()
+
+    deadline_ms = opts |> Keyword.get(:deadline_ms, @search_deadline_ms) |> search_deadline_ms()
+
+    GitCore.ScanLimiter.with_permit(:search_tree, fn ->
+      with {:ok, {results, files_scanned, bytes_scanned, truncated_reasons}} <-
+             wrap_read(
+               GitCore.Native.search_tree(
+                 path,
+                 snapshot_oid,
+                 :binary.bin_to_list(query),
+                 Atom.to_string(scope),
+                 file_limit,
+                 byte_limit,
+                 result_limit,
+                 deadline_ms
+               ),
+               :search_tree
+             ) do
+        {:ok,
+         %GitCore.SearchResults{
+           scope: scope,
+           results: Enum.map(results, &search_result_from_native/1),
+           files_scanned: files_scanned,
+           bytes_scanned: bytes_scanned,
+           truncated_reasons: Enum.map(truncated_reasons, &search_reason/1)
+         }}
+      end
+    end)
+  end
+
   def pack_objects(path, wants) when is_binary(path) and is_list(wants) do
     GitCore.Native.pack_objects(path, wants)
   end
@@ -421,6 +463,27 @@ defmodule GitCore do
     |> max(0)
     |> min(@diff_scan_deadline_ms)
   end
+
+  defp search_scope(:path), do: :path
+  defp search_scope("path"), do: :path
+  defp search_scope(:content), do: :content
+  defp search_scope("content"), do: :content
+
+  defp search_scope(scope) do
+    raise ArgumentError, "search scope must be :path or :content, got: #{inspect(scope)}"
+  end
+
+  defp search_file_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@search_file_limit)
+
+  defp search_byte_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@search_byte_limit)
+
+  defp search_result_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@search_result_limit)
+
+  defp search_deadline_ms(deadline_ms) when is_integer(deadline_ms),
+    do: deadline_ms |> max(0) |> min(@search_deadline_ms)
 
   defp blob_metadata(path, snapshot_oid, blob_path, operation) do
     with {:ok, {name, oid, size}} <-
@@ -568,6 +631,19 @@ defmodule GitCore do
   defp diff_line_type("added"), do: :added
   defp diff_line_type("deleted"), do: :deleted
   defp diff_line_type("hunk"), do: :hunk
+
+  defp search_result_from_native({path, line, snippet}) do
+    %GitCore.SearchResult{
+      path: ref_name_from_native(path),
+      line: line,
+      snippet: if(is_nil(snippet), do: nil, else: ref_name_from_native(snippet))
+    }
+  end
+
+  defp search_reason("file_limit"), do: :file_limit
+  defp search_reason("byte_limit"), do: :byte_limit
+  defp search_reason("deadline"), do: :deadline
+  defp search_reason("result_limit"), do: :result_limit
 
   defp commit_from_native(
          {oid, title, message, {author_name, author_email, author_time},

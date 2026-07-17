@@ -32,6 +32,8 @@ type NativeDiffFile = (
     NativeDiffStats,
 );
 type NativeCommitDiff = (Vec<NativeDiffFile>, Vec<u8>, bool, u64, u64, u64);
+type NativeSearchResult = (Vec<u8>, Option<u64>, Option<Vec<u8>>);
+type NativeSearchResults = (Vec<NativeSearchResult>, u64, u64, Vec<String>);
 type NativeRef = (Vec<u8>, String, String);
 type NativeRefSummary = (usize, usize, Vec<NativeRef>, Vec<NativeRef>, bool);
 type NativeTreeCommit = (String, String, String, i64);
@@ -134,6 +136,12 @@ const COMPLETE_BLOB_LIMIT: u64 = 100_000_000;
 const DIFF_SOURCE_LIMIT: usize = 200_000;
 const DIFF_FILE_LIMIT: usize = 1_000;
 const DIFF_SCAN_DEADLINE: Duration = Duration::from_secs(5);
+const SEARCH_FILE_LIMIT: u64 = 10_000;
+const SEARCH_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
+const SEARCH_RESULT_LIMIT: usize = 100;
+const SEARCH_BLOB_LIMIT: u64 = 1024 * 1024;
+const SEARCH_SCAN_DEADLINE: Duration = Duration::from_secs(2);
+const SEARCH_SNIPPET_LIMIT: usize = 240;
 const NO_FINAL_NEWLINE_MARKER: &[u8] = b"\\ No newline at end of file\n";
 // This remains independent of object size while leaving room for the complete mandatory tag
 // header, including long ref-derived tag names, before an arbitrarily large message body.
@@ -167,6 +175,29 @@ struct VerifiedDiffResource {
 struct VerifiedDiffResources {
     old: Option<VerifiedDiffResource>,
     new: Option<VerifiedDiffResource>,
+}
+
+#[derive(Clone)]
+struct SearchTreeEntry {
+    name: Vec<u8>,
+    mode: u16,
+    oid: gix_hash::ObjectId,
+}
+
+struct SearchTreeFrame {
+    prefix: Vec<u8>,
+    data: Vec<u8>,
+    hash_kind: gix_hash::Kind,
+    offset: usize,
+    previous: Option<(Vec<u8>, bool)>,
+}
+
+#[derive(Default)]
+struct SearchStopFlags {
+    file_limit: bool,
+    byte_limit: bool,
+    deadline: bool,
+    result_limit: bool,
 }
 
 fn to_error<E: std::fmt::Display>(error: E) -> String {
@@ -2121,6 +2152,343 @@ fn diff_commit(
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
+fn search_tree(
+    path: String,
+    snapshot_oid: String,
+    query: Vec<u8>,
+    scope: String,
+    file_limit: u64,
+    byte_limit: u64,
+    result_limit: usize,
+    deadline_ms: u64,
+) -> Result<NativeSearchResults, NativeError> {
+    let scope = match scope.as_str() {
+        "path" => SearchScope::Path,
+        "content" => SearchScope::Content,
+        _ => {
+            return Err(native_error(
+                "corrupt_repository",
+                "search scope must be path or content",
+            ));
+        }
+    };
+    let file_limit = file_limit.min(SEARCH_FILE_LIMIT);
+    let byte_limit = search_byte_limit(byte_limit);
+    let result_limit = result_limit.min(SEARCH_RESULT_LIMIT);
+    let deadline = Instant::now() + search_scan_duration(deadline_ms);
+    let repo = open_physical_bare_repository(&path)?;
+    let commit_oid = gix_hash::ObjectId::from_hex(snapshot_oid.as_bytes())
+        .map_err(|error| native_error("commit_not_found", error))?;
+    let commit = find_graph_commit(&repo, commit_oid, CommitPosition::Tip)?;
+    let actual_commit =
+        gix_object::compute_hash(repo.object_hash(), gix_object::Kind::Commit, &commit.data)
+            .map_err(|error| native_error("corrupt_repository", error))?;
+    if actual_commit != commit.id {
+        return Err(native_error(
+            "corrupt_repository",
+            format_args!(
+                "commit checksum mismatch: expected {}, computed {actual_commit}",
+                commit.id
+            ),
+        ));
+    }
+    let tree_oid = commit
+        .decode()
+        .map_err(|error| native_error("corrupt_repository", error))?
+        .tree();
+    drop(commit);
+
+    let root = load_search_tree_frame(&repo, tree_oid, Vec::new())?;
+    let mut frames = vec![root];
+    let query_lower = query.as_slice().to_lowercase();
+    let mut results = Vec::with_capacity(result_limit);
+    let mut files_scanned = 0_u64;
+    let mut bytes_scanned = 0_u64;
+    let mut content_exhausted = false;
+    let mut stops = SearchStopFlags::default();
+
+    'search: while let Some((entry, full_path)) = next_search_entry(&mut frames)? {
+        if Instant::now() >= deadline {
+            stops.deadline = true;
+            break;
+        }
+
+        match entry.mode {
+            0o040000 => {
+                let frame = load_search_tree_frame(&repo, entry.oid, full_path)?;
+                frames.push(frame);
+                if Instant::now() >= deadline {
+                    stops.deadline = true;
+                    break;
+                }
+            }
+            0o100644 | 0o100755 | 0o120000 => {
+                if files_scanned >= file_limit {
+                    stops.file_limit = true;
+                    break;
+                }
+                files_scanned = files_scanned.checked_add(1).ok_or_else(|| {
+                    native_error("corrupt_repository", "search file count overflow")
+                })?;
+
+                match scope {
+                    SearchScope::Path => {
+                        if contains_lowered_literal(&full_path, &query_lower) {
+                            retain_search_result(
+                                &mut results,
+                                result_limit,
+                                (full_path, None, None),
+                                &mut stops,
+                            );
+                        }
+                        if Instant::now() >= deadline {
+                            stops.deadline = true;
+                            break;
+                        }
+                    }
+                    SearchScope::Content => {
+                        if content_exhausted {
+                            continue;
+                        }
+                        let metadata = bounded_blob::read_blob_metadata(&repo, entry.oid)
+                            .map_err(bounded_blob_native_error)?;
+                        if Instant::now() >= deadline {
+                            stops.deadline = true;
+                            break;
+                        }
+                        if metadata.size > SEARCH_BLOB_LIMIT {
+                            continue;
+                        }
+                        let next_bytes =
+                            bytes_scanned.checked_add(metadata.size).ok_or_else(|| {
+                                native_error("corrupt_repository", "search byte count overflow")
+                            })?;
+                        if next_bytes > byte_limit {
+                            stops.byte_limit = true;
+                            content_exhausted = true;
+                            continue;
+                        }
+
+                        let body_limit = usize::try_from(metadata.size).map_err(|_| {
+                            native_error(
+                                "corrupt_repository",
+                                "eligible blob size does not fit usize",
+                            )
+                        })?;
+                        let body = bounded_blob::read_verified_prefix(
+                            &repo,
+                            entry.oid,
+                            metadata.size,
+                            body_limit,
+                        )
+                        .map_err(bounded_blob_native_error)?;
+                        if body.truncated || body.data.len() as u64 != metadata.size {
+                            return Err(native_error(
+                                "corrupt_repository",
+                                "search body read did not return the complete declared blob",
+                            ));
+                        }
+                        bytes_scanned = next_bytes;
+                        if Instant::now() >= deadline {
+                            stops.deadline = true;
+                            break;
+                        }
+                        if retain_content_matches(
+                            &full_path,
+                            &body.data,
+                            &query_lower,
+                            result_limit,
+                            &mut results,
+                            &mut stops,
+                            deadline,
+                        ) {
+                            break 'search;
+                        }
+                    }
+                }
+            }
+            0o160000 => {}
+            _ => unreachable!("tree modes are validated before traversal"),
+        }
+    }
+
+    Ok((
+        results,
+        files_scanned,
+        bytes_scanned,
+        ordered_search_reasons(&stops),
+    ))
+}
+
+#[derive(Clone, Copy)]
+enum SearchScope {
+    Path,
+    Content,
+}
+
+fn load_search_tree_frame(
+    repo: &gix::Repository,
+    oid: gix_hash::ObjectId,
+    prefix: Vec<u8>,
+) -> Result<SearchTreeFrame, NativeError> {
+    let mut tree = load_blob_tree(repo, oid)?;
+    let actual = gix_object::compute_hash(repo.object_hash(), gix_object::Kind::Tree, &tree.data)
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    if actual != tree.id {
+        return Err(native_error(
+            "corrupt_repository",
+            format_args!(
+                "tree checksum mismatch: expected {}, computed {actual}",
+                tree.id
+            ),
+        ));
+    }
+
+    let hash_kind = tree.id.kind();
+    let data = std::mem::take(&mut tree.data);
+    Ok(SearchTreeFrame {
+        prefix,
+        data,
+        hash_kind,
+        offset: 0,
+        previous: None,
+    })
+}
+
+fn next_search_entry(
+    frames: &mut Vec<SearchTreeFrame>,
+) -> Result<Option<(SearchTreeEntry, Vec<u8>)>, NativeError> {
+    loop {
+        let Some(frame) = frames.last_mut() else {
+            return Ok(None);
+        };
+        if frame.offset == frame.data.len() {
+            frames.pop();
+            continue;
+        }
+
+        let remaining = &frame.data[frame.offset..];
+        let mut entries = gix_object::TreeRefIter::from_bytes(remaining, frame.hash_kind);
+        let entry = entries
+            .next()
+            .ok_or_else(|| native_error("corrupt_repository", "tree entry is missing"))?
+            .map_err(|error| native_error("corrupt_repository", error))?;
+        let consumed = entries.offset_to_next_entry(remaining);
+        if consumed == 0 {
+            return Err(native_error(
+                "corrupt_repository",
+                "tree parser made no progress",
+            ));
+        }
+        frame.offset = frame
+            .offset
+            .checked_add(consumed)
+            .ok_or_else(|| native_error("corrupt_repository", "tree traversal offset overflow"))?;
+        let name = entry.filename.to_vec();
+        validate_tree_entry(&mut frame.previous, &name, entry.mode.value())?;
+        let entry = SearchTreeEntry {
+            name,
+            mode: entry.mode.value(),
+            oid: entry.oid.to_owned(),
+        };
+        let mut full_path = Vec::with_capacity(
+            frame.prefix.len() + usize::from(!frame.prefix.is_empty()) + entry.name.len(),
+        );
+        full_path.extend_from_slice(&frame.prefix);
+        if !frame.prefix.is_empty() {
+            full_path.push(b'/');
+        }
+        full_path.extend_from_slice(&entry.name);
+        return Ok(Some((entry, full_path)));
+    }
+}
+
+fn contains_lowered_literal(value: &[u8], lowered_query: &[u8]) -> bool {
+    if lowered_query.is_empty() {
+        return true;
+    }
+    value
+        .to_lowercase()
+        .windows(lowered_query.len())
+        .any(|window| window == lowered_query)
+}
+
+fn retain_content_matches(
+    path: &[u8],
+    data: &[u8],
+    lowered_query: &[u8],
+    result_limit: usize,
+    results: &mut Vec<NativeSearchResult>,
+    stops: &mut SearchStopFlags,
+    deadline: Instant,
+) -> bool {
+    if data.contains(&0) {
+        return search_deadline_reached(stops, deadline);
+    }
+    let Ok(text) = std::str::from_utf8(data) else {
+        return search_deadline_reached(stops, deadline);
+    };
+
+    for (index, line) in text.lines().enumerate() {
+        if Instant::now() >= deadline {
+            stops.deadline = true;
+            return true;
+        }
+        if !contains_lowered_literal(line.as_bytes(), lowered_query) {
+            continue;
+        }
+        let line_number = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+        let snippet = line.chars().take(SEARCH_SNIPPET_LIMIT).collect::<String>();
+        retain_search_result(
+            results,
+            result_limit,
+            (path.to_vec(), Some(line_number), Some(snippet.into_bytes())),
+            stops,
+        );
+    }
+    search_deadline_reached(stops, deadline)
+}
+
+fn search_deadline_reached(stops: &mut SearchStopFlags, deadline: Instant) -> bool {
+    let reached = Instant::now() >= deadline;
+    stops.deadline |= reached;
+    reached
+}
+
+fn retain_search_result(
+    results: &mut Vec<NativeSearchResult>,
+    result_limit: usize,
+    result: NativeSearchResult,
+    stops: &mut SearchStopFlags,
+) {
+    if results.len() < result_limit {
+        results.push(result);
+    } else {
+        stops.result_limit = true;
+    }
+}
+
+fn ordered_search_reasons(stops: &SearchStopFlags) -> Vec<String> {
+    [
+        (stops.file_limit, "file_limit"),
+        (stops.byte_limit, "byte_limit"),
+        (stops.deadline, "deadline"),
+        (stops.result_limit, "result_limit"),
+    ]
+    .into_iter()
+    .filter_map(|(stopped, reason)| stopped.then(|| reason.to_string()))
+    .collect()
+}
+
+fn search_scan_duration(deadline_ms: u64) -> Duration {
+    Duration::from_millis(deadline_ms.min(SEARCH_SCAN_DEADLINE.as_millis() as u64))
+}
+
+fn search_byte_limit(byte_limit: u64) -> u64 {
+    byte_limit.min(SEARCH_BYTE_LIMIT)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
 fn pack_objects<'env>(
     env: rustler::Env<'env>,
     path: String,
@@ -3384,6 +3752,36 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TREE_HISTORY_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn search_reasons_have_one_fixed_serialization_order() {
+        let stops = SearchStopFlags {
+            file_limit: true,
+            byte_limit: true,
+            deadline: true,
+            result_limit: true,
+        };
+
+        assert_eq!(
+            ordered_search_reasons(&stops),
+            ["file_limit", "byte_limit", "deadline", "result_limit"]
+        );
+    }
+
+    #[test]
+    fn search_deadline_override_cannot_raise_the_two_second_ceiling() {
+        assert_eq!(search_scan_duration(0), Duration::ZERO);
+        assert_eq!(search_scan_duration(1_250), Duration::from_millis(1_250));
+        assert_eq!(search_scan_duration(u64::MAX), SEARCH_SCAN_DEADLINE);
+    }
+
+    #[test]
+    fn search_byte_override_cannot_raise_the_sixty_four_mib_ceiling() {
+        assert_eq!(search_byte_limit(0), 0);
+        assert_eq!(search_byte_limit(SEARCH_BYTE_LIMIT), 67_108_864);
+        assert_eq!(search_byte_limit(SEARCH_BYTE_LIMIT + 1), 67_108_864);
+        assert_eq!(search_byte_limit(u64::MAX), 67_108_864);
+    }
 
     struct TreeHistoryFixture {
         temp_path: PathBuf,

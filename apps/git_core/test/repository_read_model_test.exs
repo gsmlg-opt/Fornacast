@@ -3078,6 +3078,587 @@ defmodule GitCore.RepositoryReadModelTest do
   end
 end
 
+defmodule GitCore.RepositorySearchTest do
+  use ExUnit.Case, async: false
+
+  @moduletag :search
+  @content_blob_limit 1_048_576
+
+  @tag :tmp_dir
+  test "path search is literal case-insensitive, raw-byte ordered, stable, and physical", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = path_search_fixture!(tmp_dir)
+
+    expected_paths = [
+      "a/match-inside.txt",
+      "foo.match",
+      "foo/match-child.txt",
+      <<"raw-", 0xFF, "-MATCH.txt">>,
+      "unicode-İ-match.txt"
+    ]
+
+    for _ <- 1..2 do
+      assert {:ok,
+              %GitCore.SearchResults{
+                scope: :path,
+                results: results,
+                files_scanned: 5,
+                bytes_scanned: 0,
+                truncated_reasons: []
+              }} = GitCore.search_tree(fixture.repo_path, fixture.commit_oid, "mAtCh")
+
+      assert Enum.map(results, & &1.path) == expected_paths
+
+      assert Enum.all?(results, fn result ->
+               match?(%GitCore.SearchResult{line: nil, snippet: nil}, result)
+             end)
+    end
+
+    assert {:ok, %GitCore.SearchResults{results: [%{path: "unicode-İ-match.txt"}]}} =
+             GitCore.search_tree(
+               fixture.repo_path,
+               fixture.commit_oid,
+               "i\u0307",
+               scope: :path
+             )
+
+    assert {:ok, %GitCore.SearchResults{results: [%{path: "foo.match"}]}} =
+             GitCore.search_tree(fixture.repo_path, fixture.commit_oid, "foo.", scope: :path)
+
+    refute Enum.any?(expected_paths, &(&1 == "replacement-only-match.txt"))
+  end
+
+  @tag :tmp_dir
+  test "path caps preserve zero, apply after ordering, and report only omitted work", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = path_search_fixture!(tmp_dir)
+
+    assert {:ok, %GitCore.SearchResults{results: exact, truncated_reasons: []}} =
+             GitCore.search_tree(fixture.repo_path, fixture.commit_oid, "match",
+               result_limit: 5,
+               file_limit: 5
+             )
+
+    assert length(exact) == 5
+
+    assert {:ok,
+            %GitCore.SearchResults{
+              results: first_three,
+              files_scanned: 5,
+              truncated_reasons: [:result_limit]
+            }} =
+             GitCore.search_tree(fixture.repo_path, fixture.commit_oid, "match", result_limit: 3)
+
+    assert Enum.map(first_three, & &1.path) == Enum.take(Enum.map(exact, & &1.path), 3)
+
+    assert {:ok,
+            %GitCore.SearchResults{
+              results: [],
+              files_scanned: 5,
+              truncated_reasons: [:result_limit]
+            }} =
+             GitCore.search_tree(fixture.repo_path, fixture.commit_oid, "match", result_limit: 0)
+
+    assert {:ok,
+            %GitCore.SearchResults{
+              results: [],
+              files_scanned: 0,
+              truncated_reasons: [:file_limit]
+            }} =
+             GitCore.search_tree(fixture.repo_path, fixture.commit_oid, "match", file_limit: 0)
+
+    assert {:ok,
+            %GitCore.SearchResults{
+              results: [],
+              files_scanned: 0,
+              truncated_reasons: [:deadline]
+            }} =
+             GitCore.search_tree(fixture.repo_path, fixture.commit_oid, "match", deadline_ms: 0)
+
+    empty = empty_search_fixture!(tmp_dir)
+
+    assert {:ok,
+            %GitCore.SearchResults{
+              results: [],
+              files_scanned: 0,
+              truncated_reasons: []
+            }} =
+             GitCore.search_tree(empty.repo_path, empty.commit_oid, "match",
+               file_limit: 0,
+               result_limit: 0,
+               deadline_ms: 0
+             )
+  end
+
+  @tag :tmp_dir
+  @tag timeout: 120_000
+  test "path search never scans more than ten thousand files", %{tmp_dir: tmp_dir} do
+    fixture = many_path_search_fixture!(tmp_dir, 10_001)
+
+    assert {:ok,
+            %GitCore.SearchResults{
+              results: [],
+              files_scanned: 10_000,
+              bytes_scanned: 0,
+              truncated_reasons: [:file_limit]
+            }} = GitCore.search_tree(fixture.repo_path, fixture.commit_oid, "absent")
+
+    assert {:ok,
+            %GitCore.SearchResults{
+              results: results,
+              files_scanned: 10_000,
+              truncated_reasons: [:file_limit, :result_limit]
+            }} =
+             GitCore.search_tree(fixture.repo_path, fixture.commit_oid, "file-",
+               file_limit: 20_000,
+               result_limit: 200,
+               deadline_ms: 20_000
+             )
+
+    assert length(results) == 100
+    assert hd(results).path == "file-00001.txt"
+    assert List.last(results).path == "file-00100.txt"
+  end
+
+  @tag :tmp_dir
+  @tag timeout: 120_000
+  test "content search excludes ineligible bodies and returns bounded ordered lines", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = content_search_fixture!(tmp_dir)
+
+    assert {:ok,
+            %GitCore.SearchResults{
+              scope: :content,
+              results: results,
+              files_scanned: 7,
+              bytes_scanned: bytes_scanned,
+              truncated_reasons: []
+            }} =
+             GitCore.search_tree(fixture.repo_path, fixture.commit_oid, "nEeDlE", scope: :content)
+
+    assert Enum.map(results, &{&1.path, &1.line}) == [
+             {"a.txt", 2},
+             {"a.txt", 3},
+             {"exact.txt", 1},
+             {"nested/inside.txt", 2},
+             {"z.txt", 1}
+           ]
+
+    assert bytes_scanned == fixture.eligible_bytes
+    assert Enum.count(results, &(&1.path == "a.txt" and &1.line == 2)) == 1
+
+    long = Enum.find(results, &(&1.path == "z.txt"))
+    assert long.snippet == String.duplicate("界", 240)
+    assert byte_size(long.snippet) == 720
+    assert String.valid?(long.snippet)
+
+    refute Enum.any?(results, &(&1.path in ["binary.txt", "huge.txt", "invalid.txt"]))
+
+    assert {:ok,
+            %GitCore.SearchResults{
+              results: [%GitCore.SearchResult{path: "nested/inside.txt", line: 2}]
+            }} =
+             GitCore.search_tree(fixture.repo_path, fixture.commit_oid, "i\u0307tem",
+               scope: :content
+             )
+  end
+
+  @tag :tmp_dir
+  test "content byte and result reasons are ordered and only mark omitted work", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = content_search_fixture!(tmp_dir)
+
+    assert {:ok,
+            %GitCore.SearchResults{
+              results: [%{path: "a.txt", line: 2}],
+              bytes_scanned: scanned,
+              truncated_reasons: [:byte_limit, :result_limit]
+            }} =
+             GitCore.search_tree(fixture.repo_path, fixture.commit_oid, "needle",
+               scope: :content,
+               byte_limit: fixture.first_blob_bytes,
+               result_limit: 1
+             )
+
+    assert scanned == fixture.first_blob_bytes
+
+    assert {:ok,
+            %GitCore.SearchResults{
+              results: [],
+              bytes_scanned: 0,
+              truncated_reasons: [:byte_limit]
+            }} =
+             GitCore.search_tree(fixture.repo_path, fixture.commit_oid, "needle",
+               scope: :content,
+               byte_limit: 0
+             )
+
+    assert {:ok,
+            %GitCore.SearchResults{
+              results: exact,
+              truncated_reasons: []
+            }} =
+             GitCore.search_tree(fixture.repo_path, fixture.commit_oid, "needle",
+               scope: :content,
+               result_limit: 5
+             )
+
+    assert length(exact) == 5
+
+    post_limit = post_byte_limit_corruption_fixture!(tmp_dir)
+
+    assert {:ok,
+            %GitCore.SearchResults{
+              results: [%GitCore.SearchResult{path: "a.txt", line: 1}],
+              files_scanned: 3,
+              bytes_scanned: 7,
+              truncated_reasons: [:byte_limit]
+            }} =
+             GitCore.search_tree(post_limit.repo_path, post_limit.commit_oid, "needle",
+               scope: :content,
+               byte_limit: 7
+             )
+  end
+
+  @tag :tmp_dir
+  test "content search rejects false blob identities and noncanonical trees", %{tmp_dir: tmp_dir} do
+    aliased = aliased_search_blob_fixture!(tmp_dir)
+
+    assert {:ok,
+            %GitCore.SearchResults{
+              results: [%GitCore.SearchResult{path: "aliased.txt"}]
+            }} = GitCore.search_tree(aliased.repo_path, aliased.commit_oid, "aliased")
+
+    assert_error(
+      GitCore.search_tree(aliased.repo_path, aliased.commit_oid, "needle", scope: :content),
+      :corrupt_repository,
+      :search_tree
+    )
+
+    malformed = malformed_search_tree_fixture!(tmp_dir)
+
+    assert_error(
+      GitCore.search_tree(malformed.repo_path, malformed.commit_oid, "needle", scope: :content),
+      :corrupt_repository,
+      :search_tree
+    )
+
+    aliased_commit = aliased_search_commit_fixture!(tmp_dir)
+
+    assert_error(
+      GitCore.search_tree(aliased_commit.repo_path, aliased_commit.commit_oid, "needle"),
+      :corrupt_repository,
+      :search_tree
+    )
+  end
+
+  test "search cannot redirect around the supervised global scan limiter" do
+    isolated_limiter =
+      start_supervised!({GitCore.ScanLimiter, server: nil}, id: make_ref())
+
+    holders = for _ <- 1..4, do: start_global_search_holder()
+
+    Enum.each(holders, fn holder ->
+      assert_receive {:global_search_scan_entered, ^holder}, 1_000
+    end)
+
+    missing_path =
+      Path.join(System.tmp_dir!(), "missing-search-#{System.unique_integer([:positive])}.git")
+
+    try do
+      assert_error(
+        GitCore.search_tree(missing_path, String.duplicate("f", 40), "query",
+          scan_limiter: isolated_limiter
+        ),
+        :scan_busy,
+        :search_tree
+      )
+    after
+      Enum.each(holders, &send(&1, :release))
+
+      Enum.each(holders, fn holder ->
+        assert_receive {:global_search_scan_finished, ^holder, :released}, 1_000
+      end)
+    end
+  end
+
+  defp path_search_fixture!(tmp_dir) do
+    {repo_path, suffix} = init_search_repo!(tmp_dir, "path-search")
+    blob_oid = write_blob!(repo_path, tmp_dir, "path-body-#{suffix}", "body\n")
+
+    a_tree =
+      write_tree!(repo_path, tmp_dir, "path-a-#{suffix}", [
+        {"100644", "match-inside.txt", blob_oid}
+      ])
+
+    foo_tree =
+      write_tree!(repo_path, tmp_dir, "path-foo-#{suffix}", [
+        {"100644", "match-child.txt", blob_oid}
+      ])
+
+    root_tree =
+      write_tree!(repo_path, tmp_dir, "path-root-#{suffix}", [
+        {"40000", "a", a_tree},
+        {"100644", "foo.match", blob_oid},
+        {"40000", "foo", foo_tree},
+        {"100644", <<"raw-", 0xFF, "-MATCH.txt">>, blob_oid},
+        {"100644", "unicode-İ-match.txt", blob_oid}
+      ])
+
+    commit_oid = commit_tree!(repo_path, root_tree, "search snapshot")
+
+    replacement_tree =
+      write_tree!(repo_path, tmp_dir, "path-replacement-#{suffix}", [
+        {"100644", "replacement-only-match.txt", blob_oid}
+      ])
+
+    replacement_oid = commit_tree!(repo_path, replacement_tree, "replacement snapshot")
+    git!(["--git-dir", repo_path, "update-ref", "refs/replace/#{commit_oid}", replacement_oid])
+
+    %{repo_path: repo_path, commit_oid: commit_oid}
+  end
+
+  defp empty_search_fixture!(tmp_dir) do
+    {repo_path, suffix} = init_search_repo!(tmp_dir, "empty-search")
+    tree_oid = write_tree!(repo_path, tmp_dir, "empty-tree-#{suffix}", [])
+    %{repo_path: repo_path, commit_oid: commit_tree!(repo_path, tree_oid, "empty search")}
+  end
+
+  defp many_path_search_fixture!(tmp_dir, count) do
+    {repo_path, suffix} = init_search_repo!(tmp_dir, "many-search")
+    blob_oid = write_blob!(repo_path, tmp_dir, "many-body-#{suffix}", "body\n")
+
+    entries =
+      for index <- 1..count do
+        {"100644", "file-#{String.pad_leading(Integer.to_string(index), 5, "0")}.txt", blob_oid}
+      end
+
+    tree_oid = write_tree!(repo_path, tmp_dir, "many-tree-#{suffix}", entries)
+    %{repo_path: repo_path, commit_oid: commit_tree!(repo_path, tree_oid, "many search")}
+  end
+
+  defp content_search_fixture!(tmp_dir) do
+    {repo_path, suffix} = init_search_repo!(tmp_dir, "content-search")
+    first = "heading\nNeedle twice needle\ntail needle\n"
+    binary = <<"needle", 0, "hidden\n">>
+    invalid = <<"needle invalid ", 0xFF, "\n">>
+    exact = String.pad_trailing("needle\n", @content_blob_limit, "x")
+    nested = "nothing\nİTEM NEEDLE nested\n"
+    long = String.duplicate("界", 250) <> " needle\n"
+
+    blobs = %{
+      first: write_blob!(repo_path, tmp_dir, "content-a-#{suffix}", first),
+      binary: write_blob!(repo_path, tmp_dir, "content-binary-#{suffix}", binary),
+      exact: write_blob!(repo_path, tmp_dir, "content-exact-#{suffix}", exact),
+      huge: write_declared_blob_header!(repo_path, @content_blob_limit + 1),
+      invalid: write_blob!(repo_path, tmp_dir, "content-invalid-#{suffix}", invalid),
+      nested: write_blob!(repo_path, tmp_dir, "content-nested-#{suffix}", nested),
+      long: write_blob!(repo_path, tmp_dir, "content-z-#{suffix}", long)
+    }
+
+    replacement = write_blob!(repo_path, tmp_dir, "content-replacement-#{suffix}", "hidden\n")
+    git!(["--git-dir", repo_path, "update-ref", "refs/replace/#{blobs.first}", replacement])
+
+    nested_tree =
+      write_tree!(repo_path, tmp_dir, "content-nested-tree-#{suffix}", [
+        {"100644", "inside.txt", blobs.nested}
+      ])
+
+    root_tree =
+      write_tree!(repo_path, tmp_dir, "content-root-#{suffix}", [
+        {"100644", "a.txt", blobs.first},
+        {"100644", "binary.txt", blobs.binary},
+        {"100644", "exact.txt", blobs.exact},
+        {"100644", "huge.txt", blobs.huge},
+        {"100644", "invalid.txt", blobs.invalid},
+        {"40000", "nested", nested_tree},
+        {"100644", "z.txt", blobs.long}
+      ])
+
+    %{
+      repo_path: repo_path,
+      commit_oid: commit_tree!(repo_path, root_tree, "content search"),
+      first_blob_bytes: byte_size(first),
+      eligible_bytes:
+        Enum.sum(Enum.map([first, binary, exact, invalid, nested, long], &byte_size/1))
+    }
+  end
+
+  defp aliased_search_blob_fixture!(tmp_dir) do
+    {repo_path, suffix} = init_search_repo!(tmp_dir, "aliased-search")
+    canonical_oid = write_blob!(repo_path, tmp_dir, "aliased-body-#{suffix}", "needle\n")
+    fake_oid = String.duplicate("b", 40)
+    fake_path = loose_object_path(repo_path, fake_oid)
+    File.mkdir_p!(Path.dirname(fake_path))
+    File.cp!(loose_object_path(repo_path, canonical_oid), fake_path)
+
+    tree_oid =
+      write_tree!(repo_path, tmp_dir, "aliased-tree-#{suffix}", [
+        {"100644", "aliased.txt", fake_oid}
+      ])
+
+    %{repo_path: repo_path, commit_oid: commit_tree!(repo_path, tree_oid, "aliased search")}
+  end
+
+  defp malformed_search_tree_fixture!(tmp_dir) do
+    {repo_path, suffix} = init_search_repo!(tmp_dir, "malformed-search")
+    blob_oid = write_blob!(repo_path, tmp_dir, "malformed-body-#{suffix}", "needle\n")
+
+    tree_oid =
+      write_tree!(repo_path, tmp_dir, "malformed-tree-#{suffix}", [
+        {"100644", "z.txt", blob_oid},
+        {"100644", "a.txt", blob_oid}
+      ])
+
+    %{repo_path: repo_path, commit_oid: commit_tree!(repo_path, tree_oid, "malformed search")}
+  end
+
+  defp aliased_search_commit_fixture!(tmp_dir) do
+    {repo_path, suffix} = init_search_repo!(tmp_dir, "aliased-search-commit")
+    blob_oid = write_blob!(repo_path, tmp_dir, "aliased-commit-body-#{suffix}", "needle\n")
+
+    tree_oid =
+      write_tree!(repo_path, tmp_dir, "aliased-commit-tree-#{suffix}", [
+        {"100644", "needle.txt", blob_oid}
+      ])
+
+    canonical_oid = commit_tree!(repo_path, tree_oid, "aliased search commit")
+    fake_oid = String.duplicate("c", 40)
+    fake_path = loose_object_path(repo_path, fake_oid)
+    File.mkdir_p!(Path.dirname(fake_path))
+    File.cp!(loose_object_path(repo_path, canonical_oid), fake_path)
+    %{repo_path: repo_path, commit_oid: fake_oid}
+  end
+
+  defp post_byte_limit_corruption_fixture!(tmp_dir) do
+    {repo_path, suffix} = init_search_repo!(tmp_dir, "post-byte-limit-corruption")
+    first_oid = write_blob!(repo_path, tmp_dir, "post-limit-first-#{suffix}", "needle\n")
+    boundary_oid = write_blob!(repo_path, tmp_dir, "post-limit-boundary-#{suffix}", "x")
+    corrupt_oid = String.duplicate("d", 40)
+    corrupt_path = loose_object_path(repo_path, corrupt_oid)
+    File.mkdir_p!(Path.dirname(corrupt_path))
+    File.write!(corrupt_path, "not a zlib stream")
+
+    tree_oid =
+      write_tree!(repo_path, tmp_dir, "post-limit-tree-#{suffix}", [
+        {"100644", "a.txt", first_oid},
+        {"100644", "b.txt", boundary_oid},
+        {"100644", "c.txt", corrupt_oid}
+      ])
+
+    %{
+      repo_path: repo_path,
+      commit_oid: commit_tree!(repo_path, tree_oid, "post byte limit corruption")
+    }
+  end
+
+  defp init_search_repo!(tmp_dir, name) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "#{name}-#{suffix}.git")
+    git!(["init", "--bare", "--object-format=sha1", repo_path])
+    {repo_path, suffix}
+  end
+
+  defp write_blob!(repo_path, tmp_dir, name, body) do
+    path = Path.join(tmp_dir, name)
+    File.write!(path, body)
+    git!(["--git-dir", repo_path, "hash-object", "-w", path])
+  end
+
+  defp write_declared_blob_header!(repo_path, declared_size) do
+    oid = String.duplicate("a", 40)
+    path = loose_object_path(repo_path, oid)
+    File.mkdir_p!(Path.dirname(path))
+    stream = :zlib.open()
+    :ok = :zlib.deflateInit(stream)
+    compressed = :zlib.deflate(stream, "blob #{declared_size}\0", :sync)
+    :zlib.close(stream)
+    File.write!(path, compressed)
+    oid
+  end
+
+  defp write_tree!(repo_path, tmp_dir, name, entries) do
+    body =
+      Enum.map(entries, fn {mode, path, oid} ->
+        [mode, " ", path, <<0>>, oid_bytes(oid)]
+      end)
+
+    path = Path.join(tmp_dir, name)
+    File.write!(path, body)
+
+    git!([
+      "--git-dir",
+      repo_path,
+      "hash-object",
+      "--literally",
+      "-t",
+      "tree",
+      "-w",
+      path
+    ])
+  end
+
+  defp commit_tree!(repo_path, tree_oid, message) do
+    git!(["--git-dir", repo_path, "commit-tree", tree_oid, "-m", message])
+  end
+
+  defp start_global_search_holder do
+    parent = self()
+
+    spawn(fn ->
+      result =
+        GitCore.ScanLimiter.with_permit(:search_busy_contract, fn ->
+          send(parent, {:global_search_scan_entered, self()})
+
+          receive do
+            :release -> :released
+          end
+        end)
+
+      send(parent, {:global_search_scan_finished, self(), result})
+    end)
+  end
+
+  defp assert_error(result, expected_kind, expected_operation) do
+    assert {:error,
+            %GitCore.Error{
+              kind: ^expected_kind,
+              operation: ^expected_operation,
+              detail: detail
+            }} = result
+
+    assert is_binary(detail)
+    refute detail == ""
+  end
+
+  defp oid_bytes(oid), do: oid |> String.upcase() |> Base.decode16!()
+
+  defp loose_object_path(repo_path, oid) do
+    {directory, filename} = String.split_at(oid, 2)
+    Path.join([repo_path, "objects", directory, filename])
+  end
+
+  defp git!(args) do
+    env = [
+      {"GIT_AUTHOR_NAME", "Fornacast Search Test"},
+      {"GIT_AUTHOR_EMAIL", "search@example.com"},
+      {"GIT_COMMITTER_NAME", "Fornacast Search Test"},
+      {"GIT_COMMITTER_EMAIL", "search@example.com"},
+      {"GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z"},
+      {"GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z"}
+    ]
+
+    case System.cmd("git", args, stderr_to_stdout: true, env: env) do
+      {output, 0} -> String.trim_trailing(output)
+      {output, code} -> flunk("git #{Enum.join(args, " ")} failed with #{code}:\n#{output}")
+    end
+  end
+end
+
 defmodule GitCore.StructuredDiffTest do
   use ExUnit.Case, async: false
 
