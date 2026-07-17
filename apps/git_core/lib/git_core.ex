@@ -123,14 +123,16 @@ defmodule GitCore do
     deadline_ms =
       opts |> Keyword.get(:deadline_ms, @commit_scan_deadline_ms) |> commit_deadline_ms()
 
-    GitCore.ScanLimiter.with_permit(:commit_summary, fn ->
-      with {:ok, {count, latest}} <-
-             wrap_read(
-               GitCore.Native.commit_summary(path, snapshot_oid, deadline_ms),
-               :commit_summary
-             ) do
-        {:ok, %GitCore.CommitSummary{count: count, latest: commit_from_native(latest)}}
-      end
+    GitCore.Cache.fetch({path, :commit_summary, snapshot_oid}, fn ->
+      GitCore.ScanLimiter.with_permit(:commit_summary, fn ->
+        with {:ok, {count, latest}} <-
+               wrap_read(
+                 GitCore.Native.commit_summary(path, snapshot_oid, deadline_ms),
+                 :commit_summary
+               ) do
+          {:ok, %GitCore.CommitSummary{count: count, latest: commit_from_native(latest)}}
+        end
+      end)
     end)
   end
 
@@ -176,33 +178,37 @@ defmodule GitCore do
     deadline_ms =
       opts |> Keyword.get(:deadline_ms, @commit_scan_deadline_ms) |> commit_deadline_ms()
 
-    GitCore.ScanLimiter.with_permit(:tree_history, fn ->
-      with {:ok, {entries, total_entries}} <-
-             wrap_read(
-               native_tree_history_call(
-                 path,
-                 snapshot_oid,
-                 :binary.bin_to_list(tree_path),
-                 Integer.to_string(page),
-                 per_page,
-                 deadline_ms
-               ),
-               :tree_history
-             ) do
-        total_pages =
-          if total_entries == 0,
-            do: 1,
-            else: div(total_entries + per_page - 1, per_page)
+    key = {path, :tree_history, snapshot_oid, tree_path, page, per_page}
 
-        {:ok,
-         %GitCore.TreePage{
-           entries: Enum.map(entries, &tree_history_entry_from_native/1),
-           total_entries: total_entries,
-           page: page,
-           per_page: per_page,
-           total_pages: total_pages
-         }}
-      end
+    GitCore.Cache.fetch(key, fn ->
+      GitCore.ScanLimiter.with_permit(:tree_history, fn ->
+        with {:ok, {entries, total_entries}} <-
+               wrap_read(
+                 native_tree_history_call(
+                   path,
+                   snapshot_oid,
+                   :binary.bin_to_list(tree_path),
+                   Integer.to_string(page),
+                   per_page,
+                   deadline_ms
+                 ),
+                 :tree_history
+               ) do
+          total_pages =
+            if total_entries == 0,
+              do: 1,
+              else: div(total_entries + per_page - 1, per_page)
+
+          {:ok,
+           %GitCore.TreePage{
+             entries: Enum.map(entries, &tree_history_entry_from_native/1),
+             total_entries: total_entries,
+             page: page,
+             per_page: per_page,
+             total_pages: total_pages
+           }}
+        end
+      end)
     end)
   end
 
@@ -310,22 +316,26 @@ defmodule GitCore do
     deadline_ms =
       opts |> Keyword.get(:deadline_ms, @diff_scan_deadline_ms) |> diff_deadline_ms()
 
-    GitCore.ScanLimiter.with_permit(:diff_commit, fn ->
-      with {:ok, {files, patch, truncated, changed_files, additions, deletions}} <-
-             wrap_read(
-               GitCore.Native.diff_commit(path, oid, limit, deadline_ms),
-               :diff_commit
-             ) do
-        {:ok,
-         %GitCore.CommitDiff{
-           files: Enum.map(files, &diff_file_from_native/1),
-           patch: IO.iodata_to_binary(patch),
-           truncated: truncated,
-           changed_files: changed_files,
-           additions: additions,
-           deletions: deletions
-         }}
-      end
+    key = {path, :diff_commit, oid, {limit, deadline_ms}}
+
+    GitCore.Cache.fetch(key, fn ->
+      GitCore.ScanLimiter.with_permit(:diff_commit, fn ->
+        with {:ok, {files, patch, truncated, changed_files, additions, deletions}} <-
+               wrap_read(
+                 GitCore.Native.diff_commit(path, oid, limit, deadline_ms),
+                 :diff_commit
+               ) do
+          {:ok,
+           %GitCore.CommitDiff{
+             files: Enum.map(files, &diff_file_from_native/1),
+             patch: IO.iodata_to_binary(patch),
+             truncated: truncated,
+             changed_files: changed_files,
+             additions: additions,
+             deletions: deletions
+           }}
+        end
+      end)
     end)
   end
 
@@ -384,30 +394,35 @@ defmodule GitCore do
       |> Keyword.get(:deadline_ms, @analysis_deadline_ms)
       |> analysis_deadline_ms()
 
-    GitCore.ScanLimiter.with_permit(:repository_analysis, fn ->
-      with {:ok, {languages, total_bytes, files_scanned, bytes_scanned, truncated}} <-
-             wrap_read(
-               GitCore.Native.repository_analysis(
-                 path,
-                 snapshot_oid,
-                 file_limit,
-                 byte_limit,
-                 deadline_ms
-               ),
-               :repository_analysis
-             ) do
-        {:ok,
-         %GitCore.RepositoryAnalysis{
-           languages:
-             Enum.map(languages, fn {language, bytes} ->
-               %GitCore.LanguageStat{language: language, bytes: bytes}
-             end),
-           total_bytes: total_bytes,
-           files_scanned: files_scanned,
-           bytes_scanned: bytes_scanned,
-           truncated: truncated
-         }}
-      end
+    key =
+      {path, :repository_analysis, snapshot_oid, {file_limit, byte_limit, deadline_ms}}
+
+    GitCore.Cache.fetch(key, fn ->
+      GitCore.ScanLimiter.with_permit(:repository_analysis, fn ->
+        with {:ok, {languages, total_bytes, files_scanned, bytes_scanned, truncated}} <-
+               wrap_read(
+                 GitCore.Native.repository_analysis(
+                   path,
+                   snapshot_oid,
+                   file_limit,
+                   byte_limit,
+                   deadline_ms
+                 ),
+                 :repository_analysis
+               ) do
+          {:ok,
+           %GitCore.RepositoryAnalysis{
+             languages:
+               Enum.map(languages, fn {language, bytes} ->
+                 %GitCore.LanguageStat{language: language, bytes: bytes}
+               end),
+             total_bytes: total_bytes,
+             files_scanned: files_scanned,
+             bytes_scanned: bytes_scanned,
+             truncated: truncated
+           }}
+        end
+      end)
     end)
   end
 

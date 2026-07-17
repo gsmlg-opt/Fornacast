@@ -3078,6 +3078,725 @@ defmodule GitCore.RepositoryReadModelTest do
   end
 end
 
+defmodule GitCore.CacheTest do
+  use ExUnit.Case, async: true
+
+  @moduletag :cache
+  @moduletag capture_log: true
+
+  test "computes a miss once and returns the cached hit" do
+    server = start_cache!()
+
+    computation = fn ->
+      Process.put(:cache_computations, Process.get(:cache_computations, 0) + 1)
+      {:ok, :cached_value}
+    end
+
+    assert {:ok, :cached_value} = GitCore.Cache.fetch(:key, computation, server: server)
+    assert {:ok, :cached_value} = GitCore.Cache.fetch(:key, computation, server: server)
+    assert Process.get(:cache_computations) == 1
+  end
+
+  test "keeps every storage path and semantic key argument isolated" do
+    server = start_cache!()
+
+    keys = [
+      {"/repos/one.git", :commit_summary, "oid-1"},
+      {"/repos/two.git", :commit_summary, "oid-1"},
+      {"/repos/one.git", :commit_summary, "oid-2"},
+      {"/repos/one.git", :tree_history, "oid-1", "", 1, 200},
+      {"/repos/one.git", :tree_history, "oid-1", "lib", 1, 200},
+      {"/repos/one.git", :tree_history, "oid-1", "", 2, 200},
+      {"/repos/one.git", :tree_history, "oid-1", "", 1, 100},
+      {"/repos/one.git", :repository_analysis, "oid-1", {100_000, 536_870_912, 2_000}},
+      {"/repos/one.git", :repository_analysis, "oid-1", {1, 536_870_912, 2_000}},
+      {"/repos/one.git", :repository_analysis, "oid-1", {100_000, 1, 2_000}},
+      {"/repos/one.git", :repository_analysis, "oid-1", {100_000, 536_870_912, 1}},
+      {"/repos/one.git", :diff_commit, "oid-1", {200_000, 5_000}},
+      {"/repos/one.git", :diff_commit, "oid-1", {1, 5_000}},
+      {"/repos/one.git", :diff_commit, "oid-1", {200_000, 1}}
+    ]
+
+    Enum.with_index(keys, fn key, index ->
+      assert {:ok, ^index} =
+               GitCore.Cache.fetch(key, fn -> {:ok, index} end, server: server)
+    end)
+
+    Enum.with_index(keys, fn key, index ->
+      assert {:ok, ^index} =
+               GitCore.Cache.fetch(key, fn -> flunk("expected an isolated cache hit") end,
+                 server: server
+               )
+    end)
+  end
+
+  test "evicts the strict least-recently-accessed entry at exactly 512 entries" do
+    server = start_cache!()
+
+    Enum.each(1..512, fn key ->
+      assert {:ok, ^key} = GitCore.Cache.fetch(key, fn -> {:ok, key} end, server: server)
+    end)
+
+    assert {:ok, 1} =
+             GitCore.Cache.fetch(1, fn -> flunk("expected key 1 to refresh") end, server: server)
+
+    assert {:ok, 513} = GitCore.Cache.fetch(513, fn -> {:ok, 513} end, server: server)
+
+    assert {:ok, 1} =
+             GitCore.Cache.fetch(1, fn -> flunk("expected refreshed key 1 to remain") end,
+               server: server
+             )
+
+    assert {:ok, :recomputed} =
+             GitCore.Cache.fetch(2, fn -> {:ok, :recomputed} end, server: server)
+
+    state = :sys.get_state(server)
+    assert state.count == 512
+    assert :ets.info(state.table, :size) == 512
+  end
+
+  test "accounts exact key-and-value external bytes and evicts at the injected byte bound" do
+    first = {String.duplicate("first-key-", 8), :value}
+    second = {String.duplicate("second-key-", 8), :value}
+    first_size = :erlang.external_size(first)
+    second_size = :erlang.external_size(second)
+    assert first_size > :erlang.external_size(elem(first, 1))
+    assert second_size > :erlang.external_size(elem(second, 1))
+
+    server = start_cache!(max_bytes: max(first_size, second_size))
+
+    assert {:ok, :value} =
+             GitCore.Cache.fetch(elem(first, 0), fn -> {:ok, elem(first, 1)} end, server: server)
+
+    first_state = :sys.get_state(server)
+    assert first_state.used_bytes == first_size
+    assert first_state.count == 1
+
+    assert {:ok, :value} =
+             GitCore.Cache.fetch(elem(second, 0), fn -> {:ok, elem(second, 1)} end,
+               server: server
+             )
+
+    second_state = :sys.get_state(server)
+    assert second_state.used_bytes == second_size
+    assert second_state.count == 1
+
+    assert {:ok, :recomputed} =
+             GitCore.Cache.fetch(elem(first, 0), fn -> {:ok, :recomputed} end, server: server)
+  end
+
+  test "caches a value exactly at one MiB and bypasses one byte over" do
+    value_limit = 1_048_576
+    exact = :binary.copy(<<0>>, value_limit - :erlang.external_size(<<>>))
+    over = exact <> <<0>>
+    assert :erlang.external_size(exact) == value_limit
+    assert :erlang.external_size(over) == value_limit + 1
+    server = start_cache!()
+
+    assert {:ok, ^exact} =
+             GitCore.Cache.fetch(:exact, fn -> {:ok, exact} end, server: server)
+
+    assert {:ok, ^exact} =
+             GitCore.Cache.fetch(:exact, fn -> flunk("exact cutoff should be cached") end,
+               server: server
+             )
+
+    counter = make_ref()
+    Process.put(counter, 0)
+
+    oversized = fn ->
+      Process.put(counter, Process.get(counter) + 1)
+      {:ok, over}
+    end
+
+    assert {:ok, ^over} = GitCore.Cache.fetch(:over, oversized, server: server)
+    assert {:ok, ^over} = GitCore.Cache.fetch(:over, oversized, server: server)
+    assert Process.get(counter) == 2
+  end
+
+  test "expires at 900,000 idle milliseconds and refreshes access time" do
+    {clock, set_clock} = manual_clock()
+    server = start_cache!(clock: clock)
+
+    assert {:ok, :refreshed} =
+             GitCore.Cache.fetch(:refreshed, fn -> {:ok, :refreshed} end, server: server)
+
+    assert {:ok, :boundary} =
+             GitCore.Cache.fetch(:boundary, fn -> {:ok, :boundary} end, server: server)
+
+    set_clock.(899_999)
+
+    assert {:ok, :refreshed} =
+             GitCore.Cache.fetch(:refreshed, fn -> flunk("899,999 ms must remain live") end,
+               server: server
+             )
+
+    set_clock.(900_000)
+
+    assert {:ok, :expired} =
+             GitCore.Cache.fetch(:boundary, fn -> {:ok, :expired} end, server: server)
+
+    set_clock.(1_799_998)
+
+    assert {:ok, :refreshed} =
+             GitCore.Cache.fetch(:refreshed, fn -> flunk("access must refresh idle time") end,
+               server: server
+             )
+
+    state = :sys.get_state(server)
+    assert state.count == 2
+  end
+
+  test "treats process and table lookup or put failures as misses" do
+    dead_server = spawn(fn -> :ok end)
+    monitor = Process.monitor(dead_server)
+    assert_receive {:DOWN, ^monitor, :process, ^dead_server, _reason}
+
+    assert {:ok, :from_dead_process} =
+             GitCore.Cache.fetch(:key, fn -> {:ok, :from_dead_process} end, server: dead_server)
+
+    lookup_server = start_cache!()
+    :sys.replace_state(lookup_server, &Map.put(&1, :table, make_ref()))
+
+    assert {:ok, :from_bad_lookup_table} =
+             GitCore.Cache.fetch(:key, fn -> {:ok, :from_bad_lookup_table} end,
+               server: lookup_server
+             )
+
+    put_server = start_cache!()
+
+    assert {:ok, :from_bad_put_table} =
+             GitCore.Cache.fetch(
+               :key,
+               fn ->
+                 :sys.replace_state(put_server, &Map.put(&1, :table, make_ref()))
+                 {:ok, :from_bad_put_table}
+               end,
+               server: put_server
+             )
+
+    stopped_server = start_cache!()
+
+    assert {:ok, :from_stopped_process} =
+             GitCore.Cache.fetch(
+               :key,
+               fn ->
+                 stopped = Process.monitor(stopped_server)
+                 Process.exit(stopped_server, :kill)
+                 assert_receive {:DOWN, ^stopped, :process, ^stopped_server, :killed}
+                 {:ok, :from_stopped_process}
+               end,
+               server: stopped_server
+             )
+  end
+
+  test "does not cache typed errors or swallow computation raise, throw, or exit" do
+    server = start_cache!()
+
+    typed_error =
+      {:error,
+       %GitCore.Error{
+         kind: :scan_timeout,
+         operation: :repository_analysis,
+         detail: "timed out"
+       }}
+
+    assert ^typed_error = GitCore.Cache.fetch(:typed, fn -> typed_error end, server: server)
+    assert ^typed_error = GitCore.Cache.fetch(:typed, fn -> typed_error end, server: server)
+
+    assert_raise RuntimeError, "boom", fn ->
+      GitCore.Cache.fetch(:raise, fn -> raise "boom" end, server: server)
+    end
+
+    assert catch_throw(GitCore.Cache.fetch(:throw, fn -> throw(:boom) end, server: server)) ==
+             :boom
+
+    assert catch_exit(GitCore.Cache.fetch(:exit, fn -> exit(:boom) end, server: server)) ==
+             :boom
+
+    assert :ets.info(:sys.get_state(server).table, :size) == 0
+  end
+
+  test "serializes concurrent same-key puts without count or byte inflation" do
+    server = start_cache!()
+    parent = self()
+    replacement = String.duplicate("replacement-", 32)
+
+    first =
+      Task.async(fn ->
+        GitCore.Cache.fetch(
+          :shared,
+          fn ->
+            send(parent, {:computed, self(), :first})
+            receive do: (:release -> {:ok, :first})
+          end,
+          server: server
+        )
+      end)
+
+    second =
+      Task.async(fn ->
+        GitCore.Cache.fetch(
+          :shared,
+          fn ->
+            send(parent, {:computed, self(), :second})
+            receive do: (:release -> {:ok, replacement})
+          end,
+          server: server
+        )
+      end)
+
+    assert_receive {:computed, first_pid, :first}
+    assert_receive {:computed, second_pid, :second}
+    send(first_pid, :release)
+    assert {:ok, :first} = Task.await(first)
+    send(second_pid, :release)
+    assert {:ok, ^replacement} = Task.await(second)
+
+    assert {:ok, ^replacement} =
+             GitCore.Cache.fetch(:shared, fn -> flunk("expected the replacement hit") end,
+               server: server
+             )
+
+    state = :sys.get_state(server)
+    assert state.count == 1
+    assert state.used_bytes == :erlang.external_size({:shared, replacement})
+    assert :ets.info(state.table, :size) == 1
+  end
+
+  test "uses a private ETS table and keeps test overrides inside production caps" do
+    server = start_cache!()
+    state = :sys.get_state(server)
+
+    assert :ets.info(state.table, :protection) == :private
+    assert :ets.info(state.table, :owner) == server
+    assert state.max_entries == 512
+    assert state.max_bytes == 67_108_864
+    assert state.max_value_bytes == 1_048_576
+    assert state.idle_expiration_ms == 900_000
+
+    assert_raise ArgumentError, fn -> GitCore.Cache.init(max_entries: 513) end
+    assert_raise ArgumentError, fn -> GitCore.Cache.init(max_bytes: 67_108_865) end
+    assert_raise ArgumentError, fn -> GitCore.Cache.init(max_value_bytes: 1_048_577) end
+    assert_raise ArgumentError, fn -> GitCore.Cache.init(idle_expiration_ms: 900_001) end
+  end
+
+  defp start_cache!(opts \\ []) do
+    opts = Keyword.put_new(opts, :clock, fn -> 0 end)
+
+    start_supervised!({GitCore.Cache, Keyword.put(opts, :server, nil)},
+      id: make_ref(),
+      restart: :temporary
+    )
+  end
+
+  defp manual_clock do
+    clock = :atomics.new(1, signed: true)
+    :atomics.put(clock, 1, 0)
+
+    {
+      fn -> :atomics.get(clock, 1) end,
+      fn now -> :atomics.put(clock, 1, now) end
+    }
+  end
+end
+
+defmodule GitCore.CacheIntegrationTest do
+  use ExUnit.Case, async: false
+
+  @moduletag :cache
+  @moduletag :tmp_dir
+  @moduletag capture_log: true
+
+  test "supervises the production cache after both limiters" do
+    assert [
+             {GitCore.Cache, cache_pid, :worker, [GitCore.Cache]},
+             {GitCore.BlobLimiter, blob_pid, :worker, [GitCore.BlobLimiter]},
+             {GitCore.ScanLimiter, scan_pid, :worker, [GitCore.ScanLimiter]}
+           ] = Supervisor.which_children(GitCore.Supervisor)
+
+    assert is_pid(cache_pid)
+    assert is_pid(blob_pid)
+    assert is_pid(scan_pid)
+  end
+
+  test "constructs exact normalized immutable keys for all four cached reads", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = repository_fixture!(tmp_dir, "keys-one")
+
+    assert {:ok, summary} = GitCore.commit_summary(fixture.repo_path, fixture.commit_oid)
+
+    assert {:ok, ^summary} =
+             GitCore.commit_summary(fixture.repo_path, fixture.commit_oid, deadline_ms: 0)
+
+    assert {:ok, _tree} =
+             GitCore.read_tree_with_history(
+               fixture.repo_path,
+               fixture.commit_oid,
+               "",
+               1,
+               per_page: 500
+             )
+
+    assert {:ok, _tree} =
+             GitCore.read_tree_with_history(
+               fixture.repo_path,
+               fixture.commit_oid,
+               "",
+               1,
+               per_page: 200
+             )
+
+    assert {:ok, _tree} =
+             GitCore.read_tree_with_history(
+               fixture.repo_path,
+               fixture.commit_oid,
+               "",
+               1,
+               per_page: 0
+             )
+
+    assert {:ok, _tree} =
+             GitCore.read_tree_with_history(
+               fixture.repo_path,
+               fixture.commit_oid,
+               "",
+               2
+             )
+
+    assert {:ok, _tree} =
+             GitCore.read_tree_with_history(
+               fixture.repo_path,
+               fixture.commit_oid,
+               "lib",
+               1
+             )
+
+    assert {:ok, _analysis} =
+             GitCore.repository_analysis(fixture.repo_path, fixture.commit_oid)
+
+    assert {:ok, _analysis} =
+             GitCore.repository_analysis(
+               fixture.repo_path,
+               fixture.commit_oid,
+               file_limit: 100_001,
+               byte_limit: 536_870_913,
+               deadline_ms: 2_001
+             )
+
+    assert {:ok, _analysis} =
+             GitCore.repository_analysis(fixture.repo_path, fixture.commit_oid, file_limit: 1)
+
+    assert {:ok, _analysis} =
+             GitCore.repository_analysis(fixture.repo_path, fixture.commit_oid, byte_limit: 1)
+
+    assert {:ok, _analysis} =
+             GitCore.repository_analysis(fixture.repo_path, fixture.commit_oid, deadline_ms: 0)
+
+    assert {:ok, _diff} = GitCore.diff_commit(fixture.repo_path, fixture.commit_oid)
+
+    assert {:ok, _diff} =
+             GitCore.diff_commit(
+               fixture.repo_path,
+               fixture.commit_oid,
+               limit: 200_001,
+               deadline_ms: 5_001
+             )
+
+    assert {:ok, _diff} =
+             GitCore.diff_commit(fixture.repo_path, fixture.commit_oid, limit: 0)
+
+    assert {:ok, _diff} =
+             GitCore.diff_commit(fixture.repo_path, fixture.commit_oid, deadline_ms: 4_999)
+
+    expected_keys =
+      MapSet.new([
+        {fixture.repo_path, :commit_summary, fixture.commit_oid},
+        {fixture.repo_path, :tree_history, fixture.commit_oid, "", 1, 200},
+        {fixture.repo_path, :tree_history, fixture.commit_oid, "", 1, 1},
+        {fixture.repo_path, :tree_history, fixture.commit_oid, "", 2, 200},
+        {fixture.repo_path, :tree_history, fixture.commit_oid, "lib", 1, 200},
+        {fixture.repo_path, :repository_analysis, fixture.commit_oid,
+         {100_000, 536_870_912, 2_000}},
+        {fixture.repo_path, :repository_analysis, fixture.commit_oid, {1, 536_870_912, 2_000}},
+        {fixture.repo_path, :repository_analysis, fixture.commit_oid, {100_000, 1, 2_000}},
+        {fixture.repo_path, :repository_analysis, fixture.commit_oid, {100_000, 536_870_912, 0}},
+        {fixture.repo_path, :diff_commit, fixture.commit_oid, {200_000, 5_000}},
+        {fixture.repo_path, :diff_commit, fixture.commit_oid, {1, 5_000}},
+        {fixture.repo_path, :diff_commit, fixture.commit_oid, {200_000, 4_999}}
+      ])
+
+    assert cache_keys_for(fixture.repo_path) == expected_keys
+
+    isolated = repository_fixture!(tmp_dir, "keys-two")
+    assert isolated.commit_oid == fixture.commit_oid
+    assert {:ok, _summary} = GitCore.commit_summary(isolated.repo_path, isolated.commit_oid)
+
+    assert cache_keys_for(isolated.repo_path) ==
+             MapSet.new([{isolated.repo_path, :commit_summary, isolated.commit_oid}])
+  end
+
+  test "cached hits bypass four saturated scan permits while a distinct miss stays protected", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = repository_fixture!(tmp_dir, "saturated")
+
+    assert {:ok, summary} = GitCore.commit_summary(fixture.repo_path, fixture.commit_oid)
+
+    assert {:ok, tree} =
+             GitCore.read_tree_with_history(fixture.repo_path, fixture.commit_oid, "", 1)
+
+    assert {:ok, analysis} =
+             GitCore.repository_analysis(fixture.repo_path, fixture.commit_oid)
+
+    assert {:ok, diff} = GitCore.diff_commit(fixture.repo_path, fixture.commit_oid)
+
+    holders = start_scan_holders(4)
+    assert_scan_holders_entered(holders)
+
+    try do
+      assert {:ok, ^summary} = GitCore.commit_summary(fixture.repo_path, fixture.commit_oid)
+
+      assert {:ok, ^tree} =
+               GitCore.read_tree_with_history(fixture.repo_path, fixture.commit_oid, "", 1)
+
+      assert {:ok, ^analysis} =
+               GitCore.repository_analysis(fixture.repo_path, fixture.commit_oid)
+
+      assert {:ok, ^diff} = GitCore.diff_commit(fixture.repo_path, fixture.commit_oid)
+
+      assert_error(
+        GitCore.commit_summary(fixture.repo_path, String.duplicate("f", 40)),
+        :scan_busy,
+        :commit_summary
+      )
+    after
+      release_scan_holders(holders)
+    end
+  end
+
+  test "cache failure falls back through ScanLimiter and its restart discards only derived data",
+       %{
+         tmp_dir: tmp_dir
+       } do
+    fixture = repository_fixture!(tmp_dir, "restart")
+    assert {:ok, summary} = GitCore.commit_summary(fixture.repo_path, fixture.commit_oid)
+    old_cache = Process.whereis(GitCore.Cache)
+    monitor = Process.monitor(old_cache)
+    holders = start_scan_holders(4)
+    assert_scan_holders_entered(holders)
+
+    try do
+      :sys.replace_state(old_cache, &Map.put(&1, :table, make_ref()))
+
+      assert_error(
+        GitCore.commit_summary(fixture.repo_path, fixture.commit_oid),
+        :scan_busy,
+        :commit_summary
+      )
+
+      assert_receive {:DOWN, ^monitor, :process, ^old_cache, _reason}, 1_000
+    after
+      release_scan_holders(holders)
+    end
+
+    new_cache = wait_for_cache_restart(old_cache)
+    refute new_cache == old_cache
+    assert :sys.get_state(new_cache).count == 0
+    assert {:ok, ^summary} = GitCore.commit_summary(fixture.repo_path, fixture.commit_oid)
+  end
+
+  test "a pushed OID gets a new key while the old immutable result stays stable", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = repository_fixture!(tmp_dir, "push")
+
+    assert {:ok, %GitCore.CommitSummary{count: 1} = old_summary} =
+             GitCore.commit_summary(fixture.repo_path, fixture.commit_oid)
+
+    File.write!(Path.join(fixture.work_path, "README.md"), "# Updated\n")
+    git!(["-C", fixture.work_path, "add", "README.md"])
+    git!(["-C", fixture.work_path, "commit", "-m", "Second commit"])
+    git!(["-C", fixture.work_path, "push", "origin", "main"])
+    new_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+    refute new_oid == fixture.commit_oid
+
+    assert {:ok, %GitCore.CommitSummary{count: 2, latest: %{oid: ^new_oid}}} =
+             GitCore.commit_summary(fixture.repo_path, new_oid)
+
+    assert {:ok, ^old_summary} =
+             GitCore.commit_summary(fixture.repo_path, fixture.commit_oid)
+
+    assert cache_keys_for(fixture.repo_path)
+           |> MapSet.intersection(
+             MapSet.new([
+               {fixture.repo_path, :commit_summary, fixture.commit_oid},
+               {fixture.repo_path, :commit_summary, new_oid}
+             ])
+           )
+           |> MapSet.size() == 2
+  end
+
+  test "explicitly uncached repository operations add no cache key", %{tmp_dir: tmp_dir} do
+    fixture = repository_fixture!(tmp_dir, "uncached")
+    assert cache_keys_for(fixture.repo_path) == MapSet.new()
+
+    assert {:ok, _refs} = GitCore.list_refs(fixture.repo_path)
+    assert {:ok, true} = GitCore.is_bare_repository?(fixture.repo_path)
+    assert {:ok, false} = GitCore.empty?(fixture.repo_path)
+    assert {:ok, _summary} = GitCore.ref_summary(fixture.repo_path)
+    assert {:ok, _page} = GitCore.ref_page(fixture.repo_path, :branch, 1)
+
+    selector = %GitCore.RefSelector{kind: :branch, full_name: "refs/heads/main"}
+    assert {:ok, _snapshot} = GitCore.resolve_snapshot(fixture.repo_path, selector)
+    assert {:ok, _page} = GitCore.commit_page(fixture.repo_path, fixture.commit_oid, 1)
+
+    assert {:ok, inline_blob} =
+             GitCore.read_blob(fixture.repo_path, fixture.commit_oid, "README.md")
+
+    assert :ok = GitCore.release_blob(inline_blob)
+
+    assert {:ok, complete_blob} =
+             GitCore.read_blob_complete(fixture.repo_path, fixture.commit_oid, "README.md")
+
+    assert :ok = GitCore.release_blob(complete_blob)
+
+    assert {:ok, _results} =
+             GitCore.search_tree(fixture.repo_path, fixture.commit_oid, "README")
+
+    assert {:ok, _bytes} = GitCore.repository_disk_usage(fixture.repo_path)
+    assert {:ok, _branches} = GitCore.branches(fixture.repo_path)
+    assert {:ok, _tags} = GitCore.tags(fixture.repo_path)
+    assert {:ok, _history} = GitCore.commit_history(fixture.repo_path, "main")
+    assert {:ok, _commit} = GitCore.commit(fixture.repo_path, fixture.commit_oid)
+    assert {:ok, _tree} = GitCore.read_tree(fixture.repo_path, "main")
+
+    assert {:ok, <<"PACK", _rest::binary>> = pack} =
+             GitCore.pack_objects(fixture.repo_path, [fixture.commit_oid])
+
+    assert {:ok, []} = GitCore.receive_pack(fixture.repo_path, pack, [])
+
+    assert cache_keys_for(fixture.repo_path) == MapSet.new()
+  end
+
+  defp repository_fixture!(tmp_dir, name) do
+    suffix = System.unique_integer([:positive])
+    repo_path = Path.join(tmp_dir, "#{name}-#{suffix}.git")
+    work_path = Path.join(tmp_dir, "#{name}-work-#{suffix}")
+
+    assert {:ok, _path} = GitCore.init_bare(repo_path)
+    git!(["init", "--object-format=sha1", work_path])
+    File.mkdir_p!(Path.join(work_path, "lib"))
+    File.write!(Path.join(work_path, "README.md"), "# Demo\n")
+    File.write!(Path.join(work_path, "lib/demo.ex"), "defmodule Demo, do: :ok\n")
+    git!(["-C", work_path, "add", "."])
+    git!(["-C", work_path, "commit", "-m", "Initial commit"])
+    git!(["-C", work_path, "branch", "-M", "main"])
+    git!(["-C", work_path, "remote", "add", "origin", repo_path])
+    git!(["-C", work_path, "push", "origin", "main"])
+
+    %{
+      repo_path: repo_path,
+      work_path: work_path,
+      commit_oid: git!(["-C", work_path, "rev-parse", "HEAD"])
+    }
+  end
+
+  defp cache_keys_for(repo_path) do
+    parent = self()
+    ref = make_ref()
+
+    :sys.replace_state(GitCore.Cache, fn state ->
+      send(parent, {ref, :ets.tab2list(state.table)})
+      state
+    end)
+
+    assert_receive {^ref, entries}
+
+    entries
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.filter(&(is_tuple(&1) and tuple_size(&1) > 0 and elem(&1, 0) == repo_path))
+    |> MapSet.new()
+  end
+
+  defp start_scan_holders(count) do
+    parent = self()
+
+    for _ <- 1..count do
+      spawn(fn ->
+        result =
+          GitCore.ScanLimiter.with_permit(:cache_scan_holder, fn ->
+            send(parent, {:cache_scan_entered, self()})
+
+            receive do
+              :release -> :released
+            end
+          end)
+
+        send(parent, {:cache_scan_finished, self(), result})
+      end)
+    end
+  end
+
+  defp assert_scan_holders_entered(holders) do
+    Enum.each(holders, fn holder ->
+      assert_receive {:cache_scan_entered, ^holder}, 1_000
+    end)
+  end
+
+  defp release_scan_holders(holders) do
+    Enum.each(holders, &send(&1, :release))
+
+    Enum.each(holders, fn holder ->
+      assert_receive {:cache_scan_finished, ^holder, :released}, 1_000
+    end)
+  end
+
+  defp wait_for_cache_restart(old_cache, attempts \\ 100)
+
+  defp wait_for_cache_restart(old_cache, attempts) when attempts > 0 do
+    case Process.whereis(GitCore.Cache) do
+      cache when is_pid(cache) and cache != old_cache ->
+        cache
+
+      _other ->
+        Process.sleep(5)
+        wait_for_cache_restart(old_cache, attempts - 1)
+    end
+  end
+
+  defp wait_for_cache_restart(_old_cache, 0), do: flunk("cache did not restart")
+
+  defp assert_error(result, expected_kind, expected_operation) do
+    assert {:error,
+            %GitCore.Error{
+              kind: ^expected_kind,
+              operation: ^expected_operation,
+              detail: detail
+            }} = result
+
+    assert is_binary(detail)
+    refute detail == ""
+  end
+
+  defp git!(args) do
+    env = [
+      {"GIT_AUTHOR_NAME", "Fornacast Cache Test"},
+      {"GIT_AUTHOR_EMAIL", "cache@example.com"},
+      {"GIT_COMMITTER_NAME", "Fornacast Cache Test"},
+      {"GIT_COMMITTER_EMAIL", "cache@example.com"},
+      {"GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z"},
+      {"GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z"}
+    ]
+
+    case System.cmd("git", args, stderr_to_stdout: true, env: env) do
+      {output, 0} -> String.trim_trailing(output)
+      {output, code} -> flunk("git #{Enum.join(args, " ")} failed with #{code}:\n#{output}")
+    end
+  end
+end
+
 defmodule GitCore.RepositorySearchTest do
   use ExUnit.Case, async: false
 
@@ -4064,6 +4783,7 @@ defmodule GitCore.RepositoryAnalysisTest do
     )
   end
 
+  @tag :cache
   test "disk usage is uncached and changes after gc repacks the same repository", %{
     tmp_dir: tmp_dir
   } do

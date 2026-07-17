@@ -9,7 +9,8 @@ defmodule GitCore.Application do
   def start(_type, _args) do
     children = [
       GitCore.ScanLimiter,
-      GitCore.BlobLimiter
+      GitCore.BlobLimiter,
+      GitCore.Cache
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
