@@ -666,6 +666,7 @@ git commit -m "feat(git): add bounded repository search"
 
 - Modify: apps/git_core/lib/git_core.ex
 - Modify: apps/git_core/lib/git_core/native.ex
+- Modify: apps/git_core/native/fornacast_git_core/src/bounded_blob.rs
 - Modify: apps/git_core/native/fornacast_git_core/src/lib.rs
 - Add tests: apps/git_core/test/repository_read_model_test.exs
 
