@@ -88,7 +88,7 @@ defmodule ForgeAccounts.SSHKey do
   defp parse_public_key(_), do: {:error, :invalid_public_key}
 
   defp validate_decoded_algorithm("ssh-rsa", {:RSAPublicKey, modulus, exponent})
-       when modulus >= @minimum_rsa_modulus and exponent >= 65_537 and rem(exponent, 2) == 1,
+       when modulus >= @minimum_rsa_modulus and exponent == 65_537,
        do: :ok
 
   defp validate_decoded_algorithm(

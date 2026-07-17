@@ -96,6 +96,21 @@ defmodule ForgeAccountsTest do
     end
   end
 
+  test "ssh key changeset rejects an oversized RSA public exponent" do
+    [{{:RSAPublicKey, modulus, _exponent}, _attrs}] =
+      :ssh_file.decode(@ssh_rsa_public_key, :auth_keys)
+
+    blob = :ssh_message.ssh2_pubkey_encode({:RSAPublicKey, modulus, modulus + 2})
+
+    changeset =
+      SSHKey.changeset(%SSHKey{user_id: 1}, %{
+        title: "oversized-exponent",
+        public_key: "ssh-rsa " <> Base.encode64(blob)
+      })
+
+    refute changeset.valid?
+  end
+
   test "ssh key changeset rejects a key whose label does not match its blob" do
     public_key = String.replace(@ed25519_public_key, "ssh-ed25519", "ssh-rsa", global: false)
 
