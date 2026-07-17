@@ -909,19 +909,19 @@ git commit -m "feat(web): compose immutable repository pages"
 - Modify: apps/fornacast_web/assets/js/app.js
 - Add tests: apps/fornacast_web/test/repository_html_test.exs
 
-- [ ] **Step 1: Add failing component-contract tests**
+- [x] **Step 1: Add failing component-contract tests**
 
 Render components directly. Assert repository identity, visibility, selected ref, exact counts, active aria-current navigation, canonical full-ref URLs with short labels, absence of future tabs/actions, escaping, form labels, status region, and anonymous brand/Login/Theme shell without authenticated controls.
 
-- [ ] **Step 2: Enable the real HEEx formatter**
+- [x] **Step 2: Enable the real HEEx formatter**
 
 Add Phoenix.LiveView.HTMLFormatter beside DuskmoonBundler.Formatter in .formatter.exs and include heex in the existing recursive input extension list. Add phoenix_live_view ~> 1.2 as a root-only development, runtime-false dependency in mix.exs so the umbrella formatter can load its plugin. Run mix deps.get here; Step 9 checks every new HEEx template with the loaded formatter.
 
-- [ ] **Step 3: Add the repository shell**
+- [x] **Step 3: Add the repository shell**
 
 Add HTML.repository_page/3 accepting Phoenix-safe iodata. Build its outer document as an iolist and convert to a binary only at the final send_resp boundary. Authenticated pages keep the current appbar but omit the generic Repository workbench heading and generic outer panel. Anonymous pages use a normal repository-width shell, not auth-shell, with only brand, Login, and Theme actions. Convert the rendered RepositoryHTML fragment with Phoenix.HTML.Safe.to_iodata/1 and pass that safe iodata to HTML.repository_page/3; never interpolate Phoenix.LiveView.Rendered or a plain list back into the current binary-string shell.
 
-- [ ] **Step 4: Create shared HEEx components**
+- [x] **Step 4: Create shared HEEx components**
 
 Use RepositoryHTML with embed_templates. Build one shared repository_frame, header, navigation, ref controls, server-link breadcrumbs, server-link pagination, clone popover, optional-state panel, and copy status region.
 
@@ -935,7 +935,7 @@ Use these primary DuskMoon mappings:
 - dm_git_clone_box with explicit URL and command slots;
 - dm_table, dm_input, dm_select, dm_popover, and dm_link for remaining controls.
 
-- [ ] **Step 5: Mark server-navigation dependency workarounds**
+- [x] **Step 5: Mark server-navigation dependency workarounds**
 
 Do not invoke the broken dm_breadcrumb or dm_pagination wrappers. Compose DuskMoon links at those two callsites and place:
 
@@ -946,11 +946,11 @@ Do not invoke the broken dm_breadcrumb or dm_pagination wrappers. Compose DuskMo
 
 Use explicit empty-repository clone/push command slots because the installed clone-box fallback hardcodes main.
 
-- [ ] **Step 6: Build all page templates**
+- [x] **Step 6: Build all page templates**
 
 Code renders exact summary links, selector/Go to file/clone toolbar, latest commit, file tree, README, search, description, size, and language sidebar. Ref controls submit GET /owner/repository with a ref field whose option values are canonical full names, labels are short names, and explicit submit is required; changing a select alone performs no hidden client navigation. When refs_truncated is false, the selector uses the bounded sample. When true, that action renders a labeled Exact full ref input named ref plus Branches and Tags page links instead of an unbounded select. A valid submitted full ref becomes the selected value; legacy bare values remain accepted; a missing or malformed ref follows the approved repository-scoped 404 behavior. Component and controller tests exercise all three outcomes. Empty repositories omit tree, README, and language panels. Partial analysis is labeled Partial language analysis with files/bytes scanned and is not presented as complete percentages. Limiter/native analysis failure says Analysis temporarily unavailable; disk timeout/failure says Size temporarily unavailable; README blob failure says README temporarily unavailable. Tree adds link breadcrumbs and bounded pagination. Blob maps binary, non-UTF-8, truncated, and Raw states. Refs, commits, and search use compact DuskMoon tables. Commit maps DiffLine values directly without parsing patch text.
 
-- [ ] **Step 7: Load dependency CSS and responsive containment**
+- [x] **Step 7: Load dependency CSS and responsive containment**
 
 Add this import to app.css:
 
@@ -960,7 +960,7 @@ Add this import to app.css:
 
 Add token-based repository layout rules. Below 1,024 px stack the sidebar; below 768 px scroll tabs horizontally; below 640 px wrap toolbars and make search/clone rows full width. Constrain long paths, snippets, hashes, code, diffs, and README tables to local wrapping/scrollers.
 
-- [ ] **Step 8: Add the clipboard bridge if issue 80 remains open**
+- [x] **Step 8: Add the clipboard bridge if issue 80 remains open**
 
 Recheck the installed package and upstream issue. If still unfixed, add one delegated listener:
 
@@ -1007,7 +1007,7 @@ document.addEventListener("click", async event => {
 
 The status element uses role=status and aria-live=polite. Native buttons retain keyboard activation and focus. Browser QA must exercise secure Clipboard API success when available, the fallback success path with navigator.clipboard unavailable, and a forced fallback failure.
 
-- [ ] **Step 9: Run and commit**
+- [x] **Step 9: Run and commit**
 
 ~~~sh
 mix format apps/fornacast_web/lib/fornacast_web/controllers/repository_html/*.heex apps/fornacast_web/assets/js/app.js
