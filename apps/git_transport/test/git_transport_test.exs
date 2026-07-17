@@ -511,8 +511,14 @@ defmodule GitTransportTest do
     repo_path = ForgeRepos.absolute_storage_path(repo)
     assert {:ok, [%GitCore.Ref{name: "refs/heads/main"}]} = GitCore.branches(repo_path)
 
+    assert {:ok, %GitCore.Snapshot{oid: snapshot_oid}} =
+             GitCore.resolve_snapshot(
+               repo_path,
+               %GitCore.RefSelector{kind: :legacy, full_name: "main"}
+             )
+
     assert {:ok, %GitCore.Blob{data: "# Demo\n"}} =
-             GitCore.read_blob(repo_path, "main", "README.md")
+             GitCore.read_blob(repo_path, snapshot_oid, "README.md")
 
     initial_oid = git!(["-C", work_path, "rev-parse", "HEAD"])
     original_limit = Application.get_env(:git_transport, :receive_pack_max_bytes)

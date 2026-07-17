@@ -1,7 +1,7 @@
 # Repository Foundation Design
 
 Date: 2026-07-16
-Status: Pending written-spec review
+Status: Approved
 
 Planning lineage: within the repository-page scope, this specification replaces
 the assumptions in

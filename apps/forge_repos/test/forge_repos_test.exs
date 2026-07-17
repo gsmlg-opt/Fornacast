@@ -76,7 +76,7 @@ defmodule ForgeReposTest do
     assert {:error, :unauthorized} = Fornacast.Access.authorize(nil, :repository_write, repo)
   end
 
-  test "organization-owned repositories resolve by namespace and authorize owners" do
+  test "organization-owned repositories resolve by namespace and use actor in clone URLs" do
     assert {:ok, owner} =
              ForgeAccounts.create_user(%{
                username: "alice",

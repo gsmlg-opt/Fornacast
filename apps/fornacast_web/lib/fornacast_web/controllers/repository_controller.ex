@@ -216,7 +216,9 @@ defmodule FornacastWeb.RepositoryController do
         storage_path = ForgeRepos.absolute_storage_path(repo)
 
         with {:ok, ref, blob_path} <- resolve_ref_and_path(storage_path, segments),
-             {:ok, blob} <- GitCore.read_blob(storage_path, ref, blob_path, limit: 100_000_000) do
+             {:ok, snapshot_oid} <- resolve_snapshot_oid(storage_path, ref),
+             {:ok, blob} <-
+               GitCore.read_blob(storage_path, snapshot_oid, blob_path, limit: 100_000_000) do
           filename = String.replace(blob.name, ~s("), "")
 
           conn
@@ -443,15 +445,21 @@ defmodule FornacastWeb.RepositoryController do
         )
 
       {:error, _reason} ->
-        case GitCore.read_blob(storage_path, ref, browse_path, limit: @inline_blob_limit) do
-          {:ok, blob} ->
-            page(
-              conn,
-              "File: #{blob.name}",
-              repo_header(owner, repo) <>
-                repo_tabs(owner, repo, :code) <> blob_view(owner, repo, ref, browse_path, blob)
-            )
-
+        with {:ok, snapshot_oid} <- resolve_snapshot_oid(storage_path, ref),
+             {:ok, blob} <-
+               GitCore.read_blob(
+                 storage_path,
+                 snapshot_oid,
+                 browse_path,
+                 limit: @inline_blob_limit
+               ) do
+          page(
+            conn,
+            "File: #{blob.name}",
+            repo_header(owner, repo) <>
+              repo_tabs(owner, repo, :code) <> blob_view(owner, repo, ref, browse_path, blob)
+          )
+        else
           {:error, reason} ->
             conn
             |> put_status(:not_found)
@@ -658,19 +666,33 @@ defmodule FornacastWeb.RepositoryController do
   defp readme_preview(repo) do
     storage_path = ForgeRepos.absolute_storage_path(repo)
 
-    ["README.md", "README", "README.txt"]
-    |> Enum.find_value(fn path ->
-      case GitCore.read_blob(storage_path, repo.default_branch, path, limit: @inline_blob_limit) do
-        {:ok, %GitCore.Blob{binary: false} = blob} when is_binary(blob.data) ->
-          if String.valid?(blob.data), do: render_readme(path, blob)
+    with {:ok, snapshot_oid} <- resolve_snapshot_oid(storage_path, repo.default_branch) do
+      ["README.md", "README", "README.txt"]
+      |> Enum.find_value(fn path ->
+        case GitCore.read_blob(storage_path, snapshot_oid, path, limit: @inline_blob_limit) do
+          {:ok, %GitCore.Blob{binary: false} = blob} when is_binary(blob.data) ->
+            if String.valid?(blob.data), do: render_readme(path, blob)
 
-        _ ->
-          nil
+          _ ->
+            nil
+        end
+      end)
+      |> case do
+        nil -> ""
+        html -> html
       end
-    end)
-    |> case do
-      nil -> ""
-      html -> html
+    else
+      {:error, _reason} -> ""
+    end
+  end
+
+  defp resolve_snapshot_oid(storage_path, ref) do
+    case GitCore.resolve_snapshot(
+           storage_path,
+           %GitCore.RefSelector{kind: :legacy, full_name: ref}
+         ) do
+      {:ok, %GitCore.Snapshot{oid: oid}} -> {:ok, oid}
+      {:error, reason} -> {:error, reason}
     end
   end
 

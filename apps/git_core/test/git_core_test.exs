@@ -47,8 +47,10 @@ defmodule GitCoreTest do
     assert {:ok, [%GitCore.TreeEntry{name: "README.md", kind: :blob}]} =
              GitCore.read_tree(repo_path, "main")
 
-    assert {:ok, %GitCore.Blob{name: "README.md", data: "# Demo\n", binary: false}} =
-             GitCore.read_blob(repo_path, "main", "README.md")
+    assert {:ok, %GitCore.Blob{name: "README.md", data: "# Demo\n", binary: false} = blob} =
+             GitCore.read_blob(repo_path, commit_oid, "README.md")
+
+    assert :ok = GitCore.release_blob(blob)
 
     File.write!(Path.join(work_path, "README.md"), "# Demo v2\n")
     git!(["-C", work_path, "add", "README.md"])

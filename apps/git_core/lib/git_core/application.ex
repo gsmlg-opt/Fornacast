@@ -8,8 +8,8 @@ defmodule GitCore.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      # Starts a worker by calling: GitCore.Worker.start_link(arg)
-      # {GitCore.Worker, arg}
+      GitCore.ScanLimiter,
+      GitCore.BlobLimiter
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html

@@ -274,6 +274,7 @@ dependencies = [
  "gix-hash",
  "gix-object",
  "gix-pack",
+ "gix-quote",
  "gix-ref",
  "rustler",
 ]
