@@ -37,8 +37,15 @@ defmodule ForgeAccounts.APIKeyTest do
     refute persisted_key.token_prefix == secret
     refute inspect(persisted_key) =~ secret
 
-    assert [%APIKey{id: id, name: "workstation"}] = ForgeAccounts.list_user_api_keys(user)
+    assert [%APIKey{id: id, name: "workstation", token_hash: nil}] =
+             ForgeAccounts.list_user_api_keys(user)
+
     assert id == api_key.id
+  end
+
+  test "normalizes atom-key scope attributes", %{user: user} do
+    assert {:ok, %APIKey{scopes: %{"repo:read" => true}}, _secret} =
+             ForgeAccounts.create_api_key(user, %{name: "automation", scopes: ["repo:read"]})
   end
 
   test "authenticates allowed scopes and records successful use", %{user: user} do
@@ -111,6 +118,34 @@ defmodule ForgeAccounts.APIKeyTest do
              ForgeAccounts.authenticate_api_key("alice", secret, "repo:read")
 
     assert is_nil(Repo.reload!(api_key).last_used_at)
+  end
+
+  test "accepts future expiry and rejects the expiry boundary", %{user: user} do
+    future = DateTime.add(DateTime.utc_now(:second), 60, :second)
+
+    assert {:ok, _future_key, future_secret} =
+             ForgeAccounts.create_api_key(user, %{
+               "name" => "future",
+               "scopes" => ["repo:read"],
+               "expires_at" => future
+             })
+
+    assert {:ok, _user, _key} =
+             ForgeAccounts.authenticate_api_key("alice", future_secret, "repo:read")
+
+    boundary = DateTime.utc_now(:second)
+
+    assert {:ok, boundary_key, boundary_secret} =
+             ForgeAccounts.create_api_key(user, %{
+               "name" => "boundary",
+               "scopes" => ["repo:read"],
+               "expires_at" => boundary
+             })
+
+    assert {:error, :invalid_credentials} =
+             ForgeAccounts.authenticate_api_key("alice", boundary_secret, "repo:read")
+
+    assert is_nil(Repo.reload!(boundary_key).last_used_at)
   end
 
   test "keys stop authenticating when their user is disabled", %{user: user} do

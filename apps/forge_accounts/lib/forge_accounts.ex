@@ -212,23 +212,35 @@ defmodule ForgeAccounts do
     APIKey
     |> where([key], key.user_id == ^user_id)
     |> order_by([key], desc: key.inserted_at)
+    |> select(
+      [key],
+      struct(key, [
+        :id,
+        :user_id,
+        :name,
+        :token_prefix,
+        :scopes,
+        :expires_at,
+        :last_used_at,
+        :revoked_at,
+        :inserted_at,
+        :updated_at
+      ])
+    )
     |> Repo.all()
   end
 
   def revoke_api_key(%User{id: user_id}, key_id) do
-    api_key =
+    revoked_at = DateTime.utc_now(:second)
+
+    {updated_count, _} =
       APIKey
       |> where([key], key.id == ^key_id and key.user_id == ^user_id and is_nil(key.revoked_at))
-      |> Repo.one()
+      |> Repo.update_all(set: [revoked_at: revoked_at, updated_at: revoked_at])
 
-    case api_key do
-      nil ->
-        {:error, :not_found}
-
-      api_key ->
-        api_key
-        |> Changeset.change(revoked_at: DateTime.utc_now(:second))
-        |> Repo.update()
+    case updated_count do
+      1 -> {:ok, Repo.get!(APIKey, key_id)}
+      0 -> {:error, :not_found}
     end
   end
 
@@ -236,8 +248,8 @@ defmodule ForgeAccounts do
       when is_binary(username) and is_binary(secret) and is_binary(required_scope) do
     with %User{state: :active} = user <- get_user_by_username(username),
          %APIKey{} = api_key <- find_api_key(user, secret),
-         :ok <- authorize_api_key_scope(api_key, required_scope) do
-      authenticated_key = touch_api_key(api_key)
+         :ok <- authorize_api_key_scope(api_key, required_scope),
+         {:ok, authenticated_key} <- touch_active_api_key(api_key) do
       {:ok, user, authenticated_key}
     else
       {:error, :insufficient_scope} = error -> error
@@ -327,10 +339,27 @@ defmodule ForgeAccounts do
 
   defp authorize_api_key_scope(%APIKey{}, _scope), do: {:error, :insufficient_scope}
 
-  defp touch_api_key(%APIKey{} = api_key) do
-    api_key
-    |> Changeset.change(last_used_at: DateTime.utc_now(:second))
-    |> Repo.update!()
+  defp touch_active_api_key(%APIKey{id: key_id, user_id: user_id} = api_key) do
+    now = DateTime.utc_now(:second)
+
+    active_user_ids =
+      User
+      |> where([user], user.id == ^user_id and user.kind == :user and user.state == :active)
+      |> select([user], user.id)
+
+    {updated_count, _} =
+      APIKey
+      |> where(
+        [key],
+        key.id == ^key_id and key.user_id in subquery(active_user_ids) and
+          is_nil(key.revoked_at) and (is_nil(key.expires_at) or key.expires_at > ^now)
+      )
+      |> Repo.update_all(set: [last_used_at: now, updated_at: now])
+
+    case updated_count do
+      1 -> {:ok, %{api_key | last_used_at: now, updated_at: now}}
+      0 -> {:error, :invalid_credentials}
+    end
   end
 
   defp reject_taken_account_slug(%Changeset{valid?: true} = changeset) do

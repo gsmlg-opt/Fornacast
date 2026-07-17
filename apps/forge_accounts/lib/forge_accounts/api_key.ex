@@ -36,14 +36,19 @@ defmodule ForgeAccounts.APIKey do
   def hash(secret), do: :crypto.hash(:sha256, secret) |> Base.encode16(case: :lower)
 
   defp normalize_scope_attrs(attrs) do
-    case Map.fetch(attrs, "scopes") do
-      {:ok, scopes} when is_list(scopes) -> Map.put(attrs, "scopes", Map.new(scopes, &{&1, true}))
-      _ -> attrs
+    scope_key = if Map.has_key?(attrs, "scopes"), do: "scopes", else: :scopes
+
+    case Map.fetch(attrs, scope_key) do
+      {:ok, scopes} when is_list(scopes) ->
+        Map.put(attrs, scope_key, Map.new(scopes, &{&1, true}))
+
+      _ ->
+        attrs
     end
   end
 
   defp validate_scopes(changeset) do
-    scopes = get_field(changeset, :scopes, %{})
+    scopes = get_field(changeset, :scopes) || %{}
 
     if map_size(scopes) > 0 and
          Enum.all?(scopes, fn {scope, enabled} -> scope in @allowed_scopes and enabled == true end) do
