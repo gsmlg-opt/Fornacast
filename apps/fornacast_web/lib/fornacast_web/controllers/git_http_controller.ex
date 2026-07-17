@@ -57,6 +57,7 @@ defmodule FornacastWeb.GitHTTPController do
          {:ok, _actor, %Repository{} = repository} <-
            load_readable_repository(conn, owner_slug, repo_slug),
          {:ok, body, conn} <- read_full_body(conn, upload_pack_max_bytes()),
+         {:ok, body} <- decode_upload_pack_body(conn, body),
          {:ok, request} <- parse_upload_pack_request(body),
          {:ok, response} <- GitTransport.UploadPack.response(repository, request) do
       send_git_response(conn, @upload_pack_result_type, response)
@@ -192,6 +193,27 @@ defmodule FornacastWeb.GitHTTPController do
     case Application.get_env(:fornacast_web, :git_upload_pack_max_bytes) do
       max when is_integer(max) and max > 0 -> max
       _ -> @default_upload_pack_max_bytes
+    end
+  end
+
+  defp decode_upload_pack_body(conn, body) do
+    case get_req_header(conn, "content-encoding") do
+      [] ->
+        {:ok, body}
+
+      [encoding] when is_binary(encoding) ->
+        if String.downcase(String.trim(encoding)) == "gzip" do
+          try do
+            {:ok, :zlib.gunzip(body)}
+          rescue
+            ErlangError -> {:error, "ERROR: Invalid gzip request body.\n"}
+          end
+        else
+          {:error, :unsupported_media_type}
+        end
+
+      _ ->
+        {:error, :unsupported_media_type}
     end
   end
 

@@ -43,7 +43,7 @@ defmodule GitTransport.UploadPack do
   end
 
   def new_request do
-    %{wants: [], haves: [], capabilities: MapSet.new()}
+    %{wants: [], haves: [], capabilities: MapSet.new(), done?: false}
   end
 
   def parse_request_data(buffer, request \\ new_request())
@@ -109,7 +109,7 @@ defmodule GitTransport.UploadPack do
   defp advertisable_ref?(%{kind: kind}) when kind in [:branch, :tag], do: true
   defp advertisable_ref?(_ref), do: false
 
-  defp read_client_request(request \\ %{wants: [], haves: [], capabilities: MapSet.new()}) do
+  defp read_client_request(request \\ new_request()) do
     case read_pkt_line() do
       {:ok, :flush} ->
         {:ok, normalize_request(request)}
@@ -136,8 +136,12 @@ defmodule GitTransport.UploadPack do
     {:cont, buffer, request}
   end
 
+  defp parse_request_buffer(<<"0000">>, request) do
+    {:done, "", normalize_request(request)}
+  end
+
   defp parse_request_buffer(<<"0000", rest::binary>>, request) do
-    {:done, rest, normalize_request(request)}
+    parse_request_buffer(rest, request)
   end
 
   defp parse_request_buffer(<<header::binary-size(4), rest::binary>> = buffer, request) do
@@ -194,7 +198,7 @@ defmodule GitTransport.UploadPack do
     end
   end
 
-  defp parse_request_line("done", request), do: {:done, request}
+  defp parse_request_line("done", request), do: {:done, %{request | done?: true}}
 
   defp parse_request_line("want " <> rest, request) do
     with {:ok, oid, capabilities} <- parse_want(rest) do
@@ -254,6 +258,10 @@ defmodule GitTransport.UploadPack do
   end
 
   defp build_pack_response(_repository, %{wants: []}), do: {:ok, ""}
+
+  defp build_pack_response(_repository, %{done?: false}) do
+    {:ok, GitTransport.PktLine.encode("NAK\n")}
+  end
 
   defp build_pack_response(repository, request) do
     path = ForgeRepos.absolute_storage_path(repository)

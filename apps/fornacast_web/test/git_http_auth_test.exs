@@ -28,7 +28,22 @@ defmodule FornacastWeb.GitHTTPAuthTest do
                "scopes" => ["repo:read"]
              })
 
-    seed_repository(repository, Path.join(tmp_dir, "work"))
+    work_path = Path.join(tmp_dir, "work")
+    seed_repository(repository, work_path)
+
+    for commit_number <- 1..60 do
+      File.write!(
+        Path.join(work_path, "history.txt"),
+        "history #{commit_number}\n",
+        [:append]
+      )
+
+      git!(["-C", work_path, "add", "history.txt"])
+      git!(["-C", work_path, "commit", "-m", "History #{commit_number}"])
+    end
+
+    git!(["-C", work_path, "push", "origin", "main"])
+
     port = start_http_server()
     clone_path = Path.join(tmp_dir, "clone")
     remote_url = "http://127.0.0.1:#{port}/alice/demo.git"
@@ -58,6 +73,22 @@ esac
     assert File.read!(Path.join(clone_path, "README.md")) == "# Demo\n"
     assert git!(["-C", clone_path, "remote", "get-url", "origin"]) == remote_url
     refute git!(["-C", clone_path, "config", "--get", "remote.origin.url"]) =~ secret
+
+    File.write!(Path.join(work_path, "README.md"), "# Demo\n\nPulled update\n")
+    git!(["-C", work_path, "add", "README.md"])
+    git!(["-C", work_path, "commit", "-m", "Update README"])
+    git!(["-C", work_path, "push", "origin", "main"])
+
+    {pull_output, pull_status} =
+      git(["-C", clone_path, "pull", "origin", "main"], [
+        {"GIT_ASKPASS", askpass_path},
+        {"GIT_ASKPASS_REQUIRE", "force"},
+        {"FORNACAST_GIT_USERNAME", "alice"},
+        {"FORNACAST_GIT_API_KEY", secret}
+      ])
+
+    assert pull_status == 0, pull_output
+    assert File.read!(Path.join(clone_path, "README.md")) == "# Demo\n\nPulled update\n"
   end
 
   @tag :tmp_dir
