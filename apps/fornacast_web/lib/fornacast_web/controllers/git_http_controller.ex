@@ -70,8 +70,9 @@ defmodule FornacastWeb.GitHTTPController do
 
   defp authenticate_basic(encoded) do
     with {:ok, decoded} <- Base.decode64(encoded),
-         [username, password] <- String.split(decoded, ":", parts: 2),
-         {:ok, user} <- ForgeAccounts.authenticate_password(username, password) do
+         [username, personal_api_key] <- String.split(decoded, ":", parts: 2),
+         {:ok, user, _api_key} <-
+           ForgeAccounts.authenticate_api_key(username, personal_api_key, "repo:read") do
       {:ok, user}
     else
       _ -> {:error, :invalid_credentials}
