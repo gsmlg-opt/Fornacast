@@ -7,7 +7,7 @@ defmodule ForgeAccounts do
 
   alias Ecto.Changeset
   alias Ecto.Multi
-  alias ForgeAccounts.{Organization, OrganizationMember, SSHKey, User}
+  alias ForgeAccounts.{APIKey, Organization, OrganizationMember, SSHKey, User}
   alias Fornacast.Repo
 
   def get_account(id), do: Repo.get(User, id)
@@ -192,6 +192,61 @@ defmodule ForgeAccounts do
     password_error()
   end
 
+  def create_api_key(%User{kind: :user, state: :active, id: user_id}, attrs) when is_map(attrs) do
+    {secret, token_prefix, token_hash} = APIKey.generate_secret()
+
+    result =
+      %APIKey{user_id: user_id, token_prefix: token_prefix, token_hash: token_hash}
+      |> APIKey.creation_changeset(attrs)
+      |> Repo.insert()
+
+    case result do
+      {:ok, api_key} -> {:ok, api_key, secret}
+      {:error, changeset} -> {:error, changeset}
+    end
+  end
+
+  def create_api_key(_user, _attrs), do: {:error, :unauthorized}
+
+  def list_user_api_keys(%User{id: user_id}) do
+    APIKey
+    |> where([key], key.user_id == ^user_id)
+    |> order_by([key], desc: key.inserted_at)
+    |> Repo.all()
+  end
+
+  def revoke_api_key(%User{id: user_id}, key_id) do
+    api_key =
+      APIKey
+      |> where([key], key.id == ^key_id and key.user_id == ^user_id and is_nil(key.revoked_at))
+      |> Repo.one()
+
+    case api_key do
+      nil ->
+        {:error, :not_found}
+
+      api_key ->
+        api_key
+        |> Changeset.change(revoked_at: DateTime.utc_now(:second))
+        |> Repo.update()
+    end
+  end
+
+  def authenticate_api_key(username, secret, required_scope)
+      when is_binary(username) and is_binary(secret) and is_binary(required_scope) do
+    with %User{state: :active} = user <- get_user_by_username(username),
+         %APIKey{} = api_key <- find_api_key(user, secret),
+         :ok <- authorize_api_key_scope(api_key, required_scope) do
+      authenticated_key = touch_api_key(api_key)
+      {:ok, user, authenticated_key}
+    else
+      {:error, :insufficient_scope} = error -> error
+      _ -> {:error, :invalid_credentials}
+    end
+  end
+
+  def authenticate_api_key(_, _, _), do: {:error, :invalid_credentials}
+
   def create_ssh_key(%User{} = user, attrs) do
     %SSHKey{user_id: user.id}
     |> SSHKey.changeset(attrs)
@@ -245,6 +300,37 @@ defmodule ForgeAccounts do
   defp password_error do
     Bcrypt.no_user_verify()
     {:error, :invalid_credentials}
+  end
+
+  defp find_api_key(%User{id: user_id}, secret) do
+    token_prefix = String.slice(secret, 0, 15)
+    token_hash = APIKey.hash(secret)
+    now = DateTime.utc_now()
+
+    APIKey
+    |> where(
+      [key],
+      key.user_id == ^user_id and key.token_prefix == ^token_prefix and is_nil(key.revoked_at) and
+        (is_nil(key.expires_at) or key.expires_at > ^now)
+    )
+    |> Repo.all()
+    |> Enum.find(fn key -> :crypto.hash_equals(key.token_hash, token_hash) end)
+  end
+
+  defp authorize_api_key_scope(%APIKey{scopes: scopes}, "repo:read") do
+    if scopes["repo:read"] || scopes["repo:write"], do: :ok, else: {:error, :insufficient_scope}
+  end
+
+  defp authorize_api_key_scope(%APIKey{scopes: scopes}, "repo:write") do
+    if scopes["repo:write"], do: :ok, else: {:error, :insufficient_scope}
+  end
+
+  defp authorize_api_key_scope(%APIKey{}, _scope), do: {:error, :insufficient_scope}
+
+  defp touch_api_key(%APIKey{} = api_key) do
+    api_key
+    |> Changeset.change(last_used_at: DateTime.utc_now(:second))
+    |> Repo.update!()
   end
 
   defp reject_taken_account_slug(%Changeset{valid?: true} = changeset) do
