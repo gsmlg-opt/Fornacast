@@ -31,16 +31,33 @@ defmodule FornacastWeb.GitHTTPAuthTest do
     seed_repository(repository, Path.join(tmp_dir, "work"))
     port = start_http_server()
     clone_path = Path.join(tmp_dir, "clone")
+    remote_url = "http://127.0.0.1:#{port}/alice/demo.git"
+    askpass_path = Path.join(tmp_dir, "git-askpass")
+
+    File.write!(
+      askpass_path,
+      ~S|#!/bin/sh
+case "$1" in
+  *Username*) printf '%s\n' "$FORNACAST_GIT_USERNAME" ;;
+  *) printf '%s\n' "$FORNACAST_GIT_API_KEY" ;;
+esac
+|
+    )
+
+    File.chmod!(askpass_path, 0o700)
 
     {output, status} =
-      git([
-        "clone",
-        "http://alice:#{secret}@127.0.0.1:#{port}/alice/demo.git",
-        clone_path
+      git(["clone", remote_url, clone_path], [
+        {"GIT_ASKPASS", askpass_path},
+        {"GIT_ASKPASS_REQUIRE", "force"},
+        {"FORNACAST_GIT_USERNAME", "alice"},
+        {"FORNACAST_GIT_API_KEY", secret}
       ])
 
     assert status == 0, output
     assert File.read!(Path.join(clone_path, "README.md")) == "# Demo\n"
+    assert git!(["-C", clone_path, "remote", "get-url", "origin"]) == remote_url
+    refute git!(["-C", clone_path, "config", "--get", "remote.origin.url"]) =~ secret
   end
 
   @tag :tmp_dir
@@ -107,6 +124,25 @@ defmodule FornacastWeb.GitHTTPAuthTest do
       assert response(response, 401) == "Authentication required.\n", case_name
       assert Plug.Conn.get_resp_header(response, "www-authenticate") == [@challenge], case_name
     end
+  end
+
+  test "private fetch accepts a case-insensitive Basic scheme with horizontal whitespace" do
+    {user, _repository} = create_user_and_repository(:private)
+
+    assert {:ok, _api_key, secret} =
+             ForgeAccounts.create_api_key(user, %{
+               "name" => "git clone",
+               "scopes" => ["repo:read"]
+             })
+
+    encoded = Base.encode64("alice:#{secret}")
+
+    response =
+      build_conn()
+      |> Plug.Conn.put_req_header("authorization", " \tBAsIc\t#{encoded} \t")
+      |> get("/alice/demo.git/info/refs?service=git-upload-pack")
+
+    assert response(response, 200) =~ "# service=git-upload-pack"
   end
 
   test "public fetch validates an Authorization header when one is provided" do
@@ -220,14 +256,15 @@ defmodule FornacastWeb.GitHTTPAuthTest do
     end
   end
 
-  defp git(args) do
-    env = [
-      {"GIT_AUTHOR_NAME", "Fornacast Test"},
-      {"GIT_AUTHOR_EMAIL", "test@example.com"},
-      {"GIT_COMMITTER_NAME", "Fornacast Test"},
-      {"GIT_COMMITTER_EMAIL", "test@example.com"},
-      {"GIT_TERMINAL_PROMPT", "0"}
-    ]
+  defp git(args, extra_env \\ []) do
+    env =
+      [
+        {"GIT_AUTHOR_NAME", "Fornacast Test"},
+        {"GIT_AUTHOR_EMAIL", "test@example.com"},
+        {"GIT_COMMITTER_NAME", "Fornacast Test"},
+        {"GIT_COMMITTER_EMAIL", "test@example.com"},
+        {"GIT_TERMINAL_PROMPT", "0"}
+      ] ++ extra_env
 
     System.cmd("git", args, stderr_to_stdout: true, env: env)
   end

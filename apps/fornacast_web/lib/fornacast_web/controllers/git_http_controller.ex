@@ -62,9 +62,15 @@ defmodule FornacastWeb.GitHTTPController do
 
   defp authenticate_actor(conn) do
     case get_req_header(conn, "authorization") do
-      ["Basic " <> encoded] -> authenticate_basic(encoded)
-      ["basic " <> encoded] -> authenticate_basic(encoded)
       [] -> {:ok, nil}
+      [authorization] -> authenticate_authorization(authorization)
+      _ -> {:error, :invalid_credentials}
+    end
+  end
+
+  defp authenticate_authorization(authorization) do
+    case Regex.run(~r/^[ \t]*basic[ \t]+(\S+)[ \t]*$/i, authorization, capture: :all_but_first) do
+      [encoded] -> authenticate_basic(encoded)
       _ -> {:error, :invalid_credentials}
     end
   end
