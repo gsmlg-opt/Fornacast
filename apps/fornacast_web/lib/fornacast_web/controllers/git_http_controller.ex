@@ -8,6 +8,7 @@ defmodule FornacastWeb.GitHTTPController do
   @receive_pack_advertisement_type "application/x-git-receive-pack-advertisement"
   @receive_pack_request_type "application/x-git-receive-pack-request"
   @receive_pack_result_type "application/x-git-receive-pack-result"
+  @default_upload_pack_max_bytes 1024 * 1024
   @default_receive_pack_max_bytes 100 * 1024 * 1024
 
   def info_refs(conn, %{
@@ -56,7 +57,7 @@ defmodule FornacastWeb.GitHTTPController do
     with {:ok, repo_slug} <- git_repo_slug(repo_dot_git),
          {:ok, _actor, %Repository{} = repository} <-
            load_readable_repository(conn, owner_slug, repo_slug),
-         {:ok, body, conn} <- read_full_body_unlimited(conn),
+         {:ok, body, conn} <- read_full_body(conn, upload_pack_max_bytes()),
          {:ok, request} <- parse_upload_pack_request(body),
          {:ok, response} <- GitTransport.UploadPack.response(repository, request) do
       send_git_response(conn, @upload_pack_result_type, response)
@@ -82,15 +83,27 @@ defmodule FornacastWeb.GitHTTPController do
   end
 
   defp load_readable_repository(conn, owner_slug, repo_slug) do
-    with %Repository{} = repository <- ForgeRepos.get_repository(owner_slug, repo_slug),
-         {:ok, actor} <- authenticate_actor(conn),
-         :ok <- Fornacast.Access.authorize(actor, :repository_read, repository) do
-      {:ok, actor, repository}
-    else
-      nil -> {:error, :not_found}
-      {:error, reason} -> {:error, reason}
+    with {:ok, actor} <- authenticate_actor(conn) do
+      load_readable_repository_for_actor(actor, owner_slug, repo_slug)
     end
   end
+
+  defp load_readable_repository_for_actor(actor, owner_slug, repo_slug) do
+    case ForgeRepos.get_repository(owner_slug, repo_slug) do
+      %Repository{} = repository -> authorize_repository_read(actor, repository)
+      nil -> read_repository_not_found(actor)
+    end
+  end
+
+  defp authorize_repository_read(actor, repository) do
+    case Fornacast.Access.authorize(actor, :repository_read, repository) do
+      :ok -> {:ok, actor, repository}
+      {:error, :unauthorized} -> read_repository_not_found(actor)
+    end
+  end
+
+  defp read_repository_not_found(nil), do: {:error, :invalid_credentials}
+  defp read_repository_not_found(_actor), do: {:error, :not_found}
 
   defp load_writable_repository(conn, owner_slug, repo_slug) do
     with {:ok, actor} <- authenticate_actor(conn, "repo:write"),
@@ -147,19 +160,6 @@ defmodule FornacastWeb.GitHTTPController do
     end
   end
 
-  defp read_full_body_unlimited(conn, acc \\ []) do
-    case read_body(conn) do
-      {:ok, chunk, conn} ->
-        {:ok, IO.iodata_to_binary(Enum.reverse([chunk | acc])), conn}
-
-      {:more, chunk, conn} ->
-        read_full_body_unlimited(conn, [chunk | acc])
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
   defp read_full_body(conn, max_bytes), do: read_full_body(conn, max_bytes, 0, [])
 
   defp read_full_body(conn, max_bytes, bytes_read, acc) do
@@ -192,6 +192,13 @@ defmodule FornacastWeb.GitHTTPController do
     case Application.get_env(:fornacast_web, :git_receive_pack_max_bytes) do
       max when is_integer(max) and max > 0 -> max
       _ -> @default_receive_pack_max_bytes
+    end
+  end
+
+  defp upload_pack_max_bytes do
+    case Application.get_env(:fornacast_web, :git_upload_pack_max_bytes) do
+      max when is_integer(max) and max > 0 -> max
+      _ -> @default_upload_pack_max_bytes
     end
   end
 

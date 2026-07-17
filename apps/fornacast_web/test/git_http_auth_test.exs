@@ -178,6 +178,73 @@ esac
     end
   end
 
+  test "anonymous upload-pack does not reveal whether a private repository exists" do
+    create_user_and_repository(:private)
+
+    for path <- ["/alice/demo.git", "/nobody/missing.git"] do
+      discovery = get(build_conn(), "#{path}/info/refs?service=git-upload-pack")
+      upload = upload_pack_request(build_conn(), path, "0000")
+
+      assert response(discovery, 401) == "Authentication required.\n"
+      assert Plug.Conn.get_resp_header(discovery, "www-authenticate") == [@challenge]
+      assert response(upload, 401) == "Authentication required.\n"
+      assert Plug.Conn.get_resp_header(upload, "www-authenticate") == [@challenge]
+    end
+  end
+
+  test "authenticated upload-pack does not distinguish unauthorized private and missing repositories" do
+    create_user_and_repository(:private)
+
+    assert {:ok, bob} =
+             ForgeAccounts.create_user(%{
+               username: "bob",
+               email: "bob-git-http@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, _api_key, secret} =
+             ForgeAccounts.create_api_key(bob, %{
+               "name" => "git clone",
+               "scopes" => ["repo:read"]
+             })
+
+    authorization = "Basic " <> Base.encode64("bob:#{secret}")
+
+    for path <- ["/alice/demo.git", "/nobody/missing.git"] do
+      discovery =
+        build_conn()
+        |> Plug.Conn.put_req_header("authorization", authorization)
+        |> get("#{path}/info/refs?service=git-upload-pack")
+
+      upload =
+        build_conn()
+        |> Plug.Conn.put_req_header("authorization", authorization)
+        |> upload_pack_request(path, "0000")
+
+      assert response(discovery, 404) == "Repository not found.\n"
+      assert response(upload, 404) == "Repository not found.\n"
+    end
+  end
+
+  test "public upload-pack rejects a request larger than the configured limit" do
+    create_user_and_repository(:public)
+
+    original_limit = Application.get_env(:fornacast_web, :git_upload_pack_max_bytes)
+    Application.put_env(:fornacast_web, :git_upload_pack_max_bytes, 8)
+
+    on_exit(fn ->
+      if is_nil(original_limit) do
+        Application.delete_env(:fornacast_web, :git_upload_pack_max_bytes)
+      else
+        Application.put_env(:fornacast_web, :git_upload_pack_max_bytes, original_limit)
+      end
+    end)
+
+    response = upload_pack_request(build_conn(), "/alice/demo.git", "123456789")
+
+    assert response(response, 413) == "Git request is too large.\n"
+  end
+
   defp create_user_and_repository(visibility) do
     assert {:ok, user} =
              ForgeAccounts.create_user(%{
@@ -204,6 +271,12 @@ esac
       "Basic " <> Base.encode64("#{username}:#{password}")
     )
     |> get("/alice/demo.git/info/refs?service=git-upload-pack")
+  end
+
+  defp upload_pack_request(conn, repository_path, body) do
+    conn
+    |> Plug.Conn.put_req_header("content-type", "application/x-git-upload-pack-request")
+    |> post("#{repository_path}/git-upload-pack", body)
   end
 
   defp seed_repository(repository, work_path) do
