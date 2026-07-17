@@ -193,6 +193,52 @@ defmodule FornacastWebTest do
     assert ForgeAccounts.list_user_api_keys(user) == []
   end
 
+  test "API key settings reject forged non-map top-level parameters without crashing" do
+    reset_database!()
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-api-forged-params@example.com",
+               password: "correct horse battery staple"
+             })
+
+    conn =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+      |> post("/settings/api-keys", %{"api_key" => "forged"})
+
+    html = html_response(conn, 422)
+    assert html =~ "Name can&#39;t be blank"
+    assert html =~ "Scopes must contain repo:read or repo:write"
+    assert ForgeAccounts.list_user_api_keys(user) == []
+  end
+
+  test "API key settings parse browser minute-precision expiration as UTC" do
+    reset_database!()
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-api-minute-expiration@example.com",
+               password: "correct horse battery staple"
+             })
+
+    conn =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+      |> post("/settings/api-keys", %{
+        "api_key" => %{
+          "name" => "minute precision",
+          "scopes" => %{"repo:read" => "true"},
+          "expires_at" => "2032-06-07T08:09"
+        }
+      })
+
+    assert html_response(conn, 201) =~ "2032-06-07 08:09:00Z"
+    assert [%{expires_at: ~U[2032-06-07 08:09:00Z]}] = ForgeAccounts.list_user_api_keys(user)
+  end
+
   test "API key settings list multiple keys with metadata and allow owner revocation" do
     reset_database!()
 

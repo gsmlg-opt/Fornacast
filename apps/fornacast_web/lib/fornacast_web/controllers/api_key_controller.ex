@@ -8,6 +8,7 @@ defmodule FornacastWeb.APIKeyController do
   end
 
   def create(%Plug.Conn{assigns: %{current_user: user}} = conn, %{"api_key" => params}) do
+    params = if is_map(params), do: params, else: %{}
     attrs = api_key_attrs(params)
 
     case ForgeAccounts.create_api_key(user, attrs) do
