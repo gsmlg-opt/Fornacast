@@ -29,6 +29,14 @@ defmodule ForgeAccounts.APIKeyTest do
     assert api_key.token_prefix == String.slice(secret, 0, 15)
     refute api_key.token_hash == secret
 
+    persisted_key = Repo.reload!(api_key)
+    expected_hash = :crypto.hash(:sha256, secret) |> Base.encode16(case: :lower)
+
+    assert persisted_key.token_hash == expected_hash
+    refute persisted_key.token_hash == secret
+    refute persisted_key.token_prefix == secret
+    refute inspect(persisted_key) =~ secret
+
     assert [%APIKey{id: id, name: "workstation"}] = ForgeAccounts.list_user_api_keys(user)
     assert id == api_key.id
   end
@@ -87,6 +95,40 @@ defmodule ForgeAccounts.APIKeyTest do
     assert {:ok, revoked_key} = ForgeAccounts.revoke_api_key(user, expired_key.id)
     assert revoked_key.revoked_at
     assert {:error, :not_found} = ForgeAccounts.revoke_api_key(user, expired_key.id)
+  end
+
+  test "revoked keys cannot authenticate and do not record use", %{user: user} do
+    assert {:ok, api_key, secret} =
+             ForgeAccounts.create_api_key(user, %{
+               "name" => "revoked",
+               "scopes" => ["repo:write"]
+             })
+
+    assert {:ok, revoked_key} = ForgeAccounts.revoke_api_key(user, api_key.id)
+    assert is_nil(revoked_key.last_used_at)
+
+    assert {:error, :invalid_credentials} =
+             ForgeAccounts.authenticate_api_key("alice", secret, "repo:read")
+
+    assert is_nil(Repo.reload!(api_key).last_used_at)
+  end
+
+  test "keys stop authenticating when their user is disabled", %{user: user} do
+    assert {:ok, api_key, secret} =
+             ForgeAccounts.create_api_key(user, %{
+               "name" => "disabled owner",
+               "scopes" => ["repo:read"]
+             })
+
+    assert {:ok, _disabled_user} =
+             user
+             |> User.state_changeset(%{state: :disabled})
+             |> Repo.update()
+
+    assert {:error, :invalid_credentials} =
+             ForgeAccounts.authenticate_api_key("alice", secret, "repo:read")
+
+    assert is_nil(Repo.reload!(api_key).last_used_at)
   end
 
   test "requires active users and valid creation scopes", %{user: user} do
