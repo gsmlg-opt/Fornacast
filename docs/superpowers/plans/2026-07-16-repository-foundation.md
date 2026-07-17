@@ -762,11 +762,11 @@ git commit -m "feat(git): cache immutable repository reads"
 - Add tests: apps/fornacast_web/test/repository_html_test.exs
 - Modify: apps/forge_repos/lib/forge_repos.ex
 
-- [ ] **Step 1: Add a narrow fake GitCore seam**
+- [x] **Step 1: Add a narrow fake GitCore seam**
 
 In repository_page_test.exs, implement a test module with the same read functions and a call log. Pass it as git_core: FakeGitCore. The production default remains GitCore.
 
-- [ ] **Step 2: Add failing orchestration tests**
+- [x] **Step 2: Add failing orchestration tests**
 
 Cover:
 
@@ -781,7 +781,7 @@ Cover:
 - README, language, and disk optional failures degrade only their panels;
 - all returned blob leases appear in the result lease list.
 
-- [ ] **Step 3: Define typed page results**
+- [x] **Step 3: Define typed page results**
 
 Use:
 
@@ -854,19 +854,19 @@ end
 
 Result.kind is one of :code, :tree, :blob, :refs, :commits, :commit, :search, :empty, :missing_default, or :raw. Keep presentation labels and routes in the web module; keep Git values typed. Expose code, tree, blob, refs, commits, commit, search, and raw functions plus release/1. The raw function performs ref summary, exact snapshot resolution, and read_blob_complete/4, then returns a Raw content value whose lease remains held for the controller.
 
-- [ ] **Step 4: Keep concurrency fixed and bounded**
+- [x] **Step 4: Keep concurrency fixed and bounded**
 
 After snapshot resolution, either execute independent scan-only reads serially or run one fixed list of at most four named scan tasks. Never derive tasks from tree rows or search results. Blob-producing reads, including README, inline blob, and complete raw, always run in the request process that will render or send the response; do not acquire a BlobLimiter lease in a short-lived child task. Ensure every successful scan task is joined and every acquired blob lease is released on failure.
 
-- [ ] **Step 5: Add HTTPS and actor-correct clone URLs**
+- [x] **Step 5: Add HTTPS and actor-correct clone URLs**
 
 Add ForgeRepos.http_clone_url/2 using Fornacast.Config.base_url/0 plus /owner/repo.git. Anonymous and disabled viewers of a public repository receive HTTPS only. An active signed-in permitted actor also receives SSH. Empty push commands appear only when Fornacast.Access.authorize(viewer, :repository_write, repository) returns :ok.
 
-- [ ] **Step 6: Add failing Markdown rewrite tests**
+- [x] **Step 6: Add failing Markdown rewrite tests**
 
 Cover README.md, README, README.txt priority; nested relative links; relative raster images; non-raster images converted to linked alt text; same-document anchors; http, https, and mailto preservation; selected full-ref preservation; percent encoding; parent traversal rejection; unsupported schemes; and raw HTML sanitization. Tag these cases :markdown.
 
-- [ ] **Step 7: Rewrite MDEx AST before sanitization**
+- [x] **Step 7: Rewrite MDEx AST before sanitization**
 
 Use:
 
@@ -880,7 +880,7 @@ markdown
 
 Normalize relative paths against the README directory without allowing a path above repository root. Use source/blob routes for document links and authorized raw routes for images. Return Phoenix-safe sanitized output.
 
-- [ ] **Step 8: Run and commit**
+- [x] **Step 8: Run and commit**
 
 ~~~sh
 mix test apps/fornacast_web/test/repository_page_test.exs --trace
