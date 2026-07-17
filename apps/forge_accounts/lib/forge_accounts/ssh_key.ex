@@ -74,7 +74,8 @@ defmodule ForgeAccounts.SSHKey do
     with [algorithm, blob | _rest] <- String.split(public_key, " "),
          true <- algorithm in @accepted_algorithms,
          {:ok, key_blob} <- Base.decode64(blob, padding: false),
-         {:ok, _decoded_key} <- decode_openssh_key(public_key) do
+         {:ok, decoded_key} <- decode_openssh_key(public_key),
+         :ok <- validate_decoded_algorithm(algorithm, decoded_key) do
       {:ok, algorithm, key_blob}
     else
       false -> {:error, :unsupported_algorithm}
@@ -84,6 +85,17 @@ defmodule ForgeAccounts.SSHKey do
   end
 
   defp parse_public_key(_), do: {:error, :invalid_public_key}
+
+  defp validate_decoded_algorithm("ssh-rsa", {:RSAPublicKey, _modulus, _exponent}), do: :ok
+
+  defp validate_decoded_algorithm(
+         "ssh-ed25519",
+         {{:ECPoint, _point}, {:namedCurve, {1, 3, 101, 112}}}
+       ),
+       do: :ok
+
+  defp validate_decoded_algorithm(_algorithm, _decoded_key),
+    do: {:error, :invalid_public_key}
 
   defp decode_openssh_key(public_key) do
     case :ssh_file.decode(public_key, :auth_keys) do

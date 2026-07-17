@@ -66,6 +66,16 @@ defmodule ForgeAccountsTest do
     assert "SHA256:" <> _ = Ecto.Changeset.get_change(changeset, :fingerprint_sha256)
   end
 
+  test "ssh key changeset rejects a key whose label does not match its blob" do
+    public_key = String.replace(@ed25519_public_key, "ssh-ed25519", "ssh-rsa", global: false)
+
+    changeset =
+      SSHKey.changeset(%SSHKey{user_id: 1}, %{title: "mislabeled", public_key: public_key})
+
+    refute changeset.valid?
+    assert [public_key: {"is not a valid OpenSSH public key", _meta}] = changeset.errors
+  end
+
   test "ssh key changeset rejects unsupported algorithms" do
     public_key = String.replace(@ed25519_public_key, "ssh-ed25519", "ssh-dss", global: false)
     changeset = SSHKey.changeset(%SSHKey{user_id: 1}, %{title: "legacy", public_key: public_key})
