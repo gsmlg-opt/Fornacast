@@ -1,6 +1,8 @@
 defmodule FornacastWeb.APIKeyController do
   use FornacastWeb, :controller
 
+  plug :require_active_user
+
   def index(%Plug.Conn{assigns: %{current_user: user}} = conn, _params) do
     render_index(conn, user)
   end
@@ -12,6 +14,8 @@ defmodule FornacastWeb.APIKeyController do
       {:ok, _key, secret} ->
         conn
         |> put_status(:created)
+        |> put_resp_header("cache-control", "private, no-store")
+        |> put_resp_header("pragma", "no-cache")
         |> render_index(user, secret: secret)
 
       {:error, changeset} ->
@@ -49,16 +53,39 @@ defmodule FornacastWeb.APIKeyController do
     scopes =
       params
       |> Map.get("scopes", %{})
-      |> Enum.filter(fn {_scope, enabled} -> enabled in ["true", "on", true] end)
-      |> Enum.map(&elem(&1, 0))
+      |> normalize_scopes()
 
     params
     |> Map.put("scopes", scopes)
-    |> drop_blank_expiration()
+    |> normalize_expiration()
   end
 
-  defp drop_blank_expiration(%{"expires_at" => ""} = attrs), do: Map.delete(attrs, "expires_at")
-  defp drop_blank_expiration(attrs), do: attrs
+  defp normalize_scopes(scopes) when is_map(scopes) do
+    scopes
+    |> Enum.filter(fn {_scope, enabled} -> enabled in ["true", "on", true] end)
+    |> Enum.map(&elem(&1, 0))
+  end
+
+  defp normalize_scopes(_scopes), do: []
+
+  defp normalize_expiration(%{"expires_at" => ""} = attrs),
+    do: Map.delete(attrs, "expires_at")
+
+  defp normalize_expiration(%{"expires_at" => value} = attrs) when is_binary(value) do
+    case NaiveDateTime.from_iso8601(value) do
+      {:ok, naive} ->
+        Map.put(
+          attrs,
+          "expires_at",
+          naive |> DateTime.from_naive!("Etc/UTC") |> DateTime.to_iso8601()
+        )
+
+      {:error, _reason} ->
+        attrs
+    end
+  end
+
+  defp normalize_expiration(attrs), do: attrs
 
   defp settings_navigation do
     ~s(<nav aria-label="Settings"><a href="/settings/ssh-keys">SSH keys</a> <a href="/settings/api-keys">API keys</a></nav>)
@@ -81,7 +108,7 @@ defmodule FornacastWeb.APIKeyController do
           <label><input type="checkbox" name="api_key[scopes][repo:read]" value="true"#{checked(scopes, "repo:read")}> repo:read</label>
           <label><input type="checkbox" name="api_key[scopes][repo:write]" value="true"#{checked(scopes, "repo:write")}> repo:write</label>
         </fieldset>
-        <label>Expires at (optional) <input type="datetime-local" name="api_key[expires_at]" value="#{expires_at}"></label>
+        <label>Expires at (optional, UTC) <input type="datetime-local" name="api_key[expires_at]" value="#{expires_at}"></label>
         <button class="btn btn-primary" type="submit">Create key</button>
       </form>
       """
@@ -119,7 +146,7 @@ defmodule FornacastWeb.APIKeyController do
       <td>#{format_datetime(key.inserted_at, "Unknown")}</td>
       <td>#{format_datetime(key.expires_at, "Never")}</td>
       <td>#{format_datetime(key.last_used_at, "Never")}</td>
-      <td>#{if key.revoked_at, do: "Revoked", else: "Active"}</td>
+      <td>#{key_status(key)}</td>
       <td>#{revoke_form(key)}</td>
     </tr>
     """
@@ -133,6 +160,16 @@ defmodule FornacastWeb.APIKeyController do
 
   defp format_datetime(nil, fallback), do: fallback
   defp format_datetime(datetime, _fallback), do: datetime |> DateTime.to_string() |> escape()
+
+  defp key_status(%{revoked_at: revoked_at}) when not is_nil(revoked_at), do: "Revoked"
+
+  defp key_status(%{expires_at: expires_at}) when not is_nil(expires_at) do
+    if DateTime.compare(expires_at, DateTime.utc_now(:second)) in [:lt, :eq],
+      do: "Expired",
+      else: "Active"
+  end
+
+  defp key_status(_key), do: "Active"
 
   defp revoke_form(%{revoked_at: nil, id: id}) do
     """
@@ -173,5 +210,15 @@ defmodule FornacastWeb.APIKeyController do
       Enum.map(messages, &"#{label} #{&1}")
     end)
     |> Enum.join("; ")
+  end
+
+  defp require_active_user(%Plug.Conn{assigns: %{current_user: %{state: :active}}} = conn, _opts),
+    do: conn
+
+  defp require_active_user(conn, _opts) do
+    conn
+    |> delete_session(:user_id)
+    |> redirect(to: "/login")
+    |> halt()
   end
 end

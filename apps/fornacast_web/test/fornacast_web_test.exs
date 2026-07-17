@@ -160,6 +160,8 @@ defmodule FornacastWebTest do
     assert html =~ "repo:write"
     assert html =~ "2030-01-02 03:04:05Z"
     assert Plug.Conn.get_resp_header(conn, "location") == []
+    assert Plug.Conn.get_resp_header(conn, "cache-control") == ["private, no-store"]
+    assert Plug.Conn.get_resp_header(conn, "pragma") == ["no-cache"]
     refute inspect(Plug.Conn.get_session(conn)) =~ secret
     refute html =~ "token_hash"
 
@@ -167,6 +169,28 @@ defmodule FornacastWebTest do
              ForgeAccounts.list_user_api_keys(user)
 
     assert scopes == %{"repo:read" => true, "repo:write" => true}
+    assert hd(ForgeAccounts.list_user_api_keys(user)).expires_at == ~U[2030-01-02 03:04:05Z]
+  end
+
+  test "API key settings reject forged non-map scopes without crashing" do
+    reset_database!()
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-api-forged-scopes@example.com",
+               password: "correct horse battery staple"
+             })
+
+    conn =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+      |> post("/settings/api-keys", %{
+        "api_key" => %{"name" => "forged", "scopes" => "repo:write"}
+      })
+
+    assert html_response(conn, 422) =~ "Scopes must contain repo:read or repo:write"
+    assert ForgeAccounts.list_user_api_keys(user) == []
   end
 
   test "API key settings list multiple keys with metadata and allow owner revocation" do
@@ -219,6 +243,70 @@ defmodule FornacastWebTest do
     refute is_nil(Fornacast.Repo.get!(ForgeAccounts.APIKey, first.id).revoked_at)
   end
 
+  test "API key settings mark past and boundary expirations as expired and revocable" do
+    reset_database!()
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-api-expired@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, past, _secret} =
+             ForgeAccounts.create_api_key(user, %{
+               name: "past",
+               scopes: ["repo:read"],
+               expires_at: "2000-01-01T00:00:00Z"
+             })
+
+    boundary = DateTime.utc_now(:second)
+
+    assert {:ok, boundary_key, _secret} =
+             ForgeAccounts.create_api_key(user, %{
+               name: "boundary",
+               scopes: ["repo:read"],
+               expires_at: boundary
+             })
+
+    html =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+      |> get("/settings/api-keys")
+      |> html_response(200)
+
+    assert Regex.match?(~r/past.*Expired.*settings\/api-keys\/#{past.id}/s, html)
+
+    assert Regex.match?(
+             ~r/boundary.*Expired.*settings\/api-keys\/#{boundary_key.id}/s,
+             html
+           )
+  end
+
+  test "disabled users with existing sessions cannot manage API keys" do
+    reset_database!()
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-api-disabled@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, _disabled_user} =
+             user
+             |> ForgeAccounts.User.state_changeset(%{state: :disabled})
+             |> Fornacast.Repo.update()
+
+    conn =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+      |> get("/settings/api-keys")
+
+    assert redirected_to(conn) == "/login"
+    assert Plug.Conn.get_session(conn, :user_id) == nil
+  end
+
   test "API key validation errors are human-readable and escaped" do
     reset_database!()
 
@@ -237,6 +325,7 @@ defmodule FornacastWebTest do
       })
 
     html = html_response(conn, 422)
+    assert html =~ "Expires at (optional, UTC)"
     assert html =~ "Scopes must contain repo:read or repo:write"
     assert html =~ "&lt;script&gt;alert(1)&lt;/script&gt;"
     refute html =~ "<script>alert(1)</script>"
