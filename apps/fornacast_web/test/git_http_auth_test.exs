@@ -118,6 +118,30 @@ defmodule FornacastWeb.GitHTTPAuthTest do
     assert Plug.Conn.get_resp_header(response, "www-authenticate") == [@challenge]
   end
 
+  test "public fetch rejects unsupported, malformed, and multiple Authorization headers" do
+    create_user_and_repository(:public)
+
+    headers = [
+      {"Bearer authorization", [{"authorization", "Bearer token"}]},
+      {"malformed Basic authorization", [{"authorization", "Basic not-base64"}]},
+      {"multiple authorization headers",
+       [
+         {"authorization", "Basic " <> Base.encode64("alice:fc_pat_invalid")},
+         {"authorization", "Basic " <> Base.encode64("alice:fc_pat_also_invalid")}
+       ]}
+    ]
+
+    for {case_name, authorization_headers} <- headers do
+      response =
+        build_conn()
+        |> Map.update!(:req_headers, &(authorization_headers ++ &1))
+        |> get("/alice/demo.git/info/refs?service=git-upload-pack")
+
+      assert response(response, 401) == "Authentication required.\n", case_name
+      assert Plug.Conn.get_resp_header(response, "www-authenticate") == [@challenge], case_name
+    end
+  end
+
   defp create_user_and_repository(visibility) do
     assert {:ok, user} =
              ForgeAccounts.create_user(%{

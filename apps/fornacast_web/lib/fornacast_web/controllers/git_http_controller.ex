@@ -64,7 +64,8 @@ defmodule FornacastWeb.GitHTTPController do
     case get_req_header(conn, "authorization") do
       ["Basic " <> encoded] -> authenticate_basic(encoded)
       ["basic " <> encoded] -> authenticate_basic(encoded)
-      _ -> {:ok, nil}
+      [] -> {:ok, nil}
+      _ -> {:error, :invalid_credentials}
     end
   end
 

@@ -836,7 +836,7 @@ defmodule FornacastWebTest do
   end
 
   @tag :tmp_dir
-  test "smart HTTP upload-pack uses Basic auth for private repositories", %{tmp_dir: tmp_dir} do
+  test "smart HTTP upload-pack uses API key auth for private repositories", %{tmp_dir: tmp_dir} do
     reset_database!()
 
     original_root = Application.get_env(:fornacast, :repo_storage_root)
@@ -862,6 +862,12 @@ defmodule FornacastWebTest do
                description: "private http repository"
              })
 
+    assert {:ok, _api_key, personal_api_key} =
+             ForgeAccounts.create_api_key(user, %{
+               name: "Git HTTP",
+               scopes: ["repo:read"]
+             })
+
     challenged = get(build_conn(), "/alice/demo.git/info/refs?service=git-upload-pack")
 
     assert response(challenged, 401) == "Authentication required.\n"
@@ -871,7 +877,10 @@ defmodule FornacastWebTest do
 
     authorized =
       build_conn()
-      |> Plug.Conn.put_req_header("authorization", "Basic " <> Base.encode64("alice:#{password}"))
+      |> Plug.Conn.put_req_header(
+        "authorization",
+        "Basic " <> Base.encode64("alice:#{personal_api_key}")
+      )
       |> get("/alice/demo.git/info/refs?service=git-upload-pack")
 
     assert response(authorized, 200) =~ "# service=git-upload-pack"
