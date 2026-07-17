@@ -74,7 +74,6 @@ defmodule FornacastWeb.GitHTTPPushTest do
 
   test "receive-pack advertisement requires a valid repo:write API key" do
     {alice, _repository} = create_user_and_repository("alice")
-    {bob, _repository} = create_user_and_repository("bob", "other")
 
     assert {:ok, _key, read_secret} =
              ForgeAccounts.create_api_key(alice, %{"name" => "read", "scopes" => ["repo:read"]})
@@ -87,15 +86,11 @@ defmodule FornacastWeb.GitHTTPPushTest do
 
     assert {:ok, _key} = ForgeAccounts.revoke_api_key(alice, revoked_key.id)
 
-    assert {:ok, _key, bob_secret} =
-             ForgeAccounts.create_api_key(bob, %{"name" => "write", "scopes" => ["repo:write"]})
-
     credentials = [
       {"missing", nil},
       {"password", {"alice", "correct horse battery staple"}},
       {"read only", {"alice", read_secret}},
-      {"revoked", {"alice", revoked_secret}},
-      {"unauthorized user", {"bob", bob_secret}}
+      {"revoked", {"alice", revoked_secret}}
     ]
 
     for {name, credentials} <- credentials do
@@ -136,6 +131,32 @@ defmodule FornacastWeb.GitHTTPPushTest do
     assert response(existing, 401) == "Authentication required.\n"
     assert response(missing, 401) == "Authentication required.\n"
     assert Plug.Conn.get_resp_header(missing, "www-authenticate") == [@challenge]
+  end
+
+  test "authenticated receive-pack does not distinguish an unauthorized private repository from missing" do
+    create_user_and_repository("alice")
+    {bob, _repository} = create_user_and_repository("bob", "other")
+
+    assert {:ok, _key, secret} =
+             ForgeAccounts.create_api_key(bob, %{"name" => "write", "scopes" => ["repo:write"]})
+
+    for path <- [
+          "/alice/demo.git/info/refs?service=git-receive-pack",
+          "/nobody/missing.git/info/refs?service=git-receive-pack"
+        ] do
+      response = build_conn() |> maybe_authorize({"bob", secret}) |> get(path)
+      assert response(response, 404) == "Repository not found.\n"
+    end
+
+    for path <- ["/alice/demo.git/git-receive-pack", "/nobody/missing.git/git-receive-pack"] do
+      response =
+        build_conn()
+        |> maybe_authorize({"bob", secret})
+        |> Plug.Conn.put_req_header("content-type", "application/x-git-receive-pack-request")
+        |> post(path, "0000")
+
+      assert response(response, 404) == "Repository not found.\n"
+    end
   end
 
   test "receive-pack POST rejects unsupported content types" do

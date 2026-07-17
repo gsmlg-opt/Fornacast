@@ -95,11 +95,18 @@ defmodule FornacastWeb.GitHTTPController do
   defp load_writable_repository(conn, owner_slug, repo_slug) do
     with {:ok, actor} <- authenticate_actor(conn, "repo:write"),
          %Repository{} = repository <- ForgeRepos.get_repository(owner_slug, repo_slug),
-         :ok <- Fornacast.Access.authorize(actor, :repository_write, repository) do
+         :ok <- authorize_repository_write(actor, repository) do
       {:ok, actor, repository}
     else
       nil -> {:error, :not_found}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp authorize_repository_write(actor, repository) do
+    case Fornacast.Access.authorize(actor, :repository_write, repository) do
+      :ok -> :ok
+      {:error, :unauthorized} -> {:error, :not_found}
     end
   end
 
