@@ -198,6 +198,47 @@ defmodule Fornacast.AccessTest do
              )
   end
 
+  test "authorized fetch reloads stale actors and preserves anonymous public access" do
+    owner = active_user_fixture("stale-fetch-owner")
+    collaborator = active_user_fixture("stale-fetch-collaborator")
+    private_repository = personal_repository_fixture(owner, slug: "private")
+    public_repository = personal_repository_fixture(owner, slug: "public", visibility: :public)
+    collaborator_fixture(private_repository, collaborator, :admin)
+    collaborator_fixture(public_repository, collaborator, :admin)
+
+    collaborator
+    |> Ecto.Changeset.change(state: :disabled)
+    |> Repo.update!()
+
+    assert {:error, :not_found} =
+             ForgeRepos.fetch_authorized_repository(
+               collaborator,
+               owner.username,
+               private_repository.slug,
+               :repository_read
+             )
+
+    for actor <- [collaborator, :invalid_actor] do
+      assert {:ok, %Repository{id: public_id}} =
+               ForgeRepos.fetch_authorized_repository(
+                 actor,
+                 owner.username,
+                 public_repository.slug,
+                 :repository_read
+               )
+
+      assert public_id == public_repository.id
+
+      assert {:error, :forbidden} =
+               ForgeRepos.fetch_authorized_repository(
+                 actor,
+                 owner.username,
+                 public_repository.slug,
+                 :repository_write
+               )
+    end
+  end
+
   test "authorized fetch rejects deleted rows and unsupported permissions before storage access" do
     owner = active_user_fixture("deleted-owner")
     repository = personal_repository_fixture(owner, visibility: :public)

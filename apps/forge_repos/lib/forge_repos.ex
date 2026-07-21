@@ -82,23 +82,16 @@ defmodule ForgeRepos do
 
   @spec repository_view(User.t() | nil, Repository.t()) ::
           {:ok, RepositoryView.t()} | {:error, :not_found | {:unavailable, atom()}}
-  def repository_view(actor, %Repository{} = repository) do
-    with :ok <- mask_repository_read(actor, repository),
-         {:ok, owner} <- typed_repository_owner(repository),
-         {:ok, bytes} <- GitCore.repository_disk_usage(absolute_storage_path(repository)) do
-      {:ok,
-       %RepositoryView{
-         repository: repository,
-         owner: owner,
-         permissions: repository_permissions(actor, repository),
-         size_kib: div(bytes + 1023, 1024)
-       }}
-    else
-      {:error, %GitCore.Error{kind: kind}} -> {:error, {:unavailable, kind}}
-      {:error, :not_found} -> {:error, :not_found}
-      {:error, _reason} -> {:error, {:unavailable, :storage_unavailable}}
+  def repository_view(actor, %Repository{id: repository_id}) when is_integer(repository_id) do
+    actor = canonical_read_actor(actor)
+
+    case load_repository_contexts([repository_id], actor) do
+      %{^repository_id => context} -> build_repository_view(actor, context)
+      %{} -> {:error, :not_found}
     end
   end
+
+  def repository_view(_actor, %Repository{}), do: {:error, :not_found}
 
   @spec list_accessible_repository_views(User.t(), keyword()) ::
           {:ok, Page.t(RepositoryView.t())} | {:error, api_error()}
@@ -292,6 +285,13 @@ defmodule ForgeRepos do
     |> Storage.repository_path!()
   end
 
+  defp safe_absolute_storage_path(%Repository{} = repository) do
+    {:ok, absolute_storage_path(repository)}
+  rescue
+    File.Error -> {:error, :storage_unavailable}
+    ArgumentError -> {:error, :storage_unavailable}
+  end
+
   def empty?(%Repository{} = repository) do
     repository
     |> absolute_storage_path()
@@ -380,6 +380,8 @@ defmodule ForgeRepos do
   defp authorize_fetched_repository(_actor, nil, _permission), do: {:error, :not_found}
 
   defp authorize_fetched_repository(actor, %Repository{} = repository, permission) do
+    actor = canonical_read_actor(actor)
+
     case Fornacast.Access.authorize(actor, permission, repository) do
       :ok ->
         {:ok, repository}
@@ -392,47 +394,87 @@ defmodule ForgeRepos do
     end
   end
 
-  defp mask_repository_read(actor, repository) do
-    case Fornacast.Access.authorize(actor, :repository_read, repository) do
-      :ok -> :ok
-      {:error, :unauthorized} -> {:error, :not_found}
+  defp build_repository_view(actor, %{repository: repository, owner: owner} = context) do
+    with :ok <- mask_repository_read(actor, context),
+         {:ok, path} <- safe_absolute_storage_path(repository),
+         {:ok, bytes} <- GitCore.repository_disk_usage(path) do
+      {:ok,
+       %RepositoryView{
+         repository: repository,
+         owner: owner,
+         permissions: repository_permissions(actor, context),
+         size_kib: div(bytes + 1023, 1024)
+       }}
+    else
+      {:error, %GitCore.Error{kind: kind}} -> {:error, {:unavailable, kind}}
+      {:error, :not_found} -> {:error, :not_found}
+      {:error, _reason} -> {:error, {:unavailable, :storage_unavailable}}
     end
   end
 
-  defp typed_repository_owner(%Repository{owner_user_id: owner_id}) do
-    case Repo.get(User, owner_id) do
-      %User{kind: :user} ->
-        case Repo.get_by(User, id: owner_id, kind: :user, state: :active) do
-          %User{} = owner -> {:ok, owner}
-          nil -> {:error, :not_found}
-        end
-
-      %User{kind: :organization} ->
-        case Repo.get_by(Organization,
-               id: owner_id,
-               kind: :organization,
-               state: :active
-             ) do
-          %Organization{} = owner -> {:ok, owner}
-          nil -> {:error, :not_found}
-        end
-
-      nil ->
-        {:error, :not_found}
-    end
+  defp mask_repository_read(actor, context) do
+    if context_authorized?(actor, :repository_read, context),
+      do: :ok,
+      else: {:error, :not_found}
   end
 
-  defp repository_permissions(actor, repository) do
+  defp repository_permissions(actor, context) do
     %{
-      admin: authorized?(actor, :repository_admin, repository),
-      push: authorized?(actor, :repository_write, repository),
-      pull: authorized?(actor, :repository_read, repository)
+      admin: context_authorized?(actor, :repository_admin, context),
+      push: context_authorized?(actor, :repository_write, context),
+      pull: context_authorized?(actor, :repository_read, context)
     }
   end
 
-  defp authorized?(actor, permission, repository) do
-    Fornacast.Access.authorize(actor, permission, repository) == :ok
+  defp context_authorized?(
+         %User{role: :admin, state: :active},
+         _permission,
+         _context
+       ),
+       do: true
+
+  defp context_authorized?(
+         %User{id: actor_id, kind: :user, state: :active},
+         _permission,
+         %{
+           repository: %Repository{owner_user_id: actor_id},
+           owner: %User{kind: :user}
+         }
+       ),
+       do: true
+
+  defp context_authorized?(
+         _actor,
+         :repository_read,
+         %{repository: %Repository{visibility: :public}}
+       ),
+       do: true
+
+  defp context_authorized?(%User{state: :active}, permission, context) do
+    organization_role_allows?(context.owner, context.organization_role, permission) or
+      collaborator_role_allows?(context.collaborator_role, permission)
   end
+
+  defp context_authorized?(_actor, _permission, _context), do: false
+
+  defp organization_role_allows?(%Organization{}, :owner, _permission), do: true
+
+  defp organization_role_allows?(%Organization{}, :member, :repository_read), do: true
+  defp organization_role_allows?(_owner, _role, _permission), do: false
+
+  defp collaborator_role_allows?(:admin, _permission), do: true
+
+  defp collaborator_role_allows?(:write, permission),
+    do: permission in [:repository_read, :repository_write]
+
+  defp collaborator_role_allows?(:read, :repository_read), do: true
+  defp collaborator_role_allows?(_role, _permission), do: false
+
+  defp canonical_read_actor(%User{id: actor_id, kind: :user}) when is_integer(actor_id) do
+    Repo.get_by(User, id: actor_id, kind: :user, state: :active)
+  end
+
+  defp canonical_read_actor(_actor), do: nil
 
   defp active_actor(%User{id: actor_id, kind: :user}) when is_integer(actor_id) do
     case Repo.get_by(User, id: actor_id, kind: :user, state: :active) do
@@ -912,16 +954,120 @@ defmodule ForgeRepos do
   end
 
   defp build_repository_views(actor, repositories) do
+    contexts =
+      repositories
+      |> Enum.map(& &1.id)
+      |> load_repository_contexts(actor)
+
     Enum.reduce_while(repositories, {:ok, []}, fn repository, {:ok, views} ->
-      case repository_view(actor, repository) do
-        {:ok, view} -> {:cont, {:ok, [view | views]}}
-        {:error, reason} -> {:halt, {:error, reason}}
+      case Map.fetch(contexts, repository.id) do
+        {:ok, context} ->
+          case build_repository_view(actor, context) do
+            {:ok, view} -> {:cont, {:ok, [view | views]}}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+
+        :error ->
+          {:halt, {:error, :not_found}}
       end
     end)
     |> case do
       {:ok, views} -> {:ok, Enum.reverse(views)}
       error -> error
     end
+  end
+
+  defp load_repository_contexts([], _actor), do: %{}
+
+  defp load_repository_contexts(repository_ids, actor) do
+    actor
+    |> repository_context_rows(repository_ids)
+    |> Enum.reduce(%{}, fn
+      {repository, %User{kind: :user} = owner, nil, organization_role, collaborator_role},
+      contexts ->
+        put_repository_context(
+          contexts,
+          repository,
+          owner,
+          organization_role,
+          collaborator_role
+        )
+
+      {repository, %User{kind: :organization}, %Organization{kind: :organization} = owner,
+       organization_role, collaborator_role},
+      contexts ->
+        put_repository_context(
+          contexts,
+          repository,
+          owner,
+          organization_role,
+          collaborator_role
+        )
+
+      _row, contexts ->
+        contexts
+    end)
+  end
+
+  defp repository_context_rows(nil, repository_ids) do
+    repository_ids
+    |> repository_context_query()
+    |> select([repository, owner, organization], {repository, owner, organization})
+    |> Repo.all()
+    |> Enum.map(fn {repository, owner, organization} ->
+      {repository, owner, organization, nil, nil}
+    end)
+  end
+
+  defp repository_context_rows(%User{id: actor_id}, repository_ids) do
+    repository_ids
+    |> repository_context_query()
+    |> join(:left, [repository, _owner, _organization], membership in OrganizationMember,
+      on:
+        membership.organization_id == repository.owner_user_id and
+          membership.user_id == ^actor_id
+    )
+    |> join(
+      :left,
+      [repository, _owner, _organization, _membership],
+      collaborator in Collaborator,
+      on: collaborator.repository_id == repository.id and collaborator.user_id == ^actor_id
+    )
+    |> select(
+      [repository, owner, organization, membership, collaborator],
+      {repository, owner, organization, membership.role, collaborator.role}
+    )
+    |> Repo.all()
+  end
+
+  defp repository_context_query(repository_ids) do
+    Repository
+    |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
+    |> join(:left, [_repository, owner], organization in Organization,
+      on:
+        organization.id == owner.id and owner.kind == :organization and
+          organization.kind == :organization and organization.state == :active
+    )
+    |> where(
+      [repository, owner, _organization],
+      repository.id in ^repository_ids and is_nil(repository.deleted_at) and
+        owner.state == :active and owner.kind in [:user, :organization]
+    )
+  end
+
+  defp put_repository_context(
+         contexts,
+         repository,
+         owner,
+         organization_role,
+         collaborator_role
+       ) do
+    Map.put(contexts, repository.id, %{
+      repository: repository,
+      owner: owner,
+      organization_role: organization_role,
+      collaborator_role: collaborator_role
+    })
   end
 
   defp order_repository_query(query, :full_name, :asc) do
@@ -1273,17 +1419,22 @@ defmodule ForgeRepos do
   defp validate_changed_default_branch(repository, branch, changeset) do
     selector = %GitCore.RefSelector{kind: :branch, full_name: "refs/heads/#{branch}"}
 
-    case GitCore.resolve_snapshot(absolute_storage_path(repository), selector) do
-      {:ok, %GitCore.Snapshot{}} ->
-        {:ok, changeset}
+    with {:ok, path} <- safe_absolute_storage_path(repository) do
+      case GitCore.resolve_snapshot(path, selector) do
+        {:ok, %GitCore.Snapshot{}} ->
+          {:ok, changeset}
 
-      {:error, %GitCore.Error{kind: kind}} when kind in [:empty_repository, :ref_not_found] ->
-        validation_result("default_branch", :missing)
+        {:error, %GitCore.Error{kind: kind}} when kind in [:empty_repository, :ref_not_found] ->
+          validation_result("default_branch", :missing)
 
-      {:error, %GitCore.Error{kind: kind}} ->
-        {:error, {:unavailable, kind}}
+        {:error, %GitCore.Error{kind: kind}} ->
+          {:error, {:unavailable, kind}}
 
-      {:error, _reason} ->
+        {:error, _reason} ->
+          {:error, {:unavailable, :storage_unavailable}}
+      end
+    else
+      {:error, :storage_unavailable} ->
         {:error, {:unavailable, :storage_unavailable}}
     end
   end

@@ -389,6 +389,89 @@ defmodule ForgeReposTest do
              ForgeRepos.repository_view(owner, missing_storage)
   end
 
+  @tag :tmp_dir
+  test "repository views reload stale actors while preserving anonymous public permissions",
+       %{tmp_dir: tmp_dir} do
+    use_storage_root(tmp_dir)
+    owner = user_fixture("stale-view-owner")
+    collaborator = user_fixture("stale-view-collaborator")
+    private_repository = repository_fixture(owner, slug: "private", storage: true)
+
+    public_repository =
+      repository_fixture(owner, slug: "public", visibility: :public, storage: true)
+
+    collaborator_fixture(private_repository, collaborator, :admin)
+    collaborator_fixture(public_repository, collaborator, :admin)
+
+    collaborator
+    |> Ecto.Changeset.change(state: :disabled)
+    |> Repo.update!()
+
+    assert {:error, :not_found} =
+             ForgeRepos.repository_view(collaborator, private_repository)
+
+    for actor <- [collaborator, :invalid_actor] do
+      assert {:ok,
+              %RepositoryView{
+                repository: %Repository{id: public_id},
+                permissions: %{admin: false, push: false, pull: true}
+              }} = ForgeRepos.repository_view(actor, public_repository)
+
+      assert public_id == public_repository.id
+    end
+  end
+
+  @tag :tmp_dir
+  test "repository views reject stale soft-deleted rows before resolving storage",
+       %{tmp_dir: tmp_dir} do
+    owner = user_fixture("deleted-view-owner")
+    repository = repository_fixture(owner, slug: "deleted", visibility: :public)
+
+    repository
+    |> Ecto.Changeset.change(deleted_at: ~U[2026-07-21 12:00:00Z])
+    |> Repo.update!()
+
+    blocked_root = Path.join(tmp_dir, "deleted-view-blocked-root")
+    File.write!(blocked_root, "unrelated")
+    use_storage_root(blocked_root)
+
+    assert {:error, :not_found} = ForgeRepos.repository_view(nil, repository)
+    assert File.read!(blocked_root) == "unrelated"
+  end
+
+  @tag :tmp_dir
+  test "repository views map an unusable storage root to storage unavailable", %{
+    tmp_dir: tmp_dir
+  } do
+    owner = user_fixture("blocked-view-owner")
+    repository = repository_fixture(owner, slug: "blocked", visibility: :public)
+    blocked_root = Path.join(tmp_dir, "blocked-view-root")
+    File.write!(blocked_root, "unrelated")
+    use_storage_root(blocked_root)
+
+    assert {:error, {:unavailable, :storage_unavailable}} =
+             ForgeRepos.repository_view(nil, repository)
+
+    assert File.read!(blocked_root) == "unrelated"
+  end
+
+  @tag :tmp_dir
+  test "repository views map invalid stored paths to storage unavailable", %{tmp_dir: tmp_dir} do
+    use_storage_root(tmp_dir)
+    owner = user_fixture("invalid-path-view-owner")
+    repository = repository_fixture(owner, slug: "invalid-path", visibility: :public)
+
+    {1, nil} =
+      Repository
+      |> where(id: ^repository.id)
+      |> Repo.update_all(set: [storage_path: "../escape.git"])
+
+    invalid_repository = Repo.get!(Repository, repository.id)
+
+    assert {:error, {:unavailable, :storage_unavailable}} =
+             ForgeRepos.repository_view(nil, invalid_repository)
+  end
+
   test "account views count only direct nondeleted ownership and never disclose private counts" do
     account = user_fixture("account-counts")
     other = user_fixture("other-counts")
@@ -507,6 +590,31 @@ defmodule ForgeReposTest do
                visibility_ceiling: :public,
                visibility: "private"
              )
+  end
+
+  @tag :tmp_dir
+  test "accessible repository pages batch SQL authorization context", %{tmp_dir: tmp_dir} do
+    use_storage_root(tmp_dir)
+    actor = user_fixture("batch-member")
+    organization = organization_fixture("batch-org")
+    organization_member_fixture(organization, actor, :member)
+
+    Enum.each(1..30, fn index ->
+      slug = "repository-#{String.pad_leading(Integer.to_string(index), 2, "0")}"
+      repository_fixture(organization, slug: slug, storage: true)
+    end)
+
+    {result, query_count} =
+      count_repo_queries(fn ->
+        ForgeRepos.list_accessible_repository_views(actor, per_page: 30)
+      end)
+
+    assert {:ok, %Page{entries: views, total: 30, page: 1, per_page: 30}} = result
+
+    assert Enum.map(views, & &1.permissions) ==
+             List.duplicate(%{admin: false, push: false, pull: true}, 30)
+
+    assert query_count <= 5
   end
 
   @tag :tmp_dir
@@ -1139,6 +1247,49 @@ defmodule ForgeReposTest do
   end
 
   @tag :tmp_dir
+  test "changed default branch maps an unusable storage root to storage unavailable", %{
+    tmp_dir: tmp_dir
+  } do
+    owner = user_fixture("blocked-branch-owner")
+    repository = repository_fixture(owner, slug: "blocked-branch")
+    blocked_root = Path.join(tmp_dir, "blocked-branch-root")
+    File.write!(blocked_root, "unrelated")
+    use_storage_root(blocked_root)
+
+    assert {:error, {:unavailable, :storage_unavailable}} =
+             ForgeRepos.update_api_repository(
+               owner,
+               repository,
+               %{"default_branch" => "trunk"},
+               %{}
+             )
+
+    assert File.read!(blocked_root) == "unrelated"
+  end
+
+  @tag :tmp_dir
+  test "changed default branch maps invalid stored paths to storage unavailable", %{
+    tmp_dir: tmp_dir
+  } do
+    use_storage_root(tmp_dir)
+    owner = user_fixture("invalid-path-branch-owner")
+    repository = repository_fixture(owner, slug: "invalid-path-branch")
+
+    {1, nil} =
+      Repository
+      |> where(id: ^repository.id)
+      |> Repo.update_all(set: [storage_path: "../escape.git"])
+
+    assert {:error, {:unavailable, :storage_unavailable}} =
+             ForgeRepos.update_api_repository(
+               owner,
+               repository,
+               %{"default_branch" => "trunk"},
+               %{}
+             )
+  end
+
+  @tag :tmp_dir
   test "API update normalizes only supplied fields and rejects incompatible settings",
        %{tmp_dir: tmp_dir} do
     use_storage_root(tmp_dir)
@@ -1358,6 +1509,37 @@ defmodule ForgeReposTest do
     assert Enum.any?(errors, fn error ->
              error == %{resource: "Repository", field: field, code: code}
            end)
+  end
+
+  defp count_repo_queries(fun) do
+    ref = make_ref()
+    handler_id = {__MODULE__, ref}
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:fornacast, :repo, :query],
+        fn _event, _measurements, _metadata, {pid, query_ref} ->
+          send(pid, {query_ref, :repo_query})
+        end,
+        {test_pid, ref}
+      )
+
+    try do
+      result = fun.()
+      {result, drain_repo_queries(ref, 0)}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_repo_queries(ref, count) do
+    receive do
+      {^ref, :repo_query} -> drain_repo_queries(ref, count + 1)
+    after
+      0 -> count
+    end
   end
 
   defp use_storage_root(tmp_dir) do
