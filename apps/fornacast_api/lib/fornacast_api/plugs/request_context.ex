@@ -8,7 +8,14 @@ defmodule FornacastAPI.Plugs.RequestContext do
 
   def call(conn, _opts) do
     if api_path?(conn.request_path) do
+      effective_client_ip =
+        FornacastAPI.ClientIP.effective(
+          conn,
+          Application.get_env(:fornacast_api, :trusted_proxy_cidrs, [])
+        )
+
       conn
+      |> assign(:effective_client_ip, effective_client_ip)
       |> assign(:api_version, @default_version)
       |> assign(:response_media_type, @default_media_type)
       |> assign(:accepted_scopes, [])
@@ -42,6 +49,8 @@ defmodule FornacastAPI.Plugs.RequestContext do
       "x-accepted-oauth-scopes",
       join_scopes(conn.assigns[:accepted_scopes])
     )
+    |> FornacastAPI.Plugs.RateLimit.ensure_bucket()
+    |> FornacastAPI.Plugs.RateLimit.put_headers()
   end
 
   defp request_id(conn) do

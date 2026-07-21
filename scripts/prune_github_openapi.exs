@@ -145,7 +145,8 @@ defmodule Fornacast.OpenAPIPruner do
 
         operations =
           Map.new(methods, fn method ->
-            {method, Map.fetch!(path_item, method)}
+            operation = path_item |> Map.fetch!(method) |> prune_operation(path, method)
+            {method, operation}
           end)
 
         {path, Map.merge(preserved, operations)}
@@ -168,6 +169,22 @@ defmodule Fornacast.OpenAPIPruner do
         end)
     }
   end
+
+  defp prune_operation(operation, "/rate_limit", "get") do
+    update_in(
+      operation,
+      ["responses", "200", "content", "application/json", "schema", "properties", "resources"],
+      fn resources ->
+        core = resources |> Map.fetch!("properties") |> Map.fetch!("core")
+
+        resources
+        |> Map.put("properties", %{"core" => core})
+        |> Map.put("required", ["core"])
+      end
+    )
+  end
+
+  defp prune_operation(operation, _path, _method), do: operation
 
   defp versions_path do
     %{

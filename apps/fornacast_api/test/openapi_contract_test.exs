@@ -230,6 +230,68 @@ defmodule FornacastAPI.OpenAPIContractTest do
     end
   end
 
+  test "rate limit contracts retain the exact versioned core schema" do
+    rate_bucket_schema = %{
+      "properties" => %{
+        "limit" => %{"type" => "integer"},
+        "remaining" => %{"type" => "integer"},
+        "reset" => %{"type" => "integer"},
+        "used" => %{"type" => "integer"}
+      },
+      "required" => ["limit", "remaining", "reset", "used"],
+      "title" => "Rate Limit",
+      "type" => "object"
+    }
+
+    resources_schema = %{
+      "properties" => %{"core" => rate_bucket_schema},
+      "required" => ["core"],
+      "type" => "object"
+    }
+
+    for {version, {filename, _source_blob}} <- @contracts do
+      document = filename |> contract_path() |> File.read!() |> JSON.decode!()
+
+      schema =
+        get_in(document, [
+          "paths",
+          "/rate_limit",
+          "get",
+          "responses",
+          "200",
+          "content",
+          "application/json",
+          "schema"
+        ])
+
+      expected_schema =
+        case version do
+          "2022-11-28" ->
+            %{
+              "description" => "Rate Limit Overview",
+              "properties" => %{
+                "rate" => rate_bucket_schema,
+                "resources" => resources_schema
+              },
+              "required" => ["rate", "resources"],
+              "title" => "Rate Limit Overview",
+              "type" => "object"
+            }
+
+          "2026-03-10" ->
+            %{
+              "description" => "Rate Limit Overview",
+              "properties" => %{"resources" => resources_schema},
+              "required" => ["resources"],
+              "title" => "Rate Limit Overview",
+              "type" => "object"
+            }
+        end
+
+      assert schema == expected_schema
+    end
+  end
+
   test "overlay owns every operation and reserves the upload server" do
     overlay = "fornacast-overlay.json" |> contract_path() |> File.read!() |> JSON.decode!()
 

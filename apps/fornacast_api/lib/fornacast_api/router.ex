@@ -6,6 +6,7 @@ defmodule FornacastAPI.Router do
     plug FornacastAPI.Plugs.APIVersion
     plug FornacastAPI.Plugs.MediaType
     plug FornacastAPI.Plugs.Authentication
+    plug FornacastAPI.Plugs.RateLimit
   end
 
   scope "/", FornacastAPI do
@@ -16,6 +17,7 @@ defmodule FornacastAPI.Router do
     pipe_through :api_context
 
     get "/versions", MetaController, :versions
+    get "/rate_limit", MetaController, :rate_limit
     get "/user", UserController, :authenticated
     match :*, "/*path", FallbackController, :not_found
   end
