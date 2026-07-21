@@ -541,6 +541,20 @@ defmodule ForgeReposTest do
 
     assert repository_ids(before_views) == [newer.id, older.id]
 
+    assert {:ok, %Page{entries: offset_since_views, total: 2}} =
+             ForgeRepos.list_accessible_repository_views(actor,
+               since: "2026-07-21T12:00:00+02:00"
+             )
+
+    assert repository_ids(offset_since_views) == [member.id, nil_pushed.id]
+
+    assert {:ok, %Page{entries: offset_before_views, total: 2}} =
+             ForgeRepos.list_accessible_repository_views(actor,
+               before: "2026-07-22T02:00:00-08:00"
+             )
+
+    assert repository_ids(offset_before_views) == [newer.id, older.id]
+
     assert {:ok, %Page{entries: ascending_pushed}} =
              ForgeRepos.list_accessible_repository_views(actor,
                sort: "pushed",
@@ -600,7 +614,6 @@ defmodule ForgeReposTest do
           {[sort: "stars"], "sort"},
           {[direction: "sideways"], "direction"},
           {[since: "2026-07-21 10:00:00"], "since"},
-          {[before: "2026-07-21T12:00:00+02:00"], "before"},
           {[visibility_ceiling: :private], "visibility_ceiling"},
           {[page: 0], "page"},
           {[per_page: 101], "per_page"}
@@ -725,12 +738,80 @@ defmodule ForgeReposTest do
                type: "private"
              )
 
+    assert {:ok,
+            %Page{
+              entries: [%RepositoryView{repository: %Repository{id: sources_page_one_id}}],
+              total: 2,
+              page: 1,
+              per_page: 1
+            }} =
+             ForgeRepos.list_account_repository_views(account, organization,
+               visibility_ceiling: :all,
+               type: "sources",
+               page: 1,
+               per_page: 1
+             )
+
+    assert {:ok,
+            %Page{
+              entries: [%RepositoryView{repository: %Repository{id: sources_page_two_id}}],
+              total: 2,
+              page: 2,
+              per_page: 1
+            }} =
+             ForgeRepos.list_account_repository_views(account, organization,
+               visibility_ceiling: :all,
+               type: "sources",
+               page: 2,
+               per_page: 1
+             )
+
+    assert Enum.sort([sources_page_one_id, sources_page_two_id]) ==
+             Enum.sort([organization_public.id, organization_private.id])
+
+    assert {:ok,
+            %Page{
+              entries: [%RepositoryView{repository: %Repository{id: source_public_id}}],
+              total: 1,
+              page: 1,
+              per_page: 30
+            }} =
+             ForgeRepos.list_account_repository_views(nil, organization,
+               visibility_ceiling: :all,
+               type: "sources"
+             )
+
+    assert source_public_id == organization_public.id
+
+    for {actor, ceiling} <- [{account, :public}, {other, :all}] do
+      assert {:ok,
+              %Page{
+                entries: [%RepositoryView{repository: %Repository{id: ^source_public_id}}],
+                total: 1,
+                page: 1,
+                per_page: 1
+              }} =
+               ForgeRepos.list_account_repository_views(actor, organization,
+                 visibility_ceiling: ceiling,
+                 type: "sources",
+                 page: 1,
+                 per_page: 1
+               )
+    end
+
+    for type <- ~w(forks internal member) do
+      assert {:ok, %Page{entries: [], total: 0, page: 2, per_page: 1}} =
+               ForgeRepos.list_account_repository_views(account, organization,
+                 visibility_ceiling: :all,
+                 type: type,
+                 page: 2,
+                 per_page: 1
+               )
+    end
+
     for {target, opts, field} <- [
           {account, [type: "private"], "type"},
-          {organization, [type: "forks"], "type"},
-          {organization, [type: "sources"], "type"},
-          {organization, [type: "member"], "type"},
-          {organization, [type: "internal"], "type"},
+          {organization, [type: "unknown"], "type"},
           {account, [sort: "stars"], "sort"},
           {account, [direction: "sideways"], "direction"},
           {account, [visibility_ceiling: :private], "visibility_ceiling"}

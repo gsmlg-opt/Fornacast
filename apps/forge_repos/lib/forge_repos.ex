@@ -535,16 +535,12 @@ defmodule ForgeRepos do
   end
 
   defp account_type_option(%Organization{}, opts) do
-    case enum_option(
-           opts,
-           :type,
-           :all,
-           [:all, :public, :private, :forks, :sources, :member, :internal]
-         ) do
-      {:ok, type} when type in [:all, :public, :private] -> {:ok, type}
-      {:ok, _unsupported} -> validation_result("type", :invalid)
-      error -> error
-    end
+    enum_option(
+      opts,
+      :type,
+      :all,
+      [:all, :public, :private, :forks, :sources, :member, :internal]
+    )
   end
 
   defp pagination_option(opts, field, default, minimum, maximum) do
@@ -642,7 +638,7 @@ defmodule ForgeRepos do
 
       {:ok, value} when is_binary(value) ->
         case DateTime.from_iso8601(value) do
-          {:ok, datetime, 0} -> {:ok, DateTime.truncate(datetime, :second)}
+          {:ok, datetime, _offset} -> {:ok, DateTime.truncate(datetime, :second)}
           _result -> validation_result(Atom.to_string(field), :invalid)
         end
 
@@ -824,6 +820,12 @@ defmodule ForgeRepos do
   end
 
   defp apply_organization_account_type(query, :all), do: query
+  defp apply_organization_account_type(query, :sources), do: query
+
+  defp apply_organization_account_type(query, type)
+       when type in [:forks, :internal, :member] do
+    where(query, [_repository], false)
+  end
 
   defp apply_organization_account_type(query, visibility)
        when visibility in [:public, :private] do
