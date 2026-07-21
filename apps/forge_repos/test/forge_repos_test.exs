@@ -1206,7 +1206,7 @@ defmodule ForgeReposTest do
     update_audits_before =
       Repo.aggregate(from(e in AuditEvent, where: e.action == "repository.updated"), :count, :id)
 
-    assert {:error, {:conflict, :repository_changed}} =
+    assert {:error, {:conflict, "repository changed"}} =
              ForgeRepos.update_api_repository(
                owner,
                repository,

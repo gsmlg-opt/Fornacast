@@ -33,7 +33,7 @@ defmodule ForgeRepos do
           :not_found
           | :forbidden
           | :git_initializer_unavailable
-          | {:conflict, :repository_changed}
+          | {:conflict, String.t()}
           | {:validation, [validation_error()]}
           | {:unavailable, atom()}
 
@@ -1200,7 +1200,7 @@ defmodule ForgeRepos do
     case Keyword.get(opts, :expected_visibility) do
       nil -> {:ok, nil}
       visibility when visibility in [:public, :private] -> {:ok, visibility}
-      _invalid -> {:error, {:conflict, :repository_changed}}
+      _invalid -> {:error, {:conflict, "repository changed"}}
     end
   end
 
@@ -1218,7 +1218,7 @@ defmodule ForgeRepos do
 
     case repo.update_all(guarded_query, set: [visibility: expected_visibility]) do
       {1, _result} -> {:ok, expected_visibility}
-      {0, _result} -> {:error, {:conflict, :repository_changed}}
+      {0, _result} -> {:error, {:conflict, "repository changed"}}
     end
   end
 

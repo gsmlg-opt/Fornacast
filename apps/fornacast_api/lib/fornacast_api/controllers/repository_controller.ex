@@ -455,7 +455,7 @@ defmodule FornacastAPI.RepositoryController do
            :repository_write
          ) do
       {:ok, %Repository{id: ^expected_id} = repository} -> {:ok, repository}
-      {:ok, %Repository{}} -> {:error, {:conflict, :repository_changed}}
+      {:ok, %Repository{}} -> {:error, {:conflict, "repository changed"}}
       {:error, reason} -> {:error, reason}
     end
   end
