@@ -176,7 +176,11 @@ defmodule ForgeAccounts do
         "organization",
         fn %{organization: organization} -> organization.id end,
         fn %{organization: organization} ->
-          %{"login" => organization.username, "admin" => owner.username}
+          %{
+            "login" => organization.username,
+            "admin" => owner.username,
+            "result" => "success"
+          }
         end,
         request_metadata: request_metadata
       )
@@ -208,7 +212,9 @@ defmodule ForgeAccounts do
         "organization.updated",
         "organization",
         fn %{organization: updated} -> updated.id end,
-        fn %{organization: updated} -> %{"login" => updated.username} end,
+        fn %{organization: updated} ->
+          %{"login" => updated.username, "result" => "success"}
+        end,
         request_metadata: request_metadata
       )
       |> Repo.transaction()

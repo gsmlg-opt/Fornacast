@@ -274,6 +274,7 @@ defmodule ForgeAccountsTest do
     assert audit.user_agent == "ExUnit"
     assert audit.metadata["login"] == "acme"
     assert audit.metadata["admin"] == "alice"
+    assert audit.metadata["result"] == "success"
     assert audit.metadata["request_id"] == "request-1"
   end
 
@@ -402,9 +403,11 @@ defmodule ForgeAccountsTest do
     assert created.action == "organization.created"
     assert owner_audit.action == "organization.updated"
     assert owner_audit.actor_user_id == owner.id
+    assert owner_audit.metadata["result"] == "success"
     assert owner_audit.metadata["request_id"] == "update-1"
     assert admin_audit.action == "organization.updated"
     assert admin_audit.actor_user_id == site_admin.id
+    assert admin_audit.metadata["result"] == "success"
     assert admin_audit.metadata["request_id"] == "update-2"
   end
 
