@@ -1,0 +1,27 @@
+{
+  "versions": {"status": 200, "body": ["2022-11-28", "2026-03-10"]},
+  "rate_top_level": false,
+  "bad_credentials": {"status": 401, "body": {"message": "Bad credentials"}},
+  "missing_user_agent": {"status": 403, "body": {"message": "User agent required"}},
+  "validation_failed": {
+    "status": 422,
+    "body": {
+      "message": "Validation Failed",
+      "errors": [{"resource": "Repository", "field": "name", "code": "missing_field"}]
+    }
+  },
+  "repository_defaults": {
+    "status": 200,
+    "body": {
+      "private": false,
+      "visibility": "public",
+      "has_issues": true,
+      "has_projects": false,
+      "has_wiki": false,
+      "has_discussions": false,
+      "allow_merge_commit": true,
+      "allow_squash_merge": false,
+      "allow_rebase_merge": false
+    }
+  }
+}
