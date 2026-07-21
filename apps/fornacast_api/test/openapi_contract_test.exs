@@ -2,6 +2,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
   use ExUnit.Case, async: true
 
   alias ForgeAccounts.{AccountView, Organization, User}
+  alias ForgeRepos.Repository
 
   @contract_root Path.expand("../priv/openapi", __DIR__)
   @fixture_root Path.expand("fixtures", __DIR__)
@@ -367,7 +368,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
         "/user/orgs",
         :get,
         200,
-        [FornacastAPI.Serializer.render(version, :organization_simple, organization_view())]
+        [FornacastAPI.Serializer.render(version, :organization_simple, organization())]
       )
 
       assert_valid_response(
@@ -409,7 +410,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
       {:simple_user, "Simple User", account()},
       {:public_user, "Public User", account_view()},
       {:private_user, "Private User", account_view()},
-      {:organization_simple, "Organization Simple", organization_view()},
+      {:organization_simple, "Organization Simple", organization()},
       {:organization_full, "Organization Full", organization_view()},
       {:minimal_repository, "Minimal Repository", repository_view()},
       {:repository, "Repository", repository_view()},
@@ -667,13 +668,15 @@ defmodule FornacastAPI.OpenAPIContractTest do
 
   defp repository_view do
     %{
-      repository: %{
+      repository: %Repository{
         id: 99,
+        owner_user_id: 42,
         slug: "hello-world",
         name: "Hello World",
         description: "A repository fixture",
         visibility: :private,
         default_branch: "trunk",
+        storage_path: "@hashed/00/00/hello-world.git",
         last_pushed_at: ~U[2026-03-10 10:30:00Z],
         inserted_at: ~U[2026-03-09 10:00:00Z],
         updated_at: ~U[2026-03-10 11:00:00Z]

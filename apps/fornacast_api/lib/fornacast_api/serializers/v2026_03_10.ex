@@ -55,14 +55,14 @@ defmodule FornacastAPI.Serializers.V2026_03_10 do
   def render(:organization_full, value, _opts),
     do: value |> Fields.organization_full() |> Map.take(@organization_full_keys)
 
-  def render(:minimal_repository, value, _opts),
-    do: value |> Fields.repository() |> Map.take(@minimal_repository_keys)
+  def render(:minimal_repository, value, opts),
+    do: value |> Fields.repository(opts) |> Map.take(@minimal_repository_keys)
 
-  def render(:repository, value, _opts),
-    do: value |> Fields.repository() |> Map.take(@repository_keys)
+  def render(:repository, value, opts),
+    do: value |> Fields.repository(opts) |> Map.take(@repository_keys)
 
-  def render(:full_repository, value, _opts),
-    do: value |> Fields.repository() |> Map.take(@full_repository_keys)
+  def render(:full_repository, value, opts),
+    do: value |> Fields.repository(opts) |> Map.take(@full_repository_keys)
 
   def render(:rate_limit, bucket, _opts) do
     %{resources: %{core: Fields.rate_limit(bucket)}}

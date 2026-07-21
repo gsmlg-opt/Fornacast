@@ -12,7 +12,7 @@ defmodule FornacastAPI.Serializer do
 end
 
 defmodule FornacastAPI.Serializer.Fields do
-  alias ForgeAccounts.AccountView
+  alias ForgeAccounts.{AccountView, Organization}
   alias FornacastAPI.URL
 
   @maximum_repository_size 2_147_483_647
@@ -47,7 +47,7 @@ defmodule FornacastAPI.Serializer.Fields do
   end
 
   def public_user(value) do
-    view = AccountView.validate!(value)
+    view = AccountView.validate_user!(value)
     account = view.account
 
     Map.merge(simple_user(account), %{
@@ -55,7 +55,7 @@ defmodule FornacastAPI.Serializer.Fields do
       blog: nil,
       company: nil,
       created_at: timestamp(fetch!(account, :inserted_at)),
-      email: get(account, :email),
+      email: nil,
       followers: 0,
       following: 0,
       hireable: nil,
@@ -68,11 +68,12 @@ defmodule FornacastAPI.Serializer.Fields do
   end
 
   def private_user(value) do
-    view = AccountView.validate!(value)
+    view = AccountView.validate_user!(value)
 
     Map.merge(public_user(value), %{
       collaborators: 0,
       disk_usage: 0,
+      email: get(view.account, :email),
       owned_private_repos: view.private_repos,
       private_gists: 0,
       total_private_repos: view.private_repos,
@@ -80,9 +81,7 @@ defmodule FornacastAPI.Serializer.Fields do
     })
   end
 
-  def organization_simple(value) do
-    view = AccountView.validate!(value)
-    account = view.account
+  def organization_simple(%Organization{kind: :organization} = account) do
     login = fetch!(account, :username)
     id = fetch!(account, :id)
     api_url = URL.organization(login)
@@ -103,12 +102,16 @@ defmodule FornacastAPI.Serializer.Fields do
     }
   end
 
+  def organization_simple(_value) do
+    raise ArgumentError, "expected a correctly typed ForgeAccounts.Organization"
+  end
+
   def organization_full(value) do
-    view = AccountView.validate!(value)
+    view = AccountView.validate_organization!(value)
     account = view.account
     login = fetch!(account, :username)
 
-    Map.merge(organization_simple(value), %{
+    Map.merge(organization_simple(account), %{
       archived_at: nil,
       created_at: timestamp(fetch!(account, :inserted_at)),
       followers: 0,
@@ -124,7 +127,7 @@ defmodule FornacastAPI.Serializer.Fields do
     })
   end
 
-  def repository(value) do
+  def repository(value, opts \\ []) do
     repository = fetch!(value, :repository)
     owner = fetch!(value, :owner)
     owner_login = fetch!(owner, :username)
@@ -133,7 +136,8 @@ defmodule FornacastAPI.Serializer.Fields do
     visibility = repository |> fetch!(:visibility) |> to_string()
     api_url = URL.repository(owner_login, slug)
     web_url = URL.web("/#{segment(owner_login)}/#{segment(slug)}")
-    clone_url = web_url <> ".git"
+    clone_url = ForgeRepos.http_clone_url(repository, owner)
+    ssh_url = ForgeRepos.ssh_clone_url(repository, owner, Keyword.get(opts, :actor))
 
     %{
       allow_merge_commit: get(repository, :allow_merge_commit, true),
@@ -201,7 +205,7 @@ defmodule FornacastAPI.Serializer.Fields do
       pushed_at: timestamp(get(repository, :last_pushed_at)),
       releases_url: api_url <> "/releases{/id}",
       size: bounded_size(get(value, :size_kib, 0)),
-      ssh_url: clone_url,
+      ssh_url: ssh_url,
       stargazers_count: 0,
       stargazers_url: api_url <> "/stargazers",
       statuses_url: api_url <> "/statuses/{sha}",
@@ -242,7 +246,7 @@ defmodule FornacastAPI.Serializer.Fields do
   end
 
   defp validation_error(error) do
-    [:resource, :field, :code, :message, :index, :value]
+    [:resource, :field, :code, :message]
     |> Enum.reduce(%{}, fn key, entry ->
       case fetch(error, key) do
         {:ok, value} -> Map.put(entry, key, if(key == :code, do: to_string(value), else: value))

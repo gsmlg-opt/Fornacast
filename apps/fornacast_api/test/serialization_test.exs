@@ -5,6 +5,7 @@ defmodule FornacastAPI.SerializationTest do
   import Plug.Test, only: [conn: 2]
 
   alias ForgeAccounts.{AccountView, Organization, User}
+  alias ForgeRepos.Repository
   alias FornacastAPI.{Pagination, Serializer, URL}
 
   @versions ["2022-11-28", "2026-03-10"]
@@ -12,8 +13,17 @@ defmodule FornacastAPI.SerializationTest do
 
   setup do
     previous_base_url = Application.fetch_env!(:fornacast, :base_url)
+    previous_ssh_host = Application.fetch_env!(:fornacast, :ssh_host)
+    previous_ssh_port = Application.fetch_env!(:fornacast, :ssh_port)
     Application.put_env(:fornacast, :base_url, @base_url)
-    on_exit(fn -> Application.put_env(:fornacast, :base_url, previous_base_url) end)
+    Application.put_env(:fornacast, :ssh_host, "ssh.forge.test")
+    Application.put_env(:fornacast, :ssh_port, 2223)
+
+    on_exit(fn ->
+      Application.put_env(:fornacast, :base_url, previous_base_url)
+      Application.put_env(:fornacast, :ssh_host, previous_ssh_host)
+      Application.put_env(:fornacast, :ssh_port, previous_ssh_port)
+    end)
   end
 
   describe "Fornacast.Page" do
@@ -149,6 +159,28 @@ defmodule FornacastAPI.SerializationTest do
                |> Pagination.put_link_header(only, url)
                |> get_resp_header("link")
     end
+
+    test "clamps previous and last links for empty and nonempty out-of-range pages" do
+      url = "https://forge.test/api/v3/user/repos"
+
+      for {page, expected} <- [
+            {struct!(Fornacast.Page, entries: [], total: 3, page: 4, per_page: 1),
+             "<#{url}?page=3&per_page=1>; rel=\"prev\", " <>
+               "<#{url}?page=1&per_page=1>; rel=\"first\", " <>
+               "<#{url}?page=3&per_page=1>; rel=\"last\""},
+            {struct!(Fornacast.Page, entries: [], total: 0, page: 2, per_page: 30),
+             "<#{url}?page=1&per_page=30>; rel=\"prev\", " <>
+               "<#{url}?page=1&per_page=30>; rel=\"first\", " <>
+               "<#{url}?page=1&per_page=30>; rel=\"last\""}
+          ] do
+        assert [link] =
+                 conn(:get, "https://attacker.invalid")
+                 |> Pagination.put_link_header(page, url)
+                 |> get_resp_header("link")
+
+        assert link == expected
+      end
+    end
   end
 
   describe "public URL construction" do
@@ -165,12 +197,33 @@ defmodule FornacastAPI.SerializationTest do
       Application.put_env(
         :fornacast,
         :base_url,
-        "https://user:secret@forge.test/untrusted?host=attacker.invalid#fragment"
+        "https://user:secret@forge.test:8443/untrusted?host=attacker.invalid#fragment"
       )
 
-      assert URL.api("/versions") == "https://forge.test/api/v3/versions"
-      assert URL.upload("/asset") == "https://forge.test/api/uploads/asset"
-      assert URL.web("/about") == "https://forge.test/about"
+      assert URL.api("/versions") == "https://forge.test:8443/api/v3/versions"
+      assert URL.upload("/asset") == "https://forge.test:8443/api/uploads/asset"
+      assert URL.web("/about") == "https://forge.test:8443/about"
+    end
+
+    test "rejects unsafe or non-HTTP configured base URLs before URL construction" do
+      invalid_base_urls = [
+        "ftp://forge.test",
+        "javascript:alert(1)",
+        "//forge.test",
+        "https://",
+        "https:/missing-host",
+        "https://forge.test\r\nx-injected: true",
+        "https://forge.test/path\0suffix",
+        "https://forge.test/path\tsuffix"
+      ]
+
+      for base_url <- invalid_base_urls do
+        Application.put_env(:fornacast, :base_url, base_url)
+
+        assert_raise ArgumentError,
+                     ~r/configured base URL must be an absolute HTTP or HTTPS URL with a nonempty host and no ASCII control characters/,
+                     fn -> URL.api("/versions") end
+      end
     end
 
     test "percent-encodes every dynamic path segment" do
@@ -222,25 +275,61 @@ defmodule FornacastAPI.SerializationTest do
       assert_raise ArgumentError, ~r/User or Organization account/, fn ->
         AccountView.new(%{}, 7, 2)
       end
+
+      for wrong_kind <- [
+            %{account() | kind: :organization},
+            %{organization() | kind: :user}
+          ] do
+        assert_raise ArgumentError, ~r/struct and kind must identify the same account type/, fn ->
+          AccountView.new(wrong_kind, 7, 2)
+        end
+      end
     end
 
-    test "rejects raw accounts and malformed account views for expanded account resources" do
+    test "enforces resource-specific account types" do
       malformed =
         struct!(AccountView,
-          account: account(),
+          account: organization(),
           public_repos: -1,
           private_repos: 2
         )
 
-      for version <- @versions,
-          {resource, value} <- [
-            public_user: account(),
-            private_user: account(),
-            organization_simple: organization(),
-            organization_full: malformed
-          ] do
-        assert_raise ArgumentError, ~r/valid ForgeAccounts.AccountView/, fn ->
-          Serializer.render(version, resource, value)
+      wrong_kind_user_view =
+        struct!(AccountView,
+          account: %{account() | kind: :organization},
+          public_repos: 7,
+          private_repos: 2
+        )
+
+      wrong_kind_organization_view =
+        struct!(AccountView,
+          account: %{organization() | kind: :user},
+          public_repos: 5,
+          private_repos: 3
+        )
+
+      for version <- @versions do
+        assert Serializer.render(version, :organization_simple, organization()).login == "acme"
+
+        for {resource, value, message} <- [
+              {:public_user, account(), ~r/valid user ForgeAccounts.AccountView/},
+              {:private_user, account(), ~r/valid user ForgeAccounts.AccountView/},
+              {:public_user, organization_view(), ~r/valid user ForgeAccounts.AccountView/},
+              {:private_user, organization_view(), ~r/valid user ForgeAccounts.AccountView/},
+              {:public_user, wrong_kind_user_view, ~r/valid user ForgeAccounts.AccountView/},
+              {:private_user, wrong_kind_user_view, ~r/valid user ForgeAccounts.AccountView/},
+              {:organization_full, account_view(),
+               ~r/valid organization ForgeAccounts.AccountView/},
+              {:organization_full, malformed, ~r/valid organization ForgeAccounts.AccountView/},
+              {:organization_full, wrong_kind_organization_view,
+               ~r/valid organization ForgeAccounts.AccountView/},
+              {:organization_simple, account(), ~r/correctly typed ForgeAccounts.Organization/},
+              {:organization_simple, %{organization() | kind: :user},
+               ~r/correctly typed ForgeAccounts.Organization/}
+            ] do
+          assert_raise ArgumentError, message, fn ->
+            Serializer.render(version, resource, value)
+          end
         end
       end
     end
@@ -250,7 +339,7 @@ defmodule FornacastAPI.SerializationTest do
         simple_user: account(),
         public_user: account_view(),
         private_user: account_view(),
-        organization_simple: organization_view(),
+        organization_simple: organization(),
         organization_full: organization_view(),
         minimal_repository: repository_view(),
         repository: repository_view(),
@@ -273,7 +362,7 @@ defmodule FornacastAPI.SerializationTest do
         simple_user: account(),
         public_user: account_view(),
         private_user: account_view(),
-        organization_simple: organization_view(),
+        organization_simple: organization(),
         organization_full: organization_view(),
         minimal_repository: repository_view(),
         repository: repository_view(),
@@ -297,11 +386,13 @@ defmodule FornacastAPI.SerializationTest do
         assert public_user.id == 42
         assert public_user.name == "Octo Cat"
         assert public_user.bio == "Builds small forges"
-        assert public_user.email == "octocat@example.test"
+        assert public_user.email == nil
+        refute JSON.encode!(public_user) =~ "octocat@example.test"
         assert public_user.public_repos == 7
         assert public_user.site_admin
         assert public_user.created_at == "2026-03-10T08:00:00Z"
         assert public_user.updated_at == "2026-03-11T09:30:00Z"
+        assert private_user.email == "octocat@example.test"
         assert private_user.total_private_repos == 2
         refute private_user.two_factor_authentication
 
@@ -336,6 +427,12 @@ defmodule FornacastAPI.SerializationTest do
         assert repository.created_at == "2026-03-09T10:00:00Z"
         assert repository.updated_at == "2026-03-10T11:00:00Z"
         assert repository.pushed_at == "2026-03-10T10:30:00Z"
+        assert repository.clone_url == "https://forge.test/octocat/hello-world.git"
+        assert repository.git_url == "https://forge.test/octocat/hello-world.git"
+        assert repository.svn_url == "https://forge.test/octocat/hello-world.git"
+
+        assert repository.ssh_url ==
+                 "ssh://octocat@ssh.forge.test:2223/octocat/hello-world.git"
 
         assert repository.archive_url =~ "/{archive_format}{/ref}"
         assert repository.assignees_url =~ "/assignees{/user}"
@@ -366,23 +463,38 @@ defmodule FornacastAPI.SerializationTest do
           assert is_binary(Map.fetch!(repository, key))
         end
 
-        assert_all_urls_are_public(repository)
+        repository |> Map.delete(:ssh_url) |> assert_all_urls_are_public()
       end
     end
 
-    test "accepts the planned RepositoryView shape and identifies organization owners" do
+    test "uses the authenticated actor in organization repository SSH clone URLs" do
+      actor = %{account() | id: 7, username: "collaborator"}
+
       for version <- @versions do
-        repository =
+        anonymous_repository =
+          Serializer.render(version, :full_repository, repository_view(organization()))
+
+        authenticated_repository =
           Serializer.render(
             version,
             :full_repository,
-            repository_view(organization())
+            repository_view(organization()),
+            actor: actor
           )
 
-        assert repository.owner.login == "acme"
-        assert repository.owner.type == "Organization"
-        refute repository.owner.site_admin
-        assert repository.full_name == "acme/hello-world"
+        assert anonymous_repository.owner.login == "acme"
+        assert anonymous_repository.owner.type == "Organization"
+        refute anonymous_repository.owner.site_admin
+        assert anonymous_repository.full_name == "acme/hello-world"
+
+        assert anonymous_repository.ssh_url ==
+                 "ssh://acme@ssh.forge.test:2223/acme/hello-world.git"
+
+        assert authenticated_repository.ssh_url ==
+                 "ssh://collaborator@ssh.forge.test:2223/acme/hello-world.git"
+
+        assert authenticated_repository.clone_url == "https://forge.test/acme/hello-world.git"
+        authenticated_repository |> Map.delete(:ssh_url) |> assert_all_urls_are_public()
       end
     end
 
@@ -452,6 +564,37 @@ defmodule FornacastAPI.SerializationTest do
                  ]
                }
 
+        sensitive_validation =
+          FornacastAPI.Error.new(
+            422,
+            "Validation Failed",
+            "https://docs.example.test/validation",
+            errors: [
+              %{
+                resource: "Repository",
+                field: "name",
+                code: :invalid,
+                message: "has an invalid format",
+                index: 7,
+                value: "fc_pat_secret-value"
+              }
+            ]
+          )
+
+        assert Serializer.render(version, :error, sensitive_validation).errors == [
+                 %{
+                   resource: "Repository",
+                   field: "name",
+                   code: "invalid",
+                   message: "has an invalid format"
+                 }
+               ]
+
+        refute version
+               |> Serializer.render(:error, sensitive_validation)
+               |> JSON.encode!()
+               |> String.contains?("fc_pat_secret-value")
+
         basic =
           FornacastAPI.Error.new(
             404,
@@ -518,13 +661,15 @@ defmodule FornacastAPI.SerializationTest do
 
   defp repository_view(owner \\ account()) do
     %{
-      repository: %{
+      repository: %Repository{
         id: 99,
+        owner_user_id: owner.id,
         slug: "hello-world",
         name: "Hello World",
         description: "A repository fixture",
         visibility: :private,
         default_branch: "trunk",
+        storage_path: "@hashed/00/00/hello-world.git",
         last_pushed_at: ~U[2026-03-10 10:30:00Z],
         inserted_at: ~U[2026-03-09 10:00:00Z],
         updated_at: ~U[2026-03-10 11:00:00Z]
@@ -570,9 +715,10 @@ defmodule FornacastAPI.SerializationTest do
       key = Atom.to_string(key)
 
       own =
-        if (key == "url" or String.ends_with?(key, "_url")) and is_binary(nested),
-          do: [nested],
-          else: []
+        if key != "ssh_url" and (key == "url" or String.ends_with?(key, "_url")) and
+             is_binary(nested),
+           do: [nested],
+           else: []
 
       own ++ collect_urls(nested)
     end)
