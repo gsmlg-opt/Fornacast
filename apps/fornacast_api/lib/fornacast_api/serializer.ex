@@ -12,6 +12,7 @@ defmodule FornacastAPI.Serializer do
 end
 
 defmodule FornacastAPI.Serializer.Fields do
+  alias ForgeAccounts.AccountView
   alias FornacastAPI.URL
 
   @maximum_repository_size 2_147_483_647
@@ -46,42 +47,49 @@ defmodule FornacastAPI.Serializer.Fields do
   end
 
   def public_user(value) do
-    Map.merge(simple_user(value), %{
-      bio: get(value, :description),
+    view = AccountView.validate!(value)
+    account = view.account
+
+    Map.merge(simple_user(account), %{
+      bio: get(account, :description),
       blog: nil,
       company: nil,
-      created_at: timestamp(fetch!(value, :inserted_at)),
-      email: get(value, :email),
+      created_at: timestamp(fetch!(account, :inserted_at)),
+      email: get(account, :email),
       followers: 0,
       following: 0,
       hireable: nil,
       location: nil,
-      name: get(value, :display_name),
+      name: get(account, :display_name),
       public_gists: 0,
-      public_repos: get(value, :public_repos, 0),
-      updated_at: timestamp(fetch!(value, :updated_at))
+      public_repos: view.public_repos,
+      updated_at: timestamp(fetch!(account, :updated_at))
     })
   end
 
   def private_user(value) do
+    view = AccountView.validate!(value)
+
     Map.merge(public_user(value), %{
       collaborators: 0,
       disk_usage: 0,
-      owned_private_repos: get(value, :private_repos, 0),
+      owned_private_repos: view.private_repos,
       private_gists: 0,
-      total_private_repos: get(value, :private_repos, 0),
-      two_factor_authentication: get(value, :two_factor_authentication, false)
+      total_private_repos: view.private_repos,
+      two_factor_authentication: view.two_factor_authentication
     })
   end
 
   def organization_simple(value) do
-    login = fetch!(value, :username)
-    id = fetch!(value, :id)
+    view = AccountView.validate!(value)
+    account = view.account
+    login = fetch!(account, :username)
+    id = fetch!(account, :id)
     api_url = URL.organization(login)
 
     %{
       avatar_url: URL.web("/#{segment(login)}"),
-      description: get(value, :description),
+      description: get(account, :description),
       events_url: api_url <> "/events",
       hooks_url: api_url <> "/hooks",
       id: id,
@@ -96,21 +104,23 @@ defmodule FornacastAPI.Serializer.Fields do
   end
 
   def organization_full(value) do
-    login = fetch!(value, :username)
+    view = AccountView.validate!(value)
+    account = view.account
+    login = fetch!(account, :username)
 
     Map.merge(organization_simple(value), %{
       archived_at: nil,
-      created_at: timestamp(fetch!(value, :inserted_at)),
+      created_at: timestamp(fetch!(account, :inserted_at)),
       followers: 0,
       following: 0,
       has_organization_projects: false,
       has_repository_projects: false,
       html_url: URL.web("/#{segment(login)}"),
-      name: get(value, :display_name),
+      name: get(account, :display_name),
       public_gists: 0,
-      public_repos: get(value, :public_repos, 0),
+      public_repos: view.public_repos,
       type: "Organization",
-      updated_at: timestamp(fetch!(value, :updated_at))
+      updated_at: timestamp(fetch!(account, :updated_at))
     })
   end
 

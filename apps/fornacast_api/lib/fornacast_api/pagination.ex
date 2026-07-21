@@ -61,7 +61,7 @@ defmodule FornacastAPI.Pagination do
         {:ok, default}
 
       {:ok, value} when is_binary(value) ->
-        if Regex.match?(~r/^\d+$/, value) do
+        if Regex.match?(~r/^[0-9]+\z/, value) do
           parsed = String.to_integer(value)
 
           if parsed > 0 and (is_nil(maximum) or parsed <= maximum),

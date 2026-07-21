@@ -4,6 +4,7 @@ defmodule FornacastAPI.SerializationTest do
   import Plug.Conn, only: [get_resp_header: 2]
   import Plug.Test, only: [conn: 2]
 
+  alias ForgeAccounts.{AccountView, Organization, User}
   alias FornacastAPI.{Pagination, Serializer, URL}
 
   @versions ["2022-11-28", "2026-03-10"]
@@ -52,7 +53,7 @@ defmodule FornacastAPI.SerializationTest do
     end
 
     test "rejects anything except full-string positive base-10 integers" do
-      invalid_values = ["0", "-1", "+1", "1.0", " 1", "1 ", "1x", 1, nil]
+      invalid_values = ["0", "-1", "+1", "1.0", " 1", "1 ", "1x", "2\n", 1, nil]
 
       for field <- ["page", "per_page"], value <- invalid_values do
         assert Pagination.parse(%{field => value}) ==
@@ -198,9 +199,55 @@ defmodule FornacastAPI.SerializationTest do
   end
 
   describe "versioned serializers" do
+    test "requires account views with real non-negative repository counts" do
+      user = account()
+
+      assert AccountView.new(user, 7, 2) == %AccountView{
+               account: user,
+               public_repos: 7,
+               private_repos: 2,
+               two_factor_authentication: false
+             }
+
+      assert_raise ArgumentError, ~r/must also be given/, fn ->
+        struct!(AccountView, account: user, public_repos: 7)
+      end
+
+      for {public_repos, private_repos} <- [{-1, 2}, {7, -1}, {"7", 2}, {7, nil}] do
+        assert_raise ArgumentError, ~r/non-negative integer repository counts/, fn ->
+          AccountView.new(user, public_repos, private_repos)
+        end
+      end
+
+      assert_raise ArgumentError, ~r/User or Organization account/, fn ->
+        AccountView.new(%{}, 7, 2)
+      end
+    end
+
+    test "rejects raw accounts and malformed account views for expanded account resources" do
+      malformed =
+        struct!(AccountView,
+          account: account(),
+          public_repos: -1,
+          private_repos: 2
+        )
+
+      for version <- @versions,
+          {resource, value} <- [
+            public_user: account(),
+            private_user: account(),
+            organization_simple: organization(),
+            organization_full: malformed
+          ] do
+        assert_raise ArgumentError, ~r/valid ForgeAccounts.AccountView/, fn ->
+          Serializer.render(version, resource, value)
+        end
+      end
+    end
+
     test "both explicit modules render every declared resource" do
       resources = [
-        simple_user: account_view(),
+        simple_user: account(),
         public_user: account_view(),
         private_user: account_view(),
         organization_simple: organization_view(),
@@ -223,7 +270,7 @@ defmodule FornacastAPI.SerializationTest do
       attacker_conn = conn(:get, "https://attacker.invalid/api/v3/user")
 
       resources = [
-        simple_user: account_view(),
+        simple_user: account(),
         public_user: account_view(),
         private_user: account_view(),
         organization_simple: organization_view(),
@@ -256,7 +303,7 @@ defmodule FornacastAPI.SerializationTest do
         assert public_user.created_at == "2026-03-10T08:00:00Z"
         assert public_user.updated_at == "2026-03-11T09:30:00Z"
         assert private_user.total_private_repos == 2
-        assert private_user.two_factor_authentication
+        refute private_user.two_factor_authentication
 
         assert organization.login == "acme"
         assert organization.name == "Acme Forge"
@@ -329,7 +376,7 @@ defmodule FornacastAPI.SerializationTest do
           Serializer.render(
             version,
             :full_repository,
-            repository_view(organization_view())
+            repository_view(organization())
           )
 
         assert repository.owner.login == "acme"
@@ -439,8 +486,8 @@ defmodule FornacastAPI.SerializationTest do
     ]
   end
 
-  defp account_view do
-    %{
+  defp account do
+    %User{
       id: 42,
       username: "octocat",
       display_name: "Octo Cat",
@@ -448,28 +495,28 @@ defmodule FornacastAPI.SerializationTest do
       email: "octocat@example.test",
       kind: :user,
       role: :admin,
-      public_repos: 7,
-      private_repos: 2,
-      two_factor_authentication: true,
       inserted_at: ~U[2026-03-10 08:00:00Z],
       updated_at: ~U[2026-03-11 09:30:00Z]
     }
   end
 
-  defp organization_view do
-    %{
+  defp account_view, do: AccountView.new(account(), 7, 2)
+
+  defp organization do
+    %Organization{
       id: 84,
       username: "acme",
       display_name: "Acme Forge",
       description: "An example organization",
       kind: :organization,
-      public_repos: 5,
       inserted_at: ~U[2026-03-08 01:02:03Z],
       updated_at: ~U[2026-03-09 04:05:06Z]
     }
   end
 
-  defp repository_view(owner \\ account_view()) do
+  defp organization_view, do: AccountView.new(organization(), 5, 3)
+
+  defp repository_view(owner \\ account()) do
     %{
       repository: %{
         id: 99,

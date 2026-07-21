@@ -382,8 +382,7 @@ defmodule FornacastAPI.RateLimitTest do
       "limit" => 42,
       "remaining" => 17,
       "reset" => 123_456,
-      "used" => 25,
-      "resource" => "assigned-core"
+      "used" => 25
     }
 
     for {version, expected} <- [
@@ -398,6 +397,7 @@ defmodule FornacastAPI.RateLimitTest do
         |> MetaController.rate_limit(%{})
 
       assert json_response(response, 200) == expected
+      assert_exact_rate_limit_keys(JSON.decode!(response.resp_body), version)
     end
   end
 
@@ -656,8 +656,7 @@ defmodule FornacastAPI.RateLimitTest do
       "limit" => String.to_integer(headers["x-ratelimit-limit"]),
       "remaining" => String.to_integer(headers["x-ratelimit-remaining"]),
       "reset" => String.to_integer(headers["x-ratelimit-reset"]),
-      "used" => String.to_integer(headers["x-ratelimit-used"]),
-      "resource" => headers["x-ratelimit-resource"]
+      "used" => String.to_integer(headers["x-ratelimit-used"])
     }
   end
 
@@ -684,7 +683,26 @@ defmodule FornacastAPI.RateLimitTest do
     schema =
       document.paths["/rate_limit"].get.responses["200"].content["application/json"].schema
 
-    assert {:ok, _cast} = OpenApiSpex.Cast.cast(schema, JSON.decode!(conn.resp_body))
+    body = JSON.decode!(conn.resp_body)
+
+    assert_exact_rate_limit_keys(body, version)
+    assert {:ok, _cast} = OpenApiSpex.Cast.cast(schema, body)
+  end
+
+  defp assert_exact_rate_limit_keys(body, version) do
+    expected_top_level_keys =
+      case version do
+        "2022-11-28" -> ["rate", "resources"]
+        "2026-03-10" -> ["resources"]
+      end
+
+    assert Enum.sort(Map.keys(body)) == expected_top_level_keys
+    assert Map.keys(body["resources"]) == ["core"]
+    assert Enum.sort(Map.keys(body["resources"]["core"])) == ~w(limit remaining reset used)
+
+    if version == "2022-11-28" do
+      assert Enum.sort(Map.keys(body["rate"])) == ~w(limit remaining reset used)
+    end
   end
 
   defp restore_env(key, {:ok, value}), do: Application.put_env(:fornacast_api, key, value)

@@ -1,6 +1,8 @@
 defmodule FornacastAPI.OpenAPIContractTest do
   use ExUnit.Case, async: true
 
+  alias ForgeAccounts.{AccountView, Organization, User}
+
   @contract_root Path.expand("../priv/openapi", __DIR__)
   @fixture_root Path.expand("fixtures", __DIR__)
   @source_commit "03ca9c1cac754ec9b8369dc75de8a8c753c6e087"
@@ -14,6 +16,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
       "02e93bd95f712c171b23c6a869ac9c0d88d89640"
     }
   }
+  @pipeline_only_error_statuses [408, 413, 414, 415, 429]
 
   @declared_delivery_slices %{
     "1" => [
@@ -403,7 +406,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
 
   test "serializer keys cover required properties without unsupported supersets" do
     resources = [
-      {:simple_user, "Simple User", account_view()},
+      {:simple_user, "Simple User", account()},
       {:public_user, "Public User", account_view()},
       {:private_user, "Private User", account_view()},
       {:organization_simple, "Organization Simple", organization_view()},
@@ -469,47 +472,118 @@ defmodule FornacastAPI.OpenAPIContractTest do
   test "every stable error body survives JSON encoding and its pinned schema" do
     documentation_url = "https://docs.example.test/rest"
 
-    stable_errors = [
-      FornacastAPI.Error.from_domain(:invalid_credentials, documentation_url),
-      FornacastAPI.Error.from_domain(:insufficient_scope, documentation_url),
-      FornacastAPI.Error.from_domain(:forbidden, documentation_url),
-      FornacastAPI.Error.from_domain(:not_found, documentation_url),
-      FornacastAPI.Error.from_domain(:git_initializer_unavailable, documentation_url),
-      FornacastAPI.Error.from_domain({:conflict, :repository_exists}, documentation_url),
-      FornacastAPI.Error.from_domain({:unavailable, :storage}, documentation_url),
-      FornacastAPI.Error.from_domain(:unclassified, documentation_url),
-      FornacastAPI.Error.from_domain(
-        {:validation, [%{resource: "Repository", field: "name", code: :missing_field}]},
-        documentation_url
-      )
-    ]
-
     for version <- Map.keys(@contracts) do
       document = decoded_contract(version)
+      raw_document = raw_contract(version)
 
-      for error <- stable_errors do
+      for status <- @pipeline_only_error_statuses do
+        refute response_status_declared?(raw_document, status),
+               "#{version} unexpectedly declares pipeline-only status #{status}"
+      end
+
+      for {name, error, expected_status, expected_message, expected_errors, schema_pin} <-
+            stable_error_cases(documentation_url) do
         rendered = FornacastAPI.Serializer.render(version, :error, error)
+        {path, method, schema_status} = schema_pin
 
-        if error.errors do
-          assert_valid_response(document, "/user/repos", :get, 422, rendered)
-        else
-          assert_valid_response(document, "/user", :get, 401, rendered)
-        end
+        assert error.status == expected_status, name
+        assert rendered.message == expected_message, name
+        assert rendered.documentation_url == documentation_url, name
+        refute Map.has_key?(rendered, :status), name
 
-        assert rendered.message == error.message
-        assert rendered.documentation_url == documentation_url
-        refute Map.has_key?(rendered, :status)
+        expected_body =
+          %{message: expected_message, documentation_url: documentation_url}
+          |> maybe_put_expected_errors(expected_errors)
 
-        if error.errors do
-          assert rendered.errors == [
-                   %{resource: "Repository", field: "name", code: "missing_field"}
-                 ]
-        else
-          refute Map.has_key?(rendered, :errors)
-        end
+        assert rendered == expected_body, name
+        assert Enum.sort(Map.keys(rendered)) == Enum.sort(Map.keys(expected_body)), name
+
+        encoded = rendered |> JSON.encode!() |> JSON.decode!()
+        expected_encoded = expected_body |> JSON.encode!() |> JSON.decode!()
+
+        assert encoded == expected_encoded, name
+        assert Enum.sort(Map.keys(encoded)) == Enum.sort(Map.keys(expected_encoded)), name
+        assert_valid_response(document, path, method, schema_status, rendered)
       end
     end
   end
+
+  defp stable_error_cases(documentation_url) do
+    validation_errors = [
+      %{resource: "Repository", field: "name", code: :missing_field}
+    ]
+
+    encoded_validation_errors = [
+      %{resource: "Repository", field: "name", code: "missing_field"}
+    ]
+
+    basic_error_schema = {"/user", :get, 401}
+    contents_path = "/repos/{owner}/{repo}/contents/{path}"
+
+    [
+      {"bad request", FornacastAPI.Error.new(400, "Bad Request", documentation_url), 400,
+       "Bad Request", nil, {"/repos/{owner}/{repo}/commits", :get, 400}},
+      {"requires authentication",
+       FornacastAPI.Error.new(401, "Requires authentication", documentation_url), 401,
+       "Requires authentication", nil, {"/user", :get, 401}},
+      {"invalid credentials",
+       FornacastAPI.Error.from_domain(:invalid_credentials, documentation_url), 401,
+       "Bad credentials", nil, {"/user", :get, 401}},
+      {"user agent required",
+       FornacastAPI.Error.new(403, "User agent required", documentation_url), 403,
+       "User agent required", nil, {"/repos/{owner}/{repo}", :get, 403}},
+      {"insufficient scope",
+       FornacastAPI.Error.from_domain(:insufficient_scope, documentation_url), 403,
+       "Resource not accessible by personal access token", nil,
+       {"/repos/{owner}/{repo}", :get, 403}},
+      {"forbidden", FornacastAPI.Error.from_domain(:forbidden, documentation_url), 403,
+       "Forbidden", nil, {"/repos/{owner}/{repo}", :get, 403}},
+      {"not found", FornacastAPI.Error.from_domain(:not_found, documentation_url), 404,
+       "Not Found", nil, {contents_path, :delete, 404}},
+      {"pull request is not mergeable",
+       FornacastAPI.Error.new(405, "Pull Request is not mergeable", documentation_url), 405,
+       "Pull Request is not mergeable", nil,
+       {"/repos/{owner}/{repo}/pulls/{pull_number}/merge", :put, 405}},
+      {"not acceptable", FornacastAPI.Error.new(406, "Not Acceptable", documentation_url), 406,
+       "Not Acceptable", nil, {"/repos/{owner}/{repo}/pulls/{pull_number}", :get, 406}},
+      {"request timeout", FornacastAPI.Error.new(408, "Request Timeout", documentation_url), 408,
+       "Request Timeout", nil, basic_error_schema},
+      {"conflict",
+       FornacastAPI.Error.from_domain({:conflict, :repository_exists}, documentation_url), 409,
+       "Conflict", nil, {contents_path, :delete, 409}},
+      {"issues disabled",
+       FornacastAPI.Error.new(
+         410,
+         "Issues are disabled for this repository",
+         documentation_url
+       ), 410, "Issues are disabled for this repository", nil,
+       {"/repos/{owner}/{repo}/issues/{issue_number}", :get, 410}},
+      {"payload too large", FornacastAPI.Error.new(413, "Payload Too Large", documentation_url),
+       413, "Payload Too Large", nil, basic_error_schema},
+      {"uri too long", FornacastAPI.Error.new(414, "URI Too Long", documentation_url), 414,
+       "URI Too Long", nil, basic_error_schema},
+      {"unsupported media type",
+       FornacastAPI.Error.new(415, "Unsupported Media Type", documentation_url), 415,
+       "Unsupported Media Type", nil, basic_error_schema},
+      {"validation failed",
+       FornacastAPI.Error.from_domain({:validation, validation_errors}, documentation_url), 422,
+       "Validation Failed", encoded_validation_errors, {contents_path, :delete, 422}},
+      {"rate limit exceeded",
+       FornacastAPI.Error.new(429, "API rate limit exceeded", documentation_url), 429,
+       "API rate limit exceeded", nil, basic_error_schema},
+      {"internal server error", FornacastAPI.Error.from_domain(:unclassified, documentation_url),
+       500, "Internal Server Error", nil, {"/repos/{owner}/{repo}/commits", :get, 500}},
+      {"git initializer unavailable",
+       FornacastAPI.Error.from_domain(:git_initializer_unavailable, documentation_url), 503,
+       "Service unavailable", nil, {contents_path, :delete, 503}},
+      {"dependency unavailable",
+       FornacastAPI.Error.from_domain({:unavailable, :storage}, documentation_url), 503,
+       "Service unavailable", nil, {contents_path, :delete, 503}}
+    ]
+  end
+
+  defp maybe_put_expected_errors(body, nil), do: body
+  defp maybe_put_expected_errors(body, errors), do: Map.put(body, :errors, errors)
 
   defp contract_path(filename), do: Path.join(@contract_root, filename)
 
@@ -561,8 +635,8 @@ defmodule FornacastAPI.OpenAPIContractTest do
 
   defp collect_schemas_by_title(_value, schemas), do: schemas
 
-  defp account_view do
-    %{
+  defp account do
+    %User{
       id: 42,
       username: "octocat",
       display_name: "Octo Cat",
@@ -570,26 +644,26 @@ defmodule FornacastAPI.OpenAPIContractTest do
       email: "octocat@example.test",
       kind: :user,
       role: :admin,
-      public_repos: 7,
-      private_repos: 2,
-      two_factor_authentication: true,
       inserted_at: ~U[2026-03-10 08:00:00Z],
       updated_at: ~U[2026-03-11 09:30:00Z]
     }
   end
 
-  defp organization_view do
-    %{
+  defp account_view, do: AccountView.new(account(), 7, 2)
+
+  defp organization do
+    %Organization{
       id: 84,
       username: "acme",
       display_name: "Acme Forge",
       description: "An example organization",
       kind: :organization,
-      public_repos: 5,
       inserted_at: ~U[2026-03-08 01:02:03Z],
       updated_at: ~U[2026-03-09 04:05:06Z]
     }
   end
+
+  defp organization_view, do: AccountView.new(organization(), 5, 3)
 
   defp repository_view do
     %{
@@ -604,7 +678,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
         inserted_at: ~U[2026-03-09 10:00:00Z],
         updated_at: ~U[2026-03-10 11:00:00Z]
       },
-      owner: account_view(),
+      owner: account(),
       permissions: %{
         admin: true,
         pull: true,
@@ -616,6 +690,21 @@ defmodule FornacastAPI.OpenAPIContractTest do
 
   defp rate_bucket do
     %{limit: 5_000, remaining: 4_999, reset: 1_800_000_000, used: 1, resource: "core"}
+  end
+
+  defp response_status_declared?(document, status) do
+    status = Integer.to_string(status)
+
+    Enum.any?(document["paths"], fn {_path, path_item} ->
+      Enum.any?(~w(get put post delete options head patch trace), fn method ->
+        path_item
+        |> get_in([method, "responses"])
+        |> case do
+          responses when is_map(responses) -> Map.has_key?(responses, status)
+          _responses -> false
+        end
+      end)
+    end)
   end
 
   defp operations(document) do
