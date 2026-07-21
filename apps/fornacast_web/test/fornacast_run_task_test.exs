@@ -1,32 +1,26 @@
 defmodule Mix.Tasks.Fornacast.RunTest do
   use ExUnit.Case, async: true
 
-  test "service_applications mirrors the web app umbrella service dependencies" do
-    assert Mix.Tasks.Fornacast.Run.service_applications() == service_applications()
+  test "service_applications starts the API immediately before the web endpoint" do
+    assert Mix.Tasks.Fornacast.Run.service_applications() == [
+             :fornacast,
+             :forge_accounts,
+             :forge_repos,
+             :git_core,
+             :git_transport,
+             :fornacast_api,
+             :fornacast_web
+           ]
   end
 
   test "service_dependency_applications leaves the web endpoint to phx.server" do
-    assert Mix.Tasks.Fornacast.Run.service_dependency_applications() ==
-             List.delete(service_applications(), :fornacast_web)
-  end
-
-  defp service_applications do
-    project = Mix.Project.config()
-
-    umbrella_dependencies =
-      project
-      |> Keyword.fetch!(:deps)
-      |> Enum.flat_map(fn
-        {app, opts} when is_list(opts) ->
-          if Keyword.get(opts, :in_umbrella), do: [app], else: []
-
-        {app, _requirement, opts} when is_list(opts) ->
-          if Keyword.get(opts, :in_umbrella), do: [app], else: []
-
-        _dep ->
-          []
-      end)
-
-    umbrella_dependencies ++ [Keyword.fetch!(project, :app)]
+    assert Mix.Tasks.Fornacast.Run.service_dependency_applications() == [
+             :fornacast,
+             :forge_accounts,
+             :forge_repos,
+             :git_core,
+             :git_transport,
+             :fornacast_api
+           ]
   end
 end

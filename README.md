@@ -2,7 +2,7 @@
 
 Fornacast is a small self-hosted Git forge built with Elixir, Phoenix, Erlang/OTP SSH, Ecto on ExTurso/Turso by default, Concord-backed key/value app config, optional PostgreSQL, and Rust NIFs over gitoxide.
 
-The first release target is intentionally narrow: create users and repositories, authenticate Git over SSH with user SSH keys, push/clone/fetch with a normal Git client, and browse repositories in the web UI.
+The first release target is intentionally narrow: create users and repositories, authenticate Git over SSH with user SSH keys, push/clone/fetch with a normal Git client, browse repositories in the web UI, and support the documented GitHub-compatible REST workflow.
 
 ## Current Release Scope
 
@@ -19,8 +19,9 @@ Implemented first-release paths:
 - Repository overview, README rendering, source tree, file view, raw file, commits, commit detail, diffs, branches, and tags.
 - `/health` endpoint.
 - First-admin setup wizard and automatic boot migrations.
+- A separate GitHub-compatible REST listener, started with the web application.
 
-Out of scope for this release: issues, pull requests, CI, packages, LFS, mirrors, forks, smart HTTP Git transport, and Forgejo/Gitea API compatibility.
+Out of scope for this release: CI, packages, LFS, mirrors, and forks.
 
 ## Local Development
 
@@ -44,11 +45,12 @@ Run locally:
 mix fornacast.run
 ```
 
-On a fresh install this prints a setup URL. Open `http://localhost:4000/setup` to create the first admin account, then log in.
+On a fresh install this prints a setup URL. Open `http://localhost:4890/setup` to create the first admin account, then log in.
 
 Default local endpoints:
 
-- Web: `http://localhost:4000`
+- Web: `http://localhost:4890`
+- REST API: `http://localhost:4001/api/v3`
 - SSH: `ssh://USER@localhost:2222/USER/REPO.git`
 
 Alternatively, create the first admin headlessly without the web wizard:
@@ -88,6 +90,7 @@ docker compose --profile postgres up --build -d
 ```
 
 Migrations run automatically on container start. Open `http://localhost:4000/setup` to create the first admin account.
+Nginx is the Compose deployment's only public HTTP service. It serves the web application and the REST API from the same origin: use `http://localhost:4000/api/v3` for REST resources and `http://localhost:4000/api/uploads` for release-asset uploads. The application container's web listener on port `4890` and API listener on port `4001` remain internal to the Compose network.
 
 Alternatively, create the first admin headlessly in the running container without the web wizard:
 
@@ -97,6 +100,32 @@ docker compose exec app /app/bin/fornacast eval \
 ```
 
 Then log in, add an SSH key, and create a repository.
+
+## GitHub-Compatible REST API
+
+API clients must send a non-empty `User-Agent`. Pin either supported contract with `X-GitHub-Api-Version: 2022-11-28` or `X-GitHub-Api-Version: 2026-03-10`; omitting the version selects `2022-11-28`.
+
+Store a classic personal access token outside scripts, then authenticate with either GitHub-compatible syntax:
+
+```sh
+export FORNACAST_TOKEN='replace-with-your-token'
+
+curl -H 'User-Agent: fornacast-example/1.0' \
+  -H 'X-GitHub-Api-Version: 2022-11-28' \
+  -H "Authorization: Bearer $FORNACAST_TOKEN" \
+  http://localhost:4001/api/v3/user
+
+curl -H 'User-Agent: fornacast-example/1.0' \
+  -H 'X-GitHub-Api-Version: 2026-03-10' \
+  -H "Authorization: token $FORNACAST_TOKEN" \
+  http://localhost:4001/api/v3/user
+```
+
+Classic scopes are `repo` for private-repository access, `public_repo` for public-repository writes, `read:org` for organization reads, and `write:org` for organization mutations. Scopes do not override domain authorization: the authenticated user must also have the required repository or organization role. Legacy API tokens are accepted only during the documented migration window and remain read-only.
+
+Published upload URLs use `/api/uploads` on the same origin as `/api/v3`. Do not publish the internal port `4001` as a separate production origin.
+
+The complete first-release compatibility claim is still blocked by the `auto_init` compatibility gate: the Git-data delivery plan must implement real repository initialization and pass the end-to-end acceptance workflow before the API is advertised as GitHub compatible.
 
 ## Git Usage
 
@@ -136,11 +165,14 @@ Production environment variables:
 - `FORNACAST_CONFIG_TURSO_AUTH_TOKEN`, optional Turso auth token for Concord-backed app config
 - `DATABASE_URL`, required only when built with `FORNACAST_DATABASE_ADAPTER=postgres`
 - `FORNACAST_BASE_URL`
+- `FORNACAST_API_BIND_IP`, default `0.0.0.0` in the release image
+- `FORNACAST_API_PORT`, default `4001` in the release image
+- `FORNACAST_API_TRUSTED_PROXIES`, comma-separated trusted proxy CIDRs
 - `FORNACAST_REPO_STORAGE_ROOT`
 - `FORNACAST_SSH_HOST`
 - `FORNACAST_SSH_PORT`
 - `FORNACAST_SSH_SYSTEM_DIR`
-- `PORT` for the HTTP listener, default `4000`
+- `PORT` for the web HTTP listener, default `4890`
 - `POOL_SIZE`, optional, default `10`
 
 Development and test also honor:

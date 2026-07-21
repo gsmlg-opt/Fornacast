@@ -15,16 +15,35 @@ services:
       DATABASE_URL: ${DATABASE_URL:-}
       SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set SECRET_KEY_BASE}
       FORNACAST_BASE_URL: ${FORNACAST_BASE_URL:-http://localhost:4000}
+      FORNACAST_API_BIND_IP: 0.0.0.0
+      FORNACAST_API_PORT: 4001
+      FORNACAST_API_TRUSTED_PROXIES: 172.30.0.0/24
       FORNACAST_REPO_STORAGE_ROOT: /data/repos
       FORNACAST_SSH_HOST: ${FORNACAST_SSH_HOST:-localhost}
       FORNACAST_SSH_PORT: ${FORNACAST_SSH_PORT:-2222}
       FORNACAST_SSH_SYSTEM_DIR: /data/ssh
-      PORT: 4000
+      PORT: 4890
+    expose:
+      - "4890"
+      - "4001"
+      - "2222"
     ports:
-      - "4000:4000"
       - "2222:2222"
     volumes:
       - fornacast-data:/data
+    networks:
+      - fornacast-internal
+
+  nginx:
+    image: nginx:1.29-alpine
+    depends_on:
+      - app
+    volumes:
+      - ./deploy/nginx/fornacast.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "4000:8080"
+    networks:
+      - fornacast-internal
 
   db:
     profiles: ["postgres"]
@@ -40,7 +59,16 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - fornacast-internal
 
 volumes:
   fornacast-data:
   postgres-data:
+
+networks:
+  fornacast-internal:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

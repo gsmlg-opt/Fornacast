@@ -1,5 +1,5 @@
 ARG ELIXIR_IMAGE=elixir:1.20.1-otp-29
-ARG DEBIAN_IMAGE=debian:bookworm-slim
+ARG DEBIAN_IMAGE=debian:trixie-slim
 ARG RUST_VERSION=1.96.0
 
 FROM ${ELIXIR_IMAGE} AS build
@@ -62,7 +62,9 @@ WORKDIR /app
 COPY --from=build --chown=fornacast:fornacast /app/_build/prod/rel/fornacast ./
 
 ENV HOME=/app \
-    PORT=4000 \
+    PORT=4890 \
+    FORNACAST_API_BIND_IP=0.0.0.0 \
+    FORNACAST_API_PORT=4001 \
     FORNACAST_DATABASE_ADAPTER=turso \
     FORNACAST_DATABASE_PATH=/data/fornacast.db \
     FORNACAST_CONFIG_DATABASE_PATH=/data/fornacast_config.db \
@@ -71,6 +73,6 @@ ENV HOME=/app \
 
 USER fornacast
 
-EXPOSE 4000 2222
+EXPOSE 4890 4001 2222
 
 CMD ["/app/bin/fornacast", "start"]

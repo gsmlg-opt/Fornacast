@@ -24,6 +24,8 @@ env:
   RUST_VERSION: 1.96.0
   MIX_ENV: prod
   FORNACAST_DATABASE_ADAPTER: turso
+  FORNACAST_API_BIND_IP: "127.0.0.1"
+  FORNACAST_API_PORT: "4101"
   FORNACAST_SSH_PORT: "22222"
   PORT: "4100"
 
@@ -178,7 +180,8 @@ jobs:
       - name: Wait for health
         run: |
           for attempt in $(seq 1 60); do
-            if curl -fsS "http://127.0.0.1:${PORT}/health"; then
+            if curl -fsS "http://127.0.0.1:${PORT}/health" && \
+               curl -fsS "http://127.0.0.1:${FORNACAST_API_PORT}/health"; then
               exit 0
             fi
             sleep 2
