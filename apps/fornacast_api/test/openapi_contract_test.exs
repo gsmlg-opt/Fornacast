@@ -329,7 +329,294 @@ defmodule FornacastAPI.OpenAPIContractTest do
     end
   end
 
+  test "versioned serializers produce complete operation-valid JSON responses" do
+    for version <- Map.keys(@contracts) do
+      document = decoded_contract(version)
+
+      assert_valid_response(document, "/versions", :get, 200, ["2022-11-28", "2026-03-10"])
+
+      assert_valid_response(
+        document,
+        "/rate_limit",
+        :get,
+        200,
+        FornacastAPI.Serializer.render(version, :rate_limit, rate_bucket())
+      )
+
+      assert_valid_response(
+        document,
+        "/user",
+        :get,
+        200,
+        FornacastAPI.Serializer.render(version, :private_user, account_view())
+      )
+
+      assert_valid_response(
+        document,
+        "/users/{username}",
+        :get,
+        200,
+        FornacastAPI.Serializer.render(version, :public_user, account_view())
+      )
+
+      assert_valid_response(
+        document,
+        "/user/orgs",
+        :get,
+        200,
+        [FornacastAPI.Serializer.render(version, :organization_simple, organization_view())]
+      )
+
+      assert_valid_response(
+        document,
+        "/orgs/{org}",
+        :get,
+        200,
+        FornacastAPI.Serializer.render(version, :organization_full, organization_view())
+      )
+
+      assert_valid_response(
+        document,
+        "/users/{username}/repos",
+        :get,
+        200,
+        [FornacastAPI.Serializer.render(version, :minimal_repository, repository_view())]
+      )
+
+      assert_valid_response(
+        document,
+        "/user/repos",
+        :get,
+        200,
+        [FornacastAPI.Serializer.render(version, :repository, repository_view())]
+      )
+
+      assert_valid_response(
+        document,
+        "/repos/{owner}/{repo}",
+        :get,
+        200,
+        FornacastAPI.Serializer.render(version, :full_repository, repository_view())
+      )
+    end
+  end
+
+  test "serializer keys cover required properties without unsupported supersets" do
+    resources = [
+      {:simple_user, "Simple User", account_view()},
+      {:public_user, "Public User", account_view()},
+      {:private_user, "Private User", account_view()},
+      {:organization_simple, "Organization Simple", organization_view()},
+      {:organization_full, "Organization Full", organization_view()},
+      {:minimal_repository, "Minimal Repository", repository_view()},
+      {:repository, "Repository", repository_view()},
+      {:full_repository, "Full Repository", repository_view()}
+    ]
+
+    for version <- Map.keys(@contracts) do
+      schemas = version |> raw_contract() |> schemas_by_title()
+
+      for {resource, title, value} <- resources do
+        rendered = FornacastAPI.Serializer.render(version, resource, value)
+        schema = Map.fetch!(schemas, title)
+        keys = rendered |> Map.keys() |> Enum.map(&Atom.to_string/1) |> Enum.sort()
+        required = schema |> Map.fetch!("required") |> Enum.sort()
+        properties = schema |> Map.fetch!("properties") |> Map.keys() |> Enum.sort()
+
+        assert required -- keys == [],
+               "#{version} #{resource} omitted required keys: #{inspect(required -- keys)}"
+
+        assert keys -- properties == [],
+               "#{version} #{resource} emitted unsupported keys: #{inspect(keys -- properties)}"
+      end
+    end
+  end
+
+  test "rate and repository key differences are explicitly pinned per version" do
+    repository_2022 =
+      FornacastAPI.Serializer.render("2022-11-28", :repository, repository_view())
+
+    repository_2026 =
+      FornacastAPI.Serializer.render("2026-03-10", :repository, repository_view())
+
+    assert Map.keys(repository_2022) -- Map.keys(repository_2026) == [:has_downloads]
+    assert Map.keys(repository_2026) -- Map.keys(repository_2022) == []
+
+    schemas_2022 = "2022-11-28" |> raw_contract() |> schemas_by_title()
+    schemas_2026 = "2026-03-10" |> raw_contract() |> schemas_by_title()
+
+    repository_properties_2022 =
+      schemas_2022["Repository"] |> Map.fetch!("properties") |> Map.keys()
+
+    repository_properties_2026 =
+      schemas_2026["Repository"] |> Map.fetch!("properties") |> Map.keys()
+
+    assert Enum.sort(repository_properties_2022 -- repository_properties_2026) ==
+             ~w(has_downloads master_branch use_squash_pr_title_as_default)
+
+    assert repository_properties_2026 -- repository_properties_2022 == []
+    refute Map.has_key?(repository_2026, :has_downloads)
+    refute Map.has_key?(repository_2026, :master_branch)
+    refute Map.has_key?(repository_2026, :use_squash_pr_title_as_default)
+
+    rate_2022 = FornacastAPI.Serializer.render("2022-11-28", :rate_limit, rate_bucket())
+    rate_2026 = FornacastAPI.Serializer.render("2026-03-10", :rate_limit, rate_bucket())
+
+    assert Map.keys(rate_2022) |> Enum.sort() == [:rate, :resources]
+    assert Map.keys(rate_2026) == [:resources]
+  end
+
+  test "every stable error body survives JSON encoding and its pinned schema" do
+    documentation_url = "https://docs.example.test/rest"
+
+    stable_errors = [
+      FornacastAPI.Error.from_domain(:invalid_credentials, documentation_url),
+      FornacastAPI.Error.from_domain(:insufficient_scope, documentation_url),
+      FornacastAPI.Error.from_domain(:forbidden, documentation_url),
+      FornacastAPI.Error.from_domain(:not_found, documentation_url),
+      FornacastAPI.Error.from_domain(:git_initializer_unavailable, documentation_url),
+      FornacastAPI.Error.from_domain({:conflict, :repository_exists}, documentation_url),
+      FornacastAPI.Error.from_domain({:unavailable, :storage}, documentation_url),
+      FornacastAPI.Error.from_domain(:unclassified, documentation_url),
+      FornacastAPI.Error.from_domain(
+        {:validation, [%{resource: "Repository", field: "name", code: :missing_field}]},
+        documentation_url
+      )
+    ]
+
+    for version <- Map.keys(@contracts) do
+      document = decoded_contract(version)
+
+      for error <- stable_errors do
+        rendered = FornacastAPI.Serializer.render(version, :error, error)
+
+        if error.errors do
+          assert_valid_response(document, "/user/repos", :get, 422, rendered)
+        else
+          assert_valid_response(document, "/user", :get, 401, rendered)
+        end
+
+        assert rendered.message == error.message
+        assert rendered.documentation_url == documentation_url
+        refute Map.has_key?(rendered, :status)
+
+        if error.errors do
+          assert rendered.errors == [
+                   %{resource: "Repository", field: "name", code: "missing_field"}
+                 ]
+        else
+          refute Map.has_key?(rendered, :errors)
+        end
+      end
+    end
+  end
+
   defp contract_path(filename), do: Path.join(@contract_root, filename)
+
+  defp raw_contract(version) do
+    {filename, _source_blob} = Map.fetch!(@contracts, version)
+    filename |> contract_path() |> File.read!() |> JSON.decode!()
+  end
+
+  defp decoded_contract(version) do
+    version
+    |> raw_contract()
+    |> OpenApiSpex.OpenApi.Decode.decode()
+  end
+
+  defp assert_valid_response(document, path, method, status, body) do
+    schema =
+      document.paths
+      |> Map.fetch!(path)
+      |> Map.fetch!(method)
+      |> Map.fetch!(:responses)
+      |> Map.fetch!(Integer.to_string(status))
+      |> Map.fetch!(:content)
+      |> Map.fetch!("application/json")
+      |> Map.fetch!(:schema)
+
+    assert_valid_schema(document, schema, body)
+  end
+
+  defp assert_valid_schema(document, schema, body) do
+    json_body = body |> JSON.encode_to_iodata!() |> IO.iodata_to_binary() |> JSON.decode!()
+    assert {:ok, _cast} = OpenApiSpex.cast_value(json_body, schema, document)
+  end
+
+  defp schemas_by_title(document), do: collect_schemas_by_title(document, %{})
+
+  defp collect_schemas_by_title(value, schemas) when is_map(value) do
+    schemas =
+      case value["title"] do
+        title when is_binary(title) -> Map.put_new(schemas, title, value)
+        _other -> schemas
+      end
+
+    Enum.reduce(Map.values(value), schemas, &collect_schemas_by_title/2)
+  end
+
+  defp collect_schemas_by_title(value, schemas) when is_list(value) do
+    Enum.reduce(value, schemas, &collect_schemas_by_title/2)
+  end
+
+  defp collect_schemas_by_title(_value, schemas), do: schemas
+
+  defp account_view do
+    %{
+      id: 42,
+      username: "octocat",
+      display_name: "Octo Cat",
+      description: "Builds small forges",
+      email: "octocat@example.test",
+      kind: :user,
+      role: :admin,
+      public_repos: 7,
+      private_repos: 2,
+      two_factor_authentication: true,
+      inserted_at: ~U[2026-03-10 08:00:00Z],
+      updated_at: ~U[2026-03-11 09:30:00Z]
+    }
+  end
+
+  defp organization_view do
+    %{
+      id: 84,
+      username: "acme",
+      display_name: "Acme Forge",
+      description: "An example organization",
+      kind: :organization,
+      public_repos: 5,
+      inserted_at: ~U[2026-03-08 01:02:03Z],
+      updated_at: ~U[2026-03-09 04:05:06Z]
+    }
+  end
+
+  defp repository_view do
+    %{
+      repository: %{
+        id: 99,
+        slug: "hello-world",
+        name: "Hello World",
+        description: "A repository fixture",
+        visibility: :private,
+        default_branch: "trunk",
+        last_pushed_at: ~U[2026-03-10 10:30:00Z],
+        inserted_at: ~U[2026-03-09 10:00:00Z],
+        updated_at: ~U[2026-03-10 11:00:00Z]
+      },
+      owner: account_view(),
+      permissions: %{
+        admin: true,
+        pull: true,
+        push: true
+      },
+      size_kib: 512
+    }
+  end
+
+  defp rate_bucket do
+    %{limit: 5_000, remaining: 4_999, reset: 1_800_000_000, used: 1, resource: "core"}
+  end
 
   defp operations(document) do
     document["paths"]
