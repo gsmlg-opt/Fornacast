@@ -83,7 +83,8 @@ config :fornacast_web, FornacastWeb.Endpoint,
 
 config :fornacast_api, FornacastAPI.Endpoint,
   url: [host: "localhost"],
-  adapter: Bandit.PhoenixAdapter
+  adapter: Bandit.PhoenixAdapter,
+  render_errors: [formats: [json: FornacastAPI.ErrorJSON], layout: false]
 
 config :fornacast_api,
   anonymous_rate_limit: 60,

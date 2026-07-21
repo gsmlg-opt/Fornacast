@@ -3,5 +3,7 @@ defmodule FornacastAPI.Endpoint do
 
   plug Plug.RequestId
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
+  plug FornacastAPI.Plugs.RequestContext
+  plug FornacastAPI.Plugs.RequestTarget
   plug FornacastAPI.Router
 end
