@@ -149,6 +149,99 @@ defmodule Fornacast.AccessTest do
     assert_permissions(disabled_site_admin, collaborator_public_repository, [:repository_read])
   end
 
+  test "authorized fetch masks private repositories and distinguishes visible forbidden writes" do
+    owner = active_user_fixture("fetch-owner")
+    unrelated = active_user_fixture("fetch-unrelated")
+    private_repository = personal_repository_fixture(owner, slug: "private")
+    public_repository = personal_repository_fixture(owner, slug: "public", visibility: :public)
+
+    assert {:ok, %Repository{id: private_id}} =
+             ForgeRepos.fetch_authorized_repository(
+               owner,
+               owner.username,
+               private_repository.slug,
+               :repository_read
+             )
+
+    assert private_id == private_repository.id
+
+    assert {:error, :not_found} =
+             ForgeRepos.fetch_authorized_repository(
+               unrelated,
+               owner.username,
+               private_repository.slug,
+               :repository_read
+             )
+
+    assert {:error, :not_found} =
+             ForgeRepos.fetch_authorized_repository(
+               nil,
+               owner.username,
+               private_repository.slug,
+               :repository_read
+             )
+
+    assert {:error, :forbidden} =
+             ForgeRepos.fetch_authorized_repository(
+               unrelated,
+               owner.username,
+               public_repository.slug,
+               :repository_write
+             )
+
+    assert {:error, :forbidden} =
+             ForgeRepos.fetch_authorized_repository(
+               nil,
+               owner.username,
+               public_repository.slug,
+               :repository_admin
+             )
+  end
+
+  test "authorized fetch rejects deleted rows and unsupported permissions before storage access" do
+    owner = active_user_fixture("deleted-owner")
+    repository = personal_repository_fixture(owner, visibility: :public)
+
+    live_repository =
+      personal_repository_fixture(owner, slug: "live", visibility: :public)
+
+    repository
+    |> Ecto.Changeset.change(deleted_at: ~U[2026-07-21 12:00:00Z])
+    |> Repo.update!()
+
+    assert {:error, :not_found} =
+             ForgeRepos.fetch_authorized_repository(
+               owner,
+               owner.username,
+               repository.slug,
+               :repository_read
+             )
+
+    assert {:error, :forbidden} =
+             ForgeRepos.fetch_authorized_repository(
+               owner,
+               owner.username,
+               live_repository.slug,
+               :unsupported_permission
+             )
+
+    assert {:error, :not_found} =
+             ForgeRepos.fetch_authorized_repository(
+               owner,
+               owner.username <> <<0>>,
+               live_repository.slug,
+               :repository_read
+             )
+
+    assert {:error, :not_found} =
+             ForgeRepos.fetch_authorized_repository(
+               owner,
+               owner.username,
+               live_repository.slug <> <<0>>,
+               :repository_read
+             )
+  end
+
   defp active_user_fixture(username, attrs \\ []) do
     user_fixture(username, Keyword.put_new(attrs, :state, :active))
   end
