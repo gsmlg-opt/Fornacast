@@ -534,12 +534,40 @@ defmodule ForgeReposTest do
 
     assert repository_ids(since_views) == [member.id, nil_pushed.id]
 
+    assert {:ok, %Page{entries: fractional_since_views, total: 2}} =
+             ForgeRepos.list_accessible_repository_views(actor,
+               since: "2026-07-21T10:00:00.500Z"
+             )
+
+    assert repository_ids(fractional_since_views) == [member.id, nil_pushed.id]
+
+    assert {:ok, %Page{entries: fractional_offset_since_views, total: 2}} =
+             ForgeRepos.list_accessible_repository_views(actor,
+               since: "2026-07-21T12:00:00.500+02:00"
+             )
+
+    assert repository_ids(fractional_offset_since_views) == [member.id, nil_pushed.id]
+
     assert {:ok, %Page{entries: before_views, total: 2}} =
              ForgeRepos.list_accessible_repository_views(actor,
                before: "2026-07-22T10:00:00Z"
              )
 
     assert repository_ids(before_views) == [newer.id, older.id]
+
+    assert {:ok, %Page{entries: fractional_before_views, total: 3}} =
+             ForgeRepos.list_accessible_repository_views(actor,
+               before: "2026-07-22T10:00:00.500Z"
+             )
+
+    assert repository_ids(fractional_before_views) == [newer.id, nil_pushed.id, older.id]
+
+    assert {:ok, %Page{entries: fractional_offset_before_views, total: 3}} =
+             ForgeRepos.list_accessible_repository_views(actor,
+               before: "2026-07-22T12:00:00.500+02:00"
+             )
+
+    assert repository_ids(fractional_offset_before_views) == [newer.id, nil_pushed.id, older.id]
 
     assert {:ok, %Page{entries: offset_since_views, total: 2}} =
              ForgeRepos.list_accessible_repository_views(actor,

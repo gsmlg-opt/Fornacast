@@ -638,7 +638,7 @@ defmodule ForgeRepos do
 
       {:ok, value} when is_binary(value) ->
         case DateTime.from_iso8601(value) do
-          {:ok, datetime, _offset} -> {:ok, DateTime.truncate(datetime, :second)}
+          {:ok, datetime, _offset} -> {:ok, normalize_datetime_bound(datetime, field)}
           _result -> validation_result(Atom.to_string(field), :invalid)
         end
 
@@ -646,6 +646,17 @@ defmodule ForgeRepos do
         validation_result(Atom.to_string(field), :invalid)
     end
   end
+
+  defp normalize_datetime_bound(%DateTime{microsecond: {0, _precision}} = datetime, _field),
+    do: DateTime.truncate(datetime, :second)
+
+  defp normalize_datetime_bound(datetime, :before) do
+    datetime
+    |> DateTime.truncate(:second)
+    |> DateTime.add(1, :second)
+  end
+
+  defp normalize_datetime_bound(datetime, :since), do: DateTime.truncate(datetime, :second)
 
   defp accessible_repository_query(actor, params) do
     ids = accessible_repository_ids(actor, params.affiliations)
