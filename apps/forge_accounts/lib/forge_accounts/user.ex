@@ -7,6 +7,8 @@ defmodule ForgeAccounts.User do
   @roles [:admin, :user]
   @states [:active, :disabled]
 
+  @type t :: %__MODULE__{}
+
   schema "users" do
     field :username, :string
     field :email, :string

@@ -6,6 +6,8 @@ defmodule ForgeAccounts.Organization do
   @kinds [:user, :organization]
   @states [:active, :disabled]
 
+  @type t :: %__MODULE__{}
+
   schema "users" do
     field :username, :string
     field :email, :string
@@ -31,8 +33,34 @@ defmodule ForgeAccounts.Organization do
     |> validate_length(:description, max: 500)
     |> validate_inclusion(:kind, @kinds)
     |> validate_inclusion(:state, @states)
-    |> unique_constraint(:username)
-    |> unique_constraint(:email)
+    |> unique_constraint(:username, name: ~r/^users_username(?: \(\d+\))?_index$/)
+    |> unique_constraint(:email, name: ~r/^users_email(?: \(\d+\))?_index$/)
+  end
+
+  def profile_changeset(organization, attrs) do
+    attrs = map_profile_name(attrs)
+
+    organization
+    |> cast(attrs, [:display_name, :description], empty_values: [])
+    |> trim_optional_string(:display_name)
+    |> trim_optional_string(:description)
+    |> validate_length(:display_name, min: 1, max: 120)
+    |> validate_length(:description, max: 500)
+  end
+
+  defp map_profile_name(attrs) do
+    cond do
+      Map.has_key?(attrs, "name") -> Map.put(attrs, "display_name", Map.fetch!(attrs, "name"))
+      Map.has_key?(attrs, :name) -> Map.put(attrs, :display_name, Map.fetch!(attrs, :name))
+      true -> attrs
+    end
+  end
+
+  defp trim_optional_string(changeset, field) do
+    update_change(changeset, field, fn
+      nil -> nil
+      value -> String.trim(value)
+    end)
   end
 
   defp normalize_username(changeset) do

@@ -8,7 +8,17 @@ defmodule ForgeAccounts do
   alias Ecto.Changeset
   alias Ecto.Multi
   alias ForgeAccounts.{APIKey, APIScope, Organization, OrganizationMember, SSHKey, User}
-  alias Fornacast.Repo
+  alias Fornacast.{Audit, Page, Repo}
+
+  @type validation_error :: %{
+          required(:resource) => String.t(),
+          required(:field) => String.t(),
+          required(:code) =>
+            :missing | :missing_field | :invalid | :already_exists | :unprocessable | :custom,
+          optional(:message) => String.t()
+        }
+
+  @type api_error :: :forbidden | :not_found | {:validation, [validation_error()]}
 
   def get_account(id), do: Repo.get(User, id)
 
@@ -24,11 +34,39 @@ defmodule ForgeAccounts do
     Repo.get_by(User, username: normalize_username(username), kind: :user)
   end
 
+  @spec get_public_user(String.t()) :: {:ok, User.t()} | {:error, :not_found}
+  def get_public_user(username) when is_binary(username) do
+    case Repo.get_by(User,
+           username: normalize_username(username),
+           kind: :user,
+           state: :active
+         ) do
+      %User{} = user -> {:ok, user}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  def get_public_user(_username), do: {:error, :not_found}
+
   def get_organization(id), do: Repo.get_by(Organization, id: id, kind: :organization)
 
   def get_organization_by_slug(slug) when is_binary(slug) do
     Repo.get_by(Organization, username: normalize_username(slug), kind: :organization)
   end
+
+  @spec get_public_organization(String.t()) :: {:ok, Organization.t()} | {:error, :not_found}
+  def get_public_organization(slug) when is_binary(slug) do
+    case Repo.get_by(Organization,
+           username: normalize_username(slug),
+           kind: :organization,
+           state: :active
+         ) do
+      %Organization{} = organization -> {:ok, organization}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  def get_public_organization(_slug), do: {:error, :not_found}
 
   def admin_exists? do
     Repo.exists?(from user in User, where: user.kind == :user and user.role == :admin)
@@ -115,6 +153,72 @@ defmodule ForgeAccounts do
     end
   end
 
+  @spec create_api_organization(User.t(), map(), map()) ::
+          {:ok, Organization.t()} | {:error, api_error()}
+  def create_api_organization(%User{} = actor, attrs, request_metadata)
+      when is_map(attrs) and is_map(request_metadata) do
+    with {:ok, active_actor} <- active_actor(actor),
+         {:ok, params, changeset} <- validate_api_organization_create(attrs),
+         {:ok, owner} <- authorize_organization_admin(active_actor, params.admin) do
+      Multi.new()
+      |> Multi.insert(:organization, changeset)
+      |> Multi.insert(:owner_membership, fn %{organization: organization} ->
+        OrganizationMember.changeset(%OrganizationMember{}, %{
+          organization_id: organization.id,
+          user_id: owner.id,
+          role: :owner
+        })
+      end)
+      |> Audit.record_multi(
+        :audit,
+        active_actor,
+        "organization.created",
+        "organization",
+        fn %{organization: organization} -> organization.id end,
+        fn %{organization: organization} ->
+          %{"login" => organization.username, "admin" => owner.username}
+        end,
+        request_metadata: request_metadata
+      )
+      |> Repo.transaction()
+      |> map_create_organization_result()
+    end
+  end
+
+  def create_api_organization(_actor, _attrs, _request_metadata), do: {:error, :forbidden}
+
+  @spec update_organization(User.t(), Organization.t(), map(), map()) ::
+          {:ok, Organization.t()} | {:error, api_error()}
+  def update_organization(
+        %User{} = actor,
+        %Organization{id: organization_id, kind: :organization},
+        attrs,
+        request_metadata
+      )
+      when is_map(attrs) and is_map(request_metadata) do
+    with {:ok, active_actor} <- active_actor(actor),
+         {:ok, organization} <- active_organization(organization_id),
+         :ok <- authorize_organization_update(active_actor, organization),
+         {:ok, changeset} <- validate_api_organization_update(organization, attrs) do
+      Multi.new()
+      |> Multi.update(:organization, changeset)
+      |> Audit.record_multi(
+        :audit,
+        active_actor,
+        "organization.updated",
+        "organization",
+        fn %{organization: updated} -> updated.id end,
+        fn %{organization: updated} -> %{"login" => updated.username} end,
+        request_metadata: request_metadata
+      )
+      |> Repo.transaction()
+      |> map_update_organization_result()
+    end
+  end
+
+  def update_organization(_actor, _organization, _attrs, _request_metadata),
+    do: {:error, :forbidden}
+
   def add_organization_member(organization, %User{kind: :user, id: user_id}, role \\ :member) do
     organization_id = organization_id(organization)
 
@@ -138,6 +242,35 @@ defmodule ForgeAccounts do
     )
     |> order_by([organization], asc: organization.username)
     |> Repo.all()
+  end
+
+  @spec list_user_organizations(User.t(), keyword()) ::
+          {:ok, Page.t(Organization.t())}
+  def list_user_organizations(%User{id: user_id}, opts) when is_list(opts) do
+    page = Keyword.get(opts, :page, 1)
+    per_page = Keyword.get(opts, :per_page, 30)
+
+    query =
+      Organization
+      |> join(:inner, [organization], member in OrganizationMember,
+        on: member.organization_id == organization.id
+      )
+      |> where(
+        [organization, member],
+        organization.kind == :organization and organization.state == :active and
+          member.user_id == ^user_id
+      )
+
+    total = Repo.aggregate(query, :count, :id)
+
+    entries =
+      query
+      |> order_by([organization], asc: organization.username, asc: organization.id)
+      |> offset(^((page - 1) * per_page))
+      |> limit(^per_page)
+      |> Repo.all()
+
+    {:ok, %Page{entries: entries, total: total, page: page, per_page: per_page}}
   end
 
   def list_repository_owners(%User{kind: :user} = user) do
@@ -451,6 +584,198 @@ defmodule ForgeAccounts do
         {:error, _reason} -> false
       end
     end)
+  end
+
+  defp validate_api_organization_create(attrs) do
+    login = fetch_param(attrs, :login)
+    admin = fetch_param(attrs, :admin)
+    profile_name = fetch_param(attrs, :profile_name)
+
+    errors =
+      validate_required_string("login", login) ++
+        validate_required_string("admin", admin) ++
+        validate_optional_string("profile_name", profile_name)
+
+    if errors == [] do
+      login = login |> elem(1) |> normalize_username()
+      admin = admin |> elem(1) |> normalize_username()
+
+      organization_attrs = %{"username" => login}
+
+      organization_attrs =
+        case profile_name do
+          {:ok, value} -> Map.put(organization_attrs, "display_name", value)
+          :missing -> organization_attrs
+        end
+
+      changeset = Organization.changeset(%Organization{}, organization_attrs)
+
+      if changeset.valid? do
+        {:ok, %{login: login, admin: admin}, changeset}
+      else
+        {:error,
+         {:validation,
+          changeset_errors(changeset, %{
+            username: "login",
+            email: "login",
+            display_name: "profile_name"
+          })}}
+      end
+    else
+      {:error, {:validation, errors}}
+    end
+  end
+
+  defp validate_api_organization_update(organization, attrs) do
+    name = fetch_param(attrs, :name)
+    description = fetch_param(attrs, :description)
+
+    errors =
+      validate_optional_string("name", name) ++
+        validate_optional_string("description", description)
+
+    if errors == [] do
+      changeset = Organization.profile_changeset(organization, attrs)
+
+      if changeset.valid? do
+        {:ok, changeset}
+      else
+        {:error,
+         {:validation,
+          changeset_errors(changeset, %{display_name: "name", description: "description"})}}
+      end
+    else
+      {:error, {:validation, errors}}
+    end
+  end
+
+  defp validate_required_string(field, :missing),
+    do: [validation_error(field, :missing_field)]
+
+  defp validate_required_string(field, {:ok, nil}),
+    do: [validation_error(field, :missing_field)]
+
+  defp validate_required_string(field, {:ok, value}) when is_binary(value) do
+    if String.trim(value) == "",
+      do: [validation_error(field, :invalid)],
+      else: []
+  end
+
+  defp validate_required_string(field, {:ok, _value}),
+    do: [validation_error(field, :invalid)]
+
+  defp validate_optional_string(_field, :missing), do: []
+  defp validate_optional_string(_field, {:ok, nil}), do: []
+  defp validate_optional_string(_field, {:ok, value}) when is_binary(value), do: []
+
+  defp validate_optional_string(field, {:ok, _value}),
+    do: [validation_error(field, :invalid)]
+
+  defp fetch_param(attrs, field) do
+    string_field = Atom.to_string(field)
+
+    cond do
+      Map.has_key?(attrs, string_field) -> {:ok, Map.fetch!(attrs, string_field)}
+      Map.has_key?(attrs, field) -> {:ok, Map.fetch!(attrs, field)}
+      true -> :missing
+    end
+  end
+
+  defp active_actor(%User{id: actor_id}) when is_integer(actor_id) do
+    case Repo.get_by(User, id: actor_id, kind: :user, state: :active) do
+      %User{} = actor -> {:ok, actor}
+      nil -> {:error, :forbidden}
+    end
+  end
+
+  defp active_actor(_actor), do: {:error, :forbidden}
+
+  defp active_organization(organization_id) when is_integer(organization_id) do
+    case Repo.get_by(Organization,
+           id: organization_id,
+           kind: :organization,
+           state: :active
+         ) do
+      %Organization{} = organization -> {:ok, organization}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  defp active_organization(_organization_id), do: {:error, :not_found}
+
+  defp authorize_organization_admin(%User{role: :admin}, admin_login) do
+    case Repo.get_by(User, username: admin_login, kind: :user, state: :active) do
+      %User{} = owner -> {:ok, owner}
+      nil -> {:error, {:validation, [validation_error("admin", :invalid)]}}
+    end
+  end
+
+  defp authorize_organization_admin(%User{username: username} = actor, username),
+    do: {:ok, actor}
+
+  defp authorize_organization_admin(%User{}, _admin_login), do: {:error, :forbidden}
+
+  defp authorize_organization_update(%User{role: :admin}, %Organization{}), do: :ok
+
+  defp authorize_organization_update(%User{} = actor, %Organization{} = organization) do
+    if organization_role(actor, organization) == :owner,
+      do: :ok,
+      else: {:error, :forbidden}
+  end
+
+  defp map_create_organization_result({:ok, %{organization: organization}}),
+    do: {:ok, organization}
+
+  defp map_create_organization_result({:error, :organization, %Changeset{} = changeset, _changes}) do
+    {:error,
+     {:validation,
+      changeset_errors(changeset, %{
+        username: "login",
+        email: "login",
+        display_name: "profile_name"
+      })}}
+  end
+
+  defp map_create_organization_result({:error, :owner_membership, %Changeset{}, _changes}) do
+    {:error, {:validation, [validation_error("admin", :invalid)]}}
+  end
+
+  defp map_create_organization_result({:error, :audit, %Changeset{}, _changes}) do
+    {:error, {:validation, [validation_error("base", :unprocessable)]}}
+  end
+
+  defp map_create_organization_result({:error, _step, _reason, _changes}) do
+    {:error, {:validation, [validation_error("base", :unprocessable)]}}
+  end
+
+  defp map_update_organization_result({:ok, %{organization: organization}}),
+    do: {:ok, organization}
+
+  defp map_update_organization_result({:error, :organization, %Changeset{} = changeset, _changes}) do
+    {:error,
+     {:validation,
+      changeset_errors(changeset, %{display_name: "name", description: "description"})}}
+  end
+
+  defp map_update_organization_result({:error, :audit, %Changeset{}, _changes}) do
+    {:error, {:validation, [validation_error("base", :unprocessable)]}}
+  end
+
+  defp map_update_organization_result({:error, _step, _reason, _changes}) do
+    {:error, {:validation, [validation_error("base", :unprocessable)]}}
+  end
+
+  defp changeset_errors(%Changeset{} = changeset, field_names) do
+    changeset.errors
+    |> Enum.map(fn {field, {_message, metadata}} ->
+      code = if Keyword.get(metadata, :constraint) == :unique, do: :already_exists, else: :invalid
+      validation_error(Map.get(field_names, field, Atom.to_string(field)), code)
+    end)
+    |> Enum.uniq()
+  end
+
+  defp validation_error(field, code) do
+    %{resource: "Organization", field: field, code: code}
   end
 
   defp normalize_username(username) do
