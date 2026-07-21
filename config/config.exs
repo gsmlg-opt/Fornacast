@@ -81,6 +81,19 @@ config :fornacast_web, FornacastWeb.Endpoint,
   pubsub_server: Fornacast.PubSub,
   live_view: [signing_salt: "fornacast-development"]
 
+config :fornacast_api, FornacastAPI.Endpoint,
+  url: [host: "localhost"],
+  adapter: Bandit.PhoenixAdapter
+
+config :fornacast_api,
+  anonymous_rate_limit: 60,
+  authenticated_rate_limit: 5_000,
+  rate_window_seconds: 3_600,
+  trusted_proxy_cidrs: [],
+  request_target_max_bytes: 8_192,
+  ordinary_json_max_bytes: 1_048_576,
+  ordinary_body_total_timeout_ms: 15_000
+
 config :logger, :console,
   format: "$time $metadata[$level] $message\n",
   metadata: [:request_id, :repo, :user_id]

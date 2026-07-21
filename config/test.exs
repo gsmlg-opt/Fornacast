@@ -44,4 +44,13 @@ config :fornacast_web, FornacastWeb.Endpoint,
     "fornacast-test-secret-key-base-for-test-use-only-and-long-enough-for-cookie-signing",
   server: false
 
+config :fornacast_api, FornacastAPI.Endpoint,
+  http: [ip: {127, 0, 0, 1}, port: 4001],
+  server: false
+
+config :fornacast_api,
+  trusted_proxy_cidrs: [],
+  anonymous_rate_limit: 60,
+  authenticated_rate_limit: 5_000
+
 config :logger, level: :warning

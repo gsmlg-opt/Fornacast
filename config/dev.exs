@@ -17,4 +17,11 @@ config :fornacast_web, FornacastWeb.Endpoint,
     duskmoon_bundler: {Mix.Tasks.DuskmoonBundler.Dev, :run, [~w(fornacast_web --tailwind)]}
   ]
 
+config :fornacast_api, FornacastAPI.Endpoint,
+  http: [
+    ip: {127, 0, 0, 1},
+    port: String.to_integer(System.get_env("FORNACAST_API_PORT", "4001"))
+  ],
+  server: true
+
 config :phoenix, :stacktrace_depth, 20

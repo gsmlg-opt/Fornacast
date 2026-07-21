@@ -27,7 +27,8 @@ defmodule FornacastUmbrella.MixProject do
           forge_repos: :permanent,
           git_core: :permanent,
           git_transport: :permanent,
-          fornacast_web: :permanent
+          fornacast_web: :permanent,
+          fornacast_api: :permanent
         ]
       ]
     ]

@@ -51,6 +51,23 @@ if config_env() == :prod do
   secret_key_base =
     fetch_runtime_env!.("SECRET_KEY_BASE", String.duplicate("0", 64))
 
+  api_bind = System.get_env("FORNACAST_API_BIND_IP", "127.0.0.1")
+
+  api_ip =
+    case :inet.parse_address(String.to_charlist(api_bind)) do
+      {:ok, address} -> address
+      {:error, reason} -> raise "invalid FORNACAST_API_BIND_IP: #{inspect(reason)}"
+    end
+
+  api_port =
+    fetch_runtime_env!.("FORNACAST_API_PORT", "4001")
+    |> String.to_integer()
+
+  trusted_proxy_cidrs =
+    System.get_env("FORNACAST_API_TRUSTED_PROXIES", "")
+    |> String.split(",", trim: true)
+    |> Enum.map(&String.trim/1)
+
   config :fornacast, :database_adapter, database_adapter
 
   config :fornacast,
@@ -96,5 +113,11 @@ if config_env() == :prod do
 
   config :fornacast_web, FornacastWeb.Endpoint,
     http: [ip: {0, 0, 0, 0}, port: String.to_integer(System.get_env("PORT") || "4890")],
+    secret_key_base: secret_key_base
+
+  config :fornacast_api, :trusted_proxy_cidrs, trusted_proxy_cidrs
+
+  config :fornacast_api, FornacastAPI.Endpoint,
+    http: [ip: api_ip, port: api_port],
     secret_key_base: secret_key_base
 end
