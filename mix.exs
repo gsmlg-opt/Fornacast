@@ -37,6 +37,7 @@ defmodule FornacastUmbrella.MixProject do
   defp aliases do
     [
       setup: ["deps.get", "ecto.setup"],
+      "fornacast.run": ["phx.server"],
       "ecto.setup": ["ecto.create", "ecto.migrate"],
       "ecto.reset": ["ecto.drop", "ecto.setup"],
       "assets.build": ["duskmoon_bundler.build fornacast_web --tailwind"],
