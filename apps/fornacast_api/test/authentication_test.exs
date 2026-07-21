@@ -42,7 +42,13 @@ defmodule FornacastAPI.AuthenticationTest do
         |> put_req_header("authorization", "#{scheme} #{secret}")
         |> get("/api/v3/user")
 
-      assert json_response(conn, 200) == %{"login" => "alice"}
+      assert %{
+               "login" => "alice",
+               "email" => "alice-api-auth@example.com",
+               "type" => "User",
+               "private_gists" => 0
+             } = json_response(conn, 200)
+
       assert get_resp_header(conn, "x-oauth-scopes") == ["repo, write:org"]
     end
 
@@ -70,7 +76,12 @@ defmodule FornacastAPI.AuthenticationTest do
       |> put_req_header("authorization", "Bearer #{secret}")
       |> get("/api/v3/user")
 
-    assert json_response(conn, 200) == %{"login" => "alice"}
+    assert %{
+             "login" => "alice",
+             "email" => "alice-api-auth@example.com",
+             "type" => "User",
+             "private_gists" => 0
+           } = json_response(conn, 200)
 
     for event <- events do
       {measurements, %{conn: %Plug.Conn{} = telemetry_conn, options: []} = metadata} =
@@ -116,7 +127,9 @@ defmodule FornacastAPI.AuthenticationTest do
 
   test "leaves optional authentication empty when credentials are absent" do
     public = api_conn() |> get("/api/v3/users/alice")
-    assert json_response(public, 404)["message"] == "Not Found"
+
+    assert %{"login" => "alice", "email" => nil, "type" => "User", "public_repos" => 0} =
+             json_response(public, 200)
 
     versions = api_conn() |> get("/api/v3/versions")
     assert json_response(versions, 200) == ["2022-11-28", "2026-03-10"]
