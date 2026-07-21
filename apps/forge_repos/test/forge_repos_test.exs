@@ -1185,6 +1185,48 @@ defmodule ForgeReposTest do
   end
 
   @tag :tmp_dir
+  test "API update rejects a stale expected visibility without changing or auditing the repository",
+       %{tmp_dir: tmp_dir} do
+    use_storage_root(tmp_dir)
+    owner = user_fixture("visibility-guard-owner")
+
+    assert {:ok, repository} =
+             ForgeRepos.create_api_repository(
+               owner,
+               owner,
+               %{"name" => "visibility-guard", "visibility" => "public"},
+               %{}
+             )
+
+    {1, nil} =
+      Repository
+      |> where(id: ^repository.id)
+      |> Repo.update_all(set: [visibility: :private])
+
+    update_audits_before =
+      Repo.aggregate(from(e in AuditEvent, where: e.action == "repository.updated"), :count, :id)
+
+    assert {:error, {:conflict, :repository_changed}} =
+             ForgeRepos.update_api_repository(
+               owner,
+               repository,
+               %{"has_issues" => false},
+               %{},
+               expected_visibility: :public
+             )
+
+    persisted = Repo.get!(Repository, repository.id)
+    assert persisted.visibility == :private
+    assert persisted.has_issues
+
+    assert Repo.aggregate(
+             from(e in AuditEvent, where: e.action == "repository.updated"),
+             :count,
+             :id
+           ) == update_audits_before
+  end
+
+  @tag :tmp_dir
   test "API update validates only a changed default branch through the canonical selector",
        %{tmp_dir: tmp_dir} do
     use_storage_root(tmp_dir)

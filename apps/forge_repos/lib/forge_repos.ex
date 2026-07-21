@@ -33,6 +33,7 @@ defmodule ForgeRepos do
           :not_found
           | :forbidden
           | :git_initializer_unavailable
+          | {:conflict, :repository_changed}
           | {:validation, [validation_error()]}
           | {:unavailable, atom()}
 
@@ -171,20 +172,32 @@ defmodule ForgeRepos do
 
   @spec update_api_repository(User.t(), Repository.t(), map(), map()) ::
           {:ok, Repository.t()} | {:error, api_error()}
+  def update_api_repository(actor, repository, attrs, request_metadata) do
+    update_api_repository(actor, repository, attrs, request_metadata, [])
+  end
+
+  @spec update_api_repository(User.t(), Repository.t(), map(), map(), keyword()) ::
+          {:ok, Repository.t()} | {:error, api_error()}
   def update_api_repository(
         %User{} = actor,
         %Repository{id: repository_id},
         attrs,
-        request_metadata
+        request_metadata,
+        opts
       )
-      when is_integer(repository_id) and is_map(attrs) and is_map(request_metadata) do
+      when is_integer(repository_id) and is_map(attrs) and is_map(request_metadata) and
+             is_list(opts) do
     required_permission = update_permission(attrs)
 
     with {:ok, actor} <- active_actor(actor),
          {:ok, _repository} <-
            authorize_repository_update(Repo, actor, repository_id, required_permission),
+         {:ok, expected_visibility} <- expected_visibility_option(opts),
          {:ok, params} <- normalize_api_update(attrs) do
       Multi.new()
+      |> Multi.run(:visibility_guard, fn repo, _changes ->
+        guard_repository_visibility(repo, repository_id, expected_visibility)
+      end)
       |> Multi.run(:authorization, fn repo, _changes ->
         authorize_repository_update(repo, actor, repository_id, required_permission)
       end)
@@ -212,7 +225,7 @@ defmodule ForgeRepos do
     end
   end
 
-  def update_api_repository(_actor, _repository, _attrs, _request_metadata),
+  def update_api_repository(_actor, _repository, _attrs, _request_metadata, _opts),
     do: {:error, :forbidden}
 
   def list_owner_repositories(%{id: owner_user_id}) do
@@ -1183,6 +1196,32 @@ defmodule ForgeRepos do
     end
   end
 
+  defp expected_visibility_option(opts) do
+    case Keyword.get(opts, :expected_visibility) do
+      nil -> {:ok, nil}
+      visibility when visibility in [:public, :private] -> {:ok, visibility}
+      _invalid -> {:error, {:conflict, :repository_changed}}
+    end
+  end
+
+  defp guard_repository_visibility(_repo, _repository_id, nil), do: {:ok, :unchecked}
+
+  defp guard_repository_visibility(repo, repository_id, expected_visibility)
+       when expected_visibility in [:public, :private] do
+    guarded_query =
+      Repository
+      |> where(
+        [repository],
+        repository.id == ^repository_id and is_nil(repository.deleted_at) and
+          repository.visibility == ^expected_visibility
+      )
+
+    case repo.update_all(guarded_query, set: [visibility: expected_visibility]) do
+      {1, _result} -> {:ok, expected_visibility}
+      {0, _result} -> {:error, {:conflict, :repository_changed}}
+    end
+  end
+
   defp active_repository_for_update(repo, repository_id) do
     Repository
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
@@ -1480,6 +1519,9 @@ defmodule ForgeRepos do
   end
 
   defp map_update_api_result({:ok, %{repository: repository}}), do: {:ok, repository}
+
+  defp map_update_api_result({:error, :visibility_guard, reason, _changes}),
+    do: {:error, reason}
 
   defp map_update_api_result({:error, :authorization, reason, _changes}),
     do: {:error, reason}

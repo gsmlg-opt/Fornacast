@@ -159,9 +159,9 @@ defmodule FornacastAPI.RepositoryController do
              actor,
              owner,
              repository_slug,
-             :repository_write
+             :repository_read
            ) do
-      update_authorized(conn, actor, api_key, repository)
+      update_visible(conn, actor, api_key, repository, owner, repository_slug)
     else
       {:error, reason} ->
         render_error(conn, reason, @update_documentation_url, @public_mutation_scopes)
@@ -297,7 +297,26 @@ defmodule FornacastAPI.RepositoryController do
     end
   end
 
-  defp update_authorized(conn, actor, api_key, repository) do
+  defp update_visible(conn, actor, api_key, repository, owner, repository_slug) do
+    accepted_scopes = mutation_scopes(repository.visibility)
+
+    case refetch_same_repository(actor, owner, repository_slug, repository.id) do
+      {:ok, writable_repository} ->
+        update_authorized(
+          conn,
+          actor,
+          api_key,
+          writable_repository,
+          owner,
+          repository_slug
+        )
+
+      {:error, reason} ->
+        render_error(conn, reason, @update_documentation_url, accepted_scopes)
+    end
+  end
+
+  defp update_authorized(conn, actor, api_key, repository, owner, repository_slug) do
     stored_scopes = mutation_scopes(repository.visibility)
 
     case ForgeAccounts.APIScope.authorize(
@@ -306,28 +325,100 @@ defmodule FornacastAPI.RepositoryController do
            repository.visibility
          ) do
       :ok ->
-        read_update_body(conn, actor, api_key, repository, stored_scopes)
+        read_update_body(
+          conn,
+          actor,
+          api_key,
+          repository,
+          owner,
+          repository_slug,
+          stored_scopes
+        )
 
       {:error, reason} ->
         render_error(conn, reason, @update_documentation_url, stored_scopes)
     end
   end
 
-  defp read_update_body(conn, actor, api_key, repository, stored_scopes) do
+  defp read_update_body(
+         conn,
+         actor,
+         api_key,
+         repository,
+         owner,
+         repository_slug,
+         stored_scopes
+       ) do
     case RequestBody.read_json(conn, :ordinary, []) do
       {:ok, body, conn} ->
-        update_from_body(conn, actor, api_key, repository, body)
+        update_from_body(conn, actor, api_key, repository, owner, repository_slug, body)
 
       {:error, %Error{} = error, _reason, conn} ->
         render_error(conn, error, stored_scopes)
     end
   end
 
-  defp update_from_body(conn, actor, api_key, repository, body) do
-    with {:ok, attrs} <-
-           RequestValidator.validate(conn.assigns.api_version, :update_repository, body),
-         resulting_visibility <- update_visibility(repository.visibility, attrs),
-         accepted_scopes <- transition_scopes(repository.visibility, resulting_visibility),
+  defp update_from_body(conn, actor, api_key, repository, owner, repository_slug, body) do
+    case RequestValidator.validate(conn.assigns.api_version, :update_repository, body) do
+      {:ok, attrs} ->
+        refetch_after_body(
+          conn,
+          actor,
+          api_key,
+          repository,
+          owner,
+          repository_slug,
+          attrs
+        )
+
+      {:error, reason} ->
+        render_error(
+          conn,
+          reason,
+          @update_documentation_url,
+          update_error_scopes(repository.visibility, body)
+        )
+    end
+  end
+
+  defp refetch_after_body(
+         conn,
+         actor,
+         api_key,
+         original_repository,
+         owner,
+         repository_slug,
+         attrs
+       ) do
+    case refetch_same_repository(
+           actor,
+           owner,
+           repository_slug,
+           original_repository.id
+         ) do
+      {:ok, repository} ->
+        authorize_refetched_update(conn, actor, api_key, repository, attrs)
+
+      {:error, reason} ->
+        render_error(
+          conn,
+          reason,
+          @update_documentation_url,
+          update_error_scopes(original_repository.visibility, attrs)
+        )
+    end
+  end
+
+  defp authorize_refetched_update(conn, actor, api_key, repository, attrs) do
+    resulting_visibility = update_visibility(repository.visibility, attrs)
+    accepted_scopes = transition_scopes(repository.visibility, resulting_visibility)
+
+    with :ok <-
+           ForgeAccounts.APIScope.authorize(
+             api_key,
+             :repository_mutation,
+             repository.visibility
+           ),
          :ok <-
            ForgeAccounts.APIScope.authorize(
              api_key,
@@ -339,7 +430,8 @@ defmodule FornacastAPI.RepositoryController do
              actor,
              repository,
              attrs,
-             RequestContext.metadata(conn)
+             RequestContext.metadata(conn),
+             expected_visibility: repository.visibility
            ) do
       render_repository(
         conn,
@@ -350,23 +442,21 @@ defmodule FornacastAPI.RepositoryController do
         @update_documentation_url
       )
     else
-      {:error, :insufficient_scope} ->
-        resulting_visibility = update_visibility(repository.visibility, body)
-
-        render_error(
-          conn,
-          :insufficient_scope,
-          @update_documentation_url,
-          transition_scopes(repository.visibility, resulting_visibility)
-        )
-
       {:error, reason} ->
-        render_error(
-          conn,
-          reason,
-          @update_documentation_url,
-          update_error_scopes(repository.visibility, body)
-        )
+        render_error(conn, reason, @update_documentation_url, accepted_scopes)
+    end
+  end
+
+  defp refetch_same_repository(actor, owner, repository_slug, expected_id) do
+    case ForgeRepos.fetch_authorized_repository(
+           actor,
+           owner,
+           repository_slug,
+           :repository_write
+         ) do
+      {:ok, %Repository{id: ^expected_id} = repository} -> {:ok, repository}
+      {:ok, %Repository{}} -> {:error, {:conflict, :repository_changed}}
+      {:error, reason} -> {:error, reason}
     end
   end
 

@@ -1,6 +1,73 @@
 defmodule FornacastAPI.RepositoriesTest do
   use FornacastAPI.ConnCase, async: false
 
+  defmodule PausingBodyAdapter do
+    @behaviour Plug.Conn.Adapter
+
+    def read_req_body(%{delegate: delegate, test_pid: test_pid, ref: ref} = state, opts) do
+      send(test_pid, {ref, :body_read, self()})
+
+      receive do
+        {^ref, :continue_body} ->
+          delegate
+          |> Plug.Adapters.Test.Conn.read_req_body(opts)
+          |> wrap_state(state)
+      end
+    end
+
+    def send_resp(%{delegate: delegate} = state, status, headers, body) do
+      delegate
+      |> Plug.Adapters.Test.Conn.send_resp(status, headers, body)
+      |> wrap_state(state)
+    end
+
+    def send_file(%{delegate: delegate} = state, status, headers, path, offset, length) do
+      delegate
+      |> Plug.Adapters.Test.Conn.send_file(status, headers, path, offset, length)
+      |> wrap_state(state)
+    end
+
+    def send_chunked(%{delegate: delegate} = state, status, headers) do
+      delegate
+      |> Plug.Adapters.Test.Conn.send_chunked(status, headers)
+      |> wrap_state(state)
+    end
+
+    def chunk(%{delegate: delegate} = state, body) do
+      delegate
+      |> Plug.Adapters.Test.Conn.chunk(body)
+      |> wrap_state(state)
+    end
+
+    def inform(%{delegate: delegate}, status, headers),
+      do: Plug.Adapters.Test.Conn.inform(delegate, status, headers)
+
+    def upgrade(%{delegate: delegate} = state, protocol, opts) do
+      case Plug.Adapters.Test.Conn.upgrade(delegate, protocol, opts) do
+        {:ok, updated_delegate} -> {:ok, %{state | delegate: updated_delegate}}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    def push(%{delegate: delegate}, path, headers),
+      do: Plug.Adapters.Test.Conn.push(delegate, path, headers)
+
+    def get_peer_data(%{delegate: delegate}),
+      do: Plug.Adapters.Test.Conn.get_peer_data(delegate)
+
+    def get_sock_data(%{delegate: delegate}),
+      do: Plug.Adapters.Test.Conn.get_sock_data(delegate)
+
+    def get_ssl_data(%{delegate: delegate}),
+      do: Plug.Adapters.Test.Conn.get_ssl_data(delegate)
+
+    def get_http_protocol(%{delegate: delegate}),
+      do: Plug.Adapters.Test.Conn.get_http_protocol(delegate)
+
+    defp wrap_state({status, body, updated_delegate}, state) when status in [:ok, :more],
+      do: {status, body, %{state | delegate: updated_delegate}}
+  end
+
   import Ecto.Query
 
   alias ForgeAccounts.OrganizationMember
@@ -685,8 +752,10 @@ defmodule FornacastAPI.RepositoriesTest do
     public = repository(alice, "public", visibility: :public)
     _private = repository(alice, "private", visibility: :private)
     _hidden_private = repository(alice, "hidden-private", visibility: :private)
+    readable_private = repository(alice, "readable-private", visibility: :private)
     collaborator(public, writer, :write)
     collaborator(public, reader, :read)
+    collaborator(readable_private, reader, :read)
     {_writer_key, writer_secret} = pat(writer, ["public_repo"])
     {_reader_key, reader_secret} = pat(reader, ["public_repo"])
     {_owner_public_key, owner_public_secret} = pat(alice, ["public_repo"])
@@ -702,6 +771,14 @@ defmodule FornacastAPI.RepositoriesTest do
       api_conn(secret: reader_secret) |> patch_raw("/api/v3/repos/alice/public", "{")
 
     assert_error(reader_malformed, 403, "Forbidden", @update_url, "public_repo")
+
+    {_reader_private_key, reader_private_secret} = pat(reader, ["repo"])
+
+    private_reader_malformed =
+      api_conn(secret: reader_private_secret)
+      |> patch_raw("/api/v3/repos/alice/readable-private", "{")
+
+    assert_error(private_reader_malformed, 403, "Forbidden", @update_url, "repo")
 
     resulting_private =
       api_conn(secret: owner_public_secret)
@@ -738,6 +815,55 @@ defmodule FornacastAPI.RepositoriesTest do
       @update_url,
       "public_repo"
     )
+  end
+
+  test "a visibility change while a PATCH body is in flight is rechecked before mutation", %{
+    alice: alice
+  } do
+    repository = repository(alice, "racing", visibility: :public)
+    {_key, secret} = pat(alice, ["public_repo"])
+    ref = make_ref()
+
+    conn =
+      api_conn(secret: secret)
+      |> put_req_header("content-type", @json_media_type)
+      |> pausing_patch_conn(
+        "/api/v3/repos/alice/racing",
+        JSON.encode!(%{"has_issues" => false}),
+        ref
+      )
+
+    task =
+      Task.async(fn ->
+        receive do
+          {^ref, :start} -> FornacastAPI.Endpoint.call(conn, FornacastAPI.Endpoint.init([]))
+        end
+      end)
+
+    allow_database_access(task.pid)
+    send(task.pid, {ref, :start})
+    assert_receive {^ref, :body_read, request_pid}, 2_000
+
+    {1, nil} =
+      Repository
+      |> where(id: ^repository.id)
+      |> Repo.update_all(set: [visibility: :private])
+
+    send(request_pid, {ref, :continue_body})
+    response = Task.await(task, 5_000)
+
+    assert_error(
+      response,
+      403,
+      "Resource not accessible by personal access token",
+      @update_url,
+      "repo"
+    )
+
+    persisted = Repo.get!(Repository, repository.id)
+    assert persisted.visibility == :private
+    assert persisted.has_issues
+    refute Repo.exists?(from event in AuditEvent, where: event.action == "repository.updated")
   end
 
   test "update validates bodies, visibility conflicts, unsupported fields, and existing default branches",
@@ -818,6 +944,24 @@ defmodule FornacastAPI.RepositoriesTest do
     |> put_optional_header("x-github-api-version", opts[:version])
     |> put_optional_header("x-request-id", opts[:request_id])
     |> put_optional_authorization(opts[:secret])
+  end
+
+  defp pausing_patch_conn(conn, path, body, ref) do
+    conn = Plug.Adapters.Test.Conn.conn(conn, :patch, path, body)
+    {Plug.Adapters.Test.Conn, delegate} = conn.adapter
+
+    %{
+      conn
+      | adapter: {PausingBodyAdapter, %{delegate: delegate, test_pid: self(), ref: ref}}
+    }
+  end
+
+  defp allow_database_access(request_pid) do
+    if Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"] do
+      Ecto.Adapters.SQL.Sandbox.allow(Repo, self(), request_pid)
+    else
+      :ok
+    end
   end
 
   defp post_json(conn, path, body), do: post_raw(conn, path, JSON.encode!(body))
