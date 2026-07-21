@@ -131,6 +131,18 @@ defmodule FornacastAPI.UsersOrganizationsTest do
     assert get_resp_header(invalid, "x-accepted-oauth-scopes") == ["read:org"]
   end
 
+  test "GET /user/orgs accepts an arbitrary positive page beyond the final page", %{alice: alice} do
+    organization(alice, "only-org")
+    {_key, secret} = pat(alice, ["read:org"])
+
+    conn =
+      api_conn(secret: secret)
+      |> get("/api/v3/user/orgs?page=9223372036854775807&per_page=100")
+
+    assert json_response(conn, 200) == []
+    assert get_resp_header(conn, "x-accepted-oauth-scopes") == ["read:org"]
+  end
+
   test "GET /orgs/:org is anonymous, typed, active, and versioned", %{alice: alice} do
     org = organization(alice, "acme", display_name: "ACME", description: "Tools")
     user("person-only")

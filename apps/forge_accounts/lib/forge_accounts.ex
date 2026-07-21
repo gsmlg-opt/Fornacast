@@ -268,13 +268,18 @@ defmodule ForgeAccounts do
       )
 
     total = Repo.aggregate(query, :count, :id)
+    offset = (page - 1) * per_page
 
     entries =
-      query
-      |> order_by([organization], asc: organization.username, asc: organization.id)
-      |> offset(^((page - 1) * per_page))
-      |> limit(^per_page)
-      |> Repo.all()
+      if offset >= total do
+        []
+      else
+        query
+        |> order_by([organization], asc: organization.username, asc: organization.id)
+        |> offset(^offset)
+        |> limit(^per_page)
+        |> Repo.all()
+      end
 
     {:ok, %Page{entries: entries, total: total, page: page, per_page: per_page}}
   end
