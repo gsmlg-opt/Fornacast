@@ -662,7 +662,7 @@ defmodule ForgeAccounts do
     do: [validation_error(field, :missing_field)]
 
   defp validate_required_string(field, {:ok, value}) when is_binary(value) do
-    if String.trim(value) == "",
+    if String.trim(value) == "" or contains_nul?(value),
       do: [validation_error(field, :invalid)],
       else: []
   end
@@ -672,7 +672,10 @@ defmodule ForgeAccounts do
 
   defp validate_optional_string(_field, :missing), do: []
   defp validate_optional_string(_field, {:ok, nil}), do: []
-  defp validate_optional_string(_field, {:ok, value}) when is_binary(value), do: []
+
+  defp validate_optional_string(field, {:ok, value}) when is_binary(value) do
+    if contains_nul?(value), do: [validation_error(field, :invalid)], else: []
+  end
 
   defp validate_optional_string(field, {:ok, _value}),
     do: [validation_error(field, :invalid)]
@@ -783,6 +786,8 @@ defmodule ForgeAccounts do
   defp validation_error(field, code) do
     %{resource: "Organization", field: field, code: code}
   end
+
+  defp contains_nul?(value), do: :binary.match(value, <<0>>) != :nomatch
 
   defp normalize_username(username) do
     username

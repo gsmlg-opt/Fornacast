@@ -31,6 +31,7 @@ defmodule ForgeAccounts.Organization do
     |> validate_format(:username, ~r/^[a-z0-9][a-z0-9_-]{1,38}[a-z0-9]$/)
     |> validate_length(:display_name, min: 1, max: 120)
     |> validate_length(:description, max: 500)
+    |> validate_no_nul([:display_name, :description])
     |> validate_inclusion(:kind, @kinds)
     |> validate_inclusion(:state, @states)
     |> unique_constraint(:username, name: ~r/^users_username(?: \(\d+\))?_index$/)
@@ -38,7 +39,7 @@ defmodule ForgeAccounts.Organization do
   end
 
   def profile_changeset(organization, attrs) do
-    attrs = map_profile_name(attrs)
+    attrs = normalize_profile_attrs(attrs)
 
     organization
     |> cast(attrs, [:display_name, :description], empty_values: [])
@@ -46,20 +47,48 @@ defmodule ForgeAccounts.Organization do
     |> trim_optional_string(:description)
     |> validate_length(:display_name, min: 1, max: 120)
     |> validate_length(:description, max: 500)
+    |> validate_no_nul([:display_name, :description])
   end
 
-  defp map_profile_name(attrs) do
+  defp normalize_profile_attrs(attrs) do
+    display_name =
+      case fetch_profile_attr(attrs, :name) do
+        :missing -> fetch_profile_attr(attrs, :display_name)
+        value -> value
+      end
+
+    %{}
+    |> put_profile_attr(:display_name, display_name)
+    |> put_profile_attr(:description, fetch_profile_attr(attrs, :description))
+  end
+
+  defp fetch_profile_attr(attrs, field) do
+    string_field = Atom.to_string(field)
+
     cond do
-      Map.has_key?(attrs, "name") -> Map.put(attrs, "display_name", Map.fetch!(attrs, "name"))
-      Map.has_key?(attrs, :name) -> Map.put(attrs, :display_name, Map.fetch!(attrs, :name))
-      true -> attrs
+      Map.has_key?(attrs, string_field) -> {:ok, Map.fetch!(attrs, string_field)}
+      Map.has_key?(attrs, field) -> {:ok, Map.fetch!(attrs, field)}
+      true -> :missing
     end
   end
+
+  defp put_profile_attr(attrs, _field, :missing), do: attrs
+  defp put_profile_attr(attrs, field, {:ok, value}), do: Map.put(attrs, field, value)
 
   defp trim_optional_string(changeset, field) do
     update_change(changeset, field, fn
       nil -> nil
       value -> String.trim(value)
+    end)
+  end
+
+  defp validate_no_nul(changeset, fields) do
+    Enum.reduce(fields, changeset, fn field, changeset ->
+      validate_change(changeset, field, fn ^field, value ->
+        if is_binary(value) and :binary.match(value, <<0>>) != :nomatch,
+          do: [{field, "must not contain NUL bytes"}],
+          else: []
+      end)
     end)
   end
 

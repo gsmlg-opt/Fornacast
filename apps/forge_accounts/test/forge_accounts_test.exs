@@ -236,6 +236,43 @@ defmodule ForgeAccountsTest do
 
     refute long_description.valid?
     assert Keyword.has_key?(long_description.errors, :description)
+
+    nul_creation =
+      Organization.changeset(%Organization{}, %{
+        "username" => "safe-org",
+        "display_name" => "bad\0name",
+        "description" => "bad\0description"
+      })
+
+    refute nul_creation.valid?
+    assert Keyword.has_key?(nul_creation.errors, :display_name)
+    assert Keyword.has_key?(nul_creation.errors, :description)
+
+    nul_profile =
+      Organization.profile_changeset(organization, %{
+        "name" => "bad\0name",
+        "description" => "bad\0description"
+      })
+
+    refute nul_profile.valid?
+    assert Keyword.has_key?(nul_profile.errors, :display_name)
+    assert Keyword.has_key?(nul_profile.errors, :description)
+  end
+
+  test "organization profile changeset normalizes mixed keys with string-key precedence" do
+    organization = %Organization{display_name: nil, description: nil, username: "acme"}
+
+    changeset =
+      Organization.profile_changeset(organization, %{
+        "name" => "String name",
+        :name => "Atom name",
+        "description" => "String description",
+        :description => "Atom description"
+      })
+
+    assert changeset.valid?
+    assert Ecto.Changeset.get_change(changeset, :display_name) == "String name"
+    assert Ecto.Changeset.get_change(changeset, :description) == "String description"
   end
 
   test "ordinary users create self-owned organizations with an audit event" do
@@ -350,6 +387,40 @@ defmodule ForgeAccountsTest do
              %{resource: "Organization", field: "profile_name", code: :invalid}
            ]
 
+    assert Repo.aggregate(AuditEvent, :count, :id) == 0
+  end
+
+  test "organization creation rejects NUL bytes before lookup or insertion" do
+    actor = user!("alice")
+
+    assert {:error, {:validation, [%{resource: "Organization", field: "admin", code: :invalid}]}} =
+             ForgeAccounts.create_api_organization(
+               actor,
+               %{"login" => "admin-nul", "admin" => "alice\0other"},
+               %{}
+             )
+
+    assert {:error,
+            {:validation, [%{resource: "Organization", field: "profile_name", code: :invalid}]}} =
+             ForgeAccounts.create_api_organization(
+               actor,
+               %{
+                 "login" => "profile-nul",
+                 "admin" => "alice",
+                 "profile_name" => "bad\0profile"
+               },
+               %{}
+             )
+
+    assert {:error, {:validation, [%{resource: "Organization", field: "login", code: :invalid}]}} =
+             ForgeAccounts.create_api_organization(
+               actor,
+               %{"login" => "bad\0login", "admin" => "alice"},
+               %{}
+             )
+
+    refute ForgeAccounts.get_account_by_username("admin-nul")
+    refute ForgeAccounts.get_account_by_username("profile-nul")
     assert Repo.aggregate(AuditEvent, :count, :id) == 0
   end
 
@@ -468,6 +539,44 @@ defmodule ForgeAccountsTest do
              )
 
     assert Repo.get!(Organization, organization.id).display_name == "acme"
+  end
+
+  test "organization updates reject NUL bytes" do
+    owner = user!("alice")
+    organization = api_organization!(owner, "acme")
+
+    assert {:error, {:validation, [%{resource: "Organization", field: "name", code: :invalid}]}} =
+             ForgeAccounts.update_organization(
+               owner,
+               organization,
+               %{"name" => "bad\0name"},
+               %{}
+             )
+
+    assert {:error,
+            {:validation, [%{resource: "Organization", field: "description", code: :invalid}]}} =
+             ForgeAccounts.update_organization(
+               owner,
+               organization,
+               %{"description" => "bad\0description"},
+               %{}
+             )
+  end
+
+  test "organization updates accept mixed key families" do
+    owner = user!("alice")
+    organization = api_organization!(owner, "acme")
+
+    assert {:ok, updated} =
+             ForgeAccounts.update_organization(
+               owner,
+               organization,
+               %{"name" => "ACME", description: "tools"},
+               %{}
+             )
+
+    assert updated.display_name == "ACME"
+    assert updated.description == "tools"
   end
 
   test "public getters normalize login and return only active correctly typed accounts" do
