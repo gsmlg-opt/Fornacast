@@ -23,11 +23,7 @@ defmodule FornacastWeb.GitHTTPPushTest do
     share_database!()
     {user, repository} = create_user_and_repository("alice")
 
-    assert {:ok, _api_key, secret} =
-             ForgeAccounts.create_api_key(user, %{
-               "name" => "git push",
-               "scopes" => ["repo:write"]
-             })
+    {_api_key, secret} = insert_legacy_api_key!(user, "repo:write", "git push")
 
     work_path = Path.join(tmp_dir, "work")
     git!(["init", work_path])
@@ -75,65 +71,44 @@ defmodule FornacastWeb.GitHTTPPushTest do
   test "receive-pack advertisement requires a valid repo:write API key" do
     {alice, _repository} = create_user_and_repository("alice")
 
-    assert {:ok, _key, read_secret} =
-             ForgeAccounts.create_api_key(alice, %{"name" => "read", "scopes" => ["repo:read"]})
+    {_key, read_secret} = insert_legacy_api_key!(alice, "repo:read", "read")
 
-    assert {:ok, revoked_key, revoked_secret} =
-             ForgeAccounts.create_api_key(alice, %{
-               "name" => "revoked",
-               "scopes" => ["repo:write"]
-             })
+    {revoked_key, revoked_secret} = insert_legacy_api_key!(alice, "repo:write", "revoked")
 
     assert {:ok, _key} = ForgeAccounts.revoke_api_key(alice, revoked_key.id)
 
     credentials = [
-      {"missing", nil},
-      {"read only", {"alice", read_secret}},
-      {"revoked", {"alice", revoked_secret}}
+      {"missing", nil, 401, "Authentication required.\n"},
+      {"read only", {"alice", read_secret}, 403, "Insufficient API key scope.\n"},
+      {"revoked", {"alice", revoked_secret}, 401, "Authentication required.\n"}
     ]
 
-    for {name, credentials} <- credentials do
+    for {name, credentials, expected_status, expected_body} <- credentials do
       conn = maybe_authorize(build_conn(), credentials)
       response = get(conn, "/alice/demo.git/info/refs?service=git-receive-pack")
-      assert response(response, 401) == "Authentication required.\n", name
-      assert Plug.Conn.get_resp_header(response, "www-authenticate") == [@challenge], name
+      assert response(response, expected_status) == expected_body, name
+
+      expected_challenge = if expected_status == 401, do: [@challenge], else: []
+      assert Plug.Conn.get_resp_header(response, "www-authenticate") == expected_challenge, name
     end
   end
 
-  @tag :tmp_dir
-  test "an account password pushes over smart HTTP", %{tmp_dir: tmp_dir} do
-    with_storage_root(tmp_dir)
-    share_database!()
-    {_user, repository} = create_user_and_repository("alice")
+  test "receive-pack rejects account passwords with a Basic challenge" do
+    create_user_and_repository("alice")
 
-    work_path = Path.join(tmp_dir, "password-work")
-    git!(["init", work_path])
-    File.write!(Path.join(work_path, "README.md"), "# Password push\n")
-    git!(["-C", work_path, "add", "README.md"])
-    git!(["-C", work_path, "commit", "-m", "Password push"])
-    git!(["-C", work_path, "branch", "-M", "main"])
+    response =
+      build_conn()
+      |> maybe_authorize({"alice", "correct horse battery staple"})
+      |> get("/alice/demo.git/info/refs?service=git-receive-pack")
 
-    port = start_http_server()
-    remote_url = "http://127.0.0.1:#{port}/alice/demo.git"
-    git!(["-C", work_path, "remote", "add", "origin", remote_url])
-    askpass_path = write_askpass!(tmp_dir)
-
-    git!(["-C", work_path, "push", "-u", "origin", "main"], [
-      {"GIT_ASKPASS", askpass_path},
-      {"GIT_ASKPASS_REQUIRE", "force"},
-      {"FORNACAST_GIT_USERNAME", "alice"},
-      {"FORNACAST_GIT_API_KEY", "correct horse battery staple"}
-    ])
-
-    assert {:ok, [%GitCore.Ref{name: "refs/heads/main"}]} =
-             repository |> ForgeRepos.absolute_storage_path() |> GitCore.branches()
+    assert response(response, 401) == "Authentication required.\n"
+    assert Plug.Conn.get_resp_header(response, "www-authenticate") == [@challenge]
   end
 
   test "receive-pack POST requires authentication and returns the smart HTTP result type" do
     {user, _repository} = create_user_and_repository("alice")
 
-    assert {:ok, _key, secret} =
-             ForgeAccounts.create_api_key(user, %{"name" => "write", "scopes" => ["repo:write"]})
+    {_key, secret} = insert_legacy_api_key!(user, "repo:write", "write")
 
     unauthenticated =
       build_conn()
@@ -165,8 +140,7 @@ defmodule FornacastWeb.GitHTTPPushTest do
     create_user_and_repository("alice")
     {bob, _repository} = create_user_and_repository("bob", "other")
 
-    assert {:ok, _key, secret} =
-             ForgeAccounts.create_api_key(bob, %{"name" => "write", "scopes" => ["repo:write"]})
+    {_key, secret} = insert_legacy_api_key!(bob, "repo:write", "write")
 
     for path <- [
           "/alice/demo.git/info/refs?service=git-receive-pack",
@@ -190,8 +164,7 @@ defmodule FornacastWeb.GitHTTPPushTest do
   test "receive-pack POST rejects unsupported content types" do
     {user, _repository} = create_user_and_repository("alice")
 
-    assert {:ok, _key, secret} =
-             ForgeAccounts.create_api_key(user, %{"name" => "write", "scopes" => ["repo:write"]})
+    {_key, secret} = insert_legacy_api_key!(user, "repo:write", "write")
 
     response =
       build_conn()
@@ -205,8 +178,7 @@ defmodule FornacastWeb.GitHTTPPushTest do
   test "receive-pack POST rejects a request larger than the configured limit" do
     {user, _repository} = create_user_and_repository("alice")
 
-    assert {:ok, _key, secret} =
-             ForgeAccounts.create_api_key(user, %{"name" => "write", "scopes" => ["repo:write"]})
+    {_key, secret} = insert_legacy_api_key!(user, "repo:write", "write")
 
     original = Application.get_env(:git_transport, :receive_pack_max_bytes)
     Application.put_env(:git_transport, :receive_pack_max_bytes, 8)
@@ -260,6 +232,22 @@ defmodule FornacastWeb.GitHTTPPushTest do
              })
 
     {user, repository}
+  end
+
+  defp insert_legacy_api_key!(user, scope, name) do
+    secret = "fc_pat_" <> Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
+
+    api_key =
+      %ForgeAccounts.APIKey{
+        user_id: user.id,
+        name: name,
+        token_prefix: String.slice(secret, 0, 15),
+        token_hash: ForgeAccounts.APIKey.hash(secret),
+        scopes: %{scope => true}
+      }
+      |> Repo.insert!()
+
+    {api_key, secret}
   end
 
   defp maybe_authorize(conn, nil), do: conn

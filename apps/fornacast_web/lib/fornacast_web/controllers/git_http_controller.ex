@@ -84,22 +84,27 @@ defmodule FornacastWeb.GitHTTPController do
   end
 
   defp load_readable_repository(conn, owner_slug, repo_slug) do
-    with {:ok, actor} <- authenticate_actor(conn) do
-      load_readable_repository_for_actor(actor, owner_slug, repo_slug)
+    with {:ok, actor, api_key} <- authenticate_actor(conn, :read) do
+      load_readable_repository_for_actor(actor, api_key, owner_slug, repo_slug)
     end
   end
 
-  defp load_readable_repository_for_actor(actor, owner_slug, repo_slug) do
+  defp load_readable_repository_for_actor(actor, api_key, owner_slug, repo_slug) do
     case ForgeRepos.get_repository(owner_slug, repo_slug) do
-      %Repository{} = repository -> authorize_repository_read(actor, repository)
+      %Repository{} = repository -> authorize_repository_read(actor, api_key, repository)
       nil -> read_repository_not_found(actor)
     end
   end
 
-  defp authorize_repository_read(actor, repository) do
+  defp authorize_repository_read(actor, api_key, repository) do
     case Fornacast.Access.authorize(actor, :repository_read, repository) do
-      :ok -> {:ok, actor, repository}
-      {:error, :unauthorized} -> read_repository_not_found(actor)
+      :ok ->
+        with :ok <- authorize_git_scope(api_key, :git_read, repository.visibility) do
+          {:ok, actor, repository}
+        end
+
+      {:error, :unauthorized} ->
+        read_repository_not_found(actor)
     end
   end
 
@@ -107,14 +112,22 @@ defmodule FornacastWeb.GitHTTPController do
   defp read_repository_not_found(_actor), do: {:error, :not_found}
 
   defp load_writable_repository(conn, owner_slug, repo_slug) do
-    with {:ok, actor} <- authenticate_actor(conn, "repo:write"),
+    with {:ok, actor, api_key} <- authenticate_actor(conn, :write),
          %Repository{} = repository <- ForgeRepos.get_repository(owner_slug, repo_slug),
-         :ok <- authorize_repository_write(actor, repository) do
+         :ok <- authorize_repository_write(actor, repository),
+         :ok <- authorize_git_scope(api_key, :git_write, repository.visibility) do
       {:ok, actor, repository}
     else
       nil -> {:error, :not_found}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp authorize_git_scope(nil, :git_read, :public), do: :ok
+  defp authorize_git_scope(nil, _action, _visibility), do: {:error, :invalid_credentials}
+
+  defp authorize_git_scope(api_key, action, visibility) do
+    ForgeAccounts.APIScope.authorize(api_key, action, visibility)
   end
 
   defp authorize_repository_write(actor, repository) do
@@ -132,43 +145,30 @@ defmodule FornacastWeb.GitHTTPController do
     end
   end
 
-  defp authenticate_actor(conn), do: authenticate_actor(conn, "repo:read")
-
-  defp authenticate_actor(conn, scope) do
+  defp authenticate_actor(conn, operation) do
     case get_req_header(conn, "authorization") do
-      [] when scope == "repo:read" -> {:ok, nil}
+      [] when operation == :read -> {:ok, nil, nil}
       [] -> {:error, :invalid_credentials}
-      [authorization] -> authenticate_authorization(authorization, scope)
+      [authorization] -> authenticate_authorization(authorization)
       _ -> {:error, :invalid_credentials}
     end
   end
 
-  defp authenticate_authorization(authorization, scope) do
-    case Regex.run(~r/^[ \t]*basic[ \t]+(\S+)[ \t]*$/i, authorization, capture: :all_but_first) do
-      [encoded] -> authenticate_basic(encoded, scope)
+  defp authenticate_authorization(authorization) do
+    case Regex.run(~r/^[ \t]*basic[ \t]+(\S+)[ \t]*\z/i, authorization, capture: :all_but_first) do
+      [encoded] -> authenticate_basic(encoded)
       _ -> {:error, :invalid_credentials}
     end
   end
 
-  defp authenticate_basic(encoded, scope) do
+  defp authenticate_basic(encoded) do
     with {:ok, decoded} <- Base.decode64(encoded),
-         [username, credential] <- String.split(decoded, ":", parts: 2),
-         {:ok, user} <- authenticate_credential(username, credential, scope) do
-      {:ok, user}
+         [username, "fc_pat_" <> _ = secret] <- String.split(decoded, ":", parts: 2),
+         {:ok, user, api_key} <- ForgeAccounts.authenticate_api_key(username, secret) do
+      {:ok, user, api_key}
     else
-      _ -> {:error, :invalid_credentials}
+      _reason -> {:error, :invalid_credentials}
     end
-  end
-
-  defp authenticate_credential(username, "fc_pat_" <> _ = personal_api_key, scope) do
-    case ForgeAccounts.authenticate_api_key(username, personal_api_key, scope) do
-      {:ok, user, _api_key} -> {:ok, user}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp authenticate_credential(username, password, _scope) do
-    ForgeAccounts.authenticate_password(username, password)
   end
 
   defp read_full_body(conn, max_bytes), do: read_full_body(conn, max_bytes, 0, [])
@@ -272,6 +272,9 @@ defmodule FornacastWeb.GitHTTPController do
     |> put_resp_header("www-authenticate", ~s(Basic realm="Fornacast Git"))
     |> send_resp(401, "Authentication required.\n")
   end
+
+  defp send_git_error(conn, :insufficient_scope),
+    do: send_resp(conn, 403, "Insufficient API key scope.\n")
 
   defp send_git_error(conn, :incomplete_request),
     do: send_resp(conn, 400, "Incomplete Git request.\n")

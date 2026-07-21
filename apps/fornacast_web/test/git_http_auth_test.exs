@@ -25,7 +25,7 @@ defmodule FornacastWeb.GitHTTPAuthTest do
     assert {:ok, _api_key, secret} =
              ForgeAccounts.create_api_key(user, %{
                "name" => "git clone",
-               "scopes" => ["repo:read"]
+               "scopes" => ["repo"]
              })
 
     work_path = Path.join(tmp_dir, "work")
@@ -108,12 +108,90 @@ esac
     assert File.read!(Path.join(clone_path, "README.md")) == "# Demo\n"
   end
 
-  test "private fetch accepts account passwords" do
+  @tag :tmp_dir
+  test "a public_repo API key clones a public repository over smart HTTP", %{tmp_dir: tmp_dir} do
+    with_storage_root(tmp_dir)
+    share_database!()
+
+    {user, repository} = create_user_and_repository(:public)
+
+    assert {:ok, _api_key, secret} =
+             ForgeAccounts.create_api_key(user, %{
+               "name" => "public git clone",
+               "scopes" => ["public_repo"]
+             })
+
+    seed_repository(repository, Path.join(tmp_dir, "work"))
+    port = start_http_server()
+    clone_path = Path.join(tmp_dir, "clone")
+    remote_url = "http://127.0.0.1:#{port}/alice/demo.git"
+    authorization = "Authorization: Basic " <> Base.encode64("alice:#{secret}")
+
+    {output, status} =
+      git(["-c", "http.extraHeader=#{authorization}", "clone", remote_url, clone_path])
+
+    assert status == 0, output
+    assert File.read!(Path.join(clone_path, "README.md")) == "# Demo\n"
+    assert git!(["-C", clone_path, "remote", "get-url", "origin"]) == remote_url
+    refute git!(["-C", clone_path, "config", "--get", "remote.origin.url"]) =~ secret
+  end
+
+  test "private fetch rejects account passwords with a Basic challenge" do
     create_user_and_repository(:private)
 
     response = request_info_refs("alice", "correct horse battery staple")
 
-    assert response(response, 200) =~ "# service=git-upload-pack"
+    assert response(response, 401) == "Authentication required.\n"
+    assert Plug.Conn.get_resp_header(response, "www-authenticate") == [@challenge]
+  end
+
+  test "Git discovery applies classic and legacy PAT scopes using repository visibility" do
+    {user, _private_repository} = create_user_and_repository(:private)
+
+    assert {:ok, _public_repository} =
+             ForgeRepos.create_repository(user, %{
+               name: "Public Demo",
+               slug: "public-demo",
+               description: "Public Git HTTP scope test",
+               visibility: :public
+             })
+
+    scope_cases = [
+      {"repo", :public, :read, 200},
+      {"repo", :private, :read, 200},
+      {"public_repo", :public, :read, 200},
+      {"public_repo", :private, :read, 403},
+      {"repo:read", :private, :read, 200},
+      {"repo:write", :private, :read, 200},
+      {"read:org", :public, :read, 403},
+      {"write:org", :public, :read, 403},
+      {"repo", :private, :write, 200},
+      {"public_repo", :public, :write, 200},
+      {"public_repo", :private, :write, 403},
+      {"repo:write", :private, :write, 200},
+      {"repo:read", :private, :write, 403}
+    ]
+
+    for {{scope, visibility, operation, expected_status}, index} <-
+          Enum.with_index(scope_cases, 1) do
+      secret = create_scope_key_secret!(user, scope, index)
+
+      repository_path =
+        if visibility == :public, do: "/alice/public-demo.git", else: "/alice/demo.git"
+
+      service = if operation == :read, do: "git-upload-pack", else: "git-receive-pack"
+      case_name = "#{scope} #{visibility} #{operation}"
+
+      response = request_info_refs("alice", secret, repository_path, service)
+
+      assert response.status == expected_status, case_name
+
+      if expected_status == 200 do
+        assert response.resp_body =~ "# service=#{service}", case_name
+      else
+        assert Plug.Conn.get_resp_header(response, "www-authenticate") == [], case_name
+      end
+    end
   end
 
   test "private fetch rejects invalid API keys with a Basic challenge" do
@@ -122,7 +200,7 @@ esac
     assert {:ok, _api_key, secret} =
              ForgeAccounts.create_api_key(user, %{
                "name" => "git clone",
-               "scopes" => ["repo:read"]
+               "scopes" => ["repo"]
              })
 
     credentials = [
@@ -138,13 +216,13 @@ esac
     end
   end
 
-  test "private fetch rejects revoked and expired API keys with a Basic challenge" do
+  test "private fetch rejects revoked, expired, and disabled-owner API keys with a Basic challenge" do
     {user, _repository} = create_user_and_repository(:private)
 
     assert {:ok, api_key, revoked_secret} =
              ForgeAccounts.create_api_key(user, %{
                "name" => "revoked",
-               "scopes" => ["repo:read"]
+               "scopes" => ["repo"]
              })
 
     assert {:ok, _api_key} = ForgeAccounts.revoke_api_key(user, api_key.id)
@@ -152,12 +230,36 @@ esac
     assert {:ok, _api_key, expired_secret} =
              ForgeAccounts.create_api_key(user, %{
                "name" => "expired",
-               "scopes" => ["repo:read"],
+               "scopes" => ["repo"],
                "expires_at" => DateTime.add(DateTime.utc_now(:second), -60, :second)
              })
 
-    for {case_name, secret} <- [{"revoked", revoked_secret}, {"expired", expired_secret}] do
-      response = request_info_refs("alice", secret)
+    assert {:ok, disabled_owner} =
+             ForgeAccounts.create_user(%{
+               username: "disabled",
+               email: "disabled-git-http@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, _api_key, disabled_secret} =
+             ForgeAccounts.create_api_key(disabled_owner, %{
+               "name" => "disabled owner",
+               "scopes" => ["repo"]
+             })
+
+    assert {:ok, _disabled_owner} =
+             disabled_owner
+             |> ForgeAccounts.User.state_changeset(%{state: :disabled})
+             |> Fornacast.Repo.update()
+
+    credentials = [
+      {"revoked", "alice", revoked_secret},
+      {"expired", "alice", expired_secret},
+      {"disabled owner", "disabled", disabled_secret}
+    ]
+
+    for {case_name, username, secret} <- credentials do
+      response = request_info_refs(username, secret)
 
       assert response(response, 401) == "Authentication required.\n", case_name
       assert Plug.Conn.get_resp_header(response, "www-authenticate") == [@challenge], case_name
@@ -170,7 +272,7 @@ esac
     assert {:ok, _api_key, secret} =
              ForgeAccounts.create_api_key(user, %{
                "name" => "git clone",
-               "scopes" => ["repo:read"]
+               "scopes" => ["repo"]
              })
 
     encoded = Base.encode64("alice:#{secret}")
@@ -193,11 +295,19 @@ esac
   end
 
   test "public fetch rejects unsupported, malformed, and multiple Authorization headers" do
-    create_user_and_repository(:public)
+    {user, _repository} = create_user_and_repository(:public)
+
+    assert {:ok, _api_key, secret} =
+             ForgeAccounts.create_api_key(user, %{
+               "name" => "valid header",
+               "scopes" => ["repo"]
+             })
 
     headers = [
       {"Bearer authorization", [{"authorization", "Bearer token"}]},
       {"malformed Basic authorization", [{"authorization", "Basic not-base64"}]},
+      {"terminal newline",
+       [{"authorization", "Basic " <> Base.encode64("alice:#{secret}") <> "\n"}]},
       {"multiple authorization headers",
        [
          {"authorization", "Basic " <> Base.encode64("alice:fc_pat_invalid")},
@@ -243,7 +353,7 @@ esac
     assert {:ok, _api_key, secret} =
              ForgeAccounts.create_api_key(bob, %{
                "name" => "git clone",
-               "scopes" => ["repo:read"]
+               "scopes" => ["repo"]
              })
 
     authorization = "Basic " <> Base.encode64("bob:#{secret}")
@@ -261,6 +371,26 @@ esac
 
       assert response(discovery, 404) == "Repository not found.\n"
       assert response(upload, 404) == "Repository not found.\n"
+    end
+  end
+
+  test "private Git endpoints mask inaccessible repositories before checking PAT scope" do
+    create_user_and_repository(:private)
+
+    assert {:ok, bob} =
+             ForgeAccounts.create_user(%{
+               username: "bob",
+               email: "bob-insufficient-git-scope@example.com",
+               password: "correct horse battery staple"
+             })
+
+    secret = create_scope_key_secret!(bob, "read:org", 99)
+
+    for service <- ["git-upload-pack", "git-receive-pack"] do
+      response = request_info_refs("bob", secret, "/alice/demo.git", service)
+
+      assert response(response, 404) == "Repository not found.\n", service
+      assert Plug.Conn.get_resp_header(response, "www-authenticate") == [], service
     end
   end
 
@@ -302,13 +432,44 @@ esac
     {user, repository}
   end
 
-  defp request_info_refs(username, password) do
+  defp request_info_refs(
+         username,
+         password,
+         repository_path \\ "/alice/demo.git",
+         service \\ "git-upload-pack"
+       ) do
     build_conn()
     |> Plug.Conn.put_req_header(
       "authorization",
       "Basic " <> Base.encode64("#{username}:#{password}")
     )
-    |> get("/alice/demo.git/info/refs?service=git-upload-pack")
+    |> get("#{repository_path}/info/refs?service=#{service}")
+  end
+
+  defp create_scope_key_secret!(user, scope, index)
+       when scope in ["repo:read", "repo:write"] do
+    secret = "fc_pat_legacy_scope_#{index}"
+
+    %ForgeAccounts.APIKey{
+      user_id: user.id,
+      name: "legacy scope case #{index}",
+      token_prefix: String.slice(secret, 0, 15),
+      token_hash: ForgeAccounts.APIKey.hash(secret),
+      scopes: %{scope => true}
+    }
+    |> Fornacast.Repo.insert!()
+
+    secret
+  end
+
+  defp create_scope_key_secret!(user, scope, index) do
+    assert {:ok, _api_key, secret} =
+             ForgeAccounts.create_api_key(user, %{
+               "name" => "classic scope case #{index}",
+               "scopes" => [scope]
+             })
+
+    secret
   end
 
   defp upload_pack_request(conn, repository_path, body) do
