@@ -1,6 +1,8 @@
 defmodule FornacastAPI.Response do
   import Plug.Conn
 
+  @default_version "2022-11-28"
+
   def json(conn, status, body, opts \\ []) do
     conn
     |> put_assign_options(opts)
@@ -9,9 +11,8 @@ defmodule FornacastAPI.Response do
   end
 
   def error(conn, %FornacastAPI.Error{} = error) do
-    body =
-      %{message: error.message, documentation_url: error.documentation_url}
-      |> maybe_put_errors(error.errors)
+    version = conn.assigns[:api_version] || @default_version
+    body = FornacastAPI.Serializer.render(version, :error, error)
 
     json(conn, error.status, body, accepted_scopes: error.accepted_scopes)
   end
@@ -46,7 +47,4 @@ defmodule FornacastAPI.Response do
       Keyword.get(opts, :media_type, conn.assigns[:response_media_type])
     )
   end
-
-  defp maybe_put_errors(body, nil), do: body
-  defp maybe_put_errors(body, errors), do: Map.put(body, :errors, errors)
 end

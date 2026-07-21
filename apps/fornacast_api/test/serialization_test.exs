@@ -6,7 +6,7 @@ defmodule FornacastAPI.SerializationTest do
 
   alias ForgeAccounts.{AccountView, Organization, User}
   alias ForgeRepos.Repository
-  alias FornacastAPI.{Pagination, Serializer, URL}
+  alias FornacastAPI.{Pagination, Response, Serializer, URL}
 
   @versions ["2022-11-28", "2026-03-10"]
   @base_url "https://forge.test"
@@ -555,6 +555,31 @@ defmodule FornacastAPI.SerializationTest do
     end
 
     test "keeps stable error fields and includes validation errors only when present" do
+      sensitive_validation =
+        FornacastAPI.Error.new(
+          422,
+          "Validation Failed",
+          "https://docs.example.test/validation",
+          errors: [
+            %{
+              resource: "Repository",
+              field: "name",
+              code: :invalid,
+              message: "has an invalid format",
+              index: 7,
+              value: "fc_pat_secret-value"
+            }
+          ],
+          accepted_scopes: ["repo"]
+        )
+
+      basic =
+        FornacastAPI.Error.new(
+          404,
+          "Not Found",
+          "https://docs.example.test/not-found"
+        )
+
       for version <- @versions do
         assert Serializer.render(version, :error, error()) == %{
                  message: "Validation Failed",
@@ -563,23 +588,6 @@ defmodule FornacastAPI.SerializationTest do
                    %{resource: "Repository", field: "name", code: "missing_field"}
                  ]
                }
-
-        sensitive_validation =
-          FornacastAPI.Error.new(
-            422,
-            "Validation Failed",
-            "https://docs.example.test/validation",
-            errors: [
-              %{
-                resource: "Repository",
-                field: "name",
-                code: :invalid,
-                message: "has an invalid format",
-                index: 7,
-                value: "fc_pat_secret-value"
-              }
-            ]
-          )
 
         assert Serializer.render(version, :error, sensitive_validation).errors == [
                  %{
@@ -595,18 +603,37 @@ defmodule FornacastAPI.SerializationTest do
                |> JSON.encode!()
                |> String.contains?("fc_pat_secret-value")
 
-        basic =
-          FornacastAPI.Error.new(
-            404,
-            "Not Found",
-            "https://docs.example.test/not-found"
-          )
-
         assert Serializer.render(version, :error, basic) == %{
                  message: "Not Found",
                  documentation_url: "https://docs.example.test/not-found"
                }
+
+        validation_response =
+          conn(:get, "/")
+          |> Plug.Conn.assign(:api_version, version)
+          |> Response.error(sensitive_validation)
+
+        assert_projected_validation_response(validation_response)
+
+        basic_response =
+          conn(:get, "/")
+          |> Plug.Conn.assign(:api_version, version)
+          |> Response.error(basic)
+
+        assert basic_response.status == 404
+        assert basic_response.assigns.accepted_scopes == []
+
+        assert JSON.decode!(basic_response.resp_body) == %{
+                 "message" => "Not Found",
+                 "documentation_url" => "https://docs.example.test/not-found"
+               }
       end
+
+      default_conn = conn(:get, "/")
+      refute Map.has_key?(default_conn.assigns, :api_version)
+
+      default_response = Response.error(default_conn, sensitive_validation)
+      assert_projected_validation_response(default_response)
     end
 
     test "fails clearly for unknown versions and resources" do
@@ -701,6 +728,33 @@ defmodule FornacastAPI.SerializationTest do
       "https://docs.example.test/validation",
       errors: [%{resource: "Repository", field: "name", code: :missing_field}]
     )
+  end
+
+  defp assert_projected_validation_response(response) do
+    body = JSON.decode!(response.resp_body)
+
+    assert response.status == 422
+    assert response.assigns.accepted_scopes == ["repo"]
+    assert Enum.sort(Map.keys(body)) == ["documentation_url", "errors", "message"]
+
+    assert body == %{
+             "message" => "Validation Failed",
+             "documentation_url" => "https://docs.example.test/validation",
+             "errors" => [
+               %{
+                 "resource" => "Repository",
+                 "field" => "name",
+                 "code" => "invalid",
+                 "message" => "has an invalid format"
+               }
+             ]
+           }
+
+    assert [error] = body["errors"]
+    assert Enum.sort(Map.keys(error)) == ["code", "field", "message", "resource"]
+    refute Map.has_key?(error, "index")
+    refute Map.has_key?(error, "value")
+    refute response.resp_body =~ "fc_pat_secret-value"
   end
 
   defp assert_all_urls_are_public(value) do
