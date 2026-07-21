@@ -397,8 +397,32 @@ defmodule FornacastAPI.OpenAPIContractTest do
 
       assert_valid_response(
         document,
+        "/user/repos",
+        :post,
+        201,
+        FornacastAPI.Serializer.render(version, :full_repository, repository_view())
+      )
+
+      assert_valid_response(
+        document,
+        "/orgs/{org}/repos",
+        :post,
+        201,
+        FornacastAPI.Serializer.render(version, :full_repository, repository_view())
+      )
+
+      assert_valid_response(
+        document,
         "/repos/{owner}/{repo}",
         :get,
+        200,
+        FornacastAPI.Serializer.render(version, :full_repository, repository_view())
+      )
+
+      assert_valid_response(
+        document,
+        "/repos/{owner}/{repo}",
+        :patch,
         200,
         FornacastAPI.Serializer.render(version, :full_repository, repository_view())
       )

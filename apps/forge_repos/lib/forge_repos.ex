@@ -929,14 +929,19 @@ defmodule ForgeRepos do
 
   defp load_repository_view_page(actor, query, params) do
     total = Repo.aggregate(query, :count, :id)
+    offset = (params.page - 1) * params.per_page
 
     repositories =
-      query
-      |> order_repository_query(params.sort, params.direction)
-      |> offset(^((params.page - 1) * params.per_page))
-      |> limit(^params.per_page)
-      |> select([repository, _owner], repository)
-      |> Repo.all()
+      if offset >= total do
+        []
+      else
+        query
+        |> order_repository_query(params.sort, params.direction)
+        |> offset(^offset)
+        |> limit(^params.per_page)
+        |> select([repository, _owner], repository)
+        |> Repo.all()
+      end
 
     case build_repository_views(actor, repositories) do
       {:ok, entries} ->
