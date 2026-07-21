@@ -3,7 +3,8 @@ defmodule ForgeAccounts.APIKey do
 
   import Ecto.Changeset
 
-  @allowed_scopes ["repo:read", "repo:write"]
+  @classic_scopes ["repo", "public_repo", "read:org", "write:org"]
+  @legacy_scopes ["repo:read", "repo:write"]
 
   schema "api_keys" do
     field :user_id, :integer
@@ -17,6 +18,11 @@ defmodule ForgeAccounts.APIKey do
 
     timestamps(type: :utc_datetime)
   end
+
+  @type t :: %__MODULE__{}
+
+  def classic_scopes, do: @classic_scopes
+  def legacy_scopes, do: @legacy_scopes
 
   def creation_changeset(api_key, attrs) do
     attrs = normalize_scope_attrs(attrs)
@@ -51,10 +57,12 @@ defmodule ForgeAccounts.APIKey do
     scopes = get_field(changeset, :scopes) || %{}
 
     if map_size(scopes) > 0 and
-         Enum.all?(scopes, fn {scope, enabled} -> scope in @allowed_scopes and enabled == true end) do
+         Enum.all?(scopes, fn {scope, enabled} ->
+           scope in @classic_scopes and enabled == true
+         end) do
       changeset
     else
-      add_error(changeset, :scopes, "must contain repo:read or repo:write")
+      add_error(changeset, :scopes, "must contain repo, public_repo, read:org, or write:org")
     end
   end
 end

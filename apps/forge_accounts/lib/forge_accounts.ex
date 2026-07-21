@@ -7,7 +7,7 @@ defmodule ForgeAccounts do
 
   alias Ecto.Changeset
   alias Ecto.Multi
-  alias ForgeAccounts.{APIKey, Organization, OrganizationMember, SSHKey, User}
+  alias ForgeAccounts.{APIKey, APIScope, Organization, OrganizationMember, SSHKey, User}
   alias Fornacast.Repo
 
   def get_account(id), do: Repo.get(User, id)
@@ -244,10 +244,40 @@ defmodule ForgeAccounts do
     end
   end
 
+  @spec authenticate_api_key(String.t()) ::
+          {:ok, User.t(), APIKey.t()} | {:error, :invalid_credentials}
+  def authenticate_api_key(secret) when is_binary(secret) do
+    with {%User{} = user, %APIKey{} = api_key} <- find_api_key(secret),
+         {:ok, authenticated_key} <- touch_active_api_key(api_key) do
+      {:ok, user, authenticated_key}
+    else
+      _ -> {:error, :invalid_credentials}
+    end
+  end
+
+  def authenticate_api_key(_secret), do: {:error, :invalid_credentials}
+
+  @spec authenticate_api_key(String.t(), String.t()) ::
+          {:ok, User.t(), APIKey.t()} | {:error, :invalid_credentials}
+  def authenticate_api_key(username, secret)
+      when is_binary(username) and is_binary(secret) do
+    with {%User{} = user, %APIKey{} = api_key} <- find_api_key(secret),
+         true <- user.username == normalize_username(username),
+         {:ok, authenticated_key} <- touch_active_api_key(api_key) do
+      {:ok, user, authenticated_key}
+    else
+      _ -> {:error, :invalid_credentials}
+    end
+  end
+
+  def authenticate_api_key(_username, _secret), do: {:error, :invalid_credentials}
+
+  @spec authenticate_api_key(String.t(), String.t(), String.t()) ::
+          {:ok, User.t(), APIKey.t()} | {:error, :invalid_credentials | :insufficient_scope}
   def authenticate_api_key(username, secret, required_scope)
       when is_binary(username) and is_binary(secret) and is_binary(required_scope) do
-    with %User{state: :active} = user <- get_user_by_username(username),
-         %APIKey{} = api_key <- find_api_key(user, secret),
+    with {%User{} = user, %APIKey{} = api_key} <- find_api_key(secret),
+         true <- user.username == normalize_username(username),
          :ok <- authorize_api_key_scope(api_key, required_scope),
          {:ok, authenticated_key} <- touch_active_api_key(api_key) do
       {:ok, user, authenticated_key}
@@ -314,28 +344,37 @@ defmodule ForgeAccounts do
     {:error, :invalid_credentials}
   end
 
-  defp find_api_key(%User{id: user_id}, secret) do
+  defp find_api_key(secret) do
     token_prefix = String.slice(secret, 0, 15)
     token_hash = APIKey.hash(secret)
-    now = DateTime.utc_now()
+    token_hash_bytes = byte_size(token_hash)
+    now = DateTime.utc_now(:second)
 
     APIKey
+    |> join(:inner, [key], user in User, on: user.id == key.user_id)
     |> where(
-      [key],
-      key.user_id == ^user_id and key.token_prefix == ^token_prefix and is_nil(key.revoked_at) and
-        (is_nil(key.expires_at) or key.expires_at > ^now)
+      [key, user],
+      key.token_prefix == ^token_prefix and is_nil(key.revoked_at) and
+        (is_nil(key.expires_at) or key.expires_at > ^now) and user.kind == :user and
+        user.state == :active
     )
+    |> select([key, user], {user, key})
     |> Repo.all()
-    |> Enum.find(fn key -> :crypto.hash_equals(key.token_hash, token_hash) end)
+    |> Enum.filter(fn {_user, key} ->
+      is_binary(key.token_hash) and byte_size(key.token_hash) == token_hash_bytes and
+        :crypto.hash_equals(key.token_hash, token_hash)
+    end)
+    |> case do
+      [match] -> match
+      _matches -> nil
+    end
   end
 
-  defp authorize_api_key_scope(%APIKey{scopes: scopes}, "repo:read") do
-    if scopes["repo:read"] || scopes["repo:write"], do: :ok, else: {:error, :insufficient_scope}
-  end
+  defp authorize_api_key_scope(%APIKey{} = api_key, "repo:read"),
+    do: APIScope.authorize(api_key, :git_read, :private)
 
-  defp authorize_api_key_scope(%APIKey{scopes: scopes}, "repo:write") do
-    if scopes["repo:write"], do: :ok, else: {:error, :insufficient_scope}
-  end
+  defp authorize_api_key_scope(%APIKey{} = api_key, "repo:write"),
+    do: APIScope.authorize(api_key, :git_write, :private)
 
   defp authorize_api_key_scope(%APIKey{}, _scope), do: {:error, :insufficient_scope}
 

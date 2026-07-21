@@ -105,15 +105,23 @@ defmodule FornacastWeb.APIKeyController do
         #{csrf_input()}
         <label>Name <input name="api_key[name]" value="#{name}"></label>
         <fieldset>
-          <legend>Repository scopes</legend>
-          <label><input type="checkbox" name="api_key[scopes][repo:read]" value="true"#{checked(scopes, "repo:read")}> repo:read</label>
-          <label><input type="checkbox" name="api_key[scopes][repo:write]" value="true"#{checked(scopes, "repo:write")}> repo:write</label>
+          <legend>Scopes</legend>
+          #{api_key_scope_fields(scopes)}
         </fieldset>
         <label>Expires at (optional, UTC) <input type="datetime-local" name="api_key[expires_at]" value="#{expires_at}"></label>
         <button class="btn btn-primary" type="submit">Create key</button>
       </form>
       """
     )
+  end
+
+  defp api_key_scope_fields(scopes) do
+    fields =
+      for scope <- ForgeAccounts.APIKey.classic_scopes() do
+        ~s(<label><input type="checkbox" name="api_key[scopes][#{scope}]" value="true"#{checked(scopes, scope)}> #{scope}</label>)
+      end
+
+    Enum.join(fields, "\n")
   end
 
   defp checked(scopes, scope) when is_map(scopes) do

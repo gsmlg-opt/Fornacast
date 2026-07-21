@@ -146,7 +146,7 @@ defmodule FornacastWebTest do
       |> post("/settings/api-keys", %{
         "api_key" => %{
           "name" => "deploy & release",
-          "scopes" => %{"repo:read" => "true", "repo:write" => "true"},
+          "scopes" => %{"repo" => "true", "write:org" => "true"},
           "expires_at" => "2030-01-02T03:04:05"
         }
       })
@@ -156,8 +156,13 @@ defmodule FornacastWebTest do
 
     assert Enum.count(Regex.scan(~r/#{Regex.escape(secret)}/, html)) == 1
     assert html =~ "deploy &amp; release"
-    assert html =~ "repo:read"
-    assert html =~ "repo:write"
+
+    checkbox_scopes =
+      ~r/name="api_key\[scopes\]\[([^"]+)\]"/
+      |> Regex.scan(html, capture: :all_but_first)
+      |> List.flatten()
+
+    assert checkbox_scopes == ["repo", "public_repo", "read:org", "write:org"]
     assert html =~ "2030-01-02 03:04:05Z"
     assert Plug.Conn.get_resp_header(conn, "location") == []
     assert Plug.Conn.get_resp_header(conn, "cache-control") == ["private, no-store"]
@@ -168,7 +173,7 @@ defmodule FornacastWebTest do
     assert [%{name: "deploy & release", scopes: scopes, token_hash: nil}] =
              ForgeAccounts.list_user_api_keys(user)
 
-    assert scopes == %{"repo:read" => true, "repo:write" => true}
+    assert scopes == %{"repo" => true, "write:org" => true}
     assert hd(ForgeAccounts.list_user_api_keys(user)).expires_at == ~U[2030-01-02 03:04:05Z]
   end
 
@@ -186,10 +191,12 @@ defmodule FornacastWebTest do
       build_conn()
       |> Plug.Test.init_test_session(user_id: user.id)
       |> post("/settings/api-keys", %{
-        "api_key" => %{"name" => "forged", "scopes" => "repo:write"}
+        "api_key" => %{"name" => "forged", "scopes" => "repo"}
       })
 
-    assert html_response(conn, 422) =~ "Scopes must contain repo:read or repo:write"
+    assert html_response(conn, 422) =~
+             "Scopes must contain repo, public_repo, read:org, or write:org"
+
     assert ForgeAccounts.list_user_api_keys(user) == []
   end
 
@@ -210,7 +217,7 @@ defmodule FornacastWebTest do
 
     html = html_response(conn, 422)
     assert html =~ "Name can&#39;t be blank"
-    assert html =~ "Scopes must contain repo:read or repo:write"
+    assert html =~ "Scopes must contain repo, public_repo, read:org, or write:org"
     assert ForgeAccounts.list_user_api_keys(user) == []
   end
 
@@ -230,7 +237,7 @@ defmodule FornacastWebTest do
       |> post("/settings/api-keys", %{
         "api_key" => %{
           "name" => "minute precision",
-          "scopes" => %{"repo:read" => "true"},
+          "scopes" => %{"repo" => "true"},
           "expires_at" => "2032-06-07T08:09"
         }
       })
@@ -257,12 +264,12 @@ defmodule FornacastWebTest do
              })
 
     assert {:ok, first, _secret} =
-             ForgeAccounts.create_api_key(alice, %{name: "laptop", scopes: ["repo:read"]})
+             ForgeAccounts.create_api_key(alice, %{name: "laptop", scopes: ["public_repo"]})
 
     assert {:ok, second, _secret} =
              ForgeAccounts.create_api_key(alice, %{
                name: "automation",
-               scopes: ["repo:write"],
+               scopes: ["repo", "write:org"],
                expires_at: "2031-04-05T06:07:08Z"
              })
 
@@ -273,8 +280,11 @@ defmodule FornacastWebTest do
     assert html =~ "automation"
     assert html =~ first.token_prefix
     assert html =~ second.token_prefix
-    assert html =~ "repo:read"
-    assert html =~ "repo:write"
+    assert html =~ "public_repo"
+    assert html =~ "repo"
+    assert html =~ "write:org"
+    refute html =~ "repo:read"
+    refute html =~ "repo:write"
     assert html =~ DateTime.to_string(second.inserted_at)
     assert html =~ "2031-04-05 06:07:08Z"
     assert html =~ ~s(action="/settings/api-keys/#{first.id}")
@@ -302,7 +312,7 @@ defmodule FornacastWebTest do
     assert {:ok, past, _secret} =
              ForgeAccounts.create_api_key(user, %{
                name: "past",
-               scopes: ["repo:read"],
+               scopes: ["repo"],
                expires_at: "2000-01-01T00:00:00Z"
              })
 
@@ -311,7 +321,7 @@ defmodule FornacastWebTest do
     assert {:ok, boundary_key, _secret} =
              ForgeAccounts.create_api_key(user, %{
                name: "boundary",
-               scopes: ["repo:read"],
+               scopes: ["repo"],
                expires_at: boundary
              })
 
@@ -372,7 +382,7 @@ defmodule FornacastWebTest do
 
     html = html_response(conn, 422)
     assert html =~ "Expires at (optional, UTC)"
-    assert html =~ "Scopes must contain repo:read or repo:write"
+    assert html =~ "Scopes must contain repo, public_repo, read:org, or write:org"
     assert html =~ "&lt;script&gt;alert(1)&lt;/script&gt;"
     refute html =~ "<script>alert(1)</script>"
     refute html =~ "scopes: {"
@@ -1029,7 +1039,7 @@ defmodule FornacastWebTest do
     assert {:ok, _api_key, personal_api_key} =
              ForgeAccounts.create_api_key(user, %{
                name: "Git HTTP",
-               scopes: ["repo:read"]
+               scopes: ["repo"]
              })
 
     challenged = get(build_conn(), "/alice/demo.git/info/refs?service=git-upload-pack")
