@@ -20,12 +20,39 @@ env:
   OTP_VERSION: "29.0"
   RUST_VERSION: 1.96.0
   MIX_ENV: test
-  FORNACAST_DATABASE_ADAPTER: turso
 
 jobs:
   unit:
-    name: Unit Tests
+    name: Unit Tests (${{ matrix.database_adapter }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        database_adapter:
+          - turso
+          - postgres
+    env:
+      FORNACAST_DATABASE_ADAPTER: ${{ matrix.database_adapter }}
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: fornacast_test
+      POSTGRES_TEST_DB: fornacast_test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: fornacast_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d fornacast_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - name: Checkout
@@ -55,9 +82,9 @@ jobs:
             ~/.cache/rebar3
             ~/.cargo/git
             ~/.cargo/registry
-          key: ${{ runner.os }}-test-${{ env.MIX_ENV }}-${{ hashFiles('mix.lock', 'apps/git_core/native/fornacast_git_core/Cargo.lock') }}
+          key: ${{ runner.os }}-test-${{ matrix.database_adapter }}-${{ env.MIX_ENV }}-${{ hashFiles('mix.lock', 'apps/git_core/native/fornacast_git_core/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-test-${{ env.MIX_ENV }}-
+            ${{ runner.os }}-test-${{ matrix.database_adapter }}-${{ env.MIX_ENV }}-
 
       - name: Install Hex and Rebar
         run: |
