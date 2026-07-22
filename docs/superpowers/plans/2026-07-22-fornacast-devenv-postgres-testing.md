@@ -595,11 +595,15 @@ Expected: `down` exits `0`; `list` reports that no process manager is running, a
 Run:
 
 ```bash
-mix format --check-formatted \
+devenv shell -- mix format --check-formatted \
   config/test.exs \
   apps/fornacast_api/test/test_helper.exs \
   apps/fornacast_api/test/database_workflow_contract_test.exs
-mix compile --warnings-as-errors
+devenv shell -- env \
+  -u FORNACAST_DATABASE_ADAPTER \
+  MIX_ENV=dev \
+  MIX_BUILD_PATH=_build/verify-turso \
+  mix compile --warnings-as-errors
 rg -n 'FORNACAST_DATABASE_ADAPTER\s*=\s*postgres|env\.FORNACAST_DATABASE_ADAPTER' devenv.nix devenv.yaml
 git diff --check
 git status --short --branch
