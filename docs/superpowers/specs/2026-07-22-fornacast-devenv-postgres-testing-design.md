@@ -99,8 +99,11 @@ The PostgreSQL branch in `config/test.exs` supports two connection forms:
    `POSTGRES_USER` and `POSTGRES_PASSWORD` fallbacks for GitHub Actions.
 
 Both forms continue to select the database through `POSTGRES_TEST_DB`, defaulting
-to `fornacast_test`. Empty password values are omitted rather than converted into
-invented credentials.
+to `fornacast_test`. Because environment-specific Config entries merge with the
+base repository keyword list, each PostgreSQL branch explicitly clears the
+connection keys it does not use. Empty password values become `nil`, preventing
+the base configuration's development password from reappearing as an invented
+test credential.
 
 `config/config.exs` and `config/dev.exs` do not change. Consequently, the
 development adapter remains the existing `FORNACAST_DATABASE_ADAPTER` default of
