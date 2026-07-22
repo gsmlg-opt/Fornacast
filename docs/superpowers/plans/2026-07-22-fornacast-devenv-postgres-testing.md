@@ -20,7 +20,7 @@
 - Do not modify Docker, Compose, release, CI-build, or E2E files. The asset-build path remains blocked by `duskmoon-dev/phoenix-duskmoon-ui#104` and is not part of this plan.
 - Preserve both PostgreSQL connection styles: Unix sockets from devenv and TCP from GitHub Actions or an external database.
 - Run database-backed tests serially with `--max-cases 1`.
-- Stop devenv processes after each live verification session.
+- Stop the devenv process manager with `devenv processes down` after each live verification session.
 - Format only touched Elixir files. If an out-of-scope test fails, record it and stop rather than widening this slice.
 
 ## File map
@@ -111,6 +111,8 @@ in {
   services.postgres = {
     enable = true;
     package = pkgs-stable.postgresql_17;
+    port = 55432;
+    listen_addresses = "";
     initialDatabases = [
       {name = "fornacast_test";}
     ];
@@ -118,7 +120,7 @@ in {
 }
 ```
 
-Do not add `env.FORNACAST_DATABASE_ADAPTER`, `processes.fornacast`, or a `fornacast_dev` database.
+Do not add `env.FORNACAST_DATABASE_ADAPTER`, `processes.fornacast`, or a `fornacast_dev` database. Port `55432` identifies the project-specific Unix socket; the empty listen address prevents TCP exposure.
 
 - [ ] **Step 5: Evaluate the environment and generate the lock**
 
@@ -136,6 +138,8 @@ Run:
 
 ```bash
 devenv eval services.postgres.enable
+devenv eval services.postgres.port
+devenv eval services.postgres.listen_addresses
 devenv shell -- env \
   -u FORNACAST_DATABASE_ADAPTER \
   MIX_ENV=dev \
@@ -145,7 +149,7 @@ devenv shell -- env \
 '
 ```
 
-Expected: the first command prints `true`; the second exits `0`, proving the shell does not switch development away from Turso.
+Expected: the eval commands print `true`, `55432`, and `""`; the shell command exits `0`, proving the service is deterministic and does not switch development away from Turso.
 
 - [ ] **Step 7: Check and commit the environment definition**
 
@@ -293,13 +297,14 @@ Expected: formatting and whitespace checks pass; the commit changes only `config
 Run:
 
 ```bash
-devenv processes start -d postgres
+devenv processes up -d --strict-ports postgres
 devenv processes wait --timeout 120
 devenv processes list
+devenv shell -- env | rg '^PG(HOST|PORT)='
 devenv shell -- psql -v ON_ERROR_STOP=1 -d fornacast_test -c 'select 1'
 ```
 
-Expected: `postgres` reports as running, the readiness wait exits `0`, and the query proves `fornacast_test` exists from the service definition.
+Expected: `postgres` reports as running, the readiness wait exits `0`, the shell reports its project socket and `PGPORT=55432`, and the query proves `fornacast_test` exists from the service definition.
 
 - [ ] **Step 2: Verify the API helper has not selected manual Sandbox mode**
 
@@ -349,11 +354,11 @@ Expected: both commands pass with the same test count and zero failures.
 Run:
 
 ```bash
-devenv processes stop
+devenv processes down
 devenv processes list
 ```
 
-Expected: no devenv process remains running.
+Expected: `down` exits `0`; `list` reports that no process manager is running, and no worktree devenv process remains.
 
 - [ ] **Step 6: Format and commit the Sandbox setup**
 
@@ -530,8 +535,9 @@ Expected: both commands exit `0`.
 Run:
 
 ```bash
-devenv processes start -d postgres
+devenv processes up -d --strict-ports postgres
 devenv processes wait --timeout 120
+devenv shell -- env | rg '^PG(HOST|PORT)='
 devenv shell -- psql -v ON_ERROR_STOP=1 -d fornacast_test -c 'select 1'
 devenv shell -- env \
   MIX_BUILD_PATH=_build/test-postgres \
@@ -572,11 +578,11 @@ Expected: all corresponding tests plus the workflow contract pass against Turso 
 Run:
 
 ```bash
-devenv processes stop
+devenv processes down
 devenv processes list
 ```
 
-Expected: no devenv process remains running.
+Expected: `down` exits `0`; `list` reports that no process manager is running, and no worktree devenv process remains.
 
 - [ ] **Step 5: Run final format, compile, secret, and diff checks**
 

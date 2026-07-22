@@ -50,7 +50,7 @@ The repository adds these checked-in files:
 
 An `.envrc` is intentionally omitted. Developers opt into the environment with
 an explicit `devenv shell -- ...` command, and PostgreSQL starts only through
-`devenv processes start -d postgres`.
+`devenv processes up -d --strict-ports postgres`.
 
 `devenv.nix` uses the stable nixpkgs input and provides the project toolchain:
 
@@ -60,6 +60,11 @@ an explicit `devenv shell -- ...` command, and PostgreSQL starts only through
 - OpenSSL and `pkg-config`; and
 - PostgreSQL 17.
 
+PostgreSQL listens only on its project-specific Unix socket. Its socket
+identifier is pinned to port `55432` so another local project's conventional
+PostgreSQL `5432` service cannot cause devenv to auto-select a value that
+disagrees with the later shell's `PGPORT`.
+
 The PostgreSQL service creates only `fornacast_test`. It does not create or own
 `fornacast_dev`, because development remains Turso. The devenv configuration
 must not set `FORNACAST_DATABASE_ADAPTER` globally.
@@ -67,18 +72,19 @@ must not set `FORNACAST_DATABASE_ADAPTER` globally.
 The explicit local lifecycle is:
 
 ```sh
-devenv processes start -d postgres
+devenv processes up -d --strict-ports postgres
 devenv processes wait --timeout 120
+devenv shell -- env | rg '^PG(HOST|PORT)='
 devenv shell -- psql -v ON_ERROR_STOP=1 -d fornacast_test -c 'select 1'
 devenv shell -- env \
   MIX_BUILD_PATH=_build/test-postgres \
   FORNACAST_DATABASE_ADAPTER=postgres \
   POSTGRES_TEST_DB=fornacast_test \
   mix test <scoped-paths> --max-cases 1
-devenv processes stop
+devenv processes down
 ```
 
-Commands run from the umbrella root. `devenv processes stop` is the cleanup
+Commands run from the umbrella root. `devenv processes down` is the cleanup
 command; no Docker command participates in this path.
 
 Fornacast compiles the Ecto repository adapter into `Fornacast.Repo`. Local
@@ -172,8 +178,9 @@ The implementation is accepted when all of the following pass:
 
 ```sh
 devenv shell -- true
-devenv processes start -d postgres
+devenv processes up -d --strict-ports postgres
 devenv processes wait --timeout 120
+devenv shell -- env | rg '^PG(HOST|PORT)='
 devenv shell -- psql -v ON_ERROR_STOP=1 -d fornacast_test -c 'select 1'
 
 devenv shell -- env \
@@ -187,7 +194,7 @@ devenv shell -- env \
   FORNACAST_DATABASE_ADAPTER=turso \
   mix test apps/fornacast_api/test/users_organizations_test.exs --max-cases 1
 
-devenv processes stop
+devenv processes down
 mix format --check-formatted
 git diff --check
 ```
