@@ -12,12 +12,37 @@ repo_config =
       ]
 
     value when value in ["postgres", "postgresql"] ->
-      [
-        username: System.get_env("POSTGRES_USER", "postgres"),
-        password: System.get_env("POSTGRES_PASSWORD", "postgres"),
-        hostname: System.get_env("POSTGRES_HOST", "localhost"),
-        database: System.get_env("POSTGRES_TEST_DB", "fornacast_test")
-      ]
+      username =
+        System.get_env("PGUSER") ||
+          System.get_env("POSTGRES_USER") ||
+          System.get_env("USER", "postgres")
+
+      password =
+        case System.get_env("PGPASSWORD") || System.get_env("POSTGRES_PASSWORD") do
+          value when value in [nil, ""] -> nil
+          value -> value
+        end
+
+      host = System.get_env("PGHOST") || System.get_env("POSTGRES_HOST", "localhost")
+
+      connection =
+        if Path.type(host) == :absolute do
+          [hostname: nil, port: nil, socket_dir: host]
+        else
+          port =
+            System.get_env("PGPORT") || System.get_env("POSTGRES_PORT", "5432")
+
+          [hostname: host, port: String.to_integer(port), socket_dir: nil]
+        end
+
+      credentials =
+        [
+          username: username,
+          password: password,
+          database: System.get_env("POSTGRES_TEST_DB", "fornacast_test")
+        ]
+
+      credentials ++ connection
   end
 
 config :fornacast, Fornacast.Repo, [pool: Ecto.Adapters.SQL.Sandbox, pool_size: 10] ++ repo_config
