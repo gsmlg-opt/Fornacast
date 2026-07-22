@@ -430,7 +430,8 @@ end
 Run:
 
 ```bash
-MIX_BUILD_PATH=_build/test-turso \
+devenv shell -- env \
+  MIX_BUILD_PATH=_build/test-turso \
   FORNACAST_DATABASE_ADAPTER=turso \
   FORNACAST_TEST_DATABASE_PATH=/tmp/fornacast-workflow-contract-red.db \
   mix test apps/fornacast_api/test/database_workflow_contract_test.exs --max-cases 1
@@ -491,7 +492,8 @@ The PostgreSQL service intentionally exists in both matrix entries. Explicit ada
 Run:
 
 ```bash
-MIX_BUILD_PATH=_build/test-turso \
+devenv shell -- env \
+  MIX_BUILD_PATH=_build/test-turso \
   FORNACAST_DATABASE_ADAPTER=turso \
   FORNACAST_TEST_DATABASE_PATH=/tmp/fornacast-workflow-contract-green.db \
   mix test apps/fornacast_api/test/database_workflow_contract_test.exs --max-cases 1
