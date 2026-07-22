@@ -26,6 +26,8 @@ in {
   services.postgres = {
     enable = true;
     package = pkgs-stable.postgresql_17;
+    port = 55432;
+    listen_addresses = "";
     initialDatabases = [
       {name = "fornacast_test";}
     ];
