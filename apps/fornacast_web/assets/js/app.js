@@ -1,4 +1,5 @@
 import "phoenix_duskmoon";
+// TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#104
 import { registerAll } from "@duskmoon-dev/elements";
 import { registerAllArts } from "@duskmoon-dev/art-elements";
 
