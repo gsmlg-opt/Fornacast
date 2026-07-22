@@ -48,7 +48,7 @@ The repository adds these checked-in files:
 
 An `.envrc` is intentionally omitted. Developers opt into the environment with
 an explicit `devenv shell -- ...` command, and PostgreSQL starts only through
-`devenv processes start postgres`.
+`devenv processes start -d postgres`.
 
 `devenv.nix` uses the stable nixpkgs input and provides the project toolchain:
 
@@ -65,8 +65,11 @@ must not set `FORNACAST_DATABASE_ADAPTER` globally.
 The explicit local lifecycle is:
 
 ```sh
-devenv processes start postgres
+devenv processes start -d postgres
+devenv processes wait --timeout 120
+devenv shell -- psql -v ON_ERROR_STOP=1 -d fornacast_test -c 'select 1'
 devenv shell -- env \
+  MIX_BUILD_PATH=_build/test-postgres \
   FORNACAST_DATABASE_ADAPTER=postgres \
   POSTGRES_TEST_DB=fornacast_test \
   mix test <scoped-paths> --max-cases 1
@@ -75,6 +78,12 @@ devenv processes stop
 
 Commands run from the umbrella root. `devenv processes stop` is the cleanup
 command; no Docker command participates in this path.
+
+Fornacast compiles the Ecto repository adapter into `Fornacast.Repo`. Local
+commands that switch adapters therefore use `_build/test-postgres` and
+`_build/test-turso` respectively; they must not reuse a single test build path.
+GitHub Actions matrix entries already run in isolated jobs and partition their
+build caches by adapter.
 
 ## PostgreSQL test configuration
 
@@ -158,14 +167,18 @@ The implementation is accepted when all of the following pass:
 
 ```sh
 devenv shell -- true
-devenv processes start postgres
+devenv processes start -d postgres
+devenv processes wait --timeout 120
+devenv shell -- psql -v ON_ERROR_STOP=1 -d fornacast_test -c 'select 1'
 
 devenv shell -- env \
+  MIX_BUILD_PATH=_build/test-postgres \
   FORNACAST_DATABASE_ADAPTER=postgres \
   POSTGRES_TEST_DB=fornacast_test \
   mix test apps/fornacast_api/test/users_organizations_test.exs --max-cases 1
 
 devenv shell -- env \
+  MIX_BUILD_PATH=_build/test-turso \
   FORNACAST_DATABASE_ADAPTER=turso \
   mix test apps/fornacast_api/test/users_organizations_test.exs --max-cases 1
 
