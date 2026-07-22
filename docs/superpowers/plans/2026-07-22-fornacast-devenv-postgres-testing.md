@@ -179,6 +179,7 @@ devenv shell -- env \
   MIX_BUILD_PATH=_build/test-postgres \
   FORNACAST_DATABASE_ADAPTER=postgres \
   PGHOST=/tmp/fornacast-postgres-socket \
+  PGPORT=55432 \
   PGUSER=fornacast_socket_user \
   PGPASSWORD= \
   POSTGRES_TEST_DB=fornacast_socket_test \
@@ -189,7 +190,7 @@ devenv shell -- env \
     "fornacast_socket_test" = config[:database]
     nil = config[:password]
     nil = config[:hostname]
-    nil = config[:port]
+    55432 = config[:port]
   '
 ```
 
@@ -214,14 +215,17 @@ Replace the PostgreSQL branch in `config/test.exs` with:
 
       host = System.get_env("PGHOST") || System.get_env("POSTGRES_HOST", "localhost")
 
+      port =
+        System.get_env("PGPORT") ||
+          System.get_env("POSTGRES_PORT", "5432")
+
+      port = String.to_integer(port)
+
       connection =
         if Path.type(host) == :absolute do
-          [hostname: nil, port: nil, socket_dir: host]
+          [hostname: nil, port: port, socket_dir: host]
         else
-          port =
-            System.get_env("PGPORT") || System.get_env("POSTGRES_PORT", "5432")
-
-          [hostname: host, port: String.to_integer(port), socket_dir: nil]
+          [hostname: host, port: port, socket_dir: nil]
         end
 
       credentials =
@@ -240,7 +244,7 @@ Do not modify the Turso branch or any non-test configuration.
 
 Run the exact Step 1 command again.
 
-Expected: exit `0`; `:socket_dir`, username, and database match, the empty password is normalized to `nil`, and the base TCP hostname is cleared.
+Expected: exit `0`; `:socket_dir`, port, username, and database match, the empty password is normalized to `nil`, and the base TCP hostname is cleared.
 
 - [ ] **Step 4: Run a TCP-config probe**
 

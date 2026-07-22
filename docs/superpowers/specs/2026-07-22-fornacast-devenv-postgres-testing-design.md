@@ -98,8 +98,10 @@ build caches by adapter.
 The PostgreSQL branch in `config/test.exs` supports two connection forms:
 
 1. When `PGHOST` is an absolute path, use it as Postgrex's `:socket_dir`. Read
-   `PGUSER` and `PGPASSWORD`, with the current user as the username fallback.
-   This is the devenv path and requires no exposed TCP port or password.
+   `PGUSER` and `PGPASSWORD`, with the current user as the username fallback,
+   and retain `PGPORT` because PostgreSQL includes the port in its Unix socket
+   filename. This is the devenv path and requires no exposed TCP port or
+   password.
 2. Otherwise, use TCP through `PGHOST` or `POSTGRES_HOST`, and read the port from
    `PGPORT` or `POSTGRES_PORT` with `5432` as the final default. Preserve
    `POSTGRES_USER` and `POSTGRES_PASSWORD` fallbacks for GitHub Actions.
