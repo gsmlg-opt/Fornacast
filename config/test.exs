@@ -25,14 +25,17 @@ repo_config =
 
       host = System.get_env("PGHOST") || System.get_env("POSTGRES_HOST", "localhost")
 
+      port =
+        System.get_env("PGPORT") ||
+          System.get_env("POSTGRES_PORT", "5432")
+
+      port = String.to_integer(port)
+
       connection =
         if Path.type(host) == :absolute do
-          [hostname: nil, port: nil, socket_dir: host]
+          [hostname: nil, port: port, socket_dir: host]
         else
-          port =
-            System.get_env("PGPORT") || System.get_env("POSTGRES_PORT", "5432")
-
-          [hostname: host, port: String.to_integer(port), socket_dir: nil]
+          [hostname: host, port: port, socket_dir: nil]
         end
 
       credentials =
