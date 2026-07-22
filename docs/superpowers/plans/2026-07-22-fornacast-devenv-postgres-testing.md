@@ -28,6 +28,7 @@
 - Create `devenv.yaml`: pin devenv's rolling modules and the stable nixpkgs release used for toolchain packages.
 - Create `devenv.nix`: provide the Elixir/Rust build tools and a test-only PostgreSQL 17 service.
 - Create `devenv.lock`: generated lock for the declared inputs.
+- Modify `.gitignore`: ignore generated devenv state and the conventional Nix result symlink.
 - Modify `config/test.exs`: translate devenv socket variables or CI TCP variables into Postgrex options.
 - Modify `apps/fornacast_api/test/test_helper.exs`: put the PostgreSQL Sandbox into manual mode before `ConnCase` checkouts.
 - Create `apps/fornacast_api/test/database_workflow_contract_test.exs`: pin the dual-adapter GitHub Actions contract.
@@ -36,6 +37,7 @@
 ### Task 1: Add the pinned test-only devenv PostgreSQL service
 
 **Files:**
+- Modify: `.gitignore`
 - Create: `devenv.yaml`
 - Create: `devenv.nix`
 - Create: `devenv.lock`
@@ -50,7 +52,18 @@ test -f devenv.nix && test -f devenv.yaml
 
 Expected: exit `1` because neither checked-in devenv definition exists.
 
-- [ ] **Step 2: Add the pinned input definition**
+- [ ] **Step 2: Ignore generated devenv and Nix state**
+
+Append this block to `.gitignore`:
+
+```gitignore
+# devenv
+.devenv/
+.devenv.*
+/result
+```
+
+- [ ] **Step 3: Add the pinned input definition**
 
 Create `devenv.yaml` with exactly:
 
@@ -65,7 +78,7 @@ inputs:
 allowUnfree: true
 ```
 
-- [ ] **Step 3: Add the toolchain and PostgreSQL service**
+- [ ] **Step 4: Add the toolchain and PostgreSQL service**
 
 Create `devenv.nix` with exactly:
 
@@ -93,7 +106,7 @@ in {
     ];
 
   languages.elixir.enable = true;
-  languages.elixir.package = pkgs-stable.beam29Packages.elixir;
+  languages.elixir.package = pkgs-stable.beam29Packages.elixir_1_20;
 
   services.postgres = {
     enable = true;
@@ -107,7 +120,7 @@ in {
 
 Do not add `env.FORNACAST_DATABASE_ADAPTER`, `processes.fornacast`, or a `fornacast_dev` database.
 
-- [ ] **Step 4: Evaluate the environment and generate the lock**
+- [ ] **Step 5: Evaluate the environment and generate the lock**
 
 Run:
 
@@ -115,9 +128,9 @@ Run:
 devenv shell -- true
 ```
 
-Expected: exit `0`, `devenv.lock` is created, and evaluation finds `beam29Packages.elixir` plus `postgresql_17` in the stable input. If input download fails, retry once only when the second attempt can reuse completed Nix store paths; otherwise report the external fetch failure without changing the pin.
+Expected: exit `0`, `devenv.lock` is created, and evaluation finds `beam29Packages.elixir_1_20` plus `postgresql_17` in the stable input. If online input resolution is slow, the checked-in Backplane lock may be reused only after confirming its declared input graph is identical; the plain shell command must still pass against that lock without changing a pin.
 
-- [ ] **Step 5: Prove the service definition is test-only**
+- [ ] **Step 6: Prove the service definition is test-only**
 
 Run:
 
@@ -134,18 +147,18 @@ devenv shell -- env \
 
 Expected: the first command prints `true`; the second exits `0`, proving the shell does not switch development away from Turso.
 
-- [ ] **Step 6: Check and commit the environment definition**
+- [ ] **Step 7: Check and commit the environment definition**
 
 Run:
 
 ```bash
 nix-instantiate --parse devenv.nix >/dev/null
 git diff --check
-git add devenv.nix devenv.yaml devenv.lock
+git add .gitignore devenv.nix devenv.yaml devenv.lock
 git commit -m "chore(devenv): add postgres test service"
 ```
 
-Expected: Nix parsing and the whitespace check pass; the commit contains only the three devenv files.
+Expected: Nix parsing and the whitespace check pass; the commit contains only `.gitignore` and the three devenv files.
 
 ### Task 2: Support devenv sockets and CI TCP connections in test config
 

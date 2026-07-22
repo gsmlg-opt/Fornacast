@@ -42,6 +42,8 @@ GitHub Actions test workflow.
 
 The repository adds these checked-in files:
 
+- `.gitignore`: ignore generated devenv state and the conventional Nix result
+  symlink;
 - `devenv.nix`: toolchain and PostgreSQL service definition;
 - `devenv.yaml`: pinned rolling devenv modules and stable nixpkgs input; and
 - `devenv.lock`: generated input lock.
