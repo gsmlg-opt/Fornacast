@@ -50,6 +50,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
       libstdc++6 \
+      libsctp1 \
       ncurses-base \
       openssl && \
     useradd --create-home --home-dir /app --shell /usr/sbin/nologin fornacast && \

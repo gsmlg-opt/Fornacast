@@ -118,6 +118,14 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert File.read!(@config) =~ ~s(config :bun, version: "1.3.4")
   end
 
+  test "release image installs the Erlang SCTP runtime library" do
+    dockerfile = File.read!(@dockerfile)
+    [_, runtime_stage] = String.split(dockerfile, "FROM ${DEBIAN_IMAGE} AS app", parts: 2)
+    [runtime_packages, _] = String.split(runtime_stage, "useradd --create-home", parts: 2)
+
+    assert "libsctp1" in String.split(runtime_packages)
+  end
+
   test "release commit, tag, and page operations are safe to retry" do
     workflow = File.read!(@workflow)
 
