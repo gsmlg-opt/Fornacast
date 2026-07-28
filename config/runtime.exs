@@ -51,6 +51,10 @@ if config_env() == :prod do
   secret_key_base =
     fetch_runtime_env!.("SECRET_KEY_BASE", String.duplicate("0", 64))
 
+  if byte_size(secret_key_base) < 64 do
+    raise "environment variable SECRET_KEY_BASE must be at least 64 bytes"
+  end
+
   api_bind = System.get_env("FORNACAST_API_BIND_IP", "127.0.0.1")
 
   api_ip =

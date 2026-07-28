@@ -7,10 +7,12 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
   @e2e_workflow Path.join(@root, ".github/workflows/e2e.yml")
   @compose Path.join(@root, "docker-compose.yml")
   @dockerfile Path.join(@root, "Dockerfile")
+  @env_example Path.join(@root, ".env.example")
   @readme Path.join(@root, "README.md")
   @version_resolver Path.join(@root, "scripts/resolve_release_version.sh")
   @web_mix Path.join(@root, "apps/fornacast_web/mix.exs")
   @config Path.join(@root, "config/config.exs")
+  @runtime_config Path.join(@root, "config/runtime.exs")
 
   test "release version resolver accepts only normalized stable versions" do
     for {input, expected} <- [
@@ -124,6 +126,23 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     [runtime_packages, _] = String.split(runtime_stage, "useradd --create-home", parts: 2)
 
     assert "libsctp1" in String.split(runtime_packages)
+  end
+
+  test "production rejects cookie secrets shorter than 64 bytes" do
+    {short_output, short_status} = read_runtime_config(String.duplicate("s", 63))
+
+    assert short_status != 0
+    assert short_output =~ "SECRET_KEY_BASE must be at least 64 bytes"
+
+    {_valid_output, valid_status} = read_runtime_config(String.duplicate("s", 64))
+    assert valid_status == 0
+  end
+
+  test "Compose env template requires a generated 64-byte cookie secret" do
+    env_example = File.read!(@env_example)
+
+    assert env_example =~ ~r/^SECRET_KEY_BASE=$/m
+    assert env_example =~ "openssl rand -hex 32"
   end
 
   test "release commit, tag, and page operations are safe to retry" do
@@ -253,5 +272,26 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
       {position, _length} -> position
       :nomatch -> flunk("expected to find #{inspect(value)}")
     end
+  end
+
+  defp read_runtime_config(secret_key_base) do
+    elixir = System.find_executable("elixir") || flunk("elixir executable not found")
+
+    System.cmd(
+      elixir,
+      ["-e", "Config.Reader.read!(#{inspect(@runtime_config)}, env: :prod)"],
+      cd: @root,
+      env: [
+        {"RELEASE_COMMAND", "start"},
+        {"SECRET_KEY_BASE", secret_key_base},
+        {"FORNACAST_API_PORT", "4001"},
+        {"FORNACAST_BASE_URL", "http://localhost:4890"},
+        {"FORNACAST_REPO_STORAGE_ROOT", "/tmp/fornacast-runtime-config-repos"},
+        {"FORNACAST_SSH_HOST", "localhost"},
+        {"FORNACAST_SSH_PORT", "2222"},
+        {"FORNACAST_SSH_SYSTEM_DIR", "/tmp/fornacast-runtime-config-ssh"}
+      ],
+      stderr_to_stdout: true
+    )
   end
 end
