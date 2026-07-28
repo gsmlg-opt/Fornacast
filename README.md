@@ -1,5 +1,8 @@
 # Fornacast
 
+[![GitHub Release](https://img.shields.io/github/v/release/gsmlg-opt/Fornacast)](https://github.com/gsmlg-opt/Fornacast/releases/latest)
+[![GHCR](https://img.shields.io/badge/GHCR-gsmlg--dev%2Ffornacast-2496ED?logo=docker&logoColor=white)](https://github.com/orgs/gsmlg-dev/packages/container/package/fornacast)
+
 Fornacast is a small self-hosted Git forge built with Elixir, Phoenix, Erlang/OTP SSH, Ecto on ExTurso/Turso by default, Concord-backed key/value app config, optional PostgreSQL, and Rust NIFs over gitoxide.
 
 The first release target is intentionally narrow: create users and repositories, authenticate Git over SSH with user SSH keys, push/clone/fetch with a normal Git client, browse repositories in the web UI, and support the documented GitHub-compatible REST workflow.
@@ -75,7 +78,46 @@ Set `SECRET_KEY_BASE` in `.env` to the generated value.
 By default Docker Compose uses a local Turso-compatible Ecto database file at `/data/fornacast.db` and a separate Concord key/value config database at `/data/fornacast_config.db`.
 Replace `POSTGRES_PASSWORD` only when using the optional PostgreSQL profile.
 
-Build and start:
+### Deploy a prebuilt release image
+
+The published image supports Turso/libSQL only. PostgreSQL requires a source
+build with the `FORNACAST_DATABASE_ADAPTER=postgres` build argument.
+
+For deployment, anonymous pulls work only when the package is public.
+If the package is private, create a separate read-only PAT with `read:packages`
+and authenticate before pulling. Do not use the release publisher's
+`GHCR_TOKEN`:
+
+```sh
+export GHCR_USERNAME=your-github-username
+export GHCR_READ_TOKEN=your-read-only-token
+printf '%s' "$GHCR_READ_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+```
+
+Choose the release tag to deploy:
+
+```sh
+export FORNACAST_IMAGE=ghcr.io/gsmlg-dev/fornacast:0.1.0
+docker compose pull app nginx
+```
+
+Version tags are convenient but can move. For a truly immutable pin, replace
+the tag with `@sha256:<digest>` using the digest printed on the GitHub release page.
+
+Before deployment, keep public port `4000` blocked in the firewall or security
+group while starting the instance:
+
+```sh
+docker compose up -d --no-build
+```
+
+Complete `/setup` locally or through an SSH tunnel, then open public port
+`4000`. Port `2222` is the public SSH endpoint; do not publish the internal
+application ports `4890` or `4001` directly.
+
+### Build from source
+
+Build and start the default Turso-backed image from source:
 
 ```sh
 docker compose up --build -d

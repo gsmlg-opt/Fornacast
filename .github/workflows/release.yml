@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release version (e.g. 1.2.3)
+        description: Stable release version (e.g. 1.2.3)
         required: true
         type: string
       git_ref:
-        description: Git ref to release from
+        description: Git branch to release from
         required: true
         default: main
         type: string
@@ -17,8 +17,8 @@ permissions:
   contents: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
 
 env:
   ELIXIR_VERSION: 1.20.1
@@ -38,6 +38,24 @@ jobs:
         with:
           ref: ${{ inputs.git_ref }}
           fetch-depth: 0
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+          GIT_REF_INPUT: ${{ inputs.git_ref }}
+        run: |
+          version="$(scripts/resolve_release_version.sh "$VERSION_INPUT")"
+          git_ref="$(git check-ref-format --branch "$GIT_REF_INPUT")"
+
+          if ! git ls-remote --exit-code --heads origin "refs/heads/${git_ref}" >/dev/null; then
+            echo "Release branch does not exist on origin: ${git_ref}" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "git_ref=$git_ref" >> "$GITHUB_OUTPUT"
 
       - name: Install system dependencies
         run: |
@@ -74,8 +92,10 @@ jobs:
 
       - name: Update project versions
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
+          # $ENV{VERSION} is expanded by Perl, not the shell.
+          # shellcheck disable=SC2016
           find mix.exs apps -name mix.exs -print0 |
             xargs -0 perl -0pi -e 's/version: "[^"]+"/version: "$ENV{VERSION}"/g'
 
@@ -98,40 +118,189 @@ jobs:
 
       - name: Build release artifact
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           mix release fornacast --overwrite
           mkdir -p artifacts
           tar -C _build/prod/rel -czf "artifacts/fornacast-${VERSION}-linux-x86_64.tar.gz" fornacast
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Commit release version
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add mix.exs apps/*/mix.exs
-          git commit -m "chore(release): v${VERSION}"
+
+          if git diff --cached --quiet; then
+            echo "Files already have requested version ${VERSION}; continuing"
+          else
+            git commit -m "chore(release): v${VERSION}"
+          fi
 
       - name: Tag release
         env:
-          VERSION: ${{ inputs.version }}
-        run: git tag "v${VERSION}"
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if git rev-parse --verify --quiet "refs/tags/v${VERSION}" >/dev/null; then
+            tag_commit="$(git rev-list -n 1 "v${VERSION}")"
+            head_commit="$(git rev-parse HEAD)"
+
+            if [[ "$tag_commit" != "$head_commit" ]]; then
+              echo "Release tag v${VERSION} points to ${tag_commit}, not ${head_commit}" >&2
+              exit 1
+            fi
+
+            echo "Release tag v${VERSION} already points to HEAD; continuing"
+          else
+            git tag "v${VERSION}"
+          fi
+
+      - name: Resolve GHCR username
+        id: ghcr
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          username="$(gh api user --jq .login)"
+
+          if [[ -z "$username" ]]; then
+            echo "GHCR_TOKEN did not resolve to a GitHub username" >&2
+            exit 1
+          fi
+
+          echo "username=$username" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ steps.ghcr.outputs.username }}
+          password: ${{ secrets.GHCR_TOKEN }}
 
       - name: Push release commit and tag
         env:
-          VERSION: ${{ inputs.version }}
-          GIT_REF: ${{ inputs.git_ref }}
+          VERSION: ${{ steps.version.outputs.version }}
+          GIT_REF: ${{ steps.version.outputs.git_ref }}
         run: |
-          git push origin "HEAD:${GIT_REF}"
+          git push origin "HEAD:refs/heads/${GIT_REF}"
           git push origin "v${VERSION}"
+
+      - name: Build and publish Docker image
+        id: docker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ghcr.io/gsmlg-dev/fornacast:latest
+            ghcr.io/gsmlg-dev/fornacast:${{ steps.version.outputs.version }}
+          cache-from: type=gha,scope=fornacast-release
+          cache-to: type=gha,mode=max,scope=fornacast-release
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+
+      - name: Prepare release deployment notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          cat > release-notes.md <<'EOF'
+          <!-- FORNACAST_DEPLOY_NOTES_START -->
+          ## Deploy with Docker Compose
+
+          This release publishes an image that supports Turso/libSQL only.
+          PostgreSQL requires a source build with `FORNACAST_DATABASE_ADAPTER=postgres`.
+
+          - `ghcr.io/gsmlg-dev/fornacast:{{VERSION}}` (release tag)
+          - `ghcr.io/gsmlg-dev/fornacast:latest` (latest release)
+          - Image digest: `${{ steps.docker.outputs.digest }}`
+
+          For deployment, anonymous pulls work only when the package is public. If
+          the package is private, create a separate read-only PAT with
+          `read:packages` and authenticate before pulling. Do not use the release
+          publisher token:
+
+          ```sh
+          export GHCR_USERNAME=your-github-username
+          export GHCR_READ_TOKEN=your-read-only-token
+          printf '%s' "$GHCR_READ_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+          ```
+
+          Clone the exact release configuration and create its environment file:
+
+          ```sh
+          git clone --branch "v{{VERSION}}" --depth 1 https://github.com/gsmlg-opt/Fornacast.git
+          cd Fornacast
+          cp .env.example .env
+          ```
+
+          Generate a strong `SECRET_KEY_BASE`, then edit `.env` to set it. Also set
+          `FORNACAST_BASE_URL` to the public base URL and `FORNACAST_SSH_HOST` to
+          the public SSH hostname.
+
+          Before deployment, keep public port `4000` blocked in the firewall or
+          security group while initializing the instance. Deploy the image by its
+          immutable digest:
+
+          ```sh
+          export FORNACAST_IMAGE=ghcr.io/gsmlg-dev/fornacast@${{ steps.docker.outputs.digest }}
+          docker compose pull app nginx
+          docker compose up -d --no-build
+          ```
+
+          Complete `/setup` locally or through an SSH tunnel, then open public port
+          `4000` in the firewall or security group.
+
+          The public ports are `4000` for HTTP and `2222` for SSH.
+          Do not publish ports `4890` or `4001` directly.
+
+          The `fornacast-data` volume is mounted at `/data` and persists the Ecto database, Concord config, repositories, and SSH keys.
+          <!-- FORNACAST_DEPLOY_NOTES_END -->
+          EOF
+
+          sed -i "s/{{VERSION}}/${VERSION}/g" release-notes.md
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          gh release create "v${VERSION}" \
-            "artifacts/fornacast-${VERSION}-linux-x86_64.tar.gz#fornacast-${VERSION}-linux-x86_64.tar.gz" \
-            --title "v${VERSION}" \
-            --generate-notes
+          notes="$(cat release-notes.md)"
+          asset="artifacts/fornacast-${VERSION}-linux-x86_64.tar.gz#fornacast-${VERSION}-linux-x86_64.tar.gz"
+
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            existing_notes="$(gh release view "v${VERSION}" --json body --jq '.body // ""')"
+            release_is_draft="$(gh release view "v${VERSION}" --json isDraft --jq .isDraft)"
+            existing_without_deploy="$(
+              printf '%s\n' "$existing_notes" |
+                awk '
+                  $0 == "<!-- FORNACAST_DEPLOY_NOTES_START -->" { in_deploy = 1; next }
+                  $0 == "<!-- FORNACAST_DEPLOY_NOTES_END -->" { in_deploy = 0; next }
+                  !in_deploy { print }
+                '
+            )"
+            combined_notes="$notes"
+
+            if [[ -n "$existing_without_deploy" ]]; then
+              combined_notes="${notes}"$'\n\n'"${existing_without_deploy}"
+            fi
+
+            gh release edit "v${VERSION}" --notes "$combined_notes"
+            gh release upload "v${VERSION}" "$asset" --clobber
+
+            if [[ "$release_is_draft" == "true" ]]; then
+              gh release edit "v${VERSION}" --draft=false
+            fi
+          else
+            gh release create "v${VERSION}" \
+              "$asset" \
+              --title "v${VERSION}" \
+              --verify-tag \
+              --generate-notes \
+              --notes "$notes"
+          fi

@@ -1,5 +1,6 @@
 services:
   app:
+    image: ${FORNACAST_IMAGE:-ghcr.io/gsmlg-dev/fornacast:latest}
     build:
       context: .
       args:
