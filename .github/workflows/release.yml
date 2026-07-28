@@ -159,25 +159,11 @@ jobs:
             git tag "v${VERSION}"
           fi
 
-      - name: Resolve GHCR username
-        id: ghcr
-        env:
-          GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
-        run: |
-          username="$(gh api user --jq .login)"
-
-          if [[ -z "$username" ]]; then
-            echo "GHCR_TOKEN did not resolve to a GitHub username" >&2
-            exit 1
-          fi
-
-          echo "username=$username" >> "$GITHUB_OUTPUT"
-
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ steps.ghcr.outputs.username }}
+          username: ${{ github.actor }}
           password: ${{ secrets.GHCR_TOKEN }}
 
       - name: Push release commit and tag

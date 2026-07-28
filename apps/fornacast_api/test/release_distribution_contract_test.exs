@@ -79,23 +79,22 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert workflow =~ ~s(git push origin "HEAD:refs/heads/${GIT_REF}")
   end
 
-  test "release publishes normalized latest and versioned images through GHCR_TOKEN owner" do
+  test "release publishes normalized images with GHCR_TOKEN used only for registry login" do
     workflow = File.read!(@workflow)
 
     refute workflow =~ "packages: write"
     assert workflow =~ "uses: docker/setup-buildx-action@v3"
+    refute workflow =~ "Resolve GHCR username"
+    refute workflow =~ "gh api user"
 
     assert workflow =~
-             ~r/- name: Resolve GHCR username\s+id: ghcr\s+env:\s+GH_TOKEN: \$\{\{ secrets\.GHCR_TOKEN \}\}\s+.*?gh api user --jq \.login.*?echo "username=\$username" >> "\$GITHUB_OUTPUT"/s
-
-    assert workflow =~
-             ~r/- name: Log in to GHCR\s+uses: docker\/login-action@v3\s+with:\s+registry: ghcr.io\s+username: \$\{\{ steps\.ghcr\.outputs\.username \}\}\s+password: \$\{\{ secrets\.GHCR_TOKEN \}\}/
+             ~r/- name: Log in to GHCR\s+uses: docker\/login-action@v3\s+with:\s+registry: ghcr.io\s+username: \$\{\{ github\.actor \}\}\s+password: \$\{\{ secrets\.GHCR_TOKEN \}\}/
 
     assert workflow =~
              ~r/- name: Build and publish Docker image.*?uses: docker\/build-push-action@v6.*?context: \.\s+file: \.\/Dockerfile\s+push: true\s+tags: \|\s+ghcr\.io\/gsmlg-dev\/fornacast:latest\s+ghcr\.io\/gsmlg-dev\/fornacast:\$\{\{ steps\.version\.outputs\.version \}\}/s
 
+    assert length(:binary.matches(workflow, ~s(${{ secrets.GHCR_TOKEN }}))) == 1
     assert length(:binary.matches(workflow, ~s(${{ github.token }}))) == 1
-    assert_order(workflow, "Resolve GHCR username", "Log in to GHCR")
     assert_order(workflow, "Log in to GHCR", "Push release commit and tag")
     assert_order(workflow, "Push release commit and tag", "Build and publish Docker image")
     assert_order(workflow, "Build and publish Docker image", "Create GitHub release")
