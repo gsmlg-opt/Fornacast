@@ -157,9 +157,9 @@ only the web listener or omitting `/api/uploads`.
 
 The release starts both `fornacast_web` and `fornacast_api`, together with all
 domain applications. The root `mix fornacast.run` development entrypoint starts
-the complete web and API stack. Development and test configuration may use
-port `4001` as the API default, while production supplies an explicit internal
-port and bind address.
+the complete web and API stack. The API listener defaults to port `4891` in
+development, test, and production; deployments may override its port and bind
+address.
 
 ```mermaid
 flowchart LR

@@ -138,6 +138,13 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert valid_status == 0
   end
 
+  test "production defaults the API listener to port 4891" do
+    {output, status} = read_runtime_config(String.duplicate("s", 64), nil)
+
+    assert status == 0
+    assert output =~ "api_port=4891"
+  end
+
   test "Compose env template requires a generated 64-byte cookie secret" do
     env_example = File.read!(@env_example)
 
@@ -216,7 +223,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert workflow =~ "docker compose up -d --no-build"
     assert workflow =~ "keep public port `4000` blocked"
     assert workflow =~ "locally or through an SSH tunnel"
-    assert workflow =~ "Do not publish ports `4890` or `4001` directly."
+    assert workflow =~ "Do not publish ports `4890` or `4891` directly."
 
     assert workflow =~
              "The `fornacast-data` volume is mounted at `/data` and persists the Ecto database, Concord config, repositories, and SSH keys."
@@ -274,17 +281,31 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     end
   end
 
-  defp read_runtime_config(secret_key_base) do
+  defp read_runtime_config(secret_key_base, api_port \\ "4891") do
     elixir = System.find_executable("elixir") || flunk("elixir executable not found")
 
     System.cmd(
       elixir,
-      ["-e", "Config.Reader.read!(#{inspect(@runtime_config)}, env: :prod)"],
+      [
+        "-e",
+        """
+        config = Config.Reader.read!(#{inspect(@runtime_config)}, env: :prod)
+
+        port =
+          config
+          |> Keyword.fetch!(:fornacast_api)
+          |> Keyword.fetch!(FornacastAPI.Endpoint)
+          |> Keyword.fetch!(:http)
+          |> Keyword.fetch!(:port)
+
+        IO.puts("api_port=\#{port}")
+        """
+      ],
       cd: @root,
       env: [
         {"RELEASE_COMMAND", "start"},
         {"SECRET_KEY_BASE", secret_key_base},
-        {"FORNACAST_API_PORT", "4001"},
+        {"FORNACAST_API_PORT", api_port},
         {"FORNACAST_BASE_URL", "http://localhost:4890"},
         {"FORNACAST_REPO_STORAGE_ROOT", "/tmp/fornacast-runtime-config-repos"},
         {"FORNACAST_SSH_HOST", "localhost"},

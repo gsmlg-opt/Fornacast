@@ -53,7 +53,7 @@ On a fresh install this prints a setup URL. Open `http://localhost:4890/setup` t
 Default local endpoints:
 
 - Web: `http://localhost:4890`
-- REST API: `http://localhost:4001/api/v3`
+- REST API: `http://localhost:4891/api/v3`
 - SSH: `ssh://USER@localhost:2222/USER/REPO.git`
 
 Alternatively, create the first admin headlessly without the web wizard:
@@ -113,7 +113,7 @@ docker compose up -d --no-build
 
 Complete `/setup` locally or through an SSH tunnel, then open public port
 `4000`. Port `2222` is the public SSH endpoint; do not publish the internal
-application ports `4890` or `4001` directly.
+application ports `4890` or `4891` directly.
 
 ### Build from source
 
@@ -132,7 +132,7 @@ docker compose --profile postgres up --build -d
 ```
 
 Migrations run automatically on container start. Open `http://localhost:4000/setup` to create the first admin account.
-Nginx is the Compose deployment's only public HTTP service. It serves the web application and the REST API from the same origin: use `http://localhost:4000/api/v3` for REST resources and `http://localhost:4000/api/uploads` for release-asset uploads. The application container's web listener on port `4890` and API listener on port `4001` remain internal to the Compose network.
+Nginx is the Compose deployment's only public HTTP service. It serves the web application and the REST API from the same origin: use `http://localhost:4000/api/v3` for REST resources and `http://localhost:4000/api/uploads` for release-asset uploads. The application container's web listener on port `4890` and API listener on port `4891` remain internal to the Compose network.
 
 Alternatively, create the first admin headlessly in the running container without the web wizard:
 
@@ -155,17 +155,17 @@ export FORNACAST_TOKEN='replace-with-your-token'
 curl -H 'User-Agent: fornacast-example/1.0' \
   -H 'X-GitHub-Api-Version: 2022-11-28' \
   -H "Authorization: Bearer $FORNACAST_TOKEN" \
-  http://localhost:4001/api/v3/user
+  http://localhost:4891/api/v3/user
 
 curl -H 'User-Agent: fornacast-example/1.0' \
   -H 'X-GitHub-Api-Version: 2026-03-10' \
   -H "Authorization: token $FORNACAST_TOKEN" \
-  http://localhost:4001/api/v3/user
+  http://localhost:4891/api/v3/user
 ```
 
 Classic scopes are `repo` for private-repository access, `public_repo` for public-repository writes, `read:org` for organization reads, and `write:org` for organization mutations. Scopes do not override domain authorization: the authenticated user must also have the required repository or organization role. Legacy API tokens are accepted only during the documented migration window and remain read-only.
 
-Published upload URLs use `/api/uploads` on the same origin as `/api/v3`. Do not publish the internal port `4001` as a separate production origin.
+Published upload URLs use `/api/uploads` on the same origin as `/api/v3`. Do not publish the internal port `4891` as a separate production origin.
 
 The complete first-release compatibility claim is still blocked by the `auto_init` compatibility gate: the Git-data delivery plan must implement real repository initialization and pass the end-to-end acceptance workflow before the API is advertised as GitHub compatible.
 
@@ -208,7 +208,7 @@ Production environment variables:
 - `DATABASE_URL`, required only when built with `FORNACAST_DATABASE_ADAPTER=postgres`
 - `FORNACAST_BASE_URL`
 - `FORNACAST_API_BIND_IP`, default `0.0.0.0` in the release image
-- `FORNACAST_API_PORT`, default `4001` in the release image
+- `FORNACAST_API_PORT`, default `4891` in the release image
 - `FORNACAST_API_TRUSTED_PROXIES`, comma-separated trusted proxy CIDRs
 - `FORNACAST_REPO_STORAGE_ROOT`
 - `FORNACAST_SSH_HOST`

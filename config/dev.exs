@@ -20,7 +20,7 @@ config :fornacast_web, FornacastWeb.Endpoint,
 config :fornacast_api, FornacastAPI.Endpoint,
   http: [
     ip: {127, 0, 0, 1},
-    port: String.to_integer(System.get_env("FORNACAST_API_PORT", "4001"))
+    port: String.to_integer(System.get_env("FORNACAST_API_PORT", "4891"))
   ],
   server: true
 

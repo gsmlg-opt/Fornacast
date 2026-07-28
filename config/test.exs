@@ -73,7 +73,7 @@ config :fornacast_web, FornacastWeb.Endpoint,
   server: false
 
 config :fornacast_api, FornacastAPI.Endpoint,
-  http: [ip: {127, 0, 0, 1}, port: 4001],
+  http: [ip: {127, 0, 0, 1}, port: 4891],
   server: false
 
 config :fornacast_api,

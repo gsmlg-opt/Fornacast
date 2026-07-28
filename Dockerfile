@@ -65,7 +65,7 @@ COPY --from=build --chown=fornacast:fornacast /app/_build/prod/rel/fornacast ./
 ENV HOME=/app \
     PORT=4890 \
     FORNACAST_API_BIND_IP=0.0.0.0 \
-    FORNACAST_API_PORT=4001 \
+    FORNACAST_API_PORT=4891 \
     FORNACAST_DATABASE_ADAPTER=turso \
     FORNACAST_DATABASE_PATH=/data/fornacast.db \
     FORNACAST_CONFIG_DATABASE_PATH=/data/fornacast_config.db \
@@ -74,6 +74,6 @@ ENV HOME=/app \
 
 USER fornacast
 
-EXPOSE 4890 4001 2222
+EXPOSE 4890 4891 2222
 
 CMD ["/app/bin/fornacast", "start"]

@@ -17,7 +17,7 @@ services:
       SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set SECRET_KEY_BASE}
       FORNACAST_BASE_URL: ${FORNACAST_BASE_URL:-http://localhost:4000}
       FORNACAST_API_BIND_IP: 0.0.0.0
-      FORNACAST_API_PORT: 4001
+      FORNACAST_API_PORT: 4891
       FORNACAST_API_TRUSTED_PROXIES: 172.30.0.0/24
       FORNACAST_REPO_STORAGE_ROOT: /data/repos
       FORNACAST_SSH_HOST: ${FORNACAST_SSH_HOST:-localhost}
@@ -26,7 +26,7 @@ services:
       PORT: 4890
     expose:
       - "4890"
-      - "4001"
+      - "4891"
       - "2222"
     ports:
       - "2222:2222"

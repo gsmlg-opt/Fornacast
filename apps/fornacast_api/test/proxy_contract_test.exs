@@ -7,7 +7,7 @@ defmodule FornacastAPI.ProxyContractTest do
     nginx = read!("deploy/nginx/fornacast.conf")
 
     assert nginx =~ ~r/upstream fornacast_web\s*\{\s*server app:4890;\s*\}/s
-    assert nginx =~ ~r/upstream fornacast_api\s*\{\s*server app:4001;\s*\}/s
+    assert nginx =~ ~r/upstream fornacast_api\s*\{\s*server app:4891;\s*\}/s
 
     api_location = location!(nginx, ~r/\^\/\(api\/v3\|api\/uploads\)\(\/\|\$\)/)
     assert api_location =~ "proxy_pass http://fornacast_api;"
@@ -45,15 +45,25 @@ defmodule FornacastAPI.ProxyContractTest do
     assert web_location =~ "proxy_set_header Connection $connection_upgrade;"
   end
 
+  test "Phoenix environments default the API listener to port 4891" do
+    dev = read!("config/dev.exs")
+    test = read!("config/test.exs")
+    runtime = read!("config/runtime.exs")
+
+    assert dev =~ ~s|System.get_env("FORNACAST_API_PORT", "4891")|
+    assert test =~ ~r/FornacastAPI\.Endpoint,\s*\n\s*http: .*port: 4891/s
+    assert runtime =~ ~s|System.get_env("FORNACAST_API_PORT", "4891")|
+  end
+
   test "the release image exposes distinct web, API, and SSH listeners" do
     dockerfile = read!("Dockerfile")
 
     assert dockerfile =~ "ARG DEBIAN_IMAGE=debian:trixie-slim"
 
     assert dockerfile =~
-             ~r/ENV HOME=\/app \\\n+\s+PORT=4890 \\\n+\s+FORNACAST_API_BIND_IP=0\.0\.0\.0 \\\n+\s+FORNACAST_API_PORT=4001 /s
+             ~r/ENV HOME=\/app \\\n+\s+PORT=4890 \\\n+\s+FORNACAST_API_BIND_IP=0\.0\.0\.0 \\\n+\s+FORNACAST_API_PORT=4891 /s
 
-    assert dockerfile =~ "EXPOSE 4890 4001 2222"
+    assert dockerfile =~ "EXPOSE 4890 4891 2222"
     refute dockerfile =~ "EXPOSE 4000 2222"
   end
 
@@ -62,14 +72,14 @@ defmodule FornacastAPI.ProxyContractTest do
 
     assert compose =~ "PORT: 4890"
     assert compose =~ "FORNACAST_API_BIND_IP: 0.0.0.0"
-    assert compose =~ "FORNACAST_API_PORT: 4001"
+    assert compose =~ "FORNACAST_API_PORT: 4891"
     assert compose =~ "FORNACAST_API_TRUSTED_PROXIES: 172.30.0.0/24"
     assert compose =~ ~s(FORNACAST_BASE_URL: ${FORNACAST_BASE_URL:-http://localhost:4000})
 
     app = service!(compose, "app")
 
     assert app =~
-             ~r/expose:\s*\n\s+- ["']?4890["']?\s*\n\s+- ["']?4001["']?\s*\n\s+- ["']?2222["']?/s
+             ~r/expose:\s*\n\s+- ["']?4890["']?\s*\n\s+- ["']?4891["']?\s*\n\s+- ["']?2222["']?/s
 
     assert app =~ ~r/ports:\s*\n\s+- ["']2222:2222["']/s
     refute app =~ ~r/["']4000:(?:4000|4890)["']/
@@ -117,7 +127,7 @@ defmodule FornacastAPI.ProxyContractTest do
     readme = read!("README.md")
 
     assert readme =~ "http://localhost:4890"
-    assert readme =~ "http://localhost:4001/api/v3"
+    assert readme =~ "http://localhost:4891/api/v3"
     assert readme =~ "http://localhost:4000/api/v3"
     assert readme =~ "http://localhost:4000/api/uploads"
     assert readme =~ "User-Agent"

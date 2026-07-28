@@ -243,7 +243,7 @@ jobs:
           `4000` in the firewall or security group.
 
           The public ports are `4000` for HTTP and `2222` for SSH.
-          Do not publish ports `4890` or `4001` directly.
+          Do not publish ports `4890` or `4891` directly.
 
           The `fornacast-data` volume is mounted at `/data` and persists the Ecto database, Concord config, repositories, and SSH keys.
           <!-- FORNACAST_DEPLOY_NOTES_END -->

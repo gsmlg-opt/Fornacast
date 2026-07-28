@@ -64,7 +64,7 @@ if config_env() == :prod do
     end
 
   api_port =
-    fetch_runtime_env!.("FORNACAST_API_PORT", "4001")
+    System.get_env("FORNACAST_API_PORT", "4891")
     |> String.to_integer()
 
   trusted_proxy_cidrs =
