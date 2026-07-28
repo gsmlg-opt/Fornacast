@@ -3,9 +3,14 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
 
   @root Path.expand("../../..", __DIR__)
   @workflow Path.join(@root, ".github/workflows/release.yml")
+  @ci_workflow Path.join(@root, ".github/workflows/ci.yml")
+  @e2e_workflow Path.join(@root, ".github/workflows/e2e.yml")
   @compose Path.join(@root, "docker-compose.yml")
+  @dockerfile Path.join(@root, "Dockerfile")
   @readme Path.join(@root, "README.md")
   @version_resolver Path.join(@root, "scripts/resolve_release_version.sh")
+  @web_mix Path.join(@root, "apps/fornacast_web/mix.exs")
+  @config Path.join(@root, "config/config.exs")
 
   test "release version resolver accepts only normalized stable versions" do
     for {input, expected} <- [
@@ -94,6 +99,24 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert_order(workflow, "Log in to GHCR", "Push release commit and tag")
     assert_order(workflow, "Push release commit and tag", "Build and publish Docker image")
     assert_order(workflow, "Build and publish Docker image", "Create GitHub release")
+  end
+
+  test "release image and build workflows install the frozen Bun lock" do
+    for path <- [@workflow, @ci_workflow, @e2e_workflow] do
+      workflow = File.read!(path)
+
+      assert workflow =~ "mix bun.install --if-missing"
+      assert workflow =~ "./_build/bun install --frozen-lockfile"
+      assert workflow =~ "bun.lock"
+    end
+
+    dockerfile = File.read!(@dockerfile)
+
+    assert dockerfile =~ "COPY package.json bun.lock bunfig.toml ./"
+    assert dockerfile =~ "mix bun.install --if-missing"
+    assert dockerfile =~ "./_build/bun install --frozen-lockfile"
+    assert File.read!(@web_mix) =~ ~s({:bun, "~> 1.4", runtime: false})
+    assert File.read!(@config) =~ ~s(config :bun, version: "1.3.4")
   end
 
   test "release commit, tag, and page operations are safe to retry" do

@@ -37,6 +37,8 @@ defmodule FornacastWeb.MixProject do
       {:duskmoon_bundler, "~> 9.8", runtime: Mix.env() == :dev},
       {:phoenix_ecto, "~> 4.7"},
       {:phoenix_html, "~> 4.3"},
+      # WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#103
+      {:bun, "~> 1.4", runtime: false},
       {:bandit, "~> 1.12"},
       {:mdex, "~> 0.13.2"},
       {:html_sanitize_ex, "~> 1.5"}
