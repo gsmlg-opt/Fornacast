@@ -342,7 +342,18 @@ defmodule ForgeAccounts.APIKeyTest do
         :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
 
       value when value in ["libsql", "turso"] ->
-        Enum.each(["api_keys", "users"], &Ecto.Adapters.SQL.query!(Repo, "delete from #{&1}", []))
+        Enum.each(
+          [
+            "audit_events",
+            "repository_collaborators",
+            "repositories",
+            "organization_members",
+            "api_keys",
+            "ssh_keys",
+            "users"
+          ],
+          &Ecto.Adapters.SQL.query!(Repo, "delete from #{&1}", [])
+        )
     end
   end
 end

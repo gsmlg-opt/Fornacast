@@ -20,7 +20,7 @@ defmodule Fornacast.SetupTest do
   end
 
   test "mark_initialized! records the flag and reports initialized" do
-    actor = %{id: 1}
+    actor = %{id: nil}
     assert :ok = Setup.mark_initialized!(actor)
     assert Setup.initialized?()
     assert {:ok, timestamp} = Fornacast.ConfigStore.get("initialized_at")
@@ -34,7 +34,7 @@ defmodule Fornacast.SetupTest do
   end
 
   test "reset! clears latch and flag" do
-    Setup.mark_initialized!(%{id: 1})
+    Setup.mark_initialized!(%{id: nil})
     assert Setup.initialized?()
     assert :ok = Setup.reset!()
     refute Setup.initialized?()

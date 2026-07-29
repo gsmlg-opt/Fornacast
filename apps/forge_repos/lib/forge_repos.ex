@@ -1473,9 +1473,6 @@ defmodule ForgeRepos do
 
         {:error, %GitCore.Error{kind: kind}} ->
           {:error, {:unavailable, kind}}
-
-        {:error, _reason} ->
-          {:error, {:unavailable, :storage_unavailable}}
       end
     else
       {:error, :storage_unavailable} ->

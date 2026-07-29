@@ -348,6 +348,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
       cd: @root,
       env: [
         {"RELEASE_COMMAND", "start"},
+        {"FORNACAST_DATABASE_ADAPTER", "turso"},
         {"SECRET_KEY_BASE", secret_key_base},
         {"FORNACAST_API_PORT", api_port},
         {"FORNACAST_BASE_URL", "http://localhost:4890"},

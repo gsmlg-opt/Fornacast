@@ -6,6 +6,7 @@ defmodule FornacastAPI.EndpointTest do
   @endpoint FornacastAPI.Endpoint
 
   test "health is served without browser state or GitHub policy" do
+    checkout_database!()
     conn = get(build_conn(), "/health")
 
     assert %{"status" => "ok"} = json_response(conn, 200)
@@ -14,7 +15,7 @@ defmodule FornacastAPI.EndpointTest do
     assert Plug.Conn.get_resp_header(conn, "x-ratelimit-limit") == []
   end
 
-  test "health reports degraded when the database is unavailable" do
+  test "health reports degraded while the database is unavailable and recovers after restart" do
     conn =
       try do
         assert :ok = Supervisor.terminate_child(Fornacast.Supervisor, Fornacast.Repo)
@@ -25,6 +26,9 @@ defmodule FornacastAPI.EndpointTest do
 
     assert %{"status" => "degraded", "checks" => %{"database" => "error"}} =
              json_response(conn, 503)
+
+    checkout_database!()
+    assert %{"status" => "ok"} = get(build_conn(), "/health") |> json_response(200)
   end
 
   test "API application has no web or transport dependency" do
@@ -45,5 +49,11 @@ defmodule FornacastAPI.EndpointTest do
   test "web application does not depend on API" do
     dependencies = :fornacast_web |> Application.spec(:applications) |> MapSet.new()
     refute MapSet.member?(dependencies, :fornacast_api)
+  end
+
+  defp checkout_database! do
+    if Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"] do
+      :ok = Ecto.Adapters.SQL.Sandbox.checkout(Fornacast.Repo)
+    end
   end
 end

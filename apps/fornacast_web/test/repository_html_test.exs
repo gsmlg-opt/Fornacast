@@ -607,6 +607,8 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     refute anonymous =~ "Create new"
     refute anonymous =~ "Account menu"
 
+    checkout_database!()
+
     authenticated =
       build_conn()
       |> Plug.Conn.assign(:current_user, owner())
@@ -933,6 +935,12 @@ defmodule FornacastWeb.RepositoryHTMLTest do
 
   defp build_conn do
     Plug.Test.conn(:get, "/alice/demo")
+  end
+
+  defp checkout_database! do
+    if Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"] do
+      :ok = Ecto.Adapters.SQL.Sandbox.checkout(Fornacast.Repo)
+    end
   end
 
   defp owner do

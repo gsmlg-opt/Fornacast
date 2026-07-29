@@ -1,5 +1,7 @@
 import Config
 
+test_root = Path.expand("..", __DIR__)
+
 database_adapter =
   System.get_env("FORNACAST_DATABASE_ADAPTER", "turso")
   |> String.downcase()
@@ -8,7 +10,9 @@ repo_config =
   case database_adapter do
     value when value in ["libsql", "turso"] ->
       [
-        database: System.get_env("FORNACAST_TEST_DATABASE_PATH", "fornacast_test.db")
+        database:
+          System.get_env("FORNACAST_TEST_DATABASE_PATH", "fornacast_test.db")
+          |> Path.expand(test_root)
       ]
 
     value when value in ["postgres", "postgresql"] ->
@@ -62,7 +66,9 @@ config :concord,
   cluster_enabled: false,
   turso: [
     enabled: true,
-    database: System.get_env("FORNACAST_TEST_CONFIG_DATABASE_PATH", "fornacast_config_test.db"),
+    database:
+      System.get_env("FORNACAST_TEST_CONFIG_DATABASE_PATH", "fornacast_config_test.db")
+      |> Path.expand(test_root),
     pool_size: 1
   ]
 

@@ -633,6 +633,7 @@ defmodule GitTransportTest do
       "repository_collaborators",
       "repositories",
       "organization_members",
+      "api_keys",
       "ssh_keys",
       "users"
     ]

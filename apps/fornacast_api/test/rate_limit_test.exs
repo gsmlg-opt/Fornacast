@@ -733,9 +733,20 @@ defmodule FornacastAPI.RateLimitTest do
         :ok = Ecto.Adapters.SQL.Sandbox.checkout(Fornacast.Repo)
 
       value when value in ["libsql", "turso"] ->
-        Enum.each(["api_keys", "users"], fn table ->
-          Ecto.Adapters.SQL.query!(Fornacast.Repo, "delete from #{table}", [])
-        end)
+        Enum.each(
+          [
+            "audit_events",
+            "repository_collaborators",
+            "repositories",
+            "organization_members",
+            "api_keys",
+            "ssh_keys",
+            "users"
+          ],
+          fn table ->
+            Ecto.Adapters.SQL.query!(Fornacast.Repo, "delete from #{table}", [])
+          end
+        )
     end
   end
 end
