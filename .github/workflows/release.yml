@@ -76,7 +76,6 @@ jobs:
         with:
           path: |
             deps
-            _build
             ~/.hex
             ~/.cache/rebar3
             ~/.cargo/git
@@ -120,9 +119,11 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          mix release fornacast --overwrite
           mkdir -p artifacts
-          tar -C _build/prod/rel -czf "artifacts/fornacast-${VERSION}-linux-x86_64.tar.gz" fornacast
+          release_path="${RUNNER_TEMP}/fornacast"
+          mix release fornacast --overwrite --path "$release_path"
+          test -s "$release_path/lib/git_core-${VERSION}/priv/native/fornacast_git_core.so"
+          tar -C "$RUNNER_TEMP" -czf "artifacts/fornacast-${VERSION}-linux-x86_64.tar.gz" fornacast
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

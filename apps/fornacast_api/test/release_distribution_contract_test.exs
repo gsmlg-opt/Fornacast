@@ -120,6 +120,23 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert File.read!(@config) =~ ~s(config :bun, version: "1.3.4")
   end
 
+  test "release archive contains the current GitCore native library" do
+    workflow = File.read!(@workflow)
+
+    [_, cache_step] = String.split(workflow, "- name: Cache release dependencies", parts: 2)
+    [cache_step, _] = String.split(cache_step, "- name: Install Hex and Rebar", parts: 2)
+
+    refute cache_step =~ ~r/^\s+_build\s*$/m
+    assert workflow =~ ~s(release_path="${RUNNER_TEMP}/fornacast")
+    refute workflow =~ ~s(release_path="artifacts/fornacast")
+    assert workflow =~ ~s(mix release fornacast --overwrite --path "$release_path")
+
+    assert workflow =~
+             ~s(test -s "$release_path/lib/git_core-${VERSION}/priv/native/fornacast_git_core.so")
+
+    assert workflow =~ ~s(tar -C "$RUNNER_TEMP")
+  end
+
   test "release image installs the Erlang SCTP runtime library" do
     dockerfile = File.read!(@dockerfile)
     [_, runtime_stage] = String.split(dockerfile, "FROM ${DEBIAN_IMAGE} AS app", parts: 2)
