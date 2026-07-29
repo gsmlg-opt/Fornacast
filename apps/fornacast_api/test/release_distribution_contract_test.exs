@@ -177,6 +177,8 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     e2e_workflow = File.read!(@e2e_workflow)
 
     assert e2e_workflow =~ "rm -rf apps/fornacast_web/priv/static"
+    assert e2e_workflow =~ ~s(grep -oE '<link[^>]*rel="stylesheet"[^>]*>')
+    assert e2e_workflow =~ ~s(grep -oE '<script[^>]*type="module"[^>]*>')
     assert e2e_workflow =~ "> e2e-data/app.css"
     assert e2e_workflow =~ ~s(grep -F '.auth-shell' e2e-data/app.css)
 

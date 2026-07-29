@@ -222,8 +222,10 @@ jobs:
           curl -fsS -b e2e-data/cookies.txt "http://127.0.0.1:${PORT}/alice/demo" > e2e-data/repository.html
           grep "E2E release smoke" e2e-data/repository.html
 
-          STYLESHEET_URL="$(sed -n '/<link[^>]*rel="stylesheet"/{s/.*href="\([^"]*\)".*/\1/p;q;}' e2e-data/repository.html)"
-          MODULE_SCRIPT_URL="$(sed -n '/<script[^>]*type="module"/{s/.*src="\([^"]*\)".*/\1/p;q;}' e2e-data/repository.html)"
+          STYLESHEET_TAG="$(grep -oE '<link[^>]*rel="stylesheet"[^>]*>' e2e-data/repository.html | head -n 1)"
+          MODULE_SCRIPT_TAG="$(grep -oE '<script[^>]*type="module"[^>]*>' e2e-data/repository.html | head -n 1)"
+          STYLESHEET_URL="$(printf '%s\n' "$STYLESHEET_TAG" | sed -n 's/.*href="\([^"]*\)".*/\1/p')"
+          MODULE_SCRIPT_URL="$(printf '%s\n' "$MODULE_SCRIPT_TAG" | sed -n 's/.*src="\([^"]*\)".*/\1/p')"
 
           test -n "$STYLESHEET_URL"
           test -n "$MODULE_SCRIPT_URL"
