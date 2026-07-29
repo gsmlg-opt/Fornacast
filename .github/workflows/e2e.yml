@@ -103,6 +103,7 @@ jobs:
           mix release fornacast --overwrite
           mkdir -p release
           cp -a _build/prod/rel/fornacast release/fornacast
+          rm -rf apps/fornacast_web/priv/static
 
       - name: Download release artifact
         if: github.event_name == 'workflow_dispatch'
@@ -229,7 +230,8 @@ jobs:
           [[ "$STYLESHEET_URL" == /* && "$STYLESHEET_URL" != //* ]]
           [[ "$MODULE_SCRIPT_URL" == /* && "$MODULE_SCRIPT_URL" != //* ]]
 
-          curl -fsS -o /dev/null "http://127.0.0.1:${PORT}${STYLESHEET_URL}"
+          curl -fsS "http://127.0.0.1:${PORT}${STYLESHEET_URL}" > e2e-data/app.css
+          grep -F '.auth-shell' e2e-data/app.css
           curl -fsS -o /dev/null "http://127.0.0.1:${PORT}${MODULE_SCRIPT_URL}"
           curl -fsS -b e2e-data/cookies.txt "http://127.0.0.1:${PORT}/alice/demo/raw/main/README.md" | grep "E2E release smoke"
 

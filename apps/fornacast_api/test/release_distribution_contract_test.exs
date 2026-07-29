@@ -145,6 +145,31 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert output =~ "api_port=4891"
   end
 
+  test "production resolves bundled assets from the packaged OTP application" do
+    {config, _imports} = Config.Reader.read_imports!(@config, env: :prod)
+
+    outdir =
+      config
+      |> Keyword.fetch!(:duskmoon_bundler_runtime)
+      |> Keyword.fetch!(:fornacast_web)
+      |> Keyword.fetch!(:outdir)
+
+    assert outdir == "priv/static/assets"
+    assert Path.type(outdir) == :relative
+
+    e2e_workflow = File.read!(@e2e_workflow)
+
+    assert e2e_workflow =~ "rm -rf apps/fornacast_web/priv/static"
+    assert e2e_workflow =~ "> e2e-data/app.css"
+    assert e2e_workflow =~ ~s(grep -F '.auth-shell' e2e-data/app.css)
+
+    assert_order(
+      e2e_workflow,
+      "cp -a _build/prod/rel/fornacast release/fornacast",
+      "rm -rf apps/fornacast_web/priv/static"
+    )
+  end
+
   test "Compose env template requires a generated 64-byte cookie secret" do
     env_example = File.read!(@env_example)
 
