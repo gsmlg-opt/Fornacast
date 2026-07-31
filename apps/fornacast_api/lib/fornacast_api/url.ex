@@ -5,16 +5,28 @@ defmodule FornacastAPI.URL do
   def upload(path), do: join("/api/uploads", path)
   def web(path), do: join("", path)
 
+  def api_v3, do: absolute("/api/v3")
+  def graphql, do: absolute("/api/graphql")
+  def uploads, do: absolute("/api/uploads")
+
   def user(login), do: api("/users/#{segment(login)}")
   def organization(login), do: api("/orgs/#{segment(login)}")
   def repository(owner, repo), do: api("/repos/#{segment(owner)}/#{segment(repo)}")
 
-  defp join(prefix, path) when is_binary(path) and is_binary(prefix) do
+  defp absolute(path) when is_binary(path) do
     if String.starts_with?(path, "/") do
       base = validated_base_uri!()
 
-      %{base | path: prefix <> path, query: nil, fragment: nil, userinfo: nil}
+      %{base | path: path, query: nil, fragment: nil, userinfo: nil}
       |> URI.to_string()
+    else
+      raise ArgumentError, "path must be a string beginning with /, got: #{inspect(path)}"
+    end
+  end
+
+  defp join(prefix, path) when is_binary(path) and is_binary(prefix) do
+    if String.starts_with?(path, "/") do
+      absolute(prefix <> path)
     else
       raise ArgumentError, "path must be a string beginning with /, got: #{inspect(path)}"
     end

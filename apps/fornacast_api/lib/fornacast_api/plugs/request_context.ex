@@ -7,22 +7,24 @@ defmodule FornacastAPI.Plugs.RequestContext do
   def init(opts), do: opts
 
   def call(conn, _opts) do
-    if api_path?(conn.request_path) do
-      effective_client_ip =
-        FornacastAPI.ClientIP.effective(
-          conn,
-          Application.get_env(:fornacast_api, :trusted_proxy_cidrs, [])
-        )
+    cond do
+      graphql_path?(conn.request_path) ->
+        conn
+        |> assign_client_ip()
+        |> assign(:api_auth, nil)
+        |> register_before_send(&put_graphql_headers/1)
 
-      conn
-      |> assign(:effective_client_ip, effective_client_ip)
-      |> assign(:api_version, @default_version)
-      |> assign(:response_media_type, @default_media_type)
-      |> assign(:accepted_scopes, [])
-      |> assign(:api_auth, nil)
-      |> register_before_send(&put_common_headers/1)
-    else
-      conn
+      api_path?(conn.request_path) ->
+        conn
+        |> assign_client_ip()
+        |> assign(:api_version, @default_version)
+        |> assign(:response_media_type, @default_media_type)
+        |> assign(:accepted_scopes, [])
+        |> assign(:api_auth, nil)
+        |> register_before_send(&put_rest_headers/1)
+
+      true ->
+        conn
     end
   end
 
@@ -36,7 +38,24 @@ defmodule FornacastAPI.Plugs.RequestContext do
     }
   end
 
-  defp put_common_headers(conn) do
+  defp assign_client_ip(conn) do
+    effective_client_ip =
+      FornacastAPI.ClientIP.effective(
+        conn,
+        Application.get_env(:fornacast_api, :trusted_proxy_cidrs, [])
+      )
+
+    assign(conn, :effective_client_ip, effective_client_ip)
+  end
+
+  defp put_graphql_headers(conn) do
+    conn
+    |> put_resp_header("x-github-request-id", request_id(conn))
+    |> FornacastAPI.Plugs.RateLimit.ensure_bucket()
+    |> FornacastAPI.Plugs.RateLimit.put_headers()
+  end
+
+  defp put_rest_headers(conn) do
     conn
     |> put_resp_header(
       "x-github-api-version-selected",
@@ -88,6 +107,10 @@ defmodule FornacastAPI.Plugs.RequestContext do
 
   defp token_id(%{api_key: %{id: id}}), do: id
   defp token_id(_api_auth), do: nil
+
+  defp graphql_path?(path) do
+    path == "/api/graphql" or String.starts_with?(path, "/api/graphql/")
+  end
 
   defp api_path?(path) do
     path == "/api/v3" or String.starts_with?(path, "/api/v3/") or

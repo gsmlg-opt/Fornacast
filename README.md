@@ -25,6 +25,7 @@ Implemented first-release paths:
 - Repository overview, README rendering, source tree, file view, raw file, commits, commit detail, diffs, branches, tags, and in-repo search.
 - `/health` endpoint and automatic boot migrations.
 - A separate GitHub-compatible REST listener (`/api/v3`), started with the web application.
+- Read-only GraphQL (`/api/graphql`) and public discovery (`/.well-known/fornacast`) on the API listener.
 
 Out of scope for this release: CI, packages, LFS, mirrors, and forks.
 
@@ -40,7 +41,7 @@ Fornacast is an Elixir **umbrella** released as a single OTP release named `forn
 | `git_core` | Git read/write API via Rustler NIF (gitoxide) |
 | `git_transport` | OTP SSH daemon (`upload-pack` / `receive-pack`) |
 | `fornacast_web` | Phoenix HTML UI, Git-over-HTTP, DuskMoon assets |
-| `fornacast_api` | GitHub-compatible REST API (`/api/v3`) |
+| `fornacast_api` | GitHub-compatible REST (`/api/v3`), GraphQL (`/api/graphql`), discovery (`/.well-known/fornacast`) |
 
 Agent-oriented contributor guidance lives in [`AGENTS.md`](./AGENTS.md). Design specs and delivery plans are under [`docs/superpowers/`](./docs/superpowers/).
 
@@ -88,6 +89,8 @@ Default local endpoints:
 
 - Web: `http://localhost:4890`
 - REST API: `http://localhost:4891/api/v3`
+- GraphQL: `http://localhost:4891/api/graphql`
+- Discovery: `http://localhost:4891/.well-known/fornacast`
 - SSH: `ssh://USER@localhost:2222/USER/REPO.git`
 
 The Ecto adapter is selected at **compile time**. Default is Turso/libSQL file databases. To use PostgreSQL, set `FORNACAST_DATABASE_ADAPTER=postgres` and recompile (see [Configuration](#configuration)).
@@ -168,7 +171,7 @@ docker compose --profile postgres up --build -d
 ```
 
 Migrations run automatically on container start. Open `http://localhost:4000/setup` to create the first admin account.
-Nginx is the Compose deployment's only public HTTP service. It serves the web application and the REST API from the same origin: use `http://localhost:4000/api/v3` for REST resources and `http://localhost:4000/api/uploads` for release-asset uploads. The application container's web listener on port `4890` and API listener on port `4891` remain internal to the Compose network.
+Nginx is the Compose deployment's only public HTTP service. It serves the web application and the API from the same origin: use `http://localhost:4000/api/v3` for REST resources, `http://localhost:4000/api/uploads` for release-asset uploads, `http://localhost:4000/api/graphql` for GraphQL, and `http://localhost:4000/.well-known/fornacast` for service discovery. The application container's web listener on port `4890` and API listener on port `4891` remain internal to the Compose network.
 
 Alternatively, create the first admin headlessly in the running container without the web wizard:
 
@@ -202,6 +205,20 @@ curl -H 'User-Agent: fornacast-example/1.0' \
 Classic scopes are `repo` for private-repository access, `public_repo` for public-repository writes, `read:org` for organization reads, and `write:org` for organization mutations. Scopes do not override domain authorization: the authenticated user must also have the required repository or organization role. Legacy API tokens are accepted only during the documented migration window and remain read-only.
 
 Published upload URLs use `/api/uploads` on the same origin as `/api/v3`. Do not publish the internal port `4891` as a separate production origin.
+
+## GraphQL and service discovery
+
+`GET /.well-known/fornacast` is public (no User-Agent or PAT) and returns canonical `base_url`, `api_v3`, `api_graphql`, and `api_uploads` URLs derived from `FORNACAST_BASE_URL`.
+
+GraphQL is available at `/api/graphql` (POST for queries, GET for introspection). Clients must send a non-empty `User-Agent`. Authentication uses the same PAT schemes as REST; GraphQL does **not** use `X-GitHub-Api-Version`. The v1 schema is read-only (`viewer`, `user`, `organization`, `repository`) and reuses domain authorization and opaque `node_id` values as GraphQL `id`s.
+
+```sh
+curl -H 'User-Agent: fornacast-example/1.0' \
+  -H "Authorization: Bearer $FORNACAST_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"{ viewer { login databaseId } }"}' \
+  http://localhost:4891/api/graphql
+```
 
 The complete first-release compatibility claim is still blocked by the `auto_init` compatibility gate: the Git-data delivery plan must implement real repository initialization and pass the end-to-end acceptance workflow before the API is advertised as GitHub compatible.
 

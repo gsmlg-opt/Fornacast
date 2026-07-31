@@ -112,7 +112,10 @@ or behavior for endpoints not listed here.
 
 ## Non-Goals
 
-- GraphQL, webhooks, GitHub Apps, OAuth Apps, deploy keys, or fine-grained PATs.
+- GraphQL *(revised for the read-only `/api/graphql` slice by
+  [`2026-07-31-graphql-well-known-design.md`](./2026-07-31-graphql-well-known-design.md);
+  full GitHub GraphQL parity remains out of scope)*, webhooks, GitHub Apps,
+  OAuth Apps, deploy keys, or fine-grained PATs.
 - Repository deletion, transfer, forks, mirrors, templates, or branch
   protection.
 - Raw Git blob, tree, commit, or tag object creation endpoints.

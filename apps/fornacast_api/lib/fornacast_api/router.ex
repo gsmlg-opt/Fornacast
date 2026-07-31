@@ -9,8 +9,27 @@ defmodule FornacastAPI.Router do
     plug FornacastAPI.Plugs.RateLimit
   end
 
+  pipeline :graphql do
+    plug FornacastAPI.Plugs.UserAgent
+    plug FornacastAPI.Plugs.Authentication
+    plug FornacastAPI.Plugs.RateLimit
+    plug FornacastAPI.GraphQL.Context
+
+    plug Plug.Parsers,
+      parsers: [:urlencoded, :multipart, :json],
+      pass: ["*/*"],
+      json_decoder: Jason
+  end
+
   scope "/", FornacastAPI do
     get "/health", HealthController, :show
+    get "/.well-known/fornacast", WellKnownController, :fornacast
+  end
+
+  scope "/api" do
+    pipe_through :graphql
+
+    forward "/graphql", Absinthe.Plug, schema: FornacastAPI.GraphQL.Schema
   end
 
   scope "/api/v3", FornacastAPI do

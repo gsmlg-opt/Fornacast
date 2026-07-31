@@ -34,6 +34,9 @@ defmodule FornacastAPI.MixProject do
       {:git_core, in_umbrella: true},
       {:phoenix, "~> 1.8"},
       {:bandit, "~> 1.12"},
+      {:absinthe, "~> 1.7"},
+      {:absinthe_plug, "~> 1.5"},
+      {:jason, "~> 1.4"},
       {:open_api_spex, "~> 3.22", only: :test, runtime: false}
     ]
   end

@@ -3,16 +3,21 @@ defmodule FornacastAPI.ProxyContractTest do
 
   @root Path.expand("../../..", __DIR__)
 
-  test "Nginx routes both API prefixes to the API listener without rewriting them" do
+  test "Nginx routes API prefixes and discovery to the API listener without rewriting them" do
     nginx = read!("deploy/nginx/fornacast.conf")
 
     assert nginx =~ ~r/upstream fornacast_web\s*\{\s*server app:4890;\s*\}/s
     assert nginx =~ ~r/upstream fornacast_api\s*\{\s*server app:4891;\s*\}/s
 
-    api_location = location!(nginx, ~r/\^\/\(api\/v3\|api\/uploads\)\(\/\|\$\)/)
+    api_location = location!(nginx, ~r/\^\/\(api\/v3\|api\/uploads\|api\/graphql\)\(\/\|\$\)/)
     assert api_location =~ "proxy_pass http://fornacast_api;"
     refute api_location =~ ~r/proxy_pass\s+http:\/\/fornacast_api\//
     refute api_location =~ ~r/\brewrite\b/
+
+    well_known_location = location!(nginx, "/.well-known/fornacast")
+    assert well_known_location =~ "proxy_pass http://fornacast_api;"
+    refute well_known_location =~ ~r/proxy_pass\s+http:\/\/fornacast_api\//
+    refute well_known_location =~ ~r/\brewrite\b/
 
     web_location = location!(nginx, "/")
     assert web_location =~ "proxy_pass http://fornacast_web;"
@@ -26,7 +31,8 @@ defmodule FornacastAPI.ProxyContractTest do
     assert nginx =~ ~r/map \$http_upgrade \$connection_upgrade\s*\{/s
 
     for location <- [
-          location!(nginx, ~r/\^\/\(api\/v3\|api\/uploads\)\(\/\|\$\)/),
+          location!(nginx, ~r/\^\/\(api\/v3\|api\/uploads\|api\/graphql\)\(\/\|\$\)/),
+          location!(nginx, "/.well-known/fornacast"),
           location!(nginx, "/")
         ] do
       assert location =~ "client_max_body_size 0;"
@@ -130,6 +136,8 @@ defmodule FornacastAPI.ProxyContractTest do
     assert readme =~ "http://localhost:4891/api/v3"
     assert readme =~ "http://localhost:4000/api/v3"
     assert readme =~ "http://localhost:4000/api/uploads"
+    assert readme =~ "http://localhost:4000/api/graphql"
+    assert readme =~ "http://localhost:4000/.well-known/fornacast"
     assert readme =~ "User-Agent"
     assert readme =~ "X-GitHub-Api-Version"
     assert readme =~ "Authorization: Bearer $FORNACAST_TOKEN"
@@ -163,9 +171,16 @@ defmodule FornacastAPI.ProxyContractTest do
         literal -> Regex.escape(literal)
       end
 
-    case Regex.run(~r/location\s+(?:~\s+)?#{header}\s*\{(?<body>.*?)\n\s*\}/s, nginx,
-           capture: ["body"]
-         ) do
+    exact? = is_binary(matcher) and String.starts_with?(matcher, "/.well-known/")
+
+    pattern =
+      if exact? do
+        ~r/location\s+=\s+#{header}\s*\{(?<body>.*?)\n\s*\}/s
+      else
+        ~r/location\s+(?:~\s+)?#{header}\s*\{(?<body>.*?)\n\s*\}/s
+      end
+
+    case Regex.run(pattern, nginx, capture: ["body"]) do
       [body] -> body
       _ -> flunk("missing Nginx location matching #{inspect(matcher)}")
     end
