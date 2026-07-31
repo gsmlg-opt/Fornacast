@@ -5,26 +5,44 @@
 
 Fornacast is a small self-hosted Git forge built with Elixir, Phoenix, Erlang/OTP SSH, Ecto on ExTurso/Turso by default, Concord-backed key/value app config, optional PostgreSQL, and Rust NIFs over gitoxide.
 
-The first release target is intentionally narrow: create users and repositories, authenticate Git over SSH with user SSH keys, push/clone/fetch with a normal Git client, browse repositories in the web UI, and support the documented GitHub-compatible REST workflow.
+The first release target is intentionally narrow: create users and repositories, authenticate Git over SSH (and HTTP) with user credentials or SSH keys, push/clone/fetch with a normal Git client, browse repositories in the web UI, and support the documented GitHub-compatible REST workflow.
+
+The web UI uses the [DuskMoon](https://github.com/gsmlg-dev/phoenix_duskmoon) component system (`phoenix_duskmoon` + `@duskmoon-dev/*`). Do not introduce DaisyUI or other CSS component libraries.
 
 ## Current Release Scope
 
 Implemented first-release paths:
 
 - Local users with password login.
-- First-admin bootstrap task.
-- SSH public key management.
-- Private repository creation.
+- Organizations and collaborator-aware repository access.
+- First-admin bootstrap task and unauthenticated `/setup` wizard.
+- SSH public key and classic personal access token (API key) management.
+- Public and private repository creation.
 - Filesystem-backed bare Git storage.
-- Erlang/OTP Git-over-SSH daemon.
+- Erlang/OTP Git-over-SSH daemon and Git-over-HTTP smart protocol.
 - `git ls-remote`, `git clone`, `git fetch`, and basic `git push`.
 - Initial branch push, fast-forward branch update, new branch push, tag creation, and force-push rejection.
-- Repository overview, README rendering, source tree, file view, raw file, commits, commit detail, diffs, branches, and tags.
-- `/health` endpoint.
-- First-admin setup wizard and automatic boot migrations.
-- A separate GitHub-compatible REST listener, started with the web application.
+- Repository overview, README rendering, source tree, file view, raw file, commits, commit detail, diffs, branches, tags, and in-repo search.
+- `/health` endpoint and automatic boot migrations.
+- A separate GitHub-compatible REST listener (`/api/v3`), started with the web application.
 
 Out of scope for this release: CI, packages, LFS, mirrors, and forks.
+
+## Architecture
+
+Fornacast is an Elixir **umbrella** released as a single OTP release named `fornacast`:
+
+| App | Role |
+|-----|------|
+| `fornacast` | Shared infra: Ecto repo/migrations, Concord config store, setup, audit, storage paths |
+| `forge_accounts` | Users, organizations, passwords, SSH keys, API keys/scopes |
+| `forge_repos` | Repositories, collaborators, authorization (`Fornacast.Access`) |
+| `git_core` | Git read/write API via Rustler NIF (gitoxide) |
+| `git_transport` | OTP SSH daemon (`upload-pack` / `receive-pack`) |
+| `fornacast_web` | Phoenix HTML UI, Git-over-HTTP, DuskMoon assets |
+| `fornacast_api` | GitHub-compatible REST API (`/api/v3`) |
+
+Agent-oriented contributor guidance lives in [`AGENTS.md`](./AGENTS.md). Design specs and delivery plans are under [`docs/superpowers/`](./docs/superpowers/).
 
 ## Local Development
 
@@ -32,14 +50,30 @@ Prerequisites:
 
 - Elixir 1.20 with Erlang/OTP 29.
 - Rust 1.96 or newer.
+- Node.js 18+ (frontend workspace install via Mix npm tasks; CI uses `mix npm.ci`).
 - Git and OpenSSH client tools for compatibility tests.
+
+Optional: use [`devenv.nix`](./devenv.nix) for pinned BEAM, Rust, and a local Postgres 17 instance (port `55432`).
 
 Setup:
 
 ```sh
 mix deps.get
 mix ecto.setup
+mix npm.ci
 mix test
+```
+
+`mix npm.ci` installs the npm workspace under `apps/*` from `package-lock.json`. Use `mix npm.install` when intentionally updating frontend dependencies.
+
+Useful Mix aliases:
+
+```sh
+mix format                  # format Elixir / HEEx / asset sources
+mix format --check-formatted
+mix assets.build            # duskmoon_bundler + Tailwind
+mix assets.deploy           # minify + phx.digest (production/CI)
+mix compile --warnings-as-errors
 ```
 
 Run locally:
@@ -55,6 +89,8 @@ Default local endpoints:
 - Web: `http://localhost:4890`
 - REST API: `http://localhost:4891/api/v3`
 - SSH: `ssh://USER@localhost:2222/USER/REPO.git`
+
+The Ecto adapter is selected at **compile time**. Default is Turso/libSQL file databases. To use PostgreSQL, set `FORNACAST_DATABASE_ADAPTER=postgres` and recompile (see [Configuration](#configuration)).
 
 Alternatively, create the first admin headlessly without the web wizard:
 
@@ -97,7 +133,7 @@ printf '%s' "$GHCR_READ_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --pass
 Choose the release tag to deploy:
 
 ```sh
-export FORNACAST_IMAGE=ghcr.io/gsmlg-dev/fornacast:0.1.0
+export FORNACAST_IMAGE=ghcr.io/gsmlg-dev/fornacast:0.1.3
 docker compose pull app nginx
 ```
 
@@ -185,6 +221,12 @@ git push -u origin main
 git clone ssh://alice@localhost:2222/alice/demo.git ../demo-clone
 ```
 
+Git-over-HTTP uses the same owner/repo path on the web listener (local example):
+
+```sh
+git remote add origin http://alice@localhost:4890/alice/demo.git
+```
+
 Supported write-side policy for v0.1:
 
 - Allow branch creation.
@@ -258,9 +300,15 @@ docker run --rm -v fornacast_fornacast-data:/data -v "$PWD":/backup debian:bookw
 
 Restore requires the database dump and the repository/SSH data from the same point in time.
 
+## Contributing
+
+- Follow the conventions in [`AGENTS.md`](./AGENTS.md) and the DuskMoon UI rules in [`CLAUDE.md`](./CLAUDE.md).
+- Keep changes scoped; run `mix format` and relevant `mix test` paths before opening a PR.
+- CI runs format checks, `mix compile --warnings-as-errors`, unit tests (Turso + Postgres), and release smoke/e2e workflows.
+
 ## Dogfood Gate
 
-Before tagging `v0.1`, Fornacast should host this repository as a normal remote for at least one development cycle:
+Before tagging a release, Fornacast should host this repository as a normal remote for at least one development cycle:
 
 ```sh
 git remote add fornacast ssh://alice@HOST:2222/alice/fornacast.git
