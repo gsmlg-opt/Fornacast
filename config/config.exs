@@ -101,8 +101,6 @@ config :logger, :console,
 
 config :phoenix, :json_library, JSON
 
-config :bun, version: "1.3.4"
-
 fornacast_web_path = Path.expand("../apps/fornacast_web", __DIR__)
 
 config :duskmoon_bundler, :fornacast_web,

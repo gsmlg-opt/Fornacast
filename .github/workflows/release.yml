@@ -80,7 +80,7 @@ jobs:
             ~/.cache/rebar3
             ~/.cargo/git
             ~/.cargo/registry
-          key: ${{ runner.os }}-release-${{ env.MIX_ENV }}-${{ hashFiles('mix.lock', 'apps/git_core/native/fornacast_git_core/Cargo.lock', 'bun.lock') }}
+          key: ${{ runner.os }}-release-${{ env.MIX_ENV }}-${{ hashFiles('mix.lock', 'apps/git_core/native/fornacast_git_core/Cargo.lock', 'package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-release-${{ env.MIX_ENV }}-
 
@@ -105,9 +105,7 @@ jobs:
         run: mix deps.compile
 
       - name: Install frontend dependencies
-        run: |
-          mix bun.install --if-missing
-          ./_build/bun install --frozen-lockfile
+        run: mix npm.ci
 
       - name: Build static assets
         run: mix assets.deploy

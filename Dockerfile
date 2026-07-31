@@ -30,16 +30,14 @@ WORKDIR /app
 RUN mix local.hex --force && mix local.rebar --force
 
 COPY mix.exs mix.lock ./
-COPY package.json bun.lock bunfig.toml ./
+COPY package.json package-lock.json ./
 COPY config config
 COPY apps/fornacast_web/package.json apps/fornacast_web/package.json
 COPY apps apps
 
-# WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#76
 RUN mix deps.get --only prod && \
     mix deps.compile && \
-    mix bun.install --if-missing && \
-    ./_build/bun install --frozen-lockfile && \
+    mix npm.ci && \
     mix assets.deploy && \
     mix compile && \
     mix release fornacast

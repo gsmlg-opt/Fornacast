@@ -102,22 +102,24 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert_order(workflow, "Build and publish Docker image", "Create GitHub release")
   end
 
-  test "release image and build workflows install the frozen Bun lock" do
+  test "release image and build workflows install the frozen npm lock" do
     for path <- [@workflow, @ci_workflow, @e2e_workflow] do
       workflow = File.read!(path)
 
-      assert workflow =~ "mix bun.install --if-missing"
-      assert workflow =~ "./_build/bun install --frozen-lockfile"
-      assert workflow =~ "bun.lock"
+      assert workflow =~ "mix npm.ci"
+      assert workflow =~ "package-lock.json"
+      refute workflow =~ "mix bun.install"
+      refute workflow =~ "bun.lock"
     end
 
     dockerfile = File.read!(@dockerfile)
 
-    assert dockerfile =~ "COPY package.json bun.lock bunfig.toml ./"
-    assert dockerfile =~ "mix bun.install --if-missing"
-    assert dockerfile =~ "./_build/bun install --frozen-lockfile"
-    assert File.read!(@web_mix) =~ ~s({:bun, "~> 1.4", runtime: false})
-    assert File.read!(@config) =~ ~s(config :bun, version: "1.3.4")
+    assert dockerfile =~ "COPY package.json package-lock.json ./"
+    assert dockerfile =~ "mix npm.ci"
+    refute dockerfile =~ "mix bun.install"
+    refute dockerfile =~ "bun.lock"
+    refute File.read!(@web_mix) =~ "{:bun,"
+    refute File.read!(@config) =~ "config :bun,"
   end
 
   test "release archive contains the current GitCore native library" do
