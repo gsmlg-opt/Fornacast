@@ -27,8 +27,8 @@ defmodule Fornacast.MixProject do
   defp deps do
     [
       {:ecto_sql, "~> 3.14"},
-      {:ex_turso, "~> 0.3"},
-      {:concord, "~> 2.4"},
+      {:ex_turso, "~> 3.0"},
+      {:concord, "~> 3.0"},
       {:postgrex, "~> 0.22.2"},
       {:phoenix_pubsub, "~> 2.2"}
     ]

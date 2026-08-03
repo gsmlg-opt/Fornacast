@@ -654,7 +654,7 @@ defmodule FornacastWeb.RepositoryHTMLTest do
 
     lock = File.read!(Path.expand("../../../mix.lock", __DIR__))
 
-    assert lock =~ ~r/"phoenix_duskmoon".*"9\.9\.0"/
+    assert lock =~ ~r/"phoenix_duskmoon".*"9\.9\.6"/
     assert source =~ "<.dm_breadcrumb"
     assert source =~ "<.dm_pagination"
     refute source =~ "WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#82"
@@ -691,6 +691,13 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     refute js =~ "const writeClipboard"
     refute js =~ "document.createElement(\"textarea\")"
     refute js =~ "Copied to clipboard."
+  end
+
+  test "production assets resolve Bun's isolated transitive packages" do
+    config = File.read!(Path.expand("../../../config/config.exs", __DIR__))
+
+    assert config =~ "WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#118"
+    assert config =~ ~S|Path.expand("../node_modules", __DIR__)|
   end
 
   test "mobile repository ref controls reset desktop flex bases" do

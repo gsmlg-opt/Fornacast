@@ -110,7 +110,11 @@ config :duskmoon_bundler, :fornacast_web,
   format: :esm,
   target: :es2020,
   sourcemap: :hidden,
-  resolve_dirs: [Path.expand("../deps", __DIR__)],
+  # WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#118
+  resolve_dirs: [
+    Path.expand("../node_modules", __DIR__),
+    Path.expand("../deps", __DIR__)
+  ],
   tailwind: [
     css: Path.join(fornacast_web_path, "assets/css/app.css"),
     sources: [
