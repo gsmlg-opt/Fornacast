@@ -125,6 +125,7 @@ defmodule FornacastWeb.GitHTTPController do
 
   defp authorize_git_scope(nil, :git_read, :public), do: :ok
   defp authorize_git_scope(nil, _action, _visibility), do: {:error, :invalid_credentials}
+  defp authorize_git_scope(:password, _action, _visibility), do: :ok
 
   defp authorize_git_scope(api_key, action, visibility) do
     ForgeAccounts.APIScope.authorize(api_key, action, visibility)
@@ -163,11 +164,20 @@ defmodule FornacastWeb.GitHTTPController do
 
   defp authenticate_basic(encoded) do
     with {:ok, decoded} <- Base.decode64(encoded),
-         [username, "fc_pat_" <> _ = secret] <- String.split(decoded, ":", parts: 2),
-         {:ok, user, api_key} <- ForgeAccounts.authenticate_api_key(username, secret) do
-      {:ok, user, api_key}
+         [username, secret] <- String.split(decoded, ":", parts: 2) do
+      authenticate_basic_credentials(username, secret)
     else
       _reason -> {:error, :invalid_credentials}
+    end
+  end
+
+  defp authenticate_basic_credentials(username, "fc_pat_" <> _ = secret) do
+    ForgeAccounts.authenticate_api_key(username, secret)
+  end
+
+  defp authenticate_basic_credentials(username, password) do
+    with {:ok, user} <- ForgeAccounts.authenticate_password(username, password) do
+      {:ok, user, :password}
     end
   end
 

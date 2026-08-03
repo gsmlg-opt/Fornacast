@@ -136,13 +136,13 @@ esac
     refute git!(["-C", clone_path, "config", "--get", "remote.origin.url"]) =~ secret
   end
 
-  test "private fetch rejects account passwords with a Basic challenge" do
+  test "private fetch accepts account passwords" do
     create_user_and_repository(:private)
 
     response = request_info_refs("alice", "correct horse battery staple")
 
-    assert response(response, 401) == "Authentication required.\n"
-    assert Plug.Conn.get_resp_header(response, "www-authenticate") == [@challenge]
+    assert response(response, 200) =~ "# service=git-upload-pack"
+    assert Plug.Conn.get_resp_header(response, "www-authenticate") == []
   end
 
   test "Git discovery applies classic and legacy PAT scopes using repository visibility" do
