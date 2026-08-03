@@ -192,7 +192,7 @@ defmodule FornacastWeb.GitHTTPController do
   end
 
   defp finish_body(chunk, conn, max_bytes, bytes_read, acc) do
-    if bytes_read + byte_size(chunk) > max_bytes do
+    if max_bytes != nil and bytes_read + byte_size(chunk) > max_bytes do
       {:error, :request_too_large}
     else
       {:ok, IO.iodata_to_binary(Enum.reverse([chunk | acc])), conn}
@@ -202,7 +202,7 @@ defmodule FornacastWeb.GitHTTPController do
   defp continue_body(chunk, conn, max_bytes, bytes_read, acc) do
     bytes_read = bytes_read + byte_size(chunk)
 
-    if bytes_read > max_bytes do
+    if max_bytes != nil and bytes_read > max_bytes do
       {:error, :request_too_large}
     else
       read_full_body(conn, max_bytes, bytes_read, [chunk | acc])

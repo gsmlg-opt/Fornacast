@@ -11,6 +11,23 @@ defmodule GitTransportTest do
     reset_database!()
   end
 
+  test "receive-pack defaults to 4 GiB and supports an unlimited nil configuration" do
+    original = Application.fetch_env(:git_transport, :receive_pack_max_bytes)
+
+    on_exit(fn ->
+      case original do
+        {:ok, value} -> Application.put_env(:git_transport, :receive_pack_max_bytes, value)
+        :error -> Application.delete_env(:git_transport, :receive_pack_max_bytes)
+      end
+    end)
+
+    Application.delete_env(:git_transport, :receive_pack_max_bytes)
+    assert GitTransport.ReceivePack.max_request_bytes() == 4 * 1024 * 1024 * 1024
+
+    Application.put_env(:git_transport, :receive_pack_max_bytes, nil)
+    assert GitTransport.ReceivePack.max_request_bytes() == nil
+  end
+
   test "parses supported Git SSH exec commands" do
     assert {:ok, command} = GitTransport.parse_exec("git-upload-pack 'alice/demo.git'")
     assert command.operation == :upload_pack

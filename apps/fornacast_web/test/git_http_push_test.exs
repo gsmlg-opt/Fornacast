@@ -215,6 +215,28 @@ defmodule FornacastWeb.GitHTTPPushTest do
     assert response(response, 413) == "Git request is too large.\n"
   end
 
+  test "receive-pack POST accepts a request when the limit is explicitly nil" do
+    {user, _repository} = create_user_and_repository("alice")
+    {_key, secret} = insert_legacy_api_key!(user, "repo:write", "write")
+    original = Application.fetch_env(:git_transport, :receive_pack_max_bytes)
+    Application.put_env(:git_transport, :receive_pack_max_bytes, nil)
+
+    on_exit(fn ->
+      case original do
+        {:ok, value} -> Application.put_env(:git_transport, :receive_pack_max_bytes, value)
+        :error -> Application.delete_env(:git_transport, :receive_pack_max_bytes)
+      end
+    end)
+
+    response =
+      build_conn()
+      |> maybe_authorize({"alice", secret})
+      |> Plug.Conn.put_req_header("content-type", "application/x-git-receive-pack-request")
+      |> post("/alice/demo.git/git-receive-pack", "0000")
+
+    assert response(response, 400) == "Incomplete Git request.\n"
+  end
+
   test "push bookkeeping rolls back when its audit event cannot be written" do
     {_user, repository} = create_user_and_repository("alice")
 

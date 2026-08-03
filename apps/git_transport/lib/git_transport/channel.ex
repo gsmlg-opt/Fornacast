@@ -168,7 +168,9 @@ defmodule GitTransport.Channel do
   end
 
   defp continue_receive_pack(cm, channel_id, data, state) do
-    if byte_size(data) > GitTransport.ReceivePack.max_request_bytes() - state.receive_pack_bytes do
+    max_bytes = GitTransport.ReceivePack.max_request_bytes()
+
+    if max_bytes != nil and byte_size(data) > max_bytes - state.receive_pack_bytes do
       fail_started(
         cm,
         channel_id,
