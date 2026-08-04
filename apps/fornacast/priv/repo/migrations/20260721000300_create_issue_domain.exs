@@ -8,7 +8,12 @@ defmodule Fornacast.Repo.Migrations.CreateIssueDomain do
         primary_key: true
       )
 
-      add(:next_number, :bigint, null: false, default: 1)
+      add(:next_number, :bigint,
+        null: false,
+        default: 1,
+        check: [name: "number_sequence_positive", expr: "next_number > 0"]
+      )
+
       timestamps(type: :utc_datetime)
     end
 
@@ -21,11 +26,28 @@ defmodule Fornacast.Repo.Migrations.CreateIssueDomain do
     create table(:issues) do
       add(:repository_id, references(:repositories, on_delete: :delete_all), null: false)
       add(:number, :bigint, null: false)
-      add(:kind, :string, null: false)
+
+      add(:kind, :string,
+        null: false,
+        check: [name: "issues_kind_check", expr: "kind in ('issue', 'pull_request')"]
+      )
+
       add(:title, :string, null: false)
       add(:body, :text)
-      add(:state, :string, null: false, default: "open")
-      add(:state_reason, :string)
+
+      add(:state, :string,
+        null: false,
+        default: "open",
+        check: [name: "issues_state_check", expr: "state in ('open', 'closed')"]
+      )
+
+      add(:state_reason, :string,
+        check: [
+          name: "issues_state_reason_check",
+          expr: "state_reason is null or state_reason in ('completed', 'not_planned', 'reopened')"
+        ]
+      )
+
       add(:author_user_id, references(:users, on_delete: :restrict), null: false)
       add(:closed_at, :utc_datetime)
       timestamps(type: :utc_datetime)
