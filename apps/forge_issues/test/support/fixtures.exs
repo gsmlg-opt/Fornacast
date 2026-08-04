@@ -13,7 +13,7 @@ defmodule ForgeIssues.Fixtures do
 
       value when value in ["libsql", "turso"] ->
         reset_turso_database!()
-        on_exit(&reset_turso_database!/0)
+        ExUnit.Callbacks.on_exit(&reset_turso_database!/0)
     end
 
     :ok
