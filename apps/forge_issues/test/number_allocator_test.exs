@@ -128,17 +128,15 @@ defmodule ForgeIssues.NumberAllocatorTest do
         Task.async(fn ->
           receive do
             :go ->
-              transaction_with_turso_lock_retry(fn ->
-                Multi.new()
-                |> ForgeIssues.insert_numbered_identity(
-                  {:issue, index},
-                  repository,
-                  actor,
-                  if(rem(index, 2) == 0, do: :pull_request, else: :issue),
-                  %{title: "Concurrent #{index}"}
-                )
-                |> Repo.transaction()
-              end)
+              Multi.new()
+              |> ForgeIssues.insert_numbered_identity(
+                {:issue, index},
+                repository,
+                actor,
+                if(rem(index, 2) == 0, do: :pull_request, else: :issue),
+                %{title: "Concurrent #{index}"}
+              )
+              |> Repo.transaction()
               |> case do
                 {:ok, changes} -> {:ok, changes[{:issue, index}].number}
                 error -> error
@@ -147,9 +145,7 @@ defmodule ForgeIssues.NumberAllocatorTest do
         end)
       end
 
-    if Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"] do
-      Enum.each(tasks, fn task -> Ecto.Adapters.SQL.Sandbox.allow(Repo, parent, task.pid) end)
-    end
+    Enum.each(tasks, fn task -> Ecto.Adapters.SQL.Sandbox.allow(Repo, parent, task.pid) end)
 
     Enum.each(tasks, fn task -> send(task.pid, :go) end)
 
@@ -160,19 +156,5 @@ defmodule ForgeIssues.NumberAllocatorTest do
       |> Enum.sort()
 
     assert numbers == Enum.to_list(1..8)
-  end
-
-  defp transaction_with_turso_lock_retry(fun, retries \\ 20)
-
-  defp transaction_with_turso_lock_retry(fun, retries) do
-    fun.()
-  rescue
-    error in Turso.Error ->
-      if retries > 0 and Exception.message(error) == "database is locked" do
-        Process.sleep(5)
-        transaction_with_turso_lock_retry(fun, retries - 1)
-      else
-        reraise error, __STACKTRACE__
-      end
   end
 end
