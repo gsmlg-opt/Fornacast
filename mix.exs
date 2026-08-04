@@ -18,13 +18,14 @@ defmodule FornacastUmbrella.MixProject do
     ]
   end
 
-  defp releases do
+  def releases do
     [
       fornacast: [
         applications: [
           fornacast: :permanent,
           forge_accounts: :permanent,
           forge_repos: :permanent,
+          forge_issues: :permanent,
           git_core: :permanent,
           git_transport: :permanent,
           fornacast_web: :permanent,
