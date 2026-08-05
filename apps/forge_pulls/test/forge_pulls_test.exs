@@ -81,6 +81,15 @@ defmodule ForgePullsTest do
     }
   }
 
+  setup do
+    if Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"] do
+      :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+      :ok = Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+    end
+
+    :ok
+  end
+
   test "pull request creation accepts the documented Task 2 constructor" do
     attrs = %{
       issue_id: 1,
@@ -117,6 +126,54 @@ defmodule ForgePullsTest do
     create_branch!(repository, "main")
     create_branch!(repository, "feature/x")
 
+    assert {:error, :invalid_head} =
+             ForgePulls.create_pull_request(
+               repository,
+               reader,
+               %{title: "missing", base: "main"},
+               %{}
+             )
+
+    assert {:error, :invalid_base} =
+             ForgePulls.create_pull_request(
+               repository,
+               reader,
+               %{title: "missing", head: "feature/x"},
+               %{}
+             )
+
+    assert {:error, :head_equals_base} =
+             ForgePulls.create_pull_request(
+               repository,
+               reader,
+               %{title: "same", head: "main", base: "main"},
+               %{}
+             )
+
+    assert {:error, :cross_repository_head} =
+             ForgePulls.create_pull_request(
+               repository,
+               reader,
+               %{title: "foreign", head: "other:feature/x", base: "main"},
+               %{}
+             )
+
+    assert {:error, :invalid_head} =
+             ForgePulls.create_pull_request(
+               repository,
+               reader,
+               %{title: "missing ref", head: "missing", base: "main"},
+               %{}
+             )
+
+    assert {:error, :invalid_base} =
+             ForgePulls.create_pull_request(
+               repository,
+               reader,
+               %{title: "missing ref", head: "feature/x", base: "missing"},
+               %{}
+             )
+
     attrs = %{
       title: "Add feature",
       body: "description",
@@ -151,6 +208,14 @@ defmodule ForgePullsTest do
              })
 
     assert listed.id == pull.id
+
+    assert {:ok, %{entries: [^listed]}} =
+             ForgePulls.list_pull_requests(repository, reader, %{
+               state: "closed",
+               head: "#{String.upcase(owner.username)}:feature/x",
+               base: "main"
+             })
+
     issue_id = pull.issue_id
 
     assert {:ok, %{^issue_id => %{merged_at: nil}}} =
@@ -369,7 +434,7 @@ defmodule ForgePullsTest do
     assert database_contract() == @expected_contract
 
     key = contract_fixture_key()
-    on_exit(fn -> delete_contract_fixture(key) end)
+    cleanup_contract_fixture(key)
     fixture = insert_contract_fixture(key)
 
     for state <- @states do
@@ -404,7 +469,7 @@ defmodule ForgePullsTest do
 
   test "deleting a repository cascades through issues, pulls, and merge operations" do
     key = contract_fixture_key()
-    on_exit(fn -> delete_contract_fixture(key) end)
+    cleanup_contract_fixture(key)
     fixture = insert_contract_fixture(key)
     assert {:ok, %{num_rows: 1}} = insert_merge_operation(fixture, "prepared", "repo-cascade")
 
@@ -424,7 +489,7 @@ defmodule ForgePullsTest do
 
   test "deleting an issue cascades through its pull and operation but retains the repository" do
     key = contract_fixture_key()
-    on_exit(fn -> delete_contract_fixture(key) end)
+    cleanup_contract_fixture(key)
     fixture = insert_contract_fixture(key)
     assert {:ok, %{num_rows: 1}} = insert_merge_operation(fixture, "prepared", "issue-cascade")
 
@@ -902,6 +967,10 @@ defmodule ForgePullsTest do
     ])
 
     sql!("DELETE FROM users WHERE username = ?", "DELETE FROM users WHERE username = $1", [key])
+  end
+
+  defp cleanup_contract_fixture(key) do
+    if database_adapter() == :turso, do: on_exit(fn -> delete_contract_fixture(key) end)
   end
 
   defp delete_by_id(table, id) do

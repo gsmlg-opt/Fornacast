@@ -22,7 +22,8 @@ defmodule ForgePulls do
           {:ok, Page.t(PullRequest.t())} | {:error, error_reason()}
   def list_pull_requests(%ForgeRepos.Repository{} = repository, actor, filters \\ %{}) do
     with :ok <- authorize_read(actor, repository),
-         {:ok, filters} <- list_filters(filters) do
+         {:ok, filters} <- list_filters(filters),
+         {:ok, filters} <- normalize_list_refs(repository, filters) do
       query =
         from(pull in PullRequest,
           join: issue in Issue,
@@ -52,8 +53,9 @@ defmodule ForgePulls do
   def get_pull_request(%ForgeRepos.Repository{} = repository, number, actor)
       when is_integer(number) and number > 0 do
     with :ok <- authorize_read(actor, repository),
-         %PullRequest{} = pull <- Repo.one(pull_query(repository, number)) do
-      {:ok, pull |> refresh_analysis(repository) |> load_issue(repository)}
+         %PullRequest{} = pull <- Repo.one(pull_query(repository, number)),
+         {:ok, pull} <- refresh_analysis(pull, repository) do
+      {:ok, load_issue(pull, repository)}
     else
       nil -> {:error, :not_found}
       {:error, _} = error -> error
@@ -243,8 +245,17 @@ defmodule ForgePulls do
            ForgeRepos.absolute_storage_path(repository),
            %GitCore.RefSelector{kind: :branch, full_name: ref}
          ) do
-      {:ok, snapshot} -> {:ok, snapshot}
-      {:error, _} -> {:error, error}
+      {:ok, snapshot} ->
+        {:ok, snapshot}
+
+      {:error, %GitCore.Error{kind: kind}} when kind in [:ref_not_found, :not_found] ->
+        {:error, error}
+
+      {:error, %GitCore.Error{kind: kind}} ->
+        {:error, {:unavailable, kind}}
+
+      {:error, _} ->
+        {:error, {:unavailable, :git}}
     end
   end
 
@@ -403,9 +414,9 @@ defmodule ForgePulls do
              mergeable_state: nil
            })
            |> Repo.update() do
-      refreshed
+      {:ok, refreshed}
     else
-      _ -> pull
+      {:error, _} = error -> error
     end
   end
 
@@ -482,6 +493,18 @@ defmodule ForgePulls do
 
   defp parse_positive(_, default), do: default
 
+  defp normalize_list_refs(repository, filters) do
+    with {:ok, head} <- normalize_optional_head(repository, filters.head),
+         {:ok, base} <- normalize_optional_base(filters.base) do
+      {:ok, %{filters | head: head, base: base}}
+    end
+  end
+
+  defp normalize_optional_head(_repository, nil), do: {:ok, nil}
+  defp normalize_optional_head(repository, value), do: head_ref(repository, value)
+  defp normalize_optional_base(nil), do: {:ok, nil}
+  defp normalize_optional_base(value), do: branch_ref(value, :invalid_base)
+
   defp state_filter(state),
     do: dynamic([_pull, issue], issue.state == ^String.to_existing_atom(to_string(state)))
 
@@ -496,10 +519,10 @@ defmodule ForgePulls do
         order_by(query, [pull, issue], [{^direction, issue.number}, {^direction, pull.id}])
 
       "updated" ->
-        order_by(query, [pull], [{^direction, pull.updated_at}, {^direction, pull.id}])
+        order_by(query, [pull, issue], [{^direction, issue.updated_at}, {^direction, pull.id}])
 
       _ ->
-        order_by(query, [pull], [{^direction, pull.inserted_at}, {^direction, pull.id}])
+        order_by(query, [pull, issue], [{^direction, issue.inserted_at}, {^direction, pull.id}])
     end
   end
 end
