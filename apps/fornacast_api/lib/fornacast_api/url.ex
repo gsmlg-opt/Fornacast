@@ -12,6 +12,10 @@ defmodule FornacastAPI.URL do
   def user(login), do: api("/users/#{segment(login)}")
   def organization(login), do: api("/orgs/#{segment(login)}")
   def repository(owner, repo), do: api("/repos/#{segment(owner)}/#{segment(repo)}")
+  def issue(owner, repo, number), do: repository(owner, repo) <> "/issues/#{number}"
+  def issue_comment(owner, repo, id), do: repository(owner, repo) <> "/issues/comments/#{id}"
+  def label(owner, repo, name), do: repository(owner, repo) <> "/labels/#{segment(name)}"
+  def pull(owner, repo, number), do: repository(owner, repo) <> "/pulls/#{number}"
 
   defp absolute(path) when is_binary(path) do
     if String.starts_with?(path, "/") do
