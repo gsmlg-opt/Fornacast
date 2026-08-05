@@ -22,7 +22,11 @@ repo_config =
       [
         database: System.get_env("FORNACAST_DATABASE_PATH", "fornacast_dev.db"),
         remote_url: System.get_env("TURSO_DATABASE_URL"),
-        auth_token: System.get_env("TURSO_AUTH_TOKEN")
+        auth_token: System.get_env("TURSO_AUTH_TOKEN"),
+        # TODO(upstream): gsmlg-dev/concord#67
+        # WORKAROUND(upstream): gsmlg-dev/concord#67
+        after_connect:
+          {Ecto.Adapters.Turso.Connection, :query, ["PRAGMA foreign_keys = ON", [], []]}
       ]
       |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
 
