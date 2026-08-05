@@ -17,6 +17,7 @@ defmodule ForgePulls.PullRequest do
     field :merged_at, :utc_datetime
     field :merged_by_user_id, :integer
     field :merge_commit_sha, :string
+    field :issue, :map, virtual: true
 
     timestamps(type: :utc_datetime)
   end
@@ -35,6 +36,13 @@ defmodule ForgePulls.PullRequest do
     pull_request
     |> change()
     |> add_error(:base, "cannot create a persisted pull request")
+  end
+
+  def update_changeset(%__MODULE__{} = pull_request, attrs) do
+    pull_request
+    |> cast(attrs, [:base_ref, :head_sha, :base_sha, :mergeable, :mergeable_state])
+    |> validate_branch_refs()
+    |> validate_distinct_refs()
   end
 
   defp validate_repository_identity(changeset, nil), do: changeset

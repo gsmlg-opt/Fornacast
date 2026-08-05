@@ -2,6 +2,7 @@ defmodule ForgePullsTest do
   use ExUnit.Case, async: false
 
   alias Ecto.Adapters.SQL
+  alias ForgeIssues.Issue
   alias ForgePulls.{MergeOperation, PullRequest}
   alias Fornacast.Repo
 
@@ -105,6 +106,55 @@ defmodule ForgePullsTest do
 
     assert head_sha == String.duplicate("a", 40)
     assert base_sha == String.duplicate("b", 40)
+  end
+
+  test "a reader opens a pull with a canonical shared issue identity and may update its shared fields" do
+    suffix = "#{System.system_time(:microsecond)}-#{System.unique_integer([:positive])}"
+    owner = user_fixture("pull-owner-#{suffix}")
+    reader = user_fixture("pull-reader-#{suffix}")
+    repository = repository_fixture(owner)
+    grant_reader!(repository, reader)
+    create_branch!(repository, "main")
+    create_branch!(repository, "feature/x")
+
+    attrs = %{
+      title: "Add feature",
+      body: "description",
+      head: "#{owner.username}:feature/x",
+      base: "main"
+    }
+
+    assert {:ok, pull} = ForgePulls.create_pull_request(repository, reader, attrs, %{})
+    assert pull.head_ref == "refs/heads/feature/x"
+    assert pull.base_ref == "refs/heads/main"
+
+    assert %Issue{number: 1, kind: :pull_request, title: "Add feature"} =
+             Repo.get!(Issue, pull.issue_id)
+
+    assert {:ok, updated} =
+             ForgePulls.update_pull_request(
+               repository,
+               pull,
+               reader,
+               %{title: "Renamed", state: :closed},
+               %{}
+             )
+
+    assert updated.id == pull.id
+    assert %Issue{title: "Renamed", state: :closed} = Repo.get!(Issue, pull.issue_id)
+
+    assert {:ok, %{entries: [listed], total: 1}} =
+             ForgePulls.list_pull_requests(repository, reader, %{
+               state: :closed,
+               sort: :number,
+               direction: :asc
+             })
+
+    assert listed.id == pull.id
+    issue_id = pull.issue_id
+
+    assert {:ok, %{^issue_id => %{merged_at: nil}}} =
+             ForgePulls.pull_links_for_issue_ids(repository, [issue_id], reader)
   end
 
   test "pull requests require distinct canonical branch refs and immutable repository identity" do
@@ -896,5 +946,66 @@ defmodule ForgePullsTest do
       value when value in ["turso", "libsql"] -> :turso
       value when value in ["postgres", "postgresql"] -> :postgres
     end
+  end
+
+  defp grant_reader!(repository, user) do
+    %ForgeRepos.Collaborator{}
+    |> ForgeRepos.Collaborator.changeset(%{
+      repository_id: repository.id,
+      user_id: user.id,
+      role: :read
+    })
+    |> Repo.insert!()
+  end
+
+  defp user_fixture(username) do
+    {:ok, user} =
+      ForgeAccounts.create_user(%{
+        username: username,
+        email: "#{username}@example.test",
+        password: "correct horse battery staple"
+      })
+
+    user
+  end
+
+  defp repository_fixture(owner) do
+    slug = "pull-#{System.unique_integer([:positive])}"
+
+    {:ok, repository} =
+      ForgeRepos.create_repository(owner, %{name: slug, slug: slug, visibility: :private})
+
+    repository
+  end
+
+  defp create_branch!(repository, branch) do
+    path = ForgeRepos.absolute_storage_path(repository)
+
+    empty_tree =
+      Path.join(System.tmp_dir!(), "pull-empty-tree-#{System.unique_integer([:positive])}")
+
+    File.write!(empty_tree, "")
+    on_exit(fn -> File.rm(empty_tree) end)
+
+    {tree, 0} =
+      System.cmd("git", ["--git-dir=#{path}", "hash-object", "-t", "tree", "-w", empty_tree])
+
+    {commit, 0} =
+      System.cmd("git", ["--git-dir=#{path}", "commit-tree", String.trim(tree), "-m", branch],
+        env: [
+          {"GIT_AUTHOR_NAME", "Test"},
+          {"GIT_AUTHOR_EMAIL", "test@example.test"},
+          {"GIT_COMMITTER_NAME", "Test"},
+          {"GIT_COMMITTER_EMAIL", "test@example.test"}
+        ]
+      )
+
+    {_, 0} =
+      System.cmd("git", [
+        "--git-dir=#{path}",
+        "update-ref",
+        "refs/heads/#{branch}",
+        String.trim(commit)
+      ])
   end
 end
