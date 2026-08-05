@@ -35,6 +35,17 @@ defmodule ForgeIssuesTest do
              Enum.sort(Enum.map(labels, & &1.normalized_name))
 
     assert Enum.all?(labels, &(&1.inserted_at.microsecond == {0, 0}))
+    assert Enum.all?(labels, &(&1.updated_at.microsecond == {0, 0}))
+  end
+
+  test "a pre-feature repository receives defaults lazily on its first issue read", %{
+    writer: writer
+  } do
+    repository = repository_fixture(writer)
+    assert 0 == Repo.aggregate(Label, :count, :id)
+
+    assert 9 == repository |> ForgeIssues.list_labels() |> length()
+    assert 9 == Repo.aggregate(Label, :count, :id)
   end
 
   test "concurrent provisioning leaves exactly nine defaults", %{repository: repository} do
@@ -102,6 +113,34 @@ defmodule ForgeIssuesTest do
     assert [assignee.id] == ForgeIssues.load_assignees(issue) |> Enum.map(& &1.id)
   end
 
+  test "writers replace existing label and assignee joins", %{
+    writer: writer,
+    repository: repository
+  } do
+    [old_label | _] = ForgeIssues.list_labels(repository)
+    new_label = label_fixture(repository, "Replacement")
+    old_assignee = readable_user(repository, "old-assignee")
+    new_assignee = readable_user(repository, "new-assignee")
+    issue = issue_fixture(repository, writer)
+    Repo.insert_all(IssueLabel, [join_row(issue.id, old_label.id)])
+    Repo.insert_all(IssueAssignee, [assignee_row(issue.id, old_assignee.id)])
+
+    assert {:ok, _} =
+             Multi.new()
+             |> Multi.run(:issue, fn _repo, _changes -> {:ok, issue} end)
+             |> ForgeIssues.put_relationship_operations(
+               :issue,
+               repository,
+               writer,
+               %{"labels" => [new_label.name], "assignees" => [new_assignee.username]},
+               :writer
+             )
+             |> ForgeIssues.transaction()
+
+    assert [new_label.id] == ForgeIssues.load_labels(issue) |> Enum.map(& &1.id)
+    assert [new_assignee.id] == ForgeIssues.load_assignees(issue) |> Enum.map(& &1.id)
+  end
+
   test "writers receive stable relationship errors", %{writer: writer, repository: repository} do
     issue = issue_fixture(repository, writer)
 
@@ -136,6 +175,7 @@ defmodule ForgeIssuesTest do
 
   test "authors ignore submitted relationship changes", %{writer: writer, repository: repository} do
     author = user_fixture("issue-author-#{System.unique_integer([:positive])}")
+    grant_read(repository, author)
     issue = issue_fixture(repository, author)
     label = ForgeIssues.list_labels(repository) |> hd()
 
@@ -156,6 +196,34 @@ defmodule ForgeIssuesTest do
 
     assert [label.id] == ForgeIssues.load_labels(issue) |> Enum.map(& &1.id)
     assert [writer.id] == ForgeIssues.load_assignees(issue) |> Enum.map(& &1.id)
+  end
+
+  test "disabled assignees return the exact invalid error", %{
+    writer: writer,
+    repository: repository
+  } do
+    disabled = user_fixture("disabled-#{System.unique_integer([:positive])}", %{state: :disabled})
+    assert_invalid_assignee(repository, writer, disabled.username)
+  end
+
+  test "organization assignees return the exact invalid error", %{
+    writer: writer,
+    repository: repository
+  } do
+    {:ok, organization} =
+      ForgeAccounts.create_organization(writer, %{
+        username: "org-#{System.unique_integer([:positive])}"
+      })
+
+    assert_invalid_assignee(repository, writer, organization.username)
+  end
+
+  test "repository-ineligible assignees return the exact invalid error", %{
+    writer: writer,
+    repository: repository
+  } do
+    ineligible = user_fixture("ineligible-#{System.unique_integer([:positive])}")
+    assert_invalid_assignee(repository, writer, ineligible.username)
   end
 
   test "metadata loading batches joins, accounts, and comment counts", %{
@@ -212,6 +280,32 @@ defmodule ForgeIssuesTest do
              |> ForgeIssues.transaction()
 
     assert [second.id] == ForgeIssues.load_assignees(issue) |> Enum.map(& &1.id)
+  end
+
+  test "absent nil and empty singular assignee values preserve existing joins", %{
+    writer: writer,
+    repository: repository
+  } do
+    assignee = readable_user(repository, "preserved")
+
+    for attrs <- [%{}, %{"assignee" => nil}, %{"assignee" => ""}] do
+      issue = issue_fixture(repository, writer)
+      Repo.insert_all(IssueAssignee, [assignee_row(issue.id, assignee.id)])
+
+      assert {:ok, _} =
+               Multi.new()
+               |> Multi.run(:issue, fn _repo, _changes -> {:ok, issue} end)
+               |> ForgeIssues.put_relationship_operations(
+                 :issue,
+                 repository,
+                 writer,
+                 attrs,
+                 :writer
+               )
+               |> ForgeIssues.transaction()
+
+      assert [assignee.id] == ForgeIssues.load_assignees(issue) |> Enum.map(& &1.id)
+    end
   end
 
   test "relationship replacement rolls back as part of the outer multi", %{
@@ -292,11 +386,15 @@ defmodule ForgeIssuesTest do
   defp readable_user(repository, prefix) do
     user = user_fixture("#{prefix}-#{System.unique_integer([:positive])}")
 
+    grant_read(repository, user)
+
+    user
+  end
+
+  defp grant_read(repository, user) do
     %Collaborator{}
     |> Collaborator.changeset(%{repository_id: repository.id, user_id: user.id, role: :read})
     |> Repo.insert!()
-
-    user
   end
 
   defp label_fixture(repository, name) do
@@ -308,6 +406,24 @@ defmodule ForgeIssuesTest do
       color: "aabbcc"
     })
     |> Repo.insert!()
+  end
+
+  defp assert_invalid_assignee(repository, writer, username) do
+    issue = issue_fixture(repository, writer)
+
+    assert {:error, {:issue, :relationships},
+            {:validation, [%{resource: "Issue", field: "assignees", code: :invalid}]},
+            _} =
+             Multi.new()
+             |> Multi.run(:issue, fn _repo, _changes -> {:ok, issue} end)
+             |> ForgeIssues.put_relationship_operations(
+               :issue,
+               repository,
+               writer,
+               %{"assignee" => username},
+               :writer
+             )
+             |> ForgeIssues.transaction()
   end
 
   defp count_repo_queries(fun) do
