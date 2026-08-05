@@ -1262,6 +1262,41 @@ defmodule ForgeIssuesTest do
     assert Enum.map(comments, & &1.author.id) == [writer.id, writer.id]
   end
 
+  test "private comment reads are authorized and mask unauthorized callers", %{
+    writer: writer,
+    repository: repository
+  } do
+    reader = readable_user(repository, "comment-reader")
+    outsider = user_fixture("comment-outsider-#{System.unique_integer([:positive])}")
+    issue = issue_fixture(repository, writer)
+    comment = insert_comment(issue, writer, "Private")
+    comment_id = comment.id
+
+    assert {:ok, %Page{entries: [%{id: ^comment_id}]}} =
+             ForgeIssues.list_comments(
+               reader,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{}
+             )
+
+    assert {:ok, %{id: ^comment_id}} =
+             ForgeIssues.get_comment(reader, writer.username, repository.slug, comment.id)
+
+    assert {:error, :not_found} =
+             ForgeIssues.list_comments(
+               outsider,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{}
+             )
+
+    assert {:error, :not_found} =
+             ForgeIssues.get_comment(nil, writer.username, repository.slug, comment.id)
+  end
+
   test "readers create comments and authors or writers mutate them with one audit each", %{
     writer: writer,
     repository: repository
@@ -1317,6 +1352,56 @@ defmodule ForgeIssuesTest do
            }
   end
 
+  test "comment mutations enforce author and writer roles", %{
+    writer: writer,
+    repository: repository
+  } do
+    author = readable_user(repository, "comment-role-author")
+    reader = readable_user(repository, "comment-role-reader")
+    other_writer = user_fixture("comment-role-writer-#{System.unique_integer([:positive])}")
+    grant_write(repository, other_writer)
+    issue = issue_fixture(repository, writer)
+    comment = insert_comment(issue, author, "Owned")
+
+    assert {:ok, %{body: "Writer edit"}} =
+             ForgeIssues.update_comment(
+               other_writer,
+               writer.username,
+               repository.slug,
+               comment.id,
+               %{"body" => "Writer edit"},
+               request_metadata()
+             )
+
+    assert {:error, :forbidden} =
+             ForgeIssues.update_comment(
+               reader,
+               writer.username,
+               repository.slug,
+               comment.id,
+               %{"body" => "Reader edit"},
+               request_metadata()
+             )
+
+    assert {:error, :forbidden} =
+             ForgeIssues.delete_comment(
+               reader,
+               writer.username,
+               repository.slug,
+               comment.id,
+               request_metadata()
+             )
+
+    assert :ok =
+             ForgeIssues.delete_comment(
+               author,
+               writer.username,
+               repository.slug,
+               comment.id,
+               request_metadata()
+             )
+  end
+
   test "comment queries keep IDs and mutations scoped to the repository", %{
     writer: writer,
     repository: repository
@@ -1338,6 +1423,25 @@ defmodule ForgeIssuesTest do
 
     assert {:error, :not_found} =
              ForgeIssues.get_comment(writer, writer.username, other.slug, comment.id)
+
+    assert {:error, :not_found} =
+             ForgeIssues.update_comment(
+               writer,
+               writer.username,
+               other.slug,
+               comment.id,
+               %{"body" => "No leak"},
+               request_metadata()
+             )
+
+    assert {:error, :not_found} =
+             ForgeIssues.delete_comment(
+               writer,
+               writer.username,
+               other.slug,
+               comment.id,
+               request_metadata()
+             )
 
     assert 0 == Repo.aggregate(AuditEvent, :count, :id)
   end
@@ -1376,6 +1480,18 @@ defmodule ForgeIssuesTest do
              ForgeIssues.list_comments(writer, writer.username, repository.slug, issue.number, %{
                page: "999999999999999999999999999999999999999999999999999999999999999999999999"
              })
+
+    assert {:error,
+            {:validation, [%{resource: "IssueComment", field: "per_page", code: :unprocessable}]}} =
+             ForgeIssues.list_comments(writer, writer.username, repository.slug, issue.number, %{
+               per_page: 0
+             })
+
+    assert {:error,
+            {:validation, [%{resource: "IssueComment", field: "since", code: :unprocessable}]}} =
+             ForgeIssues.list_comments(writer, writer.username, repository.slug, issue.number, %{
+               since: "not-a-time"
+             })
   end
 
   test "disabled issues reject ordinary comments but retain pull conversations", %{
@@ -1383,6 +1499,7 @@ defmodule ForgeIssuesTest do
     repository: repository
   } do
     issue = issue_fixture(repository, writer)
+    ordinary_comment = insert_comment(issue, writer, "Ordinary")
     repository = Repo.update!(Ecto.Changeset.change(repository, has_issues: false))
     pull = pull_fixture(repository, writer)
     comment = insert_comment(pull, writer, "Conversation")
@@ -1394,6 +1511,43 @@ defmodule ForgeIssuesTest do
                repository.slug,
                issue.number,
                %{}
+             )
+
+    assert {:error, :issues_disabled} =
+             ForgeIssues.get_comment(
+               writer,
+               writer.username,
+               repository.slug,
+               ordinary_comment.id
+             )
+
+    assert {:error, :issues_disabled} =
+             ForgeIssues.create_comment(
+               writer,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{"body" => "Blocked"},
+               request_metadata()
+             )
+
+    assert {:error, :issues_disabled} =
+             ForgeIssues.update_comment(
+               writer,
+               writer.username,
+               repository.slug,
+               ordinary_comment.id,
+               %{"body" => "Blocked"},
+               request_metadata()
+             )
+
+    assert {:error, :issues_disabled} =
+             ForgeIssues.delete_comment(
+               writer,
+               writer.username,
+               repository.slug,
+               ordinary_comment.id,
+               request_metadata()
              )
 
     assert {:ok, %Page{entries: [%{id: comment_id}]}} =
@@ -1410,6 +1564,139 @@ defmodule ForgeIssuesTest do
                %{"body" => "Still here"},
                request_metadata()
              )
+
+    assert {:ok, %{id: ^comment_id}} =
+             ForgeIssues.get_comment(writer, writer.username, repository.slug, comment.id)
+
+    assert {:ok, pull_comment} =
+             ForgeIssues.create_comment(
+               writer,
+               writer.username,
+               repository.slug,
+               pull.number,
+               %{"body" => "New conversation"},
+               request_metadata()
+             )
+
+    assert :ok =
+             ForgeIssues.delete_comment(
+               writer,
+               writer.username,
+               repository.slug,
+               pull_comment.id,
+               request_metadata()
+             )
+  end
+
+  test "comment since filters preserve non-UTC instants", %{
+    writer: writer,
+    repository: repository
+  } do
+    issue = issue_fixture(repository, writer)
+    comment = insert_comment(issue, writer, "Time zone")
+    comment_id = comment.id
+    utc = ~U[2026-08-06 01:02:03Z]
+    Repo.update_all(from(row in Comment, where: row.id == ^comment.id), set: [updated_at: utc])
+
+    shanghai = %{
+      utc
+      | hour: 9,
+        utc_offset: 28_800,
+        time_zone: "Asia/Shanghai",
+        zone_abbr: "CST"
+    }
+
+    assert {:ok, %Page{entries: [%{id: ^comment_id}], total: 1}} =
+             ForgeIssues.list_comments(writer, writer.username, repository.slug, issue.number, %{
+               since: shanghai
+             })
+  end
+
+  test "comment pages batch author metadata", %{writer: writer, repository: repository} do
+    issue = issue_fixture(repository, writer)
+
+    Enum.each(1..4, fn index ->
+      author = user_fixture("comment-page-author-#{index}-#{System.unique_integer([:positive])}")
+      insert_comment(issue, author, "Comment #{index}")
+    end)
+
+    {{:ok, %Page{entries: entries}}, query_count} =
+      count_repo_queries(fn ->
+        ForgeIssues.list_comments(writer, writer.username, repository.slug, issue.number, %{})
+      end)
+
+    assert length(entries) == 4
+    assert Enum.all?(entries, & &1.author)
+    assert query_count <= 8
+  end
+
+  test "comment mutation multi rechecks actor state and rolls audit back on a later failure", %{
+    writer: writer,
+    repository: repository
+  } do
+    issue = issue_fixture(repository, writer)
+
+    stale_actor_multi =
+      ForgeIssues.create_comment_multi(
+        writer,
+        repository,
+        issue.number,
+        %{"body" => "Stale actor"},
+        request_metadata()
+      )
+
+    Repo.update!(Ecto.Changeset.change(writer, state: :disabled))
+
+    assert {:error, :authorization, :forbidden, %{}} = ForgeIssues.transaction(stale_actor_multi)
+    assert 0 == Repo.aggregate(AuditEvent, :count, :id)
+
+    active_writer = Repo.get!(ForgeAccounts.User, writer.id)
+    Repo.update!(Ecto.Changeset.change(active_writer, state: :active))
+
+    failed_multi =
+      ForgeIssues.create_comment_multi(
+        active_writer,
+        repository,
+        issue.number,
+        %{"body" => "Rollback"},
+        request_metadata()
+      )
+      |> Multi.run(:forced_failure, fn _repo, _changes -> {:error, :forced_failure} end)
+
+    assert {:error, :forced_failure, :forced_failure, _} = ForgeIssues.transaction(failed_multi)
+    assert 0 == Repo.aggregate(AuditEvent, :count, :id)
+    assert 0 == Repo.aggregate(Comment, :count, :id)
+  end
+
+  test "retrying a comment multi leaves one audit row", %{writer: writer, repository: repository} do
+    issue = issue_fixture(repository, writer)
+    retry_key = {__MODULE__, :comment_retry, System.unique_integer([:positive])}
+
+    multi =
+      ForgeIssues.create_comment_multi(
+        writer,
+        repository,
+        issue.number,
+        %{"body" => "Retry"},
+        request_metadata()
+      )
+      |> Multi.run(:busy_once, fn _repo, _changes ->
+        case Process.get(retry_key, 0) do
+          0 ->
+            Process.put(retry_key, 1)
+            raise Turso.Error, code: :busy, message: "database is locked"
+
+          _ ->
+            {:ok, :retried}
+        end
+      end)
+
+    if Repo.__adapter__() == Ecto.Adapters.Turso do
+      assert {:ok, %{comment: _comment}} = ForgeIssues.transaction(multi)
+      assert 1 == Repo.aggregate(AuditEvent, :count, :id)
+    else
+      assert_raise Turso.Error, "database is locked", fn -> ForgeIssues.transaction(multi) end
+    end
   end
 
   defp issue_fixture(repository, author, title \\ "Relationship test") do
@@ -1512,6 +1799,12 @@ defmodule ForgeIssuesTest do
   defp grant_read(repository, user) do
     %Collaborator{}
     |> Collaborator.changeset(%{repository_id: repository.id, user_id: user.id, role: :read})
+    |> Repo.insert!()
+  end
+
+  defp grant_write(repository, user) do
+    %Collaborator{}
+    |> Collaborator.changeset(%{repository_id: repository.id, user_id: user.id, role: :write})
     |> Repo.insert!()
   end
 

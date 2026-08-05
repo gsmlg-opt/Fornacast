@@ -251,7 +251,8 @@ defmodule ForgeIssues do
   defp update_mutation_multi(_actor, _repository, _number, _attrs, _request_metadata),
     do: {:error, :forbidden}
 
-  defp create_comment_multi(actor, repository, number, attrs, request_metadata) do
+  @doc false
+  def create_comment_multi(actor, repository, number, attrs, request_metadata) do
     attrs = normalize_attrs(attrs)
     request_metadata = safe_request_metadata(request_metadata)
 
@@ -828,16 +829,23 @@ defmodule ForgeIssues do
         {:ok, nil}
 
       %DateTime{} = value ->
-        {:ok, DateTime.truncate(value, :second)}
+        normalize_since(value)
 
       value when is_binary(value) ->
         case DateTime.from_iso8601(value) do
-          {:ok, datetime, _offset} -> {:ok, datetime}
+          {:ok, datetime, _offset} -> normalize_since(datetime)
           _ -> invalid_filter("since", :unprocessable)
         end
 
       _ ->
         invalid_filter("since", :unprocessable)
+    end
+  end
+
+  defp normalize_since(datetime) do
+    case DateTime.from_unix(DateTime.to_unix(datetime, :microsecond), :microsecond) do
+      {:ok, utc_datetime} -> {:ok, DateTime.truncate(utc_datetime, :second)}
+      {:error, _reason} -> invalid_filter("since", :unprocessable)
     end
   end
 
