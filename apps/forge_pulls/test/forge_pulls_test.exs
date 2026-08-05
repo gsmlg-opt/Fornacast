@@ -80,6 +80,33 @@ defmodule ForgePullsTest do
     }
   }
 
+  test "pull request creation accepts the documented Task 2 constructor" do
+    attrs = %{
+      issue_id: 1,
+      repository_id: 10,
+      head_ref: "refs/heads/feature",
+      base_ref: "refs/heads/main",
+      head_sha: String.duplicate("a", 40),
+      base_sha: String.duplicate("b", 40)
+    }
+
+    changeset = PullRequest.create_changeset(%PullRequest{}, attrs)
+
+    assert changeset.valid?
+
+    assert %PullRequest{
+             issue_id: 1,
+             repository_id: 10,
+             head_ref: "refs/heads/feature",
+             base_ref: "refs/heads/main",
+             head_sha: head_sha,
+             base_sha: base_sha
+           } = Ecto.Changeset.apply_changes(changeset)
+
+    assert head_sha == String.duplicate("a", 40)
+    assert base_sha == String.duplicate("b", 40)
+  end
+
   test "pull requests require distinct canonical branch refs and immutable repository identity" do
     pull = %PullRequest{repository_id: 10}
 

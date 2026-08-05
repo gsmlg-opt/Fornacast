@@ -23,8 +23,8 @@ defmodule ForgePulls.PullRequest do
 
   def create_changeset(%__MODULE__{id: nil} = pull_request, attrs) do
     pull_request
-    |> cast(attrs, [:issue_id, :head_ref, :base_ref, :head_sha, :base_sha])
-    |> validate_repository_identity(attrs)
+    |> cast(attrs, [:issue_id, :repository_id, :head_ref, :base_ref, :head_sha, :base_sha])
+    |> validate_repository_identity(pull_request.repository_id)
     |> validate_required([:issue_id, :repository_id, :head_ref, :base_ref, :head_sha, :base_sha])
     |> validate_branch_refs()
     |> validate_distinct_refs()
@@ -37,14 +37,20 @@ defmodule ForgePulls.PullRequest do
     |> add_error(:base, "cannot create a persisted pull request")
   end
 
-  defp validate_repository_identity(changeset, attrs) do
-    submitted_repository_id = Map.get(attrs, :repository_id, Map.get(attrs, "repository_id"))
-    repository_id = get_field(changeset, :repository_id)
+  defp validate_repository_identity(changeset, nil), do: changeset
 
-    if not is_nil(submitted_repository_id) and submitted_repository_id != repository_id do
-      add_error(changeset, :repository_id, "is immutable")
-    else
-      changeset
+  defp validate_repository_identity(changeset, repository_id) do
+    case fetch_change(changeset, :repository_id) do
+      {:ok, submitted_repository_id} when submitted_repository_id != repository_id ->
+        changeset
+        |> delete_change(:repository_id)
+        |> add_error(:repository_id, "is immutable")
+
+      {:ok, ^repository_id} ->
+        changeset
+
+      :error ->
+        changeset
     end
   end
 
