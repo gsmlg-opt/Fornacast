@@ -1809,6 +1809,28 @@ defmodule ForgeIssuesTest do
     assert 0 == Repo.aggregate(AuditEvent, :count, :id)
   end
 
+  test "comment creation multi rechecks issues availability before writing", %{
+    writer: writer,
+    repository: repository
+  } do
+    issue = issue_fixture(repository, writer)
+
+    multi =
+      ForgeIssues.create_comment_multi(
+        writer,
+        repository,
+        issue.number,
+        %{"body" => "Blocked by disabled issues"},
+        request_metadata()
+      )
+
+    Repo.update!(Ecto.Changeset.change(repository, has_issues: false))
+
+    assert {:error, :authorization, :issues_disabled, %{}} = ForgeIssues.transaction(multi)
+    assert 0 == Repo.aggregate(Comment, :count, :id)
+    assert 0 == Repo.aggregate(AuditEvent, :count, :id)
+  end
+
   defp issue_fixture(repository, author, title \\ "Relationship test") do
     %Issue{
       repository_id: repository.id,
