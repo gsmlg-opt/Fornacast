@@ -1,7 +1,9 @@
 defmodule ForgePullsTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
+  alias Ecto.Adapters.SQL
   alias ForgePulls.{MergeOperation, PullRequest}
+  alias Fornacast.Repo
 
   test "pull requests require distinct canonical branch refs and immutable repository identity" do
     pull = %PullRequest{repository_id: 10}
@@ -126,6 +128,35 @@ defmodule ForgePullsTest do
 
     failed = MergeOperation.failed_changeset(prepared, "failure\n\u0000reason")
     assert %{state: :failed, failure_reason: "failure reason"} = Ecto.Changeset.apply_changes(failed)
+
+    for {operation, target} <- [
+          {prepared, :ref_advanced},
+          {prepared, :completed},
+          {merge_written, :prepared},
+          {merge_written, :completed},
+          {ref_advanced, :prepared},
+          {%MergeOperation{state: :completed}, :failed},
+          {%MergeOperation{state: :failed}, :prepared}
+        ] do
+      assert %{state: ["is not a valid transition"]} =
+               operation |> MergeOperation.transition_changeset(target) |> errors_on()
+    end
+  end
+
+  test "the active adapter migration has every pull durable column" do
+    expected_pull_columns = ~w(
+      id issue_id repository_id head_ref base_ref head_sha base_sha mergeable mergeable_state
+      merged_at merged_by_user_id merge_commit_sha inserted_at updated_at
+    )
+
+    expected_operation_columns = ~w(
+      id pull_request_id repository_id actor_user_id request_id base_ref head_ref expected_base_oid
+      expected_head_oid merge_oid state lease_owner lease_expires_at failure_reason lock_version
+      inserted_at updated_at
+    )
+
+    assert expected_pull_columns -- column_names("pull_requests") == []
+    assert expected_operation_columns -- column_names("pull_merge_operations") == []
   end
 
   defp errors_on(changeset) do
@@ -148,5 +179,23 @@ defmodule ForgePullsTest do
       },
       overrides
     )
+  end
+
+  defp column_names(table) do
+    case Application.fetch_env!(:fornacast, :database_adapter) do
+      value when value in ["turso", "libsql"] ->
+        %{rows: rows} = SQL.query!(Repo, "select name from pragma_table_info(?)", [table])
+        Enum.map(rows, &hd/1)
+
+      value when value in ["postgres", "postgresql"] ->
+        %{rows: rows} =
+          SQL.query!(
+            Repo,
+            "select column_name from information_schema.columns where table_schema = 'public' and table_name = $1",
+            [table]
+          )
+
+        Enum.map(rows, &hd/1)
+    end
   end
 end
