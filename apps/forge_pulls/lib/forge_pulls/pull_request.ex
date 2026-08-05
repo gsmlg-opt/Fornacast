@@ -45,13 +45,25 @@ defmodule ForgePulls.PullRequest do
   defp validate_branch_refs(changeset) do
     Enum.reduce([:head_ref, :base_ref], changeset, fn field, changeset ->
       validate_change(changeset, field, fn ^field, ref ->
-        if is_binary(ref) and String.starts_with?(ref, "refs/heads/") and
-             byte_size(ref) > byte_size("refs/heads/"),
+        if canonical_branch_ref?(ref),
           do: [],
           else: [{field, "must be a canonical branch ref"}]
       end)
     end)
   end
+
+  # This follows Git's check-ref-format rules for branch names without invoking Git.
+  defp canonical_branch_ref?("refs/heads/" <> name) do
+    name != "" and
+      not String.contains?(name, ["..", "@{"]) and
+      not String.ends_with?(name, ".") and
+      not Regex.match?(~r/[\x00-\x20\x7f ~^:?*\[\\]/u, name) and
+      Enum.all?(String.split(name, "/"), fn component ->
+        component not in ["", ".", ".."] and not String.ends_with?(component, ".lock")
+      end)
+  end
+
+  defp canonical_branch_ref?(_ref), do: false
 
   defp validate_distinct_refs(changeset) do
     if get_field(changeset, :head_ref) == get_field(changeset, :base_ref) do

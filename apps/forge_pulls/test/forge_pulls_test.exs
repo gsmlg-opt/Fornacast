@@ -41,6 +41,45 @@ defmodule ForgePullsTest do
     assert %{base_ref: ["must differ from head ref"]} = errors_on(equal_refs)
   end
 
+  test "pull requests accept valid Unicode nested branches and reject Git-invalid ref forms" do
+    valid_refs = ["refs/heads/feature/東京", "refs/heads/release/v1"]
+
+    for ref <- valid_refs do
+      changeset =
+        PullRequest.create_changeset(%PullRequest{repository_id: 10}, valid_pull_attrs(%{head_ref: ref}))
+
+      refute Map.has_key?(errors_on(changeset), :head_ref)
+    end
+
+    invalid_refs = [
+      "refs/heads/..",
+      "refs/heads/feature..next",
+      "refs/heads/feature name",
+      "refs/heads/feature\nnext",
+      "refs/heads/feature~next",
+      "refs/heads/feature^next",
+      "refs/heads/feature:next",
+      "refs/heads/feature?next",
+      "refs/heads/feature*next",
+      "refs/heads/feature[next",
+      "refs/heads/feature\\next",
+      "refs/heads/feature@{next",
+      "refs/heads//feature",
+      "refs/heads/feature/",
+      "refs/heads/./feature",
+      "refs/heads/feature/../next",
+      "refs/heads/feature.",
+      "refs/heads/feature.lock"
+    ]
+
+    for ref <- invalid_refs do
+      changeset =
+        PullRequest.create_changeset(%PullRequest{repository_id: 10}, valid_pull_attrs(%{head_ref: ref}))
+
+      assert %{head_ref: ["must be a canonical branch ref"]} = errors_on(changeset)
+    end
+  end
+
   test "merge operations only move through durable next states and redact failure reasons" do
     operation = %MergeOperation{state: :prepared, failure_reason: "private git error"}
 
@@ -96,5 +135,18 @@ defmodule ForgePullsTest do
         String.replace(acc, "%{#{key}}", replacement)
       end)
     end)
+  end
+
+  defp valid_pull_attrs(overrides) do
+    Map.merge(
+      %{
+        issue_id: 1,
+        head_ref: "refs/heads/feature",
+        base_ref: "refs/heads/main",
+        head_sha: String.duplicate("a", 40),
+        base_sha: String.duplicate("b", 40)
+      },
+      overrides
+    )
   end
 end
