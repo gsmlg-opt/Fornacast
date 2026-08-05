@@ -75,6 +75,16 @@ defmodule Fornacast.OpenAPIPruner do
     ]
   }
 
+  @issues_disabled_operations [
+    {"post", "/repos/{owner}/{repo}/issues"},
+    {"get", "/repos/{owner}/{repo}/issues/{issue_number}"},
+    {"patch", "/repos/{owner}/{repo}/issues/{issue_number}"},
+    {"get", "/repos/{owner}/{repo}/issues/{issue_number}/comments"},
+    {"post", "/repos/{owner}/{repo}/issues/{issue_number}/comments"},
+    {"patch", "/repos/{owner}/{repo}/issues/comments/{comment_id}"},
+    {"delete", "/repos/{owner}/{repo}/issues/comments/{comment_id}"}
+  ]
+
   def run([source_root, output_root, implemented_through])
       when implemented_through in ~w(1 2 3 4 5) do
     File.mkdir_p!(output_root)
@@ -135,6 +145,15 @@ defmodule Fornacast.OpenAPIPruner do
   defp prune(document, version, source_blob, implemented_through) do
     operations = @delivery_slices |> Map.values() |> List.flatten()
 
+    issues_disabled_response =
+      get_in(document, [
+        "paths",
+        "/repos/{owner}/{repo}/issues",
+        "post",
+        "responses",
+        "410"
+      ]) || raise "pinned issue-create operation is missing its shared 410 response"
+
     paths =
       operations
       |> Enum.reject(fn {_method, path} -> path == "/versions" end)
@@ -145,7 +164,12 @@ defmodule Fornacast.OpenAPIPruner do
 
         operations =
           Map.new(methods, fn method ->
-            operation = path_item |> Map.fetch!(method) |> prune_operation(path, method)
+            operation =
+              path_item
+              |> Map.fetch!(method)
+              |> prune_operation(path, method)
+              |> put_issues_disabled_response(path, method, issues_disabled_response)
+
             {method, operation}
           end)
 
@@ -185,6 +209,14 @@ defmodule Fornacast.OpenAPIPruner do
   end
 
   defp prune_operation(operation, _path, _method), do: operation
+
+  defp put_issues_disabled_response(operation, path, method, response) do
+    if {method, path} in @issues_disabled_operations do
+      put_in(operation, ["responses", "410"], response)
+    else
+      operation
+    end
+  end
 
   defp versions_path do
     %{
@@ -232,6 +264,7 @@ defmodule Fornacast.OpenAPIPruner do
           ~w(has_projects has_wiki has_discussions allow_squash_merge allow_rebase_merge),
         "git_ref_writes" => "branch_refs_fast_forward_only",
         "unsupported_issue_features" => ~w(milestone type locked active_lock_reason),
+        "issues_disabled_410_operations" => declared_issues_disabled_operations(),
         "merge_method" => "merge",
         "release_assets_server" => "/api/uploads",
         "release_archives" => nil,
@@ -239,6 +272,12 @@ defmodule Fornacast.OpenAPIPruner do
         "commit_pull_diff_patch_media" => "not_acceptable"
       }
     }
+  end
+
+  defp declared_issues_disabled_operations do
+    @issues_disabled_operations
+    |> Enum.map(fn {method, path} -> "#{String.upcase(method)} #{path}" end)
+    |> Enum.sort()
   end
 
   defp mutation_fields do

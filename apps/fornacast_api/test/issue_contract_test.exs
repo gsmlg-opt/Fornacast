@@ -35,11 +35,11 @@ defmodule FornacastAPI.IssueContractTest do
              |> List.first()
              |> String.split(", ")
 
-    assert first_link =~ ~s(page=1)
+    assert link_query(first_link)["page"] == "1"
     assert first_link =~ ~s(rel="first")
-    assert next_link =~ ~s(page=2)
+    assert link_query(next_link)["page"] == "2"
     assert next_link =~ ~s(rel="next")
-    assert last_link =~ ~s(page=2)
+    assert link_query(last_link)["page"] == "2"
     assert last_link =~ ~s(rel="last")
   end
 
@@ -57,9 +57,9 @@ defmodule FornacastAPI.IssueContractTest do
              |> List.first()
              |> String.split(", ")
 
-    assert first_link =~ ~s(page=1)
+    assert link_query(first_link)["page"] == "1"
     assert first_link =~ ~s(rel="first")
-    assert prev_link =~ ~s(page=1)
+    assert link_query(prev_link)["page"] == "1"
     assert prev_link =~ ~s(rel="prev")
   end
 
@@ -88,6 +88,11 @@ defmodule FornacastAPI.IssueContractTest do
     for version <- @versions, {operation, body} <- valid_mutations do
       assert {:ok, ^body} = RequestValidator.validate(version, operation, body)
     end
+  end
+
+  defp link_query(link) do
+    [_, url] = Regex.run(~r/^<([^>]+)>;/, link)
+    url |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
   end
 
   test "rejects every invalid issue mutation shape for both versions" do

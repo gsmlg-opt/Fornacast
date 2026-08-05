@@ -271,25 +271,28 @@ defmodule FornacastAPI.IssueWorkflowTest do
       assert [%{"id" => pull_id}] = assert_schema(list, "/repos/{owner}/{repo}/issues", :get, 200)
       assert pull_id == pull.id
 
-      for {method, path, body} <- [
-            {:post, "/api/v3/repos/disabled-owner/disabled/issues", %{"title" => "blocked"}},
-            {:get, "/api/v3/repos/disabled-owner/disabled/issues/#{ordinary.number}", nil},
+      for {method, path, contract_path, body} <- [
+            {:post, "/api/v3/repos/disabled-owner/disabled/issues",
+             "/repos/{owner}/{repo}/issues", %{"title" => "blocked"}},
+            {:get, "/api/v3/repos/disabled-owner/disabled/issues/#{ordinary.number}",
+             "/repos/{owner}/{repo}/issues/{issue_number}", nil},
             {:patch, "/api/v3/repos/disabled-owner/disabled/issues/#{ordinary.number}",
-             %{"title" => "blocked"}},
+             "/repos/{owner}/{repo}/issues/{issue_number}", %{"title" => "blocked"}},
             {:get, "/api/v3/repos/disabled-owner/disabled/issues/#{ordinary.number}/comments",
-             nil},
+             "/repos/{owner}/{repo}/issues/{issue_number}/comments", nil},
             {:post, "/api/v3/repos/disabled-owner/disabled/issues/#{ordinary.number}/comments",
-             %{"body" => "blocked"}},
+             "/repos/{owner}/{repo}/issues/{issue_number}/comments", %{"body" => "blocked"}},
             {:patch,
              "/api/v3/repos/disabled-owner/disabled/issues/comments/#{ordinary_comment.id}",
-             %{"body" => "blocked"}},
+             "/repos/{owner}/{repo}/issues/comments/{comment_id}", %{"body" => "blocked"}},
             {:delete,
-             "/api/v3/repos/disabled-owner/disabled/issues/comments/#{ordinary_comment.id}", nil}
+             "/api/v3/repos/disabled-owner/disabled/issues/comments/#{ordinary_comment.id}",
+             "/repos/{owner}/{repo}/issues/comments/{comment_id}", nil}
           ] do
         conn = request(api_conn(secret, version), method, path, body)
         error = json_response(conn, 410)
         assert %{"message" => "Issues are disabled for this repository"} = error
-        assert_basic_error_schema(version, error)
+        assert_response_schema(version, contract_path, method, 410, error)
       end
 
       shown =
@@ -385,6 +388,7 @@ defmodule FornacastAPI.IssueWorkflowTest do
                |> Enum.map(&String.trim/1)
 
       assert first_link =~ ~s(rel="first")
+      assert link_query(first_link)["page"] == "1"
       assert next_link =~ ~s(rel="next")
       assert last_link =~ ~s(rel="last")
 
@@ -498,6 +502,11 @@ defmodule FornacastAPI.IssueWorkflowTest do
   defp assert_schema(conn, path, method, status) do
     body = json_response(conn, status)
     [version] = get_req_header(conn, "x-github-api-version")
+    assert_response_schema(version, path, method, status, body)
+    body
+  end
+
+  defp assert_response_schema(version, path, method, status, body) do
     document = openapi_document(version)
 
     schema =
@@ -511,7 +520,6 @@ defmodule FornacastAPI.IssueWorkflowTest do
       |> Map.fetch!(:schema)
 
     assert {:ok, _} = OpenApiSpex.cast_value(body, schema, document)
-    body
   end
 
   defp openapi_document(version) do
@@ -521,20 +529,9 @@ defmodule FornacastAPI.IssueWorkflowTest do
     |> OpenApiSpex.OpenApi.Decode.decode()
   end
 
-  defp assert_basic_error_schema(version, body) do
-    document = openapi_document(version)
-
-    schema =
-      document.paths
-      |> Map.fetch!("/repos/{owner}/{repo}/issues")
-      |> Map.fetch!(:post)
-      |> Map.fetch!(:responses)
-      |> Map.fetch!("410")
-      |> Map.fetch!(:content)
-      |> Map.fetch!("application/json")
-      |> Map.fetch!(:schema)
-
-    assert {:ok, _} = OpenApiSpex.cast_value(body, schema, document)
+  defp link_query(link) do
+    [_, url] = Regex.run(~r/^<([^>]+)>;/, link)
+    url |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
   end
 
   defp assert_workflow_audits(

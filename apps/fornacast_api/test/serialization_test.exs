@@ -169,7 +169,8 @@ defmodule FornacastAPI.SerializationTest do
                "<#{url}?page=3&per_page=1>; rel=\"prev\", " <>
                "<#{url}?page=3&per_page=1>; rel=\"last\""},
             {struct!(Fornacast.Page, entries: [], total: 0, page: 2, per_page: 30),
-             "<#{url}?page=1&per_page=30>; rel=\"prev\", " <>
+             "<#{url}?page=1&per_page=30>; rel=\"first\", " <>
+               "<#{url}?page=1&per_page=30>; rel=\"prev\", " <>
                "<#{url}?page=1&per_page=30>; rel=\"last\""}
           ] do
         assert [link] =
