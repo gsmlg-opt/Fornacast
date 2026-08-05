@@ -73,15 +73,16 @@ defmodule FornacastAPI.IssueContractTest do
         pull_links_by_issue_id: %{3001 => %{merged_at: nil}}
       ]
 
-      rendered = Serializer.render(version, :issue, issue, opts)
+      expected_issue = expected_issue(nil)
+      expected_pull = expected_issue(expected_pull_link())
+      expected_comment = expected_comment()
 
-      assert rendered.url == "https://forge.test/api/v3/repos/acme/widget/issues/7"
-      assert rendered.html_url == rendered.url
-      assert rendered.node_id == "SXNzdWU6MzAwMQ"
-      assert rendered.pull_request.merged_at == nil
-      assert rendered.user == simple_user()
-      assert rendered.labels == [Serializer.render(version, :label, label(), opts)]
-      assert Serializer.render(version, :issue_comment, comment, opts).issue_url == rendered.url
+      assert Serializer.render(version, :issue, %{issue | kind: :issue}, opts) == expected_issue
+      assert Serializer.render(version, :issue, issue, opts) == expected_pull
+      assert Serializer.render(version, :issue_comment, comment, opts) == expected_comment
+      assert Serializer.render(version, :label, label(), opts) == expected_label()
+
+      assert_fixtures(version, expected_issue, expected_pull, expected_comment)
     end
   end
 
@@ -139,5 +140,109 @@ defmodule FornacastAPI.IssueContractTest do
       type: "User",
       url: "https://forge.test/api/v3/users/octocat"
     }
+  end
+
+  defp expected_issue(pull_request) do
+    url = "https://forge.test/api/v3/repos/acme/widget/issues/7"
+
+    %{
+      url: url,
+      repository_url: "https://forge.test/api/v3/repos/acme/widget",
+      labels_url: url <> "/labels{/name}",
+      comments_url: url <> "/comments",
+      events_url: url <> "/events",
+      html_url: url,
+      id: 3001,
+      node_id: "SXNzdWU6MzAwMQ",
+      number: 7,
+      title: "API issue",
+      user: simple_user(),
+      labels: [expected_label()],
+      state: "open",
+      locked: false,
+      assignee: nil,
+      assignees: [],
+      milestone: nil,
+      comments: 0,
+      created_at: "2026-07-21T00:00:00Z",
+      updated_at: "2026-07-21T00:00:00Z",
+      closed_at: nil,
+      author_association: "NONE",
+      active_lock_reason: nil,
+      draft: false,
+      pull_request: pull_request,
+      body: "Track compatibility",
+      closed_by: nil,
+      reactions: reactions(),
+      timeline_url: url <> "/timeline",
+      performed_via_github_app: nil,
+      state_reason: nil
+    }
+  end
+
+  defp expected_pull_link do
+    url = "https://forge.test/api/v3/repos/acme/widget/pulls/7"
+    %{url: url, html_url: url, diff_url: url, patch_url: url, merged_at: nil}
+  end
+
+  defp expected_comment do
+    url = "https://forge.test/api/v3/repos/acme/widget/issues/comments/3101"
+
+    %{
+      url: url,
+      html_url: url,
+      issue_url: "https://forge.test/api/v3/repos/acme/widget/issues/7",
+      id: 3101,
+      node_id: "SXNzdWVDb21tZW50OjMxMDE",
+      user: simple_user(),
+      created_at: "2026-07-21T00:00:00Z",
+      updated_at: "2026-07-21T00:00:00Z",
+      author_association: "NONE",
+      body: "First comment",
+      reactions: reactions(),
+      performed_via_github_app: nil
+    }
+  end
+
+  defp expected_label,
+    do: %{
+      id: 3201,
+      node_id: "TGFiZWw6MzIwMQ",
+      url: "https://forge.test/api/v3/repos/acme/widget/labels/bug",
+      name: "bug",
+      color: "ff0000",
+      default: false,
+      description: nil
+    }
+
+  defp reactions,
+    do: %{
+      "+1": 0,
+      "-1": 0,
+      laugh: 0,
+      confused: 0,
+      heart: 0,
+      hooray: 0,
+      rocket: 0,
+      eyes: 0,
+      url: nil,
+      total_count: 0
+    }
+
+  defp assert_fixtures(version, issue, pull, comment) do
+    root = Path.join([Path.expand("fixtures", __DIR__), version, "issues"])
+
+    expected = %{
+      "issue.json" => issue,
+      "pull-issue.json" => pull,
+      "issue-comment.json" => comment,
+      "issue-list.json" => [issue],
+      "issue-comment-list.json" => [comment]
+    }
+
+    for {filename, literal} <- expected do
+      bytes = File.read!(Path.join(root, filename))
+      assert JSON.decode!(bytes) == JSON.decode!(JSON.encode!(literal))
+    end
   end
 end
