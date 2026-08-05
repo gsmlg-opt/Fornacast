@@ -110,8 +110,14 @@ defmodule ForgeIssues do
         else: attrs
 
     multi
-    |> Multi.run({key, :relationships}, fn _repo, _changes ->
-      resolve_relationships(repository, attrs)
+    |> Multi.run({key, :relationships}, fn _repo, changes ->
+      case Map.fetch(changes, key) do
+        {:ok, %Issue{repository_id: repository_id}} when repository_id == repository.id ->
+          resolve_relationships(repository, attrs)
+
+        _ ->
+          {:error, :not_found}
+      end
     end)
     |> Multi.merge(fn changes ->
       issue = Map.fetch!(changes, key)
@@ -142,8 +148,24 @@ defmodule ForgeIssues do
   end
 
   @spec load_issue_metadata(Issue.t() | [Issue.t()], ForgeRepos.Repository.t()) ::
-          Issue.t() | [Issue.t()]
+          Issue.t() | [Issue.t()] | {:error, :not_found}
   def load_issue_metadata(issues, repository) when is_list(issues) do
+    if Enum.all?(issues, &issue_in_repository?(&1, repository)) do
+      do_load_issue_metadata(issues, repository)
+    else
+      {:error, :not_found}
+    end
+  end
+
+  def load_issue_metadata(%Issue{} = issue, repository) do
+    if issue_in_repository?(issue, repository) do
+      load_issue_metadata(issue, repository, comment_counts([issue]))
+    else
+      {:error, :not_found}
+    end
+  end
+
+  defp do_load_issue_metadata(issues, repository) do
     issue_ids = Enum.map(issues, & &1.id)
     labels = labels_by_issue(issue_ids)
     assignee_ids = assignee_ids_by_issue(issue_ids)
@@ -176,9 +198,6 @@ defmodule ForgeIssues do
     end)
   end
 
-  def load_issue_metadata(%Issue{} = issue, repository),
-    do: load_issue_metadata(issue, repository, comment_counts([issue]))
-
   defp load_issue_metadata(issue, repository, counts) do
     author = ForgeAccounts.get_user(issue.author_user_id)
 
@@ -191,6 +210,9 @@ defmodule ForgeIssues do
         comment_count: Map.get(counts, issue.id, 0)
     }
   end
+
+  defp issue_in_repository?(%Issue{repository_id: repository_id}, %{id: repository_id}), do: true
+  defp issue_in_repository?(_issue, _repository), do: false
 
   defp labels_by_issue([]), do: %{}
 
@@ -218,8 +240,10 @@ defmodule ForgeIssues do
   defp resolve_relationships(repository, attrs) do
     _labels = DefaultLabels.ensure(repository)
 
-    with {:ok, labels} <- resolve_labels(repository, requested_label_names(attrs)),
-         {:ok, assignees} <- resolve_assignees(repository, requested_assignee_names(attrs)) do
+    with {:ok, label_request} <- requested_label_names(attrs),
+         {:ok, assignee_request} <- requested_assignee_names(attrs),
+         {:ok, labels} <- resolve_labels(repository, label_request),
+         {:ok, assignees} <- resolve_assignees(repository, assignee_request) do
       {:ok, %{labels: labels, assignees: assignees}}
     end
   end
@@ -227,24 +251,56 @@ defmodule ForgeIssues do
   defp requested_label_names(attrs) do
     case Map.fetch(attrs, "labels") do
       :error ->
-        :unchanged
+        {:ok, :unchanged}
 
       {:ok, labels} when is_list(labels) ->
-        {:replace,
-         Enum.map(labels, fn
-           name when is_binary(name) -> DefaultLabels.normalize_name(name)
-           %{"name" => name} when is_binary(name) -> DefaultLabels.normalize_name(name)
-         end)}
+        normalize_label_entries(labels)
+
+      {:ok, _labels} ->
+        {:error, missing_labels_error()}
     end
   end
 
   defp requested_assignee_names(attrs) do
     cond do
-      Map.has_key?(attrs, "assignees") -> {:replace, Map.fetch!(attrs, "assignees")}
-      Map.get(attrs, "assignee") in [nil, ""] -> :unchanged
-      true -> {:replace, [Map.fetch!(attrs, "assignee")]}
+      Map.has_key?(attrs, "assignees") ->
+        normalize_assignee_entries(Map.fetch!(attrs, "assignees"))
+
+      Map.get(attrs, "assignee") in [nil, ""] ->
+        {:ok, :unchanged}
+
+      is_binary(Map.get(attrs, "assignee")) ->
+        {:ok, {:replace, [Map.fetch!(attrs, "assignee")]}}
+
+      true ->
+        {:error, invalid_assignees_error()}
     end
   end
+
+  defp normalize_label_entries(labels) do
+    Enum.reduce_while(labels, {:ok, []}, fn
+      name, {:ok, names} when is_binary(name) ->
+        {:cont, {:ok, [DefaultLabels.normalize_name(name) | names]}}
+
+      %{"name" => name}, {:ok, names} when is_binary(name) ->
+        {:cont, {:ok, [DefaultLabels.normalize_name(name) | names]}}
+
+      _entry, _acc ->
+        {:halt, {:error, missing_labels_error()}}
+    end)
+    |> case do
+      {:ok, names} -> {:ok, {:replace, Enum.reverse(names)}}
+      error -> error
+    end
+  end
+
+  defp normalize_assignee_entries(names) when is_list(names) do
+    if Enum.all?(names, &is_binary/1),
+      do: {:ok, {:replace, names}},
+      else: {:error, invalid_assignees_error()}
+  end
+
+  defp normalize_assignee_entries(_names), do: {:error, invalid_assignees_error()}
 
   defp resolve_labels(_repository, :unchanged), do: {:ok, :unchanged}
 

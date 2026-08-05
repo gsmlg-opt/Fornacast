@@ -366,6 +366,104 @@ defmodule ForgeIssuesTest do
     assert associations == ["OWNER", "MEMBER", "COLLABORATOR", "NONE"]
   end
 
+  test "relationship writes reject an issue from another repository without joins", %{
+    writer: writer,
+    repository: repository
+  } do
+    other_repository = repository_fixture(writer)
+    issue = issue_fixture(other_repository, writer)
+    [label | _] = ForgeIssues.list_labels(repository)
+
+    assert {:error, {:issue, :relationships}, :not_found, _} =
+             Multi.new()
+             |> Multi.run(:issue, fn _repo, _changes -> {:ok, issue} end)
+             |> ForgeIssues.put_relationship_operations(
+               :issue,
+               repository,
+               writer,
+               %{"labels" => [label.name], "assignees" => [writer.username]},
+               :writer
+             )
+             |> ForgeIssues.transaction()
+
+    assert [] = ForgeIssues.load_labels(issue)
+    assert [] = ForgeIssues.load_assignees(issue)
+  end
+
+  test "metadata loading rejects one issue from another repository before queries", %{
+    writer: writer,
+    repository: repository
+  } do
+    other_repository = repository_fixture(writer)
+    issue = issue_fixture(other_repository, writer)
+
+    {result, query_count} =
+      count_repo_queries(fn -> ForgeIssues.load_issue_metadata(issue, repository) end)
+
+    assert result == {:error, :not_found}
+    assert query_count == 0
+  end
+
+  test "metadata loading rejects mixed repositories before queries", %{
+    writer: writer,
+    repository: repository
+  } do
+    other_repository = repository_fixture(writer)
+    issues = [issue_fixture(repository, writer), issue_fixture(other_repository, writer)]
+
+    {result, query_count} =
+      count_repo_queries(fn -> ForgeIssues.load_issue_metadata(issues, repository) end)
+
+    assert result == {:error, :not_found}
+    assert query_count == 0
+  end
+
+  test "malformed writer label fields return the exact missing error without writes", %{
+    writer: writer,
+    repository: repository
+  } do
+    issue = issue_fixture(repository, writer)
+    [existing | _] = ForgeIssues.list_labels(repository)
+    Repo.insert_all(IssueLabel, [join_row(issue.id, existing.id)])
+
+    for attrs <- [
+          %{"labels" => "bug"},
+          %{"labels" => [123]},
+          %{"labels" => [%{"name" => 123}]},
+          %{"labels" => [%{"wrong" => "bug"}]}
+        ] do
+      assert {:error, {:issue, :relationships},
+              {:validation, [%{resource: "Issue", field: "labels", code: :missing}]},
+              _} =
+               relationship_transaction(issue, repository, writer, attrs)
+
+      assert [existing.id] == ForgeIssues.load_labels(issue) |> Enum.map(& &1.id)
+    end
+  end
+
+  test "malformed writer assignee fields return the exact invalid error without writes", %{
+    writer: writer,
+    repository: repository
+  } do
+    issue = issue_fixture(repository, writer)
+    existing = readable_user(repository, "malformed-preserved")
+    Repo.insert_all(IssueAssignee, [assignee_row(issue.id, existing.id)])
+
+    for attrs <- [
+          %{"assignees" => "user"},
+          %{"assignees" => [123]},
+          %{"assignees" => [%{"name" => writer.username}]},
+          %{"assignee" => 123}
+        ] do
+      assert {:error, {:issue, :relationships},
+              {:validation, [%{resource: "Issue", field: "assignees", code: :invalid}]},
+              _} =
+               relationship_transaction(issue, repository, writer, attrs)
+
+      assert [existing.id] == ForgeIssues.load_assignees(issue) |> Enum.map(& &1.id)
+    end
+  end
+
   defp issue_fixture(repository, author) do
     %Issue{
       repository_id: repository.id,
@@ -424,6 +522,13 @@ defmodule ForgeIssuesTest do
                :writer
              )
              |> ForgeIssues.transaction()
+  end
+
+  defp relationship_transaction(issue, repository, writer, attrs) do
+    Multi.new()
+    |> Multi.run(:issue, fn _repo, _changes -> {:ok, issue} end)
+    |> ForgeIssues.put_relationship_operations(:issue, repository, writer, attrs, :writer)
+    |> ForgeIssues.transaction()
   end
 
   defp count_repo_queries(fun) do
