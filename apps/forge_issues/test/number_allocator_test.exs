@@ -3,6 +3,7 @@ defmodule ForgeIssues.NumberAllocatorTest do
 
   alias Ecto.Multi
   alias ForgeIssues.{Comment, Issue, IssueAssignee, IssueLabel, Label, NumberSequence}
+  alias ForgeRepos.Collaborator
   alias Fornacast.Repo
 
   import ForgeIssues.Fixtures
@@ -35,7 +36,7 @@ defmodule ForgeIssues.NumberAllocatorTest do
         %{title: "First pull", body: nil}
       )
 
-    assert {:ok, %{issue: issue, pull_issue: pull_issue}} = Repo.transaction(multi)
+    assert {:ok, %{issue: issue, pull_issue: pull_issue}} = ForgeIssues.transaction(multi)
     assert {issue.number, issue.kind} == {1, :issue}
     assert {pull_issue.number, pull_issue.kind} == {2, :pull_request}
     assert issue.repository_id == repository.id
@@ -57,7 +58,7 @@ defmodule ForgeIssues.NumberAllocatorTest do
       )
       |> Multi.run(:forced_failure, fn _repo, _changes -> {:error, :forced_failure} end)
 
-    assert {:error, :forced_failure, :forced_failure, _changes} = Repo.transaction(failed)
+    assert {:error, :forced_failure, :forced_failure, _changes} = ForgeIssues.transaction(failed)
 
     assert {:ok, %{issue: %{number: 1}}} =
              Multi.new()
@@ -68,7 +69,7 @@ defmodule ForgeIssues.NumberAllocatorTest do
                :issue,
                %{title: "Committed"}
              )
-             |> Repo.transaction()
+             |> ForgeIssues.transaction()
   end
 
   test "schema changesets preserve canonical identity contracts" do
@@ -117,6 +118,79 @@ defmodule ForgeIssues.NumberAllocatorTest do
     assert IssueAssignee.changeset(%IssueAssignee{}, %{issue_id: 1, user_id: 1}).valid?
   end
 
+  test "identity updates defer repository authorization to the outer context", %{
+    actor: author,
+    repository: repository
+  } do
+    other_actor = user_fixture("identity-writer-#{System.unique_integer([:positive])}")
+
+    %Collaborator{}
+    |> Collaborator.changeset(%{
+      repository_id: repository.id,
+      user_id: other_actor.id,
+      role: :write
+    })
+    |> Repo.insert!()
+
+    assert :ok = Fornacast.Access.authorize(other_actor, :repository_write, repository)
+
+    assert {:ok, %{issue: issue}} =
+             Multi.new()
+             |> ForgeIssues.insert_numbered_identity(
+               :issue,
+               repository,
+               author,
+               :issue,
+               %{title: "Original"}
+             )
+             |> ForgeIssues.transaction()
+
+    assert {:ok, %{issue: author_update}} =
+             Multi.new()
+             |> ForgeIssues.update_identity(:issue, issue, author, %{title: "Author update"})
+             |> ForgeIssues.transaction()
+
+    assert author_update.title == "Author update"
+
+    assert {:ok, %{issue: writer_update}} =
+             Multi.new()
+             |> ForgeIssues.update_identity(:issue, author_update, other_actor, %{
+               title: "Writer update"
+             })
+             |> ForgeIssues.transaction()
+
+    assert writer_update.title == "Writer update"
+  end
+
+  test "transaction does not retry an ordinary multi failure" do
+    test_process = self()
+
+    multi =
+      Multi.run(Multi.new(), :failure, fn _repo, _changes ->
+        send(test_process, :transaction_attempt)
+        {:error, :ordinary_failure}
+      end)
+
+    assert {:error, :failure, :ordinary_failure, %{}} = ForgeIssues.transaction(multi)
+    assert_receive :transaction_attempt
+    refute_receive :transaction_attempt, 10
+  end
+
+  test "transaction bounds Turso busy retries and does not retry them on other adapters" do
+    counter = :counters.new(1, [])
+
+    busy =
+      Multi.run(Multi.new(), :busy, fn _repo, _changes ->
+        :counters.add(counter, 1, 1)
+        raise Turso.Error, code: :busy, message: "database is locked"
+      end)
+
+    assert_raise Turso.Error, "database is locked", fn -> ForgeIssues.transaction(busy) end
+
+    expected_attempts = if Repo.__adapter__() == Ecto.Adapters.Turso, do: 12, else: 1
+    assert :counters.get(counter, 1) == expected_attempts
+  end
+
   test "allocates eight distinct numbers concurrently across identity kinds", %{
     actor: actor,
     repository: repository
@@ -136,7 +210,7 @@ defmodule ForgeIssues.NumberAllocatorTest do
                 if(rem(index, 2) == 0, do: :pull_request, else: :issue),
                 %{title: "Concurrent #{index}"}
               )
-              |> Repo.transaction()
+              |> ForgeIssues.transaction()
               |> case do
                 {:ok, changes} -> {:ok, changes[{:issue, index}].number}
                 error -> error
@@ -145,7 +219,9 @@ defmodule ForgeIssues.NumberAllocatorTest do
         end)
       end
 
-    Enum.each(tasks, fn task -> Ecto.Adapters.SQL.Sandbox.allow(Repo, parent, task.pid) end)
+    if Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"] do
+      Enum.each(tasks, fn task -> Ecto.Adapters.SQL.Sandbox.allow(Repo, parent, task.pid) end)
+    end
 
     Enum.each(tasks, fn task -> send(task.pid, :go) end)
 
