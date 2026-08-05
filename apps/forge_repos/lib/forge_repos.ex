@@ -365,6 +365,18 @@ defmodule ForgeRepos do
     |> Repo.one()
   end
 
+  def collaborator_roles(user_ids, %Repository{id: repository_id}) when is_list(user_ids) do
+    ForgeRepos.Collaborator
+    |> where(
+      [collaborator],
+      collaborator.repository_id == ^repository_id and
+        collaborator.user_id in ^Enum.uniq(user_ids)
+    )
+    |> select([collaborator], {collaborator.user_id, collaborator.role})
+    |> Repo.all()
+    |> Map.new()
+  end
+
   defp directly_owned_repository_counts(owner_id) do
     counts =
       Repository

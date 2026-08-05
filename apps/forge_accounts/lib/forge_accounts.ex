@@ -28,6 +28,12 @@ defmodule ForgeAccounts do
 
   def get_user(id), do: Repo.get_by(User, id: id, kind: :user)
 
+  def get_users(ids) when is_list(ids) do
+    User
+    |> where([user], user.id in ^Enum.uniq(ids) and user.kind == :user)
+    |> Repo.all()
+  end
+
   def get_user!(id), do: Repo.get_by!(User, id: id, kind: :user)
 
   def get_user_by_username(username) when is_binary(username) do
@@ -320,6 +326,19 @@ defmodule ForgeAccounts do
   end
 
   def organization_role(_user, _organization), do: nil
+
+  def organization_roles(user_ids, organization) when is_list(user_ids) do
+    organization_id = organization_id(organization)
+
+    OrganizationMember
+    |> where(
+      [member],
+      member.organization_id == ^organization_id and member.user_id in ^Enum.uniq(user_ids)
+    )
+    |> select([member], {member.user_id, member.role})
+    |> Repo.all()
+    |> Map.new()
+  end
 
   def authenticate_password(username, password)
       when is_binary(username) and is_binary(password) do

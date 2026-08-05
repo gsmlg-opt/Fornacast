@@ -2,7 +2,7 @@ defmodule ForgeIssuesTest do
   use ExUnit.Case, async: false
 
   alias Ecto.Multi
-  alias ForgeIssues.{Issue, Label}
+  alias ForgeIssues.{Comment, Issue, IssueAssignee, IssueLabel, Label}
   alias ForgeRepos.Collaborator
   alias Fornacast.Repo
 
@@ -33,13 +33,26 @@ defmodule ForgeIssuesTest do
 
     assert Enum.map(labels, & &1.normalized_name) ==
              Enum.sort(Enum.map(labels, & &1.normalized_name))
+
+    assert Enum.all?(labels, &(&1.inserted_at.microsecond == {0, 0}))
   end
 
   test "concurrent provisioning leaves exactly nine defaults", %{repository: repository} do
-    repository
-    |> List.duplicate(8)
-    |> Task.async_stream(&ForgeIssues.list_labels/1, max_concurrency: 8, timeout: 30_000)
-    |> Enum.each(fn {:ok, labels} -> assert length(labels) == 9 end)
+    tasks =
+      for _ <- 1..8 do
+        Task.async(fn ->
+          receive do
+            :go -> ForgeIssues.list_labels(repository)
+          end
+        end)
+      end
+
+    if Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"] do
+      Enum.each(tasks, &Ecto.Adapters.SQL.Sandbox.allow(Repo, self(), &1.pid))
+    end
+
+    Enum.each(tasks, &send(&1.pid, :go))
+    Enum.each(tasks, fn task -> assert 9 == task |> Task.await(30_000) |> length() end)
 
     assert 9 == Repo.aggregate(Label, :count, :id)
   end
@@ -122,7 +135,69 @@ defmodule ForgeIssuesTest do
   end
 
   test "authors ignore submitted relationship changes", %{writer: writer, repository: repository} do
+    author = user_fixture("issue-author-#{System.unique_integer([:positive])}")
+    issue = issue_fixture(repository, author)
+    label = ForgeIssues.list_labels(repository) |> hd()
+
+    Repo.insert_all(IssueLabel, [join_row(issue.id, label.id)])
+    Repo.insert_all(IssueAssignee, [assignee_row(issue.id, writer.id)])
+
+    assert {:ok, _} =
+             Multi.new()
+             |> Multi.run(:issue, fn _repo, _changes -> {:ok, issue} end)
+             |> ForgeIssues.put_relationship_operations(
+               :issue,
+               repository,
+               author,
+               %{"labels" => ["unknown"], "assignee" => "missing-user"},
+               :author
+             )
+             |> ForgeIssues.transaction()
+
+    assert [label.id] == ForgeIssues.load_labels(issue) |> Enum.map(& &1.id)
+    assert [writer.id] == ForgeIssues.load_assignees(issue) |> Enum.map(& &1.id)
+  end
+
+  test "metadata loading batches joins, accounts, and comment counts", %{
+    writer: writer,
+    repository: repository
+  } do
+    issues = Enum.map(1..3, fn _ -> issue_fixture(repository, writer) end)
+    label = ForgeIssues.list_labels(repository) |> hd()
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    Repo.insert_all(IssueLabel, Enum.map(issues, &join_row(&1.id, label.id, now)))
+    Repo.insert_all(IssueAssignee, Enum.map(issues, &assignee_row(&1.id, writer.id, now)))
+
+    Repo.insert_all(Comment, [
+      %{
+        issue_id: hd(issues).id,
+        author_user_id: writer.id,
+        body: "one",
+        inserted_at: now,
+        updated_at: now
+      },
+      %{
+        issue_id: hd(issues).id,
+        author_user_id: writer.id,
+        body: "two",
+        inserted_at: now,
+        updated_at: now
+      }
+    ])
+
+    {loaded, query_count} =
+      count_repo_queries(fn -> ForgeIssues.load_issue_metadata(issues, repository) end)
+
+    assert Enum.map(loaded, & &1.comment_count) == [2, 0, 0]
+    assert Enum.all?(loaded, &match?([%Label{}], &1.labels))
+    assert query_count <= 6
+  end
+
+  test "plural assignees take precedence", %{writer: writer, repository: repository} do
     issue = issue_fixture(repository, writer)
+    first = readable_user(repository, "first")
+    second = readable_user(repository, "second")
 
     assert {:ok, _} =
              Multi.new()
@@ -131,13 +206,37 @@ defmodule ForgeIssuesTest do
                :issue,
                repository,
                writer,
-               %{"labels" => ["unknown"], "assignee" => "missing-user"},
-               :author
+               %{"assignee" => first.username, "assignees" => [second.username]},
+               :writer
              )
              |> ForgeIssues.transaction()
 
-    assert [] = ForgeIssues.load_labels(issue)
-    assert [] = ForgeIssues.load_assignees(issue)
+    assert [second.id] == ForgeIssues.load_assignees(issue) |> Enum.map(& &1.id)
+  end
+
+  test "relationship replacement rolls back as part of the outer multi", %{
+    writer: writer,
+    repository: repository
+  } do
+    issue = issue_fixture(repository, writer)
+    [old_label | _] = ForgeIssues.list_labels(repository)
+    new_label = label_fixture(repository, "Replacement")
+    Repo.insert_all(IssueLabel, [join_row(issue.id, old_label.id)])
+
+    assert {:error, :rollback, :forced, _} =
+             Multi.new()
+             |> Multi.run(:issue, fn _repo, _changes -> {:ok, issue} end)
+             |> ForgeIssues.put_relationship_operations(
+               :issue,
+               repository,
+               writer,
+               %{"labels" => [new_label.name]},
+               :writer
+             )
+             |> Multi.run(:rollback, fn _repo, _changes -> {:error, :forced} end)
+             |> ForgeIssues.transaction()
+
+    assert [old_label.id] == ForgeIssues.load_labels(issue) |> Enum.map(& &1.id)
   end
 
   defp issue_fixture(repository, author) do
@@ -149,5 +248,63 @@ defmodule ForgeIssuesTest do
     }
     |> Issue.create_changeset(%{title: "Relationship test"})
     |> Repo.insert!()
+  end
+
+  defp join_row(issue_id, label_id, now \\ DateTime.utc_now() |> DateTime.truncate(:second)),
+    do: %{issue_id: issue_id, label_id: label_id, inserted_at: now, updated_at: now}
+
+  defp assignee_row(issue_id, user_id, now \\ DateTime.utc_now() |> DateTime.truncate(:second)),
+    do: %{issue_id: issue_id, user_id: user_id, inserted_at: now, updated_at: now}
+
+  defp readable_user(repository, prefix) do
+    user = user_fixture("#{prefix}-#{System.unique_integer([:positive])}")
+
+    %Collaborator{}
+    |> Collaborator.changeset(%{repository_id: repository.id, user_id: user.id, role: :read})
+    |> Repo.insert!()
+
+    user
+  end
+
+  defp label_fixture(repository, name) do
+    %Label{}
+    |> Label.changeset(%{
+      repository_id: repository.id,
+      name: name,
+      normalized_name: String.downcase(name),
+      color: "aabbcc"
+    })
+    |> Repo.insert!()
+  end
+
+  defp count_repo_queries(fun) do
+    ref = make_ref()
+    handler_id = {__MODULE__, ref}
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:fornacast, :repo, :query],
+        fn _event, _measurements, _metadata, {pid, query_ref} ->
+          send(pid, {query_ref, :repo_query})
+        end,
+        {test_pid, ref}
+      )
+
+    try do
+      result = fun.()
+      {result, drain_repo_queries(ref, 0)}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_repo_queries(ref, count) do
+    receive do
+      {^ref, :repo_query} -> drain_repo_queries(ref, count + 1)
+    after
+      0 -> count
+    end
   end
 end

@@ -144,8 +144,36 @@ defmodule ForgeIssues do
   @spec load_issue_metadata(Issue.t() | [Issue.t()], ForgeRepos.Repository.t()) ::
           Issue.t() | [Issue.t()]
   def load_issue_metadata(issues, repository) when is_list(issues) do
+    issue_ids = Enum.map(issues, & &1.id)
+    labels = labels_by_issue(issue_ids)
+    assignee_ids = assignee_ids_by_issue(issue_ids)
+
+    users =
+      issues
+      |> Enum.map(& &1.author_user_id)
+      |> Kernel.++(assignee_ids |> Map.values() |> List.flatten())
+      |> ForgeAccounts.get_users()
+      |> Map.new(&{&1.id, &1})
+
+    associations = author_associations(issues, repository, users)
     counts = comment_counts(issues)
-    Enum.map(issues, &load_issue_metadata(&1, repository, counts))
+
+    Enum.map(issues, fn issue ->
+      assignees =
+        assignee_ids
+        |> Map.get(issue.id, [])
+        |> Enum.map(&Map.fetch!(users, &1))
+        |> Enum.sort_by(& &1.username)
+
+      %{
+        issue
+        | labels: Map.get(labels, issue.id, []),
+          assignees: assignees,
+          author: Map.get(users, issue.author_user_id),
+          author_association: Map.get(associations, issue.author_user_id, "NONE"),
+          comment_count: Map.get(counts, issue.id, 0)
+      }
+    end)
   end
 
   def load_issue_metadata(%Issue{} = issue, repository),
@@ -162,6 +190,29 @@ defmodule ForgeIssues do
         author_association: author_association(author, repository),
         comment_count: Map.get(counts, issue.id, 0)
     }
+  end
+
+  defp labels_by_issue([]), do: %{}
+
+  defp labels_by_issue(issue_ids) do
+    IssueLabel
+    |> join(:inner, [join], label in Label, on: label.id == join.label_id)
+    |> where([join], join.issue_id in ^issue_ids)
+    |> order_by([_join, label], asc: label.normalized_name)
+    |> select([join, label], {join.issue_id, label})
+    |> Repo.all()
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+  end
+
+  defp assignee_ids_by_issue([]), do: %{}
+
+  defp assignee_ids_by_issue(issue_ids) do
+    IssueAssignee
+    |> where([join], join.issue_id in ^issue_ids)
+    |> order_by([join], asc: join.user_id)
+    |> select([join], {join.issue_id, join.user_id})
+    |> Repo.all()
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
   end
 
   defp resolve_relationships(repository, attrs) do
@@ -239,7 +290,7 @@ defmodule ForgeIssues do
     multi
     |> Multi.delete_all(
       {key, :delete_labels},
-      # TODO(upstream): gsmlg-dev/concord#66
+      # WORKAROUND(upstream): gsmlg-dev/concord#66
       from(_join in IssueLabel, where: fragment("issue_id = ?", ^issue.id))
     )
     |> Multi.insert_all(
@@ -255,7 +306,7 @@ defmodule ForgeIssues do
     multi
     |> Multi.delete_all(
       {key, :delete_assignees},
-      # TODO(upstream): gsmlg-dev/concord#66
+      # WORKAROUND(upstream): gsmlg-dev/concord#66
       from(_join in IssueAssignee, where: fragment("issue_id = ?", ^issue.id))
     )
     |> Multi.insert_all(
@@ -300,6 +351,35 @@ defmodule ForgeIssues do
 
   defp collaborator_association(author, repository) do
     if ForgeRepos.collaborator_role(author, repository), do: "COLLABORATOR", else: "NONE"
+  end
+
+  defp author_associations(issues, repository, users) do
+    author_ids = issues |> Enum.map(& &1.author_user_id) |> Enum.uniq()
+    owner = ForgeRepos.repository_owner(repository)
+    collaborator_roles = ForgeRepos.collaborator_roles(author_ids, repository)
+
+    organization_roles =
+      case owner do
+        %ForgeAccounts.User{kind: :organization} = organization ->
+          ForgeAccounts.organization_roles(author_ids, organization)
+
+        _ ->
+          %{}
+      end
+
+    Map.new(author_ids, fn author_id ->
+      association =
+        cond do
+          repository.owner_user_id == author_id -> "OWNER"
+          Map.get(organization_roles, author_id) == :owner -> "OWNER"
+          Map.get(organization_roles, author_id) == :member -> "MEMBER"
+          Map.has_key?(collaborator_roles, author_id) -> "COLLABORATOR"
+          Map.has_key?(users, author_id) -> "NONE"
+          true -> "NONE"
+        end
+
+      {author_id, association}
+    end)
   end
 
   defp missing_labels_error,
