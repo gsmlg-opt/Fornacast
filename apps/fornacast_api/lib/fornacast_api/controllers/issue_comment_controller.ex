@@ -31,22 +31,27 @@ defmodule FornacastAPI.IssueCommentController do
          {:ok, repository} <-
            ForgeRepos.fetch_authorized_repository(actor, owner, repo, :repository_read),
          {:ok, accepted_scopes} <-
-           authorize_scope(conn.assigns[:api_auth], :repository_read, repository.visibility),
-         {:ok, filters} <- IssueContract.comment_filters(conn.query_params),
-         {:ok, page} <- ForgeIssues.list_comments(actor, owner, repo, number, Map.new(filters)) do
-      body =
-        Enum.map(page.entries, fn comment ->
-          Serializer.render(conn.assigns.api_version, :issue_comment, comment,
-            owner: owner,
-            repo: repo,
-            issue_number: number
-          )
-        end)
+           authorize_scope(conn.assigns[:api_auth], :repository_read, repository.visibility) do
+      conn = Plug.Conn.assign(conn, :accepted_scopes, accepted_scopes)
 
-      Response.paginated(conn, 200, body, page,
-        url: request_path_with_query(conn),
-        accepted_scopes: accepted_scopes
-      )
+      with {:ok, filters} <- IssueContract.comment_filters(conn.query_params),
+           {:ok, page} <- ForgeIssues.list_comments(actor, owner, repo, number, Map.new(filters)) do
+        body =
+          Enum.map(page.entries, fn comment ->
+            Serializer.render(conn.assigns.api_version, :issue_comment, comment,
+              owner: owner,
+              repo: repo,
+              issue_number: number
+            )
+          end)
+
+        Response.paginated(conn, 200, body, page,
+          url: request_path_with_query(conn),
+          accepted_scopes: accepted_scopes
+        )
+      else
+        {:error, reason} -> render_error(conn, reason, @index_url)
+      end
     else
       {:error, reason} -> render_error(conn, reason, @index_url)
     end
@@ -97,9 +102,13 @@ defmodule FornacastAPI.IssueCommentController do
          {:ok, repository} <-
            ForgeRepos.fetch_authorized_repository(actor, owner, repo, :repository_read),
          {:ok, accepted_scopes} <-
-           authorize_scope(authentication, :repository_mutation, repository.visibility),
-         :ok <- ForgeIssues.delete_comment(actor, owner, repo, id, RequestContext.metadata(conn)) do
-      Response.no_content(conn, accepted_scopes: accepted_scopes)
+           authorize_scope(authentication, :repository_mutation, repository.visibility) do
+      conn = Plug.Conn.assign(conn, :accepted_scopes, accepted_scopes)
+
+      case ForgeIssues.delete_comment(actor, owner, repo, id, RequestContext.metadata(conn)) do
+        :ok -> Response.no_content(conn, accepted_scopes: accepted_scopes)
+        {:error, reason} -> render_error(conn, reason, @delete_url)
+      end
     else
       {:error, reason} -> render_error(conn, reason, @delete_url)
     end
@@ -122,22 +131,27 @@ defmodule FornacastAPI.IssueCommentController do
          {:ok, repository} <-
            ForgeRepos.fetch_authorized_repository(actor, owner, repo, :repository_read),
          {:ok, accepted_scopes} <-
-           authorize_scope(authentication, :repository_mutation, repository.visibility),
-         {:ok, body, conn} <- read_authorized_body(conn, accepted_scopes),
-         {:ok, attrs} <- RequestValidator.validate(version, operation, body),
-         {:ok, comment} <- operation_fun.(actor, attrs, RequestContext.metadata(conn)) do
-      Response.json(
-        conn,
-        status,
-        Serializer.render(version, :issue_comment, comment,
-          owner: owner,
-          repo: repo,
-          issue_number: issue_number || comment.issue_number
-        ),
-        accepted_scopes: accepted_scopes
-      )
+           authorize_scope(authentication, :repository_mutation, repository.visibility) do
+      conn = Plug.Conn.assign(conn, :accepted_scopes, accepted_scopes)
+
+      with {:ok, body, conn} <- read_authorized_body(conn, accepted_scopes),
+           {:ok, attrs} <- RequestValidator.validate(version, operation, body),
+           {:ok, comment} <- operation_fun.(actor, attrs, RequestContext.metadata(conn)) do
+        Response.json(
+          conn,
+          status,
+          Serializer.render(version, :issue_comment, comment,
+            owner: owner,
+            repo: repo,
+            issue_number: issue_number || comment.issue_number
+          ),
+          accepted_scopes: accepted_scopes
+        )
+      else
+        {:error, %Error{} = error, _reason, body_conn} -> Response.error(body_conn, error)
+        {:error, reason} -> render_error(conn, reason, documentation_url)
+      end
     else
-      {:error, %Error{} = error, _reason, body_conn} -> Response.error(body_conn, error)
       {:error, reason} -> render_error(conn, reason, documentation_url)
     end
   end
@@ -180,8 +194,11 @@ defmodule FornacastAPI.IssueCommentController do
     end
   end
 
-  defp render_error(conn, reason, documentation_url),
-    do: Response.error(conn, Error.from_domain(reason, documentation_url))
+  defp render_error(conn, reason, documentation_url) do
+    error = Error.from_domain(reason, documentation_url)
+    accepted_scopes = error.accepted_scopes ++ (conn.assigns[:accepted_scopes] || [])
+    Response.error(conn, %{error | accepted_scopes: Enum.uniq(accepted_scopes)})
+  end
 
   defp request_path_with_query(conn),
     do:
