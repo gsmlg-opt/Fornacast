@@ -74,7 +74,15 @@ defmodule FornacastAPI.IssueContractTest do
       ]
 
       expected_issue = expected_issue(nil)
-      expected_pull = expected_issue(expected_pull_link())
+
+      expected_pull =
+        expected_issue(
+          if(version == "2026-03-10",
+            do: Map.delete(expected_pull_link(), :merged_at),
+            else: expected_pull_link()
+          )
+        )
+
       expected_comment = expected_comment()
 
       assert Serializer.render(version, :issue, %{issue | kind: :issue}, opts) == expected_issue
@@ -253,6 +261,45 @@ defmodule FornacastAPI.IssueContractTest do
     for {filename, literal} <- expected do
       bytes = File.read!(Path.join(root, filename))
       assert JSON.decode!(bytes) == JSON.decode!(JSON.encode!(literal))
+      assert_valid_fixture(version, filename, JSON.decode!(bytes))
     end
+  end
+
+  defp assert_valid_fixture(version, filename, body) do
+    document =
+      Path.expand("../priv/openapi/ghes-3.21-#{version}.json", __DIR__)
+      |> File.read!()
+      |> JSON.decode!()
+      |> OpenApiSpex.OpenApi.Decode.decode()
+
+    {path, method, status} =
+      case filename do
+        "issue.json" ->
+          {"/repos/{owner}/{repo}/issues/{issue_number}", :get, "200"}
+
+        "pull-issue.json" ->
+          {"/repos/{owner}/{repo}/issues/{issue_number}", :get, "200"}
+
+        "issue-list.json" ->
+          {"/repos/{owner}/{repo}/issues", :get, "200"}
+
+        "issue-comment.json" ->
+          {"/repos/{owner}/{repo}/issues/{issue_number}/comments", :post, "201"}
+
+        "issue-comment-list.json" ->
+          {"/repos/{owner}/{repo}/issues/{issue_number}/comments", :get, "200"}
+      end
+
+    schema =
+      document.paths
+      |> Map.fetch!(path)
+      |> Map.fetch!(method)
+      |> Map.fetch!(:responses)
+      |> Map.fetch!(status)
+      |> Map.fetch!(:content)
+      |> Map.fetch!("application/json")
+      |> Map.fetch!(:schema)
+
+    assert {:ok, _} = OpenApiSpex.cast_value(body, schema, document)
   end
 end

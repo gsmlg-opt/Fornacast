@@ -68,9 +68,12 @@ defmodule FornacastAPI.Serializers.V2022_11_28.Issue do
       url: url,
       html_url: url,
       diff_url: url,
-      patch_url: url,
-      merged_at: timestamp(Map.get(pull, :merged_at) || Map.get(pull, "merged_at"))
+      patch_url: url
     }
+    |> maybe_put_merged_at(
+      timestamp(Map.get(pull, :merged_at) || Map.get(pull, "merged_at")),
+      opts
+    )
   end
 
   defp repository!(opts), do: {option(opts, :owner), option(opts, :repo)}
@@ -88,6 +91,12 @@ defmodule FornacastAPI.Serializers.V2022_11_28.Issue do
 
   defp maybe_put_pull_request(map, nil), do: map
   defp maybe_put_pull_request(map, value), do: Map.put(map, :pull_request, value)
+
+  defp maybe_put_merged_at(map, nil, opts) do
+    if option(opts, :version) == "2026-03-10", do: map, else: Map.put(map, :merged_at, nil)
+  end
+
+  defp maybe_put_merged_at(map, value, _opts), do: Map.put(map, :merged_at, value)
 
   defp reactions(url),
     do: %{
