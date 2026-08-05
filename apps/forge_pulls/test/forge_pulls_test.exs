@@ -44,7 +44,7 @@ defmodule ForgePullsTest do
   end
 
   test "pull requests accept valid Unicode nested branches and reject Git-invalid ref forms" do
-    valid_refs = ["refs/heads/feature/東京", "refs/heads/release/v1"]
+    valid_refs = ["refs/heads/feature/東京", "refs/heads/release/v1", "refs/heads/feature-v1"]
 
     for ref <- valid_refs do
       changeset =
@@ -73,6 +73,8 @@ defmodule ForgePullsTest do
       "refs/heads/feature/",
       "refs/heads/./feature",
       "refs/heads/feature/../next",
+      "refs/heads/.hidden",
+      "refs/heads/feature/.hidden",
       "refs/heads/feature.",
       "refs/heads/feature.lock"
     ]
@@ -154,6 +156,27 @@ defmodule ForgePullsTest do
         ] do
       assert %{state: ["is not a valid transition"]} =
                operation |> MergeOperation.transition_changeset(target) |> errors_on()
+    end
+
+    sources = [:prepared, :merge_written, :ref_advanced, :completed, :failed]
+
+    for {transition, expected_source} <- [
+          {:merge_written_changeset, :prepared},
+          {:ref_advanced_changeset, :merge_written},
+          {:completed_changeset, :ref_advanced}
+        ],
+        source <- sources,
+        source != expected_source do
+      assert %{state: ["is not a valid transition"]} =
+               apply(MergeOperation, transition, [%MergeOperation{state: source}])
+               |> errors_on()
+    end
+
+    for source <- sources, source not in [:prepared, :merge_written, :ref_advanced] do
+      assert %{state: ["is not a valid transition"]} =
+               %MergeOperation{state: source}
+               |> MergeOperation.failed_changeset("failure")
+               |> errors_on()
     end
   end
 

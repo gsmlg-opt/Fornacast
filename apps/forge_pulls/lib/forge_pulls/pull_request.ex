@@ -59,7 +59,8 @@ defmodule ForgePulls.PullRequest do
       not String.ends_with?(name, ".") and
       not Regex.match?(~r/[\x00-\x20\x7f ~^:?*\[\\]/u, name) and
       Enum.all?(String.split(name, "/"), fn component ->
-        component not in ["", ".", ".."] and not String.ends_with?(component, ".lock")
+        component not in ["", ".", ".."] and not String.starts_with?(component, ".") and
+          not String.ends_with?(component, ".lock")
       end)
   end
 
