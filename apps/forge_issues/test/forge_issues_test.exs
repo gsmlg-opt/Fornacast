@@ -1246,6 +1246,172 @@ defmodule ForgeIssuesTest do
              ForgeIssues.list(writer, writer.username, repository.slug, %{per_page: 101})
   end
 
+  test "public repositories expose issue comments anonymously in creation order", %{
+    writer: writer,
+    repository: repository
+  } do
+    repository = Repo.update!(Ecto.Changeset.change(repository, visibility: :public))
+    issue = issue_fixture(repository, writer)
+    first = insert_comment(issue, writer, "First")
+    second = insert_comment(issue, writer, "Second")
+
+    assert {:ok, %Page{entries: comments, total: 2, page: 1, per_page: 30}} =
+             ForgeIssues.list_comments(nil, writer.username, repository.slug, issue.number, %{})
+
+    assert Enum.map(comments, & &1.id) == [first.id, second.id]
+    assert Enum.map(comments, & &1.author.id) == [writer.id, writer.id]
+  end
+
+  test "readers create comments and authors or writers mutate them with one audit each", %{
+    writer: writer,
+    repository: repository
+  } do
+    author = readable_user(repository, "comment-author")
+    issue = issue_fixture(repository, writer)
+
+    assert {:ok, comment} =
+             ForgeIssues.create_comment(
+               author,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{"body" => "Initial"},
+               request_metadata()
+             )
+
+    assert {:ok, %{body: "Edited"}} =
+             ForgeIssues.update_comment(
+               author,
+               writer.username,
+               repository.slug,
+               comment.id,
+               %{"body" => "Edited"},
+               request_metadata()
+             )
+
+    assert :ok =
+             ForgeIssues.delete_comment(
+               writer,
+               writer.username,
+               repository.slug,
+               comment.id,
+               request_metadata()
+             )
+
+    audits = Repo.all(from(audit in AuditEvent, order_by: [asc: audit.id]))
+
+    assert Enum.map(audits, &{&1.action, &1.target_type, &1.target_id}) == [
+             {"issue_comment.created", "issue_comment", to_string(comment.id)},
+             {"issue_comment.updated", "issue_comment", to_string(comment.id)},
+             {"issue_comment.deleted", "issue_comment", to_string(comment.id)}
+           ]
+
+    assert hd(audits).metadata == %{
+             "api_version" => "2022-11-28",
+             "ip_address" => "192.0.2.10",
+             "repository_id" => repository.id,
+             "request_id" => "req-issue-1",
+             "result" => "success",
+             "token_id" => 41,
+             "user_agent" => "Octokit/9.0"
+           }
+  end
+
+  test "comment queries keep IDs and mutations scoped to the repository", %{
+    writer: writer,
+    repository: repository
+  } do
+    other = repository_fixture(writer)
+    issue = issue_fixture(repository, writer)
+    comment = insert_comment(issue, writer, "Scoped")
+    stranger = readable_user(repository, "comment-stranger")
+
+    assert {:error, :forbidden} =
+             ForgeIssues.update_comment(
+               stranger,
+               writer.username,
+               repository.slug,
+               comment.id,
+               %{"body" => "No"},
+               request_metadata()
+             )
+
+    assert {:error, :not_found} =
+             ForgeIssues.get_comment(writer, writer.username, other.slug, comment.id)
+
+    assert 0 == Repo.aggregate(AuditEvent, :count, :id)
+  end
+
+  test "comment listing validates stable paging and inclusive since", %{
+    writer: writer,
+    repository: repository
+  } do
+    issue = issue_fixture(repository, writer)
+    first = insert_comment(issue, writer, "First")
+    second = insert_comment(issue, writer, "Second")
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    comment_ids = [first.id, second.id]
+
+    Repo.update_all(from(comment in Comment, where: comment.id in ^comment_ids),
+      set: [inserted_at: now, updated_at: now]
+    )
+
+    assert {:ok, %Page{entries: [%{id: second_id}], total: 2, page: 2, per_page: 1}} =
+             ForgeIssues.list_comments(writer, writer.username, repository.slug, issue.number, %{
+               page: 2,
+               per_page: 1,
+               since: now
+             })
+
+    assert second_id == second.id
+
+    assert {:error,
+            {:validation, [%{resource: "IssueComment", field: "per_page", code: :unprocessable}]}} =
+             ForgeIssues.list_comments(writer, writer.username, repository.slug, issue.number, %{
+               per_page: 101
+             })
+
+    assert {:error,
+            {:validation, [%{resource: "IssueComment", field: "page", code: :unprocessable}]}} =
+             ForgeIssues.list_comments(writer, writer.username, repository.slug, issue.number, %{
+               page: "999999999999999999999999999999999999999999999999999999999999999999999999"
+             })
+  end
+
+  test "disabled issues reject ordinary comments but retain pull conversations", %{
+    writer: writer,
+    repository: repository
+  } do
+    issue = issue_fixture(repository, writer)
+    repository = Repo.update!(Ecto.Changeset.change(repository, has_issues: false))
+    pull = pull_fixture(repository, writer)
+    comment = insert_comment(pull, writer, "Conversation")
+
+    assert {:error, :issues_disabled} =
+             ForgeIssues.list_comments(
+               writer,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{}
+             )
+
+    assert {:ok, %Page{entries: [%{id: comment_id}]}} =
+             ForgeIssues.list_comments(writer, writer.username, repository.slug, pull.number, %{})
+
+    assert comment_id == comment.id
+
+    assert {:ok, _} =
+             ForgeIssues.update_comment(
+               writer,
+               writer.username,
+               repository.slug,
+               comment.id,
+               %{"body" => "Still here"},
+               request_metadata()
+             )
+  end
+
   defp issue_fixture(repository, author, title \\ "Relationship test") do
     %Issue{
       repository_id: repository.id,
@@ -1314,6 +1480,12 @@ defmodule ForgeIssuesTest do
         }
       end)
     )
+  end
+
+  defp insert_comment(issue, author, body) do
+    %Comment{}
+    |> Comment.changeset(%{issue_id: issue.id, author_user_id: author.id, body: body})
+    |> Repo.insert!()
   end
 
   defp assert_issue_ids(repository, actor, filters, expected_ids) do

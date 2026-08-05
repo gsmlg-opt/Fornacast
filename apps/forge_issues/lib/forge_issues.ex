@@ -118,6 +118,121 @@ defmodule ForgeIssues do
   def update(_actor, _owner_slug, _repository_slug, _number, _attrs, _request_metadata),
     do: {:error, :forbidden}
 
+  @spec list_comments(ForgeAccounts.User.t() | nil, String.t(), String.t(), pos_integer(), map()) ::
+          {:ok, Page.t(Comment.t())} | {:error, term()}
+  def list_comments(actor, owner_slug, repository_slug, number, filters)
+      when is_integer(number) and number > 0 and is_map(filters) do
+    with {:ok, repository} <-
+           fetch_repository(actor, owner_slug, repository_slug, :repository_read),
+         {:ok, issue} <- fetch_issue(repository, number),
+         :ok <- require_identity_enabled(repository, issue),
+         {:ok, filters} <- validate_comment_filters(filters) do
+      query =
+        Comment
+        |> where([comment], comment.issue_id == ^issue.id)
+        |> filter_comment_since(filters.since)
+        |> order_by([comment], asc: comment.inserted_at, asc: comment.id)
+
+      total = Repo.aggregate(query, :count, :id)
+      entries = query |> limit(^filters.per_page) |> offset(^filters.offset) |> Repo.all()
+
+      {:ok,
+       %Page{
+         entries: load_comment_metadata(entries, repository),
+         total: total,
+         page: filters.page,
+         per_page: filters.per_page
+       }}
+    end
+  end
+
+  def list_comments(_actor, _owner_slug, _repository_slug, _number, _filters),
+    do: invalid_comment_filter("base")
+
+  @spec get_comment(ForgeAccounts.User.t() | nil, String.t(), String.t(), pos_integer()) ::
+          {:ok, Comment.t()} | {:error, term()}
+  def get_comment(actor, owner_slug, repository_slug, comment_id)
+      when is_integer(comment_id) and comment_id > 0 do
+    with {:ok, repository} <-
+           fetch_repository(actor, owner_slug, repository_slug, :repository_read),
+         {:ok, {comment, issue}} <- fetch_comment(repository, comment_id),
+         :ok <- require_identity_enabled(repository, issue) do
+      {:ok, load_comment_metadata(comment, repository)}
+    end
+  end
+
+  def get_comment(_actor, _owner_slug, _repository_slug, _comment_id), do: {:error, :not_found}
+
+  @spec create_comment(
+          ForgeAccounts.User.t(),
+          String.t(),
+          String.t(),
+          pos_integer(),
+          map(),
+          map()
+        ) ::
+          {:ok, Comment.t()} | {:error, term()}
+  def create_comment(actor, owner_slug, repository_slug, number, attrs, request_metadata)
+      when is_integer(number) and number > 0 and is_map(attrs) and is_map(request_metadata) do
+    with {:ok, repository} <-
+           fetch_repository(actor, owner_slug, repository_slug, :repository_read) do
+      actor
+      |> create_comment_multi(repository, number, attrs, request_metadata)
+      |> transaction()
+      |> map_comment_result()
+    end
+  end
+
+  def create_comment(_actor, _owner_slug, _repository_slug, _number, _attrs, _request_metadata),
+    do: {:error, :forbidden}
+
+  @spec update_comment(
+          ForgeAccounts.User.t(),
+          String.t(),
+          String.t(),
+          pos_integer(),
+          map(),
+          map()
+        ) ::
+          {:ok, Comment.t()} | {:error, term()}
+  def update_comment(actor, owner_slug, repository_slug, comment_id, attrs, request_metadata)
+      when is_integer(comment_id) and comment_id > 0 and is_map(attrs) and
+             is_map(request_metadata) do
+    with {:ok, repository} <-
+           fetch_repository(actor, owner_slug, repository_slug, :repository_read) do
+      actor
+      |> update_comment_multi(repository, comment_id, attrs, request_metadata)
+      |> transaction()
+      |> map_comment_result()
+    end
+  end
+
+  def update_comment(
+        _actor,
+        _owner_slug,
+        _repository_slug,
+        _comment_id,
+        _attrs,
+        _request_metadata
+      ),
+      do: {:error, :forbidden}
+
+  @spec delete_comment(ForgeAccounts.User.t(), String.t(), String.t(), pos_integer(), map()) ::
+          :ok | {:error, term()}
+  def delete_comment(actor, owner_slug, repository_slug, comment_id, request_metadata)
+      when is_integer(comment_id) and comment_id > 0 and is_map(request_metadata) do
+    with {:ok, repository} <-
+           fetch_repository(actor, owner_slug, repository_slug, :repository_read) do
+      actor
+      |> delete_comment_multi(repository, comment_id, request_metadata)
+      |> transaction()
+      |> map_comment_delete_result()
+    end
+  end
+
+  def delete_comment(_actor, _owner_slug, _repository_slug, _comment_id, _request_metadata),
+    do: {:error, :forbidden}
+
   defp create_mutation_multi(%ForgeAccounts.User{} = actor, repository, attrs, request_metadata),
     do: {:ok, create_multi(actor, repository, attrs, request_metadata)}
 
@@ -135,6 +250,98 @@ defmodule ForgeIssues do
 
   defp update_mutation_multi(_actor, _repository, _number, _attrs, _request_metadata),
     do: {:error, :forbidden}
+
+  defp create_comment_multi(actor, repository, number, attrs, request_metadata) do
+    attrs = normalize_attrs(attrs)
+    request_metadata = safe_request_metadata(request_metadata)
+
+    Multi.new()
+    |> Multi.run(:authorization, fn repo, _changes ->
+      authorize_comment_create_transaction(repo, actor, repository.id, number)
+    end)
+    |> Multi.merge(fn %{
+                        authorization: %{
+                          actor: current_actor,
+                          repository: current_repository,
+                          issue: issue
+                        }
+                      } ->
+      Multi.new()
+      |> Multi.insert(
+        :comment,
+        Comment.changeset(
+          %Comment{},
+          Map.merge(attrs, %{"issue_id" => issue.id, "author_user_id" => current_actor.id})
+        )
+      )
+      |> Audit.record_multi(
+        :audit,
+        current_actor,
+        "issue_comment.created",
+        "issue_comment",
+        fn %{comment: comment} -> comment.id end,
+        %{"repository_id" => current_repository.id, "result" => "success"},
+        request_metadata: request_metadata
+      )
+    end)
+  end
+
+  defp update_comment_multi(actor, repository, comment_id, attrs, request_metadata) do
+    attrs = normalize_attrs(attrs)
+    request_metadata = safe_request_metadata(request_metadata)
+
+    Multi.new()
+    |> Multi.run(:authorization, fn repo, _changes ->
+      authorize_comment_mutation_transaction(repo, actor, repository.id, comment_id)
+    end)
+    |> Multi.merge(fn %{
+                        authorization: %{
+                          actor: current_actor,
+                          repository: current_repository,
+                          comment: comment
+                        }
+                      } ->
+      Multi.new()
+      |> Multi.update(:comment, Comment.changeset(comment, Map.take(attrs, ["body"])))
+      |> Audit.record_multi(
+        :audit,
+        current_actor,
+        "issue_comment.updated",
+        "issue_comment",
+        fn %{comment: updated} -> updated.id end,
+        %{"repository_id" => current_repository.id, "result" => "success"},
+        request_metadata: request_metadata
+      )
+    end)
+  end
+
+  defp delete_comment_multi(actor, repository, comment_id, request_metadata) do
+    request_metadata = safe_request_metadata(request_metadata)
+
+    Multi.new()
+    |> Multi.run(:authorization, fn repo, _changes ->
+      authorize_comment_mutation_transaction(repo, actor, repository.id, comment_id)
+    end)
+    |> Multi.merge(fn %{
+                        authorization: %{
+                          actor: current_actor,
+                          repository: current_repository,
+                          comment: comment
+                        }
+                      } ->
+      Multi.new()
+      |> Multi.delete(:comment, comment)
+      |> Audit.record_multi(
+        :audit,
+        current_actor,
+        "issue_comment.deleted",
+        "issue_comment",
+        comment.id,
+        %{"repository_id" => current_repository.id, "result" => "success"},
+        request_metadata: request_metadata
+      )
+    end)
+  end
 
   @doc false
   @spec create_multi(ForgeAccounts.User.t(), ForgeRepos.Repository.t(), map(), map()) :: Multi.t()
@@ -284,6 +491,30 @@ defmodule ForgeIssues do
     end
   end
 
+  defp authorize_comment_create_transaction(repo, actor, repository_id, number) do
+    with {:ok, actor} <- active_mutation_actor(repo, actor),
+         {:ok, repository} <- current_repository(repo, repository_id),
+         :ok <- authorize_repository_read(actor, repository),
+         {:ok, issue} <- current_issue(repo, repository, number),
+         :ok <- require_identity_enabled(repository, issue) do
+      {:ok, %{actor: actor, repository: repository, issue: issue}}
+    end
+  end
+
+  defp authorize_comment_mutation_transaction(repo, actor, repository_id, comment_id) do
+    with {:ok, actor} <- active_mutation_actor(repo, actor),
+         {:ok, repository} <- current_repository(repo, repository_id),
+         :ok <- authorize_repository_read(actor, repository),
+         {:ok, {comment, issue}} <- current_comment(repo, repository, comment_id),
+         :ok <- require_identity_enabled(repository, issue),
+         :ok <- authorize_comment_mutation(actor, repository, comment) do
+      {:ok, %{actor: actor, repository: repository, comment: comment}}
+    end
+  end
+
+  defp active_mutation_actor(repo, %ForgeAccounts.User{id: actor_id}),
+    do: active_mutation_actor(repo, actor_id)
+
   defp active_mutation_actor(repo, actor_id) do
     case repo.get_by(ForgeAccounts.User, id: actor_id, kind: :user, state: :active) do
       %ForgeAccounts.User{state: :active} = actor -> {:ok, actor}
@@ -325,6 +556,40 @@ defmodule ForgeIssues do
     end
   end
 
+  defp fetch_issue(repository, number) do
+    case Repo.one(
+           from(issue in Issue,
+             where: issue.repository_id == ^repository.id and issue.number == ^number
+           )
+         ) do
+      %Issue{} = issue -> {:ok, issue}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  defp current_comment(repo, repository, comment_id) do
+    case comment_query(repository, comment_id) |> repo.one() do
+      {comment, issue} -> {:ok, {comment, issue}}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  defp fetch_comment(repository, comment_id) do
+    case comment_query(repository, comment_id) |> Repo.one() do
+      {comment, issue} -> {:ok, {comment, issue}}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  defp comment_query(repository, comment_id) do
+    from(comment in Comment,
+      join: issue in Issue,
+      on: issue.id == comment.issue_id,
+      where: comment.id == ^comment_id and issue.repository_id == ^repository.id,
+      select: {comment, issue}
+    )
+  end
+
   defp mutation_capability(%ForgeAccounts.User{} = actor, repository, %Issue{
          author_user_id: author_id
        }) do
@@ -341,6 +606,19 @@ defmodule ForgeIssues do
   end
 
   defp mutation_capability(_actor, _repository, _issue), do: {:error, :forbidden}
+
+  defp authorize_comment_mutation(actor, repository, %Comment{author_user_id: author_id}) do
+    cond do
+      Fornacast.Access.allowed?(actor, :repository_write, repository) ->
+        :ok
+
+      actor.id == author_id and Fornacast.Access.allowed?(actor, :repository_read, repository) ->
+        :ok
+
+      true ->
+        {:error, :forbidden}
+    end
+  end
 
   defp mutation_attrs(attrs, :writer, _issue), do: {:ok, attrs}
 
@@ -390,10 +668,37 @@ defmodule ForgeIssues do
   defp map_update_result({:error, _step, _reason, _changes}),
     do: invalid_filter("base", :unprocessable)
 
+  defp map_comment_result({:ok, %{authorization: %{repository: repository}, comment: comment}}),
+    do: {:ok, load_comment_metadata(comment, repository)}
+
+  defp map_comment_result({:error, :authorization, reason, _changes}), do: {:error, reason}
+
+  defp map_comment_result({:error, :comment, changeset, _changes})
+       when is_struct(changeset, Ecto.Changeset),
+       do: {:error, {:validation, comment_changeset_errors(changeset)}}
+
+  defp map_comment_result({:error, _step, {:validation, _errors} = error, _changes}),
+    do: {:error, error}
+
+  defp map_comment_result({:error, _step, _reason, _changes}),
+    do: invalid_comment_filter("base", :unprocessable)
+
+  defp map_comment_delete_result({:ok, _changes}), do: :ok
+  defp map_comment_delete_result({:error, :authorization, reason, _changes}), do: {:error, reason}
+  defp map_comment_delete_result({:error, _step, _reason, _changes}), do: {:error, :unprocessable}
+
   defp issue_changeset_errors(changeset) do
     changeset.errors
     |> Enum.map(fn {field, _error} ->
       %{resource: "Issue", field: Atom.to_string(field), code: :invalid}
+    end)
+    |> Enum.uniq()
+  end
+
+  defp comment_changeset_errors(changeset) do
+    changeset.errors
+    |> Enum.map(fn {field, _error} ->
+      %{resource: "IssueComment", field: Atom.to_string(field), code: :invalid}
     end)
     |> Enum.uniq()
   end
@@ -422,6 +727,18 @@ defmodule ForgeIssues do
          per_page: per_page,
          offset: offset
        }}
+    end
+  end
+
+  defp validate_comment_filters(filters) do
+    with {:ok, since} <- since_filter(filters),
+         {:ok, page} <- positive_integer_filter(filters, "page", 1, :infinity),
+         {:ok, per_page} <- positive_integer_filter(filters, "per_page", 30, 100),
+         {:ok, offset} <- page_offset(page, per_page) do
+      {:ok, %{since: since, page: page, per_page: per_page, offset: offset}}
+    else
+      {:error, {:validation, errors}} ->
+        {:error, {:validation, Enum.map(errors, &Map.put(&1, :resource, "IssueComment"))}}
     end
   end
 
@@ -570,6 +887,9 @@ defmodule ForgeIssues do
   defp invalid_filter(field, code \\ :invalid),
     do: {:error, {:validation, [%{resource: "Issue", field: field, code: code}]}}
 
+  defp invalid_comment_filter(field, code \\ :invalid),
+    do: {:error, {:validation, [%{resource: "IssueComment", field: field, code: code}]}}
+
   defp filter_state(query, :all), do: query
   defp filter_state(query, state), do: where(query, [issue], issue.state == ^state)
 
@@ -617,6 +937,11 @@ defmodule ForgeIssues do
   defp filter_creator(query, user_id), do: where(query, [issue], issue.author_user_id == ^user_id)
   defp filter_since(query, nil), do: query
   defp filter_since(query, since), do: where(query, [issue], issue.updated_at >= ^since)
+
+  defp filter_comment_since(query, nil), do: query
+
+  defp filter_comment_since(query, since),
+    do: where(query, [comment], comment.updated_at >= ^since)
 
   defp order_issues(query, :comments, direction) do
     counts =
@@ -841,6 +1166,29 @@ defmodule ForgeIssues do
           comment_count: Map.get(counts, issue.id, 0)
       }
     end)
+  end
+
+  defp load_comment_metadata(comments, repository) when is_list(comments) do
+    users =
+      comments
+      |> Enum.map(& &1.author_user_id)
+      |> ForgeAccounts.get_users()
+      |> Map.new(&{&1.id, &1})
+
+    associations = author_associations(comments, repository, users)
+
+    Enum.map(comments, fn comment ->
+      %{
+        comment
+        | author: Map.get(users, comment.author_user_id),
+          author_association: Map.get(associations, comment.author_user_id, "NONE")
+      }
+    end)
+  end
+
+  defp load_comment_metadata(%Comment{} = comment, repository) do
+    [loaded] = load_comment_metadata([comment], repository)
+    loaded
   end
 
   defp issue_in_repository?(%Issue{repository_id: repository_id}, %{id: repository_id}), do: true
