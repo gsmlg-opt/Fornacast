@@ -159,6 +159,26 @@ defmodule FornacastAPI.IssueWorkflowTest do
         ["reader issue #{version}", "reader body #{version}", "edited body #{version}"],
         version
       )
+
+      assert_workflow_audits(
+        repository,
+        version,
+        reader,
+        writer,
+        writer_key.id,
+        created,
+        comment_body,
+        [
+          {"issue.created", issue, reader},
+          {"issue.updated", edited, reader},
+          {"issue_comment.created", comment, reader},
+          {"issue_comment.updated", changed_comment, reader},
+          {"issue.updated", assigned, writer},
+          {"issue.updated", closed, reader},
+          {"issue.updated", reopened, reader},
+          {"issue_comment.deleted", deleted, reader}
+        ]
+      )
     end
   end
 
@@ -409,6 +429,61 @@ defmodule FornacastAPI.IssueWorkflowTest do
       metadata = JSON.encode!(audit.metadata)
       Enum.each(secrets, &refute(metadata =~ &1))
       Enum.each(request_values, &refute(metadata =~ &1))
+    end)
+  end
+
+  defp assert_workflow_audits(
+         repository,
+         version,
+         reader,
+         writer,
+         writer_token_id,
+         issue,
+         comment,
+         events
+       ) do
+    audits =
+      from(event in AuditEvent,
+        where:
+          event.metadata["repository_id"] == ^repository.id and
+            event.metadata["api_version"] == ^version
+      )
+      |> Repo.all()
+
+    assert length(audits) == 8
+
+    Enum.each(events, fn {action, conn, actor} ->
+      target =
+        if String.starts_with?(action, "issue_comment"),
+          do: {"issue_comment", to_string(comment["id"])},
+          else:
+            if(action == "issue.created",
+              do: {"repository", to_string(repository.id)},
+              else: {"issue", to_string(issue["id"])}
+            )
+
+      [request_id] = get_resp_header(conn, "x-github-request-id")
+
+      assert %AuditEvent{} =
+               audit =
+               Enum.find(audits, fn row ->
+                 row.action == action and row.target_type == elem(target, 0) and
+                   row.target_id == elem(target, 1) and
+                   row.metadata["request_id"] == request_id
+               end)
+
+      assert audit.actor_user_id == actor.id
+      assert audit.ip_address == "127.0.0.1"
+      assert audit.user_agent == @user_agent
+      assert audit.metadata["repository_id"] == repository.id
+      assert audit.metadata["api_version"] == version
+      assert audit.metadata["result"] == "success"
+
+      assert audit.metadata["token_id"] ==
+               if(actor.id == writer.id, do: writer_token_id, else: audit.metadata["token_id"])
+
+      refute JSON.encode!(audit.metadata) =~ reader.username
+      refute JSON.encode!(audit.metadata) =~ writer.username
     end)
   end
 end
