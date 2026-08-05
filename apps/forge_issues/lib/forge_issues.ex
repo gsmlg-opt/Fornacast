@@ -287,7 +287,8 @@ defmodule ForgeIssues do
     end)
   end
 
-  defp update_comment_multi(actor, repository, comment_id, attrs, request_metadata) do
+  @doc false
+  def update_comment_multi(actor, repository, comment_id, attrs, request_metadata) do
     attrs = normalize_attrs(attrs)
     request_metadata = safe_request_metadata(request_metadata)
 
@@ -316,7 +317,8 @@ defmodule ForgeIssues do
     end)
   end
 
-  defp delete_comment_multi(actor, repository, comment_id, request_metadata) do
+  @doc false
+  def delete_comment_multi(actor, repository, comment_id, request_metadata) do
     request_metadata = safe_request_metadata(request_metadata)
 
     Multi.new()

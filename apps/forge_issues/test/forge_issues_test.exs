@@ -1254,12 +1254,16 @@ defmodule ForgeIssuesTest do
     issue = issue_fixture(repository, writer)
     first = insert_comment(issue, writer, "First")
     second = insert_comment(issue, writer, "Second")
+    first_id = first.id
 
     assert {:ok, %Page{entries: comments, total: 2, page: 1, per_page: 30}} =
              ForgeIssues.list_comments(nil, writer.username, repository.slug, issue.number, %{})
 
     assert Enum.map(comments, & &1.id) == [first.id, second.id]
     assert Enum.map(comments, & &1.author.id) == [writer.id, writer.id]
+
+    assert {:ok, %{id: ^first_id}} =
+             ForgeIssues.get_comment(nil, writer.username, repository.slug, first.id)
   end
 
   test "private comment reads are authorized and mask unauthorized callers", %{
@@ -1469,6 +1473,11 @@ defmodule ForgeIssuesTest do
 
     assert second_id == second.id
 
+    assert {:ok, %Page{total: 2, page: 1, per_page: 100}} =
+             ForgeIssues.list_comments(writer, writer.username, repository.slug, issue.number, %{
+               per_page: 100
+             })
+
     assert {:error,
             {:validation, [%{resource: "IssueComment", field: "per_page", code: :unprocessable}]}} =
              ForgeIssues.list_comments(writer, writer.username, repository.slug, issue.number, %{
@@ -1549,6 +1558,8 @@ defmodule ForgeIssuesTest do
                ordinary_comment.id,
                request_metadata()
              )
+
+    assert 0 == Repo.aggregate(AuditEvent, :count, :id)
 
     assert {:ok, %Page{entries: [%{id: comment_id}]}} =
              ForgeIssues.list_comments(writer, writer.username, repository.slug, pull.number, %{})
@@ -1697,6 +1708,105 @@ defmodule ForgeIssuesTest do
     else
       assert_raise Turso.Error, "database is locked", fn -> ForgeIssues.transaction(multi) end
     end
+  end
+
+  test "comment validation failures do not audit", %{writer: writer, repository: repository} do
+    issue = issue_fixture(repository, writer)
+
+    assert {:error, {:validation, [%{resource: "IssueComment", field: "body", code: :invalid}]}} =
+             ForgeIssues.create_comment(
+               writer,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{"body" => <<0>>},
+               request_metadata()
+             )
+
+    assert 0 == Repo.aggregate(AuditEvent, :count, :id)
+  end
+
+  test "comment multis recheck repository, identity, and comment state", %{
+    writer: writer,
+    repository: repository
+  } do
+    reader = readable_user(repository, "comment-stale-reader")
+    issue = issue_fixture(repository, writer)
+    comment = insert_comment(issue, reader, "Stale")
+
+    deleted_comment_multi =
+      ForgeIssues.update_comment_multi(
+        reader,
+        repository,
+        comment.id,
+        %{"body" => "Nope"},
+        request_metadata()
+      )
+
+    Repo.delete!(comment)
+
+    assert {:error, :authorization, :not_found, %{}} =
+             ForgeIssues.transaction(deleted_comment_multi)
+
+    deleted_issue_multi =
+      ForgeIssues.create_comment_multi(
+        reader,
+        repository,
+        issue.number,
+        %{"body" => "Nope"},
+        request_metadata()
+      )
+
+    Repo.delete!(issue)
+
+    assert {:error, :authorization, :not_found, %{}} =
+             ForgeIssues.transaction(deleted_issue_multi)
+
+    assert 0 == Repo.aggregate(AuditEvent, :count, :id)
+  end
+
+  test "comment multis recheck access and repository availability", %{
+    writer: writer,
+    repository: repository
+  } do
+    reader = readable_user(repository, "comment-revoked-reader")
+    issue = issue_fixture(repository, writer)
+
+    revoked_multi =
+      ForgeIssues.create_comment_multi(
+        reader,
+        repository,
+        issue.number,
+        %{"body" => "Nope"},
+        request_metadata()
+      )
+
+    Repo.delete_all(
+      from(collaborator in Collaborator,
+        # WORKAROUND(upstream): gsmlg-dev/concord#66
+        where: fragment("repository_id = ? AND user_id = ?", ^repository.id, ^reader.id)
+      )
+    )
+
+    assert {:error, :authorization, :not_found, %{}} = ForgeIssues.transaction(revoked_multi)
+
+    repository_multi =
+      ForgeIssues.create_comment_multi(
+        writer,
+        repository,
+        issue.number,
+        %{"body" => "Nope"},
+        request_metadata()
+      )
+
+    Repo.update!(
+      Ecto.Changeset.change(repository,
+        deleted_at: DateTime.utc_now() |> DateTime.truncate(:second)
+      )
+    )
+
+    assert {:error, :authorization, :not_found, %{}} = ForgeIssues.transaction(repository_multi)
+    assert 0 == Repo.aggregate(AuditEvent, :count, :id)
   end
 
   defp issue_fixture(repository, author, title \\ "Relationship test") do
