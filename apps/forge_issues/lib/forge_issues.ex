@@ -21,10 +21,481 @@ defmodule ForgeIssues do
     NumberSequence
   }
 
-  alias Fornacast.Repo
+  alias Fornacast.{Audit, Page, Repo}
 
   @turso_busy_attempts 12
   @turso_busy_backoff_ms 5
+
+  @type validation_error :: %{
+          required(:resource) => String.t(),
+          required(:field) => String.t(),
+          required(:code) => :invalid | :unprocessable
+        }
+
+  @spec list(ForgeAccounts.User.t() | nil, String.t(), String.t(), map()) ::
+          {:ok, Page.t(Issue.t())} | {:error, term()}
+  def list(actor, owner_slug, repository_slug, filters) when is_map(filters) do
+    with {:ok, repository} <-
+           fetch_repository(actor, owner_slug, repository_slug, :repository_read),
+         {:ok, filters} <- validate_list_filters(filters) do
+      query =
+        Issue
+        |> where([issue], issue.repository_id == ^repository.id)
+        |> scope_enabled_issue_kinds(repository)
+        |> filter_state(filters.state)
+        |> filter_labels(repository.id, filters.labels)
+        |> filter_assignee(filters.assignee)
+        |> filter_creator(filters.creator)
+        |> filter_since(filters.since)
+        |> order_issues(filters.sort, filters.direction)
+
+      total = Repo.aggregate(query, :count, :id)
+
+      entries =
+        query
+        |> limit(^filters.per_page)
+        |> offset(^((filters.page - 1) * filters.per_page))
+        |> Repo.all()
+        |> do_load_issue_metadata(repository)
+
+      {:ok, %Page{entries: entries, total: total, page: filters.page, per_page: filters.per_page}}
+    end
+  end
+
+  def list(_actor, _owner_slug, _repository_slug, _filters), do: invalid_filter("base")
+
+  @spec get(ForgeAccounts.User.t() | nil, String.t(), String.t(), pos_integer()) ::
+          {:ok, Issue.t()} | {:error, term()}
+  def get(actor, owner_slug, repository_slug, number) when is_integer(number) and number > 0 do
+    with {:ok, repository} <-
+           fetch_repository(actor, owner_slug, repository_slug, :repository_read),
+         %Issue{} = issue <-
+           Repo.one(
+             from(issue in Issue,
+               where: issue.repository_id == ^repository.id and issue.number == ^number
+             )
+           ),
+         :ok <- require_identity_enabled(repository, issue) do
+      {:ok, load_issue_metadata(issue, repository)}
+    else
+      nil -> {:error, :not_found}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def get(_actor, _owner_slug, _repository_slug, _number), do: {:error, :not_found}
+
+  @spec create(ForgeAccounts.User.t(), String.t(), String.t(), map(), map()) ::
+          {:ok, Issue.t()} | {:error, term()}
+  def create(actor, owner_slug, repository_slug, attrs, request_metadata)
+      when is_map(attrs) and is_map(request_metadata) do
+    with {:ok, repository} <-
+           fetch_repository(actor, owner_slug, repository_slug, :repository_read),
+         :ok <- require_issues_enabled(repository),
+         {:ok, capability} <- create_capability(actor, repository) do
+      DefaultLabels.ensure(repository)
+
+      attrs = normalize_attrs(attrs)
+      identity_attrs = Map.take(attrs, ["title", "body", "state", "state_reason"])
+
+      Multi.new()
+      |> insert_numbered_identity(:issue, repository, actor, :issue, identity_attrs)
+      |> put_relationship_operations(:issue, repository, actor, attrs, capability)
+      |> Audit.record_multi(
+        :audit,
+        actor,
+        "issue.created",
+        "repository",
+        repository.id,
+        %{"result" => "success"},
+        request_metadata: safe_request_metadata(request_metadata)
+      )
+      |> transaction()
+      |> map_create_result(repository)
+    end
+  end
+
+  def create(_actor, _owner_slug, _repository_slug, _attrs, _request_metadata),
+    do: {:error, :forbidden}
+
+  @spec update(ForgeAccounts.User.t(), String.t(), String.t(), pos_integer(), map(), map()) ::
+          {:ok, Issue.t()} | {:error, term()}
+  def update(actor, owner_slug, repository_slug, number, attrs, request_metadata)
+      when is_integer(number) and number > 0 and is_map(attrs) and is_map(request_metadata) do
+    with {:ok, repository} <-
+           fetch_repository(actor, owner_slug, repository_slug, :repository_read),
+         %Issue{} = issue <-
+           Repo.one(
+             from(issue in Issue,
+               where: issue.repository_id == ^repository.id and issue.number == ^number
+             )
+           ),
+         :ok <- require_identity_enabled(repository, issue),
+         {:ok, capability} <- mutation_capability(actor, repository, issue),
+         {:ok, attrs} <- mutation_attrs(normalize_attrs(attrs), capability) do
+      Multi.new()
+      |> update_identity(
+        :issue,
+        issue,
+        actor,
+        Map.take(attrs, ["title", "body", "state", "state_reason"])
+      )
+      |> put_relationship_operations(:issue, repository, actor, attrs, capability)
+      |> Audit.record_multi(
+        :audit,
+        actor,
+        "issue.updated",
+        "issue",
+        fn %{issue: updated} -> updated.id end,
+        %{"result" => "success"},
+        request_metadata: safe_request_metadata(request_metadata)
+      )
+      |> transaction()
+      |> map_update_result(repository)
+    else
+      nil -> {:error, :not_found}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def update(_actor, _owner_slug, _repository_slug, _number, _attrs, _request_metadata),
+    do: {:error, :forbidden}
+
+  defp fetch_repository(actor, owner_slug, repository_slug, permission),
+    do: ForgeRepos.fetch_authorized_repository(actor, owner_slug, repository_slug, permission)
+
+  defp require_issues_enabled(%ForgeRepos.Repository{has_issues: true}), do: :ok
+  defp require_issues_enabled(%ForgeRepos.Repository{}), do: {:error, :issues_disabled}
+
+  defp require_identity_enabled(%ForgeRepos.Repository{has_issues: true}, %Issue{}), do: :ok
+  defp require_identity_enabled(%ForgeRepos.Repository{}, %Issue{kind: :pull_request}), do: :ok
+
+  defp require_identity_enabled(%ForgeRepos.Repository{}, %Issue{}),
+    do: {:error, :issues_disabled}
+
+  defp scope_enabled_issue_kinds(query, %ForgeRepos.Repository{has_issues: true}), do: query
+
+  defp scope_enabled_issue_kinds(query, %ForgeRepos.Repository{}),
+    do: where(query, [issue], issue.kind == :pull_request)
+
+  defp create_capability(%ForgeAccounts.User{} = actor, repository) do
+    if Fornacast.Access.allowed?(actor, :repository_read, repository),
+      do:
+        {:ok,
+         if(Fornacast.Access.allowed?(actor, :repository_write, repository),
+           do: :writer,
+           else: :author
+         )},
+      else: {:error, :forbidden}
+  end
+
+  defp create_capability(_actor, _repository), do: {:error, :forbidden}
+
+  defp mutation_capability(%ForgeAccounts.User{} = actor, repository, %Issue{
+         author_user_id: author_id
+       }) do
+    cond do
+      Fornacast.Access.allowed?(actor, :repository_write, repository) ->
+        {:ok, :writer}
+
+      actor.id == author_id and Fornacast.Access.allowed?(actor, :repository_read, repository) ->
+        {:ok, :author}
+
+      true ->
+        {:error, :forbidden}
+    end
+  end
+
+  defp mutation_capability(_actor, _repository, _issue), do: {:error, :forbidden}
+
+  defp mutation_attrs(attrs, :writer), do: {:ok, attrs}
+
+  defp mutation_attrs(attrs, :author) do
+    attrs = Map.take(attrs, ["title", "body", "state", "state_reason"])
+
+    if Map.get(attrs, "state_reason") == :not_planned do
+      invalid_filter("state_reason")
+    else
+      {:ok, attrs}
+    end
+  end
+
+  defp map_create_result({:ok, %{issue: issue}}, repository),
+    do: {:ok, load_issue_metadata(issue, repository)}
+
+  defp map_create_result({:error, :issue, changeset, _changes}, _repository)
+       when is_struct(changeset, Ecto.Changeset),
+       do: {:error, {:validation, issue_changeset_errors(changeset)}}
+
+  defp map_create_result({:error, _step, {:validation, _errors} = error, _changes}, _repository),
+    do: {:error, error}
+
+  defp map_create_result({:error, _step, {:unavailable, _reason} = error, _changes}, _repository),
+    do: {:error, error}
+
+  defp map_create_result({:error, _step, _reason, _changes}, _repository),
+    do: invalid_filter("base", :unprocessable)
+
+  defp map_update_result({:ok, %{issue: issue}}, repository),
+    do: {:ok, load_issue_metadata(issue, repository)}
+
+  defp map_update_result({:error, :issue, changeset, _changes}, _repository)
+       when is_struct(changeset, Ecto.Changeset),
+       do: {:error, {:validation, issue_changeset_errors(changeset)}}
+
+  defp map_update_result({:error, _step, {:validation, _errors} = error, _changes}, _repository),
+    do: {:error, error}
+
+  defp map_update_result({:error, _step, _reason, _changes}, _repository),
+    do: invalid_filter("base", :unprocessable)
+
+  defp issue_changeset_errors(changeset) do
+    changeset.errors
+    |> Enum.map(fn {field, _error} ->
+      %{resource: "Issue", field: Atom.to_string(field), code: :invalid}
+    end)
+    |> Enum.uniq()
+  end
+
+  defp validate_list_filters(filters) do
+    with {:ok, state} <- enum_filter(filters, "state", :open, [:open, :closed, :all]),
+         {:ok, labels} <- labels_filter(filters),
+         {:ok, assignee} <- assignee_filter(filters),
+         {:ok, creator} <- username_filter(filters, "creator"),
+         {:ok, sort} <- enum_filter(filters, "sort", :created, [:created, :updated, :comments]),
+         {:ok, direction} <- enum_filter(filters, "direction", :desc, [:asc, :desc]),
+         {:ok, since} <- since_filter(filters),
+         {:ok, page} <- positive_integer_filter(filters, "page", 1, 1),
+         {:ok, per_page} <- positive_integer_filter(filters, "per_page", 30, 100) do
+      {:ok,
+       %{
+         state: state,
+         labels: labels,
+         assignee: assignee,
+         creator: creator,
+         sort: sort,
+         direction: direction,
+         since: since,
+         page: page,
+         per_page: per_page
+       }}
+    end
+  end
+
+  defp enum_filter(filters, field, default, values) do
+    case fetch_filter(filters, field, default) do
+      value when is_atom(value) ->
+        if(value in values, do: {:ok, value}, else: invalid_filter(field))
+
+      value when is_binary(value) ->
+        case Enum.find(values, &(Atom.to_string(&1) == String.downcase(value))) do
+          nil -> invalid_filter(field)
+          result -> {:ok, result}
+        end
+
+      _ ->
+        invalid_filter(field)
+    end
+  end
+
+  defp labels_filter(filters) do
+    labels = fetch_filter(filters, "labels", [])
+
+    labels =
+      cond do
+        is_binary(labels) -> String.split(labels, ",", trim: true)
+        is_list(labels) and Enum.all?(labels, &is_binary/1) -> labels
+        labels == [] -> []
+        true -> :invalid
+      end
+
+    case labels do
+      :invalid ->
+        invalid_filter("labels")
+
+      names ->
+        names =
+          names
+          |> Enum.map(&DefaultLabels.normalize_name/1)
+          |> Enum.reject(&(&1 == ""))
+          |> Enum.uniq()
+
+        if length(names) <= 100, do: {:ok, names}, else: invalid_filter("labels", :unprocessable)
+    end
+  end
+
+  defp assignee_filter(filters) do
+    case fetch_filter(filters, "assignee", nil) do
+      nil ->
+        {:ok, nil}
+
+      "*" ->
+        {:ok, :any}
+
+      "none" ->
+        {:ok, :none}
+
+      username when is_binary(username) ->
+        case ForgeAccounts.get_public_user(username) do
+          {:ok, user} -> {:ok, {:user, user.id}}
+          {:error, :not_found} -> {:ok, {:user, nil}}
+        end
+
+      _ ->
+        invalid_filter("assignee")
+    end
+  end
+
+  defp username_filter(filters, field) do
+    case fetch_filter(filters, field, nil) do
+      nil ->
+        {:ok, nil}
+
+      username when is_binary(username) ->
+        case ForgeAccounts.get_public_user(username) do
+          {:ok, user} -> {:ok, user.id}
+          {:error, :not_found} -> {:ok, :missing}
+        end
+
+      _ ->
+        invalid_filter(field)
+    end
+  end
+
+  defp since_filter(filters) do
+    case fetch_filter(filters, "since", nil) do
+      nil ->
+        {:ok, nil}
+
+      %DateTime{} = value ->
+        {:ok, DateTime.truncate(value, :second)}
+
+      value when is_binary(value) ->
+        case DateTime.from_iso8601(value) do
+          {:ok, datetime, _offset} -> {:ok, datetime}
+          _ -> invalid_filter("since", :unprocessable)
+        end
+
+      _ ->
+        invalid_filter("since", :unprocessable)
+    end
+  end
+
+  defp positive_integer_filter(filters, field, default, maximum) do
+    case fetch_filter(filters, field, default) do
+      value when is_integer(value) and value >= 1 and value <= maximum ->
+        {:ok, value}
+
+      value when is_binary(value) ->
+        case Integer.parse(value) do
+          {integer, ""} when integer >= 1 and integer <= maximum -> {:ok, integer}
+          _ -> invalid_filter(field, :unprocessable)
+        end
+
+      _ ->
+        invalid_filter(field, :unprocessable)
+    end
+  end
+
+  defp fetch_filter(filters, field, default),
+    do: Map.get(filters, field, Map.get(filters, String.to_atom(field), default))
+
+  defp invalid_filter(field, code \\ :invalid),
+    do: {:error, {:validation, [%{resource: "Issue", field: field, code: code}]}}
+
+  defp filter_state(query, :all), do: query
+  defp filter_state(query, state), do: where(query, [issue], issue.state == ^state)
+
+  defp filter_labels(query, _repository_id, []), do: query
+
+  defp filter_labels(query, repository_id, names) do
+    matching_issue_ids =
+      IssueLabel
+      |> join(:inner, [join], label in Label, on: label.id == join.label_id)
+      |> where(
+        [_join, label],
+        label.repository_id == ^repository_id and label.normalized_name in ^names
+      )
+      |> group_by([join], join.issue_id)
+      |> having([_join, label], count(label.normalized_name, :distinct) == ^length(names))
+      |> select([join], join.issue_id)
+
+    where(query, [issue], issue.id in subquery(matching_issue_ids))
+  end
+
+  defp filter_assignee(query, nil), do: query
+
+  defp filter_assignee(query, :any),
+    do: where(query, [issue], issue.id in subquery(assignee_issue_ids()))
+
+  defp filter_assignee(query, :none),
+    do: where(query, [issue], issue.id not in subquery(assignee_issue_ids()))
+
+  defp filter_assignee(query, {:user, nil}), do: where(query, [issue], false)
+
+  defp filter_assignee(query, {:user, user_id}) do
+    where(query, [issue], issue.id in subquery(assignee_issue_ids(user_id)))
+  end
+
+  defp assignee_issue_ids(user_id \\ nil) do
+    IssueAssignee
+    |> then(fn query ->
+      if is_nil(user_id), do: query, else: where(query, [join], join.user_id == ^user_id)
+    end)
+    |> select([join], join.issue_id)
+  end
+
+  defp filter_creator(query, nil), do: query
+  defp filter_creator(query, :missing), do: where(query, [issue], false)
+  defp filter_creator(query, user_id), do: where(query, [issue], issue.author_user_id == ^user_id)
+  defp filter_since(query, nil), do: query
+  defp filter_since(query, since), do: where(query, [issue], issue.updated_at >= ^since)
+
+  defp order_issues(query, :comments, direction) do
+    counts =
+      Comment
+      |> group_by([comment], comment.issue_id)
+      |> select([comment], %{issue_id: comment.issue_id, count: count(comment.id)})
+
+    query
+    |> join(:left, [issue], count in subquery(counts), on: count.issue_id == issue.id)
+    |> order_by([issue, count], [{^direction, coalesce(count.count, 0)}, {^direction, issue.id}])
+  end
+
+  defp order_issues(query, :created, direction),
+    do: order_by(query, [issue], [{^direction, issue.inserted_at}, {^direction, issue.id}])
+
+  defp order_issues(query, :updated, direction),
+    do: order_by(query, [issue], [{^direction, issue.updated_at}, {^direction, issue.id}])
+
+  defp normalize_attrs(attrs),
+    do: Map.new(attrs, fn {key, value} -> {to_string(key), normalize_attr_value(key, value)} end)
+
+  defp normalize_attr_value(key, value) when key in [:state, :state_reason], do: value
+  defp normalize_attr_value("state", value) when is_binary(value), do: safe_enum(value)
+  defp normalize_attr_value("state_reason", value) when is_binary(value), do: safe_enum(value)
+  defp normalize_attr_value(_key, value), do: value
+
+  defp safe_enum(value) do
+    case value do
+      "open" -> :open
+      "closed" -> :closed
+      "completed" -> :completed
+      "not_planned" -> :not_planned
+      "reopened" -> :reopened
+      _ -> value
+    end
+  end
+
+  defp safe_request_metadata(metadata) do
+    [:request_id, :api_version, :ip_address, :user_agent, :token_id]
+    |> Enum.reduce(%{}, fn key, safe ->
+      case Map.fetch(metadata, key) do
+        {:ok, value} -> Map.put(safe, key, value)
+        :error -> Map.get(metadata, Atom.to_string(key), safe)
+      end
+    end)
+  end
 
   @doc """
   Executes a complete caller-owned multi as one transaction.
