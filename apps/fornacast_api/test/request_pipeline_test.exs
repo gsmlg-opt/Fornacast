@@ -112,13 +112,13 @@ defmodule FornacastAPI.RequestPipelineTest do
     end
   end
 
-  test "bodyless DELETE reaches the sanitized fallback without a content type" do
+  test "bodyless issue-comment DELETE reaches authentication without a content type" do
     conn =
       build_conn()
       |> put_req_header(@user_agent)
       |> delete("/api/v3/repos/octo/example/issues/comments/1")
 
-    assert json_response(conn, 404)["message"] == "Not Found"
+    assert json_response(conn, 401)["message"] == "Requires authentication"
     assert get_resp_header(conn, "x-github-api-version-selected") == ["2022-11-28"]
   end
 
