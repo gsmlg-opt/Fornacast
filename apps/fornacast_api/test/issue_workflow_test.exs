@@ -3,7 +3,7 @@ defmodule FornacastAPI.IssueWorkflowTest do
 
   import Ecto.Query
 
-  alias ForgeIssues.{Comment, Issue}
+  alias ForgeIssues.{Comment, Issue, IssueAssignee, IssueLabel, Label}
   alias ForgeRepos.{Collaborator, Repository}
   alias Fornacast.{AuditEvent, Repo}
 
@@ -17,7 +17,7 @@ defmodule FornacastAPI.IssueWorkflowTest do
     assignee = user("workflow-assignee")
     private_repository = repository(owner, "workflow-private", visibility: :private)
     grant(private_repository, reader, :read)
-    {_reader_key, reader_secret} = pat(reader, ["repo"])
+    {reader_key, reader_secret} = pat(reader, ["repo"])
     {writer_key, writer_secret} = pat(writer, ["public_repo"])
 
     for version <- @versions do
@@ -99,32 +99,95 @@ defmodule FornacastAPI.IssueWorkflowTest do
         api_conn(writer_secret, version)
         |> put_req_header("x-request-id", "workflow-#{version}")
         |> patch_json("#{path}/issues/#{created["number"]}", %{
-          "labels" => ["bug"],
+          "labels" => ["bug", "help wanted"],
           "assignee" => assignee.username
         })
 
-      assert %{"labels" => [%{"name" => "bug"}], "assignees" => [%{"login" => login}]} =
-               assert_schema(assigned, "/repos/{owner}/{repo}/issues/{issue_number}", :patch, 200)
+      assigned_body =
+        assert_schema(assigned, "/repos/{owner}/{repo}/issues/{issue_number}", :patch, 200)
 
+      assert MapSet.new(Enum.map(assigned_body["labels"], & &1["name"])) ==
+               MapSet.new(["bug", "help wanted"])
+
+      assert [%{"login" => login}] = assigned_body["assignees"]
       assert login == assignee.username
 
-      query =
-        URI.encode_query(%{
-          "state" => "open",
-          "labels" => "bug",
-          "assignee" => assignee.username,
-          "creator" => reader.username,
-          "since" => "2020-01-01T00:00:00Z"
-        })
+      labels =
+        from(label in Label,
+          where:
+            label.repository_id == ^repository.id and
+              label.normalized_name in ["bug", "help wanted"]
+        )
+        |> Repo.all()
+
+      assert MapSet.new(Enum.map(labels, & &1.normalized_name)) ==
+               MapSet.new(["bug", "help wanted"])
+
+      target = Repo.get!(Issue, created["id"])
+      since = target.updated_at
+      suffix = String.replace(version, "-", "")
+      other_creator = user("workflow-other-creator-#{suffix}")
+      other_assignee = user("workflow-other-assignee-#{suffix}")
+
+      decoys = %{
+        "state" =>
+          filtered_issue(repository, reader, 2, labels, assignee,
+            state: :closed,
+            updated_at: since
+          ),
+        "labels" =>
+          filtered_issue(repository, reader, 3, [label(labels, "bug")], assignee,
+            updated_at: since
+          ),
+        "assignee" =>
+          filtered_issue(repository, reader, 4, labels, other_assignee, updated_at: since),
+        "creator" =>
+          filtered_issue(repository, other_creator, 5, labels, assignee, updated_at: since),
+        "since" =>
+          filtered_issue(repository, reader, 6, labels, assignee,
+            updated_at: DateTime.add(since, -1, :second)
+          )
+      }
+
+      _pull_decoy =
+        filtered_issue(repository, other_creator, 7, [], nil,
+          kind: :pull_request,
+          state: :closed,
+          updated_at: DateTime.add(since, -1, :second)
+        )
+
+      filters = %{
+        "state" => "open",
+        "labels" => "bug,help wanted",
+        "assignee" => assignee.username,
+        "creator" => reader.username,
+        "since" => DateTime.to_iso8601(since)
+      }
 
       filtered =
         api_conn(reader_secret, version)
-        |> get("#{path}/issues?#{query}")
+        |> get("#{path}/issues?#{URI.encode_query(filters)}")
 
-      assert Enum.any?(
-               assert_schema(filtered, "/repos/{owner}/{repo}/issues", :get, 200),
-               &(&1["id"] == created["id"])
-             )
+      assert [%{"id" => target_id, "number" => target_number}] =
+               assert_schema(filtered, "/repos/{owner}/{repo}/issues", :get, 200)
+
+      assert target_id == created["id"]
+      assert target_number == created["number"]
+
+      for {filter, decoy} <- decoys do
+        relaxed_filters =
+          if filter == "state",
+            do: Map.put(filters, "state", "all"),
+            else: Map.delete(filters, filter)
+
+        relaxed =
+          api_conn(reader_secret, version)
+          |> get("#{path}/issues?#{URI.encode_query(relaxed_filters)}")
+          |> assert_schema("/repos/{owner}/{repo}/issues", :get, 200)
+
+        assert MapSet.new(Enum.map(relaxed, & &1["id"])) ==
+                 MapSet.new([created["id"], decoy.id])
+      end
 
       closed =
         api_conn(reader_secret, version)
@@ -152,19 +215,11 @@ defmodule FornacastAPI.IssueWorkflowTest do
 
       assert response(deleted, 204)
 
-      assert_audits_safe(
-        repository,
-        writer_key.id,
-        [reader_secret, writer_secret],
-        ["reader issue #{version}", "reader body #{version}", "edited body #{version}"],
-        version
-      )
-
       assert_workflow_audits(
         repository,
         version,
-        reader,
         writer,
+        reader_key.id,
         writer_key.id,
         created,
         comment_body,
@@ -177,6 +232,23 @@ defmodule FornacastAPI.IssueWorkflowTest do
           {"issue.updated", closed, reader},
           {"issue.updated", reopened, reader},
           {"issue_comment.deleted", deleted, reader}
+        ],
+        [
+          reader_secret,
+          writer_secret,
+          "reader issue #{version}",
+          "reader body #{version}",
+          "edited #{version}",
+          "edited body #{version}",
+          "comment #{version}",
+          "changed comment #{version}",
+          "bug",
+          "help wanted",
+          assignee.username,
+          "closed",
+          "completed",
+          "open",
+          "reopened"
         ]
       )
     end
@@ -363,6 +435,42 @@ defmodule FornacastAPI.IssueWorkflowTest do
     })
   end
 
+  defp filtered_issue(repository, author, number, labels, assignee, opts) do
+    updated_at = Keyword.fetch!(opts, :updated_at)
+    state = Keyword.get(opts, :state, :open)
+
+    issue =
+      Repo.insert!(%Issue{
+        repository_id: repository.id,
+        number: number,
+        kind: Keyword.get(opts, :kind, :issue),
+        title: "filter decoy #{number}",
+        state: state,
+        state_reason: if(state == :closed, do: :completed),
+        author_user_id: author.id,
+        inserted_at: updated_at,
+        updated_at: updated_at
+      })
+
+    Enum.each(labels, fn label ->
+      %IssueLabel{}
+      |> IssueLabel.changeset(%{issue_id: issue.id, label_id: label.id})
+      |> Repo.insert!()
+    end)
+
+    if assignee do
+      %IssueAssignee{}
+      |> IssueAssignee.changeset(%{issue_id: issue.id, user_id: assignee.id})
+      |> Repo.insert!()
+    end
+
+    issue
+  end
+
+  defp label(labels, normalized_name) do
+    Enum.find(labels, &(&1.normalized_name == normalized_name))
+  end
+
   defp api_conn(secret, version) do
     build_conn()
     |> put_req_header("user-agent", @user_agent)
@@ -421,7 +529,7 @@ defmodule FornacastAPI.IssueWorkflowTest do
       |> Map.fetch!("/repos/{owner}/{repo}/issues")
       |> Map.fetch!(:post)
       |> Map.fetch!(:responses)
-      |> Map.fetch!("422")
+      |> Map.fetch!("410")
       |> Map.fetch!(:content)
       |> Map.fetch!("application/json")
       |> Map.fetch!(:schema)
@@ -429,36 +537,16 @@ defmodule FornacastAPI.IssueWorkflowTest do
     assert {:ok, _} = OpenApiSpex.cast_value(body, schema, document)
   end
 
-  defp assert_audits_safe(repository, token_id, secrets, request_values, version) do
-    audits =
-      from(event in AuditEvent,
-        where:
-          event.metadata["repository_id"] == ^repository.id and
-            event.metadata["api_version"] == ^version
-      )
-      |> Repo.all()
-
-    assert Enum.any?(
-             audits,
-             &(&1.metadata["token_id"] == token_id and &1.metadata["result"] == "success")
-           )
-
-    Enum.each(audits, fn audit ->
-      metadata = JSON.encode!(audit.metadata)
-      Enum.each(secrets, &refute(metadata =~ &1))
-      Enum.each(request_values, &refute(metadata =~ &1))
-    end)
-  end
-
   defp assert_workflow_audits(
          repository,
          version,
-         reader,
          writer,
+         reader_token_id,
          writer_token_id,
          issue,
          comment,
-         events
+         events,
+         sensitive_values
        ) do
     audits =
       from(event in AuditEvent,
@@ -498,10 +586,15 @@ defmodule FornacastAPI.IssueWorkflowTest do
       assert audit.metadata["result"] == "success"
 
       assert audit.metadata["token_id"] ==
-               if(actor.id == writer.id, do: writer_token_id, else: audit.metadata["token_id"])
+               if(actor.id == writer.id, do: writer_token_id, else: reader_token_id)
 
-      refute JSON.encode!(audit.metadata) =~ reader.username
-      refute JSON.encode!(audit.metadata) =~ writer.username
+      serialized_details =
+        audit
+        |> Map.from_struct()
+        |> Map.take([:metadata, :details])
+        |> JSON.encode!()
+
+      Enum.each(sensitive_values, &refute(serialized_details =~ &1))
     end)
   end
 end
