@@ -1266,6 +1266,47 @@ defmodule ForgeIssuesTest do
              ForgeIssues.get_comment(nil, writer.username, repository.slug, first.id)
   end
 
+  test "anonymous public comment mutations are forbidden without auditing", %{
+    writer: writer,
+    repository: repository
+  } do
+    repository = Repo.update!(Ecto.Changeset.change(repository, visibility: :public))
+    issue = issue_fixture(repository, writer)
+    comment = insert_comment(issue, writer, "Protected")
+
+    assert {:error, :forbidden} =
+             ForgeIssues.create_comment(
+               nil,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{"body" => "No"},
+               request_metadata()
+             )
+
+    assert {:error, :forbidden} =
+             ForgeIssues.update_comment(
+               nil,
+               writer.username,
+               repository.slug,
+               comment.id,
+               %{"body" => "No"},
+               request_metadata()
+             )
+
+    assert {:error, :forbidden} =
+             ForgeIssues.delete_comment(
+               nil,
+               writer.username,
+               repository.slug,
+               comment.id,
+               request_metadata()
+             )
+
+    assert Repo.get!(Comment, comment.id).body == "Protected"
+    assert 0 == Repo.aggregate(AuditEvent, :count, :id)
+  end
+
   test "private comment reads are authorized and mask unauthorized callers", %{
     writer: writer,
     repository: repository

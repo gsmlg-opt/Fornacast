@@ -175,9 +175,10 @@ defmodule ForgeIssues do
   def create_comment(actor, owner_slug, repository_slug, number, attrs, request_metadata)
       when is_integer(number) and number > 0 and is_map(attrs) and is_map(request_metadata) do
     with {:ok, repository} <-
-           fetch_repository(actor, owner_slug, repository_slug, :repository_read) do
-      actor
-      |> create_comment_multi(repository, number, attrs, request_metadata)
+           fetch_repository(actor, owner_slug, repository_slug, :repository_read),
+         {:ok, multi} <-
+           comment_create_mutation_multi(actor, repository, number, attrs, request_metadata) do
+      multi
       |> transaction()
       |> map_comment_result()
     end
@@ -199,9 +200,10 @@ defmodule ForgeIssues do
       when is_integer(comment_id) and comment_id > 0 and is_map(attrs) and
              is_map(request_metadata) do
     with {:ok, repository} <-
-           fetch_repository(actor, owner_slug, repository_slug, :repository_read) do
-      actor
-      |> update_comment_multi(repository, comment_id, attrs, request_metadata)
+           fetch_repository(actor, owner_slug, repository_slug, :repository_read),
+         {:ok, multi} <-
+           comment_update_mutation_multi(actor, repository, comment_id, attrs, request_metadata) do
+      multi
       |> transaction()
       |> map_comment_result()
     end
@@ -222,9 +224,10 @@ defmodule ForgeIssues do
   def delete_comment(actor, owner_slug, repository_slug, comment_id, request_metadata)
       when is_integer(comment_id) and comment_id > 0 and is_map(request_metadata) do
     with {:ok, repository} <-
-           fetch_repository(actor, owner_slug, repository_slug, :repository_read) do
-      actor
-      |> delete_comment_multi(repository, comment_id, request_metadata)
+           fetch_repository(actor, owner_slug, repository_slug, :repository_read),
+         {:ok, multi} <-
+           comment_delete_mutation_multi(actor, repository, comment_id, request_metadata) do
+      multi
       |> transaction()
       |> map_comment_delete_result()
     end
@@ -249,6 +252,41 @@ defmodule ForgeIssues do
        do: {:ok, update_multi(actor, repository, number, attrs, request_metadata)}
 
   defp update_mutation_multi(_actor, _repository, _number, _attrs, _request_metadata),
+    do: {:error, :forbidden}
+
+  defp comment_create_mutation_multi(
+         %ForgeAccounts.User{} = actor,
+         repository,
+         number,
+         attrs,
+         request_metadata
+       ),
+       do: {:ok, create_comment_multi(actor, repository, number, attrs, request_metadata)}
+
+  defp comment_create_mutation_multi(_actor, _repository, _number, _attrs, _request_metadata),
+    do: {:error, :forbidden}
+
+  defp comment_update_mutation_multi(
+         %ForgeAccounts.User{} = actor,
+         repository,
+         comment_id,
+         attrs,
+         request_metadata
+       ),
+       do: {:ok, update_comment_multi(actor, repository, comment_id, attrs, request_metadata)}
+
+  defp comment_update_mutation_multi(_actor, _repository, _comment_id, _attrs, _request_metadata),
+    do: {:error, :forbidden}
+
+  defp comment_delete_mutation_multi(
+         %ForgeAccounts.User{} = actor,
+         repository,
+         comment_id,
+         request_metadata
+       ),
+       do: {:ok, delete_comment_multi(actor, repository, comment_id, request_metadata)}
+
+  defp comment_delete_mutation_multi(_actor, _repository, _comment_id, _request_metadata),
     do: {:error, :forbidden}
 
   @doc false
