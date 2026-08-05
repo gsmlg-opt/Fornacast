@@ -39,7 +39,7 @@ defmodule ForgePulls do
 
       {:ok,
        %Page{
-         entries: load_issues(pulls),
+         entries: load_issues(pulls, repository),
          total: total,
          page: filters.page,
          per_page: filters.per_page
@@ -53,7 +53,7 @@ defmodule ForgePulls do
       when is_integer(number) and number > 0 do
     with :ok <- authorize_read(actor, repository),
          %PullRequest{} = pull <- Repo.one(pull_query(repository, number)) do
-      {:ok, load_issue(pull)}
+      {:ok, pull |> refresh_analysis(repository) |> load_issue(repository)}
     else
       nil -> {:error, :not_found}
       {:error, _} = error -> error
@@ -190,16 +190,22 @@ defmodule ForgePulls do
   end
 
   defp resolve_updated_base(repository, pull, attrs) do
-    case attr(attrs, "base") do
-      nil ->
-        {:ok, %{}}
-
-      base ->
-        with {:ok, base_ref} <- branch_ref(base, :invalid_base),
-             :ok <- distinct_refs(pull.head_ref, base_ref),
-             {:ok, snapshot} <- resolve_ref(repository, base_ref, :invalid_base) do
-          {:ok, %{base_ref: snapshot.ref, base_sha: snapshot.oid}}
-        end
+    with {:ok, base_ref} <-
+           if(attr(attrs, "base"),
+             do: branch_ref(attr(attrs, "base"), :invalid_base),
+             else: {:ok, pull.base_ref}
+           ),
+         :ok <- distinct_refs(pull.head_ref, base_ref),
+         {:ok, head} <- resolve_ref(repository, pull.head_ref, :invalid_head),
+         {:ok, base} <- resolve_ref(repository, base_ref, :invalid_base) do
+      {:ok,
+       %{
+         base_ref: base.ref,
+         head_sha: head.oid,
+         base_sha: base.oid,
+         mergeable: nil,
+         mergeable_state: nil
+       }}
     end
   end
 
@@ -209,12 +215,13 @@ defmodule ForgePulls do
         branch_ref(branch, :invalid_head)
 
       [owner, branch] ->
-        owner = String.trim(owner)
-        owner_record = Repo.get(ForgeAccounts.User, repository.owner_user_id)
+        case ForgeAccounts.get_public_user(String.trim(owner)) do
+          {:ok, %{id: owner_id}} when owner_id == repository.owner_user_id ->
+            branch_ref(branch, :invalid_head)
 
-        if owner_record && owner == owner_record.username,
-          do: branch_ref(branch, :invalid_head),
-          else: {:error, :cross_repository_head}
+          _ ->
+            {:error, :cross_repository_head}
+        end
     end
   end
 
@@ -251,16 +258,7 @@ defmodule ForgePulls do
   defp issue_attrs(attrs),
     do:
       attrs
-      |> Map.take([
-        "title",
-        "body",
-        "state",
-        "state_reason",
-        :title,
-        :body,
-        :state,
-        :state_reason
-      ])
+      |> Map.take(["title", "body", :title, :body])
       |> Map.new(fn {key, value} -> {to_string(key), value} end)
 
   defp authorize_read(actor, repository),
@@ -333,7 +331,7 @@ defmodule ForgePulls do
 
   defp permitted_shared_attrs(attrs, :writer, _issue),
     do:
-      issue_attrs(
+      shared_issue_attrs(
         Map.take(attrs, [
           "title",
           "body",
@@ -347,7 +345,7 @@ defmodule ForgePulls do
       )
 
   defp permitted_shared_attrs(attrs, :author, issue) do
-    attrs = issue_attrs(Map.take(attrs, ["title", "body", "state", :title, :body, :state]))
+    attrs = shared_issue_attrs(Map.take(attrs, ["title", "body", "state", :title, :body, :state]))
 
     case {issue.state, attr(attrs, "state")} do
       {state, :closed} when state != :closed -> Map.put(attrs, "state_reason", :completed)
@@ -355,6 +353,21 @@ defmodule ForgePulls do
       _ -> attrs
     end
   end
+
+  defp shared_issue_attrs(attrs),
+    do:
+      attrs
+      |> Map.take([
+        "title",
+        "body",
+        "state",
+        "state_reason",
+        :title,
+        :body,
+        :state,
+        :state_reason
+      ])
+      |> Map.new(fn {key, value} -> {to_string(key), value} end)
 
   defp pull_query(repository, number),
     do:
@@ -366,9 +379,39 @@ defmodule ForgePulls do
         select: p
       )
 
-  defp load_issues(pulls), do: Enum.map(pulls, &load_issue/1)
-  defp load_issue(pull), do: %{pull | issue: Repo.get(Issue, pull.issue_id)}
-  defp create_result({:ok, %{pull_request: pull}}), do: {:ok, load_issue(pull)}
+  defp load_issues(pulls, repository) do
+    issues_by_id =
+      pulls
+      |> Enum.map(& &1.issue_id)
+      |> ForgeIssues.load_issue_metadata_by_ids(repository)
+      |> Map.new(&{&1.id, &1})
+
+    Enum.map(pulls, &%{&1 | issue: Map.fetch!(issues_by_id, &1.issue_id)})
+  end
+
+  defp load_issue(pull, repository), do: load_issues([pull], repository) |> hd()
+
+  defp refresh_analysis(pull, repository) do
+    with {:ok, head} <- resolve_ref(repository, pull.head_ref, :invalid_head),
+         {:ok, base} <- resolve_ref(repository, pull.base_ref, :invalid_base),
+         {:ok, refreshed} <-
+           pull
+           |> PullRequest.update_changeset(%{
+             head_sha: head.oid,
+             base_sha: base.oid,
+             mergeable: nil,
+             mergeable_state: nil
+           })
+           |> Repo.update() do
+      refreshed
+    else
+      _ -> pull
+    end
+  end
+
+  defp create_result({:ok, %{pull_request: pull}}),
+    do: {:ok, load_issue(pull, Repo.get!(ForgeRepos.Repository, pull.repository_id))}
+
   defp create_result({:error, :authorization, reason, _}), do: {:error, reason}
 
   defp create_result({:error, _step, %Ecto.Changeset{} = changeset, _}),
@@ -379,7 +422,9 @@ defmodule ForgePulls do
   defp create_result({:error, _step, _reason, _}),
     do: {:error, {:validation, [%{resource: "PullRequest", field: "base", code: :unprocessable}]}}
 
-  defp update_result({:ok, %{pull_request: pull}}), do: {:ok, load_issue(pull)}
+  defp update_result({:ok, %{pull_request: pull}}),
+    do: {:ok, load_issue(pull, Repo.get!(ForgeRepos.Repository, pull.repository_id))}
+
   defp update_result({:error, :authorization, reason, _}), do: {:error, reason}
 
   defp update_result({:error, _step, %Ecto.Changeset{} = changeset, _}),

@@ -1284,6 +1284,18 @@ defmodule ForgeIssues do
     end
   end
 
+  @doc "Loads canonical issue presentation metadata for repository-scoped identities."
+  @spec load_issue_metadata_by_ids([pos_integer()], ForgeRepos.Repository.t()) :: [Issue.t()]
+  def load_issue_metadata_by_ids(ids, %ForgeRepos.Repository{} = repository) when is_list(ids) do
+    issues =
+      from(issue in Issue,
+        where: issue.repository_id == ^repository.id and issue.id in ^ids
+      )
+      |> Repo.all()
+
+    do_load_issue_metadata(issues, repository)
+  end
+
   defp do_load_issue_metadata(issues, repository) do
     issue_ids = Enum.map(issues, & &1.id)
     labels = labels_by_issue(issue_ids)
