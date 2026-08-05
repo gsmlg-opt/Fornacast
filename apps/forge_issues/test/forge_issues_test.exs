@@ -239,6 +239,39 @@ defmodule ForgeIssuesTest do
     assert [old_label.id] == ForgeIssues.load_labels(issue) |> Enum.map(& &1.id)
   end
 
+  test "metadata maps owner member collaborator and none author associations", %{writer: writer} do
+    {:ok, organization} =
+      ForgeAccounts.create_organization(writer, %{
+        username: "issues-org-#{System.unique_integer([:positive])}"
+      })
+
+    repository = repository_fixture(organization)
+    member = user_fixture("member-#{System.unique_integer([:positive])}")
+    collaborator = user_fixture("collaborator-#{System.unique_integer([:positive])}")
+    stranger = user_fixture("stranger-#{System.unique_integer([:positive])}")
+    {:ok, _} = ForgeAccounts.add_organization_member(organization, member)
+
+    %Collaborator{}
+    |> Collaborator.changeset(%{
+      repository_id: repository.id,
+      user_id: collaborator.id,
+      role: :read
+    })
+    |> Repo.insert!()
+
+    associations =
+      [
+        issue_fixture(repository, writer),
+        issue_fixture(repository, member),
+        issue_fixture(repository, collaborator),
+        issue_fixture(repository, stranger)
+      ]
+      |> ForgeIssues.load_issue_metadata(repository)
+      |> Enum.map(& &1.author_association)
+
+    assert associations == ["OWNER", "MEMBER", "COLLABORATOR", "NONE"]
+  end
+
   defp issue_fixture(repository, author) do
     %Issue{
       repository_id: repository.id,
