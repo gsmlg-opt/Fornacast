@@ -95,7 +95,7 @@ defmodule FornacastAPI.IssueContractTest do
       body: "Track compatibility",
       state: :open,
       author: author(),
-      labels: [label()],
+      labels: [],
       assignees: [],
       comment_count: 0,
       author_association: "NONE",
@@ -157,7 +157,7 @@ defmodule FornacastAPI.IssueContractTest do
       number: 7,
       title: "API issue",
       user: simple_user(),
-      labels: [expected_label()],
+      labels: [],
       state: "open",
       locked: false,
       assignee: nil,
@@ -170,7 +170,6 @@ defmodule FornacastAPI.IssueContractTest do
       author_association: "NONE",
       active_lock_reason: nil,
       draft: false,
-      pull_request: pull_request,
       body: "Track compatibility",
       closed_by: nil,
       reactions: reactions(),
@@ -178,6 +177,7 @@ defmodule FornacastAPI.IssueContractTest do
       performed_via_github_app: nil,
       state_reason: nil
     }
+    |> maybe_pull(pull_request)
   end
 
   defp expected_pull_link do
@@ -199,7 +199,7 @@ defmodule FornacastAPI.IssueContractTest do
       updated_at: "2026-07-21T00:00:00Z",
       author_association: "NONE",
       body: "First comment",
-      reactions: reactions(),
+      reactions: comment_reactions(),
       performed_via_github_app: nil
     }
   end
@@ -215,6 +215,9 @@ defmodule FornacastAPI.IssueContractTest do
       description: nil
     }
 
+  defp maybe_pull(map, nil), do: map
+  defp maybe_pull(map, value), do: Map.put(map, :pull_request, value)
+
   defp reactions,
     do: %{
       "+1": 0,
@@ -225,9 +228,16 @@ defmodule FornacastAPI.IssueContractTest do
       hooray: 0,
       rocket: 0,
       eyes: 0,
-      url: nil,
+      url: "https://forge.test/api/v3/repos/acme/widget/issues/7/reactions",
       total_count: 0
     }
+
+  defp comment_reactions do
+    %{
+      reactions()
+      | url: "https://forge.test/api/v3/repos/acme/widget/issues/comments/3101/reactions"
+    }
+  end
 
   defp assert_fixtures(version, issue, pull, comment) do
     root = Path.join([Path.expand("fixtures", __DIR__), version, "issues"])

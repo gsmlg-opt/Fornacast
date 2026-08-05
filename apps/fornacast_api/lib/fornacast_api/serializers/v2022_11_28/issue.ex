@@ -2,11 +2,12 @@ defmodule FornacastAPI.Serializers.V2022_11_28.Issue do
   alias FornacastAPI.{Serializer, URL}
 
   def render(issue, opts) do
+    version = option(opts, :version, "2022-11-28")
     {owner, repo} = repository!(opts)
     url = URL.issue(owner, repo, issue.number)
 
     assignees =
-      Enum.map(issue.assignees || [], &Serializer.render("2022-11-28", :simple_user, &1, opts))
+      Enum.map(issue.assignees || [], &Serializer.render(version, :simple_user, &1, opts))
 
     labels = Enum.map(issue.labels || [], &render_label(&1, owner, repo))
 
@@ -21,7 +22,7 @@ defmodule FornacastAPI.Serializers.V2022_11_28.Issue do
       node_id: node_id("Issue", issue.id),
       number: issue.number,
       title: issue.title,
-      user: Serializer.render("2022-11-28", :simple_user, issue.author, opts),
+      user: Serializer.render(version, :simple_user, issue.author, opts),
       labels: labels,
       state: Atom.to_string(issue.state),
       locked: false,
@@ -35,14 +36,14 @@ defmodule FornacastAPI.Serializers.V2022_11_28.Issue do
       author_association: issue.author_association,
       active_lock_reason: nil,
       draft: false,
-      pull_request: pull_request(issue, owner, repo, opts),
       body: issue.body,
       closed_by: nil,
-      reactions: reactions(),
+      reactions: reactions(URL.issue_reactions(owner, repo, issue.number)),
       timeline_url: url <> "/timeline",
       performed_via_github_app: nil,
       state_reason: enum_or_nil(issue.state_reason)
     }
+    |> maybe_put_pull_request(pull_request(issue, owner, repo, opts))
   end
 
   def render_label(label, owner, repo) do
@@ -85,7 +86,10 @@ defmodule FornacastAPI.Serializers.V2022_11_28.Issue do
   defp enum_or_nil(nil), do: nil
   defp enum_or_nil(value), do: Atom.to_string(value)
 
-  defp reactions,
+  defp maybe_put_pull_request(map, nil), do: map
+  defp maybe_put_pull_request(map, value), do: Map.put(map, :pull_request, value)
+
+  defp reactions(url),
     do: %{
       "+1": 0,
       "-1": 0,
@@ -95,7 +99,7 @@ defmodule FornacastAPI.Serializers.V2022_11_28.Issue do
       hooray: 0,
       rocket: 0,
       eyes: 0,
-      url: nil,
+      url: url,
       total_count: 0
     }
 end

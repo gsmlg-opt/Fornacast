@@ -66,19 +66,20 @@ defmodule FornacastAPI.Validators.V2022_11_28 do
     "allow_rebase_merge"
   ]
 
+  def validate(:issue_create, body), do: Issue.validate(:issue_create, body)
+  def validate(:issue_update, body), do: Issue.validate(:issue_update, body)
+  def validate(:issue_comment_create, body), do: Issue.validate(:issue_comment_create, body)
+  def validate(:issue_comment_update, body), do: Issue.validate(:issue_comment_update, body)
+
   def validate(operation, body) when is_atom(operation) and is_map(body) do
-    if operation in [:issue_create, :issue_update, :issue_comment_create, :issue_comment_update] do
-      Issue.validate(operation, body)
-    else
-      %{resource: resource, required: required, fields: fields} =
-        Map.fetch!(@schemas, operation)
+    %{resource: resource, required: required, fields: fields} =
+      Map.fetch!(@schemas, operation)
 
-      fields = Map.new(fields, fn {field, type} -> {field, predicate(type)} end)
+    fields = Map.new(fields, fn {field, type} -> {field, predicate(type)} end)
 
-      with {:ok, validated} <-
-             FornacastAPI.RequestValidator.validate_fields(body, resource, fields, required) do
-        validate_repository_constraints(operation, validated, resource)
-      end
+    with {:ok, validated} <-
+           FornacastAPI.RequestValidator.validate_fields(body, resource, fields, required) do
+      validate_repository_constraints(operation, validated, resource)
     end
   end
 

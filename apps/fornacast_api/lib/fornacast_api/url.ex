@@ -16,6 +16,8 @@ defmodule FornacastAPI.URL do
   def issue_comment(owner, repo, id), do: repository(owner, repo) <> "/issues/comments/#{id}"
   def label(owner, repo, name), do: repository(owner, repo) <> "/labels/#{segment(name)}"
   def pull(owner, repo, number), do: repository(owner, repo) <> "/pulls/#{number}"
+  def issue_reactions(owner, repo, number), do: issue(owner, repo, number) <> "/reactions"
+  def issue_comment_reactions(owner, repo, id), do: issue_comment(owner, repo, id) <> "/reactions"
 
   defp absolute(path) when is_binary(path) do
     if String.starts_with?(path, "/") do
