@@ -100,9 +100,9 @@ defmodule FornacastAPI.SerializationTest do
         )
 
       assert get_resp_header(response, "link") == [
-               "<https://forge.test/api/v3/user/repos?page=3&per_page=50&type=all>; rel=\"next\", " <>
+               "<https://forge.test/api/v3/user/repos?page=1&per_page=50&type=all>; rel=\"first\", " <>
                  "<https://forge.test/api/v3/user/repos?page=1&per_page=50&type=all>; rel=\"prev\", " <>
-                 "<https://forge.test/api/v3/user/repos?page=1&per_page=50&type=all>; rel=\"first\", " <>
+                 "<https://forge.test/api/v3/user/repos?page=3&per_page=50&type=all>; rel=\"next\", " <>
                  "<https://forge.test/api/v3/user/repos?page=4&per_page=50&type=all>; rel=\"last\""
              ]
     end
@@ -121,9 +121,9 @@ defmodule FornacastAPI.SerializationTest do
       suffix = "&per_page=50&q=a%20b&q=a%2Fb&tag=a&tag=b&z=last"
 
       assert get_resp_header(response, "link") == [
-               "<#{prefix}page=3#{suffix}>; rel=\"next\", " <>
+               "<#{prefix}page=1#{suffix}>; rel=\"first\", " <>
                  "<#{prefix}page=1#{suffix}>; rel=\"prev\", " <>
-                 "<#{prefix}page=1#{suffix}>; rel=\"first\", " <>
+                 "<#{prefix}page=3#{suffix}>; rel=\"next\", " <>
                  "<#{prefix}page=4#{suffix}>; rel=\"last\""
              ]
     end
@@ -139,10 +139,10 @@ defmodule FornacastAPI.SerializationTest do
                |> Pagination.put_link_header(first, url)
                |> get_resp_header("link")
 
+      assert first_link =~ ~s(rel="first")
       assert first_link =~ ~s(rel="next")
       assert first_link =~ ~s(rel="last")
       refute first_link =~ ~s(rel="prev")
-      refute first_link =~ ~s(rel="first")
 
       assert [last_link] =
                conn(:get, "https://attacker.invalid")
@@ -165,12 +165,11 @@ defmodule FornacastAPI.SerializationTest do
 
       for {page, expected} <- [
             {struct!(Fornacast.Page, entries: [], total: 3, page: 4, per_page: 1),
-             "<#{url}?page=3&per_page=1>; rel=\"prev\", " <>
-               "<#{url}?page=1&per_page=1>; rel=\"first\", " <>
+             "<#{url}?page=1&per_page=1>; rel=\"first\", " <>
+               "<#{url}?page=3&per_page=1>; rel=\"prev\", " <>
                "<#{url}?page=3&per_page=1>; rel=\"last\""},
             {struct!(Fornacast.Page, entries: [], total: 0, page: 2, per_page: 30),
              "<#{url}?page=1&per_page=30>; rel=\"prev\", " <>
-               "<#{url}?page=1&per_page=30>; rel=\"first\", " <>
                "<#{url}?page=1&per_page=30>; rel=\"last\""}
           ] do
         assert [link] =

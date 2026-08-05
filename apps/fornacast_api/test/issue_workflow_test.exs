@@ -15,17 +15,27 @@ defmodule FornacastAPI.IssueWorkflowTest do
     reader = user("workflow-reader")
     writer = user("workflow-writer")
     assignee = user("workflow-assignee")
-    repository = repository(owner, "workflow")
-    grant(repository, reader, :read)
-    grant(repository, writer, :write)
-    grant(repository, assignee, :read)
-    {_reader_key, reader_secret} = pat(reader, ["public_repo"])
+    private_repository = repository(owner, "workflow-private", visibility: :private)
+    grant(private_repository, reader, :read)
+    {_reader_key, reader_secret} = pat(reader, ["repo"])
     {writer_key, writer_secret} = pat(writer, ["public_repo"])
 
     for version <- @versions do
+      private_read =
+        api_conn(reader_secret, version)
+        |> get("/api/v3/repos/workflow-owner/workflow-private/issues")
+
+      assert [] = assert_schema(private_read, "/repos/{owner}/{repo}/issues", :get, 200)
+      slug = "workflow-#{String.replace(version, "-", "")}"
+      repository = repository(owner, slug)
+      grant(repository, reader, :read)
+      grant(repository, writer, :write)
+      grant(repository, assignee, :read)
+      path = "/api/v3/repos/workflow-owner/#{slug}"
+
       issue =
         api_conn(reader_secret, version)
-        |> post_json("/api/v3/repos/workflow-owner/workflow/issues", %{
+        |> post_json("#{path}/issues", %{
           "title" => "reader issue #{version}",
           "body" => "reader body #{version}",
           "labels" => ["bug"],
@@ -33,20 +43,20 @@ defmodule FornacastAPI.IssueWorkflowTest do
         })
 
       created = assert_schema(issue, "/repos/{owner}/{repo}/issues", :post, 201)
-      assert created["number"] == if(version == hd(@versions), do: 1, else: 2)
+      assert created["number"] == 1
       assert created["labels"] == []
       assert created["assignees"] == []
 
       shown =
         api_conn(reader_secret, version)
-        |> get("/api/v3/repos/workflow-owner/workflow/issues/#{created["number"]}")
+        |> get("#{path}/issues/#{created["number"]}")
 
       assert assert_schema(shown, "/repos/{owner}/{repo}/issues/{issue_number}", :get, 200)["id"] ==
                created["id"]
 
       edited =
         api_conn(reader_secret, version)
-        |> patch_json("/api/v3/repos/workflow-owner/workflow/issues/#{created["number"]}", %{
+        |> patch_json("#{path}/issues/#{created["number"]}", %{
           "title" => "edited #{version}",
           "body" => "edited body #{version}"
         })
@@ -60,7 +70,7 @@ defmodule FornacastAPI.IssueWorkflowTest do
       comment =
         api_conn(reader_secret, version)
         |> post_json(
-          "/api/v3/repos/workflow-owner/workflow/issues/#{created["number"]}/comments",
+          "#{path}/issues/#{created["number"]}/comments",
           %{
             "body" => "comment #{version}"
           }
@@ -72,7 +82,7 @@ defmodule FornacastAPI.IssueWorkflowTest do
       changed_comment =
         api_conn(reader_secret, version)
         |> patch_json(
-          "/api/v3/repos/workflow-owner/workflow/issues/comments/#{comment_body["id"]}",
+          "#{path}/issues/comments/#{comment_body["id"]}",
           %{
             "body" => "changed comment #{version}"
           }
@@ -88,7 +98,7 @@ defmodule FornacastAPI.IssueWorkflowTest do
       assigned =
         api_conn(writer_secret, version)
         |> put_req_header("x-request-id", "workflow-#{version}")
-        |> patch_json("/api/v3/repos/workflow-owner/workflow/issues/#{created["number"]}", %{
+        |> patch_json("#{path}/issues/#{created["number"]}", %{
           "labels" => ["bug"],
           "assignee" => assignee.username
         })
@@ -109,7 +119,7 @@ defmodule FornacastAPI.IssueWorkflowTest do
 
       filtered =
         api_conn(reader_secret, version)
-        |> get("/api/v3/repos/workflow-owner/workflow/issues?#{query}")
+        |> get("#{path}/issues?#{query}")
 
       assert Enum.any?(
                assert_schema(filtered, "/repos/{owner}/{repo}/issues", :get, 200),
@@ -118,7 +128,7 @@ defmodule FornacastAPI.IssueWorkflowTest do
 
       closed =
         api_conn(reader_secret, version)
-        |> patch_json("/api/v3/repos/workflow-owner/workflow/issues/#{created["number"]}", %{
+        |> patch_json("#{path}/issues/#{created["number"]}", %{
           "state" => "closed",
           "state_reason" => "completed"
         })
@@ -128,7 +138,7 @@ defmodule FornacastAPI.IssueWorkflowTest do
 
       reopened =
         api_conn(reader_secret, version)
-        |> patch_json("/api/v3/repos/workflow-owner/workflow/issues/#{created["number"]}", %{
+        |> patch_json("#{path}/issues/#{created["number"]}", %{
           "state" => "open",
           "state_reason" => "reopened"
         })
@@ -138,7 +148,7 @@ defmodule FornacastAPI.IssueWorkflowTest do
 
       deleted =
         api_conn(reader_secret, version)
-        |> delete("/api/v3/repos/workflow-owner/workflow/issues/comments/#{comment_body["id"]}")
+        |> delete("#{path}/issues/comments/#{comment_body["id"]}")
 
       assert response(deleted, 204)
 
@@ -180,7 +190,9 @@ defmodule FornacastAPI.IssueWorkflowTest do
              %{"body" => "blocked"}},
             {:patch,
              "/api/v3/repos/disabled-owner/disabled/issues/comments/#{ordinary_comment.id}",
-             %{"body" => "blocked"}}
+             %{"body" => "blocked"}},
+            {:delete,
+             "/api/v3/repos/disabled-owner/disabled/issues/comments/#{ordinary_comment.id}", nil}
           ] do
         assert %{"message" => "Issues are disabled for this repository"} =
                  request(api_conn(secret, version), method, path, body) |> json_response(410)
@@ -230,6 +242,14 @@ defmodule FornacastAPI.IssueWorkflowTest do
                  :patch,
                  200
                )
+
+      assert response(
+               api_conn(secret, version)
+               |> delete(
+                 "/api/v3/repos/disabled-owner/disabled/issues/comments/#{comment_body["id"]}"
+               ),
+               204
+             )
     end
   end
 
@@ -296,7 +316,7 @@ defmodule FornacastAPI.IssueWorkflowTest do
     |> Repository.create_changeset(%{
       name: slug,
       slug: slug,
-      visibility: :public,
+      visibility: Keyword.get(opts, :visibility, :public),
       default_branch: "main",
       has_issues: Keyword.get(opts, :has_issues, true),
       allow_merge_commit: true
@@ -343,6 +363,7 @@ defmodule FornacastAPI.IssueWorkflowTest do
   defp request(conn, :get, path, _body), do: get(conn, path)
   defp request(conn, :post, path, body), do: post_json(conn, path, body)
   defp request(conn, :patch, path, body), do: patch_json(conn, path, body)
+  defp request(conn, :delete, path, _body), do: delete(conn, path)
 
   defp assert_schema(conn, path, method, status) do
     body = json_response(conn, status)
