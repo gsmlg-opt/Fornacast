@@ -214,8 +214,10 @@ defmodule FornacastAPI.IssueWorkflowTest do
             {:delete,
              "/api/v3/repos/disabled-owner/disabled/issues/comments/#{ordinary_comment.id}", nil}
           ] do
-        assert %{"message" => "Issues are disabled for this repository"} =
-                 request(api_conn(secret, version), method, path, body) |> json_response(410)
+        conn = request(api_conn(secret, version), method, path, body)
+        error = json_response(conn, 410)
+        assert %{"message" => "Issues are disabled for this repository"} = error
+        assert_basic_error_schema(version, error)
       end
 
       shown =
@@ -409,6 +411,22 @@ defmodule FornacastAPI.IssueWorkflowTest do
     |> File.read!()
     |> JSON.decode!()
     |> OpenApiSpex.OpenApi.Decode.decode()
+  end
+
+  defp assert_basic_error_schema(version, body) do
+    document = openapi_document(version)
+
+    schema =
+      document.paths
+      |> Map.fetch!("/repos/{owner}/{repo}/issues")
+      |> Map.fetch!(:post)
+      |> Map.fetch!(:responses)
+      |> Map.fetch!("422")
+      |> Map.fetch!(:content)
+      |> Map.fetch!("application/json")
+      |> Map.fetch!(:schema)
+
+    assert {:ok, _} = OpenApiSpex.cast_value(body, schema, document)
   end
 
   defp assert_audits_safe(repository, token_id, secrets, request_values, version) do
