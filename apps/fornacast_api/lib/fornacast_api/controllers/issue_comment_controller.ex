@@ -58,55 +58,51 @@ defmodule FornacastAPI.IssueCommentController do
   end
 
   def create(conn, %{"owner" => owner, "repo" => repo, "issue_number" => issue_number}) do
-    with {:ok, number} <- positive_integer(issue_number) do
-      mutate(
-        conn,
-        owner,
-        repo,
-        :issue_comment_create,
-        @create_url,
-        fn actor, attrs, metadata ->
-          ForgeIssues.create_comment(actor, owner, repo, number, attrs, metadata)
-        end,
-        :json,
-        201,
-        number
-      )
-    else
-      {:error, reason} -> render_error(conn, reason, @create_url)
-    end
+    mutate(
+      conn,
+      owner,
+      repo,
+      :issue_comment_create,
+      @create_url,
+      fn -> positive_integer(issue_number) end,
+      fn actor, number, attrs, metadata ->
+        ForgeIssues.create_comment(actor, owner, repo, number, attrs, metadata)
+      end,
+      201,
+      :target
+    )
   end
 
   def update(conn, %{"owner" => owner, "repo" => repo, "comment_id" => comment_id}) do
-    with {:ok, id} <- positive_integer(comment_id) do
-      mutate(
-        conn,
-        owner,
-        repo,
-        :issue_comment_update,
-        @update_url,
-        fn actor, attrs, metadata ->
-          ForgeIssues.update_comment(actor, owner, repo, id, attrs, metadata)
-        end,
-        :json,
-        200
-      )
-    else
-      {:error, reason} -> render_error(conn, reason, @update_url)
-    end
+    mutate(
+      conn,
+      owner,
+      repo,
+      :issue_comment_update,
+      @update_url,
+      fn -> positive_integer(comment_id) end,
+      fn actor, id, attrs, metadata ->
+        ForgeIssues.update_comment(actor, owner, repo, id, attrs, metadata)
+      end,
+      200,
+      :comment
+    )
   end
 
   def delete(conn, %{"owner" => owner, "repo" => repo, "comment_id" => comment_id}) do
-    with {:ok, id} <- positive_integer(comment_id),
-         {:ok, %{actor: actor} = authentication} <- require_auth(conn),
+    with {:ok, %{actor: actor} = authentication} <- require_auth(conn),
          {:ok, repository} <-
            ForgeRepos.fetch_authorized_repository(actor, owner, repo, :repository_read),
          {:ok, accepted_scopes} <-
            authorize_scope(authentication, :repository_mutation, repository.visibility) do
       conn = Plug.Conn.assign(conn, :accepted_scopes, accepted_scopes)
 
-      case ForgeIssues.delete_comment(actor, owner, repo, id, RequestContext.metadata(conn)) do
-        :ok -> Response.no_content(conn, accepted_scopes: accepted_scopes)
+      with {:ok, id} <- positive_integer(comment_id) do
+        case ForgeIssues.delete_comment(actor, owner, repo, id, RequestContext.metadata(conn)) do
+          :ok -> Response.no_content(conn, accepted_scopes: accepted_scopes)
+          {:error, reason} -> render_error(conn, reason, @delete_url)
+        end
+      else
         {:error, reason} -> render_error(conn, reason, @delete_url)
       end
     else
@@ -120,10 +116,10 @@ defmodule FornacastAPI.IssueCommentController do
          repo,
          operation,
          documentation_url,
+         target_fun,
          operation_fun,
-         :json,
          status,
-         issue_number \\ nil
+         issue_number_source
        ) do
     version = conn.assigns.api_version
 
@@ -134,21 +130,33 @@ defmodule FornacastAPI.IssueCommentController do
            authorize_scope(authentication, :repository_mutation, repository.visibility) do
       conn = Plug.Conn.assign(conn, :accepted_scopes, accepted_scopes)
 
-      with {:ok, body, conn} <- read_authorized_body(conn, accepted_scopes),
-           {:ok, attrs} <- RequestValidator.validate(version, operation, body),
-           {:ok, comment} <- operation_fun.(actor, attrs, RequestContext.metadata(conn)) do
-        Response.json(
-          conn,
-          status,
-          Serializer.render(version, :issue_comment, comment,
-            owner: owner,
-            repo: repo,
-            issue_number: issue_number || comment.issue_number
-          ),
-          accepted_scopes: accepted_scopes
-        )
+      with {:ok, target} <- target_fun.() do
+        case read_authorized_body(conn, accepted_scopes) do
+          {:ok, body, body_conn} ->
+            with {:ok, attrs} <- RequestValidator.validate(version, operation, body),
+                 {:ok, comment} <-
+                   operation_fun.(actor, target, attrs, RequestContext.metadata(body_conn)) do
+              issue_number =
+                if issue_number_source == :target, do: target, else: comment.issue_number
+
+              Response.json(
+                body_conn,
+                status,
+                Serializer.render(version, :issue_comment, comment,
+                  owner: owner,
+                  repo: repo,
+                  issue_number: issue_number
+                ),
+                accepted_scopes: accepted_scopes
+              )
+            else
+              {:error, reason} -> render_error(body_conn, reason, documentation_url)
+            end
+
+          {:error, %Error{} = error, _reason, body_conn} ->
+            Response.error(body_conn, error)
+        end
       else
-        {:error, %Error{} = error, _reason, body_conn} -> Response.error(body_conn, error)
         {:error, reason} -> render_error(conn, reason, documentation_url)
       end
     else

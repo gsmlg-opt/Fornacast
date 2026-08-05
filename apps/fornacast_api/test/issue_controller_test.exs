@@ -94,6 +94,83 @@ defmodule FornacastAPI.IssueControllerTest do
     end
   end
 
+  test "validation and domain errors respond with the consumed body connection" do
+    alice = user("alice")
+    repository(alice, "example")
+    {_key, secret} = pat(alice, ["public_repo"])
+
+    for version <- @versions do
+      for {method, path, body, status, docs} <- [
+            {:post, "/api/v3/repos/alice/example/issues", ~s({"title":""}), 422,
+             @issue_docs.create},
+            {:patch, "/api/v3/repos/alice/example/issues/999", ~s({"title":"missing"}), 404,
+             @issue_docs.update},
+            {:post, "/api/v3/repos/alice/example/issues/999/comments", ~s({"body":""}), 422,
+             @issue_docs.comment_create},
+            {:patch, "/api/v3/repos/alice/example/issues/comments/999", ~s({"body":"missing"}),
+             404, @issue_docs.comment_update}
+          ] do
+        conn = request(api_conn(secret, version), method, path, body)
+        assert json_response(conn, status)["documentation_url"] == docs
+        assert_scope_headers(conn, "public_repo", "public_repo, repo")
+        assert adapter_request_body(conn) == ""
+      end
+    end
+  end
+
+  test "mutation authentication and repository masking precede identifier parsing" do
+    alice = user("alice")
+    bob = user("bob")
+    repository(alice, "public")
+    repository(alice, "private", visibility: :private)
+    {_owner_key, owner_secret} = pat(alice, ["public_repo"])
+    {_bob_key, bob_secret} = pat(bob, ["repo"])
+    {_insufficient_key, insufficient_secret} = pat(alice, ["read:org"])
+
+    mutations = [
+      {:patch, "/api/v3/repos/alice/%s/issues/not-a-number", "{", @issue_docs.update},
+      {:post, "/api/v3/repos/alice/%s/issues/not-a-number/comments", "{",
+       @issue_docs.comment_create},
+      {:patch, "/api/v3/repos/alice/%s/issues/comments/not-a-number", "{",
+       @issue_docs.comment_update},
+      {:delete, "/api/v3/repos/alice/%s/issues/comments/not-a-number", nil,
+       @issue_docs.comment_delete}
+    ]
+
+    for version <- @versions,
+        {method, path_template, body, docs} <- mutations do
+      public_path = String.replace(path_template, "%s", "public")
+
+      missing = request(api_conn(nil, version), method, public_path, body)
+      assert_error(missing, 401, "Requires authentication", docs)
+      assert_scope_headers(missing, "", "")
+
+      invalid = request(api_conn("fc_pat_invalid", version), method, public_path, body)
+      assert json_response(invalid, 401)["message"] == "Bad credentials"
+      assert_scope_headers(invalid, "", "")
+
+      insufficient = request(api_conn(insufficient_secret, version), method, public_path, body)
+
+      assert_error(
+        insufficient,
+        403,
+        "Resource not accessible by personal access token",
+        docs
+      )
+
+      assert_scope_headers(insufficient, "read:org", "public_repo, repo")
+
+      malformed = request(api_conn(owner_secret, version), method, public_path, body)
+      assert_error(malformed, 404, "Not Found", docs)
+      assert_scope_headers(malformed, "public_repo", "public_repo, repo")
+
+      private_path = String.replace(path_template, "%s", "private")
+      hidden = request(api_conn(bob_secret, version), method, private_path, body)
+      assert_error(hidden, 404, "Not Found", docs)
+      assert_scope_headers(hidden, "repo", "")
+    end
+  end
+
   test "repo scope succeeds on every public and private route while legacy scopes never mutate" do
     alice = user("alice")
     public = repository(alice, "public")
@@ -338,15 +415,15 @@ defmodule FornacastAPI.IssueControllerTest do
             {:get, "/api/v3/repos/alice/example/issues/0", @issue_docs.show, "", ""},
             {:get, "/api/v3/repos/alice/example/issues/nope", @issue_docs.show, "", ""},
             {:patch, "/api/v3/repos/alice/example/issues/-1", @issue_docs.update, "public_repo",
-             ""},
+             "public_repo, repo"},
             {:get, "/api/v3/repos/alice/example/issues/0/comments", @issue_docs.comment_index, "",
              ""},
             {:post, "/api/v3/repos/alice/example/issues/nope/comments",
-             @issue_docs.comment_create, "public_repo", ""},
+             @issue_docs.comment_create, "public_repo", "public_repo, repo"},
             {:patch, "/api/v3/repos/alice/example/issues/comments/0", @issue_docs.comment_update,
-             "public_repo", ""},
+             "public_repo", "public_repo, repo"},
             {:delete, "/api/v3/repos/alice/example/issues/comments/nope",
-             @issue_docs.comment_delete, "public_repo", ""}
+             @issue_docs.comment_delete, "public_repo", "public_repo, repo"}
           ] do
         conn =
           request(
@@ -951,6 +1028,9 @@ defmodule FornacastAPI.IssueControllerTest do
     assert get_resp_header(conn, "x-oauth-scopes") == [oauth_scopes]
     assert get_resp_header(conn, "x-accepted-oauth-scopes") == [accepted_scopes]
   end
+
+  defp adapter_request_body(%Plug.Conn{adapter: {Plug.Adapters.Test.Conn, state}}),
+    do: state.req_body
 
   defp docs_for(:post, path) do
     if String.ends_with?(path, "/comments"),
