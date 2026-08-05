@@ -48,7 +48,10 @@ defmodule ForgePullsTest do
 
     for ref <- valid_refs do
       changeset =
-        PullRequest.create_changeset(%PullRequest{repository_id: 10}, valid_pull_attrs(%{head_ref: ref}))
+        PullRequest.create_changeset(
+          %PullRequest{repository_id: 10},
+          valid_pull_attrs(%{head_ref: ref})
+        )
 
       refute Map.has_key?(errors_on(changeset), :head_ref)
     end
@@ -76,7 +79,10 @@ defmodule ForgePullsTest do
 
     for ref <- invalid_refs do
       changeset =
-        PullRequest.create_changeset(%PullRequest{repository_id: 10}, valid_pull_attrs(%{head_ref: ref}))
+        PullRequest.create_changeset(
+          %PullRequest{repository_id: 10},
+          valid_pull_attrs(%{head_ref: ref})
+        )
 
       assert %{head_ref: ["must be a canonical branch ref"]} = errors_on(changeset)
     end
@@ -89,7 +95,9 @@ defmodule ForgePullsTest do
              operation |> MergeOperation.transition_changeset(:completed) |> errors_on()
 
     assert %{state: :merge_written} =
-             operation |> MergeOperation.transition_changeset(:merge_written) |> Ecto.Changeset.apply_changes()
+             operation
+             |> MergeOperation.transition_changeset(:merge_written)
+             |> Ecto.Changeset.apply_changes()
 
     assert %{failure_reason: nil} = MergeOperation.public(operation)
   end
@@ -116,7 +124,9 @@ defmodule ForgePullsTest do
     ref_advanced = %MergeOperation{state: :ref_advanced}
 
     assert %{state: :merge_written} =
-             prepared |> MergeOperation.merge_written_changeset() |> Ecto.Changeset.apply_changes()
+             prepared
+             |> MergeOperation.merge_written_changeset()
+             |> Ecto.Changeset.apply_changes()
 
     assert %{state: :ref_advanced} =
              merge_written
@@ -124,10 +134,14 @@ defmodule ForgePullsTest do
              |> Ecto.Changeset.apply_changes()
 
     assert %{state: :completed} =
-             ref_advanced |> MergeOperation.completed_changeset() |> Ecto.Changeset.apply_changes()
+             ref_advanced
+             |> MergeOperation.completed_changeset()
+             |> Ecto.Changeset.apply_changes()
 
     failed = MergeOperation.failed_changeset(prepared, "failure\n\u0000reason")
-    assert %{state: :failed, failure_reason: "failure reason"} = Ecto.Changeset.apply_changes(failed)
+
+    assert %{state: :failed, failure_reason: "failure reason"} =
+             Ecto.Changeset.apply_changes(failed)
 
     for {operation, target} <- [
           {prepared, :ref_advanced},
