@@ -191,14 +191,14 @@ defmodule ForgeIssues.NumberAllocatorTest do
     assert :counters.get(counter, 1) == expected_attempts
   end
 
-  test "allocates eight distinct numbers concurrently across identity kinds", %{
+  test "allocates twenty distinct numbers concurrently across identity kinds", %{
     actor: actor,
     repository: repository
   } do
     parent = self()
 
     tasks =
-      for index <- 1..8 do
+      for index <- 1..20 do
         Task.async(fn ->
           receive do
             :go ->
@@ -231,6 +231,6 @@ defmodule ForgeIssues.NumberAllocatorTest do
       |> Enum.map(fn {:ok, number} -> number end)
       |> Enum.sort()
 
-    assert numbers == Enum.to_list(1..8)
+    assert numbers == Enum.to_list(1..20)
   end
 end

@@ -3,10 +3,12 @@ defmodule FornacastAPI.IssueContractTest do
 
   alias ForgeAccounts.User
   alias ForgeIssues.{Comment, Issue, Label}
+  alias Fornacast.Page
 
   alias FornacastAPI.{
     IssueContract,
     IssueFixtureLiterals,
+    Pagination,
     RequestValidator,
     Serializer
   }
@@ -17,6 +19,48 @@ defmodule FornacastAPI.IssueContractTest do
     previous_base_url = Application.fetch_env!(:fornacast, :base_url)
     Application.put_env(:fornacast, :base_url, "https://forge.test")
     on_exit(fn -> Application.put_env(:fornacast, :base_url, previous_base_url) end)
+  end
+
+  test "pagination includes first, next, and last links from the first page" do
+    first_page =
+      Plug.Test.conn(:get, "/issues")
+      |> Pagination.put_link_header(
+        %Page{entries: [], total: 105, page: 1, per_page: 100},
+        "https://forge.test/issues?state=open"
+      )
+
+    assert [first_link, next_link, last_link] =
+             first_page
+             |> Plug.Conn.get_resp_header("link")
+             |> List.first()
+             |> String.split(", ")
+
+    assert first_link =~ ~s(page=1)
+    assert first_link =~ ~s(rel="first")
+    assert next_link =~ ~s(page=2)
+    assert next_link =~ ~s(rel="next")
+    assert last_link =~ ~s(page=2)
+    assert last_link =~ ~s(rel="last")
+  end
+
+  test "pagination retains previous, first, and last links from the second page" do
+    second_page =
+      Plug.Test.conn(:get, "/issues")
+      |> Pagination.put_link_header(
+        %Page{entries: [], total: 105, page: 2, per_page: 100},
+        "https://forge.test/issues?state=open"
+      )
+
+    assert [first_link, prev_link] =
+             second_page
+             |> Plug.Conn.get_resp_header("link")
+             |> List.first()
+             |> String.split(", ")
+
+    assert first_link =~ ~s(page=1)
+    assert first_link =~ ~s(rel="first")
+    assert prev_link =~ ~s(page=1)
+    assert prev_link =~ ~s(rel="prev")
   end
 
   test "accepts every issue mutation operation for both versions" do
