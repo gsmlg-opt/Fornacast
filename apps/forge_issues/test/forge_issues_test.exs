@@ -528,6 +528,56 @@ defmodule ForgeIssuesTest do
            end)
   end
 
+  test "audit metadata accepts atom string and mixed keys with string precedence", %{
+    writer: writer,
+    repository: repository
+  } do
+    atom_metadata = Map.put(request_metadata(), :request_id, "atom-only")
+
+    string_metadata = %{
+      "request_id" => "string-only",
+      "api_version" => "2022-11-28",
+      "ip_address" => "192.0.2.11",
+      "user_agent" => "Octokit/9.1",
+      "token_id" => 42,
+      "secret" => "must-not-be-audited"
+    }
+
+    mixed_metadata =
+      Map.merge(string_metadata, %{
+        "request_id" => "string-wins",
+        "token_id" => 43,
+        request_id: "atom-loses",
+        token_id: 99
+      })
+
+    for {title, metadata} <- [
+          {"Atom metadata", atom_metadata},
+          {"String metadata", string_metadata},
+          {"Mixed metadata", mixed_metadata}
+        ] do
+      assert {:ok, _issue} =
+               ForgeIssues.create(
+                 writer,
+                 writer.username,
+                 repository.slug,
+                 %{title: title},
+                 metadata
+               )
+    end
+
+    audits = Repo.all(from audit in AuditEvent, order_by: [asc: audit.id])
+
+    assert Enum.map(audits, & &1.metadata["request_id"]) == [
+             "atom-only",
+             "string-only",
+             "string-wins"
+           ]
+
+    assert Enum.map(audits, & &1.metadata["token_id"]) == [41, 42, 43]
+    assert Enum.all?(audits, &(not Map.has_key?(&1.metadata, "secret")))
+  end
+
   test "page accepts values beyond one and returns the requested stable slice", %{
     writer: writer,
     repository: repository
@@ -600,6 +650,124 @@ defmodule ForgeIssuesTest do
                request_metadata()
              )
 
+    assert Repo.aggregate(AuditEvent, :count, :id) == 0
+  end
+
+  test "anonymous public mutation attempts return forbidden without bypassing repository lookup",
+       %{
+         writer: writer
+       } do
+    repository = repository_fixture(writer, %{visibility: :public})
+    issue = issue_fixture(repository, writer, "Anonymous mutation")
+
+    assert {:error, :forbidden} =
+             ForgeIssues.create(
+               nil,
+               writer.username,
+               repository.slug,
+               %{title: "Anonymous create"},
+               request_metadata()
+             )
+
+    assert {:error, :forbidden} =
+             ForgeIssues.update(
+               nil,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{title: "Anonymous update"},
+               request_metadata()
+             )
+  end
+
+  test "create multi revalidates actor and repository state at transaction execution", %{
+    writer: writer,
+    repository: repository
+  } do
+    actor = readable_user(repository, "multi-create-actor")
+
+    actor_multi =
+      ForgeIssues.create_multi(
+        actor,
+        repository,
+        %{title: "Actor revoked"},
+        request_metadata()
+      )
+
+    actor |> Ecto.Changeset.change(state: :disabled) |> Repo.update!()
+    assert {:error, :authorization, :forbidden, %{}} = ForgeIssues.transaction(actor_multi)
+
+    issues_multi =
+      ForgeIssues.create_multi(
+        writer,
+        repository,
+        %{title: "Issues disabled"},
+        request_metadata()
+      )
+
+    repository |> Ecto.Changeset.change(has_issues: false) |> Repo.update!()
+    assert {:error, :authorization, :issues_disabled, %{}} = ForgeIssues.transaction(issues_multi)
+
+    deleted_repository = repository_fixture(writer)
+
+    deleted_multi =
+      ForgeIssues.create_multi(
+        writer,
+        deleted_repository,
+        %{title: "Repository deleted"},
+        request_metadata()
+      )
+
+    deleted_repository
+    |> Ecto.Changeset.change(deleted_at: DateTime.utc_now() |> DateTime.truncate(:second))
+    |> Repo.update!()
+
+    assert {:error, :authorization, :not_found, %{}} = ForgeIssues.transaction(deleted_multi)
+
+    assert Repo.aggregate(Issue, :count, :id) == 0
+    assert Repo.aggregate(AuditEvent, :count, :id) == 0
+  end
+
+  test "update multi revalidates repository permission and current issue ownership", %{
+    writer: writer,
+    repository: repository
+  } do
+    author = readable_user(repository, "multi-update-author")
+    issue = issue_fixture(repository, writer, "Revalidated update")
+
+    collaborator =
+      Repo.get_by!(Collaborator, repository_id: repository.id, user_id: author.id)
+      |> Ecto.Changeset.change(role: :write)
+      |> Repo.update!()
+
+    permission_multi =
+      ForgeIssues.update_multi(
+        author,
+        repository,
+        issue.number,
+        %{title: "Permission revoked"},
+        request_metadata()
+      )
+
+    collaborator |> Ecto.Changeset.change(role: :read) |> Repo.update!()
+    assert {:error, :authorization, :forbidden, %{}} = ForgeIssues.transaction(permission_multi)
+
+    own_issue = issue_fixture(repository, author, "Ownership changed")
+
+    ownership_multi =
+      ForgeIssues.update_multi(
+        author,
+        repository,
+        own_issue.number,
+        %{title: "Stale ownership"},
+        request_metadata()
+      )
+
+    Repo.update_all(from(row in Issue, where: row.id == ^own_issue.id),
+      set: [author_user_id: writer.id]
+    )
+
+    assert {:error, :authorization, :forbidden, %{}} = ForgeIssues.transaction(ownership_multi)
     assert Repo.aggregate(AuditEvent, :count, :id) == 0
   end
 
@@ -904,6 +1072,49 @@ defmodule ForgeIssuesTest do
       assert {:error, {:validation, [%{resource: "Issue", field: ^field, code: ^code}]}} =
                ForgeIssues.list(writer, writer.username, repository.slug, filters)
     end)
+  end
+
+  test "page offset accepts the signed 64-bit boundary and rejects overflow before querying", %{
+    writer: writer,
+    repository: repository
+  } do
+    max_signed_64 = 9_223_372_036_854_775_807
+
+    assert {:ok, %Page{entries: [], page: boundary_page, per_page: 1}} =
+             ForgeIssues.list(writer, writer.username, repository.slug, %{
+               page: max_signed_64 + 1,
+               per_page: 1
+             })
+
+    assert boundary_page == max_signed_64 + 1
+
+    assert {:error, {:validation, [%{resource: "Issue", field: "page", code: :unprocessable}]}} =
+             ForgeIssues.list(writer, writer.username, repository.slug, %{
+               page: String.duplicate("9", 100),
+               per_page: 100
+             })
+  end
+
+  test "mixed filter keys use string request values deterministically", %{
+    writer: writer,
+    repository: repository
+  } do
+    first = issue_fixture(repository, writer, "First mixed filter")
+    second = issue_fixture(repository, writer, "Second mixed filter")
+
+    assert {:ok, %Page{entries: [entry], page: 2, per_page: 1, total: 2}} =
+             ForgeIssues.list(writer, writer.username, repository.slug, %{
+               "state" => "open",
+               "page" => "2",
+               state: :closed,
+               page: 1,
+               per_page: 1,
+               sort: :created,
+               direction: :asc
+             })
+
+    assert first.id < second.id
+    assert entry.id == second.id
   end
 
   test "issue lists filter and page pull-backed identities with stable ties", %{

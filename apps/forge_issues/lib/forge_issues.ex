@@ -54,7 +54,7 @@ defmodule ForgeIssues do
       entries =
         query
         |> limit(^filters.per_page)
-        |> offset(^((filters.page - 1) * filters.per_page))
+        |> offset(^filters.offset)
         |> Repo.all()
         |> do_load_issue_metadata(repository)
 
@@ -91,28 +91,10 @@ defmodule ForgeIssues do
       when is_map(attrs) and is_map(request_metadata) do
     with {:ok, repository} <-
            fetch_repository(actor, owner_slug, repository_slug, :repository_read),
-         {:ok, actor} <- active_mutation_actor(actor),
-         :ok <- require_issues_enabled(repository),
-         {:ok, capability} <- create_capability(actor, repository) do
-      DefaultLabels.ensure(repository)
-
-      attrs = normalize_attrs(attrs)
-      identity_attrs = Map.take(attrs, ["title", "body", "state", "state_reason"])
-
-      Multi.new()
-      |> insert_numbered_identity(:issue, repository, actor, :issue, identity_attrs)
-      |> put_relationship_operations(:issue, repository, actor, attrs, capability)
-      |> Audit.record_multi(
-        :audit,
-        actor,
-        "issue.created",
-        "repository",
-        repository.id,
-        %{"repository_id" => repository.id, "result" => "success"},
-        request_metadata: safe_request_metadata(request_metadata)
-      )
+         {:ok, multi} <- create_mutation_multi(actor, repository, attrs, request_metadata) do
+      multi
       |> transaction()
-      |> map_create_result(repository)
+      |> map_create_result()
     end
   end
 
@@ -125,24 +107,112 @@ defmodule ForgeIssues do
       when is_integer(number) and number > 0 and is_map(attrs) and is_map(request_metadata) do
     with {:ok, repository} <-
            fetch_repository(actor, owner_slug, repository_slug, :repository_read),
-         {:ok, actor} <- active_mutation_actor(actor),
-         %Issue{} = issue <-
-           Repo.one(
-             from(issue in Issue,
-               where: issue.repository_id == ^repository.id and issue.number == ^number
-             )
-           ),
-         :ok <- require_identity_enabled(repository, issue),
-         {:ok, capability} <- mutation_capability(actor, repository, issue),
-         {:ok, attrs} <- mutation_attrs(normalize_attrs(attrs), capability, issue) do
+         {:ok, multi} <-
+           update_mutation_multi(actor, repository, number, attrs, request_metadata) do
+      multi
+      |> transaction()
+      |> map_update_result()
+    end
+  end
+
+  def update(_actor, _owner_slug, _repository_slug, _number, _attrs, _request_metadata),
+    do: {:error, :forbidden}
+
+  defp create_mutation_multi(%ForgeAccounts.User{} = actor, repository, attrs, request_metadata),
+    do: {:ok, create_multi(actor, repository, attrs, request_metadata)}
+
+  defp create_mutation_multi(_actor, _repository, _attrs, _request_metadata),
+    do: {:error, :forbidden}
+
+  defp update_mutation_multi(
+         %ForgeAccounts.User{} = actor,
+         repository,
+         number,
+         attrs,
+         request_metadata
+       ),
+       do: {:ok, update_multi(actor, repository, number, attrs, request_metadata)}
+
+  defp update_mutation_multi(_actor, _repository, _number, _attrs, _request_metadata),
+    do: {:error, :forbidden}
+
+  @doc false
+  @spec create_multi(ForgeAccounts.User.t(), ForgeRepos.Repository.t(), map(), map()) :: Multi.t()
+  def create_multi(
+        %ForgeAccounts.User{id: actor_id},
+        %ForgeRepos.Repository{id: repository_id},
+        attrs,
+        request_metadata
+      )
+      when is_integer(actor_id) and is_integer(repository_id) and is_map(attrs) and
+             is_map(request_metadata) do
+    attrs = normalize_attrs(attrs)
+    request_metadata = safe_request_metadata(request_metadata)
+
+    Multi.new()
+    |> Multi.run(:authorization, fn repo, _changes ->
+      authorize_create_transaction(repo, actor_id, repository_id)
+    end)
+    |> Multi.merge(fn %{authorization: context} ->
+      %{actor: actor, repository: repository, capability: capability} = context
+      identity_attrs = Map.take(attrs, ["title", "body", "state", "state_reason"])
+
+      Multi.new()
+      |> insert_numbered_identity(:issue, repository, actor, :issue, identity_attrs)
+      |> put_relationship_operations(:issue, repository, actor, attrs, capability)
+      |> Audit.record_multi(
+        :audit,
+        actor,
+        "issue.created",
+        "repository",
+        repository.id,
+        %{"repository_id" => repository.id, "result" => "success"},
+        request_metadata: request_metadata
+      )
+    end)
+  end
+
+  @doc false
+  @spec update_multi(
+          ForgeAccounts.User.t(),
+          ForgeRepos.Repository.t(),
+          pos_integer(),
+          map(),
+          map()
+        ) :: Multi.t()
+  def update_multi(
+        %ForgeAccounts.User{id: actor_id},
+        %ForgeRepos.Repository{id: repository_id},
+        number,
+        attrs,
+        request_metadata
+      )
+      when is_integer(actor_id) and is_integer(repository_id) and is_integer(number) and
+             number > 0 and is_map(attrs) and is_map(request_metadata) do
+    attrs = normalize_attrs(attrs)
+    request_metadata = safe_request_metadata(request_metadata)
+
+    Multi.new()
+    |> Multi.run(:authorization, fn repo, _changes ->
+      authorize_update_transaction(repo, actor_id, repository_id, number, attrs)
+    end)
+    |> Multi.merge(fn %{authorization: context} ->
+      %{
+        actor: actor,
+        repository: repository,
+        issue: issue,
+        capability: capability,
+        attrs: authorized_attrs
+      } = context
+
       Multi.new()
       |> update_identity(
         :issue,
         issue,
         actor,
-        Map.take(attrs, ["title", "body", "state", "state_reason"])
+        Map.take(authorized_attrs, ["title", "body", "state", "state_reason"])
       )
-      |> put_relationship_operations(:issue, repository, actor, attrs, capability)
+      |> put_relationship_operations(:issue, repository, actor, authorized_attrs, capability)
       |> Audit.record_multi(
         :audit,
         actor,
@@ -150,18 +220,10 @@ defmodule ForgeIssues do
         "issue",
         fn %{issue: updated} -> updated.id end,
         %{"repository_id" => repository.id, "result" => "success"},
-        request_metadata: safe_request_metadata(request_metadata)
+        request_metadata: request_metadata
       )
-      |> transaction()
-      |> map_update_result(repository)
-    else
-      nil -> {:error, :not_found}
-      {:error, _reason} = error -> error
-    end
+    end)
   end
-
-  def update(_actor, _owner_slug, _repository_slug, _number, _attrs, _request_metadata),
-    do: {:error, :forbidden}
 
   defp fetch_repository(actor, owner_slug, repository_slug, permission),
     do: ForgeRepos.fetch_authorized_repository(actor, owner_slug, repository_slug, permission)
@@ -193,14 +255,75 @@ defmodule ForgeIssues do
 
   defp create_capability(_actor, _repository), do: {:error, :forbidden}
 
-  defp active_mutation_actor(%ForgeAccounts.User{id: actor_id}) when is_integer(actor_id) do
-    case ForgeAccounts.get_user(actor_id) do
+  defp authorize_create_transaction(repo, actor_id, repository_id) do
+    with {:ok, actor} <- active_mutation_actor(repo, actor_id),
+         {:ok, repository} <- current_repository(repo, repository_id),
+         :ok <- authorize_repository_read(actor, repository),
+         :ok <- require_issues_enabled(repository),
+         {:ok, capability} <- create_capability(actor, repository) do
+      {:ok, %{actor: actor, repository: repository, capability: capability}}
+    end
+  end
+
+  defp authorize_update_transaction(repo, actor_id, repository_id, number, attrs) do
+    with {:ok, actor} <- active_mutation_actor(repo, actor_id),
+         {:ok, repository} <- current_repository(repo, repository_id),
+         :ok <- authorize_repository_read(actor, repository),
+         {:ok, issue} <- current_issue(repo, repository, number),
+         :ok <- require_identity_enabled(repository, issue),
+         {:ok, capability} <- mutation_capability(actor, repository, issue),
+         {:ok, attrs} <- mutation_attrs(attrs, capability, issue) do
+      {:ok,
+       %{
+         actor: actor,
+         repository: repository,
+         issue: issue,
+         capability: capability,
+         attrs: attrs
+       }}
+    end
+  end
+
+  defp active_mutation_actor(repo, actor_id) do
+    case repo.get_by(ForgeAccounts.User, id: actor_id, kind: :user, state: :active) do
       %ForgeAccounts.User{state: :active} = actor -> {:ok, actor}
       _actor -> {:error, :forbidden}
     end
   end
 
-  defp active_mutation_actor(_actor), do: {:error, :forbidden}
+  defp current_repository(repo, repository_id) do
+    repository =
+      ForgeRepos.Repository
+      |> join(:inner, [repository], owner in ForgeAccounts.User,
+        on: owner.id == repository.owner_user_id
+      )
+      |> where(
+        [repository, owner],
+        repository.id == ^repository_id and is_nil(repository.deleted_at) and
+          owner.state == :active and owner.kind in [:user, :organization]
+      )
+      |> select([repository, _owner], repository)
+      |> repo.one()
+
+    if repository, do: {:ok, repository}, else: {:error, :not_found}
+  end
+
+  defp authorize_repository_read(actor, repository) do
+    if Fornacast.Access.allowed?(actor, :repository_read, repository),
+      do: :ok,
+      else: {:error, :not_found}
+  end
+
+  defp current_issue(repo, repository, number) do
+    case repo.one(
+           from(issue in Issue,
+             where: issue.repository_id == ^repository.id and issue.number == ^number
+           )
+         ) do
+      %Issue{} = issue -> {:ok, issue}
+      nil -> {:error, :not_found}
+    end
+  end
 
   defp mutation_capability(%ForgeAccounts.User{} = actor, repository, %Issue{
          author_user_id: author_id
@@ -234,33 +357,37 @@ defmodule ForgeIssues do
     {:ok, attrs}
   end
 
-  defp map_create_result({:ok, %{issue: issue}}, repository),
+  defp map_create_result({:ok, %{authorization: %{repository: repository}, issue: issue}}),
     do: {:ok, load_issue_metadata(issue, repository)}
 
-  defp map_create_result({:error, :issue, changeset, _changes}, _repository)
+  defp map_create_result({:error, :authorization, reason, _changes}), do: {:error, reason}
+
+  defp map_create_result({:error, :issue, changeset, _changes})
        when is_struct(changeset, Ecto.Changeset),
        do: {:error, {:validation, issue_changeset_errors(changeset)}}
 
-  defp map_create_result({:error, _step, {:validation, _errors} = error, _changes}, _repository),
+  defp map_create_result({:error, _step, {:validation, _errors} = error, _changes}),
     do: {:error, error}
 
-  defp map_create_result({:error, _step, {:unavailable, _reason} = error, _changes}, _repository),
+  defp map_create_result({:error, _step, {:unavailable, _reason} = error, _changes}),
     do: {:error, error}
 
-  defp map_create_result({:error, _step, _reason, _changes}, _repository),
+  defp map_create_result({:error, _step, _reason, _changes}),
     do: invalid_filter("base", :unprocessable)
 
-  defp map_update_result({:ok, %{issue: issue}}, repository),
+  defp map_update_result({:ok, %{authorization: %{repository: repository}, issue: issue}}),
     do: {:ok, load_issue_metadata(issue, repository)}
 
-  defp map_update_result({:error, :issue, changeset, _changes}, _repository)
+  defp map_update_result({:error, :authorization, reason, _changes}), do: {:error, reason}
+
+  defp map_update_result({:error, :issue, changeset, _changes})
        when is_struct(changeset, Ecto.Changeset),
        do: {:error, {:validation, issue_changeset_errors(changeset)}}
 
-  defp map_update_result({:error, _step, {:validation, _errors} = error, _changes}, _repository),
+  defp map_update_result({:error, _step, {:validation, _errors} = error, _changes}),
     do: {:error, error}
 
-  defp map_update_result({:error, _step, _reason, _changes}, _repository),
+  defp map_update_result({:error, _step, _reason, _changes}),
     do: invalid_filter("base", :unprocessable)
 
   defp issue_changeset_errors(changeset) do
@@ -280,7 +407,8 @@ defmodule ForgeIssues do
          {:ok, direction} <- enum_filter(filters, "direction", :desc, [:asc, :desc]),
          {:ok, since} <- since_filter(filters),
          {:ok, page} <- positive_integer_filter(filters, "page", 1, :infinity),
-         {:ok, per_page} <- positive_integer_filter(filters, "per_page", 30, 100) do
+         {:ok, per_page} <- positive_integer_filter(filters, "per_page", 30, 100),
+         {:ok, offset} <- page_offset(page, per_page) do
       {:ok,
        %{
          state: state,
@@ -291,7 +419,8 @@ defmodule ForgeIssues do
          direction: direction,
          since: since,
          page: page,
-         per_page: per_page
+         per_page: per_page,
+         offset: offset
        }}
     end
   end
@@ -427,6 +556,14 @@ defmodule ForgeIssues do
     end
   end
 
+  defp page_offset(page, per_page) do
+    offset = (page - 1) * per_page
+
+    if offset <= 9_223_372_036_854_775_807,
+      do: {:ok, offset},
+      else: invalid_filter("page", :unprocessable)
+  end
+
   defp fetch_filter(filters, field, default),
     do: Map.get(filters, field, Map.get(filters, String.to_atom(field), default))
 
@@ -523,9 +660,12 @@ defmodule ForgeIssues do
   defp safe_request_metadata(metadata) do
     [:request_id, :api_version, :ip_address, :user_agent, :token_id]
     |> Enum.reduce(%{}, fn key, safe ->
-      case Map.fetch(metadata, key) do
-        {:ok, value} -> Map.put(safe, key, value)
-        :error -> Map.get(metadata, Atom.to_string(key), safe)
+      string_key = Atom.to_string(key)
+
+      cond do
+        Map.has_key?(metadata, string_key) -> Map.put(safe, key, Map.fetch!(metadata, string_key))
+        Map.has_key?(metadata, key) -> Map.put(safe, key, Map.fetch!(metadata, key))
+        true -> safe
       end
     end)
   end
