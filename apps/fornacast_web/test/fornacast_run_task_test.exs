@@ -1,7 +1,7 @@
 defmodule Mix.Tasks.Fornacast.RunTest do
   use ExUnit.Case, async: true
 
-  test "service applications include the issue application before the API and web endpoints" do
+  test "service applications include the issue and pull applications before the API and web endpoints" do
     assert Mix.Tasks.Fornacast.Run.service_applications() == [
              :fornacast,
              :forge_accounts,
@@ -9,15 +9,17 @@ defmodule Mix.Tasks.Fornacast.RunTest do
              :git_core,
              :git_transport,
              :forge_issues,
+             :forge_pulls,
              :fornacast_api,
              :fornacast_web
            ]
   end
 
-  test "root release starts the issue application permanently" do
+  test "root release starts the issue and pull applications permanently" do
     applications = FornacastUmbrella.MixProject.releases()[:fornacast][:applications]
 
     assert applications[:forge_issues] == :permanent
+    assert applications[:forge_pulls] == :permanent
   end
 
   test "service_dependency_applications leaves the web endpoint to phx.server" do
@@ -28,6 +30,7 @@ defmodule Mix.Tasks.Fornacast.RunTest do
              :git_core,
              :git_transport,
              :forge_issues,
+             :forge_pulls,
              :fornacast_api
            ]
   end

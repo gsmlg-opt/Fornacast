@@ -50,6 +50,8 @@ defmodule ForgeIssues.Fixtures do
   defp reset_turso_database! do
     Enum.each(
       [
+        "pull_merge_operations",
+        "pull_requests",
         "issue_assignees",
         "issue_labels",
         "issue_comments",

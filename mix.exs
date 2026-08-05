@@ -26,6 +26,7 @@ defmodule FornacastUmbrella.MixProject do
           forge_accounts: :permanent,
           forge_repos: :permanent,
           forge_issues: :permanent,
+          forge_pulls: :permanent,
           git_core: :permanent,
           git_transport: :permanent,
           fornacast_web: :permanent,
