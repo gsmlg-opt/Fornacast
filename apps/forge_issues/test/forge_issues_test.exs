@@ -508,13 +508,369 @@ defmodule ForgeIssuesTest do
     audits = Repo.all(from audit in AuditEvent, order_by: [asc: audit.id])
     assert Enum.map(audits, & &1.action) == ["issue.created", "issue.updated", "issue.updated"]
 
+    [created_audit, closed_audit, reopened_audit] = audits
+
+    assert {created_audit.target_type, created_audit.target_id} ==
+             {"repository", to_string(repository.id)}
+
+    assert {closed_audit.target_type, closed_audit.target_id} == {"issue", to_string(created.id)}
+
+    assert {reopened_audit.target_type, reopened_audit.target_id} ==
+             {"issue", to_string(created.id)}
+
     assert Enum.all?(audits, fn audit ->
              audit.actor_user_id == writer.id and audit.metadata["result"] == "success" and
+               audit.metadata["repository_id"] == repository.id and
                audit.metadata["request_id"] == "req-issue-1" and
                audit.metadata["api_version"] == "2022-11-28" and
                audit.metadata["token_id"] == 41 and audit.ip_address == "192.0.2.10" and
                audit.user_agent == "Octokit/9.0"
            end)
+  end
+
+  test "page accepts values beyond one and returns the requested stable slice", %{
+    writer: writer,
+    repository: repository
+  } do
+    issues = Enum.map(1..3, &issue_fixture(repository, writer, "Page #{&1}"))
+
+    assert {:ok, %Page{page: 2, per_page: 2, total: 3, entries: [entry]}} =
+             ForgeIssues.list(writer, writer.username, repository.slug, %{
+               state: :all,
+               sort: :created,
+               direction: :asc,
+               page: 2,
+               per_page: 2
+             })
+
+    assert entry.id == List.last(issues).id
+  end
+
+  test "disabled stale actors cannot create or update through a public repository", %{
+    writer: writer
+  } do
+    repository = repository_fixture(writer, %{visibility: :public})
+    stale_actor = readable_user(repository, "stale-actor")
+    issue = issue_fixture(repository, stale_actor, "Stale issue")
+
+    stale_actor
+    |> Ecto.Changeset.change(state: :disabled)
+    |> Repo.update!()
+
+    assert {:error, :forbidden} =
+             ForgeIssues.create(
+               stale_actor,
+               writer.username,
+               repository.slug,
+               %{"title" => "Rejected create"},
+               request_metadata()
+             )
+
+    assert {:error, :forbidden} =
+             ForgeIssues.update(
+               stale_actor,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{"title" => "Rejected update"},
+               request_metadata()
+             )
+
+    assert Repo.aggregate(AuditEvent, :count, :id) == 0
+  end
+
+  test "authors derive close and reopen reasons and discard hostile supplied reasons", %{
+    writer: writer,
+    repository: repository
+  } do
+    author = readable_user(repository, "state-author")
+    issue = issue_fixture(repository, author, "State issue")
+
+    assert {:ok, closed} =
+             ForgeIssues.update(
+               author,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{state: "closed", state_reason: "not_planned"},
+               request_metadata()
+             )
+
+    assert %{state: :closed, state_reason: :completed, closed_at: %DateTime{}} = closed
+
+    assert {:ok, reopened} =
+             ForgeIssues.update(
+               author,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{"state" => "open", "state_reason" => "completed"},
+               request_metadata()
+             )
+
+    assert %{state: :open, state_reason: :reopened, closed_at: nil} = reopened
+  end
+
+  test "get batches metadata for multiple assignees", %{writer: writer, repository: repository} do
+    issue = issue_fixture(repository, writer, "Assigned issue")
+    comparison_issue = issue_fixture(repository, writer, "Single assigned issue")
+
+    assignees =
+      Enum.map(1..4, fn index -> readable_user(repository, "get-assignee-#{index}") end)
+
+    Repo.insert_all(IssueAssignee, Enum.map(assignees, &assignee_row(issue.id, &1.id)))
+    Repo.insert_all(IssueAssignee, [assignee_row(comparison_issue.id, hd(assignees).id)])
+
+    {{:ok, _comparison}, comparison_query_count} =
+      count_repo_queries(fn ->
+        ForgeIssues.get(writer, writer.username, repository.slug, comparison_issue.number)
+      end)
+
+    {{:ok, loaded}, query_count} =
+      count_repo_queries(fn ->
+        ForgeIssues.get(writer, writer.username, repository.slug, issue.number)
+      end)
+
+    assert Enum.map(loaded.assignees, & &1.id) == Enum.map(assignees, & &1.id)
+    assert query_count == comparison_query_count
+    assert query_count <= 9
+  end
+
+  test "writers and site admins mutate other authors while disabled identities stay blocked", %{
+    writer: writer,
+    repository: repository
+  } do
+    author = readable_user(repository, "permission-author")
+    issue = issue_fixture(repository, author, "Permission issue")
+
+    assert {:ok, %{state_reason: :not_planned}} =
+             ForgeIssues.update(
+               writer,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{state: :closed, state_reason: :not_planned},
+               request_metadata()
+             )
+
+    assert {:ok, %{state_reason: :completed}} =
+             ForgeIssues.update(
+               writer,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{state_reason: :completed},
+               request_metadata()
+             )
+
+    {:ok, admin} =
+      ForgeAccounts.create_admin(%{
+        username: "issue-admin-#{System.unique_integer([:positive])}",
+        email: "issue-admin-#{System.unique_integer([:positive])}@example.test",
+        password: "correct horse battery staple"
+      })
+
+    assert {:ok, %{title: "Admin edit"}} =
+             ForgeIssues.update(
+               admin,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{title: "Admin edit"},
+               request_metadata()
+             )
+
+    repository |> Ecto.Changeset.change(has_issues: false) |> Repo.update!()
+
+    assert {:error, :issues_disabled} =
+             ForgeIssues.update(
+               writer,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{title: "Disabled edit"},
+               request_metadata()
+             )
+  end
+
+  test "failed issue mutations never write success audits", %{
+    writer: writer,
+    repository: repository
+  } do
+    author = readable_user(repository, "failure-author")
+    stranger = readable_user(repository, "failure-stranger")
+    issue = issue_fixture(repository, author, "Failure issue")
+
+    assert {:error, {:validation, _errors}} =
+             ForgeIssues.create(
+               writer,
+               writer.username,
+               repository.slug,
+               %{"title" => ""},
+               request_metadata()
+             )
+
+    assert {:error, :forbidden} =
+             ForgeIssues.update(
+               stranger,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{"title" => "Unauthorized"},
+               request_metadata()
+             )
+
+    assert {:error, {:validation, [%{resource: "Issue", field: "labels", code: :missing}]}} =
+             ForgeIssues.update(
+               writer,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{"labels" => ["transaction-failure"]},
+               request_metadata()
+             )
+
+    assert Repo.aggregate(AuditEvent, :count, :id) == 0
+  end
+
+  test "issue filters cover state relationships ordering since and paging", %{
+    writer: writer,
+    repository: repository
+  } do
+    [bug | _] = ForgeIssues.list_labels(repository)
+    help = Enum.find(ForgeIssues.list_labels(repository), &(&1.name == "help wanted"))
+    assignee = readable_user(repository, "matrix-assignee")
+    creator = readable_user(repository, "matrix-creator")
+
+    first =
+      create_issue!(writer, repository, %{
+        title: "First",
+        labels: [bug.name, help.name],
+        assignees: [assignee.username]
+      })
+
+    second = create_issue!(creator, repository, %{title: "Second"})
+    third = create_issue!(writer, repository, %{title: "Third"})
+    pull = pull_fixture(repository, writer)
+
+    assert {:ok, second} =
+             ForgeIssues.update(
+               writer,
+               writer.username,
+               repository.slug,
+               second.number,
+               %{state: :closed, state_reason: :completed},
+               request_metadata()
+             )
+
+    base = ~U[2026-07-01 00:00:00Z]
+    set_issue_times(first, base, DateTime.add(base, 30, :second))
+    set_issue_times(second, DateTime.add(base, 10, :second), DateTime.add(base, 20, :second))
+    set_issue_times(third, DateTime.add(base, 20, :second), DateTime.add(base, 10, :second))
+    set_issue_times(pull, DateTime.add(base, 30, :second), base)
+    insert_comments(first, writer, 2)
+    insert_comments(second, writer, 1)
+
+    assert_issue_ids(repository, writer, %{}, [pull.id, third.id, first.id])
+    assert_issue_ids(repository, writer, %{state: :open}, [pull.id, third.id, first.id])
+    assert_issue_ids(repository, writer, %{state: :closed}, [second.id])
+
+    assert_issue_ids(repository, writer, %{state: :all, sort: :created, direction: :asc}, [
+      first.id,
+      second.id,
+      third.id,
+      pull.id
+    ])
+
+    assert_issue_ids(repository, writer, %{state: :all, labels: "BUG, help wanted"}, [first.id])
+    assert_issue_ids(repository, writer, %{state: :all, assignee: assignee.username}, [first.id])
+    assert_issue_ids(repository, writer, %{state: :all, assignee: "*"}, [first.id])
+
+    assert_issue_ids(
+      repository,
+      writer,
+      %{state: :all, assignee: "none", sort: :created, direction: :asc},
+      [second.id, third.id, pull.id]
+    )
+
+    assert_issue_ids(repository, writer, %{state: :all, creator: creator.username}, [second.id])
+
+    assert_issue_ids(repository, writer, %{state: :all, sort: :updated, direction: :asc}, [
+      pull.id,
+      third.id,
+      second.id,
+      first.id
+    ])
+
+    assert_issue_ids(repository, writer, %{state: :all, sort: :comments, direction: :desc}, [
+      first.id,
+      second.id,
+      pull.id,
+      third.id
+    ])
+
+    assert_issue_ids(
+      repository,
+      writer,
+      %{state: :all, since: DateTime.add(base, 20, :second), sort: :updated, direction: :asc},
+      [second.id, first.id]
+    )
+
+    assert {:ok, %Page{entries: page_two, total: 4, page: 2, per_page: 2}} =
+             ForgeIssues.list(writer, writer.username, repository.slug, %{
+               state: :all,
+               sort: :created,
+               direction: :asc,
+               page: 2,
+               per_page: 2
+             })
+
+    assert Enum.map(page_two, & &1.id) == [third.id, pull.id]
+
+    tied_at = ~U[2026-07-02 00:00:00Z]
+    Enum.each([first, second, third, pull], &set_issue_times(&1, tied_at, tied_at))
+    ids = Enum.sort([first.id, second.id, third.id, pull.id])
+    assert_issue_ids(repository, writer, %{state: :all, sort: :created, direction: :asc}, ids)
+
+    assert_issue_ids(
+      repository,
+      writer,
+      %{state: :all, sort: :created, direction: :desc},
+      Enum.reverse(ids)
+    )
+  end
+
+  test "issue filters accept limits and reject every invalid field exactly", %{
+    writer: writer,
+    repository: repository
+  } do
+    hundred_labels = Enum.map_join(1..100, ",", &"label-#{&1}")
+
+    assert {:ok, %Page{entries: [], per_page: 100}} =
+             ForgeIssues.list(writer, writer.username, repository.slug, %{
+               labels: hundred_labels,
+               per_page: 100
+             })
+
+    too_many_labels = hundred_labels <> ",label-101"
+
+    invalid_filters = [
+      {%{state: :invalid}, "state", :invalid},
+      {%{labels: 1}, "labels", :invalid},
+      {%{labels: too_many_labels}, "labels", :unprocessable},
+      {%{assignee: 1}, "assignee", :invalid},
+      {%{creator: 1}, "creator", :invalid},
+      {%{sort: :invalid}, "sort", :invalid},
+      {%{direction: :invalid}, "direction", :invalid},
+      {%{since: "not-a-date"}, "since", :unprocessable},
+      {%{page: 0}, "page", :unprocessable},
+      {%{per_page: 101}, "per_page", :unprocessable}
+    ]
+
+    Enum.each(invalid_filters, fn {filters, field, code} ->
+      assert {:error, {:validation, [%{resource: "Issue", field: ^field, code: ^code}]}} =
+               ForgeIssues.list(writer, writer.username, repository.slug, filters)
+    end)
   end
 
   test "issue lists filter and page pull-backed identities with stable ties", %{
@@ -646,14 +1002,14 @@ defmodule ForgeIssuesTest do
              ForgeIssues.list(writer, writer.username, repository.slug, %{per_page: 101})
   end
 
-  defp issue_fixture(repository, author) do
+  defp issue_fixture(repository, author, title \\ "Relationship test") do
     %Issue{
       repository_id: repository.id,
       number: System.unique_integer([:positive]),
       kind: :issue,
       author_user_id: author.id
     }
-    |> Issue.create_changeset(%{title: "Relationship test"})
+    |> Issue.create_changeset(%{title: title})
     |> Repo.insert!()
   end
 
@@ -676,6 +1032,51 @@ defmodule ForgeIssuesTest do
       user_agent: "Octokit/9.0",
       token_id: 41
     }
+  end
+
+  defp create_issue!(actor, repository, attrs) do
+    assert {:ok, issue} =
+             ForgeIssues.create(
+               actor,
+               repository_owner_slug(repository),
+               repository.slug,
+               attrs,
+               request_metadata()
+             )
+
+    issue
+  end
+
+  defp repository_owner_slug(repository), do: ForgeRepos.repository_owner(repository).username
+
+  defp set_issue_times(issue, inserted_at, updated_at) do
+    Repo.update_all(from(row in Issue, where: row.id == ^issue.id),
+      set: [inserted_at: inserted_at, updated_at: updated_at]
+    )
+  end
+
+  defp insert_comments(issue, author, count) do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    Repo.insert_all(
+      Comment,
+      Enum.map(1..count, fn index ->
+        %{
+          issue_id: issue.id,
+          author_user_id: author.id,
+          body: "Comment #{index}",
+          inserted_at: now,
+          updated_at: now
+        }
+      end)
+    )
+  end
+
+  defp assert_issue_ids(repository, actor, filters, expected_ids) do
+    assert {:ok, %Page{entries: entries}} =
+             ForgeIssues.list(actor, repository_owner_slug(repository), repository.slug, filters)
+
+    assert Enum.map(entries, & &1.id) == expected_ids
   end
 
   defp join_row(issue_id, label_id, now \\ DateTime.utc_now() |> DateTime.truncate(:second)),

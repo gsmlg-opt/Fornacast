@@ -91,6 +91,7 @@ defmodule ForgeIssues do
       when is_map(attrs) and is_map(request_metadata) do
     with {:ok, repository} <-
            fetch_repository(actor, owner_slug, repository_slug, :repository_read),
+         {:ok, actor} <- active_mutation_actor(actor),
          :ok <- require_issues_enabled(repository),
          {:ok, capability} <- create_capability(actor, repository) do
       DefaultLabels.ensure(repository)
@@ -107,7 +108,7 @@ defmodule ForgeIssues do
         "issue.created",
         "repository",
         repository.id,
-        %{"result" => "success"},
+        %{"repository_id" => repository.id, "result" => "success"},
         request_metadata: safe_request_metadata(request_metadata)
       )
       |> transaction()
@@ -124,6 +125,7 @@ defmodule ForgeIssues do
       when is_integer(number) and number > 0 and is_map(attrs) and is_map(request_metadata) do
     with {:ok, repository} <-
            fetch_repository(actor, owner_slug, repository_slug, :repository_read),
+         {:ok, actor} <- active_mutation_actor(actor),
          %Issue{} = issue <-
            Repo.one(
              from(issue in Issue,
@@ -132,7 +134,7 @@ defmodule ForgeIssues do
            ),
          :ok <- require_identity_enabled(repository, issue),
          {:ok, capability} <- mutation_capability(actor, repository, issue),
-         {:ok, attrs} <- mutation_attrs(normalize_attrs(attrs), capability) do
+         {:ok, attrs} <- mutation_attrs(normalize_attrs(attrs), capability, issue) do
       Multi.new()
       |> update_identity(
         :issue,
@@ -147,7 +149,7 @@ defmodule ForgeIssues do
         "issue.updated",
         "issue",
         fn %{issue: updated} -> updated.id end,
-        %{"result" => "success"},
+        %{"repository_id" => repository.id, "result" => "success"},
         request_metadata: safe_request_metadata(request_metadata)
       )
       |> transaction()
@@ -191,6 +193,15 @@ defmodule ForgeIssues do
 
   defp create_capability(_actor, _repository), do: {:error, :forbidden}
 
+  defp active_mutation_actor(%ForgeAccounts.User{id: actor_id}) when is_integer(actor_id) do
+    case ForgeAccounts.get_user(actor_id) do
+      %ForgeAccounts.User{state: :active} = actor -> {:ok, actor}
+      _actor -> {:error, :forbidden}
+    end
+  end
+
+  defp active_mutation_actor(_actor), do: {:error, :forbidden}
+
   defp mutation_capability(%ForgeAccounts.User{} = actor, repository, %Issue{
          author_user_id: author_id
        }) do
@@ -208,16 +219,19 @@ defmodule ForgeIssues do
 
   defp mutation_capability(_actor, _repository, _issue), do: {:error, :forbidden}
 
-  defp mutation_attrs(attrs, :writer), do: {:ok, attrs}
+  defp mutation_attrs(attrs, :writer, _issue), do: {:ok, attrs}
 
-  defp mutation_attrs(attrs, :author) do
-    attrs = Map.take(attrs, ["title", "body", "state", "state_reason"])
+  defp mutation_attrs(attrs, :author, issue) do
+    attrs = Map.take(attrs, ["title", "body", "state"])
 
-    if Map.get(attrs, "state_reason") == :not_planned do
-      invalid_filter("state_reason")
-    else
-      {:ok, attrs}
-    end
+    attrs =
+      case {issue.state, Map.get(attrs, "state")} do
+        {state, :closed} when state != :closed -> Map.put(attrs, "state_reason", :completed)
+        {state, :open} when state != :open -> Map.put(attrs, "state_reason", :reopened)
+        _transition -> attrs
+      end
+
+    {:ok, attrs}
   end
 
   defp map_create_result({:ok, %{issue: issue}}, repository),
@@ -265,7 +279,7 @@ defmodule ForgeIssues do
          {:ok, sort} <- enum_filter(filters, "sort", :created, [:created, :updated, :comments]),
          {:ok, direction} <- enum_filter(filters, "direction", :desc, [:asc, :desc]),
          {:ok, since} <- since_filter(filters),
-         {:ok, page} <- positive_integer_filter(filters, "page", 1, 1),
+         {:ok, page} <- positive_integer_filter(filters, "page", 1, :infinity),
          {:ok, per_page} <- positive_integer_filter(filters, "per_page", 30, 100) do
       {:ok,
        %{
@@ -381,6 +395,22 @@ defmodule ForgeIssues do
     end
   end
 
+  defp positive_integer_filter(filters, field, default, :infinity) do
+    case fetch_filter(filters, field, default) do
+      value when is_integer(value) and value >= 1 ->
+        {:ok, value}
+
+      value when is_binary(value) ->
+        case Integer.parse(value) do
+          {integer, ""} when integer >= 1 -> {:ok, integer}
+          _ -> invalid_filter(field, :unprocessable)
+        end
+
+      _ ->
+        invalid_filter(field, :unprocessable)
+    end
+  end
+
   defp positive_integer_filter(filters, field, default, maximum) do
     case fetch_filter(filters, field, default) do
       value when is_integer(value) and value >= 1 and value <= maximum ->
@@ -468,10 +498,13 @@ defmodule ForgeIssues do
   defp order_issues(query, :updated, direction),
     do: order_by(query, [issue], [{^direction, issue.updated_at}, {^direction, issue.id}])
 
-  defp normalize_attrs(attrs),
-    do: Map.new(attrs, fn {key, value} -> {to_string(key), normalize_attr_value(key, value)} end)
+  defp normalize_attrs(attrs) do
+    Map.new(attrs, fn {key, value} ->
+      key = to_string(key)
+      {key, normalize_attr_value(key, value)}
+    end)
+  end
 
-  defp normalize_attr_value(key, value) when key in [:state, :state_reason], do: value
   defp normalize_attr_value("state", value) when is_binary(value), do: safe_enum(value)
   defp normalize_attr_value("state_reason", value) when is_binary(value), do: safe_enum(value)
   defp normalize_attr_value(_key, value), do: value
@@ -630,7 +663,8 @@ defmodule ForgeIssues do
 
   def load_issue_metadata(%Issue{} = issue, repository) do
     if issue_in_repository?(issue, repository) do
-      load_issue_metadata(issue, repository, comment_counts([issue]))
+      [loaded] = do_load_issue_metadata([issue], repository)
+      loaded
     else
       {:error, :not_found}
     end
@@ -667,19 +701,6 @@ defmodule ForgeIssues do
           comment_count: Map.get(counts, issue.id, 0)
       }
     end)
-  end
-
-  defp load_issue_metadata(issue, repository, counts) do
-    author = ForgeAccounts.get_user(issue.author_user_id)
-
-    %{
-      issue
-      | labels: load_labels(issue),
-        assignees: load_assignees(issue),
-        author: author,
-        author_association: author_association(author, repository),
-        comment_count: Map.get(counts, issue.id, 0)
-    }
   end
 
   defp issue_in_repository?(%Issue{repository_id: repository_id}, %{id: repository_id}), do: true
@@ -857,27 +878,6 @@ defmodule ForgeIssues do
     |> select([comment], {comment.issue_id, count(comment.id)})
     |> Repo.all()
     |> Map.new()
-  end
-
-  defp author_association(nil, _repository), do: "NONE"
-  defp author_association(%ForgeAccounts.User{id: id}, %{owner_user_id: id}), do: "OWNER"
-
-  defp author_association(author, repository) do
-    case ForgeRepos.repository_owner(repository) do
-      %ForgeAccounts.User{kind: :organization} = organization ->
-        case ForgeAccounts.organization_role(author, organization) do
-          :owner -> "OWNER"
-          :member -> "MEMBER"
-          _ -> collaborator_association(author, repository)
-        end
-
-      _ ->
-        collaborator_association(author, repository)
-    end
-  end
-
-  defp collaborator_association(author, repository) do
-    if ForgeRepos.collaborator_role(author, repository), do: "COLLABORATOR", else: "NONE"
   end
 
   defp author_associations(issues, repository, users) do
