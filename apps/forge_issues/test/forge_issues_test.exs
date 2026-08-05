@@ -546,6 +546,30 @@ defmodule ForgeIssuesTest do
     assert entry.id == List.last(issues).id
   end
 
+  test "authenticated public readers create with author capability and ignore relationships", %{
+    writer: writer
+  } do
+    repository = repository_fixture(writer, %{visibility: :public})
+    reader = user_fixture("public-reader-#{System.unique_integer([:positive])}")
+
+    assert {:ok, issue} =
+             ForgeIssues.create(
+               reader,
+               writer.username,
+               repository.slug,
+               %{
+                 title: "Reader issue",
+                 labels: ["missing-label"],
+                 assignees: ["missing-assignee"]
+               },
+               request_metadata()
+             )
+
+    assert issue.author_user_id == reader.id
+    assert issue.labels == []
+    assert issue.assignees == []
+  end
+
   test "disabled stale actors cannot create or update through a public repository", %{
     writer: writer
   } do
@@ -838,6 +862,15 @@ defmodule ForgeIssuesTest do
       %{state: :all, sort: :created, direction: :desc},
       Enum.reverse(ids)
     )
+
+    assert_issue_ids(repository, writer, %{state: :all, sort: :updated, direction: :asc}, ids)
+
+    assert_issue_ids(
+      repository,
+      writer,
+      %{state: :all, sort: :updated, direction: :desc},
+      Enum.reverse(ids)
+    )
   end
 
   test "issue filters accept limits and reject every invalid field exactly", %{
@@ -943,13 +976,13 @@ defmodule ForgeIssuesTest do
                request_metadata()
              )
 
-    assert {:ok, %{title: "Edited"}} =
+    assert {:ok, %{title: "Edited", body: "Edited body"}} =
              ForgeIssues.update(
                author,
                writer.username,
                repository.slug,
                issue.number,
-               %{"title" => "Edited", "labels" => ["missing"]},
+               %{"title" => "Edited", "body" => "Edited body", "labels" => ["missing"]},
                request_metadata()
              )
 
