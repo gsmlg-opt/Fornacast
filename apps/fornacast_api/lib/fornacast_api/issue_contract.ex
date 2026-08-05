@@ -5,6 +5,8 @@ defmodule FornacastAPI.IssueContract do
     with {:ok, pagination} <- Pagination.parse(params),
          {:ok, state} <- enum(params, "state", :open, ~w(open closed all)),
          {:ok, labels} <- parse_labels(Map.get(params, "labels")),
+         {:ok, assignee} <- optional_string(params, "assignee"),
+         {:ok, creator} <- optional_string(params, "creator"),
          {:ok, sort} <- enum(params, "sort", :created, ~w(created updated comments)),
          {:ok, direction} <- enum(params, "direction", :desc, ~w(asc desc)),
          {:ok, since} <- timestamp(params, "since") do
@@ -13,8 +15,8 @@ defmodule FornacastAPI.IssueContract do
          [
            state: state,
            labels: labels,
-           assignee: value(params, "assignee"),
-           creator: value(params, "creator"),
+           assignee: assignee,
+           creator: creator,
            sort: sort,
            direction: direction,
            since: since
@@ -29,10 +31,11 @@ defmodule FornacastAPI.IssueContract do
     end
   end
 
-  defp value(params, field) do
+  defp optional_string(params, field) do
     case Map.get(params, field) do
-      value when is_binary(value) -> value
-      _ -> nil
+      nil -> {:ok, nil}
+      value when is_binary(value) -> {:ok, value}
+      _ -> {:error, {:validation, [%{resource: "Issue", field: field, code: :invalid}]}}
     end
   end
 

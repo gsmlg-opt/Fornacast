@@ -3,9 +3,15 @@ defmodule FornacastAPI.IssueContractTest do
 
   alias ForgeAccounts.User
   alias ForgeIssues.{Comment, Issue, Label}
-  alias FornacastAPI.{IssueContract, RequestValidator, Serializer}
 
-  @versions ["2022-11-28", "2026-03-10"]
+  alias FornacastAPI.{
+    IssueContract,
+    IssueFixtureLiterals,
+    RequestValidator,
+    Serializer
+  }
+
+  @versions IssueFixtureLiterals.versions()
 
   setup do
     previous_base_url = Application.fetch_env!(:fornacast, :base_url)
@@ -13,59 +19,176 @@ defmodule FornacastAPI.IssueContractTest do
     on_exit(fn -> Application.put_env(:fornacast, :base_url, previous_base_url) end)
   end
 
-  test "validates issue mutations explicitly for both versions" do
-    for version <- @versions do
-      assert {:ok, %{"title" => "API issue"}} =
-               RequestValidator.validate(version, :issue_create, %{"title" => "API issue"})
+  test "accepts every issue mutation operation for both versions" do
+    valid_mutations = [
+      issue_create: %{
+        "title" => "API issue",
+        "body" => nil,
+        "assignee" => nil,
+        "assignees" => ["octocat"],
+        "labels" => ["bug", %{"name" => "api"}]
+      },
+      issue_update: %{
+        "title" => "Updated issue",
+        "body" => "Updated body",
+        "state" => "closed",
+        "state_reason" => "completed",
+        "assignee" => "octocat",
+        "assignees" => ["octocat"],
+        "labels" => ["bug", %{"name" => "api"}]
+      },
+      issue_comment_create: %{"body" => "First comment"},
+      issue_comment_update: %{"body" => "Updated comment"}
+    ]
 
-      assert {:error, {:validation, [%{resource: "Issue", field: "title", code: :missing_field}]}} =
-               RequestValidator.validate(version, :issue_create, %{})
-
-      assert {:error, {:validation, [%{resource: "Issue", field: "labels", code: :invalid}]}} =
-               RequestValidator.validate(version, :issue_update, %{"labels" => [%{"name" => 1}]})
-
-      assert {:error, {:validation, [%{resource: "Issue", field: "extra", code: :unprocessable}]}} =
-               RequestValidator.validate(version, :issue_comment_create, %{
-                 "body" => "ok",
-                 "extra" => true
-               })
+    for version <- @versions, {operation, body} <- valid_mutations do
+      assert {:ok, ^body} = RequestValidator.validate(version, operation, body)
     end
   end
 
-  test "parses issue and comment filters independently" do
+  test "rejects every invalid issue mutation shape for both versions" do
+    invalid_mutations = [
+      {:issue_create, %{}, "title", :missing_field},
+      {:issue_create, %{"title" => ""}, "title", :invalid},
+      {:issue_create, %{"title" => "  "}, "title", :invalid},
+      {:issue_create, %{"title" => 1}, "title", :invalid},
+      {:issue_create, %{"title" => "Issue", "body" => 1}, "body", :invalid},
+      {:issue_create, %{"title" => "Issue", "unknown" => true}, "unknown", :unprocessable},
+      {:issue_update, %{"title" => ""}, "title", :invalid},
+      {:issue_update, %{"title" => 1}, "title", :invalid},
+      {:issue_update, %{"body" => 1}, "body", :invalid},
+      {:issue_update, %{"state" => 1}, "state", :invalid},
+      {:issue_update, %{"state" => "merged"}, "state", :invalid},
+      {:issue_update, %{"state_reason" => 1}, "state_reason", :invalid},
+      {:issue_update, %{"state_reason" => "duplicate"}, "state_reason", :invalid},
+      {:issue_update, %{"assignee" => []}, "assignee", :invalid},
+      {:issue_update, %{"assignees" => "octocat"}, "assignees", :invalid},
+      {:issue_update, %{"assignees" => [1]}, "assignees", :invalid},
+      {:issue_update, %{"labels" => "bug"}, "labels", :invalid},
+      {:issue_update, %{"labels" => [1]}, "labels", :invalid},
+      {:issue_update, %{"labels" => [%{}]}, "labels", :invalid},
+      {:issue_update, %{"labels" => [%{"name" => 1}]}, "labels", :invalid},
+      {:issue_update, %{"labels" => [%{"label" => "bug"}]}, "labels", :invalid},
+      {:issue_update, %{"labels" => [%{"name" => "bug", "color" => "fff"}]}, "labels", :invalid},
+      {:issue_update, %{"unknown" => true}, "unknown", :unprocessable},
+      {:issue_comment_create, %{}, "body", :missing_field},
+      {:issue_comment_create, %{"body" => ""}, "body", :invalid},
+      {:issue_comment_create, %{"body" => "  "}, "body", :invalid},
+      {:issue_comment_create, %{"body" => 1}, "body", :invalid},
+      {:issue_comment_create, %{"body" => "ok", "unknown" => true}, "unknown", :unprocessable},
+      {:issue_comment_update, %{}, "body", :missing_field},
+      {:issue_comment_update, %{"body" => ""}, "body", :invalid},
+      {:issue_comment_update, %{"body" => "  "}, "body", :invalid},
+      {:issue_comment_update, %{"body" => 1}, "body", :invalid},
+      {:issue_comment_update, %{"body" => "ok", "unknown" => true}, "unknown", :unprocessable}
+    ]
+
+    for version <- @versions, {operation, body, field, code} <- invalid_mutations do
+      assert {:error, {:validation, [%{resource: "Issue", field: ^field, code: ^code}]}} =
+               RequestValidator.validate(version, operation, body)
+    end
+  end
+
+  test "parses exact issue and comment filter contracts" do
     assert {:ok, filters} =
              IssueContract.list_filters(%{
+               "page" => "2",
+               "per_page" => "100",
                "labels" => "bug, api",
                "state" => "all",
+               "assignee" => "octocat",
+               "creator" => "hubot",
+               "sort" => "updated",
+               "direction" => "asc",
                "since" => "2026-07-21T00:00:00Z",
                "ignored" => "yes"
              })
 
     assert filters == [
-             page: 1,
-             per_page: 30,
+             page: 2,
+             per_page: 100,
              state: :all,
              labels: ["bug", "api"],
-             assignee: nil,
-             creator: nil,
-             sort: :created,
-             direction: :desc,
+             assignee: "octocat",
+             creator: "hubot",
+             sort: :updated,
+             direction: :asc,
              since: ~U[2026-07-21 00:00:00Z]
            ]
 
-    assert {:ok, [page: 1, per_page: 30, since: nil]} = IssueContract.comment_filters(%{})
+    assert {:ok,
+            [
+              page: 1,
+              per_page: 30,
+              state: :open,
+              labels: [],
+              assignee: nil,
+              creator: nil,
+              sort: :created,
+              direction: :desc,
+              since: nil
+            ]} = IssueContract.list_filters(%{"unknown" => []})
+
+    assert {:ok, [page: 1, per_page: 30, since: nil]} =
+             IssueContract.comment_filters(%{"unknown" => []})
+
+    assert {:ok, [page: 2, per_page: 50, since: ~U[2026-07-21 00:00:00Z]]} =
+             IssueContract.comment_filters(%{
+               "page" => "2",
+               "per_page" => "50",
+               "since" => "2026-07-21T00:00:00Z"
+             })
+  end
+
+  test "rejects invalid filters and enforces label and pagination bounds" do
+    issue_filter_errors = [
+      {%{"state" => "merged"}, "Issue", "state", :invalid},
+      {%{"state" => 1}, "Issue", "state", :invalid},
+      {%{"labels" => []}, "Issue", "labels", :invalid},
+      {%{"assignee" => []}, "Issue", "assignee", :invalid},
+      {%{"creator" => []}, "Issue", "creator", :invalid},
+      {%{"sort" => "relevance"}, "Issue", "sort", :invalid},
+      {%{"sort" => 1}, "Issue", "sort", :invalid},
+      {%{"direction" => "sideways"}, "Issue", "direction", :invalid},
+      {%{"direction" => 1}, "Issue", "direction", :invalid},
+      {%{"since" => "yesterday"}, "Issue", "since", :invalid},
+      {%{"since" => "2026-07-21T08:00:00+08:00"}, "Issue", "since", :invalid},
+      {%{"since" => 1}, "Issue", "since", :invalid},
+      {%{"page" => "0"}, "Pagination", "page", :invalid},
+      {%{"page" => 1}, "Pagination", "page", :invalid},
+      {%{"per_page" => "0"}, "Pagination", "per_page", :invalid},
+      {%{"per_page" => "101"}, "Pagination", "per_page", :invalid}
+    ]
+
+    for {params, resource, field, code} <- issue_filter_errors do
+      assert {:error, {:validation, [%{resource: ^resource, field: ^field, code: ^code}]}} =
+               IssueContract.list_filters(params)
+    end
+
+    for params <- [
+          %{"since" => "yesterday"},
+          %{"since" => "2026-07-21T08:00:00+08:00"},
+          %{"since" => 1}
+        ] do
+      assert {:error, {:validation, [%{resource: "Issue", field: "since", code: :invalid}]}} =
+               IssueContract.comment_filters(params)
+    end
+
+    labels = Enum.map_join(1..100, ",", &"label-#{&1}")
+    assert {:ok, filters} = IssueContract.list_filters(%{"labels" => labels})
+    assert length(filters[:labels]) == 100
 
     assert {:error, {:validation, [%{resource: "Issue", field: "labels", code: :unprocessable}]}} =
-             IssueContract.list_filters(%{
-               "labels" => Enum.join(List.duplicate("label", 101), ",")
-             })
+             IssueContract.list_filters(%{"labels" => labels <> ",label-101"})
+
+    maximum_page = "9223372036854775807"
+
+    assert {:ok, filters} = IssueContract.list_filters(%{"page" => maximum_page})
+    assert filters[:page] == 9_223_372_036_854_775_807
   end
 
   test "renders complete pinned issue resources" do
     for version <- @versions do
-      issue = issue()
-      comment = comment()
-
       opts = [
         owner: "acme",
         repo: "widget",
@@ -73,24 +196,18 @@ defmodule FornacastAPI.IssueContractTest do
         pull_links_by_issue_id: %{3001 => %{merged_at: nil}}
       ]
 
-      expected_issue = expected_issue(nil)
+      assert Serializer.render(version, :issue, %{issue() | kind: :issue}, opts) ==
+               IssueFixtureLiterals.issue()
 
-      expected_pull =
-        expected_issue(
-          if(version == "2026-03-10",
-            do: Map.delete(expected_pull_link(), :merged_at),
-            else: expected_pull_link()
-          )
-        )
+      assert Serializer.render(version, :issue, issue(), opts) ==
+               IssueFixtureLiterals.pull_issue(version)
 
-      expected_comment = expected_comment()
+      assert Serializer.render(version, :issue_comment, comment(), opts) ==
+               IssueFixtureLiterals.comment()
 
-      assert Serializer.render(version, :issue, %{issue | kind: :issue}, opts) == expected_issue
-      assert Serializer.render(version, :issue, issue, opts) == expected_pull
-      assert Serializer.render(version, :issue_comment, comment, opts) == expected_comment
-      assert Serializer.render(version, :label, label(), opts) == expected_label()
+      assert Serializer.render(version, :label, label(), opts) == IssueFixtureLiterals.label()
 
-      assert_fixtures(version, expected_issue, expected_pull, expected_comment)
+      assert_fixtures(version)
     end
   end
 
@@ -124,154 +241,34 @@ defmodule FornacastAPI.IssueContractTest do
     }
   end
 
-  defp label, do: %Label{id: 3201, name: "bug", color: "ff0000", default: false, description: nil}
+  defp label,
+    do: %Label{id: 3201, name: "bug", color: "ff0000", default: false, description: nil}
+
   defp author, do: %User{id: 41, username: "octocat", kind: :user, role: :user}
 
-  defp simple_user do
-    %{
-      avatar_url: "https://forge.test/octocat",
-      events_url: "https://forge.test/api/v3/users/octocat/events{/privacy}",
-      followers_url: "https://forge.test/api/v3/users/octocat/followers",
-      following_url: "https://forge.test/api/v3/users/octocat/following{/other_user}",
-      gists_url: "https://forge.test/api/v3/users/octocat/gists{/gist_id}",
-      gravatar_id: nil,
-      html_url: "https://forge.test/octocat",
-      id: 41,
-      login: "octocat",
-      node_id: "VXNlcjo0MQ",
-      organizations_url: "https://forge.test/api/v3/users/octocat/orgs",
-      received_events_url: "https://forge.test/api/v3/users/octocat/received_events",
-      repos_url: "https://forge.test/api/v3/users/octocat/repos",
-      site_admin: false,
-      starred_url: "https://forge.test/api/v3/users/octocat/starred{/owner}{/repo}",
-      subscriptions_url: "https://forge.test/api/v3/users/octocat/subscriptions",
-      type: "User",
-      url: "https://forge.test/api/v3/users/octocat"
-    }
-  end
-
-  defp expected_issue(pull_request) do
-    url = "https://forge.test/api/v3/repos/acme/widget/issues/7"
-
-    %{
-      url: url,
-      repository_url: "https://forge.test/api/v3/repos/acme/widget",
-      labels_url: url <> "/labels{/name}",
-      comments_url: url <> "/comments",
-      events_url: url <> "/events",
-      html_url: url,
-      id: 3001,
-      node_id: "SXNzdWU6MzAwMQ",
-      number: 7,
-      title: "API issue",
-      user: simple_user(),
-      labels: [],
-      state: "open",
-      locked: false,
-      assignee: nil,
-      assignees: [],
-      milestone: nil,
-      comments: 0,
-      created_at: "2026-07-21T00:00:00Z",
-      updated_at: "2026-07-21T00:00:00Z",
-      closed_at: nil,
-      author_association: "NONE",
-      active_lock_reason: nil,
-      draft: false,
-      body: "Track compatibility",
-      closed_by: nil,
-      reactions: reactions(),
-      timeline_url: url <> "/timeline",
-      performed_via_github_app: nil,
-      state_reason: nil
-    }
-    |> maybe_pull(pull_request)
-  end
-
-  defp expected_pull_link do
-    url = "https://forge.test/api/v3/repos/acme/widget/pulls/7"
-    %{url: url, html_url: url, diff_url: url, patch_url: url, merged_at: nil}
-  end
-
-  defp expected_comment do
-    url = "https://forge.test/api/v3/repos/acme/widget/issues/comments/3101"
-
-    %{
-      url: url,
-      html_url: url,
-      issue_url: "https://forge.test/api/v3/repos/acme/widget/issues/7",
-      id: 3101,
-      node_id: "SXNzdWVDb21tZW50OjMxMDE",
-      user: simple_user(),
-      created_at: "2026-07-21T00:00:00Z",
-      updated_at: "2026-07-21T00:00:00Z",
-      author_association: "NONE",
-      body: "First comment",
-      reactions: comment_reactions(),
-      performed_via_github_app: nil
-    }
-  end
-
-  defp expected_label,
-    do: %{
-      id: 3201,
-      node_id: "TGFiZWw6MzIwMQ",
-      url: "https://forge.test/api/v3/repos/acme/widget/labels/bug",
-      name: "bug",
-      color: "ff0000",
-      default: false,
-      description: nil
-    }
-
-  defp maybe_pull(map, nil), do: map
-  defp maybe_pull(map, value), do: Map.put(map, :pull_request, value)
-
-  defp reactions,
-    do: %{
-      "+1": 0,
-      "-1": 0,
-      laugh: 0,
-      confused: 0,
-      heart: 0,
-      hooray: 0,
-      rocket: 0,
-      eyes: 0,
-      url: "https://forge.test/api/v3/repos/acme/widget/issues/7/reactions",
-      total_count: 0
-    }
-
-  defp comment_reactions do
-    %{
-      reactions()
-      | url: "https://forge.test/api/v3/repos/acme/widget/issues/comments/3101/reactions"
-    }
-  end
-
-  defp assert_fixtures(version, issue, pull, comment) do
+  defp assert_fixtures(version) do
     root = Path.join([Path.expand("fixtures", __DIR__), version, "issues"])
+    document = openapi_document(version)
 
-    expected = %{
-      "issue.json" => issue,
-      "pull-issue.json" => pull,
-      "issue-comment.json" => comment,
-      "issue-list.json" => [issue],
-      "issue-comment-list.json" => [comment]
-    }
-
-    for {filename, literal} <- expected do
+    for {filename, literal} <- IssueFixtureLiterals.files(version) do
       bytes = File.read!(Path.join(root, filename))
-      assert JSON.decode!(bytes) == JSON.decode!(JSON.encode!(literal))
-      assert_valid_fixture(version, filename, JSON.decode!(bytes))
+      encoded_literal = JSON.encode!(literal, &IssueFixtureLiterals.encode/2)
+      assert bytes == encoded_literal
+
+      decoded = JSON.decode!(bytes)
+      assert decoded == JSON.decode!(encoded_literal)
+      assert_valid_fixture(document, filename, decoded)
     end
   end
 
-  defp assert_valid_fixture(version, filename, body) do
-    document =
-      Path.expand("../priv/openapi/ghes-3.21-#{version}.json", __DIR__)
-      |> File.read!()
-      |> JSON.decode!()
-      |> OpenApiSpex.OpenApi.Decode.decode()
+  defp openapi_document(version) do
+    Path.expand("../priv/openapi/ghes-3.21-#{version}.json", __DIR__)
+    |> File.read!()
+    |> JSON.decode!()
+    |> OpenApiSpex.OpenApi.Decode.decode()
+  end
 
+  defp assert_valid_fixture(document, filename, body) do
     {path, method, status} =
       case filename do
         "issue.json" ->
