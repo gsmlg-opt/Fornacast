@@ -10,7 +10,17 @@ defmodule ForgeIssues do
   import Ecto.Query
 
   alias Ecto.Multi
-  alias ForgeIssues.{Issue, NumberSequence}
+
+  alias ForgeIssues.{
+    Comment,
+    DefaultLabels,
+    Issue,
+    IssueAssignee,
+    IssueLabel,
+    Label,
+    NumberSequence
+  }
+
   alias Fornacast.Repo
 
   @turso_busy_attempts 12
@@ -80,6 +90,223 @@ defmodule ForgeIssues do
   def update_identity(multi, key, %Issue{} = issue, _actor, attrs) do
     Multi.update(multi, key, fn _changes -> Issue.update_changeset(issue, attrs) end)
   end
+
+  @spec list_labels(ForgeRepos.Repository.t()) :: [Label.t()]
+  def list_labels(%ForgeRepos.Repository{} = repository), do: DefaultLabels.ensure(repository)
+
+  @spec put_relationship_operations(
+          Multi.t(),
+          Multi.name(),
+          ForgeRepos.Repository.t(),
+          ForgeAccounts.User.t(),
+          map(),
+          :author | :writer
+        ) :: Multi.t()
+  def put_relationship_operations(multi, key, repository, _actor, attrs, capability)
+      when capability in [:author, :writer] and is_map(attrs) do
+    attrs =
+      if capability == :author,
+        do: Map.drop(attrs, ["labels", "assignee", "assignees"]),
+        else: attrs
+
+    multi
+    |> Multi.run({key, :relationships}, fn _repo, _changes ->
+      resolve_relationships(repository, attrs)
+    end)
+    |> Multi.merge(fn changes ->
+      issue = Map.fetch!(changes, key)
+      relationships = Map.fetch!(changes, {key, :relationships})
+      replace_relationships(key, issue, relationships)
+    end)
+  end
+
+  @spec load_labels(Issue.t()) :: [Label.t()]
+  def load_labels(%Issue{} = issue) do
+    IssueLabel
+    |> join(:inner, [join], label in Label, on: label.id == join.label_id)
+    |> where([join], join.issue_id == ^issue.id)
+    |> order_by([_join, label], asc: label.normalized_name)
+    |> select([_join, label], label)
+    |> Repo.all()
+  end
+
+  @spec load_assignees(Issue.t()) :: [ForgeAccounts.User.t()]
+  def load_assignees(%Issue{} = issue) do
+    IssueAssignee
+    |> where([join], join.issue_id == ^issue.id)
+    |> select([join], join.user_id)
+    |> Repo.all()
+    |> Enum.map(&ForgeAccounts.get_user/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.sort_by(& &1.username)
+  end
+
+  @spec load_issue_metadata(Issue.t() | [Issue.t()], ForgeRepos.Repository.t()) ::
+          Issue.t() | [Issue.t()]
+  def load_issue_metadata(issues, repository) when is_list(issues) do
+    counts = comment_counts(issues)
+    Enum.map(issues, &load_issue_metadata(&1, repository, counts))
+  end
+
+  def load_issue_metadata(%Issue{} = issue, repository),
+    do: load_issue_metadata(issue, repository, comment_counts([issue]))
+
+  defp load_issue_metadata(issue, repository, counts) do
+    author = ForgeAccounts.get_user(issue.author_user_id)
+
+    %{
+      issue
+      | labels: load_labels(issue),
+        assignees: load_assignees(issue),
+        author: author,
+        author_association: author_association(author, repository),
+        comment_count: Map.get(counts, issue.id, 0)
+    }
+  end
+
+  defp resolve_relationships(repository, attrs) do
+    _labels = DefaultLabels.ensure(repository)
+
+    with {:ok, labels} <- resolve_labels(repository, requested_label_names(attrs)),
+         {:ok, assignees} <- resolve_assignees(repository, requested_assignee_names(attrs)) do
+      {:ok, %{labels: labels, assignees: assignees}}
+    end
+  end
+
+  defp requested_label_names(attrs) do
+    case Map.fetch(attrs, "labels") do
+      :error ->
+        :unchanged
+
+      {:ok, labels} when is_list(labels) ->
+        {:replace,
+         Enum.map(labels, fn
+           name when is_binary(name) -> DefaultLabels.normalize_name(name)
+           %{"name" => name} when is_binary(name) -> DefaultLabels.normalize_name(name)
+         end)}
+    end
+  end
+
+  defp requested_assignee_names(attrs) do
+    cond do
+      Map.has_key?(attrs, "assignees") -> {:replace, Map.fetch!(attrs, "assignees")}
+      Map.get(attrs, "assignee") in [nil, ""] -> :unchanged
+      true -> {:replace, [Map.fetch!(attrs, "assignee")]}
+    end
+  end
+
+  defp resolve_labels(_repository, :unchanged), do: {:ok, :unchanged}
+
+  defp resolve_labels(repository, {:replace, names}) do
+    names = Enum.uniq(names)
+
+    labels =
+      Label
+      |> where([label], label.repository_id == ^repository.id and label.normalized_name in ^names)
+      |> Repo.all()
+
+    if length(labels) == length(names), do: {:ok, labels}, else: {:error, missing_labels_error()}
+  end
+
+  defp resolve_assignees(_repository, :unchanged), do: {:ok, :unchanged}
+
+  defp resolve_assignees(repository, {:replace, names}) do
+    users = Enum.map(names, &ForgeAccounts.get_user_by_username/1)
+
+    if Enum.all?(users, &eligible_assignee?(&1, repository)) do
+      {:ok, users |> Enum.reject(&is_nil/1) |> Enum.uniq_by(& &1.id)}
+    else
+      {:error, invalid_assignees_error()}
+    end
+  end
+
+  defp eligible_assignee?(%ForgeAccounts.User{kind: :user, state: :active} = user, repository),
+    do: Fornacast.Access.authorize(user, :repository_read, repository) == :ok
+
+  defp eligible_assignee?(_, _repository), do: false
+
+  defp replace_relationships(key, issue, %{labels: labels, assignees: assignees}) do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    Multi.new()
+    |> replace_label_joins(key, issue, labels, now)
+    |> replace_assignee_joins(key, issue, assignees, now)
+  end
+
+  defp replace_label_joins(multi, _key, _issue, :unchanged, _now), do: multi
+
+  defp replace_label_joins(multi, key, issue, labels, now) do
+    multi
+    |> Multi.delete_all(
+      {key, :delete_labels},
+      # TODO(upstream): gsmlg-dev/concord#66
+      from(_join in IssueLabel, where: fragment("issue_id = ?", ^issue.id))
+    )
+    |> Multi.insert_all(
+      {key, :insert_labels},
+      IssueLabel,
+      Enum.map(labels, &%{issue_id: issue.id, label_id: &1.id, inserted_at: now, updated_at: now})
+    )
+  end
+
+  defp replace_assignee_joins(multi, _key, _issue, :unchanged, _now), do: multi
+
+  defp replace_assignee_joins(multi, key, issue, assignees, now) do
+    multi
+    |> Multi.delete_all(
+      {key, :delete_assignees},
+      # TODO(upstream): gsmlg-dev/concord#66
+      from(_join in IssueAssignee, where: fragment("issue_id = ?", ^issue.id))
+    )
+    |> Multi.insert_all(
+      {key, :insert_assignees},
+      IssueAssignee,
+      Enum.map(
+        assignees,
+        &%{issue_id: issue.id, user_id: &1.id, inserted_at: now, updated_at: now}
+      )
+    )
+  end
+
+  defp comment_counts([]), do: %{}
+
+  defp comment_counts(issues) do
+    ids = Enum.map(issues, & &1.id)
+
+    Comment
+    |> where([comment], comment.issue_id in ^ids)
+    |> group_by([comment], comment.issue_id)
+    |> select([comment], {comment.issue_id, count(comment.id)})
+    |> Repo.all()
+    |> Map.new()
+  end
+
+  defp author_association(nil, _repository), do: "NONE"
+  defp author_association(%ForgeAccounts.User{id: id}, %{owner_user_id: id}), do: "OWNER"
+
+  defp author_association(author, repository) do
+    case ForgeRepos.repository_owner(repository) do
+      %ForgeAccounts.User{kind: :organization} = organization ->
+        case ForgeAccounts.organization_role(author, organization) do
+          :owner -> "OWNER"
+          :member -> "MEMBER"
+          _ -> collaborator_association(author, repository)
+        end
+
+      _ ->
+        collaborator_association(author, repository)
+    end
+  end
+
+  defp collaborator_association(author, repository) do
+    if ForgeRepos.collaborator_role(author, repository), do: "COLLABORATOR", else: "NONE"
+  end
+
+  defp missing_labels_error,
+    do: {:validation, [%{resource: "Issue", field: "labels", code: :missing}]}
+
+  defp invalid_assignees_error,
+    do: {:validation, [%{resource: "Issue", field: "assignees", code: :invalid}]}
 
   defp transact(multi, attempts_remaining) do
     Repo.transaction(multi)
