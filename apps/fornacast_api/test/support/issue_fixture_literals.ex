@@ -5,15 +5,6 @@ defmodule FornacastAPI.IssueFixtureLiterals do
 
   def versions, do: @versions
 
-  def regenerate! do
-    fixture_root = Path.expand("../fixtures", __DIR__)
-
-    for version <- versions(), {filename, literal} <- files(version) do
-      fixture_path = Path.join([fixture_root, version, "issues", filename])
-      File.write!(fixture_path, JSON.encode!(literal))
-    end
-  end
-
   def files(version) when version in @versions do
     issue = build_issue() |> stringify_keys()
     comment = comment() |> stringify_keys()

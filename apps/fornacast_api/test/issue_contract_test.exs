@@ -187,13 +187,7 @@ defmodule FornacastAPI.IssueContractTest do
     assert filters[:page] == 9_223_372_036_854_775_807
   end
 
-  # Regenerate with:
-  # REGENERATE_ISSUE_FIXTURES=1 mix test apps/fornacast_api/test/issue_contract_test.exs --max-cases 1
   test "renders complete pinned issue resources" do
-    if System.get_env("REGENERATE_ISSUE_FIXTURES") == "1" do
-      IssueFixtureLiterals.regenerate!()
-    end
-
     for version <- @versions do
       opts = [
         owner: "acme",
@@ -215,6 +209,25 @@ defmodule FornacastAPI.IssueContractTest do
 
       assert_fixtures(version)
     end
+  end
+
+  test "2022 serializers ignore a conflicting version option" do
+    opts = [
+      owner: "acme",
+      repo: "widget",
+      issue_number: 7,
+      pull_links_by_issue_id: %{3001 => %{merged_at: nil}},
+      version: "2026-03-10"
+    ]
+
+    assert Serializer.render("2022-11-28", :issue, issue(), opts) ==
+             IssueFixtureLiterals.pull_issue("2022-11-28")
+
+    assert Serializer.render("2022-11-28", :issue_comment, comment(), opts) ==
+             IssueFixtureLiterals.comment()
+
+    assert Serializer.render("2022-11-28", :label, label(), opts) ==
+             IssueFixtureLiterals.label()
   end
 
   defp issue do

@@ -1,8 +1,9 @@
 defmodule FornacastAPI.Serializers.V2022_11_28.IssueComment do
   alias FornacastAPI.{Serializer, URL}
 
+  @version "2022-11-28"
+
   def render(comment, opts) do
-    version = option(opts, :version, "2022-11-28")
     owner = option(opts, :owner)
     repo = option(opts, :repo)
     issue_number = option(opts, :issue_number)
@@ -14,7 +15,7 @@ defmodule FornacastAPI.Serializers.V2022_11_28.IssueComment do
       issue_url: URL.issue(owner, repo, issue_number),
       id: comment.id,
       node_id: Base.url_encode64("IssueComment:#{comment.id}", padding: false),
-      user: Serializer.render(version, :simple_user, comment.author, opts),
+      user: Serializer.render(@version, :simple_user, comment.author, opts),
       created_at: DateTime.to_iso8601(comment.inserted_at),
       updated_at: DateTime.to_iso8601(comment.updated_at),
       author_association: comment.author_association,
