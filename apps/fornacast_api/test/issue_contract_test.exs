@@ -187,7 +187,13 @@ defmodule FornacastAPI.IssueContractTest do
     assert filters[:page] == 9_223_372_036_854_775_807
   end
 
+  # Regenerate with:
+  # REGENERATE_ISSUE_FIXTURES=1 mix test apps/fornacast_api/test/issue_contract_test.exs --max-cases 1
   test "renders complete pinned issue resources" do
+    if System.get_env("REGENERATE_ISSUE_FIXTURES") == "1" do
+      IssueFixtureLiterals.regenerate!()
+    end
+
     for version <- @versions do
       opts = [
         owner: "acme",
@@ -252,11 +258,11 @@ defmodule FornacastAPI.IssueContractTest do
 
     for {filename, literal} <- IssueFixtureLiterals.files(version) do
       bytes = File.read!(Path.join(root, filename))
-      encoded_literal = JSON.encode!(literal, &IssueFixtureLiterals.encode/2)
+      encoded_literal = JSON.encode!(literal)
       assert bytes == encoded_literal
 
       decoded = JSON.decode!(bytes)
-      assert decoded == JSON.decode!(encoded_literal)
+      assert decoded == literal
       assert_valid_fixture(document, filename, decoded)
     end
   end

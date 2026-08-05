@@ -5,27 +5,22 @@ defmodule FornacastAPI.IssueFixtureLiterals do
 
   def versions, do: @versions
 
-  def encode(value, encoder) when is_map(value) and not is_struct(value) do
-    entries =
-      value
-      |> Enum.sort_by(fn {key, _value} -> to_string(key) end)
-      |> Enum.map(fn {key, entry} ->
-        [encoder.(to_string(key), encoder), ?:, encoder.(entry, encoder)]
-      end)
-      |> Enum.intersperse(?,)
+  def regenerate! do
+    fixture_root = Path.expand("../fixtures", __DIR__)
 
-    [?{, entries, ?}]
+    for version <- versions(), {filename, literal} <- files(version) do
+      fixture_path = Path.join([fixture_root, version, "issues", filename])
+      File.write!(fixture_path, JSON.encode!(literal))
+    end
   end
 
-  def encode(value, encoder), do: JSON.protocol_encode(value, encoder)
-
   def files(version) when version in @versions do
-    issue = build_issue()
-    comment = comment()
+    issue = build_issue() |> stringify_keys()
+    comment = comment() |> stringify_keys()
 
     %{
       "issue.json" => issue,
-      "pull-issue.json" => pull_issue(version),
+      "pull-issue.json" => version |> pull_issue() |> stringify_keys(),
       "issue-comment.json" => comment,
       "issue-list.json" => [issue],
       "issue-comment-list.json" => [comment]
@@ -160,4 +155,11 @@ defmodule FornacastAPI.IssueFixtureLiterals do
 
   defp maybe_put_pull_request(issue, pull_request),
     do: Map.put(issue, :pull_request, pull_request)
+
+  defp stringify_keys(value) when is_map(value) do
+    Map.new(value, fn {key, entry} -> {to_string(key), stringify_keys(entry)} end)
+  end
+
+  defp stringify_keys(value) when is_list(value), do: Enum.map(value, &stringify_keys/1)
+  defp stringify_keys(value), do: value
 end
