@@ -28,7 +28,7 @@ defmodule ForgePullsTest do
       foreign_keys:
         MapSet.new([
           {"issue_id", "issues", "id", :cascade},
-          {"repository_id", "repositories", "id", :restrict},
+          {"repository_id", "repositories", "id", :cascade},
           {"merged_by_user_id", "users", "id", :nilify}
         ]),
       indexes:
@@ -66,8 +66,8 @@ defmodule ForgePullsTest do
       },
       foreign_keys:
         MapSet.new([
-          {"pull_request_id", "pull_requests", "id", :restrict},
-          {"repository_id", "repositories", "id", :restrict},
+          {"pull_request_id", "pull_requests", "id", :cascade},
+          {"repository_id", "repositories", "id", :cascade},
           {"actor_user_id", "users", "id", :nilify}
         ]),
       indexes:
@@ -165,6 +165,34 @@ defmodule ForgePullsTest do
     end
   end
 
+  test "pull request creation rejects persisted structs without applying mutable snapshots" do
+    pull = %PullRequest{
+      id: 42,
+      issue_id: 1,
+      repository_id: 10,
+      head_ref: "refs/heads/original",
+      base_ref: "refs/heads/main",
+      head_sha: String.duplicate("a", 40),
+      base_sha: String.duplicate("b", 40)
+    }
+
+    changeset =
+      PullRequest.create_changeset(
+        pull,
+        valid_pull_attrs(%{
+          issue_id: 2,
+          repository_id: 11,
+          head_ref: "refs/heads/replacement",
+          base_ref: "refs/heads/release",
+          head_sha: String.duplicate("c", 40),
+          base_sha: String.duplicate("d", 40)
+        })
+      )
+
+    assert %{base: ["cannot create a persisted pull request"]} = errors_on(changeset)
+    assert changeset.changes == %{}
+  end
+
   test "merge operations only move through durable next states and redact failure reasons" do
     operation = %MergeOperation{state: :prepared, failure_reason: "private git error"}
 
@@ -195,109 +223,145 @@ defmodule ForgePullsTest do
              %MergeOperation{} |> MergeOperation.prepare_changeset(attrs) |> errors_on()
   end
 
-  test "dedicated merge transitions accept only their immediate next state" do
-    prepared = %MergeOperation{state: :prepared}
-    merge_written = %MergeOperation{state: :merge_written}
-    ref_advanced = %MergeOperation{state: :ref_advanced}
+  test "merge transitions expose only the sequential graph and sanitized pre-CAS failure" do
+    sources = [:prepared, :merge_written, :ref_advanced, :completed, :failed]
 
-    assert %{state: :merge_written} =
-             prepared
-             |> MergeOperation.merge_written_changeset()
-             |> Ecto.Changeset.apply_changes()
+    sequential =
+      MapSet.new(prepared: :merge_written, merge_written: :ref_advanced, ref_advanced: :completed)
 
-    assert %{state: :ref_advanced} =
-             merge_written
-             |> MergeOperation.ref_advanced_changeset()
-             |> Ecto.Changeset.apply_changes()
+    for source <- sources, target <- sources do
+      changeset = MergeOperation.transition_changeset(%MergeOperation{state: source}, target)
 
-    assert %{state: :completed} =
-             ref_advanced
-             |> MergeOperation.completed_changeset()
-             |> Ecto.Changeset.apply_changes()
+      if MapSet.member?(sequential, {source, target}) do
+        assert %{state: ^target} = Ecto.Changeset.apply_changes(changeset)
+      else
+        assert %{state: ["is not a valid transition"]} = errors_on(changeset)
+      end
+    end
+
+    for {transition, expected_source, target} <- [
+          {:merge_written_changeset, :prepared, :merge_written},
+          {:ref_advanced_changeset, :merge_written, :ref_advanced},
+          {:completed_changeset, :ref_advanced, :completed}
+        ],
+        source <- sources do
+      changeset = apply(MergeOperation, transition, [%MergeOperation{state: source}])
+
+      if source == expected_source do
+        assert %{state: ^target} = Ecto.Changeset.apply_changes(changeset)
+      else
+        assert %{state: ["is not a valid transition"]} = errors_on(changeset)
+      end
+    end
 
     for {source, reason, sanitized_reason} <- [
-          {prepared, "prepared\n\u0000failure", "prepared failure"},
-          {merge_written, "merge-written\u0000\n failure", "merge-written failure"},
-          {ref_advanced, "ref-advanced\r\n failure", "ref-advanced failure"}
+          {:prepared, "prepared\n\u0000failure", "prepared failure"},
+          {:merge_written, "merge-written\u0000\n failure", "merge-written failure"}
         ] do
       assert %{state: :failed, failure_reason: ^sanitized_reason} =
-               source
+               %MergeOperation{state: source}
                |> MergeOperation.failed_changeset(reason)
                |> Ecto.Changeset.apply_changes()
     end
 
-    for {operation, target} <- [
-          {prepared, :ref_advanced},
-          {prepared, :completed},
-          {merge_written, :prepared},
-          {merge_written, :completed},
-          {ref_advanced, :prepared},
-          {%MergeOperation{state: :completed}, :failed},
-          {%MergeOperation{state: :failed}, :prepared}
-        ] do
-      assert %{state: ["is not a valid transition"]} =
-               operation |> MergeOperation.transition_changeset(target) |> errors_on()
-    end
-
-    sources = [:prepared, :merge_written, :ref_advanced, :completed, :failed]
-
-    for {transition, expected_source} <- [
-          {:merge_written_changeset, :prepared},
-          {:ref_advanced_changeset, :merge_written},
-          {:completed_changeset, :ref_advanced}
-        ],
-        source <- sources,
-        source != expected_source do
-      assert %{state: ["is not a valid transition"]} =
-               apply(MergeOperation, transition, [%MergeOperation{state: source}])
-               |> errors_on()
-    end
-
-    for source <- sources, source not in [:prepared, :merge_written, :ref_advanced] do
+    for source <- [:ref_advanced, :completed, :failed] do
       assert %{state: ["is not a valid transition"]} =
                %MergeOperation{state: source}
                |> MergeOperation.failed_changeset("failure")
                |> errors_on()
     end
+
+    for source <- [:prepared, :merge_written], reason <- [nil, "", " \n\u0000\t "] do
+      assert %{failure_reason: ["can't be blank"]} =
+               %MergeOperation{state: source}
+               |> MergeOperation.failed_changeset(reason)
+               |> errors_on()
+    end
+
+    bounded_reason = String.duplicate("x", 600)
+
+    assert %{state: :failed, failure_reason: sanitized_reason} =
+             %MergeOperation{state: :prepared}
+             |> MergeOperation.failed_changeset(bounded_reason)
+             |> Ecto.Changeset.apply_changes()
+
+    assert String.length(sanitized_reason) == 512
   end
 
   test "the active adapter enforces the exact durable pull database contract" do
     assert database_contract() == @expected_contract
 
-    fixture = insert_contract_fixture()
+    key = contract_fixture_key()
+    on_exit(fn -> delete_contract_fixture(key) end)
+    fixture = insert_contract_fixture(key)
 
-    try do
-      for state <- @states do
-        assert {:ok, %{num_rows: 1}} =
-                 insert_merge_operation(fixture, state, "allowed-#{state}")
-      end
-
-      assert_constraint_rejected(fn ->
-        insert_merge_operation(fixture, "not-a-pull-state", "invalid-state")
-      end)
-
-      assert_constraint_rejected(fn -> insert_pull(fixture.issue_id, fixture.repository_id) end)
-      assert_constraint_rejected(fn -> insert_pull(-1, fixture.repository_id) end)
-      assert_constraint_rejected(fn -> insert_pull(fixture.spare_issue_ids.issue_2, -1) end)
-
-      assert_constraint_rejected(fn ->
-        insert_pull(fixture.spare_issue_ids.issue_3, fixture.repository_id, -1)
-      end)
-
-      assert_constraint_rejected(fn ->
-        insert_merge_operation(%{fixture | pull_request_id: -1}, "prepared", "missing-pull")
-      end)
-
-      assert_constraint_rejected(fn ->
-        insert_merge_operation(%{fixture | repository_id: -1}, "prepared", "missing-repo")
-      end)
-
-      assert_constraint_rejected(fn ->
-        insert_merge_operation(fixture, "prepared", "missing-actor", -1)
-      end)
-    after
-      delete_contract_fixture(fixture.key)
+    for state <- @states do
+      assert {:ok, %{num_rows: 1}} =
+               insert_merge_operation(fixture, state, "allowed-#{state}")
     end
+
+    assert_constraint_rejected(fn ->
+      insert_merge_operation(fixture, "not-a-pull-state", "invalid-state")
+    end)
+
+    assert_constraint_rejected(fn -> insert_pull(fixture.issue_id, fixture.repository_id) end)
+    assert_constraint_rejected(fn -> insert_pull(-1, fixture.repository_id) end)
+    assert_constraint_rejected(fn -> insert_pull(fixture.spare_issue_ids.issue_2, -1) end)
+
+    assert_constraint_rejected(fn ->
+      insert_pull(fixture.spare_issue_ids.issue_3, fixture.repository_id, -1)
+    end)
+
+    assert_constraint_rejected(fn ->
+      insert_merge_operation(%{fixture | pull_request_id: -1}, "prepared", "missing-pull")
+    end)
+
+    assert_constraint_rejected(fn ->
+      insert_merge_operation(%{fixture | repository_id: -1}, "prepared", "missing-repo")
+    end)
+
+    assert_constraint_rejected(fn ->
+      insert_merge_operation(fixture, "prepared", "missing-actor", -1)
+    end)
+  end
+
+  test "deleting a repository cascades through issues, pulls, and merge operations" do
+    key = contract_fixture_key()
+    on_exit(fn -> delete_contract_fixture(key) end)
+    fixture = insert_contract_fixture(key)
+    assert {:ok, %{num_rows: 1}} = insert_merge_operation(fixture, "prepared", "repo-cascade")
+
+    assert %{num_rows: 1} = delete_by_id("repositories", fixture.repository_id)
+    assert count_by_id("repositories", fixture.repository_id) == 0
+    assert count_by_foreign_key("issues", "repository_id", fixture.repository_id) == 0
+    assert count_by_foreign_key("pull_requests", "repository_id", fixture.repository_id) == 0
+
+    assert count_by_foreign_key(
+             "pull_merge_operations",
+             "repository_id",
+             fixture.repository_id
+           ) == 0
+
+    assert count_by_id("users", fixture.user_id) == 1
+  end
+
+  test "deleting an issue cascades through its pull and operation but retains the repository" do
+    key = contract_fixture_key()
+    on_exit(fn -> delete_contract_fixture(key) end)
+    fixture = insert_contract_fixture(key)
+    assert {:ok, %{num_rows: 1}} = insert_merge_operation(fixture, "prepared", "issue-cascade")
+
+    assert %{num_rows: 1} = delete_by_id("issues", fixture.issue_id)
+    assert count_by_id("issues", fixture.issue_id) == 0
+    assert count_by_id("pull_requests", fixture.pull_request_id) == 0
+
+    assert count_by_foreign_key(
+             "pull_merge_operations",
+             "pull_request_id",
+             fixture.pull_request_id
+           ) == 0
+
+    assert count_by_id("repositories", fixture.repository_id) == 1
   end
 
   defp errors_on(changeset) do
@@ -574,9 +638,7 @@ defmodule ForgePullsTest do
   defp normalize_delete_action("CASCADE"), do: :cascade
   defp normalize_delete_action("SET NULL"), do: :nilify
 
-  defp insert_contract_fixture do
-    key = "pull-contract-#{System.unique_integer([:positive, :monotonic])}"
-
+  defp insert_contract_fixture(key) do
     user_id =
       insert_id(
         """
@@ -649,6 +711,10 @@ defmodule ForgePullsTest do
       spare_issue_ids: issue_ids,
       pull_request_id: pull_request_id
     }
+  end
+
+  defp contract_fixture_key do
+    "pull-contract-#{System.unique_integer([:positive, :monotonic])}"
   end
 
   defp insert_pull(issue_id, repository_id, merged_by_user_id \\ nil) do
@@ -759,6 +825,23 @@ defmodule ForgePullsTest do
     ])
 
     sql!("DELETE FROM users WHERE username = ?", "DELETE FROM users WHERE username = $1", [key])
+  end
+
+  defp delete_by_id(table, id) do
+    sql!("DELETE FROM #{table} WHERE id = ?", "DELETE FROM #{table} WHERE id = $1", [id])
+  end
+
+  defp count_by_id(table, id), do: count_by_foreign_key(table, "id", id)
+
+  defp count_by_foreign_key(table, column, id) do
+    %{rows: [[count]]} =
+      sql!(
+        "SELECT count(*) FROM #{table} WHERE #{column} = ?",
+        "SELECT count(*) FROM #{table} WHERE #{column} = $1",
+        [id]
+      )
+
+    count
   end
 
   defp insert_id(turso_sql, postgres_sql, params) do

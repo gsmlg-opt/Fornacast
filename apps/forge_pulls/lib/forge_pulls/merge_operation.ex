@@ -5,10 +5,11 @@ defmodule ForgePulls.MergeOperation do
 
   @states [:prepared, :merge_written, :ref_advanced, :completed, :failed]
   @transitions %{
-    prepared: [:merge_written, :failed],
-    merge_written: [:ref_advanced, :failed],
-    ref_advanced: [:completed, :failed]
+    prepared: [:merge_written],
+    merge_written: [:ref_advanced],
+    ref_advanced: [:completed]
   }
+  @failure_states [:prepared, :merge_written]
 
   schema "pull_merge_operations" do
     field :pull_request_id, :integer
@@ -61,13 +62,11 @@ defmodule ForgePulls.MergeOperation do
     if state in Map.get(@transitions, operation.state, []) do
       change(operation, state: state)
     else
-      operation |> change() |> add_error(:state, "is not a valid transition")
+      invalid_transition_changeset(operation)
     end
   end
 
-  def transition_changeset(operation, _state) do
-    operation |> change() |> add_error(:state, "is not a valid transition")
-  end
+  def transition_changeset(operation, _state), do: invalid_transition_changeset(operation)
 
   def merge_written_changeset(operation), do: transition_changeset(operation, :merge_written)
 
@@ -75,11 +74,14 @@ defmodule ForgePulls.MergeOperation do
 
   def completed_changeset(operation), do: transition_changeset(operation, :completed)
 
-  def failed_changeset(operation, reason) do
+  def failed_changeset(%__MODULE__{state: state} = operation, reason)
+      when state in @failure_states do
     operation
-    |> transition_changeset(:failed)
-    |> put_change(:failure_reason, sanitize_failure_reason(reason))
+    |> change(state: :failed, failure_reason: sanitize_failure_reason(reason))
+    |> validate_required([:failure_reason])
   end
+
+  def failed_changeset(operation, _reason), do: invalid_transition_changeset(operation)
 
   def public(%__MODULE__{} = operation), do: %{operation | failure_reason: nil}
 
@@ -92,4 +94,8 @@ defmodule ForgePulls.MergeOperation do
   end
 
   def sanitize_failure_reason(_reason), do: nil
+
+  defp invalid_transition_changeset(operation) do
+    operation |> change() |> add_error(:state, "is not a valid transition")
+  end
 end

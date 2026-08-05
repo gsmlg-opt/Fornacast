@@ -4,7 +4,7 @@ defmodule Fornacast.Repo.Migrations.CreatePullDomain do
   def change do
     create table(:pull_requests) do
       add(:issue_id, references(:issues, on_delete: :delete_all), null: false)
-      add(:repository_id, references(:repositories, on_delete: :restrict), null: false)
+      add(:repository_id, references(:repositories, on_delete: :delete_all), null: false)
       add(:head_ref, :string, null: false)
       add(:base_ref, :string, null: false)
       add(:head_sha, :string, null: false)
@@ -22,8 +22,8 @@ defmodule Fornacast.Repo.Migrations.CreatePullDomain do
     create(index(:pull_requests, [:repository_id, :base_ref]))
 
     create table(:pull_merge_operations) do
-      add(:pull_request_id, references(:pull_requests, on_delete: :restrict), null: false)
-      add(:repository_id, references(:repositories, on_delete: :restrict), null: false)
+      add(:pull_request_id, references(:pull_requests, on_delete: :delete_all), null: false)
+      add(:repository_id, references(:repositories, on_delete: :delete_all), null: false)
       add(:actor_user_id, references(:users, on_delete: :nilify_all))
       add(:request_id, :string, null: false)
       add(:base_ref, :string, null: false)

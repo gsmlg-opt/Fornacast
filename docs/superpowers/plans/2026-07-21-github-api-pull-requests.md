@@ -195,7 +195,7 @@ Assert `failure_reason` is redacted or omitted from public structs returned by t
 Create `pull_requests` with:
 
 - `issue_id` referencing `issues` with `on_delete: :delete_all`, not null and unique;
-- `repository_id` referencing `repositories` with `on_delete: :restrict`, not null;
+- `repository_id` referencing `repositories` with `on_delete: :delete_all`, not null;
 - `head_ref` and `base_ref`, not null;
 - `head_sha` and `base_sha`, not null, holding the last immutable snapshots analyzed for the pull;
 - nullable `mergeable` and `mergeable_state`, updated only with the matching snapshot pair;
@@ -205,7 +205,7 @@ Create `pull_requests` with:
 
 Create `pull_merge_operations` with:
 
-- `pull_request_id` and `repository_id`, not null and restricted;
+- `pull_request_id` and `repository_id`, not null with `on_delete: :delete_all`;
 - nullable `actor_user_id` with `on_delete: :nilify_all`;
 - `request_id`, `base_ref`, `head_ref`, `expected_base_oid`, and `expected_head_oid`, not null;
 - nullable `merge_oid` and sanitized `failure_reason`;

@@ -21,7 +21,7 @@ defmodule ForgePulls.PullRequest do
     timestamps(type: :utc_datetime)
   end
 
-  def create_changeset(pull_request, attrs) do
+  def create_changeset(%__MODULE__{id: nil} = pull_request, attrs) do
     pull_request
     |> cast(attrs, [:issue_id, :head_ref, :base_ref, :head_sha, :base_sha])
     |> validate_repository_identity(attrs)
@@ -29,6 +29,12 @@ defmodule ForgePulls.PullRequest do
     |> validate_branch_refs()
     |> validate_distinct_refs()
     |> unique_constraint(:issue_id)
+  end
+
+  def create_changeset(%__MODULE__{} = pull_request, _attrs) do
+    pull_request
+    |> change()
+    |> add_error(:base, "cannot create a persisted pull request")
   end
 
   defp validate_repository_identity(changeset, attrs) do
