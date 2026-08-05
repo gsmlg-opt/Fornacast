@@ -10,6 +10,7 @@ defmodule ForgeIssues.Comment do
 
     field :author, :map, virtual: true
     field :author_association, :string, virtual: true, default: "NONE"
+    field :issue_number, :integer, virtual: true
 
     timestamps(type: :utc_datetime)
   end

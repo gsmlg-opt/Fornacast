@@ -138,7 +138,7 @@ defmodule ForgeIssues do
 
       {:ok,
        %Page{
-         entries: load_comment_metadata(entries, repository),
+         entries: load_comment_metadata(entries, repository, issue.number),
          total: total,
          page: filters.page,
          per_page: filters.per_page
@@ -157,7 +157,7 @@ defmodule ForgeIssues do
            fetch_repository(actor, owner_slug, repository_slug, :repository_read),
          {:ok, {comment, issue}} <- fetch_comment(repository, comment_id),
          :ok <- require_identity_enabled(repository, issue) do
-      {:ok, load_comment_metadata(comment, repository)}
+      {:ok, load_comment_metadata(comment, repository, issue.number)}
     end
   end
 
@@ -622,7 +622,7 @@ defmodule ForgeIssues do
          {:ok, {comment, issue}} <- current_comment(repo, repository, comment_id),
          :ok <- require_identity_enabled(repository, issue),
          :ok <- authorize_comment_mutation(actor, repository, comment) do
-      {:ok, %{actor: actor, repository: repository, comment: comment}}
+      {:ok, %{actor: actor, repository: repository, comment: comment, issue: issue}}
     end
   end
 
@@ -802,8 +802,10 @@ defmodule ForgeIssues do
   defp map_update_result({:error, _step, _reason, _changes}),
     do: invalid_filter("base", :unprocessable)
 
-  defp map_comment_result({:ok, %{authorization: %{repository: repository}, comment: comment}}),
-    do: {:ok, load_comment_metadata(comment, repository)}
+  defp map_comment_result(
+         {:ok, %{authorization: %{repository: repository, issue: issue}, comment: comment}}
+       ),
+       do: {:ok, load_comment_metadata(comment, repository, issue.number)}
 
   defp map_comment_result({:error, :authorization, reason, _changes}), do: {:error, reason}
   defp map_comment_result({:error, :comment, :not_found, _changes}), do: {:error, :not_found}
@@ -1315,7 +1317,7 @@ defmodule ForgeIssues do
     end)
   end
 
-  defp load_comment_metadata(comments, repository) when is_list(comments) do
+  defp load_comment_metadata(comments, repository, issue_number) when is_list(comments) do
     users =
       comments
       |> Enum.map(& &1.author_user_id)
@@ -1328,13 +1330,14 @@ defmodule ForgeIssues do
       %{
         comment
         | author: Map.get(users, comment.author_user_id),
-          author_association: Map.get(associations, comment.author_user_id, "NONE")
+          author_association: Map.get(associations, comment.author_user_id, "NONE"),
+          issue_number: issue_number
       }
     end)
   end
 
-  defp load_comment_metadata(%Comment{} = comment, repository) do
-    [loaded] = load_comment_metadata([comment], repository)
+  defp load_comment_metadata(%Comment{} = comment, repository, issue_number) do
+    [loaded] = load_comment_metadata([comment], repository, issue_number)
     loaded
   end
 

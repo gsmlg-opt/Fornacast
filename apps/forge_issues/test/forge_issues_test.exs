@@ -1261,9 +1261,12 @@ defmodule ForgeIssuesTest do
 
     assert Enum.map(comments, & &1.id) == [first.id, second.id]
     assert Enum.map(comments, & &1.author.id) == [writer.id, writer.id]
+    assert Enum.map(comments, & &1.issue_number) == [issue.number, issue.number]
 
-    assert {:ok, %{id: ^first_id}} =
+    assert {:ok, %{id: ^first_id, issue_number: issue_number}} =
              ForgeIssues.get_comment(nil, writer.username, repository.slug, first.id)
+
+    assert issue_number == issue.number
   end
 
   test "anonymous public comment mutations are forbidden without auditing", %{

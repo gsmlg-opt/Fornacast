@@ -2,6 +2,7 @@ defmodule FornacastAPI.IssueControllerTest do
   use FornacastAPI.ConnCase, async: false
 
   alias ForgeRepos.Repository
+  alias ForgeIssues.{Comment, Issue}
 
   @user_agent "fornacast-issue-api-test/1.0"
   @versions ["2022-11-28", "2026-03-10"]
@@ -47,6 +48,14 @@ defmodule FornacastAPI.IssueControllerTest do
         })
 
       comment_body = json_response(comment, 201)
+      assert comment_body["issue_url"] =~ "/issues/#{issue_body["number"]}"
+
+      comments =
+        api_conn(secret, version)
+        |> get("/api/v3/repos/alice/example/issues/#{issue_body["number"]}/comments")
+
+      assert [listed_comment] = json_response(comments, 200)
+      assert listed_comment["issue_url"] == comment_body["issue_url"]
 
       changed =
         api_conn(secret, version)
@@ -54,7 +63,9 @@ defmodule FornacastAPI.IssueControllerTest do
           "body" => "Updated comment #{version}"
         })
 
-      assert json_response(changed, 200)["body"] == "Updated comment #{version}"
+      changed_body = json_response(changed, 200)
+      assert changed_body["body"] == "Updated comment #{version}"
+      assert changed_body["issue_url"] == comment_body["issue_url"]
 
       deleted =
         api_conn(secret, version)
@@ -136,6 +147,82 @@ defmodule FornacastAPI.IssueControllerTest do
     assert json_response(visible_but_forbidden, 403)["message"] == "Forbidden"
   end
 
+  test "private mutations require repo while legacy scopes retain read access in both versions" do
+    alice = user("alice")
+    private = repository(alice, "private", visibility: :private)
+    {_repo_key, repo_secret} = pat(alice, ["repo"])
+
+    for {_scope, secret} <-
+          Enum.map(["repo:read", "repo:write"], fn scope ->
+            {_key, secret} = pat(alice, [scope], name: "#{scope}-private")
+            {scope, secret}
+          end) do
+      for version <- @versions do
+        read = api_conn(secret, version) |> get("/api/v3/repos/alice/private/issues")
+        assert json_response(read, 200) == []
+        assert scopes(read) == "repo, repo:read, repo:write"
+
+        mutation =
+          api_conn(secret, version)
+          |> post_raw("/api/v3/repos/alice/private/issues", "{")
+
+        assert json_response(mutation, 403)["message"] ==
+                 "Resource not accessible by personal access token"
+
+        assert scopes(mutation) == "repo"
+      end
+    end
+
+    for version <- @versions do
+      created =
+        api_conn(repo_secret, version)
+        |> post_json("/api/v3/repos/alice/private/issues", %{"title" => "Private #{version}"})
+
+      assert created_body = json_response(created, 201)
+
+      comment =
+        api_conn(repo_secret, version)
+        |> post_json("/api/v3/repos/alice/private/issues/#{created_body["number"]}/comments", %{
+          "body" => "Private comment"
+        })
+
+      assert json_response(comment, 201)["issue_url"] =~ "/issues/#{created_body["number"]}"
+    end
+
+    assert private.visibility == :private
+  end
+
+  test "disabled ordinary issue operations return 410 while pull rows remain listed" do
+    alice = user("alice")
+    repository = repository(alice, "disabled", has_issues: false)
+    {_key, secret} = pat(alice, ["public_repo"])
+    issue = issue(repository, alice, 1, :issue)
+    pull = issue(repository, alice, 2, :pull_request)
+    comment = comment(issue, alice)
+
+    for version <- @versions do
+      list = api_conn(secret, version) |> get("/api/v3/repos/alice/disabled/issues?state=all")
+      assert [pull_body] = json_response(list, 200)
+      assert pull_body["number"] == pull.number
+
+      for {method, path, body} <- [
+            {:post, "/api/v3/repos/alice/disabled/issues", ~s({"title":"blocked"})},
+            {:get, "/api/v3/repos/alice/disabled/issues/#{issue.number}", nil},
+            {:patch, "/api/v3/repos/alice/disabled/issues/#{issue.number}",
+             ~s({"title":"blocked"})},
+            {:get, "/api/v3/repos/alice/disabled/issues/#{issue.number}/comments", nil},
+            {:post, "/api/v3/repos/alice/disabled/issues/#{issue.number}/comments",
+             ~s({"body":"blocked"})},
+            {:patch, "/api/v3/repos/alice/disabled/issues/comments/#{comment.id}",
+             ~s({"body":"blocked"})},
+            {:delete, "/api/v3/repos/alice/disabled/issues/comments/#{comment.id}", nil}
+          ] do
+        conn = request(api_conn(secret, version), method, path, body)
+        assert json_response(conn, 410)["message"] == "Issues are disabled for this repository"
+      end
+    end
+  end
+
   defp repository(owner, slug, opts \\ []) do
     %Repository{owner_user_id: owner.id, storage_path: "@issue-api/#{owner.id}/#{slug}.git"}
     |> Repository.create_changeset(%{
@@ -143,7 +230,7 @@ defmodule FornacastAPI.IssueControllerTest do
       slug: slug,
       visibility: Keyword.get(opts, :visibility, :public),
       default_branch: "main",
-      has_issues: true,
+      has_issues: Keyword.get(opts, :has_issues, true),
       allow_merge_commit: true
     })
     |> Repo.insert!()
@@ -166,6 +253,31 @@ defmodule FornacastAPI.IssueControllerTest do
 
   defp post_raw(conn, path, body) do
     conn |> put_req_header("content-type", "application/json") |> post(path, body)
+  end
+
+  defp issue(repository, author, number, kind) do
+    Repo.insert!(%Issue{
+      repository_id: repository.id,
+      number: number,
+      kind: kind,
+      title: "#{kind} #{number}",
+      state: :open,
+      author_user_id: author.id
+    })
+  end
+
+  defp comment(issue, author) do
+    Repo.insert!(%Comment{issue_id: issue.id, author_user_id: author.id, body: "existing"})
+  end
+
+  defp request(conn, :get, path, _body), do: get(conn, path)
+  defp request(conn, :delete, path, _body), do: delete(conn, path)
+
+  defp request(conn, :post, path, body), do: post_raw(conn, path, body)
+  defp request(conn, :patch, path, body), do: patch_raw(conn, path, body)
+
+  defp patch_raw(conn, path, body) do
+    conn |> put_req_header("content-type", "application/json") |> patch(path, body)
   end
 
   defp api_conn_for(user, scopes) do

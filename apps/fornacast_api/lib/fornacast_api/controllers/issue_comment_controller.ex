@@ -35,13 +35,13 @@ defmodule FornacastAPI.IssueCommentController do
          {:ok, filters} <- IssueContract.comment_filters(conn.query_params),
          {:ok, page} <- ForgeIssues.list_comments(actor, owner, repo, number, Map.new(filters)) do
       body =
-        Enum.map(
-          page.entries,
-          &Serializer.render(conn.assigns.api_version, :issue_comment, &1,
+        Enum.map(page.entries, fn comment ->
+          Serializer.render(conn.assigns.api_version, :issue_comment, comment,
             owner: owner,
-            repo: repo
+            repo: repo,
+            issue_number: number
           )
-        )
+        end)
 
       Response.paginated(conn, 200, body, page,
         url: request_path_with_query(conn),
@@ -64,7 +64,8 @@ defmodule FornacastAPI.IssueCommentController do
           ForgeIssues.create_comment(actor, owner, repo, number, attrs, metadata)
         end,
         :json,
-        201
+        201,
+        number
       )
     else
       {:error, reason} -> render_error(conn, reason, @create_url)
@@ -104,7 +105,17 @@ defmodule FornacastAPI.IssueCommentController do
     end
   end
 
-  defp mutate(conn, owner, repo, operation, documentation_url, operation_fun, :json, status) do
+  defp mutate(
+         conn,
+         owner,
+         repo,
+         operation,
+         documentation_url,
+         operation_fun,
+         :json,
+         status,
+         issue_number \\ nil
+       ) do
     version = conn.assigns.api_version
 
     with {:ok, %{actor: actor} = authentication} <- require_auth(conn),
@@ -118,7 +129,11 @@ defmodule FornacastAPI.IssueCommentController do
       Response.json(
         conn,
         status,
-        Serializer.render(version, :issue_comment, comment, owner: owner, repo: repo),
+        Serializer.render(version, :issue_comment, comment,
+          owner: owner,
+          repo: repo,
+          issue_number: issue_number || comment.issue_number
+        ),
         accepted_scopes: accepted_scopes
       )
     else

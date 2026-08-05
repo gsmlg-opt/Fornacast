@@ -6,7 +6,7 @@ defmodule FornacastAPI.Serializers.V2022_11_28.IssueComment do
   def render(comment, opts) do
     owner = option(opts, :owner)
     repo = option(opts, :repo)
-    issue_number = option(opts, :issue_number)
+    issue_number = option(opts, :issue_number, comment.issue_number)
     url = URL.issue_comment(owner, repo, comment.id)
 
     %{
