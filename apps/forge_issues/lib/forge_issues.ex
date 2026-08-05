@@ -252,7 +252,22 @@ defmodule ForgeIssues do
     do: {:error, :forbidden}
 
   @doc false
-  def create_comment_multi(actor, repository, number, attrs, request_metadata) do
+  @spec create_comment_multi(
+          ForgeAccounts.User.t(),
+          ForgeRepos.Repository.t(),
+          pos_integer(),
+          map(),
+          map()
+        ) :: Multi.t()
+  def create_comment_multi(
+        %ForgeAccounts.User{} = actor,
+        %ForgeRepos.Repository{id: repository_id} = repository,
+        number,
+        attrs,
+        request_metadata
+      )
+      when is_integer(repository_id) and is_integer(number) and number > 0 and is_map(attrs) and
+             is_map(request_metadata) do
     attrs = normalize_attrs(attrs)
     request_metadata = safe_request_metadata(request_metadata)
 
@@ -288,23 +303,84 @@ defmodule ForgeIssues do
   end
 
   @doc false
-  def update_comment_multi(actor, repository, comment_id, attrs, request_metadata) do
+  @spec update_comment_multi(
+          ForgeAccounts.User.t(),
+          ForgeRepos.Repository.t(),
+          pos_integer(),
+          map(),
+          map()
+        ) :: Multi.t()
+  def update_comment_multi(
+        %ForgeAccounts.User{} = actor,
+        %ForgeRepos.Repository{} = repository,
+        comment_id,
+        attrs,
+        request_metadata
+      )
+      when is_integer(comment_id) and comment_id > 0 and is_map(attrs) and
+             is_map(request_metadata) do
+    actor
+    |> comment_mutation_multi(repository, comment_id)
+    |> put_comment_update(attrs, request_metadata)
+  end
+
+  @doc false
+  @spec delete_comment_multi(
+          ForgeAccounts.User.t(),
+          ForgeRepos.Repository.t(),
+          pos_integer(),
+          map()
+        ) :: Multi.t()
+  def delete_comment_multi(
+        %ForgeAccounts.User{} = actor,
+        %ForgeRepos.Repository{} = repository,
+        comment_id,
+        request_metadata
+      )
+      when is_integer(comment_id) and comment_id > 0 and is_map(request_metadata) do
+    actor
+    |> comment_mutation_multi(repository, comment_id)
+    |> put_comment_delete(request_metadata)
+  end
+
+  @doc false
+  @spec comment_mutation_multi(
+          ForgeAccounts.User.t(),
+          ForgeRepos.Repository.t(),
+          pos_integer()
+        ) :: Multi.t()
+  def comment_mutation_multi(
+        %ForgeAccounts.User{} = actor,
+        %ForgeRepos.Repository{id: repository_id},
+        comment_id
+      )
+      when is_integer(repository_id) and is_integer(comment_id) and comment_id > 0 do
+    Multi.new()
+    |> Multi.run(:authorization, fn repo, _changes ->
+      authorize_comment_mutation_transaction(repo, actor, repository_id, comment_id)
+    end)
+  end
+
+  @doc false
+  @spec put_comment_update(Multi.t(), map(), map()) :: Multi.t()
+  def put_comment_update(%Multi{} = multi, attrs, request_metadata)
+      when is_map(attrs) and is_map(request_metadata) do
     attrs = normalize_attrs(attrs)
     request_metadata = safe_request_metadata(request_metadata)
 
-    Multi.new()
-    |> Multi.run(:authorization, fn repo, _changes ->
-      authorize_comment_mutation_transaction(repo, actor, repository.id, comment_id)
-    end)
-    |> Multi.merge(fn %{
-                        authorization: %{
-                          actor: current_actor,
-                          repository: current_repository,
-                          comment: comment
-                        }
-                      } ->
+    Multi.merge(multi, fn %{
+                            authorization: %{
+                              actor: current_actor,
+                              repository: current_repository,
+                              comment: comment
+                            }
+                          } ->
       Multi.new()
-      |> Multi.update(:comment, Comment.changeset(comment, Map.take(attrs, ["body"])))
+      |> Multi.run(:comment, fn repo, _changes ->
+        comment
+        |> Comment.update_changeset(Map.take(attrs, ["body"]))
+        |> update_comment_row(repo)
+      end)
       |> Audit.record_multi(
         :audit,
         current_actor,
@@ -318,22 +394,19 @@ defmodule ForgeIssues do
   end
 
   @doc false
-  def delete_comment_multi(actor, repository, comment_id, request_metadata) do
+  @spec put_comment_delete(Multi.t(), map()) :: Multi.t()
+  def put_comment_delete(%Multi{} = multi, request_metadata) when is_map(request_metadata) do
     request_metadata = safe_request_metadata(request_metadata)
 
-    Multi.new()
-    |> Multi.run(:authorization, fn repo, _changes ->
-      authorize_comment_mutation_transaction(repo, actor, repository.id, comment_id)
-    end)
-    |> Multi.merge(fn %{
-                        authorization: %{
-                          actor: current_actor,
-                          repository: current_repository,
-                          comment: comment
-                        }
-                      } ->
+    Multi.merge(multi, fn %{
+                            authorization: %{
+                              actor: current_actor,
+                              repository: current_repository,
+                              comment: comment
+                            }
+                          } ->
       Multi.new()
-      |> Multi.delete(:comment, comment)
+      |> Multi.run(:comment, fn repo, _changes -> delete_comment_row(repo, comment) end)
       |> Audit.record_multi(
         :audit,
         current_actor,
@@ -623,6 +696,26 @@ defmodule ForgeIssues do
     end
   end
 
+  defp update_comment_row(changeset, repo) do
+    case repo.update(changeset, stale_error_field: :id) do
+      {:ok, comment} -> {:ok, comment}
+      {:error, changeset} -> stale_or_changeset_error(changeset)
+    end
+  end
+
+  defp delete_comment_row(repo, comment) do
+    case repo.delete(comment, stale_error_field: :id) do
+      {:ok, deleted} -> {:ok, deleted}
+      {:error, changeset} -> stale_or_changeset_error(changeset)
+    end
+  end
+
+  defp stale_or_changeset_error(changeset) do
+    if Enum.any?(changeset.errors, fn {_field, {_message, metadata}} -> metadata[:stale] end),
+      do: {:error, :not_found},
+      else: {:error, changeset}
+  end
+
   defp mutation_attrs(attrs, :writer, _issue), do: {:ok, attrs}
 
   defp mutation_attrs(attrs, :author, issue) do
@@ -675,6 +768,7 @@ defmodule ForgeIssues do
     do: {:ok, load_comment_metadata(comment, repository)}
 
   defp map_comment_result({:error, :authorization, reason, _changes}), do: {:error, reason}
+  defp map_comment_result({:error, :comment, :not_found, _changes}), do: {:error, :not_found}
 
   defp map_comment_result({:error, :comment, changeset, _changes})
        when is_struct(changeset, Ecto.Changeset),
@@ -688,7 +782,12 @@ defmodule ForgeIssues do
 
   defp map_comment_delete_result({:ok, _changes}), do: :ok
   defp map_comment_delete_result({:error, :authorization, reason, _changes}), do: {:error, reason}
-  defp map_comment_delete_result({:error, _step, _reason, _changes}), do: {:error, :unprocessable}
+
+  defp map_comment_delete_result({:error, :comment, :not_found, _changes}),
+    do: {:error, :not_found}
+
+  defp map_comment_delete_result({:error, _step, _reason, _changes}),
+    do: invalid_comment_filter("base", :unprocessable)
 
   defp issue_changeset_errors(changeset) do
     changeset.errors

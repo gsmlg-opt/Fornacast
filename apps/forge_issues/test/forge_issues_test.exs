@@ -1726,6 +1726,45 @@ defmodule ForgeIssuesTest do
     assert 0 == Repo.aggregate(AuditEvent, :count, :id)
   end
 
+  test "comment updates require a valid body field and audit only success", %{
+    writer: writer,
+    repository: repository
+  } do
+    issue = issue_fixture(repository, writer)
+    comment = insert_comment(issue, writer, "Original")
+
+    Enum.each(
+      [%{}, %{"unknown" => "value"}, %{"body" => nil}, %{"body" => ""}, %{"body" => <<0>>}],
+      fn attrs ->
+        assert {:error,
+                {:validation, [%{resource: "IssueComment", field: "body", code: :invalid}]}} =
+                 ForgeIssues.update_comment(
+                   writer,
+                   writer.username,
+                   repository.slug,
+                   comment.id,
+                   attrs,
+                   request_metadata()
+                 )
+      end
+    )
+
+    assert 0 == Repo.aggregate(AuditEvent, :count, :id)
+    assert Repo.get!(Comment, comment.id).body == "Original"
+
+    assert {:ok, %{body: "Updated"}} =
+             ForgeIssues.update_comment(
+               writer,
+               writer.username,
+               repository.slug,
+               comment.id,
+               %{"body" => "Updated"},
+               request_metadata()
+             )
+
+    assert 1 == Repo.aggregate(AuditEvent, :count, :id)
+  end
+
   test "comment multis recheck repository, identity, and comment state", %{
     writer: writer,
     repository: repository
@@ -1763,6 +1802,40 @@ defmodule ForgeIssuesTest do
              ForgeIssues.transaction(deleted_issue_multi)
 
     assert 0 == Repo.aggregate(AuditEvent, :count, :id)
+  end
+
+  test "comment update and delete return not found when the row disappears after authorization",
+       %{
+         writer: writer,
+         repository: repository
+       } do
+    issue = issue_fixture(repository, writer)
+
+    Enum.each([:update, :delete], fn operation ->
+      comment = insert_comment(issue, writer, "Race #{operation}")
+
+      multi =
+        ForgeIssues.comment_mutation_multi(writer, repository, comment.id)
+        |> Multi.run(:concurrent_delete, fn repo, %{authorization: %{comment: authorized}} ->
+          {:ok, _deleted} = repo.delete(authorized)
+          {:ok, :deleted}
+        end)
+        |> case do
+          multi when operation == :update ->
+            ForgeIssues.put_comment_update(
+              multi,
+              %{"body" => "Too late"},
+              request_metadata()
+            )
+
+          multi ->
+            ForgeIssues.put_comment_delete(multi, request_metadata())
+        end
+
+      assert {:error, :comment, :not_found, _changes} = ForgeIssues.transaction(multi)
+      assert Repo.get(Comment, comment.id)
+      assert 0 == Repo.aggregate(AuditEvent, :count, :id)
+    end)
   end
 
   test "comment multis recheck access and repository availability", %{
