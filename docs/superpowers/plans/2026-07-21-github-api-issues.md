@@ -1191,12 +1191,6 @@ Assert both documents and the overlay now require implemented-through marker `"3
 
 Use one fixed issue (`id: 3001`, number `7`, title `API issue`, body `Track compatibility`, state `open`, author ID `41`, no assignees or labels, zero comments, timestamps `2026-07-21T00:00:00Z`) and one fixed comment (`id: 3101`, body `First comment`, the same author and timestamps). Build literal expected maps from the complete field maps in Step 6, including the foundation's complete literal simple-user map; do not derive expected maps by invoking the serializer under test. `issue.json` is the issue map, `pull-issue.json` is the same canonical identity with `kind: :pull_request` and a pull link whose `merged_at` is null, `issue-comment.json` is the comment map, and the two list files are one-element arrays of their corresponding singular maps. Check in the exact `JSON.encode!/1` result at all ten paths above, compare decoded files to those literal maps, and validate every fixture against its selected response schema.
 
-Regenerate the issue fixtures without starting repository applications:
-
-~~~bash
-MIX_ENV=test mix run --no-start scripts/regenerate_issue_fixtures.exs
-~~~
-
 - [ ] **Step 2: Run the contract test and verify issue codecs are absent**
 
 Run:
