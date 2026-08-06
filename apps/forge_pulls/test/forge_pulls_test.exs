@@ -350,55 +350,64 @@ defmodule ForgePullsTest do
   end
 
   test "simultaneous public issue and pull creates share unique consecutive numbers" do
-    owner = user_fixture(unique("pull-concurrent-owner"))
-    repository = repository_fixture(owner)
+    {owner, repository} = independent_pull_concurrency_fixture()
     create_branch!(repository, "main")
 
-    Enum.each(1..5, fn index -> create_branch!(repository, "feature-#{index}") end)
+    Enum.each(1..4, fn index -> create_branch!(repository, "feature-#{index}") end)
 
     parent = self()
+    ready_ref = make_ref()
+    worker_count = 8
 
     tasks =
-      Enum.map(1..10, fn index ->
+      Enum.map(1..worker_count, fn index ->
         Task.async(fn ->
-          receive do
-            :go when rem(index, 2) == 0 ->
-              ForgeIssues.create(
-                owner,
-                owner.username,
-                repository.slug,
-                %{title: "Issue #{index}"},
-                %{}
-              )
+          backend_pid = independent_pull_connection!(ready_ref, parent)
 
-            :go ->
-              create_pull(
-                repository,
-                owner,
-                "Pull #{index}",
-                "feature-#{div(index + 1, 2)}",
-                "main"
-              )
+          receive do
+            {:go, ^ready_ref} ->
+              result =
+                if rem(index, 2) == 0 do
+                  ForgeIssues.create(
+                    owner,
+                    owner.username,
+                    repository.slug,
+                    %{title: "Issue #{index}"},
+                    %{}
+                  )
+                else
+                  create_pull(
+                    repository,
+                    owner,
+                    "Pull #{index}",
+                    "feature-#{div(index + 1, 2)}",
+                    "main"
+                  )
+                end
+
+              independent_pull_checkin()
+              {result, backend_pid}
           end
         end)
       end)
 
-    if database_adapter() == :postgres do
-      Enum.each(tasks, &Ecto.Adapters.SQL.Sandbox.allow(Repo, parent, &1.pid))
-    end
+    backend_pids = await_independent_pull_workers(tasks, ready_ref)
 
-    Enum.each(tasks, &send(&1.pid, :go))
+    if database_adapter() == :postgres,
+      do: assert(MapSet.size(MapSet.new(backend_pids)) > 1)
+
+    Enum.each(tasks, &send(&1.pid, {:go, ready_ref}))
 
     numbers =
       tasks
       |> Enum.map(&Task.await(&1, 30_000))
       |> Enum.map(fn
-        {:ok, %PullRequest{issue: issue}} -> issue.number
-        {:ok, %Issue{} = issue} -> issue.number
+        {{:ok, %PullRequest{issue: issue}}, _backend_pid} -> issue.number
+        {{:ok, %Issue{} = issue}, _backend_pid} -> issue.number
       end)
       |> Enum.sort()
 
-    assert numbers == Enum.to_list(1..10)
+    assert numbers == Enum.to_list(1..worker_count)
   end
 
   test "updates keep source repository and head immutable and refresh an existing base snapshot" do
@@ -452,7 +461,7 @@ defmodule ForgePullsTest do
              )
   end
 
-  test "authors edit and close their pull writers manage every pull and unrelated readers are forbidden" do
+  test "authors and writers close and reopen pulls with public string states and derived reasons" do
     owner = user_fixture(unique("pull-policy-owner"))
     author = user_fixture(unique("pull-policy-author"))
     writer = user_fixture(unique("pull-policy-writer"))
@@ -470,7 +479,7 @@ defmodule ForgePullsTest do
                repository,
                pull,
                author,
-               %{title: "Author edit", body: "body", state: :closed},
+               %{"title" => "Author edit", "body" => "body", "state" => "closed"},
                %{}
              )
 
@@ -478,12 +487,47 @@ defmodule ForgePullsTest do
     assert author_update.issue.state == :closed
     assert author_update.issue.state_reason == :completed
 
-    assert {:ok, writer_update} =
+    assert {:ok, author_unchanged} =
              ForgePulls.update_pull_request(
                repository,
                author_update,
+               author,
+               %{"state" => "closed"},
+               %{}
+             )
+
+    assert author_unchanged.issue.state_reason == :completed
+
+    assert {:ok, author_reopen} =
+             ForgePulls.update_pull_request(
+               repository,
+               author_unchanged,
+               author,
+               %{"state" => "open"},
+               %{}
+             )
+
+    assert author_reopen.issue.state == :open
+    assert author_reopen.issue.state_reason == :reopened
+
+    assert {:ok, writer_close} =
+             ForgePulls.update_pull_request(
+               repository,
+               author_reopen,
                writer,
-               %{title: "Writer edit", state: :open, state_reason: :reopened},
+               %{"state" => "closed"},
+               %{}
+             )
+
+    assert writer_close.issue.state == :closed
+    assert writer_close.issue.state_reason == :completed
+
+    assert {:ok, writer_update} =
+             ForgePulls.update_pull_request(
+               repository,
+               writer_close,
+               writer,
+               %{"title" => "Writer edit", "state" => "open"},
                %{}
              )
 
@@ -491,14 +535,62 @@ defmodule ForgePullsTest do
     assert writer_update.issue.state == :open
     assert writer_update.issue.state_reason == :reopened
 
-    assert {:error, :forbidden} =
+    assert {:ok, writer_unchanged} =
              ForgePulls.update_pull_request(
                repository,
                writer_update,
+               writer,
+               %{"state" => "open"},
+               %{}
+             )
+
+    assert writer_unchanged.issue.state_reason == :reopened
+
+    assert {:error, :forbidden} =
+             ForgePulls.update_pull_request(
+               repository,
+               writer_unchanged,
                unrelated,
                %{title: "Forbidden"},
                %{}
              )
+  end
+
+  test "pull state updates accept atom equivalents ignore internal reasons and reject other values" do
+    owner = user_fixture(unique("pull-state-owner"))
+    repository = repository_fixture(owner)
+    create_branch!(repository, "main")
+    create_branch!(repository, "feature")
+    assert {:ok, pull} = create_pull(repository, owner, "States", "feature", "main")
+
+    assert {:ok, closed} =
+             ForgePulls.update_pull_request(
+               repository,
+               pull,
+               owner,
+               %{state: :closed, state_reason: :not_planned},
+               %{}
+             )
+
+    assert closed.issue.state == :closed
+    assert closed.issue.state_reason == :completed
+
+    assert {:ok, reopened} =
+             ForgePulls.update_pull_request(repository, closed, owner, %{state: :open}, %{})
+
+    assert reopened.issue.state == :open
+    assert reopened.issue.state_reason == :reopened
+
+    for invalid_state <- ["merged", :merged, nil] do
+      assert {:error, {:validation, [%{resource: "PullRequest", field: "state", code: :invalid}]}} =
+               ForgePulls.update_pull_request(
+                 repository,
+                 reopened,
+                 owner,
+                 %{"state" => invalid_state},
+                 %{}
+               )
+    end
   end
 
   test "mutations revalidate disabled and revoked actors and deleted repositories inside the transaction" do
@@ -1181,8 +1273,80 @@ defmodule ForgePullsTest do
     )
   end
 
-  defp unique(prefix),
-    do: "#{String.slice(prefix, 0, 22)}-#{System.unique_integer([:positive, :monotonic])}"
+  defp unique(prefix) do
+    stamp = System.system_time(:nanosecond) |> Integer.to_string(36) |> String.slice(-10, 10)
+    counter = System.unique_integer([:positive, :monotonic]) |> Integer.to_string(36)
+    "#{String.slice(prefix, 0, 12)}-#{stamp}-#{counter}"
+  end
+
+  defp independent_pull_concurrency_fixture do
+    if database_adapter() == :postgres do
+      :ok = Ecto.Adapters.SQL.Sandbox.mode(Repo, :manual)
+
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+        owner = user_fixture(unique("pull-pg-owner"))
+        repository = repository_fixture(owner)
+        register_committed_pull_fixture_cleanup(owner, repository)
+        {owner, repository}
+      end)
+    else
+      owner = user_fixture(unique("pull-concurrent-owner"))
+      {owner, repository_fixture(owner)}
+    end
+  end
+
+  defp register_committed_pull_fixture_cleanup(owner, repository) do
+    path = ForgeRepos.absolute_storage_path(repository)
+
+    on_exit(fn ->
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+        Repo.delete_all(
+          from(event in AuditEvent,
+            where:
+              event.target_type == "repository" and
+                event.target_id == ^Integer.to_string(repository.id)
+          )
+        )
+
+        if stored_repository = Repo.get(ForgeRepos.Repository, repository.id) do
+          Repo.delete!(stored_repository)
+        end
+
+        if stored_owner = Repo.get(ForgeAccounts.User, owner.id) do
+          Repo.delete!(stored_owner)
+        end
+      end)
+
+      File.rm_rf!(path)
+    end)
+  end
+
+  defp independent_pull_connection!(ready_ref, parent) do
+    backend_pid =
+      if database_adapter() == :postgres do
+        :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
+        %{rows: [[backend_pid]]} = SQL.query!(Repo, "SELECT pg_backend_pid()", [])
+        backend_pid
+      end
+
+    send(parent, {ready_ref, self(), backend_pid})
+    backend_pid
+  end
+
+  defp independent_pull_checkin do
+    if database_adapter() == :postgres,
+      do: :ok = Ecto.Adapters.SQL.Sandbox.checkin(Repo)
+  end
+
+  defp await_independent_pull_workers(tasks, ready_ref) do
+    Enum.map(tasks, fn task ->
+      receive do
+        {^ready_ref, worker_pid, backend_pid} when worker_pid == task.pid -> backend_pid
+      after
+        15_000 -> flunk("independent pull worker did not reach the start barrier")
+      end
+    end)
+  end
 
   defp create_pull(repository, actor, title, head, base) do
     ForgePulls.create_pull_request(

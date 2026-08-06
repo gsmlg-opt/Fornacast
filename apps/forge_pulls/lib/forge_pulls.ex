@@ -236,6 +236,7 @@ defmodule ForgePulls do
          :ok <- authorize_read(actor, repository),
          :ok <- same_repository(pull, repository),
          :ok <- immutable_source(attrs),
+         {:ok, attrs} <- normalize_update_attrs(attrs),
          {:ok, pull_attrs} <- resolve_updated_base(repository, pull, attrs) do
       Ecto.Multi.new()
       |> Ecto.Multi.run(:authorization, fn repo, _ ->
@@ -488,28 +489,41 @@ defmodule ForgePulls do
     end
   end
 
-  defp permitted_shared_attrs(attrs, :writer, _issue),
-    do:
-      shared_issue_attrs(
-        Map.take(attrs, [
-          "title",
-          "body",
-          "state",
-          "state_reason",
-          :title,
-          :body,
-          :state,
-          :state_reason
-        ])
-      )
-
-  defp permitted_shared_attrs(attrs, :author, issue) do
+  defp permitted_shared_attrs(attrs, capability, issue) when capability in [:author, :writer] do
     attrs = shared_issue_attrs(Map.take(attrs, ["title", "body", "state", :title, :body, :state]))
 
     case {issue.state, attr(attrs, "state")} do
       {state, :closed} when state != :closed -> Map.put(attrs, "state_reason", :completed)
       {state, :open} when state != :open -> Map.put(attrs, "state_reason", :reopened)
       _ -> attrs
+    end
+  end
+
+  defp normalize_update_attrs(attrs) do
+    attrs = attrs |> Map.delete("state_reason") |> Map.delete(:state_reason)
+
+    case fetch_attr(attrs, "state") do
+      :error ->
+        {:ok, attrs}
+
+      {:ok, state} when state in [:open, "open"] ->
+        {:ok, attrs |> Map.delete(:state) |> Map.put("state", :open)}
+
+      {:ok, state} when state in [:closed, "closed"] ->
+        {:ok, attrs |> Map.delete(:state) |> Map.put("state", :closed)}
+
+      {:ok, _state} ->
+        {:error, {:validation, [%{resource: "PullRequest", field: "state", code: :invalid}]}}
+    end
+  end
+
+  defp fetch_attr(attrs, key) do
+    atom_key = String.to_atom(key)
+
+    cond do
+      Map.has_key?(attrs, key) -> {:ok, Map.fetch!(attrs, key)}
+      Map.has_key?(attrs, atom_key) -> {:ok, Map.fetch!(attrs, atom_key)}
+      true -> :error
     end
   end
 

@@ -1,6 +1,7 @@
 defmodule ForgeIssues.NumberAllocatorTest do
   use ExUnit.Case, async: false
 
+  alias Ecto.Adapters.SQL
   alias Ecto.Multi
   alias ForgeIssues.{Comment, Issue, IssueAssignee, IssueLabel, Label, NumberSequence}
   alias ForgeRepos.Collaborator
@@ -191,46 +192,118 @@ defmodule ForgeIssues.NumberAllocatorTest do
     assert :counters.get(counter, 1) == expected_attempts
   end
 
-  test "allocates twenty distinct numbers concurrently across identity kinds", %{
-    actor: actor,
-    repository: repository
-  } do
+  test "independent transactions allocate consecutive numbers concurrently across identity kinds",
+       %{
+         actor: actor,
+         repository: repository
+       } do
+    {actor, repository} = independent_concurrency_fixture(actor, repository)
     parent = self()
+    ready_ref = make_ref()
+    worker_count = 8
 
     tasks =
-      for index <- 1..20 do
+      for index <- 1..worker_count do
         Task.async(fn ->
+          backend_pid = independent_connection!(ready_ref, parent)
+
           receive do
-            :go ->
-              Multi.new()
-              |> ForgeIssues.insert_numbered_identity(
-                {:issue, index},
-                repository,
-                actor,
-                if(rem(index, 2) == 0, do: :pull_request, else: :issue),
-                %{title: "Concurrent #{index}"}
-              )
-              |> ForgeIssues.transaction()
-              |> case do
-                {:ok, changes} -> {:ok, changes[{:issue, index}].number}
+            {:go, ^ready_ref} ->
+              result =
+                Multi.new()
+                |> ForgeIssues.insert_numbered_identity(
+                  {:issue, index},
+                  repository,
+                  actor,
+                  if(rem(index, 2) == 0, do: :pull_request, else: :issue),
+                  %{title: "Concurrent #{index}"}
+                )
+                |> ForgeIssues.transaction()
+
+              independent_checkin()
+
+              case result do
+                {:ok, changes} -> {:ok, changes[{:issue, index}].number, backend_pid}
                 error -> error
               end
           end
         end)
       end
 
-    if Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"] do
-      Enum.each(tasks, fn task -> Ecto.Adapters.SQL.Sandbox.allow(Repo, parent, task.pid) end)
-    end
+    backend_pids = await_independent_workers(tasks, ready_ref)
 
-    Enum.each(tasks, fn task -> send(task.pid, :go) end)
+    if postgres?(), do: assert(MapSet.size(MapSet.new(backend_pids)) > 1)
+
+    Enum.each(tasks, fn task -> send(task.pid, {:go, ready_ref}) end)
 
     numbers =
       tasks
-      |> Enum.map(&Task.await(&1, 15_000))
-      |> Enum.map(fn {:ok, number} -> number end)
+      |> Enum.map(&Task.await(&1, 30_000))
+      |> Enum.map(fn {:ok, number, _backend_pid} -> number end)
       |> Enum.sort()
 
-    assert numbers == Enum.to_list(1..20)
+    assert numbers == Enum.to_list(1..worker_count)
   end
+
+  defp independent_concurrency_fixture(actor, repository) do
+    if postgres?() do
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+        committed_actor =
+          user_fixture("allocator-pg-#{System.system_time(:nanosecond)}")
+
+        committed_repository = repository_fixture(committed_actor)
+        register_committed_fixture_cleanup(committed_actor, committed_repository)
+        {committed_actor, committed_repository}
+      end)
+    else
+      {actor, repository}
+    end
+  end
+
+  defp register_committed_fixture_cleanup(actor, repository) do
+    path = ForgeRepos.absolute_storage_path(repository)
+
+    on_exit(fn ->
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+        if stored_repository = Repo.get(ForgeRepos.Repository, repository.id) do
+          Repo.delete!(stored_repository)
+        end
+
+        if stored_actor = Repo.get(ForgeAccounts.User, actor.id) do
+          Repo.delete!(stored_actor)
+        end
+      end)
+
+      File.rm_rf!(path)
+    end)
+  end
+
+  defp independent_connection!(ready_ref, parent) do
+    backend_pid =
+      if postgres?() do
+        :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
+        %{rows: [[backend_pid]]} = SQL.query!(Repo, "SELECT pg_backend_pid()", [])
+        backend_pid
+      end
+
+    send(parent, {ready_ref, self(), backend_pid})
+    backend_pid
+  end
+
+  defp independent_checkin do
+    if postgres?(), do: :ok = Ecto.Adapters.SQL.Sandbox.checkin(Repo)
+  end
+
+  defp await_independent_workers(tasks, ready_ref) do
+    Enum.map(tasks, fn task ->
+      receive do
+        {^ready_ref, worker_pid, backend_pid} when worker_pid == task.pid -> backend_pid
+      after
+        15_000 -> flunk("independent allocator worker did not reach the start barrier")
+      end
+    end)
+  end
+
+  defp postgres?,
+    do: Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"]
 end
