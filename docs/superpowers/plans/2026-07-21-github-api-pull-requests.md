@@ -101,6 +101,8 @@
 ### Issue composition and Git operations
 
 - Reuse `ForgeIssues.insert_numbered_identity/6` and `ForgeIssues.update_identity/5` unchanged; Plan 3 already guarantees caller-selected `Ecto.Multi` keys.
+- Modify `apps/forge_issues/lib/forge_issues.ex` only to expose the repository-scoped batch `ForgeIssues.load_issue_metadata_by_ids/2` composition function used by pull list/detail reads.
+- Modify `apps/forge_issues/test/forge_issues_test.exs` to lock repository scoping, canonical metadata, and bounded query count for that batch function.
 - Modify `apps/git_core/lib/git_core/write_model.ex`.
 - Modify `apps/git_core/lib/git_core.ex`.
 - Modify `apps/git_core/lib/git_core/native.ex`.
@@ -244,6 +246,8 @@ git commit -m "feat(pulls): add pull request persistence"
 
 - Create: `apps/forge_pulls/lib/forge_pulls.ex`
 - Modify: `apps/forge_pulls/test/forge_pulls_test.exs`
+- Modify: `apps/forge_issues/lib/forge_issues.ex` (narrow batch metadata composition function only)
+- Modify: `apps/forge_issues/test/forge_issues_test.exs` (batch metadata contract only)
 
 - [ ] **Step 1: Write failing atomic creation tests**
 
@@ -329,7 +333,7 @@ end)
 |> Fornacast.Repo.transaction()
 ```
 
-The author/writer policy determines `shared_attrs` and `pull_attrs` before the multi; a validation or audit failure rolls back both rows. A detail or mergeability read resolves each ref once, computes against that pair, and persists `head_sha`, `base_sha`, `mergeable`, and `mergeable_state` together so stored analysis never mixes snapshots.
+The author/writer policy determines `shared_attrs` and `pull_attrs` before the multi; a validation or audit failure rolls back both rows. A detail or mergeability read resolves each ref once, computes against that pair, and persists `head_sha`, `base_sha`, `mergeable`, and `mergeable_state` together so stored analysis never mixes snapshots. Task 2 has no merge-analysis primitive: its computed current-snapshot result is always `mergeable: nil, mergeable_state: :unknown`. Detail refresh and base update must clear any older analysis to that explicit pair atomically; Task 3 replaces `:unknown` only after analyzing the same immutable OID pair.
 
 Implement `pull_links_for_issue_ids/3` as one repository-scoped query over `pull_requests`, selecting only `issue_id` and `merged_at` for the supplied IDs after repository-read authorization. Return a map keyed by issue ID. This is the one-way bridge used by the HTTP application; `forge_issues` does not query or depend on `forge_pulls`.
 

@@ -264,6 +264,32 @@ defmodule ForgeIssuesTest do
     assert query_count <= 6
   end
 
+  test "metadata-by-id loading stays repository scoped and batches canonical presentation fields",
+       %{
+         writer: writer,
+         repository: repository
+       } do
+    first = issue_fixture(repository, writer)
+    second = issue_fixture(repository, writer)
+    other_repository = repository_fixture(writer)
+    foreign = issue_fixture(other_repository, writer)
+
+    {loaded, query_count} =
+      count_repo_queries(fn ->
+        ForgeIssues.load_issue_metadata_by_ids(
+          [second.id, foreign.id, first.id, first.id],
+          repository
+        )
+      end)
+
+    assert MapSet.new(Enum.map(loaded, & &1.id)) == MapSet.new([first.id, second.id])
+    assert Enum.all?(loaded, &(&1.repository_id == repository.id))
+    assert Enum.all?(loaded, &(&1.author.id == writer.id))
+    assert Enum.all?(loaded, &is_list(&1.labels))
+    assert Enum.all?(loaded, &is_list(&1.assignees))
+    assert query_count <= 7
+  end
+
   test "plural assignees take precedence", %{writer: writer, repository: repository} do
     issue = issue_fixture(repository, writer)
     first = readable_user(repository, "first")

@@ -1,10 +1,13 @@
 defmodule ForgePullsTest do
   use ExUnit.Case, async: false
 
+  import Ecto.Query
+
+  alias Ecto.Multi
   alias Ecto.Adapters.SQL
-  alias ForgeIssues.Issue
+  alias ForgeIssues.{Comment, Issue, IssueAssignee, IssueLabel}
   alias ForgePulls.{MergeOperation, PullRequest}
-  alias Fornacast.Repo
+  alias Fornacast.{AuditEvent, Repo}
 
   @states ~w(prepared merge_written ref_advanced completed failed)
 
@@ -117,10 +120,126 @@ defmodule ForgePullsTest do
     assert base_sha == String.duplicate("b", 40)
   end
 
-  test "a reader opens a pull with a canonical shared issue identity and may update its shared fields" do
+  test "a reader opens a pull with the next canonical issue identity and only shared title and body" do
     suffix = "#{System.system_time(:microsecond)}-#{System.unique_integer([:positive])}"
     owner = user_fixture("pull-owner-#{suffix}")
     reader = user_fixture("pull-reader-#{suffix}")
+    repository = repository_fixture(owner)
+    grant_reader!(repository, reader)
+    create_branch!(repository, "main")
+    create_branch!(repository, "feature/x")
+
+    assert {:ok, issue} =
+             ForgeIssues.create(
+               owner,
+               owner.username,
+               repository.slug,
+               %{title: "Shared issue"},
+               %{}
+             )
+
+    assert issue.number == 1
+
+    attrs = %{
+      title: "Add feature",
+      body: "description",
+      state: :closed,
+      state_reason: :not_planned,
+      labels: ["bug"],
+      head: "feature/x",
+      base: "main"
+    }
+
+    assert {:ok, pull} = ForgePulls.create_pull_request(repository, reader, attrs, %{})
+
+    assert %PullRequest{
+             head_ref: "refs/heads/feature/x",
+             base_ref: "refs/heads/main",
+             mergeable: nil,
+             mergeable_state: :unknown
+           } = pull
+
+    assert %Issue{
+             number: 2,
+             kind: :pull_request,
+             title: "Add feature",
+             body: "description",
+             state: :open,
+             state_reason: nil,
+             labels: []
+           } = pull.issue
+  end
+
+  test "bare and case-normalized personal owner-qualified heads resolve in the target repository" do
+    owner = user_fixture(unique("pull-personal-owner"))
+    reader = user_fixture(unique("pull-personal-reader"))
+    repository = repository_fixture(owner)
+    grant_reader!(repository, reader)
+    create_branch!(repository, "main")
+    create_branch!(repository, "bare")
+    create_branch!(repository, "qualified")
+
+    assert {:ok, bare} =
+             create_pull(repository, reader, "Bare", "bare", "main")
+
+    assert bare.head_ref == "refs/heads/bare"
+
+    assert {:ok, qualified} =
+             create_pull(
+               repository,
+               reader,
+               "Qualified",
+               "#{String.upcase(owner.username)}:qualified",
+               "main"
+             )
+
+    assert qualified.head_ref == "refs/heads/qualified"
+  end
+
+  test "case-normalized organization-qualified heads require the target organization identity" do
+    manager = user_fixture(unique("pull-org-manager"))
+    reader = user_fixture(unique("pull-org-reader"))
+    foreign_owner = user_fixture(unique("pull-foreign-owner"))
+    organization = organization_fixture(manager, unique("pull-org"))
+    foreign_organization = organization_fixture(foreign_owner, unique("pull-foreign-org"))
+    repository = repository_fixture(organization)
+    grant_reader!(repository, reader)
+    create_branch!(repository, "main")
+    create_branch!(repository, "feature")
+
+    assert {:ok, pull} =
+             create_pull(
+               repository,
+               reader,
+               "Organization",
+               "#{String.upcase(organization.username)}:feature",
+               "main"
+             )
+
+    assert pull.head_ref == "refs/heads/feature"
+
+    assert {:error, :cross_repository_head} =
+             create_pull(
+               repository,
+               reader,
+               "Foreign organization",
+               "#{foreign_organization.username}:feature",
+               "main"
+             )
+
+    assert {:error, :cross_repository_head} =
+             create_pull(
+               repository,
+               reader,
+               "Foreign user",
+               "#{foreign_owner.username}:feature",
+               "main"
+             )
+  end
+
+  test "missing equal foreign and nonexistent pull refs return stable errors" do
+    owner = user_fixture(unique("pull-ref-owner"))
+    reader = user_fixture(unique("pull-ref-reader"))
     repository = repository_fixture(owner)
     grant_reader!(repository, reader)
     create_branch!(repository, "main")
@@ -173,53 +292,587 @@ defmodule ForgePullsTest do
                %{title: "missing ref", head: "feature/x", base: "missing"},
                %{}
              )
+  end
 
-    attrs = %{
-      title: "Add feature",
-      body: "description",
-      head: "#{owner.username}:feature/x",
-      base: "main"
+  test "Git snapshot failures retain their typed unavailable reason" do
+    owner = user_fixture(unique("pull-git-error-owner"))
+    repository = repository_fixture(owner)
+
+    missing_storage = %{
+      repository
+      | storage_path: "missing/#{System.unique_integer([:positive, :monotonic])}.git"
     }
 
-    assert {:ok, pull} = ForgePulls.create_pull_request(repository, reader, attrs, %{})
-    assert pull.head_ref == "refs/heads/feature/x"
-    assert pull.base_ref == "refs/heads/main"
+    assert {:error, {:unavailable, reason}} =
+             create_pull(missing_storage, owner, "Unavailable", "feature", "main")
 
-    assert %Issue{number: 1, kind: :pull_request, title: "Add feature"} =
-             Repo.get!(Issue, pull.issue_id)
+    assert reason in [:invalid_repository, :storage_unavailable, :corrupt_repository]
+  end
 
-    assert {:ok, updated} =
+  test "a forced pull insert constraint failure rolls back the issue identity audit and number" do
+    owner = user_fixture(unique("pull-rollback-owner"))
+    repository = repository_fixture(owner)
+    create_branch!(repository, "main")
+    create_branch!(repository, "feature")
+    refs = resolved_pair(repository, "feature", "main")
+
+    failed_multi =
+      owner
+      |> ForgePulls.Mutations.create_multi(
+        repository,
+        %{title: "Rolled back", head: "feature", base: "main"},
+        refs,
+        request_metadata("pull-rollback")
+      )
+      |> Multi.insert(:duplicate_pull, fn %{pull_request: pull} ->
+        %PullRequest{}
+        |> PullRequest.create_changeset(%{
+          issue_id: pull.issue_id,
+          repository_id: repository.id,
+          head_ref: pull.head_ref,
+          base_ref: pull.base_ref,
+          head_sha: pull.head_sha,
+          base_sha: pull.base_sha
+        })
+        |> Ecto.Changeset.unique_constraint(:issue_id,
+          name: ~r/^pull_requests_issue_id(?: \(\d+\))?_index$/
+        )
+      end)
+
+    assert {:error, :duplicate_pull, %Ecto.Changeset{}, _changes} =
+             ForgeIssues.transaction(failed_multi)
+
+    refute Repo.get_by(Issue, repository_id: repository.id, title: "Rolled back")
+    refute Repo.get_by(AuditEvent, action: "pull_request.created", target_id: "#{repository.id}")
+
+    assert {:ok, pull} = create_pull(repository, owner, "Committed", "feature", "main")
+    assert pull.issue.number == 1
+  end
+
+  test "simultaneous public issue and pull creates share unique consecutive numbers" do
+    owner = user_fixture(unique("pull-concurrent-owner"))
+    repository = repository_fixture(owner)
+    create_branch!(repository, "main")
+
+    Enum.each(1..5, fn index -> create_branch!(repository, "feature-#{index}") end)
+
+    parent = self()
+
+    tasks =
+      Enum.map(1..10, fn index ->
+        Task.async(fn ->
+          receive do
+            :go when rem(index, 2) == 0 ->
+              ForgeIssues.create(
+                owner,
+                owner.username,
+                repository.slug,
+                %{title: "Issue #{index}"},
+                %{}
+              )
+
+            :go ->
+              create_pull(
+                repository,
+                owner,
+                "Pull #{index}",
+                "feature-#{div(index + 1, 2)}",
+                "main"
+              )
+          end
+        end)
+      end)
+
+    if database_adapter() == :postgres do
+      Enum.each(tasks, &Ecto.Adapters.SQL.Sandbox.allow(Repo, parent, &1.pid))
+    end
+
+    Enum.each(tasks, &send(&1.pid, :go))
+
+    numbers =
+      tasks
+      |> Enum.map(&Task.await(&1, 30_000))
+      |> Enum.map(fn
+        {:ok, %PullRequest{issue: issue}} -> issue.number
+        {:ok, %Issue{} = issue} -> issue.number
+      end)
+      |> Enum.sort()
+
+    assert numbers == Enum.to_list(1..10)
+  end
+
+  test "updates keep source repository and head immutable and refresh an existing base snapshot" do
+    owner = user_fixture(unique("pull-update-owner"))
+    repository = repository_fixture(owner)
+    create_branch!(repository, "main")
+    create_branch!(repository, "release")
+    create_branch!(repository, "feature")
+    assert {:ok, pull} = create_pull(repository, owner, "Update", "feature", "main")
+
+    assert {:error, :invalid_head} =
+             ForgePulls.update_pull_request(repository, pull, owner, %{head: "release"}, %{})
+
+    assert {:error, {:validation, [repository_error]}} =
              ForgePulls.update_pull_request(
                repository,
                pull,
-               reader,
-               %{title: "Renamed", state: :closed},
+               owner,
+               %{repository_id: repository.id + 1},
                %{}
              )
 
-    assert updated.id == pull.id
-    assert %Issue{title: "Renamed", state: :closed} = Repo.get!(Issue, pull.issue_id)
+    assert repository_error == %{
+             resource: "PullRequest",
+             field: "repository",
+             code: :invalid
+           }
 
-    assert {:ok, %{entries: [listed], total: 1}} =
-             ForgePulls.list_pull_requests(repository, reader, %{
-               state: :closed,
+    assert {:error, :invalid_base} =
+             ForgePulls.update_pull_request(repository, pull, owner, %{base: "missing"}, %{})
+
+    assert {:ok, updated} =
+             ForgePulls.update_pull_request(repository, pull, owner, %{base: "release"}, %{})
+
+    assert updated.head_ref == pull.head_ref
+    assert updated.base_ref == "refs/heads/release"
+    assert updated.head_sha == snapshot_oid(repository, "feature")
+    assert updated.base_sha == snapshot_oid(repository, "release")
+    assert updated.mergeable == nil
+    assert updated.mergeable_state == :unknown
+
+    foreign_repository = repository_fixture(owner)
+
+    assert {:error, :not_found} =
+             ForgePulls.update_pull_request(
+               foreign_repository,
+               updated,
+               owner,
+               %{title: "No"},
+               %{}
+             )
+  end
+
+  test "authors edit and close their pull writers manage every pull and unrelated readers are forbidden" do
+    owner = user_fixture(unique("pull-policy-owner"))
+    author = user_fixture(unique("pull-policy-author"))
+    writer = user_fixture(unique("pull-policy-writer"))
+    unrelated = user_fixture(unique("pull-policy-unrelated"))
+    repository = repository_fixture(owner)
+    grant_reader!(repository, author)
+    grant_writer!(repository, writer)
+    grant_reader!(repository, unrelated)
+    create_branch!(repository, "main")
+    create_branch!(repository, "feature")
+    assert {:ok, pull} = create_pull(repository, author, "Policy", "feature", "main")
+
+    assert {:ok, author_update} =
+             ForgePulls.update_pull_request(
+               repository,
+               pull,
+               author,
+               %{title: "Author edit", body: "body", state: :closed},
+               %{}
+             )
+
+    assert author_update.issue.title == "Author edit"
+    assert author_update.issue.state == :closed
+    assert author_update.issue.state_reason == :completed
+
+    assert {:ok, writer_update} =
+             ForgePulls.update_pull_request(
+               repository,
+               author_update,
+               writer,
+               %{title: "Writer edit", state: :open, state_reason: :reopened},
+               %{}
+             )
+
+    assert writer_update.issue.title == "Writer edit"
+    assert writer_update.issue.state == :open
+    assert writer_update.issue.state_reason == :reopened
+
+    assert {:error, :forbidden} =
+             ForgePulls.update_pull_request(
+               repository,
+               writer_update,
+               unrelated,
+               %{title: "Forbidden"},
+               %{}
+             )
+  end
+
+  test "mutations revalidate disabled and revoked actors and deleted repositories inside the transaction" do
+    owner = user_fixture(unique("pull-stale-owner"))
+    author = user_fixture(unique("pull-stale-author"))
+    writer = user_fixture(unique("pull-stale-writer"))
+    repository = repository_fixture(owner)
+    grant_reader!(repository, author)
+    writer_collaborator = grant_writer!(repository, writer)
+    create_branch!(repository, "main")
+    create_branch!(repository, "feature")
+    assert {:ok, pull} = create_pull(repository, author, "Stale", "feature", "main")
+
+    author
+    |> ForgeAccounts.User.state_changeset(%{state: :disabled})
+    |> Repo.update!()
+
+    assert {:error, :forbidden} =
+             ForgePulls.update_pull_request(
+               repository,
+               pull,
+               author,
+               %{title: "Disabled"},
+               %{}
+             )
+
+    public_repository = repository |> Ecto.Changeset.change(visibility: :public) |> Repo.update!()
+    Repo.delete!(writer_collaborator)
+
+    assert {:error, :forbidden} =
+             ForgePulls.update_pull_request(
+               public_repository,
+               pull,
+               writer,
+               %{title: "Revoked"},
+               %{}
+             )
+
+    Repo.update_all(
+      from(repo in ForgeRepos.Repository, where: repo.id == ^repository.id),
+      set: [deleted_at: DateTime.utc_now() |> DateTime.truncate(:second)]
+    )
+
+    assert {:error, :not_found} =
+             ForgePulls.update_pull_request(
+               public_repository,
+               pull,
+               owner,
+               %{title: "Deleted"},
+               %{}
+             )
+  end
+
+  test "detail refreshes one immutable pair clears old mergeability and loads full canonical issue metadata" do
+    owner = user_fixture(unique("pull-detail-owner"))
+    assignee = user_fixture(unique("pull-detail-assignee"))
+    repository = repository_fixture(owner)
+    grant_reader!(repository, assignee)
+    create_branch!(repository, "main")
+    create_branch!(repository, "feature")
+    assert {:ok, pull} = create_pull(repository, owner, "Detail", "feature", "main")
+
+    label = ForgeIssues.list_labels(repository) |> hd()
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    Repo.insert!(%IssueLabel{
+      issue_id: pull.issue_id,
+      label_id: label.id,
+      inserted_at: now,
+      updated_at: now
+    })
+
+    Repo.insert!(%IssueAssignee{
+      issue_id: pull.issue_id,
+      user_id: assignee.id,
+      inserted_at: now,
+      updated_at: now
+    })
+
+    Repo.insert!(%Comment{
+      issue_id: pull.issue_id,
+      author_user_id: assignee.id,
+      body: "canonical comment",
+      inserted_at: now,
+      updated_at: now
+    })
+
+    pull
+    |> PullRequest.update_changeset(%{mergeable: true, mergeable_state: :mergeable})
+    |> Repo.update!()
+
+    old_head_sha = pull.head_sha
+    create_branch!(repository, "feature")
+
+    assert {:ok, refreshed} =
+             ForgePulls.get_pull_request(repository, pull.issue.number, owner)
+
+    refute refreshed.head_sha == old_head_sha
+    assert refreshed.head_sha == snapshot_oid(repository, "feature")
+    assert refreshed.base_sha == snapshot_oid(repository, "main")
+    assert refreshed.mergeable == nil
+    assert refreshed.mergeable_state == :unknown
+    assert refreshed.issue.id == pull.issue_id
+    assert refreshed.issue.title == "Detail"
+    assert refreshed.issue.author.id == owner.id
+    assert refreshed.issue.author_association == "OWNER"
+    assert [%{id: label_id}] = refreshed.issue.labels
+    assert label_id == label.id
+    assert [%{id: assignee_id}] = refreshed.issue.assignees
+    assert assignee_id == assignee.id
+    assert refreshed.issue.comment_count == 1
+  end
+
+  test "list filters multiple pulls and uses issue timestamps for stable sorting and paging" do
+    owner = user_fixture(unique("pull-list-owner"))
+    repository = repository_fixture(owner)
+    create_branch!(repository, "main")
+    Enum.each(~w(alpha beta gamma), &create_branch!(repository, &1))
+    assert {:ok, alpha} = create_pull(repository, owner, "Alpha", "alpha", "main")
+    assert {:ok, beta} = create_pull(repository, owner, "Beta", "beta", "main")
+    assert {:ok, gamma} = create_pull(repository, owner, "Gamma", "gamma", "main")
+
+    assert {:ok, gamma} =
+             ForgePulls.update_pull_request(
+               repository,
+               gamma,
+               owner,
+               %{state: :closed},
+               %{}
+             )
+
+    early = ~U[2026-01-01 00:00:00Z]
+    late = ~U[2026-01-02 00:00:00Z]
+
+    Repo.update_all(from(issue in Issue, where: issue.id in ^[alpha.issue_id, beta.issue_id]),
+      set: [inserted_at: early, updated_at: late]
+    )
+
+    Repo.update_all(from(issue in Issue, where: issue.id == ^gamma.issue_id),
+      set: [inserted_at: late, updated_at: early]
+    )
+
+    assert {:ok, %{entries: [first], total: 2, page: 1, per_page: 1}} =
+             ForgePulls.list_pull_requests(repository, owner,
+               state: :open,
+               sort: :created,
+               direction: :asc,
+               page: 1,
+               per_page: 1
+             )
+
+    assert first.id == alpha.id
+
+    assert {:ok, %{entries: [second], total: 2}} =
+             ForgePulls.list_pull_requests(repository, owner,
+               state: :open,
+               sort: :created,
+               direction: :asc,
+               page: 2,
+               per_page: 1
+             )
+
+    assert second.id == beta.id
+
+    assert {:ok, %{entries: [updated_first, updated_second]}} =
+             ForgePulls.list_pull_requests(repository, owner,
+               state: :open,
+               sort: :updated,
+               direction: :desc
+             )
+
+    assert [updated_first.id, updated_second.id] == [beta.id, alpha.id]
+
+    assert {:ok, %{entries: [number_first, number_second]}} =
+             ForgePulls.list_pull_requests(repository, owner,
+               state: :open,
                sort: :number,
-               direction: :asc
-             })
+               direction: :desc
+             )
 
-    assert listed.id == pull.id
+    assert [number_first.issue.number, number_second.issue.number] == [2, 1]
 
-    assert {:ok, %{entries: [^listed]}} =
-             ForgePulls.list_pull_requests(repository, reader, %{
-               state: "closed",
-               head: "#{String.upcase(owner.username)}:feature/x",
+    assert {:ok, %{entries: [head_only]}} =
+             ForgePulls.list_pull_requests(repository, owner,
+               state: :closed,
+               head: "#{String.upcase(owner.username)}:gamma",
                base: "main"
-             })
+             )
 
-    issue_id = pull.issue_id
+    assert head_only.id == gamma.id
 
-    assert {:ok, %{^issue_id => %{merged_at: nil}}} =
-             ForgePulls.pull_links_for_issue_ids(repository, [issue_id], reader)
+    public_repository = repository |> Ecto.Changeset.change(visibility: :public) |> Repo.update!()
+
+    {result, query_count} =
+      count_repo_queries(fn ->
+        ForgePulls.list_pull_requests(public_repository, nil,
+          state: :open,
+          sort: :number,
+          direction: :asc
+        )
+      end)
+
+    assert {:ok, %{entries: [_, _], total: 2}} = result
+    assert query_count <= 9
+    assert {:error, {:validation, [_]}} = ForgePulls.list_pull_requests(repository, owner, %{})
+  end
+
+  test "conditional snapshot persistence rejects a raced ref update without mixing names and OIDs" do
+    owner = user_fixture(unique("pull-race-owner"))
+    repository = repository_fixture(owner)
+    Enum.each(~w(main release feature), &create_branch!(repository, &1))
+    assert {:ok, pull} = create_pull(repository, owner, "Race", "feature", "main")
+
+    stale_attrs = resolved_pair(repository, "feature", "main")
+    fresh_attrs = resolved_pair(repository, "feature", "release")
+
+    assert {:ok, raced} = ForgePulls.SnapshotRefresh.persist(pull, fresh_attrs)
+    assert raced.base_ref == "refs/heads/release"
+
+    assert {:error, :ref_conflict} =
+             ForgePulls.SnapshotRefresh.persist(pull, stale_attrs)
+
+    assert {:error, :ref_conflict} =
+             ForgePulls.update_pull_request(
+               repository,
+               pull,
+               owner,
+               %{title: "Stale mutation"},
+               %{}
+             )
+
+    stored = Repo.get!(PullRequest, pull.id)
+    assert stored.head_ref == fresh_attrs.head_ref
+    assert stored.base_ref == fresh_attrs.base_ref
+    assert stored.head_sha == fresh_attrs.head_sha
+    assert stored.base_sha == fresh_attrs.base_sha
+    assert stored.mergeable == nil
+    assert stored.mergeable_state == :unknown
+  end
+
+  test "successful create and update write exact audits while validation authorization and later failure write none" do
+    owner = user_fixture(unique("pull-audit-owner"))
+    outsider = user_fixture(unique("pull-audit-outsider"))
+    repository = repository_fixture(owner)
+    create_branch!(repository, "main")
+    create_branch!(repository, "feature")
+    metadata = request_metadata("pull-audit-success")
+
+    assert {:ok, pull} =
+             ForgePulls.create_pull_request(
+               repository,
+               owner,
+               %{title: "Audited", head: "feature", base: "main"},
+               metadata
+             )
+
+    assert %AuditEvent{
+             actor_user_id: actor_id,
+             action: "pull_request.created",
+             target_type: "repository",
+             target_id: target_id,
+             metadata: audit_metadata,
+             ip_address: "203.0.113.44",
+             user_agent: "forge-pulls-test"
+           } =
+             Repo.get_by!(AuditEvent,
+               action: "pull_request.created",
+               target_id: Integer.to_string(repository.id)
+             )
+
+    assert actor_id == owner.id
+    assert target_id == Integer.to_string(repository.id)
+    assert audit_metadata["repository_id"] == repository.id
+    assert audit_metadata["result"] == "success"
+    assert audit_metadata["request_id"] == "pull-audit-success"
+
+    assert {:ok, _updated} =
+             ForgePulls.update_pull_request(
+               repository,
+               pull,
+               owner,
+               %{title: "Audited update"},
+               request_metadata("pull-audit-update")
+             )
+
+    assert %AuditEvent{metadata: %{"request_id" => "pull-audit-update"}} =
+             Repo.get_by!(AuditEvent,
+               action: "pull_request.updated",
+               target_id: Integer.to_string(repository.id)
+             )
+
+    before_count = pull_audit_count(repository)
+
+    assert {:error, {:validation, _errors}} =
+             ForgePulls.create_pull_request(
+               repository,
+               owner,
+               %{head: "feature", base: "main"},
+               request_metadata("pull-audit-validation")
+             )
+
+    assert {:error, :not_found} =
+             ForgePulls.create_pull_request(
+               repository,
+               outsider,
+               %{title: "Forbidden", head: "feature", base: "main"},
+               request_metadata("pull-audit-forbidden")
+             )
+
+    refs = resolved_pair(repository, "feature", "main")
+
+    forced =
+      owner
+      |> ForgePulls.Mutations.create_multi(
+        repository,
+        %{title: "Forced", head: "feature", base: "main"},
+        refs,
+        request_metadata("pull-audit-forced")
+      )
+      |> Multi.run(:forced_later_failure, fn _repo, _changes ->
+        {:error, :forced_later_failure}
+      end)
+
+    assert {:error, :forced_later_failure, :forced_later_failure, _changes} =
+             ForgeIssues.transaction(forced)
+
+    assert pull_audit_count(repository) == before_count
+    refute Repo.get_by(Issue, repository_id: repository.id, title: "Forced")
+  end
+
+  test "pull links handle empty subset duplicate mixed repository IDs masking and one bounded query" do
+    owner = user_fixture(unique("pull-links-owner"))
+    repository = repository_fixture(owner)
+    other_repository = repository_fixture(owner)
+
+    Enum.each([repository, other_repository], fn repo ->
+      create_branch!(repo, "main")
+      create_branch!(repo, "feature")
+    end)
+
+    assert {:ok, first} = create_pull(repository, owner, "First", "feature", "main")
+    create_branch!(repository, "second")
+    assert {:ok, second} = create_pull(repository, owner, "Second", "second", "main")
+    assert {:ok, foreign} = create_pull(other_repository, owner, "Foreign", "feature", "main")
+    merged_at = ~U[2026-01-03 00:00:00Z]
+
+    Repo.update_all(from(pull in PullRequest, where: pull.id == ^first.id),
+      set: [merged_at: merged_at]
+    )
+
+    public_repository = repository |> Ecto.Changeset.change(visibility: :public) |> Repo.update!()
+
+    assert {:ok, %{}} = ForgePulls.pull_links_for_issue_ids(public_repository, [], nil)
+
+    {result, query_count} =
+      count_repo_queries(fn ->
+        ForgePulls.pull_links_for_issue_ids(
+          public_repository,
+          [first.issue_id, first.issue_id, foreign.issue_id, 9_999_999],
+          nil
+        )
+      end)
+
+    first_issue_id = first.issue_id
+    assert {:ok, %{^first_issue_id => %{merged_at: ^merged_at}}} = result
+    assert query_count == 1
+
+    second_issue_id = second.issue_id
+
+    assert {:ok, %{^second_issue_id => %{merged_at: nil}}} =
+             ForgePulls.pull_links_for_issue_ids(public_repository, [second.issue_id], nil)
+
+    assert {:error, :not_found} =
+             ForgePulls.pull_links_for_issue_ids(other_repository, [foreign.issue_id], nil)
   end
 
   test "pull requests require distinct canonical branch refs and immutable repository identity" do
@@ -526,6 +1179,111 @@ defmodule ForgePullsTest do
       },
       overrides
     )
+  end
+
+  defp unique(prefix),
+    do: "#{String.slice(prefix, 0, 22)}-#{System.unique_integer([:positive, :monotonic])}"
+
+  defp create_pull(repository, actor, title, head, base) do
+    ForgePulls.create_pull_request(
+      repository,
+      actor,
+      %{title: title, body: "#{title} body", head: head, base: base},
+      request_metadata("create-#{System.unique_integer([:positive])}")
+    )
+  end
+
+  defp resolved_pair(repository, head, base) do
+    %{
+      head_ref: "refs/heads/#{head}",
+      base_ref: "refs/heads/#{base}",
+      head_sha: snapshot_oid(repository, head),
+      base_sha: snapshot_oid(repository, base),
+      mergeable: nil,
+      mergeable_state: :unknown
+    }
+  end
+
+  defp snapshot_oid(repository, branch) do
+    assert {:ok, snapshot} =
+             GitCore.resolve_snapshot(
+               ForgeRepos.absolute_storage_path(repository),
+               %GitCore.RefSelector{kind: :branch, full_name: "refs/heads/#{branch}"}
+             )
+
+    snapshot.oid
+  end
+
+  defp organization_fixture(owner, username) do
+    assert {:ok, organization} =
+             ForgeAccounts.create_organization(owner, %{
+               username: username,
+               display_name: username
+             })
+
+    organization
+  end
+
+  defp grant_writer!(repository, user) do
+    %ForgeRepos.Collaborator{}
+    |> ForgeRepos.Collaborator.changeset(%{
+      repository_id: repository.id,
+      user_id: user.id,
+      role: :write
+    })
+    |> Repo.insert!()
+  end
+
+  defp request_metadata(request_id) do
+    %{
+      request_id: request_id,
+      ip_address: "203.0.113.44",
+      user_agent: "forge-pulls-test"
+    }
+  end
+
+  defp pull_audit_count(repository) do
+    Repo.aggregate(
+      from(event in AuditEvent,
+        where:
+          event.target_type == "repository" and
+            event.target_id == ^Integer.to_string(repository.id) and
+            event.action in ["pull_request.created", "pull_request.updated"]
+      ),
+      :count,
+      :id
+    )
+  end
+
+  defp count_repo_queries(fun) do
+    ref = make_ref()
+    handler_id = {__MODULE__, ref}
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:fornacast, :repo, :query],
+        fn _event, _measurements, _metadata, {pid, query_ref} ->
+          send(pid, {query_ref, :repo_query})
+        end,
+        {test_pid, ref}
+      )
+
+    try do
+      result = fun.()
+      {result, drain_repo_queries(ref, 0)}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_repo_queries(ref, count) do
+    receive do
+      {^ref, :repo_query} -> drain_repo_queries(ref, count + 1)
+    after
+      0 -> count
+    end
   end
 
   defp database_contract do
@@ -1060,7 +1818,15 @@ defmodule ForgePullsTest do
       System.cmd("git", ["--git-dir=#{path}", "hash-object", "-t", "tree", "-w", empty_tree])
 
     {commit, 0} =
-      System.cmd("git", ["--git-dir=#{path}", "commit-tree", String.trim(tree), "-m", branch],
+      System.cmd(
+        "git",
+        [
+          "--git-dir=#{path}",
+          "commit-tree",
+          String.trim(tree),
+          "-m",
+          "#{branch}-#{System.unique_integer([:positive, :monotonic])}"
+        ],
         env: [
           {"GIT_AUTHOR_NAME", "Test"},
           {"GIT_AUTHOR_EMAIL", "test@example.test"},
