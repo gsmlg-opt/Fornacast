@@ -74,6 +74,31 @@ defmodule GitCore.Native do
 
   def repository_disk_usage(_path, _deadline_ms), do: :erlang.nif_error(:nif_not_loaded)
 
+  def merge_analysis(
+        _path,
+        _base_oid,
+        _head_oid,
+        _commit_limit,
+        _tree_entry_limit,
+        _changed_path_limit,
+        _deadline_ms
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  def write_merge_commit(
+        _path,
+        _base_oid,
+        _head_oid,
+        _author,
+        _committer,
+        _message,
+        _commit_limit,
+        _tree_entry_limit,
+        _changed_path_limit,
+        _deadline_ms
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   def pack_objects(_path, _wants), do: :erlang.nif_error(:nif_not_loaded)
   def receive_pack(_path, _pack, _commands), do: :erlang.nif_error(:nif_not_loaded)
 end

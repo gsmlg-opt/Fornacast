@@ -45,6 +45,8 @@ type NativeTreeHistoryEntry = (Vec<u8>, String, String, String, NativeTreeCommit
 type NativeReceiveCommand = (String, String, String);
 type NativeReceiveStatus = (String, String, String);
 type NativeError = (String, String);
+type NativeSignature = (Vec<u8>, Vec<u8>, i64, i32);
+type NativeMergeAnalysis = (String, String, bool, u64, u64, u64, u64);
 
 struct PackObject {
     kind: gix_object::Kind,
@@ -150,6 +152,14 @@ const ANALYSIS_FILE_LIMIT: u64 = 100_000;
 const ANALYSIS_BYTE_LIMIT: u64 = 512 * 1024 * 1024;
 const ANALYSIS_SCAN_DEADLINE: Duration = Duration::from_secs(2);
 const DISK_USAGE_SCAN_DEADLINE: Duration = Duration::from_secs(2);
+const MERGE_COMMIT_LIMIT: usize = 50_000;
+const MERGE_TREE_ENTRY_LIMIT: usize = 100_000;
+const MERGE_CHANGED_PATH_LIMIT: usize = 10_000;
+const MERGE_DEADLINE: Duration = Duration::from_secs(30);
+const MERGE_MESSAGE_LIMIT: usize = 1024 * 1024;
+const SIGNATURE_NAME_LIMIT: usize = 255;
+const SIGNATURE_EMAIL_LIMIT: usize = 320;
+const MERGE_PERSIST_STACK_SIZE: usize = 2 * 1024 * 1024;
 const NO_FINAL_NEWLINE_MARKER: &[u8] = b"\\ No newline at end of file\n";
 // This remains independent of object size while leaving room for the complete mandatory tag
 // header, including long ref-derived tag names, before an arbitrarily large message body.
@@ -3058,6 +3068,623 @@ fn analysis_scan_duration(deadline_ms: u64) -> Duration {
     Duration::from_millis(deadline_ms.min(ANALYSIS_SCAN_DEADLINE.as_millis() as u64))
 }
 
+struct PreparedMergeCommit {
+    author: gix::actor::Signature,
+    committer: gix::actor::Signature,
+    message: String,
+}
+
+struct MergeMetrics {
+    base_oid: gix_hash::ObjectId,
+    head_oid: gix_hash::ObjectId,
+    ahead_by: usize,
+    behind_by: usize,
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn merge_analysis(
+    path: String,
+    base_oid: String,
+    head_oid: String,
+    commit_limit: usize,
+    tree_entry_limit: usize,
+    changed_path_limit: usize,
+    deadline_ms: u64,
+) -> Result<NativeMergeAnalysis, NativeError> {
+    let (analysis, _) = bounded_merge(
+        &path,
+        &base_oid,
+        &head_oid,
+        commit_limit,
+        tree_entry_limit,
+        changed_path_limit,
+        deadline_ms,
+        None,
+    )?;
+    Ok(analysis)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::too_many_arguments)]
+fn write_merge_commit(
+    path: String,
+    base_oid: String,
+    head_oid: String,
+    author: NativeSignature,
+    committer: NativeSignature,
+    message: Vec<u8>,
+    commit_limit: usize,
+    tree_entry_limit: usize,
+    changed_path_limit: usize,
+    deadline_ms: u64,
+) -> Result<String, NativeError> {
+    // All caller-controlled commit bytes are validated before the repository is opened or a merge
+    // result is computed, and therefore before any object can be inserted.
+    let commit = PreparedMergeCommit {
+        author: validated_merge_signature(author)?,
+        committer: validated_merge_signature(committer)?,
+        message: validated_merge_message(message)?,
+    };
+    let (_, merge_oid) = bounded_merge(
+        &path,
+        &base_oid,
+        &head_oid,
+        commit_limit,
+        tree_entry_limit,
+        changed_path_limit,
+        deadline_ms,
+        Some(commit),
+    )?;
+    merge_oid.ok_or_else(|| native_error("corrupt_repository", "merge commit was not produced"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bounded_merge(
+    path: &str,
+    base_oid: &str,
+    head_oid: &str,
+    commit_limit: usize,
+    tree_entry_limit: usize,
+    changed_path_limit: usize,
+    deadline_ms: u64,
+    commit: Option<PreparedMergeCommit>,
+) -> Result<(NativeMergeAnalysis, Option<String>), NativeError> {
+    let deadline = Instant::now() + merge_scan_duration(deadline_ms);
+    check_merge_deadline(deadline)?;
+
+    let commit_limit = merge_commit_limit(commit_limit);
+    let tree_entry_limit = merge_tree_entry_limit(tree_entry_limit);
+    let changed_path_limit = merge_changed_path_limit(changed_path_limit);
+    let mut repo = open_physical_bare_repository(path)?.with_object_memory();
+    let base_oid = parse_merge_commit_oid(&repo, base_oid, deadline)?;
+    let head_oid = parse_merge_commit_oid(&repo, head_oid, deadline)?;
+    let metrics = merge_metrics(&repo, base_oid, head_oid, commit_limit, deadline)?;
+
+    let merge_base_oid = repo
+        .merge_base(base_oid, head_oid)
+        .map_err(|error| native_error("merge_conflict", error))?
+        .detach();
+    check_merge_deadline(deadline)?;
+
+    let base_tree = merge_commit_tree(&repo, base_oid, deadline)?;
+    let head_tree = merge_commit_tree(&repo, head_oid, deadline)?;
+    let merge_base_tree = merge_commit_tree(&repo, merge_base_oid, deadline)?;
+    let mut tree_entries_scanned = 0_usize;
+    let ancestor_paths = flatten_merge_tree(
+        &repo,
+        merge_base_tree,
+        &mut tree_entries_scanned,
+        tree_entry_limit,
+        deadline,
+    )?;
+    let head_paths = flatten_merge_tree(
+        &repo,
+        head_tree,
+        &mut tree_entries_scanned,
+        tree_entry_limit,
+        deadline,
+    )?;
+    // Scan our side independently as part of the hard total work budget before invoking gix's
+    // in-memory three-way merge.
+    flatten_merge_tree(
+        &repo,
+        base_tree,
+        &mut tree_entries_scanned,
+        tree_entry_limit,
+        deadline,
+    )?;
+    let changed_paths =
+        count_changed_merge_paths(&ancestor_paths, &head_paths, changed_path_limit, deadline)?;
+
+    check_merge_deadline(deadline)?;
+    let options = repo
+        .tree_merge_options()
+        .map_err(|error| native_error("corrupt_repository", error))?
+        .with_rewrites(None)
+        .with_fail_on_conflict(Some(gix::merge::tree::TreatAsUnresolved::git()));
+    let commit_options: gix::merge::commit::Options = options.into();
+    let labels = gix::merge::blob::builtin_driver::text::Labels::default();
+
+    // Build both gix resource caches from the supplied base tree instead of HEAD. Empty driver
+    // lists keep all merging inside gix's built-in implementation and prevent configured external
+    // diff or merge programs from being executed.
+    let (diff_filter, _) = repo
+        .filter_pipeline(Some(base_tree))
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let (diff_filter, diff_attributes) = diff_filter.into_parts();
+    let diff_pipeline = gix::diff::blob::Pipeline::new(
+        Default::default(),
+        diff_filter,
+        Vec::new(),
+        Default::default(),
+    );
+    let mut diff_cache = gix::diff::blob::Platform::new(
+        Default::default(),
+        diff_pipeline,
+        gix::diff::blob::pipeline::Mode::ToGit,
+        diff_attributes,
+    );
+    let (merge_filter, _) = repo
+        .filter_pipeline(Some(base_tree))
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let (merge_filter, merge_attributes) = merge_filter.into_parts();
+    let merge_pipeline = gix::merge::plumbing::blob::Pipeline::new(
+        Default::default(),
+        merge_filter,
+        Default::default(),
+    );
+    let mut blob_merge = gix::merge::plumbing::blob::Platform::new(
+        merge_pipeline,
+        gix::merge::plumbing::blob::pipeline::Mode::ToGit,
+        merge_attributes,
+        Vec::new(),
+        gix::merge::plumbing::blob::platform::Options {
+            default_driver: None,
+        },
+    );
+    let commit_graph = repo
+        .commit_graph_if_enabled()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let mut graph = repo.revision_graph(commit_graph.as_ref());
+    let outcome = gix::merge::plumbing::commit(
+        base_oid,
+        head_oid,
+        labels,
+        &mut graph,
+        &mut diff_cache,
+        &mut blob_merge,
+        &repo,
+        &mut |oid| oid.to_string(),
+        commit_options.into(),
+    )
+    .map_err(|error| native_error("corrupt_repository", error))?;
+    drop(graph);
+    drop(commit_graph);
+    drop(blob_merge);
+    drop(diff_cache);
+    check_merge_deadline(deadline)?;
+    let mergeable = !outcome
+        .tree_merge
+        .has_unresolved_conflicts(gix::merge::tree::TreatAsUnresolved::git());
+
+    let native_analysis = (
+        metrics.base_oid.to_string(),
+        metrics.head_oid.to_string(),
+        mergeable,
+        usize_to_u64(metrics.ahead_by, "ahead count")?,
+        usize_to_u64(metrics.behind_by, "behind count")?,
+        usize_to_u64(metrics.ahead_by, "commit count")?,
+        usize_to_u64(changed_paths, "changed path count")?,
+    );
+
+    if !mergeable {
+        return if commit.is_some() {
+            Err(native_error(
+                "merge_conflict",
+                "base and head have unresolved merge conflicts",
+            ))
+        } else {
+            Ok((native_analysis, None))
+        };
+    }
+
+    let mut tree_merge = outcome.tree_merge;
+    let merged_tree = tree_merge
+        .tree
+        .write(|tree| repo.write_object(tree).map(|id| id.detach()))
+        .map_err(|error| native_error("storage_unavailable", error))?;
+    drop(tree_merge);
+    check_merge_deadline(deadline)?;
+    flatten_merge_tree(
+        &repo,
+        merged_tree,
+        &mut tree_entries_scanned,
+        tree_entry_limit,
+        deadline,
+    )?;
+
+    let Some(commit) = commit else {
+        return Ok((native_analysis, None));
+    };
+
+    check_merge_deadline(deadline)?;
+    let commit_object = gix_object::Commit {
+        tree: merged_tree,
+        parents: vec![base_oid, head_oid].into(),
+        author: commit.author,
+        committer: commit.committer,
+        encoding: None,
+        message: commit.message.into(),
+        extra_headers: Vec::new(),
+    };
+    let merge_oid = repo
+        .write_object(commit_object)
+        .map_err(|error| native_error("storage_unavailable", error))?
+        .detach();
+    check_merge_deadline(deadline)?;
+
+    persist_merge_object_memory(&mut repo, path, deadline)?;
+    Ok((native_analysis, Some(merge_oid.to_string())))
+}
+
+fn merge_metrics(
+    repo: &gix::Repository,
+    base_oid: gix_hash::ObjectId,
+    head_oid: gix_hash::ObjectId,
+    commit_limit: usize,
+    deadline: Instant,
+) -> Result<MergeMetrics, NativeError> {
+    let mut globally_visited = BTreeSet::new();
+    let base_reachable = collect_merge_reachable(
+        repo,
+        base_oid,
+        &mut globally_visited,
+        commit_limit,
+        deadline,
+    )?;
+    let head_reachable = collect_merge_reachable(
+        repo,
+        head_oid,
+        &mut globally_visited,
+        commit_limit,
+        deadline,
+    )?;
+    let ahead_by = head_reachable.difference(&base_reachable).count();
+    let behind_by = base_reachable.difference(&head_reachable).count();
+    check_merge_deadline(deadline)?;
+    Ok(MergeMetrics {
+        base_oid,
+        head_oid,
+        ahead_by,
+        behind_by,
+    })
+}
+
+fn collect_merge_reachable(
+    repo: &gix::Repository,
+    tip: gix_hash::ObjectId,
+    globally_visited: &mut BTreeSet<gix_hash::ObjectId>,
+    commit_limit: usize,
+    deadline: Instant,
+) -> Result<BTreeSet<gix_hash::ObjectId>, NativeError> {
+    let mut pending = vec![tip];
+    let mut reachable = BTreeSet::new();
+
+    while let Some(oid) = pending.pop() {
+        check_merge_deadline(deadline)?;
+        if !reachable.insert(oid) {
+            continue;
+        }
+        if !globally_visited.contains(&oid) {
+            if globally_visited.len() >= commit_limit {
+                return Err(native_error(
+                    "commit_limit",
+                    "merge analysis exceeded the 50,000-commit limit",
+                ));
+            }
+            globally_visited.insert(oid);
+        }
+        let position = if oid == tip {
+            CommitPosition::Tip
+        } else {
+            CommitPosition::Ancestor
+        };
+        let node = load_commit_node(repo, oid, position, deadline)?;
+        for parent in node.parents {
+            check_merge_deadline(deadline)?;
+            pending.push(parent);
+        }
+    }
+    Ok(reachable)
+}
+
+fn flatten_merge_tree(
+    repo: &gix::Repository,
+    root: gix_hash::ObjectId,
+    entries_scanned: &mut usize,
+    tree_entry_limit: usize,
+    deadline: Instant,
+) -> Result<BTreeMap<Vec<u8>, (u16, gix_hash::ObjectId)>, NativeError> {
+    let mut pending = vec![(root, Vec::<u8>::new())];
+    let mut paths = BTreeMap::new();
+
+    while let Some((tree_oid, prefix)) = pending.pop() {
+        check_merge_deadline(deadline)?;
+        let tree = load_merge_tree(repo, tree_oid, deadline)?;
+        let mut previous = None;
+        for entry in gix_object::TreeRefIter::from_bytes(&tree.data, tree.id.kind()) {
+            check_merge_deadline(deadline)?;
+            if *entries_scanned >= tree_entry_limit {
+                return Err(native_error(
+                    "tree_entry_limit",
+                    "merge analysis exceeded the 100,000-tree-entry limit",
+                ));
+            }
+            *entries_scanned = entries_scanned.checked_add(1).ok_or_else(|| {
+                native_error("corrupt_repository", "merge tree entry count overflow")
+            })?;
+            let entry = entry.map_err(|error| native_error("corrupt_repository", error))?;
+            let name: &[u8] = entry.filename.as_ref();
+            validate_tree_entry(&mut previous, name, entry.mode.value())?;
+            let path_len = prefix
+                .len()
+                .checked_add(usize::from(!prefix.is_empty()))
+                .and_then(|length| length.checked_add(name.len()))
+                .ok_or_else(|| native_error("corrupt_repository", "merge path length overflow"))?;
+            if path_len > 4096 {
+                return Err(native_error(
+                    "corrupt_repository",
+                    "merge tree path exceeds 4096 bytes",
+                ));
+            }
+            let mut path = Vec::with_capacity(path_len);
+            path.extend_from_slice(&prefix);
+            if !prefix.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(name);
+            let oid = entry.oid.to_owned();
+            if entry.mode.is_tree() {
+                pending.push((oid, path));
+            } else if paths.insert(path, (entry.mode.value(), oid)).is_some() {
+                return Err(native_error(
+                    "corrupt_repository",
+                    "merge tree contains a duplicate path",
+                ));
+            }
+        }
+    }
+    check_merge_deadline(deadline)?;
+    Ok(paths)
+}
+
+fn count_changed_merge_paths(
+    ancestor: &BTreeMap<Vec<u8>, (u16, gix_hash::ObjectId)>,
+    head: &BTreeMap<Vec<u8>, (u16, gix_hash::ObjectId)>,
+    changed_path_limit: usize,
+    deadline: Instant,
+) -> Result<usize, NativeError> {
+    let mut changed = 0_usize;
+    for (path, state) in ancestor {
+        check_merge_deadline(deadline)?;
+        if head.get(path) != Some(state) {
+            record_changed_merge_path(&mut changed, changed_path_limit)?;
+        }
+    }
+    for path in head.keys() {
+        check_merge_deadline(deadline)?;
+        if !ancestor.contains_key(path) {
+            record_changed_merge_path(&mut changed, changed_path_limit)?;
+        }
+    }
+    Ok(changed)
+}
+
+fn record_changed_merge_path(
+    changed: &mut usize,
+    changed_path_limit: usize,
+) -> Result<(), NativeError> {
+    if *changed >= changed_path_limit {
+        return Err(native_error(
+            "changed_path_limit",
+            "merge analysis exceeded the 10,000-changed-path limit",
+        ));
+    }
+    *changed = changed
+        .checked_add(1)
+        .ok_or_else(|| native_error("corrupt_repository", "changed path count overflow"))?;
+    Ok(())
+}
+
+fn persist_merge_object_memory(
+    repo: &mut gix::Repository,
+    path: &str,
+    deadline: Instant,
+) -> Result<(), NativeError> {
+    let mut storage = repo
+        .objects
+        .take_object_memory()
+        .ok_or_else(|| native_error("corrupt_repository", "merge object memory was not enabled"))?;
+    let mut objects: Vec<_> = storage.drain().collect();
+    objects.sort_by_key(|(_, (kind, _))| match kind {
+        gix_object::Kind::Blob => 0,
+        gix_object::Kind::Tree => 1,
+        gix_object::Kind::Commit => 2,
+        gix_object::Kind::Tag => 3,
+    });
+    let path = path.to_owned();
+
+    // gix's loose-object encoder keeps a 32 KiB compression buffer on the stack. The BEAM dirty
+    // I/O scheduler stack can be smaller than the merge frame plus that buffer, so perform only
+    // the final, already-validated object flush on a joined worker with an explicit bounded stack.
+    std::thread::Builder::new()
+        .name("fornacast-merge-persist".into())
+        .stack_size(MERGE_PERSIST_STACK_SIZE)
+        .spawn(move || persist_merge_objects(&path, objects, deadline))
+        .map_err(|error| native_error("storage_unavailable", error))?
+        .join()
+        .map_err(|_| native_error("corrupt_repository", "merge object persistence panicked"))?
+}
+
+fn persist_merge_objects(
+    path: &str,
+    objects: Vec<(gix_hash::ObjectId, (gix_object::Kind, Vec<u8>))>,
+    deadline: Instant,
+) -> Result<(), NativeError> {
+    use gix_object::Write as ObjectWrite;
+
+    let repo = open_physical_bare_repository(path)?;
+    for (oid, (kind, data)) in objects {
+        check_merge_deadline(deadline)?;
+        ObjectWrite::write_buf_with_known_id(&repo, kind, &data, oid)
+            .map_err(|error| native_error("storage_unavailable", error))?;
+    }
+    check_merge_deadline(deadline)
+}
+
+fn parse_merge_commit_oid(
+    repo: &gix::Repository,
+    value: &str,
+    deadline: Instant,
+) -> Result<gix_hash::ObjectId, NativeError> {
+    check_merge_deadline(deadline)?;
+    let oid = gix_hash::ObjectId::from_hex(value.as_bytes())
+        .map_err(|error| native_error("commit_not_found", error))?;
+    find_graph_commit(repo, oid, CommitPosition::Tip)?;
+    check_merge_deadline(deadline)?;
+    Ok(oid)
+}
+
+fn merge_commit_tree(
+    repo: &gix::Repository,
+    oid: gix_hash::ObjectId,
+    deadline: Instant,
+) -> Result<gix_hash::ObjectId, NativeError> {
+    check_merge_deadline(deadline)?;
+    let commit = find_graph_commit(repo, oid, CommitPosition::Tip)?;
+    let tree = commit
+        .decode()
+        .map_err(|error| native_error("corrupt_repository", error))?
+        .tree();
+    check_merge_deadline(deadline)?;
+    Ok(tree)
+}
+
+fn load_merge_tree<'repo>(
+    repo: &'repo gix::Repository,
+    oid: gix_hash::ObjectId,
+    deadline: Instant,
+) -> Result<gix::Tree<'repo>, NativeError> {
+    check_merge_deadline(deadline)?;
+    let object = repo
+        .find_object(oid)
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let tree = object
+        .try_into_tree()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    check_merge_deadline(deadline)?;
+    Ok(tree)
+}
+
+fn validated_merge_signature(value: NativeSignature) -> Result<gix::actor::Signature, NativeError> {
+    let (name, email, seconds, offset_minutes) = value;
+    let name = validated_signature_field(name, SIGNATURE_NAME_LIMIT, "name")?;
+    let email = validated_signature_field(email, SIGNATURE_EMAIL_LIMIT, "email")?;
+    if !(-1439..=1439).contains(&offset_minutes) {
+        return Err(native_error(
+            "invalid_input",
+            "signature offset must be between -1439 and 1439 minutes",
+        ));
+    }
+    Ok(gix::actor::Signature {
+        name: name.into(),
+        email: email.into(),
+        time: gix::date::Time {
+            seconds,
+            offset: offset_minutes
+                .checked_mul(60)
+                .ok_or_else(|| native_error("invalid_input", "signature offset overflow"))?,
+        },
+    })
+}
+
+fn validated_signature_field(
+    value: Vec<u8>,
+    limit: usize,
+    field: &str,
+) -> Result<String, NativeError> {
+    if value.is_empty() || value.len() > limit {
+        return Err(native_error(
+            "invalid_input",
+            format!("signature {field} has an invalid size"),
+        ));
+    }
+    if value
+        .iter()
+        .any(|byte| matches!(byte, 0 | b'\n' | b'\r' | b'<' | b'>'))
+    {
+        return Err(native_error(
+            "invalid_input",
+            format!("signature {field} contains a forbidden byte"),
+        ));
+    }
+    String::from_utf8(value).map_err(|_| {
+        native_error(
+            "invalid_input",
+            format!("signature {field} must be valid UTF-8"),
+        )
+    })
+}
+
+fn validated_merge_message(message: Vec<u8>) -> Result<String, NativeError> {
+    if message.len() > MERGE_MESSAGE_LIMIT {
+        return Err(native_error(
+            "invalid_input",
+            "merge commit message exceeds 1 MiB",
+        ));
+    }
+    if message.contains(&0) {
+        return Err(native_error(
+            "invalid_input",
+            "merge commit message contains NUL",
+        ));
+    }
+    String::from_utf8(message)
+        .map_err(|_| native_error("invalid_input", "merge commit message must be valid UTF-8"))
+}
+
+fn merge_commit_limit(limit: usize) -> usize {
+    limit.min(MERGE_COMMIT_LIMIT)
+}
+
+fn merge_tree_entry_limit(limit: usize) -> usize {
+    limit.min(MERGE_TREE_ENTRY_LIMIT)
+}
+
+fn merge_changed_path_limit(limit: usize) -> usize {
+    limit.min(MERGE_CHANGED_PATH_LIMIT)
+}
+
+fn merge_scan_duration(deadline_ms: u64) -> Duration {
+    Duration::from_millis(deadline_ms.min(MERGE_DEADLINE.as_millis() as u64))
+}
+
+fn check_merge_deadline(deadline: Instant) -> Result<(), NativeError> {
+    if Instant::now() >= deadline {
+        Err(native_error(
+            "scan_timeout",
+            "merge analysis exceeded the 30-second deadline",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn usize_to_u64(value: usize, label: &str) -> Result<u64, NativeError> {
+    u64::try_from(value)
+        .map_err(|_| native_error("corrupt_repository", format!("{label} overflow")))
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
 fn repository_disk_usage(path: String, deadline_ms: u64) -> Result<u64, NativeError> {
     let deadline = Instant::now() + disk_usage_scan_duration(deadline_ms);
@@ -4379,6 +5006,33 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TREE_HISTORY_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn pull_merge_production_bounds_cannot_be_raised() {
+        assert_eq!(merge_commit_limit(usize::MAX), MERGE_COMMIT_LIMIT);
+        assert_eq!(merge_tree_entry_limit(usize::MAX), MERGE_TREE_ENTRY_LIMIT);
+        assert_eq!(
+            merge_changed_path_limit(usize::MAX),
+            MERGE_CHANGED_PATH_LIMIT
+        );
+        assert_eq!(merge_scan_duration(u64::MAX), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn pull_merge_validates_all_commit_bytes_before_object_work() {
+        assert!(matches!(
+            validated_merge_message(vec![0xff]),
+            Err((kind, _)) if kind == "invalid_input"
+        ));
+        assert!(matches!(
+            validated_merge_signature((b"bad\nname".to_vec(), b"a@b.test".to_vec(), 0, 0)),
+            Err((kind, _)) if kind == "invalid_input"
+        ));
+        assert!(matches!(
+            validated_merge_signature((b"name".to_vec(), b"a@b.test".to_vec(), 0, 1440)),
+            Err((kind, _)) if kind == "invalid_input"
+        ));
+    }
 
     #[test]
     fn search_reasons_have_one_fixed_serialization_order() {

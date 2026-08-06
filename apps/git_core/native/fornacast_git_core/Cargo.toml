@@ -9,7 +9,7 @@ name = "fornacast_git_core"
 crate-type = ["cdylib"]
 
 [dependencies]
-gix = "0.85.0"
+gix = { version = "0.85.0", features = ["merge"] }
 gix-features = "0.48.1"
 gix-hash = "0.25.1"
 gix-object = "0.62.0"

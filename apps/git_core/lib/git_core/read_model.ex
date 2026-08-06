@@ -1,6 +1,8 @@
 defmodule GitCore.Error do
   @enforce_keys [:kind, :operation]
   defstruct [:kind, :operation, :detail]
+
+  @type t :: %__MODULE__{kind: atom(), operation: atom(), detail: String.t() | nil}
 end
 
 defmodule GitCore.RefSelector do

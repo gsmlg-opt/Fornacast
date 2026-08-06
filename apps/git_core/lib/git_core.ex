@@ -18,6 +18,10 @@ defmodule GitCore do
   @analysis_byte_limit 536_870_912
   @analysis_deadline_ms 2_000
   @disk_usage_deadline_ms 2_000
+  @merge_commit_limit 50_000
+  @merge_tree_entry_limit 100_000
+  @merge_changed_path_limit 10_000
+  @merge_deadline_ms 30_000
 
   def init_bare(path) when is_binary(path) do
     GitCore.Native.init_bare(path)
@@ -438,6 +442,97 @@ defmodule GitCore do
     end)
   end
 
+  @doc """
+  Analyzes one immutable base/head commit pair without moving a ref or persisting merge objects.
+
+  The scan visits at most 50,000 commits and 100,000 physical tree entries, retains at most
+  10,000 changed leaf paths, and is capped by one 30-second deadline. Tests may lower these
+  bounds through options, but callers cannot raise the production caps.
+  """
+  @spec merge_analysis(Path.t(), String.t(), String.t(), keyword()) ::
+          {:ok, GitCore.MergeAnalysis.t()} | {:error, GitCore.Error.t()}
+  def merge_analysis(path, base_oid, head_oid, opts \\ [])
+      when is_binary(path) and is_binary(base_oid) and is_binary(head_oid) and is_list(opts) do
+    {commit_limit, tree_entry_limit, changed_path_limit, deadline_ms} = merge_bounds(opts)
+    limiter = Keyword.get(opts, :limiter, GitCore.ScanLimiter)
+
+    GitCore.ScanLimiter.with_permit(
+      :merge_analysis,
+      fn ->
+        with {:ok,
+              {native_base_oid, native_head_oid, mergeable, ahead_by, behind_by, commit_count,
+               changed_paths}} <-
+               wrap_read(
+                 GitCore.Native.merge_analysis(
+                   path,
+                   base_oid,
+                   head_oid,
+                   commit_limit,
+                   tree_entry_limit,
+                   changed_path_limit,
+                   deadline_ms
+                 ),
+                 :merge_analysis
+               ) do
+          {:ok,
+           %GitCore.MergeAnalysis{
+             base_oid: native_base_oid,
+             head_oid: native_head_oid,
+             mergeable: mergeable,
+             ahead_by: ahead_by,
+             behind_by: behind_by,
+             commit_count: commit_count,
+             changed_paths: changed_paths
+           }}
+        end
+      end,
+      server: limiter
+    )
+  end
+
+  @doc """
+  Writes the merged tree and its two-parent commit without updating a reference.
+
+  The caller must already hold the repository writer permit. This function deliberately does
+  not acquire another permit, which keeps it composable inside the durable write fence.
+  """
+  @spec write_merge_commit(
+          Path.t(),
+          String.t(),
+          String.t(),
+          GitCore.Signature.t(),
+          GitCore.Signature.t(),
+          String.t(),
+          keyword()
+        ) :: {:ok, String.t()} | {:error, GitCore.Error.t()}
+  def write_merge_commit(
+        path,
+        base_oid,
+        head_oid,
+        %GitCore.Signature{} = author,
+        %GitCore.Signature{} = committer,
+        message,
+        opts \\ []
+      )
+      when is_binary(path) and is_binary(base_oid) and is_binary(head_oid) and
+             is_binary(message) and is_list(opts) do
+    {commit_limit, tree_entry_limit, changed_path_limit, deadline_ms} = merge_bounds(opts)
+
+    GitCore.Native.write_merge_commit(
+      path,
+      base_oid,
+      head_oid,
+      signature_to_native(author),
+      signature_to_native(committer),
+      :binary.bin_to_list(message),
+      commit_limit,
+      tree_entry_limit,
+      changed_path_limit,
+      deadline_ms
+    )
+    |> wrap_read(:write_merge_commit)
+  end
+
   def pack_objects(path, wants) when is_binary(path) and is_list(wants) do
     GitCore.Native.pack_objects(path, wants)
   end
@@ -571,6 +666,40 @@ defmodule GitCore do
 
   defp disk_usage_deadline_ms(deadline_ms) when is_integer(deadline_ms),
     do: deadline_ms |> max(0) |> min(@disk_usage_deadline_ms)
+
+  defp merge_bounds(opts) do
+    {
+      opts |> Keyword.get(:commit_limit, @merge_commit_limit) |> merge_commit_limit(),
+      opts
+      |> Keyword.get(:tree_entry_limit, @merge_tree_entry_limit)
+      |> merge_tree_entry_limit(),
+      opts
+      |> Keyword.get(:changed_path_limit, @merge_changed_path_limit)
+      |> merge_changed_path_limit(),
+      opts |> Keyword.get(:deadline_ms, @merge_deadline_ms) |> merge_deadline_ms()
+    }
+  end
+
+  defp merge_commit_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@merge_commit_limit)
+
+  defp merge_tree_entry_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@merge_tree_entry_limit)
+
+  defp merge_changed_path_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@merge_changed_path_limit)
+
+  defp merge_deadline_ms(deadline_ms) when is_integer(deadline_ms),
+    do: deadline_ms |> max(0) |> min(@merge_deadline_ms)
+
+  defp signature_to_native(%GitCore.Signature{} = signature) do
+    {
+      :binary.bin_to_list(signature.name),
+      :binary.bin_to_list(signature.email),
+      signature.seconds,
+      signature.offset_minutes
+    }
+  end
 
   defp blob_metadata(path, snapshot_oid, blob_path, operation) do
     with {:ok, {name, oid, size}} <-
@@ -767,4 +896,9 @@ defmodule GitCore do
   defp native_error_kind("corrupt_repository"), do: :corrupt_repository
   defp native_error_kind("scan_timeout"), do: :scan_timeout
   defp native_error_kind("scan_busy"), do: :scan_busy
+  defp native_error_kind("commit_limit"), do: :commit_limit
+  defp native_error_kind("tree_entry_limit"), do: :tree_entry_limit
+  defp native_error_kind("changed_path_limit"), do: :changed_path_limit
+  defp native_error_kind("merge_conflict"), do: :merge_conflict
+  defp native_error_kind("invalid_input"), do: :invalid_input
 end
