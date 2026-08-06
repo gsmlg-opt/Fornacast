@@ -9,6 +9,11 @@ defmodule GitCore.Application do
   def start(_type, _args) do
     children = [
       GitCore.ScanLimiter,
+      Supervisor.child_spec(
+        {Task.Supervisor, name: GitCore.MergeTaskSupervisor},
+        id: GitCore.MergeTaskSupervisor,
+        shutdown: :infinity
+      ),
       GitCore.BlobLimiter,
       GitCore.Cache
     ]

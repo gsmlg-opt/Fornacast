@@ -5,6 +5,7 @@ defmodule GitCore.ScanLimiter do
 
   @capacity 4
   @wait_timeout 250
+  @task_supervisor GitCore.MergeTaskSupervisor
 
   defmodule State do
     @moduledoc false
@@ -51,6 +52,35 @@ defmodule GitCore.ScanLimiter do
 
       {:error, :unavailable} ->
         busy_error(operation, "scan limiter is unavailable")
+    end
+  end
+
+  @doc false
+  def with_deferred_permit(operation, fun, opts \\ []) when is_function(fun, 0) do
+    server = Keyword.get(opts, :server, __MODULE__)
+    task_supervisor = Keyword.get(opts, :task_supervisor, @task_supervisor)
+    caller = self()
+    reply = make_ref()
+
+    case Task.Supervisor.start_child(
+           task_supervisor,
+           fn -> run_deferred_keeper(caller, reply, operation, fun, server) end,
+           shutdown: :infinity
+         ) do
+      {:ok, keeper} ->
+        monitor = Process.monitor(keeper)
+
+        receive do
+          {^reply, result} ->
+            Process.demonitor(monitor, [:flush])
+            result
+
+          {:DOWN, ^monitor, :process, ^keeper, _reason} ->
+            busy_error(operation, "scan keeper is unavailable")
+        end
+
+      {:error, _reason} ->
+        busy_error(operation, "scan keeper supervisor is unavailable")
     end
   end
 
@@ -152,6 +182,32 @@ defmodule GitCore.ScanLimiter do
       GenServer.call(server, {:release, lease}, :infinity)
     catch
       :exit, _reason -> :ok
+    end
+  end
+
+  defp run_deferred_keeper(caller, reply, operation, fun, server) do
+    replied = make_ref()
+
+    result =
+      with_permit(
+        operation,
+        fn ->
+          case fun.() do
+            {:complete, result} ->
+              send(caller, {reply, result})
+              replied
+
+            {:deferred, result, await} when is_function(await, 0) ->
+              send(caller, {reply, result})
+              await.()
+              replied
+          end
+        end,
+        server: server
+      )
+
+    if result != replied do
+      send(caller, {reply, result})
     end
   end
 

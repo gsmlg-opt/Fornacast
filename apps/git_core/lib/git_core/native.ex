@@ -101,6 +101,8 @@ defmodule GitCore.Native do
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
+  def await_merge_worker(_ticket), do: :erlang.nif_error(:nif_not_loaded)
+
   def pack_objects(_path, _wants), do: :erlang.nif_error(:nif_not_loaded)
   def receive_pack(_path, _pack, _commands), do: :erlang.nif_error(:nif_not_loaded)
 end

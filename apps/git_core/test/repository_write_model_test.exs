@@ -256,16 +256,94 @@ defmodule GitCore.RepositoryWriteModelTest do
     assert_receive :permit_held
 
     assert {:error, %GitCore.Error{kind: :scan_busy, operation: :merge_analysis}} =
-             GitCore.merge_analysis(
+             GitCore.merge_analysis_with_runtime(
                fixture.repo_path,
                fixture.base_oid,
                fixture.head_oid,
+               [],
                limiter: limiter,
-               wait_timeout: 0
+               task_supervisor: GitCore.MergeTaskSupervisor,
+               native_merge: &GitCore.Native.merge_analysis/8,
+               native_await: &GitCore.Native.await_merge_worker/1
              )
 
     send(holder.pid, :release)
     assert Task.await(holder) == :ok
+  end
+
+  test "timed-out merge keepers remain inside the node-wide scan capacity" do
+    limiter =
+      start_supervised!(
+        {GitCore.ScanLimiter, server: nil, capacity: 4, wait_timeout: 0},
+        id: make_ref()
+      )
+
+    keeper_supervisor =
+      start_supervised!({Task.Supervisor, name: nil}, id: make_ref())
+
+    parent = self()
+
+    callers =
+      for _ <- 1..4 do
+        Task.async(fn ->
+          GitCore.merge_analysis_with_runtime(
+            "unused-test-repository",
+            String.duplicate("a", 40),
+            String.duplicate("b", 40),
+            [],
+            limiter: limiter,
+            task_supervisor: keeper_supervisor,
+            native_merge: fn _path,
+                             _base_oid,
+                             _head_oid,
+                             _commit_limit,
+                             _tree_entry_limit,
+                             _changed_path_limit,
+                             _byte_limit,
+                             _deadline_ms ->
+              keeper = self()
+              send(parent, {:merge_keeper_active, keeper})
+              {:deferred, {"scan_timeout", "merge analysis exceeded its deadline"}, keeper}
+            end,
+            native_await: fn keeper ->
+              receive do
+                :release_merge_worker -> send(parent, {:merge_keeper_finished, keeper})
+              end
+            end
+          )
+        end)
+      end
+
+    keepers =
+      for _ <- 1..4 do
+        assert_receive {:merge_keeper_active, keeper}
+        keeper
+      end
+
+    for caller <- callers do
+      assert {:error, %GitCore.Error{kind: :scan_timeout, operation: :merge_analysis}} =
+               Task.await(caller)
+    end
+
+    assert {:error, %GitCore.Error{kind: :scan_busy, operation: :ref_summary}} =
+             GitCore.ScanLimiter.with_permit(:ref_summary, fn -> :unexpected end, server: limiter)
+
+    [released | remaining] = keepers
+    send(released, :release_merge_worker)
+    assert_receive {:merge_keeper_finished, ^released}
+
+    assert :ordinary_scan_entered =
+             GitCore.ScanLimiter.with_permit(:ref_summary, fn -> :ordinary_scan_entered end,
+               server: limiter
+             )
+
+    Enum.each(remaining, &send(&1, :release_merge_worker))
+
+    for keeper <- remaining do
+      assert_receive {:merge_keeper_finished, ^keeper}
+    end
+
+    assert :ok = wait_for_deferred_release(limiter, keeper_supervisor)
   end
 
   defp clean_fixture!(tmp_dir) do
@@ -404,6 +482,22 @@ defmodule GitCore.RepositoryWriteModelTest do
     raw
     |> String.split("\n")
     |> Enum.filter(&String.starts_with?(&1, "parent "))
+  end
+
+  defp wait_for_deferred_release(limiter, supervisor, attempts \\ 100)
+
+  defp wait_for_deferred_release(_limiter, _supervisor, 0), do: {:error, :still_active}
+
+  defp wait_for_deferred_release(limiter, supervisor, attempts) do
+    %{active: active} = Supervisor.count_children(supervisor)
+    %{grants: grants} = :sys.get_state(limiter)
+
+    if active == 0 and map_size(grants) == 0 do
+      :ok
+    else
+      Process.sleep(5)
+      wait_for_deferred_release(limiter, supervisor, attempts - 1)
+    end
   end
 
   defp git!(args) do

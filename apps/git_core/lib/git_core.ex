@@ -447,51 +447,60 @@ defmodule GitCore do
   Analyzes one immutable base/head commit pair without moving a ref or persisting merge objects.
 
   The scan visits at most 50,000 commits and 100,000 physical tree entries, retains at most
-  10,000 changed leaf paths, and is capped by one 30-second deadline. Decoded and generated
-  object data is limited to 64 MiB in aggregate and 8 MiB for any individual blob. Tests may
-  lower these bounds through options, but callers cannot raise the production caps.
+  10,000 changed leaf paths, and is capped by one 30-second deadline. Unique decoded/generated
+  object data and retained merge paths are limited to 64 MiB in aggregate, with an 8 MiB cap for
+  any individual blob. Tests may lower these bounds through options, but callers cannot raise the
+  production caps.
   """
   @spec merge_analysis(Path.t(), String.t(), String.t(), keyword()) ::
           {:ok, GitCore.MergeAnalysis.t()} | {:error, GitCore.Error.t()}
   def merge_analysis(path, base_oid, head_oid, opts \\ [])
       when is_binary(path) and is_binary(base_oid) and is_binary(head_oid) and is_list(opts) do
+    merge_analysis_with_runtime(path, base_oid, head_oid, opts,
+      limiter: GitCore.ScanLimiter,
+      task_supervisor: GitCore.MergeTaskSupervisor,
+      native_merge: &GitCore.Native.merge_analysis/8,
+      native_await: &GitCore.Native.await_merge_worker/1
+    )
+  end
+
+  @doc false
+  def merge_analysis_with_runtime(path, base_oid, head_oid, opts, runtime)
+      when is_binary(path) and is_binary(base_oid) and is_binary(head_oid) and is_list(opts) and
+             is_list(runtime) do
     {commit_limit, tree_entry_limit, changed_path_limit, byte_limit, deadline_ms} =
       merge_bounds(opts)
 
-    limiter = Keyword.get(opts, :limiter, GitCore.ScanLimiter)
+    limiter = Keyword.fetch!(runtime, :limiter)
+    task_supervisor = Keyword.fetch!(runtime, :task_supervisor)
+    native_merge = Keyword.fetch!(runtime, :native_merge)
+    native_await = Keyword.fetch!(runtime, :native_await)
 
-    GitCore.ScanLimiter.with_permit(
+    GitCore.ScanLimiter.with_deferred_permit(
       :merge_analysis,
       fn ->
-        with {:ok,
-              {native_base_oid, native_head_oid, mergeable, ahead_by, behind_by, commit_count,
-               changed_paths}} <-
-               wrap_read(
-                 GitCore.Native.merge_analysis(
-                   path,
-                   base_oid,
-                   head_oid,
-                   commit_limit,
-                   tree_entry_limit,
-                   changed_path_limit,
-                   byte_limit,
-                   deadline_ms
-                 ),
-                 :merge_analysis
-               ) do
-          {:ok,
-           %GitCore.MergeAnalysis{
-             base_oid: native_base_oid,
-             head_oid: native_head_oid,
-             mergeable: mergeable,
-             ahead_by: ahead_by,
-             behind_by: behind_by,
-             commit_count: commit_count,
-             changed_paths: changed_paths
-           }}
+        case native_merge.(
+               path,
+               base_oid,
+               head_oid,
+               commit_limit,
+               tree_entry_limit,
+               changed_path_limit,
+               byte_limit,
+               deadline_ms
+             ) do
+          {:deferred, native_error, ticket} ->
+            {:deferred, merge_analysis_result({:error, native_error}),
+             fn ->
+               native_await.(ticket)
+             end}
+
+          native_result ->
+            {:complete, merge_analysis_result(native_result)}
         end
       end,
-      server: limiter
+      server: limiter,
+      task_supervisor: task_supervisor
     )
   end
 
@@ -894,8 +903,28 @@ defmodule GitCore do
 
   defp wrap_read({:ok, value}, _operation), do: {:ok, value}
 
+  defp wrap_read({:deferred, native_error, _ticket}, operation),
+    do: wrap_read({:error, native_error}, operation)
+
   defp wrap_read({:error, {kind, detail}}, operation) do
     {:error, %GitCore.Error{kind: native_error_kind(kind), operation: operation, detail: detail}}
+  end
+
+  defp merge_analysis_result(native_result) do
+    with {:ok,
+          {native_base_oid, native_head_oid, mergeable, ahead_by, behind_by, commit_count,
+           changed_paths}} <- wrap_read(native_result, :merge_analysis) do
+      {:ok,
+       %GitCore.MergeAnalysis{
+         base_oid: native_base_oid,
+         head_oid: native_head_oid,
+         mergeable: mergeable,
+         ahead_by: ahead_by,
+         behind_by: behind_by,
+         commit_count: commit_count,
+         changed_paths: changed_paths
+       }}
+    end
   end
 
   defp native_error_kind("empty_repository"), do: :empty_repository
