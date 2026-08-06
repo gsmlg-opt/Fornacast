@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use gix_object::bstr::ByteSlice;
@@ -159,7 +160,7 @@ const MERGE_DEADLINE: Duration = Duration::from_secs(30);
 const MERGE_MESSAGE_LIMIT: usize = 1024 * 1024;
 const SIGNATURE_NAME_LIMIT: usize = 255;
 const SIGNATURE_EMAIL_LIMIT: usize = 320;
-const MERGE_PERSIST_STACK_SIZE: usize = 2 * 1024 * 1024;
+const MERGE_WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
 const NO_FINAL_NEWLINE_MARKER: &[u8] = b"\\ No newline at end of file\n";
 // This remains independent of object size while leaving room for the complete mandatory tag
 // header, including long ref-derived tag names, before an arbitrarily large message body.
@@ -167,6 +168,9 @@ const SNAPSHOT_OBJECT_PREFIX_LIMIT: usize = 64 * 1024;
 
 #[cfg(test)]
 static TREE_HISTORY_GRAPH_WALKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static MERGE_WORKERS_STARTED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 struct RetainedDiffSource {
@@ -3081,6 +3085,14 @@ struct MergeMetrics {
     behind_by: usize,
 }
 
+type MergeObjectMemory = Vec<(gix_hash::ObjectId, (gix_object::Kind, Vec<u8>))>;
+
+struct ComputedMerge {
+    analysis: NativeMergeAnalysis,
+    merge_oid: Option<String>,
+    objects: MergeObjectMemory,
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
 fn merge_analysis(
     path: String,
@@ -3152,12 +3164,113 @@ fn bounded_merge(
     let deadline = Instant::now() + merge_scan_duration(deadline_ms);
     check_merge_deadline(deadline)?;
 
+    let publish = commit.is_some();
+    let worker_path = path.to_owned();
+    let publish_path = worker_path.clone();
+    let base_oid = base_oid.to_owned();
+    let head_oid = head_oid.to_owned();
+    let computed = run_merge_worker(deadline, move |cancelled| {
+        compute_bounded_merge(
+            worker_path,
+            base_oid,
+            head_oid,
+            commit_limit,
+            tree_entry_limit,
+            changed_path_limit,
+            deadline,
+            commit,
+            cancelled,
+        )
+    })?;
+
+    if publish {
+        // This is the final cancellation/deadline boundary. Once publication starts, storage
+        // errors may leave unreachable content-addressed objects, but this primitive never moves
+        // a ref and never returns a deadline error after the first object write begins.
+        check_merge_deadline(deadline)?;
+        publish_merge_objects(publish_path, computed.objects)?;
+    }
+
+    Ok((computed.analysis, computed.merge_oid))
+}
+
+fn run_merge_worker<T, F>(deadline: Instant, task: F) -> Result<T, NativeError>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<AtomicBool>) -> Result<T, NativeError> + Send + 'static,
+{
+    check_merge_deadline(deadline)?;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let handle = std::thread::Builder::new()
+        .name("fornacast-merge-compute".into())
+        .stack_size(MERGE_WORKER_STACK_SIZE)
+        .spawn(move || {
+            let result = task(Arc::clone(&worker_cancelled));
+            if !worker_cancelled.load(Ordering::Acquire) {
+                let _ = sender.send(result);
+            }
+        })
+        .map_err(|error| native_error("storage_unavailable", error))?;
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let result = if remaining.is_zero() {
+        Err(mpsc::RecvTimeoutError::Timeout)
+    } else {
+        receiver.recv_timeout(remaining)
+    };
+
+    match result {
+        Ok(result) if Instant::now() < deadline => {
+            handle
+                .join()
+                .map_err(|_| native_error("corrupt_repository", "merge worker panicked"))?;
+            result
+        }
+        Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {
+            cancelled.store(true, Ordering::Release);
+            drop(handle);
+            Err(native_error(
+                "scan_timeout",
+                "merge analysis exceeded the 30-second deadline",
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            cancelled.store(true, Ordering::Release);
+            handle
+                .join()
+                .map_err(|_| native_error("corrupt_repository", "merge worker panicked"))?;
+            Err(native_error(
+                "corrupt_repository",
+                "merge worker exited without a result",
+            ))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_bounded_merge(
+    path: String,
+    base_oid: String,
+    head_oid: String,
+    commit_limit: usize,
+    tree_entry_limit: usize,
+    changed_path_limit: usize,
+    deadline: Instant,
+    commit: Option<PreparedMergeCommit>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<ComputedMerge, NativeError> {
+    check_merge_worker(&cancelled, deadline)?;
+    #[cfg(test)]
+    MERGE_WORKERS_STARTED.fetch_add(1, Ordering::Relaxed);
+
     let commit_limit = merge_commit_limit(commit_limit);
     let tree_entry_limit = merge_tree_entry_limit(tree_entry_limit);
     let changed_path_limit = merge_changed_path_limit(changed_path_limit);
-    let mut repo = open_physical_bare_repository(path)?.with_object_memory();
-    let base_oid = parse_merge_commit_oid(&repo, base_oid, deadline)?;
-    let head_oid = parse_merge_commit_oid(&repo, head_oid, deadline)?;
+    let mut repo = open_physical_bare_repository(&path)?.with_object_memory();
+    let base_oid = parse_merge_commit_oid(&repo, &base_oid, deadline)?;
+    let head_oid = parse_merge_commit_oid(&repo, &head_oid, deadline)?;
     let metrics = merge_metrics(&repo, base_oid, head_oid, commit_limit, deadline)?;
 
     let merge_base_oid = repo
@@ -3262,7 +3375,7 @@ fn bounded_merge(
     drop(commit_graph);
     drop(blob_merge);
     drop(diff_cache);
-    check_merge_deadline(deadline)?;
+    check_merge_worker(&cancelled, deadline)?;
     let mergeable = !outcome
         .tree_merge
         .has_unresolved_conflicts(gix::merge::tree::TreatAsUnresolved::git());
@@ -3284,7 +3397,11 @@ fn bounded_merge(
                 "base and head have unresolved merge conflicts",
             ))
         } else {
-            Ok((native_analysis, None))
+            Ok(ComputedMerge {
+                analysis: native_analysis,
+                merge_oid: None,
+                objects: Vec::new(),
+            })
         };
     }
 
@@ -3304,7 +3421,11 @@ fn bounded_merge(
     )?;
 
     let Some(commit) = commit else {
-        return Ok((native_analysis, None));
+        return Ok(ComputedMerge {
+            analysis: native_analysis,
+            merge_oid: None,
+            objects: Vec::new(),
+        });
     };
 
     check_merge_deadline(deadline)?;
@@ -3321,10 +3442,13 @@ fn bounded_merge(
         .write_object(commit_object)
         .map_err(|error| native_error("storage_unavailable", error))?
         .detach();
-    check_merge_deadline(deadline)?;
-
-    persist_merge_object_memory(&mut repo, path, deadline)?;
-    Ok((native_analysis, Some(merge_oid.to_string())))
+    check_merge_worker(&cancelled, deadline)?;
+    let objects = take_merge_object_memory(&mut repo)?;
+    Ok(ComputedMerge {
+        analysis: native_analysis,
+        merge_oid: Some(merge_oid.to_string()),
+        objects,
+    })
 }
 
 fn merge_metrics(
@@ -3496,50 +3620,47 @@ fn record_changed_merge_path(
     Ok(())
 }
 
-fn persist_merge_object_memory(
-    repo: &mut gix::Repository,
-    path: &str,
-    deadline: Instant,
-) -> Result<(), NativeError> {
+fn take_merge_object_memory(repo: &mut gix::Repository) -> Result<MergeObjectMemory, NativeError> {
     let mut storage = repo
         .objects
         .take_object_memory()
         .ok_or_else(|| native_error("corrupt_repository", "merge object memory was not enabled"))?;
-    let mut objects: Vec<_> = storage.drain().collect();
+    Ok(storage.drain().collect())
+}
+
+fn publish_merge_objects(path: String, mut objects: MergeObjectMemory) -> Result<(), NativeError> {
     objects.sort_by_key(|(_, (kind, _))| match kind {
         gix_object::Kind::Blob => 0,
         gix_object::Kind::Tree => 1,
         gix_object::Kind::Commit => 2,
         gix_object::Kind::Tag => 3,
     });
-    let path = path.to_owned();
 
     // gix's loose-object encoder keeps a 32 KiB compression buffer on the stack. The BEAM dirty
-    // I/O scheduler stack can be smaller than the merge frame plus that buffer, so perform only
-    // the final, already-validated object flush on a joined worker with an explicit bounded stack.
+    // I/O scheduler stack can be smaller than that buffer, so publish on a joined worker with an
+    // explicit stack. Publication is deliberately outside the merge deadline: a storage failure
+    // can leave unreachable content-addressed objects, but this primitive never updates a ref.
     std::thread::Builder::new()
-        .name("fornacast-merge-persist".into())
-        .stack_size(MERGE_PERSIST_STACK_SIZE)
-        .spawn(move || persist_merge_objects(&path, objects, deadline))
+        .name("fornacast-merge-publish".into())
+        .stack_size(MERGE_WORKER_STACK_SIZE)
+        .spawn(move || publish_merge_objects_on_worker(&path, objects))
         .map_err(|error| native_error("storage_unavailable", error))?
         .join()
-        .map_err(|_| native_error("corrupt_repository", "merge object persistence panicked"))?
+        .map_err(|_| native_error("corrupt_repository", "merge object publication panicked"))?
 }
 
-fn persist_merge_objects(
+fn publish_merge_objects_on_worker(
     path: &str,
-    objects: Vec<(gix_hash::ObjectId, (gix_object::Kind, Vec<u8>))>,
-    deadline: Instant,
+    objects: MergeObjectMemory,
 ) -> Result<(), NativeError> {
     use gix_object::Write as ObjectWrite;
 
     let repo = open_physical_bare_repository(path)?;
     for (oid, (kind, data)) in objects {
-        check_merge_deadline(deadline)?;
         ObjectWrite::write_buf_with_known_id(&repo, kind, &data, oid)
             .map_err(|error| native_error("storage_unavailable", error))?;
     }
-    check_merge_deadline(deadline)
+    Ok(())
 }
 
 fn parse_merge_commit_oid(
@@ -3677,6 +3798,14 @@ fn check_merge_deadline(deadline: Instant) -> Result<(), NativeError> {
         ))
     } else {
         Ok(())
+    }
+}
+
+fn check_merge_worker(cancelled: &AtomicBool, deadline: Instant) -> Result<(), NativeError> {
+    if cancelled.load(Ordering::Acquire) {
+        Err(native_error("scan_timeout", "merge analysis was cancelled"))
+    } else {
+        check_merge_deadline(deadline)
     }
 }
 
@@ -5002,10 +5131,13 @@ rustler::init!("Elixir.GitCore.Native");
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     static TREE_HISTORY_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+    static MERGE_BOUNDARY_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn pull_merge_production_bounds_cannot_be_raised() {
@@ -5032,6 +5164,162 @@ mod tests {
             validated_merge_signature((b"name".to_vec(), b"a@b.test".to_vec(), 0, 1440)),
             Err((kind, _)) if kind == "invalid_input"
         ));
+    }
+
+    #[test]
+    fn pull_merge_worker_returns_at_a_positive_deadline_and_discards_late_completion() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let observed_cancellation = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::clone(&finished);
+        let worker_observed_cancellation = Arc::clone(&observed_cancellation);
+        let started = Instant::now();
+
+        let result = run_merge_worker(started + Duration::from_millis(20), move |cancelled| {
+            std::thread::sleep(Duration::from_millis(300));
+            worker_observed_cancellation
+                .store(cancelled.load(Ordering::Acquire), Ordering::Release);
+            worker_finished.store(true, Ordering::Release);
+            Ok(17_u8)
+        });
+
+        assert!(matches!(result, Err((kind, _)) if kind == "scan_timeout"));
+        assert!(started.elapsed() < Duration::from_millis(150));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(finished.load(Ordering::Acquire));
+        assert!(observed_cancellation.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pull_merge_enforces_the_exact_50000_commit_boundary() {
+        let fixture = MergeBoundaryFixture::new("commits");
+        let marks = fixture.fast_import_empty_chain(MERGE_COMMIT_LIMIT + 1);
+
+        let (analysis, merge_oid) = bounded_merge(
+            fixture.path(),
+            &marks[&1],
+            &marks[&MERGE_COMMIT_LIMIT],
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            None,
+        )
+        .expect("the exact production commit budget is accepted");
+        assert_eq!(analysis.3, (MERGE_COMMIT_LIMIT - 1) as u64);
+        assert_eq!(analysis.5, (MERGE_COMMIT_LIMIT - 1) as u64);
+        assert!(merge_oid.is_none());
+
+        let before = fixture.object_and_ref_snapshot();
+        let result = bounded_merge(
+            fixture.path(),
+            &marks[&1],
+            &marks[&(MERGE_COMMIT_LIMIT + 1)],
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            None,
+        );
+        assert!(matches!(result, Err((kind, _)) if kind == "commit_limit"));
+        assert_eq!(fixture.object_and_ref_snapshot(), before);
+
+        MERGE_WORKERS_STARTED.store(0, Ordering::Release);
+        let before = fixture.object_and_ref_snapshot();
+        let result = bounded_merge(
+            fixture.path(),
+            &marks[&1],
+            &marks[&MERGE_COMMIT_LIMIT],
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            100,
+            Some(test_merge_commit()),
+        );
+        assert!(matches!(result, Err((kind, _)) if kind == "scan_timeout"));
+        let workers_started = MERGE_WORKERS_STARTED.load(Ordering::Acquire);
+        assert!(
+            workers_started > 0,
+            "the positive deadline must expire after the computation worker starts"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(fixture.object_and_ref_snapshot(), before);
+    }
+
+    #[test]
+    fn pull_merge_enforces_the_exact_100000_tree_entry_boundary() {
+        let fixture = MergeBoundaryFixture::new("tree-entries");
+        let exact = fixture.commit_with_flat_tree(MERGE_TREE_ENTRY_LIMIT / 4, "exact tree");
+        let over = fixture.commit_with_flat_tree(MERGE_TREE_ENTRY_LIMIT / 4 + 1, "over tree");
+
+        bounded_merge(
+            fixture.path(),
+            &exact,
+            &exact,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            None,
+        )
+        .expect("the exact aggregate tree-entry budget is accepted");
+
+        let before = fixture.object_and_ref_snapshot();
+        let result = bounded_merge(
+            fixture.path(),
+            &over,
+            &over,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            None,
+        );
+        assert!(matches!(result, Err((kind, _)) if kind == "tree_entry_limit"));
+        assert_eq!(fixture.object_and_ref_snapshot(), before);
+    }
+
+    #[test]
+    fn pull_merge_enforces_the_exact_10000_changed_path_boundary() {
+        let fixture = MergeBoundaryFixture::new("changed-paths");
+        let root = fixture.commit_with_flat_tree(0, "root");
+        let base = fixture.commit_with_flat_tree_and_parent(1, "base", Some(&root));
+        let exact = fixture.commit_with_flat_tree_and_parent(
+            MERGE_CHANGED_PATH_LIMIT,
+            "exact changed paths",
+            Some(&root),
+        );
+        let over = fixture.commit_with_flat_tree_and_parent(
+            MERGE_CHANGED_PATH_LIMIT + 1,
+            "over changed paths",
+            Some(&root),
+        );
+
+        let (analysis, _) = bounded_merge(
+            fixture.path(),
+            &base,
+            &exact,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            None,
+        )
+        .expect("the exact changed-path budget is accepted");
+        assert_eq!(analysis.6, MERGE_CHANGED_PATH_LIMIT as u64);
+
+        let before = fixture.object_and_ref_snapshot();
+        let result = bounded_merge(
+            fixture.path(),
+            &base,
+            &over,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            None,
+        );
+        assert!(matches!(result, Err((kind, _)) if kind == "changed_path_limit"));
+        assert_eq!(fixture.object_and_ref_snapshot(), before);
     }
 
     #[test]
@@ -5148,6 +5436,177 @@ mod tests {
         temp_path: PathBuf,
         repo_path: PathBuf,
         tip_oid: String,
+    }
+
+    struct MergeBoundaryFixture {
+        temp_path: PathBuf,
+        repo_path: PathBuf,
+        blob_oid: String,
+    }
+
+    fn test_merge_commit() -> PreparedMergeCommit {
+        PreparedMergeCommit {
+            author: validated_merge_signature((
+                b"Boundary Author".to_vec(),
+                b"author@example.com".to_vec(),
+                1_700_000_000,
+                0,
+            ))
+            .expect("valid boundary author"),
+            committer: validated_merge_signature((
+                b"Boundary Committer".to_vec(),
+                b"committer@example.com".to_vec(),
+                1_700_000_001,
+                0,
+            ))
+            .expect("valid boundary committer"),
+            message: "Boundary merge".into(),
+        }
+    }
+
+    impl MergeBoundaryFixture {
+        fn new(name: &str) -> Self {
+            let sequence = MERGE_BOUNDARY_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+            let temp_path = std::env::temp_dir().join(format!(
+                "fornacast-merge-boundary-{name}-{}-{sequence}",
+                std::process::id()
+            ));
+            let repo_path = temp_path.join("repo.git");
+            let _ = std::fs::remove_dir_all(&temp_path);
+            std::fs::create_dir_all(&temp_path).expect("create merge-boundary fixture");
+            tree_history_git(
+                &[
+                    "init",
+                    "--bare",
+                    "--object-format=sha1",
+                    tree_history_path(&repo_path),
+                ],
+                None,
+            );
+            let blob_oid = tree_history_git(
+                &[
+                    "--git-dir",
+                    tree_history_path(&repo_path),
+                    "hash-object",
+                    "-w",
+                    "--stdin",
+                ],
+                Some(b"merge boundary\n"),
+            );
+            Self {
+                temp_path,
+                repo_path,
+                blob_oid,
+            }
+        }
+
+        fn path(&self) -> &str {
+            tree_history_path(&self.repo_path)
+        }
+
+        fn fast_import_empty_chain(&self, count: usize) -> BTreeMap<usize, String> {
+            let marks_path = self.temp_path.join("marks");
+            let mut input = Vec::with_capacity(count.saturating_mul(180));
+            for mark in 1..=count {
+                use std::fmt::Write as _;
+
+                let mut command = String::new();
+                write!(
+                    command,
+                    "commit refs/heads/chain\nmark :{mark}\nauthor Boundary <boundary@example.com> {mark} +0000\ncommitter Boundary <boundary@example.com> {mark} +0000\ndata 1\nx\n"
+                )
+                .expect("format fast-import commit");
+                if mark == 1 {
+                    command.push_str("deleteall\n");
+                } else {
+                    writeln!(command, "from :{}", mark - 1).expect("format fast-import parent");
+                }
+                command.push('\n');
+                input.extend_from_slice(command.as_bytes());
+            }
+            let export_marks = format!("--export-marks={}", tree_history_path(&marks_path));
+            tree_history_git(
+                &[
+                    "--git-dir",
+                    self.path(),
+                    "fast-import",
+                    "--quiet",
+                    &export_marks,
+                ],
+                Some(&input),
+            );
+
+            std::fs::read_to_string(marks_path)
+                .expect("read fast-import marks")
+                .lines()
+                .map(|line| {
+                    let (mark, oid) = line.split_once(' ').expect("valid fast-import mark");
+                    (
+                        mark.trim_start_matches(':')
+                            .parse::<usize>()
+                            .expect("numeric fast-import mark"),
+                        oid.to_owned(),
+                    )
+                })
+                .collect()
+        }
+
+        fn commit_with_flat_tree(&self, entries: usize, message: &str) -> String {
+            self.commit_with_flat_tree_and_parent(entries, message, None)
+        }
+
+        fn commit_with_flat_tree_and_parent(
+            &self,
+            entries: usize,
+            message: &str,
+            parent: Option<&str>,
+        ) -> String {
+            let mut tree = String::with_capacity(entries.saturating_mul(80));
+            for index in 0..entries {
+                use std::fmt::Write as _;
+
+                writeln!(tree, "100644 blob {}\tfile-{index:05}.txt", self.blob_oid)
+                    .expect("format merge-boundary tree");
+            }
+            let tree_oid =
+                tree_history_git(&["--git-dir", self.path(), "mktree"], Some(tree.as_bytes()));
+            let mut args = vec!["--git-dir", self.path(), "commit-tree", &tree_oid];
+            if let Some(parent) = parent {
+                args.extend(["-p", parent]);
+            }
+            args.extend(["-m", message]);
+            tree_history_git(&args, None)
+        }
+
+        fn object_and_ref_snapshot(&self) -> (String, String) {
+            (
+                tree_history_git(
+                    &[
+                        "--git-dir",
+                        self.path(),
+                        "cat-file",
+                        "--batch-all-objects",
+                        "--batch-check=%(objectname)",
+                    ],
+                    None,
+                ),
+                tree_history_git(
+                    &[
+                        "--git-dir",
+                        self.path(),
+                        "for-each-ref",
+                        "--format=%(refname) %(objectname)",
+                    ],
+                    None,
+                ),
+            )
+        }
+    }
+
+    impl Drop for MergeBoundaryFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.temp_path);
+        }
     }
 
     struct AnalysisStopFixture {

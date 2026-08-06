@@ -494,7 +494,9 @@ defmodule GitCore do
   Writes the merged tree and its two-parent commit without updating a reference.
 
   The caller must already hold the repository writer permit. This function deliberately does
-  not acquire another permit, which keeps it composable inside the durable write fence.
+  not acquire another permit, which keeps it composable inside the durable write fence. After
+  the final deadline check, object publication is not cancelled. A storage failure during that
+  phase may leave unreachable content-addressed objects, but this function never updates a ref.
   """
   @spec write_merge_commit(
           Path.t(),
