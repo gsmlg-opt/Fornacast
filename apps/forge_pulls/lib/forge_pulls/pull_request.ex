@@ -5,6 +5,8 @@ defmodule ForgePulls.PullRequest do
 
   @mergeable_states [:unknown, :mergeable, :conflicting]
 
+  @type t :: %__MODULE__{}
+
   schema "pull_requests" do
     field :issue_id, :integer
     field :repository_id, :integer

@@ -298,13 +298,14 @@ defmodule ForgePullsTest do
     owner = user_fixture(unique("pull-git-error-owner"))
     repository = repository_fixture(owner)
 
-    missing_storage = %{
-      repository
-      | storage_path: "missing/#{System.unique_integer([:positive, :monotonic])}.git"
-    }
+    missing_storage = "missing/#{System.unique_integer([:positive, :monotonic])}.git"
+
+    Repo.update_all(from(repo in ForgeRepos.Repository, where: repo.id == ^repository.id),
+      set: [storage_path: missing_storage]
+    )
 
     assert {:error, {:unavailable, reason}} =
-             create_pull(missing_storage, owner, "Unavailable", "feature", "main")
+             create_pull(repository, owner, "Unavailable", "feature", "main")
 
     assert reason in [:invalid_repository, :storage_unavailable, :corrupt_repository]
   end
@@ -551,7 +552,16 @@ defmodule ForgePullsTest do
                repository,
                writer_unchanged,
                unrelated,
-               %{title: "Forbidden"},
+               %{head: "immutable", base: "missing"},
+               %{}
+             )
+
+    assert {:error, :forbidden} =
+             ForgePulls.update_pull_request(
+               %{repository | storage_path: "missing/corrupt.git"},
+               %{writer_unchanged | head_ref: "corrupt"},
+               unrelated,
+               %{base: "missing"},
                %{}
              )
   end
@@ -629,6 +639,27 @@ defmodule ForgePullsTest do
                %{}
              )
 
+    Repo.update_all(from(user in ForgeAccounts.User, where: user.id == ^author.id),
+      set: [state: :active]
+    )
+
+    owner
+    |> ForgeAccounts.User.state_changeset(%{state: :disabled})
+    |> Repo.update!()
+
+    assert {:error, :not_found} =
+             ForgePulls.update_pull_request(
+               public_repository,
+               pull,
+               author,
+               %{title: "Inactive owner"},
+               %{}
+             )
+
+    Repo.update_all(from(user in ForgeAccounts.User, where: user.id == ^owner.id),
+      set: [state: :active]
+    )
+
     Repo.update_all(
       from(repo in ForgeRepos.Repository, where: repo.id == ^repository.id),
       set: [deleted_at: DateTime.utc_now() |> DateTime.truncate(:second)]
@@ -642,6 +673,63 @@ defmodule ForgePullsTest do
                %{title: "Deleted"},
                %{}
              )
+  end
+
+  test "reads reload repository owner actor visibility and deletion before pull queries" do
+    owner = user_fixture(unique("pull-read-owner"))
+    reader = user_fixture(unique("pull-read-reader"))
+    repository = repository_fixture(owner)
+    grant_reader!(repository, reader)
+    create_branch!(repository, "main")
+    create_branch!(repository, "feature")
+    assert {:ok, pull} = create_pull(repository, owner, "Canonical read", "feature", "main")
+
+    stale_public = repository |> Ecto.Changeset.change(visibility: :public) |> Repo.update!()
+
+    Repo.update_all(from(repo in ForgeRepos.Repository, where: repo.id == ^repository.id),
+      set: [visibility: :private]
+    )
+
+    assert {:error, :not_found} = ForgePulls.list_pull_requests(stale_public, nil)
+
+    assert {:error, :not_found} =
+             ForgePulls.get_pull_request(stale_public, pull.issue.number, nil)
+
+    assert {:error, :not_found} =
+             ForgePulls.pull_links_for_issue_ids(stale_public, [pull.issue_id], nil)
+
+    reader
+    |> ForgeAccounts.User.state_changeset(%{state: :disabled})
+    |> Repo.update!()
+
+    assert {:error, :not_found} = ForgePulls.list_pull_requests(repository, reader)
+
+    assert {:error, :not_found} =
+             ForgePulls.get_pull_request(repository, pull.issue.number, reader)
+
+    assert {:error, :not_found} =
+             ForgePulls.pull_links_for_issue_ids(repository, [pull.issue_id], reader)
+
+    Repo.update_all(from(repo in ForgeRepos.Repository, where: repo.id == ^repository.id),
+      set: [visibility: :public]
+    )
+
+    owner
+    |> ForgeAccounts.User.state_changeset(%{state: :disabled})
+    |> Repo.update!()
+
+    current_public = %{repository | visibility: :public}
+    assert {:error, :not_found} = ForgePulls.list_pull_requests(current_public, nil)
+
+    Repo.update_all(from(user in ForgeAccounts.User, where: user.id == ^owner.id),
+      set: [state: :active]
+    )
+
+    Repo.update_all(from(repo in ForgeRepos.Repository, where: repo.id == ^repository.id),
+      set: [deleted_at: DateTime.utc_now() |> DateTime.truncate(:second)]
+    )
+
+    assert {:error, :not_found} = ForgePulls.list_pull_requests(current_public, nil)
   end
 
   test "detail refreshes one immutable pair clears old mergeability and loads full canonical issue metadata" do
@@ -704,7 +792,7 @@ defmodule ForgePullsTest do
     assert refreshed.issue.comment_count == 1
   end
 
-  test "list filters multiple pulls and uses issue timestamps for stable sorting and paging" do
+  test "list accepts canonical states and sorts by issue timestamps popularity and stable IDs" do
     owner = user_fixture(unique("pull-list-owner"))
     repository = repository_fixture(owner)
     create_branch!(repository, "main")
@@ -732,6 +820,22 @@ defmodule ForgePullsTest do
     Repo.update_all(from(issue in Issue, where: issue.id == ^gamma.issue_id),
       set: [inserted_at: late, updated_at: early]
     )
+
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    for {issue_id, body} <- [
+          {alpha.issue_id, "alpha one"},
+          {alpha.issue_id, "alpha two"},
+          {gamma.issue_id, "gamma one"}
+        ] do
+      Repo.insert!(%Comment{
+        issue_id: issue_id,
+        author_user_id: owner.id,
+        body: body,
+        inserted_at: now,
+        updated_at: now
+      })
+    end
 
     assert {:ok, %{entries: [first], total: 2, page: 1, per_page: 1}} =
              ForgePulls.list_pull_requests(repository, owner,
@@ -764,14 +868,39 @@ defmodule ForgePullsTest do
 
     assert [updated_first.id, updated_second.id] == [beta.id, alpha.id]
 
-    assert {:ok, %{entries: [number_first, number_second]}} =
+    assert {:ok, %{entries: [popular_first, popular_second]}} =
              ForgePulls.list_pull_requests(repository, owner,
                state: :open,
-               sort: :number,
+               sort: :popularity,
                direction: :desc
              )
 
-    assert [number_first.issue.number, number_second.issue.number] == [2, 1]
+    assert [popular_first.id, popular_second.id] == [alpha.id, beta.id]
+
+    assert {:ok, %{entries: [quiet_first, quiet_second]}} =
+             ForgePulls.list_pull_requests(repository, owner,
+               state: "open",
+               sort: "popularity"
+             )
+
+    assert [quiet_first.id, quiet_second.id] == [beta.id, alpha.id]
+
+    assert {:ok, %{entries: [long_first, long_second]}} =
+             ForgePulls.list_pull_requests(repository, owner,
+               state: :open,
+               sort: "long-running"
+             )
+
+    assert [long_first.id, long_second.id] == [alpha.id, beta.id]
+
+    assert {:ok, %{entries: all_entries, total: 3}} =
+             ForgePulls.list_pull_requests(repository, owner,
+               state: :all,
+               sort: :long_running,
+               direction: :asc
+             )
+
+    assert Enum.map(all_entries, & &1.id) == [alpha.id, beta.id, gamma.id]
 
     assert {:ok, %{entries: [head_only]}} =
              ForgePulls.list_pull_requests(repository, owner,
@@ -788,27 +917,49 @@ defmodule ForgePullsTest do
       count_repo_queries(fn ->
         ForgePulls.list_pull_requests(public_repository, nil,
           state: :open,
-          sort: :number,
+          sort: :created,
           direction: :asc
         )
       end)
 
     assert {:ok, %{entries: [_, _], total: 2}} = result
-    assert query_count <= 9
+    assert query_count <= 11
+
+    for {field, filters} <- [
+          {"state", [state: :merged]},
+          {"state", [state: "merged"]},
+          {"sort", [sort: :number]},
+          {"sort", [sort: "number"]},
+          {"sort", [sort: "long_running"]},
+          {"direction", [direction: :sideways]},
+          {"direction", [direction: "sideways"]}
+        ] do
+      assert {:error, {:validation, [%{resource: "PullRequest", field: ^field, code: :invalid}]}} =
+               ForgePulls.list_pull_requests(repository, owner, filters)
+    end
+
     assert {:error, {:validation, [_]}} = ForgePulls.list_pull_requests(repository, owner, %{})
   end
 
-  test "conditional snapshot persistence rejects a raced ref update without mixing names and OIDs" do
+  test "conditional snapshot persistence rejects stale OIDs when ref names are unchanged" do
     owner = user_fixture(unique("pull-race-owner"))
     repository = repository_fixture(owner)
     Enum.each(~w(main release feature), &create_branch!(repository, &1))
     assert {:ok, pull} = create_pull(repository, owner, "Race", "feature", "main")
 
-    stale_attrs = resolved_pair(repository, "feature", "main")
-    fresh_attrs = resolved_pair(repository, "feature", "release")
+    stale_attrs =
+      repository
+      |> resolved_pair("feature", "main")
+      |> Map.merge(%{head_sha: String.duplicate("1", 40), base_sha: String.duplicate("2", 40)})
+
+    fresh_attrs =
+      repository
+      |> resolved_pair("feature", "main")
+      |> Map.merge(%{head_sha: String.duplicate("3", 40), base_sha: String.duplicate("4", 40)})
 
     assert {:ok, raced} = ForgePulls.SnapshotRefresh.persist(pull, fresh_attrs)
-    assert raced.base_ref == "refs/heads/release"
+    assert raced.head_ref == pull.head_ref
+    assert raced.base_ref == pull.base_ref
 
     assert {:error, :ref_conflict} =
              ForgePulls.SnapshotRefresh.persist(pull, stale_attrs)
@@ -837,7 +988,21 @@ defmodule ForgePullsTest do
     repository = repository_fixture(owner)
     create_branch!(repository, "main")
     create_branch!(repository, "feature")
-    metadata = request_metadata("pull-audit-success")
+
+    metadata = %{
+      "request_id" => "pull-audit-success",
+      "ip_address" => "203.0.113.44",
+      request_id: "ignored-atom-request",
+      api_version: "2026-03-10",
+      ip_address: "198.51.100.9",
+      user_agent: "forge-pulls-test",
+      token_id: 42,
+      repository_id: -1,
+      token: "secret-token",
+      password: "secret-password",
+      body: "secret-body",
+      unknown: "discard-me"
+    }
 
     assert {:ok, pull} =
              ForgePulls.create_pull_request(
@@ -866,6 +1031,16 @@ defmodule ForgePullsTest do
     assert audit_metadata["repository_id"] == repository.id
     assert audit_metadata["result"] == "success"
     assert audit_metadata["request_id"] == "pull-audit-success"
+    assert audit_metadata["api_version"] == "2026-03-10"
+    assert audit_metadata["token_id"] == 42
+
+    assert Map.keys(audit_metadata) |> Enum.sort() ==
+             ~w(api_version ip_address repository_id request_id result token_id user_agent)
+
+    refute audit_metadata["token"]
+    refute audit_metadata["password"]
+    refute audit_metadata["body"]
+    refute audit_metadata["unknown"]
 
     assert {:ok, _updated} =
              ForgePulls.update_pull_request(
@@ -873,14 +1048,24 @@ defmodule ForgePullsTest do
                pull,
                owner,
                %{title: "Audited update"},
-               request_metadata("pull-audit-update")
+               %{
+                 "request_id" => "pull-audit-update",
+                 "repository_id" => -2,
+                 "token" => "update-secret"
+               }
              )
 
-    assert %AuditEvent{metadata: %{"request_id" => "pull-audit-update"}} =
+    assert %AuditEvent{metadata: update_metadata} =
              Repo.get_by!(AuditEvent,
                action: "pull_request.updated",
                target_id: Integer.to_string(repository.id)
              )
+
+    assert update_metadata == %{
+             "repository_id" => repository.id,
+             "request_id" => "pull-audit-update",
+             "result" => "success"
+           }
 
     before_count = pull_audit_count(repository)
 
@@ -921,7 +1106,7 @@ defmodule ForgePullsTest do
     refute Repo.get_by(Issue, repository_id: repository.id, title: "Forced")
   end
 
-  test "pull links handle empty subset duplicate mixed repository IDs masking and one bounded query" do
+  test "pull links handle empty subset duplicate mixed repository IDs masking and bounded queries" do
     owner = user_fixture(unique("pull-links-owner"))
     repository = repository_fixture(owner)
     other_repository = repository_fixture(owner)
@@ -956,7 +1141,7 @@ defmodule ForgePullsTest do
 
     first_issue_id = first.issue_id
     assert {:ok, %{^first_issue_id => %{merged_at: ^merged_at}}} = result
-    assert query_count == 1
+    assert query_count == 3
 
     second_issue_id = second.issue_id
 

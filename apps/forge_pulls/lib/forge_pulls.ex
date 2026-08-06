@@ -6,6 +6,8 @@ defmodule ForgePulls.Mutations do
   alias Fornacast.Audit
 
   def create_multi(actor, repository, attrs, refs, request_metadata) do
+    request_metadata = safe_request_metadata(request_metadata)
+
     Multi.new()
     |> ForgeIssues.insert_numbered_identity(
       :issue,
@@ -38,6 +40,20 @@ defmodule ForgePulls.Mutations do
       attrs
       |> Map.take(["title", "body", :title, :body])
       |> Map.new(fn {key, value} -> {to_string(key), value} end)
+
+  @doc false
+  def safe_request_metadata(metadata) when is_map(metadata) do
+    [:request_id, :api_version, :ip_address, :user_agent, :token_id]
+    |> Enum.reduce(%{}, fn key, safe ->
+      string_key = Atom.to_string(key)
+
+      cond do
+        Map.has_key?(metadata, string_key) -> Map.put(safe, key, Map.fetch!(metadata, string_key))
+        Map.has_key?(metadata, key) -> Map.put(safe, key, Map.fetch!(metadata, key))
+        true -> safe
+      end
+    end)
+  end
 end
 
 defmodule ForgePulls.SnapshotRefresh do
@@ -70,7 +86,8 @@ defmodule ForgePulls.SnapshotRefresh do
       from(pull in PullRequest,
         where:
           pull.id == ^expected.id and pull.repository_id == ^expected.repository_id and
-            pull.head_ref == ^expected.head_ref and pull.base_ref == ^expected.base_ref
+            pull.head_ref == ^expected.head_ref and pull.base_ref == ^expected.base_ref and
+            pull.head_sha == ^expected.head_sha and pull.base_sha == ^expected.base_sha
       )
 
     updates = [
@@ -107,11 +124,9 @@ defmodule ForgePulls do
 
   import Ecto.Query
 
-  alias ForgeIssues.Issue
+  alias ForgeIssues.{Comment, Issue}
   alias ForgePulls.PullRequest
   alias Fornacast.{Audit, Page, Repo}
-
-  @snapshot_refresh_attempts 3
 
   @type error_reason ::
           :not_found
@@ -141,7 +156,7 @@ defmodule ForgePulls do
 
   def list_pull_requests(%ForgeRepos.Repository{} = repository, actor, filters)
       when is_list(filters) do
-    with :ok <- authorize_read(actor, repository),
+    with {:ok, repository} <- canonical_read_repository(repository, actor),
          {:ok, filters} <- list_filters(filters),
          {:ok, filters} <- normalize_list_refs(repository, filters) do
       query =
@@ -174,10 +189,11 @@ defmodule ForgePulls do
           {:ok, PullRequest.t()} | {:error, error_reason()}
   def get_pull_request(%ForgeRepos.Repository{} = repository, number, actor)
       when is_integer(number) and number > 0 do
-    with :ok <- authorize_read(actor, repository),
+    with {:ok, repository} <- canonical_read_repository(repository, actor),
          %PullRequest{} = pull <- Repo.one(pull_query(repository, number)),
-         {:ok, pull} <- refresh_analysis(pull, repository) do
-      {:ok, load_issue(pull, repository)}
+         {:ok, pull} <- refresh_analysis(pull, repository),
+         {:ok, loaded} <- load_issue_result(pull, repository) do
+      {:ok, loaded}
     else
       nil -> {:error, :not_found}
       {:error, _} = error -> error
@@ -191,7 +207,7 @@ defmodule ForgePulls do
   def create_pull_request(%ForgeRepos.Repository{} = repository, actor, attrs, request_metadata)
       when is_map(attrs) and is_map(request_metadata) do
     with %ForgeAccounts.User{} = actor <- actor,
-         :ok <- authorize_read(actor, repository),
+         {:ok, repository} <- canonical_read_repository(repository, actor),
          {:ok, refs} <- resolve_creation_refs(repository, attrs) do
       Ecto.Multi.new()
       |> Ecto.Multi.run(:authorization, fn repo, _ ->
@@ -233,14 +249,14 @@ defmodule ForgePulls do
       )
       when is_map(attrs) and is_map(request_metadata) do
     with %ForgeAccounts.User{} = actor <- actor,
-         :ok <- authorize_read(actor, repository),
-         :ok <- same_repository(pull, repository),
+         {:ok, preflight} <- authorize_update_preflight(actor, repository, pull),
+         :ok <- unchanged_snapshot(preflight.pull, pull),
          :ok <- immutable_source(attrs),
          {:ok, attrs} <- normalize_update_attrs(attrs),
-         {:ok, pull_attrs} <- resolve_updated_base(repository, pull, attrs) do
+         {:ok, pull_attrs} <- resolve_updated_base(preflight.repository, preflight.pull, attrs) do
       Ecto.Multi.new()
       |> Ecto.Multi.run(:authorization, fn repo, _ ->
-        authorize_update(repo, actor.id, repository.id, pull)
+        authorize_update(repo, actor.id, preflight.repository.id, preflight.pull)
       end)
       |> Ecto.Multi.merge(fn %{authorization: context} ->
         %{
@@ -265,7 +281,7 @@ defmodule ForgePulls do
           "repository",
           current_repository.id,
           %{"repository_id" => current_repository.id, "result" => "success"},
-          request_metadata: request_metadata
+          request_metadata: ForgePulls.Mutations.safe_request_metadata(request_metadata)
         )
       end)
       |> ForgeIssues.transaction()
@@ -281,7 +297,7 @@ defmodule ForgePulls do
           | {:error, error_reason()}
   def pull_links_for_issue_ids(%ForgeRepos.Repository{} = repository, ids, actor)
       when is_list(ids) do
-    with :ok <- authorize_read(actor, repository) do
+    with {:ok, repository} <- canonical_read_repository(repository, actor) do
       links = pull_links(repository.id, ids)
 
       {:ok, links}
@@ -399,42 +415,61 @@ defmodule ForgePulls do
     end
   end
 
-  defp same_repository(
-         %PullRequest{repository_id: repository_id},
-         %ForgeRepos.Repository{id: repository_id}
-       ),
-       do: :ok
-
-  defp same_repository(_pull, _repository), do: {:error, :not_found}
-
   defp attr(attrs, key), do: Map.get(attrs, key) || Map.get(attrs, String.to_atom(key))
 
-  defp authorize_read(actor, repository),
-    do:
-      if(Fornacast.Access.allowed?(actor, :repository_read, repository),
-        do: :ok,
-        else: {:error, :not_found}
-      )
+  defp canonical_read_repository(repository, actor) do
+    with %ForgeAccounts.User{} = owner <- ForgeAccounts.get_account(repository.owner_user_id),
+         {:ok, repository} <-
+           ForgeRepos.fetch_authorized_repository(
+             actor,
+             owner.username,
+             repository.slug,
+             :repository_read
+           ) do
+      {:ok, repository}
+    else
+      _ -> {:error, :not_found}
+    end
+  end
 
   defp authorize_create(repo, actor_id, repository_id) do
     with {:ok, actor} <- current_actor(repo, actor_id),
-         {:ok, repository} <- current_repository(repo, repository_id),
-         :ok <- authorize_read(actor, repository) do
+         {:ok, repository} <-
+           ForgeRepos.fetch_authorized_repository_by_id(actor, repository_id, :repository_read) do
       {:ok, %{actor: actor, repository: repository}}
+    end
+  end
+
+  defp authorize_update_preflight(actor, repository, expected_pull) do
+    with {:ok, actor} <- current_actor(Repo, actor.id),
+         {:ok, repository} <- canonical_read_repository(repository, actor),
+         %PullRequest{} = pull <-
+           Repo.one(
+             from(p in PullRequest,
+               where: p.id == ^expected_pull.id and p.repository_id == ^repository.id
+             )
+           ),
+         %Issue{kind: :pull_request} = issue <- current_issue(pull.issue_id, repository),
+         {:ok, capability} <- mutation_capability(actor, repository, issue) do
+      {:ok,
+       %{actor: actor, repository: repository, issue: issue, pull: pull, capability: capability}}
+    else
+      nil -> {:error, :not_found}
+      {:error, _} = error -> error
     end
   end
 
   defp authorize_update(repo, actor_id, repository_id, %PullRequest{} = expected_pull) do
     with {:ok, actor} <- current_actor(repo, actor_id),
-         {:ok, repository} <- current_repository(repo, repository_id),
-         :ok <- authorize_read(actor, repository),
+         {:ok, repository} <-
+           ForgeRepos.fetch_authorized_repository_by_id(actor, repository_id, :repository_read),
          %PullRequest{} = pull <-
            repo.one(
              from(p in PullRequest,
                where: p.id == ^expected_pull.id and p.repository_id == ^repository_id
              )
            ),
-         :ok <- unchanged_refs(pull, expected_pull),
+         :ok <- unchanged_snapshot(pull, expected_pull),
          %Issue{kind: :pull_request} = issue <-
            current_issue(pull.issue_id, repository),
          {:ok, capability} <- mutation_capability(actor, repository, issue) do
@@ -446,13 +481,23 @@ defmodule ForgePulls do
     end
   end
 
-  defp unchanged_refs(
-         %PullRequest{head_ref: head_ref, base_ref: base_ref},
-         %PullRequest{head_ref: head_ref, base_ref: base_ref}
+  defp unchanged_snapshot(
+         %PullRequest{
+           head_ref: head_ref,
+           base_ref: base_ref,
+           head_sha: head_sha,
+           base_sha: base_sha
+         },
+         %PullRequest{
+           head_ref: head_ref,
+           base_ref: base_ref,
+           head_sha: head_sha,
+           base_sha: base_sha
+         }
        ),
        do: :ok
 
-  defp unchanged_refs(_current, _expected), do: {:error, :ref_conflict}
+  defp unchanged_snapshot(_current, _expected), do: {:error, :ref_conflict}
 
   defp current_issue(issue_id, repository) do
     case ForgeIssues.load_issue_metadata_by_ids([issue_id], repository) do
@@ -465,13 +510,6 @@ defmodule ForgePulls do
     case repo.get_by(ForgeAccounts.User, id: id, kind: :user, state: :active) do
       %ForgeAccounts.User{} = actor -> {:ok, actor}
       _ -> {:error, :forbidden}
-    end
-  end
-
-  defp current_repository(repo, id) do
-    case repo.get(ForgeRepos.Repository, id) do
-      %ForgeRepos.Repository{deleted_at: nil} = repository -> {:ok, repository}
-      _ -> {:error, :not_found}
     end
   end
 
@@ -559,14 +597,24 @@ defmodule ForgePulls do
       |> ForgeIssues.load_issue_metadata_by_ids(repository)
       |> Map.new(&{&1.id, &1})
 
-    Enum.map(pulls, &%{&1 | issue: Map.fetch!(issues_by_id, &1.issue_id)})
+    Enum.flat_map(pulls, fn pull ->
+      case Map.fetch(issues_by_id, pull.issue_id) do
+        {:ok, issue} -> [%{pull | issue: issue}]
+        :error -> []
+      end
+    end)
   end
 
-  defp load_issue(pull, repository), do: load_issues([pull], repository) |> hd()
+  defp load_issue_result(pull, repository) do
+    case load_issues([pull], repository) do
+      [loaded] -> {:ok, loaded}
+      [] -> {:error, :not_found}
+    end
+  end
 
   # Task 2 records the immutable snapshot pair but deliberately leaves merge
-  # analysis to Task 3. `:unknown` is the computed status for every Task 2 pair.
-  defp refresh_analysis(pull, repository, attempts \\ @snapshot_refresh_attempts) do
+  # analysis integration to Task 4. `:unknown` is the computed status for every Task 2 pair.
+  defp refresh_analysis(pull, repository) do
     with {:ok, head} <- resolve_ref(repository, pull.head_ref, :invalid_head),
          {:ok, base} <- resolve_ref(repository, pull.base_ref, :invalid_base),
          {:ok, refreshed} <-
@@ -579,20 +627,11 @@ defmodule ForgePulls do
              mergeable_state: :unknown
            }) do
       {:ok, refreshed}
-    else
-      {:error, :ref_conflict} when attempts > 1 ->
-        case Repo.get_by(PullRequest, id: pull.id, repository_id: repository.id) do
-          %PullRequest{} = current -> refresh_analysis(current, repository, attempts - 1)
-          nil -> {:error, :not_found}
-        end
-
-      {:error, _} = error ->
-        error
     end
   end
 
-  defp create_result({:ok, %{pull_request: pull}}),
-    do: {:ok, load_issue(pull, Repo.get!(ForgeRepos.Repository, pull.repository_id))}
+  defp create_result({:ok, %{pull_request: pull, authorization: %{repository: repository}}}),
+    do: load_issue_result(pull, repository)
 
   defp create_result({:error, :authorization, reason, _}), do: {:error, reason}
 
@@ -604,8 +643,8 @@ defmodule ForgePulls do
   defp create_result({:error, _step, _reason, _}),
     do: {:error, {:validation, [%{resource: "PullRequest", field: "base", code: :unprocessable}]}}
 
-  defp update_result({:ok, %{pull_request: pull}}),
-    do: {:ok, load_issue(pull, Repo.get!(ForgeRepos.Repository, pull.repository_id))}
+  defp update_result({:ok, %{pull_request: pull, authorization: %{repository: repository}}}),
+    do: load_issue_result(pull, repository)
 
   defp update_result({:error, :authorization, reason, _}), do: {:error, reason}
 
@@ -625,33 +664,53 @@ defmodule ForgePulls do
 
   defp list_filters(filters) when is_list(filters) do
     filters = Map.new(filters)
-    state = attr(filters, "state") || :open
-    sort = attr(filters, "sort") || :created
-    direction = attr(filters, "direction") || :desc
     page = parse_positive(attr(filters, "page"), 1)
     per_page = min(parse_positive(attr(filters, "per_page") || attr(filters, "per"), 30), 100)
 
-    if state in [:open, :closed, "open", "closed"] and
-         sort in [:created, :updated, :number, "created", "updated", "number"] and
-         direction in [:asc, :desc, "asc", "desc"],
-       do:
-         {:ok,
-          %{
-            state: state,
-            sort: sort,
-            direction: direction,
-            page: page,
-            per_page: per_page,
-            offset: (page - 1) * per_page,
-            head: attr(filters, "head"),
-            base: attr(filters, "base")
-          }},
-       else:
-         {:error, {:validation, [%{resource: "PullRequest", field: "filter", code: :invalid}]}}
+    with {:ok, state} <- normalize_state(attr(filters, "state") || :open),
+         {:ok, sort} <- normalize_sort(attr(filters, "sort") || :created),
+         {:ok, direction} <-
+           normalize_direction(attr(filters, "direction") || default_direction(sort)) do
+      {:ok,
+       %{
+         state: state,
+         sort: sort,
+         direction: direction,
+         page: page,
+         per_page: per_page,
+         offset: (page - 1) * per_page,
+         head: attr(filters, "head"),
+         base: attr(filters, "base")
+       }}
+    end
   end
 
   defp invalid_filter,
     do: {:error, {:validation, [%{resource: "PullRequest", field: "filter", code: :invalid}]}}
+
+  defp normalize_state(state) when state in [:open, "open"], do: {:ok, :open}
+  defp normalize_state(state) when state in [:closed, "closed"], do: {:ok, :closed}
+  defp normalize_state(state) when state in [:all, "all"], do: {:ok, :all}
+  defp normalize_state(_state), do: invalid_filter_value("state")
+
+  defp normalize_sort(sort) when sort in [:created, "created"], do: {:ok, :created}
+  defp normalize_sort(sort) when sort in [:updated, "updated"], do: {:ok, :updated}
+  defp normalize_sort(sort) when sort in [:popularity, "popularity"], do: {:ok, :popularity}
+
+  defp normalize_sort(sort) when sort in [:long_running, "long-running"],
+    do: {:ok, :long_running}
+
+  defp normalize_sort(_sort), do: invalid_filter_value("sort")
+
+  defp normalize_direction(direction) when direction in [:asc, "asc"], do: {:ok, :asc}
+  defp normalize_direction(direction) when direction in [:desc, "desc"], do: {:ok, :desc}
+  defp normalize_direction(_direction), do: invalid_filter_value("direction")
+
+  defp invalid_filter_value(field),
+    do: {:error, {:validation, [%{resource: "PullRequest", field: field, code: :invalid}]}}
+
+  defp default_direction(:created), do: :desc
+  defp default_direction(_sort), do: :asc
 
   defp parse_positive(nil, default), do: default
   defp parse_positive(value, _default) when is_integer(value) and value > 0, do: value
@@ -677,24 +736,41 @@ defmodule ForgePulls do
   defp normalize_optional_base(nil), do: {:ok, nil}
   defp normalize_optional_base(value), do: branch_ref(value, :invalid_base)
 
-  defp state_filter(state),
-    do: dynamic([_pull, issue], issue.state == ^String.to_existing_atom(to_string(state)))
+  defp state_filter(:all), do: dynamic(true)
+  defp state_filter(state), do: dynamic([_pull, issue], issue.state == ^state)
 
   defp ref_filter(_field, nil), do: dynamic(true)
   defp ref_filter(field, value), do: dynamic([pull, _issue], field(pull, ^field) == ^value)
 
   defp apply_order(query, sort, direction) do
-    direction = if to_string(direction) == "asc", do: :asc, else: :desc
+    case sort do
+      :popularity ->
+        counts =
+          Comment
+          |> group_by([comment], comment.issue_id)
+          |> select([comment], %{issue_id: comment.issue_id, count: count(comment.id)})
 
-    case to_string(sort) do
-      "number" ->
-        order_by(query, [pull, issue], [{^direction, issue.number}, {^direction, pull.id}])
+        query
+        |> join(:left, [pull, issue], counts in subquery(counts), on: counts.issue_id == issue.id)
+        |> order_by([pull, issue, counts], [
+          {^direction, coalesce(counts.count, 0)},
+          {^direction, issue.id},
+          {^direction, pull.id}
+        ])
 
-      "updated" ->
-        order_by(query, [pull, issue], [{^direction, issue.updated_at}, {^direction, pull.id}])
+      :updated ->
+        order_by(query, [pull, issue], [
+          {^direction, issue.updated_at},
+          {^direction, issue.id},
+          {^direction, pull.id}
+        ])
 
-      _ ->
-        order_by(query, [pull, issue], [{^direction, issue.inserted_at}, {^direction, pull.id}])
+      sort when sort in [:created, :long_running] ->
+        order_by(query, [pull, issue], [
+          {^direction, issue.inserted_at},
+          {^direction, issue.id},
+          {^direction, pull.id}
+        ])
     end
   end
 end

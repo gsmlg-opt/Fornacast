@@ -11,6 +11,8 @@ defmodule ForgePulls.MergeOperation do
   }
   @failure_states [:prepared, :merge_written]
 
+  @type t :: %__MODULE__{}
+
   schema "pull_merge_operations" do
     field :pull_request_id, :integer
     field :repository_id, :integer

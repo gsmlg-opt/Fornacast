@@ -81,6 +81,28 @@ defmodule ForgeRepos do
   def fetch_authorized_repository(_actor, _owner_slug, _repository_slug, _permission),
     do: {:error, :forbidden}
 
+  @spec fetch_authorized_repository_by_id(User.t() | nil, pos_integer(), atom()) ::
+          {:ok, Repository.t()} | {:error, :not_found | :forbidden}
+  def fetch_authorized_repository_by_id(actor, repository_id, permission)
+      when is_integer(repository_id) and repository_id > 0 and
+             permission in @repository_permissions do
+    repository =
+      Repository
+      |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
+      |> where(
+        [repository, owner],
+        repository.id == ^repository_id and is_nil(repository.deleted_at) and
+          owner.state == :active and owner.kind in [:user, :organization]
+      )
+      |> select([repository, _owner], repository)
+      |> Repo.one()
+
+    authorize_fetched_repository(actor, repository, permission)
+  end
+
+  def fetch_authorized_repository_by_id(_actor, _repository_id, _permission),
+    do: {:error, :forbidden}
+
   @spec repository_view(User.t() | nil, Repository.t()) ::
           {:ok, RepositoryView.t()} | {:error, :not_found | {:unavailable, atom()}}
   def repository_view(actor, %Repository{id: repository_id}) when is_integer(repository_id) do
