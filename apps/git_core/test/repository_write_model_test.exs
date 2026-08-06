@@ -109,6 +109,7 @@ defmodule GitCore.RepositoryWriteModelTest do
           {[commit_limit: 2], :commit_limit},
           {[tree_entry_limit: 1], :tree_entry_limit},
           {[changed_path_limit: 1], :changed_path_limit},
+          {[byte_limit: 1], :merge_byte_limit},
           {[deadline_ms: 0], :scan_timeout}
         ] do
       before_objects = object_ids(fixture.repo_path)
@@ -142,7 +143,7 @@ defmodule GitCore.RepositoryWriteModelTest do
   end
 
   test "rejects configured external merge drivers without executing them", %{tmp_dir: tmp_dir} do
-    fixture = clean_fixture!(tmp_dir)
+    fixture = external_driver_fixture!(tmp_dir)
     marker = Path.join(tmp_dir, "external-driver-ran")
 
     git!([
@@ -153,7 +154,7 @@ defmodule GitCore.RepositoryWriteModelTest do
       "touch #{marker}"
     ])
 
-    assert {:ok, %GitCore.MergeAnalysis{mergeable: true}} =
+    assert {:ok, %GitCore.MergeAnalysis{mergeable: false}} =
              GitCore.merge_analysis(
                fixture.repo_path,
                fixture.base_oid,
@@ -320,6 +321,32 @@ defmodule GitCore.RepositoryWriteModelTest do
     head_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
 
     publish_fixture!(fixture, base_oid, head_oid)
+  end
+
+  defp external_driver_fixture!(tmp_dir) do
+    fixture = base_fixture!(tmp_dir, "external-driver")
+    attributed_path = Path.join(fixture.work_path, "driver.txt")
+
+    File.write!(
+      Path.join(fixture.work_path, ".gitattributes"),
+      "driver.txt merge=fornacast-test\n"
+    )
+
+    File.write!(attributed_path, "ancestor\n")
+    git!(["-C", fixture.work_path, "add", ".gitattributes", "driver.txt"])
+    git!(["-C", fixture.work_path, "commit", "-m", "configure attributed merge driver"])
+    root_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    File.write!(attributed_path, "base version\n")
+    git!(["-C", fixture.work_path, "commit", "-am", "base attributed change"])
+    base_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    git!(["-C", fixture.work_path, "checkout", "-b", "feature", root_oid])
+    File.write!(attributed_path, "head version\n")
+    git!(["-C", fixture.work_path, "commit", "-am", "head attributed change"])
+    head_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    publish_fixture!(Map.put(fixture, :root_oid, root_oid), base_oid, head_oid)
   end
 
   defp base_fixture!(tmp_dir, name) do

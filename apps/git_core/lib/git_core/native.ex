@@ -81,6 +81,7 @@ defmodule GitCore.Native do
         _commit_limit,
         _tree_entry_limit,
         _changed_path_limit,
+        _byte_limit,
         _deadline_ms
       ),
       do: :erlang.nif_error(:nif_not_loaded)
@@ -95,6 +96,7 @@ defmodule GitCore.Native do
         _commit_limit,
         _tree_entry_limit,
         _changed_path_limit,
+        _byte_limit,
         _deadline_ms
       ),
       do: :erlang.nif_error(:nif_not_loaded)

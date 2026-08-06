@@ -5,7 +5,7 @@ use std::io::{Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use gix_object::bstr::ByteSlice;
@@ -156,11 +156,15 @@ const DISK_USAGE_SCAN_DEADLINE: Duration = Duration::from_secs(2);
 const MERGE_COMMIT_LIMIT: usize = 50_000;
 const MERGE_TREE_ENTRY_LIMIT: usize = 100_000;
 const MERGE_CHANGED_PATH_LIMIT: usize = 10_000;
+const MERGE_BLOB_LIMIT: u64 = 8 * 1024 * 1024;
+const MERGE_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
 const MERGE_DEADLINE: Duration = Duration::from_secs(30);
 const MERGE_MESSAGE_LIMIT: usize = 1024 * 1024;
 const SIGNATURE_NAME_LIMIT: usize = 255;
 const SIGNATURE_EMAIL_LIMIT: usize = 320;
 const MERGE_WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
+const MERGE_ANALYSIS_WORKERS: usize = 4;
+const MERGE_WRITE_WORKERS: usize = 1;
 const NO_FINAL_NEWLINE_MARKER: &[u8] = b"\\ No newline at end of file\n";
 // This remains independent of object size while leaving room for the complete mandatory tag
 // header, including long ref-derived tag names, before an arbitrarily large message body.
@@ -621,6 +625,40 @@ fn error_chain_contains_storage_io(error: &(dyn std::error::Error + 'static)) ->
     }
 
     false
+}
+
+fn error_chain_contains_merge_byte_limit(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.downcast_ref::<MergeByteLimitError>().is_some() {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn merge_operation_error<E>(error: E) -> NativeError
+where
+    E: std::error::Error + 'static,
+{
+    if error_chain_contains_merge_byte_limit(&error) {
+        native_error("merge_byte_limit", error)
+    } else if error_chain_contains_storage_io(&error) {
+        native_error("storage_unavailable", error)
+    } else {
+        native_error("corrupt_repository", error)
+    }
+}
+
+fn merge_boxed_operation_error(error: gix_object::write::Error) -> NativeError {
+    if error_chain_contains_merge_byte_limit(error.as_ref()) {
+        native_error("merge_byte_limit", error)
+    } else if error_chain_contains_storage_io(error.as_ref()) {
+        native_error("storage_unavailable", error)
+    } else {
+        native_error("corrupt_repository", error)
+    }
 }
 
 fn bounded_blob_native_error(error: bounded_blob::Error) -> NativeError {
@@ -3093,7 +3131,257 @@ struct ComputedMerge {
     objects: MergeObjectMemory,
 }
 
+struct NativeMergeWorkerPool {
+    capacity: usize,
+    in_use: Mutex<usize>,
+    available: Condvar,
+}
+
+struct NativeMergeWorkerPermit {
+    pool: Arc<NativeMergeWorkerPool>,
+}
+
+struct CompletedMergeWorker<T> {
+    value: T,
+    _permit: Arc<NativeMergeWorkerPermit>,
+}
+
+struct MergeByteBudget {
+    limit: u64,
+    used: u64,
+}
+
+#[derive(Debug)]
+struct MergeByteLimitError {
+    detail: String,
+}
+
+struct BudgetedMergeObjects<'repo> {
+    repo: &'repo gix::Repository,
+    budget: &'repo RefCell<MergeByteBudget>,
+}
+
+impl std::fmt::Display for MergeByteLimitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for MergeByteLimitError {}
+
+impl MergeByteBudget {
+    fn new(limit: u64) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    fn charge(&mut self, kind: gix_object::Kind, size: u64) -> Result<(), MergeByteLimitError> {
+        if kind == gix_object::Kind::Blob && size > MERGE_BLOB_LIMIT {
+            return Err(MergeByteLimitError {
+                detail: format!(
+                    "merge blob size {size} exceeds the {}-byte limit",
+                    MERGE_BLOB_LIMIT
+                ),
+            });
+        }
+        let used = self
+            .used
+            .checked_add(size)
+            .ok_or_else(|| MergeByteLimitError {
+                detail: "merge byte accounting overflowed".into(),
+            })?;
+        if used > self.limit {
+            return Err(MergeByteLimitError {
+                detail: format!(
+                    "merge decoded/generated object bytes exceed the {}-byte limit",
+                    self.limit
+                ),
+            });
+        }
+        self.used = used;
+        Ok(())
+    }
+}
+
+impl gix_object::Exists for BudgetedMergeObjects<'_> {
+    fn exists(&self, id: &gix_hash::oid) -> bool {
+        gix_object::Exists::exists(self.repo, id)
+    }
+}
+
+impl gix_object::Find for BudgetedMergeObjects<'_> {
+    fn try_find<'a>(
+        &self,
+        id: &gix_hash::oid,
+        buffer: &'a mut Vec<u8>,
+    ) -> Result<Option<gix_object::Data<'a>>, gix_object::find::Error> {
+        if let Some(header) = gix_object::FindHeader::try_header(self.repo, id)? {
+            self.budget
+                .borrow_mut()
+                .charge(header.kind, header.size)
+                .map_err(|error| Box::new(error) as gix_object::find::Error)?;
+        }
+        gix_object::Find::try_find(self.repo, id, buffer)
+    }
+}
+
+impl gix_object::FindHeader for BudgetedMergeObjects<'_> {
+    fn try_header(
+        &self,
+        id: &gix_hash::oid,
+    ) -> Result<Option<gix_object::Header>, gix_object::find::Error> {
+        gix_object::FindHeader::try_header(self.repo, id)
+    }
+}
+
+impl gix_object::Write for BudgetedMergeObjects<'_> {
+    fn write(
+        &self,
+        object: &dyn gix_object::WriteTo,
+    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+        self.charge_write(object.kind(), object.size())?;
+        gix_object::Write::write(self.repo, object)
+    }
+
+    fn write_buf(
+        &self,
+        kind: gix_object::Kind,
+        from: &[u8],
+    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+        self.charge_write(kind, from.len() as u64)?;
+        gix_object::Write::write_buf(self.repo, kind, from)
+    }
+
+    fn write_buf_with_known_id(
+        &self,
+        kind: gix_object::Kind,
+        from: &[u8],
+        id: gix_hash::ObjectId,
+    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+        self.charge_write(kind, from.len() as u64)?;
+        gix_object::Write::write_buf_with_known_id(self.repo, kind, from, id)
+    }
+
+    fn write_stream(
+        &self,
+        kind: gix_object::Kind,
+        size: u64,
+        from: &mut dyn std::io::Read,
+    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+        self.charge_write(kind, size)?;
+        gix_object::Write::write_stream(self.repo, kind, size, from)
+    }
+
+    fn write_stream_with_known_id(
+        &self,
+        kind: gix_object::Kind,
+        size: u64,
+        from: &mut dyn std::io::Read,
+        id: gix_hash::ObjectId,
+    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+        self.charge_write(kind, size)?;
+        gix_object::Write::write_stream_with_known_id(self.repo, kind, size, from, id)
+    }
+}
+
+impl BudgetedMergeObjects<'_> {
+    fn charge_write(
+        &self,
+        kind: gix_object::Kind,
+        size: u64,
+    ) -> Result<(), gix_object::write::Error> {
+        self.budget
+            .borrow_mut()
+            .charge(kind, size)
+            .map_err(|error| Box::new(error) as gix_object::write::Error)
+    }
+}
+
+impl NativeMergeWorkerPool {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            in_use: Mutex::new(0),
+            available: Condvar::new(),
+        }
+    }
+
+    fn acquire(
+        self: &Arc<Self>,
+        deadline: Instant,
+    ) -> Result<NativeMergeWorkerPermit, NativeError> {
+        let mut in_use = self
+            .in_use
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(native_error(
+                    "scan_timeout",
+                    "merge worker admission exceeded the 30-second deadline",
+                ));
+            }
+            if *in_use < self.capacity {
+                *in_use += 1;
+                return Ok(NativeMergeWorkerPermit {
+                    pool: Arc::clone(self),
+                });
+            }
+
+            let (guard, wait) = self
+                .available
+                .wait_timeout(in_use, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            in_use = guard;
+            if wait.timed_out() && *in_use >= self.capacity {
+                return Err(native_error(
+                    "scan_timeout",
+                    "merge worker admission exceeded the 30-second deadline",
+                ));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn in_use(&self) -> usize {
+        *self
+            .in_use
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Drop for NativeMergeWorkerPermit {
+    fn drop(&mut self) {
+        let mut in_use = self
+            .pool
+            .in_use
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *in_use = in_use.saturating_sub(1);
+        self.pool.available.notify_one();
+    }
+}
+
+fn native_merge_worker_pool(write: bool) -> Arc<NativeMergeWorkerPool> {
+    static ANALYSIS_POOL: OnceLock<Arc<NativeMergeWorkerPool>> = OnceLock::new();
+    static WRITE_POOL: OnceLock<Arc<NativeMergeWorkerPool>> = OnceLock::new();
+
+    if write {
+        Arc::clone(
+            WRITE_POOL.get_or_init(|| Arc::new(NativeMergeWorkerPool::new(MERGE_WRITE_WORKERS))),
+        )
+    } else {
+        Arc::clone(
+            ANALYSIS_POOL
+                .get_or_init(|| Arc::new(NativeMergeWorkerPool::new(MERGE_ANALYSIS_WORKERS))),
+        )
+    }
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::too_many_arguments)]
 fn merge_analysis(
     path: String,
     base_oid: String,
@@ -3101,6 +3389,7 @@ fn merge_analysis(
     commit_limit: usize,
     tree_entry_limit: usize,
     changed_path_limit: usize,
+    byte_limit: u64,
     deadline_ms: u64,
 ) -> Result<NativeMergeAnalysis, NativeError> {
     let (analysis, _) = bounded_merge(
@@ -3110,6 +3399,7 @@ fn merge_analysis(
         commit_limit,
         tree_entry_limit,
         changed_path_limit,
+        byte_limit,
         deadline_ms,
         None,
     )?;
@@ -3128,6 +3418,7 @@ fn write_merge_commit(
     commit_limit: usize,
     tree_entry_limit: usize,
     changed_path_limit: usize,
+    byte_limit: u64,
     deadline_ms: u64,
 ) -> Result<String, NativeError> {
     // All caller-controlled commit bytes are validated before the repository is opened or a merge
@@ -3144,6 +3435,7 @@ fn write_merge_commit(
         commit_limit,
         tree_entry_limit,
         changed_path_limit,
+        byte_limit,
         deadline_ms,
         Some(commit),
     )?;
@@ -3158,6 +3450,7 @@ fn bounded_merge(
     commit_limit: usize,
     tree_entry_limit: usize,
     changed_path_limit: usize,
+    byte_limit: u64,
     deadline_ms: u64,
     commit: Option<PreparedMergeCommit>,
 ) -> Result<(NativeMergeAnalysis, Option<String>), NativeError> {
@@ -3169,7 +3462,7 @@ fn bounded_merge(
     let publish_path = worker_path.clone();
     let base_oid = base_oid.to_owned();
     let head_oid = head_oid.to_owned();
-    let computed = run_merge_worker(deadline, move |cancelled| {
+    let completed = run_merge_worker(deadline, publish, move |cancelled| {
         compute_bounded_merge(
             worker_path,
             base_oid,
@@ -3177,11 +3470,16 @@ fn bounded_merge(
             commit_limit,
             tree_entry_limit,
             changed_path_limit,
+            byte_limit,
             deadline,
             commit,
             cancelled,
         )
     })?;
+    let CompletedMergeWorker {
+        value: computed,
+        _permit: permit,
+    } = completed;
 
     if publish {
         // This is the final cancellation/deadline boundary. Once publication starts, storage
@@ -3191,15 +3489,36 @@ fn bounded_merge(
         publish_merge_objects(publish_path, computed.objects)?;
     }
 
-    Ok((computed.analysis, computed.merge_oid))
+    let result = (computed.analysis, computed.merge_oid);
+    drop(permit);
+    Ok(result)
 }
 
-fn run_merge_worker<T, F>(deadline: Instant, task: F) -> Result<T, NativeError>
+fn run_merge_worker<T, F>(
+    deadline: Instant,
+    write: bool,
+    task: F,
+) -> Result<CompletedMergeWorker<T>, NativeError>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<AtomicBool>) -> Result<T, NativeError> + Send + 'static,
+{
+    run_merge_worker_in_pool(deadline, native_merge_worker_pool(write), task)
+}
+
+fn run_merge_worker_in_pool<T, F>(
+    deadline: Instant,
+    pool: Arc<NativeMergeWorkerPool>,
+    task: F,
+) -> Result<CompletedMergeWorker<T>, NativeError>
 where
     T: Send + 'static,
     F: FnOnce(Arc<AtomicBool>) -> Result<T, NativeError> + Send + 'static,
 {
     check_merge_deadline(deadline)?;
+    let permit = Arc::new(pool.acquire(deadline)?);
+    check_merge_deadline(deadline)?;
+    let worker_permit = Arc::clone(&permit);
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = Arc::clone(&cancelled);
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -3207,6 +3526,7 @@ where
         .name("fornacast-merge-compute".into())
         .stack_size(MERGE_WORKER_STACK_SIZE)
         .spawn(move || {
+            let _permit = worker_permit;
             let result = task(Arc::clone(&worker_cancelled));
             if !worker_cancelled.load(Ordering::Acquire) {
                 let _ = sender.send(result);
@@ -3226,7 +3546,10 @@ where
             handle
                 .join()
                 .map_err(|_| native_error("corrupt_repository", "merge worker panicked"))?;
-            result
+            result.map(|value| CompletedMergeWorker {
+                value,
+                _permit: permit,
+            })
         }
         Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {
             cancelled.store(true, Ordering::Release);
@@ -3257,6 +3580,7 @@ fn compute_bounded_merge(
     commit_limit: usize,
     tree_entry_limit: usize,
     changed_path_limit: usize,
+    byte_limit: u64,
     deadline: Instant,
     commit: Option<PreparedMergeCommit>,
     cancelled: Arc<AtomicBool>,
@@ -3268,10 +3592,18 @@ fn compute_bounded_merge(
     let commit_limit = merge_commit_limit(commit_limit);
     let tree_entry_limit = merge_tree_entry_limit(tree_entry_limit);
     let changed_path_limit = merge_changed_path_limit(changed_path_limit);
+    let byte_budget = RefCell::new(MergeByteBudget::new(merge_byte_limit(byte_limit)));
     let mut repo = open_physical_bare_repository(&path)?.with_object_memory();
-    let base_oid = parse_merge_commit_oid(&repo, &base_oid, deadline)?;
-    let head_oid = parse_merge_commit_oid(&repo, &head_oid, deadline)?;
-    let metrics = merge_metrics(&repo, base_oid, head_oid, commit_limit, deadline)?;
+    let base_oid = parse_merge_commit_oid(&repo, &base_oid, &byte_budget, deadline)?;
+    let head_oid = parse_merge_commit_oid(&repo, &head_oid, &byte_budget, deadline)?;
+    let metrics = merge_metrics(
+        &repo,
+        base_oid,
+        head_oid,
+        commit_limit,
+        &byte_budget,
+        deadline,
+    )?;
 
     let merge_base_oid = repo
         .merge_base(base_oid, head_oid)
@@ -3279,15 +3611,16 @@ fn compute_bounded_merge(
         .detach();
     check_merge_deadline(deadline)?;
 
-    let base_tree = merge_commit_tree(&repo, base_oid, deadline)?;
-    let head_tree = merge_commit_tree(&repo, head_oid, deadline)?;
-    let merge_base_tree = merge_commit_tree(&repo, merge_base_oid, deadline)?;
+    let base_tree = merge_commit_tree(&repo, base_oid, &byte_budget, deadline)?;
+    let head_tree = merge_commit_tree(&repo, head_oid, &byte_budget, deadline)?;
+    let merge_base_tree = merge_commit_tree(&repo, merge_base_oid, &byte_budget, deadline)?;
     let mut tree_entries_scanned = 0_usize;
     let ancestor_paths = flatten_merge_tree(
         &repo,
         merge_base_tree,
         &mut tree_entries_scanned,
         tree_entry_limit,
+        &byte_budget,
         deadline,
     )?;
     let head_paths = flatten_merge_tree(
@@ -3295,6 +3628,7 @@ fn compute_bounded_merge(
         head_tree,
         &mut tree_entries_scanned,
         tree_entry_limit,
+        &byte_budget,
         deadline,
     )?;
     // Scan our side independently as part of the hard total work budget before invoking gix's
@@ -3304,6 +3638,7 @@ fn compute_bounded_merge(
         base_tree,
         &mut tree_entries_scanned,
         tree_entry_limit,
+        &byte_budget,
         deadline,
     )?;
     let changed_paths =
@@ -3344,7 +3679,9 @@ fn compute_bounded_merge(
     let merge_pipeline = gix::merge::plumbing::blob::Pipeline::new(
         Default::default(),
         merge_filter,
-        Default::default(),
+        gix::merge::plumbing::blob::pipeline::Options {
+            large_file_threshold_bytes: MERGE_BLOB_LIMIT,
+        },
     );
     let mut blob_merge = gix::merge::plumbing::blob::Platform::new(
         merge_pipeline,
@@ -3359,6 +3696,10 @@ fn compute_bounded_merge(
         .commit_graph_if_enabled()
         .map_err(|error| native_error("corrupt_repository", error))?;
     let mut graph = repo.revision_graph(commit_graph.as_ref());
+    let budgeted_objects = BudgetedMergeObjects {
+        repo: &repo,
+        budget: &byte_budget,
+    };
     let outcome = gix::merge::plumbing::commit(
         base_oid,
         head_oid,
@@ -3366,11 +3707,11 @@ fn compute_bounded_merge(
         &mut graph,
         &mut diff_cache,
         &mut blob_merge,
-        &repo,
+        &budgeted_objects,
         &mut |oid| oid.to_string(),
         commit_options.into(),
     )
-    .map_err(|error| native_error("corrupt_repository", error))?;
+    .map_err(merge_operation_error)?;
     drop(graph);
     drop(commit_graph);
     drop(blob_merge);
@@ -3408,8 +3749,8 @@ fn compute_bounded_merge(
     let mut tree_merge = outcome.tree_merge;
     let merged_tree = tree_merge
         .tree
-        .write(|tree| repo.write_object(tree).map(|id| id.detach()))
-        .map_err(|error| native_error("storage_unavailable", error))?;
+        .write(|tree| gix_object::Write::write(&budgeted_objects, tree))
+        .map_err(merge_boxed_operation_error)?;
     drop(tree_merge);
     check_merge_deadline(deadline)?;
     flatten_merge_tree(
@@ -3417,6 +3758,7 @@ fn compute_bounded_merge(
         merged_tree,
         &mut tree_entries_scanned,
         tree_entry_limit,
+        &byte_budget,
         deadline,
     )?;
 
@@ -3438,10 +3780,8 @@ fn compute_bounded_merge(
         message: commit.message.into(),
         extra_headers: Vec::new(),
     };
-    let merge_oid = repo
-        .write_object(commit_object)
-        .map_err(|error| native_error("storage_unavailable", error))?
-        .detach();
+    let merge_oid = gix_object::Write::write(&budgeted_objects, &commit_object)
+        .map_err(merge_boxed_operation_error)?;
     check_merge_worker(&cancelled, deadline)?;
     let objects = take_merge_object_memory(&mut repo)?;
     Ok(ComputedMerge {
@@ -3456,6 +3796,7 @@ fn merge_metrics(
     base_oid: gix_hash::ObjectId,
     head_oid: gix_hash::ObjectId,
     commit_limit: usize,
+    byte_budget: &RefCell<MergeByteBudget>,
     deadline: Instant,
 ) -> Result<MergeMetrics, NativeError> {
     let mut globally_visited = BTreeSet::new();
@@ -3464,6 +3805,7 @@ fn merge_metrics(
         base_oid,
         &mut globally_visited,
         commit_limit,
+        byte_budget,
         deadline,
     )?;
     let head_reachable = collect_merge_reachable(
@@ -3471,6 +3813,7 @@ fn merge_metrics(
         head_oid,
         &mut globally_visited,
         commit_limit,
+        byte_budget,
         deadline,
     )?;
     let ahead_by = head_reachable.difference(&base_reachable).count();
@@ -3489,6 +3832,7 @@ fn collect_merge_reachable(
     tip: gix_hash::ObjectId,
     globally_visited: &mut BTreeSet<gix_hash::ObjectId>,
     commit_limit: usize,
+    byte_budget: &RefCell<MergeByteBudget>,
     deadline: Instant,
 ) -> Result<BTreeSet<gix_hash::ObjectId>, NativeError> {
     let mut pending = vec![tip];
@@ -3513,6 +3857,7 @@ fn collect_merge_reachable(
         } else {
             CommitPosition::Ancestor
         };
+        charge_merge_object(repo, oid, byte_budget)?;
         let node = load_commit_node(repo, oid, position, deadline)?;
         for parent in node.parents {
             check_merge_deadline(deadline)?;
@@ -3527,6 +3872,7 @@ fn flatten_merge_tree(
     root: gix_hash::ObjectId,
     entries_scanned: &mut usize,
     tree_entry_limit: usize,
+    byte_budget: &RefCell<MergeByteBudget>,
     deadline: Instant,
 ) -> Result<BTreeMap<Vec<u8>, (u16, gix_hash::ObjectId)>, NativeError> {
     let mut pending = vec![(root, Vec::<u8>::new())];
@@ -3534,6 +3880,7 @@ fn flatten_merge_tree(
 
     while let Some((tree_oid, prefix)) = pending.pop() {
         check_merge_deadline(deadline)?;
+        charge_merge_object(repo, tree_oid, byte_budget)?;
         let tree = load_merge_tree(repo, tree_oid, deadline)?;
         let mut previous = None;
         for entry in gix_object::TreeRefIter::from_bytes(&tree.data, tree.id.kind()) {
@@ -3570,11 +3917,14 @@ fn flatten_merge_tree(
             let oid = entry.oid.to_owned();
             if entry.mode.is_tree() {
                 pending.push((oid, path));
-            } else if paths.insert(path, (entry.mode.value(), oid)).is_some() {
-                return Err(native_error(
-                    "corrupt_repository",
-                    "merge tree contains a duplicate path",
-                ));
+            } else {
+                charge_merge_object(repo, oid, byte_budget)?;
+                if paths.insert(path, (entry.mode.value(), oid)).is_some() {
+                    return Err(native_error(
+                        "corrupt_repository",
+                        "merge tree contains a duplicate path",
+                    ));
+                }
             }
         }
     }
@@ -3618,6 +3968,18 @@ fn record_changed_merge_path(
         .checked_add(1)
         .ok_or_else(|| native_error("corrupt_repository", "changed path count overflow"))?;
     Ok(())
+}
+
+fn charge_merge_object(
+    repo: &gix::Repository,
+    oid: gix_hash::ObjectId,
+    byte_budget: &RefCell<MergeByteBudget>,
+) -> Result<(), NativeError> {
+    let header = repo.find_header(oid).map_err(diff_read_error)?;
+    byte_budget
+        .borrow_mut()
+        .charge(header.kind(), header.size())
+        .map_err(|error| native_error("merge_byte_limit", error))
 }
 
 fn take_merge_object_memory(repo: &mut gix::Repository) -> Result<MergeObjectMemory, NativeError> {
@@ -3666,11 +4028,13 @@ fn publish_merge_objects_on_worker(
 fn parse_merge_commit_oid(
     repo: &gix::Repository,
     value: &str,
+    byte_budget: &RefCell<MergeByteBudget>,
     deadline: Instant,
 ) -> Result<gix_hash::ObjectId, NativeError> {
     check_merge_deadline(deadline)?;
     let oid = gix_hash::ObjectId::from_hex(value.as_bytes())
         .map_err(|error| native_error("commit_not_found", error))?;
+    charge_merge_object(repo, oid, byte_budget)?;
     find_graph_commit(repo, oid, CommitPosition::Tip)?;
     check_merge_deadline(deadline)?;
     Ok(oid)
@@ -3679,9 +4043,11 @@ fn parse_merge_commit_oid(
 fn merge_commit_tree(
     repo: &gix::Repository,
     oid: gix_hash::ObjectId,
+    byte_budget: &RefCell<MergeByteBudget>,
     deadline: Instant,
 ) -> Result<gix_hash::ObjectId, NativeError> {
     check_merge_deadline(deadline)?;
+    charge_merge_object(repo, oid, byte_budget)?;
     let commit = find_graph_commit(repo, oid, CommitPosition::Tip)?;
     let tree = commit
         .decode()
@@ -3784,6 +4150,10 @@ fn merge_tree_entry_limit(limit: usize) -> usize {
 
 fn merge_changed_path_limit(limit: usize) -> usize {
     limit.min(MERGE_CHANGED_PATH_LIMIT)
+}
+
+fn merge_byte_limit(limit: u64) -> u64 {
+    limit.min(MERGE_BYTE_LIMIT)
 }
 
 fn merge_scan_duration(deadline_ms: u64) -> Duration {
@@ -5147,7 +5517,10 @@ mod tests {
             merge_changed_path_limit(usize::MAX),
             MERGE_CHANGED_PATH_LIMIT
         );
+        assert_eq!(merge_byte_limit(u64::MAX), MERGE_BYTE_LIMIT);
         assert_eq!(merge_scan_duration(u64::MAX), Duration::from_secs(30));
+        assert_eq!(MERGE_ANALYSIS_WORKERS, 4);
+        assert_eq!(MERGE_WRITE_WORKERS, 1);
     }
 
     #[test]
@@ -5174,19 +5547,124 @@ mod tests {
         let worker_observed_cancellation = Arc::clone(&observed_cancellation);
         let started = Instant::now();
 
-        let result = run_merge_worker(started + Duration::from_millis(20), move |cancelled| {
-            std::thread::sleep(Duration::from_millis(300));
-            worker_observed_cancellation
-                .store(cancelled.load(Ordering::Acquire), Ordering::Release);
-            worker_finished.store(true, Ordering::Release);
-            Ok(17_u8)
-        });
+        let result = run_merge_worker(
+            started + Duration::from_millis(20),
+            false,
+            move |cancelled| {
+                std::thread::sleep(Duration::from_millis(300));
+                worker_observed_cancellation
+                    .store(cancelled.load(Ordering::Acquire), Ordering::Release);
+                worker_finished.store(true, Ordering::Release);
+                Ok(17_u8)
+            },
+        );
 
         assert!(matches!(result, Err((kind, _)) if kind == "scan_timeout"));
         assert!(started.elapsed() < Duration::from_millis(150));
         std::thread::sleep(Duration::from_millis(300));
         assert!(finished.load(Ordering::Acquire));
         assert!(observed_cancellation.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pull_merge_worker_slots_remain_held_until_timed_out_workers_exit() {
+        let pool = Arc::new(NativeMergeWorkerPool::new(2));
+        let release = Arc::new(AtomicBool::new(false));
+
+        for _ in 0..2 {
+            let worker_release = Arc::clone(&release);
+            let result = run_merge_worker_in_pool(
+                Instant::now() + Duration::from_millis(20),
+                Arc::clone(&pool),
+                move |_| {
+                    while !worker_release.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Ok(())
+                },
+            );
+            assert!(matches!(result, Err((kind, _)) if kind == "scan_timeout"));
+        }
+        assert_eq!(pool.in_use(), 2);
+
+        let unexpectedly_started = Arc::new(AtomicBool::new(false));
+        let worker_started = Arc::clone(&unexpectedly_started);
+        let result = run_merge_worker_in_pool(
+            Instant::now() + Duration::from_millis(20),
+            Arc::clone(&pool),
+            move |_| {
+                worker_started.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err((kind, _)) if kind == "scan_timeout"));
+        assert!(!unexpectedly_started.load(Ordering::Acquire));
+        assert_eq!(pool.in_use(), 2);
+
+        release.store(true, Ordering::Release);
+        let release_deadline = Instant::now() + Duration::from_secs(1);
+        while pool.in_use() != 0 && Instant::now() < release_deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(pool.in_use(), 0);
+
+        assert_eq!(
+            run_merge_worker_in_pool(
+                Instant::now() + Duration::from_secs(1),
+                Arc::clone(&pool),
+                |_| Ok(17_u8),
+            )
+            .expect("released native worker capacity is reusable")
+            .value,
+            17
+        );
+        assert_eq!(pool.in_use(), 0);
+    }
+
+    #[test]
+    fn pull_merge_rejects_a_blob_over_the_production_byte_limit_without_writes() {
+        let fixture = MergeBoundaryFixture::new("blob-bytes");
+        let commit = fixture.commit_with_single_blob(8 * 1024 * 1024 + 1);
+        let before = fixture.object_and_ref_snapshot();
+
+        let result = bounded_merge(
+            fixture.path(),
+            &commit,
+            &commit,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            u64::MAX,
+            Some(test_merge_commit()),
+        );
+        assert!(matches!(result, Err((kind, _)) if kind == "merge_byte_limit"));
+        assert_eq!(fixture.object_and_ref_snapshot(), before);
+    }
+
+    #[test]
+    fn pull_merge_charges_generated_objects_before_in_memory_insertion() {
+        let fixture = MergeBoundaryFixture::new("generated-bytes");
+        let mut repo = open_physical_bare_repository(fixture.path())
+            .expect("open merge fixture")
+            .with_object_memory();
+        let byte_budget = RefCell::new(MergeByteBudget::new(3));
+        let objects = BudgetedMergeObjects {
+            repo: &repo,
+            budget: &byte_budget,
+        };
+
+        let result = gix_object::Write::write_buf(&objects, gix_object::Kind::Blob, b"four");
+        assert!(matches!(
+            result,
+            Err(error) if error_chain_contains_merge_byte_limit(error.as_ref())
+        ));
+
+        assert!(
+            take_merge_object_memory(&mut repo)
+                .expect("read merge object memory")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5201,6 +5679,7 @@ mod tests {
             usize::MAX,
             usize::MAX,
             usize::MAX,
+            u64::MAX,
             u64::MAX,
             None,
         )
@@ -5218,6 +5697,7 @@ mod tests {
             usize::MAX,
             usize::MAX,
             u64::MAX,
+            u64::MAX,
             None,
         );
         assert!(matches!(result, Err((kind, _)) if kind == "commit_limit"));
@@ -5232,6 +5712,7 @@ mod tests {
             usize::MAX,
             usize::MAX,
             usize::MAX,
+            u64::MAX,
             100,
             Some(test_merge_commit()),
         );
@@ -5259,6 +5740,7 @@ mod tests {
             usize::MAX,
             usize::MAX,
             u64::MAX,
+            u64::MAX,
             None,
         )
         .expect("the exact aggregate tree-entry budget is accepted");
@@ -5271,6 +5753,7 @@ mod tests {
             usize::MAX,
             usize::MAX,
             usize::MAX,
+            u64::MAX,
             u64::MAX,
             None,
         );
@@ -5302,6 +5785,7 @@ mod tests {
             usize::MAX,
             usize::MAX,
             u64::MAX,
+            u64::MAX,
             None,
         )
         .expect("the exact changed-path budget is accepted");
@@ -5315,6 +5799,7 @@ mod tests {
             usize::MAX,
             usize::MAX,
             usize::MAX,
+            u64::MAX,
             u64::MAX,
             None,
         );
@@ -5553,6 +6038,28 @@ mod tests {
 
         fn commit_with_flat_tree(&self, entries: usize, message: &str) -> String {
             self.commit_with_flat_tree_and_parent(entries, message, None)
+        }
+
+        fn commit_with_single_blob(&self, size: usize) -> String {
+            let body = vec![b'x'; size];
+            let blob_oid = tree_history_git(
+                &["--git-dir", self.path(), "hash-object", "-w", "--stdin"],
+                Some(&body),
+            );
+            let tree = format!("100644 blob {blob_oid}\tlarge.bin\n");
+            let tree_oid =
+                tree_history_git(&["--git-dir", self.path(), "mktree"], Some(tree.as_bytes()));
+            tree_history_git(
+                &[
+                    "--git-dir",
+                    self.path(),
+                    "commit-tree",
+                    &tree_oid,
+                    "-m",
+                    "large blob",
+                ],
+                None,
+            )
         }
 
         fn commit_with_flat_tree_and_parent(

@@ -21,6 +21,7 @@ defmodule GitCore do
   @merge_commit_limit 50_000
   @merge_tree_entry_limit 100_000
   @merge_changed_path_limit 10_000
+  @merge_byte_limit 67_108_864
   @merge_deadline_ms 30_000
 
   def init_bare(path) when is_binary(path) do
@@ -446,14 +447,17 @@ defmodule GitCore do
   Analyzes one immutable base/head commit pair without moving a ref or persisting merge objects.
 
   The scan visits at most 50,000 commits and 100,000 physical tree entries, retains at most
-  10,000 changed leaf paths, and is capped by one 30-second deadline. Tests may lower these
-  bounds through options, but callers cannot raise the production caps.
+  10,000 changed leaf paths, and is capped by one 30-second deadline. Decoded and generated
+  object data is limited to 64 MiB in aggregate and 8 MiB for any individual blob. Tests may
+  lower these bounds through options, but callers cannot raise the production caps.
   """
   @spec merge_analysis(Path.t(), String.t(), String.t(), keyword()) ::
           {:ok, GitCore.MergeAnalysis.t()} | {:error, GitCore.Error.t()}
   def merge_analysis(path, base_oid, head_oid, opts \\ [])
       when is_binary(path) and is_binary(base_oid) and is_binary(head_oid) and is_list(opts) do
-    {commit_limit, tree_entry_limit, changed_path_limit, deadline_ms} = merge_bounds(opts)
+    {commit_limit, tree_entry_limit, changed_path_limit, byte_limit, deadline_ms} =
+      merge_bounds(opts)
+
     limiter = Keyword.get(opts, :limiter, GitCore.ScanLimiter)
 
     GitCore.ScanLimiter.with_permit(
@@ -470,6 +474,7 @@ defmodule GitCore do
                    commit_limit,
                    tree_entry_limit,
                    changed_path_limit,
+                   byte_limit,
                    deadline_ms
                  ),
                  :merge_analysis
@@ -518,7 +523,8 @@ defmodule GitCore do
       )
       when is_binary(path) and is_binary(base_oid) and is_binary(head_oid) and
              is_binary(message) and is_list(opts) do
-    {commit_limit, tree_entry_limit, changed_path_limit, deadline_ms} = merge_bounds(opts)
+    {commit_limit, tree_entry_limit, changed_path_limit, byte_limit, deadline_ms} =
+      merge_bounds(opts)
 
     GitCore.Native.write_merge_commit(
       path,
@@ -530,6 +536,7 @@ defmodule GitCore do
       commit_limit,
       tree_entry_limit,
       changed_path_limit,
+      byte_limit,
       deadline_ms
     )
     |> wrap_read(:write_merge_commit)
@@ -678,6 +685,7 @@ defmodule GitCore do
       opts
       |> Keyword.get(:changed_path_limit, @merge_changed_path_limit)
       |> merge_changed_path_limit(),
+      opts |> Keyword.get(:byte_limit, @merge_byte_limit) |> merge_byte_limit(),
       opts |> Keyword.get(:deadline_ms, @merge_deadline_ms) |> merge_deadline_ms()
     }
   end
@@ -690,6 +698,9 @@ defmodule GitCore do
 
   defp merge_changed_path_limit(limit) when is_integer(limit),
     do: limit |> max(0) |> min(@merge_changed_path_limit)
+
+  defp merge_byte_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@merge_byte_limit)
 
   defp merge_deadline_ms(deadline_ms) when is_integer(deadline_ms),
     do: deadline_ms |> max(0) |> min(@merge_deadline_ms)
@@ -902,5 +913,6 @@ defmodule GitCore do
   defp native_error_kind("tree_entry_limit"), do: :tree_entry_limit
   defp native_error_kind("changed_path_limit"), do: :changed_path_limit
   defp native_error_kind("merge_conflict"), do: :merge_conflict
+  defp native_error_kind("merge_byte_limit"), do: :merge_byte_limit
   defp native_error_kind("invalid_input"), do: :invalid_input
 end
