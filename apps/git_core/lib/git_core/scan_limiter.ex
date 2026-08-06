@@ -5,6 +5,7 @@ defmodule GitCore.ScanLimiter do
 
   @capacity 4
   @wait_timeout 250
+  @deferred_keeper_shutdown 4_000
   @task_supervisor GitCore.MergeTaskSupervisor
 
   defmodule State do
@@ -65,7 +66,7 @@ defmodule GitCore.ScanLimiter do
     case Task.Supervisor.start_child(
            task_supervisor,
            fn -> run_deferred_keeper(caller, reply, operation, fun, server) end,
-           shutdown: :infinity
+           shutdown: @deferred_keeper_shutdown
          ) do
       {:ok, keeper} ->
         monitor = Process.monitor(keeper)

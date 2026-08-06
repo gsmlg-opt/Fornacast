@@ -3412,8 +3412,8 @@ defmodule GitCore.CacheIntegrationTest do
     assert [
              {GitCore.Cache, cache_pid, :worker, [GitCore.Cache]},
              {GitCore.BlobLimiter, blob_pid, :worker, [GitCore.BlobLimiter]},
-             {GitCore.MergeTaskSupervisor, merge_supervisor_pid, :supervisor, [Task.Supervisor]},
-             {GitCore.ScanLimiter, scan_pid, :worker, [GitCore.ScanLimiter]}
+             {GitCore.ScanLimiter, scan_pid, :worker, [GitCore.ScanLimiter]},
+             {GitCore.MergeTaskSupervisor, merge_supervisor_pid, :supervisor, [Task.Supervisor]}
            ] = Supervisor.which_children(GitCore.Supervisor)
 
     assert is_pid(cache_pid)

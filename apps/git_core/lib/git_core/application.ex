@@ -5,22 +5,25 @@ defmodule GitCore.Application do
 
   use Application
 
+  @merge_shutdown 5_000
+
   @impl true
   def start(_type, _args) do
-    children = [
-      GitCore.ScanLimiter,
+    opts = [strategy: :one_for_one, name: GitCore.Supervisor]
+    Supervisor.start_link(child_specs(), opts)
+  end
+
+  @doc false
+  def child_specs do
+    [
       Supervisor.child_spec(
         {Task.Supervisor, name: GitCore.MergeTaskSupervisor},
         id: GitCore.MergeTaskSupervisor,
-        shutdown: :infinity
+        shutdown: @merge_shutdown
       ),
-      GitCore.BlobLimiter,
-      GitCore.Cache
+      Supervisor.child_spec(GitCore.ScanLimiter, []),
+      Supervisor.child_spec(GitCore.BlobLimiter, []),
+      Supervisor.child_spec(GitCore.Cache, [])
     ]
-
-    # See https://hexdocs.pm/elixir/Supervisor.html
-    # for other strategies and supported options
-    opts = [strategy: :one_for_one, name: GitCore.Supervisor]
-    Supervisor.start_link(children, opts)
   end
 end

@@ -271,6 +271,71 @@ defmodule GitCore.RepositoryWriteModelTest do
     assert Task.await(holder) == :ok
   end
 
+  test "shutdown closes scan admission before finite keeper teardown" do
+    children = GitCore.Application.child_specs()
+    startup_order = Enum.map(children, & &1.id)
+
+    assert Enum.find_index(startup_order, &(&1 == GitCore.MergeTaskSupervisor)) <
+             Enum.find_index(startup_order, &(&1 == GitCore.ScanLimiter))
+
+    merge_supervisor = Enum.find(children, &(&1.id == GitCore.MergeTaskSupervisor))
+    assert merge_supervisor.shutdown == 5_000
+  end
+
+  test "finite keeper shutdown forcibly ends a non-cooperative deferred task" do
+    limiter =
+      start_supervised!(
+        {GitCore.ScanLimiter, server: nil, capacity: 1, wait_timeout: 0},
+        id: make_ref()
+      )
+
+    keeper_supervisor =
+      start_supervised!({Task.Supervisor, name: nil}, id: make_ref())
+
+    parent = self()
+
+    assert :timed_out =
+             GitCore.ScanLimiter.with_deferred_permit(
+               :merge_analysis,
+               fn ->
+                 {:deferred, :timed_out,
+                  fn ->
+                    Process.flag(:trap_exit, true)
+                    send(parent, {:keeper_ignoring_shutdown, self()})
+
+                    receive do
+                      :release -> :ok
+                      {:EXIT, _supervisor, :shutdown} -> receive do: (:release -> :ok)
+                    end
+                  end}
+               end,
+               server: limiter,
+               task_supervisor: keeper_supervisor
+             )
+
+    assert_receive {:keeper_ignoring_shutdown, keeper}
+    keeper_monitor = Process.monitor(keeper)
+    stopper = Task.async(fn -> Supervisor.stop(keeper_supervisor, :shutdown, :infinity) end)
+
+    try do
+      assert_receive {:DOWN, ^keeper_monitor, :process, ^keeper, :killed}, 6_000
+      assert {:ok, :ok} = Task.yield(stopper, 1_000)
+    after
+      send(keeper, :release)
+
+      if Process.alive?(stopper.pid) do
+        Task.yield(stopper, 1_000) || Task.shutdown(stopper, :brutal_kill)
+      end
+    end
+
+    assert :ok = wait_for_scan_release(limiter)
+
+    assert :released =
+             GitCore.ScanLimiter.with_permit(:merge_analysis, fn -> :released end,
+               server: limiter
+             )
+  end
+
   test "timed-out merge keepers remain inside the node-wide scan capacity" do
     limiter =
       start_supervised!(
@@ -497,6 +562,21 @@ defmodule GitCore.RepositoryWriteModelTest do
     else
       Process.sleep(5)
       wait_for_deferred_release(limiter, supervisor, attempts - 1)
+    end
+  end
+
+  defp wait_for_scan_release(limiter, attempts \\ 100)
+
+  defp wait_for_scan_release(_limiter, 0), do: {:error, :still_active}
+
+  defp wait_for_scan_release(limiter, attempts) do
+    %{grants: grants} = :sys.get_state(limiter)
+
+    if map_size(grants) == 0 do
+      :ok
+    else
+      Process.sleep(5)
+      wait_for_scan_release(limiter, attempts - 1)
     end
   end
 

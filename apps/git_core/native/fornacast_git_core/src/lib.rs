@@ -3196,6 +3196,7 @@ struct MergeByteBudget {
 
 struct MergeByteState {
     used: u64,
+    transient_used: u64,
     objects: BTreeSet<gix_hash::ObjectId>,
 }
 
@@ -3212,6 +3213,16 @@ struct BudgetedMergeObjects<'repo> {
 struct MergeByteReservation<'budget> {
     budget: &'budget MergeByteBudget,
     bytes: u64,
+}
+
+struct MergeTransientReservation<'budget> {
+    budget: &'budget MergeByteBudget,
+    bytes: u64,
+}
+
+struct ExactMergeObjectBuffer {
+    bytes: Vec<u8>,
+    expected: usize,
 }
 
 struct BudgetedMergePaths<'budget> {
@@ -3240,6 +3251,7 @@ impl MergeByteBudget {
             limit,
             state: Mutex::new(MergeByteState {
                 used: 0,
+                transient_used: 0,
                 objects: BTreeSet::new(),
             }),
         }
@@ -3325,18 +3337,36 @@ impl MergeByteBudget {
         })
     }
 
-    fn reserve_generated(
+    fn reserve_transient(
         &self,
         kind: gix_object::Kind,
         size: u64,
-    ) -> Result<MergeByteReservation<'_>, MergeByteLimitError> {
+    ) -> Result<MergeTransientReservation<'_>, MergeByteLimitError> {
         self.preflight_object(kind, size)?;
-        let bytes = size
-            .checked_add(MERGE_OBJECT_ENTRY_OVERHEAD)
-            .ok_or_else(|| MergeByteLimitError {
-                detail: "merge byte accounting overflowed".into(),
-            })?;
-        self.reserve(bytes)
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let transient_used =
+            state
+                .transient_used
+                .checked_add(size)
+                .ok_or_else(|| MergeByteLimitError {
+                    detail: "merge transient byte accounting overflowed".into(),
+                })?;
+        if transient_used > self.limit {
+            return Err(MergeByteLimitError {
+                detail: format!(
+                    "merge transient generated-object bytes exceed the {}-byte limit",
+                    self.limit
+                ),
+            });
+        }
+        state.transient_used = transient_used;
+        Ok(MergeTransientReservation {
+            budget: self,
+            bytes: size,
+        })
     }
 
     fn release(&self, bytes: u64) {
@@ -3345,6 +3375,14 @@ impl MergeByteBudget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.used = state.used.saturating_sub(bytes);
+    }
+
+    fn release_transient(&self, bytes: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.transient_used = state.transient_used.saturating_sub(bytes);
     }
 }
 
@@ -3359,17 +3397,6 @@ impl MergeByteReservation<'_> {
         self.bytes = 0;
         Ok(())
     }
-
-    fn retain_object(mut self, oid: gix_hash::ObjectId) {
-        let mut state = self
-            .budget
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.objects.insert(oid) {
-            self.bytes = 0;
-        }
-    }
 }
 
 impl Drop for MergeByteReservation<'_> {
@@ -3377,6 +3404,51 @@ impl Drop for MergeByteReservation<'_> {
         if self.bytes != 0 {
             self.budget.release(self.bytes);
         }
+    }
+}
+
+impl Drop for MergeTransientReservation<'_> {
+    fn drop(&mut self) {
+        self.budget.release_transient(self.bytes);
+    }
+}
+
+impl ExactMergeObjectBuffer {
+    fn new(size: u64) -> Result<Self, gix_object::write::Error> {
+        let expected = usize::try_from(size)
+            .map_err(|_| "generated merge object size does not fit in memory")?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(expected)?;
+        Ok(Self { bytes, expected })
+    }
+
+    fn finish(self) -> Result<Vec<u8>, gix_object::write::Error> {
+        if self.bytes.len() != self.expected {
+            return Err(format!(
+                "generated merge object wrote {} bytes, but declared {}",
+                self.bytes.len(),
+                self.expected
+            )
+            .into());
+        }
+        Ok(self.bytes)
+    }
+}
+
+impl std::io::Write for ExactMergeObjectBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.expected.saturating_sub(self.bytes.len()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "generated merge object exceeded its declared size",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -3429,10 +3501,11 @@ impl gix_object::Write for BudgetedMergeObjects<'_> {
         &self,
         object: &dyn gix_object::WriteTo,
     ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
-        let reservation = self.reserve_write(object.kind(), object.size())?;
-        let oid = gix_object::Write::write(self.repo, object)?;
-        reservation.retain_object(oid);
-        Ok(oid)
+        let _transient = self.reserve_transient_write(object.kind(), object.size())?;
+        let mut buffer = ExactMergeObjectBuffer::new(object.size())?;
+        object.write_to(&mut buffer)?;
+        let bytes = buffer.finish()?;
+        self.write_computed(object.kind(), &bytes)
     }
 
     fn write_buf(
@@ -3440,10 +3513,8 @@ impl gix_object::Write for BudgetedMergeObjects<'_> {
         kind: gix_object::Kind,
         from: &[u8],
     ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
-        let reservation = self.reserve_write(kind, from.len() as u64)?;
-        let oid = gix_object::Write::write_buf(self.repo, kind, from)?;
-        reservation.retain_object(oid);
-        Ok(oid)
+        let _transient = self.reserve_transient_write(kind, from.len() as u64)?;
+        self.write_computed(kind, from)
     }
 
     fn write_buf_with_known_id(
@@ -3452,10 +3523,8 @@ impl gix_object::Write for BudgetedMergeObjects<'_> {
         from: &[u8],
         id: gix_hash::ObjectId,
     ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
-        let reservation = self.reserve_write(kind, from.len() as u64)?;
-        let oid = gix_object::Write::write_buf_with_known_id(self.repo, kind, from, id)?;
-        reservation.retain_object(oid);
-        Ok(oid)
+        let _transient = self.reserve_transient_write(kind, from.len() as u64)?;
+        self.write_known(kind, from, id)
     }
 
     fn write_stream(
@@ -3464,10 +3533,9 @@ impl gix_object::Write for BudgetedMergeObjects<'_> {
         size: u64,
         from: &mut dyn std::io::Read,
     ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
-        let reservation = self.reserve_write(kind, size)?;
-        let oid = gix_object::Write::write_stream(self.repo, kind, size, from)?;
-        reservation.retain_object(oid);
-        Ok(oid)
+        let _transient = self.reserve_transient_write(kind, size)?;
+        let bytes = Self::read_exact_stream(size, from)?;
+        self.write_computed(kind, &bytes)
     }
 
     fn write_stream_with_known_id(
@@ -3477,22 +3545,61 @@ impl gix_object::Write for BudgetedMergeObjects<'_> {
         from: &mut dyn std::io::Read,
         id: gix_hash::ObjectId,
     ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
-        let reservation = self.reserve_write(kind, size)?;
-        let oid = gix_object::Write::write_stream_with_known_id(self.repo, kind, size, from, id)?;
-        reservation.retain_object(oid);
-        Ok(oid)
+        let _transient = self.reserve_transient_write(kind, size)?;
+        let bytes = Self::read_exact_stream(size, from)?;
+        self.write_known(kind, &bytes, id)
     }
 }
 
 impl BudgetedMergeObjects<'_> {
-    fn reserve_write(
+    fn reserve_transient_write(
         &self,
         kind: gix_object::Kind,
         size: u64,
-    ) -> Result<MergeByteReservation<'_>, gix_object::write::Error> {
+    ) -> Result<MergeTransientReservation<'_>, gix_object::write::Error> {
         self.budget
-            .reserve_generated(kind, size)
+            .reserve_transient(kind, size)
             .map_err(|error| Box::new(error) as gix_object::write::Error)
+    }
+
+    fn write_computed(
+        &self,
+        kind: gix_object::Kind,
+        from: &[u8],
+    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+        let oid = gix_object::compute_hash(self.repo.object_hash(), kind, from)?;
+        self.write_known(kind, from, oid)
+    }
+
+    fn write_known(
+        &self,
+        kind: gix_object::Kind,
+        from: &[u8],
+        oid: gix_hash::ObjectId,
+    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+        self.budget
+            .charge_object(oid, kind, from.len() as u64)
+            .map_err(|error| Box::new(error) as gix_object::write::Error)?;
+        gix_object::Write::write_buf_with_known_id(self.repo, kind, from, oid)
+    }
+
+    fn read_exact_stream(
+        size: u64,
+        mut from: &mut dyn std::io::Read,
+    ) -> Result<Vec<u8>, gix_object::write::Error> {
+        let mut buffer = ExactMergeObjectBuffer::new(size)?;
+        {
+            let mut declared = std::io::Read::take(&mut from, size);
+            std::io::copy(&mut declared, &mut buffer)?;
+        }
+        let bytes = buffer.finish()?;
+        let mut extra = [0_u8; 1];
+        if from.read(&mut extra)? != 0 {
+            return Err(
+                format!("generated merge object exceeded its declared {size} bytes").into(),
+            );
+        }
+        Ok(bytes)
     }
 }
 
@@ -6058,6 +6165,62 @@ mod tests {
     }
 
     #[test]
+    fn pull_merge_generated_tree_reuses_the_exact_one_file_object_budget() {
+        let fixture = MergeBoundaryFixture::new("generated-tree-reuse");
+        let commit = fixture.commit_with_flat_tree(1, "one file");
+        let tree_oid = tree_history_git(
+            &[
+                "--git-dir",
+                fixture.path(),
+                "rev-parse",
+                &format!("{commit}^{{tree}}"),
+            ],
+            None,
+        );
+        let commit_oid = gix_hash::ObjectId::from_hex(commit.as_bytes()).expect("commit oid");
+        let tree_oid = gix_hash::ObjectId::from_hex(tree_oid.as_bytes()).expect("tree oid");
+        let blob_oid = gix_hash::ObjectId::from_hex(fixture.blob_oid.as_bytes()).expect("blob oid");
+        let mut repo = open_physical_bare_repository(fixture.path())
+            .expect("open merge fixture")
+            .with_object_memory();
+        let exact_unique_bytes = [commit_oid, tree_oid, blob_oid]
+            .into_iter()
+            .map(|oid| {
+                repo.find_header(oid).expect("object header").size() + MERGE_OBJECT_ENTRY_OVERHEAD
+            })
+            .sum();
+        // Exercise the writer directly: a full merge simultaneously retains three path maps, and
+        // that legitimate path headroom is larger than this duplicate tree's temporary encoding.
+        let byte_budget = MergeByteBudget::new(exact_unique_bytes);
+        for oid in [commit_oid, tree_oid, blob_oid] {
+            charge_merge_object(&repo, oid, &byte_budget).expect("charge unique input object");
+        }
+        let tree_data = repo
+            .find_object(tree_oid)
+            .expect("tree object")
+            .data
+            .clone();
+        let tree =
+            gix_object::TreeRef::from_bytes(&tree_data, repo.object_hash()).expect("one-file tree");
+        let objects = BudgetedMergeObjects {
+            repo: &repo,
+            budget: &byte_budget,
+        };
+
+        assert_eq!(
+            gix_object::Write::write(&objects, &tree)
+                .expect("an identical generated tree must reuse its existing charge"),
+            tree_oid
+        );
+        assert!(
+            take_merge_object_memory(&mut repo)
+                .expect("read merge object memory")
+                .is_empty(),
+            "the already-present tree must not be inserted into merge object memory"
+        );
+    }
+
+    #[test]
     fn pull_merge_rejects_retained_long_paths_before_the_tree_entry_limit() {
         let fixture = MergeBoundaryFixture::new("retained-path-bytes");
         let commit = fixture.commit_with_long_prefix_tree(25_000, 3_900);
@@ -6084,7 +6247,7 @@ mod tests {
         let mut repo = open_physical_bare_repository(fixture.path())
             .expect("open merge fixture")
             .with_object_memory();
-        let byte_budget = MergeByteBudget::new(3);
+        let byte_budget = MergeByteBudget::new(4);
         let objects = BudgetedMergeObjects {
             repo: &repo,
             budget: &byte_budget,
