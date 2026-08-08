@@ -4,6 +4,11 @@ defmodule GitTransport.ReceivePack do
 
   This implements the protocol-v0 write path needed for initial pushes, new
   branches, fast-forward branch updates, and tag creation.
+
+  The write-fence deadline bounds admission, reconciliation, and later durable
+  CAS operations. Legacy native receive-pack is not cancellable, so once it is
+  admitted its writer lease remains held until the native call returns or
+  raises, even if the absolute deadline passes in the meantime.
   """
 
   alias ForgeRepos.Repository
@@ -13,6 +18,7 @@ defmodule GitTransport.ReceivePack do
   @object_id_pattern ~r/\A[0-9a-fA-F]{40}\z/
   @sideband_payload_size 65_515
   @default_max_request_bytes 4 * 1024 * 1024 * 1024
+  @native_hook_key {__MODULE__, :native_hook}
   @capabilities [
     "report-status",
     "side-band-64k",
@@ -57,15 +63,14 @@ defmodule GitTransport.ReceivePack do
   def response(%Repository{} = repository, request, pack)
       when is_map(request) and is_binary(pack) do
     request = normalize_request(request)
-    path = ForgeRepos.absolute_storage_path(repository)
     commands = Enum.map(request.commands, &command_to_native/1)
 
-    case GitCore.receive_pack(path, pack, commands) do
-      {:ok, statuses} ->
+    case fenced_receive_pack(repository, pack, commands) do
+      {:native, {:ok, statuses}} ->
         {:ok, render_status_report(request, "ok", statuses), statuses}
 
-      {:error, reason} ->
-        Logger.error("Native Git receive-pack error: #{inspect(reason)}")
+      {:native, {:error, reason}} ->
+        Logger.error("Native Git receive-pack failed")
 
         statuses =
           Enum.map(request.commands, fn command ->
@@ -73,6 +78,24 @@ defmodule GitTransport.ReceivePack do
           end)
 
         {:ok, render_status_report(request, sanitize_status(reason), statuses), statuses}
+
+      {:error, {:unavailable, _reason}} ->
+        Logger.warning("Git receive-pack write fence unavailable")
+        unavailable_response(request)
+    end
+  end
+
+  @doc false
+  def with_test_native(native, fun) when is_function(native, 3) and is_function(fun, 0) do
+    previous = Process.get(@native_hook_key)
+    Process.put(@native_hook_key, native)
+
+    try do
+      fun.()
+    after
+      if previous == nil,
+        do: Process.delete(@native_hook_key),
+        else: Process.put(@native_hook_key, previous)
     end
   end
 
@@ -106,6 +129,34 @@ defmodule GitTransport.ReceivePack do
     else
       :ok
     end
+  end
+
+  defp fenced_receive_pack(repository, pack, commands) do
+    ForgeRepos.with_write_fence(repository, :receive_pack, fn path, remaining ->
+      if remaining > 0 do
+        {:native, native_receive_pack(path, pack, commands)}
+      else
+        {:error, {:unavailable, :write_timeout}}
+      end
+    end)
+  end
+
+  defp native_receive_pack(path, pack, commands) do
+    case Process.get(@native_hook_key) do
+      native when is_function(native, 3) -> native.(path, pack, commands)
+      nil -> GitCore.receive_pack(path, pack, commands)
+    end
+  end
+
+  defp unavailable_response(request) do
+    message = "Git receive-pack unavailable"
+
+    statuses =
+      Enum.map(request.commands, fn command ->
+        {command.ref, "ng", message}
+      end)
+
+    {:ok, render_status_report(request, message, statuses), statuses}
   end
 
   defp render_advertisement([]) do
