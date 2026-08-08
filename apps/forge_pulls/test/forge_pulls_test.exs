@@ -1293,6 +1293,20 @@ defmodule ForgePullsTest do
 
     assert %{state: ["is invalid"]} =
              %MergeOperation{} |> MergeOperation.prepare_changeset(attrs) |> errors_on()
+
+    prepared =
+      MergeOperation.prepare_changeset(
+        %MergeOperation{},
+        Map.merge(attrs, %{
+          state: :prepared,
+          merge_oid: String.duplicate("c", 40),
+          failure_reason: "effect_not_started"
+        })
+      )
+
+    assert prepared.valid?
+    assert Ecto.Changeset.get_field(prepared, :merge_oid) == nil
+    assert Ecto.Changeset.get_field(prepared, :failure_reason) == nil
   end
 
   test "operation leases preserve immutable merge evidence and validate transitions" do
@@ -1384,6 +1398,18 @@ defmodule ForgePullsTest do
              OperationLease.update_owned(MergeOperation, split_reclaimed, state: :merge_written)
 
     assert split_advanced.merge_oid == String.downcase(split_oid)
+
+    assert {:ok, split_nil_reclaimed} =
+             OperationLease.claim(MergeOperation, split_advanced.id, "split-c", now, 30)
+
+    assert {:error, :invalid_update} =
+             OperationLease.update_owned(MergeOperation, split_nil_reclaimed,
+               state: :ref_advanced,
+               merge_oid: nil
+             )
+
+    assert Repo.get!(MergeOperation, split_nil_reclaimed.id) == split_nil_reclaimed
+    assert :ok = OperationLease.release(MergeOperation, split_nil_reclaimed)
 
     assert {:ok, _} = insert_merge_operation(fixture, "prepared", "lease-failure")
     failure = Repo.get_by!(MergeOperation, request_id: "lease-failure")

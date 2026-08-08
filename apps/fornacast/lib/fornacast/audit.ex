@@ -106,10 +106,16 @@ defmodule Fornacast.Audit do
   end
 
   defp insert_options(opts) do
-    if option_value(opts, :operation_id, Keyword.get(opts, :request_metadata, %{})) == nil do
+    operation_id = option_value(opts, :operation_id, Keyword.get(opts, :request_metadata, %{}))
+
+    if operation_id == nil do
       []
     else
-      [on_conflict: :nothing, conflict_target: [:operation_id, :action]]
+      [
+        on_conflict: [set: [operation_id: operation_id]],
+        conflict_target: [:operation_id, :action],
+        returning: true
+      ]
     end
   end
 

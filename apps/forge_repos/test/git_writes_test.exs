@@ -60,6 +60,38 @@ defmodule ForgeRepos.GitWritesTest do
     end
   end
 
+  test "changeset enforces lifecycle and evidence coupling on direct persistence" do
+    oid = String.duplicate("C", 40)
+
+    invalid = [
+      %{state: :object_written, result_blob_oid: nil},
+      %{state: :ref_advanced, result_blob_oid: nil},
+      %{state: :prepared, result_blob_oid: oid},
+      %{state: :failed, failure_reason: nil},
+      %{state: :failed, failure_reason: "unexpected_ref"},
+      %{state: :prepared, failure_reason: "effect_not_started"},
+      %{state: :bookkeeping_complete, failure_reason: "unexpected_ref"},
+      %{kind: :ref_update, state: :object_written, result_blob_oid: oid}
+    ]
+
+    for overrides <- invalid do
+      changeset =
+        GitWriteOperation.changeset(%GitWriteOperation{}, Map.merge(valid_attrs(), overrides))
+
+      refute changeset.valid?, "expected #{inspect(overrides)} to be rejected"
+      assert {:error, %Ecto.Changeset{}} = Repo.insert(changeset)
+    end
+
+    valid =
+      GitWriteOperation.changeset(
+        %GitWriteOperation{},
+        Map.merge(valid_attrs(), %{state: :object_written, result_blob_oid: oid})
+      )
+
+    assert valid.valid?
+    assert Ecto.Changeset.get_change(valid, :result_blob_oid) == String.downcase(oid)
+  end
+
   test "audit options override normalized request metadata and operation actions deduplicate" do
     operation_id = "git_write:42"
 
@@ -107,6 +139,38 @@ defmodule ForgeRepos.GitWritesTest do
     assert event.user_agent == "test"
     assert event.metadata["ref"] == "refs/heads/feature/x"
     assert event.metadata["nested"] == %{"kept" => true}
+
+    assert {:ok, first} =
+             Audit.record(nil, "git.ref.updated", "repository", 7, %{},
+               operation_id: "git-write:returned"
+             )
+
+    assert {:ok, duplicate} =
+             Audit.record(nil, "git.ref.updated", "repository", 7, %{},
+               operation_id: "git-write:returned"
+             )
+
+    assert is_integer(first.id)
+    assert duplicate.id == first.id
+
+    multi =
+      Multi.new()
+      |> Audit.record_multi(
+        :deduplicated_audit,
+        nil,
+        "git.ref.updated",
+        "repository",
+        7,
+        %{},
+        operation_id: "git-write:returned"
+      )
+      |> Multi.run(:downstream, fn _repo, %{deduplicated_audit: audit} ->
+        {:ok, audit.id}
+      end)
+
+    assert {:ok, %{deduplicated_audit: duplicate, downstream: id}} = Repo.transaction(multi)
+    assert duplicate.id == first.id
+    assert id == first.id
 
     for _ <- 1..2 do
       assert {:ok, _event} =

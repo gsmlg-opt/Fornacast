@@ -5,6 +5,22 @@ defmodule Fornacast.OperationLease do
 
   alias Fornacast.Repo
 
+  @after_write_hook_key {__MODULE__, :after_write_hook}
+
+  @doc false
+  def with_test_after_write_hook(hook, fun) when is_function(hook, 4) and is_function(fun, 0) do
+    previous = Process.get(@after_write_hook_key)
+    Process.put(@after_write_hook_key, hook)
+
+    try do
+      fun.()
+    after
+      if previous == nil,
+        do: Process.delete(@after_write_hook_key),
+        else: Process.put(@after_write_hook_key, previous)
+    end
+  end
+
   @spec claim(module(), pos_integer(), String.t(), DateTime.t(), pos_integer()) ::
           {:ok, struct()} | :busy | {:error, :not_found | :invalid_argument}
   def claim(module, id, owner, %DateTime{} = now, lease_seconds)
@@ -12,7 +28,9 @@ defmodule Fornacast.OperationLease do
              is_integer(lease_seconds) and lease_seconds > 0 do
     with :ok <- validate_utc(now),
          %{} = row <- Repo.get(module, id) do
-      expires_at = now |> DateTime.add(lease_seconds, :second) |> DateTime.truncate(:second)
+      now = DateTime.truncate(now, :second)
+      expires_at = DateTime.add(now, lease_seconds, :second)
+      expected_version = row.lock_version + 1
 
       query =
         from item in module,
@@ -24,8 +42,16 @@ defmodule Fornacast.OperationLease do
              set: [lease_owner: owner, lease_expires_at: expires_at],
              inc: [lock_version: 1]
            ) do
-        {1, _} -> {:ok, Repo.get!(module, id)}
-        {0, _} -> :busy
+        {1, _} ->
+          run_after_write_hook(:claim, module, id, expected_version)
+
+          case owned_row(module, id, owner, expected_version) do
+            nil -> :busy
+            claimed -> {:ok, claimed}
+          end
+
+        {0, _} ->
+          :busy
       end
     else
       nil -> {:error, :not_found}
@@ -58,8 +84,17 @@ defmodule Fornacast.OperationLease do
     case validated_updates(module, operation, updates) do
       {:ok, validated} ->
         case guarded_update(module, id, owner, version, validated) do
-          {1, _} -> {:ok, Repo.get!(module, id)}
-          {0, _} -> {:error, :lost_lease}
+          {1, _} ->
+            expected_version = version + 1
+            run_after_write_hook(:update_owned, module, id, expected_version)
+
+            case released_row(module, id, expected_version) do
+              nil -> {:error, :lost_lease}
+              updated -> {:ok, updated}
+            end
+
+          {0, _} ->
+            {:error, :lost_lease}
         end
 
       :error ->
@@ -89,6 +124,29 @@ defmodule Fornacast.OperationLease do
       set: updates ++ [lease_owner: nil, lease_expires_at: nil],
       inc: [lock_version: 1]
     )
+  end
+
+  defp owned_row(module, id, owner, version) do
+    Repo.one(
+      from item in module,
+        where: item.id == ^id and item.lease_owner == ^owner and item.lock_version == ^version
+    )
+  end
+
+  defp released_row(module, id, version) do
+    Repo.one(
+      from item in module,
+        where:
+          item.id == ^id and item.lock_version == ^version and is_nil(item.lease_owner) and
+            is_nil(item.lease_expires_at)
+    )
+  end
+
+  defp run_after_write_hook(kind, module, id, version) do
+    case Process.delete(@after_write_hook_key) do
+      hook when is_function(hook, 4) -> hook.(kind, module, id, version)
+      nil -> :ok
+    end
   end
 
   defp validate_utc(%DateTime{time_zone: "Etc/UTC", utc_offset: 0, std_offset: 0}), do: :ok

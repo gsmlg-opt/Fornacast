@@ -70,6 +70,7 @@ defmodule ForgePulls.MergeOperation do
       |> normalize_oid(:merge_oid)
       |> validate_oid(:merge_oid)
       |> validate_inclusion(:failure_reason, @lease_failure_reasons)
+      |> reject_explicit_nil(:merge_oid)
       |> validate_lease_transition()
       |> validate_failure_reason_transition(operation)
       |> validate_merge_oid_transition()
@@ -132,6 +133,13 @@ defmodule ForgePulls.MergeOperation do
         do: [],
         else: [{field, "is invalid"}]
     end)
+  end
+
+  defp reject_explicit_nil(changeset, field) do
+    case fetch_change(changeset, field) do
+      {:ok, nil} -> add_error(changeset, field, "cannot be cleared")
+      _ -> changeset
+    end
   end
 
   defp validate_lease_transition(changeset) do

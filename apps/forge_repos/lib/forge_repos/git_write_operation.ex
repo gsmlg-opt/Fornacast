@@ -67,6 +67,7 @@ defmodule ForgeRepos.GitWriteOperation do
     |> validate_oid(:result_blob_oid)
     |> validate_target_ref()
     |> validate_inclusion(:failure_reason, @failure_reasons)
+    |> validate_initial_lifecycle()
     |> validate_number(:lock_version, greater_than_or_equal_to: 0)
     |> unique_constraint([:request_id, :kind, :target_ref],
       name: :git_write_operations_request_ref_index
@@ -80,6 +81,7 @@ defmodule ForgeRepos.GitWriteOperation do
       |> normalize_oid(:result_blob_oid)
       |> validate_oid(:result_blob_oid)
       |> validate_inclusion(:failure_reason, @failure_reasons)
+      |> reject_explicit_nil(:result_blob_oid)
       |> validate_lease_transition()
       |> validate_failure_reason_transition(operation)
       |> validate_result_blob_update(operation)
@@ -111,6 +113,67 @@ defmodule ForgeRepos.GitWriteOperation do
     validate_change(changeset, :target_ref, fn :target_ref, ref ->
       if canonical_full_ref?(ref), do: [], else: [target_ref: "is not a canonical full ref"]
     end)
+  end
+
+  defp validate_initial_lifecycle(changeset) do
+    kind = get_field(changeset, :kind)
+    state = get_field(changeset, :state)
+    oid = get_field(changeset, :result_blob_oid)
+    reason = get_field(changeset, :failure_reason)
+    content? = kind in [:content_create, :content_update]
+
+    changeset
+    |> validate_initial_result(content?, state, oid, reason)
+    |> validate_initial_failure(state, reason)
+  end
+
+  defp validate_initial_result(changeset, true, state, oid, reason) do
+    oid_required? =
+      state in [:object_written, :ref_advanced, :bookkeeping_complete] or
+        (state == :failed and reason == "ref_not_advanced")
+
+    oid_forbidden? =
+      state == :prepared or (state == :failed and reason == "effect_not_started")
+
+    cond do
+      oid_required? and not valid_oid?(oid) ->
+        add_error(changeset, :result_blob_oid, "is required for this lifecycle state")
+
+      oid_forbidden? and oid != nil ->
+        add_error(changeset, :result_blob_oid, "is not valid for this lifecycle state")
+
+      true ->
+        changeset
+    end
+  end
+
+  defp validate_initial_result(changeset, false, _state, nil, _reason), do: changeset
+
+  defp validate_initial_result(changeset, false, _state, _oid, _reason),
+    do: add_error(changeset, :result_blob_oid, "is not valid for this operation kind")
+
+  defp validate_initial_failure(changeset, :failed, reason)
+       when reason in ["effect_not_started", "ref_not_advanced"],
+       do: changeset
+
+  defp validate_initial_failure(changeset, :failed, _reason),
+    do: add_error(changeset, :failure_reason, "is invalid for terminal failure")
+
+  defp validate_initial_failure(changeset, state, reason)
+       when state in [:prepared, :object_written, :ref_advanced] and
+              reason in [nil, "unexpected_ref"],
+       do: changeset
+
+  defp validate_initial_failure(changeset, _state, nil), do: changeset
+
+  defp validate_initial_failure(changeset, _state, _reason),
+    do: add_error(changeset, :failure_reason, "is invalid for this lifecycle state")
+
+  defp reject_explicit_nil(changeset, field) do
+    case fetch_change(changeset, field) do
+      {:ok, nil} -> add_error(changeset, field, "cannot be cleared")
+      _ -> changeset
+    end
   end
 
   defp validate_lease_transition(changeset) do

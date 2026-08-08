@@ -99,6 +99,66 @@ defmodule Fornacast.OperationLeaseTest do
     assert :busy = OperationLease.claim(GitWriteOperation, operation.id, "owner-b", now, 30)
   end
 
+  test "claim uses the same second-precision UTC instant for availability and expiry", %{
+    operation: operation
+  } do
+    now = DateTime.utc_now()
+
+    assert {:ok, claimed} =
+             OperationLease.claim(GitWriteOperation, operation.id, "owner-a", now, 30)
+
+    assert claimed.lease_expires_at == now |> DateTime.truncate(:second) |> DateTime.add(30)
+  end
+
+  test "claim never returns a capability reclaimed after its compare-and-swap", %{
+    operation: operation,
+    now: now
+  } do
+    result =
+      OperationLease.with_test_after_write_hook(
+        fn :claim, GitWriteOperation, id, _version ->
+          Repo.update_all(from(item in GitWriteOperation, where: item.id == ^id),
+            set: [lease_expires_at: DateTime.add(now, -1, :second)]
+          )
+
+          Process.put(
+            :replacement_claim,
+            OperationLease.claim(GitWriteOperation, id, "owner-b", now, 30)
+          )
+        end,
+        fn -> OperationLease.claim(GitWriteOperation, operation.id, "owner-a", now, 30) end
+      )
+
+    assert :busy = result
+    assert {:ok, replacement} = Process.delete(:replacement_claim)
+    assert replacement.lease_owner == "owner-b"
+  end
+
+  test "update never returns a capability reclaimed after its compare-and-swap", %{
+    operation: operation,
+    now: now
+  } do
+    assert {:ok, claimed} =
+             OperationLease.claim(GitWriteOperation, operation.id, "owner-a", now, 30)
+
+    result =
+      OperationLease.with_test_after_write_hook(
+        fn :update_owned, GitWriteOperation, id, _version ->
+          Process.put(
+            :replacement_claim,
+            OperationLease.claim(GitWriteOperation, id, "owner-b", now, 30)
+          )
+        end,
+        fn ->
+          OperationLease.update_owned(GitWriteOperation, claimed, state: :object_written)
+        end
+      )
+
+    assert {:error, :lost_lease} = result
+    assert {:ok, replacement} = Process.delete(:replacement_claim)
+    assert replacement.lease_owner == "owner-b"
+  end
+
   test "expired lease can be reclaimed and stale owner cannot update or release", %{
     operation: operation,
     now: now
@@ -234,6 +294,34 @@ defmodule Fornacast.OperationLeaseTest do
              OperationLease.update_owned(GitWriteOperation, reclaimed, state: :object_written)
 
     assert advanced.result_blob_oid == String.downcase(blob_oid)
+  end
+
+  test "explicit nil content outcome is rejected without changing state or lease", %{
+    operation: operation,
+    now: now
+  } do
+    content_operation =
+      operation |> Ecto.Changeset.change(kind: :content_update) |> Repo.update!()
+
+    assert {:ok, claimed} =
+             OperationLease.claim(GitWriteOperation, content_operation.id, "a", now, 30)
+
+    assert {:ok, recorded} =
+             OperationLease.update_owned(GitWriteOperation, claimed,
+               result_blob_oid: String.duplicate("d", 40)
+             )
+
+    assert {:ok, reclaimed} =
+             OperationLease.claim(GitWriteOperation, recorded.id, "b", now, 30)
+
+    assert {:error, :invalid_update} =
+             OperationLease.update_owned(GitWriteOperation, reclaimed,
+               state: :object_written,
+               result_blob_oid: nil
+             )
+
+    assert Repo.get!(GitWriteOperation, reclaimed.id) == reclaimed
+    assert :ok = OperationLease.release(GitWriteOperation, reclaimed)
   end
 
   test "terminal Git failure validates the effective state-specific reason", %{
