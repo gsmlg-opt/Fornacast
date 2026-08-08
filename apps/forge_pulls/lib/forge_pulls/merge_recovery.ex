@@ -301,86 +301,78 @@ defmodule ForgePulls.MergeRecovery do
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     actor = load_actor(operation.actor_user_id)
     pull = Repo.get!(PullRequest, operation.pull_request_id)
-    issue = Repo.get!(Issue, pull.issue_id)
 
-    operation_query =
-      from candidate in MergeOperation,
-        where:
-          candidate.id == ^operation.id and candidate.lease_owner == ^operation.lease_owner and
-            candidate.lock_version == ^operation.lock_version and
-            candidate.state == :ref_advanced and candidate.merge_oid == ^operation.merge_oid
+    with %Issue{kind: :pull_request, state: :open} = issue <- Repo.get(Issue, pull.issue_id) do
+      operation_query =
+        from candidate in MergeOperation,
+          where:
+            candidate.id == ^operation.id and candidate.lease_owner == ^operation.lease_owner and
+              candidate.lock_version == ^operation.lock_version and
+              candidate.state == :ref_advanced and candidate.merge_oid == ^operation.merge_oid
 
-    pull_query =
-      from candidate in PullRequest,
-        where:
-          candidate.id == ^pull.id and candidate.repository_id == ^repository.id and
-            candidate.head_ref == ^operation.head_ref and
-            candidate.base_ref == ^operation.base_ref and
-            is_nil(candidate.merge_commit_sha)
+      pull_query =
+        from candidate in PullRequest,
+          where:
+            candidate.id == ^pull.id and candidate.repository_id == ^repository.id and
+              candidate.head_ref == ^operation.head_ref and
+              candidate.base_ref == ^operation.base_ref and
+              is_nil(candidate.merge_commit_sha)
 
-    issue_query =
-      from candidate in Issue,
-        where:
-          candidate.id == ^issue.id and candidate.repository_id == ^repository.id and
-            candidate.kind == :pull_request and candidate.state == :open
+      repository_query = from candidate in Repository, where: candidate.id == ^repository.id
 
-    repository_query = from candidate in Repository, where: candidate.id == ^repository.id
+      multi =
+        Multi.new()
+        |> Multi.update_all(
+          :operation,
+          operation_query,
+          set: [
+            state: :completed,
+            failure_reason: nil,
+            lease_owner: nil,
+            lease_expires_at: nil,
+            updated_at: now
+          ],
+          inc: [lock_version: 1]
+        )
+        |> require_one(:operation)
+        |> Multi.update_all(:pull_request, pull_query,
+          set: [
+            merge_commit_sha: operation.merge_oid,
+            merged_at: now,
+            merged_by_user_id: operation.actor_user_id,
+            updated_at: now
+          ]
+        )
+        |> require_one(:pull_request)
+        |> ForgeIssues.update_identity(:issue, issue, actor, %{
+          "state" => "closed",
+          "state_reason" => "completed"
+        })
+        |> Multi.update_all(:repository, repository_query,
+          set: [last_pushed_at: now, updated_at: now]
+        )
+        |> Audit.record_multi(
+          :audit,
+          actor,
+          "pull_request.merged",
+          "repository",
+          repository.id,
+          %{
+            "pull_request_id" => pull.id,
+            "ref" => operation.base_ref,
+            "oid" => operation.merge_oid,
+            "result" => "success"
+          },
+          request_metadata: operation_request_metadata(operation),
+          operation_id: operation_id(operation)
+        )
 
-    multi =
-      Multi.new()
-      |> Multi.update_all(
-        :operation,
-        operation_query,
-        set: [
-          state: :completed,
-          failure_reason: nil,
-          lease_owner: nil,
-          lease_expires_at: nil,
-          updated_at: now
-        ],
-        inc: [lock_version: 1]
-      )
-      |> require_one(:operation)
-      |> Multi.update_all(:pull_request, pull_query,
-        set: [
-          merge_commit_sha: operation.merge_oid,
-          merged_at: now,
-          merged_by_user_id: operation.actor_user_id,
-          updated_at: now
-        ]
-      )
-      |> require_one(:pull_request)
-      |> Multi.update_all(:issue, issue_query,
-        set: [
-          state: :closed,
-          state_reason: :completed,
-          closed_at: now,
-          updated_at: now
-        ]
-      )
-      |> require_one(:issue)
-      |> Multi.update_all(:repository, repository_query,
-        set: [last_pushed_at: now, updated_at: now]
-      )
-      |> Audit.record_multi(
-        :audit,
-        actor,
-        "pull_request.merged",
-        "repository",
-        repository.id,
-        %{
-          "pull_request_id" => pull.id,
-          "ref" => operation.base_ref,
-          "oid" => operation.merge_oid,
-          "result" => "success"
-        },
-        request_metadata: operation_request_metadata(operation),
-        operation_id: operation_id(operation)
-      )
-
-    operation
-    |> then(&apply_complete_multi_hook(multi, &1))
-    |> Repo.transaction()
+      operation
+      |> then(&apply_complete_multi_hook(multi, &1))
+      |> Repo.transaction()
+    else
+      _not_open -> {:error, :issue_not_open}
+    end
   end
 
   defp require_one(multi, key) do

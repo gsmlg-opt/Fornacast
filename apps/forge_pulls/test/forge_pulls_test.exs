@@ -2207,7 +2207,7 @@ defmodule ForgePullsTest do
     end)
   end
 
-  test "the Turso metadata migration preserves existing operation values FKs and indexes" do
+  test "the Turso metadata migration up and down DDL preserve operation values FKs and indexes" do
     if database_adapter() == :turso do
       database =
         Path.join(System.tmp_dir!(), "pull-metadata-migration-#{System.unique_integer()}.db")
@@ -2246,6 +2246,61 @@ defmodule ForgePullsTest do
         assert {:ok, %{num_rows: 1}} = insert_merge_operation(fixture, "prepared", request_id)
 
         assert [^version] = Ecto.Migrator.run(Repo, migrations, :up, to: version)
+
+        Enum.each(
+          Fornacast.Repo.Migrations.AddPullMergeRequestMetadata.turso_down_statements(),
+          &SQL.query!(Repo, &1, [])
+        )
+
+        assert %{rows: [[^request_id, "refs/heads/main", "refs/heads/feature", "prepared"]]} =
+                 SQL.query!(
+                   Repo,
+                   "SELECT request_id, base_ref, head_ref, state " <>
+                     "FROM pull_merge_operations WHERE request_id = ?",
+                   [request_id]
+                 )
+
+        %{rows: down_column_rows} =
+          SQL.query!(Repo, "PRAGMA table_info('pull_merge_operations')", [])
+
+        down_columns = MapSet.new(down_column_rows, &Enum.at(&1, 1))
+
+        for removed <- ~w(api_version ip_address user_agent token_id) do
+          refute MapSet.member?(down_columns, removed)
+        end
+
+        down_table_sql = turso_table_sql("pull_merge_operations")
+        assert MapSet.size(turso_foreign_keys("pull_merge_operations", down_table_sql)) == 3
+        assert MapSet.size(turso_indexes("pull_merge_operations")) == 3
+        assert Map.has_key?(turso_checks(down_table_sql), "state")
+
+        Enum.each(
+          Fornacast.Repo.Migrations.AddPullMergeRequestMetadata.turso_up_statements(),
+          &SQL.query!(Repo, &1, [])
+        )
+
+        # WORKAROUND(upstream): gsmlg-dev/concord#69
+        assert_raise Turso.Error, ~r/no such table: s0/, fn ->
+          Ecto.Migrator.run(Repo, migrations, :down, step: 1)
+        end
+
+        assert %{rows: [[^request_id]]} =
+                 SQL.query!(
+                   Repo,
+                   "SELECT request_id FROM pull_merge_operations WHERE request_id = ?",
+                   [request_id]
+                 )
+
+        %{rows: failed_rollback_column_rows} =
+          SQL.query!(Repo, "PRAGMA table_info('pull_merge_operations')", [])
+
+        failed_rollback_columns = MapSet.new(failed_rollback_column_rows, &Enum.at(&1, 1))
+
+        for retained <- ~w(api_version ip_address user_agent token_id) do
+          assert MapSet.member?(failed_rollback_columns, retained)
+        end
+
+        assert database_contract() == @expected_contract
 
         assert %{
                  rows: [

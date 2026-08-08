@@ -98,8 +98,18 @@ defmodule ForgePulls.MergeRecoveryTest do
     assert merge_oid == context.merge_oid
     assert merged_by_user_id == context.owner.id
 
-    assert %Issue{state: :closed, state_reason: :completed} =
+    assert %Issue{state: :closed, state_reason: :completed, closed_at: %DateTime{}} =
              Repo.get!(Issue, context.pull.issue_id)
+
+    assert {:ok,
+            %PullRequest{
+              issue: %Issue{state: :closed, state_reason: :completed, closed_at: %DateTime{}}
+            }} =
+             ForgePulls.get_pull_request(
+               context.repository,
+               context.pull.issue.number,
+               context.owner
+             )
 
     assert %Repository{last_pushed_at: %DateTime{}} = Repo.get!(Repository, context.repository.id)
 

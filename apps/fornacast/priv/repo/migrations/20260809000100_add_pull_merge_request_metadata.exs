@@ -4,7 +4,7 @@ defmodule Fornacast.Repo.Migrations.AddPullMergeRequestMetadata do
   def up do
     if turso?() do
       # WORKAROUND(upstream): gsmlg-dev/concord#71
-      rebuild_turso_operations(:with_request_metadata)
+      Enum.each(turso_up_statements(), &execute/1)
     else
       alter table(:pull_merge_operations) do
         add(:api_version, :text)
@@ -18,7 +18,8 @@ defmodule Fornacast.Repo.Migrations.AddPullMergeRequestMetadata do
   def down do
     if turso?() do
       # WORKAROUND(upstream): gsmlg-dev/concord#71
-      rebuild_turso_operations(:without_request_metadata)
+      # WORKAROUND(upstream): gsmlg-dev/concord#69
+      Enum.each(turso_down_statements(), &execute/1)
     else
       alter table(:pull_merge_operations) do
         remove(:token_id)
@@ -29,42 +30,44 @@ defmodule Fornacast.Repo.Migrations.AddPullMergeRequestMetadata do
     end
   end
 
-  defp rebuild_turso_operations(:with_request_metadata) do
-    execute(create_turso_table("pull_merge_operations_with_request_metadata", metadata_columns()))
-
-    execute("""
-    INSERT INTO pull_merge_operations_with_request_metadata
-      (id, pull_request_id, repository_id, actor_user_id, request_id,
-       base_ref, head_ref, expected_base_oid, expected_head_oid, merge_oid,
-       state, lease_owner, lease_expires_at, failure_reason, lock_version,
-       inserted_at, updated_at)
-    SELECT id, pull_request_id, repository_id, actor_user_id, request_id,
-           base_ref, head_ref, expected_base_oid, expected_head_oid, merge_oid,
-           state, lease_owner, lease_expires_at, failure_reason, lock_version,
-           inserted_at, updated_at
-    FROM pull_merge_operations
-    """)
-
-    replace_turso_table("pull_merge_operations_with_request_metadata")
+  @doc false
+  def turso_up_statements do
+    [
+      create_turso_table("pull_merge_operations_with_request_metadata", metadata_columns()),
+      """
+      INSERT INTO pull_merge_operations_with_request_metadata
+        (id, pull_request_id, repository_id, actor_user_id, request_id,
+         base_ref, head_ref, expected_base_oid, expected_head_oid, merge_oid,
+         state, lease_owner, lease_expires_at, failure_reason, lock_version,
+         inserted_at, updated_at)
+      SELECT id, pull_request_id, repository_id, actor_user_id, request_id,
+             base_ref, head_ref, expected_base_oid, expected_head_oid, merge_oid,
+             state, lease_owner, lease_expires_at, failure_reason, lock_version,
+             inserted_at, updated_at
+      FROM pull_merge_operations
+      """
+      | replace_turso_table_statements("pull_merge_operations_with_request_metadata")
+    ]
   end
 
-  defp rebuild_turso_operations(:without_request_metadata) do
-    execute(create_turso_table("pull_merge_operations_without_request_metadata", ""))
-
-    execute("""
-    INSERT INTO pull_merge_operations_without_request_metadata
-      (id, pull_request_id, repository_id, actor_user_id, request_id,
-       base_ref, head_ref, expected_base_oid, expected_head_oid, merge_oid,
-       state, lease_owner, lease_expires_at, failure_reason, lock_version,
-       inserted_at, updated_at)
-    SELECT id, pull_request_id, repository_id, actor_user_id, request_id,
-           base_ref, head_ref, expected_base_oid, expected_head_oid, merge_oid,
-           state, lease_owner, lease_expires_at, failure_reason, lock_version,
-           inserted_at, updated_at
-    FROM pull_merge_operations
-    """)
-
-    replace_turso_table("pull_merge_operations_without_request_metadata")
+  @doc false
+  def turso_down_statements do
+    [
+      create_turso_table("pull_merge_operations_without_request_metadata", ""),
+      """
+      INSERT INTO pull_merge_operations_without_request_metadata
+        (id, pull_request_id, repository_id, actor_user_id, request_id,
+         base_ref, head_ref, expected_base_oid, expected_head_oid, merge_oid,
+         state, lease_owner, lease_expires_at, failure_reason, lock_version,
+         inserted_at, updated_at)
+      SELECT id, pull_request_id, repository_id, actor_user_id, request_id,
+             base_ref, head_ref, expected_base_oid, expected_head_oid, merge_oid,
+             state, lease_owner, lease_expires_at, failure_reason, lock_version,
+             inserted_at, updated_at
+      FROM pull_merge_operations
+      """
+      | replace_turso_table_statements("pull_merge_operations_without_request_metadata")
+    ]
   end
 
   defp create_turso_table(name, metadata_columns) do
@@ -108,24 +111,17 @@ defmodule Fornacast.Repo.Migrations.AddPullMergeRequestMetadata do
     """
   end
 
-  defp replace_turso_table(replacement) do
-    execute("DROP TABLE pull_merge_operations")
-    execute("ALTER TABLE #{replacement} RENAME TO pull_merge_operations")
-
-    execute(
+  defp replace_turso_table_statements(replacement) do
+    [
+      "DROP TABLE pull_merge_operations",
+      "ALTER TABLE #{replacement} RENAME TO pull_merge_operations",
       "CREATE INDEX pull_merge_operations_repository_id_state_index " <>
-        "ON pull_merge_operations (repository_id, state)"
-    )
-
-    execute(
+        "ON pull_merge_operations (repository_id, state)",
       "CREATE INDEX pull_merge_operations_pull_request_id_state_index " <>
-        "ON pull_merge_operations (pull_request_id, state)"
-    )
-
-    execute(
+        "ON pull_merge_operations (pull_request_id, state)",
       "CREATE INDEX pull_merge_operations_lease_expires_at_index " <>
         "ON pull_merge_operations (lease_expires_at)"
-    )
+    ]
   end
 
   defp turso?, do: repo().__adapter__() == Ecto.Adapters.Turso
