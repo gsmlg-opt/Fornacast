@@ -228,7 +228,7 @@ defmodule GitTransport.ReceivePackFenceTest do
     parent = self()
 
     dirty_native = fn _path, _pack, _commands ->
-      {:ok, {}} = GitCore.Native.test_dirty_io_wait(entered_path, release_path)
+      {:ok, {}} = GitTransport.TestDirtyIoNative.test_dirty_io_wait(entered_path, release_path)
       {:ok, [{"refs/heads/main", "ok", nil}]}
     end
 
@@ -288,7 +288,7 @@ defmodule GitTransport.ReceivePackFenceTest do
 
     first =
       response_task(repository, fn _path, _pack, _commands ->
-        {:ok, {}} = GitCore.Native.test_dirty_io_wait(entered_path, release_path)
+        {:ok, {}} = GitTransport.TestDirtyIoNative.test_dirty_io_wait(entered_path, release_path)
         {:ok, [{"refs/heads/main", "ok", nil}]}
       end)
 
@@ -469,7 +469,7 @@ defmodule GitTransport.ReceivePackFenceTest do
 
     response =
       response_task(repository, fn _path, _pack, _commands ->
-        {:ok, {}} = GitCore.Native.test_dirty_io_wait(entered_path, release_path)
+        {:ok, {}} = GitTransport.TestDirtyIoNative.test_dirty_io_wait(entered_path, release_path)
         {:ok, [{"refs/heads/main", "ok", nil}]}
       end)
 
@@ -567,7 +567,7 @@ defmodule GitTransport.ReceivePackFenceTest do
 
     response =
       response_task(repository, fn _path, _pack, _commands ->
-        {:ok, {}} = GitCore.Native.test_dirty_io_wait(entered_path, release_path)
+        {:ok, {}} = GitTransport.TestDirtyIoNative.test_dirty_io_wait(entered_path, release_path)
         {:ok, [{"refs/heads/main", "ok", nil}]}
       end)
 
@@ -603,7 +603,7 @@ defmodule GitTransport.ReceivePackFenceTest do
 
     response =
       response_task(repository, fn _path, _pack, _commands ->
-        {:ok, {}} = GitCore.Native.test_dirty_io_wait(entered_path, release_path)
+        {:ok, {}} = GitTransport.TestDirtyIoNative.test_dirty_io_wait(entered_path, release_path)
         {:ok, [{"refs/heads/main", "ok", nil}]}
       end)
 

@@ -5,13 +5,11 @@ defmodule GitCore.Native do
 
   @darwin_target :erlang.system_info(:system_architecture) |> to_string()
   @target if String.ends_with?(@darwin_target, "-apple-darwin"), do: @darwin_target
-  @features if Mix.env() == :test, do: ["test-support"], else: []
 
   use Rustler,
     otp_app: :git_core,
     crate: "fornacast_git_core",
     mode: if(Mix.env() == :prod, do: :release, else: :debug),
-    features: @features,
     target: @target
 
   def init_bare(_path), do: :erlang.nif_error(:nif_not_loaded)
@@ -119,10 +117,4 @@ defmodule GitCore.Native do
 
   def pack_objects(_path, _wants), do: :erlang.nif_error(:nif_not_loaded)
   def receive_pack(_path, _pack, _commands), do: :erlang.nif_error(:nif_not_loaded)
-
-  if Mix.env() == :test do
-    @doc false
-    def test_dirty_io_wait(_entered_path, _release_path),
-      do: :erlang.nif_error(:nif_not_loaded)
-  end
 end
