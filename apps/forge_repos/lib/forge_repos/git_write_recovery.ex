@@ -63,20 +63,38 @@ defmodule ForgeRepos.GitWriteRecovery do
       when is_integer(repository_id) and is_binary(repository_path) and
              is_integer(absolute_deadline) do
     owner = lease_owner(repository_id)
-    reconcile_next(repository, repository_path, absolute_deadline, owner)
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    reconcile_next(repository, repository_path, absolute_deadline, owner, now, 0)
   end
 
-  defp reconcile_next(repository, repository_path, absolute_deadline, owner) do
+  defp reconcile_next(repository, repository_path, absolute_deadline, owner, now, after_id) do
     with :ok <- check_deadline(absolute_deadline) do
-      case next_operation(repository.id) do
+      case next_claimable_operation(repository.id, after_id, now) do
         nil ->
           :ok
 
         %GitWriteOperation{} = operation ->
-          reconcile_operation(repository, repository_path, operation, absolute_deadline, owner)
+          reconcile_operation(
+            repository,
+            repository_path,
+            operation,
+            absolute_deadline,
+            owner,
+            now
+          )
           |> case do
-            :ok -> reconcile_next(repository, repository_path, absolute_deadline, owner)
-            {:error, :unavailable} = error -> error
+            result when result in [:ok, :busy] ->
+              reconcile_next(
+                repository,
+                repository_path,
+                absolute_deadline,
+                owner,
+                now,
+                operation.id
+              )
+
+            {:error, :unavailable} = error ->
+              error
           end
       end
     end
@@ -86,18 +104,30 @@ defmodule ForgeRepos.GitWriteRecovery do
     _kind, _reason -> {:error, :unavailable}
   end
 
-  defp next_operation(repository_id) do
+  defp next_claimable_operation(repository_id, after_id, now) do
     GitWriteOperation
     |> where([operation], operation.repository_id == ^repository_id)
     |> where([operation], operation.state not in ^@terminal_states)
+    |> where([operation], operation.id > ^after_id)
+    |> where(
+      [operation],
+      is_nil(operation.lease_expires_at) or operation.lease_expires_at <= ^now
+    )
     |> order_by([operation], asc: operation.id)
     |> limit(1)
     |> Repo.one()
   end
 
-  defp reconcile_operation(repository, repository_path, operation, absolute_deadline, owner) do
+  defp reconcile_operation(
+         repository,
+         repository_path,
+         operation,
+         absolute_deadline,
+         owner,
+         now
+       ) do
     with :ok <- check_deadline(absolute_deadline),
-         {:ok, claimed} <- claim(operation, owner) do
+         {:ok, claimed} <- claim(operation, owner, now) do
       try do
         with :ok <- check_deadline_or_release(claimed, absolute_deadline),
              {:ok, current_oid} <- read_current_ref(repository_path, claimed, absolute_deadline) do
@@ -107,18 +137,19 @@ defmodule ForgeRepos.GitWriteRecovery do
         _result = OperationLease.release(GitWriteOperation, claimed)
       end
     else
-      :busy -> {:error, :unavailable}
+      :busy -> :busy
+      {:error, :not_found} -> :busy
       {:error, :unavailable} = error -> error
       {:error, _reason} -> {:error, :unavailable}
     end
   end
 
-  defp claim(operation, owner) do
+  defp claim(operation, owner, now) do
     OperationLease.claim(
       GitWriteOperation,
       operation.id,
       owner,
-      DateTime.utc_now() |> DateTime.truncate(:second),
+      now,
       @lease_seconds
     )
   end

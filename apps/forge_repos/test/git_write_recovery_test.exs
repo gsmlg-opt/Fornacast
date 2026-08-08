@@ -111,17 +111,37 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
              )
   end
 
-  test "live leases block while expired leases are reclaimed", context do
+  test "older live leases are skipped while later proposed, expected, and expired rows recover",
+       context do
     update_ref(context.path, context.expected_oid)
     live = operation!(context, :prepared, request_id: "live")
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     assert {:ok, claimed_live} = OperationLease.claim(GitWriteOperation, live.id, "live", now, 30)
 
-    assert {:error, :unavailable} = locked_reconcile(context)
-    assert %{state: :prepared, lease_owner: "live"} = Repo.get!(GitWriteOperation, live.id)
-    assert :ok = OperationLease.release(GitWriteOperation, claimed_live)
+    proposed_ref = "refs/heads/proposed"
+    expected_ref = "refs/heads/expected"
+    expired_ref = "refs/heads/expired"
+    update_ref(context.path, context.proposed_oid, proposed_ref)
+    update_ref(context.path, context.expected_oid, expected_ref)
+    update_ref(context.path, context.expected_oid, expired_ref)
 
-    expired = operation!(context, :prepared, request_id: "expired")
+    proposed =
+      operation!(context, :ref_advanced,
+        request_id: "proposed",
+        target_ref: proposed_ref
+      )
+
+    expected =
+      operation!(context, :prepared,
+        request_id: "expected",
+        target_ref: expected_ref
+      )
+
+    expired =
+      operation!(context, :prepared,
+        request_id: "expired",
+        target_ref: expired_ref
+      )
 
     assert {:ok, _expired_claim} =
              OperationLease.claim(
@@ -134,13 +154,30 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
 
     assert :ok = locked_reconcile(context)
 
+    assert %{state: :prepared, lease_owner: "live"} = Repo.get!(GitWriteOperation, live.id)
+    assert Repo.get!(GitWriteOperation, proposed.id).state == :bookkeeping_complete
+
+    assert %{state: :failed, failure_reason: "effect_not_started"} =
+             Repo.get!(GitWriteOperation, expected.id)
+
     assert %{state: :failed, failure_reason: "effect_not_started", lease_owner: nil} =
              Repo.get!(GitWriteOperation, expired.id)
+
+    assert :ok = OperationLease.release(GitWriteOperation, claimed_live)
   end
 
-  test "lost ownership blocks without committing repository or audit bookkeeping", context do
-    update_ref(context.path, context.proposed_oid)
-    operation = operation!(context, :ref_advanced)
+  test "a claim race advances the cursor without looping or starving later rows", context do
+    update_ref(context.path, context.expected_oid)
+    raced = operation!(context, :prepared, request_id: "raced")
+    later_ref = "refs/heads/later"
+    update_ref(context.path, context.expected_oid, later_ref)
+
+    later =
+      operation!(context, :prepared,
+        request_id: "later",
+        target_ref: later_ref
+      )
+
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     result =
@@ -156,13 +193,13 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
         fn -> locked_reconcile(context) end
       )
 
-    assert {:error, :unavailable} = result
+    assert :ok = result
 
-    assert %{state: :ref_advanced, lease_owner: "stolen"} =
-             Repo.get!(GitWriteOperation, operation.id)
+    assert %{state: :prepared, lease_owner: "stolen"} =
+             Repo.get!(GitWriteOperation, raced.id)
 
-    assert is_nil(Repo.get!(Repository, context.repository.id).last_pushed_at)
-    assert Repo.aggregate(AuditEvent, :count, :id) == 0
+    assert %{state: :failed, failure_reason: "effect_not_started"} =
+             Repo.get!(GitWriteOperation, later.id)
   end
 
   test "SQL failure after proposed evidence rolls back bookkeeping and remains recoverable",
@@ -252,7 +289,7 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
         Keyword.get(overrides, :request_id, "request-#{System.unique_integer([:positive])}"),
       kind: :ref_update,
       state: state,
-      target_ref: "refs/heads/main",
+      target_ref: Keyword.get(overrides, :target_ref, "refs/heads/main"),
       expected_oid: Keyword.get(overrides, :expected_oid, context.expected_oid),
       proposed_oid: context.proposed_oid,
       result_blob_oid: nil,
@@ -275,7 +312,7 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
     {first, second, third}
   end
 
-  defp update_ref(path, oid), do: git!(path, ["update-ref", "refs/heads/main", oid])
+  defp update_ref(path, oid, ref \\ "refs/heads/main"), do: git!(path, ["update-ref", ref, oid])
 
   defp git_snapshot(path) do
     {git!(path, ["for-each-ref", "--format=%(refname) %(objectname)"]),
