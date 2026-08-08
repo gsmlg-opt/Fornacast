@@ -2281,6 +2281,45 @@ defmodule ForgePullsTest do
       database =
         Path.join(System.tmp_dir!(), "pull-metadata-migration-#{System.unique_integer()}.db")
 
+      migrations_path = Ecto.Migrator.migrations_path(Repo)
+
+      migration_specs = [
+        {20_260_703_000_100, "CreateFirstReleaseCoreTables",
+         "20260703000100_create_first_release_core_tables.exs"},
+        {20_260_706_000_100, "AddOrganizationAccounts",
+         "20260706000100_add_organization_accounts.exs"},
+        {20_260_717_000_100, "CreateAPIKeys", "20260717000100_create_api_keys.exs"},
+        {20_260_721_000_100, "AddAPIRepositorySettings",
+         "20260721000100_add_api_repository_settings.exs"},
+        {20_260_721_000_200, "CreateGitWriteOperations",
+         "20260721000200_create_git_write_operations.exs"},
+        {20_260_721_000_300, "CreateIssueDomain", "20260721000300_create_issue_domain.exs"},
+        {20_260_721_000_400, "CreatePullDomain", "20260721000400_create_pull_domain.exs"},
+        {20_260_809_000_100, "AddPullMergeRequestMetadata",
+         "20260809000100_add_pull_merge_request_metadata.exs"}
+      ]
+
+      migration_specs =
+        Enum.map(migration_specs, fn {version, module_name, file} ->
+          {version, Module.concat(["Fornacast", "Repo", "Migrations", module_name]), file}
+        end)
+
+      newly_loaded_migrations =
+        Enum.flat_map(migration_specs, fn {_version, module, file} ->
+          if Code.ensure_loaded?(module) and function_exported?(module, :__migration__, 0) do
+            []
+          else
+            compiled = Code.compile_file(Path.join(migrations_path, file))
+            assert {^module, _bytecode} = List.keyfind(compiled, module, 0)
+            [module]
+          end
+        end)
+
+      migrations = Enum.map(migration_specs, fn {version, module, _file} -> {version, module} end)
+
+      metadata_migration =
+        Module.concat(["Fornacast", "Repo", "Migrations", "AddPullMergeRequestMetadata"])
+
       assert {:ok, isolated_repo} =
                Repo.start_link(
                  name: nil,
@@ -2291,17 +2330,6 @@ defmodule ForgePullsTest do
 
       previous_repo = Repo.get_dynamic_repo()
       Repo.put_dynamic_repo(isolated_repo)
-
-      migrations = [
-        {20_260_703_000_100, Fornacast.Repo.Migrations.CreateFirstReleaseCoreTables},
-        {20_260_706_000_100, Fornacast.Repo.Migrations.AddOrganizationAccounts},
-        {20_260_717_000_100, Fornacast.Repo.Migrations.CreateAPIKeys},
-        {20_260_721_000_100, Fornacast.Repo.Migrations.AddAPIRepositorySettings},
-        {20_260_721_000_200, Fornacast.Repo.Migrations.CreateGitWriteOperations},
-        {20_260_721_000_300, Fornacast.Repo.Migrations.CreateIssueDomain},
-        {20_260_721_000_400, Fornacast.Repo.Migrations.CreatePullDomain},
-        {20_260_809_000_100, Fornacast.Repo.Migrations.AddPullMergeRequestMetadata}
-      ]
 
       previous_version = 20_260_721_000_400
       version = 20_260_809_000_100
@@ -2317,7 +2345,7 @@ defmodule ForgePullsTest do
         assert [^version] = Ecto.Migrator.run(Repo, migrations, :up, to: version)
 
         Enum.each(
-          Fornacast.Repo.Migrations.AddPullMergeRequestMetadata.turso_down_statements(),
+          apply(metadata_migration, :turso_down_statements, []),
           &SQL.query!(Repo, &1, [])
         )
 
@@ -2344,7 +2372,7 @@ defmodule ForgePullsTest do
         assert Map.has_key?(turso_checks(down_table_sql), "state")
 
         Enum.each(
-          Fornacast.Repo.Migrations.AddPullMergeRequestMetadata.turso_up_statements(),
+          apply(metadata_migration, :turso_up_statements, []),
           &SQL.query!(Repo, &1, [])
         )
 
@@ -2403,6 +2431,11 @@ defmodule ForgePullsTest do
         Repo.put_dynamic_repo(previous_repo)
         GenServer.stop(isolated_repo)
         File.rm(database)
+
+        Enum.each(newly_loaded_migrations, fn module ->
+          :code.purge(module)
+          :code.delete(module)
+        end)
       end
     end
   end
