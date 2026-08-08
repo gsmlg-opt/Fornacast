@@ -167,6 +167,7 @@ const SIGNATURE_EMAIL_LIMIT: usize = 320;
 const MERGE_WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
 const MERGE_ANALYSIS_WORKERS: usize = 4;
 const MERGE_WRITE_WORKERS: usize = 1;
+const REF_UPDATE_DEADLINE: Duration = Duration::from_secs(10);
 const NO_FINAL_NEWLINE_MARKER: &[u8] = b"\\ No newline at end of file\n";
 // This remains independent of object size while leaving room for the complete mandatory tag
 // header, including long ref-derived tag names, before an arbitrarily large message body.
@@ -4708,6 +4709,271 @@ fn disk_usage_scan_duration(deadline_ms: u64) -> Duration {
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
+fn compare_and_swap_ref(
+    path: String,
+    full_ref: String,
+    expected_oid: Option<String>,
+    proposed_oid: String,
+    mode: String,
+    deadline_ms: u64,
+) -> Result<String, NativeError> {
+    compare_and_swap_ref_impl(
+        path,
+        full_ref,
+        expected_oid,
+        proposed_oid,
+        mode,
+        deadline_ms,
+    )
+}
+
+fn compare_and_swap_ref_impl(
+    path: String,
+    full_ref: String,
+    expected_oid: Option<String>,
+    proposed_oid: String,
+    mode: String,
+    deadline_ms: u64,
+) -> Result<String, NativeError> {
+    let deadline = Instant::now() + cas_duration(deadline_ms);
+    check_cas_deadline(deadline)?;
+
+    if mode != "fast_forward" {
+        return Err(native_error(
+            "invalid_input",
+            "only fast_forward ref updates are supported",
+        ));
+    }
+
+    let full_ref = validated_cas_ref_name(&full_ref)?;
+    let full_ref_for_error = full_ref.to_string();
+    let proposed_id = parse_cas_oid(&proposed_oid)?;
+    let expected_id = expected_oid.as_deref().map(parse_cas_oid).transpose()?;
+    let repo = open_physical_bare_repository(&path)?;
+    // gix validates a ref's previous value before it acquires that ref's transaction lock. This
+    // repository-scoped filesystem marker closes that window between CAS invocations, including
+    // invocations in other OS processes. Callers still use the repository writer fence to exclude
+    // non-CAS writers such as receive-pack.
+    let _cas_lock = acquire_cas_file_lock(&repo, deadline)?;
+
+    find_cas_commit(&repo, proposed_id, "proposed")?;
+
+    let actual = direct_ref_target(&repo, full_ref.as_bstr())?;
+    let previous = match (expected_id, actual) {
+        (None, DirectRefTarget::Missing) => gix_ref::transaction::PreviousValue::MustNotExist,
+        (None, DirectRefTarget::Object(_) | DirectRefTarget::Symbolic) => {
+            return Err(native_error("ref_exists", "reference already exists"));
+        }
+        (Some(expected), DirectRefTarget::Object(actual)) if expected == actual => {
+            find_cas_commit(&repo, expected, "expected")?;
+
+            if !cas_is_ancestor(&repo, expected, proposed_id, deadline)? {
+                return Err(native_error(
+                    "non_fast_forward",
+                    "proposed target is not a descendant of the expected target",
+                ));
+            }
+
+            gix_ref::transaction::PreviousValue::MustExistAndMatch(gix_ref::Target::Object(
+                expected,
+            ))
+        }
+        (Some(_), DirectRefTarget::Missing | DirectRefTarget::Symbolic) => {
+            return Err(native_error(
+                "stale_ref",
+                "reference no longer has the expected target",
+            ));
+        }
+        (Some(_), DirectRefTarget::Object(_)) => {
+            return Err(native_error("stale_ref", "reference target has changed"));
+        }
+    };
+
+    let edit = gix_ref::transaction::RefEdit {
+        change: gix_ref::transaction::Change::Update {
+            log: gix_ref::transaction::LogChange {
+                mode: gix_ref::transaction::RefLog::AndReference,
+                force_create_reflog: false,
+                message: format!("fornacast: compare-and-swap {full_ref}").into(),
+            },
+            expected: previous,
+            new: gix_ref::Target::Object(proposed_id),
+        },
+        name: full_ref,
+        deref: false,
+    };
+
+    check_cas_deadline(deadline)?;
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let lock_failure = gix::lock::acquire::Fail::from(remaining);
+    let transaction = repo
+        .refs
+        .transaction()
+        .prepare([edit], lock_failure, lock_failure)
+        .map_err(|error| {
+            classify_cas_transaction_error(&repo, &full_ref_for_error, expected_id, &error)
+        })?;
+
+    check_cas_deadline(deadline)?;
+    let committer = repo
+        .committer()
+        .transpose()
+        .map_err(|error| native_error("invalid_repository", error))?;
+    transaction.commit(committer).map_err(|error| {
+        classify_cas_transaction_error(&repo, &full_ref_for_error, expected_id, &error)
+    })?;
+
+    Ok(proposed_id.to_string())
+}
+
+fn validated_cas_ref_name(full_ref: &str) -> Result<gix_ref::FullName, NativeError> {
+    let allowed_namespace = full_ref
+        .strip_prefix("refs/heads/")
+        .or_else(|| full_ref.strip_prefix("refs/tags/"));
+
+    if allowed_namespace.is_none_or(str::is_empty) {
+        return Err(native_error(
+            "invalid_ref",
+            "reference must be a canonical full branch or tag ref",
+        ));
+    }
+
+    gix_ref::FullName::try_from(full_ref).map_err(|error| native_error("invalid_ref", error))
+}
+
+fn parse_cas_oid(oid: &str) -> Result<gix_hash::ObjectId, NativeError> {
+    if oid.len() != 40 || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(native_error(
+            "invalid_oid",
+            "object id must be 40 hexadecimal characters",
+        ));
+    }
+
+    if oid.bytes().all(|byte| byte == b'0') {
+        return Err(native_error(
+            "invalid_oid",
+            "reference deletion is not supported",
+        ));
+    }
+
+    gix_hash::ObjectId::from_hex(oid.as_bytes()).map_err(|error| native_error("invalid_oid", error))
+}
+
+fn cas_is_ancestor(
+    repo: &gix::Repository,
+    ancestor: gix_hash::ObjectId,
+    tip: gix_hash::ObjectId,
+    deadline: Instant,
+) -> Result<bool, NativeError> {
+    if ancestor == tip {
+        return Ok(true);
+    }
+
+    let walk = repo.rev_walk([tip]).all().map_err(diff_read_error)?;
+
+    for info in walk {
+        check_cas_deadline(deadline)?;
+        if info.map_err(diff_read_error)?.id == ancestor {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn find_cas_commit<'repo>(
+    repo: &'repo gix::Repository,
+    oid: gix_hash::ObjectId,
+    position: &str,
+) -> Result<gix::Commit<'repo>, NativeError> {
+    let object = match repo.find_object(oid) {
+        Ok(object) => object,
+        Err(gix_object::find::existing::Error::NotFound { .. }) => {
+            return Err(native_error(
+                "target_not_commit",
+                format!("{position} target must be an existing commit"),
+            ));
+        }
+        Err(gix_object::find::existing::Error::Find(error)) => {
+            let kind = if error_chain_contains_storage_io(error.as_ref()) {
+                "storage_unavailable"
+            } else {
+                "corrupt_repository"
+            };
+            return Err(native_error(kind, error));
+        }
+    };
+
+    object.try_into_commit().map_err(|_| {
+        native_error(
+            "target_not_commit",
+            format!("{position} target must be a commit"),
+        )
+    })
+}
+
+fn classify_cas_transaction_error(
+    repo: &gix::Repository,
+    full_ref: &str,
+    expected: Option<gix_hash::ObjectId>,
+    transaction_error: &impl std::fmt::Display,
+) -> NativeError {
+    let actual = match direct_ref_target(repo, full_ref.as_bytes()) {
+        Ok(actual) => actual,
+        Err(read_error) => return read_error,
+    };
+    let detail = format!("reference transaction failed: {transaction_error}");
+
+    match (expected, actual) {
+        (None, DirectRefTarget::Object(_) | DirectRefTarget::Symbolic) => {
+            native_error("ref_exists", detail)
+        }
+        (Some(expected), DirectRefTarget::Object(actual)) if expected == actual => {
+            native_error("storage_unavailable", detail)
+        }
+        (Some(_), _) => native_error("stale_ref", detail),
+        (None, DirectRefTarget::Missing) => native_error("storage_unavailable", detail),
+    }
+}
+
+fn check_cas_deadline(deadline: Instant) -> Result<(), NativeError> {
+    if Instant::now() >= deadline {
+        Err(native_error(
+            "ref_timeout",
+            "reference update exceeded its deadline",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn acquire_cas_file_lock(
+    repo: &gix::Repository,
+    deadline: Instant,
+) -> Result<gix::lock::Marker, NativeError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let resource = repo.path().join("fornacast-ref-cas");
+
+    gix::lock::Marker::acquire_to_hold_resource(
+        resource,
+        gix::lock::acquire::Fail::from(remaining),
+        Some(repo.path().to_path_buf()),
+    )
+    .map_err(|error| match error {
+        gix::lock::acquire::Error::PermanentlyLocked { .. } => native_error(
+            "ref_timeout",
+            "reference update exceeded its deadline waiting for the CAS lock",
+        ),
+        gix::lock::acquire::Error::Io(error) => native_error("storage_unavailable", error),
+    })
+}
+
+fn cas_duration(deadline_ms: u64) -> Duration {
+    Duration::from_millis(deadline_ms.min(REF_UPDATE_DEADLINE.as_millis() as u64))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
 fn pack_objects<'env>(
     env: rustler::Env<'env>,
     path: String,
@@ -5987,6 +6253,121 @@ mod tests {
         assert_eq!(merge_scan_duration(u64::MAX), Duration::from_secs(30));
         assert_eq!(MERGE_ANALYSIS_WORKERS, 4);
         assert_eq!(MERGE_WRITE_WORKERS, 1);
+    }
+
+    #[test]
+    fn compare_and_swap_ref_accepts_only_canonical_branch_or_tag_refs() {
+        assert!(validated_cas_ref_name("refs/heads/main").is_ok());
+        assert!(validated_cas_ref_name("refs/tags/v1.0.0").is_ok());
+
+        for invalid in [
+            "main",
+            "HEAD",
+            "refs/main",
+            "refs/heads/",
+            "refs/heads/main.lock",
+            "refs/heads/../main",
+            "refs/remotes/origin/main",
+        ] {
+            assert!(
+                matches!(validated_cas_ref_name(invalid), Err((kind, _)) if kind == "invalid_ref"),
+                "{invalid:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn compare_and_swap_ref_deadline_cannot_exceed_ten_seconds() {
+        assert_eq!(cas_duration(0), Duration::ZERO);
+        assert_eq!(cas_duration(u64::MAX), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn compare_and_swap_ref_commits_an_exact_fast_forward_without_writing_objects() {
+        let fixture = MergeBoundaryFixture::new("ref-cas");
+        let commits = fixture.fast_import_empty_chain(2);
+        let first = commits.get(&1).expect("first commit");
+        let second = commits.get(&2).expect("second commit");
+        let before_objects = tree_history_git(
+            &[
+                "--git-dir",
+                fixture.path(),
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname)",
+            ],
+            None,
+        );
+
+        assert_eq!(
+            compare_and_swap_ref_impl(
+                fixture.path().to_owned(),
+                "refs/heads/cas".to_owned(),
+                None,
+                first.clone(),
+                "fast_forward".to_owned(),
+                10_000,
+            ),
+            Ok(first.clone())
+        );
+        assert_eq!(
+            compare_and_swap_ref_impl(
+                fixture.path().to_owned(),
+                "refs/heads/cas".to_owned(),
+                Some(first.clone()),
+                second.clone(),
+                "fast_forward".to_owned(),
+                10_000,
+            ),
+            Ok(second.clone())
+        );
+        assert_eq!(
+            tree_history_git(
+                &["--git-dir", fixture.path(), "rev-parse", "refs/heads/cas"],
+                None,
+            ),
+            *second
+        );
+        assert_eq!(
+            tree_history_git(
+                &[
+                    "--git-dir",
+                    fixture.path(),
+                    "cat-file",
+                    "--batch-all-objects",
+                    "--batch-check=%(objectname)",
+                ],
+                None,
+            ),
+            before_objects
+        );
+    }
+
+    #[test]
+    fn compare_and_swap_ref_times_out_behind_the_repository_filesystem_lock() {
+        let fixture = MergeBoundaryFixture::new("ref-cas-lock");
+        let commits = fixture.fast_import_empty_chain(1);
+        let proposed = commits.get(&1).expect("proposed commit");
+        let resource = fixture.repo_path.join("fornacast-ref-cas");
+        let _held_lock = gix::lock::Marker::acquire_to_hold_resource(
+            resource,
+            gix::lock::acquire::Fail::Immediately,
+            Some(fixture.repo_path.clone()),
+        )
+        .expect("hold repository CAS lock");
+
+        assert!(matches!(
+            compare_and_swap_ref_impl(
+                fixture.path().to_owned(),
+                "refs/heads/cas-timeout".to_owned(),
+                None,
+                proposed.clone(),
+                "fast_forward".to_owned(),
+                1,
+            ),
+            Err((kind, _)) if kind == "ref_timeout"
+        ));
+        assert!(!fixture.repo_path.join("refs/heads/cas-timeout").exists());
     }
 
     #[test]

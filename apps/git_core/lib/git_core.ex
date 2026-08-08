@@ -551,6 +551,68 @@ defmodule GitCore do
     |> wrap_read(:write_merge_commit)
   end
 
+  @doc """
+  Atomically creates or fast-forwards a canonical full ref from the exact expected target.
+
+  The proposed object must already exist and be a commit. This operation never writes objects,
+  deletes refs, or permits force updates. The caller must hold the repository writer fence when
+  non-CAS writers can target the same repository.
+  """
+  @spec compare_and_swap_ref(
+          Path.t(),
+          String.t(),
+          String.t() | nil,
+          String.t(),
+          :fast_forward,
+          keyword()
+        ) :: {:ok, String.t()} | {:error, GitCore.Error.t()}
+  def compare_and_swap_ref(path, full_ref, expected_oid, proposed_oid, :fast_forward, opts)
+      when is_binary(path) and is_binary(full_ref) and
+             (is_nil(expected_oid) or is_binary(expected_oid)) and is_binary(proposed_oid) and
+             is_list(opts) do
+    deadline =
+      if Keyword.keyword?(opts),
+        do: Keyword.get(opts, :deadline_ms, GitCore.Limits.get(:ref_deadline_ms)),
+        else: :invalid
+
+    case deadline do
+      deadline_ms when is_integer(deadline_ms) ->
+        deadline_ms = deadline_ms |> max(0) |> min(GitCore.Limits.get(:ref_deadline_ms))
+
+        GitCore.Native.compare_and_swap_ref(
+          path,
+          full_ref,
+          expected_oid,
+          proposed_oid,
+          "fast_forward",
+          deadline_ms
+        )
+        |> wrap_read(:compare_and_swap_ref)
+
+      _invalid_deadline ->
+        invalid_input(:compare_and_swap_ref, "deadline_ms must be an integer")
+    end
+  end
+
+  def compare_and_swap_ref(_path, _full_ref, _expected_oid, _proposed_oid, _mode, _opts) do
+    invalid_input(:compare_and_swap_ref, "invalid compare-and-swap arguments")
+  end
+
+  @spec invalidate_repository_cache(Path.t()) :: :ok
+  def invalidate_repository_cache(repository_path) when is_binary(repository_path) do
+    invalidate_repository_cache(repository_path, [])
+  end
+
+  @doc false
+  def invalidate_repository_cache(repository_path, opts)
+      when is_binary(repository_path) and is_list(opts) do
+    try do
+      GitCore.Cache.invalidate_repository(repository_path, opts)
+    catch
+      _kind, _reason -> :ok
+    end
+  end
+
   def pack_objects(path, wants) when is_binary(path) and is_list(wants) do
     GitCore.Native.pack_objects(path, wants)
   end
@@ -910,6 +972,10 @@ defmodule GitCore do
     {:error, %GitCore.Error{kind: native_error_kind(kind), operation: operation, detail: detail}}
   end
 
+  defp invalid_input(operation, detail) do
+    {:error, %GitCore.Error{kind: :invalid_input, operation: operation, detail: detail}}
+  end
+
   defp merge_analysis_result(native_result) do
     with {:ok,
           {native_base_oid, native_head_oid, mergeable, ahead_by, behind_by, commit_count,
@@ -944,4 +1010,11 @@ defmodule GitCore do
   defp native_error_kind("merge_conflict"), do: :merge_conflict
   defp native_error_kind("merge_byte_limit"), do: :merge_byte_limit
   defp native_error_kind("invalid_input"), do: :invalid_input
+  defp native_error_kind("stale_ref"), do: :stale_ref
+  defp native_error_kind("ref_exists"), do: :ref_exists
+  defp native_error_kind("non_fast_forward"), do: :non_fast_forward
+  defp native_error_kind("invalid_ref"), do: :invalid_ref
+  defp native_error_kind("invalid_oid"), do: :invalid_oid
+  defp native_error_kind("target_not_commit"), do: :target_not_commit
+  defp native_error_kind("ref_timeout"), do: :ref_timeout
 end

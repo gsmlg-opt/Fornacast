@@ -29,6 +29,141 @@ defmodule GitCore.RepositoryWriteModelTest do
     end
   end
 
+  test "compare-and-swap creates an absent ref and advances it by exact fast-forward", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = clean_fixture!(tmp_dir)
+    target_ref = "refs/heads/cas-target"
+    before_objects = object_ids(fixture.repo_path)
+
+    raw_base = git!(["--git-dir", fixture.repo_path, "cat-file", "-p", fixture.base_oid])
+    assert "parent #{fixture.root_oid}" in String.split(raw_base, "\n")
+
+    assert {:ok, root_oid} =
+             GitCore.compare_and_swap_ref(
+               fixture.repo_path,
+               target_ref,
+               nil,
+               fixture.root_oid,
+               :fast_forward,
+               deadline_ms: 10_001
+             )
+
+    assert root_oid == fixture.root_oid
+    assert git!(["--git-dir", fixture.repo_path, "rev-parse", target_ref]) == fixture.root_oid
+    assert object_ids(fixture.repo_path) == before_objects
+
+    assert {:ok, base_oid} =
+             GitCore.compare_and_swap_ref(
+               fixture.repo_path,
+               target_ref,
+               fixture.root_oid,
+               fixture.base_oid,
+               :fast_forward,
+               deadline_ms: 10_001
+             )
+
+    assert base_oid == fixture.base_oid
+    assert git!(["--git-dir", fixture.repo_path, "rev-parse", target_ref]) == fixture.base_oid
+    assert object_ids(fixture.repo_path) == before_objects
+  end
+
+  test "only one expected-absent compare-and-swap wins a race", %{tmp_dir: tmp_dir} do
+    fixture = clean_fixture!(tmp_dir)
+    target_ref = "refs/heads/raced"
+
+    results =
+      [fixture.base_oid, fixture.head_oid]
+      |> Task.async_stream(
+        fn proposed_oid ->
+          GitCore.compare_and_swap_ref(
+            fixture.repo_path,
+            target_ref,
+            nil,
+            proposed_oid,
+            :fast_forward,
+            deadline_ms: 10_000
+          )
+        end,
+        max_concurrency: 2,
+        ordered: false,
+        timeout: 15_000
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.count(results, &match?({:ok, _oid}, &1)) == 1
+
+    assert Enum.count(results, fn
+             {:error, %GitCore.Error{kind: :ref_exists, operation: :compare_and_swap_ref}} -> true
+             _other -> false
+           end) == 1
+
+    [{:ok, recorded_oid}] = Enum.filter(results, &match?({:ok, _oid}, &1))
+    assert git!(["--git-dir", fixture.repo_path, "rev-parse", target_ref]) == recorded_oid
+  end
+
+  test "compare-and-swap rejects conflicts and invalid targets without side effects", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = clean_fixture!(tmp_dir)
+    target_ref = "refs/heads/main"
+    tree_oid = git!(["--git-dir", fixture.repo_path, "rev-parse", "#{fixture.base_oid}^{tree}"])
+
+    failures = [
+      {fixture.root_oid, fixture.head_oid, target_ref, 10_000, :stale_ref},
+      {fixture.base_oid, fixture.base_oid, "refs/heads/missing", 10_000, :stale_ref},
+      {nil, fixture.head_oid, target_ref, 10_000, :ref_exists},
+      {fixture.base_oid, fixture.head_oid, target_ref, 10_000, :non_fast_forward},
+      {fixture.base_oid, tree_oid, target_ref, 10_000, :target_not_commit},
+      {fixture.base_oid, fixture.base_oid, "main", 10_000, :invalid_ref},
+      {"not-an-oid", fixture.base_oid, target_ref, 10_000, :invalid_oid},
+      {fixture.base_oid, "not-an-oid", target_ref, 10_000, :invalid_oid},
+      {fixture.base_oid, String.duplicate("0", 40), target_ref, 10_000, :invalid_oid},
+      {fixture.base_oid, String.duplicate("f", 40), target_ref, 10_000, :target_not_commit},
+      {fixture.base_oid, fixture.base_oid, target_ref, 0, :ref_timeout}
+    ]
+
+    for {expected, proposed, ref, deadline_ms, kind} <- failures do
+      before_refs = refs(fixture.repo_path)
+      before_objects = object_ids(fixture.repo_path)
+
+      assert {:error, %GitCore.Error{kind: ^kind, operation: :compare_and_swap_ref}} =
+               GitCore.compare_and_swap_ref(
+                 fixture.repo_path,
+                 ref,
+                 expected,
+                 proposed,
+                 :fast_forward,
+                 deadline_ms: deadline_ms
+               )
+
+      assert refs(fixture.repo_path) == before_refs
+      assert object_ids(fixture.repo_path) == before_objects
+    end
+  end
+
+  test "compare-and-swap validates its public mode and deadline options" do
+    assert {:error, %GitCore.Error{kind: :invalid_input, operation: :compare_and_swap_ref}} =
+             GitCore.compare_and_swap_ref(
+               "unused",
+               "refs/heads/main",
+               nil,
+               String.duplicate("a", 40),
+               :force,
+               []
+             )
+
+    assert {:error, %GitCore.Error{kind: :invalid_input, operation: :compare_and_swap_ref}} =
+             GitCore.compare_and_swap_ref(
+               "unused",
+               "refs/heads/main",
+               nil,
+               String.duplicate("a", 40),
+               :fast_forward,
+               deadline_ms: "later"
+             )
+  end
+
   test "analyzes clean divergence, identical tips, and an already-contained head", %{
     tmp_dir: tmp_dir
   } do
