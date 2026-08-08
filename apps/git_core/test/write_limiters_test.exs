@@ -98,20 +98,45 @@ defmodule GitCore.RepositoryWriteLimiterTest do
     assert_receive {:released, ^waiter}
   end
 
-  test "the supervised production limiter restarts after a crash" do
+  test "a production crash stays unavailable while existing owners survive" do
+    parent = self()
+
+    holder =
+      spawn(fn ->
+        {:ok, lease} = RepositoryWriteLimiter.acquire(:surviving_owner, deadline())
+        send(parent, {:holder_acquired, self(), lease})
+
+        receive do
+          :release ->
+            :ok = RepositoryWriteLimiter.release(lease)
+            send(parent, {:holder_released, self()})
+        end
+      end)
+
+    assert_receive {:holder_acquired, ^holder, _lease}
     limiter = Process.whereis(RepositoryWriteLimiter)
     monitor = Process.monitor(limiter)
     Process.exit(limiter, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^limiter, :killed}
 
-    replacement = wait_for_restarted_limiter(limiter)
+    assert Process.alive?(holder)
+    assert Process.whereis(RepositoryWriteLimiter) == nil
+    assert {:error, :unavailable} = RepositoryWriteLimiter.acquire(:surviving_owner, deadline())
+    assert {:error, :unavailable} = RepositoryWriteLimiter.acquire(:other_repository, deadline())
+
+    assert :ok = Application.stop(:git_core)
+    assert {:ok, _started} = Application.ensure_all_started(:git_core)
+    replacement = Process.whereis(RepositoryWriteLimiter)
     assert is_pid(replacement)
-    assert {:ok, lease} = RepositoryWriteLimiter.acquire(:after_restart, deadline())
+    assert {:ok, lease} = RepositoryWriteLimiter.acquire(:after_operator_restart, deadline())
     assert :ok = RepositoryWriteLimiter.release(lease)
+
+    send(holder, :release)
+    assert_receive {:holder_released, ^holder}
   end
 
-  test "production is permanent while isolated child specs are temporary" do
-    assert RepositoryWriteLimiter.child_spec([]).restart == :permanent
+  test "production and isolated child specs are temporary to fail closed" do
+    assert RepositoryWriteLimiter.child_spec([]).restart == :temporary
     assert RepositoryWriteLimiter.child_spec(server: nil).restart == :temporary
   end
 
@@ -150,22 +175,5 @@ defmodule GitCore.RepositoryWriteLimiterTest do
 
   defp wait_for_waiters(expected, 0) do
     flunk("repository writer limiter did not reach #{expected} waiters")
-  end
-
-  defp wait_for_restarted_limiter(old_pid, attempts \\ 100)
-
-  defp wait_for_restarted_limiter(old_pid, attempts) when attempts > 0 do
-    case Process.whereis(RepositoryWriteLimiter) do
-      pid when is_pid(pid) and pid != old_pid ->
-        pid
-
-      _ ->
-        Process.sleep(5)
-        wait_for_restarted_limiter(old_pid, attempts - 1)
-    end
-  end
-
-  defp wait_for_restarted_limiter(_old_pid, 0) do
-    flunk("repository writer limiter did not restart")
   end
 end

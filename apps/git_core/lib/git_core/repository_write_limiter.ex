@@ -1,11 +1,19 @@
 defmodule GitCore.RepositoryWriteLimiter do
-  @moduledoc false
+  @moduledoc """
+  Serializes repository writes by repository key and across the node.
+
+  The supervised child is temporary by design. Restarting it automatically
+  would forget leases whose owners survived the crash and could admit
+  conflicting writes. After a crash, admission fails closed until an operator
+  or application restart deliberately restores the limiter.
+  """
 
   use GenServer
 
   @lease_tag {__MODULE__, :lease}
   @deadline_timer_chunk_ms 60_000
   @opaque lease :: {{__MODULE__, :lease}, GenServer.server(), reference()}
+  @type acquire_error :: :timeout | :unavailable
 
   defmodule State do
     @moduledoc false
@@ -20,15 +28,10 @@ defmodule GitCore.RepositoryWriteLimiter do
 
   @doc false
   def child_spec(opts) do
-    restart =
-      if Keyword.get(opts, :server, __MODULE__) == __MODULE__,
-        do: :permanent,
-        else: :temporary
-
     %{
       id: __MODULE__,
       start: {__MODULE__, :start_link, [opts]},
-      restart: restart,
+      restart: :temporary,
       shutdown: 5_000,
       type: :worker,
       modules: [__MODULE__]
@@ -41,11 +44,16 @@ defmodule GitCore.RepositoryWriteLimiter do
     GenServer.start_link(__MODULE__, opts, start_opts)
   end
 
-  @spec acquire(term(), integer()) :: {:ok, lease()} | {:error, :timeout}
+  @spec acquire(term(), integer()) ::
+          {:ok, lease()} | {:error, acquire_error()}
   def acquire(repository_key, absolute_deadline_ms) when is_integer(absolute_deadline_ms) do
-    case GenServer.call(__MODULE__, {:acquire, repository_key, absolute_deadline_ms}, :infinity) do
-      {:ok, lease} -> {:ok, {@lease_tag, __MODULE__, lease}}
-      {:error, :timeout} = error -> error
+    try do
+      case GenServer.call(__MODULE__, {:acquire, repository_key, absolute_deadline_ms}, :infinity) do
+        {:ok, lease} -> {:ok, {@lease_tag, __MODULE__, lease}}
+        {:error, :timeout} = error -> error
+      end
+    catch
+      :exit, _reason -> {:error, :unavailable}
     end
   end
 
