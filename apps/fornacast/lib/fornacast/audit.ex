@@ -3,22 +3,27 @@ defmodule Fornacast.Audit do
   Minimal audit-event writer for first-release repository operations.
   """
 
+  @sensitive_metadata_keys ~w(token content message storage_path)
+
   alias Fornacast.{AuditEvent, Repo}
 
   def record(actor, action, target_type, target_id, metadata \\ %{}, opts \\ []) do
-    attrs = %{
-      actor_user_id: actor_id(actor),
-      action: action,
-      target_type: target_type,
-      target_id: to_string(target_id),
-      metadata: metadata || %{},
-      ip_address: opts[:ip_address],
-      user_agent: opts[:user_agent]
-    }
+    # WORKAROUND(upstream): gsmlg-dev/concord#70
+    if turso?() or Repo.in_transaction?() do
+      request_metadata = Keyword.get(opts, :request_metadata, %{}) || %{}
 
-    %AuditEvent{}
-    |> AuditEvent.changeset(attrs)
-    |> Repo.insert()
+      actor
+      |> audit_attrs(action, target_type, target_id, metadata, request_metadata, opts)
+      |> then(&AuditEvent.changeset(%AuditEvent{}, &1))
+      |> Repo.insert(insert_options(opts))
+    else
+      case Ecto.Multi.new()
+           |> record_multi(:audit, actor, action, target_type, target_id, metadata, opts)
+           |> Repo.transaction() do
+        {:ok, %{audit: audit}} -> {:ok, audit}
+        {:error, :audit, reason, _changes} -> {:error, reason}
+      end
+    end
   end
 
   @spec record_multi(
@@ -32,23 +37,35 @@ defmodule Fornacast.Audit do
           keyword()
         ) :: Ecto.Multi.t()
   def record_multi(multi, key, actor, action, target_type, target_id, metadata, opts \\ []) do
-    Ecto.Multi.insert(multi, key, fn changes ->
-      target_id = resolve_multi_value(target_id, changes)
-      metadata = resolve_multi_value(metadata, changes)
-      request_metadata = Keyword.get(opts, :request_metadata, %{}) || %{}
+    Ecto.Multi.insert(
+      multi,
+      key,
+      fn changes ->
+        target_id = resolve_multi_value(target_id, changes)
+        metadata = resolve_multi_value(metadata, changes)
+        request_metadata = Keyword.get(opts, :request_metadata, %{}) || %{}
 
-      attrs = %{
-        actor_user_id: actor_id(actor),
-        action: action,
-        target_type: target_type,
-        target_id: to_string(target_id),
-        metadata: merge_metadata(metadata || %{}, request_metadata),
-        ip_address: request_metadata_value(request_metadata, :ip_address),
-        user_agent: request_metadata_value(request_metadata, :user_agent)
-      }
+        attrs =
+          audit_attrs(actor, action, target_type, target_id, metadata, request_metadata, opts)
 
-      AuditEvent.changeset(%AuditEvent{}, attrs)
-    end)
+        AuditEvent.changeset(%AuditEvent{}, attrs)
+      end,
+      insert_options(opts)
+    )
+  end
+
+  defp audit_attrs(actor, action, target_type, target_id, metadata, request_metadata, opts) do
+    %{
+      actor_user_id: actor_id(actor),
+      action: action,
+      target_type: target_type,
+      target_id: to_string(target_id),
+      metadata: metadata |> merge_metadata(request_metadata) |> reject_sensitive_metadata(),
+      request_id: option_value(opts, :request_id, request_metadata),
+      operation_id: option_value(opts, :operation_id, request_metadata),
+      ip_address: option_value(opts, :ip_address, request_metadata),
+      user_agent: option_value(opts, :user_agent, request_metadata)
+    }
   end
 
   defp resolve_multi_value(fun, changes) when is_function(fun, 1), do: fun.(changes)
@@ -78,6 +95,41 @@ defmodule Fornacast.Audit do
       {:ok, value} -> value
       :error -> Map.get(metadata, key)
     end
+  end
+
+  defp option_value(opts, key, request_metadata) do
+    if Keyword.has_key?(opts, key) do
+      Keyword.get(opts, key)
+    else
+      request_metadata_value(request_metadata || %{}, key)
+    end
+  end
+
+  defp insert_options(opts) do
+    if option_value(opts, :operation_id, Keyword.get(opts, :request_metadata, %{})) == nil do
+      []
+    else
+      [on_conflict: :nothing, conflict_target: [:operation_id, :action]]
+    end
+  end
+
+  defp reject_sensitive_metadata(metadata) when is_map(metadata) do
+    Enum.reduce(metadata, %{}, fn {key, value}, safe ->
+      if to_string(key) in @sensitive_metadata_keys do
+        safe
+      else
+        Map.put(safe, key, reject_sensitive_metadata(value))
+      end
+    end)
+  end
+
+  defp reject_sensitive_metadata(metadata) when is_list(metadata),
+    do: Enum.map(metadata, &reject_sensitive_metadata/1)
+
+  defp reject_sensitive_metadata(metadata), do: metadata
+
+  defp turso? do
+    Application.get_env(:fornacast, :database_adapter) in ["libsql", "turso"]
   end
 
   defp actor_id(%{id: id}), do: id
