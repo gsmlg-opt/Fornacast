@@ -3,6 +3,7 @@ defmodule GitCore.RepositoryWriteLimiterTest do
 
   alias GitCore.RepositoryWriteLimiter
   @production_registry_key {RepositoryWriteLimiter, :production_grants}
+  @production_registry_lock {RepositoryWriteLimiter, :production_registry_lock}
 
   test "two repository keys run concurrently while a third waits" do
     assert {:ok, first} = RepositoryWriteLimiter.acquire(:first, deadline())
@@ -199,6 +200,78 @@ defmodule GitCore.RepositoryWriteLimiterTest do
     release_holder(holder)
   end
 
+  test "release during absence prevents grant recovery and stays idempotent" do
+    {holder, lease} = start_holder(:released_during_absence)
+    crash_limiter()
+
+    assert :ok = RepositoryWriteLimiter.release(lease)
+    assert :ok = RepositoryWriteLimiter.release(lease)
+
+    restart_git_core()
+    assert Process.alive?(holder)
+    assert_grant_count(0)
+
+    assert {:ok, replacement} =
+             RepositoryWriteLimiter.acquire(:released_during_absence, deadline())
+
+    assert :ok = RepositoryWriteLimiter.release(replacement)
+    Process.exit(holder, :kill)
+  end
+
+  test "concurrent releases during absence remove every exact lease" do
+    {first_holder, first_lease} = start_holder(:concurrent_release_one)
+    {second_holder, second_lease} = start_holder(:concurrent_release_two)
+    crash_limiter()
+
+    releases =
+      for lease <- [first_lease, second_lease] do
+        Task.async(fn -> RepositoryWriteLimiter.release(lease) end)
+      end
+
+    assert Enum.map(releases, &Task.await/1) == [:ok, :ok]
+    restart_git_core()
+    assert_grant_count(0)
+
+    assert {:ok, first} = RepositoryWriteLimiter.acquire(:concurrent_release_one, deadline())
+    assert {:ok, second} = RepositoryWriteLimiter.acquire(:concurrent_release_two, deadline())
+    assert :ok = RepositoryWriteLimiter.release(first)
+    assert :ok = RepositoryWriteLimiter.release(second)
+    Process.exit(first_holder, :kill)
+    Process.exit(second_holder, :kill)
+  end
+
+  test "release racing production init removes persistent and recovered state" do
+    {holder, lease} = start_holder(:release_restart_race)
+    crash_limiter()
+
+    lock = {@production_registry_lock, self()}
+    assert :global.set_lock(lock)
+
+    release = Task.async(fn -> RepositoryWriteLimiter.release(lease) end)
+    assert Task.yield(release, 20) == nil
+
+    parent = self()
+
+    restart =
+      Task.async(fn ->
+        :ok = Application.stop(:git_core)
+        send(parent, :git_core_stopped_for_race)
+        Application.ensure_all_started(:git_core)
+      end)
+
+    assert_receive :git_core_stopped_for_race
+    :global.del_lock(lock)
+
+    assert Task.await(release) == :ok
+    assert {:ok, _started} = Task.await(restart)
+    assert_grant_count(0)
+    assert :persistent_term.get(@production_registry_key) == %{}
+
+    assert {:ok, replacement} = RepositoryWriteLimiter.acquire(:release_restart_race, deadline())
+    assert :ok = RepositoryWriteLimiter.release(replacement)
+    Process.exit(holder, :kill)
+  end
+
   test "production and isolated child specs are temporary" do
     assert RepositoryWriteLimiter.child_spec([]).restart == :temporary
     assert RepositoryWriteLimiter.child_spec(server: nil).restart == :temporary
@@ -229,12 +302,16 @@ defmodule GitCore.RepositoryWriteLimiterTest do
   end
 
   defp crash_and_restart_limiter do
+    crash_limiter()
+    assert {:error, :unavailable} = RepositoryWriteLimiter.acquire(:during_crash, deadline())
+    restart_git_core()
+  end
+
+  defp crash_limiter do
     limiter = Process.whereis(RepositoryWriteLimiter)
     monitor = Process.monitor(limiter)
     Process.exit(limiter, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^limiter, :killed}
-    assert {:error, :unavailable} = RepositoryWriteLimiter.acquire(:during_crash, deadline())
-    restart_git_core()
   end
 
   defp restart_git_core do

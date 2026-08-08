@@ -12,6 +12,7 @@ defmodule GitCore.RepositoryWriteLimiter do
 
   @lease_tag {__MODULE__, :lease}
   @production_registry_key {__MODULE__, :production_grants}
+  @production_registry_lock {__MODULE__, :production_registry_lock}
   @deadline_timer_chunk_ms 60_000
   @opaque lease :: {{__MODULE__, :lease}, GenServer.server(), reference()}
   @type acquire_error :: :timeout | :unavailable
@@ -64,7 +65,13 @@ defmodule GitCore.RepositoryWriteLimiter do
     try do
       GenServer.call(server, {:release, lease}, :infinity)
     catch
-      :exit, _reason -> :ok
+      :exit, _reason ->
+        if server == __MODULE__ do
+          delete_production_grant(lease)
+          release_recovered_grant(server, lease)
+        end
+
+        :ok
     end
   end
 
@@ -303,32 +310,33 @@ defmodule GitCore.RepositoryWriteLimiter do
   end
 
   defp recover_production_grants(state) do
-    registry = :persistent_term.get(@production_registry_key, %{})
-
-    {grants, active_keys, monitors, live_registry} =
-      Enum.reduce(registry, {%{}, MapSet.new(), %{}, %{}}, fn
-        {lease, %{owner: owner, repository_key: repository_key}},
-        {grants, active_keys, monitors, live_registry}
-        when is_reference(lease) and is_pid(owner) ->
-          if Process.alive?(owner) do
-            monitor = Process.monitor(owner)
-            grant = %{owner: owner, monitor: monitor, repository_key: repository_key}
-
-            {
-              Map.put(grants, lease, grant),
-              MapSet.put(active_keys, repository_key),
-              Map.put(monitors, monitor, {:grant, lease}),
-              Map.put(live_registry, lease, %{owner: owner, repository_key: repository_key})
-            }
-          else
+    {grants, active_keys, monitors} =
+      registry_transaction(fn registry ->
+        {grants, active_keys, monitors, live_registry} =
+          Enum.reduce(registry, {%{}, MapSet.new(), %{}, %{}}, fn
+            {lease, %{owner: owner, repository_key: repository_key}},
             {grants, active_keys, monitors, live_registry}
-          end
+            when is_reference(lease) and is_pid(owner) ->
+              if Process.alive?(owner) do
+                monitor = Process.monitor(owner)
+                grant = %{owner: owner, monitor: monitor, repository_key: repository_key}
 
-        _entry, acc ->
-          acc
+                {
+                  Map.put(grants, lease, grant),
+                  MapSet.put(active_keys, repository_key),
+                  Map.put(monitors, monitor, {:grant, lease}),
+                  Map.put(live_registry, lease, %{owner: owner, repository_key: repository_key})
+                }
+              else
+                {grants, active_keys, monitors, live_registry}
+              end
+
+            _entry, acc ->
+              acc
+          end)
+
+        {live_registry, {grants, active_keys, monitors}}
       end)
-
-    :persistent_term.put(@production_registry_key, live_registry)
 
     %{state | grants: grants, active_keys: active_keys, monitors: monitors}
   end
@@ -339,17 +347,46 @@ defmodule GitCore.RepositoryWriteLimiter do
          owner,
          repository_key
        ) do
-    registry = :persistent_term.get(@production_registry_key, %{})
     grant = %{owner: owner, repository_key: repository_key}
-    :persistent_term.put(@production_registry_key, Map.put(registry, lease, grant))
+    registry_transaction(fn registry -> {Map.put(registry, lease, grant), :ok} end)
   end
 
   defp persist_production_grant(_state, _lease, _owner, _repository_key), do: :ok
 
   defp forget_production_grant(%{production_registry?: true}, lease) do
-    registry = :persistent_term.get(@production_registry_key, %{})
-    :persistent_term.put(@production_registry_key, Map.delete(registry, lease))
+    delete_production_grant(lease)
   end
 
   defp forget_production_grant(_state, _lease), do: :ok
+
+  defp delete_production_grant(lease) do
+    registry_transaction(fn registry -> {Map.delete(registry, lease), :ok} end)
+  end
+
+  defp registry_transaction(fun) do
+    lock = {@production_registry_lock, self()}
+
+    :global.trans(
+      lock,
+      fn ->
+        registry = :persistent_term.get(@production_registry_key, %{})
+        {updated_registry, result} = fun.(registry)
+
+        if updated_registry != registry do
+          :persistent_term.put(@production_registry_key, updated_registry)
+        end
+
+        result
+      end,
+      [node()]
+    )
+  end
+
+  defp release_recovered_grant(server, lease) do
+    try do
+      GenServer.call(server, {:release, lease}, :infinity)
+    catch
+      :exit, _reason -> :ok
+    end
+  end
 end
