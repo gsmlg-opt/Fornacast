@@ -293,6 +293,14 @@ defmodule GitTransport.ReceivePackFenceTest do
       end)
 
     wait_for_file(entered_path)
+    original_manager = Process.whereis(GitTransport.ReceivePackWorkerManager)
+    manager_monitor = Process.monitor(original_manager)
+    Process.exit(original_manager, :kill)
+    assert_receive {:DOWN, ^manager_monitor, :process, ^original_manager, :killed}
+    wait_for_worker_manager_restart(original_manager)
+    assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 1
+    assert GitTransport.ReceivePackWorkerManager.persisted_worker_count() == 1
+
     original_supervisor = Process.whereis(GitTransport.ReceivePackWorkerSupervisor)
     supervisor_monitor = Process.monitor(original_supervisor)
     Process.exit(original_supervisor, :kill)
@@ -338,6 +346,7 @@ defmodule GitTransport.ReceivePackFenceTest do
     assert {:ok, _response, _statuses} = Task.await(second)
     wait_for_workers(0)
     assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 0
+    assert GitTransport.ReceivePackWorkerManager.persisted_worker_count() == 0
   end
 
   @tag :tmp_dir
@@ -444,6 +453,93 @@ defmodule GitTransport.ReceivePackFenceTest do
   end
 
   @tag :tmp_dir
+  test "worker completion during manager downtime removes its persistent registry entry", %{
+    repository: repository,
+    tmp_dir: tmp_dir
+  } do
+    entered_path = Path.join(tmp_dir, "manager-downtime-dirty-nif-entered")
+    release_path = Path.join(tmp_dir, "manager-downtime-dirty-nif-release")
+    root_supervisor = Process.whereis(GitTransport.Supervisor)
+
+    on_exit(fn ->
+      File.write(release_path, "release")
+      safe_resume(root_supervisor)
+      Application.ensure_all_started(:git_transport)
+    end)
+
+    response =
+      response_task(repository, fn _path, _pack, _commands ->
+        {:ok, {}} = GitCore.Native.test_dirty_io_wait(entered_path, release_path)
+        {:ok, [{"refs/heads/main", "ok", nil}]}
+      end)
+
+    wait_for_file(entered_path)
+    assert GitTransport.ReceivePackWorkerManager.persisted_worker_count() == 1
+    :ok = :sys.suspend(root_supervisor)
+    manager = Process.whereis(GitTransport.ReceivePackWorkerManager)
+    monitor = Process.monitor(manager)
+    Process.exit(manager, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^manager, :killed}
+    assert Process.whereis(GitTransport.ReceivePackWorkerManager) == nil
+
+    File.write!(release_path, "release")
+    assert {:ok, _response, [{"refs/heads/main", "ok", nil}]} = Task.await(response)
+    assert GitTransport.ReceivePackWorkerManager.persisted_worker_count() == 0
+
+    :ok = :sys.resume(root_supervisor)
+    wait_for_worker_manager_restart(manager)
+    assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 0
+    assert GitTransport.ReceivePackWorkerManager.persisted_worker_count() == 0
+    wait_for_workers(0)
+  end
+
+  @tag :tmp_dir
+  test "manager crashes at readiness and activation boundaries never leak or mutate invisibly", %{
+    repository: repository
+  } do
+    on_exit(fn -> GitTransport.ReceivePackWorkerManager.set_test_fault(nil) end)
+    parent = self()
+
+    for phase <- [
+          :after_ready,
+          :after_persist,
+          :after_active_persist,
+          :after_reply,
+          :after_go
+        ] do
+      manager = Process.whereis(GitTransport.ReceivePackWorkerManager)
+      monitor = Process.monitor(manager)
+      :ok = GitTransport.ReceivePackWorkerManager.set_test_fault(phase)
+
+      response =
+        response_task(repository, fn _path, _pack, _commands ->
+          send(parent, {:boundary_native_entered, phase})
+          {:ok, [{"refs/heads/main", "ok", nil}]}
+        end)
+
+      assert_receive {:DOWN, ^monitor, :process, ^manager, :killed}
+      :ok = GitTransport.ReceivePackWorkerManager.set_test_fault(nil)
+      wait_for_worker_manager_restart(manager)
+
+      assert {:ok, _response, [{"refs/heads/main", status, _message}]} = Task.await(response)
+
+      if phase == :after_go do
+        assert status == "ok"
+        assert_receive {:boundary_native_entered, :after_go}
+      else
+        assert status == "ng"
+        refute_receive {:boundary_native_entered, ^phase}
+      end
+
+      wait_for_tracked_workers(0)
+      wait_for_persisted_workers(0)
+      wait_for_workers(0)
+    end
+
+    assert {:messages, []} = Process.info(self(), :messages)
+  end
+
+  @tag :tmp_dir
   test "receive-pack worker supervision waits indefinitely and precedes SSH admission" do
     [worker_spec, manager_spec | daemon_specs] = GitTransport.Application.child_specs()
     assert worker_spec.id == GitTransport.ReceivePackWorkerSupervisor
@@ -512,6 +608,13 @@ defmodule GitTransport.ReceivePackFenceTest do
       end)
 
     wait_for_file(entered_path)
+    original_manager = Process.whereis(GitTransport.ReceivePackWorkerManager)
+    manager_monitor = Process.monitor(original_manager)
+    Process.exit(original_manager, :kill)
+    assert_receive {:DOWN, ^manager_monitor, :process, ^original_manager, :killed}
+    wait_for_worker_manager_restart(original_manager)
+    assert GitTransport.ReceivePackWorkerManager.persisted_worker_count() == 1
+
     original_supervisor = Process.whereis(GitTransport.ReceivePackWorkerSupervisor)
     monitor = Process.monitor(original_supervisor)
     Process.exit(original_supervisor, :kill)
@@ -533,6 +636,7 @@ defmodule GitTransport.ReceivePackFenceTest do
     assert :ok = Task.await(stopper)
     assert {:ok, _started} = Application.ensure_all_started(:git_transport)
     assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 0
+    assert GitTransport.ReceivePackWorkerManager.persisted_worker_count() == 0
     wait_for_workers(0)
   end
 
@@ -658,6 +762,20 @@ defmodule GitTransport.ReceivePackFenceTest do
   defp wait_for_tracked_workers(expected, 0),
     do: flunk("expected #{expected} manager-tracked receive-pack worker(s)")
 
+  defp wait_for_persisted_workers(expected, attempts \\ 100)
+
+  defp wait_for_persisted_workers(expected, attempts) when attempts > 0 do
+    if GitTransport.ReceivePackWorkerManager.persisted_worker_count() == expected do
+      :ok
+    else
+      Process.sleep(5)
+      wait_for_persisted_workers(expected, attempts - 1)
+    end
+  end
+
+  defp wait_for_persisted_workers(expected, 0),
+    do: flunk("expected #{expected} persisted receive-pack worker(s)")
+
   defp wait_for_worker_supervisor_restart(previous, attempts \\ 100)
 
   defp wait_for_worker_supervisor_restart(previous, attempts) when attempts > 0 do
@@ -673,6 +791,30 @@ defmodule GitTransport.ReceivePackFenceTest do
 
   defp wait_for_worker_supervisor_restart(_previous, 0),
     do: flunk("expected receive-pack worker supervisor to restart")
+
+  defp wait_for_worker_manager_restart(previous, attempts \\ 100)
+
+  defp wait_for_worker_manager_restart(previous, attempts) when attempts > 0 do
+    case Process.whereis(GitTransport.ReceivePackWorkerManager) do
+      pid when is_pid(pid) and pid != previous ->
+        :ok
+
+      _other ->
+        Process.sleep(5)
+        wait_for_worker_manager_restart(previous, attempts - 1)
+    end
+  end
+
+  defp wait_for_worker_manager_restart(_previous, 0),
+    do: flunk("expected receive-pack worker manager to restart")
+
+  defp safe_resume(supervisor) do
+    try do
+      :sys.resume(supervisor)
+    catch
+      :exit, _reason -> :ok
+    end
+  end
 
   defp restore_env(application, key, {:ok, value}),
     do: Application.put_env(application, key, value)
