@@ -164,6 +164,33 @@ defmodule GitCore.RepositoryWriteModelTest do
              )
   end
 
+  test "compare-and-swap maps real ref lock contention to a deadline without side effects", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = clean_fixture!(tmp_dir)
+    lock_path = Path.join(fixture.repo_path, "refs/heads/main.lock")
+    before_refs = refs(fixture.repo_path)
+    before_objects = object_ids(fixture.repo_path)
+    File.write!(lock_path, "held by test")
+
+    try do
+      assert {:error, %GitCore.Error{kind: :ref_timeout, operation: :compare_and_swap_ref}} =
+               GitCore.compare_and_swap_ref(
+                 fixture.repo_path,
+                 "refs/heads/main",
+                 fixture.base_oid,
+                 fixture.base_oid,
+                 :fast_forward,
+                 deadline_ms: 5
+               )
+
+      assert refs(fixture.repo_path) == before_refs
+      assert object_ids(fixture.repo_path) == before_objects
+    after
+      File.rm(lock_path)
+    end
+  end
+
   test "analyzes clean divergence, identical tips, and an already-contained head", %{
     tmp_dir: tmp_dir
   } do

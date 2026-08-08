@@ -4735,6 +4735,29 @@ fn compare_and_swap_ref_impl(
     mode: String,
     deadline_ms: u64,
 ) -> Result<String, NativeError> {
+    compare_and_swap_ref_impl_with_precommit(
+        path,
+        full_ref,
+        expected_oid,
+        proposed_oid,
+        mode,
+        deadline_ms,
+        || {},
+    )
+}
+
+fn compare_and_swap_ref_impl_with_precommit<F>(
+    path: String,
+    full_ref: String,
+    expected_oid: Option<String>,
+    proposed_oid: String,
+    mode: String,
+    deadline_ms: u64,
+    before_final_deadline_check: F,
+) -> Result<String, NativeError>
+where
+    F: FnOnce(),
+{
     let deadline = Instant::now() + cas_duration(deadline_ms);
     check_cas_deadline(deadline)?;
 
@@ -4812,14 +4835,15 @@ fn compare_and_swap_ref_impl(
         .transaction()
         .prepare([edit], lock_failure, lock_failure)
         .map_err(|error| {
-            classify_cas_transaction_error(&repo, &full_ref_for_error, expected_id, &error)
+            classify_cas_prepare_error(&repo, &full_ref_for_error, expected_id, &error)
         })?;
 
-    check_cas_deadline(deadline)?;
     let committer = repo
         .committer()
         .transpose()
         .map_err(|error| native_error("invalid_repository", error))?;
+    before_final_deadline_check();
+    check_cas_deadline(deadline)?;
     transaction.commit(committer).map_err(|error| {
         classify_cas_transaction_error(&repo, &full_ref_for_error, expected_id, &error)
     })?;
@@ -4911,6 +4935,31 @@ fn find_cas_commit<'repo>(
             format!("{position} target must be a commit"),
         )
     })
+}
+
+fn classify_cas_prepare_error(
+    repo: &gix::Repository,
+    full_ref: &str,
+    expected: Option<gix_hash::ObjectId>,
+    error: &gix_ref::file::transaction::prepare::Error,
+) -> NativeError {
+    use gix::lock::acquire::Error::PermanentlyLocked;
+    use gix_ref::file::transaction::prepare::Error::{LockAcquire, PackedTransactionAcquire};
+
+    if matches!(
+        error,
+        LockAcquire {
+            source: PermanentlyLocked { .. },
+            ..
+        } | PackedTransactionAcquire(PermanentlyLocked { .. })
+    ) {
+        native_error(
+            "ref_timeout",
+            "reference update exceeded its deadline waiting for a Git reference lock",
+        )
+    } else {
+        classify_cas_transaction_error(repo, full_ref, expected, error)
+    }
 }
 
 fn classify_cas_transaction_error(
@@ -6371,6 +6420,132 @@ mod tests {
     }
 
     #[test]
+    fn compare_and_swap_ref_rechecks_deadline_after_precommit_work() {
+        let fixture = MergeBoundaryFixture::new("ref-cas-precommit");
+        let commits = fixture.fast_import_empty_chain(1);
+        let proposed = commits.get(&1).expect("proposed commit");
+        let before_objects = tree_history_git(
+            &[
+                "--git-dir",
+                fixture.path(),
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname)",
+            ],
+            None,
+        );
+
+        assert!(matches!(
+            compare_and_swap_ref_impl_with_precommit(
+                fixture.path().to_owned(),
+                "refs/heads/cas-precommit".to_owned(),
+                None,
+                proposed.clone(),
+                "fast_forward".to_owned(),
+                100,
+                || std::thread::sleep(Duration::from_millis(150)),
+            ),
+            Err((kind, _)) if kind == "ref_timeout"
+        ));
+        assert!(!fixture.repo_path.join("refs/heads/cas-precommit").exists());
+        assert_eq!(
+            tree_history_git(
+                &[
+                    "--git-dir",
+                    fixture.path(),
+                    "cat-file",
+                    "--batch-all-objects",
+                    "--batch-check=%(objectname)",
+                ],
+                None,
+            ),
+            before_objects
+        );
+    }
+
+    #[test]
+    fn compare_and_swap_ref_filesystem_lock_coordinates_os_processes() {
+        let fixture = MergeBoundaryFixture::new("ref-cas-processes");
+        let commits = fixture.fast_import_empty_chain(2);
+        let first = commits.get(&1).expect("first commit");
+        let second = commits.get(&2).expect("second commit");
+        let first_outcome = fixture.temp_path.join("cas-first.out");
+        let second_outcome = fixture.temp_path.join("cas-second.out");
+        let resource = fixture.repo_path.join("fornacast-ref-cas");
+        let held_lock = gix::lock::Marker::acquire_to_hold_resource(
+            resource,
+            gix::lock::acquire::Fail::Immediately,
+            Some(fixture.repo_path.clone()),
+        )
+        .expect("hold repository CAS lock before spawning workers");
+
+        let mut first_worker = spawn_cas_process_worker(&fixture, first, &first_outcome);
+        let mut second_worker = spawn_cas_process_worker(&fixture, second, &second_outcome);
+        std::thread::sleep(Duration::from_millis(50));
+        drop(held_lock);
+
+        let first_status = first_worker.wait().expect("wait for first CAS process");
+        let second_status = second_worker.wait().expect("wait for second CAS process");
+        assert!(first_status.success());
+        assert!(second_status.success());
+
+        let outcomes = [
+            std::fs::read_to_string(first_outcome).expect("read first CAS outcome"),
+            std::fs::read_to_string(second_outcome).expect("read second CAS outcome"),
+        ];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome.starts_with("ok:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome.as_str() == "error:ref_exists")
+                .count(),
+            1
+        );
+
+        let recorded = tree_history_git(
+            &[
+                "--git-dir",
+                fixture.path(),
+                "rev-parse",
+                "refs/heads/cas-process",
+            ],
+            None,
+        );
+        assert!(outcomes.contains(&format!("ok:{recorded}")));
+    }
+
+    #[test]
+    fn compare_and_swap_ref_os_process_worker() {
+        let Ok(repo_path) = std::env::var("FORNACAST_CAS_WORKER_REPO") else {
+            return;
+        };
+        let proposed = std::env::var("FORNACAST_CAS_WORKER_PROPOSED")
+            .expect("worker proposed commit environment");
+        let outcome_path =
+            std::env::var("FORNACAST_CAS_WORKER_OUTCOME").expect("worker outcome environment");
+
+        let outcome = match compare_and_swap_ref_impl(
+            repo_path,
+            "refs/heads/cas-process".to_owned(),
+            None,
+            proposed,
+            "fast_forward".to_owned(),
+            5_000,
+        ) {
+            Ok(oid) => format!("ok:{oid}"),
+            Err((kind, _detail)) => format!("error:{kind}"),
+        };
+
+        std::fs::write(outcome_path, outcome).expect("write CAS worker outcome");
+    }
+
+    #[test]
     fn pull_merge_validates_all_commit_bytes_before_object_work() {
         assert!(matches!(
             validated_merge_message(vec![0xff]),
@@ -6907,6 +7082,25 @@ mod tests {
         temp_path: PathBuf,
         repo_path: PathBuf,
         blob_oid: String,
+    }
+
+    fn spawn_cas_process_worker(
+        fixture: &MergeBoundaryFixture,
+        proposed: &str,
+        outcome_path: &Path,
+    ) -> std::process::Child {
+        Command::new(std::env::current_exe().expect("current native test executable"))
+            .args([
+                "--exact",
+                "tests::compare_and_swap_ref_os_process_worker",
+                "--nocapture",
+            ])
+            .env("FORNACAST_CAS_WORKER_REPO", fixture.path())
+            .env("FORNACAST_CAS_WORKER_PROPOSED", proposed)
+            .env("FORNACAST_CAS_WORKER_OUTCOME", outcome_path)
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn CAS process worker")
     }
 
     fn test_merge_commit() -> PreparedMergeCommit {
