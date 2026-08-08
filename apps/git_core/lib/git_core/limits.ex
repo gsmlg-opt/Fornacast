@@ -1,5 +1,10 @@
 defmodule GitCore.Limits do
-  @moduledoc false
+  @moduledoc """
+  Hard ceilings for bounded Git work shared by GitCore and future API ingestion.
+
+  `:receive_pack_bytes` is the future API request ceiling. Git-over-SSH and
+  Git-over-HTTP keep their independent `GitTransport.ReceivePack` policy.
+  """
 
   @hard %{
     scan_concurrency: 4,

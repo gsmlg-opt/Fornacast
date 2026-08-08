@@ -76,11 +76,50 @@ defmodule GitCore.RepositoryWriteLimiterTest do
     assert :ok = RepositoryWriteLimiter.release(replacement)
   end
 
-  defp start_waiter(key) do
+  test "a huge future deadline stays queued without crashing the limiter" do
+    limiter = Process.whereis(RepositoryWriteLimiter)
+    monitor = Process.monitor(limiter)
+    assert {:ok, holder} = RepositoryWriteLimiter.acquire(:huge_deadline, deadline())
+
+    huge_deadline = System.monotonic_time(:millisecond) + Bitwise.bsl(1, 70)
+    waiter = start_waiter(:huge_deadline, huge_deadline)
+    wait_for_waiters(1)
+    refute_receive {:DOWN, ^monitor, :process, ^limiter, _reason}, 30
+
+    [waiter_id] = Map.keys(:sys.get_state(RepositoryWriteLimiter).waiters)
+    send(RepositoryWriteLimiter, {:deadline, waiter_id})
+    Process.sleep(10)
+    assert map_size(:sys.get_state(RepositoryWriteLimiter).waiters) == 1
+    refute_receive {:acquire_error, ^waiter, {:error, :timeout}}, 10
+
+    assert :ok = RepositoryWriteLimiter.release(holder)
+    assert_receive {:acquired, ^waiter, waiter_lease}, 500
+    send(waiter, {:release, waiter_lease})
+    assert_receive {:released, ^waiter}
+  end
+
+  test "the supervised production limiter restarts after a crash" do
+    limiter = Process.whereis(RepositoryWriteLimiter)
+    monitor = Process.monitor(limiter)
+    Process.exit(limiter, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^limiter, :killed}
+
+    replacement = wait_for_restarted_limiter(limiter)
+    assert is_pid(replacement)
+    assert {:ok, lease} = RepositoryWriteLimiter.acquire(:after_restart, deadline())
+    assert :ok = RepositoryWriteLimiter.release(lease)
+  end
+
+  test "production is permanent while isolated child specs are temporary" do
+    assert RepositoryWriteLimiter.child_spec([]).restart == :permanent
+    assert RepositoryWriteLimiter.child_spec(server: nil).restart == :temporary
+  end
+
+  defp start_waiter(key, absolute_deadline \\ nil) do
     parent = self()
 
     spawn(fn ->
-      case RepositoryWriteLimiter.acquire(key, deadline()) do
+      case RepositoryWriteLimiter.acquire(key, absolute_deadline || deadline()) do
         {:ok, lease} ->
           send(parent, {:acquired, self(), lease})
 
@@ -111,5 +150,22 @@ defmodule GitCore.RepositoryWriteLimiterTest do
 
   defp wait_for_waiters(expected, 0) do
     flunk("repository writer limiter did not reach #{expected} waiters")
+  end
+
+  defp wait_for_restarted_limiter(old_pid, attempts \\ 100)
+
+  defp wait_for_restarted_limiter(old_pid, attempts) when attempts > 0 do
+    case Process.whereis(RepositoryWriteLimiter) do
+      pid when is_pid(pid) and pid != old_pid ->
+        pid
+
+      _ ->
+        Process.sleep(5)
+        wait_for_restarted_limiter(old_pid, attempts - 1)
+    end
+  end
+
+  defp wait_for_restarted_limiter(_old_pid, 0) do
+    flunk("repository writer limiter did not restart")
   end
 end

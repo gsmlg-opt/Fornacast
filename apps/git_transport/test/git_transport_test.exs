@@ -28,6 +28,32 @@ defmodule GitTransportTest do
     assert GitTransport.ReceivePack.max_request_bytes() == nil
   end
 
+  test "GitCore's future API receive-pack ceiling does not configure Git transport" do
+    original_git_core_limits = Application.get_env(:git_core, :limits)
+    original_transport_limit = Application.fetch_env(:git_transport, :receive_pack_max_bytes)
+
+    on_exit(fn ->
+      if is_nil(original_git_core_limits) do
+        Application.delete_env(:git_core, :limits)
+      else
+        Application.put_env(:git_core, :limits, original_git_core_limits)
+      end
+
+      case original_transport_limit do
+        {:ok, value} -> Application.put_env(:git_transport, :receive_pack_max_bytes, value)
+        :error -> Application.delete_env(:git_transport, :receive_pack_max_bytes)
+      end
+    end)
+
+    Application.put_env(:git_core, :limits, receive_pack_bytes: 1)
+    Application.delete_env(:git_transport, :receive_pack_max_bytes)
+    assert GitCore.Limits.get(:receive_pack_bytes) == 1
+    assert GitTransport.ReceivePack.max_request_bytes() == 4 * 1024 * 1024 * 1024
+
+    Application.put_env(:git_transport, :receive_pack_max_bytes, nil)
+    assert GitTransport.ReceivePack.max_request_bytes() == nil
+  end
+
   test "parses supported Git SSH exec commands" do
     assert {:ok, command} = GitTransport.parse_exec("git-upload-pack 'alice/demo.git'")
     assert command.operation == :upload_pack

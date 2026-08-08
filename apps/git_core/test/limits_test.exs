@@ -68,4 +68,9 @@ defmodule GitCore.LimitsTest do
     assert_raise KeyError, fn -> GitCore.Limits.hard(:unknown) end
     assert_raise KeyError, fn -> GitCore.Limits.get(:unknown) end
   end
+
+  test "receive_pack_bytes is the bounded future API ingestion ceiling" do
+    assert GitCore.Limits.hard(:receive_pack_bytes) == 100 * 1024 * 1024
+    assert GitCore.Limits.get(:receive_pack_bytes) == 100 * 1024 * 1024
+  end
 end

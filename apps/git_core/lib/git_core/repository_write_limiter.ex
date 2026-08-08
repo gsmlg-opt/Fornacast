@@ -4,6 +4,7 @@ defmodule GitCore.RepositoryWriteLimiter do
   use GenServer
 
   @lease_tag {__MODULE__, :lease}
+  @deadline_timer_chunk_ms 60_000
   @opaque lease :: {{__MODULE__, :lease}, GenServer.server(), reference()}
 
   defmodule State do
@@ -19,10 +20,15 @@ defmodule GitCore.RepositoryWriteLimiter do
 
   @doc false
   def child_spec(opts) do
+    restart =
+      if Keyword.get(opts, :server, __MODULE__) == __MODULE__,
+        do: :permanent,
+        else: :temporary
+
     %{
       id: __MODULE__,
       start: {__MODULE__, :start_link, [opts]},
-      restart: :temporary,
+      restart: restart,
       shutdown: 5_000,
       type: :worker,
       modules: [__MODULE__]
@@ -88,22 +94,22 @@ defmodule GitCore.RepositoryWriteLimiter do
 
   @impl true
   def handle_info({:deadline, waiter_id}, state) do
-    case Map.pop(state.waiters, waiter_id) do
-      {nil, _waiters} ->
+    case Map.fetch(state.waiters, waiter_id) do
+      :error ->
         {:noreply, state}
 
-      {%{from: from, monitor: monitor, sequence: sequence}, waiters} ->
-        Process.demonitor(monitor, [:flush])
-        GenServer.reply(from, {:error, :timeout})
+      {:ok, waiter} ->
+        now = System.monotonic_time(:millisecond)
 
-        state = %{
-          state
-          | waiters: waiters,
-            queue: :gb_trees.delete_any(sequence, state.queue),
-            monitors: Map.delete(state.monitors, monitor)
-        }
-
-        {:noreply, drain_waiters(state)}
+        if waiter.deadline <= now do
+          GenServer.reply(waiter.from, {:error, :timeout})
+          state = remove_waiter(waiter_id, waiter, state)
+          {:noreply, drain_waiters(state)}
+        else
+          timer = schedule_deadline(waiter_id, waiter.deadline, now)
+          waiter = %{waiter | timer: timer}
+          {:noreply, put_in(state.waiters[waiter_id], waiter)}
+        end
     end
   end
 
@@ -163,7 +169,7 @@ defmodule GitCore.RepositoryWriteLimiter do
   defp enqueue(from, owner, repository_key, deadline, now, state) do
     waiter_id = make_ref()
     monitor = Process.monitor(owner)
-    timer = Process.send_after(self(), {:deadline, waiter_id}, deadline - now)
+    timer = schedule_deadline(waiter_id, deadline, now)
     sequence = state.next_sequence
 
     waiter = %{
@@ -262,5 +268,10 @@ defmodule GitCore.RepositoryWriteLimiter do
         waiters: Map.delete(state.waiters, waiter_id),
         monitors: Map.delete(state.monitors, waiter.monitor)
     }
+  end
+
+  defp schedule_deadline(waiter_id, deadline, now) do
+    delay = min(deadline - now, @deadline_timer_chunk_ms)
+    Process.send_after(self(), {:deadline, waiter_id}, delay)
   end
 end
