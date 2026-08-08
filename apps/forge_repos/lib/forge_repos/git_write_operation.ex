@@ -83,6 +83,7 @@ defmodule ForgeRepos.GitWriteOperation do
       |> validate_lease_transition()
       |> validate_failure_reason_transition(operation)
       |> validate_result_blob_update(operation)
+      |> validate_effective_transition_values(operation)
     else
       operation |> change() |> add_error(:base, "contains immutable fields")
     end
@@ -142,8 +143,9 @@ defmodule ForgeRepos.GitWriteOperation do
         operation.result_blob_oid != nil ->
           add_error(changeset, :result_blob_oid, "is already recorded")
 
-        get_change(changeset, :state) != :object_written ->
-          add_error(changeset, :result_blob_oid, "requires object_written transition")
+        operation.state != :prepared or
+            get_change(changeset, :state) not in [nil, :object_written] ->
+          add_error(changeset, :result_blob_oid, "is not valid in this transition")
 
         true ->
           changeset
@@ -179,6 +181,36 @@ defmodule ForgeRepos.GitWriteOperation do
         changeset
     end
   end
+
+  defp validate_effective_transition_values(changeset, operation) do
+    case get_change(changeset, :state) do
+      :object_written when operation.kind in [:content_create, :content_update] ->
+        if valid_oid?(get_field(changeset, :result_blob_oid)) do
+          changeset
+        else
+          add_error(changeset, :result_blob_oid, "is required for object_written")
+        end
+
+      :failed ->
+        expected_reason =
+          case operation.state do
+            :prepared -> "effect_not_started"
+            :object_written -> "ref_not_advanced"
+            _ -> nil
+          end
+
+        if expected_reason != nil and get_field(changeset, :failure_reason) == expected_reason do
+          changeset
+        else
+          add_error(changeset, :failure_reason, "is invalid for terminal failure")
+        end
+
+      _state ->
+        changeset
+    end
+  end
+
+  defp valid_oid?(oid), do: is_binary(oid) and Regex.match?(@oid_regex, oid)
 
   defp exact_fields?(updates, allowed) do
     keys = Keyword.keys(updates)

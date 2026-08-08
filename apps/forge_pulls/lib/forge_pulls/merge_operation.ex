@@ -73,6 +73,7 @@ defmodule ForgePulls.MergeOperation do
       |> validate_lease_transition()
       |> validate_failure_reason_transition(operation)
       |> validate_merge_oid_transition()
+      |> validate_effective_transition_values(operation)
     else
       operation |> change() |> add_error(:base, "contains immutable fields")
     end
@@ -161,8 +162,9 @@ defmodule ForgePulls.MergeOperation do
         changeset.data.merge_oid != nil ->
           add_error(changeset, :merge_oid, "is already recorded")
 
-        get_change(changeset, :state) != :merge_written ->
-          add_error(changeset, :merge_oid, "requires merge_written transition")
+        changeset.data.state != :prepared or
+            get_change(changeset, :state) not in [nil, :merge_written] ->
+          add_error(changeset, :merge_oid, "is not valid in this transition")
 
         true ->
           changeset
@@ -198,6 +200,36 @@ defmodule ForgePulls.MergeOperation do
         changeset
     end
   end
+
+  defp validate_effective_transition_values(changeset, operation) do
+    case get_change(changeset, :state) do
+      :merge_written ->
+        if valid_oid?(get_field(changeset, :merge_oid)) do
+          changeset
+        else
+          add_error(changeset, :merge_oid, "is required for merge_written")
+        end
+
+      :failed ->
+        expected_reason =
+          case operation.state do
+            :prepared -> "effect_not_started"
+            :merge_written -> "ref_not_advanced"
+            _ -> nil
+          end
+
+        if expected_reason != nil and get_field(changeset, :failure_reason) == expected_reason do
+          changeset
+        else
+          add_error(changeset, :failure_reason, "is invalid for terminal failure")
+        end
+
+      _state ->
+        changeset
+    end
+  end
+
+  defp valid_oid?(oid), do: is_binary(oid) and Regex.match?(@oid_regex, oid)
 
   defp exact_fields?(updates, allowed) do
     keys = Keyword.keys(updates)

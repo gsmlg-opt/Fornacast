@@ -1357,6 +1357,85 @@ defmodule ForgePullsTest do
 
     assert Repo.get!(MergeOperation, reclaimed.id) == reclaimed
     assert :ok = OperationLease.release(MergeOperation, reclaimed)
+
+    assert {:ok, _} = insert_merge_operation(fixture, "prepared", "lease-split")
+    split = Repo.get_by!(MergeOperation, request_id: "lease-split")
+
+    assert {:ok, split_claimed} =
+             OperationLease.claim(MergeOperation, split.id, "split-a", now, 30)
+
+    assert {:error, :invalid_update} =
+             OperationLease.update_owned(MergeOperation, split_claimed, state: :merge_written)
+
+    assert Repo.get!(MergeOperation, split_claimed.id) == split_claimed
+
+    split_oid = String.duplicate("A", 40)
+
+    assert {:ok, split_recorded} =
+             OperationLease.update_owned(MergeOperation, split_claimed, merge_oid: split_oid)
+
+    assert split_recorded.state == :prepared
+    assert split_recorded.merge_oid == String.downcase(split_oid)
+
+    assert {:ok, split_reclaimed} =
+             OperationLease.claim(MergeOperation, split_recorded.id, "split-b", now, 30)
+
+    assert {:ok, split_advanced} =
+             OperationLease.update_owned(MergeOperation, split_reclaimed, state: :merge_written)
+
+    assert split_advanced.merge_oid == String.downcase(split_oid)
+
+    assert {:ok, _} = insert_merge_operation(fixture, "prepared", "lease-failure")
+    failure = Repo.get_by!(MergeOperation, request_id: "lease-failure")
+
+    assert {:ok, failure_claimed} =
+             OperationLease.claim(MergeOperation, failure.id, "failure-a", now, 30)
+
+    assert {:ok, alerted} =
+             OperationLease.update_owned(MergeOperation, failure_claimed,
+               failure_reason: "unexpected_ref"
+             )
+
+    assert {:ok, alert_reclaimed} =
+             OperationLease.claim(MergeOperation, alerted.id, "failure-b", now, 30)
+
+    assert {:error, :invalid_update} =
+             OperationLease.update_owned(MergeOperation, alert_reclaimed, state: :failed)
+
+    assert Repo.get!(MergeOperation, alert_reclaimed.id) == alert_reclaimed
+    assert :ok = OperationLease.release(MergeOperation, alert_reclaimed)
+
+    assert {:ok, _} = insert_merge_operation(fixture, "prepared", "lease-valid-failure")
+    valid_failure = Repo.get_by!(MergeOperation, request_id: "lease-valid-failure")
+
+    assert {:ok, valid_failure_claimed} =
+             OperationLease.claim(MergeOperation, valid_failure.id, "failure-c", now, 30)
+
+    assert {:ok, failed} =
+             OperationLease.update_owned(MergeOperation, valid_failure_claimed,
+               state: :failed,
+               failure_reason: "effect_not_started"
+             )
+
+    assert failed.state == :failed
+    assert failed.failure_reason == "effect_not_started"
+
+    assert {:ok, _} = insert_merge_operation(fixture, "prepared", "lease-persisted-failure")
+    persisted_failure = Repo.get_by!(MergeOperation, request_id: "lease-persisted-failure")
+
+    Repo.update_all(from(item in MergeOperation, where: item.id == ^persisted_failure.id),
+      set: [failure_reason: "effect_not_started"]
+    )
+
+    persisted_failure = Repo.get!(MergeOperation, persisted_failure.id)
+
+    assert {:ok, persisted_claimed} =
+             OperationLease.claim(MergeOperation, persisted_failure.id, "failure-d", now, 30)
+
+    assert {:ok, persisted_failed} =
+             OperationLease.update_owned(MergeOperation, persisted_claimed, state: :failed)
+
+    assert persisted_failed.failure_reason == "effect_not_started"
   end
 
   test "merge transitions expose only the sequential graph and sanitized pre-CAS failure" do

@@ -204,6 +204,105 @@ defmodule Fornacast.OperationLeaseTest do
     assert :ok = OperationLease.release(GitWriteOperation, reclaimed)
   end
 
+  test "content outcome supports split persistence but object_written requires an effective OID",
+       %{
+         operation: operation,
+         now: now
+       } do
+    content_operation =
+      operation |> Ecto.Changeset.change(kind: :content_create) |> Repo.update!()
+
+    assert {:ok, claimed} =
+             OperationLease.claim(GitWriteOperation, content_operation.id, "a", now, 30)
+
+    assert {:error, :invalid_update} =
+             OperationLease.update_owned(GitWriteOperation, claimed, state: :object_written)
+
+    assert Repo.get!(GitWriteOperation, claimed.id) == claimed
+
+    blob_oid = String.duplicate("D", 40)
+
+    assert {:ok, recorded} =
+             OperationLease.update_owned(GitWriteOperation, claimed, result_blob_oid: blob_oid)
+
+    assert recorded.state == :prepared
+    assert recorded.result_blob_oid == String.downcase(blob_oid)
+
+    assert {:ok, reclaimed} = OperationLease.claim(GitWriteOperation, recorded.id, "b", now, 30)
+
+    assert {:ok, advanced} =
+             OperationLease.update_owned(GitWriteOperation, reclaimed, state: :object_written)
+
+    assert advanced.result_blob_oid == String.downcase(blob_oid)
+  end
+
+  test "terminal Git failure validates the effective state-specific reason", %{
+    operation: operation,
+    now: now
+  } do
+    assert {:ok, claimed} = OperationLease.claim(GitWriteOperation, operation.id, "a", now, 30)
+
+    assert {:ok, alerted} =
+             OperationLease.update_owned(GitWriteOperation, claimed,
+               failure_reason: "unexpected_ref"
+             )
+
+    assert {:ok, reclaimed} = OperationLease.claim(GitWriteOperation, alerted.id, "b", now, 30)
+
+    assert {:error, :invalid_update} =
+             OperationLease.update_owned(GitWriteOperation, reclaimed, state: :failed)
+
+    assert Repo.get!(GitWriteOperation, reclaimed.id) == reclaimed
+    assert :ok = OperationLease.release(GitWriteOperation, reclaimed)
+  end
+
+  test "simultaneous terminal Git failure persists the exact reason", %{
+    operation: operation,
+    now: now
+  } do
+    assert {:ok, claimed} = OperationLease.claim(GitWriteOperation, operation.id, "a", now, 30)
+
+    assert {:ok, failed} =
+             OperationLease.update_owned(GitWriteOperation, claimed,
+               state: :failed,
+               failure_reason: "effect_not_started"
+             )
+
+    assert failed.state == :failed
+    assert failed.failure_reason == "effect_not_started"
+  end
+
+  test "content_delete advances without a result blob and valid persisted failure is reusable", %{
+    operation: operation,
+    now: now
+  } do
+    delete_operation = operation |> Ecto.Changeset.change(kind: :content_delete) |> Repo.update!()
+
+    assert {:ok, claimed} =
+             OperationLease.claim(GitWriteOperation, delete_operation.id, "a", now, 30)
+
+    assert {:ok, written} =
+             OperationLease.update_owned(GitWriteOperation, claimed, state: :object_written)
+
+    assert written.result_blob_oid == nil
+
+    second = insert_operation!()
+
+    Repo.update_all(from(item in GitWriteOperation, where: item.id == ^second.id),
+      set: [failure_reason: "effect_not_started"]
+    )
+
+    persisted = Repo.get!(GitWriteOperation, second.id)
+
+    assert {:ok, failure_claimed} =
+             OperationLease.claim(GitWriteOperation, persisted.id, "b", now, 30)
+
+    assert {:ok, failed} =
+             OperationLease.update_owned(GitWriteOperation, failure_claimed, state: :failed)
+
+    assert failed.failure_reason == "effect_not_started"
+  end
+
   test "arguments are validated", %{operation: operation, now: now} do
     assert {:error, :invalid_argument} =
              OperationLease.claim(GitWriteOperation, operation.id, "", now, 30)
