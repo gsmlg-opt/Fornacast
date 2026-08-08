@@ -3408,9 +3408,11 @@ defmodule GitCore.CacheIntegrationTest do
   @moduletag :tmp_dir
   @moduletag capture_log: true
 
-  test "supervises the production cache after merge keepers and both limiters" do
+  test "supervises the production cache after merge keepers and all limiters" do
     assert [
              {GitCore.Cache, cache_pid, :worker, [GitCore.Cache]},
+             {GitCore.RepositoryWriteLimiter, writer_pid, :worker,
+              [GitCore.RepositoryWriteLimiter]},
              {GitCore.BlobLimiter, blob_pid, :worker, [GitCore.BlobLimiter]},
              {GitCore.ScanLimiter, scan_pid, :worker, [GitCore.ScanLimiter]},
              {GitCore.MergeTaskSupervisor, merge_supervisor_pid, :supervisor, [Task.Supervisor]}
@@ -3420,6 +3422,7 @@ defmodule GitCore.CacheIntegrationTest do
     assert is_pid(blob_pid)
     assert is_pid(merge_supervisor_pid)
     assert is_pid(scan_pid)
+    assert is_pid(writer_pid)
   end
 
   test "constructs exact normalized immutable keys for all four cached reads", %{

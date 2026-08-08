@@ -3,8 +3,6 @@ defmodule GitCore.BlobLimiter do
 
   use GenServer
 
-  @capacity 8
-  @byte_capacity 128 * 1024 * 1024
   @wait_timeout 250
   @lease_tag {__MODULE__, :lease}
 
@@ -46,7 +44,7 @@ defmodule GitCore.BlobLimiter do
     server = Keyword.get(opts, :server, __MODULE__)
     operation = Keyword.get(opts, :operation, :read_blob)
 
-    if weight > @byte_capacity do
+    if weight > GitCore.Limits.get(:blob_reserved_bytes) do
       error(:blob_too_large, operation, "blob exceeds the 128 MiB declared-byte limit")
     else
       case call(server, {:acquire, weight}) do
@@ -76,17 +74,22 @@ defmodule GitCore.BlobLimiter do
 
   @impl true
   def init(opts) do
-    capacity = Keyword.get(opts, :capacity, @capacity)
-    byte_capacity = Keyword.get(opts, :byte_capacity, @byte_capacity)
-    wait_timeout = Keyword.get(opts, :wait_timeout, @wait_timeout)
+    capacity = Keyword.get(opts, :capacity, GitCore.Limits.get(:blob_concurrency))
 
-    if not (is_integer(capacity) and capacity in 1..@capacity) do
-      raise ArgumentError, "blob limiter capacity must be between 1 and #{@capacity}"
+    byte_capacity =
+      Keyword.get(opts, :byte_capacity, GitCore.Limits.get(:blob_reserved_bytes))
+
+    wait_timeout = Keyword.get(opts, :wait_timeout, @wait_timeout)
+    hard_capacity = GitCore.Limits.hard(:blob_concurrency)
+    hard_byte_capacity = GitCore.Limits.hard(:blob_reserved_bytes)
+
+    if not (is_integer(capacity) and capacity in 1..hard_capacity) do
+      raise ArgumentError, "blob limiter capacity must be between 1 and #{hard_capacity}"
     end
 
-    if not (is_integer(byte_capacity) and byte_capacity in 0..@byte_capacity) do
+    if not (is_integer(byte_capacity) and byte_capacity in 0..hard_byte_capacity) do
       raise ArgumentError,
-            "blob limiter byte capacity must be between 0 and #{@byte_capacity}"
+            "blob limiter byte capacity must be between 0 and #{hard_byte_capacity}"
     end
 
     if not (is_integer(wait_timeout) and wait_timeout in 0..@wait_timeout) do

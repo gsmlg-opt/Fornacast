@@ -1,5 +1,26 @@
 import Config
 
+config :git_core, :limits,
+  scan_concurrency: 4,
+  scan_deadline_ms: 30_000,
+  commit_visits: 50_000,
+  tree_entry_visits: 100_000,
+  changed_path_visits: 10_000,
+  patch_bytes: 20_971_520,
+  blob_concurrency: 8,
+  blob_reserved_bytes: 134_217_728,
+  blob_bytes: 104_857_600,
+  repository_writer_concurrency: 2,
+  body_memory_bytes: 536_870_912,
+  contents_reservation_bytes: 251_658_240,
+  contents_json_bytes: 146_800_640,
+  ref_deadline_ms: 10_000,
+  content_deadline_ms: 60_000,
+  receive_pack_bytes: 104_857_600,
+  body_total_timeout_ms: 120_000,
+  body_idle_timeout_ms: 15_000,
+  reconcile_interval_ms: 30_000
+
 test_root = Path.expand("..", __DIR__)
 
 database_adapter =
