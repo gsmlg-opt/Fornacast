@@ -765,6 +765,38 @@ fn list_refs(path: String) -> Result<Vec<(String, String, String)>, NativeError>
     Ok(result)
 }
 
+#[rustler::nif(schedule = "DirtyIo")]
+fn exact_ref(
+    path: String,
+    full_name: Vec<u8>,
+    deadline_ms: u64,
+) -> Result<Option<String>, NativeError> {
+    let deadline = Instant::now() + Duration::from_millis(deadline_ms);
+    let repo = open_bare_repository(&path)?;
+    check_ref_deadline(deadline)?;
+
+    if !valid_full_ref_name(&full_name) {
+        return Err(native_error(
+            "invalid_ref",
+            "reference name is not canonical",
+        ));
+    }
+
+    let result = match direct_ref_target(&repo, &full_name)? {
+        DirectRefTarget::Missing => None,
+        DirectRefTarget::Object(target) => Some(target.to_string()),
+        DirectRefTarget::Symbolic => {
+            return Err(native_error(
+                "corrupt_repository",
+                "reference has no direct object target",
+            ));
+        }
+    };
+
+    check_ref_deadline(deadline)?;
+    Ok(result)
+}
+
 fn ref_kind(name: &str) -> Option<&'static str> {
     if name.starts_with("refs/heads/") {
         Some("branch")

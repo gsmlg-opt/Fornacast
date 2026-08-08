@@ -16,6 +16,7 @@ defmodule GitCore.Native do
   def is_bare_repository(_path), do: :erlang.nif_error(:nif_not_loaded)
   def empty(_path), do: :erlang.nif_error(:nif_not_loaded)
   def list_refs(_path), do: :erlang.nif_error(:nif_not_loaded)
+  def exact_ref(_path, _full_name, _deadline_ms), do: :erlang.nif_error(:nif_not_loaded)
   def ref_summary(_path, _selected_ref), do: :erlang.nif_error(:nif_not_loaded)
 
   def ref_summary_for_route(_path, _route_segments),

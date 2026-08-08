@@ -16,6 +16,9 @@ config :fornacast, :database_adapter, database_adapter
 config :fornacast, :repo_adapter, repo_adapter
 config :fornacast, :auto_migrate, true
 
+config :forge_repos,
+  repository_write_reconcilers: [{100, :git_writes, ForgeRepos.GitWriteRecovery}]
+
 config :git_core, :limits,
   scan_concurrency: 4,
   scan_deadline_ms: 30_000,

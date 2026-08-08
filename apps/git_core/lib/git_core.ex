@@ -42,6 +42,23 @@ defmodule GitCore do
     read_refs(path, :list_refs)
   end
 
+  @doc "Reads one canonical full reference without peeling its direct object target."
+  @spec exact_ref(Path.t(), String.t(), keyword()) ::
+          {:ok, String.t() | nil} | {:error, GitCore.Error.t()}
+  def exact_ref(path, full_name, opts \\ [])
+      when is_binary(path) and is_binary(full_name) and is_list(opts) do
+    deadline_ms = Keyword.get(opts, :deadline_ms, GitCore.Limits.get(:ref_deadline_ms))
+
+    if is_integer(deadline_ms) and deadline_ms > 0 do
+      bounded_deadline_ms = min(deadline_ms, GitCore.Limits.get(:ref_deadline_ms))
+
+      GitCore.Native.exact_ref(path, :binary.bin_to_list(full_name), bounded_deadline_ms)
+      |> wrap_read(:exact_ref)
+    else
+      invalid_input(:exact_ref, "deadline_ms must be a positive integer")
+    end
+  end
+
   def ref_summary(path, opts \\ []) when is_binary(path) and is_list(opts) do
     selected_ref = opts |> Keyword.get(:selected_ref) |> ref_name_to_native()
 

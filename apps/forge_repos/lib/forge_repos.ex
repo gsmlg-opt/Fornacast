@@ -9,7 +9,7 @@ defmodule ForgeRepos do
   alias Ecto.Changeset
   alias Ecto.Multi
   alias ForgeAccounts.{AccountView, Organization, OrganizationMember, User}
-  alias ForgeRepos.{Collaborator, Repository, RepositoryView}
+  alias ForgeRepos.{Collaborator, Repository, RepositoryView, RepositoryWriteReconcilers}
   alias Fornacast.{Audit, Page, Repo, Storage}
 
   @repository_permissions [:repository_read, :repository_write, :repository_admin]
@@ -319,6 +319,50 @@ defmodule ForgeRepos do
     repository.storage_path
     |> Storage.repository_path!()
   end
+
+  @spec with_write_fence(
+          Repository.t(),
+          :ref | :content | :merge | :tag | :receive_pack,
+          (Path.t(), non_neg_integer() -> term())
+        ) :: term()
+  def with_write_fence(%Repository{id: repository_id} = repository, class, fun)
+      when is_integer(repository_id) and
+             class in [:ref, :content, :merge, :tag, :receive_pack] and
+             is_function(fun, 2) do
+    absolute_deadline = System.monotonic_time(:millisecond) + write_deadline(class)
+
+    case GitCore.RepositoryWriteLimiter.acquire(repository_id, absolute_deadline) do
+      {:ok, lease} ->
+        try do
+          with {:ok, repository_path} <- safe_absolute_storage_path(repository),
+               :ok <-
+                 RepositoryWriteReconcilers.reconcile_locked(
+                   repository,
+                   repository_path,
+                   absolute_deadline
+                 ) do
+            remaining = max(absolute_deadline - System.monotonic_time(:millisecond), 0)
+            fun.(repository_path, remaining)
+          else
+            {:error, :storage_unavailable} -> {:error, {:unavailable, :storage}}
+            {:error, :unavailable} -> {:error, {:unavailable, :write_fence}}
+          end
+        after
+          GitCore.RepositoryWriteLimiter.release(lease)
+        end
+
+      {:error, :timeout} ->
+        {:error, {:unavailable, :write_timeout}}
+
+      {:error, :unavailable} ->
+        {:error, {:unavailable, :write_limiter}}
+    end
+  end
+
+  defp write_deadline(class) when class in [:ref, :tag], do: GitCore.Limits.get(:ref_deadline_ms)
+
+  defp write_deadline(class) when class in [:content, :merge, :receive_pack],
+    do: GitCore.Limits.get(:content_deadline_ms)
 
   defp safe_absolute_storage_path(%Repository{} = repository) do
     {:ok, absolute_storage_path(repository)}
