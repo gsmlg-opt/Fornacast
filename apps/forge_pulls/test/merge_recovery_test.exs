@@ -210,24 +210,61 @@ defmodule ForgePulls.MergeRecoveryTest do
     refute Repo.get_by(AuditEvent, operation_id: "pull_merge:#{context.operation.id}")
   end
 
-  test "completion fails closed when the canonical issue is no longer open", context do
+  test "proven ref advancement completes when the canonical pull issue is already closed",
+       context do
     context.pull.issue_id
     |> then(&Repo.get!(Issue, &1))
-    |> Issue.update_changeset(%{state: :closed, state_reason: :completed})
+    |> Issue.update_changeset(%{state: :closed, state_reason: :not_planned})
     |> Repo.update!()
 
-    assert {:error, :unavailable} =
+    assert :ok =
              MergeRecovery.reconcile_repository_locked(
                context.repository,
                context.path,
                System.monotonic_time(:millisecond) + 10_000
              )
 
-    assert %MergeOperation{state: :ref_advanced, lease_owner: nil} =
+    assert %MergeOperation{state: :completed, lease_owner: nil} =
+             Repo.get!(MergeOperation, context.operation.id)
+
+    assert %PullRequest{merge_commit_sha: merge_oid} = Repo.get!(PullRequest, context.pull.id)
+    assert merge_oid == context.merge_oid
+
+    assert %Issue{state: :closed, state_reason: :completed} =
+             Repo.get!(Issue, context.pull.issue_id)
+
+    assert %AuditEvent{action: "pull_request.merged"} =
+             Repo.get_by!(AuditEvent, operation_id: "pull_merge:#{context.operation.id}")
+  end
+
+  test "a closed issue remains fail-closed when the merge ref was not advanced", context do
+    Repo.update_all(
+      from(operation in MergeOperation, where: operation.id == ^context.operation.id),
+      set: [state: :merge_written]
+    )
+
+    update_ref(context.path, context.operation.expected_base_oid, context.operation.base_ref)
+
+    context.pull.issue_id
+    |> then(&Repo.get!(Issue, &1))
+    |> Issue.update_changeset(%{state: :closed, state_reason: :not_planned})
+    |> Repo.update!()
+
+    assert :ok =
+             MergeRecovery.reconcile_repository_locked(
+               context.repository,
+               context.path,
+               System.monotonic_time(:millisecond) + 10_000
+             )
+
+    assert %MergeOperation{state: :failed, failure_reason: "ref_not_advanced"} =
              Repo.get!(MergeOperation, context.operation.id)
 
     assert %PullRequest{merge_commit_sha: nil} = Repo.get!(PullRequest, context.pull.id)
-    assert %Issue{state: :closed} = Repo.get!(Issue, context.pull.issue_id)
+
+    assert %Issue{state: :closed, state_reason: :not_planned} =
+             Repo.get!(Issue, context.pull.issue_id)
+
     refute Repo.get_by(AuditEvent, operation_id: "pull_merge:#{context.operation.id}")
   end
 

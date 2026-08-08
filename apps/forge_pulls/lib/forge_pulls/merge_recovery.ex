@@ -302,7 +302,9 @@ defmodule ForgePulls.MergeRecovery do
     actor = load_actor(operation.actor_user_id)
     pull = Repo.get!(PullRequest, operation.pull_request_id)
 
-    with %Issue{kind: :pull_request, state: :open} = issue <- Repo.get(Issue, pull.issue_id) do
+    with %Issue{kind: :pull_request, repository_id: repository_id, state: state} = issue
+         when repository_id == repository.id and state in [:open, :closed] <-
+           Repo.get(Issue, pull.issue_id) do
       operation_query =
         from candidate in MergeOperation,
           where:
@@ -371,7 +373,7 @@ defmodule ForgePulls.MergeRecovery do
       |> then(&apply_complete_multi_hook(multi, &1))
       |> Repo.transaction()
     else
-      _not_open -> {:error, :issue_not_open}
+      _invalid_issue -> {:error, :invalid_issue}
     end
   end
 

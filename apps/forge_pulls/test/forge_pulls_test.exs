@@ -1863,6 +1863,75 @@ defmodule ForgePullsTest do
     end
   end
 
+  test "recovery completes a proven merge after the public issue API closes its issue" do
+    owner = user_fixture(unique("merge-issue-close-race"))
+    repository = repository_fixture(owner)
+    create_mergeable_branches!(repository)
+    assert {:ok, pull} = create_pull(repository, owner, "Issue close race", "feature", "main")
+    path = ForgeRepos.absolute_storage_path(repository)
+    cache_key = {path, :pull_issue_close_race}
+    assert {:ok, :cached} = GitCore.Cache.fetch(cache_key, fn -> {:ok, :cached} end)
+
+    assert {:error, {:unavailable, :forced_after_ref}} =
+             ForgePulls.with_test_merge_transition_hook(
+               fn
+                 :ref_advanced, _operation ->
+                   assert {:ok, %Issue{state: :closed, state_reason: :not_planned}} =
+                            ForgeIssues.update(
+                              owner,
+                              owner.username,
+                              repository.slug,
+                              pull.issue.number,
+                              %{"state" => "closed", "state_reason" => "not_planned"},
+                              request_metadata(unique("issue-close-race"))
+                            )
+
+                   {:error, {:unavailable, :forced_after_ref}}
+
+                 _state, _operation ->
+                   :ok
+               end,
+               fn ->
+                 ForgePulls.merge(
+                   repository,
+                   pull,
+                   owner,
+                   %{},
+                   request_metadata(unique("merge-issue-close-race"))
+                 )
+               end
+             )
+
+    assert %MergeOperation{state: :ref_advanced, merge_oid: merge_oid} =
+             operation =
+             Repo.one!(
+               from candidate in MergeOperation,
+                 where: candidate.pull_request_id == ^pull.id,
+                 order_by: [desc: candidate.id],
+                 limit: 1
+             )
+
+    assert :ok =
+             ForgePulls.MergeRecovery.reconcile_repository_locked(
+               repository,
+               path,
+               System.monotonic_time(:millisecond) + 10_000
+             )
+
+    assert %MergeOperation{state: :completed} = Repo.get!(MergeOperation, operation.id)
+    assert %PullRequest{merge_commit_sha: ^merge_oid} = Repo.get!(PullRequest, pull.id)
+
+    assert %Issue{state: :closed, state_reason: :completed} =
+             Repo.get!(Issue, pull.issue_id)
+
+    assert %AuditEvent{action: "pull_request.merged"} =
+             Repo.get_by!(AuditEvent, operation_id: "pull_merge:#{operation.id}")
+
+    assert {:ok, ^merge_oid} = GitCore.exact_ref(path, pull.base_ref)
+
+    assert {:ok, :refreshed} = GitCore.Cache.fetch(cache_key, fn -> {:ok, :refreshed} end)
+  end
+
   test "two racing merge callers produce exactly one winning ref update" do
     owner = user_fixture(unique("merge-race"))
     repository = repository_fixture(owner)
