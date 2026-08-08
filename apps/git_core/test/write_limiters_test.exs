@@ -2,6 +2,7 @@ defmodule GitCore.RepositoryWriteLimiterTest do
   use ExUnit.Case, async: false
 
   alias GitCore.RepositoryWriteLimiter
+  @production_registry_key {RepositoryWriteLimiter, :production_grants}
 
   test "two repository keys run concurrently while a third waits" do
     assert {:ok, first} = RepositoryWriteLimiter.acquire(:first, deadline())
@@ -98,12 +99,117 @@ defmodule GitCore.RepositoryWriteLimiterTest do
     assert_receive {:released, ^waiter}
   end
 
-  test "a production crash stays unavailable while existing owners survive" do
+  test "application restart recovers live grants and stale leases release them" do
+    {holder, _lease} = start_holder(:surviving_owner)
+    crash_and_restart_limiter()
+    assert Process.alive?(holder)
+    assert_grant_count(1)
+
+    assert {:error, :timeout} =
+             RepositoryWriteLimiter.acquire(:surviving_owner, short_deadline())
+
+    assert {:ok, other} = RepositoryWriteLimiter.acquire(:other_repository, deadline())
+
+    assert {:error, :timeout} =
+             RepositoryWriteLimiter.acquire(:third_repository, short_deadline())
+
+    assert :ok = RepositoryWriteLimiter.release(other)
+
+    release_holder(holder)
+    assert_grant_count(0)
+    restart_git_core()
+    assert_grant_count(0)
+
+    assert {:ok, replacement} = RepositoryWriteLimiter.acquire(:surviving_owner, deadline())
+    assert :ok = RepositoryWriteLimiter.release(replacement)
+  end
+
+  test "a recovered grant is removed when its owner dies" do
+    {holder, _lease} = start_holder(:owner_death_after_restart)
+    crash_and_restart_limiter()
+    assert_grant_count(1)
+
+    monitor = Process.monitor(holder)
+    Process.exit(holder, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^holder, :killed}
+    wait_for_grant_count(0)
+
+    assert {:ok, replacement} =
+             RepositoryWriteLimiter.acquire(:owner_death_after_restart, deadline())
+
+    assert :ok = RepositoryWriteLimiter.release(replacement)
+  end
+
+  test "live grants survive repeated application restarts" do
+    {holder, _lease} = start_holder(:repeated_restart)
+    crash_and_restart_limiter()
+    assert_grant_count(1)
+
+    assert :ok = Application.stop(:git_core)
+    assert {:ok, _started} = Application.ensure_all_started(:git_core)
+    assert_grant_count(1)
+
+    assert {:error, :timeout} =
+             RepositoryWriteLimiter.acquire(:repeated_restart, short_deadline())
+
+    release_holder(holder)
+    assert {:ok, replacement} = RepositoryWriteLimiter.acquire(:repeated_restart, deadline())
+    assert :ok = RepositoryWriteLimiter.release(replacement)
+  end
+
+  test "isolated limiters do not load the production grant registry" do
+    assert {:ok, lease} = RepositoryWriteLimiter.acquire(:production_only, deadline())
+    isolated = start_supervised!({RepositoryWriteLimiter, server: nil}, id: make_ref())
+    assert :sys.get_state(isolated).grants == %{}
+    assert :ok = RepositoryWriteLimiter.release(lease)
+  end
+
+  test "production init discards dead-owner and malformed registry entries" do
+    dead_owner = spawn(fn -> Process.sleep(:infinity) end)
+    monitor = Process.monitor(dead_owner)
+    Process.exit(dead_owner, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^dead_owner, :killed}
+
+    assert :ok = Application.stop(:git_core)
+
+    :persistent_term.put(@production_registry_key, %{
+      make_ref() => %{owner: dead_owner, repository_key: :stale_repository},
+      :malformed => :entry
+    })
+
+    assert {:ok, _started} = Application.ensure_all_started(:git_core)
+    assert_grant_count(0)
+    assert :persistent_term.get(@production_registry_key) == %{}
+
+    assert {:ok, lease} = RepositoryWriteLimiter.acquire(:stale_repository, deadline())
+    assert :ok = RepositoryWriteLimiter.release(lease)
+  end
+
+  test "a production crash is unavailable until application restart" do
+    {holder, _lease} = start_holder(:unavailable_during_crash)
+    limiter = Process.whereis(RepositoryWriteLimiter)
+    monitor = Process.monitor(limiter)
+    Process.exit(limiter, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^limiter, :killed}
+
+    assert Process.alive?(holder)
+    assert {:error, :unavailable} = RepositoryWriteLimiter.acquire(:other_repository, deadline())
+
+    restart_git_core()
+    release_holder(holder)
+  end
+
+  test "production and isolated child specs are temporary" do
+    assert RepositoryWriteLimiter.child_spec([]).restart == :temporary
+    assert RepositoryWriteLimiter.child_spec(server: nil).restart == :temporary
+  end
+
+  defp start_holder(key) do
     parent = self()
 
     holder =
       spawn(fn ->
-        {:ok, lease} = RepositoryWriteLimiter.acquire(:surviving_owner, deadline())
+        {:ok, lease} = RepositoryWriteLimiter.acquire(key, deadline())
         send(parent, {:holder_acquired, self(), lease})
 
         receive do
@@ -113,31 +219,51 @@ defmodule GitCore.RepositoryWriteLimiterTest do
         end
       end)
 
-    assert_receive {:holder_acquired, ^holder, _lease}
-    limiter = Process.whereis(RepositoryWriteLimiter)
-    monitor = Process.monitor(limiter)
-    Process.exit(limiter, :kill)
-    assert_receive {:DOWN, ^monitor, :process, ^limiter, :killed}
+    assert_receive {:holder_acquired, ^holder, lease}
+    {holder, lease}
+  end
 
-    assert Process.alive?(holder)
-    assert Process.whereis(RepositoryWriteLimiter) == nil
-    assert {:error, :unavailable} = RepositoryWriteLimiter.acquire(:surviving_owner, deadline())
-    assert {:error, :unavailable} = RepositoryWriteLimiter.acquire(:other_repository, deadline())
-
-    assert :ok = Application.stop(:git_core)
-    assert {:ok, _started} = Application.ensure_all_started(:git_core)
-    replacement = Process.whereis(RepositoryWriteLimiter)
-    assert is_pid(replacement)
-    assert {:ok, lease} = RepositoryWriteLimiter.acquire(:after_operator_restart, deadline())
-    assert :ok = RepositoryWriteLimiter.release(lease)
-
+  defp release_holder(holder) do
     send(holder, :release)
     assert_receive {:holder_released, ^holder}
   end
 
-  test "production and isolated child specs are temporary to fail closed" do
-    assert RepositoryWriteLimiter.child_spec([]).restart == :temporary
-    assert RepositoryWriteLimiter.child_spec(server: nil).restart == :temporary
+  defp crash_and_restart_limiter do
+    limiter = Process.whereis(RepositoryWriteLimiter)
+    monitor = Process.monitor(limiter)
+    Process.exit(limiter, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^limiter, :killed}
+    assert {:error, :unavailable} = RepositoryWriteLimiter.acquire(:during_crash, deadline())
+    restart_git_core()
+  end
+
+  defp restart_git_core do
+    assert :ok = Application.stop(:git_core)
+    assert {:ok, _started} = Application.ensure_all_started(:git_core)
+    assert is_pid(Process.whereis(RepositoryWriteLimiter))
+  end
+
+  defp assert_grant_count(expected) do
+    assert map_size(:sys.get_state(RepositoryWriteLimiter).grants) == expected
+  end
+
+  defp wait_for_grant_count(expected, attempts \\ 100)
+
+  defp wait_for_grant_count(expected, attempts) when attempts > 0 do
+    if map_size(:sys.get_state(RepositoryWriteLimiter).grants) == expected do
+      :ok
+    else
+      Process.sleep(5)
+      wait_for_grant_count(expected, attempts - 1)
+    end
+  end
+
+  defp wait_for_grant_count(expected, 0) do
+    flunk("repository writer limiter did not reach #{expected} grants")
+  end
+
+  defp short_deadline do
+    System.monotonic_time(:millisecond) + 20
   end
 
   defp start_waiter(key, absolute_deadline \\ nil) do

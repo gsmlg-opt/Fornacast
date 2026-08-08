@@ -3,14 +3,15 @@ defmodule GitCore.RepositoryWriteLimiter do
   Serializes repository writes by repository key and across the node.
 
   The supervised child is temporary by design. Restarting it automatically
-  would forget leases whose owners survived the crash and could admit
-  conflicting writes. After a crash, admission fails closed until an operator
-  or application restart deliberately restores the limiter.
+  could admit conflicting writes before lease state is recovered. After a
+  crash, admission fails closed until an operator or application restart
+  reconstructs live production grants and their owner monitors.
   """
 
   use GenServer
 
   @lease_tag {__MODULE__, :lease}
+  @production_registry_key {__MODULE__, :production_grants}
   @deadline_timer_chunk_ms 60_000
   @opaque lease :: {{__MODULE__, :lease}, GenServer.server(), reference()}
   @type acquire_error :: :timeout | :unavailable
@@ -18,6 +19,7 @@ defmodule GitCore.RepositoryWriteLimiter do
   defmodule State do
     @moduledoc false
     defstruct capacity: nil,
+              production_registry?: false,
               grants: %{},
               active_keys: MapSet.new(),
               waiters: %{},
@@ -70,13 +72,20 @@ defmodule GitCore.RepositoryWriteLimiter do
   def init(opts) do
     capacity = Keyword.get(opts, :capacity, GitCore.Limits.get(:repository_writer_concurrency))
     hard_capacity = GitCore.Limits.hard(:repository_writer_concurrency)
+    production_registry? = Keyword.get(opts, :server, __MODULE__) == __MODULE__
 
     if not (is_integer(capacity) and capacity in 1..hard_capacity) do
       raise ArgumentError,
             "repository writer capacity must be between 1 and #{hard_capacity}"
     end
 
-    {:ok, %State{capacity: capacity}}
+    state = %State{capacity: capacity, production_registry?: production_registry?}
+
+    if production_registry? do
+      {:ok, recover_production_grants(state)}
+    else
+      {:ok, state}
+    end
   end
 
   @impl true
@@ -128,6 +137,7 @@ defmodule GitCore.RepositoryWriteLimiter do
 
       {{:grant, lease}, monitors} ->
         {grant, grants} = Map.pop!(state.grants, lease)
+        forget_production_grant(state, lease)
 
         state = %{
           state
@@ -163,6 +173,7 @@ defmodule GitCore.RepositoryWriteLimiter do
     lease = make_ref()
     monitor = Process.monitor(owner)
     grant = %{owner: owner, monitor: monitor, repository_key: repository_key}
+    persist_production_grant(state, lease, owner, repository_key)
 
     state = %{
       state
@@ -205,6 +216,7 @@ defmodule GitCore.RepositoryWriteLimiter do
         state
 
       {%{monitor: monitor, repository_key: repository_key}, grants} ->
+        forget_production_grant(state, lease)
         Process.demonitor(monitor, [:flush])
 
         state = %{
@@ -247,6 +259,13 @@ defmodule GitCore.RepositoryWriteLimiter do
                 repository_key: waiter.repository_key
               }
 
+              persist_production_grant(
+                state,
+                lease,
+                waiter.owner,
+                waiter.repository_key
+              )
+
               state = %{
                 state
                 | queue: :gb_trees.delete(sequence, state.queue),
@@ -282,4 +301,55 @@ defmodule GitCore.RepositoryWriteLimiter do
     delay = min(deadline - now, @deadline_timer_chunk_ms)
     Process.send_after(self(), {:deadline, waiter_id}, delay)
   end
+
+  defp recover_production_grants(state) do
+    registry = :persistent_term.get(@production_registry_key, %{})
+
+    {grants, active_keys, monitors, live_registry} =
+      Enum.reduce(registry, {%{}, MapSet.new(), %{}, %{}}, fn
+        {lease, %{owner: owner, repository_key: repository_key}},
+        {grants, active_keys, monitors, live_registry}
+        when is_reference(lease) and is_pid(owner) ->
+          if Process.alive?(owner) do
+            monitor = Process.monitor(owner)
+            grant = %{owner: owner, monitor: monitor, repository_key: repository_key}
+
+            {
+              Map.put(grants, lease, grant),
+              MapSet.put(active_keys, repository_key),
+              Map.put(monitors, monitor, {:grant, lease}),
+              Map.put(live_registry, lease, %{owner: owner, repository_key: repository_key})
+            }
+          else
+            {grants, active_keys, monitors, live_registry}
+          end
+
+        _entry, acc ->
+          acc
+      end)
+
+    :persistent_term.put(@production_registry_key, live_registry)
+
+    %{state | grants: grants, active_keys: active_keys, monitors: monitors}
+  end
+
+  defp persist_production_grant(
+         %{production_registry?: true},
+         lease,
+         owner,
+         repository_key
+       ) do
+    registry = :persistent_term.get(@production_registry_key, %{})
+    grant = %{owner: owner, repository_key: repository_key}
+    :persistent_term.put(@production_registry_key, Map.put(registry, lease, grant))
+  end
+
+  defp persist_production_grant(_state, _lease, _owner, _repository_key), do: :ok
+
+  defp forget_production_grant(%{production_registry?: true}, lease) do
+    registry = :persistent_term.get(@production_registry_key, %{})
+    :persistent_term.put(@production_registry_key, Map.delete(registry, lease))
+  end
+
+  defp forget_production_grant(_state, _lease), do: :ok
 end
