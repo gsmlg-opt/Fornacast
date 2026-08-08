@@ -277,6 +277,70 @@ defmodule GitTransport.ReceivePackFenceTest do
   end
 
   @tag :tmp_dir
+  test "dirty NIF worker and fence survive worker supervisor crash and restart", %{
+    repository: repository,
+    tmp_dir: tmp_dir
+  } do
+    entered_path = Path.join(tmp_dir, "supervisor-crash-dirty-nif-entered")
+    release_path = Path.join(tmp_dir, "supervisor-crash-dirty-nif-release")
+    on_exit(fn -> File.write(release_path, "release") end)
+    parent = self()
+
+    first =
+      response_task(repository, fn _path, _pack, _commands ->
+        {:ok, {}} = GitCore.Native.test_dirty_io_wait(entered_path, release_path)
+        {:ok, [{"refs/heads/main", "ok", nil}]}
+      end)
+
+    wait_for_file(entered_path)
+    original_supervisor = Process.whereis(GitTransport.ReceivePackWorkerSupervisor)
+    supervisor_monitor = Process.monitor(original_supervisor)
+    Process.exit(original_supervisor, :kill)
+    assert_receive {:DOWN, ^supervisor_monitor, :process, ^original_supervisor, :killed}
+    wait_for_worker_supervisor_restart(original_supervisor)
+    assert Task.yield(first, 0) == nil
+    assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 1
+
+    restarted_supervisor = Process.whereis(GitTransport.ReceivePackWorkerSupervisor)
+    restarted_monitor = Process.monitor(restarted_supervisor)
+    Process.exit(restarted_supervisor, :kill)
+
+    assert_receive {:DOWN, ^restarted_monitor, :process, ^restarted_supervisor, :killed}
+    wait_for_worker_supervisor_restart(restarted_supervisor)
+    assert Task.yield(first, 0) == nil
+    assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 1
+
+    other_repository = %Repository{
+      id: repository.id + 1,
+      storage_path: "test/supervisor-crash-other.git"
+    }
+
+    assert {:ok, _response, _statuses} =
+             response_task(other_repository, fn _path, _pack, _commands ->
+               send(parent, :supervisor_crash_other_entered)
+               {:ok, [{"refs/heads/main", "ok", nil}]}
+             end)
+             |> Task.await()
+
+    assert_receive :supervisor_crash_other_entered
+
+    second =
+      response_task(repository, fn _path, _pack, _commands ->
+        send(parent, :supervisor_crash_same_entered)
+        {:ok, [{"refs/heads/main", "ok", nil}]}
+      end)
+
+    wait_for_waiters(1)
+    refute_receive :supervisor_crash_same_entered
+    File.write!(release_path, "release")
+    assert {:ok, _response, _statuses} = Task.await(first)
+    assert_receive :supervisor_crash_same_entered
+    assert {:ok, _response, _statuses} = Task.await(second)
+    wait_for_workers(0)
+    assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 0
+  end
+
+  @tag :tmp_dir
   test "native errors and raises render ng and release the writer lease", %{
     repository: repository
   } do
@@ -350,6 +414,36 @@ defmodule GitTransport.ReceivePackFenceTest do
   end
 
   @tag :tmp_dir
+  test "repeated worker start and supervisor crash races leave no monitor or mailbox residue", %{
+    repository: repository
+  } do
+    decoy = make_ref()
+    send(self(), {decoy, :keep})
+
+    for _iteration <- 1..3 do
+      supervisor = Process.whereis(GitTransport.ReceivePackWorkerSupervisor)
+      monitor = Process.monitor(supervisor)
+
+      response =
+        response_task(repository, fn _path, _pack, _commands ->
+          {:ok, [{"refs/heads/main", "ok", nil}]}
+        end)
+
+      Process.exit(supervisor, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^supervisor, :killed}
+      wait_for_worker_supervisor_restart(supervisor)
+
+      assert {:ok, _response, [{"refs/heads/main", status, _message}]} = Task.await(response)
+      assert status in ["ok", "ng"]
+      wait_for_tracked_workers(0)
+      wait_for_workers(0)
+    end
+
+    assert_receive {^decoy, :keep}
+    assert {:messages, []} = Process.info(self(), :messages)
+  end
+
+  @tag :tmp_dir
   test "receive-pack worker supervision waits indefinitely and precedes SSH admission" do
     [worker_spec, manager_spec | daemon_specs] = GitTransport.Application.child_specs()
     assert worker_spec.id == GitTransport.ReceivePackWorkerSupervisor
@@ -395,6 +489,50 @@ defmodule GitTransport.ReceivePackFenceTest do
     assert {:ok, _response, [{"refs/heads/main", "ok", nil}]} = Task.await(response)
     assert :ok = Task.await(stopper)
     assert {:ok, _started} = Application.ensure_all_started(:git_transport)
+    wait_for_workers(0)
+  end
+
+  @tag :tmp_dir
+  test "application shutdown waits for a dirty NIF orphaned by supervisor restart", %{
+    repository: repository,
+    tmp_dir: tmp_dir
+  } do
+    entered_path = Path.join(tmp_dir, "orphan-shutdown-dirty-nif-entered")
+    release_path = Path.join(tmp_dir, "orphan-shutdown-dirty-nif-release")
+
+    on_exit(fn ->
+      File.write(release_path, "release")
+      Application.ensure_all_started(:git_transport)
+    end)
+
+    response =
+      response_task(repository, fn _path, _pack, _commands ->
+        {:ok, {}} = GitCore.Native.test_dirty_io_wait(entered_path, release_path)
+        {:ok, [{"refs/heads/main", "ok", nil}]}
+      end)
+
+    wait_for_file(entered_path)
+    original_supervisor = Process.whereis(GitTransport.ReceivePackWorkerSupervisor)
+    monitor = Process.monitor(original_supervisor)
+    Process.exit(original_supervisor, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^original_supervisor, :killed}
+    wait_for_worker_supervisor_restart(original_supervisor)
+    assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 1
+
+    stopper = Task.async(fn -> Application.stop(:git_transport) end)
+    assert Task.yield(stopper, 30) == nil
+
+    assert {:error, :timeout} =
+             GitCore.RepositoryWriteLimiter.acquire(
+               repository.id,
+               System.monotonic_time(:millisecond) + 25
+             )
+
+    File.write!(release_path, "release")
+    assert {:ok, _response, [{"refs/heads/main", "ok", nil}]} = Task.await(response)
+    assert :ok = Task.await(stopper)
+    assert {:ok, _started} = Application.ensure_all_started(:git_transport)
+    assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 0
     wait_for_workers(0)
   end
 
@@ -505,6 +643,36 @@ defmodule GitTransport.ReceivePackFenceTest do
   end
 
   defp wait_for_workers(expected, 0), do: flunk("expected #{expected} receive-pack worker(s)")
+
+  defp wait_for_tracked_workers(expected, attempts \\ 100)
+
+  defp wait_for_tracked_workers(expected, attempts) when attempts > 0 do
+    if GitTransport.ReceivePackWorkerManager.tracked_worker_count() == expected do
+      :ok
+    else
+      Process.sleep(5)
+      wait_for_tracked_workers(expected, attempts - 1)
+    end
+  end
+
+  defp wait_for_tracked_workers(expected, 0),
+    do: flunk("expected #{expected} manager-tracked receive-pack worker(s)")
+
+  defp wait_for_worker_supervisor_restart(previous, attempts \\ 100)
+
+  defp wait_for_worker_supervisor_restart(previous, attempts) when attempts > 0 do
+    case Process.whereis(GitTransport.ReceivePackWorkerSupervisor) do
+      pid when is_pid(pid) and pid != previous ->
+        :ok
+
+      _other ->
+        Process.sleep(5)
+        wait_for_worker_supervisor_restart(previous, attempts - 1)
+    end
+  end
+
+  defp wait_for_worker_supervisor_restart(_previous, 0),
+    do: flunk("expected receive-pack worker supervisor to restart")
 
   defp restore_env(application, key, {:ok, value}),
     do: Application.put_env(application, key, value)

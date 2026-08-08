@@ -7,6 +7,8 @@ defmodule GitTransport.ReceivePackWorker do
   def run(caller, reply, repository, pack, commands, native)
       when is_pid(caller) and is_reference(reply) and is_binary(pack) and is_list(commands) and
              is_function(native, 3) do
+    Process.flag(:trap_exit, true)
+
     result =
       ForgeRepos.with_write_fence(repository, :receive_pack, fn path, remaining ->
         if remaining > 0 do

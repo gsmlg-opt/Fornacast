@@ -6,10 +6,19 @@ defmodule GitTransport.Application do
   use Application
 
   @receive_pack_shutdown :infinity
+  # Keep the manager registry alive while the replaceable worker supervisor is
+  # restarted after clustered faults; the manager and limiter remain fail-safe.
+  @max_worker_supervisor_restarts 20
 
   @impl true
   def start(_type, _args) do
-    opts = [strategy: :one_for_one, name: GitTransport.Supervisor]
+    opts = [
+      strategy: :one_for_one,
+      name: GitTransport.Supervisor,
+      max_restarts: @max_worker_supervisor_restarts,
+      max_seconds: 5
+    ]
+
     Supervisor.start_link(child_specs(), opts)
   end
 
