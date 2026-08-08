@@ -1265,6 +1265,328 @@ defmodule ForgePullsTest do
     assert changeset.changes == %{}
   end
 
+  test "a writer merges the resolved snapshots through a durable two-parent ref CAS" do
+    owner = user_fixture(unique("merge-owner"))
+    repository = repository_fixture(owner)
+    {base_oid, head_oid} = create_mergeable_branches!(repository)
+    assert {:ok, pull} = create_pull(repository, owner, "Merge feature", "feature", "main")
+
+    assert {:ok, %{merged: true, message: "Pull Request successfully merged", sha: merge_oid}} =
+             ForgePulls.merge(
+               repository,
+               pull,
+               owner,
+               %{
+                 sha: head_oid,
+                 merge_method: "merge",
+                 commit_title: "Custom merge title",
+                 commit_message: "Custom merge body"
+               },
+               request_metadata(unique("merge-request"))
+             )
+
+    path = ForgeRepos.absolute_storage_path(repository)
+    assert {:ok, ^merge_oid} = GitCore.exact_ref(path, "refs/heads/main")
+
+    commit = git!(path, ["cat-file", "-p", merge_oid])
+    assert String.contains?(commit, "parent #{base_oid}\nparent #{head_oid}\n")
+    assert String.ends_with?(commit, "\n\nCustom merge title\n\nCustom merge body")
+
+    assert %PullRequest{merge_commit_sha: ^merge_oid, merged_by_user_id: actor_id} =
+             Repo.get!(PullRequest, pull.id)
+
+    assert actor_id == owner.id
+    assert %Issue{state: :closed, state_reason: :completed} = Repo.get!(Issue, pull.issue_id)
+
+    assert %MergeOperation{state: :completed, merge_oid: ^merge_oid} =
+             Repo.one!(
+               from operation in MergeOperation,
+                 where: operation.pull_request_id == ^pull.id,
+                 order_by: [desc: operation.id],
+                 limit: 1
+             )
+  end
+
+  test "merge validates method messages sha policy and closed or already-merged pulls" do
+    owner = user_fixture(unique("merge-policy"))
+    repository = repository_fixture(owner)
+    {_base_oid, head_oid} = create_mergeable_branches!(repository)
+    assert {:ok, pull} = create_pull(repository, owner, "Default merge", "feature", "main")
+    metadata = request_metadata(unique("merge-policy"))
+
+    for {attrs, field} <- [
+          {%{merge_method: "squash"}, "merge_method"},
+          {%{sha: "not-an-oid"}, "sha"},
+          {%{commit_title: ""}, "commit_title"},
+          {%{commit_message: <<0>>}, "commit_message"}
+        ] do
+      assert {:error, {:validation, [%{field: ^field, code: :invalid}]}} =
+               ForgePulls.merge(repository, pull, owner, attrs, metadata)
+    end
+
+    assert {:error, :head_changed} =
+             ForgePulls.merge(
+               repository,
+               pull,
+               owner,
+               %{sha: String.duplicate("0", 40)},
+               metadata
+             )
+
+    path = ForgeRepos.absolute_storage_path(repository)
+    moved_head_oid = child_commit!(path, head_oid, "head moved")
+    git!(path, ["update-ref", "refs/heads/feature", moved_head_oid, head_oid])
+
+    assert {:error, :head_changed} =
+             ForgePulls.merge(repository, pull, owner, %{sha: head_oid}, metadata)
+
+    disabled = repository |> Ecto.Changeset.change(allow_merge_commit: false) |> Repo.update!()
+
+    assert {:error, :merge_commits_disabled} =
+             ForgePulls.merge(disabled, pull, owner, %{}, metadata)
+
+    repository = disabled |> Ecto.Changeset.change(allow_merge_commit: true) |> Repo.update!()
+    issue = Repo.get!(Issue, pull.issue_id)
+    Repo.update!(Ecto.Changeset.change(issue, state: :closed, state_reason: :completed))
+    assert {:error, :conflict} = ForgePulls.merge(repository, pull, owner, %{}, metadata)
+
+    pull.issue_id
+    |> then(&Repo.get!(Issue, &1))
+    |> Ecto.Changeset.change(state: :open, state_reason: nil)
+    |> Repo.update!()
+
+    assert {:ok, %{sha: merge_oid}} =
+             ForgePulls.merge(repository, pull, owner, %{sha: moved_head_oid}, metadata)
+
+    commit = git!(ForgeRepos.absolute_storage_path(repository), ["cat-file", "-p", merge_oid])
+
+    assert String.ends_with?(
+             commit,
+             "\n\nMerge pull request ##{pull.issue.number} from feature\n\nDefault merge"
+           )
+
+    assert {:error, :conflict} = ForgePulls.merge(repository, pull, owner, %{}, metadata)
+  end
+
+  test "a moved base loses the exact CAS and leaves merge evidence diagnosable" do
+    owner = user_fixture(unique("merge-base-race"))
+    repository = repository_fixture(owner)
+    {_base_oid, _head_oid} = create_mergeable_branches!(repository)
+    assert {:ok, pull} = create_pull(repository, owner, "Base race", "feature", "main")
+    path = ForgeRepos.absolute_storage_path(repository)
+
+    assert {:error, :ref_conflict} =
+             ForgePulls.with_test_merge_transition_hook(
+               fn
+                 :merge_written, operation ->
+                   raced_oid = child_commit!(path, operation.expected_base_oid, "base raced")
+                   _updated = git!(path, ["update-ref", operation.base_ref, raced_oid])
+                   :ok
+
+                 _state, _operation ->
+                   :ok
+               end,
+               fn ->
+                 ForgePulls.merge(
+                   repository,
+                   pull,
+                   owner,
+                   %{},
+                   request_metadata(unique("merge-base-race"))
+                 )
+               end
+             )
+
+    assert %MergeOperation{state: :merge_written, merge_oid: merge_oid} =
+             Repo.one!(
+               from operation in MergeOperation,
+                 where: operation.pull_request_id == ^pull.id,
+                 order_by: [desc: operation.id],
+                 limit: 1
+             )
+
+    assert is_binary(merge_oid)
+    refute Repo.get!(PullRequest, pull.id).merge_commit_sha
+  end
+
+  test "conflicts and writer exhaustion never prepare or advance a merge" do
+    owner = user_fixture(unique("merge-reject"))
+    conflict_repository = repository_fixture(owner)
+    create_conflicting_branches!(conflict_repository)
+
+    assert {:ok, conflict_pull} =
+             create_pull(conflict_repository, owner, "Conflict", "feature", "main")
+
+    base_before = snapshot_oid(conflict_repository, "main")
+
+    assert {:error, :conflict} =
+             ForgePulls.merge(
+               conflict_repository,
+               conflict_pull,
+               owner,
+               %{},
+               request_metadata(unique("merge-conflict"))
+             )
+
+    assert snapshot_oid(conflict_repository, "main") == base_before
+    refute Repo.get_by(MergeOperation, pull_request_id: conflict_pull.id)
+
+    repository = repository_fixture(owner)
+    create_mergeable_branches!(repository)
+    assert {:ok, pull} = create_pull(repository, owner, "Exhausted", "feature", "main")
+    original_limits = Application.fetch_env!(:git_core, :limits)
+    Application.put_env(:git_core, :limits, Keyword.put(original_limits, :content_deadline_ms, 1))
+
+    assert {:ok, lease} =
+             GitCore.RepositoryWriteLimiter.acquire(
+               repository.id,
+               System.monotonic_time(:millisecond) + 10_000
+             )
+
+    try do
+      assert {:error, {:unavailable, :write_timeout}} =
+               ForgePulls.merge(
+                 repository,
+                 pull,
+                 owner,
+                 %{},
+                 request_metadata(unique("merge-exhausted"))
+               )
+    after
+      GitCore.RepositoryWriteLimiter.release(lease)
+      Application.put_env(:git_core, :limits, original_limits)
+    end
+
+    refute Repo.get_by(MergeOperation, pull_request_id: pull.id)
+  end
+
+  test "the earlier-operation fence resolves old evidence before a new merge" do
+    owner = user_fixture(unique("merge-fence"))
+    repository = repository_fixture(owner)
+    {base_oid, head_oid} = create_mergeable_branches!(repository)
+    assert {:ok, pull} = create_pull(repository, owner, "Fenced", "feature", "main")
+
+    older =
+      %MergeOperation{}
+      |> MergeOperation.prepare_changeset(%{
+        pull_request_id: pull.id,
+        repository_id: repository.id,
+        actor_user_id: owner.id,
+        request_id: unique("older-merge"),
+        base_ref: pull.base_ref,
+        head_ref: pull.head_ref,
+        expected_base_oid: base_oid,
+        expected_head_oid: head_oid,
+        state: :prepared
+      })
+      |> Repo.insert!()
+
+    assert {:ok, %{merged: true}} =
+             ForgePulls.merge(
+               repository,
+               pull,
+               owner,
+               %{},
+               request_metadata(unique("new-merge"))
+             )
+
+    assert %MergeOperation{state: :failed, failure_reason: "effect_not_started"} =
+             Repo.get!(MergeOperation, older.id)
+  end
+
+  test "faults after every persisted transition leave one recoverable operation" do
+    for {fault_state, recovered_state} <- [
+          prepared: :failed,
+          merge_written: :failed,
+          ref_advanced: :completed,
+          completed: :completed
+        ] do
+      owner = user_fixture(unique("merge-fault"))
+      repository = repository_fixture(owner)
+      create_mergeable_branches!(repository)
+      assert {:ok, pull} = create_pull(repository, owner, "Fault", "feature", "main")
+
+      assert_raise RuntimeError, "fault after #{fault_state}", fn ->
+        ForgePulls.with_test_merge_transition_hook(
+          fn state, _operation ->
+            if state == fault_state, do: raise("fault after #{state}"), else: :ok
+          end,
+          fn ->
+            ForgePulls.merge(
+              repository,
+              pull,
+              owner,
+              %{},
+              request_metadata(unique("merge-fault"))
+            )
+          end
+        )
+      end
+
+      operation =
+        Repo.one!(
+          from candidate in MergeOperation,
+            where: candidate.pull_request_id == ^pull.id,
+            order_by: [desc: candidate.id],
+            limit: 1
+        )
+
+      assert operation.state == fault_state
+
+      assert :ok =
+               ForgePulls.MergeRecovery.reconcile_repository_locked(
+                 repository,
+                 ForgeRepos.absolute_storage_path(repository),
+                 System.monotonic_time(:millisecond) + 10_000
+               )
+
+      assert Repo.get!(MergeOperation, operation.id).state == recovered_state
+    end
+  end
+
+  test "two racing merge callers produce exactly one winning ref update" do
+    owner = user_fixture(unique("merge-race"))
+    repository = repository_fixture(owner)
+    create_mergeable_branches!(repository)
+    assert {:ok, pull} = create_pull(repository, owner, "Race", "feature", "main")
+    parent = self()
+    barrier = make_ref()
+
+    tasks =
+      for index <- 1..2 do
+        Task.async(fn ->
+          send(parent, {barrier, self()})
+          receive do: ({:go, ^barrier} -> :ok)
+
+          ForgePulls.merge(
+            repository,
+            pull,
+            owner,
+            %{},
+            request_metadata(unique("merge-racer-#{index}"))
+          )
+        end)
+      end
+
+    for task <- tasks do
+      assert_receive {^barrier, worker} when worker == task.pid
+    end
+
+    Enum.each(tasks, &send(&1.pid, {:go, barrier}))
+    results = Enum.map(tasks, &Task.await(&1, 30_000))
+
+    assert 1 == Enum.count(results, &match?({:ok, %{merged: true}}, &1))
+    assert 1 == Enum.count(results, &match?({:error, :conflict}, &1))
+
+    assert 1 ==
+             Repo.aggregate(
+               from(op in MergeOperation,
+                 where: op.pull_request_id == ^pull.id and op.state == :completed
+               ),
+               :count
+             )
+  end
+
   test "merge operations only move through durable next states and redact failure reasons" do
     operation = %MergeOperation{state: :prepared, failure_reason: "private git error"}
 
@@ -2360,5 +2682,62 @@ defmodule ForgePullsTest do
         "refs/heads/#{branch}",
         String.trim(commit)
       ])
+  end
+
+  defp create_mergeable_branches!(repository) do
+    path = ForgeRepos.absolute_storage_path(repository)
+    tree = git!(path, ["hash-object", "-t", "tree", "-w", "/dev/null"])
+    base = git!(path, ["commit-tree", tree, "-m", "base"])
+    head = git!(path, ["commit-tree", tree, "-p", base, "-m", "head"])
+    _main = git!(path, ["update-ref", "refs/heads/main", base])
+    _feature = git!(path, ["update-ref", "refs/heads/feature", head])
+    {base, head}
+  end
+
+  defp child_commit!(path, parent, message) do
+    tree = git!(path, ["hash-object", "-t", "tree", "-w", "/dev/null"])
+    git!(path, ["commit-tree", tree, "-p", parent, "-m", message])
+  end
+
+  defp create_conflicting_branches!(repository) do
+    worktree =
+      Path.join(System.tmp_dir!(), "pull-conflict-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(worktree)
+    on_exit(fn -> File.rm_rf!(worktree) end)
+    _init = worktree_git!(worktree, ["init", "-b", "main"])
+    _name = worktree_git!(worktree, ["config", "user.name", "Pull Test"])
+    _email = worktree_git!(worktree, ["config", "user.email", "pull@example.test"])
+    file = Path.join(worktree, "conflict.txt")
+    File.write!(file, "base\n")
+    _add = worktree_git!(worktree, ["add", "conflict.txt"])
+    _base = worktree_git!(worktree, ["commit", "-m", "base"])
+    _branch = worktree_git!(worktree, ["checkout", "-b", "feature"])
+    File.write!(file, "feature\n")
+    _head = worktree_git!(worktree, ["commit", "-am", "feature"])
+    _main = worktree_git!(worktree, ["checkout", "main"])
+    File.write!(file, "main\n")
+    _main_commit = worktree_git!(worktree, ["commit", "-am", "main"])
+
+    path = ForgeRepos.absolute_storage_path(repository)
+    _push = worktree_git!(worktree, ["push", path, "main", "feature"])
+    :ok
+  end
+
+  defp git!(path, args) do
+    env = [
+      {"GIT_AUTHOR_NAME", "Pull Test"},
+      {"GIT_AUTHOR_EMAIL", "pull@example.test"},
+      {"GIT_COMMITTER_NAME", "Pull Test"},
+      {"GIT_COMMITTER_EMAIL", "pull@example.test"}
+    ]
+
+    {output, 0} = System.cmd("git", ["--git-dir=#{path}" | args], env: env)
+    String.trim(output)
+  end
+
+  defp worktree_git!(worktree, args) do
+    {output, 0} = System.cmd("git", ["-C", worktree | args], stderr_to_stdout: true)
+    String.trim(output)
   end
 end

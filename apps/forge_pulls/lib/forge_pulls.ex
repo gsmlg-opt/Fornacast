@@ -125,8 +125,10 @@ defmodule ForgePulls do
   import Ecto.Query
 
   alias ForgeIssues.{Comment, Issue}
-  alias ForgePulls.PullRequest
+  alias ForgePulls.{MergeOperation, MergeRecovery, PullRequest}
   alias Fornacast.{Audit, Page, Repo}
+
+  @oid_regex ~r/\A[0-9a-f]{40}(?:[0-9a-f]{24})?\z/
 
   @type error_reason ::
           :not_found
@@ -306,6 +308,70 @@ defmodule ForgePulls do
 
   def pull_links_for_issue_ids(_repository, _ids, _actor), do: {:error, :not_found}
 
+  @spec merge(ForgeRepos.Repository.t(), PullRequest.t(), map(), map(), map()) ::
+          {:ok, %{merged: true, message: String.t(), sha: String.t()}}
+          | {:error, error_reason()}
+  def merge(
+        %ForgeRepos.Repository{} = repository,
+        %PullRequest{} = expected_pull,
+        actor,
+        attrs,
+        request_metadata
+      )
+      when is_map(attrs) and is_map(request_metadata) do
+    with %ForgeAccounts.User{} = actor <- actor,
+         {:ok, merge_attrs} <- normalize_merge_attrs(attrs),
+         {:ok, context} <- authorize_merge(actor, repository, expected_pull),
+         result <-
+           ForgeRepos.with_write_fence(context.repository, :merge, fn repository_path,
+                                                                      remaining ->
+             absolute_deadline = System.monotonic_time(:millisecond) + remaining
+
+             execute_merge(
+               context,
+               merge_attrs,
+               request_metadata,
+               repository_path,
+               absolute_deadline
+             )
+           end) do
+      result
+    else
+      nil -> {:error, :forbidden}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def merge(_repository, _pull, _actor, _attrs, _request_metadata), do: {:error, :forbidden}
+
+  if Mix.env() == :test do
+    @merge_transition_hook_key {__MODULE__, :merge_transition_hook}
+
+    @doc false
+    def with_test_merge_transition_hook(hook, fun)
+        when is_function(hook, 2) and is_function(fun, 0) do
+      previous = Process.get(@merge_transition_hook_key)
+      Process.put(@merge_transition_hook_key, hook)
+
+      try do
+        fun.()
+      after
+        if previous == nil,
+          do: Process.delete(@merge_transition_hook_key),
+          else: Process.put(@merge_transition_hook_key, previous)
+      end
+    end
+
+    defp notify_merge_transition(state, operation) do
+      case Process.get(@merge_transition_hook_key) do
+        hook when is_function(hook, 2) -> hook.(state, operation)
+        nil -> :ok
+      end
+    end
+  else
+    defp notify_merge_transition(_state, _operation), do: :ok
+  end
+
   defp pull_links(_repository_id, []), do: %{}
 
   defp pull_links(repository_id, ids) do
@@ -315,6 +381,288 @@ defmodule ForgePulls do
     )
     |> Repo.all()
     |> Map.new(fn {issue_id, merged_at} -> {issue_id, %{merged_at: merged_at}} end)
+  end
+
+  defp execute_merge(context, attrs, request_metadata, repository_path, absolute_deadline) do
+    with {:ok, context} <-
+           authorize_merge(context.actor, context.repository, context.pull),
+         :ok <- merge_allowed(context),
+         {:ok, head_oid} <- exact_ref(repository_path, context.pull.head_ref, absolute_deadline),
+         {:ok, base_oid} <- exact_ref(repository_path, context.pull.base_ref, absolute_deadline),
+         :ok <- expected_head(attrs.sha, head_oid),
+         {:ok, analysis} <-
+           merge_analysis(repository_path, base_oid, head_oid, absolute_deadline),
+         :ok <- mergeable(analysis),
+         {:ok, operation} <-
+           prepare_merge_operation(context, attrs, request_metadata, base_oid, head_oid),
+         :ok <- notify_merge_transition(:prepared, operation),
+         {:ok, merge_oid} <-
+           write_merge_commit(
+             repository_path,
+             base_oid,
+             head_oid,
+             context,
+             attrs,
+             absolute_deadline
+           ),
+         {:ok, operation} <- persist_merge_written(operation, merge_oid),
+         :ok <- notify_merge_transition(:merge_written, operation),
+         {:ok, ^merge_oid} <-
+           compare_and_swap(
+             repository_path,
+             context.pull.base_ref,
+             base_oid,
+             merge_oid,
+             absolute_deadline
+           ),
+         {:ok, operation} <- persist_ref_advanced(operation),
+         :ok <- notify_merge_transition(:ref_advanced, operation),
+         :ok <-
+           MergeRecovery.reconcile_repository_locked(
+             context.repository,
+             repository_path,
+             absolute_deadline
+           ),
+         %MergeOperation{state: :completed} = operation <- Repo.get(MergeOperation, operation.id),
+         :ok <- notify_merge_transition(:completed, operation) do
+      {:ok, %{merged: true, message: "Pull Request successfully merged", sha: merge_oid}}
+    else
+      {:error, _reason} = error -> error
+      _other -> {:error, {:unavailable, :pull_merge}}
+    end
+  end
+
+  defp authorize_merge(actor, repository, expected_pull) do
+    with {:ok, actor} <- current_actor(Repo, actor.id),
+         {:ok, repository} <- canonical_read_repository(repository, actor),
+         %PullRequest{} = pull <-
+           Repo.one(
+             from candidate in PullRequest,
+               where:
+                 candidate.id == ^expected_pull.id and
+                   candidate.repository_id == ^repository.id
+           ),
+         :ok <- same_pull_refs(pull, expected_pull),
+         %Issue{kind: :pull_request} = issue <- current_issue(pull.issue_id, repository),
+         true <- Fornacast.Access.allowed?(actor, :repository_write, repository) do
+      {:ok, %{actor: actor, repository: repository, pull: pull, issue: issue}}
+    else
+      false -> {:error, :forbidden}
+      nil -> {:error, :not_found}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp same_pull_refs(
+         %PullRequest{head_ref: head_ref, base_ref: base_ref},
+         %PullRequest{head_ref: head_ref, base_ref: base_ref}
+       ),
+       do: :ok
+
+  defp same_pull_refs(_pull, _expected), do: {:error, :ref_conflict}
+
+  defp merge_allowed(%{repository: %{allow_merge_commit: false}}),
+    do: {:error, :merge_commits_disabled}
+
+  defp merge_allowed(%{pull: %{merge_commit_sha: merge_oid}}) when is_binary(merge_oid),
+    do: {:error, :conflict}
+
+  defp merge_allowed(%{issue: %{state: state}}) when state != :open, do: {:error, :conflict}
+  defp merge_allowed(_context), do: :ok
+
+  defp exact_ref(repository_path, ref, absolute_deadline) do
+    with {:ok, remaining} <- remaining_ms(absolute_deadline) do
+      case GitCore.exact_ref(repository_path, ref, deadline_ms: remaining) do
+        {:ok, oid} when is_binary(oid) -> {:ok, oid}
+        {:ok, nil} -> {:error, :ref_conflict}
+        {:error, %GitCore.Error{kind: kind}} -> {:error, {:unavailable, kind}}
+      end
+    end
+  end
+
+  defp expected_head(nil, _head_oid), do: :ok
+  defp expected_head(head_oid, head_oid), do: :ok
+  defp expected_head(_expected, _actual), do: {:error, :head_changed}
+
+  defp merge_analysis(repository_path, base_oid, head_oid, absolute_deadline) do
+    with {:ok, remaining} <- remaining_ms(absolute_deadline) do
+      case GitCore.merge_analysis(repository_path, base_oid, head_oid, deadline_ms: remaining) do
+        {:ok, analysis} -> {:ok, analysis}
+        {:error, %GitCore.Error{kind: :merge_conflict}} -> {:error, :conflict}
+        {:error, %GitCore.Error{kind: kind}} -> {:error, {:unavailable, kind}}
+      end
+    end
+  end
+
+  defp mergeable(%GitCore.MergeAnalysis{mergeable: true}), do: :ok
+  defp mergeable(%GitCore.MergeAnalysis{mergeable: false}), do: {:error, :conflict}
+
+  defp prepare_merge_operation(context, _attrs, request_metadata, base_oid, head_oid) do
+    safe_metadata = ForgePulls.Mutations.safe_request_metadata(request_metadata)
+
+    case Map.get(safe_metadata, :request_id) do
+      request_id when is_binary(request_id) and request_id != "" ->
+        %MergeOperation{}
+        |> MergeOperation.prepare_changeset(%{
+          pull_request_id: context.pull.id,
+          repository_id: context.repository.id,
+          actor_user_id: context.actor.id,
+          request_id: request_id,
+          base_ref: context.pull.base_ref,
+          head_ref: context.pull.head_ref,
+          expected_base_oid: base_oid,
+          expected_head_oid: head_oid,
+          state: :prepared
+        })
+        |> Repo.insert()
+        |> case do
+          {:ok, operation} -> {:ok, operation}
+          {:error, _changeset} -> {:error, {:unavailable, :database}}
+        end
+
+      _missing ->
+        merge_validation("request_id", :missing)
+    end
+  end
+
+  defp write_merge_commit(
+         repository_path,
+         base_oid,
+         head_oid,
+         context,
+         attrs,
+         absolute_deadline
+       ) do
+    with {:ok, remaining} <- remaining_ms(absolute_deadline) do
+      signature = merge_signature(context.actor)
+      message = merge_message(context, attrs)
+
+      case GitCore.write_merge_commit(
+             repository_path,
+             base_oid,
+             head_oid,
+             signature,
+             signature,
+             message,
+             deadline_ms: remaining
+           ) do
+        {:ok, merge_oid} -> {:ok, merge_oid}
+        {:error, %GitCore.Error{kind: :merge_conflict}} -> {:error, :conflict}
+        {:error, %GitCore.Error{kind: kind}} -> {:error, {:unavailable, kind}}
+      end
+    end
+  end
+
+  defp persist_merge_written(operation, merge_oid) do
+    operation
+    |> MergeOperation.merge_written_changeset(merge_oid)
+    |> Repo.update()
+    |> database_result()
+  end
+
+  defp persist_ref_advanced(operation) do
+    operation
+    |> MergeOperation.ref_advanced_changeset()
+    |> Repo.update()
+    |> database_result()
+  end
+
+  defp database_result({:ok, operation}), do: {:ok, operation}
+  defp database_result({:error, _changeset}), do: {:error, {:unavailable, :database}}
+
+  defp compare_and_swap(repository_path, base_ref, base_oid, merge_oid, absolute_deadline) do
+    with {:ok, remaining} <- remaining_ms(absolute_deadline) do
+      case GitCore.compare_and_swap_ref(
+             repository_path,
+             base_ref,
+             base_oid,
+             merge_oid,
+             :fast_forward,
+             deadline_ms: remaining
+           ) do
+        {:ok, oid} ->
+          {:ok, oid}
+
+        {:error, %GitCore.Error{kind: kind}}
+        when kind in [:stale_ref, :ref_exists, :non_fast_forward] ->
+          {:error, :ref_conflict}
+
+        {:error, %GitCore.Error{kind: kind}} ->
+          {:error, {:unavailable, kind}}
+      end
+    end
+  end
+
+  defp merge_signature(actor) do
+    %GitCore.Signature{
+      name: actor.username,
+      email: actor.email,
+      seconds: System.system_time(:second),
+      offset_minutes: 0
+    }
+  end
+
+  defp merge_message(context, attrs) do
+    title = attrs.commit_title || default_merge_title(context)
+    body = attrs.commit_message || context.issue.title
+    if body == "", do: title, else: title <> "\n\n" <> body
+  end
+
+  defp default_merge_title(context) do
+    branch = String.replace_prefix(context.pull.head_ref, "refs/heads/", "")
+    "Merge pull request ##{context.issue.number} from #{branch}"
+  end
+
+  defp normalize_merge_attrs(attrs) do
+    method = attr(attrs, "merge_method") || "merge"
+    sha = attr(attrs, "sha")
+    title = attr(attrs, "commit_title")
+    message = attr(attrs, "commit_message")
+
+    with :ok <- valid_merge_method(method),
+         :ok <- valid_optional_oid(sha),
+         :ok <- valid_optional_message("commit_title", title, 256, false),
+         :ok <- valid_optional_message("commit_message", message, 65_536, true) do
+      {:ok,
+       %{
+         sha: if(is_binary(sha), do: String.downcase(sha), else: nil),
+         commit_title: title,
+         commit_message: message
+       }}
+    end
+  end
+
+  defp valid_merge_method(method) when method in [:merge, "merge"], do: :ok
+  defp valid_merge_method(_method), do: merge_validation("merge_method", :invalid)
+
+  defp valid_optional_oid(nil), do: :ok
+
+  defp valid_optional_oid(oid) when is_binary(oid) do
+    if Regex.match?(@oid_regex, String.downcase(oid)),
+      do: :ok,
+      else: merge_validation("sha", :invalid)
+  end
+
+  defp valid_optional_oid(_oid), do: merge_validation("sha", :invalid)
+
+  defp valid_optional_message(_field, nil, _max, _empty?), do: :ok
+
+  defp valid_optional_message(field, value, max, empty?) when is_binary(value) do
+    if byte_size(value) <= max and not String.contains?(value, <<0>>) and
+         (empty? or String.trim(value) != ""),
+       do: :ok,
+       else: merge_validation(field, :invalid)
+  end
+
+  defp valid_optional_message(field, _value, _max, _empty?),
+    do: merge_validation(field, :invalid)
+
+  defp merge_validation(field, code),
+    do: {:error, {:validation, [%{resource: "PullRequest", field: field, code: code}]}}
+
+  defp remaining_ms(absolute_deadline) do
+    remaining = absolute_deadline - System.monotonic_time(:millisecond)
+    if remaining > 0, do: {:ok, remaining}, else: {:error, {:unavailable, :write_timeout}}
   end
 
   defp resolve_creation_refs(repository, attrs) do

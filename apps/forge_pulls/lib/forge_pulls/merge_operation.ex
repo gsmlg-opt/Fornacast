@@ -95,6 +95,15 @@ defmodule ForgePulls.MergeOperation do
 
   def merge_written_changeset(operation), do: transition_changeset(operation, :merge_written)
 
+  def merge_written_changeset(%__MODULE__{state: :prepared} = operation, merge_oid) do
+    operation
+    |> change(state: :merge_written, merge_oid: normalize_oid_value(merge_oid))
+    |> validate_required([:merge_oid])
+    |> validate_oid(:merge_oid)
+  end
+
+  def merge_written_changeset(operation, _merge_oid), do: invalid_transition_changeset(operation)
+
   def ref_advanced_changeset(operation), do: transition_changeset(operation, :ref_advanced)
 
   def completed_changeset(operation), do: transition_changeset(operation, :completed)
@@ -238,6 +247,9 @@ defmodule ForgePulls.MergeOperation do
   end
 
   defp valid_oid?(oid), do: is_binary(oid) and Regex.match?(@oid_regex, oid)
+
+  defp normalize_oid_value(oid) when is_binary(oid), do: String.downcase(oid)
+  defp normalize_oid_value(oid), do: oid
 
   defp exact_fields?(updates, allowed) do
     keys = Keyword.keys(updates)
