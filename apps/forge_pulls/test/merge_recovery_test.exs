@@ -33,6 +33,10 @@ defmodule ForgePulls.MergeRecoveryTest do
         repository_id: repository.id,
         actor_user_id: owner.id,
         request_id: unique("merge"),
+        api_version: "2026-03-10",
+        ip_address: "203.0.113.9",
+        user_agent: "merge-recovery-test/1.0",
+        token_id: "token-recovery",
         base_ref: pull.base_ref,
         head_ref: pull.head_ref,
         expected_base_oid: base_oid,
@@ -103,7 +107,10 @@ defmodule ForgePulls.MergeRecoveryTest do
              %AuditEvent{
                action: "pull_request.merged",
                actor_user_id: actor_user_id,
-               request_id: request_id
+               request_id: request_id,
+               ip_address: "203.0.113.9",
+               user_agent: "merge-recovery-test/1.0",
+               metadata: audit_metadata
              }
            ] =
              Repo.all(
@@ -113,6 +120,8 @@ defmodule ForgePulls.MergeRecoveryTest do
 
     assert actor_user_id == context.owner.id
     assert request_id == context.operation.request_id
+    assert audit_metadata["api_version"] == "2026-03-10"
+    assert audit_metadata["token_id"] == "token-recovery"
     assert {:ok, :refreshed} = GitCore.Cache.fetch(cache_key, fn -> {:ok, :refreshed} end)
   end
 
@@ -166,6 +175,50 @@ defmodule ForgePulls.MergeRecoveryTest do
              )
 
     assert Repo.get!(MergeOperation, context.operation.id).state == :completed
+  end
+
+  test "completion fails closed when canonical pull refs no longer match recorded evidence",
+       context do
+    context.pull
+    |> Ecto.Changeset.change(base_ref: "refs/heads/release")
+    |> Repo.update!()
+
+    assert {:error, :unavailable} =
+             MergeRecovery.reconcile_repository_locked(
+               context.repository,
+               context.path,
+               System.monotonic_time(:millisecond) + 10_000
+             )
+
+    assert %MergeOperation{state: :ref_advanced, lease_owner: nil} =
+             Repo.get!(MergeOperation, context.operation.id)
+
+    assert %PullRequest{base_ref: "refs/heads/release", merge_commit_sha: nil} =
+             Repo.get!(PullRequest, context.pull.id)
+
+    assert %Issue{state: :open} = Repo.get!(Issue, context.pull.issue_id)
+    refute Repo.get_by(AuditEvent, operation_id: "pull_merge:#{context.operation.id}")
+  end
+
+  test "completion fails closed when the canonical issue is no longer open", context do
+    context.pull.issue_id
+    |> then(&Repo.get!(Issue, &1))
+    |> Issue.update_changeset(%{state: :closed, state_reason: :completed})
+    |> Repo.update!()
+
+    assert {:error, :unavailable} =
+             MergeRecovery.reconcile_repository_locked(
+               context.repository,
+               context.path,
+               System.monotonic_time(:millisecond) + 10_000
+             )
+
+    assert %MergeOperation{state: :ref_advanced, lease_owner: nil} =
+             Repo.get!(MergeOperation, context.operation.id)
+
+    assert %PullRequest{merge_commit_sha: nil} = Repo.get!(PullRequest, context.pull.id)
+    assert %Issue{state: :closed} = Repo.get!(Issue, context.pull.issue_id)
+    refute Repo.get_by(AuditEvent, operation_id: "pull_merge:#{context.operation.id}")
   end
 
   defp user_fixture do

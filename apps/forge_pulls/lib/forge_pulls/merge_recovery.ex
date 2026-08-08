@@ -314,7 +314,15 @@ defmodule ForgePulls.MergeRecovery do
       from candidate in PullRequest,
         where:
           candidate.id == ^pull.id and candidate.repository_id == ^repository.id and
+            candidate.head_ref == ^operation.head_ref and
+            candidate.base_ref == ^operation.base_ref and
             is_nil(candidate.merge_commit_sha)
+
+    issue_query =
+      from candidate in Issue,
+        where:
+          candidate.id == ^issue.id and candidate.repository_id == ^repository.id and
+            candidate.kind == :pull_request and candidate.state == :open
 
     repository_query = from candidate in Repository, where: candidate.id == ^repository.id
 
@@ -342,10 +350,15 @@ defmodule ForgePulls.MergeRecovery do
         ]
       )
       |> require_one(:pull_request)
-      |> ForgeIssues.update_identity(:issue, issue, actor, %{
-        state: :closed,
-        state_reason: :completed
-      })
+      |> Multi.update_all(:issue, issue_query,
+        set: [
+          state: :closed,
+          state_reason: :completed,
+          closed_at: now,
+          updated_at: now
+        ]
+      )
+      |> require_one(:issue)
       |> Multi.update_all(:repository, repository_query,
         set: [last_pushed_at: now, updated_at: now]
       )
@@ -361,7 +374,7 @@ defmodule ForgePulls.MergeRecovery do
           "oid" => operation.merge_oid,
           "result" => "success"
         },
-        request_id: operation.request_id,
+        request_metadata: operation_request_metadata(operation),
         operation_id: operation_id(operation)
       )
 
@@ -398,4 +411,14 @@ defmodule ForgePulls.MergeRecovery do
     do: "pull-merge-recovery:#{node()}:#{inspect(self())}:#{repository_id}"
 
   defp operation_id(operation), do: "pull_merge:" <> Integer.to_string(operation.id)
+
+  defp operation_request_metadata(operation) do
+    [:request_id, :api_version, :ip_address, :user_agent, :token_id]
+    |> Enum.reduce(%{}, fn key, metadata ->
+      case Map.get(operation, key) do
+        nil -> metadata
+        value -> Map.put(metadata, key, value)
+      end
+    end)
+  end
 end

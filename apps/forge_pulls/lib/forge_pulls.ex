@@ -254,40 +254,10 @@ defmodule ForgePulls do
          {:ok, preflight} <- authorize_update_preflight(actor, repository, pull),
          :ok <- unchanged_snapshot(preflight.pull, pull),
          :ok <- immutable_source(attrs),
-         {:ok, attrs} <- normalize_update_attrs(attrs),
-         {:ok, pull_attrs} <- resolve_updated_base(preflight.repository, preflight.pull, attrs) do
-      Ecto.Multi.new()
-      |> Ecto.Multi.run(:authorization, fn repo, _ ->
-        authorize_update(repo, actor.id, preflight.repository.id, preflight.pull)
+         {:ok, attrs} <- normalize_update_attrs(attrs) do
+      ForgeRepos.with_write_fence(preflight.repository, :merge, fn _repository_path, _remaining ->
+        execute_update(preflight.repository, pull, actor, attrs, request_metadata)
       end)
-      |> Ecto.Multi.merge(fn %{authorization: context} ->
-        %{
-          actor: current_actor,
-          repository: current_repository,
-          issue: issue,
-          pull: current_pull,
-          capability: capability
-        } = context
-
-        shared_attrs = permitted_shared_attrs(attrs, capability, issue)
-
-        Ecto.Multi.new()
-        |> ForgeIssues.update_identity(:issue, issue, current_actor, shared_attrs)
-        |> Ecto.Multi.run(:pull_request, fn repo, _changes ->
-          ForgePulls.SnapshotRefresh.persist_in_transaction(repo, current_pull, pull_attrs)
-        end)
-        |> Audit.record_multi(
-          :audit,
-          current_actor,
-          "pull_request.updated",
-          "repository",
-          current_repository.id,
-          %{"repository_id" => current_repository.id, "result" => "success"},
-          request_metadata: ForgePulls.Mutations.safe_request_metadata(request_metadata)
-        )
-      end)
-      |> ForgeIssues.transaction()
-      |> update_result()
     else
       nil -> {:error, :forbidden}
       {:error, _} = error -> error
@@ -320,8 +290,8 @@ defmodule ForgePulls do
       )
       when is_map(attrs) and is_map(request_metadata) do
     with %ForgeAccounts.User{} = actor <- actor,
-         {:ok, merge_attrs} <- normalize_merge_attrs(attrs),
          {:ok, context} <- authorize_merge(actor, repository, expected_pull),
+         {:ok, merge_attrs} <- normalize_merge_attrs(attrs),
          result <-
            ForgeRepos.with_write_fence(context.repository, :merge, fn repository_path,
                                                                       remaining ->
@@ -502,18 +472,28 @@ defmodule ForgePulls do
 
     case Map.get(safe_metadata, :request_id) do
       request_id when is_binary(request_id) and request_id != "" ->
+        operation_metadata =
+          Map.take(safe_metadata, [
+            :request_id,
+            :api_version,
+            :ip_address,
+            :user_agent,
+            :token_id
+          ])
+
         %MergeOperation{}
-        |> MergeOperation.prepare_changeset(%{
-          pull_request_id: context.pull.id,
-          repository_id: context.repository.id,
-          actor_user_id: context.actor.id,
-          request_id: request_id,
-          base_ref: context.pull.base_ref,
-          head_ref: context.pull.head_ref,
-          expected_base_oid: base_oid,
-          expected_head_oid: head_oid,
-          state: :prepared
-        })
+        |> MergeOperation.prepare_changeset(
+          Map.merge(operation_metadata, %{
+            pull_request_id: context.pull.id,
+            repository_id: context.repository.id,
+            actor_user_id: context.actor.id,
+            base_ref: context.pull.base_ref,
+            head_ref: context.pull.head_ref,
+            expected_base_oid: base_oid,
+            expected_head_oid: head_oid,
+            state: :prepared
+          })
+        )
         |> Repo.insert()
         |> case do
           {:ok, operation} -> {:ok, operation}
@@ -826,6 +806,56 @@ defmodule ForgePulls do
     else
       nil -> {:error, :not_found}
       {:error, _} = error -> error
+    end
+  end
+
+  defp execute_update(repository, expected_pull, actor, attrs, request_metadata) do
+    with {:ok, context} <- authorize_update_preflight(actor, repository, expected_pull),
+         :ok <- unchanged_snapshot(context.pull, expected_pull),
+         :ok <- compatible_merged_update(context.pull, attrs),
+         {:ok, pull_attrs} <- resolve_updated_base(context.repository, context.pull, attrs) do
+      Ecto.Multi.new()
+      |> Ecto.Multi.run(:authorization, fn repo, _ ->
+        authorize_update(repo, context.actor.id, context.repository.id, context.pull)
+      end)
+      |> Ecto.Multi.merge(fn %{authorization: authorized} ->
+        %{
+          actor: current_actor,
+          repository: current_repository,
+          issue: issue,
+          pull: current_pull,
+          capability: capability
+        } = authorized
+
+        shared_attrs = permitted_shared_attrs(attrs, capability, issue)
+
+        Ecto.Multi.new()
+        |> ForgeIssues.update_identity(:issue, issue, current_actor, shared_attrs)
+        |> Ecto.Multi.run(:pull_request, fn repo, _changes ->
+          ForgePulls.SnapshotRefresh.persist_in_transaction(repo, current_pull, pull_attrs)
+        end)
+        |> Audit.record_multi(
+          :audit,
+          current_actor,
+          "pull_request.updated",
+          "repository",
+          current_repository.id,
+          %{"repository_id" => current_repository.id, "result" => "success"},
+          request_metadata: ForgePulls.Mutations.safe_request_metadata(request_metadata)
+        )
+      end)
+      |> ForgeIssues.transaction()
+      |> update_result()
+    end
+  end
+
+  defp compatible_merged_update(%PullRequest{merge_commit_sha: nil}, _attrs), do: :ok
+
+  defp compatible_merged_update(%PullRequest{}, attrs) do
+    cond do
+      fetch_attr(attrs, "base") != :error -> {:error, :conflict}
+      fetch_attr(attrs, "state") in [{:ok, :open}, {:ok, "open"}] -> {:error, :conflict}
+      true -> :ok
     end
   end
 

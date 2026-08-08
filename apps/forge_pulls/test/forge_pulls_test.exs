@@ -50,6 +50,10 @@ defmodule ForgePullsTest do
         "repository_id" => %{type: :bigint, nullable: false, default: nil},
         "actor_user_id" => %{type: :bigint, nullable: true, default: nil},
         "request_id" => %{type: :text, nullable: false, default: nil},
+        "api_version" => %{type: :text, nullable: true, default: nil},
+        "ip_address" => %{type: :text, nullable: true, default: nil},
+        "user_agent" => %{type: :text, nullable: true, default: nil},
+        "token_id" => %{type: :text, nullable: true, default: nil},
         "base_ref" => %{type: :text, nullable: false, default: nil},
         "head_ref" => %{type: :text, nullable: false, default: nil},
         "expected_base_oid" => %{type: :text, nullable: false, default: nil},
@@ -1271,6 +1275,22 @@ defmodule ForgePullsTest do
     {base_oid, head_oid} = create_mergeable_branches!(repository)
     assert {:ok, pull} = create_pull(repository, owner, "Merge feature", "feature", "main")
 
+    merge_request_id = unique("merge-request")
+
+    merge_metadata = %{
+      "request_id" => merge_request_id,
+      "api_version" => "2026-03-10",
+      "ip_address" => "198.51.100.9",
+      "user_agent" => "fornacast-merge-test/1.0",
+      "token_id" => "token-immediate",
+      "unsafe" => "must-not-persist",
+      request_id: "ignored-atom-request",
+      api_version: "ignored-atom-version",
+      ip_address: "198.51.100.1",
+      user_agent: "ignored-atom-agent",
+      token_id: "ignored-atom-token"
+    }
+
     assert {:ok, %{merged: true, message: "Pull Request successfully merged", sha: merge_oid}} =
              ForgePulls.merge(
                repository,
@@ -1282,7 +1302,7 @@ defmodule ForgePullsTest do
                  commit_title: "Custom merge title",
                  commit_message: "Custom merge body"
                },
-               request_metadata(unique("merge-request"))
+               merge_metadata
              )
 
     path = ForgeRepos.absolute_storage_path(repository)
@@ -1298,13 +1318,33 @@ defmodule ForgePullsTest do
     assert actor_id == owner.id
     assert %Issue{state: :closed, state_reason: :completed} = Repo.get!(Issue, pull.issue_id)
 
-    assert %MergeOperation{state: :completed, merge_oid: ^merge_oid} =
+    assert %MergeOperation{
+             state: :completed,
+             merge_oid: ^merge_oid,
+             request_id: ^merge_request_id,
+             api_version: "2026-03-10",
+             ip_address: "198.51.100.9",
+             user_agent: "fornacast-merge-test/1.0",
+             token_id: "token-immediate"
+           } =
+             operation =
              Repo.one!(
-               from operation in MergeOperation,
-                 where: operation.pull_request_id == ^pull.id,
-                 order_by: [desc: operation.id],
+               from candidate in MergeOperation,
+                 where: candidate.pull_request_id == ^pull.id,
+                 order_by: [desc: candidate.id],
                  limit: 1
              )
+
+    assert %AuditEvent{
+             request_id: ^merge_request_id,
+             ip_address: "198.51.100.9",
+             user_agent: "fornacast-merge-test/1.0",
+             metadata: audit_metadata
+           } = Repo.get_by!(AuditEvent, operation_id: "pull_merge:#{operation.id}")
+
+    assert audit_metadata["api_version"] == "2026-03-10"
+    assert audit_metadata["token_id"] == "token-immediate"
+    refute Map.has_key?(audit_metadata, "unsafe")
   end
 
   test "merge validates method messages sha policy and closed or already-merged pulls" do
@@ -1368,6 +1408,36 @@ defmodule ForgePullsTest do
     assert {:error, :conflict} = ForgePulls.merge(repository, pull, owner, %{}, metadata)
   end
 
+  test "merge authorization masks malformed attrs before validation" do
+    owner = user_fixture(unique("merge-mask-owner"))
+    reader = user_fixture(unique("merge-mask-reader"))
+    outsider = user_fixture(unique("merge-mask-outsider"))
+    repository = repository_fixture(owner)
+    grant_reader!(repository, reader)
+    create_mergeable_branches!(repository)
+    assert {:ok, pull} = create_pull(repository, owner, "Masked merge", "feature", "main")
+
+    assert {:error, :not_found} =
+             ForgePulls.merge(
+               repository,
+               pull,
+               outsider,
+               %{sha: "not-an-oid"},
+               request_metadata(unique("masked-outsider"))
+             )
+
+    assert {:error, :forbidden} =
+             ForgePulls.merge(
+               repository,
+               pull,
+               reader,
+               %{merge_method: "squash"},
+               request_metadata(unique("masked-reader"))
+             )
+
+    refute Repo.get_by(MergeOperation, pull_request_id: pull.id)
+  end
+
   test "a moved base loses the exact CAS and leaves merge evidence diagnosable" do
     owner = user_fixture(unique("merge-base-race"))
     repository = repository_fixture(owner)
@@ -1407,6 +1477,146 @@ defmodule ForgePullsTest do
 
     assert is_binary(merge_oid)
     refute Repo.get!(PullRequest, pull.id).merge_commit_sha
+  end
+
+  test "a retarget starting after merge preparation serializes behind the merge" do
+    owner = user_fixture(unique("merge-retarget-overlap"))
+    repository = repository_fixture(owner)
+    {base_oid, _head_oid} = create_mergeable_branches!(repository)
+    path = ForgeRepos.absolute_storage_path(repository)
+    release_oid = child_commit!(path, base_oid, "release")
+    git!(path, ["update-ref", "refs/heads/release", release_oid])
+    assert {:ok, pull} = create_pull(repository, owner, "Retarget overlap", "feature", "main")
+    parent = self()
+    prepared = make_ref()
+
+    merge_task =
+      Task.async(fn ->
+        ForgePulls.with_test_merge_transition_hook(
+          fn
+            :prepared, _operation ->
+              send(parent, {:merge_prepared, prepared})
+              receive do: ({:continue_merge, ^prepared} -> :ok)
+
+            _state, _operation ->
+              :ok
+          end,
+          fn ->
+            ForgePulls.merge(
+              repository,
+              pull,
+              owner,
+              %{},
+              request_metadata(unique("merge-retarget-overlap"))
+            )
+          end
+        )
+      end)
+
+    assert_receive {:merge_prepared, ^prepared}, 5_000
+
+    update_task =
+      Task.async(fn ->
+        send(parent, {:retarget_started, prepared})
+
+        ForgePulls.update_pull_request(
+          repository,
+          pull,
+          owner,
+          %{base: "release"},
+          request_metadata(unique("retarget-overlap"))
+        )
+      end)
+
+    assert_receive {:retarget_started, ^prepared}, 5_000
+    early_update = Task.yield(update_task, 200)
+    send(merge_task.pid, {:continue_merge, prepared})
+    merge_result = Task.await(merge_task, 30_000)
+
+    update_result =
+      case early_update do
+        nil -> Task.await(update_task, 30_000)
+        {:ok, result} -> result
+      end
+
+    assert early_update == nil
+    assert {:ok, %{sha: merge_oid}} = merge_result
+    assert {:error, :conflict} = update_result
+
+    assert %PullRequest{base_ref: "refs/heads/main", merge_commit_sha: ^merge_oid} =
+             Repo.get!(PullRequest, pull.id)
+
+    assert {:ok, ^merge_oid} = GitCore.exact_ref(path, "refs/heads/main")
+    assert {:ok, ^release_oid} = GitCore.exact_ref(path, "refs/heads/release")
+  end
+
+  test "a close starting after merge preparation serializes to an idempotent closed result" do
+    owner = user_fixture(unique("merge-close-overlap"))
+    repository = repository_fixture(owner)
+    create_mergeable_branches!(repository)
+    assert {:ok, pull} = create_pull(repository, owner, "Close overlap", "feature", "main")
+    parent = self()
+    prepared = make_ref()
+
+    merge_task =
+      Task.async(fn ->
+        ForgePulls.with_test_merge_transition_hook(
+          fn
+            :prepared, _operation ->
+              send(parent, {:merge_prepared, prepared})
+              receive do: ({:continue_merge, ^prepared} -> :ok)
+
+            _state, _operation ->
+              :ok
+          end,
+          fn ->
+            ForgePulls.merge(
+              repository,
+              pull,
+              owner,
+              %{},
+              request_metadata(unique("merge-close-overlap"))
+            )
+          end
+        )
+      end)
+
+    assert_receive {:merge_prepared, ^prepared}, 5_000
+
+    update_task =
+      Task.async(fn ->
+        send(parent, {:close_started, prepared})
+
+        ForgePulls.update_pull_request(
+          repository,
+          pull,
+          owner,
+          %{state: :closed},
+          request_metadata(unique("close-overlap"))
+        )
+      end)
+
+    assert_receive {:close_started, ^prepared}, 5_000
+    early_update = Task.yield(update_task, 200)
+    send(merge_task.pid, {:continue_merge, prepared})
+    merge_result = Task.await(merge_task, 30_000)
+
+    update_result =
+      case early_update do
+        nil -> Task.await(update_task, 30_000)
+        {:ok, result} -> result
+      end
+
+    assert early_update == nil
+    assert {:ok, %{sha: merge_oid}} = merge_result
+
+    assert {:ok, %PullRequest{merge_commit_sha: ^merge_oid, issue: %Issue{state: :closed}}} =
+             update_result
+
+    assert %PullRequest{base_ref: "refs/heads/main", merge_commit_sha: ^merge_oid} =
+             Repo.get!(PullRequest, pull.id)
+
+    assert %Issue{state: :closed, state_reason: :completed} = Repo.get!(Issue, pull.issue_id)
   end
 
   test "conflicts and writer exhaustion never prepare or advance a merge" do
@@ -1995,6 +2205,82 @@ defmodule ForgePullsTest do
     assert_constraint_rejected(fn ->
       insert_merge_operation(fixture, "prepared", "missing-actor", -1)
     end)
+  end
+
+  test "the Turso metadata migration preserves existing operation values FKs and indexes" do
+    if database_adapter() == :turso do
+      database =
+        Path.join(System.tmp_dir!(), "pull-metadata-migration-#{System.unique_integer()}.db")
+
+      assert {:ok, isolated_repo} =
+               Repo.start_link(
+                 name: nil,
+                 database: database,
+                 pool: DBConnection.ConnectionPool,
+                 pool_size: 2
+               )
+
+      previous_repo = Repo.get_dynamic_repo()
+      Repo.put_dynamic_repo(isolated_repo)
+
+      migrations = [
+        {20_260_703_000_100, Fornacast.Repo.Migrations.CreateFirstReleaseCoreTables},
+        {20_260_706_000_100, Fornacast.Repo.Migrations.AddOrganizationAccounts},
+        {20_260_717_000_100, Fornacast.Repo.Migrations.CreateAPIKeys},
+        {20_260_721_000_100, Fornacast.Repo.Migrations.AddAPIRepositorySettings},
+        {20_260_721_000_200, Fornacast.Repo.Migrations.CreateGitWriteOperations},
+        {20_260_721_000_300, Fornacast.Repo.Migrations.CreateIssueDomain},
+        {20_260_721_000_400, Fornacast.Repo.Migrations.CreatePullDomain},
+        {20_260_809_000_100, Fornacast.Repo.Migrations.AddPullMergeRequestMetadata}
+      ]
+
+      previous_version = 20_260_721_000_400
+      version = 20_260_809_000_100
+
+      try do
+        assert previous_version in Ecto.Migrator.run(Repo, migrations, :up, to: previous_version)
+
+        key = contract_fixture_key()
+        fixture = insert_contract_fixture(key)
+        request_id = "migration-existing-#{key}"
+        assert {:ok, %{num_rows: 1}} = insert_merge_operation(fixture, "prepared", request_id)
+
+        assert [^version] = Ecto.Migrator.run(Repo, migrations, :up, to: version)
+
+        assert %{
+                 rows: [
+                   [
+                     ^request_id,
+                     "refs/heads/main",
+                     "refs/heads/feature",
+                     "prepared",
+                     nil,
+                     nil,
+                     nil,
+                     nil
+                   ]
+                 ]
+               } =
+                 SQL.query!(
+                   Repo,
+                   "SELECT request_id, base_ref, head_ref, state, " <>
+                     "api_version, ip_address, user_agent, token_id " <>
+                     "FROM pull_merge_operations WHERE request_id = ?",
+                   [request_id]
+                 )
+
+        table_sql = turso_table_sql("pull_merge_operations")
+
+        assert MapSet.size(turso_foreign_keys("pull_merge_operations", table_sql)) == 3
+        assert MapSet.size(turso_indexes("pull_merge_operations")) == 3
+
+        assert database_contract() == @expected_contract
+      after
+        Repo.put_dynamic_repo(previous_repo)
+        GenServer.stop(isolated_repo)
+        File.rm(database)
+      end
+    end
   end
 
   test "deleting a repository cascades through issues, pulls, and merge operations" do

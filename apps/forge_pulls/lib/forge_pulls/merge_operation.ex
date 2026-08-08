@@ -21,6 +21,10 @@ defmodule ForgePulls.MergeOperation do
     field :repository_id, :integer
     field :actor_user_id, :integer
     field :request_id, :string
+    field :api_version, :string
+    field :ip_address, :string
+    field :user_agent, :string
+    field :token_id, :string
     field :base_ref, :string
     field :head_ref, :string
     field :expected_base_oid, :string
@@ -42,6 +46,10 @@ defmodule ForgePulls.MergeOperation do
       :repository_id,
       :actor_user_id,
       :request_id,
+      :api_version,
+      :ip_address,
+      :user_agent,
+      :token_id,
       :base_ref,
       :head_ref,
       :expected_base_oid,
