@@ -4,6 +4,20 @@ defmodule GitCore.RepositoryWriteLimiterTest do
   alias GitCore.RepositoryWriteLimiter
   @production_registry_key {RepositoryWriteLimiter, :production_grants}
   @production_registry_lock {RepositoryWriteLimiter, :production_registry_lock}
+  @fault_config_key :repository_write_limiter_fault
+
+  setup do
+    original_fault = Application.fetch_env(:git_core, @fault_config_key)
+
+    on_exit(fn ->
+      restore_fault(original_fault)
+
+      if Process.whereis(RepositoryWriteLimiter) == nil do
+        Application.stop(:git_core)
+        Application.ensure_all_started(:git_core)
+      end
+    end)
+  end
 
   test "two repository keys run concurrently while a third waits" do
     assert {:ok, first} = RepositoryWriteLimiter.acquire(:first, deadline())
@@ -76,6 +90,18 @@ defmodule GitCore.RepositoryWriteLimiterTest do
     assert :ok = RepositoryWriteLimiter.release(lease)
     assert {:ok, replacement} = RepositoryWriteLimiter.acquire(:idempotent, deadline())
     assert :ok = RepositoryWriteLimiter.release(replacement)
+  end
+
+  test "public acquire returns only a confirmed production lease" do
+    assert {:ok, {{RepositoryWriteLimiter, :lease}, RepositoryWriteLimiter, lease_ref} = lease} =
+             RepositoryWriteLimiter.acquire(:confirmed_public_lease, deadline())
+
+    assert %{status: :confirmed} =
+             @production_registry_key
+             |> :persistent_term.get()
+             |> Map.fetch!(lease_ref)
+
+    assert :ok = RepositoryWriteLimiter.release(lease)
   end
 
   test "a huge future deadline stays queued without crashing the limiter" do
@@ -272,6 +298,66 @@ defmodule GitCore.RepositoryWriteLimiterTest do
     Process.exit(holder, :kill)
   end
 
+  test "crash after immediate pending persistence never publishes or recovers the lease" do
+    set_fault(:after_pending_persist)
+    assert {:error, :unavailable} = RepositoryWriteLimiter.acquire(:pending_immediate, deadline())
+    assert Process.whereis(RepositoryWriteLimiter) == nil
+
+    assert [%{status: :pending}] =
+             @production_registry_key
+             |> :persistent_term.get()
+             |> Map.values()
+
+    clear_fault()
+    restart_git_core()
+    assert_grant_count(0)
+    assert :persistent_term.get(@production_registry_key, %{}) == %{}
+
+    assert {:ok, lease} = RepositoryWriteLimiter.acquire(:pending_immediate, deadline())
+    assert :ok = RepositoryWriteLimiter.release(lease)
+  end
+
+  test "crash after internal reply cleans the unpublished pending lease" do
+    set_fault(:after_internal_reply)
+    assert {:error, :unavailable} = RepositoryWriteLimiter.acquire(:internal_reply, deadline())
+    assert Process.whereis(RepositoryWriteLimiter) == nil
+    assert :persistent_term.get(@production_registry_key, %{}) == %{}
+
+    clear_fault()
+    restart_git_core()
+    assert_grant_count(0)
+  end
+
+  test "crash after confirmed persistence cleans the lease before public return" do
+    set_fault(:after_confirmed_persist)
+
+    assert {:error, :unavailable} =
+             RepositoryWriteLimiter.acquire(:confirmed_no_reply, deadline())
+
+    assert Process.whereis(RepositoryWriteLimiter) == nil
+    assert :persistent_term.get(@production_registry_key, %{}) == %{}
+
+    clear_fault()
+    restart_git_core()
+    assert_grant_count(0)
+  end
+
+  test "queued promotion persists pending before reply and discards it after a crash" do
+    assert {:ok, holder} = RepositoryWriteLimiter.acquire(:queued_holder, deadline())
+    set_fault(:after_pending_persist)
+    waiter = start_waiter(:queued_holder)
+    wait_for_waiters(1)
+
+    assert :ok = RepositoryWriteLimiter.release(holder)
+    assert_receive {:acquire_error, ^waiter, {:error, :unavailable}}
+    assert Process.whereis(RepositoryWriteLimiter) == nil
+
+    clear_fault()
+    restart_git_core()
+    assert_grant_count(0)
+    assert :persistent_term.get(@production_registry_key, %{}) == %{}
+  end
+
   test "production and isolated child specs are temporary" do
     assert RepositoryWriteLimiter.child_spec([]).restart == :temporary
     assert RepositoryWriteLimiter.child_spec(server: nil).restart == :temporary
@@ -342,6 +428,12 @@ defmodule GitCore.RepositoryWriteLimiterTest do
   defp short_deadline do
     System.monotonic_time(:millisecond) + 20
   end
+
+  defp set_fault(phase), do: Application.put_env(:git_core, @fault_config_key, phase)
+  defp clear_fault, do: Application.delete_env(:git_core, @fault_config_key)
+
+  defp restore_fault({:ok, phase}), do: set_fault(phase)
+  defp restore_fault(:error), do: clear_fault()
 
   defp start_waiter(key, absolute_deadline \\ nil) do
     parent = self()

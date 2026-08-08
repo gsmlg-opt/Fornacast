@@ -6,6 +6,9 @@ defmodule GitCore.RepositoryWriteLimiter do
   could admit conflicting writes before lease state is recovered. After a
   crash, admission fails closed until an operator or application restart
   reconstructs live production grants and their owner monitors.
+
+  New grants are persisted as pending and confirmed before the opaque lease is
+  returned. Restart recovery discards any pending lease that was never public.
   """
 
   use GenServer
@@ -13,6 +16,7 @@ defmodule GitCore.RepositoryWriteLimiter do
   @lease_tag {__MODULE__, :lease}
   @production_registry_key {__MODULE__, :production_grants}
   @production_registry_lock {__MODULE__, :production_registry_lock}
+  @fault_config_key :repository_write_limiter_fault
   @deadline_timer_chunk_ms 60_000
   @opaque lease :: {{__MODULE__, :lease}, GenServer.server(), reference()}
   @type acquire_error :: :timeout | :unavailable
@@ -50,13 +54,10 @@ defmodule GitCore.RepositoryWriteLimiter do
   @spec acquire(term(), integer()) ::
           {:ok, lease()} | {:error, acquire_error()}
   def acquire(repository_key, absolute_deadline_ms) when is_integer(absolute_deadline_ms) do
-    try do
-      case GenServer.call(__MODULE__, {:acquire, repository_key, absolute_deadline_ms}, :infinity) do
-        {:ok, lease} -> {:ok, {@lease_tag, __MODULE__, lease}}
-        {:error, :timeout} = error -> error
-      end
-    catch
-      :exit, _reason -> {:error, :unavailable}
+    case call_server({:acquire, repository_key, absolute_deadline_ms}) do
+      {:ok, lease} -> confirm_public_lease(lease)
+      {:error, :timeout} = error -> error
+      {:error, :unavailable} = error -> error
     end
   end
 
@@ -109,6 +110,29 @@ defmodule GitCore.RepositoryWriteLimiter do
 
       true ->
         {:noreply, enqueue(from, elem(from, 0), repository_key, deadline, now, state)}
+    end
+  end
+
+  def handle_call({:confirm, lease}, from, state) do
+    owner = elem(from, 0)
+
+    case Map.fetch(state.grants, lease) do
+      {:ok, %{owner: ^owner, status: :pending} = grant} ->
+        case confirm_production_grant(state, lease) do
+          :ok ->
+            maybe_crash_limiter!(state, :after_confirmed_persist)
+            grant = %{grant | status: :confirmed}
+            {:reply, :ok, %{state | grants: Map.put(state.grants, lease, grant)}}
+
+          :error ->
+            {:reply, {:error, :invalid_lease}, state}
+        end
+
+      {:ok, %{owner: ^owner, status: :confirmed}} ->
+        {:reply, :ok, state}
+
+      _other ->
+        {:reply, {:error, :invalid_lease}, state}
     end
   end
 
@@ -179,8 +203,8 @@ defmodule GitCore.RepositoryWriteLimiter do
   defp grant(owner, repository_key, state) do
     lease = make_ref()
     monitor = Process.monitor(owner)
-    grant = %{owner: owner, monitor: monitor, repository_key: repository_key}
-    persist_production_grant(state, lease, owner, repository_key)
+    grant = %{owner: owner, monitor: monitor, repository_key: repository_key, status: :pending}
+    persist_production_grant(state, lease, owner, repository_key, :pending)
 
     state = %{
       state
@@ -189,6 +213,7 @@ defmodule GitCore.RepositoryWriteLimiter do
         monitors: Map.put(state.monitors, monitor, {:grant, lease})
     }
 
+    maybe_crash_limiter!(state, :after_pending_persist)
     {lease, state}
   end
 
@@ -263,14 +288,16 @@ defmodule GitCore.RepositoryWriteLimiter do
               grant = %{
                 owner: waiter.owner,
                 monitor: waiter.monitor,
-                repository_key: waiter.repository_key
+                repository_key: waiter.repository_key,
+                status: :pending
               }
 
               persist_production_grant(
                 state,
                 lease,
                 waiter.owner,
-                waiter.repository_key
+                waiter.repository_key,
+                :pending
               )
 
               state = %{
@@ -282,6 +309,7 @@ defmodule GitCore.RepositoryWriteLimiter do
                   monitors: Map.put(state.monitors, waiter.monitor, {:grant, lease})
               }
 
+              maybe_crash_limiter!(state, :after_pending_persist)
               GenServer.reply(waiter.from, {:ok, lease})
               drain_waiters(state)
 
@@ -314,18 +342,28 @@ defmodule GitCore.RepositoryWriteLimiter do
       registry_transaction(fn registry ->
         {grants, active_keys, monitors, live_registry} =
           Enum.reduce(registry, {%{}, MapSet.new(), %{}, %{}}, fn
-            {lease, %{owner: owner, repository_key: repository_key}},
+            {lease, %{owner: owner, repository_key: repository_key, status: :confirmed}},
             {grants, active_keys, monitors, live_registry}
             when is_reference(lease) and is_pid(owner) ->
               if Process.alive?(owner) do
                 monitor = Process.monitor(owner)
-                grant = %{owner: owner, monitor: monitor, repository_key: repository_key}
+
+                grant = %{
+                  owner: owner,
+                  monitor: monitor,
+                  repository_key: repository_key,
+                  status: :confirmed
+                }
 
                 {
                   Map.put(grants, lease, grant),
                   MapSet.put(active_keys, repository_key),
                   Map.put(monitors, monitor, {:grant, lease}),
-                  Map.put(live_registry, lease, %{owner: owner, repository_key: repository_key})
+                  Map.put(live_registry, lease, %{
+                    owner: owner,
+                    repository_key: repository_key,
+                    status: :confirmed
+                  })
                 }
               else
                 {grants, active_keys, monitors, live_registry}
@@ -345,13 +383,28 @@ defmodule GitCore.RepositoryWriteLimiter do
          %{production_registry?: true},
          lease,
          owner,
-         repository_key
+         repository_key,
+         status
        ) do
-    grant = %{owner: owner, repository_key: repository_key}
+    grant = %{owner: owner, repository_key: repository_key, status: status}
     registry_transaction(fn registry -> {Map.put(registry, lease, grant), :ok} end)
   end
 
-  defp persist_production_grant(_state, _lease, _owner, _repository_key), do: :ok
+  defp persist_production_grant(_state, _lease, _owner, _repository_key, _status), do: :ok
+
+  defp confirm_production_grant(%{production_registry?: true}, lease) do
+    registry_transaction(fn registry ->
+      case Map.fetch(registry, lease) do
+        {:ok, %{status: :pending} = grant} ->
+          {Map.put(registry, lease, %{grant | status: :confirmed}), :ok}
+
+        _missing_or_invalid ->
+          {registry, :error}
+      end
+    end)
+  end
+
+  defp confirm_production_grant(_state, _lease), do: :ok
 
   defp forget_production_grant(%{production_registry?: true}, lease) do
     delete_production_grant(lease)
@@ -387,6 +440,53 @@ defmodule GitCore.RepositoryWriteLimiter do
       GenServer.call(server, {:release, lease}, :infinity)
     catch
       :exit, _reason -> :ok
+    end
+  end
+
+  defp call_server(message) do
+    try do
+      GenServer.call(__MODULE__, message, :infinity)
+    catch
+      :exit, _reason -> {:error, :unavailable}
+    end
+  end
+
+  defp confirm_public_lease(lease) do
+    maybe_crash_after_internal_reply()
+
+    case call_server({:confirm, lease}) do
+      :ok ->
+        {:ok, {@lease_tag, __MODULE__, lease}}
+
+      _error ->
+        delete_production_grant(lease)
+        release_recovered_grant(__MODULE__, lease)
+        {:error, :unavailable}
+    end
+  end
+
+  defp maybe_crash_limiter!(%{production_registry?: true}, phase) do
+    if Application.get_env(:git_core, @fault_config_key) == phase do
+      Process.exit(self(), :kill)
+    end
+  end
+
+  defp maybe_crash_limiter!(_state, _phase), do: :ok
+
+  defp maybe_crash_after_internal_reply do
+    if Application.get_env(:git_core, @fault_config_key) == :after_internal_reply do
+      case Process.whereis(__MODULE__) do
+        limiter when is_pid(limiter) ->
+          monitor = Process.monitor(limiter)
+          Process.exit(limiter, :kill)
+
+          receive do
+            {:DOWN, ^monitor, :process, ^limiter, _reason} -> :ok
+          end
+
+        nil ->
+          :ok
+      end
     end
   end
 end
