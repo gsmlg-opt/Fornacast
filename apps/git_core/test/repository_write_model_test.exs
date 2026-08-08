@@ -191,6 +191,74 @@ defmodule GitCore.RepositoryWriteModelTest do
     end
   end
 
+  test "compare-and-swap keeps tags create-only", %{tmp_dir: tmp_dir} do
+    fixture = clean_fixture!(tmp_dir)
+    tag_ref = "refs/tags/v1.0.0"
+    assert {:ok, _oid} = cas(fixture, tag_ref, nil, fixture.base_oid)
+    before_refs = refs(fixture.repo_path)
+    before_objects = object_ids(fixture.repo_path)
+
+    assert {:error, %GitCore.Error{kind: :ref_exists, operation: :compare_and_swap_ref}} =
+             cas(fixture, tag_ref, fixture.base_oid, fixture.base_oid)
+
+    assert refs(fixture.repo_path) == before_refs
+    assert object_ids(fixture.repo_path) == before_objects
+  end
+
+  test "compare-and-swap rejects ref namespace collisions in both directions", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = clean_fixture!(tmp_dir)
+    assert {:ok, _oid} = cas(fixture, "refs/heads/foo", nil, fixture.base_oid)
+    assert {:ok, _oid} = cas(fixture, "refs/heads/tree/leaf", nil, fixture.base_oid)
+    before_refs = refs(fixture.repo_path)
+    before_objects = object_ids(fixture.repo_path)
+
+    for full_ref <- ["refs/heads/foo/bar", "refs/heads/tree"] do
+      assert {:error, %GitCore.Error{kind: :ref_exists, operation: :compare_and_swap_ref}} =
+               cas(fixture, full_ref, nil, fixture.root_oid)
+
+      assert refs(fixture.repo_path) == before_refs
+      assert object_ids(fixture.repo_path) == before_objects
+    end
+  end
+
+  test "compare-and-swap applies the configured ancestry visit limit without caller override", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = clean_fixture!(tmp_dir)
+    git!(["-C", fixture.work_path, "checkout", "main"])
+    File.write!(Path.join(fixture.work_path, "cas-limit.txt"), "limit\n")
+    git!(["-C", fixture.work_path, "add", "cas-limit.txt"])
+    git!(["-C", fixture.work_path, "commit", "-m", "cas limit child"])
+    proposed_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+    git!(["-C", fixture.work_path, "push", fixture.repo_path, "HEAD:refs/heads/cas-limit"])
+    before_refs = refs(fixture.repo_path)
+    before_objects = object_ids(fixture.repo_path)
+    previous_limits = Application.get_env(:git_core, :limits)
+    Application.put_env(:git_core, :limits, commit_visits: 1)
+
+    try do
+      assert {:error, %GitCore.Error{kind: :commit_limit, operation: :compare_and_swap_ref}} =
+               GitCore.compare_and_swap_ref(
+                 fixture.repo_path,
+                 "refs/heads/main",
+                 fixture.base_oid,
+                 proposed_oid,
+                 :fast_forward,
+                 deadline_ms: 10_000,
+                 commit_limit: 50_000
+               )
+
+      assert refs(fixture.repo_path) == before_refs
+      assert object_ids(fixture.repo_path) == before_objects
+    after
+      if previous_limits,
+        do: Application.put_env(:git_core, :limits, previous_limits),
+        else: Application.delete_env(:git_core, :limits)
+    end
+  end
+
   test "analyzes clean divergence, identical tips, and an already-contained head", %{
     tmp_dir: tmp_dir
   } do
@@ -693,6 +761,17 @@ defmodule GitCore.RepositoryWriteModelTest do
 
   defp refs(repo_path) do
     git!(["--git-dir", repo_path, "for-each-ref", "--format=%(refname) %(objectname)"])
+  end
+
+  defp cas(fixture, full_ref, expected_oid, proposed_oid) do
+    GitCore.compare_and_swap_ref(
+      fixture.repo_path,
+      full_ref,
+      expected_oid,
+      proposed_oid,
+      :fast_forward,
+      deadline_ms: 10_000
+    )
   end
 
   defp object_ids(repo_path) do

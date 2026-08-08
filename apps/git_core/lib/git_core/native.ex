@@ -109,6 +109,7 @@ defmodule GitCore.Native do
         _expected_oid,
         _proposed_oid,
         _mode,
+        _commit_limit,
         _deadline_ms
       ),
       do: :erlang.nif_error(:nif_not_loaded)

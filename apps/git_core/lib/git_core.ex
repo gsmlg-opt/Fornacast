@@ -555,8 +555,8 @@ defmodule GitCore do
   Atomically creates or fast-forwards a canonical full ref from the exact expected target.
 
   The proposed object must already exist and be a commit. This operation never writes objects,
-  deletes refs, or permits force updates. The caller must hold the repository writer fence when
-  non-CAS writers can target the same repository.
+  deletes refs, or permits force updates. Branches may fast-forward; tags are create-only. The
+  caller must hold the repository writer fence when non-CAS writers can target the same repository.
   """
   @spec compare_and_swap_ref(
           Path.t(),
@@ -585,6 +585,7 @@ defmodule GitCore do
           expected_oid,
           proposed_oid,
           "fast_forward",
+          GitCore.Limits.get(:commit_visits),
           deadline_ms
         )
         |> wrap_read(:compare_and_swap_ref)

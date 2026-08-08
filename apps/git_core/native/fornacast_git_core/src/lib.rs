@@ -168,6 +168,8 @@ const MERGE_WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
 const MERGE_ANALYSIS_WORKERS: usize = 4;
 const MERGE_WRITE_WORKERS: usize = 1;
 const REF_UPDATE_DEADLINE: Duration = Duration::from_secs(10);
+const CAS_COMMIT_VISIT_LIMIT: usize = 50_000;
+static CAS_QUARANTINE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const NO_FINAL_NEWLINE_MARKER: &[u8] = b"\\ No newline at end of file\n";
 // This remains independent of object size while leaving room for the complete mandatory tag
 // header, including long ref-derived tag names, before an arbitrarily large message body.
@@ -184,6 +186,11 @@ struct RetainedDiffSource {
     patch: Vec<u8>,
     limit: usize,
     truncated: bool,
+}
+
+struct CasFileLock {
+    _guard: std::fs::File,
+    _marker: gix::lock::Marker,
 }
 
 struct DiffFileMetadata {
@@ -4715,18 +4722,21 @@ fn compare_and_swap_ref(
     expected_oid: Option<String>,
     proposed_oid: String,
     mode: String,
+    commit_limit: usize,
     deadline_ms: u64,
 ) -> Result<String, NativeError> {
-    compare_and_swap_ref_impl(
+    compare_and_swap_ref_impl_with_limit(
         path,
         full_ref,
         expected_oid,
         proposed_oid,
         mode,
+        commit_limit,
         deadline_ms,
     )
 }
 
+#[cfg(test)]
 fn compare_and_swap_ref_impl(
     path: String,
     full_ref: String,
@@ -4735,12 +4745,33 @@ fn compare_and_swap_ref_impl(
     mode: String,
     deadline_ms: u64,
 ) -> Result<String, NativeError> {
+    compare_and_swap_ref_impl_with_limit(
+        path,
+        full_ref,
+        expected_oid,
+        proposed_oid,
+        mode,
+        CAS_COMMIT_VISIT_LIMIT,
+        deadline_ms,
+    )
+}
+
+fn compare_and_swap_ref_impl_with_limit(
+    path: String,
+    full_ref: String,
+    expected_oid: Option<String>,
+    proposed_oid: String,
+    mode: String,
+    commit_limit: usize,
+    deadline_ms: u64,
+) -> Result<String, NativeError> {
     compare_and_swap_ref_impl_with_precommit(
         path,
         full_ref,
         expected_oid,
         proposed_oid,
         mode,
+        commit_limit,
         deadline_ms,
         || {},
     )
@@ -4752,6 +4783,7 @@ fn compare_and_swap_ref_impl_with_precommit<F>(
     expected_oid: Option<String>,
     proposed_oid: String,
     mode: String,
+    commit_limit: usize,
     deadline_ms: u64,
     before_final_deadline_check: F,
 ) -> Result<String, NativeError>
@@ -4783,14 +4815,26 @@ where
 
     let actual = direct_ref_target(&repo, full_ref.as_bstr())?;
     let previous = match (expected_id, actual) {
-        (None, DirectRefTarget::Missing) => gix_ref::transaction::PreviousValue::MustNotExist,
+        (None, DirectRefTarget::Missing) => {
+            ensure_no_ref_namespace_conflict(&repo, &full_ref_for_error, deadline)?;
+            gix_ref::transaction::PreviousValue::MustNotExist
+        }
         (None, DirectRefTarget::Object(_) | DirectRefTarget::Symbolic) => {
             return Err(native_error("ref_exists", "reference already exists"));
         }
         (Some(expected), DirectRefTarget::Object(actual)) if expected == actual => {
+            if full_ref_for_error.starts_with("refs/tags/") {
+                return Err(native_error("ref_exists", "tags are create-only"));
+            }
             find_cas_commit(&repo, expected, "expected")?;
 
-            if !cas_is_ancestor(&repo, expected, proposed_id, deadline)? {
+            if !cas_is_ancestor(
+                &repo,
+                expected,
+                proposed_id,
+                cas_commit_limit(commit_limit),
+                deadline,
+            )? {
                 return Err(native_error(
                     "non_fast_forward",
                     "proposed target is not a descendant of the expected target",
@@ -4851,6 +4895,55 @@ where
     Ok(proposed_id.to_string())
 }
 
+fn ensure_no_ref_namespace_conflict(
+    repo: &gix::Repository,
+    full_ref: &str,
+    deadline: Instant,
+) -> Result<(), NativeError> {
+    let namespace_len = if full_ref.starts_with("refs/heads/") {
+        "refs/heads/".len()
+    } else {
+        "refs/tags/".len()
+    };
+
+    for (offset, byte) in full_ref.as_bytes()[namespace_len..].iter().enumerate() {
+        check_cas_deadline(deadline)?;
+        if *byte == b'/' {
+            let prefix = &full_ref.as_bytes()[..namespace_len + offset];
+            if !matches!(direct_ref_target(repo, prefix)?, DirectRefTarget::Missing) {
+                return Err(native_error(
+                    "ref_exists",
+                    "reference namespace prefix already exists",
+                ));
+            }
+        }
+    }
+
+    let descendant_prefix = format!("{full_ref}/");
+    let references = repo
+        .references()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let refs = references
+        .all()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    for reference in refs {
+        check_cas_deadline(deadline)?;
+        let reference = reference.map_err(|error| native_error("corrupt_repository", error))?;
+        if reference
+            .name()
+            .as_bstr()
+            .starts_with_str(&descendant_prefix)
+        {
+            return Err(native_error(
+                "ref_exists",
+                "reference namespace descendant already exists",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn validated_cas_ref_name(full_ref: &str) -> Result<gix_ref::FullName, NativeError> {
     let allowed_namespace = full_ref
         .strip_prefix("refs/heads/")
@@ -4888,6 +4981,7 @@ fn cas_is_ancestor(
     repo: &gix::Repository,
     ancestor: gix_hash::ObjectId,
     tip: gix_hash::ObjectId,
+    commit_limit: usize,
     deadline: Instant,
 ) -> Result<bool, NativeError> {
     if ancestor == tip {
@@ -4896,14 +4990,24 @@ fn cas_is_ancestor(
 
     let walk = repo.rev_walk([tip]).all().map_err(diff_read_error)?;
 
-    for info in walk {
+    for (index, info) in walk.enumerate() {
         check_cas_deadline(deadline)?;
+        if index >= commit_limit {
+            return Err(native_error(
+                "commit_limit",
+                "reference ancestry exceeded the commit visit limit",
+            ));
+        }
         if info.map_err(diff_read_error)?.id == ancestor {
             return Ok(true);
         }
     }
 
     Ok(false)
+}
+
+fn cas_commit_limit(commit_limit: usize) -> usize {
+    commit_limit.min(CAS_COMMIT_VISIT_LIMIT)
 }
 
 fn find_cas_commit<'repo>(
@@ -5000,22 +5104,146 @@ fn check_cas_deadline(deadline: Instant) -> Result<(), NativeError> {
 fn acquire_cas_file_lock(
     repo: &gix::Repository,
     deadline: Instant,
-) -> Result<gix::lock::Marker, NativeError> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let resource = repo.path().join("fornacast-ref-cas");
+) -> Result<CasFileLock, NativeError> {
+    let guard_path = repo.path().join("fornacast-ref-cas.guard");
+    let guard = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&guard_path)
+        .map_err(|error| native_error("storage_unavailable", error))?;
 
-    gix::lock::Marker::acquire_to_hold_resource(
-        resource,
-        gix::lock::acquire::Fail::from(remaining),
-        Some(repo.path().to_path_buf()),
-    )
-    .map_err(|error| match error {
-        gix::lock::acquire::Error::PermanentlyLocked { .. } => native_error(
-            "ref_timeout",
-            "reference update exceeded its deadline waiting for the CAS lock",
-        ),
-        gix::lock::acquire::Error::Io(error) => native_error("storage_unavailable", error),
-    })
+    loop {
+        check_cas_deadline(deadline)?;
+        match guard.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(native_error("storage_unavailable", error));
+            }
+        }
+    }
+
+    let resource = repo.path().join("fornacast-ref-cas");
+    let marker_path = repo.path().join("fornacast-ref-cas.lock");
+    cleanup_stale_cas_quarantines(repo, deadline)?;
+
+    loop {
+        check_cas_deadline(deadline)?;
+        match gix::lock::Marker::acquire_to_hold_resource(
+            &resource,
+            gix::lock::acquire::Fail::Immediately,
+            Some(repo.path().to_path_buf()),
+        ) {
+            Ok(marker) => {
+                return Ok(CasFileLock {
+                    _guard: guard,
+                    _marker: marker,
+                });
+            }
+            Err(gix::lock::acquire::Error::PermanentlyLocked { .. }) => {
+                if reclaim_stale_cas_marker(&marker_path)? {
+                    continue;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(gix::lock::acquire::Error::Io(error)) => {
+                return Err(native_error("storage_unavailable", error));
+            }
+        }
+    }
+}
+
+fn reclaim_stale_cas_marker(marker_path: &Path) -> Result<bool, NativeError> {
+    let observed = match std::fs::metadata(marker_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(native_error("storage_unavailable", error)),
+    };
+
+    if !cas_lock_metadata_is_stale(&observed)? {
+        return Ok(false);
+    }
+
+    let quarantine_id = CAS_QUARANTINE_ID.fetch_add(1, Ordering::Relaxed);
+    let quarantine = marker_path.with_file_name(format!(
+        "fornacast-ref-cas.quarantine-{}-{quarantine_id}",
+        std::process::id()
+    ));
+    match std::fs::rename(marker_path, &quarantine) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(native_error("storage_unavailable", error)),
+    }
+
+    let quarantined = std::fs::metadata(&quarantine)
+        .map_err(|error| native_error("storage_unavailable", error))?;
+    if !same_file_identity(&observed, &quarantined) {
+        if std::fs::hard_link(&quarantine, marker_path).is_ok() {
+            let _ = std::fs::remove_file(&quarantine);
+        }
+        return Err(native_error(
+            "storage_unavailable",
+            "CAS marker changed during stale-lock quarantine",
+        ));
+    }
+
+    std::fs::remove_file(&quarantine)
+        .map_err(|error| native_error("storage_unavailable", error))?;
+    Ok(true)
+}
+
+fn cleanup_stale_cas_quarantines(
+    repo: &gix::Repository,
+    deadline: Instant,
+) -> Result<(), NativeError> {
+    for entry in std::fs::read_dir(repo.path())
+        .map_err(|error| native_error("storage_unavailable", error))?
+    {
+        check_cas_deadline(deadline)?;
+        let entry = entry.map_err(|error| native_error("storage_unavailable", error))?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("fornacast-ref-cas.quarantine-")
+        {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|error| native_error("storage_unavailable", error))?;
+        if cas_lock_metadata_is_stale(&metadata)? {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(native_error("storage_unavailable", error)),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cas_lock_metadata_is_stale(metadata: &std::fs::Metadata) -> Result<bool, NativeError> {
+    let modified = metadata
+        .modified()
+        .map_err(|error| native_error("storage_unavailable", error))?;
+    Ok(std::time::SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(Duration::ZERO)
+        >= REF_UPDATE_DEADLINE)
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
 fn cas_duration(deadline_ms: u64) -> Duration {
@@ -6417,6 +6645,73 @@ mod tests {
             Err((kind, _)) if kind == "ref_timeout"
         ));
         assert!(!fixture.repo_path.join("refs/heads/cas-timeout").exists());
+        assert!(fixture.repo_path.join("fornacast-ref-cas.lock").exists());
+    }
+
+    #[test]
+    fn compare_and_swap_ref_recovers_a_crashed_stale_marker() {
+        let fixture = MergeBoundaryFixture::new("ref-cas-crash");
+        let commits = fixture.fast_import_empty_chain(1);
+        let proposed = commits.get(&1).expect("proposed commit");
+        let marker_path = fixture.repo_path.join("fornacast-ref-cas.lock");
+        let status = Command::new(std::env::current_exe().expect("current native test executable"))
+            .args([
+                "--exact",
+                "tests::compare_and_swap_ref_crash_holder_worker",
+                "--nocapture",
+            ])
+            .env("FORNACAST_CAS_CRASH_HOLDER_REPO", fixture.path())
+            .stdout(Stdio::null())
+            .status()
+            .expect("run crashing CAS lock holder");
+        assert!(status.success());
+        assert!(marker_path.exists());
+        age_file_past_ref_deadline(&marker_path);
+
+        assert_eq!(
+            compare_and_swap_ref_impl(
+                fixture.path().to_owned(),
+                "refs/heads/recovered".to_owned(),
+                None,
+                proposed.clone(),
+                "fast_forward".to_owned(),
+                500,
+            ),
+            Ok(proposed.clone())
+        );
+        assert!(!marker_path.exists());
+        assert!(
+            std::fs::read_dir(&fixture.repo_path)
+                .expect("list repository after stale reclaim")
+                .all(|entry| !entry
+                    .expect("repository entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("fornacast-ref-cas.quarantine-"))
+        );
+    }
+
+    #[test]
+    fn compare_and_swap_ref_crash_holder_worker() {
+        let Ok(repo_path) = std::env::var("FORNACAST_CAS_CRASH_HOLDER_REPO") else {
+            return;
+        };
+        let repo_path = PathBuf::from(repo_path);
+        let guard = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(repo_path.join("fornacast-ref-cas.guard"))
+            .expect("crash worker opens advisory guard");
+        guard.lock().expect("crash worker acquires advisory guard");
+        let resource = repo_path.join("fornacast-ref-cas");
+        let _marker = gix::lock::Marker::acquire_to_hold_resource(
+            resource,
+            gix::lock::acquire::Fail::Immediately,
+            Some(repo_path),
+        )
+        .expect("crash worker acquires CAS marker");
+        std::process::exit(0);
     }
 
     #[test]
@@ -6442,6 +6737,7 @@ mod tests {
                 None,
                 proposed.clone(),
                 "fast_forward".to_owned(),
+                CAS_COMMIT_VISIT_LIMIT,
                 100,
                 || std::thread::sleep(Duration::from_millis(150)),
             ),
@@ -6464,25 +6760,64 @@ mod tests {
     }
 
     #[test]
-    fn compare_and_swap_ref_filesystem_lock_coordinates_os_processes() {
+    fn compare_and_swap_ref_ancestry_allows_50000_visits_and_rejects_50001() {
+        let fixture = MergeBoundaryFixture::new("ref-cas-ancestry-limit");
+        let commits = fixture.fast_import_empty_chain(50_001);
+        let repo = open_physical_bare_repository(fixture.path()).expect("open ancestry fixture");
+        let ancestor = parse_cas_oid(commits.get(&1).expect("first commit")).expect("ancestor");
+        let at_limit =
+            parse_cas_oid(commits.get(&50_000).expect("50000th commit")).expect("limit tip");
+        let over_limit =
+            parse_cas_oid(commits.get(&50_001).expect("50001st commit")).expect("over-limit tip");
+        assert_eq!(cas_commit_limit(usize::MAX), 50_000);
+
+        assert_eq!(
+            cas_is_ancestor(
+                &repo,
+                ancestor,
+                at_limit,
+                50_000,
+                Instant::now() + Duration::from_secs(10),
+            ),
+            Ok(true)
+        );
+        assert!(matches!(
+            cas_is_ancestor(
+                &repo,
+                ancestor,
+                over_limit,
+                50_000,
+                Instant::now() + Duration::from_secs(10),
+            ),
+            Err((kind, _)) if kind == "commit_limit"
+        ));
+    }
+
+    #[test]
+    fn compare_and_swap_ref_coordinates_concurrent_stale_reclaimers() {
         let fixture = MergeBoundaryFixture::new("ref-cas-processes");
         let commits = fixture.fast_import_empty_chain(2);
         let first = commits.get(&1).expect("first commit");
         let second = commits.get(&2).expect("second commit");
         let first_outcome = fixture.temp_path.join("cas-first.out");
         let second_outcome = fixture.temp_path.join("cas-second.out");
-        let resource = fixture.repo_path.join("fornacast-ref-cas");
-        let held_lock = gix::lock::Marker::acquire_to_hold_resource(
-            resource,
-            gix::lock::acquire::Fail::Immediately,
-            Some(fixture.repo_path.clone()),
-        )
-        .expect("hold repository CAS lock before spawning workers");
+        let marker_path = fixture.repo_path.join("fornacast-ref-cas.lock");
+        let crash_status =
+            Command::new(std::env::current_exe().expect("current native test executable"))
+                .args([
+                    "--exact",
+                    "tests::compare_and_swap_ref_crash_holder_worker",
+                    "--nocapture",
+                ])
+                .env("FORNACAST_CAS_CRASH_HOLDER_REPO", fixture.path())
+                .stdout(Stdio::null())
+                .status()
+                .expect("run crashing CAS lock holder");
+        assert!(crash_status.success());
+        age_file_past_ref_deadline(&marker_path);
 
         let mut first_worker = spawn_cas_process_worker(&fixture, first, &first_outcome);
         let mut second_worker = spawn_cas_process_worker(&fixture, second, &second_outcome);
-        std::thread::sleep(Duration::from_millis(50));
-        drop(held_lock);
 
         let first_status = first_worker.wait().expect("wait for first CAS process");
         let second_status = second_worker.wait().expect("wait for second CAS process");
@@ -6518,6 +6853,16 @@ mod tests {
             None,
         );
         assert!(outcomes.contains(&format!("ok:{recorded}")));
+        assert!(!marker_path.exists());
+        assert!(
+            std::fs::read_dir(&fixture.repo_path)
+                .expect("list repository after concurrent reclaim")
+                .all(|entry| !entry
+                    .expect("repository entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("fornacast-ref-cas.quarantine-"))
+        );
     }
 
     #[test]
@@ -7101,6 +7446,18 @@ mod tests {
             .stdout(Stdio::null())
             .spawn()
             .expect("spawn CAS process worker")
+    }
+
+    fn age_file_past_ref_deadline(path: &Path) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open stale CAS marker");
+        let modified = std::time::SystemTime::now()
+            .checked_sub(REF_UPDATE_DEADLINE + Duration::from_secs(1))
+            .expect("stale marker timestamp");
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("age CAS marker");
     }
 
     fn test_merge_commit() -> PreparedMergeCommit {
