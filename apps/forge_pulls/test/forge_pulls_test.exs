@@ -7,7 +7,7 @@ defmodule ForgePullsTest do
   alias Ecto.Adapters.SQL
   alias ForgeIssues.{Comment, Issue, IssueAssignee, IssueLabel}
   alias ForgePulls.{MergeOperation, PullRequest}
-  alias Fornacast.{AuditEvent, Repo}
+  alias Fornacast.{AuditEvent, OperationLease, Repo}
 
   @states ~w(prepared merge_written ref_advanced completed failed)
 
@@ -1293,6 +1293,70 @@ defmodule ForgePullsTest do
 
     assert %{state: ["is invalid"]} =
              %MergeOperation{} |> MergeOperation.prepare_changeset(attrs) |> errors_on()
+  end
+
+  test "operation leases preserve immutable merge evidence and validate transitions" do
+    key = contract_fixture_key()
+    cleanup_contract_fixture(key)
+    fixture = insert_contract_fixture(key)
+    assert {:ok, _} = insert_merge_operation(fixture, "prepared", "lease-contract")
+
+    operation = Repo.get_by!(MergeOperation, request_id: "lease-contract")
+    now = ~U[2026-07-21 12:00:00Z]
+    assert {:ok, claimed} = OperationLease.claim(MergeOperation, operation.id, "owner-a", now, 30)
+
+    immutable_updates = [
+      id: operation.id + 1,
+      pull_request_id: operation.pull_request_id + 1,
+      repository_id: operation.repository_id + 1,
+      actor_user_id: fixture.user_id,
+      request_id: "changed-request",
+      base_ref: "refs/heads/changed",
+      head_ref: "refs/heads/changed-head",
+      expected_base_oid: String.duplicate("c", 40),
+      expected_head_oid: String.duplicate("d", 40),
+      lease_owner: "owner-b",
+      lease_expires_at: DateTime.add(now, 60, :second),
+      lock_version: 0,
+      inserted_at: DateTime.add(now, -60, :second),
+      updated_at: DateTime.add(now, -60, :second)
+    ]
+
+    for update <- immutable_updates do
+      assert {:error, :invalid_update} =
+               OperationLease.update_owned(MergeOperation, claimed, [update])
+
+      assert Repo.get!(MergeOperation, claimed.id) == claimed
+    end
+
+    assert {:error, :invalid_update} =
+             OperationLease.update_owned(MergeOperation, claimed,
+               failure_reason: "native panic at /private/repository token=secret"
+             )
+
+    assert Repo.get!(MergeOperation, claimed.id) == claimed
+
+    merge_oid = String.duplicate("E", 40)
+
+    assert {:ok, updated} =
+             OperationLease.update_owned(MergeOperation, claimed,
+               state: :merge_written,
+               merge_oid: merge_oid
+             )
+
+    assert updated.state == :merge_written
+    assert updated.merge_oid == String.downcase(merge_oid)
+
+    assert {:ok, reclaimed} =
+             OperationLease.claim(MergeOperation, updated.id, "owner-b", now, 30)
+
+    assert {:error, :invalid_update} =
+             OperationLease.update_owned(MergeOperation, reclaimed,
+               merge_oid: String.duplicate("f", 40)
+             )
+
+    assert Repo.get!(MergeOperation, reclaimed.id) == reclaimed
+    assert :ok = OperationLease.release(MergeOperation, reclaimed)
   end
 
   test "merge transitions expose only the sequential graph and sanitized pre-CAS failure" do

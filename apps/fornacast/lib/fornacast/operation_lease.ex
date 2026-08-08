@@ -5,15 +5,6 @@ defmodule Fornacast.OperationLease do
 
   alias Fornacast.Repo
 
-  @protected_fields [
-    :id,
-    :lease_owner,
-    :lease_expires_at,
-    :lock_version,
-    :inserted_at,
-    :updated_at
-  ]
-
   @spec claim(module(), pos_integer(), String.t(), DateTime.t(), pos_integer()) ::
           {:ok, struct()} | :busy | {:error, :not_found | :invalid_argument}
   def claim(module, id, owner, %DateTime{} = now, lease_seconds)
@@ -56,21 +47,38 @@ defmodule Fornacast.OperationLease do
   def release(_module, _operation), do: {:error, :lost_lease}
 
   @spec update_owned(module(), struct(), keyword()) ::
-          {:ok, struct()} | {:error, :lost_lease | :invalid_fields}
-  def update_owned(module, %{id: id, lease_owner: owner, lock_version: version}, updates)
+          {:ok, struct()} | {:error, :lost_lease | :invalid_update}
+  def update_owned(
+        module,
+        %{id: id, lease_owner: owner, lock_version: version} = operation,
+        updates
+      )
       when is_atom(module) and is_integer(id) and is_binary(owner) and is_integer(version) and
              is_list(updates) do
-    if allowed_updates?(module, updates) do
-      case guarded_update(module, id, owner, version, updates) do
-        {1, _} -> {:ok, Repo.get!(module, id)}
-        {0, _} -> {:error, :lost_lease}
-      end
-    else
-      {:error, :invalid_fields}
+    case validated_updates(module, operation, updates) do
+      {:ok, validated} ->
+        case guarded_update(module, id, owner, version, validated) do
+          {1, _} -> {:ok, Repo.get!(module, id)}
+          {0, _} -> {:error, :lost_lease}
+        end
+
+      :error ->
+        {:error, :invalid_update}
     end
   end
 
-  def update_owned(_module, _operation, _updates), do: {:error, :lost_lease}
+  def update_owned(_module, _operation, _updates), do: {:error, :invalid_update}
+
+  defp validated_updates(module, operation, updates) do
+    with true <- Keyword.keyword?(updates),
+         true <- function_exported?(module, :lease_update_changeset, 2),
+         %Ecto.Changeset{valid?: true, changes: changes} when map_size(changes) > 0 <-
+           module.lease_update_changeset(operation, updates) do
+      {:ok, Map.to_list(changes)}
+    else
+      _ -> :error
+    end
+  end
 
   defp guarded_update(module, id, owner, version, updates) do
     query =
@@ -81,11 +89,6 @@ defmodule Fornacast.OperationLease do
       set: updates ++ [lease_owner: nil, lease_expires_at: nil],
       inc: [lock_version: 1]
     )
-  end
-
-  defp allowed_updates?(module, updates) do
-    allowed = module.__schema__(:fields) -- @protected_fields
-    Keyword.keyword?(updates) and Enum.all?(Keyword.keys(updates), &(&1 in allowed))
   end
 
   defp validate_utc(%DateTime{time_zone: "Etc/UTC", utc_offset: 0, std_offset: 0}), do: :ok

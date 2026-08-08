@@ -120,29 +120,49 @@ defmodule Fornacast.OperationLeaseTest do
     assert {:error, :lost_lease} = OperationLease.release(GitWriteOperation, stale)
 
     assert {:ok, updated} =
-             OperationLease.update_owned(GitWriteOperation, current,
-               state: :object_written,
-               result_blob_oid: String.duplicate("b", 40)
-             )
+             OperationLease.update_owned(GitWriteOperation, current, state: :object_written)
 
     assert updated.state == :object_written
     assert updated.lease_owner == nil
     assert updated.lock_version == current.lock_version + 1
   end
 
-  test "current owner releases and unsafe update fields are rejected", %{
+  test "immutable Git write evidence cannot be updated and leaves the lease unchanged", %{
     operation: operation,
     now: now
   } do
     assert {:ok, claimed} =
              OperationLease.claim(GitWriteOperation, operation.id, "owner-a", now, 30)
 
-    assert {:error, :invalid_fields} =
+    immutable_updates = [
+      id: operation.id + 1,
+      repository_id: operation.repository_id + 1,
+      actor_user_id: operation.repository_id,
+      request_id: "changed-request",
+      kind: :content_delete,
+      target_ref: "refs/heads/changed",
+      expected_oid: String.duplicate("c", 40),
+      proposed_oid: String.duplicate("d", 40),
+      lease_owner: "owner-b",
+      lease_expires_at: DateTime.add(now, 60, :second),
+      lock_version: 0,
+      inserted_at: DateTime.add(now, -60, :second),
+      updated_at: DateTime.add(now, -60, :second)
+    ]
+
+    for update <- immutable_updates do
+      assert {:error, :invalid_update} =
+               OperationLease.update_owned(GitWriteOperation, claimed, [update])
+
+      assert Repo.get!(GitWriteOperation, claimed.id) == claimed
+    end
+
+    assert {:error, :invalid_update} =
              OperationLease.update_owned(GitWriteOperation, claimed,
-               id: operation.id + 1,
-               lease_owner: "owner-b",
-               lock_version: 0
+               failure_reason: "native panic at /private/repository token=secret"
              )
+
+    assert Repo.get!(GitWriteOperation, claimed.id) == claimed
 
     assert :ok = OperationLease.release(GitWriteOperation, claimed)
     released = Repo.get!(GitWriteOperation, operation.id)
@@ -150,6 +170,38 @@ defmodule Fornacast.OperationLeaseTest do
     assert released.lease_expires_at == nil
     assert released.lock_version == claimed.lock_version + 1
     assert {:error, :lost_lease} = OperationLease.release(GitWriteOperation, claimed)
+  end
+
+  test "valid Git write transition values are canonicalized", %{operation: operation, now: now} do
+    content_operation =
+      operation
+      |> Ecto.Changeset.change(kind: :content_update)
+      |> Repo.update!()
+
+    assert {:ok, claimed} =
+             OperationLease.claim(GitWriteOperation, content_operation.id, "owner-a", now, 30)
+
+    blob_oid = String.duplicate("C", 40)
+
+    assert {:ok, updated} =
+             OperationLease.update_owned(GitWriteOperation, claimed,
+               state: :object_written,
+               result_blob_oid: blob_oid
+             )
+
+    assert updated.state == :object_written
+    assert updated.result_blob_oid == String.downcase(blob_oid)
+
+    assert {:ok, reclaimed} =
+             OperationLease.claim(GitWriteOperation, updated.id, "owner-b", now, 30)
+
+    assert {:error, :invalid_update} =
+             OperationLease.update_owned(GitWriteOperation, reclaimed,
+               result_blob_oid: String.duplicate("d", 40)
+             )
+
+    assert Repo.get!(GitWriteOperation, reclaimed.id) == reclaimed
+    assert :ok = OperationLease.release(GitWriteOperation, reclaimed)
   end
 
   test "arguments are validated", %{operation: operation, now: now} do

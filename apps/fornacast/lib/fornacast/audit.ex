@@ -72,9 +72,9 @@ defmodule Fornacast.Audit do
   defp resolve_multi_value(value, _changes), do: value
 
   defp merge_metadata(metadata, request_metadata) do
-    metadata
+    (metadata || %{})
     |> stringify_keys()
-    |> Map.merge(stringify_keys(request_metadata))
+    |> Map.merge(stringify_keys(request_metadata || %{}))
   end
 
   defp stringify_keys(map) do

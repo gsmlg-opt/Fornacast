@@ -10,6 +10,9 @@ defmodule ForgePulls.MergeOperation do
     ref_advanced: [:completed]
   }
   @failure_states [:prepared, :merge_written]
+  @lease_failure_reasons ~w(effect_not_started ref_not_advanced unexpected_ref)
+  @lease_mutable_fields [:state, :merge_oid, :failure_reason]
+  @oid_regex ~r/\A[0-9a-f]{40}(?:[0-9a-f]{24})?\z/
 
   @type t :: %__MODULE__{}
 
@@ -60,6 +63,24 @@ defmodule ForgePulls.MergeOperation do
     |> validate_inclusion(:state, [:prepared])
   end
 
+  def lease_update_changeset(operation, updates) when is_list(updates) do
+    if exact_fields?(updates, @lease_mutable_fields) do
+      operation
+      |> cast(Map.new(updates), @lease_mutable_fields)
+      |> normalize_oid(:merge_oid)
+      |> validate_oid(:merge_oid)
+      |> validate_inclusion(:failure_reason, @lease_failure_reasons)
+      |> validate_lease_transition()
+      |> validate_failure_reason_transition(operation)
+      |> validate_merge_oid_transition()
+    else
+      operation |> change() |> add_error(:base, "contains immutable fields")
+    end
+  end
+
+  def lease_update_changeset(operation, _updates),
+    do: operation |> change() |> add_error(:base, "is invalid")
+
   def transition_changeset(operation, state) when is_atom(state) do
     if state in Map.get(@transitions, operation.state, []) do
       change(operation, state: state)
@@ -96,6 +117,92 @@ defmodule ForgePulls.MergeOperation do
   end
 
   def sanitize_failure_reason(_reason), do: nil
+
+  defp normalize_oid(changeset, field) do
+    update_change(changeset, field, fn
+      oid when is_binary(oid) -> String.downcase(oid)
+      oid -> oid
+    end)
+  end
+
+  defp validate_oid(changeset, field) do
+    validate_change(changeset, field, fn ^field, value ->
+      if is_binary(value) and Regex.match?(@oid_regex, value),
+        do: [],
+        else: [{field, "is invalid"}]
+    end)
+  end
+
+  defp validate_lease_transition(changeset) do
+    case fetch_change(changeset, :state) do
+      {:ok, target} ->
+        source = changeset.data.state
+
+        changeset =
+          if target in Map.get(@transitions, source, []) or
+               (target == :failed and source in @failure_states),
+             do: changeset,
+             else: add_error(changeset, :state, "is not a valid transition")
+
+        if target == :failed do
+          validate_required(changeset, [:failure_reason])
+        else
+          changeset
+        end
+
+      :error ->
+        changeset
+    end
+  end
+
+  defp validate_merge_oid_transition(changeset) do
+    if get_change(changeset, :merge_oid) != nil do
+      cond do
+        changeset.data.merge_oid != nil ->
+          add_error(changeset, :merge_oid, "is already recorded")
+
+        get_change(changeset, :state) != :merge_written ->
+          add_error(changeset, :merge_oid, "requires merge_written transition")
+
+        true ->
+          changeset
+      end
+    else
+      changeset
+    end
+  end
+
+  defp validate_failure_reason_transition(changeset, operation) do
+    case fetch_change(changeset, :failure_reason) do
+      {:ok, reason} ->
+        valid? =
+          operation.failure_reason == nil and
+            case reason do
+              "effect_not_started" ->
+                operation.state == :prepared and get_change(changeset, :state) == :failed
+
+              "ref_not_advanced" ->
+                operation.state == :merge_written and get_change(changeset, :state) == :failed
+
+              "unexpected_ref" ->
+                operation.state in [:prepared, :merge_written, :ref_advanced] and
+                  get_change(changeset, :state) == nil
+
+              _ ->
+                false
+            end
+
+        if valid?, do: changeset, else: add_error(changeset, :failure_reason, "is invalid here")
+
+      :error ->
+        changeset
+    end
+  end
+
+  defp exact_fields?(updates, allowed) do
+    keys = Keyword.keys(updates)
+    keys != [] and length(keys) == length(Enum.uniq(keys)) and Enum.all?(keys, &(&1 in allowed))
+  end
 
   defp invalid_transition_changeset(operation) do
     operation |> change() |> add_error(:state, "is not a valid transition")

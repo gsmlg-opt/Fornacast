@@ -14,6 +14,12 @@ defmodule ForgeRepos.GitWriteOperation do
   @states [:prepared, :object_written, :ref_advanced, :bookkeeping_complete, :failed]
   @failure_reasons ~w(effect_not_started ref_not_advanced unexpected_ref)
   @oid_regex ~r/\A[0-9a-f]{40}(?:[0-9a-f]{24})?\z/
+  @lease_mutable_fields [:state, :failure_reason, :result_blob_oid]
+  @transitions %{
+    prepared: [:object_written, :failed],
+    object_written: [:ref_advanced, :failed],
+    ref_advanced: [:bookkeeping_complete]
+  }
 
   @type t :: %__MODULE__{}
 
@@ -67,6 +73,24 @@ defmodule ForgeRepos.GitWriteOperation do
     )
   end
 
+  def lease_update_changeset(operation, updates) when is_list(updates) do
+    if exact_fields?(updates, @lease_mutable_fields) do
+      operation
+      |> cast(Map.new(updates), @lease_mutable_fields)
+      |> normalize_oid(:result_blob_oid)
+      |> validate_oid(:result_blob_oid)
+      |> validate_inclusion(:failure_reason, @failure_reasons)
+      |> validate_lease_transition()
+      |> validate_failure_reason_transition(operation)
+      |> validate_result_blob_update(operation)
+    else
+      operation |> change() |> add_error(:base, "contains immutable fields")
+    end
+  end
+
+  def lease_update_changeset(operation, _updates),
+    do: operation |> change() |> add_error(:base, "is invalid")
+
   defp normalize_oid(changeset, field) do
     update_change(changeset, field, fn
       oid when is_binary(oid) -> String.downcase(oid)
@@ -86,6 +110,79 @@ defmodule ForgeRepos.GitWriteOperation do
     validate_change(changeset, :target_ref, fn :target_ref, ref ->
       if canonical_full_ref?(ref), do: [], else: [target_ref: "is not a canonical full ref"]
     end)
+  end
+
+  defp validate_lease_transition(changeset) do
+    case fetch_change(changeset, :state) do
+      {:ok, target} ->
+        source = changeset.data.state
+
+        changeset =
+          if target in Map.get(@transitions, source, []),
+            do: changeset,
+            else: add_error(changeset, :state, "is not a valid lease transition")
+
+        if target == :failed do
+          validate_required(changeset, [:failure_reason])
+        else
+          changeset
+        end
+
+      :error ->
+        changeset
+    end
+  end
+
+  defp validate_result_blob_update(changeset, operation) do
+    if get_change(changeset, :result_blob_oid) != nil do
+      cond do
+        operation.kind not in [:content_create, :content_update] ->
+          add_error(changeset, :result_blob_oid, "is not valid for this operation kind")
+
+        operation.result_blob_oid != nil ->
+          add_error(changeset, :result_blob_oid, "is already recorded")
+
+        get_change(changeset, :state) != :object_written ->
+          add_error(changeset, :result_blob_oid, "requires object_written transition")
+
+        true ->
+          changeset
+      end
+    else
+      changeset
+    end
+  end
+
+  defp validate_failure_reason_transition(changeset, operation) do
+    case fetch_change(changeset, :failure_reason) do
+      {:ok, reason} ->
+        valid? =
+          operation.failure_reason == nil and
+            case reason do
+              "effect_not_started" ->
+                operation.state == :prepared and get_change(changeset, :state) == :failed
+
+              "ref_not_advanced" ->
+                operation.state == :object_written and get_change(changeset, :state) == :failed
+
+              "unexpected_ref" ->
+                operation.state in [:prepared, :object_written, :ref_advanced] and
+                  get_change(changeset, :state) == nil
+
+              _ ->
+                false
+            end
+
+        if valid?, do: changeset, else: add_error(changeset, :failure_reason, "is invalid here")
+
+      :error ->
+        changeset
+    end
+  end
+
+  defp exact_fields?(updates, allowed) do
+    keys = Keyword.keys(updates)
+    keys != [] and length(keys) == length(Enum.uniq(keys)) and Enum.all?(keys, &(&1 in allowed))
   end
 
   defp canonical_full_ref?(ref) when is_binary(ref) do

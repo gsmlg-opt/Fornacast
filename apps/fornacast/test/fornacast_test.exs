@@ -126,4 +126,32 @@ defmodule FornacastTest do
 
     assert Repo.aggregate(AuditEvent, :count, :id) == count_before
   end
+
+  test "record and record_multi normalize literal and callback nil metadata" do
+    assert {:ok, direct} =
+             Audit.record(nil, "nil.direct", "test", "1", nil,
+               request_metadata: %{"request_id" => "request-direct"},
+               request_id: "explicit-direct"
+             )
+
+    assert direct.metadata == %{"request_id" => "request-direct"}
+    assert direct.request_id == "explicit-direct"
+
+    multi =
+      Multi.new()
+      |> Audit.record_multi(
+        :audit,
+        nil,
+        "nil.callback",
+        "test",
+        fn _changes -> "2" end,
+        fn _changes -> nil end,
+        request_metadata: %{"request_id" => "request-callback"},
+        request_id: "explicit-callback"
+      )
+
+    assert {:ok, %{audit: callback}} = Repo.transaction(multi)
+    assert callback.metadata == %{"request_id" => "request-callback"}
+    assert callback.request_id == "explicit-callback"
+  end
 end
