@@ -5,10 +5,11 @@ defmodule GitTransport.ReceivePack do
   This implements the protocol-v0 write path needed for initial pushes, new
   branches, fast-forward branch updates, and tag creation.
 
-  The write-fence deadline bounds admission, reconciliation, and later durable
-  CAS operations. Legacy native receive-pack is not cancellable, so once it is
-  admitted its writer lease remains held until the native call returns or
-  raises, even if the absolute deadline passes in the meantime.
+  A supervised worker owns the write fence independently of the HTTP or SSH
+  caller. The deadline bounds admission, reconciliation, and later durable CAS
+  operations. Legacy native receive-pack is not cancellable, so once it is
+  admitted its worker and writer lease remain alive until the native call
+  returns or raises, even if the caller exits or the deadline passes.
   """
 
   alias ForgeRepos.Repository
@@ -18,7 +19,6 @@ defmodule GitTransport.ReceivePack do
   @object_id_pattern ~r/\A[0-9a-fA-F]{40}\z/
   @sideband_payload_size 65_515
   @default_max_request_bytes 4 * 1024 * 1024 * 1024
-  @native_hook_key {__MODULE__, :native_hook}
   @capabilities [
     "report-status",
     "side-band-64k",
@@ -65,13 +65,11 @@ defmodule GitTransport.ReceivePack do
     request = normalize_request(request)
     commands = Enum.map(request.commands, &command_to_native/1)
 
-    case fenced_receive_pack(repository, pack, commands) do
+    case supervised_receive_pack(repository, pack, commands) do
       {:native, {:ok, statuses}} ->
         {:ok, render_status_report(request, "ok", statuses), statuses}
 
       {:native, {:error, reason}} ->
-        Logger.error("Native Git receive-pack failed")
-
         statuses =
           Enum.map(request.commands, fn command ->
             {command.ref, "ng", "Git receive-pack failed"}
@@ -85,18 +83,26 @@ defmodule GitTransport.ReceivePack do
     end
   end
 
-  @doc false
-  def with_test_native(native, fun) when is_function(native, 3) and is_function(fun, 0) do
-    previous = Process.get(@native_hook_key)
-    Process.put(@native_hook_key, native)
+  if Mix.env() == :test do
+    @native_hook_key {__MODULE__, :native_hook}
 
-    try do
-      fun.()
-    after
-      if previous == nil,
-        do: Process.delete(@native_hook_key),
-        else: Process.put(@native_hook_key, previous)
+    @doc false
+    def with_test_native(native, fun) when is_function(native, 3) and is_function(fun, 0) do
+      previous = Process.get(@native_hook_key)
+      Process.put(@native_hook_key, native)
+
+      try do
+        fun.()
+      after
+        if previous == nil,
+          do: Process.delete(@native_hook_key),
+          else: Process.put(@native_hook_key, previous)
+      end
     end
+
+    defp native_adapter, do: Process.get(@native_hook_key, &GitCore.receive_pack/3)
+  else
+    defp native_adapter, do: &GitCore.receive_pack/3
   end
 
   def record_push(actor, %Repository{} = repository, statuses) when is_list(statuses) do
@@ -131,20 +137,40 @@ defmodule GitTransport.ReceivePack do
     end
   end
 
-  defp fenced_receive_pack(repository, pack, commands) do
-    ForgeRepos.with_write_fence(repository, :receive_pack, fn path, remaining ->
-      if remaining > 0 do
-        {:native, native_receive_pack(path, pack, commands)}
-      else
-        {:error, {:unavailable, :write_timeout}}
-      end
-    end)
+  defp supervised_receive_pack(repository, pack, commands) do
+    caller = self()
+    reply = make_ref()
+    native = native_adapter()
+
+    case GitTransport.ReceivePackWorkerManager.start_worker(fn ->
+           GitTransport.ReceivePackWorker.run(
+             caller,
+             reply,
+             repository,
+             pack,
+             commands,
+             native
+           )
+         end) do
+      {:ok, worker} -> await_worker(worker, reply)
+      {:error, _reason} -> {:error, {:unavailable, :receive_pack_worker}}
+    end
   end
 
-  defp native_receive_pack(path, pack, commands) do
-    case Process.get(@native_hook_key) do
-      native when is_function(native, 3) -> native.(path, pack, commands)
-      nil -> GitCore.receive_pack(path, pack, commands)
+  defp await_worker(worker, reply) do
+    monitor = Process.monitor(worker)
+
+    receive do
+      {^reply, result} ->
+        Process.demonitor(monitor, [:flush])
+        result
+
+      {:DOWN, ^monitor, :process, ^worker, _reason} ->
+        receive do
+          {^reply, result} -> result
+        after
+          0 -> {:error, {:unavailable, :receive_pack_worker}}
+        end
     end
   end
 

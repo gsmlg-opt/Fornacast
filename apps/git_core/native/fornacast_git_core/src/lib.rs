@@ -5355,6 +5355,18 @@ fn receive_pack(
     }
 }
 
+// Internal deterministic test primitive. Production receive-pack never calls this NIF.
+#[rustler::nif(schedule = "DirtyIo")]
+fn test_dirty_io_wait(entered_path: String, release_path: String) -> Result<(), String> {
+    std::fs::write(&entered_path, b"entered").map_err(to_error)?;
+
+    while !Path::new(&release_path).exists() {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    Ok(())
+}
+
 fn parse_receive_commands(
     commands: Vec<NativeReceiveCommand>,
 ) -> Result<Vec<ReceiveCommand>, String> {

@@ -117,4 +117,8 @@ defmodule GitCore.Native do
 
   def pack_objects(_path, _wants), do: :erlang.nif_error(:nif_not_loaded)
   def receive_pack(_path, _pack, _commands), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  def test_dirty_io_wait(_entered_path, _release_path),
+    do: :erlang.nif_error(:nif_not_loaded)
 end

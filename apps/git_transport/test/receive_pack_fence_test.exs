@@ -76,14 +76,15 @@ defmodule GitTransport.ReceivePackFenceTest do
 
     first =
       response_task(repository, fn _path, _pack, _commands ->
-        send(parent, {:native_entered, :first})
+        send(parent, {:native_entered, :first, self()})
 
         receive do
           :release -> {:ok, [{"refs/heads/main", "ok", nil}]}
         end
       end)
 
-    assert_receive {:native_entered, :first}
+    assert_receive {:native_entered, :first, first_worker}
+    on_exit(fn -> send(first_worker, :release) end)
 
     second =
       response_task(repository, fn _path, _pack, _commands ->
@@ -93,7 +94,7 @@ defmodule GitTransport.ReceivePackFenceTest do
 
     wait_for_waiters(1)
     refute_receive {:native_entered, :second}
-    send(first.pid, :release)
+    send(first_worker, :release)
     assert_receive {:native_entered, :second}
 
     assert {:ok, _response, _statuses} = Task.await(first)
@@ -182,14 +183,15 @@ defmodule GitTransport.ReceivePackFenceTest do
 
     first =
       response_task(repository, fn _path, _pack, _commands ->
-        send(parent, {:native_entered, :long})
+        send(parent, {:native_entered, :long, self()})
 
         receive do
           :release -> {:ok, [{"refs/heads/main", "ok", nil}]}
         end
       end)
 
-    assert_receive {:native_entered, :long}
+    assert_receive {:native_entered, :long, first_worker}
+    on_exit(fn -> send(first_worker, :release) end)
     Process.sleep(30)
 
     second =
@@ -205,7 +207,7 @@ defmodule GitTransport.ReceivePackFenceTest do
     refute_receive {:native_entered, :timed_out_waiter}
     assert Task.yield(first, 0) == nil
 
-    send(first.pid, :release)
+    send(first_worker, :release)
     assert {:ok, _response, [{"refs/heads/main", "ok", nil}]} = Task.await(first)
 
     assert {:ok, _response, [{"refs/heads/main", "ok", nil}]} =
@@ -216,19 +218,79 @@ defmodule GitTransport.ReceivePackFenceTest do
   end
 
   @tag :tmp_dir
-  test "releases the writer lease after native errors and raises", %{repository: repository} do
+  test "caller death cannot release a repository while its dirty NIF is still running", %{
+    repository: repository,
+    tmp_dir: tmp_dir
+  } do
+    entered_path = Path.join(tmp_dir, "dirty-nif-entered")
+    release_path = Path.join(tmp_dir, "dirty-nif-release")
+    on_exit(fn -> File.write(release_path, "release") end)
+    parent = self()
+
+    dirty_native = fn _path, _pack, _commands ->
+      {:ok, {}} = GitCore.Native.test_dirty_io_wait(entered_path, release_path)
+      {:ok, [{"refs/heads/main", "ok", nil}]}
+    end
+
+    caller =
+      spawn(fn ->
+        result =
+          ReceivePack.with_test_native(dirty_native, fn ->
+            ReceivePack.response(repository, request(), "PACK")
+          end)
+
+        send(parent, {:first_response, result})
+      end)
+
+    caller_monitor = Process.monitor(caller)
+    wait_for_file(entered_path)
+    Process.exit(caller, :kill)
+    assert_receive {:DOWN, ^caller_monitor, :process, ^caller, :killed}, 500
+
+    other_repository = %Repository{
+      id: repository.id + 1,
+      storage_path: "test/other.git"
+    }
+
+    assert {:ok, _response, _statuses} =
+             response_task(other_repository, fn _path, _pack, _commands ->
+               send(parent, :other_repository_entered)
+               {:ok, [{"refs/heads/main", "ok", nil}]}
+             end)
+             |> Task.await()
+
+    assert_receive :other_repository_entered
+
+    second =
+      response_task(repository, fn _path, _pack, _commands ->
+        send(parent, :second_native_entered)
+        {:ok, [{"refs/heads/main", "ok", nil}]}
+      end)
+
+    wait_for_waiters(1)
+    refute_receive :second_native_entered
+    File.write!(release_path, "release")
+    assert_receive :second_native_entered
+    assert {:ok, _response, _statuses} = Task.await(second)
+    refute_receive {:first_response, _result}
+    wait_for_workers(0)
+  end
+
+  @tag :tmp_dir
+  test "native errors and raises render ng and release the writer lease", %{
+    repository: repository
+  } do
     assert {:ok, _response, [{"refs/heads/main", "ng", "Git receive-pack failed"}]} =
              ReceivePack.with_test_native(
                fn _path, _pack, _commands -> {:error, :native_failed} end,
                fn -> ReceivePack.response(repository, request(), "PACK") end
              )
 
-    assert_raise RuntimeError, "native crashed", fn ->
-      ReceivePack.with_test_native(
-        fn _path, _pack, _commands -> raise "native crashed" end,
-        fn -> ReceivePack.response(repository, request(), "PACK") end
-      )
-    end
+    assert {:ok, _response, [{"refs/heads/main", "ng", "Git receive-pack failed"}]} =
+             ReceivePack.with_test_native(
+               fn _path, _pack, _commands -> raise "native crashed" end,
+               fn -> ReceivePack.response(repository, request(), "PACK") end
+             )
 
     assert {:ok, lease} =
              GitCore.RepositoryWriteLimiter.acquire(
@@ -237,6 +299,103 @@ defmodule GitTransport.ReceivePackFenceTest do
              )
 
     assert :ok = GitCore.RepositoryWriteLimiter.release(lease)
+    wait_for_workers(0)
+  end
+
+  @tag :tmp_dir
+  test "worker crashes before a result render ng and release the writer lease", %{
+    repository: repository
+  } do
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, response, [{"refs/heads/main", "ng", "Git receive-pack unavailable"}]} =
+                 ReceivePack.with_test_native(
+                   fn _path, _pack, _commands -> exit(:simulated_worker_crash) end,
+                   fn -> ReceivePack.response(repository, request(), "PACK") end
+                 )
+
+        assert response =~ "ng refs/heads/main Git receive-pack unavailable"
+      end)
+
+    refute log =~ "PACK"
+
+    assert {:ok, lease} =
+             GitCore.RepositoryWriteLimiter.acquire(
+               repository.id,
+               System.monotonic_time(:millisecond) + 1_000
+             )
+
+    assert :ok = GitCore.RepositoryWriteLimiter.release(lease)
+    wait_for_workers(0)
+  end
+
+  @tag :tmp_dir
+  test "worker replies are correlated and completed workers leave no mailbox or child residue", %{
+    repository: repository
+  } do
+    decoy = make_ref()
+    send(self(), {decoy, :keep})
+
+    assert {:ok, _response, _statuses} =
+             ReceivePack.with_test_native(
+               fn _path, _pack, _commands ->
+                 {:ok, [{"refs/heads/main", "ok", nil}]}
+               end,
+               fn -> ReceivePack.response(repository, request(), "PACK") end
+             )
+
+    assert_receive {^decoy, :keep}
+    wait_for_workers(0)
+    assert {:messages, []} = Process.info(self(), :messages)
+  end
+
+  @tag :tmp_dir
+  test "receive-pack worker supervision waits indefinitely and precedes SSH admission" do
+    [worker_spec, manager_spec | daemon_specs] = GitTransport.Application.child_specs()
+    assert worker_spec.id == GitTransport.ReceivePackWorkerSupervisor
+    assert worker_spec.shutdown == :infinity
+    assert manager_spec.id == GitTransport.ReceivePackWorkerManager
+    assert manager_spec.shutdown == :infinity
+
+    assert Enum.all?(daemon_specs, fn spec ->
+             Supervisor.child_spec(spec, []).id == GitTransport.Daemon
+           end)
+  end
+
+  @tag :tmp_dir
+  test "application shutdown waits for an admitted dirty NIF without reopening the lease", %{
+    repository: repository,
+    tmp_dir: tmp_dir
+  } do
+    entered_path = Path.join(tmp_dir, "shutdown-dirty-nif-entered")
+    release_path = Path.join(tmp_dir, "shutdown-dirty-nif-release")
+
+    on_exit(fn ->
+      File.write(release_path, "release")
+      Application.ensure_all_started(:git_transport)
+    end)
+
+    response =
+      response_task(repository, fn _path, _pack, _commands ->
+        {:ok, {}} = GitCore.Native.test_dirty_io_wait(entered_path, release_path)
+        {:ok, [{"refs/heads/main", "ok", nil}]}
+      end)
+
+    wait_for_file(entered_path)
+    stopper = Task.async(fn -> Application.stop(:git_transport) end)
+    assert Task.yield(stopper, 30) == nil
+
+    assert {:error, :timeout} =
+             GitCore.RepositoryWriteLimiter.acquire(
+               repository.id,
+               System.monotonic_time(:millisecond) + 25
+             )
+
+    File.write!(release_path, "release")
+    assert {:ok, _response, [{"refs/heads/main", "ok", nil}]} = Task.await(response)
+    assert :ok = Task.await(stopper)
+    assert {:ok, _started} = Application.ensure_all_started(:git_transport)
+    wait_for_workers(0)
   end
 
   @tag :tmp_dir
@@ -272,7 +431,7 @@ defmodule GitTransport.ReceivePackFenceTest do
     native_calls =
       for path <- app_libs,
           source = File.read!(path),
-          Regex.match?(~r/GitCore\.receive_pack\s*\(/, source),
+          Regex.match?(~r/GitCore\.receive_pack(?:\s*\(|\/3)/, source),
           do: path
 
     assert native_calls == [Path.expand("../lib/git_transport/receive_pack.ex", __DIR__)]
@@ -320,6 +479,32 @@ defmodule GitTransport.ReceivePackFenceTest do
 
   defp wait_for_waiters(expected, 0),
     do: flunk("expected #{expected} repository write waiter(s)")
+
+  defp wait_for_file(path, attempts \\ 200)
+
+  defp wait_for_file(path, attempts) when attempts > 0 do
+    if File.exists?(path) do
+      :ok
+    else
+      Process.sleep(5)
+      wait_for_file(path, attempts - 1)
+    end
+  end
+
+  defp wait_for_file(path, 0), do: flunk("expected #{path} to exist")
+
+  defp wait_for_workers(expected, attempts \\ 100)
+
+  defp wait_for_workers(expected, attempts) when attempts > 0 do
+    if length(Task.Supervisor.children(GitTransport.ReceivePackWorkerSupervisor)) == expected do
+      :ok
+    else
+      Process.sleep(5)
+      wait_for_workers(expected, attempts - 1)
+    end
+  end
+
+  defp wait_for_workers(expected, 0), do: flunk("expected #{expected} receive-pack worker(s)")
 
   defp restore_env(application, key, {:ok, value}),
     do: Application.put_env(application, key, value)
