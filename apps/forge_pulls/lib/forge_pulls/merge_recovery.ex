@@ -68,7 +68,7 @@ defmodule ForgePulls.MergeRecovery do
     with :ok <- check_deadline(absolute_deadline) do
       now = DateTime.utc_now() |> DateTime.truncate(:second)
 
-      case next_operation(repository.id, after_id, now) do
+      case next_operation(repository.id, after_id) do
         nil ->
           :ok
 
@@ -81,7 +81,7 @@ defmodule ForgePulls.MergeRecovery do
                  owner,
                  now
                ) do
-            result when result in [:ok, :busy] ->
+            :ok ->
               reconcile_next(
                 repository,
                 repository_path,
@@ -97,15 +97,11 @@ defmodule ForgePulls.MergeRecovery do
     end
   end
 
-  defp next_operation(repository_id, after_id, now) do
+  defp next_operation(repository_id, after_id) do
     MergeOperation
     |> where([operation], operation.repository_id == ^repository_id)
     |> where([operation], operation.state not in ^@terminal_states)
     |> where([operation], operation.id > ^after_id)
-    |> where(
-      [operation],
-      is_nil(operation.lease_expires_at) or operation.lease_expires_at <= ^now
-    )
     |> order_by([operation], asc: operation.id)
     |> limit(1)
     |> Repo.one()
@@ -138,8 +134,8 @@ defmodule ForgePulls.MergeRecovery do
         _result = OperationLease.release(MergeOperation, claimed)
       end
     else
-      :busy -> :busy
-      {:error, :not_found} -> :busy
+      :busy -> {:error, :unavailable}
+      {:error, :not_found} -> {:error, :unavailable}
       _error -> {:error, :unavailable}
     end
   end

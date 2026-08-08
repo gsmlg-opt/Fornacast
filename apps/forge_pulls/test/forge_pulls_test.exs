@@ -1494,6 +1494,115 @@ defmodule ForgePullsTest do
              Repo.get!(MergeOperation, older.id)
   end
 
+  test "an older live operation lease blocks a newer merge at the recovery fence" do
+    owner = user_fixture(unique("merge-live-fence"))
+    repository = repository_fixture(owner)
+    {base_oid, head_oid} = create_mergeable_branches!(repository)
+    assert {:ok, pull} = create_pull(repository, owner, "Live fence", "feature", "main")
+
+    older =
+      %MergeOperation{}
+      |> MergeOperation.prepare_changeset(%{
+        pull_request_id: pull.id,
+        repository_id: repository.id,
+        actor_user_id: owner.id,
+        request_id: unique("older-live-merge"),
+        base_ref: pull.base_ref,
+        head_ref: pull.head_ref,
+        expected_base_oid: base_oid,
+        expected_head_oid: head_oid,
+        state: :prepared
+      })
+      |> Repo.insert!()
+
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    assert {:ok, claimed} = OperationLease.claim(MergeOperation, older.id, "live", now, 30)
+
+    try do
+      assert {:error, {:unavailable, :write_fence}} =
+               ForgePulls.merge(
+                 repository,
+                 pull,
+                 owner,
+                 %{},
+                 request_metadata(unique("blocked-new-merge"))
+               )
+
+      assert snapshot_oid(repository, "main") == base_oid
+
+      assert Repo.aggregate(
+               from(operation in MergeOperation,
+                 where: operation.pull_request_id == ^pull.id
+               ),
+               :count
+             ) == 1
+
+      assert %MergeOperation{state: :prepared, lease_owner: "live"} =
+               Repo.get!(MergeOperation, older.id)
+    after
+      OperationLease.release(MergeOperation, claimed)
+    end
+  end
+
+  test "an older operation claim race blocks rather than advancing the recovery cursor" do
+    owner = user_fixture(unique("merge-claim-race"))
+    repository = repository_fixture(owner)
+    {base_oid, head_oid} = create_mergeable_branches!(repository)
+    assert {:ok, pull} = create_pull(repository, owner, "Claim race", "feature", "main")
+
+    older =
+      %MergeOperation{}
+      |> MergeOperation.prepare_changeset(%{
+        pull_request_id: pull.id,
+        repository_id: repository.id,
+        actor_user_id: owner.id,
+        request_id: unique("older-raced-merge"),
+        base_ref: pull.base_ref,
+        head_ref: pull.head_ref,
+        expected_base_oid: base_oid,
+        expected_head_oid: head_oid,
+        state: :prepared
+      })
+      |> Repo.insert!()
+
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    result =
+      OperationLease.with_test_after_write_hook(
+        fn :claim, MergeOperation, id, _version ->
+          Repo.update_all(from(operation in MergeOperation, where: operation.id == ^id),
+            set: [lease_expires_at: DateTime.add(now, -1, :second)]
+          )
+
+          assert {:ok, _stolen} =
+                   OperationLease.claim(MergeOperation, id, "stolen", now, 30)
+        end,
+        fn ->
+          ForgePulls.merge(
+            repository,
+            pull,
+            owner,
+            %{},
+            request_metadata(unique("blocked-raced-merge"))
+          )
+        end
+      )
+
+    assert {:error, {:unavailable, :write_fence}} = result
+    assert snapshot_oid(repository, "main") == base_oid
+
+    assert Repo.aggregate(
+             from(operation in MergeOperation, where: operation.pull_request_id == ^pull.id),
+             :count
+           ) == 1
+
+    assert %MergeOperation{state: :prepared, lease_owner: "stolen"} =
+             raced =
+             Repo.get!(MergeOperation, older.id)
+
+    assert :ok = OperationLease.release(MergeOperation, raced)
+  end
+
   test "faults after every persisted transition leave one recoverable operation" do
     for {fault_state, recovered_state} <- [
           prepared: :failed,
