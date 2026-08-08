@@ -5166,6 +5166,12 @@ fn reclaim_stale_cas_marker(marker_path: &Path) -> Result<bool, NativeError> {
     if !cas_lock_metadata_is_stale(&observed)? {
         return Ok(false);
     }
+    // Without stable filesystem identity, size and timestamps cannot distinguish a stale
+    // zero-byte marker from a same-shaped live replacement. Refuse automatic reclamation and let
+    // the caller receive the bounded ref timeout so an operator can inspect/remove it safely.
+    if !automatic_stale_reclamation_supported() {
+        return Ok(false);
+    }
 
     let quarantine_id = CAS_QUARANTINE_ID.fetch_add(1, Ordering::Relaxed);
     let quarantine = marker_path.with_file_name(format!(
@@ -5235,15 +5241,27 @@ fn cas_lock_metadata_is_stale(metadata: &std::fs::Metadata) -> Result<bool, Nati
         >= REF_UPDATE_DEADLINE)
 }
 
-#[cfg(unix)]
 fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    stable_file_identities_match(stable_file_identity(left), stable_file_identity(right))
+}
+
+fn stable_file_identities_match(left: Option<(u64, u64)>, right: Option<(u64, u64)>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if left == right)
+}
+
+#[cfg(unix)]
+fn stable_file_identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
+    Some((metadata.dev(), metadata.ino()))
 }
 
 #[cfg(not(unix))]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    left.len() == right.len() && left.modified().ok() == right.modified().ok()
+fn stable_file_identity(_metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+fn automatic_stale_reclamation_supported() -> bool {
+    cfg!(unix)
 }
 
 fn cas_duration(deadline_ms: u64) -> Duration {
@@ -6557,6 +6575,13 @@ mod tests {
     fn compare_and_swap_ref_deadline_cannot_exceed_ten_seconds() {
         assert_eq!(cas_duration(0), Duration::ZERO);
         assert_eq!(cas_duration(u64::MAX), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn compare_and_swap_ref_refuses_reclaim_without_stable_file_identity() {
+        assert!(!stable_file_identities_match(None, None));
+        assert!(stable_file_identities_match(Some((7, 11)), Some((7, 11))));
+        assert!(!stable_file_identities_match(Some((7, 11)), Some((7, 12))));
     }
 
     #[test]
