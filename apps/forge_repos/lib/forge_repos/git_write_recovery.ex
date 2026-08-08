@@ -13,6 +13,8 @@ defmodule ForgeRepos.GitWriteRecovery do
   @lease_seconds 30
   @terminal_states [:bookkeeping_complete, :failed]
   @complete_multi_hook_key {__MODULE__, :complete_multi_hook}
+  @iteration_clock_key {__MODULE__, :iteration_clock}
+  @claim_observer_key {__MODULE__, :claim_observer}
 
   @doc false
   def with_test_complete_multi_hook(hook, fun)
@@ -26,6 +28,22 @@ defmodule ForgeRepos.GitWriteRecovery do
       if previous == nil,
         do: Process.delete(@complete_multi_hook_key),
         else: Process.put(@complete_multi_hook_key, previous)
+    end
+  end
+
+  @doc false
+  def with_test_iteration_clock(clock, claim_observer, fun)
+      when is_function(clock, 0) and is_function(claim_observer, 2) and is_function(fun, 0) do
+    previous_clock = Process.get(@iteration_clock_key)
+    previous_observer = Process.get(@claim_observer_key)
+    Process.put(@iteration_clock_key, clock)
+    Process.put(@claim_observer_key, claim_observer)
+
+    try do
+      fun.()
+    after
+      restore_process_value(@iteration_clock_key, previous_clock)
+      restore_process_value(@claim_observer_key, previous_observer)
     end
   end
 
@@ -63,12 +81,13 @@ defmodule ForgeRepos.GitWriteRecovery do
       when is_integer(repository_id) and is_binary(repository_path) and
              is_integer(absolute_deadline) do
     owner = lease_owner(repository_id)
-    now = DateTime.utc_now() |> DateTime.truncate(:second)
-    reconcile_next(repository, repository_path, absolute_deadline, owner, now, 0)
+    reconcile_next(repository, repository_path, absolute_deadline, owner, 0)
   end
 
-  defp reconcile_next(repository, repository_path, absolute_deadline, owner, now, after_id) do
+  defp reconcile_next(repository, repository_path, absolute_deadline, owner, after_id) do
     with :ok <- check_deadline(absolute_deadline) do
+      now = iteration_now()
+
       case next_claimable_operation(repository.id, after_id, now) do
         nil ->
           :ok
@@ -89,7 +108,6 @@ defmodule ForgeRepos.GitWriteRecovery do
                 repository_path,
                 absolute_deadline,
                 owner,
-                now,
                 operation.id
               )
 
@@ -129,6 +147,8 @@ defmodule ForgeRepos.GitWriteRecovery do
     with :ok <- check_deadline(absolute_deadline),
          {:ok, claimed} <- claim(operation, owner, now) do
       try do
+        notify_claim_observer(claimed, now)
+
         with :ok <- check_deadline_or_release(claimed, absolute_deadline),
              {:ok, current_oid} <- read_current_ref(repository_path, claimed, absolute_deadline) do
           classify(repository, repository_path, claimed, current_oid, absolute_deadline)
@@ -341,6 +361,24 @@ defmodule ForgeRepos.GitWriteRecovery do
   defp lease_owner(repository_id) do
     "git-write-recovery:#{node()}:#{inspect(self())}:#{repository_id}"
   end
+
+  defp iteration_now do
+    case Process.get(@iteration_clock_key) do
+      clock when is_function(clock, 0) -> clock.()
+      nil -> DateTime.utc_now()
+    end
+    |> DateTime.truncate(:second)
+  end
+
+  defp notify_claim_observer(claimed, now) do
+    case Process.get(@claim_observer_key) do
+      observer when is_function(observer, 2) -> observer.(claimed, now)
+      nil -> :ok
+    end
+  end
+
+  defp restore_process_value(key, nil), do: Process.delete(key)
+  defp restore_process_value(key, value), do: Process.put(key, value)
 
   defp safe_repository_path(repository) do
     {:ok, ForgeRepos.absolute_storage_path(repository)}

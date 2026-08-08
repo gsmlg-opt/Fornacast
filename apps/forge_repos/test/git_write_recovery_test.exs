@@ -202,6 +202,65 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
              Repo.get!(GitWriteOperation, later.id)
   end
 
+  test "each cursor iteration shares a fresh wall clock between selection and claim", context do
+    first_ref = "refs/heads/clock-first"
+    second_ref = "refs/heads/clock-second"
+    update_ref(context.path, context.expected_oid, first_ref)
+    update_ref(context.path, context.expected_oid, second_ref)
+
+    first =
+      operation!(context, :prepared,
+        request_id: "clock-first",
+        target_ref: first_ref
+      )
+
+    second =
+      operation!(context, :prepared,
+        request_id: "clock-second",
+        target_ref: second_ref
+      )
+
+    first_now = ~U[2026-08-09 04:00:00Z]
+    second_now = DateTime.add(first_now, 31, :second)
+
+    Repo.update_all(from(item in GitWriteOperation, where: item.id == ^second.id),
+      set: [lease_owner: "aging", lease_expires_at: DateTime.add(first_now, 20, :second)]
+    )
+
+    counter = :counters.new(1, [])
+
+    clock = fn ->
+      :counters.add(counter, 1, 1)
+
+      case :counters.get(counter, 1) do
+        1 -> first_now
+        _later -> second_now
+      end
+    end
+
+    test_pid = self()
+
+    claim_observer = fn claimed, iteration_now ->
+      send(test_pid, {:claimed, claimed.id, iteration_now, claimed.lease_expires_at})
+    end
+
+    assert :ok =
+             GitWriteRecovery.with_test_iteration_clock(clock, claim_observer, fn ->
+               locked_reconcile(context)
+             end)
+
+    assert_receive {:claimed, first_id, ^first_now, first_expires_at}
+    assert first_id == first.id
+    assert first_expires_at == DateTime.add(first_now, 30, :second)
+
+    assert_receive {:claimed, second_id, ^second_now, second_expires_at}
+    assert second_id == second.id
+    assert second_expires_at == DateTime.add(second_now, 30, :second)
+
+    assert Repo.get!(GitWriteOperation, first.id).state == :failed
+    assert Repo.get!(GitWriteOperation, second.id).state == :failed
+  end
+
   test "SQL failure after proposed evidence rolls back bookkeeping and remains recoverable",
        context do
     update_ref(context.path, context.proposed_oid)
