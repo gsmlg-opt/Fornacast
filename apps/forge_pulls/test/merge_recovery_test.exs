@@ -763,6 +763,31 @@ defmodule ForgePulls.MergeRecoveryTest do
     send(second_pid, :finish)
   end
 
+  test "a scheduler crash terminates its supervised task before the replacement dispatches" do
+    test_pid = self()
+
+    task = fn ->
+      send(test_pid, {:crash_topology_task_started, self()})
+      receive do: (:finish -> :ok)
+    end
+
+    reconciler = await_idle_reconciler()
+    install_reconciler_task(reconciler, task)
+    send(reconciler, :tick)
+    assert_receive {:crash_topology_task_started, first_pid}, 500
+
+    Process.exit(reconciler, :kill)
+
+    replacement = await_replacement_reconciler(reconciler)
+    install_reconciler_task(replacement, task)
+    send(replacement, :tick)
+    assert_receive {:crash_topology_task_started, second_pid}, 500
+
+    refute Process.alive?(first_pid)
+    assert Process.alive?(second_pid)
+    send(second_pid, :finish)
+  end
+
   defp user_fixture do
     name = unique("merge-owner")
 
@@ -909,6 +934,60 @@ defmodule ForgePulls.MergeRecoveryTest do
 
     send(task.pid, :run)
     task
+  end
+
+  defp await_idle_reconciler(deadline \\ System.monotonic_time(:millisecond) + 1_000) do
+    case Process.whereis(MergeReconciler) do
+      pid when is_pid(pid) ->
+        case :sys.get_state(pid) do
+          %{task: nil} ->
+            pid
+
+          _busy ->
+            if System.monotonic_time(:millisecond) < deadline do
+              Process.sleep(10)
+              await_idle_reconciler(deadline)
+            else
+              flunk("application merge reconciler did not become idle")
+            end
+        end
+
+      nil ->
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(10)
+          await_idle_reconciler(deadline)
+        else
+          flunk("application merge reconciler was not running")
+        end
+    end
+  end
+
+  defp await_replacement_reconciler(
+         previous,
+         deadline \\ System.monotonic_time(:millisecond) + 1_000
+       ) do
+    case Process.whereis(MergeReconciler) do
+      pid when is_pid(pid) and pid != previous ->
+        await_idle_reconciler(deadline)
+
+      _same_or_missing ->
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(10)
+          await_replacement_reconciler(previous, deadline)
+        else
+          flunk("application merge reconciler was not restarted")
+        end
+    end
+  end
+
+  defp install_reconciler_task(reconciler, task) do
+    :ok = :sys.suspend(reconciler)
+
+    :sys.replace_state(reconciler, fn state ->
+      %{state | task_fun: task, interval_ms: 30_000, runtime_ms: 500}
+    end)
+
+    :ok = :sys.resume(reconciler)
   end
 
   defp allow_background_repo(owner) do

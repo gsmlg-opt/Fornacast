@@ -10,6 +10,6 @@ defmodule ForgePulls.Application do
       ForgePulls.MergeReconciler
     ]
 
-    Supervisor.start_link(children, strategy: :one_for_one, name: ForgePulls.Supervisor)
+    Supervisor.start_link(children, strategy: :one_for_all, name: ForgePulls.Supervisor)
   end
 end
