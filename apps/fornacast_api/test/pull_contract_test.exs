@@ -201,6 +201,52 @@ defmodule FornacastAPI.PullContractTest do
     end
   end
 
+  test "merge interoperability fields are explicit in both raw contracts" do
+    for version <- @versions do
+      document = openapi_json("ghes-3.21-#{version}.json")
+
+      merge_schema =
+        get_in(document, [
+          "paths",
+          "/repos/{owner}/{repo}/pulls/{pull_number}/merge",
+          "put",
+          "responses",
+          "200",
+          "content",
+          "application/json",
+          "schema"
+        ])
+
+      pull_schema =
+        get_in(document, [
+          "paths",
+          "/repos/{owner}/{repo}/pulls/{pull_number}",
+          "get",
+          "responses",
+          "200",
+          "content",
+          "application/json",
+          "schema"
+        ])
+
+      issue_schema =
+        get_in(document, [
+          "paths",
+          "/repos/{owner}/{repo}/issues/{issue_number}",
+          "get",
+          "responses",
+          "200",
+          "content",
+          "application/json",
+          "schema"
+        ])
+
+      assert Enum.sort(merge_schema["required"]) == ~w(merged message sha)
+      assert Map.has_key?(pull_schema["properties"], "merged_at")
+      assert Map.has_key?(issue_schema["properties"]["pull_request"]["properties"], "merged_at")
+    end
+  end
+
   def pull_literal("2022-11-28" = version),
     do: version |> pull_literal_map() |> Map.take(@pull_fields_2022)
 
