@@ -193,6 +193,7 @@ defmodule ForgePulls do
       when is_integer(number) and number > 0 do
     with {:ok, repository} <- canonical_read_repository(repository, actor),
          %PullRequest{} = pull <- Repo.one(pull_query(repository, number)),
+         {:ok, pull} <- reconcile_pull_on_touch(repository, pull),
          {:ok, pull} <- refresh_analysis(pull, repository),
          {:ok, loaded} <- load_issue_result(pull, repository) do
       {:ok, loaded}
@@ -278,6 +279,28 @@ defmodule ForgePulls do
 
   def pull_links_for_issue_ids(_repository, _ids, _actor), do: {:error, :not_found}
 
+  @spec reconcile_repository(ForgeRepos.Repository.t(), keyword()) ::
+          :ok | {:error, {:unavailable, :pull_recovery}}
+  def reconcile_repository(repository, opts \\ [])
+
+  def reconcile_repository(%ForgeRepos.Repository{} = repository, opts) when is_list(opts) do
+    case ForgeRepos.with_write_fence(repository, :merge, fn repository_path, remaining ->
+           absolute_deadline = System.monotonic_time(:millisecond) + remaining
+
+           MergeRecovery.reconcile_repository_locked(
+             repository,
+             repository_path,
+             absolute_deadline
+           )
+         end) do
+      :ok -> :ok
+      _error -> {:error, {:unavailable, :pull_recovery}}
+    end
+  end
+
+  def reconcile_repository(_repository, _opts),
+    do: {:error, {:unavailable, :pull_recovery}}
+
   @spec merge(ForgeRepos.Repository.t(), PullRequest.t(), map(), map(), map()) ::
           {:ok, %{merged: true, message: String.t(), sha: String.t()}}
           | {:error, error_reason()}
@@ -291,6 +314,7 @@ defmodule ForgePulls do
       when is_map(attrs) and is_map(request_metadata) do
     with %ForgeAccounts.User{} = actor <- actor,
          {:ok, context} <- authorize_merge(actor, repository, expected_pull),
+         :ok <- reconcile_before_merge(context.repository),
          {:ok, merge_attrs} <- normalize_merge_attrs(attrs),
          result <-
            ForgeRepos.with_write_fence(context.repository, :merge, fn repository_path,
@@ -967,6 +991,43 @@ defmodule ForgePulls do
           p.repository_id == ^repository.id and i.number == ^number and i.kind == :pull_request,
         select: p
       )
+
+  defp reconcile_pull_on_touch(repository, pull) do
+    pending? =
+      Repo.exists?(
+        from operation in MergeOperation,
+          where:
+            operation.pull_request_id == ^pull.id and
+              operation.state not in [:completed, :failed]
+      )
+
+    if pending? do
+      with :ok <- reconcile_repository(repository, []) do
+        case Repo.get(PullRequest, pull.id) do
+          %PullRequest{} = reconciled -> {:ok, reconciled}
+          nil -> {:error, :not_found}
+        end
+      end
+    else
+      {:ok, pull}
+    end
+  end
+
+  defp reconcile_before_merge(repository) do
+    pending? =
+      Repo.exists?(
+        from operation in MergeOperation,
+          where:
+            operation.repository_id == ^repository.id and
+              operation.state not in [:completed, :failed]
+      )
+
+    if pending? do
+      reconcile_repository(repository, [])
+    else
+      :ok
+    end
+  end
 
   defp load_issues(pulls, repository) do
     issues_by_id =

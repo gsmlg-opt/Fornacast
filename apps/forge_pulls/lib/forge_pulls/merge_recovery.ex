@@ -14,6 +14,9 @@ defmodule ForgePulls.MergeRecovery do
 
   @lease_seconds 30
   @terminal_states [:completed, :failed]
+  @iteration_clock_key {__MODULE__, :iteration_clock}
+  @lease_owner_key {__MODULE__, :lease_owner}
+  @claim_observer_key {__MODULE__, :claim_observer}
 
   if Mix.env() == :test do
     @complete_multi_hook_key {__MODULE__, :complete_multi_hook}
@@ -32,6 +35,29 @@ defmodule ForgePulls.MergeRecovery do
           else: Process.put(@complete_multi_hook_key, previous)
       end
     end
+
+    @doc false
+    def with_test_iteration_context(clock, owner, observer, fun)
+        when is_function(clock, 0) and is_binary(owner) and owner != "" and
+               is_function(observer, 2) and is_function(fun, 0) do
+      previous_clock = Process.get(@iteration_clock_key)
+      previous_owner = Process.get(@lease_owner_key)
+      previous_observer = Process.get(@claim_observer_key)
+      Process.put(@iteration_clock_key, clock)
+      Process.put(@lease_owner_key, owner)
+      Process.put(@claim_observer_key, observer)
+
+      try do
+        fun.()
+      after
+        restore_process_value(@iteration_clock_key, previous_clock)
+        restore_process_value(@lease_owner_key, previous_owner)
+        restore_process_value(@claim_observer_key, previous_observer)
+      end
+    end
+
+    defp restore_process_value(key, nil), do: Process.delete(key)
+    defp restore_process_value(key, value), do: Process.put(key, value)
 
     defp apply_complete_multi_hook(multi, operation) do
       case Process.get(@complete_multi_hook_key) do
@@ -66,7 +92,7 @@ defmodule ForgePulls.MergeRecovery do
 
   defp reconcile_next(repository, repository_path, absolute_deadline, owner, after_id) do
     with :ok <- check_deadline(absolute_deadline) do
-      now = DateTime.utc_now() |> DateTime.truncate(:second)
+      now = iteration_now()
 
       case next_operation(repository.id, after_id) do
         nil ->
@@ -119,6 +145,8 @@ defmodule ForgePulls.MergeRecovery do
          {:ok, claimed} <-
            OperationLease.claim(MergeOperation, operation.id, owner, now, @lease_seconds) do
       try do
+        notify_claim_observer(claimed, now)
+
         with {:ok, current_oid} <- read_base_ref(repository_path, claimed, absolute_deadline) do
           classify(
             repository,
@@ -195,19 +223,54 @@ defmodule ForgePulls.MergeRecovery do
          _repository,
          _repository_path,
          operation,
-         _current_oid,
+         current_oid,
          absolute_deadline,
          _owner,
          _now
        ) do
+    block(operation, current_oid, absolute_deadline)
+  end
+
+  defp block(operation, current_oid, absolute_deadline) do
     with :ok <- check_deadline(absolute_deadline),
-         {:ok, _operation} <-
-           OperationLease.update_owned(MergeOperation, operation,
-             failure_reason: "unexpected_ref"
-           ) do
+         :ok <- mark_unexpected(operation),
+         :ok <- record_blocked_audit(operation, current_oid) do
       {:error, :unavailable}
     else
       _error -> {:error, :unavailable}
+    end
+  end
+
+  defp mark_unexpected(%MergeOperation{failure_reason: "unexpected_ref"} = operation),
+    do: OperationLease.release(MergeOperation, operation)
+
+  defp mark_unexpected(operation) do
+    case OperationLease.update_owned(MergeOperation, operation, failure_reason: "unexpected_ref") do
+      {:ok, _operation} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp record_blocked_audit(operation, current_oid) do
+    metadata = %{
+      "ref" => operation.base_ref,
+      "expected_oid" => operation.expected_base_oid,
+      "merge_oid" => operation.merge_oid,
+      "current_oid" => current_oid,
+      "result" => "blocked"
+    }
+
+    case Audit.record(
+           nil,
+           "pull_request.merge_recovery_blocked",
+           "repository",
+           operation.repository_id,
+           metadata,
+           request_metadata: operation_request_metadata(operation),
+           operation_id: operation_id(operation)
+         ) do
+      {:ok, _audit} -> :ok
+      {:error, _reason} -> {:error, :unavailable}
     end
   end
 
@@ -401,8 +464,27 @@ defmodule ForgePulls.MergeRecovery do
     end
   end
 
-  defp lease_owner(repository_id),
-    do: "pull-merge-recovery:#{node()}:#{inspect(self())}:#{repository_id}"
+  defp lease_owner(repository_id) do
+    case Process.get(@lease_owner_key) do
+      owner when is_binary(owner) and owner != "" -> owner
+      nil -> "pull-merge-recovery:#{node()}:#{inspect(self())}:#{repository_id}"
+    end
+  end
+
+  defp iteration_now do
+    case Process.get(@iteration_clock_key) do
+      clock when is_function(clock, 0) -> clock.()
+      nil -> DateTime.utc_now()
+    end
+    |> DateTime.truncate(:second)
+  end
+
+  defp notify_claim_observer(claimed, now) do
+    case Process.get(@claim_observer_key) do
+      observer when is_function(observer, 2) -> observer.(claimed, now)
+      nil -> :ok
+    end
+  end
 
   defp operation_id(operation), do: "pull_merge:" <> Integer.to_string(operation.id)
 

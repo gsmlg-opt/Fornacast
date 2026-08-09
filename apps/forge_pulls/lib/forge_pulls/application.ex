@@ -5,6 +5,11 @@ defmodule ForgePulls.Application do
 
   @impl true
   def start(_type, _args) do
-    Supervisor.start_link([], strategy: :one_for_one, name: ForgePulls.Supervisor)
+    children = [
+      {Task.Supervisor, name: ForgePulls.MergeRecoveryTaskSupervisor},
+      ForgePulls.MergeReconciler
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: ForgePulls.Supervisor)
   end
 end

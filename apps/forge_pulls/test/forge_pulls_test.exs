@@ -1729,7 +1729,7 @@ defmodule ForgePullsTest do
     assert {:ok, claimed} = OperationLease.claim(MergeOperation, older.id, "live", now, 30)
 
     try do
-      assert {:error, {:unavailable, :write_fence}} =
+      assert {:error, {:unavailable, :pull_recovery}} =
                ForgePulls.merge(
                  repository,
                  pull,
@@ -1798,7 +1798,7 @@ defmodule ForgePullsTest do
         end
       )
 
-    assert {:error, {:unavailable, :write_fence}} = result
+    assert {:error, {:unavailable, :pull_recovery}} = result
     assert snapshot_oid(repository, "main") == base_oid
 
     assert Repo.aggregate(
