@@ -9,6 +9,7 @@ defmodule GitCore do
   @inline_blob_limit 1_048_576
   @complete_blob_limit 100_000_000
   @diff_source_limit 200_000
+  @diff_file_page_limit 100
   @diff_scan_deadline_ms 5_000
   @search_file_limit 10_000
   @search_byte_limit 67_108_864
@@ -23,6 +24,10 @@ defmodule GitCore do
   @merge_changed_path_limit 10_000
   @merge_byte_limit 67_108_864
   @merge_deadline_ms 30_000
+  @comparison_commit_limit @merge_commit_limit
+  @comparison_tree_entry_limit @merge_tree_entry_limit
+  @comparison_file_limit @search_file_limit
+  @comparison_byte_limit @merge_byte_limit
 
   def init_bare(path) when is_binary(path) do
     GitCore.Native.init_bare(path)
@@ -177,6 +182,54 @@ defmodule GitCore do
                  deadline_ms
                ),
                :commit_page
+             ) do
+        total_pages = if total == 0, do: 1, else: div(total + per_page - 1, per_page)
+
+        {:ok,
+         %GitCore.CommitPage{
+           commits: Enum.map(commits, &commit_from_native/1),
+           total: total,
+           page: page,
+           per_page: per_page,
+           total_pages: total_pages
+         }}
+      end
+    end)
+  end
+
+  @doc "Reads one page of commits reachable from an immutable head OID but not a base OID."
+  @spec commit_range_page(Path.t(), String.t(), String.t(), pos_integer(), keyword()) ::
+          {:ok, GitCore.CommitPage.t()} | {:error, GitCore.Error.t()}
+  def commit_range_page(path, base_oid, head_oid, page, opts \\ [])
+      when is_binary(path) and is_binary(base_oid) and is_binary(head_oid) and
+             is_integer(page) and page > 0 and is_list(opts) do
+    per_page = opts |> Keyword.get(:per_page, @commit_page_limit) |> bounded_commit_page_size()
+
+    deadline_ms =
+      opts |> Keyword.get(:deadline_ms, @commit_scan_deadline_ms) |> commit_deadline_ms()
+
+    commit_limit =
+      opts
+      |> Keyword.get(:commit_limit, @comparison_commit_limit)
+      |> comparison_commit_limit()
+
+    byte_limit =
+      opts |> Keyword.get(:byte_limit, @comparison_byte_limit) |> comparison_byte_limit()
+
+    GitCore.ScanLimiter.with_permit(:commit_range_page, fn ->
+      with {:ok, {commits, total}} <-
+             wrap_read(
+               GitCore.Native.commit_range_page(
+                 path,
+                 base_oid,
+                 head_oid,
+                 Integer.to_string(page),
+                 per_page,
+                 commit_limit,
+                 byte_limit,
+                 deadline_ms
+               ),
+               :commit_range_page
              ) do
         total_pages = if total == 0, do: 1, else: div(total + per_page - 1, per_page)
 
@@ -359,6 +412,65 @@ defmodule GitCore do
         end
       end)
     end)
+  end
+
+  @doc "Reads one path-sorted page of the aggregate diff between two immutable commit OIDs."
+  @spec diff_between(Path.t(), String.t(), String.t(), keyword()) ::
+          {:ok, GitCore.ComparisonDiff.t()} | {:error, GitCore.Error.t()}
+  def diff_between(path, base_oid, head_oid, opts \\ [])
+      when is_binary(path) and is_binary(base_oid) and is_binary(head_oid) and is_list(opts) do
+    page = Keyword.get(opts, :page, 1)
+
+    if is_integer(page) and page > 0 do
+      per_page =
+        opts |> Keyword.get(:per_page, @diff_file_page_limit) |> bounded_diff_file_page_size()
+
+      limit = opts |> Keyword.get(:limit, @diff_source_limit) |> bounded_diff_source_size()
+
+      deadline_ms =
+        opts |> Keyword.get(:deadline_ms, @diff_scan_deadline_ms) |> diff_deadline_ms()
+
+      tree_entry_limit =
+        opts
+        |> Keyword.get(:tree_entry_limit, @comparison_tree_entry_limit)
+        |> comparison_tree_entry_limit()
+
+      file_limit =
+        opts |> Keyword.get(:file_limit, @comparison_file_limit) |> comparison_file_limit()
+
+      byte_limit =
+        opts |> Keyword.get(:byte_limit, @comparison_byte_limit) |> comparison_byte_limit()
+
+      GitCore.ScanLimiter.with_permit(:diff_between, fn ->
+        with {:ok, {files, truncated, changed_files, additions, deletions}} <-
+               wrap_read(
+                 GitCore.Native.diff_between(
+                   path,
+                   base_oid,
+                   head_oid,
+                   Integer.to_string(page),
+                   per_page,
+                   limit,
+                   tree_entry_limit,
+                   file_limit,
+                   byte_limit,
+                   deadline_ms
+                 ),
+                 :diff_between
+               ) do
+          {:ok,
+           %GitCore.ComparisonDiff{
+             files: Enum.map(files, &diff_file_from_native/1),
+             changed_files: changed_files,
+             additions: additions,
+             deletions: deletions,
+             truncated: truncated
+           }}
+        end
+      end)
+    else
+      invalid_input(:diff_between, "page must be a positive integer")
+    end
   end
 
   def search_tree(path, snapshot_oid, query, opts \\ [])
@@ -726,6 +838,24 @@ defmodule GitCore do
     |> min(@diff_source_limit)
   end
 
+  defp bounded_diff_file_page_size(per_page) when is_integer(per_page) do
+    per_page
+    |> max(1)
+    |> min(@diff_file_page_limit)
+  end
+
+  defp comparison_commit_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@comparison_commit_limit)
+
+  defp comparison_tree_entry_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@comparison_tree_entry_limit)
+
+  defp comparison_file_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@comparison_file_limit)
+
+  defp comparison_byte_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@comparison_byte_limit)
+
   defp diff_deadline_ms(deadline_ms) when is_integer(deadline_ms) do
     deadline_ms
     |> max(0)
@@ -1024,6 +1154,8 @@ defmodule GitCore do
   defp native_error_kind("scan_busy"), do: :scan_busy
   defp native_error_kind("commit_limit"), do: :commit_limit
   defp native_error_kind("tree_entry_limit"), do: :tree_entry_limit
+  defp native_error_kind("diff_file_limit"), do: :diff_file_limit
+  defp native_error_kind("scan_byte_limit"), do: :scan_byte_limit
   defp native_error_kind("changed_path_limit"), do: :changed_path_limit
   defp native_error_kind("merge_conflict"), do: :merge_conflict
   defp native_error_kind("merge_byte_limit"), do: :merge_byte_limit

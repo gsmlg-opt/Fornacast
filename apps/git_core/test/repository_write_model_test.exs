@@ -336,7 +336,7 @@ defmodule GitCore.RepositoryWriteModelTest do
     fixture = clean_fixture!(tmp_dir)
 
     for {opts, kind} <- [
-          {[commit_limit: 2], :commit_limit},
+          {[commit_limit: 3], :commit_limit},
           {[tree_entry_limit: 1], :tree_entry_limit},
           {[changed_path_limit: 1], :changed_path_limit},
           {[byte_limit: 1], :merge_byte_limit},
@@ -641,6 +641,308 @@ defmodule GitCore.RepositoryWriteModelTest do
     assert :ok = wait_for_deferred_release(limiter, keeper_supervisor)
   end
 
+  @tag :pull_compare
+  test "comparison diff is a typed value with enforced aggregate keys" do
+    assert_raise ArgumentError, fn ->
+      struct!(GitCore.ComparisonDiff,
+        files: [],
+        changed_files: 0,
+        additions: 0,
+        deletions: 0
+      )
+    end
+  end
+
+  @tag :pull_compare
+  test "reads a divergent immutable commit range and aggregate diff in deterministic order", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = comparison_fixture!(tmp_dir)
+    before_refs = refs(fixture.repo_path)
+    before_objects = object_ids(fixture.repo_path)
+
+    assert {:ok,
+            %GitCore.CommitPage{
+              commits: commits,
+              total: 3,
+              page: 1,
+              per_page: 50,
+              total_pages: 1
+            }} =
+             GitCore.commit_range_page(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               1,
+               per_page: 50
+             )
+
+    assert Enum.map(commits, & &1.oid) == [
+             fixture.head_oid,
+             fixture.second_oid,
+             fixture.first_oid
+           ]
+
+    assert {:ok,
+            %GitCore.ComparisonDiff{
+              files: [added, changed],
+              changed_files: 2,
+              additions: 3,
+              deletions: 1,
+              truncated: false
+            }} =
+             GitCore.diff_between(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               page: 1,
+               per_page: 100
+             )
+
+    assert %GitCore.DiffFile{path: "lib/added.ex", status: :added, binary: false} = added
+    assert %GitCore.DiffFile{path: "lib/changed.ex", status: :modified, binary: false} = changed
+    assert refs(fixture.repo_path) == before_refs
+    assert object_ids(fixture.repo_path) == before_objects
+  end
+
+  @tag :pull_compare
+  test "paginates newest-first range commits and path-sorted changed files", %{tmp_dir: tmp_dir} do
+    fixture = comparison_fixture!(tmp_dir)
+
+    assert {:ok,
+            %GitCore.CommitPage{
+              commits: [head, second],
+              total: 3,
+              page: 1,
+              per_page: 2,
+              total_pages: 2
+            }} =
+             GitCore.commit_range_page(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               1,
+               per_page: 2
+             )
+
+    assert [head.oid, second.oid] == [fixture.head_oid, fixture.second_oid]
+
+    assert {:ok, %GitCore.CommitPage{commits: [first], page: 2}} =
+             GitCore.commit_range_page(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               2,
+               per_page: 2
+             )
+
+    assert first.oid == fixture.first_oid
+
+    assert {:ok,
+            %GitCore.ComparisonDiff{
+              files: [%GitCore.DiffFile{path: "lib/changed.ex"}],
+              changed_files: 2,
+              truncated: false
+            }} =
+             GitCore.diff_between(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               page: 2,
+               per_page: 1
+             )
+  end
+
+  @tag :pull_compare
+  test "identical OIDs produce empty comparison pages", %{tmp_dir: tmp_dir} do
+    fixture = comparison_fixture!(tmp_dir)
+
+    assert {:ok, %GitCore.CommitPage{commits: [], total: 0, total_pages: 1}} =
+             GitCore.commit_range_page(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.base_oid,
+               1
+             )
+
+    assert {:ok,
+            %GitCore.ComparisonDiff{
+              files: [],
+              changed_files: 0,
+              additions: 0,
+              deletions: 0,
+              truncated: false
+            }} =
+             GitCore.diff_between(fixture.repo_path, fixture.base_oid, fixture.base_oid)
+  end
+
+  @tag :pull_compare
+  test "comparison rejects invalid OIDs and exhausts one bounded deadline without mutation", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = comparison_fixture!(tmp_dir)
+
+    for {operation, call} <- [
+          {:commit_range_page,
+           fn ->
+             GitCore.commit_range_page(fixture.repo_path, "not-an-oid", fixture.head_oid, 1)
+           end},
+          {:diff_between,
+           fn -> GitCore.diff_between(fixture.repo_path, fixture.base_oid, "not-an-oid") end}
+        ] do
+      before_refs = refs(fixture.repo_path)
+      before_objects = object_ids(fixture.repo_path)
+
+      assert {:error, %GitCore.Error{kind: :commit_not_found, operation: ^operation}} = call.()
+      assert refs(fixture.repo_path) == before_refs
+      assert object_ids(fixture.repo_path) == before_objects
+    end
+
+    for {operation, call} <- [
+          {:commit_range_page,
+           fn ->
+             GitCore.commit_range_page(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               1,
+               deadline_ms: 0
+             )
+           end},
+          {:diff_between,
+           fn ->
+             GitCore.diff_between(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               deadline_ms: 0
+             )
+           end}
+        ] do
+      before_refs = refs(fixture.repo_path)
+      before_objects = object_ids(fixture.repo_path)
+
+      assert {:error, %GitCore.Error{kind: :scan_timeout, operation: ^operation}} = call.()
+      assert refs(fixture.repo_path) == before_refs
+      assert object_ids(fixture.repo_path) == before_objects
+    end
+  end
+
+  @tag :pull_compare
+  test "comparison represents binary files and renames within existing output limits", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = binary_rename_fixture!(tmp_dir)
+
+    assert {:ok,
+            %GitCore.ComparisonDiff{
+              files: files,
+              changed_files: 3,
+              additions: 1,
+              deletions: 1,
+              truncated: true
+            }} =
+             GitCore.diff_between(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               page: 1,
+               per_page: 100,
+               limit: 1
+             )
+
+    assert Enum.map(files, &{&1.path, &1.status, &1.binary}) == [
+             {"binary.dat", :modified, true},
+             {"renamed-new.txt", :added, false},
+             {"renamed-old.txt", :deleted, false}
+           ]
+  end
+
+  @tag :pull_compare
+  test "commit range enforces shared commit and decoded-byte budgets without mutation", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = comparison_fixture!(tmp_dir)
+
+    for {opts, kind} <- [
+          {[commit_limit: 2], :commit_limit},
+          {[byte_limit: 1], :scan_byte_limit}
+        ] do
+      before_refs = refs(fixture.repo_path)
+      before_objects = object_ids(fixture.repo_path)
+
+      assert {:error, %GitCore.Error{kind: ^kind, operation: :commit_range_page}} =
+               GitCore.commit_range_page(
+                 fixture.repo_path,
+                 fixture.base_oid,
+                 fixture.head_oid,
+                 1,
+                 opts
+               )
+
+      assert refs(fixture.repo_path) == before_refs
+      assert object_ids(fixture.repo_path) == before_objects
+    end
+  end
+
+  @tag :pull_compare
+  test "aggregate diff enforces tree, changed-file, and decoded-byte budgets without mutation", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = comparison_fixture!(tmp_dir)
+
+    for {opts, kind} <- [
+          {[tree_entry_limit: 1], :tree_entry_limit},
+          {[file_limit: 1], :diff_file_limit},
+          {[byte_limit: 1], :scan_byte_limit}
+        ] do
+      before_refs = refs(fixture.repo_path)
+      before_objects = object_ids(fixture.repo_path)
+
+      assert {:error, %GitCore.Error{kind: ^kind, operation: :diff_between}} =
+               GitCore.diff_between(
+                 fixture.repo_path,
+                 fixture.base_oid,
+                 fixture.head_oid,
+                 opts
+               )
+
+      assert refs(fixture.repo_path) == before_refs
+      assert object_ids(fixture.repo_path) == before_objects
+    end
+  end
+
+  @tag :pull_compare
+  test "comparison retains path-sorted metadata beyond the legacy commit-diff file ceiling", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = large_comparison_fixture!(tmp_dir, 1_005)
+    before_refs = refs(fixture.repo_path)
+    before_objects = object_ids(fixture.repo_path)
+
+    assert {:ok,
+            %GitCore.ComparisonDiff{
+              files: files,
+              changed_files: 1_005,
+              truncated: true
+            }} =
+             GitCore.diff_between(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               page: 11,
+               per_page: 100,
+               file_limit: 2_000,
+               limit: 1
+             )
+
+    assert Enum.map(files, & &1.path) ==
+             Enum.map(1_000..1_004, &"bulk/file-#{String.pad_leading(to_string(&1), 4, "0")}.txt")
+
+    assert refs(fixture.repo_path) == before_refs
+    assert object_ids(fixture.repo_path) == before_objects
+  end
+
   defp clean_fixture!(tmp_dir) do
     fixture = base_fixture!(tmp_dir, "clean")
 
@@ -658,6 +960,71 @@ defmodule GitCore.RepositoryWriteModelTest do
     git!(["-C", fixture.work_path, "commit", "-m", "head change two"])
     head_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
 
+    publish_fixture!(fixture, base_oid, head_oid)
+  end
+
+  defp comparison_fixture!(tmp_dir) do
+    fixture = base_fixture!(tmp_dir, "comparison")
+    File.mkdir_p!(Path.join(fixture.work_path, "lib"))
+    File.write!(Path.join(fixture.work_path, "lib/changed.ex"), "base\n")
+    git!(["-C", fixture.work_path, "add", "lib/changed.ex"])
+    git!(["-C", fixture.work_path, "commit", "-m", "comparison root"])
+    comparison_root_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+    git!(["-C", fixture.work_path, "commit", "--allow-empty", "-m", "base comparison"])
+    base_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    git!(["-C", fixture.work_path, "checkout", "-b", "feature", comparison_root_oid])
+    File.write!(Path.join(fixture.work_path, "lib/changed.ex"), "first\n")
+    git!(["-C", fixture.work_path, "add", "lib/changed.ex"])
+    git!(["-C", fixture.work_path, "commit", "-m", "first comparison"])
+    first_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    File.write!(Path.join(fixture.work_path, "lib/added.ex"), "added\n")
+    git!(["-C", fixture.work_path, "add", "lib/added.ex"])
+    git!(["-C", fixture.work_path, "commit", "-m", "second comparison"])
+    second_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    File.write!(Path.join(fixture.work_path, "lib/changed.ex"), "second\nthird\n")
+    git!(["-C", fixture.work_path, "commit", "-am", "third comparison"])
+    head_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    fixture
+    |> Map.merge(%{first_oid: first_oid, second_oid: second_oid})
+    |> publish_fixture!(base_oid, head_oid)
+  end
+
+  defp binary_rename_fixture!(tmp_dir) do
+    fixture = base_fixture!(tmp_dir, "binary-rename")
+    File.write!(Path.join(fixture.work_path, "binary.dat"), <<0, 1, 2>>)
+    File.write!(Path.join(fixture.work_path, "renamed-old.txt"), "rename me\n")
+    git!(["-C", fixture.work_path, "add", "binary.dat", "renamed-old.txt"])
+    git!(["-C", fixture.work_path, "commit", "-m", "comparison base files"])
+    base_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    git!(["-C", fixture.work_path, "checkout", "-b", "feature", base_oid])
+    File.write!(Path.join(fixture.work_path, "binary.dat"), <<0, 3, 4>>)
+    git!(["-C", fixture.work_path, "mv", "renamed-old.txt", "renamed-new.txt"])
+    git!(["-C", fixture.work_path, "commit", "-am", "binary and rename"])
+    head_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    publish_fixture!(fixture, base_oid, head_oid)
+  end
+
+  defp large_comparison_fixture!(tmp_dir, file_count) do
+    fixture = base_fixture!(tmp_dir, "large-comparison")
+    base_oid = fixture.root_oid
+    git!(["-C", fixture.work_path, "checkout", "-b", "feature", base_oid])
+    bulk_path = Path.join(fixture.work_path, "bulk")
+    File.mkdir_p!(bulk_path)
+
+    for index <- 0..(file_count - 1) do
+      name = "file-#{String.pad_leading(to_string(index), 4, "0")}.txt"
+      File.write!(Path.join(bulk_path, name), "#{index}\n")
+    end
+
+    git!(["-C", fixture.work_path, "add", "bulk"])
+    git!(["-C", fixture.work_path, "commit", "-m", "large comparison"])
+    head_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
     publish_fixture!(fixture, base_oid, head_oid)
   end
 

@@ -35,6 +35,7 @@ type NativeDiffFile = (
     NativeDiffStats,
 );
 type NativeCommitDiff = (Vec<NativeDiffFile>, Vec<u8>, bool, u64, u64, u64);
+type NativeComparisonDiff = (Vec<NativeDiffFile>, bool, u64, u64, u64);
 type NativeSearchResult = (Vec<u8>, Option<u64>, Option<Vec<u8>>);
 type NativeSearchResults = (Vec<NativeSearchResult>, u64, u64, Vec<String>);
 type NativeLanguageStat = (String, u64);
@@ -86,10 +87,115 @@ enum DirectRefTarget {
     Object(gix_hash::ObjectId),
 }
 
+#[derive(Clone)]
 struct CommitNode {
     tree: gix_hash::ObjectId,
     parents: Vec<gix_hash::ObjectId>,
     committer_time: i64,
+}
+
+struct DecodedByteBudget {
+    seen: BTreeSet<gix_hash::ObjectId>,
+    used: u64,
+    limit: u64,
+}
+
+struct ComparisonCommitBudget {
+    seen_commits: BTreeSet<gix_hash::ObjectId>,
+    commit_limit: usize,
+    decoded: DecodedByteBudget,
+}
+
+struct ComparisonDiffBudget {
+    validated_trees: BTreeSet<gix_hash::ObjectId>,
+    tree_entries: usize,
+    tree_entry_limit: usize,
+    changed_files: usize,
+    file_limit: usize,
+    decoded: DecodedByteBudget,
+}
+
+impl DecodedByteBudget {
+    fn new(limit: u64) -> Self {
+        Self {
+            seen: BTreeSet::new(),
+            used: 0,
+            limit: comparison_byte_limit(limit),
+        }
+    }
+
+    fn charge(
+        &mut self,
+        oid: gix_hash::ObjectId,
+        decoded_size: usize,
+        detail: &'static str,
+    ) -> Result<(), NativeError> {
+        if !self.seen.insert(oid) {
+            return Ok(());
+        }
+        let decoded_size =
+            u64::try_from(decoded_size).map_err(|_| native_error("scan_byte_limit", detail))?;
+        let next = self
+            .used
+            .checked_add(decoded_size)
+            .ok_or_else(|| native_error("scan_byte_limit", detail))?;
+        if next > self.limit {
+            return Err(native_error("scan_byte_limit", detail));
+        }
+        self.used = next;
+        Ok(())
+    }
+}
+
+impl ComparisonCommitBudget {
+    fn new(commit_limit: usize, byte_limit: u64) -> Self {
+        Self {
+            seen_commits: BTreeSet::new(),
+            commit_limit: comparison_commit_limit(commit_limit),
+            decoded: DecodedByteBudget::new(byte_limit),
+        }
+    }
+}
+
+impl ComparisonDiffBudget {
+    fn new(tree_entry_limit: usize, file_limit: usize, byte_limit: u64) -> Self {
+        Self {
+            validated_trees: BTreeSet::new(),
+            tree_entries: 0,
+            tree_entry_limit: comparison_tree_entry_limit(tree_entry_limit),
+            changed_files: 0,
+            file_limit: comparison_file_limit(file_limit),
+            decoded: DecodedByteBudget::new(byte_limit),
+        }
+    }
+
+    fn record_tree_entry(&mut self) -> Result<(), NativeError> {
+        self.tree_entries = self.tree_entries.checked_add(1).ok_or_else(|| {
+            native_error("tree_entry_limit", "comparison tree-entry count overflow")
+        })?;
+        if self.tree_entries > self.tree_entry_limit {
+            Err(native_error(
+                "tree_entry_limit",
+                "comparison diff exceeded its tree-entry limit",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn record_changed_file(&mut self) -> Result<(), NativeError> {
+        self.changed_files = self.changed_files.checked_add(1).ok_or_else(|| {
+            native_error("diff_file_limit", "comparison changed-file count overflow")
+        })?;
+        if self.changed_files > self.file_limit {
+            Err(native_error(
+                "diff_file_limit",
+                "comparison diff exceeded its changed-file limit",
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 struct OrderedCommitGraph {
@@ -142,6 +248,7 @@ const INLINE_BLOB_LIMIT: usize = 1_048_576;
 const COMPLETE_BLOB_LIMIT: u64 = 100_000_000;
 const DIFF_SOURCE_LIMIT: usize = 200_000;
 const DIFF_FILE_LIMIT: usize = 1_000;
+const DIFF_FILE_PAGE_LIMIT: usize = 100;
 const DIFF_SCAN_DEADLINE: Duration = Duration::from_secs(5);
 const SEARCH_FILE_LIMIT: u64 = 10_000;
 const SEARCH_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
@@ -167,6 +274,10 @@ const SIGNATURE_EMAIL_LIMIT: usize = 320;
 const MERGE_WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
 const MERGE_ANALYSIS_WORKERS: usize = 4;
 const MERGE_WRITE_WORKERS: usize = 1;
+const COMPARISON_COMMIT_LIMIT: usize = MERGE_COMMIT_LIMIT;
+const COMPARISON_TREE_ENTRY_LIMIT: usize = MERGE_TREE_ENTRY_LIMIT;
+const COMPARISON_FILE_LIMIT: usize = SEARCH_FILE_LIMIT as usize;
+const COMPARISON_BYTE_LIMIT: u64 = MERGE_BYTE_LIMIT;
 const REF_UPDATE_DEADLINE: Duration = Duration::from_secs(10);
 const CAS_COMMIT_VISIT_LIMIT: usize = 50_000;
 static CAS_QUARANTINE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1395,6 +1506,63 @@ fn commit_page(
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
+fn commit_range_page(
+    path: String,
+    base_oid: String,
+    head_oid: String,
+    page: String,
+    per_page: usize,
+    commit_limit: usize,
+    byte_limit: u64,
+    deadline_ms: u64,
+) -> Result<(Vec<NativeCommit>, usize), NativeError> {
+    commit_range_page_impl(
+        &path,
+        &base_oid,
+        &head_oid,
+        &page,
+        per_page,
+        commit_limit,
+        byte_limit,
+        deadline_ms,
+    )
+}
+
+fn commit_range_page_impl(
+    path: &str,
+    base_oid: &str,
+    head_oid: &str,
+    page: &str,
+    per_page: usize,
+    commit_limit: usize,
+    byte_limit: u64,
+    deadline_ms: u64,
+) -> Result<(Vec<NativeCommit>, usize), NativeError> {
+    let page = comparison_page(page)?;
+    let deadline = Instant::now() + commit_scan_duration(deadline_ms);
+    check_commit_deadline(deadline)?;
+    let repo = open_physical_bare_repository(path)?;
+    let mut budget = ComparisonCommitBudget::new(commit_limit, byte_limit);
+    let base_graph = walk_comparison_commit_graph(&repo, base_oid, deadline, &mut budget)?;
+    let head_graph = walk_comparison_commit_graph(&repo, head_oid, deadline, &mut budget)?;
+    let range = head_graph
+        .ordered
+        .into_iter()
+        .filter(|oid| !base_graph.nodes.contains_key(oid))
+        .collect::<Vec<_>>();
+    let total = range.len();
+    let window = commit_range_page_window(total, page, per_page);
+    let mut commits = Vec::with_capacity(window.end.saturating_sub(window.start));
+
+    for oid in &range[window.start..window.end] {
+        check_commit_deadline(deadline)?;
+        commits.push(hydrate_commit(&repo, *oid, deadline)?);
+    }
+    check_commit_deadline(deadline)?;
+    Ok((commits, total))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
 fn read_tree_with_history(
     path: String,
     snapshot_oid: String,
@@ -1997,6 +2165,27 @@ fn walk_commit_graph(
     snapshot_oid: &str,
     deadline: Instant,
 ) -> Result<OrderedCommitGraph, NativeError> {
+    walk_commit_graph_with(snapshot_oid, deadline, |oid, position| {
+        load_commit_node(repo, oid, position, deadline)
+    })
+}
+
+fn walk_comparison_commit_graph(
+    repo: &gix::Repository,
+    snapshot_oid: &str,
+    deadline: Instant,
+    budget: &mut ComparisonCommitBudget,
+) -> Result<OrderedCommitGraph, NativeError> {
+    walk_commit_graph_with(snapshot_oid, deadline, |oid, position| {
+        load_comparison_commit_node(repo, oid, position, deadline, budget)
+    })
+}
+
+fn walk_commit_graph_with(
+    snapshot_oid: &str,
+    deadline: Instant,
+    mut load_node: impl FnMut(gix_hash::ObjectId, CommitPosition) -> Result<CommitNode, NativeError>,
+) -> Result<OrderedCommitGraph, NativeError> {
     check_commit_deadline(deadline)?;
     let tip = gix_hash::ObjectId::from_hex(snapshot_oid.as_bytes())
         .map_err(|error| native_error("commit_not_found", error))?;
@@ -2016,7 +2205,7 @@ fn walk_commit_graph(
         } else {
             CommitPosition::Ancestor
         };
-        let node = load_commit_node(repo, oid, position, deadline)?;
+        let node = load_node(oid, position)?;
         child_counts.entry(oid).or_default();
 
         for parent in &node.parents {
@@ -2081,6 +2270,33 @@ fn walk_commit_graph(
     })
 }
 
+fn load_comparison_commit_node(
+    repo: &gix::Repository,
+    oid: gix_hash::ObjectId,
+    position: CommitPosition,
+    deadline: Instant,
+    budget: &mut ComparisonCommitBudget,
+) -> Result<CommitNode, NativeError> {
+    check_commit_deadline(deadline)?;
+    let commit = find_graph_commit(repo, oid, position)?;
+
+    if budget.seen_commits.insert(oid) {
+        if budget.seen_commits.len() > budget.commit_limit {
+            return Err(native_error(
+                "commit_limit",
+                "comparison commit traversal exceeded its commit limit",
+            ));
+        }
+        budget.decoded.charge(
+            oid,
+            commit.data.len(),
+            "comparison commit traversal exceeded its decoded-byte limit",
+        )?;
+    }
+
+    decode_commit_node(&commit, deadline)
+}
+
 fn load_commit_node(
     repo: &gix::Repository,
     oid: gix_hash::ObjectId,
@@ -2090,6 +2306,13 @@ fn load_commit_node(
     check_commit_deadline(deadline)?;
     let commit = find_graph_commit(repo, oid, position)?;
     check_commit_deadline(deadline)?;
+    decode_commit_node(&commit, deadline)
+}
+
+fn decode_commit_node(
+    commit: &gix::Commit<'_>,
+    deadline: Instant,
+) -> Result<CommitNode, NativeError> {
     let decoded = commit
         .decode()
         .map_err(|error| native_error("corrupt_repository", error))?;
@@ -2531,8 +2754,111 @@ fn diff_commit(
         None => repo.empty_tree(),
     };
 
-    validate_diff_tree(&repo, &new_tree, deadline)?;
-    validate_diff_tree(&repo, &old_tree, deadline)?;
+    diff_trees(&repo, old_tree, new_tree, limit, deadline, None)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn diff_between(
+    path: String,
+    base_oid: String,
+    head_oid: String,
+    page: String,
+    per_page: usize,
+    limit: usize,
+    tree_entry_limit: usize,
+    file_limit: usize,
+    byte_limit: u64,
+    deadline_ms: u64,
+) -> Result<NativeComparisonDiff, NativeError> {
+    diff_between_impl(
+        &path,
+        &base_oid,
+        &head_oid,
+        &page,
+        per_page,
+        limit,
+        tree_entry_limit,
+        file_limit,
+        byte_limit,
+        deadline_ms,
+    )
+}
+
+fn diff_between_impl(
+    path: &str,
+    base_oid: &str,
+    head_oid: &str,
+    page: &str,
+    per_page: usize,
+    limit: usize,
+    tree_entry_limit: usize,
+    file_limit: usize,
+    byte_limit: u64,
+    deadline_ms: u64,
+) -> Result<NativeComparisonDiff, NativeError> {
+    let page = comparison_page(page)?;
+    let deadline = Instant::now() + diff_scan_duration(deadline_ms);
+    check_diff_deadline(deadline)?;
+    let repo = open_physical_bare_repository(path)?;
+    let mut budget = ComparisonDiffBudget::new(tree_entry_limit, file_limit, byte_limit);
+    let base_tree = diff_commit_tree(&repo, base_oid, deadline, &mut budget)?;
+    let head_tree = diff_commit_tree(&repo, head_oid, deadline, &mut budget)?;
+    let (mut files, _patch, truncated, changed_files, additions, deletions) = diff_trees(
+        &repo,
+        base_tree,
+        head_tree,
+        limit,
+        deadline,
+        Some(&mut budget),
+    )?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let window = diff_page_window(files.len(), page, per_page);
+    let files = files
+        .into_iter()
+        .skip(window.start)
+        .take(window.end.saturating_sub(window.start))
+        .collect();
+    check_diff_deadline(deadline)?;
+    Ok((files, truncated, changed_files, additions, deletions))
+}
+
+fn diff_commit_tree<'repo>(
+    repo: &'repo gix::Repository,
+    oid: &str,
+    deadline: Instant,
+    budget: &mut ComparisonDiffBudget,
+) -> Result<gix::Tree<'repo>, NativeError> {
+    check_diff_deadline(deadline)?;
+    let commit_oid = gix_hash::ObjectId::from_hex(oid.as_bytes())
+        .map_err(|error| native_error("commit_not_found", error))?;
+    let commit = find_graph_commit(repo, commit_oid, CommitPosition::Tip)?;
+    budget.decoded.charge(
+        commit_oid,
+        commit.data.len(),
+        "comparison diff exceeded its decoded-byte limit",
+    )?;
+    let tree_oid = commit
+        .decode()
+        .map_err(|error| native_error("corrupt_repository", error))?
+        .tree();
+    load_diff_tree(repo, tree_oid, deadline)
+}
+
+fn diff_trees(
+    repo: &gix::Repository,
+    old_tree: gix::Tree<'_>,
+    new_tree: gix::Tree<'_>,
+    limit: usize,
+    deadline: Instant,
+    mut budget: Option<&mut ComparisonDiffBudget>,
+) -> Result<NativeCommitDiff, NativeError> {
+    if let Some(budget) = budget.as_deref_mut() {
+        validate_comparison_diff_tree(repo, &new_tree, deadline, budget)?;
+        validate_comparison_diff_tree(repo, &old_tree, deadline, budget)?;
+    } else {
+        validate_diff_tree(repo, &new_tree, deadline)?;
+        validate_diff_tree(repo, &old_tree, deadline)?;
+    }
 
     let mut changes = old_tree.changes().map_err(diff_read_error)?;
     changes.options(|options| {
@@ -2558,7 +2884,7 @@ fn diff_commit(
     let walk_result = changes.for_each_to_obtain_tree(&new_tree, |change| {
         let result = process_diff_change(
             change,
-            &repo,
+            repo,
             &mut blob_cache,
             &mut source,
             &mut files,
@@ -2566,6 +2892,7 @@ fn diff_commit(
             &mut additions,
             &mut deletions,
             deadline,
+            &mut budget,
         );
         blob_cache.clear_resource_cache();
 
@@ -2592,6 +2919,42 @@ fn diff_commit(
         additions,
         deletions,
     ))
+}
+
+fn commit_range_page_window(total: usize, page: usize, per_page: usize) -> CommitPageWindow {
+    commit_page_window(total, page, per_page)
+}
+
+fn comparison_page(page: &str) -> Result<usize, NativeError> {
+    let page = page.parse::<usize>().unwrap_or(usize::MAX);
+    if page == 0 {
+        Err(native_error(
+            "invalid_input",
+            "comparison page must be positive",
+        ))
+    } else {
+        Ok(page)
+    }
+}
+
+fn comparison_commit_limit(limit: usize) -> usize {
+    limit.min(COMPARISON_COMMIT_LIMIT)
+}
+
+fn comparison_tree_entry_limit(limit: usize) -> usize {
+    limit.min(COMPARISON_TREE_ENTRY_LIMIT)
+}
+
+fn comparison_file_limit(limit: usize) -> usize {
+    limit.min(COMPARISON_FILE_LIMIT)
+}
+
+fn comparison_byte_limit(limit: u64) -> u64 {
+    limit.min(COMPARISON_BYTE_LIMIT)
+}
+
+fn diff_page_window(total: usize, page: usize, per_page: usize) -> TreePageWindow {
+    tree_page_window(total, page, per_page.clamp(1, DIFF_FILE_PAGE_LIMIT))
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -5870,6 +6233,68 @@ fn validate_diff_tree(
     check_diff_deadline(deadline)
 }
 
+fn validate_comparison_diff_tree(
+    repo: &gix::Repository,
+    root: &gix::Tree<'_>,
+    deadline: Instant,
+    budget: &mut ComparisonDiffBudget,
+) -> Result<(), NativeError> {
+    let mut pending = Vec::new();
+    if budget.validated_trees.insert(root.id) {
+        validate_comparison_diff_tree_object(repo, root, &mut pending, deadline, budget)?;
+    }
+
+    while let Some(oid) = pending.pop() {
+        check_diff_deadline(deadline)?;
+        if !budget.validated_trees.insert(oid) {
+            continue;
+        }
+        let tree = load_diff_tree(repo, oid, deadline)?;
+        validate_comparison_diff_tree_object(repo, &tree, &mut pending, deadline, budget)?;
+    }
+
+    check_diff_deadline(deadline)
+}
+
+fn validate_comparison_diff_tree_object(
+    repo: &gix::Repository,
+    tree: &gix::Tree<'_>,
+    pending: &mut Vec<gix_hash::ObjectId>,
+    deadline: Instant,
+    budget: &mut ComparisonDiffBudget,
+) -> Result<(), NativeError> {
+    budget.decoded.charge(
+        tree.id,
+        tree.data.len(),
+        "comparison diff exceeded its decoded-byte limit",
+    )?;
+    check_diff_deadline(deadline)?;
+    let actual = gix_object::compute_hash(repo.object_hash(), gix_object::Kind::Tree, &tree.data)
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    if actual != tree.id {
+        return Err(native_error(
+            "corrupt_repository",
+            format_args!(
+                "tree checksum mismatch: expected {}, computed {actual}",
+                tree.id
+            ),
+        ));
+    }
+
+    let mut previous = None;
+    for entry in gix_object::TreeRefIter::from_bytes(&tree.data, tree.id.kind()) {
+        check_diff_deadline(deadline)?;
+        let entry = entry.map_err(|error| native_error("corrupt_repository", error))?;
+        budget.record_tree_entry()?;
+        validate_tree_entry(&mut previous, entry.filename.as_ref(), entry.mode.value())?;
+        if entry.mode.is_tree() {
+            pending.push(entry.oid.to_owned());
+        }
+    }
+
+    check_diff_deadline(deadline)
+}
+
 fn validate_diff_tree_object(
     repo: &gix::Repository,
     tree: &gix::Tree<'_>,
@@ -5912,21 +6337,30 @@ fn process_diff_change(
     total_additions: &mut u64,
     total_deletions: &mut u64,
     deadline: Instant,
+    budget: &mut Option<&mut ComparisonDiffBudget>,
 ) -> Result<(), NativeError> {
     check_diff_deadline(deadline)?;
     let Some(metadata) = diff_file_metadata(&change)? else {
         return Ok(());
     };
 
+    let retention_limit = match budget.as_deref_mut() {
+        Some(budget) => {
+            budget.record_changed_file()?;
+            budget.file_limit
+        }
+        None => DIFF_FILE_LIMIT,
+    };
+
     *changed_files = changed_files
         .checked_add(1)
         .ok_or_else(|| native_error("corrupt_repository", "changed-file total overflow"))?;
-    let retain_file = files.len() < DIFF_FILE_LIMIT;
+    let retain_file = files.len() < retention_limit;
     if !retain_file {
         source.truncated = true;
     }
 
-    let verified = verify_diff_resources(repo, &metadata, deadline)?;
+    let verified = verify_diff_resources(repo, &metadata, deadline, budget)?;
     let content_changed = metadata.old_oid != metadata.new_oid;
     let mut binary = !diff_modes_are_diffable(&metadata)
         || verified.old.is_some_and(|resource| resource.binary)
@@ -6123,15 +6557,16 @@ fn verify_diff_resources(
     repo: &gix::Repository,
     metadata: &DiffFileMetadata,
     deadline: Instant,
+    budget: &mut Option<&mut ComparisonDiffBudget>,
 ) -> Result<VerifiedDiffResources, NativeError> {
-    let old = verify_diff_resource(repo, metadata.old_mode, metadata.old_oid, deadline)?;
+    let old = verify_diff_resource(repo, metadata.old_mode, metadata.old_oid, deadline, budget)?;
     let new = if old.is_some()
         && metadata.old_oid == metadata.new_oid
         && diff_mode_has_blob_resource(metadata.new_mode)
     {
         old
     } else {
-        verify_diff_resource(repo, metadata.new_mode, metadata.new_oid, deadline)?
+        verify_diff_resource(repo, metadata.new_mode, metadata.new_oid, deadline, budget)?
     };
 
     Ok(VerifiedDiffResources { old, new })
@@ -6142,6 +6577,7 @@ fn verify_diff_resource(
     mode: Option<gix_object::tree::EntryMode>,
     oid: Option<gix_hash::ObjectId>,
     deadline: Instant,
+    budget: &mut Option<&mut ComparisonDiffBudget>,
 ) -> Result<Option<VerifiedDiffResource>, NativeError> {
     if !diff_mode_has_blob_resource(mode) {
         return Ok(None);
@@ -6155,6 +6591,13 @@ fn verify_diff_resource(
 
     check_diff_deadline(deadline)?;
     let object = repo.find_object(oid).map_err(diff_read_error)?;
+    if let Some(budget) = budget.as_deref_mut() {
+        budget.decoded.charge(
+            oid,
+            object.data.len(),
+            "comparison diff exceeded its decoded-byte limit",
+        )?;
+    }
     check_diff_deadline(deadline)?;
     if object.kind != gix_object::Kind::Blob {
         return Err(native_error(
@@ -6567,6 +7010,115 @@ mod tests {
 
     static TREE_HISTORY_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
     static MERGE_BOUNDARY_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn pull_compare_page_windows_are_bounded_and_stable() {
+        assert_eq!(
+            commit_range_page_window(3, 2, 2),
+            CommitPageWindow {
+                start: 2,
+                end: 3,
+                total_pages: 2,
+            }
+        );
+        assert_eq!(
+            commit_range_page_window(500, 1, usize::MAX).end,
+            COMMIT_PAGE_LIMIT
+        );
+        assert_eq!(
+            diff_page_window(3, 2, 1),
+            TreePageWindow { start: 1, end: 2 }
+        );
+        assert_eq!(
+            diff_page_window(500, 1, usize::MAX).end,
+            DIFF_FILE_PAGE_LIMIT
+        );
+        assert_eq!(diff_scan_duration(u64::MAX), DIFF_SCAN_DEADLINE);
+        assert_eq!(comparison_commit_limit(usize::MAX), COMPARISON_COMMIT_LIMIT);
+        assert_eq!(
+            comparison_tree_entry_limit(usize::MAX),
+            COMPARISON_TREE_ENTRY_LIMIT
+        );
+        assert_eq!(comparison_file_limit(usize::MAX), COMPARISON_FILE_LIMIT);
+        assert_eq!(comparison_byte_limit(u64::MAX), COMPARISON_BYTE_LIMIT);
+    }
+
+    #[test]
+    fn pull_compare_reads_oid_range_and_diff_without_repository_mutation() {
+        let fixture = MergeBoundaryFixture::new("pull-compare");
+        let base = fixture.commit_with_flat_tree(0, "base");
+        let first = fixture.commit_with_flat_tree_and_parent(1, "first", Some(&base));
+        let head = fixture.commit_with_flat_tree_and_parent(2, "head", Some(&first));
+        let before = fixture.object_and_ref_snapshot();
+
+        let (commits, total) = commit_range_page_impl(
+            fixture.path(),
+            &base,
+            &head,
+            "1",
+            50,
+            COMPARISON_COMMIT_LIMIT,
+            COMPARISON_BYTE_LIMIT,
+            5_000,
+        )
+        .expect("read immutable commit range");
+        assert_eq!(total, 2);
+        assert_eq!(
+            commits
+                .into_iter()
+                .map(|commit| commit.0)
+                .collect::<Vec<_>>(),
+            vec![head.clone(), first]
+        );
+
+        let (files, truncated, changed_files, additions, deletions) = diff_between_impl(
+            fixture.path(),
+            &base,
+            &head,
+            "1",
+            100,
+            DIFF_SOURCE_LIMIT,
+            COMPARISON_TREE_ENTRY_LIMIT,
+            COMPARISON_FILE_LIMIT,
+            COMPARISON_BYTE_LIMIT,
+            5_000,
+        )
+        .expect("read immutable aggregate diff");
+        assert_eq!(
+            files.into_iter().map(|file| file.0).collect::<Vec<_>>(),
+            vec![b"file-00000.txt".to_vec(), b"file-00001.txt".to_vec()]
+        );
+        assert!(!truncated);
+        assert_eq!((changed_files, additions, deletions), (2, 2, 0));
+        assert_eq!(fixture.object_and_ref_snapshot(), before);
+    }
+
+    #[test]
+    fn pull_compare_pages_beyond_the_legacy_diff_retention_ceiling() {
+        let fixture = MergeBoundaryFixture::new("pull-compare-large-page");
+        let base = fixture.commit_with_flat_tree(0, "base");
+        let head = fixture.commit_with_flat_tree_and_parent(1_005, "head", Some(&base));
+
+        let (files, truncated, changed_files, _, _) = diff_between_impl(
+            fixture.path(),
+            &base,
+            &head,
+            "11",
+            100,
+            1,
+            COMPARISON_TREE_ENTRY_LIMIT,
+            2_000,
+            COMPARISON_BYTE_LIMIT,
+            5_000,
+        )
+        .expect("read comparison page after one thousand files");
+
+        assert_eq!(changed_files, 1_005);
+        assert!(truncated);
+        assert_eq!(files.len(), 5);
+        assert_eq!(files.first().expect("first file").0, b"file-01000.txt");
+        assert_eq!(files.last().expect("last file").0, b"file-01004.txt");
+    }
 
     #[test]
     fn pull_merge_production_bounds_cannot_be_raised() {

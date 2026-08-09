@@ -20,6 +20,8 @@ defmodule ForgePulls.PullRequest do
     field :merged_by_user_id, :integer
     field :merge_commit_sha, :string
     field :issue, :map, virtual: true
+    field :analysis, :map, virtual: true
+    field :capabilities, :map, virtual: true
 
     timestamps(type: :utc_datetime)
   end

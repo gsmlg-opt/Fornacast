@@ -29,6 +29,18 @@ defmodule GitCore.Native do
   def commit_page(_path, _snapshot_oid, _page, _per_page, _deadline_ms),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  def commit_range_page(
+        _path,
+        _base_oid,
+        _head_oid,
+        _page,
+        _per_page,
+        _commit_limit,
+        _byte_limit,
+        _deadline_ms
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   def read_tree_with_history(
         _path,
         _snapshot_oid,
@@ -51,6 +63,20 @@ defmodule GitCore.Native do
     do: :erlang.nif_error(:nif_not_loaded)
 
   def diff_commit(_path, _oid, _limit, _deadline_ms), do: :erlang.nif_error(:nif_not_loaded)
+
+  def diff_between(
+        _path,
+        _base_oid,
+        _head_oid,
+        _page,
+        _per_page,
+        _limit,
+        _tree_entry_limit,
+        _file_limit,
+        _byte_limit,
+        _deadline_ms
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
 
   def search_tree(
         _path,

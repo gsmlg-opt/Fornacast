@@ -42,6 +42,14 @@ end
 defmodule GitCore.CommitPage do
   @enforce_keys [:commits, :total, :page, :per_page, :total_pages]
   defstruct [:commits, :total, :page, :per_page, :total_pages]
+
+  @type t :: %__MODULE__{
+          commits: [GitCore.Commit.t()],
+          total: non_neg_integer(),
+          page: pos_integer(),
+          per_page: pos_integer(),
+          total_pages: pos_integer()
+        }
 end
 
 defmodule GitCore.Commit do
@@ -73,6 +81,19 @@ defmodule GitCore.Commit do
     :committer_time,
     :parents
   ]
+
+  @type t :: %__MODULE__{
+          oid: String.t(),
+          title: String.t(),
+          message: String.t() | nil,
+          author_name: String.t(),
+          author_email: String.t() | nil,
+          author_time: integer(),
+          committer_name: String.t() | nil,
+          committer_email: String.t() | nil,
+          committer_time: integer() | nil,
+          parents: [String.t()] | nil
+        }
 end
 
 defmodule GitCore.TreeEntry do
@@ -106,6 +127,13 @@ end
 defmodule GitCore.DiffLine do
   @enforce_keys [:type, :content]
   defstruct [:type, :old_line, :new_line, :content]
+
+  @type t :: %__MODULE__{
+          type: :context | :added | :deleted | :hunk,
+          old_line: non_neg_integer() | nil,
+          new_line: non_neg_integer() | nil,
+          content: String.t()
+        }
 end
 
 defmodule GitCore.DiffFile do
@@ -125,6 +153,18 @@ defmodule GitCore.DiffFile do
     :truncated,
     :lines
   ]
+
+  @type t :: %__MODULE__{
+          path: String.t(),
+          status: :added | :modified | :deleted,
+          old_oid: String.t() | nil,
+          new_oid: String.t() | nil,
+          binary: boolean(),
+          additions: non_neg_integer(),
+          deletions: non_neg_integer(),
+          truncated: boolean(),
+          lines: [GitCore.DiffLine.t()]
+        }
 end
 
 defmodule GitCore.CommitDiff do
@@ -134,6 +174,23 @@ defmodule GitCore.CommitDiff do
 
   @enforce_keys [:files, :patch, :truncated]
   defstruct [:files, :patch, :truncated, :changed_files, :additions, :deletions]
+end
+
+defmodule GitCore.ComparisonDiff do
+  @moduledoc """
+  Bounded aggregate diff data for an immutable base/head commit pair.
+  """
+
+  @enforce_keys [:files, :changed_files, :additions, :deletions, :truncated]
+  defstruct [:files, :changed_files, :additions, :deletions, :truncated]
+
+  @type t :: %__MODULE__{
+          files: [GitCore.DiffFile.t()],
+          changed_files: non_neg_integer(),
+          additions: non_neg_integer(),
+          deletions: non_neg_integer(),
+          truncated: boolean()
+        }
 end
 
 defmodule GitCore.SearchResult do

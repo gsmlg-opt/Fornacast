@@ -124,6 +124,179 @@ defmodule ForgePullsTest do
     assert base_sha == String.duplicate("b", 40)
   end
 
+  test "browser comparison views authorize reads and retain immutable branch snapshots" do
+    owner = user_fixture(unique("pull-compare-owner"))
+    reader = user_fixture(unique("pull-compare-reader"))
+    outsider = user_fixture(unique("pull-compare-outsider"))
+    repository = repository_fixture(owner)
+    grant_reader!(repository, reader)
+    {base_oid, commit_oids} = create_comparison_branches!(repository)
+    [first_oid, second_oid, head_oid] = commit_oids
+
+    assert {:ok, branches} = ForgePulls.branch_options(repository, reader)
+    assert Enum.map(branches, & &1.name) == ["refs/heads/feature", "refs/heads/main"]
+    assert {:error, :not_found} = ForgePulls.branch_options(repository, outsider)
+
+    path = ForgeRepos.absolute_storage_path(repository)
+
+    for index <- 0..100 do
+      git!(path, ["update-ref", "refs/heads/z-#{index}", base_oid])
+    end
+
+    assert {:ok, all_branches} = ForgePulls.branch_options(repository, reader)
+    assert length(all_branches) == 103
+    assert Enum.any?(all_branches, &(&1.name == "refs/heads/z-100"))
+
+    assert {:ok,
+            %ForgePulls.Comparison{
+              head_ref: "refs/heads/feature",
+              base_ref: "refs/heads/main",
+              head_oid: ^head_oid,
+              base_oid: ^base_oid,
+              analysis: %GitCore.MergeAnalysis{mergeable: true, ahead_by: 3}
+            }} = ForgePulls.compare(repository, reader, "feature", "main", [])
+
+    assert {:error, :head_equals_base} =
+             ForgePulls.compare(repository, reader, "main", "main", [])
+
+    assert {:ok, pull} = create_pull(repository, reader, "Comparison", "feature", "main")
+
+    assert {:ok, %Fornacast.Page{entries: commits, total: 3, page: 1, per_page: 2}} =
+             ForgePulls.list_commits(repository, pull, reader, page: 1, per_page: 2)
+
+    assert Enum.map(commits, & &1.oid) == [head_oid, second_oid]
+
+    assert {:ok, %Fornacast.Page{entries: [last], total: 3, page: 2, per_page: 2}} =
+             ForgePulls.list_commits(repository, pull, reader, page: 2, per_page: 2)
+
+    assert last.oid == first_oid
+
+    assert {:ok,
+            %ForgePulls.ChangedFilePage{
+              entries: files,
+              total: 2,
+              page: 1,
+              per_page: 100,
+              truncated: false
+            }} = ForgePulls.changed_files(repository, pull, reader, page: 1, per_page: 100)
+
+    assert Enum.map(files, & &1.path) == ["lib/added.ex", "lib/changed.ex"]
+
+    assert {:ok, %ForgePulls.ChangedFilePage{per_page: 100}} =
+             ForgePulls.changed_files(repository, pull, reader, page: 1, per_page: 1_000)
+
+    moved_head = child_commit!(ForgeRepos.absolute_storage_path(repository), head_oid, "moved")
+
+    git!(ForgeRepos.absolute_storage_path(repository), [
+      "update-ref",
+      "refs/heads/feature",
+      moved_head
+    ])
+
+    assert {:ok, %Fornacast.Page{entries: [moved | _], total: 4}} =
+             ForgePulls.list_commits(repository, pull, reader, page: 1, per_page: 50)
+
+    assert moved.oid == moved_head
+    assert {:error, :not_found} = ForgePulls.changed_files(repository, pull, outsider, [])
+  end
+
+  test "fully loaded pulls expose canonical issues analysis and reader-specific capabilities" do
+    owner = user_fixture(unique("pull-caps-owner"))
+    author = user_fixture(unique("pull-caps-author"))
+    writer = user_fixture(unique("pull-caps-writer"))
+    repository = repository_fixture(owner)
+    grant_reader!(repository, author)
+    grant_writer!(repository, writer)
+    create_mergeable_branches!(repository)
+    assert {:ok, pull} = create_pull(repository, author, "Capabilities", "feature", "main")
+
+    assert {:ok, author_view} =
+             ForgePulls.get_pull_request(repository, pull.issue.number, author)
+
+    assert %Issue{id: issue_id, capabilities: issue_capabilities} = author_view.issue
+    assert issue_id == pull.issue_id
+    assert %GitCore.MergeAnalysis{mergeable: true} = author_view.analysis
+
+    assert author_view.capabilities ==
+             Map.take(issue_capabilities, [:can_edit, :can_close, :can_comment])
+             |> Map.put(:can_merge, false)
+
+    assert {:ok, %Fornacast.Page{entries: [listed]}} =
+             ForgePulls.list_pull_requests(repository, author)
+
+    assert %Issue{id: ^issue_id} = listed.issue
+    assert %GitCore.MergeAnalysis{mergeable: true} = listed.analysis
+
+    assert Map.keys(listed.capabilities) |> Enum.sort() ==
+             [:can_close, :can_comment, :can_edit, :can_merge]
+
+    assert {:ok, writer_view} = ForgePulls.get_pull_request(repository, pull.issue.number, writer)
+    assert writer_view.capabilities.can_merge
+
+    merge_disabled =
+      repository |> Ecto.Changeset.change(allow_merge_commit: false) |> Repo.update!()
+
+    assert {:ok, merge_disabled_view} =
+             ForgePulls.get_pull_request(merge_disabled, pull.issue.number, writer)
+
+    refute merge_disabled_view.capabilities.can_merge
+
+    repository =
+      merge_disabled |> Ecto.Changeset.change(allow_merge_commit: true) |> Repo.update!()
+
+    public_repository = repository |> Ecto.Changeset.change(visibility: :public) |> Repo.update!()
+
+    assert {:ok, anonymous_view} =
+             ForgePulls.get_pull_request(public_repository, pull.issue.number, nil)
+
+    refute Enum.any?(anonymous_view.capabilities, fn {_key, allowed?} -> allowed? end)
+
+    assert {:ok, closed} =
+             ForgePulls.update_pull_request(repository, pull, author, %{state: :closed}, %{})
+
+    assert {:ok, closed_view} =
+             ForgePulls.get_pull_request(repository, closed.issue.number, owner)
+
+    refute closed_view.capabilities.can_merge
+
+    Repo.update_all(from(candidate in PullRequest, where: candidate.id == ^pull.id),
+      set: [merged_at: DateTime.utc_now() |> DateTime.truncate(:second)]
+    )
+
+    assert {:ok, merged_view} =
+             ForgePulls.get_pull_request(repository, pull.issue.number, owner)
+
+    refute merged_view.capabilities.can_merge
+
+    conflicting_repository = repository_fixture(owner)
+    create_conflicting_branches!(conflicting_repository)
+
+    assert {:ok, conflicting_pull} =
+             create_pull(conflicting_repository, owner, "Conflict", "feature", "main")
+
+    assert {:ok, conflicting_view} =
+             ForgePulls.get_pull_request(
+               conflicting_repository,
+               conflicting_pull.issue.number,
+               owner
+             )
+
+    refute conflicting_view.analysis.mergeable
+    refute conflicting_view.capabilities.can_merge
+
+    git!(ForgeRepos.absolute_storage_path(conflicting_repository), [
+      "update-ref",
+      "-d",
+      "refs/heads/feature"
+    ])
+
+    assert {:ok, %Fornacast.Page{entries: [listed_conflict]}} =
+             ForgePulls.list_pull_requests(conflicting_repository, owner)
+
+    refute listed_conflict.analysis.mergeable
+    refute listed_conflict.capabilities.can_merge
+  end
+
   test "a reader opens a pull with the next canonical issue identity and only shared title and body" do
     suffix = "#{System.system_time(:microsecond)}-#{System.unique_integer([:positive])}"
     owner = user_fixture("pull-owner-#{suffix}")
@@ -3326,6 +3499,33 @@ defmodule ForgePullsTest do
     _main = git!(path, ["update-ref", "refs/heads/main", base])
     _feature = git!(path, ["update-ref", "refs/heads/feature", head])
     {base, head}
+  end
+
+  defp create_comparison_branches!(repository) do
+    worktree = Path.join(System.tmp_dir!(), "pull-compare-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(Path.join(worktree, "lib"))
+    on_exit(fn -> File.rm_rf!(worktree) end)
+    _init = worktree_git!(worktree, ["init", "-b", "main"])
+    _name = worktree_git!(worktree, ["config", "user.name", "Pull Test"])
+    _email = worktree_git!(worktree, ["config", "user.email", "pull@example.test"])
+    File.write!(Path.join(worktree, "lib/changed.ex"), "base\n")
+    _add = worktree_git!(worktree, ["add", "lib/changed.ex"])
+    _base = worktree_git!(worktree, ["commit", "-m", "base"])
+    base_oid = worktree_git!(worktree, ["rev-parse", "HEAD"])
+    _branch = worktree_git!(worktree, ["checkout", "-b", "feature"])
+    File.write!(Path.join(worktree, "lib/changed.ex"), "first\n")
+    _first = worktree_git!(worktree, ["commit", "-am", "first"])
+    first_oid = worktree_git!(worktree, ["rev-parse", "HEAD"])
+    File.write!(Path.join(worktree, "lib/added.ex"), "second\n")
+    _add = worktree_git!(worktree, ["add", "lib/added.ex"])
+    _second = worktree_git!(worktree, ["commit", "-m", "second"])
+    second_oid = worktree_git!(worktree, ["rev-parse", "HEAD"])
+    File.write!(Path.join(worktree, "lib/changed.ex"), "head\n")
+    _head = worktree_git!(worktree, ["commit", "-am", "head"])
+    head_oid = worktree_git!(worktree, ["rev-parse", "HEAD"])
+    path = ForgeRepos.absolute_storage_path(repository)
+    _push = worktree_git!(worktree, ["push", path, "main", "feature"])
+    {base_oid, [first_oid, second_oid, head_oid]}
   end
 
   defp child_commit!(path, parent, message) do
