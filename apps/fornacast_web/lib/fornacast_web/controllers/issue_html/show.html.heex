@@ -1,0 +1,68 @@
+<RepositoryHTML.repository_frame result={@result} active={:issues}>
+  <section class="grid min-w-0 gap-3 p-4" data-issue-conversation>
+    <header class="bg-surface-container text-on-surface rounded-lg p-4">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div class="min-w-0">
+          <p class="text-xs text-on-surface-variant">Issue #{@result.content.issue.number}</p>
+          <h2 class="text-lg font-semibold">{@result.content.issue.title}</h2>
+          <p class="mt-1 text-xs text-on-surface-variant">
+            Opened by {author_name(@result.content.issue.author)} · {comment_label(
+              @result.content.comments.total
+            )}
+          </p>
+        </div>
+        <.dm_badge variant={state_variant(@result.content.issue.state)} soft size="sm">
+          {@result.content.issue.state}
+        </.dm_badge>
+      </div>
+      <div
+        :if={@result.content.issue.labels != []}
+        class="mt-3 flex flex-wrap gap-2"
+        aria-label="Labels"
+      >
+        <.dm_badge
+          :for={label <- @result.content.issue.labels}
+          variant="secondary"
+          soft
+          size="xs"
+        >
+          {label_name(label)}
+        </.dm_badge>
+      </div>
+    </header>
+
+    <article class="bg-surface-container text-on-surface rounded-lg border border-outline-variant">
+      <header class="border-b border-outline-variant px-4 py-3 text-sm">
+        <span class="font-semibold">{author_name(@result.content.issue.author)}</span>
+        <span class="text-on-surface-variant">
+          opened this issue {format_time(@result.content.issue.inserted_at)}
+        </span>
+      </header>
+      <div class="prose max-w-none p-4 text-on-surface">
+        {markdown(@result.content.issue.body)}
+      </div>
+    </article>
+
+    <ol :if={@result.content.comments.entries != []} class="grid gap-3" aria-label="Comments">
+      <li
+        :for={comment <- @result.content.comments.entries}
+        class="bg-surface-container text-on-surface rounded-lg border border-outline-variant"
+      >
+        <header class="border-b border-outline-variant px-4 py-3 text-sm">
+          <span class="font-semibold">{author_name(comment.author)}</span>
+          <span class="text-on-surface-variant">
+            commented {format_time(comment.inserted_at)}
+          </span>
+        </header>
+        <div class="prose max-w-none p-4 text-on-surface">{markdown(comment.body)}</div>
+      </li>
+    </ol>
+
+    <RepositoryHTML.optional_panel
+      :if={@result.content.comments.entries == []}
+      title="No comments"
+      message="No comments yet."
+      kind="empty"
+    />
+  </section>
+</RepositoryHTML.repository_frame>

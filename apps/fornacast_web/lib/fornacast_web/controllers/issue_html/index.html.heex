@@ -1,0 +1,114 @@
+<RepositoryHTML.repository_frame result={@result} active={:issues}>
+  <section class="grid min-w-0 gap-3 p-4" data-issues-page>
+    <header class="flex flex-wrap items-center justify-between gap-3 bg-surface-container text-on-surface rounded-lg p-4">
+      <div>
+        <p class="text-xs text-on-surface-variant">Repository issues</p>
+        <h2 class="text-lg font-semibold">Issues</h2>
+      </div>
+      <.dm_badge variant="primary" soft size="sm">
+        {@result.content.issues.total} issues
+      </.dm_badge>
+    </header>
+
+    <form
+      action={RepositoryHTML.issues_path(@result.chrome)}
+      method="get"
+      class="grid gap-3 bg-surface-container text-on-surface rounded-lg p-4 md:grid-cols-3"
+      data-issue-filters
+    >
+      <.dm_select
+        id="issue-state-filter"
+        name="state"
+        label="State"
+        size="sm"
+        value={filter_value(@result.content.filters, :state)}
+        options={[{"open", "Open"}, {"closed", "Closed"}, {"all", "All"}]}
+      />
+      <.dm_input
+        id="issue-label-filter"
+        name="labels"
+        label="Labels"
+        size="sm"
+        value={filter_value(@result.content.filters, :labels)}
+      />
+      <.dm_input
+        id="issue-assignee-filter"
+        name="assignee"
+        label="Assignee"
+        size="sm"
+        value={filter_value(@result.content.filters, :assignee)}
+      />
+      <.dm_input
+        id="issue-creator-filter"
+        name="creator"
+        label="Creator"
+        size="sm"
+        value={filter_value(@result.content.filters, :creator)}
+      />
+      <.dm_select
+        id="issue-sort-filter"
+        name="sort"
+        label="Sort"
+        size="sm"
+        value={filter_value(@result.content.filters, :sort)}
+        options={[{"created", "Created"}, {"updated", "Updated"}, {"comments", "Comments"}]}
+      />
+      <.dm_select
+        id="issue-direction-filter"
+        name="direction"
+        label="Direction"
+        size="sm"
+        value={filter_value(@result.content.filters, :direction)}
+        options={[{"desc", "Newest first"}, {"asc", "Oldest first"}]}
+      />
+      <div class="md:col-span-3">
+        <.dm_btn type="submit" variant="primary" size="sm">Apply filters</.dm_btn>
+      </div>
+    </form>
+
+    <ul :if={@result.content.issues.entries != []} class="grid gap-3" role="list">
+      <li
+        :for={issue <- @result.content.issues.entries}
+        class="bg-surface-container text-on-surface rounded-lg border border-outline-variant p-4"
+        data-issue-row
+      >
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div class="min-w-0">
+            <.dm_link
+              href={RepositoryHTML.issue_path(@result.chrome, issue.number)}
+              class="font-semibold text-primary"
+            >
+              {issue.title}
+            </.dm_link>
+            <p class="mt-1 text-xs text-on-surface-variant">
+              #{issue.number} opened by {author_name(issue.author)} · {comment_label(
+                issue.comment_count
+              )}
+            </p>
+          </div>
+          <.dm_badge variant={state_variant(issue.state)} soft size="sm">
+            {issue.state}
+          </.dm_badge>
+        </div>
+        <div :if={issue.labels != []} class="mt-3 flex flex-wrap gap-2" aria-label="Labels">
+          <.dm_badge :for={label <- issue.labels} variant="secondary" soft size="xs">
+            {label_name(label)}
+          </.dm_badge>
+        </div>
+      </li>
+    </ul>
+
+    <RepositoryHTML.optional_panel
+      :if={@result.content.issues.entries == []}
+      title="No issues"
+      message="No ordinary issues match these filters."
+      kind="empty"
+    />
+
+    <RepositoryHTML.server_pagination
+      page={@result.content.issues.page}
+      total_pages={total_pages(@result.content.issues)}
+      base_href={pagination_base(@result)}
+    />
+  </section>
+</RepositoryHTML.repository_frame>

@@ -73,6 +73,8 @@ defmodule FornacastWeb.Router do
   scope "/", FornacastWeb do
     pipe_through :browser
 
+    get "/:owner/:repo/issues", IssueController, :index
+    get "/:owner/:repo/issues/:number", IssueController, :show
     get "/:owner/:repo", RepositoryController, :show
     get "/:owner/:repo/branches", RepositoryController, :branches
     get "/:owner/:repo/tags", RepositoryController, :tags
