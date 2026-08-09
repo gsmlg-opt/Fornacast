@@ -205,6 +205,34 @@ defmodule ForgePulls do
 
   def get_pull_request(_repository, _number, _actor), do: {:error, :not_found}
 
+  @spec merged?(ForgeRepos.Repository.t(), PullRequest.t(), map() | nil) ::
+          {:ok, boolean()} | {:error, error_reason()}
+  def merged?(
+        %ForgeRepos.Repository{} = repository,
+        %PullRequest{} = expected_pull,
+        actor
+      ) do
+    with {:ok, repository} <- canonical_read_repository(repository, actor),
+         %PullRequest{} = pull <-
+           Repo.one(
+             from candidate in PullRequest,
+               join: issue in Issue,
+               on: issue.id == candidate.issue_id,
+               where:
+                 candidate.id == ^expected_pull.id and
+                   candidate.repository_id == ^repository.id and
+                   issue.kind == :pull_request
+           ),
+         {:ok, pull} <- reconcile_pull_on_touch(repository, pull) do
+      {:ok, not is_nil(pull.merged_at) and not is_nil(pull.merge_commit_sha)}
+    else
+      nil -> {:error, :not_found}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def merged?(_repository, _pull, _actor), do: {:error, :not_found}
+
   @spec create_pull_request(ForgeRepos.Repository.t(), map(), map(), map()) ::
           {:ok, PullRequest.t()} | {:error, error_reason()}
   def create_pull_request(%ForgeRepos.Repository{} = repository, actor, attrs, request_metadata)

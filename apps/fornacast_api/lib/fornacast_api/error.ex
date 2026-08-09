@@ -45,6 +45,12 @@ defmodule FornacastAPI.Error do
   def from_domain(:issues_disabled, url),
     do: new(410, "Issues are disabled for this repository", url)
 
+  def from_domain(reason, url) when reason in [:conflict, :merge_commits_disabled],
+    do: new(405, "Pull Request is not mergeable", url)
+
+  def from_domain(reason, url) when reason in [:head_changed, :ref_conflict],
+    do: new(409, "Conflict", url)
+
   def from_domain(:git_initializer_unavailable, url), do: new(503, "Service unavailable", url)
   def from_domain({:conflict, _safe_reason}, url), do: new(409, "Conflict", url)
 

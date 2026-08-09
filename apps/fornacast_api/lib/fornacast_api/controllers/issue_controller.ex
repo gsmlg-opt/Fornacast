@@ -3,6 +3,7 @@ defmodule FornacastAPI.IssueController do
 
   alias ForgeAccounts.APIScope
   alias ForgeIssues
+  alias ForgePulls
   alias ForgeRepos
 
   alias FornacastAPI.{
@@ -34,11 +35,16 @@ defmodule FornacastAPI.IssueController do
       conn = Plug.Conn.assign(conn, :accepted_scopes, accepted_scopes)
 
       with {:ok, filters} <- IssueContract.list_filters(conn.query_params),
-           {:ok, page} <- ForgeIssues.list(actor, owner, repo, Map.new(filters)) do
+           {:ok, page} <- ForgeIssues.list(actor, owner, repo, Map.new(filters)),
+           {:ok, pull_links_by_issue_id} <- pull_links(repository, page.entries, actor) do
         body =
           Enum.map(
             page.entries,
-            &Serializer.render(conn.assigns.api_version, :issue, &1, owner: owner, repo: repo)
+            &Serializer.render(conn.assigns.api_version, :issue, &1,
+              owner: owner,
+              repo: repo,
+              pull_links_by_issue_id: pull_links_by_issue_id
+            )
           )
 
         Response.paginated(conn, 200, body, page,
@@ -63,17 +69,20 @@ defmodule FornacastAPI.IssueController do
            authorize_scope(conn.assigns[:api_auth], :repository_read, repository.visibility) do
       conn = Plug.Conn.assign(conn, :accepted_scopes, accepted_scopes)
 
-      case ForgeIssues.get(actor, owner, repo, number) do
-        {:ok, issue} ->
-          Response.json(
-            conn,
-            200,
-            Serializer.render(conn.assigns.api_version, :issue, issue, owner: owner, repo: repo),
-            accepted_scopes: accepted_scopes
-          )
-
-        {:error, reason} ->
-          render_error(conn, reason, @show_url)
+      with {:ok, issue} <- ForgeIssues.get(actor, owner, repo, number),
+           {:ok, pull_links_by_issue_id} <- pull_links(repository, [issue], actor) do
+        Response.json(
+          conn,
+          200,
+          Serializer.render(conn.assigns.api_version, :issue, issue,
+            owner: owner,
+            repo: repo,
+            pull_links_by_issue_id: pull_links_by_issue_id
+          ),
+          accepted_scopes: accepted_scopes
+        )
+      else
+        {:error, reason} -> render_error(conn, reason, @show_url)
       end
     else
       {:error, reason} -> render_error(conn, reason, @show_url)
@@ -158,6 +167,14 @@ defmodule FornacastAPI.IssueController do
 
   defp optional_actor(%Authentication{actor: actor}), do: actor
   defp optional_actor(_authentication), do: nil
+
+  defp pull_links(repository, issues, actor) do
+    ids = for %{kind: :pull_request, id: id} <- issues, do: id
+
+    if ids == [],
+      do: {:ok, %{}},
+      else: ForgePulls.pull_links_for_issue_ids(repository, ids, actor)
+  end
 
   defp authorize_scope(nil, :repository_read, :public), do: {:ok, []}
 

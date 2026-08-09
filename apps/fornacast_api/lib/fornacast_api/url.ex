@@ -12,10 +12,19 @@ defmodule FornacastAPI.URL do
   def user(login), do: api("/users/#{segment(login)}")
   def organization(login), do: api("/orgs/#{segment(login)}")
   def repository(owner, repo), do: api("/repos/#{segment(owner)}/#{segment(repo)}")
+  def repository_web(owner, repo), do: web("/#{segment(owner)}/#{segment(repo)}")
   def issue(owner, repo, number), do: repository(owner, repo) <> "/issues/#{number}"
   def issue_comment(owner, repo, id), do: repository(owner, repo) <> "/issues/comments/#{id}"
   def label(owner, repo, name), do: repository(owner, repo) <> "/labels/#{segment(name)}"
-  def pull(owner, repo, number), do: repository(owner, repo) <> "/pulls/#{number}"
+  def pulls(owner, repo), do: repository(owner, repo) <> "/pulls"
+  def pull(owner, repo, number), do: pulls(owner, repo) <> "/#{number}"
+  def pull_merge(owner, repo, number), do: pull(owner, repo, number) <> "/merge"
+  def pull_commits(owner, repo, number), do: pull(owner, repo, number) <> "/commits"
+  def commit(owner, repo, sha), do: repository(owner, repo) <> "/commits/#{segment(sha)}"
+
+  def commit_statuses(owner, repo, sha),
+    do: repository(owner, repo) <> "/statuses/#{segment(sha)}"
+
   def issue_reactions(owner, repo, number), do: issue(owner, repo, number) <> "/reactions"
   def issue_comment_reactions(owner, repo, id), do: issue_comment(owner, repo, id) <> "/reactions"
 

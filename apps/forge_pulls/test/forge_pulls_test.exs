@@ -1156,6 +1156,51 @@ defmodule ForgePullsTest do
              ForgePulls.pull_links_for_issue_ids(other_repository, [foreign.issue_id], nil)
   end
 
+  test "merged? reconciles nonterminal operations, reports persisted state, and masks inaccessible pulls" do
+    owner = user_fixture(unique("pull-merged-owner"))
+    outsider = user_fixture(unique("pull-merged-outsider"))
+    repository = repository_fixture(owner)
+    create_branch!(repository, "main")
+    create_branch!(repository, "feature")
+    assert {:ok, pull} = create_pull(repository, owner, "Merged state", "feature", "main")
+
+    {settled_result, settled_queries} =
+      count_repo_queries(fn -> ForgePulls.merged?(repository, pull, owner) end)
+
+    assert {:ok, false} = settled_result
+    assert {:error, :not_found} = ForgePulls.merged?(repository, pull, outsider)
+
+    pending =
+      %MergeOperation{}
+      |> MergeOperation.prepare_changeset(%{
+        pull_request_id: pull.id,
+        repository_id: repository.id,
+        actor_user_id: owner.id,
+        request_id: unique("merged-check-pending"),
+        base_ref: pull.base_ref,
+        head_ref: pull.head_ref,
+        expected_base_oid: pull.base_sha,
+        expected_head_oid: pull.head_sha,
+        state: :prepared
+      })
+      |> Repo.insert!()
+
+    {pending_result, pending_queries} =
+      count_repo_queries(fn -> ForgePulls.merged?(repository, pull, owner) end)
+
+    assert {:ok, false} = pending_result
+    assert pending_queries > settled_queries
+    Repo.delete!(pending)
+
+    merged_at = ~U[2026-07-21 00:00:00Z]
+
+    Repo.update_all(from(candidate in PullRequest, where: candidate.id == ^pull.id),
+      set: [merged_at: merged_at, merge_commit_sha: String.duplicate("c", 40)]
+    )
+
+    assert {:ok, true} = ForgePulls.merged?(repository, pull, owner)
+  end
+
   test "pull requests require distinct canonical branch refs and immutable repository identity" do
     pull = %PullRequest{repository_id: 10}
 
@@ -1911,12 +1956,7 @@ defmodule ForgePullsTest do
                  limit: 1
              )
 
-    assert :ok =
-             ForgePulls.MergeRecovery.reconcile_repository_locked(
-               repository,
-               path,
-               System.monotonic_time(:millisecond) + 10_000
-             )
+    assert {:ok, true} = ForgePulls.merged?(repository, pull, owner)
 
     assert %MergeOperation{state: :completed} = Repo.get!(MergeOperation, operation.id)
     assert %PullRequest{merge_commit_sha: ^merge_oid} = Repo.get!(PullRequest, pull.id)
@@ -1930,6 +1970,48 @@ defmodule ForgePullsTest do
     assert {:ok, ^merge_oid} = GitCore.exact_ref(path, pull.base_ref)
 
     assert {:ok, :refreshed} = GitCore.Cache.fetch(cache_key, fn -> {:ok, :refreshed} end)
+  end
+
+  test "merged? blocks on ambiguous third-OID recovery evidence" do
+    owner = user_fixture(unique("merge-third-oid"))
+    repository = repository_fixture(owner)
+    {base_oid, _head_oid} = create_mergeable_branches!(repository)
+    assert {:ok, pull} = create_pull(repository, owner, "Third OID", "feature", "main")
+    path = ForgeRepos.absolute_storage_path(repository)
+
+    assert {:error, {:unavailable, :forced_after_write}} =
+             ForgePulls.with_test_merge_transition_hook(
+               fn
+                 :merge_written, _operation -> {:error, {:unavailable, :forced_after_write}}
+                 _state, _operation -> :ok
+               end,
+               fn ->
+                 ForgePulls.merge(
+                   repository,
+                   pull,
+                   owner,
+                   %{},
+                   request_metadata(unique("merge-third-oid"))
+                 )
+               end
+             )
+
+    assert %MergeOperation{state: :merge_written, merge_oid: merge_oid} =
+             operation = Repo.get_by!(MergeOperation, pull_request_id: pull.id)
+
+    third_oid = child_commit!(path, base_oid, "third oid")
+    _updated = git!(path, ["update-ref", pull.base_ref, third_oid, base_oid])
+
+    assert third_oid != merge_oid
+
+    assert {:error, {:unavailable, :pull_recovery}} =
+             ForgePulls.merged?(repository, pull, owner)
+
+    assert %MergeOperation{state: :merge_written, failure_reason: "unexpected_ref"} =
+             Repo.get!(MergeOperation, operation.id)
+
+    assert %PullRequest{merged_at: nil, merge_commit_sha: nil} =
+             Repo.get!(PullRequest, pull.id)
   end
 
   test "two racing merge callers produce exactly one winning ref update" do
