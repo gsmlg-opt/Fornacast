@@ -284,14 +284,8 @@ defmodule ForgePulls do
   def reconcile_repository(repository, opts \\ [])
 
   def reconcile_repository(%ForgeRepos.Repository{} = repository, opts) when is_list(opts) do
-    case ForgeRepos.with_write_fence(repository, :merge, fn repository_path, remaining ->
-           absolute_deadline = System.monotonic_time(:millisecond) + remaining
-
-           MergeRecovery.reconcile_repository_locked(
-             repository,
-             repository_path,
-             absolute_deadline
-           )
+    case ForgeRepos.with_write_fence(repository, :merge, fn _repository_path, _remaining ->
+           :ok
          end) do
       :ok -> :ok
       _error -> {:error, {:unavailable, :pull_recovery}}

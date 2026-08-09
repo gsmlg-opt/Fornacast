@@ -20,6 +20,7 @@ defmodule ForgePulls.MergeRecovery do
 
   if Mix.env() == :test do
     @complete_multi_hook_key {__MODULE__, :complete_multi_hook}
+    @reconcile_observer_key {__MODULE__, :reconcile_observer}
 
     @doc false
     def with_test_complete_multi_hook(hook, fun)
@@ -56,6 +57,19 @@ defmodule ForgePulls.MergeRecovery do
       end
     end
 
+    @doc false
+    def with_test_reconcile_observer(observer, fun)
+        when is_function(observer, 0) and is_function(fun, 0) do
+      previous = Process.get(@reconcile_observer_key)
+      Process.put(@reconcile_observer_key, observer)
+
+      try do
+        fun.()
+      after
+        restore_process_value(@reconcile_observer_key, previous)
+      end
+    end
+
     defp restore_process_value(key, nil), do: Process.delete(key)
     defp restore_process_value(key, value), do: Process.put(key, value)
 
@@ -65,8 +79,16 @@ defmodule ForgePulls.MergeRecovery do
         nil -> multi
       end
     end
+
+    defp notify_reconcile_observer do
+      case Process.get(@reconcile_observer_key) do
+        observer when is_function(observer, 0) -> observer.()
+        nil -> :ok
+      end
+    end
   else
     defp apply_complete_multi_hook(multi, _operation), do: multi
+    defp notify_reconcile_observer, do: :ok
   end
 
   @impl true
@@ -77,6 +99,8 @@ defmodule ForgePulls.MergeRecovery do
       )
       when is_integer(repository_id) and is_binary(repository_path) and
              is_integer(absolute_deadline) do
+    notify_reconcile_observer()
+
     reconcile_next(
       repository,
       repository_path,

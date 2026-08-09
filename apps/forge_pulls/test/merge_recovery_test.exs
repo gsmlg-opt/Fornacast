@@ -157,6 +157,19 @@ defmodule ForgePulls.MergeRecoveryTest do
     assert Repo.get!(MergeOperation, context.operation.id).state == :completed
   end
 
+  test "the public wrapper invokes configured pull recovery exactly once", context do
+    test_pid = self()
+
+    assert :ok =
+             MergeRecovery.with_test_reconcile_observer(
+               fn -> send(test_pid, :pull_recovery_called) end,
+               fn -> ForgePulls.reconcile_repository(context.repository) end
+             )
+
+    assert_receive :pull_recovery_called
+    refute_receive :pull_recovery_called, 50
+  end
+
   test "completion SQL failure rolls back every canonical field and remains recoverable",
        context do
     cache_key = {context.path, :pull_merge_rollback}
@@ -334,6 +347,73 @@ defmodule ForgePulls.MergeRecoveryTest do
              ForgePulls.reconcile_repository(context.repository)
   end
 
+  test "prepared evidence at a third OID stays prepared and alerts once", context do
+    Repo.update_all(
+      from(operation in MergeOperation, where: operation.id == ^context.operation.id),
+      set: [state: :prepared, merge_oid: nil]
+    )
+
+    update_ref(context.path, context.third_oid, context.operation.base_ref)
+    before_git = git_snapshot(context.path)
+
+    assert {:error, :unavailable} = locked_reconcile(context)
+    assert {:error, :unavailable} = locked_reconcile(context)
+
+    assert %MergeOperation{
+             state: :prepared,
+             merge_oid: nil,
+             failure_reason: "unexpected_ref",
+             lease_owner: nil
+           } = Repo.get!(MergeOperation, context.operation.id)
+
+    assert git_snapshot(context.path) == before_git
+
+    assert 1 ==
+             Repo.aggregate(
+               from(audit in AuditEvent,
+                 where:
+                   audit.operation_id == ^"pull_merge:#{context.operation.id}" and
+                     audit.action == "pull_request.merge_recovery_blocked"
+               ),
+               :count,
+               :id
+             )
+  end
+
+  test "merge-written evidence at a third OID stays merge-written and alerts once", context do
+    Repo.update_all(
+      from(operation in MergeOperation, where: operation.id == ^context.operation.id),
+      set: [state: :merge_written]
+    )
+
+    update_ref(context.path, context.third_oid, context.operation.base_ref)
+    before_git = git_snapshot(context.path)
+
+    assert {:error, :unavailable} = locked_reconcile(context)
+    assert {:error, :unavailable} = locked_reconcile(context)
+
+    assert %MergeOperation{
+             state: :merge_written,
+             merge_oid: merge_oid,
+             failure_reason: "unexpected_ref",
+             lease_owner: nil
+           } = Repo.get!(MergeOperation, context.operation.id)
+
+    assert merge_oid == context.merge_oid
+    assert git_snapshot(context.path) == before_git
+
+    assert 1 ==
+             Repo.aggregate(
+               from(audit in AuditEvent,
+                 where:
+                   audit.operation_id == ^"pull_merge:#{context.operation.id}" and
+                     audit.action == "pull_request.merge_recovery_blocked"
+               ),
+               :count,
+               :id
+             )
+  end
+
   test "a new merge cannot pass retained third-OID evidence", context do
     update_ref(context.path, context.third_oid, context.operation.base_ref)
 
@@ -391,6 +471,27 @@ defmodule ForgePulls.MergeRecoveryTest do
              Repo.get!(MergeOperation, context.operation.id)
 
     assert git_snapshot(context.path) == before_git
+  end
+
+  test "merge-written evidence at the recorded merge OID completes bookkeeping", context do
+    Repo.update_all(
+      from(operation in MergeOperation, where: operation.id == ^context.operation.id),
+      set: [state: :merge_written]
+    )
+
+    assert :ok = locked_reconcile(context)
+
+    assert %MergeOperation{state: :completed, failure_reason: nil, lease_owner: nil} =
+             Repo.get!(MergeOperation, context.operation.id)
+
+    assert %PullRequest{merge_commit_sha: merge_oid} = Repo.get!(PullRequest, context.pull.id)
+    assert merge_oid == context.merge_oid
+
+    assert %Issue{state: :closed, state_reason: :completed} =
+             Repo.get!(Issue, context.pull.issue_id)
+
+    assert %AuditEvent{action: "pull_request.merged"} =
+             Repo.get_by!(AuditEvent, operation_id: "pull_merge:#{context.operation.id}")
   end
 
   test "terminal operations are no-ops for every observed ref", context do
@@ -528,28 +629,59 @@ defmodule ForgePulls.MergeRecoveryTest do
   end
 
   test "the bounded batch continues to another repository when one repository is busy", context do
+    terminalize_other_operations(context.operation.id)
+    busy = recovery_fixture(context.owner)
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     assert {:ok, live_claim} =
              OperationLease.claim(
                MergeOperation,
-               context.operation.id,
+               busy.operation.id,
                "busy-repository",
                now,
                30
              )
 
-    recoverable = recovery_fixture(context.owner)
+    assert busy.repository.id > context.repository.id
 
     assert :ok = MergeReconciler.reconcile_pending_repositories()
 
     assert %MergeOperation{state: :ref_advanced, lease_owner: "busy-repository"} =
-             Repo.get!(MergeOperation, context.operation.id)
+             Repo.get!(MergeOperation, busy.operation.id)
 
     assert %MergeOperation{state: :completed, lease_owner: nil} =
-             Repo.get!(MergeOperation, recoverable.operation.id)
+             Repo.get!(MergeOperation, context.operation.id)
 
     assert :ok = OperationLease.release(MergeOperation, live_claim)
+  end
+
+  test "the bounded batch processes at most 50 distinct repositories per run", context do
+    terminalize_other_operations(context.operation.id)
+
+    batched =
+      for _index <- 1..50 do
+        lightweight_prepared_fixture(context)
+      end
+
+    assert Enum.all?(batched, &(&1.repository.id > context.repository.id))
+
+    assert :ok = MergeReconciler.reconcile_pending_repositories()
+
+    batched_ids = Enum.map(batched, & &1.operation.id)
+
+    assert 50 ==
+             Repo.aggregate(
+               from(operation in MergeOperation,
+                 where: operation.id in ^batched_ids and operation.state == :failed
+               ),
+               :count,
+               :id
+             )
+
+    assert Repo.get!(MergeOperation, context.operation.id).state == :ref_advanced
+
+    assert :ok = MergeReconciler.reconcile_pending_repositories()
+    assert Repo.get!(MergeOperation, context.operation.id).state == :completed
   end
 
   test "the reconciler recovers at startup and dispatches again on its hard-capped timer",
@@ -701,6 +833,58 @@ defmodule ForgePulls.MergeRecoveryTest do
         |> MergeOperation.ref_advanced_changeset()
         |> Repo.update!()
     end
+  end
+
+  defp lightweight_prepared_fixture(context) do
+    slug = unique("batch-repo")
+
+    repository =
+      %Repository{
+        owner_user_id: context.owner.id,
+        storage_path: "@test/#{context.owner.id}/#{slug}.git"
+      }
+      |> Repository.create_changeset(%{name: slug, slug: slug})
+      |> Repo.insert!()
+
+    path = ForgeRepos.absolute_storage_path(repository)
+    File.mkdir_p!(Path.dirname(path))
+    {:ok, _path} = GitCore.init_bare(path)
+    tree_oid = git!(path, ["hash-object", "-t", "tree", "-w", "/dev/null"])
+    expected_oid = git!(path, ["commit-tree", tree_oid, "-m", "expected"])
+    update_ref(path, expected_oid, "refs/heads/main")
+
+    operation =
+      %MergeOperation{}
+      |> MergeOperation.prepare_changeset(%{
+        pull_request_id: context.pull.id,
+        repository_id: repository.id,
+        actor_user_id: context.owner.id,
+        request_id: unique("batch-operation"),
+        base_ref: "refs/heads/main",
+        head_ref: "refs/heads/feature",
+        expected_base_oid: expected_oid,
+        expected_head_oid: expected_oid,
+        state: :prepared
+      })
+      |> Repo.insert!()
+
+    %{repository: repository, operation: operation}
+  end
+
+  defp terminalize_other_operations(keep_id) do
+    Repo.update_all(
+      from(operation in MergeOperation,
+        where:
+          operation.id != ^keep_id and
+            operation.state not in [:completed, :failed]
+      ),
+      set: [
+        state: :failed,
+        failure_reason: "effect_not_started",
+        lease_owner: nil,
+        lease_expires_at: nil
+      ]
+    )
   end
 
   defp recovery_worker(context, owner, now, observer) do
