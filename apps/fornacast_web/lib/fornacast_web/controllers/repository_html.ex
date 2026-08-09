@@ -36,7 +36,10 @@ defmodule FornacastWeb.RepositoryHTML do
         <.repository_header result={@result} />
         <.repository_navigation result={@result} active={@active} />
       </div>
-      <.ref_controls :if={@result.kind != :code} result={@result} />
+      <.ref_controls
+        :if={@result.kind in [:tree, :blob, :commits, :commit, :search]}
+        result={@result}
+      />
       <div class="repository-page-content min-w-0">
         {render_slot(@inner_block)}
       </div>
@@ -114,6 +117,20 @@ defmodule FornacastWeb.RepositoryHTML do
         active={@active == :tags}
         icon="tag-outline"
         count={@summary.tag_count}
+      />
+      <:item
+        label="Issues"
+        href={issues_path(@result.chrome)}
+        active={@active == :issues}
+        icon="alert-circle-outline"
+        count={@result.chrome.collaboration_counts.issues}
+      />
+      <:item
+        label="Pull Requests"
+        href={pulls_path(@result.chrome)}
+        active={@active == :pulls}
+        icon="source-pull"
+        count={@result.chrome.collaboration_counts.pull_requests}
       />
     </.dm_git_repository_nav>
     """
@@ -340,6 +357,23 @@ defmodule FornacastWeb.RepositoryHTML do
 
   def refs_path(chrome, :branch), do: repository_base(chrome) <> "/branches"
   def refs_path(chrome, :tag), do: repository_base(chrome) <> "/tags"
+  def issues_path(chrome), do: repository_base(chrome) <> "/issues"
+  def new_issue_path(chrome), do: issues_path(chrome) <> "/new"
+  def issue_path(chrome, number), do: issues_path(chrome) <> "/" <> encode_segment(number)
+  def edit_issue_path(chrome, number), do: issue_path(chrome, number) <> "/edit"
+  def issue_comments_path(chrome, number), do: issue_path(chrome, number) <> "/comments"
+
+  def issue_comment_path(chrome, number, comment_id),
+    do: issue_comments_path(chrome, number) <> "/" <> encode_segment(comment_id)
+
+  def issue_state_path(chrome, number), do: issue_path(chrome, number) <> "/state"
+  def pulls_path(chrome), do: repository_base(chrome) <> "/pulls"
+  def new_pull_path(chrome), do: pulls_path(chrome) <> "/new"
+  def pull_path(chrome, number), do: pulls_path(chrome) <> "/" <> encode_segment(number)
+  def pull_commits_path(chrome, number), do: pull_path(chrome, number) <> "/commits"
+  def pull_files_path(chrome, number), do: pull_path(chrome, number) <> "/files"
+  def pull_state_path(chrome, number), do: pull_path(chrome, number) <> "/state"
+  def pull_merge_path(chrome, number), do: pull_path(chrome, number) <> "/merge"
 
   def ref_code_path(chrome, full_ref) do
     repository_base(chrome) <> "?ref=" <> URI.encode_www_form(full_ref)

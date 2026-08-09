@@ -162,9 +162,20 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     assert html =~ "href=\"/alice/demo/commits/refs/heads/feature/forge"
     assert html =~ "href=\"/alice/demo/branches"
     assert html =~ "href=\"/alice/demo/tags"
+    assert html =~ "href=\"/alice/demo/issues"
+    assert html =~ "href=\"/alice/demo/pulls"
+    assert navigation =~ "Issues"
+    assert navigation =~ "Pull Requests"
 
-    refute html =~ ">Issues<"
-    refute html =~ ">Pull Requests<"
+    labels =
+      Regex.scan(~r/<span class="whitespace-nowrap">\s*([^<]+?)\s*<\/span>/s, navigation,
+        capture: :all_but_first
+      )
+      |> List.flatten()
+      |> Enum.map(&String.trim/1)
+
+    assert labels == ["Code", "Commits", "Branches", "Tags", "Issues", "Pull Requests"]
+
     refute html =~ ">Actions<"
     refute html =~ ">Packages<"
     refute html =~ ">Projects<"
@@ -642,8 +653,8 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     assert header =~ "Fornacast"
     assert header =~ "href=\"/login\""
     assert header =~ "Theme"
-    refute anonymous =~ ">Issues<"
-    refute anonymous =~ ">Pull Requests<"
+    assert anonymous =~ "Issues"
+    assert anonymous =~ "Pull Requests"
     refute anonymous =~ "Profile"
     refute anonymous =~ "Logout"
   end
@@ -752,6 +763,52 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     assert malicious_search =~ "lib/&lt;unsafe&gt;.ex"
     assert malicious_search =~ "&lt;script&gt;alert(&#39;match&#39;)&lt;/script&gt;"
     refute malicious_search =~ "<script>alert"
+  end
+
+  test "repository navigation has one active collaboration tab and exact collaboration paths" do
+    result = code_result()
+
+    for {active, label} <- [issues: "Issues", pulls: "Pull Requests"] do
+      html =
+        render_component(&RepositoryHTML.repository_navigation/1, result: result, active: active)
+
+      assert active_navigation_label(html) == label
+    end
+
+    assert RepositoryHTML.issues_path(result.chrome) == "/alice/demo/issues"
+    assert RepositoryHTML.new_issue_path(result.chrome) == "/alice/demo/issues/new"
+    assert RepositoryHTML.issue_path(result.chrome, 17) == "/alice/demo/issues/17"
+    assert RepositoryHTML.edit_issue_path(result.chrome, 17) == "/alice/demo/issues/17/edit"
+
+    assert RepositoryHTML.issue_comments_path(result.chrome, 17) ==
+             "/alice/demo/issues/17/comments"
+
+    assert RepositoryHTML.issue_comment_path(result.chrome, 17, 31) ==
+             "/alice/demo/issues/17/comments/31"
+
+    assert RepositoryHTML.issue_state_path(result.chrome, 17) == "/alice/demo/issues/17/state"
+    assert RepositoryHTML.pulls_path(result.chrome) == "/alice/demo/pulls"
+    assert RepositoryHTML.new_pull_path(result.chrome) == "/alice/demo/pulls/new"
+    assert RepositoryHTML.pull_path(result.chrome, 23) == "/alice/demo/pulls/23"
+    assert RepositoryHTML.pull_commits_path(result.chrome, 23) == "/alice/demo/pulls/23/commits"
+    assert RepositoryHTML.pull_files_path(result.chrome, 23) == "/alice/demo/pulls/23/files"
+    assert RepositoryHTML.pull_state_path(result.chrome, 23) == "/alice/demo/pulls/23/state"
+    assert RepositoryHTML.pull_merge_path(result.chrome, 23) == "/alice/demo/pulls/23/merge"
+  end
+
+  test "collaboration page kinds omit repository ref controls" do
+    for kind <- [:issues, :issue, :pulls, :pull, :pull_commits, :pull_files] do
+      result = %{code_result() | kind: kind, content: %{}}
+
+      html =
+        render_component(&RepositoryHTML.repository_frame/1,
+          result: result,
+          active: if(kind in [:issues, :issue], do: :issues, else: :pulls),
+          inner_block: [%{inner_block: fn _changed, _argument -> "content" end}]
+        )
+
+      refute html =~ "id=\"repository-ref-controls\""
+    end
   end
 
   test "README, language analysis, and disk failures degrade independently" do
@@ -1066,7 +1123,8 @@ defmodule FornacastWeb.RepositoryHTMLTest do
           "git branch -M trunk",
           "git push -u origin trunk"
         ]
-      }
+      },
+      collaboration_counts: %{issues: 4, pull_requests: 2}
     }
   end
 

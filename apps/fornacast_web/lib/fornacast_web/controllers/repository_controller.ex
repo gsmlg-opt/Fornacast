@@ -3,8 +3,7 @@ defmodule FornacastWeb.RepositoryController do
 
   require Logger
 
-  alias ForgeRepos.Repository
-  alias FornacastWeb.{RepositoryHTML, RepositoryPage, RepositoryRaw}
+  alias FornacastWeb.{RepositoryHTML, RepositoryPage, RepositoryRaw, RepositoryWeb}
 
   def new(%Plug.Conn{assigns: %{current_user: user}} = conn, _params) do
     page(
@@ -203,15 +202,7 @@ defmodule FornacastWeb.RepositoryController do
           repository_content_not_found(conn, repository, "Page not found")
 
         true ->
-          rendered =
-            repository_html_module(conn).repository(%{result: result, __changed__: nil})
-
-          conn
-          |> put_private_cache_headers()
-          |> FornacastWeb.HTML.repository_page(
-            repository_title(result),
-            Phoenix.HTML.Safe.to_iodata(rendered)
-          )
+          RepositoryWeb.render(conn, result, repository_html_module(conn), :repository)
       end
     after
       page_module.release(result)
@@ -297,12 +288,8 @@ defmodule FornacastWeb.RepositoryController do
   end
 
   defp with_readable_repository(conn, owner_slug, repo_slug, fun) do
-    viewer = conn.assigns[:current_user]
-
-    with %Repository{} = repository <- ForgeRepos.get_repository(owner_slug, repo_slug),
-         :ok <- Fornacast.Access.authorize(viewer, :repository_read, repository),
-         owner when not is_nil(owner) <- ForgeAccounts.get_account_by_username(owner_slug) do
-      fun.(owner, repository, viewer)
+    with {:ok, context} <- RepositoryWeb.fetch(conn, owner_slug, repo_slug) do
+      fun.(context.owner, context.repository, context.viewer)
     else
       _reason -> repository_not_found(conn)
     end
@@ -508,10 +495,6 @@ defmodule FornacastWeb.RepositoryController do
     "/" <>
       URI.encode(owner.username, &URI.char_unreserved?/1) <>
       "/" <> URI.encode(repository.slug, &URI.char_unreserved?/1)
-  end
-
-  defp repository_title(result) do
-    "#{result.chrome.owner.username}/#{result.chrome.repository.slug}"
   end
 
   defp log_git_error(conn, repository, %GitCore.Error{
