@@ -1067,6 +1067,232 @@ defmodule ForgeIssuesTest do
     )
   end
 
+  test "browser issue queries filter kind before count and preserve pull counts when issues are disabled",
+       %{
+         writer: writer,
+         repository: repository
+       } do
+    open_issue = create_issue!(writer, repository, %{title: "Open issue"})
+    closed_issue = create_issue!(writer, repository, %{title: "Closed issue"})
+    pull = pull_fixture(repository, writer)
+
+    assert {:ok, _closed} =
+             ForgeIssues.update(
+               writer,
+               writer.username,
+               repository.slug,
+               closed_issue.number,
+               %{state: :closed, state_reason: :completed},
+               request_metadata()
+             )
+
+    assert {:ok, %Page{entries: [%Issue{id: open_id, kind: :issue}], total: 1}} =
+             ForgeIssues.list(writer, writer.username, repository.slug, %{
+               kind: :issue,
+               state: "open",
+               page: 1,
+               per_page: 30
+             })
+
+    assert open_id == open_issue.id
+
+    assert {:ok, %Page{entries: default_entries, total: 2}} =
+             ForgeIssues.list(writer, writer.username, repository.slug, %{state: :open})
+
+    assert MapSet.new(Enum.map(default_entries, & &1.id)) == MapSet.new([open_issue.id, pull.id])
+
+    assert {:ok, %Page{entries: [%Issue{id: pull_id, kind: :pull_request}], total: 1}} =
+             ForgeIssues.list(writer, writer.username, repository.slug, %{
+               kind: :pull_request,
+               state: :open
+             })
+
+    assert pull_id == pull.id
+
+    assert {:error, {:validation, [%{resource: "Issue", field: "kind", code: :invalid}]}} =
+             ForgeIssues.list(writer, writer.username, repository.slug, %{kind: :unknown})
+
+    {{:ok, %{issues: 1, pull_requests: 1}}, count_queries} =
+      capture_repo_queries(fn ->
+        ForgeIssues.open_counts(writer, writer.username, repository.slug)
+      end)
+
+    assert Enum.count(count_queries, &grouped_issue_count_query?/1) == 1
+
+    disabled_repository = Repo.update!(Ecto.Changeset.change(repository, has_issues: false))
+
+    assert {:ok, %{issues: 0, pull_requests: 1}} =
+             ForgeIssues.open_counts(writer, writer.username, disabled_repository.slug)
+
+    assert {:ok, %Page{entries: [], total: 0}} =
+             ForgeIssues.list(writer, writer.username, disabled_repository.slug, %{
+               kind: :issue,
+               state: :open
+             })
+
+    assert {:error, :issues_disabled} =
+             ForgeIssues.form_options(
+               writer,
+               writer.username,
+               disabled_repository.slug,
+               open_issue
+             )
+
+    assert {:ok, %{capabilities: %{can_comment: true, can_edit: true, can_close: true}}} =
+             ForgeIssues.get(writer, writer.username, disabled_repository.slug, pull.number)
+  end
+
+  test "browser form options are stable and expose issue capabilities from domain policy", %{
+    writer: writer,
+    repository: repository
+  } do
+    author = readable_user(repository, "browser-author")
+    reader = readable_user(repository, "browser-reader")
+    disabled = readable_user(repository, "browser-disabled")
+    Repo.update!(Ecto.Changeset.change(disabled, state: :disabled))
+    unrelated = user_fixture("browser-unrelated-#{System.unique_integer([:positive])}")
+    issue = create_issue!(author, repository, %{title: "Capability issue"})
+
+    {{:ok, %{labels: labels, assignees: assignees, capabilities: create_capabilities}},
+     baseline_query_count} =
+      count_repo_queries(fn ->
+        ForgeIssues.form_options(writer, writer.username, repository.slug, nil)
+      end)
+
+    Enum.each(1..12, fn index ->
+      user_fixture("browser-unrelated-#{index}-#{System.unique_integer([:positive])}")
+    end)
+
+    {{:ok, %{assignees: bounded_assignees}}, expanded_query_count} =
+      count_repo_queries(fn ->
+        ForgeIssues.form_options(writer, writer.username, repository.slug, nil)
+      end)
+
+    assert Enum.map(bounded_assignees, & &1.id) == Enum.map(assignees, & &1.id)
+    assert expanded_query_count == baseline_query_count
+
+    assert Enum.map(labels, & &1.normalized_name) ==
+             Enum.sort(Enum.map(labels, & &1.normalized_name))
+
+    assert Enum.map(assignees, & &1.username) ==
+             Enum.sort(Enum.map(assignees, & &1.username))
+
+    assert MapSet.new(Enum.map(assignees, & &1.id)) ==
+             MapSet.new([writer.id, author.id, reader.id])
+
+    refute Enum.any?(assignees, &(&1.id in [disabled.id, unrelated.id]))
+    assert create_capabilities.can_create
+
+    assert {:ok, %{capabilities: %{can_manage_relationships: true}}} =
+             ForgeIssues.form_options(writer, writer.username, repository.slug, issue)
+
+    other_repository = repository_fixture(writer)
+    foreign_issue = issue_fixture(other_repository, writer, "Foreign form issue")
+
+    assert {:error, :not_found} =
+             ForgeIssues.form_options(writer, writer.username, repository.slug, foreign_issue)
+
+    assert {:ok, %{capabilities: author_capabilities}} =
+             ForgeIssues.get(author, writer.username, repository.slug, issue.number)
+
+    assert author_capabilities == %{
+             can_create: true,
+             can_comment: true,
+             can_edit: true,
+             can_close: true,
+             can_manage_relationships: false
+           }
+
+    assert {:ok, %{capabilities: writer_capabilities}} =
+             ForgeIssues.get(writer, writer.username, repository.slug, issue.number)
+
+    assert writer_capabilities == %{
+             can_create: true,
+             can_comment: true,
+             can_edit: true,
+             can_close: true,
+             can_manage_relationships: true
+           }
+
+    assert {:ok, %{capabilities: reader_capabilities}} =
+             ForgeIssues.get(reader, writer.username, repository.slug, issue.number)
+
+    assert reader_capabilities == %{
+             can_create: true,
+             can_comment: true,
+             can_edit: false,
+             can_close: false,
+             can_manage_relationships: false
+           }
+
+    public_repository = Repo.update!(Ecto.Changeset.change(repository, visibility: :public))
+
+    assert {:ok, %{capabilities: anonymous_capabilities}} =
+             ForgeIssues.get(nil, writer.username, public_repository.slug, issue.number)
+
+    assert anonymous_capabilities == %{
+             can_create: false,
+             can_comment: false,
+             can_edit: false,
+             can_close: false,
+             can_manage_relationships: false
+           }
+
+    assert {:ok, %{capabilities: %{can_create: false}}} =
+             ForgeIssues.form_options(nil, writer.username, public_repository.slug, nil)
+
+    assert {:ok, %{capabilities: disabled_capabilities}} =
+             ForgeIssues.get(disabled, writer.username, public_repository.slug, issue.number)
+
+    assert disabled_capabilities == anonymous_capabilities
+  end
+
+  test "closed issues and comment loaders expose author and writer mutation capabilities", %{
+    writer: writer,
+    repository: repository
+  } do
+    issue_author = readable_user(repository, "closed-issue-author")
+    comment_author = readable_user(repository, "browser-comment-author")
+    reader = readable_user(repository, "browser-comment-reader")
+    issue = create_issue!(issue_author, repository, %{title: "Closed capability issue"})
+    comment = insert_comment(issue, comment_author, "Owned comment")
+
+    assert {:ok, _closed} =
+             ForgeIssues.update(
+               issue_author,
+               writer.username,
+               repository.slug,
+               issue.number,
+               %{state: :closed},
+               request_metadata()
+             )
+
+    assert {:ok, %{capabilities: %{can_edit: true, can_close: true}}} =
+             ForgeIssues.get(issue_author, writer.username, repository.slug, issue.number)
+
+    assert {:ok, %{capabilities: %{can_edit: true, can_close: true}}} =
+             ForgeIssues.get(writer, writer.username, repository.slug, issue.number)
+
+    assert {:ok, %{capabilities: %{can_edit: true, can_delete: true}}} =
+             ForgeIssues.get_comment(
+               comment_author,
+               writer.username,
+               repository.slug,
+               comment.id
+             )
+
+    assert {:ok, %{capabilities: %{can_edit: true, can_delete: true}}} =
+             ForgeIssues.get_comment(writer, writer.username, repository.slug, comment.id)
+
+    assert {:ok, %{capabilities: %{can_edit: false, can_delete: false}}} =
+             ForgeIssues.get_comment(reader, writer.username, repository.slug, comment.id)
+
+    public_repository = Repo.update!(Ecto.Changeset.change(repository, visibility: :public))
+
+    assert {:ok, %{capabilities: %{can_edit: false, can_delete: false}}} =
+             ForgeIssues.get_comment(nil, writer.username, public_repository.slug, comment.id)
+  end
+
   test "issue filters accept limits and reject every invalid field exactly", %{
     writer: writer,
     repository: repository
@@ -2142,11 +2368,49 @@ defmodule ForgeIssuesTest do
     end
   end
 
+  defp capture_repo_queries(fun) do
+    ref = make_ref()
+    handler_id = {__MODULE__, ref}
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:fornacast, :repo, :query],
+        fn _event, _measurements, metadata, {pid, query_ref} ->
+          send(pid, {query_ref, metadata.query})
+        end,
+        {test_pid, ref}
+      )
+
+    try do
+      result = fun.()
+      {result, drain_repo_query_texts(ref, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp grouped_issue_count_query?(query) when is_binary(query) do
+    query = String.upcase(query)
+    String.contains?(query, "ISSUES") and String.contains?(query, "GROUP BY")
+  end
+
+  defp grouped_issue_count_query?(_query), do: false
+
   defp drain_repo_queries(ref, count) do
     receive do
       {^ref, :repo_query} -> drain_repo_queries(ref, count + 1)
     after
       0 -> count
+    end
+  end
+
+  defp drain_repo_query_texts(ref, queries) do
+    receive do
+      {^ref, query} -> drain_repo_query_texts(ref, [query | queries])
+    after
+      0 -> Enum.reverse(queries)
     end
   end
 end

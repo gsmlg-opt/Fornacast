@@ -6,6 +6,13 @@ defmodule ForgeIssues.Issue do
   @kinds [:issue, :pull_request]
   @states [:open, :closed]
   @state_reasons [:completed, :not_planned, :reopened]
+  @default_capabilities %{
+    can_create: false,
+    can_comment: false,
+    can_edit: false,
+    can_close: false,
+    can_manage_relationships: false
+  }
 
   schema "issues" do
     field :repository_id, :integer
@@ -23,6 +30,7 @@ defmodule ForgeIssues.Issue do
     field :author, :map, virtual: true
     field :author_association, :string, virtual: true, default: "NONE"
     field :comment_count, :integer, virtual: true, default: 0
+    field :capabilities, :map, virtual: true, default: @default_capabilities
 
     timestamps(type: :utc_datetime)
   end

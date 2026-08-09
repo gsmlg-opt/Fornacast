@@ -3,6 +3,8 @@ defmodule ForgeIssues.Comment do
 
   import Ecto.Changeset
 
+  @default_capabilities %{can_edit: false, can_delete: false}
+
   schema "issue_comments" do
     field :issue_id, :integer
     field :author_user_id, :integer
@@ -11,6 +13,7 @@ defmodule ForgeIssues.Comment do
     field :author, :map, virtual: true
     field :author_association, :string, virtual: true, default: "NONE"
     field :issue_number, :integer, virtual: true
+    field :capabilities, :map, virtual: true, default: @default_capabilities
 
     timestamps(type: :utc_datetime)
   end

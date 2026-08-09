@@ -10,6 +10,7 @@ defmodule ForgeIssues do
   import Ecto.Query
 
   alias Ecto.Multi
+  alias ForgeAccounts.OrganizationMember
 
   alias ForgeIssues.{
     Comment,
@@ -20,6 +21,8 @@ defmodule ForgeIssues do
     Label,
     NumberSequence
   }
+
+  alias ForgeRepos.Collaborator
 
   alias Fornacast.{Audit, Page, Repo}
 
@@ -32,6 +35,17 @@ defmodule ForgeIssues do
           required(:code) => :invalid | :unprocessable
         }
 
+  @type error_reason ::
+          :forbidden | :issues_disabled | :not_found | {:validation, [validation_error()]}
+
+  @type capabilities :: %{
+          can_create: boolean(),
+          can_comment: boolean(),
+          can_edit: boolean(),
+          can_close: boolean(),
+          can_manage_relationships: boolean()
+        }
+
   @spec list(ForgeAccounts.User.t() | nil, String.t(), String.t(), map()) ::
           {:ok, Page.t(Issue.t())} | {:error, term()}
   def list(actor, owner_slug, repository_slug, filters) when is_map(filters) do
@@ -42,6 +56,7 @@ defmodule ForgeIssues do
         Issue
         |> where([issue], issue.repository_id == ^repository.id)
         |> scope_enabled_issue_kinds(repository)
+        |> filter_kind(filters.kind)
         |> filter_state(filters.state)
         |> filter_labels(repository.id, filters.labels)
         |> filter_assignee(filters.assignee)
@@ -56,13 +71,72 @@ defmodule ForgeIssues do
         |> limit(^filters.per_page)
         |> offset(^filters.offset)
         |> Repo.all()
-        |> do_load_issue_metadata(repository)
+        |> do_load_issue_metadata(repository, actor)
 
       {:ok, %Page{entries: entries, total: total, page: filters.page, per_page: filters.per_page}}
     end
   end
 
   def list(_actor, _owner_slug, _repository_slug, _filters), do: invalid_filter("base")
+
+  @spec open_counts(ForgeAccounts.User.t() | nil, String.t(), String.t()) ::
+          {:ok, %{issues: non_neg_integer(), pull_requests: non_neg_integer()}}
+          | {:error, error_reason()}
+  def open_counts(actor, owner_slug, repository_slug) do
+    with {:ok, repository} <-
+           fetch_repository(actor, owner_slug, repository_slug, :repository_read) do
+      counts =
+        Issue
+        |> where(
+          [issue],
+          issue.repository_id == ^repository.id and issue.state == :open
+        )
+        |> scope_enabled_issue_kinds(repository)
+        |> group_by([issue], issue.kind)
+        |> select([issue], {issue.kind, count(issue.id)})
+        |> Repo.all()
+        |> Map.new()
+
+      {:ok,
+       %{
+         issues: Map.get(counts, :issue, 0),
+         pull_requests: Map.get(counts, :pull_request, 0)
+       }}
+    end
+  end
+
+  @spec form_options(
+          ForgeAccounts.User.t() | nil,
+          String.t(),
+          String.t(),
+          Issue.t() | nil
+        ) ::
+          {:ok,
+           %{
+             labels: [Label.t()],
+             assignees: [ForgeAccounts.User.t()],
+             capabilities: capabilities()
+           }}
+          | {:error, error_reason()}
+  def form_options(actor, owner_slug, repository_slug, issue)
+      when is_nil(issue) or is_struct(issue, Issue) do
+    with {:ok, repository} <-
+           fetch_repository(actor, owner_slug, repository_slug, :repository_read),
+         :ok <- validate_form_issue(repository, issue) do
+      assignees = eligible_assignees(repository)
+      actor = canonical_capability_actor(actor, assignees)
+      repository_capability = repository_capability(actor, repository)
+
+      {:ok,
+       %{
+         labels: list_labels(repository),
+         assignees: assignees,
+         capabilities: issue_capabilities(actor, repository, issue, repository_capability)
+       }}
+    end
+  end
+
+  def form_options(_actor, _owner_slug, _repository_slug, _issue), do: {:error, :not_found}
 
   @spec get(ForgeAccounts.User.t() | nil, String.t(), String.t(), pos_integer()) ::
           {:ok, Issue.t()} | {:error, term()}
@@ -76,7 +150,7 @@ defmodule ForgeIssues do
              )
            ),
          :ok <- require_identity_enabled(repository, issue) do
-      {:ok, load_issue_metadata(issue, repository)}
+      {:ok, load_issue_metadata(issue, repository, actor)}
     else
       nil -> {:error, :not_found}
       {:error, _reason} = error -> error
@@ -138,7 +212,7 @@ defmodule ForgeIssues do
 
       {:ok,
        %Page{
-         entries: load_comment_metadata(entries, repository, issue.number),
+         entries: load_comment_metadata(entries, repository, issue.number, actor),
          total: total,
          page: filters.page,
          per_page: filters.per_page
@@ -157,7 +231,7 @@ defmodule ForgeIssues do
            fetch_repository(actor, owner_slug, repository_slug, :repository_read),
          {:ok, {comment, issue}} <- fetch_comment(repository, comment_id),
          :ok <- require_identity_enabled(repository, issue) do
-      {:ok, load_comment_metadata(comment, repository, issue.number)}
+      {:ok, load_comment_metadata(comment, repository, issue.number, actor)}
     end
   end
 
@@ -564,14 +638,11 @@ defmodule ForgeIssues do
     do: where(query, [issue], issue.kind == :pull_request)
 
   defp create_capability(%ForgeAccounts.User{} = actor, repository) do
-    if Fornacast.Access.allowed?(actor, :repository_read, repository),
-      do:
-        {:ok,
-         if(Fornacast.Access.allowed?(actor, :repository_write, repository),
-           do: :writer,
-           else: :author
-         )},
-      else: {:error, :forbidden}
+    case repository_capability(actor, repository) do
+      :writer -> {:ok, :writer}
+      :reader -> {:ok, :author}
+      :anonymous -> {:error, :forbidden}
+    end
   end
 
   defp create_capability(_actor, _repository), do: {:error, :forbidden}
@@ -707,32 +778,75 @@ defmodule ForgeIssues do
   defp mutation_capability(%ForgeAccounts.User{} = actor, repository, %Issue{
          author_user_id: author_id
        }) do
-    cond do
-      Fornacast.Access.allowed?(actor, :repository_write, repository) ->
-        {:ok, :writer}
-
-      actor.id == author_id and Fornacast.Access.allowed?(actor, :repository_read, repository) ->
-        {:ok, :author}
-
-      true ->
-        {:error, :forbidden}
-    end
+    mutation_capability(actor, repository, author_id, repository_capability(actor, repository))
   end
 
   defp mutation_capability(_actor, _repository, _issue), do: {:error, :forbidden}
 
+  defp mutation_capability(_actor, _repository, _author_id, :writer), do: {:ok, :writer}
+
+  defp mutation_capability(%ForgeAccounts.User{id: author_id}, _repository, author_id, :reader),
+    do: {:ok, :author}
+
+  defp mutation_capability(_actor, _repository, _author_id, _repository_capability),
+    do: {:error, :forbidden}
+
   defp authorize_comment_mutation(actor, repository, %Comment{author_user_id: author_id}) do
-    cond do
-      Fornacast.Access.allowed?(actor, :repository_write, repository) ->
-        :ok
-
-      actor.id == author_id and Fornacast.Access.allowed?(actor, :repository_read, repository) ->
-        :ok
-
-      true ->
-        {:error, :forbidden}
+    case comment_mutation_capability(
+           actor,
+           repository,
+           author_id,
+           repository_capability(actor, repository)
+         ) do
+      true -> :ok
+      false -> {:error, :forbidden}
     end
   end
+
+  defp repository_capability(
+         %ForgeAccounts.User{kind: :user, state: :active} = actor,
+         repository
+       ) do
+    cond do
+      Fornacast.Access.allowed?(actor, :repository_write, repository) -> :writer
+      Fornacast.Access.allowed?(actor, :repository_read, repository) -> :reader
+      true -> :anonymous
+    end
+  end
+
+  defp repository_capability(_actor, _repository), do: :anonymous
+
+  defp canonical_capability_actor(%ForgeAccounts.User{id: actor_id}, users)
+       when is_integer(actor_id) and is_list(users) do
+    Enum.find(users, &(&1.id == actor_id and &1.kind == :user and &1.state == :active))
+  end
+
+  defp canonical_capability_actor(%ForgeAccounts.User{id: actor_id}, users)
+       when is_integer(actor_id) and is_map(users) do
+    case Map.get(users, actor_id) do
+      %ForgeAccounts.User{kind: :user, state: :active} = actor -> actor
+      _actor -> nil
+    end
+  end
+
+  defp canonical_capability_actor(_actor, _users), do: nil
+
+  defp capability_actor_ids(%ForgeAccounts.User{id: actor_id}) when is_integer(actor_id),
+    do: [actor_id]
+
+  defp capability_actor_ids(_actor), do: []
+
+  defp comment_mutation_capability(_actor, _repository, _author_id, :writer), do: true
+
+  defp comment_mutation_capability(
+         %ForgeAccounts.User{id: author_id},
+         _repository,
+         author_id,
+         :reader
+       ),
+       do: true
+
+  defp comment_mutation_capability(_actor, _repository, _author_id, _capability), do: false
 
   defp update_comment_row(changeset, repo) do
     case repo.update(changeset, stale_error_field: :id) do
@@ -769,8 +883,10 @@ defmodule ForgeIssues do
     {:ok, attrs}
   end
 
-  defp map_create_result({:ok, %{authorization: %{repository: repository}, issue: issue}}),
-    do: {:ok, load_issue_metadata(issue, repository)}
+  defp map_create_result(
+         {:ok, %{authorization: %{actor: actor, repository: repository}, issue: issue}}
+       ),
+       do: {:ok, load_issue_metadata(issue, repository, actor)}
 
   defp map_create_result({:error, :authorization, reason, _changes}), do: {:error, reason}
 
@@ -787,8 +903,10 @@ defmodule ForgeIssues do
   defp map_create_result({:error, _step, _reason, _changes}),
     do: invalid_filter("base", :unprocessable)
 
-  defp map_update_result({:ok, %{authorization: %{repository: repository}, issue: issue}}),
-    do: {:ok, load_issue_metadata(issue, repository)}
+  defp map_update_result(
+         {:ok, %{authorization: %{actor: actor, repository: repository}, issue: issue}}
+       ),
+       do: {:ok, load_issue_metadata(issue, repository, actor)}
 
   defp map_update_result({:error, :authorization, reason, _changes}), do: {:error, reason}
 
@@ -803,9 +921,13 @@ defmodule ForgeIssues do
     do: invalid_filter("base", :unprocessable)
 
   defp map_comment_result(
-         {:ok, %{authorization: %{repository: repository, issue: issue}, comment: comment}}
+         {:ok,
+          %{
+            authorization: %{actor: actor, repository: repository, issue: issue},
+            comment: comment
+          }}
        ),
-       do: {:ok, load_comment_metadata(comment, repository, issue.number)}
+       do: {:ok, load_comment_metadata(comment, repository, issue.number, actor)}
 
   defp map_comment_result({:error, :authorization, reason, _changes}), do: {:error, reason}
   defp map_comment_result({:error, :comment, :not_found, _changes}), do: {:error, :not_found}
@@ -846,7 +968,8 @@ defmodule ForgeIssues do
   end
 
   defp validate_list_filters(filters) do
-    with {:ok, state} <- enum_filter(filters, "state", :open, [:open, :closed, :all]),
+    with {:ok, kind} <- enum_filter(filters, "kind", :all, [:issue, :pull_request, :all]),
+         {:ok, state} <- enum_filter(filters, "state", :open, [:open, :closed, :all]),
          {:ok, labels} <- labels_filter(filters),
          {:ok, assignee} <- assignee_filter(filters),
          {:ok, creator} <- username_filter(filters, "creator"),
@@ -858,6 +981,7 @@ defmodule ForgeIssues do
          {:ok, offset} <- page_offset(page, per_page) do
       {:ok,
        %{
+         kind: kind,
          state: state,
          labels: labels,
          assignee: assignee,
@@ -1039,6 +1163,9 @@ defmodule ForgeIssues do
   defp invalid_comment_filter(field, code \\ :invalid),
     do: {:error, {:validation, [%{resource: "IssueComment", field: field, code: code}]}}
 
+  defp filter_kind(query, :all), do: query
+  defp filter_kind(query, kind), do: where(query, [issue], issue.kind == ^kind)
+
   defp filter_state(query, :all), do: query
   defp filter_state(query, state), do: where(query, [issue], issue.state == ^state)
 
@@ -1212,6 +1339,92 @@ defmodule ForgeIssues do
   @spec list_labels(ForgeRepos.Repository.t()) :: [Label.t()]
   def list_labels(%ForgeRepos.Repository{} = repository), do: DefaultLabels.ensure(repository)
 
+  defp validate_form_issue(_repository, nil), do: :ok
+
+  defp validate_form_issue(repository, %Issue{} = issue) do
+    if issue_in_repository?(issue, repository),
+      do: require_identity_enabled(repository, issue),
+      else: {:error, :not_found}
+  end
+
+  defp eligible_assignees(repository) do
+    collaborator_ids =
+      Collaborator
+      |> where([collaborator], collaborator.repository_id == ^repository.id)
+      |> select([collaborator], collaborator.user_id)
+
+    organization_member_ids =
+      OrganizationMember
+      |> where([member], member.organization_id == ^repository.owner_user_id)
+      |> select([member], member.user_id)
+
+    ForgeAccounts.User
+    |> where([user], user.kind == :user and user.state == :active)
+    |> then(fn query ->
+      if repository.visibility == :public do
+        query
+      else
+        where(
+          query,
+          [user],
+          user.role == :admin or user.id == ^repository.owner_user_id or
+            user.id in subquery(collaborator_ids) or
+            user.id in subquery(organization_member_ids)
+        )
+      end
+    end)
+    |> order_by([user], asc: user.username)
+    |> Repo.all()
+  end
+
+  defp issue_capabilities(actor, repository, issue, repository_capability) do
+    resource_enabled =
+      case issue do
+        nil -> repository.has_issues
+        %Issue{kind: :pull_request} -> true
+        %Issue{} -> repository.has_issues
+      end
+
+    can_create = repository.has_issues and repository_capability in [:reader, :writer]
+
+    can_comment =
+      resource_enabled and not is_nil(issue) and repository_capability in [:reader, :writer]
+
+    mutation_capability =
+      case {resource_enabled, issue} do
+        {false, _issue} ->
+          {:error, :forbidden}
+
+        {true, %Issue{author_user_id: author_id}} ->
+          mutation_capability(actor, repository, author_id, repository_capability)
+
+        {true, nil} ->
+          {:error, :forbidden}
+      end
+
+    %{
+      can_create: can_create,
+      can_comment: can_comment,
+      can_edit: match?({:ok, _capability}, mutation_capability),
+      can_close: match?({:ok, _capability}, mutation_capability),
+      can_manage_relationships:
+        resource_enabled and repository_capability == :writer and
+          (is_nil(issue) or mutation_capability == {:ok, :writer})
+    }
+  end
+
+  defp comment_capabilities(actor, repository, comment, repository_capability) do
+    allowed =
+      comment_mutation_capability(
+        actor,
+        repository,
+        comment.author_user_id,
+        repository_capability
+      )
+
+    %{can_edit: allowed, can_delete: allowed}
+  end
+
   @spec put_relationship_operations(
           Multi.t(),
           Multi.name(),
@@ -1267,17 +1480,24 @@ defmodule ForgeIssues do
 
   @spec load_issue_metadata(Issue.t() | [Issue.t()], ForgeRepos.Repository.t()) ::
           Issue.t() | [Issue.t()] | {:error, :not_found}
-  def load_issue_metadata(issues, repository) when is_list(issues) do
+  def load_issue_metadata(issues, repository), do: load_issue_metadata(issues, repository, nil)
+
+  @spec load_issue_metadata(
+          Issue.t() | [Issue.t()],
+          ForgeRepos.Repository.t(),
+          ForgeAccounts.User.t() | nil
+        ) :: Issue.t() | [Issue.t()] | {:error, :not_found}
+  def load_issue_metadata(issues, repository, actor) when is_list(issues) do
     if Enum.all?(issues, &issue_in_repository?(&1, repository)) do
-      do_load_issue_metadata(issues, repository)
+      do_load_issue_metadata(issues, repository, actor)
     else
       {:error, :not_found}
     end
   end
 
-  def load_issue_metadata(%Issue{} = issue, repository) do
+  def load_issue_metadata(%Issue{} = issue, repository, actor) do
     if issue_in_repository?(issue, repository) do
-      [loaded] = do_load_issue_metadata([issue], repository)
+      [loaded] = do_load_issue_metadata([issue], repository, actor)
       loaded
     else
       {:error, :not_found}
@@ -1286,17 +1506,26 @@ defmodule ForgeIssues do
 
   @doc "Loads canonical issue presentation metadata for repository-scoped identities."
   @spec load_issue_metadata_by_ids([pos_integer()], ForgeRepos.Repository.t()) :: [Issue.t()]
-  def load_issue_metadata_by_ids(ids, %ForgeRepos.Repository{} = repository) when is_list(ids) do
+  def load_issue_metadata_by_ids(ids, repository),
+    do: load_issue_metadata_by_ids(ids, repository, nil)
+
+  @spec load_issue_metadata_by_ids(
+          [pos_integer()],
+          ForgeRepos.Repository.t(),
+          ForgeAccounts.User.t() | nil
+        ) :: [Issue.t()]
+  def load_issue_metadata_by_ids(ids, %ForgeRepos.Repository{} = repository, actor)
+      when is_list(ids) do
     issues =
       from(issue in Issue,
         where: issue.repository_id == ^repository.id and issue.id in ^ids
       )
       |> Repo.all()
 
-    do_load_issue_metadata(issues, repository)
+    do_load_issue_metadata(issues, repository, actor)
   end
 
-  defp do_load_issue_metadata(issues, repository) do
+  defp do_load_issue_metadata(issues, repository, actor) do
     issue_ids = Enum.map(issues, & &1.id)
     labels = labels_by_issue(issue_ids)
     assignee_ids = assignee_ids_by_issue(issue_ids)
@@ -1305,11 +1534,14 @@ defmodule ForgeIssues do
       issues
       |> Enum.map(& &1.author_user_id)
       |> Kernel.++(assignee_ids |> Map.values() |> List.flatten())
+      |> Kernel.++(capability_actor_ids(actor))
       |> ForgeAccounts.get_users()
       |> Map.new(&{&1.id, &1})
 
     associations = author_associations(issues, repository, users)
     counts = comment_counts(issues)
+    actor = canonical_capability_actor(actor, users)
+    repository_capability = repository_capability(actor, repository)
 
     Enum.map(issues, fn issue ->
       assignees =
@@ -1324,32 +1556,37 @@ defmodule ForgeIssues do
           assignees: assignees,
           author: Map.get(users, issue.author_user_id),
           author_association: Map.get(associations, issue.author_user_id, "NONE"),
-          comment_count: Map.get(counts, issue.id, 0)
+          comment_count: Map.get(counts, issue.id, 0),
+          capabilities: issue_capabilities(actor, repository, issue, repository_capability)
       }
     end)
   end
 
-  defp load_comment_metadata(comments, repository, issue_number) when is_list(comments) do
+  defp load_comment_metadata(comments, repository, issue_number, actor) when is_list(comments) do
     users =
       comments
       |> Enum.map(& &1.author_user_id)
+      |> Kernel.++(capability_actor_ids(actor))
       |> ForgeAccounts.get_users()
       |> Map.new(&{&1.id, &1})
 
     associations = author_associations(comments, repository, users)
+    actor = canonical_capability_actor(actor, users)
+    repository_capability = repository_capability(actor, repository)
 
     Enum.map(comments, fn comment ->
       %{
         comment
         | author: Map.get(users, comment.author_user_id),
           author_association: Map.get(associations, comment.author_user_id, "NONE"),
-          issue_number: issue_number
+          issue_number: issue_number,
+          capabilities: comment_capabilities(actor, repository, comment, repository_capability)
       }
     end)
   end
 
-  defp load_comment_metadata(%Comment{} = comment, repository, issue_number) do
-    [loaded] = load_comment_metadata([comment], repository, issue_number)
+  defp load_comment_metadata(%Comment{} = comment, repository, issue_number, actor) do
+    [loaded] = load_comment_metadata([comment], repository, issue_number, actor)
     loaded
   end
 
