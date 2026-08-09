@@ -3,6 +3,7 @@ defmodule ForgePulls.MergeRecoveryTest do
 
   import Ecto.Query
 
+  alias Ecto.Adapters.SQL
   alias ForgeIssues.Issue
   alias ForgePulls.{MergeOperation, MergeReconciler, MergeRecovery, PullRequest}
   alias ForgeRepos.Repository
@@ -629,7 +630,6 @@ defmodule ForgePulls.MergeRecoveryTest do
   end
 
   test "the bounded batch continues to another repository when one repository is busy", context do
-    terminalize_other_operations(context.operation.id)
     busy = recovery_fixture(context.owner)
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
@@ -656,7 +656,10 @@ defmodule ForgePulls.MergeRecoveryTest do
   end
 
   test "the bounded batch processes at most 50 distinct repositories per run", context do
-    terminalize_other_operations(context.operation.id)
+    sentinel_ref = "refs/heads/batch-isolation-sentinel"
+    update_ref(context.path, context.operation.expected_base_oid, sentinel_ref)
+    sentinel = operation!(context, :prepared, base_ref: sentinel_ref)
+    cleanup_turso_operation_on_exit(sentinel.id)
 
     batched =
       for _index <- 1..50 do
@@ -679,6 +682,9 @@ defmodule ForgePulls.MergeRecoveryTest do
              )
 
     assert Repo.get!(MergeOperation, context.operation.id).state == :ref_advanced
+
+    assert %MergeOperation{state: :prepared, failure_reason: nil, lease_owner: nil} =
+             Repo.get!(MergeOperation, sentinel.id)
 
     assert :ok = MergeReconciler.reconcile_pending_repositories()
     assert Repo.get!(MergeOperation, context.operation.id).state == :completed
@@ -872,6 +878,7 @@ defmodule ForgePulls.MergeRecoveryTest do
       |> Repo.insert!()
 
     path = ForgeRepos.absolute_storage_path(repository)
+    cleanup_lightweight_fixture_on_exit(repository, path)
     File.mkdir_p!(Path.dirname(path))
     {:ok, _path} = GitCore.init_bare(path)
     tree_oid = git!(path, ["hash-object", "-t", "tree", "-w", "/dev/null"])
@@ -896,20 +903,28 @@ defmodule ForgePulls.MergeRecoveryTest do
     %{repository: repository, operation: operation}
   end
 
-  defp terminalize_other_operations(keep_id) do
-    Repo.update_all(
-      from(operation in MergeOperation,
-        where:
-          operation.id != ^keep_id and
-            operation.state not in [:completed, :failed]
-      ),
-      set: [
-        state: :failed,
-        failure_reason: "effect_not_started",
-        lease_owner: nil,
-        lease_expires_at: nil
-      ]
-    )
+  defp cleanup_lightweight_fixture_on_exit(repository, path) do
+    on_exit(fn ->
+      File.rm_rf!(path)
+
+      if turso?() do
+        # WORKAROUND(upstream): gsmlg-dev/concord#72
+        SQL.query!(Repo, "DELETE FROM pull_merge_operations WHERE repository_id = ?", [
+          repository.id
+        ])
+
+        SQL.query!(Repo, "DELETE FROM repositories WHERE id = ?", [repository.id])
+      end
+    end)
+  end
+
+  defp cleanup_turso_operation_on_exit(operation_id) do
+    if turso?() do
+      on_exit(fn ->
+        # WORKAROUND(upstream): gsmlg-dev/concord#72
+        SQL.query!(Repo, "DELETE FROM pull_merge_operations WHERE id = ?", [operation_id])
+      end)
+    end
   end
 
   defp recovery_worker(context, owner, now, observer) do
@@ -996,6 +1011,10 @@ defmodule ForgePulls.MergeRecoveryTest do
     end
 
     :ok
+  end
+
+  defp turso? do
+    Application.get_env(:fornacast, :database_adapter) in ["libsql", "turso"]
   end
 
   defp update_ref(path, oid, ref), do: git!(path, ["update-ref", ref, oid])
