@@ -179,6 +179,42 @@ defmodule FornacastWeb.PullRequestHTMLTest do
     assert length(Regex.scan(~r/aria-current="page"/, nav)) == 1
   end
 
+  test "conversation exposes only capability-gated canonical comment controls and retained errors" do
+    editable =
+      comment(1, "Editable original")
+      |> put_in([Access.key(:capabilities), :can_edit], true)
+      |> put_in([Access.key(:capabilities), :can_delete], true)
+
+    readonly = comment(2, "Read only")
+
+    content = %{
+      pull:
+        pull(7, "Review comments", :open,
+          capabilities: %{can_close: false, can_comment: true, can_merge: false}
+        ),
+      comments: %Fornacast.Page{
+        entries: [editable, readonly],
+        total: 2,
+        page: 1,
+        per_page: 100
+      },
+      comment_form: %{
+        operation: {:edit, "1"},
+        values: %{"body" => "Retained edit"},
+        errors: [%{resource: "IssueComment", field: "body", code: :invalid}]
+      }
+    }
+
+    html = render_component(&PullRequestHTML.show/1, result: result(:pull, content))
+
+    assert html =~ ~s(action="/alice/demo/issues/7/comments/1")
+    assert html =~ ~s(name="_method" value="patch")
+    assert html =~ ~s(name="_method" value="delete")
+    assert html =~ ~r/id="pull-comment-1"[^>]*>Retained edit</s
+    assert html =~ "Body is invalid"
+    refute html =~ ~s(id="pull-comment-2")
+  end
+
   test "merged, closed, and non-writer conversations use only domain capabilities" do
     merged =
       pull(7, "Merged", :closed,

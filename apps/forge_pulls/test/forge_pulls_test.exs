@@ -124,6 +124,18 @@ defmodule ForgePullsTest do
     assert base_sha == String.duplicate("b", 40)
   end
 
+  test "changed file pages require aggregate additions and deletions" do
+    assert_raise ArgumentError, fn ->
+      struct!(ForgePulls.ChangedFilePage,
+        entries: [],
+        total: 0,
+        page: 1,
+        per_page: 100,
+        truncated: false
+      )
+    end
+  end
+
   test "browser comparison views authorize reads and retain immutable branch snapshots" do
     owner = user_fixture(unique("pull-compare-owner"))
     reader = user_fixture(unique("pull-compare-reader"))

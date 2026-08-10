@@ -115,6 +115,25 @@ defmodule FornacastWeb.PullRequestHTML do
     |> Enum.map(&validation_message/1)
   end
 
+  def resource_errors(errors, resource) do
+    errors
+    |> Enum.filter(&(&1.resource == resource and &1.field == "base"))
+    |> Enum.map(&validation_message/1)
+  end
+
+  def comment_values(content, operation), do: comment_form_value(content, operation, :values, %{})
+  def comment_errors(content, operation), do: comment_form_value(content, operation, :errors, [])
+
+  defp comment_form_value(content, operation, key, default) do
+    case Map.get(content, :comment_form) do
+      %{operation: ^operation} = form -> Map.get(form, key, default)
+      _form -> default
+    end
+  end
+
+  defp validation_message(%{resource: "IssueComment", field: "base"}),
+    do: "The comment could not be processed"
+
   defp validation_message(%{message: message}) when is_binary(message), do: message
 
   defp validation_message(%{field: field, code: code}) do

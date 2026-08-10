@@ -1,5 +1,5 @@
 defmodule ForgePulls.ChangedFilePage do
-  @enforce_keys [:entries, :total, :page, :per_page, :truncated]
+  @enforce_keys [:entries, :total, :additions, :deletions, :page, :per_page, :truncated]
   defstruct [:entries, :total, :additions, :deletions, :page, :per_page, :truncated]
 
   @type t :: %__MODULE__{

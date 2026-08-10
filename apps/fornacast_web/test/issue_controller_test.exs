@@ -43,6 +43,46 @@ defmodule FornacastWeb.IssueControllerTestCollaborationPage do
     end)
   end
 
+  def pull(repository, owner, viewer, number, opts) do
+    reply(:pull, [repository, owner, viewer, number, opts], fn ->
+      {:ok, pull_result(repository, owner, viewer, number)}
+    end)
+  end
+
+  def pull_result(repository, owner, viewer, number) do
+    issue = issue(number, "Pull #{number}", :pull_request)
+
+    pull = %ForgePulls.PullRequest{
+      id: number,
+      issue_id: number,
+      repository_id: repository.id,
+      head_ref: "refs/heads/feature",
+      base_ref: "refs/heads/main",
+      head_sha: String.duplicate("a", 40),
+      base_sha: String.duplicate("b", 40),
+      issue: issue,
+      analysis: %GitCore.MergeAnalysis{
+        base_oid: String.duplicate("b", 40),
+        head_oid: String.duplicate("a", 40),
+        mergeable: true,
+        ahead_by: 1,
+        behind_by: 0,
+        commit_count: 1,
+        changed_paths: 1
+      },
+      capabilities: %{can_close: false, can_comment: true, can_merge: false}
+    }
+
+    %RepositoryPage.Result{
+      kind: :pull,
+      chrome: chrome(repository, owner, viewer),
+      content: %{
+        pull: pull,
+        comments: %Fornacast.Page{entries: [], total: 0, page: 1, per_page: 100}
+      }
+    }
+  end
+
   def result(repository, owner, viewer, issue) do
     %RepositoryPage.Result{
       kind: :issue,
@@ -526,6 +566,118 @@ defmodule FornacastWeb.IssueControllerTest do
 
     assert [{:get, [^bob, "alice", "public-repo", 9]}] =
              Enum.filter(TestIssues.calls(), &match?({:get, _}, &1))
+  end
+
+  test "pull-backed comments remain available when ordinary issues are disabled", %{
+    alice: alice
+  } do
+    TestIssues.respond(:get, fn [_actor, _owner, _repository, number] ->
+      {:ok, TestPage.issue(number, "Pull", :pull_request)}
+    end)
+
+    created =
+      submit_with_csrf(
+        alice,
+        "/alice/public-repo/issues/7",
+        :post,
+        "/alice/disabled-repo/issues/9/comments",
+        %{"comment" => %{"body" => "Still available"}}
+      )
+
+    assert redirected_to(created) == "/alice/disabled-repo/pulls/9"
+
+    TestIssues.reset()
+    TestIssues.respond(:get, {:ok, TestPage.issue(9, "Pull", :pull_request)})
+    TestIssues.respond(:get_comment, {:ok, %ForgeIssues.Comment{id: 4, issue_number: 9}})
+
+    updated =
+      submit_with_csrf(
+        alice,
+        "/alice/public-repo/issues/7",
+        :patch,
+        "/alice/disabled-repo/issues/9/comments/4",
+        %{"comment" => %{"body" => "Edited while disabled"}}
+      )
+
+    assert redirected_to(updated) == "/alice/disabled-repo/pulls/9"
+
+    TestIssues.reset()
+    TestIssues.respond(:get, {:ok, TestPage.issue(9, "Pull", :pull_request)})
+    TestIssues.respond(:get_comment, {:ok, %ForgeIssues.Comment{id: 4, issue_number: 9}})
+
+    deleted =
+      submit_with_csrf(
+        alice,
+        "/alice/public-repo/issues/7",
+        :delete,
+        "/alice/disabled-repo/issues/9/comments/4",
+        %{}
+      )
+
+    assert redirected_to(deleted) == "/alice/disabled-repo/pulls/9"
+  end
+
+  test "invalid pull comments retain errors on the exact pull conversation form", %{
+    alice: alice,
+    public: public
+  } do
+    editable = %ForgeIssues.Comment{
+      id: 4,
+      issue_number: 9,
+      body: "Original pull comment",
+      author: %{username: "alice"},
+      capabilities: %{can_edit: true, can_delete: true},
+      inserted_at: ~U[2026-08-09 08:01:00Z]
+    }
+
+    TestIssues.respond(:get, {:ok, TestPage.issue(9, "Pull", :pull_request)})
+    TestIssues.respond(:get_comment, {:ok, editable})
+
+    TestIssues.respond(
+      :update_comment,
+      {:error, {:validation, [%{resource: "IssueComment", field: "body", code: :invalid}]}}
+    )
+
+    TestPage.respond(:pull, fn ->
+      result = TestPage.pull_result(public, alice, alice, 9)
+      {:ok, put_in(result.content.comments.entries, [editable])}
+    end)
+
+    conn =
+      submit_with_csrf(
+        alice,
+        "/alice/public-repo/issues/7",
+        :patch,
+        "/alice/public-repo/issues/9/comments/4",
+        %{"comment" => %{"body" => "Retained pull edit"}}
+      )
+
+    assert html_response(conn, 422) =~ "data-pull-conversation"
+    assert conn.resp_body =~ "Body is invalid"
+    assert conn.resp_body =~ ~r/id="pull-comment-4"[^>]*>Retained pull edit</s
+    refute conn.resp_body =~ ~r/id="pull-comment-body"[^>]*>Retained pull edit</s
+
+    TestIssues.reset()
+    TestIssues.respond(:get, {:ok, TestPage.issue(9, "Pull", :pull_request)})
+
+    TestIssues.respond(
+      :create_comment,
+      {:error, {:validation, [%{resource: "IssueComment", field: "body", code: :invalid}]}}
+    )
+
+    create_conn =
+      submit_with_csrf(
+        alice,
+        "/alice/public-repo/issues/7",
+        :post,
+        "/alice/public-repo/issues/9/comments",
+        %{"comment" => %{"body" => "Retained pull creation"}}
+      )
+
+    assert html_response(create_conn, 422) =~ "data-pull-conversation"
+    assert create_conn.resp_body =~ "Body is invalid"
+    assert create_conn.resp_body =~ ~r/id="pull-comment-body"[^>]*>Retained pull creation</s
+    refute create_conn.resp_body =~ ~r/id="pull-comment-4"[^>]*>Retained pull creation</s
   end
 
   test "comment update and delete verify route parent before one mutation", %{alice: alice} do

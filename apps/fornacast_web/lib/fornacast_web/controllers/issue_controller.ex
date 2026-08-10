@@ -3,6 +3,7 @@ defmodule FornacastWeb.IssueController do
 
   alias FornacastWeb.{
     IssueHTML,
+    PullRequestHTML,
     RepositoryCollaborationPage,
     RepositoryHTML,
     RepositoryPage,
@@ -189,7 +190,6 @@ defmodule FornacastWeb.IssueController do
         %{"owner" => owner_slug, "repo" => repository_slug, "number" => number} = params
       ) do
     with {:ok, context} <- RepositoryWeb.fetch(conn, owner_slug, repository_slug),
-         :ok <- issues_enabled(context.repository),
          {:ok, number} <- positive_integer(number),
          {:ok, issue} <-
            issues(conn).get(
@@ -198,6 +198,7 @@ defmodule FornacastWeb.IssueController do
              context.repository.slug,
              number
            ),
+         :ok <- issue_available(context.repository, issue),
          {:ok, attrs} <- comment_attrs(params),
          {:ok, _comment} <-
            issues(conn).create_comment(
@@ -227,7 +228,6 @@ defmodule FornacastWeb.IssueController do
           params
       ) do
     with {:ok, context} <- RepositoryWeb.fetch(conn, owner_slug, repository_slug),
-         :ok <- issues_enabled(context.repository),
          {:ok, number} <- positive_integer(number),
          {:ok, id} <- positive_integer(id),
          {:ok, comment} <-
@@ -245,6 +245,7 @@ defmodule FornacastWeb.IssueController do
              context.repository.slug,
              number
            ),
+         :ok <- issue_available(context.repository, issue),
          {:ok, attrs} <- comment_attrs(params),
          {:ok, _comment} <-
            issues(conn).update_comment(
@@ -281,7 +282,6 @@ defmodule FornacastWeb.IssueController do
         %{"owner" => owner_slug, "repo" => repository_slug, "number" => number, "id" => id}
       ) do
     with {:ok, context} <- RepositoryWeb.fetch(conn, owner_slug, repository_slug),
-         :ok <- issues_enabled(context.repository),
          {:ok, number} <- positive_integer(number),
          {:ok, id} <- positive_integer(id),
          {:ok, comment} <-
@@ -299,6 +299,7 @@ defmodule FornacastWeb.IssueController do
              context.repository.slug,
              number
            ),
+         :ok <- issue_available(context.repository, issue),
          :ok <-
            issues(conn).delete_comment(
              context.viewer,
@@ -441,14 +442,15 @@ defmodule FornacastWeb.IssueController do
     with {:ok, context} <- RepositoryWeb.fetch(conn, owner_slug, repository_slug),
          {:ok, number} <- positive_integer(number),
          {:ok, values} <- comment_attrs(params),
-         {:ok, result} <-
-           collaboration_page(conn).issue(
-             context.repository,
-             context.owner,
+         {:ok, issue} <-
+           issues(conn).get(
              context.viewer,
-             number,
-             []
-           ) do
+             context.owner.username,
+             context.repository.slug,
+             number
+           ),
+         :ok <- issue_available(context.repository, issue),
+         {:ok, result, html} <- comment_result(conn, context, issue, number) do
       result =
         update_in(result.content, fn content ->
           Map.put(content, :comment_form, %{
@@ -460,7 +462,7 @@ defmodule FornacastWeb.IssueController do
 
       conn
       |> put_status(:unprocessable_entity)
-      |> RepositoryWeb.render(result, html_module(conn), :show)
+      |> RepositoryWeb.render(result, html, :show)
     else
       {:error, :invalid_integer} -> RepositoryWeb.error(conn, nil, :not_found)
       {:error, reason} -> RepositoryWeb.error(conn, nil, reason)
@@ -614,6 +616,35 @@ defmodule FornacastWeb.IssueController do
 
   defp issues_enabled(%{has_issues: true}), do: :ok
   defp issues_enabled(_repository), do: {:error, :issues_disabled}
+
+  defp issue_available(_repository, %{kind: :pull_request}), do: :ok
+  defp issue_available(repository, _issue), do: issues_enabled(repository)
+
+  defp comment_result(conn, context, %{kind: :pull_request}, number) do
+    with {:ok, result} <-
+           collaboration_page(conn).pull(
+             context.repository,
+             context.owner,
+             context.viewer,
+             number,
+             []
+           ) do
+      {:ok, result, PullRequestHTML}
+    end
+  end
+
+  defp comment_result(conn, context, _issue, number) do
+    with {:ok, result} <-
+           collaboration_page(conn).issue(
+             context.repository,
+             context.owner,
+             context.viewer,
+             number,
+             []
+           ) do
+      {:ok, result, html_module(conn)}
+    end
+  end
 
   defp private_redirect(conn, path) do
     conn

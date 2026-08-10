@@ -58,6 +58,7 @@
     <ol :if={@result.content.comments.entries != []} class="grid gap-3" aria-label="Comments">
       <li
         :for={comment <- @result.content.comments.entries}
+        id={"issuecomment-#{comment.id}"}
         class="rounded-lg border border-outline-variant bg-surface-container text-on-surface"
       >
         <header class="border-b border-outline-variant px-4 py-3 text-sm">
@@ -65,6 +66,74 @@
           <span class="text-on-surface-variant">commented {format_time(comment.inserted_at)}</span>
         </header>
         <div class="prose max-w-none p-4 text-on-surface">{markdown(comment.body)}</div>
+        <div
+          :if={comment.capabilities.can_edit or comment.capabilities.can_delete}
+          class="grid gap-3 border-t border-outline-variant p-4"
+        >
+          <form
+            :if={comment.capabilities.can_edit}
+            action={
+              RepositoryHTML.issue_comment_path(
+                @result.chrome,
+                @result.content.pull.issue.number,
+                comment.id
+              )
+            }
+            method="post"
+            class="grid gap-3"
+          >
+            <input type="hidden" name="_csrf_token" value={csrf_token()} />
+            <input type="hidden" name="_method" value="patch" />
+            <.dm_alert
+              :for={
+                error <-
+                  resource_errors(
+                    comment_errors(@result.content, {:edit, to_string(comment.id)}),
+                    "IssueComment"
+                  )
+              }
+              variant="error"
+            >
+              {error}
+            </.dm_alert>
+            <.dm_textarea
+              id={"pull-comment-#{comment.id}"}
+              name="comment[body]"
+              label="Edit comment"
+              value={
+                form_value(
+                  comment_values(@result.content, {:edit, to_string(comment.id)}),
+                  "body",
+                  comment.body
+                )
+              }
+              errors={
+                field_errors(
+                  comment_errors(@result.content, {:edit, to_string(comment.id)}),
+                  "IssueComment",
+                  "body"
+                )
+              }
+              rows={4}
+            />
+            <.dm_btn type="submit" variant="outline" size="sm">Save comment</.dm_btn>
+          </form>
+          <form
+            :if={comment.capabilities.can_delete}
+            action={
+              RepositoryHTML.issue_comment_path(
+                @result.chrome,
+                @result.content.pull.issue.number,
+                comment.id
+              )
+            }
+            method="post"
+          >
+            <input type="hidden" name="_csrf_token" value={csrf_token()} />
+            <input type="hidden" name="_method" value="delete" />
+            <.dm_btn type="submit" variant="error" size="sm">Delete comment</.dm_btn>
+          </form>
+        </div>
       </li>
     </ol>
 
@@ -77,10 +146,18 @@
       class="grid gap-3 rounded-lg bg-surface-container p-4 text-on-surface"
     >
       <input type="hidden" name="_csrf_token" value={csrf_token()} />
+      <.dm_alert
+        :for={error <- resource_errors(comment_errors(@result.content, :create), "IssueComment")}
+        variant="error"
+      >
+        {error}
+      </.dm_alert>
       <.dm_textarea
         id="pull-comment-body"
         name="comment[body]"
         label="Comment"
+        value={form_value(comment_values(@result.content, :create), "body")}
+        errors={field_errors(comment_errors(@result.content, :create), "IssueComment", "body")}
         rows={6}
         required
       />

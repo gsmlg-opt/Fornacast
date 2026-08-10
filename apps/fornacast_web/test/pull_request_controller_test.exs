@@ -300,7 +300,9 @@ defmodule FornacastWeb.PullRequestControllerTestPulls do
 
   def update_pull_request(repository, pull, actor, attrs, metadata) do
     reply(:update_pull_request, [repository, pull, actor, attrs, metadata], fn ->
-      {:ok, put_in(pull.issue.state, attrs["state"])}
+      if actor.username == pull.issue.author.username,
+        do: {:ok, put_in(pull.issue.state, attrs["state"])},
+        else: {:error, :forbidden}
     end)
   end
 
@@ -655,13 +657,13 @@ defmodule FornacastWeb.PullRequestControllerTest do
     refute String.starts_with?(login_return_to(hostile), "//")
   end
 
-  test "author closes and reopens through exactly one metadata-bearing update", %{bob: bob} do
+  test "author closes and reopens through exactly one metadata-bearing update", %{alice: alice} do
     for state <- ["closed", "open"] do
       TestPulls.reset()
 
       conn =
         submit_action_with_csrf(
-          bob,
+          alice,
           "/alice/public-repo/pulls/7",
           :patch,
           "/alice/public-repo/pulls/7/state",
@@ -672,7 +674,8 @@ defmodule FornacastWeb.PullRequestControllerTest do
       assert_private_no_store(conn)
 
       assert [
-               {:update_pull_request, [_repository, _pull, ^bob, %{"state" => ^state}, metadata]}
+               {:update_pull_request,
+                [_repository, _pull, ^alice, %{"state" => ^state}, metadata]}
              ] = task7_mutation_calls()
 
       assert Map.keys(metadata) |> Enum.sort() == [:ip_address, :request_id, :user_agent]

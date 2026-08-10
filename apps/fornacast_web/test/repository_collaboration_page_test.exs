@@ -64,6 +64,8 @@ defmodule FornacastWeb.RepositoryCollaborationPageTestPulls do
        %ForgePulls.ChangedFilePage{
          entries: [%{path: "lib/a.ex"}],
          total: 1,
+         additions: 1,
+         deletions: 0,
          page: opts[:page],
          per_page: opts[:per_page],
          truncated: false
