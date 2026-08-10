@@ -83,6 +83,9 @@ defmodule FornacastWeb.Router do
     delete "/:owner/:repo/issues/:number/comments/:id", IssueController, :delete_comment
     patch "/:owner/:repo/issues/:number/state", IssueController, :state
     get "/:owner/:repo/issues/:number", IssueController, :show
+    get "/:owner/:repo/pulls", PullRequestController, :index
+    get "/:owner/:repo/pulls/new", PullRequestController, :new
+    post "/:owner/:repo/pulls", PullRequestController, :create
     get "/:owner/:repo", RepositoryController, :show
     get "/:owner/:repo/branches", RepositoryController, :branches
     get "/:owner/:repo/tags", RepositoryController, :tags

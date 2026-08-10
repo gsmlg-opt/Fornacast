@@ -1,0 +1,96 @@
+<RepositoryHTML.repository_frame result={@result} active={:pulls}>
+  <section class="grid min-w-0 gap-3 p-4" data-pull-form>
+    <header class="bg-surface-container text-on-surface rounded-lg p-4">
+      <p class="text-xs text-on-surface-variant">Repository pull requests</p>
+      <h2 class="text-lg font-semibold">Open a pull request</h2>
+    </header>
+
+    <form
+      action={RepositoryHTML.pulls_path(@result.chrome)}
+      method="post"
+      class="grid gap-3 bg-surface-container text-on-surface rounded-lg p-4"
+    >
+      <input type="hidden" name="_csrf_token" value={csrf_token()} />
+
+      <div class="grid gap-3 md:grid-cols-2">
+        <.dm_select
+          id="pull-head"
+          name="pull[head]"
+          label="Head branch"
+          value={form_value(@result.content.values, "head")}
+          options={
+            branch_options(
+              @result.content.branches,
+              form_value(@result.content.values, "head")
+            )
+          }
+          errors={field_errors(@result.content.errors, "PullRequest", "head")}
+        />
+        <.dm_select
+          id="pull-base"
+          name="pull[base]"
+          label="Base branch"
+          value={form_value(@result.content.values, "base")}
+          options={
+            branch_options(
+              @result.content.branches,
+              form_value(@result.content.values, "base")
+            )
+          }
+          errors={field_errors(@result.content.errors, "PullRequest", "base")}
+        />
+      </div>
+
+      <section
+        :if={@result.content.comparison}
+        class="grid gap-3 bg-surface-container-high text-on-surface rounded-lg border border-outline-variant p-4"
+        data-pull-compare
+      >
+        <div class="grid grid-cols-2 gap-3 md:grid-cols-4">
+          <p>
+            <span class="font-semibold">{@result.content.comparison.analysis.ahead_by}</span>
+            ahead
+          </p>
+          <p>
+            <span class="font-semibold">{@result.content.comparison.analysis.behind_by}</span>
+            behind
+          </p>
+          <p>
+            <span class="font-semibold">{@result.content.comparison.analysis.commit_count}</span>
+            commits
+          </p>
+          <p>
+            <span class="font-semibold">{@result.content.comparison.analysis.changed_paths}</span>
+            files
+          </p>
+        </div>
+        <.dm_alert :if={not @result.content.comparison.analysis.mergeable} variant="warning">
+          These branches have conflicts that must be resolved before merging.
+        </.dm_alert>
+      </section>
+
+      <.dm_input
+        id="pull-title"
+        name="pull[title]"
+        label="Title"
+        value={form_value(@result.content.values, "title")}
+        errors={field_errors(@result.content.errors, "PullRequest", "title")}
+        maxlength="256"
+        required
+      />
+      <.dm_textarea
+        id="pull-body"
+        name="pull[body]"
+        label="Body"
+        value={form_value(@result.content.values, "body")}
+        errors={field_errors(@result.content.errors, "PullRequest", "body")}
+        rows={10}
+      />
+
+      <div class="flex gap-3">
+        <.dm_btn type="submit" variant="primary">Create pull request</.dm_btn>
+        <.dm_link href={RepositoryHTML.pulls_path(@result.chrome)}>Cancel</.dm_link>
+      </div>
+    </form>
+  </section>
+</RepositoryHTML.repository_frame>

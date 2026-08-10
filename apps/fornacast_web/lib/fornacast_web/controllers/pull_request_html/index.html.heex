@@ -1,0 +1,110 @@
+<RepositoryHTML.repository_frame result={@result} active={:pulls}>
+  <section class="grid min-w-0 gap-3 p-4" data-pulls-page>
+    <header class="flex flex-wrap items-center justify-between gap-3 bg-surface-container text-on-surface rounded-lg p-4">
+      <div>
+        <p class="text-xs text-on-surface-variant">Repository collaboration</p>
+        <h2 class="text-lg font-semibold">Pull Requests</h2>
+      </div>
+      <.dm_badge variant="primary" soft size="sm">
+        {@result.content.pulls.total} pull requests
+      </.dm_badge>
+    </header>
+
+    <form
+      action={RepositoryHTML.pulls_path(@result.chrome)}
+      method="get"
+      class="grid gap-3 bg-surface-container text-on-surface rounded-lg p-4 md:grid-cols-3"
+      data-pull-filters
+    >
+      <.dm_select
+        id="pull-state-filter"
+        name="state"
+        label="State"
+        size="sm"
+        value={filter_value(@result.content.filters, :state)}
+        options={[{"open", "Open"}, {"closed", "Closed"}, {"all", "All"}]}
+      />
+      <.dm_input
+        id="pull-head-filter"
+        name="head"
+        label="Head branch"
+        size="sm"
+        value={filter_value(@result.content.filters, :head)}
+      />
+      <.dm_input
+        id="pull-base-filter"
+        name="base"
+        label="Base branch"
+        size="sm"
+        value={filter_value(@result.content.filters, :base)}
+      />
+      <.dm_select
+        id="pull-sort-filter"
+        name="sort"
+        label="Sort"
+        size="sm"
+        value={filter_value(@result.content.filters, :sort)}
+        options={[
+          {"created", "Created"},
+          {"updated", "Updated"},
+          {"popularity", "Popularity"},
+          {"long-running", "Long-running"}
+        ]}
+      />
+      <.dm_select
+        id="pull-direction-filter"
+        name="direction"
+        label="Direction"
+        size="sm"
+        value={filter_value(@result.content.filters, :direction)}
+        options={[{"desc", "Descending"}, {"asc", "Ascending"}]}
+      />
+      <div class="md:col-span-3">
+        <.dm_btn type="submit" variant="primary" size="sm">Apply filters</.dm_btn>
+      </div>
+    </form>
+
+    <ul :if={@result.content.pulls.entries != []} class="grid gap-3" role="list">
+      <li
+        :for={pull <- @result.content.pulls.entries}
+        class="bg-surface-container text-on-surface rounded-lg border border-outline-variant p-4"
+        data-pull-row
+      >
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div class="min-w-0">
+            <.dm_link
+              href={RepositoryHTML.pull_path(@result.chrome, pull.issue.number)}
+              class="font-semibold text-primary"
+            >
+              {pull.issue.title}
+            </.dm_link>
+            <p class="mt-1 text-xs text-on-surface-variant">
+              #{pull.issue.number} opened by {author_name(pull.issue.author)} · {comment_label(
+                pull.issue.comment_count
+              )}
+            </p>
+            <p class="mt-2 font-mono text-xs text-on-surface-variant">
+              {branch_name(pull.head_ref)} → {branch_name(pull.base_ref)}
+            </p>
+          </div>
+          <.dm_badge variant={state_variant(pull.issue.state)} soft size="sm">
+            {pull.issue.state}
+          </.dm_badge>
+        </div>
+      </li>
+    </ul>
+
+    <RepositoryHTML.optional_panel
+      :if={@result.content.pulls.entries == []}
+      title="No pull requests"
+      message="No pull requests match these filters."
+      kind="empty"
+    />
+
+    <RepositoryHTML.server_pagination
+      page={@result.content.pulls.page}
+      total_pages={total_pages(@result.content.pulls)}
+      base_href={pagination_base(@result)}
+    />
+  </section>
+</RepositoryHTML.repository_frame>
