@@ -7,11 +7,12 @@ defmodule FornacastAPI.Serializers.V2022_11_28.IssueComment do
     owner = option(opts, :owner)
     repo = option(opts, :repo)
     issue_number = option(opts, :issue_number, comment.issue_number)
+    issue_kind = option(opts, :issue_kind, :issue)
     url = URL.issue_comment(owner, repo, comment.id)
 
     %{
       url: url,
-      html_url: url,
+      html_url: URL.issue_comment_web(owner, repo, issue_kind, issue_number, comment.id),
       issue_url: URL.issue(owner, repo, issue_number),
       id: comment.id,
       node_id: Base.url_encode64("IssueComment:#{comment.id}", padding: false),

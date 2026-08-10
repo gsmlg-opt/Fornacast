@@ -35,13 +35,15 @@ defmodule FornacastAPI.IssueCommentController do
       conn = Plug.Conn.assign(conn, :accepted_scopes, accepted_scopes)
 
       with {:ok, filters} <- IssueContract.comment_filters(conn.query_params),
+           {:ok, issue} <- ForgeIssues.get(actor, owner, repo, number),
            {:ok, page} <- ForgeIssues.list_comments(actor, owner, repo, number, Map.new(filters)) do
         body =
           Enum.map(page.entries, fn comment ->
             Serializer.render(conn.assigns.api_version, :issue_comment, comment,
               owner: owner,
               repo: repo,
-              issue_number: number
+              issue_number: number,
+              issue_kind: issue.kind
             )
           end)
 
@@ -139,16 +141,23 @@ defmodule FornacastAPI.IssueCommentController do
               issue_number =
                 if issue_number_source == :target, do: target, else: comment.issue_number
 
-              Response.json(
-                body_conn,
-                status,
-                Serializer.render(version, :issue_comment, comment,
-                  owner: owner,
-                  repo: repo,
-                  issue_number: issue_number
-                ),
-                accepted_scopes: accepted_scopes
-              )
+              case ForgeIssues.get(actor, owner, repo, issue_number) do
+                {:ok, issue} ->
+                  Response.json(
+                    body_conn,
+                    status,
+                    Serializer.render(version, :issue_comment, comment,
+                      owner: owner,
+                      repo: repo,
+                      issue_number: issue_number,
+                      issue_kind: issue.kind
+                    ),
+                    accepted_scopes: accepted_scopes
+                  )
+
+                {:error, reason} ->
+                  render_error(body_conn, reason, documentation_url)
+              end
             else
               {:error, reason} -> render_error(body_conn, reason, documentation_url)
             end

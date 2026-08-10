@@ -5,7 +5,7 @@ defmodule FornacastAPI.PullContractTest do
   alias ForgeIssues.Issue
   alias ForgePulls.PullRequest
   alias ForgeRepos.{Repository, RepositoryView}
-  alias FornacastAPI.{Error, RequestValidator, Serializer}
+  alias FornacastAPI.{Error, RequestValidator, Serializer, URL}
 
   @versions ["2022-11-28", "2026-03-10"]
   @pull_paths [
@@ -155,6 +155,43 @@ defmodule FornacastAPI.PullContractTest do
     end
   end
 
+  test "pull browser URL resolves to pull HTML while REST relations remain API URLs" do
+    web = "https://forge.test/alice/demo/pulls/8"
+    api = "https://forge.test/api/v3/repos/alice/demo/pulls/8"
+
+    assert URL.pull_web("alice", "demo", 8) == web
+
+    assert URL.pull_web("alice/team", "demo repo", 8) ==
+             "https://forge.test/alice%2Fteam/demo%20repo/pulls/8"
+
+    uri = URI.parse(web)
+
+    assert %{plug: FornacastWeb.PullRequestController, plug_opts: :show} =
+             Phoenix.Router.route_info(FornacastWeb.Router, "GET", uri.path, uri.host)
+
+    for version <- @versions do
+      rendered =
+        Serializer.render(version, :pull, fixed_pull(),
+          owner: "alice",
+          repo: "demo",
+          actor: nil,
+          repository_view: fixed_repository_view()
+        )
+
+      assert rendered.html_url == web
+      assert rendered._links.html.href == web
+      assert rendered.url == api
+
+      assert rendered.comments_url ==
+               "https://forge.test/api/v3/repos/alice/demo/issues/8/comments"
+
+      assert rendered._links.self.href == api
+
+      assert rendered._links.issue.href ==
+               "https://forge.test/api/v3/repos/alice/demo/issues/8"
+    end
+  end
+
   test "checked-in pull fixtures are literal JSON for both versions" do
     merge_literal = %{
       "sha" => String.duplicate("c", 40),
@@ -258,6 +295,7 @@ defmodule FornacastAPI.PullContractTest do
     repository = repository_literal(version)
     pull_url = "https://forge.test/api/v3/repos/octocat/hello-world/pulls/8"
     issue_url = "https://forge.test/api/v3/repos/octocat/hello-world/issues/8"
+    pull_web_url = "https://forge.test/octocat/hello-world/pulls/8"
 
     statuses_url =
       "https://forge.test/api/v3/repos/octocat/hello-world/statuses/" <>
@@ -267,7 +305,7 @@ defmodule FornacastAPI.PullContractTest do
       "_links" => %{
         "comments" => %{"href" => issue_url <> "/comments"},
         "commits" => %{"href" => pull_url <> "/commits"},
-        "html" => %{"href" => pull_url},
+        "html" => %{"href" => pull_web_url},
         "issue" => %{"href" => issue_url},
         "review_comment" => %{"href" => pull_url <> "/comments{/number}"},
         "review_comments" => %{"href" => pull_url <> "/comments"},
@@ -292,7 +330,7 @@ defmodule FornacastAPI.PullContractTest do
       "diff_url" => pull_url,
       "draft" => false,
       "head" => branch_literal("feature/api", String.duplicate("b", 40), repository, user),
-      "html_url" => pull_url,
+      "html_url" => pull_web_url,
       "id" => 4001,
       "issue_url" => issue_url,
       "labels" => [],

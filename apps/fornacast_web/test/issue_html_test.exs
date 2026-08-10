@@ -86,6 +86,8 @@ defmodule FornacastWeb.IssueHTMLTest do
     assert html =~ "2 comments"
     assert html =~ "alice"
     assert html =~ "bob"
+    assert html =~ ~s(id="issuecomment-1")
+    assert html =~ ~s(id="issuecomment-2")
     refute html =~ "<script"
     refute html =~ "onerror"
     assert byte_index(html, "first <strong>") < byte_index(html, "chronological second")

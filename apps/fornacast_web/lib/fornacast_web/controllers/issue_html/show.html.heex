@@ -70,6 +70,7 @@
     <ol :if={@result.content.comments.entries != []} class="grid gap-3" aria-label="Comments">
       <li
         :for={comment <- @result.content.comments.entries}
+        id={"issuecomment-#{comment.id}"}
         class="bg-surface-container text-on-surface rounded-lg border border-outline-variant"
       >
         <header class="border-b border-outline-variant px-4 py-3 text-sm">

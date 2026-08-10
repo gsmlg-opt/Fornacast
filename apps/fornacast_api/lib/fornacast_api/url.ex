@@ -14,10 +14,33 @@ defmodule FornacastAPI.URL do
   def repository(owner, repo), do: api("/repos/#{segment(owner)}/#{segment(repo)}")
   def repository_web(owner, repo), do: web("/#{segment(owner)}/#{segment(repo)}")
   def issue(owner, repo, number), do: repository(owner, repo) <> "/issues/#{number}"
+
+  @spec issue_web(String.t(), String.t(), pos_integer()) :: String.t()
+  def issue_web(owner, repo, number),
+    do: web("/#{segment(owner)}/#{segment(repo)}/issues/#{number}")
+
+  @spec issue_comment_web(
+          String.t(),
+          String.t(),
+          :issue | :pull_request,
+          pos_integer(),
+          pos_integer()
+        ) :: String.t()
+  def issue_comment_web(owner, repo, :issue, number, id),
+    do: issue_web(owner, repo, number) <> "#issuecomment-#{id}"
+
+  def issue_comment_web(owner, repo, :pull_request, number, id),
+    do: pull_web(owner, repo, number) <> "#issuecomment-#{id}"
+
   def issue_comment(owner, repo, id), do: repository(owner, repo) <> "/issues/comments/#{id}"
   def label(owner, repo, name), do: repository(owner, repo) <> "/labels/#{segment(name)}"
   def pulls(owner, repo), do: repository(owner, repo) <> "/pulls"
   def pull(owner, repo, number), do: pulls(owner, repo) <> "/#{number}"
+
+  @spec pull_web(String.t(), String.t(), pos_integer()) :: String.t()
+  def pull_web(owner, repo, number),
+    do: web("/#{segment(owner)}/#{segment(repo)}/pulls/#{number}")
+
   def pull_merge(owner, repo, number), do: pull(owner, repo, number) <> "/merge"
   def pull_commits(owner, repo, number), do: pull(owner, repo, number) <> "/commits"
   def commit(owner, repo, sha), do: repository(owner, repo) <> "/commits/#{segment(sha)}"

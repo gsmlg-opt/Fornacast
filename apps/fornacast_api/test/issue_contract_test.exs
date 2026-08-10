@@ -10,7 +10,8 @@ defmodule FornacastAPI.IssueContractTest do
     IssueFixtureLiterals,
     Pagination,
     RequestValidator,
-    Serializer
+    Serializer,
+    URL
   }
 
   @versions IssueFixtureLiterals.versions()
@@ -246,13 +247,13 @@ defmodule FornacastAPI.IssueContractTest do
       ]
 
       assert Serializer.render(version, :issue, %{issue() | kind: :issue}, opts) ==
-               IssueFixtureLiterals.issue()
+               issue_literal()
 
       assert Serializer.render(version, :issue, issue(), opts) ==
-               IssueFixtureLiterals.pull_issue(version)
+               pull_issue_literal(version)
 
       assert Serializer.render(version, :issue_comment, comment(), opts) ==
-               IssueFixtureLiterals.comment()
+               comment_literal()
 
       assert Serializer.render(version, :label, label(), opts) == IssueFixtureLiterals.label()
 
@@ -270,13 +271,79 @@ defmodule FornacastAPI.IssueContractTest do
     ]
 
     assert Serializer.render("2022-11-28", :issue, issue(), opts) ==
-             IssueFixtureLiterals.pull_issue("2022-11-28")
+             pull_issue_literal("2022-11-28")
 
     assert Serializer.render("2022-11-28", :issue_comment, comment(), opts) ==
-             IssueFixtureLiterals.comment()
+             comment_literal()
 
     assert Serializer.render("2022-11-28", :label, label(), opts) ==
              IssueFixtureLiterals.label()
+  end
+
+  test "browser issue and canonical comment URLs are encoded and resolve to matching web pages" do
+    issue_url = URL.issue_web("alice", "demo", 7)
+    pull_url = URL.pull_web("alice", "demo", 7)
+
+    assert issue_url == "https://forge.test/alice/demo/issues/7"
+    assert pull_url == "https://forge.test/alice/demo/pulls/7"
+
+    assert URL.issue_web("alice/team", "demo repo", 7) ==
+             "https://forge.test/alice%2Fteam/demo%20repo/issues/7"
+
+    assert URL.issue_comment_web("alice", "demo", :issue, 7, 3101) ==
+             issue_url <> "#issuecomment-3101"
+
+    assert URL.issue_comment_web("alice", "demo", :pull_request, 7, 3101) ==
+             pull_url <> "#issuecomment-3101"
+
+    assert %{plug: FornacastWeb.IssueController, plug_opts: :show} =
+             web_route(issue_url)
+
+    assert %{plug: FornacastWeb.PullRequestController, plug_opts: :show} =
+             web_route(pull_url)
+
+    for version <- @versions do
+      ordinary =
+        Serializer.render(version, :issue, %{issue() | kind: :issue},
+          owner: "alice",
+          repo: "demo"
+        )
+
+      pull_issue =
+        Serializer.render(version, :issue, issue(),
+          owner: "alice",
+          repo: "demo",
+          pull_links_by_issue_id: %{3001 => %{merged_at: nil}}
+        )
+
+      ordinary_comment =
+        Serializer.render(version, :issue_comment, comment(),
+          owner: "alice",
+          repo: "demo",
+          issue_number: 7,
+          issue_kind: :issue
+        )
+
+      pull_comment =
+        Serializer.render(version, :issue_comment, comment(),
+          owner: "alice",
+          repo: "demo",
+          issue_number: 7,
+          issue_kind: :pull_request
+        )
+
+      assert ordinary.html_url == issue_url
+      assert ordinary.url == "https://forge.test/api/v3/repos/alice/demo/issues/7"
+      assert ordinary.comments_url == ordinary.url <> "/comments"
+      assert pull_issue.html_url == pull_url
+      assert pull_issue.pull_request.html_url == pull_url
+      assert pull_issue.pull_request.url == "https://forge.test/api/v3/repos/alice/demo/pulls/7"
+      assert ordinary_comment.html_url == issue_url <> "#issuecomment-3101"
+      assert pull_comment.html_url == pull_url <> "#issuecomment-3101"
+
+      assert ordinary_comment.url ==
+               "https://forge.test/api/v3/repos/alice/demo/issues/comments/3101"
+    end
   end
 
   defp issue do
@@ -319,6 +386,7 @@ defmodule FornacastAPI.IssueContractTest do
     document = openapi_document(version)
 
     for {filename, literal} <- IssueFixtureLiterals.files(version) do
+      literal = browser_fixture_literal(filename, literal)
       bytes = File.read!(Path.join(root, filename))
       encoded_literal = JSON.encode!(literal)
       assert bytes == encoded_literal
@@ -327,6 +395,54 @@ defmodule FornacastAPI.IssueContractTest do
       assert decoded == literal
       assert_valid_fixture(document, filename, decoded)
     end
+  end
+
+  defp issue_literal do
+    Map.put(IssueFixtureLiterals.issue(), :html_url, "https://forge.test/acme/widget/issues/7")
+  end
+
+  defp pull_issue_literal(version) do
+    web = "https://forge.test/acme/widget/pulls/7"
+
+    version
+    |> IssueFixtureLiterals.pull_issue()
+    |> Map.put(:html_url, web)
+    |> put_in([:pull_request, :html_url], web)
+  end
+
+  defp comment_literal do
+    Map.put(
+      IssueFixtureLiterals.comment(),
+      :html_url,
+      "https://forge.test/acme/widget/issues/7#issuecomment-3101"
+    )
+  end
+
+  defp browser_fixture_literal("issue.json", literal),
+    do: Map.put(literal, "html_url", "https://forge.test/acme/widget/issues/7")
+
+  defp browser_fixture_literal("issue-list.json", [literal]),
+    do: [browser_fixture_literal("issue.json", literal)]
+
+  defp browser_fixture_literal("pull-issue.json", literal) do
+    web = "https://forge.test/acme/widget/pulls/7"
+    literal |> Map.put("html_url", web) |> put_in(["pull_request", "html_url"], web)
+  end
+
+  defp browser_fixture_literal("issue-comment.json", literal),
+    do:
+      Map.put(
+        literal,
+        "html_url",
+        "https://forge.test/acme/widget/issues/7#issuecomment-3101"
+      )
+
+  defp browser_fixture_literal("issue-comment-list.json", [literal]),
+    do: [browser_fixture_literal("issue-comment.json", literal)]
+
+  defp web_route(url) do
+    uri = URI.parse(url)
+    Phoenix.Router.route_info(FornacastWeb.Router, "GET", uri.path, uri.host)
   end
 
   defp openapi_document(version) do

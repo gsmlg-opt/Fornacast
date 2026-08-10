@@ -39,7 +39,7 @@ defmodule FornacastAPI.Serializers.V2026_03_10.Pull do
       diff_url: url,
       draft: false,
       head: branch(owner, pull.head_ref, pull.head_sha, repository, owner_user),
-      html_url: url,
+      html_url: URL.pull_web(owner, repo, issue.number),
       id: pull.id,
       issue_url: issue_url,
       labels:
@@ -86,7 +86,7 @@ defmodule FornacastAPI.Serializers.V2026_03_10.Pull do
 
     %{
       self: %{href: url},
-      html: %{href: url},
+      html: %{href: URL.pull_web(owner, repo, number)},
       issue: %{href: issue_url},
       comments: %{href: issue_url <> "/comments"},
       review_comments: %{href: url <> "/comments"},

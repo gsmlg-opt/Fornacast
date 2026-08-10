@@ -907,6 +907,14 @@ defmodule FornacastAPI.IssueControllerTest do
 
       pull_comment_body = json_response(pull_comment, 201)
 
+      pull_comment_web =
+        "http://localhost:4890/alice/disabled/pulls/#{pull.number}#issuecomment-#{pull_comment_body["id"]}"
+
+      assert pull_comment_body["html_url"] == pull_comment_web
+
+      assert pull_comment_body["url"] ==
+               "http://localhost:4890/api/v3/repos/alice/disabled/issues/comments/#{pull_comment_body["id"]}"
+
       changed_pull_comment =
         api_conn(secret, version)
         |> patch_json(
@@ -914,13 +922,18 @@ defmodule FornacastAPI.IssueControllerTest do
           %{"body" => "still routed"}
         )
 
-      assert json_response(changed_pull_comment, 200)["body"] == "still routed"
+      changed_pull_comment_body = json_response(changed_pull_comment, 200)
+      assert changed_pull_comment_body["body"] == "still routed"
+      assert changed_pull_comment_body["html_url"] == pull_comment_web
 
       pull_comments =
         api_conn(secret, version)
         |> get("/api/v3/repos/alice/disabled/issues/#{pull.number}/comments")
 
-      assert Enum.any?(json_response(pull_comments, 200), &(&1["id"] == pull_comment_body["id"]))
+      assert Enum.any?(json_response(pull_comments, 200), fn listed ->
+               listed["id"] == pull_comment_body["id"] and
+                 listed["html_url"] == pull_comment_web
+             end)
 
       deleted_pull_comment =
         api_conn(secret, version)
@@ -1068,7 +1081,7 @@ defmodule FornacastAPI.IssueControllerTest do
       "created_at" => timestamp(issue.inserted_at),
       "draft" => false,
       "events_url" => api_url <> "/events",
-      "html_url" => api_url,
+      "html_url" => "http://localhost:4890/#{owner}/#{repo}/issues/#{issue.number}",
       "id" => issue.id,
       "labels" => [],
       "labels_url" => api_url <> "/labels{/name}",
@@ -1096,7 +1109,8 @@ defmodule FornacastAPI.IssueControllerTest do
       "author_association" => "OWNER",
       "body" => comment.body,
       "created_at" => timestamp(comment.inserted_at),
-      "html_url" => api_url,
+      "html_url" =>
+        "http://localhost:4890/#{owner}/#{repo}/#{comment_web_kind(issue)}/#{issue.number}#issuecomment-#{comment.id}",
       "id" => comment.id,
       "issue_url" => "http://localhost:4890/api/v3/repos/#{owner}/#{repo}/issues/#{issue.number}",
       "node_id" => Base.url_encode64("IssueComment:#{comment.id}", padding: false),
@@ -1110,10 +1124,11 @@ defmodule FornacastAPI.IssueControllerTest do
 
   defp expected_pull(issue, author, owner, repo, version) do
     pull_url = "http://localhost:4890/api/v3/repos/#{owner}/#{repo}/pulls/#{issue.number}"
+    pull_web = "http://localhost:4890/#{owner}/#{repo}/pulls/#{issue.number}"
 
     pull_request = %{
       "diff_url" => pull_url,
-      "html_url" => pull_url,
+      "html_url" => pull_web,
       "patch_url" => pull_url,
       "url" => pull_url
     }
@@ -1125,8 +1140,12 @@ defmodule FornacastAPI.IssueControllerTest do
 
     issue
     |> expected_issue(author, owner, repo)
+    |> Map.put("html_url", pull_web)
     |> Map.put("pull_request", pull_request)
   end
+
+  defp comment_web_kind(%Issue{kind: :pull_request}), do: "pulls"
+  defp comment_web_kind(%Issue{}), do: "issues"
 
   defp expected_user(%User{} = user) do
     api_url = "http://localhost:4890/api/v3/users/#{user.username}"

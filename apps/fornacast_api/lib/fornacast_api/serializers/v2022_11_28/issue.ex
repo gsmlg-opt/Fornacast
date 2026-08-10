@@ -6,6 +6,7 @@ defmodule FornacastAPI.Serializers.V2022_11_28.Issue do
   def render(issue, opts) do
     {owner, repo} = repository!(opts)
     url = URL.issue(owner, repo, issue.number)
+    html_url = web_url(issue.kind, owner, repo, issue.number)
 
     assignees =
       Enum.map(issue.assignees || [], &Serializer.render(@version, :simple_user, &1, opts))
@@ -18,7 +19,7 @@ defmodule FornacastAPI.Serializers.V2022_11_28.Issue do
       labels_url: url <> "/labels{/name}",
       comments_url: url <> "/comments",
       events_url: url <> "/events",
-      html_url: url,
+      html_url: html_url,
       id: issue.id,
       node_id: node_id("Issue", issue.id),
       number: issue.number,
@@ -67,7 +68,7 @@ defmodule FornacastAPI.Serializers.V2022_11_28.Issue do
 
     %{
       url: url,
-      html_url: url,
+      html_url: URL.pull_web(owner, repo, issue.number),
       diff_url: url,
       patch_url: url,
       merged_at: timestamp(Map.get(pull, :merged_at) || Map.get(pull, "merged_at"))
@@ -75,6 +76,8 @@ defmodule FornacastAPI.Serializers.V2022_11_28.Issue do
   end
 
   defp repository!(opts), do: {option(opts, :owner), option(opts, :repo)}
+  defp web_url(:pull_request, owner, repo, number), do: URL.pull_web(owner, repo, number)
+  defp web_url(_kind, owner, repo, number), do: URL.issue_web(owner, repo, number)
   defp option(opts, key, default \\ nil)
   defp option(opts, key, default) when is_list(opts), do: Keyword.get(opts, key, default)
 
