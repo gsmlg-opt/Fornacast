@@ -10,7 +10,7 @@ defmodule FornacastWeb.PullRequestController do
     RequestMetadata
   }
 
-  @authenticated_actions [:new, :create]
+  @authenticated_actions [:new, :create, :state, :merge]
   @filter_keys ~w(page state head base sort direction)
   @route_keys ~w(owner repo)
   @pull_ref_errors [:invalid_head, :invalid_base, :cross_repository_head, :head_equals_base]
@@ -93,6 +93,121 @@ defmodule FornacastWeb.PullRequestController do
 
       {:error, reason} ->
         RepositoryWeb.error(conn, nil, reason)
+    end
+  end
+
+  def show(conn, %{"owner" => owner_slug, "repo" => repository_slug, "number" => number}) do
+    with {:ok, context} <- RepositoryWeb.fetch(conn, owner_slug, repository_slug),
+         {:ok, number} <- positive_integer(number),
+         {:ok, result} <-
+           collaboration_page(conn).pull(
+             context.repository,
+             context.owner,
+             context.viewer,
+             number,
+             []
+           ) do
+      RepositoryWeb.render(conn, result, html_module(conn), :show)
+    else
+      {:error, :invalid_integer} -> RepositoryWeb.error(conn, nil, :not_found)
+      {:error, reason} -> RepositoryWeb.error(conn, nil, reason)
+    end
+  end
+
+  def commits(
+        conn,
+        %{"owner" => owner_slug, "repo" => repository_slug, "number" => number} = params
+      ) do
+    render_pull_page(
+      conn,
+      owner_slug,
+      repository_slug,
+      number,
+      params,
+      :pull_commits,
+      :commits,
+      50
+    )
+  end
+
+  def files(
+        conn,
+        %{"owner" => owner_slug, "repo" => repository_slug, "number" => number} = params
+      ) do
+    render_pull_page(conn, owner_slug, repository_slug, number, params, :pull_files, :files, 100)
+  end
+
+  def state(
+        conn,
+        %{"owner" => owner_slug, "repo" => repository_slug, "number" => number} = params
+      ) do
+    with {:ok, context} <- RepositoryWeb.fetch(conn, owner_slug, repository_slug),
+         {:ok, number} <- positive_integer(number),
+         {:ok, attrs} <- state_attrs(params),
+         {:ok, pull} <- pulls(conn).get_pull_request(context.repository, number, context.viewer),
+         {:ok, _pull} <-
+           pulls(conn).update_pull_request(
+             context.repository,
+             pull,
+             context.viewer,
+             attrs,
+             RequestMetadata.from_conn(conn)
+           ) do
+      private_redirect(conn, RepositoryHTML.pull_path(path_chrome(context), number))
+    else
+      {:error, :invalid_integer} -> RepositoryWeb.error(conn, nil, :not_found)
+      {:error, reason} -> RepositoryWeb.error(conn, nil, reason)
+    end
+  end
+
+  def merge(
+        conn,
+        %{"owner" => owner_slug, "repo" => repository_slug, "number" => number} = params
+      ) do
+    with {:ok, context} <- RepositoryWeb.fetch(conn, owner_slug, repository_slug),
+         {:ok, number} <- positive_integer(number),
+         {:ok, attrs} <- merge_attrs(params),
+         {:ok, pull} <- pulls(conn).get_pull_request(context.repository, number, context.viewer),
+         {:ok, _result} <-
+           pulls(conn).merge(
+             context.repository,
+             pull,
+             context.viewer,
+             attrs,
+             RequestMetadata.from_conn(conn)
+           ) do
+      private_redirect(conn, RepositoryHTML.pull_path(path_chrome(context), number))
+    else
+      {:error, :invalid_integer} -> RepositoryWeb.error(conn, nil, :not_found)
+      {:error, reason} -> RepositoryWeb.error(conn, nil, reason)
+    end
+  end
+
+  defp render_pull_page(
+         conn,
+         owner_slug,
+         repository_slug,
+         number,
+         params,
+         composer,
+         template,
+         per_page
+       ) do
+    with {:ok, context} <- RepositoryWeb.fetch(conn, owner_slug, repository_slug),
+         {:ok, number} <- positive_integer(number),
+         {:ok, page} <- positive_integer(Map.get(params, "page", "1")),
+         {:ok, result} <-
+           apply(collaboration_page(conn), composer, [
+             context.repository,
+             context.owner,
+             context.viewer,
+             number,
+             %{page: page, per_page: per_page}
+           ]) do
+      RepositoryWeb.render(conn, result, html_module(conn), template)
+    else
+      {:error, :invalid_integer} -> RepositoryWeb.error(conn, nil, :not_found)
+      {:error, reason} -> RepositoryWeb.error(conn, nil, reason)
     end
   end
 
@@ -260,6 +375,20 @@ defmodule FornacastWeb.PullRequestController do
   defp safe_pull_attrs(_params),
     do: %{"title" => "", "body" => "", "head" => "", "base" => ""}
 
+  defp state_attrs(%{"state" => state}) when state in ["open", "closed"],
+    do: {:ok, %{"state" => state}}
+
+  defp state_attrs(_params), do: validation("state")
+
+  defp merge_attrs(params) do
+    case Map.get(params, "sha") do
+      nil -> {:ok, %{"merge_method" => "merge"}}
+      "" -> {:ok, %{"merge_method" => "merge"}}
+      sha when is_binary(sha) -> {:ok, %{"merge_method" => "merge", "sha" => sha}}
+      _value -> validation("sha")
+    end
+  end
+
   defp ref_errors(:invalid_head), do: [validation_error("head")]
   defp ref_errors(:cross_repository_head), do: [validation_error("head")]
   defp ref_errors(:invalid_base), do: [validation_error("base")]
@@ -300,8 +429,14 @@ defmodule FornacastWeb.PullRequestController do
     base = "/#{owner}/#{repository}/pulls"
 
     case conn.private[:phoenix_action] do
-      :new -> base <> "/new"
-      :create -> base
+      :new ->
+        base <> "/new"
+
+      :create ->
+        base
+
+      action when action in [:state, :merge] ->
+        base <> "/#{encode_path_segment(conn.path_params["number"])}"
     end
   end
 
@@ -323,6 +458,12 @@ defmodule FornacastWeb.PullRequestController do
     conn
     |> put_resp_header("cache-control", "private, no-store")
     |> put_resp_header("pragma", "no-cache")
+  end
+
+  defp private_redirect(conn, path) do
+    conn
+    |> put_private_cache_headers()
+    |> redirect(to: path)
   end
 
   defp collaboration_page(conn),

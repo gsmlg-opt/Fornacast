@@ -1,0 +1,135 @@
+<RepositoryHTML.repository_frame result={@result} active={:pulls}>
+  <section class="grid min-w-0 gap-3 p-4" data-pull-conversation>
+    <header class="grid gap-3 rounded-lg bg-surface-container p-4 text-on-surface">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div class="min-w-0">
+          <p class="text-xs text-on-surface-variant">Pull {@result.content.pull.issue.number}</p>
+          <h2 class="text-lg font-semibold">{@result.content.pull.issue.title}</h2>
+          <p class="mt-1 text-xs text-on-surface-variant">
+            {branch_name(@result.content.pull.head_ref)} → {branch_name(
+              @result.content.pull.base_ref
+            )}
+          </p>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <.dm_badge variant={state_variant(@result.content.pull.issue.state)} soft size="sm">
+            {if @result.content.pull.merged_at,
+              do: "merged",
+              else: @result.content.pull.issue.state}
+          </.dm_badge>
+          <form
+            :if={
+              @result.content.pull.capabilities.can_close and
+                is_nil(@result.content.pull.merged_at)
+            }
+            action={
+              RepositoryHTML.pull_state_path(@result.chrome, @result.content.pull.issue.number)
+            }
+            method="post"
+          >
+            <input type="hidden" name="_csrf_token" value={csrf_token()} />
+            <input type="hidden" name="_method" value="patch" />
+            <input
+              type="hidden"
+              name="state"
+              value={if @result.content.pull.issue.state == :open, do: "closed", else: "open"}
+            />
+            <.dm_btn type="submit" variant="outline" size="sm">
+              {if @result.content.pull.issue.state == :open, do: "Close", else: "Reopen"}
+            </.dm_btn>
+          </form>
+        </div>
+      </div>
+      <.pull_navigation result={@result} active={:conversation} />
+    </header>
+
+    <article class="rounded-lg border border-outline-variant bg-surface-container text-on-surface">
+      <header class="border-b border-outline-variant px-4 py-3 text-sm">
+        <span class="font-semibold">{author_name(@result.content.pull.issue.author)}</span>
+        <span class="text-on-surface-variant">
+          opened this pull request {format_time(@result.content.pull.issue.inserted_at)}
+        </span>
+      </header>
+      <div class="prose max-w-none p-4 text-on-surface">
+        {markdown(@result.content.pull.issue.body)}
+      </div>
+    </article>
+
+    <ol :if={@result.content.comments.entries != []} class="grid gap-3" aria-label="Comments">
+      <li
+        :for={comment <- @result.content.comments.entries}
+        class="rounded-lg border border-outline-variant bg-surface-container text-on-surface"
+      >
+        <header class="border-b border-outline-variant px-4 py-3 text-sm">
+          <span class="font-semibold">{author_name(comment.author)}</span>
+          <span class="text-on-surface-variant">commented {format_time(comment.inserted_at)}</span>
+        </header>
+        <div class="prose max-w-none p-4 text-on-surface">{markdown(comment.body)}</div>
+      </li>
+    </ol>
+
+    <form
+      :if={Map.get(@result.content.pull.capabilities, :can_comment, false)}
+      action={
+        RepositoryHTML.issue_comments_path(@result.chrome, @result.content.pull.issue.number)
+      }
+      method="post"
+      class="grid gap-3 rounded-lg bg-surface-container p-4 text-on-surface"
+    >
+      <input type="hidden" name="_csrf_token" value={csrf_token()} />
+      <.dm_textarea
+        id="pull-comment-body"
+        name="comment[body]"
+        label="Comment"
+        rows={6}
+        required
+      />
+      <.dm_btn type="submit" variant="primary">Add comment</.dm_btn>
+    </form>
+
+    <section class="grid gap-3 rounded-lg bg-surface-container p-4 text-on-surface" data-merge-box>
+      <header>
+        <h3 class="font-semibold">Merge pull request</h3>
+        <p class="text-sm text-on-surface-variant">
+          {@result.content.pull.analysis.commit_count} commits · {@result.content.pull.analysis.changed_paths} files changed · {@result.content.pull.analysis.ahead_by} ahead · {@result.content.pull.analysis.behind_by} behind
+        </p>
+      </header>
+
+      <.dm_alert :if={@result.content.pull.merged_at} variant="success">
+        Merged as {@result.content.pull.merge_commit_sha}
+      </.dm_alert>
+      <.dm_alert
+        :if={
+          is_nil(@result.content.pull.merged_at) and @result.content.pull.issue.state == :closed
+        }
+        variant="info"
+      >
+        This pull request is closed.
+      </.dm_alert>
+      <.dm_alert
+        :if={
+          is_nil(@result.content.pull.merged_at) and
+            @result.content.pull.issue.state == :open and
+            @result.content.pull.analysis.mergeable == false
+        }
+        variant="warning"
+      >
+        This pull request has merge conflicts.
+      </.dm_alert>
+
+      <form
+        :if={
+          @result.content.pull.capabilities.can_merge and
+            is_nil(@result.content.pull.merged_at) and
+            @result.content.pull.issue.state == :open
+        }
+        action={RepositoryHTML.pull_merge_path(@result.chrome, @result.content.pull.issue.number)}
+        method="post"
+      >
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <input type="hidden" name="sha" value={@result.content.pull.head_sha} />
+        <.dm_btn type="submit" variant="primary">Merge</.dm_btn>
+      </form>
+    </section>
+  </section>
+</RepositoryHTML.repository_frame>

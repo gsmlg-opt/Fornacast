@@ -274,6 +274,8 @@ defmodule ForgePulls do
        %ForgePulls.ChangedFilePage{
          entries: diff.files,
          total: diff.changed_files,
+         additions: diff.additions,
+         deletions: diff.deletions,
          page: page,
          per_page: per_page,
          truncated: diff.truncated

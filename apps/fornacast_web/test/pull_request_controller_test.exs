@@ -25,6 +25,76 @@ defmodule FornacastWeb.PullRequestControllerTestCollaborationPage do
     end
   end
 
+  def pull(repository, owner, viewer, number, opts) do
+    record(:pull, [repository, owner, viewer, number, opts])
+
+    reply(:pull, fn ->
+      {:ok,
+       %RepositoryPage.Result{
+         kind: :pull,
+         chrome: chrome(repository, owner, viewer),
+         content: %{
+           pull: pull(number, "Pull #{number}"),
+           comments: %Fornacast.Page{
+             entries: [comment(1, "Canonical comment")],
+             total: 1,
+             page: 1,
+             per_page: 100
+           }
+         }
+       }}
+    end)
+  end
+
+  def pull_commits(repository, owner, viewer, number, params) do
+    record(:pull_commits, [repository, owner, viewer, number, params])
+
+    reply(:pull_commits, fn ->
+      page = Map.get(params, :page, 1)
+
+      {:ok,
+       %RepositoryPage.Result{
+         kind: :pull_commits,
+         chrome: chrome(repository, owner, viewer),
+         content: %{
+           pull: pull(number, "Pull #{number}"),
+           commits: %Fornacast.Page{
+             entries: [commit("commit-#{page}", "Commit page #{page}")],
+             total: 101,
+             page: page,
+             per_page: 50
+           }
+         }
+       }}
+    end)
+  end
+
+  def pull_files(repository, owner, viewer, number, params) do
+    record(:pull_files, [repository, owner, viewer, number, params])
+
+    reply(:pull_files, fn ->
+      page = Map.get(params, :page, 1)
+
+      {:ok,
+       %RepositoryPage.Result{
+         kind: :pull_files,
+         chrome: chrome(repository, owner, viewer),
+         content: %{
+           pull: pull(number, "Pull #{number}"),
+           files: %ForgePulls.ChangedFilePage{
+             entries: [changed_file(), binary_file()],
+             total: 102,
+             additions: 4,
+             deletions: 2,
+             page: page,
+             per_page: 100,
+             truncated: true
+           }
+         }
+       }}
+    end)
+  end
+
   def result(repository, owner, viewer, filters) do
     pull = pull(7, "Ship comparison")
 
@@ -79,6 +149,79 @@ defmodule FornacastWeb.PullRequestControllerTestCollaborationPage do
       commit_count: 3,
       changed_paths: 4
     }
+  end
+
+  def comment(id, body) do
+    %ForgeIssues.Comment{
+      id: id,
+      issue_id: 7,
+      issue_number: 7,
+      author_user_id: 2,
+      author: %{username: "bob"},
+      author_association: "CONTRIBUTOR",
+      body: body,
+      capabilities: %{can_edit: false, can_delete: false},
+      inserted_at: ~U[2026-08-09 08:01:00Z],
+      updated_at: ~U[2026-08-09 08:01:00Z]
+    }
+  end
+
+  def commit(oid, title) do
+    %GitCore.Commit{
+      oid: oid,
+      title: title,
+      message: "#{title} <script>unsafe()</script>",
+      author_name: "Alice <script>",
+      author_email: "alice@example.test",
+      author_time: 1_754_723_200,
+      committer_name: "Alice",
+      committer_email: "alice@example.test",
+      committer_time: 1_754_723_200,
+      parents: []
+    }
+  end
+
+  def changed_file do
+    %GitCore.DiffFile{
+      path: "lib/changed.ex",
+      status: :modified,
+      old_oid: String.duplicate("1", 40),
+      new_oid: String.duplicate("2", 40),
+      binary: false,
+      additions: 4,
+      deletions: 2,
+      truncated: true,
+      lines: [
+        %GitCore.DiffLine{
+          type: :added,
+          old_line: nil,
+          new_line: 1,
+          content: "<script>unsafe diff</script>"
+        }
+      ]
+    }
+  end
+
+  def binary_file do
+    %GitCore.DiffFile{
+      path: "priv/logo.bin",
+      status: :added,
+      old_oid: nil,
+      new_oid: String.duplicate("3", 40),
+      binary: true,
+      additions: 0,
+      deletions: 0,
+      truncated: false,
+      lines: []
+    }
+  end
+
+  defp reply(operation, fallback) do
+    case Map.get(Process.get({__MODULE__, :responses}, %{}), operation) do
+      nil -> fallback.()
+      response when is_function(response, 0) -> response.()
+      response -> response
+    end
   end
 
   defp record(operation, args),
@@ -145,6 +288,30 @@ defmodule FornacastWeb.PullRequestControllerTestPulls do
   def create_pull_request(repository, actor, attrs, metadata) do
     reply(:create_pull_request, [repository, actor, attrs, metadata], fn ->
       {:ok, FornacastWeb.PullRequestControllerTestCollaborationPage.pull(12, attrs["title"])}
+    end)
+  end
+
+  def get_pull_request(repository, number, actor) do
+    reply(:get_pull_request, [repository, number, actor], fn ->
+      {:ok,
+       FornacastWeb.PullRequestControllerTestCollaborationPage.pull(number, "Pull #{number}")}
+    end)
+  end
+
+  def update_pull_request(repository, pull, actor, attrs, metadata) do
+    reply(:update_pull_request, [repository, pull, actor, attrs, metadata], fn ->
+      {:ok, put_in(pull.issue.state, attrs["state"])}
+    end)
+  end
+
+  def merge(repository, pull, actor, attrs, metadata) do
+    reply(:merge, [repository, pull, actor, attrs, metadata], fn ->
+      {:ok,
+       %{
+         merged: true,
+         message: "Pull Request successfully merged",
+         sha: String.duplicate("c", 40)
+       }}
     end)
   end
 
@@ -428,6 +595,149 @@ defmodule FornacastWeb.PullRequestControllerTest do
     assert TestPulls.calls() == []
   end
 
+  test "anonymous readers view the canonical pull conversation" do
+    conn = request_conn() |> get("/alice/public-repo/pulls/7")
+
+    assert html_response(conn, 200) =~ "data-pull-conversation"
+    assert conn.resp_body =~ "Pull 7"
+    assert conn.resp_body =~ "Canonical comment"
+    assert_private_no_store(conn)
+    assert [{:pull, [_repository, _owner, nil, 7, []]}] = TestPage.calls()
+  end
+
+  test "private pull detail masks like missing while the owner may read it", %{alice: alice} do
+    private = request_conn() |> get("/alice/private-repo/pulls/7")
+    missing = request_conn() |> get("/alice/missing-repo/pulls/7")
+
+    assert private.status == 404
+    assert missing.status == 404
+    assert masked_body(private.resp_body) == masked_body(missing.resp_body)
+
+    TestPage.reset()
+    owner = request_conn(alice) |> get("/alice/private-repo/pulls/7")
+    assert html_response(owner, 200) =~ "data-pull-conversation"
+  end
+
+  test "commit and file routes forward bounded pagination to the page composer" do
+    commits = request_conn() |> get("/alice/public-repo/pulls/7/commits?page=2")
+    files = request_conn() |> get("/alice/public-repo/pulls/7/files?page=2")
+
+    assert html_response(commits, 200) =~ "data-pull-commits"
+    assert commits.resp_body =~ "page=3"
+    assert html_response(files, 200) =~ "data-pull-files"
+    assert files.resp_body =~ "page=1"
+
+    assert [
+             {:pull_commits,
+              [_commits_repository, _commits_owner, nil, 7, %{page: 2, per_page: 50}]},
+             {:pull_files, [_files_repository, _files_owner, nil, 7, %{page: 2, per_page: 100}]}
+           ] = TestPage.calls()
+  end
+
+  test "invalid detail numbers and pagination are controlled before composition" do
+    assert (request_conn() |> get("/alice/public-repo/pulls/nope")).status == 404
+    assert (request_conn() |> get("/alice/public-repo/pulls/7/commits?page=0")).status == 404
+    assert (request_conn() |> get("/alice/public-repo/pulls/7/files?page[]=1")).status == 422
+    assert TestPage.calls() == []
+  end
+
+  test "state and merge require sign-in with generated local detail return targets" do
+    state = request_conn() |> patch("/alice/public-repo/pulls/7/state", %{"state" => "closed"})
+    merge = request_conn() |> post("/alice/public-repo/pulls/7/merge", %{})
+
+    hostile =
+      request_conn()
+      |> post("/%2F%2Fevil.test/public-repo/pulls/7/merge", %{})
+
+    assert login_return_to(state) == "/alice/public-repo/pulls/7"
+    assert login_return_to(merge) == "/alice/public-repo/pulls/7"
+    assert login_return_to(hostile) == "/%2F%2Fevil.test/public-repo/pulls/7"
+    refute String.starts_with?(login_return_to(hostile), "//")
+  end
+
+  test "author closes and reopens through exactly one metadata-bearing update", %{bob: bob} do
+    for state <- ["closed", "open"] do
+      TestPulls.reset()
+
+      conn =
+        submit_action_with_csrf(
+          bob,
+          "/alice/public-repo/pulls/7",
+          :patch,
+          "/alice/public-repo/pulls/7/state",
+          %{"state" => state}
+        )
+
+      assert redirected_to(conn) == "/alice/public-repo/pulls/7"
+      assert_private_no_store(conn)
+
+      assert [
+               {:update_pull_request, [_repository, _pull, ^bob, %{"state" => ^state}, metadata]}
+             ] = task7_mutation_calls()
+
+      assert Map.keys(metadata) |> Enum.sort() == [:ip_address, :request_id, :user_agent]
+    end
+  end
+
+  test "writer merge forces merge method, accepts only optional expected head, and PRGs", %{
+    alice: alice
+  } do
+    expected_head = String.duplicate("a", 40)
+
+    assert_raise Plug.CSRFProtection.InvalidCSRFTokenError, fn ->
+      request_conn(alice)
+      |> with_production_csrf()
+      |> post("/alice/public-repo/pulls/7/merge", %{})
+    end
+
+    conn =
+      submit_action_with_csrf(
+        alice,
+        "/alice/public-repo/pulls/7",
+        :post,
+        "/alice/public-repo/pulls/7/merge",
+        %{
+          "sha" => expected_head,
+          "merge_method" => "squash",
+          "commit_title" => "not accepted"
+        }
+      )
+
+    assert redirected_to(conn) == "/alice/public-repo/pulls/7"
+    assert_private_no_store(conn)
+
+    assert [{:merge, [_repository, _pull, ^alice, attrs, metadata]}] = task7_mutation_calls()
+    assert attrs == %{"sha" => expected_head, "merge_method" => "merge"}
+    assert Map.keys(metadata) |> Enum.sort() == [:ip_address, :request_id, :user_agent]
+  end
+
+  test "merge domain failures retain exact web status semantics", %{alice: alice} do
+    for {reason, status} <- [
+          {:conflict, 405},
+          {:merge_commits_disabled, 405},
+          {:head_changed, 409},
+          {:ref_conflict, 409},
+          {{:unavailable, :timeout}, 503},
+          {:forbidden, 403}
+        ] do
+      TestPulls.reset()
+      TestPulls.respond(:merge, {:error, reason})
+
+      conn =
+        submit_action_with_csrf(
+          alice,
+          "/alice/public-repo/pulls/7",
+          :post,
+          "/alice/public-repo/pulls/7/merge",
+          %{}
+        )
+
+      assert conn.status == status
+      assert length(task7_mutation_calls()) == 1
+      assert_private_no_store(conn)
+    end
+  end
+
   defp request_conn(user \\ nil) do
     conn =
       build_conn()
@@ -449,6 +759,25 @@ defmodule FornacastWeb.PullRequestControllerTest do
     |> post("/alice/public-repo/pulls", Map.put(params, "_csrf_token", token))
   end
 
+  defp submit_action_with_csrf(user, form_path, method, path, params) do
+    form = request_conn(user) |> get(form_path)
+    token = extract_csrf_token(form.resp_body)
+
+    conn =
+      form
+      |> recycle()
+      |> Plug.Conn.put_private(:repository_collaboration_page, TestPage)
+      |> Plug.Conn.put_private(:forge_pulls, TestPulls)
+      |> with_production_csrf()
+
+    params = Map.put(params, "_csrf_token", token)
+
+    case method do
+      :post -> post(conn, path, params)
+      :patch -> patch(conn, path, params)
+    end
+  end
+
   defp extract_csrf_token(html) do
     [_full, token] = Regex.run(~r/name="_csrf_token"\s+value="([^"]+)"/, html)
     token
@@ -468,6 +797,12 @@ defmodule FornacastWeb.PullRequestControllerTest do
 
   defp mutation_calls,
     do: Enum.filter(TestPulls.calls(), &match?({:create_pull_request, _}, &1))
+
+  defp task7_mutation_calls do
+    Enum.filter(TestPulls.calls(), fn {operation, _args} ->
+      operation in [:update_pull_request, :merge]
+    end)
+  end
 
   defp assert_private_no_store(conn) do
     assert Plug.Conn.get_resp_header(conn, "cache-control") == ["private, no-store"]

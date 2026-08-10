@@ -1,0 +1,34 @@
+<RepositoryHTML.repository_frame result={@result} active={:pulls}>
+  <section class="grid min-w-0 gap-3 p-4" data-pull-commits>
+    <header class="grid gap-3 rounded-lg bg-surface-container p-4 text-on-surface">
+      <h2 class="text-lg font-semibold">Commits</h2>
+      <.pull_navigation result={@result} active={:commits} />
+    </header>
+
+    <div class="repository-table-wrap" data-repository-table>
+      <.dm_table
+        id="pull-commits-table"
+        data={@result.content.commits.entries}
+        compact
+        hover
+        class="repository-component repository-table"
+      >
+        <:col :let={commit} label="Commit">
+          <p>{commit.title}</p>
+          <p class="text-xs text-on-surface-variant">{commit.message}</p>
+        </:col>
+        <:col :let={commit} label="Author">{commit.author_name}</:col>
+        <:col :let={commit} label="Committed">{format_time(commit.author_time)}</:col>
+        <:col :let={commit} label="SHA"><code>{short_oid(commit.oid)}</code></:col>
+      </.dm_table>
+    </div>
+
+    <RepositoryHTML.server_pagination
+      page={@result.content.commits.page}
+      total_pages={total_pages(@result.content.commits)}
+      base_href={
+        RepositoryHTML.pull_commits_path(@result.chrome, @result.content.pull.issue.number)
+      }
+    />
+  </section>
+</RepositoryHTML.repository_frame>

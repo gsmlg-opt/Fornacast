@@ -182,6 +182,20 @@ defmodule ForgePullsTest do
 
     assert Enum.map(files, & &1.path) == ["lib/added.ex", "lib/changed.ex"]
 
+    assert {:ok,
+            %ForgePulls.ChangedFilePage{
+              entries: [second_page_file],
+              total: 2,
+              additions: 2,
+              deletions: 1,
+              page: 2,
+              per_page: 1
+            }} = ForgePulls.changed_files(repository, pull, reader, page: 2, per_page: 1)
+
+    assert second_page_file.path == "lib/changed.ex"
+    assert second_page_file.additions == 1
+    assert second_page_file.deletions == 1
+
     assert {:ok, %ForgePulls.ChangedFilePage{per_page: 100}} =
              ForgePulls.changed_files(repository, pull, reader, page: 1, per_page: 1_000)
 

@@ -1,0 +1,56 @@
+<RepositoryHTML.repository_frame result={@result} active={:pulls}>
+  <section class="grid min-w-0 gap-3 p-4" data-pull-files>
+    <header class="grid gap-3 rounded-lg bg-surface-container p-4 text-on-surface">
+      <h2 class="text-lg font-semibold">Files changed</h2>
+      <.pull_navigation result={@result} active={:files} />
+    </header>
+
+    <RepositoryHTML.optional_panel
+      :if={@result.content.files.truncated}
+      title="Pull request diff truncated."
+      message="This pull request diff exceeded the configured display limit."
+      kind="warning"
+      data-diff-truncated
+    />
+
+    <.dm_git_commit_diff
+      id="pull-request-diff"
+      class="repository-component repository-commit-diff"
+      title={@result.content.pull.issue.title}
+      sha={@result.content.pull.head_sha}
+      author={author_name(@result.content.pull.issue.author)}
+      committed_at={format_time(@result.content.pull.issue.updated_at)}
+      message={@result.content.pull.issue.body}
+      changed_files={@result.content.files.total}
+      additions={@result.content.files.additions}
+      deletions={@result.content.files.deletions}
+      data-pull-diff
+    >
+      <:file
+        :for={file <- @result.content.files.entries}
+        path={file.path}
+        status={to_string(file.status)}
+        additions={file.additions}
+        deletions={file.deletions}
+        binary={file.binary}
+        truncated={file.truncated}
+        lines={Enum.map(file.lines || [], &diff_line_map/1)}
+      />
+    </.dm_git_commit_diff>
+
+    <p
+      :if={Enum.any?(@result.content.files.entries, & &1.binary)}
+      class="text-sm text-on-surface-variant"
+    >
+      This comparison includes binary files.
+    </p>
+
+    <RepositoryHTML.server_pagination
+      page={@result.content.files.page}
+      total_pages={changed_file_pages(@result.content.files)}
+      base_href={
+        RepositoryHTML.pull_files_path(@result.chrome, @result.content.pull.issue.number)
+      }
+    />
+  </section>
+</RepositoryHTML.repository_frame>

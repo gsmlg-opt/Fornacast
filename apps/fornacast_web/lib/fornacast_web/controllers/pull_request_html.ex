@@ -3,7 +3,7 @@ defmodule FornacastWeb.PullRequestHTML do
 
   use FornacastWeb, :html
 
-  alias FornacastWeb.RepositoryHTML
+  alias FornacastWeb.{CollaborationMarkdown, RepositoryHTML}
 
   embed_templates "pull_request_html/*"
 
@@ -46,6 +46,46 @@ defmodule FornacastWeb.PullRequestHTML do
 
   def comment_label(1), do: "1 comment"
   def comment_label(count), do: "#{count} comments"
+
+  def markdown(nil), do: CollaborationMarkdown.render("")
+  def markdown(body), do: CollaborationMarkdown.render(body)
+
+  def format_time(value), do: RepositoryHTML.format_time(value)
+  def short_oid(value), do: RepositoryHTML.short_oid(value)
+  def diff_line_map(value), do: RepositoryHTML.diff_line_map(value)
+
+  def changed_file_pages(%{total: total, per_page: per_page}) when total > 0,
+    do: div(total + per_page - 1, per_page)
+
+  def changed_file_pages(_page), do: 1
+
+  attr :result, :map, required: true
+  attr :active, :atom, required: true
+
+  def pull_navigation(assigns) do
+    ~H"""
+    <nav class="flex flex-wrap gap-2" aria-label="Pull request navigation" data-pull-navigation>
+      <.dm_link
+        href={RepositoryHTML.pull_path(@result.chrome, @result.content.pull.issue.number)}
+        aria-current={if @active == :conversation, do: "page"}
+      >
+        Conversation
+      </.dm_link>
+      <.dm_link
+        href={RepositoryHTML.pull_commits_path(@result.chrome, @result.content.pull.issue.number)}
+        aria-current={if @active == :commits, do: "page"}
+      >
+        Commits
+      </.dm_link>
+      <.dm_link
+        href={RepositoryHTML.pull_files_path(@result.chrome, @result.content.pull.issue.number)}
+        aria-current={if @active == :files, do: "page"}
+      >
+        Files changed
+      </.dm_link>
+    </nav>
+    """
+  end
 
   def branch_name("refs/heads/" <> name), do: name
   def branch_name(name), do: name

@@ -86,6 +86,11 @@ defmodule FornacastWeb.Router do
     get "/:owner/:repo/pulls", PullRequestController, :index
     get "/:owner/:repo/pulls/new", PullRequestController, :new
     post "/:owner/:repo/pulls", PullRequestController, :create
+    get "/:owner/:repo/pulls/:number/commits", PullRequestController, :commits
+    get "/:owner/:repo/pulls/:number/files", PullRequestController, :files
+    patch "/:owner/:repo/pulls/:number/state", PullRequestController, :state
+    post "/:owner/:repo/pulls/:number/merge", PullRequestController, :merge
+    get "/:owner/:repo/pulls/:number", PullRequestController, :show
     get "/:owner/:repo", RepositoryController, :show
     get "/:owner/:repo/branches", RepositoryController, :branches
     get "/:owner/:repo/tags", RepositoryController, :tags
