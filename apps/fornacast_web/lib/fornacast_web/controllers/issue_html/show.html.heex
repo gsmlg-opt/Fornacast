@@ -11,9 +11,33 @@
             )}
           </p>
         </div>
-        <.dm_badge variant={state_variant(@result.content.issue.state)} soft size="sm">
-          {@result.content.issue.state}
-        </.dm_badge>
+        <div class="flex flex-wrap items-center gap-2">
+          <.dm_badge variant={state_variant(@result.content.issue.state)} soft size="sm">
+            {@result.content.issue.state}
+          </.dm_badge>
+          <.dm_link
+            :if={@result.content.issue.capabilities.can_edit}
+            href={RepositoryHTML.edit_issue_path(@result.chrome, @result.content.issue.number)}
+          >
+            Edit
+          </.dm_link>
+          <form
+            :if={@result.content.issue.capabilities.can_close}
+            action={RepositoryHTML.issue_state_path(@result.chrome, @result.content.issue.number)}
+            method="post"
+          >
+            <input type="hidden" name="_csrf_token" value={csrf_token()} />
+            <input type="hidden" name="_method" value="patch" />
+            <input
+              type="hidden"
+              name="state"
+              value={if @result.content.issue.state == :open, do: "closed", else: "open"}
+            />
+            <.dm_btn type="submit" variant="outline" size="sm">
+              {if @result.content.issue.state == :open, do: "Close", else: "Reopen"}
+            </.dm_btn>
+          </form>
+        </div>
       </div>
       <div
         :if={@result.content.issue.labels != []}
@@ -55,6 +79,74 @@
           </span>
         </header>
         <div class="prose max-w-none p-4 text-on-surface">{markdown(comment.body)}</div>
+        <div
+          :if={comment.capabilities.can_edit or comment.capabilities.can_delete}
+          class="grid gap-3 border-t border-outline-variant p-4"
+        >
+          <form
+            :if={comment.capabilities.can_edit}
+            action={
+              RepositoryHTML.issue_comment_path(
+                @result.chrome,
+                @result.content.issue.number,
+                comment.id
+              )
+            }
+            method="post"
+            class="grid gap-3"
+          >
+            <input type="hidden" name="_csrf_token" value={csrf_token()} />
+            <input type="hidden" name="_method" value="patch" />
+            <.dm_alert
+              :for={
+                error <-
+                  resource_errors(
+                    comment_errors(@result.content, {:edit, to_string(comment.id)}),
+                    "IssueComment"
+                  )
+              }
+              variant="error"
+            >
+              {error}
+            </.dm_alert>
+            <.dm_textarea
+              id={"issue-comment-#{comment.id}"}
+              name="comment[body]"
+              label="Edit comment"
+              value={
+                form_value(
+                  comment_values(@result.content, {:edit, to_string(comment.id)}),
+                  "body",
+                  comment.body
+                )
+              }
+              errors={
+                field_errors(
+                  comment_errors(@result.content, {:edit, to_string(comment.id)}),
+                  "IssueComment",
+                  "body"
+                )
+              }
+              rows={4}
+            />
+            <.dm_btn type="submit" variant="outline" size="sm">Save comment</.dm_btn>
+          </form>
+          <form
+            :if={comment.capabilities.can_delete}
+            action={
+              RepositoryHTML.issue_comment_path(
+                @result.chrome,
+                @result.content.issue.number,
+                comment.id
+              )
+            }
+            method="post"
+          >
+            <input type="hidden" name="_csrf_token" value={csrf_token()} />
+            <input type="hidden" name="_method" value="delete" />
+            <.dm_btn type="submit" variant="error" size="sm">Delete comment</.dm_btn>
+          </form>
+        </div>
       </li>
     </ol>
 
@@ -64,5 +156,31 @@
       message="No comments yet."
       kind="empty"
     />
+
+    <form
+      :if={@result.content.issue.capabilities.can_comment}
+      action={RepositoryHTML.issue_comments_path(@result.chrome, @result.content.issue.number)}
+      method="post"
+      class="grid gap-3 bg-surface-container text-on-surface rounded-lg p-4"
+      data-issue-comment-form
+    >
+      <input type="hidden" name="_csrf_token" value={csrf_token()} />
+      <.dm_alert
+        :for={error <- resource_errors(comment_errors(@result.content, :create), "IssueComment")}
+        variant="error"
+      >
+        {error}
+      </.dm_alert>
+      <.dm_textarea
+        id="issue-comment-body"
+        name="comment[body]"
+        label="Comment"
+        value={form_value(comment_values(@result.content, :create), "body")}
+        errors={field_errors(comment_errors(@result.content, :create), "IssueComment", "body")}
+        rows={6}
+        required
+      />
+      <.dm_btn type="submit" variant="primary">Add comment</.dm_btn>
+    </form>
   </section>
 </RepositoryHTML.repository_frame>

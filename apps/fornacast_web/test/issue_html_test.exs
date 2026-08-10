@@ -95,6 +95,142 @@ defmodule FornacastWeb.IssueHTMLTest do
     refute html =~ "data-repository-toolbar"
   end
 
+  test "new form uses DuskMoon fields, CSRF, relationship options, and field errors" do
+    result =
+      result(:issues, %{
+        issue: nil,
+        options: form_options(true),
+        values: %{
+          "title" => "Retained title",
+          "body" => "Retained body",
+          "labels" => ["bug"],
+          "assignees" => ["bob"]
+        },
+        errors: [
+          %{resource: "Issue", field: "title", code: :invalid},
+          %{resource: "Issue", field: "base", code: :unprocessable}
+        ]
+      })
+
+    html = render_component(&IssueHTML.new/1, result: result)
+
+    assert html =~ "data-issue-form"
+    assert html =~ ~s(name="_csrf_token")
+    assert html =~ ~s(name="issue[title]")
+    assert html =~ ~s(name="issue[body]")
+    assert html =~ ~s(name="issue[labels][]")
+    assert html =~ ~s(name="issue[assignees][]")
+    assert html =~ ~r/<option[^>]*value="bug"[^>]*selected/
+    assert html =~ ~r/<option[^>]*value="bob"[^>]*selected/
+    assert html =~ "Retained title"
+    assert html =~ "Retained body"
+    assert html =~ "Title is invalid"
+    assert html =~ "The issue could not be processed"
+    assert length(Regex.scan(~r/aria-current="page"/, navigation(html))) == 1
+  end
+
+  test "non-writer author edit form omits relationship controls and uses PATCH override" do
+    author_issue = put_in(issue(7, "Author issue").capabilities.can_edit, true)
+
+    result =
+      result(:issue, %{
+        issue: author_issue,
+        options: form_options(false),
+        values: %{"title" => "Author issue", "body" => "Body"},
+        errors: []
+      })
+
+    html = render_component(&IssueHTML.edit/1, result: result)
+
+    assert html =~ "data-issue-form"
+    assert html =~ ~s(name="_method" value="patch")
+    assert html =~ ~s(name="_csrf_token")
+    refute html =~ ~s(name="issue[labels][]")
+    refute html =~ ~s(name="issue[assignees][]")
+  end
+
+  test "conversation actions are visible only from issue and comment capabilities" do
+    issue =
+      issue(7, "Actionable")
+      |> put_in([Access.key(:capabilities), :can_edit], true)
+      |> put_in([Access.key(:capabilities), :can_close], true)
+      |> put_in([Access.key(:capabilities), :can_comment], true)
+
+    first_editable =
+      comment(1, "editable", ~U[2026-08-09 08:01:00Z])
+      |> put_in([Access.key(:capabilities), :can_edit], true)
+      |> put_in([Access.key(:capabilities), :can_delete], true)
+
+    second_editable =
+      comment(2, "second original", ~U[2026-08-09 08:02:00Z])
+      |> put_in([Access.key(:capabilities), :can_edit], true)
+
+    content = %{
+      issue: issue,
+      comments: %Fornacast.Page{
+        entries: [first_editable, second_editable],
+        total: 2,
+        page: 1,
+        per_page: 100
+      },
+      comment_form: %{
+        operation: {:edit, "1"},
+        values: %{"body" => "Retained edit"},
+        errors: [%{resource: "IssueComment", field: "body", code: :invalid}]
+      }
+    }
+
+    html = render_component(&IssueHTML.show/1, result: result(:issue, content))
+
+    assert html =~ ~s(href="/alice/demo/issues/7/edit")
+    assert html =~ ~s(action="/alice/demo/issues/7/state")
+    assert html =~ ~s(action="/alice/demo/issues/7/comments")
+    assert html =~ ~s(action="/alice/demo/issues/7/comments/1")
+    assert html =~ ~s(name="comment[body]")
+    assert textarea_body(html, "issue-comment-1") =~ "Retained edit"
+    assert textarea_body(html, "issue-comment-2") =~ "second original"
+    assert textarea_body(html, "issue-comment-body") == ""
+    assert html =~ "Body is invalid"
+
+    create_html =
+      render_component(&IssueHTML.show/1,
+        result:
+          result(:issue, %{
+            content
+            | comment_form: %{
+                operation: :create,
+                values: %{"body" => "Retained creation"},
+                errors: [%{resource: "IssueComment", field: "base", code: :unprocessable}]
+              }
+          })
+      )
+
+    assert textarea_body(create_html, "issue-comment-1") =~ "editable"
+    assert textarea_body(create_html, "issue-comment-2") =~ "second original"
+    assert textarea_body(create_html, "issue-comment-body") =~ "Retained creation"
+    assert create_html =~ "The comment could not be processed"
+
+    hidden_issue = issue(8, "Read only")
+
+    hidden =
+      render_component(&IssueHTML.show/1,
+        result:
+          result(:issue, %{
+            issue: hidden_issue,
+            comments: %Fornacast.Page{
+              entries: [comment(2, "read only", ~U[2026-08-09 08:02:00Z])],
+              total: 1,
+              page: 1,
+              per_page: 100
+            }
+          })
+      )
+
+    refute hidden =~ "/edit"
+    refute hidden =~ "/state"
+    refute hidden =~ "/comments"
+  end
+
   defp result(kind, content) do
     owner = %User{id: 1, username: "alice", kind: :user, state: :active}
 
@@ -128,6 +264,13 @@ defmodule FornacastWeb.IssueHTMLTest do
       },
       content: content
     }
+  end
+
+  defp textarea_body(html, id) do
+    [_, body] =
+      Regex.run(~r/<textarea[^>]*id="#{Regex.escape(id)}"[^>]*>(.*?)<\/textarea>/s, html)
+
+    body
   end
 
   defp issue(number, title) do
@@ -182,6 +325,25 @@ defmodule FornacastWeb.IssueHTMLTest do
       sort: :created,
       direction: :desc
     }
+  end
+
+  defp form_options(can_manage_relationships) do
+    %{
+      labels: [%{name: "bug", normalized_name: "bug"}],
+      assignees: [%{username: "bob"}],
+      capabilities: %{
+        can_create: true,
+        can_comment: true,
+        can_edit: true,
+        can_close: true,
+        can_manage_relationships: can_manage_relationships
+      }
+    }
+  end
+
+  defp navigation(html) do
+    [navigation] = Regex.run(~r/<nav\b[^>]*id="repository-navigation".*?<\/nav>/s, html)
+    navigation
   end
 
   defp byte_index(text, pattern) do

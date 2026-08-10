@@ -53,4 +53,57 @@ defmodule FornacastWeb.IssueHTML do
   def markdown(body), do: CollaborationMarkdown.render(body)
 
   def format_time(value), do: RepositoryHTML.format_time(value)
+
+  def csrf_token, do: Plug.CSRFProtection.get_csrf_token()
+
+  def form_value(values, key, default \\ ""), do: Map.get(values, key, default)
+
+  def label_options(options),
+    do: Enum.map(options.labels, fn label -> {label.name, label.name} end)
+
+  def assignee_options(options),
+    do: Enum.map(options.assignees, fn assignee -> {assignee.username, assignee.username} end)
+
+  def selected_option?(values, value) when is_list(values), do: value in values
+  def selected_option?(value, value), do: true
+  def selected_option?(_values, _value), do: false
+
+  def field_errors(errors, resource, field) do
+    errors
+    |> Enum.filter(&(&1.resource == resource and &1.field == field))
+    |> Enum.map(&validation_message/1)
+  end
+
+  def resource_errors(errors, resource) do
+    errors
+    |> Enum.filter(&(&1.resource == resource and &1.field == "base"))
+    |> Enum.map(&validation_message/1)
+  end
+
+  def comment_values(content, operation), do: comment_form_value(content, operation, :values, %{})
+  def comment_errors(content, operation), do: comment_form_value(content, operation, :errors, [])
+
+  defp comment_form_value(content, operation, key, default) do
+    case Map.get(content, :comment_form) do
+      %{operation: ^operation} = form -> Map.get(form, key, default)
+      _form -> default
+    end
+  end
+
+  defp validation_message(%{resource: "Issue", field: "base"}),
+    do: "The issue could not be processed"
+
+  defp validation_message(%{resource: "IssueComment", field: "base"}),
+    do: "The comment could not be processed"
+
+  defp validation_message(%{field: field, code: code}) do
+    label = field |> String.replace("_", " ") |> String.capitalize()
+
+    case code do
+      :invalid -> "#{label} is invalid"
+      :missing -> "#{label} is missing"
+      :unprocessable -> "#{label} could not be processed"
+      _code -> "#{label} is invalid"
+    end
+  end
 end

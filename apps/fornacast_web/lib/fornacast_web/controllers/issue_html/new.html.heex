@@ -1,0 +1,90 @@
+<RepositoryHTML.repository_frame result={@result} active={:issues}>
+  <section class="grid min-w-0 gap-3 p-4" data-issue-form>
+    <header class="bg-surface-container text-on-surface rounded-lg p-4">
+      <p class="text-xs text-on-surface-variant">Repository issues</p>
+      <h2 class="text-lg font-semibold">New issue</h2>
+    </header>
+
+    <form
+      action={RepositoryHTML.issues_path(@result.chrome)}
+      method="post"
+      class="grid gap-3 bg-surface-container text-on-surface rounded-lg p-4"
+    >
+      <input type="hidden" name="_csrf_token" value={csrf_token()} />
+
+      <.dm_alert
+        :for={error <- resource_errors(@result.content.errors, "Issue")}
+        variant="error"
+      >
+        {error}
+      </.dm_alert>
+
+      <.dm_input
+        id="issue-title"
+        name="issue[title]"
+        label="Title"
+        value={form_value(@result.content.values, "title")}
+        errors={field_errors(@result.content.errors, "Issue", "title")}
+        maxlength="256"
+        required
+      />
+      <.dm_textarea
+        id="issue-body"
+        name="issue[body]"
+        label="Body"
+        value={form_value(@result.content.values, "body")}
+        errors={field_errors(@result.content.errors, "Issue", "body")}
+        rows={10}
+      />
+
+      <div
+        :if={@result.content.options.capabilities.can_manage_relationships}
+        class="grid gap-3 md:grid-cols-2"
+        data-issue-relationships
+      >
+        <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#131 --%>
+        <input type="hidden" name="issue[labels][]" value="" />
+        <.dm_select
+          id="issue-labels"
+          name="issue[labels][]"
+          label="Labels"
+          value={form_value(@result.content.values, "labels", [])}
+          errors={field_errors(@result.content.errors, "Issue", "labels")}
+          multiple
+        >
+          <option
+            :for={{value, label} <- label_options(@result.content.options)}
+            value={value}
+            selected={selected_option?(form_value(@result.content.values, "labels", []), value)}
+          >
+            {label}
+          </option>
+        </.dm_select>
+        <input type="hidden" name="issue[assignees][]" value="" />
+        <.dm_select
+          id="issue-assignees"
+          name="issue[assignees][]"
+          label="Assignees"
+          value={form_value(@result.content.values, "assignees", [])}
+          errors={field_errors(@result.content.errors, "Issue", "assignees")}
+          multiple
+        >
+          <option
+            :for={{value, label} <- assignee_options(@result.content.options)}
+            value={value}
+            selected={
+              selected_option?(form_value(@result.content.values, "assignees", []), value)
+            }
+          >
+            {label}
+          </option>
+        </.dm_select>
+      </div>
+
+      <div class="flex gap-3">
+        <.dm_btn type="submit" variant="primary">Create issue</.dm_btn>
+        <.dm_link href={RepositoryHTML.issues_path(@result.chrome)}>Cancel</.dm_link>
+      </div>
+    </form>
+  </section>
+</RepositoryHTML.repository_frame>

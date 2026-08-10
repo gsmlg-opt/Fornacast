@@ -74,6 +74,14 @@ defmodule FornacastWeb.Router do
     pipe_through :browser
 
     get "/:owner/:repo/issues", IssueController, :index
+    get "/:owner/:repo/issues/new", IssueController, :new
+    post "/:owner/:repo/issues", IssueController, :create
+    get "/:owner/:repo/issues/:number/edit", IssueController, :edit
+    patch "/:owner/:repo/issues/:number", IssueController, :update
+    post "/:owner/:repo/issues/:number/comments", IssueController, :comment
+    patch "/:owner/:repo/issues/:number/comments/:id", IssueController, :update_comment
+    delete "/:owner/:repo/issues/:number/comments/:id", IssueController, :delete_comment
+    patch "/:owner/:repo/issues/:number/state", IssueController, :state
     get "/:owner/:repo/issues/:number", IssueController, :show
     get "/:owner/:repo", RepositoryController, :show
     get "/:owner/:repo/branches", RepositoryController, :branches
