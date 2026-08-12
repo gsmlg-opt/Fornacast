@@ -10,6 +10,7 @@ defmodule Mix.Tasks.Fornacast.Run do
     :git_transport,
     :forge_issues,
     :forge_pulls,
+    :forge_releases,
     :fornacast_api,
     :fornacast_web
   ]
