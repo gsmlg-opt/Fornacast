@@ -1,5 +1,5 @@
 defmodule ForgeReleases.ApplicationTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   test "release and development startup include forge_releases in dependency order" do
     release_apps =
@@ -38,5 +38,12 @@ defmodule ForgeReleases.ApplicationTest do
   test "only the core ex_storage_service application is available" do
     assert Application.spec(:ex_storage_service)
     refute Application.spec(:ex_storage_service_s3)
+  end
+
+  test "forge_releases owns the storage subtree" do
+    assert Process.whereis(ForgeReleases.Supervisor)
+    assert Process.whereis(ForgeReleases.AssetStorage.Supervisor)
+    assert Process.whereis(ForgeReleases.AssetStorage.InstanceSupervisor)
+    assert Process.whereis(ForgeReleases.AssetStorage.Manager)
   end
 end

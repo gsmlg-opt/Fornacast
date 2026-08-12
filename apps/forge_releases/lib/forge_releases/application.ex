@@ -5,6 +5,7 @@ defmodule ForgeReleases.Application do
 
   @impl true
   def start(_type, _args) do
-    Supervisor.start_link([], strategy: :one_for_one, name: ForgeReleases.Supervisor)
+    children = [ForgeReleases.AssetStorage.Supervisor]
+    Supervisor.start_link(children, strategy: :one_for_one, name: ForgeReleases.Supervisor)
   end
 end
