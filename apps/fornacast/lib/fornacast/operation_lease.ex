@@ -72,6 +72,41 @@ defmodule Fornacast.OperationLease do
 
   def release(_module, _operation), do: {:error, :lost_lease}
 
+  @spec renew_owned(module(), struct(), keyword()) ::
+          {:ok, struct()} | {:error, :lost_lease | :invalid_argument}
+  def renew_owned(module, operation, options)
+      when is_atom(module) and is_list(options) do
+    with {:ok, now, expires_at} <- lease_window(options),
+         {:ok, renewed} <-
+           renew_owned_row(module, operation, [], now, expires_at, :renew_owned) do
+      {:ok, renewed}
+    end
+  end
+
+  def renew_owned(_module, _operation, _options), do: {:error, :invalid_argument}
+
+  @spec update_owned(module(), struct(), keyword(), keyword()) ::
+          {:ok, struct()} | {:error, :lost_lease | :invalid_update | :invalid_argument}
+  def update_owned(module, operation, updates, options)
+      when is_atom(module) and is_list(updates) and is_list(options) do
+    with {:ok, now, expires_at} <- lease_window(options),
+         {:ok, validated} <- owned_updates(module, operation, updates),
+         {:ok, updated} <-
+           renew_owned_row(
+             module,
+             operation,
+             validated,
+             now,
+             expires_at,
+             :update_owned_retained
+           ) do
+      {:ok, updated}
+    end
+  end
+
+  def update_owned(_module, _operation, _updates, _options),
+    do: {:error, :invalid_argument}
+
   @spec update_owned(module(), struct(), keyword()) ::
           {:ok, struct()} | {:error, :lost_lease | :invalid_update}
   def update_owned(
@@ -104,6 +139,13 @@ defmodule Fornacast.OperationLease do
 
   def update_owned(_module, _operation, _updates), do: {:error, :invalid_update}
 
+  defp owned_updates(module, operation, updates) do
+    case validated_updates(module, operation, updates) do
+      {:ok, validated} -> {:ok, validated}
+      :error -> {:error, :invalid_update}
+    end
+  end
+
   defp validated_updates(module, operation, updates) do
     with true <- Keyword.keyword?(updates),
          true <- function_exported?(module, :lease_update_changeset, 2),
@@ -114,6 +156,57 @@ defmodule Fornacast.OperationLease do
       _ -> :error
     end
   end
+
+  defp lease_window(options) do
+    with true <- Keyword.keyword?(options),
+         {:ok, now} <- Keyword.fetch(options, :now),
+         {:ok, lease_seconds} <- Keyword.fetch(options, :lease_seconds),
+         true <- Keyword.keys(options) |> Enum.sort() == [:lease_seconds, :now],
+         %DateTime{} <- now,
+         :ok <- validate_utc(now),
+         true <- is_integer(lease_seconds) and lease_seconds > 0 do
+      now = DateTime.truncate(now, :second)
+      {:ok, now, DateTime.add(now, lease_seconds, :second)}
+    else
+      _ -> {:error, :invalid_argument}
+    end
+  end
+
+  defp renew_owned_row(
+         module,
+         %{id: id, lease_owner: owner, lock_version: version},
+         updates,
+         now,
+         expires_at,
+         hook_kind
+       )
+       when is_integer(id) and is_binary(owner) and owner != "" and is_integer(version) do
+    query =
+      from item in module,
+        where:
+          item.id == ^id and item.lease_owner == ^owner and item.lock_version == ^version and
+            item.lease_expires_at > ^now
+
+    case Repo.update_all(query,
+           set: updates ++ [lease_expires_at: expires_at],
+           inc: [lock_version: 1]
+         ) do
+      {1, _} ->
+        expected_version = version + 1
+        run_after_write_hook(hook_kind, module, id, expected_version)
+
+        case owned_row(module, id, owner, expected_version) do
+          nil -> {:error, :lost_lease}
+          row -> {:ok, row}
+        end
+
+      {0, _} ->
+        {:error, :lost_lease}
+    end
+  end
+
+  defp renew_owned_row(_module, _operation, _updates, _now, _expires_at, _hook_kind),
+    do: {:error, :lost_lease}
 
   defp guarded_update(module, id, owner, version, updates) do
     query =

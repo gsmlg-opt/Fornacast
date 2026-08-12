@@ -159,6 +159,210 @@ defmodule Fornacast.OperationLeaseTest do
     assert replacement.lease_owner == "owner-b"
   end
 
+  test "renew_owned retains ownership and advances expiry and version", %{
+    operation: operation,
+    now: now
+  } do
+    assert {:ok, claimed} =
+             OperationLease.claim(GitWriteOperation, operation.id, "owner-a", now, 30)
+
+    renewal_now = DateTime.add(now, 10, :second)
+
+    assert {:ok, renewed} =
+             OperationLease.renew_owned(GitWriteOperation, claimed,
+               now: renewal_now,
+               lease_seconds: 45
+             )
+
+    assert renewed.lease_owner == "owner-a"
+    assert renewed.lease_expires_at == DateTime.add(renewal_now, 45, :second)
+    assert renewed.lock_version == claimed.lock_version + 1
+  end
+
+  test "update_owned/4 changes state while retaining a renewed lease", %{
+    operation: operation,
+    now: now
+  } do
+    assert {:ok, claimed} =
+             OperationLease.claim(GitWriteOperation, operation.id, "owner-a", now, 30)
+
+    update_now = DateTime.add(now, 5, :second)
+
+    assert {:ok, updated} =
+             OperationLease.update_owned(
+               GitWriteOperation,
+               claimed,
+               [state: :object_written],
+               now: update_now,
+               lease_seconds: 40
+             )
+
+    assert updated.state == :object_written
+    assert updated.lease_owner == "owner-a"
+    assert updated.lease_expires_at == DateTime.add(update_now, 40, :second)
+    assert updated.lock_version == claimed.lock_version + 1
+  end
+
+  test "owner-retaining operations reject expired, stale, and foreign handles", %{
+    operation: operation,
+    now: now
+  } do
+    assert {:ok, claimed} =
+             OperationLease.claim(GitWriteOperation, operation.id, "owner-a", now, 5)
+
+    assert {:error, :lost_lease} =
+             OperationLease.renew_owned(GitWriteOperation, claimed,
+               now: DateTime.add(now, 5, :second),
+               lease_seconds: 30
+             )
+
+    assert {:ok, reclaimed} =
+             OperationLease.claim(
+               GitWriteOperation,
+               operation.id,
+               "owner-b",
+               DateTime.add(now, 5, :second),
+               30
+             )
+
+    assert {:error, :lost_lease} =
+             OperationLease.renew_owned(GitWriteOperation, claimed,
+               now: DateTime.add(now, 6, :second),
+               lease_seconds: 30
+             )
+
+    foreign = %{reclaimed | lease_owner: "owner-c"}
+
+    assert {:error, :lost_lease} =
+             OperationLease.update_owned(
+               GitWriteOperation,
+               foreign,
+               [state: :object_written],
+               now: DateTime.add(now, 6, :second),
+               lease_seconds: 30
+             )
+  end
+
+  test "owner-retaining operations reject invalid options and updates without changing the lease",
+       %{
+         operation: operation,
+         now: now
+       } do
+    assert {:ok, claimed} =
+             OperationLease.claim(GitWriteOperation, operation.id, "owner-a", now, 30)
+
+    invalid_now = %DateTime{
+      now
+      | time_zone: "Europe/Paris",
+        zone_abbr: "CET",
+        utc_offset: 3_600
+    }
+
+    invalid_options = [
+      [now: invalid_now, lease_seconds: 30],
+      [now: now, lease_seconds: 0],
+      [lease_seconds: 30],
+      [now: now],
+      [now: now, lease_seconds: 30, extra: true],
+      [now, 30]
+    ]
+
+    for options <- invalid_options do
+      assert {:error, :invalid_argument} =
+               OperationLease.renew_owned(GitWriteOperation, claimed, options)
+
+      assert Repo.get!(GitWriteOperation, claimed.id) == claimed
+    end
+
+    assert {:error, :invalid_update} =
+             OperationLease.update_owned(
+               GitWriteOperation,
+               claimed,
+               [lease_owner: "owner-b"],
+               now: now,
+               lease_seconds: 30
+             )
+
+    assert {:error, :invalid_update} =
+             OperationLease.update_owned(
+               GitWriteOperation,
+               claimed,
+               [],
+               now: now,
+               lease_seconds: 30
+             )
+
+    assert Repo.get!(GitWriteOperation, claimed.id) == claimed
+  end
+
+  test "renew_owned never returns a capability superseded after its compare-and-swap", %{
+    operation: operation,
+    now: now
+  } do
+    assert {:ok, claimed} =
+             OperationLease.claim(GitWriteOperation, operation.id, "owner-a", now, 30)
+
+    result =
+      OperationLease.with_test_after_write_hook(
+        fn :renew_owned, GitWriteOperation, id, _version ->
+          Repo.update_all(from(item in GitWriteOperation, where: item.id == ^id),
+            set: [lease_expires_at: DateTime.add(now, -1, :second)]
+          )
+
+          Process.put(
+            :replacement_claim,
+            OperationLease.claim(GitWriteOperation, id, "owner-b", now, 30)
+          )
+        end,
+        fn ->
+          OperationLease.renew_owned(GitWriteOperation, claimed,
+            now: now,
+            lease_seconds: 30
+          )
+        end
+      )
+
+    assert {:error, :lost_lease} = result
+    assert {:ok, replacement} = Process.delete(:replacement_claim)
+    assert replacement.lease_owner == "owner-b"
+  end
+
+  test "update_owned/4 never returns a capability superseded after its compare-and-swap", %{
+    operation: operation,
+    now: now
+  } do
+    assert {:ok, claimed} =
+             OperationLease.claim(GitWriteOperation, operation.id, "owner-a", now, 30)
+
+    result =
+      OperationLease.with_test_after_write_hook(
+        fn :update_owned_retained, GitWriteOperation, id, _version ->
+          Repo.update_all(from(item in GitWriteOperation, where: item.id == ^id),
+            set: [lease_expires_at: DateTime.add(now, -1, :second)]
+          )
+
+          Process.put(
+            :replacement_claim,
+            OperationLease.claim(GitWriteOperation, id, "owner-b", now, 30)
+          )
+        end,
+        fn ->
+          OperationLease.update_owned(
+            GitWriteOperation,
+            claimed,
+            [state: :object_written],
+            now: now,
+            lease_seconds: 30
+          )
+        end
+      )
+
+    assert {:error, :lost_lease} = result
+    assert {:ok, replacement} = Process.delete(:replacement_claim)
+    assert replacement.lease_owner == "owner-b"
+    assert replacement.state == :object_written
+  end
+
   test "expired lease can be reclaimed and stale owner cannot update or release", %{
     operation: operation,
     now: now
