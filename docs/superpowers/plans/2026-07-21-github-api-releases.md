@@ -1,5 +1,13 @@
 # GitHub-Compatible Releases and Assets Implementation Plan
 
+> **Superseded 2026-08-12:** Do not execute this plan. Its release behavior is
+> retained, but its storage, upload, deletion, and recovery steps conflict with
+> the approved embedded-LocalCAS design. Use these replacement plans in order:
+>
+> 1. `docs/superpowers/plans/2026-08-12-release-assets-localcas-foundation.md`
+> 2. `docs/superpowers/plans/2026-08-12-release-domain-on-localcas.md`
+> 3. `docs/superpowers/plans/2026-08-12-release-api-and-acceptance.md`
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Let repository writers publish GitHub-compatible releases, create or reuse real Git tags, stream release assets safely, and recover every Git/SQL/filesystem transition after interruption.
