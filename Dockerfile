@@ -47,6 +47,7 @@ FROM ${DEBIAN_IMAGE} AS app
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
+      coreutils \
       libstdc++6 \
       libsctp1 \
       ncurses-base \
@@ -59,8 +60,12 @@ RUN apt-get update && \
 WORKDIR /app
 
 COPY --from=build --chown=fornacast:fornacast /app/_build/prod/rel/fornacast ./
+COPY --chown=fornacast:fornacast \
+  scripts/release_asset_storage_smoke.sh \
+  /app/bin/release_asset_storage_smoke
 
-ENV HOME=/app \
+ENV LANG=C.UTF-8 \
+    HOME=/app \
     PORT=4890 \
     FORNACAST_API_BIND_IP=0.0.0.0 \
     FORNACAST_API_PORT=4891 \
@@ -68,7 +73,14 @@ ENV HOME=/app \
     FORNACAST_DATABASE_PATH=/data/fornacast.db \
     FORNACAST_CONFIG_DATABASE_PATH=/data/fornacast_config.db \
     FORNACAST_REPO_STORAGE_ROOT=/data/repos \
-    FORNACAST_SSH_SYSTEM_DIR=/data/ssh
+    FORNACAST_RELEASE_ASSET_STORAGE_ROOT=/data/release-assets \
+    FORNACAST_RELEASE_ASSET_MAX_BYTES=2147483648 \
+    FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS=86400 \
+    FORNACAST_SSH_SYSTEM_DIR=/data/ssh \
+    ELIXIR_ERL_OPTIONS="-kernel inet_dist_use_interface {127,0,0,1}" \
+    ERL_EPMD_ADDRESS=127.0.0.1 \
+    RELEASE_DISTRIBUTION=name \
+    RELEASE_NODE=fornacast@127.0.0.1
 
 USER fornacast
 

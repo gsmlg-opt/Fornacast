@@ -9,7 +9,7 @@ defmodule ForgeRepos do
   alias Ecto.Changeset
   alias Ecto.Multi
   alias ForgeAccounts.{AccountView, Organization, OrganizationMember, User}
-  alias ForgeRepos.{Collaborator, Repository, RepositoryView}
+  alias ForgeRepos.{Collaborator, Repository, RepositoryView, RepositoryWriteReconcilers}
   alias Fornacast.{Audit, Page, Repo, Storage}
 
   @repository_permissions [:repository_read, :repository_write, :repository_admin]
@@ -79,6 +79,28 @@ defmodule ForgeRepos do
   end
 
   def fetch_authorized_repository(_actor, _owner_slug, _repository_slug, _permission),
+    do: {:error, :forbidden}
+
+  @spec fetch_authorized_repository_by_id(User.t() | nil, pos_integer(), atom()) ::
+          {:ok, Repository.t()} | {:error, :not_found | :forbidden}
+  def fetch_authorized_repository_by_id(actor, repository_id, permission)
+      when is_integer(repository_id) and repository_id > 0 and
+             permission in @repository_permissions do
+    repository =
+      Repository
+      |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
+      |> where(
+        [repository, owner],
+        repository.id == ^repository_id and is_nil(repository.deleted_at) and
+          owner.state == :active and owner.kind in [:user, :organization]
+      )
+      |> select([repository, _owner], repository)
+      |> Repo.one()
+
+    authorize_fetched_repository(actor, repository, permission)
+  end
+
+  def fetch_authorized_repository_by_id(_actor, _repository_id, _permission),
     do: {:error, :forbidden}
 
   @spec repository_view(User.t() | nil, Repository.t()) ::
@@ -298,6 +320,50 @@ defmodule ForgeRepos do
     |> Storage.repository_path!()
   end
 
+  @spec with_write_fence(
+          Repository.t(),
+          :ref | :content | :merge | :tag | :receive_pack,
+          (Path.t(), non_neg_integer() -> term())
+        ) :: term()
+  def with_write_fence(%Repository{id: repository_id} = repository, class, fun)
+      when is_integer(repository_id) and
+             class in [:ref, :content, :merge, :tag, :receive_pack] and
+             is_function(fun, 2) do
+    absolute_deadline = System.monotonic_time(:millisecond) + write_deadline(class)
+
+    case GitCore.RepositoryWriteLimiter.acquire(repository_id, absolute_deadline) do
+      {:ok, lease} ->
+        try do
+          with {:ok, repository_path} <- safe_absolute_storage_path(repository),
+               :ok <-
+                 RepositoryWriteReconcilers.reconcile_locked(
+                   repository,
+                   repository_path,
+                   absolute_deadline
+                 ) do
+            remaining = max(absolute_deadline - System.monotonic_time(:millisecond), 0)
+            fun.(repository_path, remaining)
+          else
+            {:error, :storage_unavailable} -> {:error, {:unavailable, :storage}}
+            {:error, :unavailable} -> {:error, {:unavailable, :write_fence}}
+          end
+        after
+          GitCore.RepositoryWriteLimiter.release(lease)
+        end
+
+      {:error, :timeout} ->
+        {:error, {:unavailable, :write_timeout}}
+
+      {:error, :unavailable} ->
+        {:error, {:unavailable, :write_limiter}}
+    end
+  end
+
+  defp write_deadline(class) when class in [:ref, :tag], do: GitCore.Limits.get(:ref_deadline_ms)
+
+  defp write_deadline(class) when class in [:content, :merge, :receive_pack],
+    do: GitCore.Limits.get(:content_deadline_ms)
+
   defp safe_absolute_storage_path(%Repository{} = repository) do
     {:ok, absolute_storage_path(repository)}
   rescue
@@ -363,6 +429,18 @@ defmodule ForgeRepos do
     |> where([collaborator], collaborator.user_id == ^user_id)
     |> select([collaborator], collaborator.role)
     |> Repo.one()
+  end
+
+  def collaborator_roles(user_ids, %Repository{id: repository_id}) when is_list(user_ids) do
+    ForgeRepos.Collaborator
+    |> where(
+      [collaborator],
+      collaborator.repository_id == ^repository_id and
+        collaborator.user_id in ^Enum.uniq(user_ids)
+    )
+    |> select([collaborator], {collaborator.user_id, collaborator.role})
+    |> Repo.all()
+    |> Map.new()
   end
 
   defp directly_owned_repository_counts(owner_id) do

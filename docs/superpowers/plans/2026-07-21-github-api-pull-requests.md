@@ -101,6 +101,8 @@
 ### Issue composition and Git operations
 
 - Reuse `ForgeIssues.insert_numbered_identity/6` and `ForgeIssues.update_identity/5` unchanged; Plan 3 already guarantees caller-selected `Ecto.Multi` keys.
+- Modify `apps/forge_issues/lib/forge_issues.ex` only to expose the repository-scoped batch `ForgeIssues.load_issue_metadata_by_ids/2` composition function used by pull list/detail reads.
+- Modify `apps/forge_issues/test/forge_issues_test.exs` to lock repository scoping, canonical metadata, and bounded query count for that batch function.
 - Modify `apps/git_core/lib/git_core/write_model.ex`.
 - Modify `apps/git_core/lib/git_core.ex`.
 - Modify `apps/git_core/lib/git_core/native.ex`.
@@ -195,7 +197,7 @@ Assert `failure_reason` is redacted or omitted from public structs returned by t
 Create `pull_requests` with:
 
 - `issue_id` referencing `issues` with `on_delete: :delete_all`, not null and unique;
-- `repository_id` referencing `repositories` with `on_delete: :restrict`, not null;
+- `repository_id` referencing `repositories` with `on_delete: :delete_all`, not null;
 - `head_ref` and `base_ref`, not null;
 - `head_sha` and `base_sha`, not null, holding the last immutable snapshots analyzed for the pull;
 - nullable `mergeable` and `mergeable_state`, updated only with the matching snapshot pair;
@@ -205,7 +207,7 @@ Create `pull_requests` with:
 
 Create `pull_merge_operations` with:
 
-- `pull_request_id` and `repository_id`, not null and restricted;
+- `pull_request_id` and `repository_id`, not null with `on_delete: :delete_all`;
 - nullable `actor_user_id` with `on_delete: :nilify_all`;
 - `request_id`, `base_ref`, `head_ref`, `expected_base_oid`, and `expected_head_oid`, not null;
 - nullable `merge_oid` and sanitized `failure_reason`;
@@ -244,6 +246,10 @@ git commit -m "feat(pulls): add pull request persistence"
 
 - Create: `apps/forge_pulls/lib/forge_pulls.ex`
 - Modify: `apps/forge_pulls/test/forge_pulls_test.exs`
+- Modify: `apps/forge_issues/lib/forge_issues.ex` (narrow batch metadata composition function only)
+- Modify: `apps/forge_issues/test/forge_issues_test.exs` (batch metadata contract only)
+- Modify: `apps/forge_repos/lib/forge_repos.ex` (canonical repository-by-ID authorization helper only)
+- Modify: `apps/forge_repos/test/access_test.exs` (canonical helper contract only)
 
 - [ ] **Step 1: Write failing atomic creation tests**
 
@@ -309,7 +315,7 @@ Authorize repository read, normalize `head` without double decoding, resolve bot
 
 - [ ] **Step 5: Implement list, get, and update through the issue context**
 
-Use deterministic `{sort_field, id}` ordering. Apply state, head, base, sort, direction, page, and per-page filters. Load the issue identity through context-owned queries. Update the base only after validating that the new branch exists; source repository and head ref are immutable. Compose every update in one outer multi:
+Use deterministic `{sort_field, issue_id, pull_id}` ordering. Accept list state `open`, `closed`, or `all`; accept sort `created`, `updated`, `popularity`, or `long-running`. Popularity comes from a grouped canonical issue-comment count with zero coalescing, while long-running uses the canonical issue creation timestamp. Apply head, base, direction, page, and per-page filters. Load the issue identity through context-owned queries. Canonicalize every read through the active owner and `ForgeRepos.fetch_authorized_repository/4`; transactional authorization uses the narrowly scoped canonical repository-by-ID helper. Update authorization and capability checks precede client ref validation or Git resolution and repeat inside the transaction. Update the base only after validating that the new branch exists; source repository and head ref are immutable. Compose every update in one outer multi:
 
 ```elixir
 Ecto.Multi.new()
@@ -329,7 +335,7 @@ end)
 |> Fornacast.Repo.transaction()
 ```
 
-The author/writer policy determines `shared_attrs` and `pull_attrs` before the multi; a validation or audit failure rolls back both rows. A detail or mergeability read resolves each ref once, computes against that pair, and persists `head_sha`, `base_sha`, `mergeable`, and `mergeable_state` together so stored analysis never mixes snapshots.
+The author/writer policy determines `shared_attrs` and `pull_attrs` before the multi; a validation or audit failure rolls back both rows. Public pull updates accept `state` as `"open"`, `"closed"`, or their atom equivalents and derive the canonical transition reason (`:completed` when closing and `:reopened` when reopening) for both authors and writers; `state_reason` is not public pull-update input. Audit request metadata is limited to `request_id`, `api_version`, `ip_address`, `user_agent`, and `token_id`, with string-key precedence. A detail or mergeability read resolves each ref exactly once, computes against that pair, and persists `head_sha`, `base_sha`, `mergeable`, and `mergeable_state` together so stored analysis never mixes snapshots. Conditional persistence matches the expected ref names and stored head/base OIDs; a lost race returns `:ref_conflict` without re-resolving. Task 2 has no merge-analysis primitive: its computed current-snapshot result is always `mergeable: nil, mergeable_state: :unknown`. Detail refresh and base update must clear any older analysis to that explicit pair atomically; Task 4 replaces `:unknown` using Task 3's analysis primitive only after analyzing the same immutable OID pair.
 
 Implement `pull_links_for_issue_ids/3` as one repository-scoped query over `pull_requests`, selecting only `issue_id` and `merged_at` for the supplied IDs after repository-read authorization. Return a map keyed by issue ID. This is the one-way bridge used by the HTTP application; `forge_issues` does not query or depend on `forge_pulls`.
 

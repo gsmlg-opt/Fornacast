@@ -73,8 +73,8 @@ defmodule FornacastWebTest do
              ~s(<a class="brand-mark" href="/" aria-label="Fornacast dashboard">Fornacast</a>)
 
     assert html =~ ~s(<nav class="appbar-nav" aria-label="Workspace">)
-    assert html =~ ~s(<a class="nav-link" href="/issues">Issues</a>)
-    assert html =~ ~s(<a class="nav-link" href="/pulls">Pull Requests</a>)
+    refute html =~ ~s(<a class="nav-link" href="/issues">Issues</a>)
+    refute html =~ ~s(<a class="nav-link" href="/pulls">Pull Requests</a>)
     assert html =~ ~s(<details class="repo-menu">)
     assert html =~ ~s(<summary class="repo-menu-trigger" aria-label="User repositories")
     assert html =~ ~s(<span>User Repos</span>)

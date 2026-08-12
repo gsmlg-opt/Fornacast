@@ -1247,7 +1247,7 @@ Regenerate both artifacts:
 rm -rf /tmp/fornacast-openapi-source
 git clone --filter=blob:none --no-checkout https://github.com/github/rest-api-description.git /tmp/fornacast-openapi-source
 git -C /tmp/fornacast-openapi-source checkout 03ca9c1cac754ec9b8369dc75de8a8c753c6e087 -- descriptions/ghes-3.21/dereferenced/ghes-3.21.2022-11-28.deref.json descriptions/ghes-3.21/dereferenced/ghes-3.21.2026-03-10.deref.json
-mix run scripts/prune_github_openapi.exs -- /tmp/fornacast-openapi-source apps/fornacast_api/priv/openapi 3
+mix run --no-start scripts/prune_github_openapi.exs /tmp/fornacast-openapi-source apps/fornacast_api/priv/openapi 3
 ~~~
 
 Expected: both generated files retain the complete first-release manifest and advance only the implemented-through marker from `2` to `3`.

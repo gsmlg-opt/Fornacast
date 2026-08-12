@@ -5,7 +5,15 @@ end
 
 defmodule FornacastWeb.RepositoryPage.Chrome do
   @enforce_keys [:owner, :repository, :viewer, :ref_summary, :clone]
-  defstruct [:owner, :repository, :viewer, :ref_summary, :snapshot, :clone]
+  defstruct [
+    :owner,
+    :repository,
+    :viewer,
+    :ref_summary,
+    :snapshot,
+    :clone,
+    collaboration_counts: %{issues: nil, pull_requests: nil}
+  ]
 end
 
 defmodule FornacastWeb.RepositoryPage.Clone do
@@ -77,6 +85,21 @@ defmodule FornacastWeb.RepositoryPage do
 
   @inline_blob_limit 1_048_576
   @complete_blob_limit 100_000_000
+
+  @collaboration_kinds [:issues, :issue, :pulls, :pull, :pull_commits, :pull_files]
+
+  def collaboration(repository, owner, viewer, kind, content, opts \\ [])
+
+  def collaboration(%Repository{} = repository, owner, viewer, kind, content, opts)
+      when kind in @collaboration_kinds and is_list(opts) do
+    git_core = Keyword.get(opts, :git_core, GitCore)
+    path = ForgeRepos.absolute_storage_path(repository)
+
+    with {:ok, ref_summary} <-
+           git_core.ref_summary(path, selected_ref: default_ref(repository)) do
+      result(kind, chrome(repository, owner, viewer, ref_summary, nil), content)
+    end
+  end
 
   def code(
         %Repository{} = repository,

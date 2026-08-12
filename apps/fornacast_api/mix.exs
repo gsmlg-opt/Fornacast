@@ -31,6 +31,8 @@ defmodule FornacastAPI.MixProject do
       {:fornacast, in_umbrella: true},
       {:forge_accounts, in_umbrella: true},
       {:forge_repos, in_umbrella: true},
+      {:forge_issues, in_umbrella: true},
+      {:forge_pulls, in_umbrella: true},
       {:git_core, in_umbrella: true},
       {:phoenix, "~> 1.8"},
       {:bandit, "~> 1.12"},

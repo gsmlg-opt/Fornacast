@@ -93,6 +93,24 @@ defmodule FornacastAPI.OpenAPIContractTest do
                   |> Enum.map(fn [method, path] -> {method, path} end)
                   |> MapSet.new()
 
+  @issues_disabled_operations [
+    {"post", "/repos/{owner}/{repo}/issues"},
+    {"get", "/repos/{owner}/{repo}/issues/{issue_number}"},
+    {"patch", "/repos/{owner}/{repo}/issues/{issue_number}"},
+    {"get", "/repos/{owner}/{repo}/issues/{issue_number}/comments"},
+    {"post", "/repos/{owner}/{repo}/issues/{issue_number}/comments"},
+    {"patch", "/repos/{owner}/{repo}/issues/comments/{comment_id}"},
+    {"delete", "/repos/{owner}/{repo}/issues/comments/{comment_id}"}
+  ]
+
+  @declared_issues_disabled_operations Enum.map(
+                                         @issues_disabled_operations,
+                                         fn {method, path} ->
+                                           "#{String.upcase(method)} #{path}"
+                                         end
+                                       )
+                                       |> Enum.sort()
+
   @foundation_operations MapSet.new([
                            {"get", "/versions"},
                            {"get", "/rate_limit"},
@@ -181,6 +199,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
       ~w(has_projects has_wiki has_discussions allow_squash_merge allow_rebase_merge),
     "git_ref_writes" => "branch_refs_fast_forward_only",
     "unsupported_issue_features" => ~w(milestone type locked active_lock_reason),
+    "issues_disabled_410_operations" => @declared_issues_disabled_operations,
     "merge_method" => "merge",
     "release_assets_server" => "/api/uploads",
     "release_archives" => nil,
@@ -226,7 +245,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
       assert document["x-fornacast-source-commit"] == @source_commit
       assert document["x-fornacast-source-blob"] == source_blob
       assert document["x-github-api-version"] == version
-      assert document["x-fornacast-implemented-through-slice"] == "1"
+      assert document["x-fornacast-implemented-through-slice"] == "3"
       assert MapSet.subset?(@foundation_operations, operations(document))
       assert get_in(document, ["paths", "/repos/{owner}/{repo}", "get"])
       assert document["x-fornacast-delivery-slices"] == @delivery_slices
@@ -303,7 +322,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
     assert overlay["versions"] == ["2022-11-28", "2026-03-10"]
     assert overlay["servers"]["rest"] == "/api/v3"
     assert overlay["servers"]["uploads"] == "/api/uploads"
-    assert overlay["implemented_through_slice"] == "1"
+    assert overlay["implemented_through_slice"] == "3"
     assert overlay["delivery_slices"] == @delivery_slices
     assert overlay["mutation_fields"] == @mutation_fields
     assert overlay["required_mutation_fields"] == @required_mutation_fields
@@ -318,6 +337,38 @@ defmodule FornacastAPI.OpenAPIContractTest do
 
     assert overlay["delivery_slices"]["1"] == expected_foundation
     assert Enum.sort(Map.keys(overlay["delivery_slices"])) == ~w(1 2 3 4 5)
+  end
+
+  test "every disabled-issue controller operation declares the shared 410 response" do
+    overlay = "fornacast-overlay.json" |> contract_path() |> File.read!() |> JSON.decode!()
+
+    assert overlay["divergences"]["issues_disabled_410_operations"] ==
+             @declared_issues_disabled_operations
+
+    for {version, {filename, _source_blob}} <- @contracts do
+      document = filename |> contract_path() |> File.read!() |> JSON.decode!()
+
+      shared_response =
+        get_in(document, [
+          "paths",
+          "/repos/{owner}/{repo}/issues",
+          "post",
+          "responses",
+          "410"
+        ])
+
+      assert shared_response["description"] == "Gone", version
+
+      assert get_in(shared_response, ["content", "application/json", "schema", "title"]) ==
+               "Basic Error",
+             version
+
+      for {method, path} <- @issues_disabled_operations do
+        assert get_in(document, ["paths", path, method, "responses", "410"]) ==
+                 shared_response,
+               "#{version} #{String.upcase(method)} #{path}"
+      end
+    end
   end
 
   test "foundation fixtures exactly match the versioned golden envelopes" do

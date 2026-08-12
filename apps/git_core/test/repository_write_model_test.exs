@@ -1,0 +1,1205 @@
+defmodule GitCore.RepositoryWriteModelTest do
+  use ExUnit.Case, async: false
+
+  @moduletag :pull_merge
+
+  setup do
+    tmp_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "fornacast-pull-merge-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    File.rm_rf!(tmp_dir)
+    File.mkdir_p!(tmp_dir)
+    on_exit(fn -> File.rm_rf!(tmp_dir) end)
+    %{tmp_dir: tmp_dir}
+  end
+
+  test "merge analysis is a typed value with enforced keys" do
+    assert_raise ArgumentError, fn ->
+      struct!(GitCore.MergeAnalysis,
+        base_oid: String.duplicate("a", 40),
+        head_oid: String.duplicate("b", 40),
+        mergeable: true,
+        ahead_by: 1,
+        behind_by: 1,
+        commit_count: 1
+      )
+    end
+  end
+
+  test "compare-and-swap creates an absent ref and advances it by exact fast-forward", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = clean_fixture!(tmp_dir)
+    target_ref = "refs/heads/cas-target"
+    before_objects = object_ids(fixture.repo_path)
+
+    raw_base = git!(["--git-dir", fixture.repo_path, "cat-file", "-p", fixture.base_oid])
+    assert "parent #{fixture.root_oid}" in String.split(raw_base, "\n")
+
+    assert {:ok, root_oid} =
+             GitCore.compare_and_swap_ref(
+               fixture.repo_path,
+               target_ref,
+               nil,
+               fixture.root_oid,
+               :fast_forward,
+               deadline_ms: 10_001
+             )
+
+    assert root_oid == fixture.root_oid
+    assert git!(["--git-dir", fixture.repo_path, "rev-parse", target_ref]) == fixture.root_oid
+    assert object_ids(fixture.repo_path) == before_objects
+
+    assert {:ok, base_oid} =
+             GitCore.compare_and_swap_ref(
+               fixture.repo_path,
+               target_ref,
+               fixture.root_oid,
+               fixture.base_oid,
+               :fast_forward,
+               deadline_ms: 10_001
+             )
+
+    assert base_oid == fixture.base_oid
+    assert git!(["--git-dir", fixture.repo_path, "rev-parse", target_ref]) == fixture.base_oid
+    assert object_ids(fixture.repo_path) == before_objects
+  end
+
+  test "only one expected-absent compare-and-swap wins a race", %{tmp_dir: tmp_dir} do
+    fixture = clean_fixture!(tmp_dir)
+    target_ref = "refs/heads/raced"
+
+    results =
+      [fixture.base_oid, fixture.head_oid]
+      |> Task.async_stream(
+        fn proposed_oid ->
+          GitCore.compare_and_swap_ref(
+            fixture.repo_path,
+            target_ref,
+            nil,
+            proposed_oid,
+            :fast_forward,
+            deadline_ms: 10_000
+          )
+        end,
+        max_concurrency: 2,
+        ordered: false,
+        timeout: 15_000
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.count(results, &match?({:ok, _oid}, &1)) == 1
+
+    assert Enum.count(results, fn
+             {:error, %GitCore.Error{kind: :ref_exists, operation: :compare_and_swap_ref}} -> true
+             _other -> false
+           end) == 1
+
+    [{:ok, recorded_oid}] = Enum.filter(results, &match?({:ok, _oid}, &1))
+    assert git!(["--git-dir", fixture.repo_path, "rev-parse", target_ref]) == recorded_oid
+  end
+
+  test "compare-and-swap rejects conflicts and invalid targets without side effects", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = clean_fixture!(tmp_dir)
+    target_ref = "refs/heads/main"
+    tree_oid = git!(["--git-dir", fixture.repo_path, "rev-parse", "#{fixture.base_oid}^{tree}"])
+
+    failures = [
+      {fixture.root_oid, fixture.head_oid, target_ref, 10_000, :stale_ref},
+      {fixture.base_oid, fixture.base_oid, "refs/heads/missing", 10_000, :stale_ref},
+      {nil, fixture.head_oid, target_ref, 10_000, :ref_exists},
+      {fixture.base_oid, fixture.head_oid, target_ref, 10_000, :non_fast_forward},
+      {fixture.base_oid, tree_oid, target_ref, 10_000, :target_not_commit},
+      {fixture.base_oid, fixture.base_oid, "main", 10_000, :invalid_ref},
+      {"not-an-oid", fixture.base_oid, target_ref, 10_000, :invalid_oid},
+      {fixture.base_oid, "not-an-oid", target_ref, 10_000, :invalid_oid},
+      {fixture.base_oid, String.duplicate("0", 40), target_ref, 10_000, :invalid_oid},
+      {fixture.base_oid, String.duplicate("f", 40), target_ref, 10_000, :target_not_commit},
+      {fixture.base_oid, fixture.base_oid, target_ref, 0, :ref_timeout}
+    ]
+
+    for {expected, proposed, ref, deadline_ms, kind} <- failures do
+      before_refs = refs(fixture.repo_path)
+      before_objects = object_ids(fixture.repo_path)
+
+      assert {:error, %GitCore.Error{kind: ^kind, operation: :compare_and_swap_ref}} =
+               GitCore.compare_and_swap_ref(
+                 fixture.repo_path,
+                 ref,
+                 expected,
+                 proposed,
+                 :fast_forward,
+                 deadline_ms: deadline_ms
+               )
+
+      assert refs(fixture.repo_path) == before_refs
+      assert object_ids(fixture.repo_path) == before_objects
+    end
+  end
+
+  test "compare-and-swap validates its public mode and deadline options" do
+    assert {:error, %GitCore.Error{kind: :invalid_input, operation: :compare_and_swap_ref}} =
+             GitCore.compare_and_swap_ref(
+               "unused",
+               "refs/heads/main",
+               nil,
+               String.duplicate("a", 40),
+               :force,
+               []
+             )
+
+    assert {:error, %GitCore.Error{kind: :invalid_input, operation: :compare_and_swap_ref}} =
+             GitCore.compare_and_swap_ref(
+               "unused",
+               "refs/heads/main",
+               nil,
+               String.duplicate("a", 40),
+               :fast_forward,
+               deadline_ms: "later"
+             )
+  end
+
+  test "compare-and-swap maps real ref lock contention to a deadline without side effects", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = clean_fixture!(tmp_dir)
+    lock_path = Path.join(fixture.repo_path, "refs/heads/main.lock")
+    before_refs = refs(fixture.repo_path)
+    before_objects = object_ids(fixture.repo_path)
+    File.write!(lock_path, "held by test")
+
+    try do
+      assert {:error, %GitCore.Error{kind: :ref_timeout, operation: :compare_and_swap_ref}} =
+               GitCore.compare_and_swap_ref(
+                 fixture.repo_path,
+                 "refs/heads/main",
+                 fixture.base_oid,
+                 fixture.base_oid,
+                 :fast_forward,
+                 deadline_ms: 5
+               )
+
+      assert refs(fixture.repo_path) == before_refs
+      assert object_ids(fixture.repo_path) == before_objects
+    after
+      File.rm(lock_path)
+    end
+  end
+
+  test "compare-and-swap keeps tags create-only", %{tmp_dir: tmp_dir} do
+    fixture = clean_fixture!(tmp_dir)
+    tag_ref = "refs/tags/v1.0.0"
+    assert {:ok, _oid} = cas(fixture, tag_ref, nil, fixture.base_oid)
+    before_refs = refs(fixture.repo_path)
+    before_objects = object_ids(fixture.repo_path)
+
+    assert {:error, %GitCore.Error{kind: :ref_exists, operation: :compare_and_swap_ref}} =
+             cas(fixture, tag_ref, fixture.base_oid, fixture.base_oid)
+
+    assert refs(fixture.repo_path) == before_refs
+    assert object_ids(fixture.repo_path) == before_objects
+  end
+
+  test "compare-and-swap rejects ref namespace collisions in both directions", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = clean_fixture!(tmp_dir)
+    assert {:ok, _oid} = cas(fixture, "refs/heads/foo", nil, fixture.base_oid)
+    assert {:ok, _oid} = cas(fixture, "refs/heads/tree/leaf", nil, fixture.base_oid)
+    before_refs = refs(fixture.repo_path)
+    before_objects = object_ids(fixture.repo_path)
+
+    for full_ref <- ["refs/heads/foo/bar", "refs/heads/tree"] do
+      assert {:error, %GitCore.Error{kind: :ref_exists, operation: :compare_and_swap_ref}} =
+               cas(fixture, full_ref, nil, fixture.root_oid)
+
+      assert refs(fixture.repo_path) == before_refs
+      assert object_ids(fixture.repo_path) == before_objects
+    end
+  end
+
+  test "compare-and-swap applies the configured ancestry visit limit without caller override", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = clean_fixture!(tmp_dir)
+    git!(["-C", fixture.work_path, "checkout", "main"])
+    File.write!(Path.join(fixture.work_path, "cas-limit.txt"), "limit\n")
+    git!(["-C", fixture.work_path, "add", "cas-limit.txt"])
+    git!(["-C", fixture.work_path, "commit", "-m", "cas limit child"])
+    proposed_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+    git!(["-C", fixture.work_path, "push", fixture.repo_path, "HEAD:refs/heads/cas-limit"])
+    before_refs = refs(fixture.repo_path)
+    before_objects = object_ids(fixture.repo_path)
+    previous_limits = Application.get_env(:git_core, :limits)
+    Application.put_env(:git_core, :limits, commit_visits: 1)
+
+    try do
+      assert {:error, %GitCore.Error{kind: :commit_limit, operation: :compare_and_swap_ref}} =
+               GitCore.compare_and_swap_ref(
+                 fixture.repo_path,
+                 "refs/heads/main",
+                 fixture.base_oid,
+                 proposed_oid,
+                 :fast_forward,
+                 deadline_ms: 10_000,
+                 commit_limit: 50_000
+               )
+
+      assert refs(fixture.repo_path) == before_refs
+      assert object_ids(fixture.repo_path) == before_objects
+    after
+      if previous_limits,
+        do: Application.put_env(:git_core, :limits, previous_limits),
+        else: Application.delete_env(:git_core, :limits)
+    end
+  end
+
+  test "analyzes clean divergence, identical tips, and an already-contained head", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = clean_fixture!(tmp_dir)
+
+    assert {:ok,
+            %{
+              __struct__: GitCore.MergeAnalysis,
+              base_oid: base_oid,
+              head_oid: head_oid,
+              mergeable: true,
+              ahead_by: 2,
+              behind_by: 1,
+              commit_count: 2,
+              changed_paths: 2
+            }} = GitCore.merge_analysis(fixture.repo_path, fixture.base_oid, fixture.head_oid, [])
+
+    assert base_oid == fixture.base_oid
+    assert head_oid == fixture.head_oid
+
+    assert {:ok,
+            %{
+              __struct__: GitCore.MergeAnalysis,
+              mergeable: true,
+              ahead_by: 0,
+              behind_by: 0,
+              commit_count: 0,
+              changed_paths: 0
+            }} = GitCore.merge_analysis(fixture.repo_path, fixture.base_oid, fixture.base_oid, [])
+
+    assert {:ok,
+            %{
+              __struct__: GitCore.MergeAnalysis,
+              mergeable: true,
+              ahead_by: 0,
+              behind_by: 1,
+              commit_count: 0,
+              changed_paths: 0
+            }} = GitCore.merge_analysis(fixture.repo_path, fixture.base_oid, fixture.root_oid, [])
+  end
+
+  test "reports text and tree conflicts without writing objects or moving refs", %{
+    tmp_dir: tmp_dir
+  } do
+    for fixture <- [text_conflict_fixture!(tmp_dir), tree_conflict_fixture!(tmp_dir)] do
+      before_objects = object_ids(fixture.repo_path)
+      before_refs = refs(fixture.repo_path)
+
+      assert {:ok, %{__struct__: GitCore.MergeAnalysis, mergeable: false}} =
+               GitCore.merge_analysis(fixture.repo_path, fixture.base_oid, fixture.head_oid, [])
+
+      assert object_ids(fixture.repo_path) == before_objects
+      assert refs(fixture.repo_path) == before_refs
+
+      assert {:error, %GitCore.Error{kind: :merge_conflict, operation: :write_merge_commit}} =
+               GitCore.write_merge_commit(
+                 fixture.repo_path,
+                 fixture.base_oid,
+                 fixture.head_oid,
+                 signature(),
+                 signature(),
+                 "Merge conflicting pull",
+                 []
+               )
+
+      assert object_ids(fixture.repo_path) == before_objects
+      assert refs(fixture.repo_path) == before_refs
+    end
+  end
+
+  test "enforces commit, tree-entry, changed-path, and deadline bounds before persistent writes",
+       %{
+         tmp_dir: tmp_dir
+       } do
+    fixture = clean_fixture!(tmp_dir)
+
+    for {opts, kind} <- [
+          {[commit_limit: 3], :commit_limit},
+          {[tree_entry_limit: 1], :tree_entry_limit},
+          {[changed_path_limit: 1], :changed_path_limit},
+          {[byte_limit: 1], :merge_byte_limit},
+          {[deadline_ms: 0], :scan_timeout}
+        ] do
+      before_objects = object_ids(fixture.repo_path)
+      before_refs = refs(fixture.repo_path)
+
+      assert {:error, %GitCore.Error{kind: ^kind, operation: :merge_analysis}} =
+               GitCore.merge_analysis(
+                 fixture.repo_path,
+                 fixture.base_oid,
+                 fixture.head_oid,
+                 opts
+               )
+
+      assert object_ids(fixture.repo_path) == before_objects
+      assert refs(fixture.repo_path) == before_refs
+
+      assert {:error, %GitCore.Error{kind: ^kind, operation: :write_merge_commit}} =
+               GitCore.write_merge_commit(
+                 fixture.repo_path,
+                 fixture.base_oid,
+                 fixture.head_oid,
+                 signature(),
+                 signature(),
+                 "Bounded merge",
+                 opts
+               )
+
+      assert object_ids(fixture.repo_path) == before_objects
+      assert refs(fixture.repo_path) == before_refs
+    end
+  end
+
+  test "rejects configured external merge drivers without executing them", %{tmp_dir: tmp_dir} do
+    fixture = external_driver_fixture!(tmp_dir)
+    marker = Path.join(tmp_dir, "external-driver-ran")
+
+    git!([
+      "--git-dir",
+      fixture.repo_path,
+      "config",
+      "merge.fornacast-test.driver",
+      "touch #{marker}"
+    ])
+
+    assert {:ok, %GitCore.MergeAnalysis{mergeable: false}} =
+             GitCore.merge_analysis(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               []
+             )
+
+    refute File.exists?(marker)
+  end
+
+  test "writes a genuine two-parent merge commit without moving a ref", %{tmp_dir: tmp_dir} do
+    fixture = clean_fixture!(tmp_dir)
+    before_refs = refs(fixture.repo_path)
+    author = signature(name: "Pull Author", email: "author@example.com", seconds: 1_700_000_000)
+
+    committer =
+      signature(name: "Pull Merger", email: "merger@example.com", seconds: 1_700_000_100)
+
+    assert {:ok, merge_oid} =
+             GitCore.write_merge_commit(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               author,
+               committer,
+               "Merge feature branch\n\nA bounded merge.",
+               []
+             )
+
+    assert {:ok, commit} = GitCore.commit(fixture.repo_path, merge_oid)
+    assert commit.parents == [fixture.base_oid, fixture.head_oid]
+    assert commit.author_name == "Pull Author"
+    assert commit.committer_name == "Pull Merger"
+    assert commit.message == "Merge feature branch\n\nA bounded merge."
+
+    raw = git!(["--git-dir", fixture.repo_path, "cat-file", "-p", merge_oid])
+    assert parent_lines(raw) == ["parent #{fixture.base_oid}", "parent #{fixture.head_oid}"]
+    assert refs(fixture.repo_path) == before_refs
+
+    assert git!(["--git-dir", fixture.repo_path, "rev-parse", "refs/heads/main"]) ==
+             fixture.base_oid
+  end
+
+  test "validates UTF-8 and signature/message size before inserting any object", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = clean_fixture!(tmp_dir)
+
+    invalid_calls = [
+      {signature(name: "bad\nname"), signature(), "message"},
+      {signature(), signature(email: "bad\n@example.com"), "message"},
+      {signature(), signature(), <<255>>},
+      {signature(), signature(), :binary.copy("m", 1_048_577)}
+    ]
+
+    for {author, committer, message} <- invalid_calls do
+      before_objects = object_ids(fixture.repo_path)
+      before_refs = refs(fixture.repo_path)
+
+      assert {:error, %GitCore.Error{kind: :invalid_input, operation: :write_merge_commit}} =
+               GitCore.write_merge_commit(
+                 fixture.repo_path,
+                 fixture.base_oid,
+                 fixture.head_oid,
+                 author,
+                 committer,
+                 message,
+                 []
+               )
+
+      assert object_ids(fixture.repo_path) == before_objects
+      assert refs(fixture.repo_path) == before_refs
+    end
+  end
+
+  test "analysis runs under the supervised global scan limiter", %{tmp_dir: tmp_dir} do
+    fixture = clean_fixture!(tmp_dir)
+
+    limiter =
+      start_supervised!(
+        {GitCore.ScanLimiter, server: nil, capacity: 1, wait_timeout: 0},
+        id: make_ref()
+      )
+
+    parent = self()
+
+    holder =
+      Task.async(fn ->
+        GitCore.ScanLimiter.with_permit(
+          :pull_merge_holder,
+          fn ->
+            send(parent, :permit_held)
+            receive do: (:release -> :ok)
+          end,
+          server: limiter
+        )
+      end)
+
+    assert_receive :permit_held
+
+    assert {:error, %GitCore.Error{kind: :scan_busy, operation: :merge_analysis}} =
+             GitCore.merge_analysis_with_runtime(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               [],
+               limiter: limiter,
+               task_supervisor: GitCore.MergeTaskSupervisor,
+               native_merge: &GitCore.Native.merge_analysis/8,
+               native_await: &GitCore.Native.await_merge_worker/1
+             )
+
+    send(holder.pid, :release)
+    assert Task.await(holder) == :ok
+  end
+
+  test "shutdown closes scan admission before finite keeper teardown" do
+    children = GitCore.Application.child_specs()
+    startup_order = Enum.map(children, & &1.id)
+
+    assert Enum.find_index(startup_order, &(&1 == GitCore.MergeTaskSupervisor)) <
+             Enum.find_index(startup_order, &(&1 == GitCore.ScanLimiter))
+
+    merge_supervisor = Enum.find(children, &(&1.id == GitCore.MergeTaskSupervisor))
+    assert merge_supervisor.shutdown == 5_000
+  end
+
+  test "finite keeper shutdown forcibly ends a non-cooperative deferred task" do
+    limiter =
+      start_supervised!(
+        {GitCore.ScanLimiter, server: nil, capacity: 1, wait_timeout: 0},
+        id: make_ref()
+      )
+
+    keeper_supervisor =
+      start_supervised!({Task.Supervisor, name: nil}, id: make_ref())
+
+    parent = self()
+
+    assert :timed_out =
+             GitCore.ScanLimiter.with_deferred_permit(
+               :merge_analysis,
+               fn ->
+                 {:deferred, :timed_out,
+                  fn ->
+                    Process.flag(:trap_exit, true)
+                    send(parent, {:keeper_ignoring_shutdown, self()})
+
+                    receive do
+                      :release -> :ok
+                      {:EXIT, _supervisor, :shutdown} -> receive do: (:release -> :ok)
+                    end
+                  end}
+               end,
+               server: limiter,
+               task_supervisor: keeper_supervisor
+             )
+
+    assert_receive {:keeper_ignoring_shutdown, keeper}
+    keeper_monitor = Process.monitor(keeper)
+    stopper = Task.async(fn -> Supervisor.stop(keeper_supervisor, :shutdown, :infinity) end)
+
+    try do
+      assert_receive {:DOWN, ^keeper_monitor, :process, ^keeper, :killed}, 6_000
+      assert {:ok, :ok} = Task.yield(stopper, 1_000)
+    after
+      send(keeper, :release)
+
+      if Process.alive?(stopper.pid) do
+        Task.yield(stopper, 1_000) || Task.shutdown(stopper, :brutal_kill)
+      end
+    end
+
+    assert :ok = wait_for_scan_release(limiter)
+
+    assert :released =
+             GitCore.ScanLimiter.with_permit(:merge_analysis, fn -> :released end,
+               server: limiter
+             )
+  end
+
+  test "timed-out merge keepers remain inside the node-wide scan capacity" do
+    limiter =
+      start_supervised!(
+        {GitCore.ScanLimiter, server: nil, capacity: 4, wait_timeout: 0},
+        id: make_ref()
+      )
+
+    keeper_supervisor =
+      start_supervised!({Task.Supervisor, name: nil}, id: make_ref())
+
+    parent = self()
+
+    callers =
+      for _ <- 1..4 do
+        Task.async(fn ->
+          GitCore.merge_analysis_with_runtime(
+            "unused-test-repository",
+            String.duplicate("a", 40),
+            String.duplicate("b", 40),
+            [],
+            limiter: limiter,
+            task_supervisor: keeper_supervisor,
+            native_merge: fn _path,
+                             _base_oid,
+                             _head_oid,
+                             _commit_limit,
+                             _tree_entry_limit,
+                             _changed_path_limit,
+                             _byte_limit,
+                             _deadline_ms ->
+              keeper = self()
+              send(parent, {:merge_keeper_active, keeper})
+              {:deferred, {"scan_timeout", "merge analysis exceeded its deadline"}, keeper}
+            end,
+            native_await: fn keeper ->
+              receive do
+                :release_merge_worker -> send(parent, {:merge_keeper_finished, keeper})
+              end
+            end
+          )
+        end)
+      end
+
+    keepers =
+      for _ <- 1..4 do
+        assert_receive {:merge_keeper_active, keeper}
+        keeper
+      end
+
+    for caller <- callers do
+      assert {:error, %GitCore.Error{kind: :scan_timeout, operation: :merge_analysis}} =
+               Task.await(caller)
+    end
+
+    assert {:error, %GitCore.Error{kind: :scan_busy, operation: :ref_summary}} =
+             GitCore.ScanLimiter.with_permit(:ref_summary, fn -> :unexpected end, server: limiter)
+
+    [released | remaining] = keepers
+    send(released, :release_merge_worker)
+    assert_receive {:merge_keeper_finished, ^released}
+
+    assert :ordinary_scan_entered =
+             GitCore.ScanLimiter.with_permit(:ref_summary, fn -> :ordinary_scan_entered end,
+               server: limiter
+             )
+
+    Enum.each(remaining, &send(&1, :release_merge_worker))
+
+    for keeper <- remaining do
+      assert_receive {:merge_keeper_finished, ^keeper}
+    end
+
+    assert :ok = wait_for_deferred_release(limiter, keeper_supervisor)
+  end
+
+  @tag :pull_compare
+  test "comparison diff is a typed value with enforced aggregate keys" do
+    assert_raise ArgumentError, fn ->
+      struct!(GitCore.ComparisonDiff,
+        files: [],
+        changed_files: 0,
+        additions: 0,
+        deletions: 0
+      )
+    end
+  end
+
+  @tag :pull_compare
+  test "reads a divergent immutable commit range and aggregate diff in deterministic order", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = comparison_fixture!(tmp_dir)
+    before_refs = refs(fixture.repo_path)
+    before_objects = object_ids(fixture.repo_path)
+
+    assert {:ok,
+            %GitCore.CommitPage{
+              commits: commits,
+              total: 3,
+              page: 1,
+              per_page: 50,
+              total_pages: 1
+            }} =
+             GitCore.commit_range_page(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               1,
+               per_page: 50
+             )
+
+    assert Enum.map(commits, & &1.oid) == [
+             fixture.head_oid,
+             fixture.second_oid,
+             fixture.first_oid
+           ]
+
+    assert {:ok,
+            %GitCore.ComparisonDiff{
+              files: [added, changed],
+              changed_files: 2,
+              additions: 3,
+              deletions: 1,
+              truncated: false
+            }} =
+             GitCore.diff_between(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               page: 1,
+               per_page: 100
+             )
+
+    assert %GitCore.DiffFile{path: "lib/added.ex", status: :added, binary: false} = added
+    assert %GitCore.DiffFile{path: "lib/changed.ex", status: :modified, binary: false} = changed
+    assert refs(fixture.repo_path) == before_refs
+    assert object_ids(fixture.repo_path) == before_objects
+  end
+
+  @tag :pull_compare
+  test "paginates newest-first range commits and path-sorted changed files", %{tmp_dir: tmp_dir} do
+    fixture = comparison_fixture!(tmp_dir)
+
+    assert {:ok,
+            %GitCore.CommitPage{
+              commits: [head, second],
+              total: 3,
+              page: 1,
+              per_page: 2,
+              total_pages: 2
+            }} =
+             GitCore.commit_range_page(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               1,
+               per_page: 2
+             )
+
+    assert [head.oid, second.oid] == [fixture.head_oid, fixture.second_oid]
+
+    assert {:ok, %GitCore.CommitPage{commits: [first], page: 2}} =
+             GitCore.commit_range_page(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               2,
+               per_page: 2
+             )
+
+    assert first.oid == fixture.first_oid
+
+    assert {:ok,
+            %GitCore.ComparisonDiff{
+              files: [%GitCore.DiffFile{path: "lib/changed.ex"}],
+              changed_files: 2,
+              truncated: false
+            }} =
+             GitCore.diff_between(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               page: 2,
+               per_page: 1
+             )
+  end
+
+  @tag :pull_compare
+  test "identical OIDs produce empty comparison pages", %{tmp_dir: tmp_dir} do
+    fixture = comparison_fixture!(tmp_dir)
+
+    assert {:ok, %GitCore.CommitPage{commits: [], total: 0, total_pages: 1}} =
+             GitCore.commit_range_page(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.base_oid,
+               1
+             )
+
+    assert {:ok,
+            %GitCore.ComparisonDiff{
+              files: [],
+              changed_files: 0,
+              additions: 0,
+              deletions: 0,
+              truncated: false
+            }} =
+             GitCore.diff_between(fixture.repo_path, fixture.base_oid, fixture.base_oid)
+  end
+
+  @tag :pull_compare
+  test "comparison rejects invalid OIDs and exhausts one bounded deadline without mutation", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = comparison_fixture!(tmp_dir)
+
+    for {operation, call} <- [
+          {:commit_range_page,
+           fn ->
+             GitCore.commit_range_page(fixture.repo_path, "not-an-oid", fixture.head_oid, 1)
+           end},
+          {:diff_between,
+           fn -> GitCore.diff_between(fixture.repo_path, fixture.base_oid, "not-an-oid") end}
+        ] do
+      before_refs = refs(fixture.repo_path)
+      before_objects = object_ids(fixture.repo_path)
+
+      assert {:error, %GitCore.Error{kind: :commit_not_found, operation: ^operation}} = call.()
+      assert refs(fixture.repo_path) == before_refs
+      assert object_ids(fixture.repo_path) == before_objects
+    end
+
+    for {operation, call} <- [
+          {:commit_range_page,
+           fn ->
+             GitCore.commit_range_page(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               1,
+               deadline_ms: 0
+             )
+           end},
+          {:diff_between,
+           fn ->
+             GitCore.diff_between(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               deadline_ms: 0
+             )
+           end}
+        ] do
+      before_refs = refs(fixture.repo_path)
+      before_objects = object_ids(fixture.repo_path)
+
+      assert {:error, %GitCore.Error{kind: :scan_timeout, operation: ^operation}} = call.()
+      assert refs(fixture.repo_path) == before_refs
+      assert object_ids(fixture.repo_path) == before_objects
+    end
+  end
+
+  @tag :pull_compare
+  test "comparison represents binary files and renames within existing output limits", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = binary_rename_fixture!(tmp_dir)
+
+    assert {:ok,
+            %GitCore.ComparisonDiff{
+              files: files,
+              changed_files: 3,
+              additions: 1,
+              deletions: 1,
+              truncated: true
+            }} =
+             GitCore.diff_between(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               page: 1,
+               per_page: 100,
+               limit: 1
+             )
+
+    assert Enum.map(files, &{&1.path, &1.status, &1.binary}) == [
+             {"binary.dat", :modified, true},
+             {"renamed-new.txt", :added, false},
+             {"renamed-old.txt", :deleted, false}
+           ]
+  end
+
+  @tag :pull_compare
+  test "commit range enforces shared commit and decoded-byte budgets without mutation", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = comparison_fixture!(tmp_dir)
+
+    for {opts, kind} <- [
+          {[commit_limit: 2], :commit_limit},
+          {[byte_limit: 1], :scan_byte_limit}
+        ] do
+      before_refs = refs(fixture.repo_path)
+      before_objects = object_ids(fixture.repo_path)
+
+      assert {:error, %GitCore.Error{kind: ^kind, operation: :commit_range_page}} =
+               GitCore.commit_range_page(
+                 fixture.repo_path,
+                 fixture.base_oid,
+                 fixture.head_oid,
+                 1,
+                 opts
+               )
+
+      assert refs(fixture.repo_path) == before_refs
+      assert object_ids(fixture.repo_path) == before_objects
+    end
+  end
+
+  @tag :pull_compare
+  test "aggregate diff enforces tree, changed-file, and decoded-byte budgets without mutation", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = comparison_fixture!(tmp_dir)
+
+    for {opts, kind} <- [
+          {[tree_entry_limit: 1], :tree_entry_limit},
+          {[file_limit: 1], :diff_file_limit},
+          {[byte_limit: 1], :scan_byte_limit}
+        ] do
+      before_refs = refs(fixture.repo_path)
+      before_objects = object_ids(fixture.repo_path)
+
+      assert {:error, %GitCore.Error{kind: ^kind, operation: :diff_between}} =
+               GitCore.diff_between(
+                 fixture.repo_path,
+                 fixture.base_oid,
+                 fixture.head_oid,
+                 opts
+               )
+
+      assert refs(fixture.repo_path) == before_refs
+      assert object_ids(fixture.repo_path) == before_objects
+    end
+  end
+
+  @tag :pull_compare
+  test "comparison retains path-sorted metadata beyond the legacy commit-diff file ceiling", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = large_comparison_fixture!(tmp_dir, 1_005)
+    before_refs = refs(fixture.repo_path)
+    before_objects = object_ids(fixture.repo_path)
+
+    assert {:ok,
+            %GitCore.ComparisonDiff{
+              files: files,
+              changed_files: 1_005,
+              truncated: true
+            }} =
+             GitCore.diff_between(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.head_oid,
+               page: 11,
+               per_page: 100,
+               file_limit: 2_000,
+               limit: 1
+             )
+
+    assert Enum.map(files, & &1.path) ==
+             Enum.map(1_000..1_004, &"bulk/file-#{String.pad_leading(to_string(&1), 4, "0")}.txt")
+
+    assert refs(fixture.repo_path) == before_refs
+    assert object_ids(fixture.repo_path) == before_objects
+  end
+
+  defp clean_fixture!(tmp_dir) do
+    fixture = base_fixture!(tmp_dir, "clean")
+
+    File.write!(Path.join(fixture.work_path, "base.txt"), "base\n")
+    git!(["-C", fixture.work_path, "add", "base.txt"])
+    git!(["-C", fixture.work_path, "commit", "-m", "base change"])
+    base_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    git!(["-C", fixture.work_path, "checkout", "-b", "feature", fixture.root_oid])
+    File.write!(Path.join(fixture.work_path, "head.txt"), "head\n")
+    git!(["-C", fixture.work_path, "add", "head.txt"])
+    git!(["-C", fixture.work_path, "commit", "-m", "head change one"])
+    File.write!(Path.join(fixture.work_path, "head-two.txt"), "head two\n")
+    git!(["-C", fixture.work_path, "add", "head-two.txt"])
+    git!(["-C", fixture.work_path, "commit", "-m", "head change two"])
+    head_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    publish_fixture!(fixture, base_oid, head_oid)
+  end
+
+  defp comparison_fixture!(tmp_dir) do
+    fixture = base_fixture!(tmp_dir, "comparison")
+    File.mkdir_p!(Path.join(fixture.work_path, "lib"))
+    File.write!(Path.join(fixture.work_path, "lib/changed.ex"), "base\n")
+    git!(["-C", fixture.work_path, "add", "lib/changed.ex"])
+    git!(["-C", fixture.work_path, "commit", "-m", "comparison root"])
+    comparison_root_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+    git!(["-C", fixture.work_path, "commit", "--allow-empty", "-m", "base comparison"])
+    base_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    git!(["-C", fixture.work_path, "checkout", "-b", "feature", comparison_root_oid])
+    File.write!(Path.join(fixture.work_path, "lib/changed.ex"), "first\n")
+    git!(["-C", fixture.work_path, "add", "lib/changed.ex"])
+    git!(["-C", fixture.work_path, "commit", "-m", "first comparison"])
+    first_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    File.write!(Path.join(fixture.work_path, "lib/added.ex"), "added\n")
+    git!(["-C", fixture.work_path, "add", "lib/added.ex"])
+    git!(["-C", fixture.work_path, "commit", "-m", "second comparison"])
+    second_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    File.write!(Path.join(fixture.work_path, "lib/changed.ex"), "second\nthird\n")
+    git!(["-C", fixture.work_path, "commit", "-am", "third comparison"])
+    head_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    fixture
+    |> Map.merge(%{first_oid: first_oid, second_oid: second_oid})
+    |> publish_fixture!(base_oid, head_oid)
+  end
+
+  defp binary_rename_fixture!(tmp_dir) do
+    fixture = base_fixture!(tmp_dir, "binary-rename")
+    File.write!(Path.join(fixture.work_path, "binary.dat"), <<0, 1, 2>>)
+    File.write!(Path.join(fixture.work_path, "renamed-old.txt"), "rename me\n")
+    git!(["-C", fixture.work_path, "add", "binary.dat", "renamed-old.txt"])
+    git!(["-C", fixture.work_path, "commit", "-m", "comparison base files"])
+    base_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    git!(["-C", fixture.work_path, "checkout", "-b", "feature", base_oid])
+    File.write!(Path.join(fixture.work_path, "binary.dat"), <<0, 3, 4>>)
+    git!(["-C", fixture.work_path, "mv", "renamed-old.txt", "renamed-new.txt"])
+    git!(["-C", fixture.work_path, "commit", "-am", "binary and rename"])
+    head_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    publish_fixture!(fixture, base_oid, head_oid)
+  end
+
+  defp large_comparison_fixture!(tmp_dir, file_count) do
+    fixture = base_fixture!(tmp_dir, "large-comparison")
+    base_oid = fixture.root_oid
+    git!(["-C", fixture.work_path, "checkout", "-b", "feature", base_oid])
+    bulk_path = Path.join(fixture.work_path, "bulk")
+    File.mkdir_p!(bulk_path)
+
+    for index <- 0..(file_count - 1) do
+      name = "file-#{String.pad_leading(to_string(index), 4, "0")}.txt"
+      File.write!(Path.join(bulk_path, name), "#{index}\n")
+    end
+
+    git!(["-C", fixture.work_path, "add", "bulk"])
+    git!(["-C", fixture.work_path, "commit", "-m", "large comparison"])
+    head_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+    publish_fixture!(fixture, base_oid, head_oid)
+  end
+
+  defp text_conflict_fixture!(tmp_dir) do
+    fixture = base_fixture!(tmp_dir, "text-conflict")
+    path = Path.join(fixture.work_path, "common.txt")
+
+    File.write!(path, "base version\n")
+    git!(["-C", fixture.work_path, "commit", "-am", "base conflict"])
+    base_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    git!(["-C", fixture.work_path, "checkout", "-b", "feature", fixture.root_oid])
+    File.write!(path, "head version\n")
+    git!(["-C", fixture.work_path, "commit", "-am", "head conflict"])
+    head_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    publish_fixture!(fixture, base_oid, head_oid)
+  end
+
+  defp tree_conflict_fixture!(tmp_dir) do
+    fixture = base_fixture!(tmp_dir, "tree-conflict")
+    shape = Path.join(fixture.work_path, "shape")
+
+    File.write!(shape, "file\n")
+    git!(["-C", fixture.work_path, "add", "shape"])
+    git!(["-C", fixture.work_path, "commit", "-m", "base file"])
+    base_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    git!(["-C", fixture.work_path, "checkout", "-b", "feature", fixture.root_oid])
+    File.mkdir_p!(shape)
+    File.write!(Path.join(shape, "item.txt"), "directory\n")
+    git!(["-C", fixture.work_path, "add", "shape/item.txt"])
+    git!(["-C", fixture.work_path, "commit", "-m", "head directory"])
+    head_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    publish_fixture!(fixture, base_oid, head_oid)
+  end
+
+  defp external_driver_fixture!(tmp_dir) do
+    fixture = base_fixture!(tmp_dir, "external-driver")
+    attributed_path = Path.join(fixture.work_path, "driver.txt")
+
+    File.write!(
+      Path.join(fixture.work_path, ".gitattributes"),
+      "driver.txt merge=fornacast-test\n"
+    )
+
+    File.write!(attributed_path, "ancestor\n")
+    git!(["-C", fixture.work_path, "add", ".gitattributes", "driver.txt"])
+    git!(["-C", fixture.work_path, "commit", "-m", "configure attributed merge driver"])
+    root_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    File.write!(attributed_path, "base version\n")
+    git!(["-C", fixture.work_path, "commit", "-am", "base attributed change"])
+    base_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    git!(["-C", fixture.work_path, "checkout", "-b", "feature", root_oid])
+    File.write!(attributed_path, "head version\n")
+    git!(["-C", fixture.work_path, "commit", "-am", "head attributed change"])
+    head_oid = git!(["-C", fixture.work_path, "rev-parse", "HEAD"])
+
+    publish_fixture!(Map.put(fixture, :root_oid, root_oid), base_oid, head_oid)
+  end
+
+  defp base_fixture!(tmp_dir, name) do
+    suffix = System.unique_integer([:positive, :monotonic])
+    work_path = Path.join(tmp_dir, "#{name}-work-#{suffix}")
+    repo_path = Path.join(tmp_dir, "#{name}-bare-#{suffix}.git")
+    git!(["init", work_path])
+    git!(["-C", work_path, "config", "user.name", "Fornacast Test"])
+    git!(["-C", work_path, "config", "user.email", "test@example.com"])
+    File.write!(Path.join(work_path, "common.txt"), "common\n")
+    git!(["-C", work_path, "add", "common.txt"])
+    git!(["-C", work_path, "commit", "-m", "root"])
+    git!(["-C", work_path, "branch", "-M", "main"])
+    root_oid = git!(["-C", work_path, "rev-parse", "HEAD"])
+    git!(["init", "--bare", repo_path])
+    %{work_path: work_path, repo_path: repo_path, root_oid: root_oid}
+  end
+
+  defp publish_fixture!(fixture, base_oid, head_oid) do
+    git!(["-C", fixture.work_path, "push", fixture.repo_path, "main:refs/heads/main"])
+    git!(["-C", fixture.work_path, "push", fixture.repo_path, "feature:refs/heads/feature"])
+    Map.merge(fixture, %{base_oid: base_oid, head_oid: head_oid})
+  end
+
+  defp signature(overrides \\ []) do
+    struct!(
+      GitCore.Signature,
+      Keyword.merge(
+        [
+          name: "Fornacast Test",
+          email: "test@example.com",
+          seconds: 1_700_000_000,
+          offset_minutes: 0
+        ],
+        overrides
+      )
+    )
+  end
+
+  defp refs(repo_path) do
+    git!(["--git-dir", repo_path, "for-each-ref", "--format=%(refname) %(objectname)"])
+  end
+
+  defp cas(fixture, full_ref, expected_oid, proposed_oid) do
+    GitCore.compare_and_swap_ref(
+      fixture.repo_path,
+      full_ref,
+      expected_oid,
+      proposed_oid,
+      :fast_forward,
+      deadline_ms: 10_000
+    )
+  end
+
+  defp object_ids(repo_path) do
+    git!([
+      "--git-dir",
+      repo_path,
+      "cat-file",
+      "--batch-all-objects",
+      "--batch-check=%(objectname)"
+    ])
+  end
+
+  defp parent_lines(raw) do
+    raw
+    |> String.split("\n")
+    |> Enum.filter(&String.starts_with?(&1, "parent "))
+  end
+
+  defp wait_for_deferred_release(limiter, supervisor, attempts \\ 100)
+
+  defp wait_for_deferred_release(_limiter, _supervisor, 0), do: {:error, :still_active}
+
+  defp wait_for_deferred_release(limiter, supervisor, attempts) do
+    %{active: active} = Supervisor.count_children(supervisor)
+    %{grants: grants} = :sys.get_state(limiter)
+
+    if active == 0 and map_size(grants) == 0 do
+      :ok
+    else
+      Process.sleep(5)
+      wait_for_deferred_release(limiter, supervisor, attempts - 1)
+    end
+  end
+
+  defp wait_for_scan_release(limiter, attempts \\ 100)
+
+  defp wait_for_scan_release(_limiter, 0), do: {:error, :still_active}
+
+  defp wait_for_scan_release(limiter, attempts) do
+    %{grants: grants} = :sys.get_state(limiter)
+
+    if map_size(grants) == 0 do
+      :ok
+    else
+      Process.sleep(5)
+      wait_for_scan_release(limiter, attempts - 1)
+    end
+  end
+
+  defp git!(args) do
+    {output, status} =
+      System.cmd("git", args,
+        stderr_to_stdout: true,
+        env: [
+          {"GIT_CONFIG_NOSYSTEM", "1"},
+          {"GIT_AUTHOR_DATE", "1700000000 +0000"},
+          {"GIT_COMMITTER_DATE", "1700000000 +0000"}
+        ]
+      )
+
+    assert status == 0, "git #{Enum.join(args, " ")} failed:\n#{output}"
+    String.trim(output)
+  end
+end

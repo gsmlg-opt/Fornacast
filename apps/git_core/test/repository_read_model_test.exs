@@ -3130,6 +3130,54 @@ defmodule GitCore.CacheTest do
     end)
   end
 
+  test "invalidates only exact repository-path tuple keys and updates accounting" do
+    server = start_cache!()
+    repository_path = "/repos/one.git"
+    other_path = "/repos/one.git-backup"
+
+    removed_keys = [
+      {repository_path, :commit_summary, "oid-1"},
+      {repository_path, :tree_history, "oid-1", "lib", 1, 200}
+    ]
+
+    retained_keys = [
+      {other_path, :commit_summary, "oid-1"},
+      {:unrelated, repository_path}
+    ]
+
+    for key <- removed_keys ++ retained_keys do
+      assert {:ok, ^key} = GitCore.Cache.fetch(key, fn -> {:ok, key} end, server: server)
+    end
+
+    state_before = :sys.get_state(server)
+    retained_bytes = Enum.sum(Enum.map(retained_keys, &:erlang.external_size({&1, &1})))
+    assert state_before.count == 4
+
+    assert :ok = GitCore.Cache.invalidate_repository(repository_path, server: server)
+
+    state_after = :sys.get_state(server)
+    assert state_after.count == 2
+    assert state_after.used_bytes == retained_bytes
+    assert :ets.info(state_after.table, :size) == 2
+
+    for key <- retained_keys do
+      assert {:ok, ^key} =
+               GitCore.Cache.fetch(key, fn -> flunk("expected another repository's hit") end,
+                 server: server
+               )
+    end
+
+    for key <- removed_keys do
+      assert {:ok, :recomputed} =
+               GitCore.Cache.fetch(key, fn -> {:ok, :recomputed} end, server: server)
+    end
+  end
+
+  test "public repository invalidation is best-effort when the cache is unavailable" do
+    assert :ok = GitCore.invalidate_repository_cache("/repos/no-cache-entries.git")
+    assert :ok = GitCore.invalidate_repository_cache("/repos/one.git", server: make_ref())
+  end
+
   test "evicts the strict least-recently-accessed entry at exactly 512 entries" do
     server = start_cache!()
 
@@ -3408,16 +3456,21 @@ defmodule GitCore.CacheIntegrationTest do
   @moduletag :tmp_dir
   @moduletag capture_log: true
 
-  test "supervises the production cache after both limiters" do
+  test "supervises the production cache after merge keepers and all limiters" do
     assert [
              {GitCore.Cache, cache_pid, :worker, [GitCore.Cache]},
+             {GitCore.RepositoryWriteLimiter, writer_pid, :worker,
+              [GitCore.RepositoryWriteLimiter]},
              {GitCore.BlobLimiter, blob_pid, :worker, [GitCore.BlobLimiter]},
-             {GitCore.ScanLimiter, scan_pid, :worker, [GitCore.ScanLimiter]}
+             {GitCore.ScanLimiter, scan_pid, :worker, [GitCore.ScanLimiter]},
+             {GitCore.MergeTaskSupervisor, merge_supervisor_pid, :supervisor, [Task.Supervisor]}
            ] = Supervisor.which_children(GitCore.Supervisor)
 
     assert is_pid(cache_pid)
     assert is_pid(blob_pid)
+    assert is_pid(merge_supervisor_pid)
     assert is_pid(scan_pid)
+    assert is_pid(writer_pid)
   end
 
   test "constructs exact normalized immutable keys for all four cached reads", %{

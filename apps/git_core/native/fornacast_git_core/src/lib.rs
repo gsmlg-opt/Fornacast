@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use gix_object::bstr::ByteSlice;
@@ -34,6 +35,7 @@ type NativeDiffFile = (
     NativeDiffStats,
 );
 type NativeCommitDiff = (Vec<NativeDiffFile>, Vec<u8>, bool, u64, u64, u64);
+type NativeComparisonDiff = (Vec<NativeDiffFile>, bool, u64, u64, u64);
 type NativeSearchResult = (Vec<u8>, Option<u64>, Option<Vec<u8>>);
 type NativeSearchResults = (Vec<NativeSearchResult>, u64, u64, Vec<String>);
 type NativeLanguageStat = (String, u64);
@@ -45,6 +47,8 @@ type NativeTreeHistoryEntry = (Vec<u8>, String, String, String, NativeTreeCommit
 type NativeReceiveCommand = (String, String, String);
 type NativeReceiveStatus = (String, String, String);
 type NativeError = (String, String);
+type NativeSignature = (Vec<u8>, Vec<u8>, i64, i32);
+type NativeMergeAnalysis = (String, String, bool, u64, u64, u64, u64);
 
 struct PackObject {
     kind: gix_object::Kind,
@@ -83,10 +87,115 @@ enum DirectRefTarget {
     Object(gix_hash::ObjectId),
 }
 
+#[derive(Clone)]
 struct CommitNode {
     tree: gix_hash::ObjectId,
     parents: Vec<gix_hash::ObjectId>,
     committer_time: i64,
+}
+
+struct DecodedByteBudget {
+    seen: BTreeSet<gix_hash::ObjectId>,
+    used: u64,
+    limit: u64,
+}
+
+struct ComparisonCommitBudget {
+    seen_commits: BTreeSet<gix_hash::ObjectId>,
+    commit_limit: usize,
+    decoded: DecodedByteBudget,
+}
+
+struct ComparisonDiffBudget {
+    validated_trees: BTreeSet<gix_hash::ObjectId>,
+    tree_entries: usize,
+    tree_entry_limit: usize,
+    changed_files: usize,
+    file_limit: usize,
+    decoded: DecodedByteBudget,
+}
+
+impl DecodedByteBudget {
+    fn new(limit: u64) -> Self {
+        Self {
+            seen: BTreeSet::new(),
+            used: 0,
+            limit: comparison_byte_limit(limit),
+        }
+    }
+
+    fn charge(
+        &mut self,
+        oid: gix_hash::ObjectId,
+        decoded_size: usize,
+        detail: &'static str,
+    ) -> Result<(), NativeError> {
+        if !self.seen.insert(oid) {
+            return Ok(());
+        }
+        let decoded_size =
+            u64::try_from(decoded_size).map_err(|_| native_error("scan_byte_limit", detail))?;
+        let next = self
+            .used
+            .checked_add(decoded_size)
+            .ok_or_else(|| native_error("scan_byte_limit", detail))?;
+        if next > self.limit {
+            return Err(native_error("scan_byte_limit", detail));
+        }
+        self.used = next;
+        Ok(())
+    }
+}
+
+impl ComparisonCommitBudget {
+    fn new(commit_limit: usize, byte_limit: u64) -> Self {
+        Self {
+            seen_commits: BTreeSet::new(),
+            commit_limit: comparison_commit_limit(commit_limit),
+            decoded: DecodedByteBudget::new(byte_limit),
+        }
+    }
+}
+
+impl ComparisonDiffBudget {
+    fn new(tree_entry_limit: usize, file_limit: usize, byte_limit: u64) -> Self {
+        Self {
+            validated_trees: BTreeSet::new(),
+            tree_entries: 0,
+            tree_entry_limit: comparison_tree_entry_limit(tree_entry_limit),
+            changed_files: 0,
+            file_limit: comparison_file_limit(file_limit),
+            decoded: DecodedByteBudget::new(byte_limit),
+        }
+    }
+
+    fn record_tree_entry(&mut self) -> Result<(), NativeError> {
+        self.tree_entries = self.tree_entries.checked_add(1).ok_or_else(|| {
+            native_error("tree_entry_limit", "comparison tree-entry count overflow")
+        })?;
+        if self.tree_entries > self.tree_entry_limit {
+            Err(native_error(
+                "tree_entry_limit",
+                "comparison diff exceeded its tree-entry limit",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn record_changed_file(&mut self) -> Result<(), NativeError> {
+        self.changed_files = self.changed_files.checked_add(1).ok_or_else(|| {
+            native_error("diff_file_limit", "comparison changed-file count overflow")
+        })?;
+        if self.changed_files > self.file_limit {
+            Err(native_error(
+                "diff_file_limit",
+                "comparison diff exceeded its changed-file limit",
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 struct OrderedCommitGraph {
@@ -139,6 +248,7 @@ const INLINE_BLOB_LIMIT: usize = 1_048_576;
 const COMPLETE_BLOB_LIMIT: u64 = 100_000_000;
 const DIFF_SOURCE_LIMIT: usize = 200_000;
 const DIFF_FILE_LIMIT: usize = 1_000;
+const DIFF_FILE_PAGE_LIMIT: usize = 100;
 const DIFF_SCAN_DEADLINE: Duration = Duration::from_secs(5);
 const SEARCH_FILE_LIMIT: u64 = 10_000;
 const SEARCH_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
@@ -150,6 +260,27 @@ const ANALYSIS_FILE_LIMIT: u64 = 100_000;
 const ANALYSIS_BYTE_LIMIT: u64 = 512 * 1024 * 1024;
 const ANALYSIS_SCAN_DEADLINE: Duration = Duration::from_secs(2);
 const DISK_USAGE_SCAN_DEADLINE: Duration = Duration::from_secs(2);
+const MERGE_COMMIT_LIMIT: usize = 50_000;
+const MERGE_TREE_ENTRY_LIMIT: usize = 100_000;
+const MERGE_CHANGED_PATH_LIMIT: usize = 10_000;
+const MERGE_BLOB_LIMIT: u64 = 8 * 1024 * 1024;
+const MERGE_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
+const MERGE_OBJECT_ENTRY_OVERHEAD: u64 = 64;
+const MERGE_PATH_ENTRY_OVERHEAD: u64 = 128;
+const MERGE_DEADLINE: Duration = Duration::from_secs(30);
+const MERGE_MESSAGE_LIMIT: usize = 1024 * 1024;
+const SIGNATURE_NAME_LIMIT: usize = 255;
+const SIGNATURE_EMAIL_LIMIT: usize = 320;
+const MERGE_WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
+const MERGE_ANALYSIS_WORKERS: usize = 4;
+const MERGE_WRITE_WORKERS: usize = 1;
+const COMPARISON_COMMIT_LIMIT: usize = MERGE_COMMIT_LIMIT;
+const COMPARISON_TREE_ENTRY_LIMIT: usize = MERGE_TREE_ENTRY_LIMIT;
+const COMPARISON_FILE_LIMIT: usize = SEARCH_FILE_LIMIT as usize;
+const COMPARISON_BYTE_LIMIT: u64 = MERGE_BYTE_LIMIT;
+const REF_UPDATE_DEADLINE: Duration = Duration::from_secs(10);
+const CAS_COMMIT_VISIT_LIMIT: usize = 50_000;
+static CAS_QUARANTINE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const NO_FINAL_NEWLINE_MARKER: &[u8] = b"\\ No newline at end of file\n";
 // This remains independent of object size while leaving room for the complete mandatory tag
 // header, including long ref-derived tag names, before an arbitrarily large message body.
@@ -158,11 +289,19 @@ const SNAPSHOT_OBJECT_PREFIX_LIMIT: usize = 64 * 1024;
 #[cfg(test)]
 static TREE_HISTORY_GRAPH_WALKS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static MERGE_WORKERS_STARTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 struct RetainedDiffSource {
     patch: Vec<u8>,
     limit: usize,
     truncated: bool,
+}
+
+struct CasFileLock {
+    _guard: std::fs::File,
+    _marker: gix::lock::Marker,
 }
 
 struct DiffFileMetadata {
@@ -609,6 +748,40 @@ fn error_chain_contains_storage_io(error: &(dyn std::error::Error + 'static)) ->
     false
 }
 
+fn error_chain_contains_merge_byte_limit(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.downcast_ref::<MergeByteLimitError>().is_some() {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn merge_operation_error<E>(error: E) -> NativeError
+where
+    E: std::error::Error + 'static,
+{
+    if error_chain_contains_merge_byte_limit(&error) {
+        native_error("merge_byte_limit", error)
+    } else if error_chain_contains_storage_io(&error) {
+        native_error("storage_unavailable", error)
+    } else {
+        native_error("corrupt_repository", error)
+    }
+}
+
+fn merge_boxed_operation_error(error: gix_object::write::Error) -> NativeError {
+    if error_chain_contains_merge_byte_limit(error.as_ref()) {
+        native_error("merge_byte_limit", error)
+    } else if error_chain_contains_storage_io(error.as_ref()) {
+        native_error("storage_unavailable", error)
+    } else {
+        native_error("corrupt_repository", error)
+    }
+}
+
 fn bounded_blob_native_error(error: bounded_blob::Error) -> NativeError {
     let kind = match error.kind() {
         bounded_blob::ErrorKind::StorageUnavailable => "storage_unavailable",
@@ -700,6 +873,38 @@ fn list_refs(path: String) -> Result<Vec<(String, String, String)>, NativeError>
         }
     }
 
+    Ok(result)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn exact_ref(
+    path: String,
+    full_name: Vec<u8>,
+    deadline_ms: u64,
+) -> Result<Option<String>, NativeError> {
+    let deadline = Instant::now() + Duration::from_millis(deadline_ms);
+    let repo = open_bare_repository(&path)?;
+    check_ref_deadline(deadline)?;
+
+    if !valid_full_ref_name(&full_name) {
+        return Err(native_error(
+            "invalid_ref",
+            "reference name is not canonical",
+        ));
+    }
+
+    let result = match direct_ref_target(&repo, &full_name)? {
+        DirectRefTarget::Missing => None,
+        DirectRefTarget::Object(target) => Some(target.to_string()),
+        DirectRefTarget::Symbolic => {
+            return Err(native_error(
+                "corrupt_repository",
+                "reference has no direct object target",
+            ));
+        }
+    };
+
+    check_ref_deadline(deadline)?;
     Ok(result)
 }
 
@@ -1296,6 +1501,63 @@ fn commit_page(
         commits.push(hydrate_commit(&repo, oid, deadline)?);
     }
 
+    check_commit_deadline(deadline)?;
+    Ok((commits, total))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn commit_range_page(
+    path: String,
+    base_oid: String,
+    head_oid: String,
+    page: String,
+    per_page: usize,
+    commit_limit: usize,
+    byte_limit: u64,
+    deadline_ms: u64,
+) -> Result<(Vec<NativeCommit>, usize), NativeError> {
+    commit_range_page_impl(
+        &path,
+        &base_oid,
+        &head_oid,
+        &page,
+        per_page,
+        commit_limit,
+        byte_limit,
+        deadline_ms,
+    )
+}
+
+fn commit_range_page_impl(
+    path: &str,
+    base_oid: &str,
+    head_oid: &str,
+    page: &str,
+    per_page: usize,
+    commit_limit: usize,
+    byte_limit: u64,
+    deadline_ms: u64,
+) -> Result<(Vec<NativeCommit>, usize), NativeError> {
+    let page = comparison_page(page)?;
+    let deadline = Instant::now() + commit_scan_duration(deadline_ms);
+    check_commit_deadline(deadline)?;
+    let repo = open_physical_bare_repository(path)?;
+    let mut budget = ComparisonCommitBudget::new(commit_limit, byte_limit);
+    let base_graph = walk_comparison_commit_graph(&repo, base_oid, deadline, &mut budget)?;
+    let head_graph = walk_comparison_commit_graph(&repo, head_oid, deadline, &mut budget)?;
+    let range = head_graph
+        .ordered
+        .into_iter()
+        .filter(|oid| !base_graph.nodes.contains_key(oid))
+        .collect::<Vec<_>>();
+    let total = range.len();
+    let window = commit_range_page_window(total, page, per_page);
+    let mut commits = Vec::with_capacity(window.end.saturating_sub(window.start));
+
+    for oid in &range[window.start..window.end] {
+        check_commit_deadline(deadline)?;
+        commits.push(hydrate_commit(&repo, *oid, deadline)?);
+    }
     check_commit_deadline(deadline)?;
     Ok((commits, total))
 }
@@ -1903,6 +2165,27 @@ fn walk_commit_graph(
     snapshot_oid: &str,
     deadline: Instant,
 ) -> Result<OrderedCommitGraph, NativeError> {
+    walk_commit_graph_with(snapshot_oid, deadline, |oid, position| {
+        load_commit_node(repo, oid, position, deadline)
+    })
+}
+
+fn walk_comparison_commit_graph(
+    repo: &gix::Repository,
+    snapshot_oid: &str,
+    deadline: Instant,
+    budget: &mut ComparisonCommitBudget,
+) -> Result<OrderedCommitGraph, NativeError> {
+    walk_commit_graph_with(snapshot_oid, deadline, |oid, position| {
+        load_comparison_commit_node(repo, oid, position, deadline, budget)
+    })
+}
+
+fn walk_commit_graph_with(
+    snapshot_oid: &str,
+    deadline: Instant,
+    mut load_node: impl FnMut(gix_hash::ObjectId, CommitPosition) -> Result<CommitNode, NativeError>,
+) -> Result<OrderedCommitGraph, NativeError> {
     check_commit_deadline(deadline)?;
     let tip = gix_hash::ObjectId::from_hex(snapshot_oid.as_bytes())
         .map_err(|error| native_error("commit_not_found", error))?;
@@ -1922,7 +2205,7 @@ fn walk_commit_graph(
         } else {
             CommitPosition::Ancestor
         };
-        let node = load_commit_node(repo, oid, position, deadline)?;
+        let node = load_node(oid, position)?;
         child_counts.entry(oid).or_default();
 
         for parent in &node.parents {
@@ -1987,6 +2270,33 @@ fn walk_commit_graph(
     })
 }
 
+fn load_comparison_commit_node(
+    repo: &gix::Repository,
+    oid: gix_hash::ObjectId,
+    position: CommitPosition,
+    deadline: Instant,
+    budget: &mut ComparisonCommitBudget,
+) -> Result<CommitNode, NativeError> {
+    check_commit_deadline(deadline)?;
+    let commit = find_graph_commit(repo, oid, position)?;
+
+    if budget.seen_commits.insert(oid) {
+        if budget.seen_commits.len() > budget.commit_limit {
+            return Err(native_error(
+                "commit_limit",
+                "comparison commit traversal exceeded its commit limit",
+            ));
+        }
+        budget.decoded.charge(
+            oid,
+            commit.data.len(),
+            "comparison commit traversal exceeded its decoded-byte limit",
+        )?;
+    }
+
+    decode_commit_node(&commit, deadline)
+}
+
 fn load_commit_node(
     repo: &gix::Repository,
     oid: gix_hash::ObjectId,
@@ -1996,6 +2306,13 @@ fn load_commit_node(
     check_commit_deadline(deadline)?;
     let commit = find_graph_commit(repo, oid, position)?;
     check_commit_deadline(deadline)?;
+    decode_commit_node(&commit, deadline)
+}
+
+fn decode_commit_node(
+    commit: &gix::Commit<'_>,
+    deadline: Instant,
+) -> Result<CommitNode, NativeError> {
     let decoded = commit
         .decode()
         .map_err(|error| native_error("corrupt_repository", error))?;
@@ -2437,8 +2754,111 @@ fn diff_commit(
         None => repo.empty_tree(),
     };
 
-    validate_diff_tree(&repo, &new_tree, deadline)?;
-    validate_diff_tree(&repo, &old_tree, deadline)?;
+    diff_trees(&repo, old_tree, new_tree, limit, deadline, None)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn diff_between(
+    path: String,
+    base_oid: String,
+    head_oid: String,
+    page: String,
+    per_page: usize,
+    limit: usize,
+    tree_entry_limit: usize,
+    file_limit: usize,
+    byte_limit: u64,
+    deadline_ms: u64,
+) -> Result<NativeComparisonDiff, NativeError> {
+    diff_between_impl(
+        &path,
+        &base_oid,
+        &head_oid,
+        &page,
+        per_page,
+        limit,
+        tree_entry_limit,
+        file_limit,
+        byte_limit,
+        deadline_ms,
+    )
+}
+
+fn diff_between_impl(
+    path: &str,
+    base_oid: &str,
+    head_oid: &str,
+    page: &str,
+    per_page: usize,
+    limit: usize,
+    tree_entry_limit: usize,
+    file_limit: usize,
+    byte_limit: u64,
+    deadline_ms: u64,
+) -> Result<NativeComparisonDiff, NativeError> {
+    let page = comparison_page(page)?;
+    let deadline = Instant::now() + diff_scan_duration(deadline_ms);
+    check_diff_deadline(deadline)?;
+    let repo = open_physical_bare_repository(path)?;
+    let mut budget = ComparisonDiffBudget::new(tree_entry_limit, file_limit, byte_limit);
+    let base_tree = diff_commit_tree(&repo, base_oid, deadline, &mut budget)?;
+    let head_tree = diff_commit_tree(&repo, head_oid, deadline, &mut budget)?;
+    let (mut files, _patch, truncated, changed_files, additions, deletions) = diff_trees(
+        &repo,
+        base_tree,
+        head_tree,
+        limit,
+        deadline,
+        Some(&mut budget),
+    )?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let window = diff_page_window(files.len(), page, per_page);
+    let files = files
+        .into_iter()
+        .skip(window.start)
+        .take(window.end.saturating_sub(window.start))
+        .collect();
+    check_diff_deadline(deadline)?;
+    Ok((files, truncated, changed_files, additions, deletions))
+}
+
+fn diff_commit_tree<'repo>(
+    repo: &'repo gix::Repository,
+    oid: &str,
+    deadline: Instant,
+    budget: &mut ComparisonDiffBudget,
+) -> Result<gix::Tree<'repo>, NativeError> {
+    check_diff_deadline(deadline)?;
+    let commit_oid = gix_hash::ObjectId::from_hex(oid.as_bytes())
+        .map_err(|error| native_error("commit_not_found", error))?;
+    let commit = find_graph_commit(repo, commit_oid, CommitPosition::Tip)?;
+    budget.decoded.charge(
+        commit_oid,
+        commit.data.len(),
+        "comparison diff exceeded its decoded-byte limit",
+    )?;
+    let tree_oid = commit
+        .decode()
+        .map_err(|error| native_error("corrupt_repository", error))?
+        .tree();
+    load_diff_tree(repo, tree_oid, deadline)
+}
+
+fn diff_trees(
+    repo: &gix::Repository,
+    old_tree: gix::Tree<'_>,
+    new_tree: gix::Tree<'_>,
+    limit: usize,
+    deadline: Instant,
+    mut budget: Option<&mut ComparisonDiffBudget>,
+) -> Result<NativeCommitDiff, NativeError> {
+    if let Some(budget) = budget.as_deref_mut() {
+        validate_comparison_diff_tree(repo, &new_tree, deadline, budget)?;
+        validate_comparison_diff_tree(repo, &old_tree, deadline, budget)?;
+    } else {
+        validate_diff_tree(repo, &new_tree, deadline)?;
+        validate_diff_tree(repo, &old_tree, deadline)?;
+    }
 
     let mut changes = old_tree.changes().map_err(diff_read_error)?;
     changes.options(|options| {
@@ -2464,7 +2884,7 @@ fn diff_commit(
     let walk_result = changes.for_each_to_obtain_tree(&new_tree, |change| {
         let result = process_diff_change(
             change,
-            &repo,
+            repo,
             &mut blob_cache,
             &mut source,
             &mut files,
@@ -2472,6 +2892,7 @@ fn diff_commit(
             &mut additions,
             &mut deletions,
             deadline,
+            &mut budget,
         );
         blob_cache.clear_resource_cache();
 
@@ -2498,6 +2919,42 @@ fn diff_commit(
         additions,
         deletions,
     ))
+}
+
+fn commit_range_page_window(total: usize, page: usize, per_page: usize) -> CommitPageWindow {
+    commit_page_window(total, page, per_page)
+}
+
+fn comparison_page(page: &str) -> Result<usize, NativeError> {
+    let page = page.parse::<usize>().unwrap_or(usize::MAX);
+    if page == 0 {
+        Err(native_error(
+            "invalid_input",
+            "comparison page must be positive",
+        ))
+    } else {
+        Ok(page)
+    }
+}
+
+fn comparison_commit_limit(limit: usize) -> usize {
+    limit.min(COMPARISON_COMMIT_LIMIT)
+}
+
+fn comparison_tree_entry_limit(limit: usize) -> usize {
+    limit.min(COMPARISON_TREE_ENTRY_LIMIT)
+}
+
+fn comparison_file_limit(limit: usize) -> usize {
+    limit.min(COMPARISON_FILE_LIMIT)
+}
+
+fn comparison_byte_limit(limit: u64) -> u64 {
+    limit.min(COMPARISON_BYTE_LIMIT)
+}
+
+fn diff_page_window(total: usize, page: usize, per_page: usize) -> TreePageWindow {
+    tree_page_window(total, page, per_page.clamp(1, DIFF_FILE_PAGE_LIMIT))
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -3058,6 +3515,1544 @@ fn analysis_scan_duration(deadline_ms: u64) -> Duration {
     Duration::from_millis(deadline_ms.min(ANALYSIS_SCAN_DEADLINE.as_millis() as u64))
 }
 
+struct PreparedMergeCommit {
+    author: gix::actor::Signature,
+    committer: gix::actor::Signature,
+    message: String,
+}
+
+struct MergeMetrics {
+    base_oid: gix_hash::ObjectId,
+    head_oid: gix_hash::ObjectId,
+    ahead_by: usize,
+    behind_by: usize,
+}
+
+type MergeObjectMemory = Vec<(gix_hash::ObjectId, (gix_object::Kind, Vec<u8>))>;
+
+struct ComputedMerge {
+    analysis: NativeMergeAnalysis,
+    merge_oid: Option<String>,
+    objects: MergeObjectMemory,
+}
+
+struct NativeMergeWorkerPool {
+    capacity: usize,
+    in_use: Mutex<usize>,
+    available: Condvar,
+}
+
+struct NativeMergeWorkerPermit {
+    pool: Arc<NativeMergeWorkerPool>,
+}
+
+struct CompletedMergeWorker<T> {
+    value: T,
+    _permit: Arc<NativeMergeWorkerPermit>,
+}
+
+struct MergeWorkerTicket {
+    handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+struct MergeWorkerTicketResource {
+    ticket: Arc<MergeWorkerTicket>,
+}
+
+enum NativeMergeWorkerResult<T> {
+    Complete(Result<CompletedMergeWorker<T>, NativeError>),
+    Deferred {
+        error: NativeError,
+        ticket: Arc<MergeWorkerTicket>,
+    },
+}
+
+enum DeferredMergeResult {
+    Complete(Result<(NativeMergeAnalysis, Option<String>), NativeError>),
+    Deferred {
+        error: NativeError,
+        ticket: Arc<MergeWorkerTicket>,
+    },
+}
+
+#[derive(rustler::NifTaggedEnum)]
+enum NativeMergeAnalysisReply {
+    Ok(NativeMergeAnalysis),
+    Error(NativeError),
+    Deferred(NativeError, rustler::ResourceArc<MergeWorkerTicketResource>),
+}
+
+#[derive(rustler::NifTaggedEnum)]
+enum NativeMergeWriteReply {
+    Ok(String),
+    Error(NativeError),
+    Deferred(NativeError, rustler::ResourceArc<MergeWorkerTicketResource>),
+}
+
+#[rustler::resource_impl]
+impl rustler::Resource for MergeWorkerTicketResource {}
+
+struct MergeByteBudget {
+    limit: u64,
+    state: Mutex<MergeByteState>,
+}
+
+struct MergeByteState {
+    used: u64,
+    transient_used: u64,
+    objects: BTreeSet<gix_hash::ObjectId>,
+}
+
+#[derive(Debug)]
+struct MergeByteLimitError {
+    detail: String,
+}
+
+struct BudgetedMergeObjects<'repo> {
+    repo: &'repo gix::Repository,
+    budget: &'repo MergeByteBudget,
+}
+
+struct MergeByteReservation<'budget> {
+    budget: &'budget MergeByteBudget,
+    bytes: u64,
+}
+
+struct MergeTransientReservation<'budget> {
+    budget: &'budget MergeByteBudget,
+    bytes: u64,
+}
+
+struct ExactMergeObjectBuffer {
+    bytes: Vec<u8>,
+    expected: usize,
+}
+
+struct BudgetedMergePaths<'budget> {
+    entries: BTreeMap<Vec<u8>, (u16, gix_hash::ObjectId)>,
+    budget: &'budget MergeByteBudget,
+    retained_bytes: u64,
+}
+
+struct PendingMergeTree<'budget> {
+    oid: gix_hash::ObjectId,
+    prefix: Vec<u8>,
+    _reservation: Option<MergeByteReservation<'budget>>,
+}
+
+impl std::fmt::Display for MergeByteLimitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for MergeByteLimitError {}
+
+impl MergeByteBudget {
+    fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            state: Mutex::new(MergeByteState {
+                used: 0,
+                transient_used: 0,
+                objects: BTreeSet::new(),
+            }),
+        }
+    }
+
+    fn preflight_object(
+        &self,
+        kind: gix_object::Kind,
+        size: u64,
+    ) -> Result<(), MergeByteLimitError> {
+        if kind == gix_object::Kind::Blob && size > MERGE_BLOB_LIMIT {
+            return Err(MergeByteLimitError {
+                detail: format!(
+                    "merge blob size {size} exceeds the {}-byte limit",
+                    MERGE_BLOB_LIMIT
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn charge_object(
+        &self,
+        oid: gix_hash::ObjectId,
+        kind: gix_object::Kind,
+        size: u64,
+    ) -> Result<(), MergeByteLimitError> {
+        self.preflight_object(kind, size)?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.objects.contains(&oid) {
+            return Ok(());
+        }
+        let bytes = size
+            .checked_add(MERGE_OBJECT_ENTRY_OVERHEAD)
+            .ok_or_else(|| MergeByteLimitError {
+                detail: "merge byte accounting overflowed".into(),
+            })?;
+        let used = state
+            .used
+            .checked_add(bytes)
+            .ok_or_else(|| MergeByteLimitError {
+                detail: "merge byte accounting overflowed".into(),
+            })?;
+        if used > self.limit {
+            return Err(MergeByteLimitError {
+                detail: format!(
+                    "merge unique object and retained path bytes exceed the {}-byte limit",
+                    self.limit
+                ),
+            });
+        }
+        state.objects.insert(oid);
+        state.used = used;
+        Ok(())
+    }
+
+    fn reserve(&self, bytes: u64) -> Result<MergeByteReservation<'_>, MergeByteLimitError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let used = state
+            .used
+            .checked_add(bytes)
+            .ok_or_else(|| MergeByteLimitError {
+                detail: "merge byte accounting overflowed".into(),
+            })?;
+        if used > self.limit {
+            return Err(MergeByteLimitError {
+                detail: format!(
+                    "merge unique object and retained path bytes exceed the {}-byte limit",
+                    self.limit
+                ),
+            });
+        }
+        state.used = used;
+        Ok(MergeByteReservation {
+            budget: self,
+            bytes,
+        })
+    }
+
+    fn reserve_transient(
+        &self,
+        kind: gix_object::Kind,
+        size: u64,
+    ) -> Result<MergeTransientReservation<'_>, MergeByteLimitError> {
+        self.preflight_object(kind, size)?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let transient_used =
+            state
+                .transient_used
+                .checked_add(size)
+                .ok_or_else(|| MergeByteLimitError {
+                    detail: "merge transient byte accounting overflowed".into(),
+                })?;
+        if transient_used > self.limit {
+            return Err(MergeByteLimitError {
+                detail: format!(
+                    "merge transient generated-object bytes exceed the {}-byte limit",
+                    self.limit
+                ),
+            });
+        }
+        state.transient_used = transient_used;
+        Ok(MergeTransientReservation {
+            budget: self,
+            bytes: size,
+        })
+    }
+
+    fn release(&self, bytes: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.used = state.used.saturating_sub(bytes);
+    }
+
+    fn release_transient(&self, bytes: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.transient_used = state.transient_used.saturating_sub(bytes);
+    }
+}
+
+impl MergeByteReservation<'_> {
+    fn retain_in(mut self, retained_bytes: &mut u64) -> Result<(), MergeByteLimitError> {
+        *retained_bytes =
+            retained_bytes
+                .checked_add(self.bytes)
+                .ok_or_else(|| MergeByteLimitError {
+                    detail: "merge retained path accounting overflowed".into(),
+                })?;
+        self.bytes = 0;
+        Ok(())
+    }
+}
+
+impl Drop for MergeByteReservation<'_> {
+    fn drop(&mut self) {
+        if self.bytes != 0 {
+            self.budget.release(self.bytes);
+        }
+    }
+}
+
+impl Drop for MergeTransientReservation<'_> {
+    fn drop(&mut self) {
+        self.budget.release_transient(self.bytes);
+    }
+}
+
+impl ExactMergeObjectBuffer {
+    fn new(size: u64) -> Result<Self, gix_object::write::Error> {
+        let expected = usize::try_from(size)
+            .map_err(|_| "generated merge object size does not fit in memory")?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(expected)?;
+        Ok(Self { bytes, expected })
+    }
+
+    fn finish(self) -> Result<Vec<u8>, gix_object::write::Error> {
+        if self.bytes.len() != self.expected {
+            return Err(format!(
+                "generated merge object wrote {} bytes, but declared {}",
+                self.bytes.len(),
+                self.expected
+            )
+            .into());
+        }
+        Ok(self.bytes)
+    }
+}
+
+impl std::io::Write for ExactMergeObjectBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.expected.saturating_sub(self.bytes.len()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "generated merge object exceeded its declared size",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for BudgetedMergePaths<'_> {
+    type Target = BTreeMap<Vec<u8>, (u16, gix_hash::ObjectId)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl Drop for BudgetedMergePaths<'_> {
+    fn drop(&mut self) {
+        self.budget.release(self.retained_bytes);
+    }
+}
+
+impl gix_object::Exists for BudgetedMergeObjects<'_> {
+    fn exists(&self, id: &gix_hash::oid) -> bool {
+        gix_object::Exists::exists(self.repo, id)
+    }
+}
+
+impl gix_object::Find for BudgetedMergeObjects<'_> {
+    fn try_find<'a>(
+        &self,
+        id: &gix_hash::oid,
+        buffer: &'a mut Vec<u8>,
+    ) -> Result<Option<gix_object::Data<'a>>, gix_object::find::Error> {
+        if let Some(header) = gix_object::FindHeader::try_header(self.repo, id)? {
+            self.budget
+                .charge_object(id.to_owned(), header.kind, header.size)
+                .map_err(|error| Box::new(error) as gix_object::find::Error)?;
+        }
+        gix_object::Find::try_find(self.repo, id, buffer)
+    }
+}
+
+impl gix_object::FindHeader for BudgetedMergeObjects<'_> {
+    fn try_header(
+        &self,
+        id: &gix_hash::oid,
+    ) -> Result<Option<gix_object::Header>, gix_object::find::Error> {
+        gix_object::FindHeader::try_header(self.repo, id)
+    }
+}
+
+impl gix_object::Write for BudgetedMergeObjects<'_> {
+    fn write(
+        &self,
+        object: &dyn gix_object::WriteTo,
+    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+        let _transient = self.reserve_transient_write(object.kind(), object.size())?;
+        let mut buffer = ExactMergeObjectBuffer::new(object.size())?;
+        object.write_to(&mut buffer)?;
+        let bytes = buffer.finish()?;
+        self.write_computed(object.kind(), &bytes)
+    }
+
+    fn write_buf(
+        &self,
+        kind: gix_object::Kind,
+        from: &[u8],
+    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+        let _transient = self.reserve_transient_write(kind, from.len() as u64)?;
+        self.write_computed(kind, from)
+    }
+
+    fn write_buf_with_known_id(
+        &self,
+        kind: gix_object::Kind,
+        from: &[u8],
+        id: gix_hash::ObjectId,
+    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+        let _transient = self.reserve_transient_write(kind, from.len() as u64)?;
+        self.write_known(kind, from, id)
+    }
+
+    fn write_stream(
+        &self,
+        kind: gix_object::Kind,
+        size: u64,
+        from: &mut dyn std::io::Read,
+    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+        let _transient = self.reserve_transient_write(kind, size)?;
+        let bytes = Self::read_exact_stream(size, from)?;
+        self.write_computed(kind, &bytes)
+    }
+
+    fn write_stream_with_known_id(
+        &self,
+        kind: gix_object::Kind,
+        size: u64,
+        from: &mut dyn std::io::Read,
+        id: gix_hash::ObjectId,
+    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+        let _transient = self.reserve_transient_write(kind, size)?;
+        let bytes = Self::read_exact_stream(size, from)?;
+        self.write_known(kind, &bytes, id)
+    }
+}
+
+impl BudgetedMergeObjects<'_> {
+    fn reserve_transient_write(
+        &self,
+        kind: gix_object::Kind,
+        size: u64,
+    ) -> Result<MergeTransientReservation<'_>, gix_object::write::Error> {
+        self.budget
+            .reserve_transient(kind, size)
+            .map_err(|error| Box::new(error) as gix_object::write::Error)
+    }
+
+    fn write_computed(
+        &self,
+        kind: gix_object::Kind,
+        from: &[u8],
+    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+        let oid = gix_object::compute_hash(self.repo.object_hash(), kind, from)?;
+        self.write_known(kind, from, oid)
+    }
+
+    fn write_known(
+        &self,
+        kind: gix_object::Kind,
+        from: &[u8],
+        oid: gix_hash::ObjectId,
+    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+        self.budget
+            .charge_object(oid, kind, from.len() as u64)
+            .map_err(|error| Box::new(error) as gix_object::write::Error)?;
+        gix_object::Write::write_buf_with_known_id(self.repo, kind, from, oid)
+    }
+
+    fn read_exact_stream(
+        size: u64,
+        mut from: &mut dyn std::io::Read,
+    ) -> Result<Vec<u8>, gix_object::write::Error> {
+        let mut buffer = ExactMergeObjectBuffer::new(size)?;
+        {
+            let mut declared = std::io::Read::take(&mut from, size);
+            std::io::copy(&mut declared, &mut buffer)?;
+        }
+        let bytes = buffer.finish()?;
+        let mut extra = [0_u8; 1];
+        if from.read(&mut extra)? != 0 {
+            return Err(
+                format!("generated merge object exceeded its declared {size} bytes").into(),
+            );
+        }
+        Ok(bytes)
+    }
+}
+
+impl NativeMergeWorkerPool {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            in_use: Mutex::new(0),
+            available: Condvar::new(),
+        }
+    }
+
+    fn acquire(
+        self: &Arc<Self>,
+        deadline: Instant,
+    ) -> Result<NativeMergeWorkerPermit, NativeError> {
+        let mut in_use = self
+            .in_use
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(native_error(
+                    "scan_timeout",
+                    "merge worker admission exceeded the 30-second deadline",
+                ));
+            }
+            if *in_use < self.capacity {
+                *in_use += 1;
+                return Ok(NativeMergeWorkerPermit {
+                    pool: Arc::clone(self),
+                });
+            }
+
+            let (guard, wait) = self
+                .available
+                .wait_timeout(in_use, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            in_use = guard;
+            if wait.timed_out() && *in_use >= self.capacity {
+                return Err(native_error(
+                    "scan_timeout",
+                    "merge worker admission exceeded the 30-second deadline",
+                ));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn in_use(&self) -> usize {
+        *self
+            .in_use
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Drop for NativeMergeWorkerPermit {
+    fn drop(&mut self) {
+        let mut in_use = self
+            .pool
+            .in_use
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *in_use = in_use.saturating_sub(1);
+        self.pool.available.notify_one();
+    }
+}
+
+fn native_merge_worker_pool(write: bool) -> Arc<NativeMergeWorkerPool> {
+    static ANALYSIS_POOL: OnceLock<Arc<NativeMergeWorkerPool>> = OnceLock::new();
+    static WRITE_POOL: OnceLock<Arc<NativeMergeWorkerPool>> = OnceLock::new();
+
+    if write {
+        Arc::clone(
+            WRITE_POOL.get_or_init(|| Arc::new(NativeMergeWorkerPool::new(MERGE_WRITE_WORKERS))),
+        )
+    } else {
+        Arc::clone(
+            ANALYSIS_POOL
+                .get_or_init(|| Arc::new(NativeMergeWorkerPool::new(MERGE_ANALYSIS_WORKERS))),
+        )
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::too_many_arguments)]
+fn merge_analysis(
+    path: String,
+    base_oid: String,
+    head_oid: String,
+    commit_limit: usize,
+    tree_entry_limit: usize,
+    changed_path_limit: usize,
+    byte_limit: u64,
+    deadline_ms: u64,
+) -> NativeMergeAnalysisReply {
+    match bounded_merge_deferred(
+        &path,
+        &base_oid,
+        &head_oid,
+        commit_limit,
+        tree_entry_limit,
+        changed_path_limit,
+        byte_limit,
+        deadline_ms,
+        None,
+    ) {
+        DeferredMergeResult::Complete(Ok((analysis, _))) => NativeMergeAnalysisReply::Ok(analysis),
+        DeferredMergeResult::Complete(Err(error)) => NativeMergeAnalysisReply::Error(error),
+        DeferredMergeResult::Deferred { error, ticket } => NativeMergeAnalysisReply::Deferred(
+            error,
+            rustler::ResourceArc::new(MergeWorkerTicketResource { ticket }),
+        ),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::too_many_arguments)]
+fn write_merge_commit(
+    path: String,
+    base_oid: String,
+    head_oid: String,
+    author: NativeSignature,
+    committer: NativeSignature,
+    message: Vec<u8>,
+    commit_limit: usize,
+    tree_entry_limit: usize,
+    changed_path_limit: usize,
+    byte_limit: u64,
+    deadline_ms: u64,
+) -> NativeMergeWriteReply {
+    // All caller-controlled commit bytes are validated before the repository is opened or a merge
+    // result is computed, and therefore before any object can be inserted.
+    let commit = match (
+        validated_merge_signature(author),
+        validated_merge_signature(committer),
+        validated_merge_message(message),
+    ) {
+        (Ok(author), Ok(committer), Ok(message)) => PreparedMergeCommit {
+            author,
+            committer,
+            message,
+        },
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+            return NativeMergeWriteReply::Error(error);
+        }
+    };
+    match bounded_merge_deferred(
+        &path,
+        &base_oid,
+        &head_oid,
+        commit_limit,
+        tree_entry_limit,
+        changed_path_limit,
+        byte_limit,
+        deadline_ms,
+        Some(commit),
+    ) {
+        DeferredMergeResult::Complete(Ok((_, Some(merge_oid)))) => {
+            NativeMergeWriteReply::Ok(merge_oid)
+        }
+        DeferredMergeResult::Complete(Ok((_, None))) => NativeMergeWriteReply::Error(native_error(
+            "corrupt_repository",
+            "merge commit was not produced",
+        )),
+        DeferredMergeResult::Complete(Err(error)) => NativeMergeWriteReply::Error(error),
+        DeferredMergeResult::Deferred { error, ticket } => NativeMergeWriteReply::Deferred(
+            error,
+            rustler::ResourceArc::new(MergeWorkerTicketResource { ticket }),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bounded_merge_deferred(
+    path: &str,
+    base_oid: &str,
+    head_oid: &str,
+    commit_limit: usize,
+    tree_entry_limit: usize,
+    changed_path_limit: usize,
+    byte_limit: u64,
+    deadline_ms: u64,
+    commit: Option<PreparedMergeCommit>,
+) -> DeferredMergeResult {
+    let deadline = Instant::now() + merge_scan_duration(deadline_ms);
+    if let Err(error) = check_merge_deadline(deadline) {
+        return DeferredMergeResult::Complete(Err(error));
+    }
+
+    let publish = commit.is_some();
+    let worker_path = path.to_owned();
+    let publish_path = worker_path.clone();
+    let base_oid = base_oid.to_owned();
+    let head_oid = head_oid.to_owned();
+    let completed = match run_merge_worker(deadline, publish, move |cancelled| {
+        compute_bounded_merge(
+            worker_path,
+            base_oid,
+            head_oid,
+            commit_limit,
+            tree_entry_limit,
+            changed_path_limit,
+            byte_limit,
+            deadline,
+            commit,
+            cancelled,
+        )
+    }) {
+        NativeMergeWorkerResult::Complete(result) => match result {
+            Ok(completed) => completed,
+            Err(error) => return DeferredMergeResult::Complete(Err(error)),
+        },
+        NativeMergeWorkerResult::Deferred { error, ticket } => {
+            return DeferredMergeResult::Deferred { error, ticket };
+        }
+    };
+    let CompletedMergeWorker {
+        value: computed,
+        _permit: permit,
+    } = completed;
+
+    if publish {
+        // This is the final cancellation/deadline boundary. Once publication starts, storage
+        // errors may leave unreachable content-addressed objects, but this primitive never moves
+        // a ref and never returns a deadline error after the first object write begins.
+        if let Err(error) = check_merge_deadline(deadline) {
+            return DeferredMergeResult::Complete(Err(error));
+        }
+        if let Err(error) = publish_merge_objects(publish_path, computed.objects) {
+            return DeferredMergeResult::Complete(Err(error));
+        }
+    }
+
+    let result = (computed.analysis, computed.merge_oid);
+    drop(permit);
+    DeferredMergeResult::Complete(Ok(result))
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn bounded_merge(
+    path: &str,
+    base_oid: &str,
+    head_oid: &str,
+    commit_limit: usize,
+    tree_entry_limit: usize,
+    changed_path_limit: usize,
+    byte_limit: u64,
+    deadline_ms: u64,
+    commit: Option<PreparedMergeCommit>,
+) -> Result<(NativeMergeAnalysis, Option<String>), NativeError> {
+    match bounded_merge_deferred(
+        path,
+        base_oid,
+        head_oid,
+        commit_limit,
+        tree_entry_limit,
+        changed_path_limit,
+        byte_limit,
+        deadline_ms,
+        commit,
+    ) {
+        DeferredMergeResult::Complete(result) => result,
+        DeferredMergeResult::Deferred { error, ticket } => {
+            await_merge_worker_impl(ticket)?;
+            Err(error)
+        }
+    }
+}
+
+fn run_merge_worker<T, F>(deadline: Instant, write: bool, task: F) -> NativeMergeWorkerResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<AtomicBool>) -> Result<T, NativeError> + Send + 'static,
+{
+    run_merge_worker_in_pool(deadline, native_merge_worker_pool(write), task)
+}
+
+fn run_merge_worker_in_pool<T, F>(
+    deadline: Instant,
+    pool: Arc<NativeMergeWorkerPool>,
+    task: F,
+) -> NativeMergeWorkerResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<AtomicBool>) -> Result<T, NativeError> + Send + 'static,
+{
+    if let Err(error) = check_merge_deadline(deadline) {
+        return NativeMergeWorkerResult::Complete(Err(error));
+    }
+    let permit = match pool.acquire(deadline) {
+        Ok(permit) => Arc::new(permit),
+        Err(error) => return NativeMergeWorkerResult::Complete(Err(error)),
+    };
+    if let Err(error) = check_merge_deadline(deadline) {
+        return NativeMergeWorkerResult::Complete(Err(error));
+    }
+    let worker_permit = Arc::clone(&permit);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let handle = match std::thread::Builder::new()
+        .name("fornacast-merge-compute".into())
+        .stack_size(MERGE_WORKER_STACK_SIZE)
+        .spawn(move || {
+            let _permit = worker_permit;
+            let result = task(Arc::clone(&worker_cancelled));
+            if !worker_cancelled.load(Ordering::Acquire) {
+                let _ = sender.send(result);
+            }
+        }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            return NativeMergeWorkerResult::Complete(Err(native_error(
+                "storage_unavailable",
+                error,
+            )));
+        }
+    };
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let result = if remaining.is_zero() {
+        Err(mpsc::RecvTimeoutError::Timeout)
+    } else {
+        receiver.recv_timeout(remaining)
+    };
+
+    match result {
+        Ok(result) if Instant::now() < deadline => {
+            let joined = handle
+                .join()
+                .map_err(|_| native_error("corrupt_repository", "merge worker panicked"));
+            NativeMergeWorkerResult::Complete(joined.and_then(|()| {
+                result.map(|value| CompletedMergeWorker {
+                    value,
+                    _permit: permit,
+                })
+            }))
+        }
+        Ok(_) => {
+            cancelled.store(true, Ordering::Release);
+            let result = handle
+                .join()
+                .map_err(|_| native_error("corrupt_repository", "merge worker panicked"))
+                .and(Err(native_error(
+                    "scan_timeout",
+                    "merge analysis exceeded the 30-second deadline",
+                )));
+            NativeMergeWorkerResult::Complete(result)
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            cancelled.store(true, Ordering::Release);
+            NativeMergeWorkerResult::Deferred {
+                error: native_error(
+                    "scan_timeout",
+                    "merge analysis exceeded the 30-second deadline",
+                ),
+                ticket: Arc::new(MergeWorkerTicket {
+                    handle: Mutex::new(Some(handle)),
+                }),
+            }
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            cancelled.store(true, Ordering::Release);
+            let result = handle
+                .join()
+                .map_err(|_| native_error("corrupt_repository", "merge worker panicked"))
+                .and(Err(native_error(
+                    "corrupt_repository",
+                    "merge worker exited without a result",
+                )));
+            NativeMergeWorkerResult::Complete(result)
+        }
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn await_merge_worker(
+    ticket: rustler::ResourceArc<MergeWorkerTicketResource>,
+) -> Result<(), NativeError> {
+    await_merge_worker_impl(Arc::clone(&ticket.ticket))
+}
+
+fn await_merge_worker_impl(ticket: Arc<MergeWorkerTicket>) -> Result<(), NativeError> {
+    let handle = ticket
+        .handle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    match handle {
+        Some(handle) => handle.join().map_err(|_| {
+            native_error(
+                "corrupt_repository",
+                "timed-out merge worker panicked before exit",
+            )
+        }),
+        None => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_bounded_merge(
+    path: String,
+    base_oid: String,
+    head_oid: String,
+    commit_limit: usize,
+    tree_entry_limit: usize,
+    changed_path_limit: usize,
+    byte_limit: u64,
+    deadline: Instant,
+    commit: Option<PreparedMergeCommit>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<ComputedMerge, NativeError> {
+    check_merge_worker(&cancelled, deadline)?;
+    #[cfg(test)]
+    MERGE_WORKERS_STARTED.fetch_add(1, Ordering::Relaxed);
+
+    let commit_limit = merge_commit_limit(commit_limit);
+    let tree_entry_limit = merge_tree_entry_limit(tree_entry_limit);
+    let changed_path_limit = merge_changed_path_limit(changed_path_limit);
+    let byte_budget = MergeByteBudget::new(merge_byte_limit(byte_limit));
+    let mut repo = open_physical_bare_repository(&path)?.with_object_memory();
+    let base_oid = parse_merge_commit_oid(&repo, &base_oid, &byte_budget, deadline)?;
+    let head_oid = parse_merge_commit_oid(&repo, &head_oid, &byte_budget, deadline)?;
+    let metrics = merge_metrics(
+        &repo,
+        base_oid,
+        head_oid,
+        commit_limit,
+        &byte_budget,
+        deadline,
+    )?;
+
+    let merge_base_oid = repo
+        .merge_base(base_oid, head_oid)
+        .map_err(|error| native_error("merge_conflict", error))?
+        .detach();
+    check_merge_deadline(deadline)?;
+
+    let base_tree = merge_commit_tree(&repo, base_oid, &byte_budget, deadline)?;
+    let head_tree = merge_commit_tree(&repo, head_oid, &byte_budget, deadline)?;
+    let merge_base_tree = merge_commit_tree(&repo, merge_base_oid, &byte_budget, deadline)?;
+    let mut tree_entries_scanned = 0_usize;
+    let ancestor_paths = flatten_merge_tree(
+        &repo,
+        merge_base_tree,
+        &mut tree_entries_scanned,
+        tree_entry_limit,
+        &byte_budget,
+        deadline,
+    )?;
+    let head_paths = flatten_merge_tree(
+        &repo,
+        head_tree,
+        &mut tree_entries_scanned,
+        tree_entry_limit,
+        &byte_budget,
+        deadline,
+    )?;
+    // Scan our side independently as part of the hard total work budget before invoking gix's
+    // in-memory three-way merge.
+    flatten_merge_tree(
+        &repo,
+        base_tree,
+        &mut tree_entries_scanned,
+        tree_entry_limit,
+        &byte_budget,
+        deadline,
+    )?;
+    let changed_paths =
+        count_changed_merge_paths(&ancestor_paths, &head_paths, changed_path_limit, deadline)?;
+    drop(ancestor_paths);
+    drop(head_paths);
+
+    check_merge_deadline(deadline)?;
+    let options = repo
+        .tree_merge_options()
+        .map_err(|error| native_error("corrupt_repository", error))?
+        .with_rewrites(None)
+        .with_fail_on_conflict(Some(gix::merge::tree::TreatAsUnresolved::git()));
+    let commit_options: gix::merge::commit::Options = options.into();
+    let labels = gix::merge::blob::builtin_driver::text::Labels::default();
+
+    // Build both gix resource caches from the supplied base tree instead of HEAD. Empty driver
+    // lists keep all merging inside gix's built-in implementation and prevent configured external
+    // diff or merge programs from being executed.
+    let (diff_filter, _) = repo
+        .filter_pipeline(Some(base_tree))
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let (diff_filter, diff_attributes) = diff_filter.into_parts();
+    let diff_pipeline = gix::diff::blob::Pipeline::new(
+        Default::default(),
+        diff_filter,
+        Vec::new(),
+        Default::default(),
+    );
+    let mut diff_cache = gix::diff::blob::Platform::new(
+        Default::default(),
+        diff_pipeline,
+        gix::diff::blob::pipeline::Mode::ToGit,
+        diff_attributes,
+    );
+    let (merge_filter, _) = repo
+        .filter_pipeline(Some(base_tree))
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let (merge_filter, merge_attributes) = merge_filter.into_parts();
+    let merge_pipeline = gix::merge::plumbing::blob::Pipeline::new(
+        Default::default(),
+        merge_filter,
+        gix::merge::plumbing::blob::pipeline::Options {
+            large_file_threshold_bytes: MERGE_BLOB_LIMIT,
+        },
+    );
+    let mut blob_merge = gix::merge::plumbing::blob::Platform::new(
+        merge_pipeline,
+        gix::merge::plumbing::blob::pipeline::Mode::ToGit,
+        merge_attributes,
+        Vec::new(),
+        gix::merge::plumbing::blob::platform::Options {
+            default_driver: None,
+        },
+    );
+    let commit_graph = repo
+        .commit_graph_if_enabled()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let mut graph = repo.revision_graph(commit_graph.as_ref());
+    let budgeted_objects = BudgetedMergeObjects {
+        repo: &repo,
+        budget: &byte_budget,
+    };
+    let outcome = gix::merge::plumbing::commit(
+        base_oid,
+        head_oid,
+        labels,
+        &mut graph,
+        &mut diff_cache,
+        &mut blob_merge,
+        &budgeted_objects,
+        &mut |oid| oid.to_string(),
+        commit_options.into(),
+    )
+    .map_err(merge_operation_error)?;
+    drop(graph);
+    drop(commit_graph);
+    drop(blob_merge);
+    drop(diff_cache);
+    check_merge_worker(&cancelled, deadline)?;
+    let mergeable = !outcome
+        .tree_merge
+        .has_unresolved_conflicts(gix::merge::tree::TreatAsUnresolved::git());
+
+    let native_analysis = (
+        metrics.base_oid.to_string(),
+        metrics.head_oid.to_string(),
+        mergeable,
+        usize_to_u64(metrics.ahead_by, "ahead count")?,
+        usize_to_u64(metrics.behind_by, "behind count")?,
+        usize_to_u64(metrics.ahead_by, "commit count")?,
+        usize_to_u64(changed_paths, "changed path count")?,
+    );
+
+    if !mergeable {
+        return if commit.is_some() {
+            Err(native_error(
+                "merge_conflict",
+                "base and head have unresolved merge conflicts",
+            ))
+        } else {
+            Ok(ComputedMerge {
+                analysis: native_analysis,
+                merge_oid: None,
+                objects: Vec::new(),
+            })
+        };
+    }
+
+    let mut tree_merge = outcome.tree_merge;
+    let merged_tree = tree_merge
+        .tree
+        .write(|tree| gix_object::Write::write(&budgeted_objects, tree))
+        .map_err(merge_boxed_operation_error)?;
+    drop(tree_merge);
+    check_merge_deadline(deadline)?;
+    flatten_merge_tree(
+        &repo,
+        merged_tree,
+        &mut tree_entries_scanned,
+        tree_entry_limit,
+        &byte_budget,
+        deadline,
+    )?;
+
+    let Some(commit) = commit else {
+        return Ok(ComputedMerge {
+            analysis: native_analysis,
+            merge_oid: None,
+            objects: Vec::new(),
+        });
+    };
+
+    check_merge_deadline(deadline)?;
+    let commit_object = gix_object::Commit {
+        tree: merged_tree,
+        parents: vec![base_oid, head_oid].into(),
+        author: commit.author,
+        committer: commit.committer,
+        encoding: None,
+        message: commit.message.into(),
+        extra_headers: Vec::new(),
+    };
+    let merge_oid = gix_object::Write::write(&budgeted_objects, &commit_object)
+        .map_err(merge_boxed_operation_error)?;
+    check_merge_worker(&cancelled, deadline)?;
+    let objects = take_merge_object_memory(&mut repo)?;
+    Ok(ComputedMerge {
+        analysis: native_analysis,
+        merge_oid: Some(merge_oid.to_string()),
+        objects,
+    })
+}
+
+fn merge_metrics(
+    repo: &gix::Repository,
+    base_oid: gix_hash::ObjectId,
+    head_oid: gix_hash::ObjectId,
+    commit_limit: usize,
+    byte_budget: &MergeByteBudget,
+    deadline: Instant,
+) -> Result<MergeMetrics, NativeError> {
+    let mut globally_visited = BTreeSet::new();
+    let base_reachable = collect_merge_reachable(
+        repo,
+        base_oid,
+        &mut globally_visited,
+        commit_limit,
+        byte_budget,
+        deadline,
+    )?;
+    let head_reachable = collect_merge_reachable(
+        repo,
+        head_oid,
+        &mut globally_visited,
+        commit_limit,
+        byte_budget,
+        deadline,
+    )?;
+    let ahead_by = head_reachable.difference(&base_reachable).count();
+    let behind_by = base_reachable.difference(&head_reachable).count();
+    check_merge_deadline(deadline)?;
+    Ok(MergeMetrics {
+        base_oid,
+        head_oid,
+        ahead_by,
+        behind_by,
+    })
+}
+
+fn collect_merge_reachable(
+    repo: &gix::Repository,
+    tip: gix_hash::ObjectId,
+    globally_visited: &mut BTreeSet<gix_hash::ObjectId>,
+    commit_limit: usize,
+    byte_budget: &MergeByteBudget,
+    deadline: Instant,
+) -> Result<BTreeSet<gix_hash::ObjectId>, NativeError> {
+    let mut pending = vec![tip];
+    let mut reachable = BTreeSet::new();
+
+    while let Some(oid) = pending.pop() {
+        check_merge_deadline(deadline)?;
+        if !reachable.insert(oid) {
+            continue;
+        }
+        if !globally_visited.contains(&oid) {
+            if globally_visited.len() >= commit_limit {
+                return Err(native_error(
+                    "commit_limit",
+                    "merge analysis exceeded the 50,000-commit limit",
+                ));
+            }
+            globally_visited.insert(oid);
+        }
+        let position = if oid == tip {
+            CommitPosition::Tip
+        } else {
+            CommitPosition::Ancestor
+        };
+        charge_merge_object(repo, oid, byte_budget)?;
+        let node = load_commit_node(repo, oid, position, deadline)?;
+        for parent in node.parents {
+            check_merge_deadline(deadline)?;
+            pending.push(parent);
+        }
+    }
+    Ok(reachable)
+}
+
+fn flatten_merge_tree<'budget>(
+    repo: &gix::Repository,
+    root: gix_hash::ObjectId,
+    entries_scanned: &mut usize,
+    tree_entry_limit: usize,
+    byte_budget: &'budget MergeByteBudget,
+    deadline: Instant,
+) -> Result<BudgetedMergePaths<'budget>, NativeError> {
+    let mut pending = vec![PendingMergeTree {
+        oid: root,
+        prefix: Vec::new(),
+        _reservation: None,
+    }];
+    let mut paths = BudgetedMergePaths {
+        entries: BTreeMap::new(),
+        budget: byte_budget,
+        retained_bytes: 0,
+    };
+
+    while let Some(PendingMergeTree {
+        oid: tree_oid,
+        prefix,
+        _reservation,
+    }) = pending.pop()
+    {
+        check_merge_deadline(deadline)?;
+        charge_merge_object(repo, tree_oid, byte_budget)?;
+        let tree = load_merge_tree(repo, tree_oid, deadline)?;
+        let mut previous = None;
+        for entry in gix_object::TreeRefIter::from_bytes(&tree.data, tree.id.kind()) {
+            check_merge_deadline(deadline)?;
+            if *entries_scanned >= tree_entry_limit {
+                return Err(native_error(
+                    "tree_entry_limit",
+                    "merge analysis exceeded the 100,000-tree-entry limit",
+                ));
+            }
+            *entries_scanned = entries_scanned.checked_add(1).ok_or_else(|| {
+                native_error("corrupt_repository", "merge tree entry count overflow")
+            })?;
+            let entry = entry.map_err(|error| native_error("corrupt_repository", error))?;
+            let name: &[u8] = entry.filename.as_ref();
+            validate_tree_entry(&mut previous, name, entry.mode.value())?;
+            let path_len = prefix
+                .len()
+                .checked_add(usize::from(!prefix.is_empty()))
+                .and_then(|length| length.checked_add(name.len()))
+                .ok_or_else(|| native_error("corrupt_repository", "merge path length overflow"))?;
+            if path_len > 4096 {
+                return Err(native_error(
+                    "corrupt_repository",
+                    "merge tree path exceeds 4096 bytes",
+                ));
+            }
+            let retained_bytes = u64::try_from(path_len)
+                .ok()
+                .and_then(|length| length.checked_add(MERGE_PATH_ENTRY_OVERHEAD))
+                .ok_or_else(|| {
+                    native_error("corrupt_repository", "merge retained path size overflow")
+                })?;
+            let reservation = byte_budget
+                .reserve(retained_bytes)
+                .map_err(|error| native_error("merge_byte_limit", error))?;
+            let mut path = Vec::with_capacity(path_len);
+            path.extend_from_slice(&prefix);
+            if !prefix.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(name);
+            let oid = entry.oid.to_owned();
+            if entry.mode.is_tree() {
+                pending.push(PendingMergeTree {
+                    oid,
+                    prefix: path,
+                    _reservation: Some(reservation),
+                });
+            } else {
+                charge_merge_object(repo, oid, byte_budget)?;
+                if paths
+                    .entries
+                    .insert(path, (entry.mode.value(), oid))
+                    .is_some()
+                {
+                    return Err(native_error(
+                        "corrupt_repository",
+                        "merge tree contains a duplicate path",
+                    ));
+                }
+                reservation
+                    .retain_in(&mut paths.retained_bytes)
+                    .map_err(|error| native_error("merge_byte_limit", error))?;
+            }
+        }
+    }
+    check_merge_deadline(deadline)?;
+    Ok(paths)
+}
+
+fn count_changed_merge_paths(
+    ancestor: &BTreeMap<Vec<u8>, (u16, gix_hash::ObjectId)>,
+    head: &BTreeMap<Vec<u8>, (u16, gix_hash::ObjectId)>,
+    changed_path_limit: usize,
+    deadline: Instant,
+) -> Result<usize, NativeError> {
+    let mut changed = 0_usize;
+    for (path, state) in ancestor {
+        check_merge_deadline(deadline)?;
+        if head.get(path) != Some(state) {
+            record_changed_merge_path(&mut changed, changed_path_limit)?;
+        }
+    }
+    for path in head.keys() {
+        check_merge_deadline(deadline)?;
+        if !ancestor.contains_key(path) {
+            record_changed_merge_path(&mut changed, changed_path_limit)?;
+        }
+    }
+    Ok(changed)
+}
+
+fn record_changed_merge_path(
+    changed: &mut usize,
+    changed_path_limit: usize,
+) -> Result<(), NativeError> {
+    if *changed >= changed_path_limit {
+        return Err(native_error(
+            "changed_path_limit",
+            "merge analysis exceeded the 10,000-changed-path limit",
+        ));
+    }
+    *changed = changed
+        .checked_add(1)
+        .ok_or_else(|| native_error("corrupt_repository", "changed path count overflow"))?;
+    Ok(())
+}
+
+fn charge_merge_object(
+    repo: &gix::Repository,
+    oid: gix_hash::ObjectId,
+    byte_budget: &MergeByteBudget,
+) -> Result<(), NativeError> {
+    let header = repo.find_header(oid).map_err(diff_read_error)?;
+    byte_budget
+        .charge_object(oid, header.kind(), header.size())
+        .map_err(|error| native_error("merge_byte_limit", error))
+}
+
+fn take_merge_object_memory(repo: &mut gix::Repository) -> Result<MergeObjectMemory, NativeError> {
+    let mut storage = repo
+        .objects
+        .take_object_memory()
+        .ok_or_else(|| native_error("corrupt_repository", "merge object memory was not enabled"))?;
+    Ok(storage.drain().collect())
+}
+
+fn publish_merge_objects(path: String, mut objects: MergeObjectMemory) -> Result<(), NativeError> {
+    objects.sort_by_key(|(_, (kind, _))| match kind {
+        gix_object::Kind::Blob => 0,
+        gix_object::Kind::Tree => 1,
+        gix_object::Kind::Commit => 2,
+        gix_object::Kind::Tag => 3,
+    });
+
+    // gix's loose-object encoder keeps a 32 KiB compression buffer on the stack. The BEAM dirty
+    // I/O scheduler stack can be smaller than that buffer, so publish on a joined worker with an
+    // explicit stack. Publication is deliberately outside the merge deadline: a storage failure
+    // can leave unreachable content-addressed objects, but this primitive never updates a ref.
+    std::thread::Builder::new()
+        .name("fornacast-merge-publish".into())
+        .stack_size(MERGE_WORKER_STACK_SIZE)
+        .spawn(move || publish_merge_objects_on_worker(&path, objects))
+        .map_err(|error| native_error("storage_unavailable", error))?
+        .join()
+        .map_err(|_| native_error("corrupt_repository", "merge object publication panicked"))?
+}
+
+fn publish_merge_objects_on_worker(
+    path: &str,
+    objects: MergeObjectMemory,
+) -> Result<(), NativeError> {
+    use gix_object::Write as ObjectWrite;
+
+    let repo = open_physical_bare_repository(path)?;
+    for (oid, (kind, data)) in objects {
+        ObjectWrite::write_buf_with_known_id(&repo, kind, &data, oid)
+            .map_err(|error| native_error("storage_unavailable", error))?;
+    }
+    Ok(())
+}
+
+fn parse_merge_commit_oid(
+    repo: &gix::Repository,
+    value: &str,
+    byte_budget: &MergeByteBudget,
+    deadline: Instant,
+) -> Result<gix_hash::ObjectId, NativeError> {
+    check_merge_deadline(deadline)?;
+    let oid = gix_hash::ObjectId::from_hex(value.as_bytes())
+        .map_err(|error| native_error("commit_not_found", error))?;
+    charge_merge_object(repo, oid, byte_budget)?;
+    find_graph_commit(repo, oid, CommitPosition::Tip)?;
+    check_merge_deadline(deadline)?;
+    Ok(oid)
+}
+
+fn merge_commit_tree(
+    repo: &gix::Repository,
+    oid: gix_hash::ObjectId,
+    byte_budget: &MergeByteBudget,
+    deadline: Instant,
+) -> Result<gix_hash::ObjectId, NativeError> {
+    check_merge_deadline(deadline)?;
+    charge_merge_object(repo, oid, byte_budget)?;
+    let commit = find_graph_commit(repo, oid, CommitPosition::Tip)?;
+    let tree = commit
+        .decode()
+        .map_err(|error| native_error("corrupt_repository", error))?
+        .tree();
+    check_merge_deadline(deadline)?;
+    Ok(tree)
+}
+
+fn load_merge_tree<'repo>(
+    repo: &'repo gix::Repository,
+    oid: gix_hash::ObjectId,
+    deadline: Instant,
+) -> Result<gix::Tree<'repo>, NativeError> {
+    check_merge_deadline(deadline)?;
+    let object = repo
+        .find_object(oid)
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let tree = object
+        .try_into_tree()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    check_merge_deadline(deadline)?;
+    Ok(tree)
+}
+
+fn validated_merge_signature(value: NativeSignature) -> Result<gix::actor::Signature, NativeError> {
+    let (name, email, seconds, offset_minutes) = value;
+    let name = validated_signature_field(name, SIGNATURE_NAME_LIMIT, "name")?;
+    let email = validated_signature_field(email, SIGNATURE_EMAIL_LIMIT, "email")?;
+    if !(-1439..=1439).contains(&offset_minutes) {
+        return Err(native_error(
+            "invalid_input",
+            "signature offset must be between -1439 and 1439 minutes",
+        ));
+    }
+    Ok(gix::actor::Signature {
+        name: name.into(),
+        email: email.into(),
+        time: gix::date::Time {
+            seconds,
+            offset: offset_minutes
+                .checked_mul(60)
+                .ok_or_else(|| native_error("invalid_input", "signature offset overflow"))?,
+        },
+    })
+}
+
+fn validated_signature_field(
+    value: Vec<u8>,
+    limit: usize,
+    field: &str,
+) -> Result<String, NativeError> {
+    if value.is_empty() || value.len() > limit {
+        return Err(native_error(
+            "invalid_input",
+            format!("signature {field} has an invalid size"),
+        ));
+    }
+    if value
+        .iter()
+        .any(|byte| matches!(byte, 0 | b'\n' | b'\r' | b'<' | b'>'))
+    {
+        return Err(native_error(
+            "invalid_input",
+            format!("signature {field} contains a forbidden byte"),
+        ));
+    }
+    String::from_utf8(value).map_err(|_| {
+        native_error(
+            "invalid_input",
+            format!("signature {field} must be valid UTF-8"),
+        )
+    })
+}
+
+fn validated_merge_message(message: Vec<u8>) -> Result<String, NativeError> {
+    if message.len() > MERGE_MESSAGE_LIMIT {
+        return Err(native_error(
+            "invalid_input",
+            "merge commit message exceeds 1 MiB",
+        ));
+    }
+    if message.contains(&0) {
+        return Err(native_error(
+            "invalid_input",
+            "merge commit message contains NUL",
+        ));
+    }
+    String::from_utf8(message)
+        .map_err(|_| native_error("invalid_input", "merge commit message must be valid UTF-8"))
+}
+
+fn merge_commit_limit(limit: usize) -> usize {
+    limit.min(MERGE_COMMIT_LIMIT)
+}
+
+fn merge_tree_entry_limit(limit: usize) -> usize {
+    limit.min(MERGE_TREE_ENTRY_LIMIT)
+}
+
+fn merge_changed_path_limit(limit: usize) -> usize {
+    limit.min(MERGE_CHANGED_PATH_LIMIT)
+}
+
+fn merge_byte_limit(limit: u64) -> u64 {
+    limit.min(MERGE_BYTE_LIMIT)
+}
+
+fn merge_scan_duration(deadline_ms: u64) -> Duration {
+    Duration::from_millis(deadline_ms.min(MERGE_DEADLINE.as_millis() as u64))
+}
+
+fn check_merge_deadline(deadline: Instant) -> Result<(), NativeError> {
+    if Instant::now() >= deadline {
+        Err(native_error(
+            "scan_timeout",
+            "merge analysis exceeded the 30-second deadline",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_merge_worker(cancelled: &AtomicBool, deadline: Instant) -> Result<(), NativeError> {
+    if cancelled.load(Ordering::Acquire) {
+        Err(native_error("scan_timeout", "merge analysis was cancelled"))
+    } else {
+        check_merge_deadline(deadline)
+    }
+}
+
+fn usize_to_u64(value: usize, label: &str) -> Result<u64, NativeError> {
+    u64::try_from(value)
+        .map_err(|_| native_error("corrupt_repository", format!("{label} overflow")))
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
 fn repository_disk_usage(path: String, deadline_ms: u64) -> Result<u64, NativeError> {
     let deadline = Instant::now() + disk_usage_scan_duration(deadline_ms);
@@ -3113,6 +5108,559 @@ fn check_disk_usage_deadline(deadline: Instant) -> Result<(), NativeError> {
 
 fn disk_usage_scan_duration(deadline_ms: u64) -> Duration {
     Duration::from_millis(deadline_ms.min(DISK_USAGE_SCAN_DEADLINE.as_millis() as u64))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn compare_and_swap_ref(
+    path: String,
+    full_ref: String,
+    expected_oid: Option<String>,
+    proposed_oid: String,
+    mode: String,
+    commit_limit: usize,
+    deadline_ms: u64,
+) -> Result<String, NativeError> {
+    compare_and_swap_ref_impl_with_limit(
+        path,
+        full_ref,
+        expected_oid,
+        proposed_oid,
+        mode,
+        commit_limit,
+        deadline_ms,
+    )
+}
+
+#[cfg(test)]
+fn compare_and_swap_ref_impl(
+    path: String,
+    full_ref: String,
+    expected_oid: Option<String>,
+    proposed_oid: String,
+    mode: String,
+    deadline_ms: u64,
+) -> Result<String, NativeError> {
+    compare_and_swap_ref_impl_with_limit(
+        path,
+        full_ref,
+        expected_oid,
+        proposed_oid,
+        mode,
+        CAS_COMMIT_VISIT_LIMIT,
+        deadline_ms,
+    )
+}
+
+fn compare_and_swap_ref_impl_with_limit(
+    path: String,
+    full_ref: String,
+    expected_oid: Option<String>,
+    proposed_oid: String,
+    mode: String,
+    commit_limit: usize,
+    deadline_ms: u64,
+) -> Result<String, NativeError> {
+    compare_and_swap_ref_impl_with_precommit(
+        path,
+        full_ref,
+        expected_oid,
+        proposed_oid,
+        mode,
+        commit_limit,
+        deadline_ms,
+        || {},
+    )
+}
+
+fn compare_and_swap_ref_impl_with_precommit<F>(
+    path: String,
+    full_ref: String,
+    expected_oid: Option<String>,
+    proposed_oid: String,
+    mode: String,
+    commit_limit: usize,
+    deadline_ms: u64,
+    before_final_deadline_check: F,
+) -> Result<String, NativeError>
+where
+    F: FnOnce(),
+{
+    let deadline = Instant::now() + cas_duration(deadline_ms);
+    check_cas_deadline(deadline)?;
+
+    if mode != "fast_forward" {
+        return Err(native_error(
+            "invalid_input",
+            "only fast_forward ref updates are supported",
+        ));
+    }
+
+    let full_ref = validated_cas_ref_name(&full_ref)?;
+    let full_ref_for_error = full_ref.to_string();
+    let proposed_id = parse_cas_oid(&proposed_oid)?;
+    let expected_id = expected_oid.as_deref().map(parse_cas_oid).transpose()?;
+    let repo = open_physical_bare_repository(&path)?;
+    // gix validates a ref's previous value before it acquires that ref's transaction lock. This
+    // repository-scoped filesystem marker closes that window between CAS invocations, including
+    // invocations in other OS processes. Callers still use the repository writer fence to exclude
+    // non-CAS writers such as receive-pack.
+    let _cas_lock = acquire_cas_file_lock(&repo, deadline)?;
+
+    find_cas_commit(&repo, proposed_id, "proposed")?;
+
+    let actual = direct_ref_target(&repo, full_ref.as_bstr())?;
+    let previous = match (expected_id, actual) {
+        (None, DirectRefTarget::Missing) => {
+            ensure_no_ref_namespace_conflict(&repo, &full_ref_for_error, deadline)?;
+            gix_ref::transaction::PreviousValue::MustNotExist
+        }
+        (None, DirectRefTarget::Object(_) | DirectRefTarget::Symbolic) => {
+            return Err(native_error("ref_exists", "reference already exists"));
+        }
+        (Some(expected), DirectRefTarget::Object(actual)) if expected == actual => {
+            if full_ref_for_error.starts_with("refs/tags/") {
+                return Err(native_error("ref_exists", "tags are create-only"));
+            }
+            find_cas_commit(&repo, expected, "expected")?;
+
+            if !cas_is_ancestor(
+                &repo,
+                expected,
+                proposed_id,
+                cas_commit_limit(commit_limit),
+                deadline,
+            )? {
+                return Err(native_error(
+                    "non_fast_forward",
+                    "proposed target is not a descendant of the expected target",
+                ));
+            }
+
+            gix_ref::transaction::PreviousValue::MustExistAndMatch(gix_ref::Target::Object(
+                expected,
+            ))
+        }
+        (Some(_), DirectRefTarget::Missing | DirectRefTarget::Symbolic) => {
+            return Err(native_error(
+                "stale_ref",
+                "reference no longer has the expected target",
+            ));
+        }
+        (Some(_), DirectRefTarget::Object(_)) => {
+            return Err(native_error("stale_ref", "reference target has changed"));
+        }
+    };
+
+    let edit = gix_ref::transaction::RefEdit {
+        change: gix_ref::transaction::Change::Update {
+            log: gix_ref::transaction::LogChange {
+                mode: gix_ref::transaction::RefLog::AndReference,
+                force_create_reflog: false,
+                message: format!("fornacast: compare-and-swap {full_ref}").into(),
+            },
+            expected: previous,
+            new: gix_ref::Target::Object(proposed_id),
+        },
+        name: full_ref,
+        deref: false,
+    };
+
+    check_cas_deadline(deadline)?;
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let lock_failure = gix::lock::acquire::Fail::from(remaining);
+    let transaction = repo
+        .refs
+        .transaction()
+        .prepare([edit], lock_failure, lock_failure)
+        .map_err(|error| {
+            classify_cas_prepare_error(&repo, &full_ref_for_error, expected_id, &error)
+        })?;
+
+    let committer = repo
+        .committer()
+        .transpose()
+        .map_err(|error| native_error("invalid_repository", error))?;
+    before_final_deadline_check();
+    check_cas_deadline(deadline)?;
+    transaction.commit(committer).map_err(|error| {
+        classify_cas_transaction_error(&repo, &full_ref_for_error, expected_id, &error)
+    })?;
+
+    Ok(proposed_id.to_string())
+}
+
+fn ensure_no_ref_namespace_conflict(
+    repo: &gix::Repository,
+    full_ref: &str,
+    deadline: Instant,
+) -> Result<(), NativeError> {
+    let namespace_len = if full_ref.starts_with("refs/heads/") {
+        "refs/heads/".len()
+    } else {
+        "refs/tags/".len()
+    };
+
+    for (offset, byte) in full_ref.as_bytes()[namespace_len..].iter().enumerate() {
+        check_cas_deadline(deadline)?;
+        if *byte == b'/' {
+            let prefix = &full_ref.as_bytes()[..namespace_len + offset];
+            if !matches!(direct_ref_target(repo, prefix)?, DirectRefTarget::Missing) {
+                return Err(native_error(
+                    "ref_exists",
+                    "reference namespace prefix already exists",
+                ));
+            }
+        }
+    }
+
+    let descendant_prefix = format!("{full_ref}/");
+    let references = repo
+        .references()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let refs = references
+        .all()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    for reference in refs {
+        check_cas_deadline(deadline)?;
+        let reference = reference.map_err(|error| native_error("corrupt_repository", error))?;
+        if reference
+            .name()
+            .as_bstr()
+            .starts_with_str(&descendant_prefix)
+        {
+            return Err(native_error(
+                "ref_exists",
+                "reference namespace descendant already exists",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validated_cas_ref_name(full_ref: &str) -> Result<gix_ref::FullName, NativeError> {
+    let allowed_namespace = full_ref
+        .strip_prefix("refs/heads/")
+        .or_else(|| full_ref.strip_prefix("refs/tags/"));
+
+    if allowed_namespace.is_none_or(str::is_empty) {
+        return Err(native_error(
+            "invalid_ref",
+            "reference must be a canonical full branch or tag ref",
+        ));
+    }
+
+    gix_ref::FullName::try_from(full_ref).map_err(|error| native_error("invalid_ref", error))
+}
+
+fn parse_cas_oid(oid: &str) -> Result<gix_hash::ObjectId, NativeError> {
+    if oid.len() != 40 || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(native_error(
+            "invalid_oid",
+            "object id must be 40 hexadecimal characters",
+        ));
+    }
+
+    if oid.bytes().all(|byte| byte == b'0') {
+        return Err(native_error(
+            "invalid_oid",
+            "reference deletion is not supported",
+        ));
+    }
+
+    gix_hash::ObjectId::from_hex(oid.as_bytes()).map_err(|error| native_error("invalid_oid", error))
+}
+
+fn cas_is_ancestor(
+    repo: &gix::Repository,
+    ancestor: gix_hash::ObjectId,
+    tip: gix_hash::ObjectId,
+    commit_limit: usize,
+    deadline: Instant,
+) -> Result<bool, NativeError> {
+    if ancestor == tip {
+        return Ok(true);
+    }
+
+    let walk = repo.rev_walk([tip]).all().map_err(diff_read_error)?;
+
+    for (index, info) in walk.enumerate() {
+        check_cas_deadline(deadline)?;
+        if index >= commit_limit {
+            return Err(native_error(
+                "commit_limit",
+                "reference ancestry exceeded the commit visit limit",
+            ));
+        }
+        if info.map_err(diff_read_error)?.id == ancestor {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn cas_commit_limit(commit_limit: usize) -> usize {
+    commit_limit.min(CAS_COMMIT_VISIT_LIMIT)
+}
+
+fn find_cas_commit<'repo>(
+    repo: &'repo gix::Repository,
+    oid: gix_hash::ObjectId,
+    position: &str,
+) -> Result<gix::Commit<'repo>, NativeError> {
+    let object = match repo.find_object(oid) {
+        Ok(object) => object,
+        Err(gix_object::find::existing::Error::NotFound { .. }) => {
+            return Err(native_error(
+                "target_not_commit",
+                format!("{position} target must be an existing commit"),
+            ));
+        }
+        Err(gix_object::find::existing::Error::Find(error)) => {
+            let kind = if error_chain_contains_storage_io(error.as_ref()) {
+                "storage_unavailable"
+            } else {
+                "corrupt_repository"
+            };
+            return Err(native_error(kind, error));
+        }
+    };
+
+    object.try_into_commit().map_err(|_| {
+        native_error(
+            "target_not_commit",
+            format!("{position} target must be a commit"),
+        )
+    })
+}
+
+fn classify_cas_prepare_error(
+    repo: &gix::Repository,
+    full_ref: &str,
+    expected: Option<gix_hash::ObjectId>,
+    error: &gix_ref::file::transaction::prepare::Error,
+) -> NativeError {
+    use gix::lock::acquire::Error::PermanentlyLocked;
+    use gix_ref::file::transaction::prepare::Error::{LockAcquire, PackedTransactionAcquire};
+
+    if matches!(
+        error,
+        LockAcquire {
+            source: PermanentlyLocked { .. },
+            ..
+        } | PackedTransactionAcquire(PermanentlyLocked { .. })
+    ) {
+        native_error(
+            "ref_timeout",
+            "reference update exceeded its deadline waiting for a Git reference lock",
+        )
+    } else {
+        classify_cas_transaction_error(repo, full_ref, expected, error)
+    }
+}
+
+fn classify_cas_transaction_error(
+    repo: &gix::Repository,
+    full_ref: &str,
+    expected: Option<gix_hash::ObjectId>,
+    transaction_error: &impl std::fmt::Display,
+) -> NativeError {
+    let actual = match direct_ref_target(repo, full_ref.as_bytes()) {
+        Ok(actual) => actual,
+        Err(read_error) => return read_error,
+    };
+    let detail = format!("reference transaction failed: {transaction_error}");
+
+    match (expected, actual) {
+        (None, DirectRefTarget::Object(_) | DirectRefTarget::Symbolic) => {
+            native_error("ref_exists", detail)
+        }
+        (Some(expected), DirectRefTarget::Object(actual)) if expected == actual => {
+            native_error("storage_unavailable", detail)
+        }
+        (Some(_), _) => native_error("stale_ref", detail),
+        (None, DirectRefTarget::Missing) => native_error("storage_unavailable", detail),
+    }
+}
+
+fn check_cas_deadline(deadline: Instant) -> Result<(), NativeError> {
+    if Instant::now() >= deadline {
+        Err(native_error(
+            "ref_timeout",
+            "reference update exceeded its deadline",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn acquire_cas_file_lock(
+    repo: &gix::Repository,
+    deadline: Instant,
+) -> Result<CasFileLock, NativeError> {
+    let guard_path = repo.path().join("fornacast-ref-cas.guard");
+    let guard = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&guard_path)
+        .map_err(|error| native_error("storage_unavailable", error))?;
+
+    loop {
+        check_cas_deadline(deadline)?;
+        match guard.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(native_error("storage_unavailable", error));
+            }
+        }
+    }
+
+    let resource = repo.path().join("fornacast-ref-cas");
+    let marker_path = repo.path().join("fornacast-ref-cas.lock");
+    cleanup_stale_cas_quarantines(repo, deadline)?;
+
+    loop {
+        check_cas_deadline(deadline)?;
+        match gix::lock::Marker::acquire_to_hold_resource(
+            &resource,
+            gix::lock::acquire::Fail::Immediately,
+            Some(repo.path().to_path_buf()),
+        ) {
+            Ok(marker) => {
+                return Ok(CasFileLock {
+                    _guard: guard,
+                    _marker: marker,
+                });
+            }
+            Err(gix::lock::acquire::Error::PermanentlyLocked { .. }) => {
+                if reclaim_stale_cas_marker(&marker_path)? {
+                    continue;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(gix::lock::acquire::Error::Io(error)) => {
+                return Err(native_error("storage_unavailable", error));
+            }
+        }
+    }
+}
+
+fn reclaim_stale_cas_marker(marker_path: &Path) -> Result<bool, NativeError> {
+    let observed = match std::fs::metadata(marker_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(native_error("storage_unavailable", error)),
+    };
+
+    if !cas_lock_metadata_is_stale(&observed)? {
+        return Ok(false);
+    }
+    // Without stable filesystem identity, size and timestamps cannot distinguish a stale
+    // zero-byte marker from a same-shaped live replacement. Refuse automatic reclamation and let
+    // the caller receive the bounded ref timeout so an operator can inspect/remove it safely.
+    if !automatic_stale_reclamation_supported() {
+        return Ok(false);
+    }
+
+    let quarantine_id = CAS_QUARANTINE_ID.fetch_add(1, Ordering::Relaxed);
+    let quarantine = marker_path.with_file_name(format!(
+        "fornacast-ref-cas.quarantine-{}-{quarantine_id}",
+        std::process::id()
+    ));
+    match std::fs::rename(marker_path, &quarantine) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(native_error("storage_unavailable", error)),
+    }
+
+    let quarantined = std::fs::metadata(&quarantine)
+        .map_err(|error| native_error("storage_unavailable", error))?;
+    if !same_file_identity(&observed, &quarantined) {
+        if std::fs::hard_link(&quarantine, marker_path).is_ok() {
+            let _ = std::fs::remove_file(&quarantine);
+        }
+        return Err(native_error(
+            "storage_unavailable",
+            "CAS marker changed during stale-lock quarantine",
+        ));
+    }
+
+    std::fs::remove_file(&quarantine)
+        .map_err(|error| native_error("storage_unavailable", error))?;
+    Ok(true)
+}
+
+fn cleanup_stale_cas_quarantines(
+    repo: &gix::Repository,
+    deadline: Instant,
+) -> Result<(), NativeError> {
+    for entry in std::fs::read_dir(repo.path())
+        .map_err(|error| native_error("storage_unavailable", error))?
+    {
+        check_cas_deadline(deadline)?;
+        let entry = entry.map_err(|error| native_error("storage_unavailable", error))?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("fornacast-ref-cas.quarantine-")
+        {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|error| native_error("storage_unavailable", error))?;
+        if cas_lock_metadata_is_stale(&metadata)? {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(native_error("storage_unavailable", error)),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cas_lock_metadata_is_stale(metadata: &std::fs::Metadata) -> Result<bool, NativeError> {
+    let modified = metadata
+        .modified()
+        .map_err(|error| native_error("storage_unavailable", error))?;
+    Ok(std::time::SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(Duration::ZERO)
+        >= REF_UPDATE_DEADLINE)
+}
+
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    stable_file_identities_match(stable_file_identity(left), stable_file_identity(right))
+}
+
+fn stable_file_identities_match(left: Option<(u64, u64)>, right: Option<(u64, u64)>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if left == right)
+}
+
+#[cfg(unix)]
+fn stable_file_identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn stable_file_identity(_metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+fn automatic_stale_reclamation_supported() -> bool {
+    cfg!(unix)
+}
+
+fn cas_duration(deadline_ms: u64) -> Duration {
+    Duration::from_millis(deadline_ms.min(REF_UPDATE_DEADLINE.as_millis() as u64))
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -3685,6 +6233,68 @@ fn validate_diff_tree(
     check_diff_deadline(deadline)
 }
 
+fn validate_comparison_diff_tree(
+    repo: &gix::Repository,
+    root: &gix::Tree<'_>,
+    deadline: Instant,
+    budget: &mut ComparisonDiffBudget,
+) -> Result<(), NativeError> {
+    let mut pending = Vec::new();
+    if budget.validated_trees.insert(root.id) {
+        validate_comparison_diff_tree_object(repo, root, &mut pending, deadline, budget)?;
+    }
+
+    while let Some(oid) = pending.pop() {
+        check_diff_deadline(deadline)?;
+        if !budget.validated_trees.insert(oid) {
+            continue;
+        }
+        let tree = load_diff_tree(repo, oid, deadline)?;
+        validate_comparison_diff_tree_object(repo, &tree, &mut pending, deadline, budget)?;
+    }
+
+    check_diff_deadline(deadline)
+}
+
+fn validate_comparison_diff_tree_object(
+    repo: &gix::Repository,
+    tree: &gix::Tree<'_>,
+    pending: &mut Vec<gix_hash::ObjectId>,
+    deadline: Instant,
+    budget: &mut ComparisonDiffBudget,
+) -> Result<(), NativeError> {
+    budget.decoded.charge(
+        tree.id,
+        tree.data.len(),
+        "comparison diff exceeded its decoded-byte limit",
+    )?;
+    check_diff_deadline(deadline)?;
+    let actual = gix_object::compute_hash(repo.object_hash(), gix_object::Kind::Tree, &tree.data)
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    if actual != tree.id {
+        return Err(native_error(
+            "corrupt_repository",
+            format_args!(
+                "tree checksum mismatch: expected {}, computed {actual}",
+                tree.id
+            ),
+        ));
+    }
+
+    let mut previous = None;
+    for entry in gix_object::TreeRefIter::from_bytes(&tree.data, tree.id.kind()) {
+        check_diff_deadline(deadline)?;
+        let entry = entry.map_err(|error| native_error("corrupt_repository", error))?;
+        budget.record_tree_entry()?;
+        validate_tree_entry(&mut previous, entry.filename.as_ref(), entry.mode.value())?;
+        if entry.mode.is_tree() {
+            pending.push(entry.oid.to_owned());
+        }
+    }
+
+    check_diff_deadline(deadline)
+}
+
 fn validate_diff_tree_object(
     repo: &gix::Repository,
     tree: &gix::Tree<'_>,
@@ -3727,21 +6337,30 @@ fn process_diff_change(
     total_additions: &mut u64,
     total_deletions: &mut u64,
     deadline: Instant,
+    budget: &mut Option<&mut ComparisonDiffBudget>,
 ) -> Result<(), NativeError> {
     check_diff_deadline(deadline)?;
     let Some(metadata) = diff_file_metadata(&change)? else {
         return Ok(());
     };
 
+    let retention_limit = match budget.as_deref_mut() {
+        Some(budget) => {
+            budget.record_changed_file()?;
+            budget.file_limit
+        }
+        None => DIFF_FILE_LIMIT,
+    };
+
     *changed_files = changed_files
         .checked_add(1)
         .ok_or_else(|| native_error("corrupt_repository", "changed-file total overflow"))?;
-    let retain_file = files.len() < DIFF_FILE_LIMIT;
+    let retain_file = files.len() < retention_limit;
     if !retain_file {
         source.truncated = true;
     }
 
-    let verified = verify_diff_resources(repo, &metadata, deadline)?;
+    let verified = verify_diff_resources(repo, &metadata, deadline, budget)?;
     let content_changed = metadata.old_oid != metadata.new_oid;
     let mut binary = !diff_modes_are_diffable(&metadata)
         || verified.old.is_some_and(|resource| resource.binary)
@@ -3938,15 +6557,16 @@ fn verify_diff_resources(
     repo: &gix::Repository,
     metadata: &DiffFileMetadata,
     deadline: Instant,
+    budget: &mut Option<&mut ComparisonDiffBudget>,
 ) -> Result<VerifiedDiffResources, NativeError> {
-    let old = verify_diff_resource(repo, metadata.old_mode, metadata.old_oid, deadline)?;
+    let old = verify_diff_resource(repo, metadata.old_mode, metadata.old_oid, deadline, budget)?;
     let new = if old.is_some()
         && metadata.old_oid == metadata.new_oid
         && diff_mode_has_blob_resource(metadata.new_mode)
     {
         old
     } else {
-        verify_diff_resource(repo, metadata.new_mode, metadata.new_oid, deadline)?
+        verify_diff_resource(repo, metadata.new_mode, metadata.new_oid, deadline, budget)?
     };
 
     Ok(VerifiedDiffResources { old, new })
@@ -3957,6 +6577,7 @@ fn verify_diff_resource(
     mode: Option<gix_object::tree::EntryMode>,
     oid: Option<gix_hash::ObjectId>,
     deadline: Instant,
+    budget: &mut Option<&mut ComparisonDiffBudget>,
 ) -> Result<Option<VerifiedDiffResource>, NativeError> {
     if !diff_mode_has_blob_resource(mode) {
         return Ok(None);
@@ -3970,6 +6591,13 @@ fn verify_diff_resource(
 
     check_diff_deadline(deadline)?;
     let object = repo.find_object(oid).map_err(diff_read_error)?;
+    if let Some(budget) = budget.as_deref_mut() {
+        budget.decoded.charge(
+            oid,
+            object.data.len(),
+            "comparison diff exceeded its decoded-byte limit",
+        )?;
+    }
     check_diff_deadline(deadline)?;
     if object.kind != gix_object::Kind::Blob {
         return Err(native_error(
@@ -4375,10 +7003,918 @@ rustler::init!("Elixir.GitCore.Native");
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     static TREE_HISTORY_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+    static MERGE_BOUNDARY_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn pull_compare_page_windows_are_bounded_and_stable() {
+        assert_eq!(
+            commit_range_page_window(3, 2, 2),
+            CommitPageWindow {
+                start: 2,
+                end: 3,
+                total_pages: 2,
+            }
+        );
+        assert_eq!(
+            commit_range_page_window(500, 1, usize::MAX).end,
+            COMMIT_PAGE_LIMIT
+        );
+        assert_eq!(
+            diff_page_window(3, 2, 1),
+            TreePageWindow { start: 1, end: 2 }
+        );
+        assert_eq!(
+            diff_page_window(500, 1, usize::MAX).end,
+            DIFF_FILE_PAGE_LIMIT
+        );
+        assert_eq!(diff_scan_duration(u64::MAX), DIFF_SCAN_DEADLINE);
+        assert_eq!(comparison_commit_limit(usize::MAX), COMPARISON_COMMIT_LIMIT);
+        assert_eq!(
+            comparison_tree_entry_limit(usize::MAX),
+            COMPARISON_TREE_ENTRY_LIMIT
+        );
+        assert_eq!(comparison_file_limit(usize::MAX), COMPARISON_FILE_LIMIT);
+        assert_eq!(comparison_byte_limit(u64::MAX), COMPARISON_BYTE_LIMIT);
+    }
+
+    #[test]
+    fn pull_compare_reads_oid_range_and_diff_without_repository_mutation() {
+        let fixture = MergeBoundaryFixture::new("pull-compare");
+        let base = fixture.commit_with_flat_tree(0, "base");
+        let first = fixture.commit_with_flat_tree_and_parent(1, "first", Some(&base));
+        let head = fixture.commit_with_flat_tree_and_parent(2, "head", Some(&first));
+        let before = fixture.object_and_ref_snapshot();
+
+        let (commits, total) = commit_range_page_impl(
+            fixture.path(),
+            &base,
+            &head,
+            "1",
+            50,
+            COMPARISON_COMMIT_LIMIT,
+            COMPARISON_BYTE_LIMIT,
+            5_000,
+        )
+        .expect("read immutable commit range");
+        assert_eq!(total, 2);
+        assert_eq!(
+            commits
+                .into_iter()
+                .map(|commit| commit.0)
+                .collect::<Vec<_>>(),
+            vec![head.clone(), first]
+        );
+
+        let (files, truncated, changed_files, additions, deletions) = diff_between_impl(
+            fixture.path(),
+            &base,
+            &head,
+            "1",
+            100,
+            DIFF_SOURCE_LIMIT,
+            COMPARISON_TREE_ENTRY_LIMIT,
+            COMPARISON_FILE_LIMIT,
+            COMPARISON_BYTE_LIMIT,
+            5_000,
+        )
+        .expect("read immutable aggregate diff");
+        assert_eq!(
+            files.into_iter().map(|file| file.0).collect::<Vec<_>>(),
+            vec![b"file-00000.txt".to_vec(), b"file-00001.txt".to_vec()]
+        );
+        assert!(!truncated);
+        assert_eq!((changed_files, additions, deletions), (2, 2, 0));
+        assert_eq!(fixture.object_and_ref_snapshot(), before);
+    }
+
+    #[test]
+    fn pull_compare_pages_beyond_the_legacy_diff_retention_ceiling() {
+        let fixture = MergeBoundaryFixture::new("pull-compare-large-page");
+        let base = fixture.commit_with_flat_tree(0, "base");
+        let head = fixture.commit_with_flat_tree_and_parent(1_005, "head", Some(&base));
+
+        let (files, truncated, changed_files, _, _) = diff_between_impl(
+            fixture.path(),
+            &base,
+            &head,
+            "11",
+            100,
+            1,
+            COMPARISON_TREE_ENTRY_LIMIT,
+            2_000,
+            COMPARISON_BYTE_LIMIT,
+            5_000,
+        )
+        .expect("read comparison page after one thousand files");
+
+        assert_eq!(changed_files, 1_005);
+        assert!(truncated);
+        assert_eq!(files.len(), 5);
+        assert_eq!(files.first().expect("first file").0, b"file-01000.txt");
+        assert_eq!(files.last().expect("last file").0, b"file-01004.txt");
+    }
+
+    #[test]
+    fn pull_merge_production_bounds_cannot_be_raised() {
+        assert_eq!(merge_commit_limit(usize::MAX), MERGE_COMMIT_LIMIT);
+        assert_eq!(merge_tree_entry_limit(usize::MAX), MERGE_TREE_ENTRY_LIMIT);
+        assert_eq!(
+            merge_changed_path_limit(usize::MAX),
+            MERGE_CHANGED_PATH_LIMIT
+        );
+        assert_eq!(merge_byte_limit(u64::MAX), MERGE_BYTE_LIMIT);
+        assert_eq!(merge_scan_duration(u64::MAX), Duration::from_secs(30));
+        assert_eq!(MERGE_ANALYSIS_WORKERS, 4);
+        assert_eq!(MERGE_WRITE_WORKERS, 1);
+    }
+
+    #[test]
+    fn compare_and_swap_ref_accepts_only_canonical_branch_or_tag_refs() {
+        assert!(validated_cas_ref_name("refs/heads/main").is_ok());
+        assert!(validated_cas_ref_name("refs/tags/v1.0.0").is_ok());
+
+        for invalid in [
+            "main",
+            "HEAD",
+            "refs/main",
+            "refs/heads/",
+            "refs/heads/main.lock",
+            "refs/heads/../main",
+            "refs/remotes/origin/main",
+        ] {
+            assert!(
+                matches!(validated_cas_ref_name(invalid), Err((kind, _)) if kind == "invalid_ref"),
+                "{invalid:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn compare_and_swap_ref_deadline_cannot_exceed_ten_seconds() {
+        assert_eq!(cas_duration(0), Duration::ZERO);
+        assert_eq!(cas_duration(u64::MAX), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn compare_and_swap_ref_refuses_reclaim_without_stable_file_identity() {
+        assert!(!stable_file_identities_match(None, None));
+        assert!(stable_file_identities_match(Some((7, 11)), Some((7, 11))));
+        assert!(!stable_file_identities_match(Some((7, 11)), Some((7, 12))));
+    }
+
+    #[test]
+    fn compare_and_swap_ref_commits_an_exact_fast_forward_without_writing_objects() {
+        let fixture = MergeBoundaryFixture::new("ref-cas");
+        let commits = fixture.fast_import_empty_chain(2);
+        let first = commits.get(&1).expect("first commit");
+        let second = commits.get(&2).expect("second commit");
+        let before_objects = tree_history_git(
+            &[
+                "--git-dir",
+                fixture.path(),
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname)",
+            ],
+            None,
+        );
+
+        assert_eq!(
+            compare_and_swap_ref_impl(
+                fixture.path().to_owned(),
+                "refs/heads/cas".to_owned(),
+                None,
+                first.clone(),
+                "fast_forward".to_owned(),
+                10_000,
+            ),
+            Ok(first.clone())
+        );
+        assert_eq!(
+            compare_and_swap_ref_impl(
+                fixture.path().to_owned(),
+                "refs/heads/cas".to_owned(),
+                Some(first.clone()),
+                second.clone(),
+                "fast_forward".to_owned(),
+                10_000,
+            ),
+            Ok(second.clone())
+        );
+        assert_eq!(
+            tree_history_git(
+                &["--git-dir", fixture.path(), "rev-parse", "refs/heads/cas"],
+                None,
+            ),
+            *second
+        );
+        assert_eq!(
+            tree_history_git(
+                &[
+                    "--git-dir",
+                    fixture.path(),
+                    "cat-file",
+                    "--batch-all-objects",
+                    "--batch-check=%(objectname)",
+                ],
+                None,
+            ),
+            before_objects
+        );
+    }
+
+    #[test]
+    fn compare_and_swap_ref_times_out_behind_the_repository_filesystem_lock() {
+        let fixture = MergeBoundaryFixture::new("ref-cas-lock");
+        let commits = fixture.fast_import_empty_chain(1);
+        let proposed = commits.get(&1).expect("proposed commit");
+        let resource = fixture.repo_path.join("fornacast-ref-cas");
+        let _held_lock = gix::lock::Marker::acquire_to_hold_resource(
+            resource,
+            gix::lock::acquire::Fail::Immediately,
+            Some(fixture.repo_path.clone()),
+        )
+        .expect("hold repository CAS lock");
+
+        assert!(matches!(
+            compare_and_swap_ref_impl(
+                fixture.path().to_owned(),
+                "refs/heads/cas-timeout".to_owned(),
+                None,
+                proposed.clone(),
+                "fast_forward".to_owned(),
+                1,
+            ),
+            Err((kind, _)) if kind == "ref_timeout"
+        ));
+        assert!(!fixture.repo_path.join("refs/heads/cas-timeout").exists());
+        assert!(fixture.repo_path.join("fornacast-ref-cas.lock").exists());
+    }
+
+    #[test]
+    fn compare_and_swap_ref_recovers_a_crashed_stale_marker() {
+        let fixture = MergeBoundaryFixture::new("ref-cas-crash");
+        let commits = fixture.fast_import_empty_chain(1);
+        let proposed = commits.get(&1).expect("proposed commit");
+        let marker_path = fixture.repo_path.join("fornacast-ref-cas.lock");
+        let status = Command::new(std::env::current_exe().expect("current native test executable"))
+            .args([
+                "--exact",
+                "tests::compare_and_swap_ref_crash_holder_worker",
+                "--nocapture",
+            ])
+            .env("FORNACAST_CAS_CRASH_HOLDER_REPO", fixture.path())
+            .stdout(Stdio::null())
+            .status()
+            .expect("run crashing CAS lock holder");
+        assert!(status.success());
+        assert!(marker_path.exists());
+        age_file_past_ref_deadline(&marker_path);
+
+        assert_eq!(
+            compare_and_swap_ref_impl(
+                fixture.path().to_owned(),
+                "refs/heads/recovered".to_owned(),
+                None,
+                proposed.clone(),
+                "fast_forward".to_owned(),
+                500,
+            ),
+            Ok(proposed.clone())
+        );
+        assert!(!marker_path.exists());
+        assert!(
+            std::fs::read_dir(&fixture.repo_path)
+                .expect("list repository after stale reclaim")
+                .all(|entry| !entry
+                    .expect("repository entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("fornacast-ref-cas.quarantine-"))
+        );
+    }
+
+    #[test]
+    fn compare_and_swap_ref_crash_holder_worker() {
+        let Ok(repo_path) = std::env::var("FORNACAST_CAS_CRASH_HOLDER_REPO") else {
+            return;
+        };
+        let repo_path = PathBuf::from(repo_path);
+        let guard = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(repo_path.join("fornacast-ref-cas.guard"))
+            .expect("crash worker opens advisory guard");
+        guard.lock().expect("crash worker acquires advisory guard");
+        let resource = repo_path.join("fornacast-ref-cas");
+        let _marker = gix::lock::Marker::acquire_to_hold_resource(
+            resource,
+            gix::lock::acquire::Fail::Immediately,
+            Some(repo_path),
+        )
+        .expect("crash worker acquires CAS marker");
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn compare_and_swap_ref_rechecks_deadline_after_precommit_work() {
+        let fixture = MergeBoundaryFixture::new("ref-cas-precommit");
+        let commits = fixture.fast_import_empty_chain(1);
+        let proposed = commits.get(&1).expect("proposed commit");
+        let before_objects = tree_history_git(
+            &[
+                "--git-dir",
+                fixture.path(),
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname)",
+            ],
+            None,
+        );
+
+        assert!(matches!(
+            compare_and_swap_ref_impl_with_precommit(
+                fixture.path().to_owned(),
+                "refs/heads/cas-precommit".to_owned(),
+                None,
+                proposed.clone(),
+                "fast_forward".to_owned(),
+                CAS_COMMIT_VISIT_LIMIT,
+                100,
+                || std::thread::sleep(Duration::from_millis(150)),
+            ),
+            Err((kind, _)) if kind == "ref_timeout"
+        ));
+        assert!(!fixture.repo_path.join("refs/heads/cas-precommit").exists());
+        assert_eq!(
+            tree_history_git(
+                &[
+                    "--git-dir",
+                    fixture.path(),
+                    "cat-file",
+                    "--batch-all-objects",
+                    "--batch-check=%(objectname)",
+                ],
+                None,
+            ),
+            before_objects
+        );
+    }
+
+    #[test]
+    fn compare_and_swap_ref_ancestry_allows_50000_visits_and_rejects_50001() {
+        let fixture = MergeBoundaryFixture::new("ref-cas-ancestry-limit");
+        let commits = fixture.fast_import_empty_chain(50_001);
+        let repo = open_physical_bare_repository(fixture.path()).expect("open ancestry fixture");
+        let ancestor = parse_cas_oid(commits.get(&1).expect("first commit")).expect("ancestor");
+        let at_limit =
+            parse_cas_oid(commits.get(&50_000).expect("50000th commit")).expect("limit tip");
+        let over_limit =
+            parse_cas_oid(commits.get(&50_001).expect("50001st commit")).expect("over-limit tip");
+        assert_eq!(cas_commit_limit(usize::MAX), 50_000);
+
+        assert_eq!(
+            cas_is_ancestor(
+                &repo,
+                ancestor,
+                at_limit,
+                50_000,
+                Instant::now() + Duration::from_secs(10),
+            ),
+            Ok(true)
+        );
+        assert!(matches!(
+            cas_is_ancestor(
+                &repo,
+                ancestor,
+                over_limit,
+                50_000,
+                Instant::now() + Duration::from_secs(10),
+            ),
+            Err((kind, _)) if kind == "commit_limit"
+        ));
+    }
+
+    #[test]
+    fn compare_and_swap_ref_coordinates_concurrent_stale_reclaimers() {
+        let fixture = MergeBoundaryFixture::new("ref-cas-processes");
+        let commits = fixture.fast_import_empty_chain(2);
+        let first = commits.get(&1).expect("first commit");
+        let second = commits.get(&2).expect("second commit");
+        let first_outcome = fixture.temp_path.join("cas-first.out");
+        let second_outcome = fixture.temp_path.join("cas-second.out");
+        let marker_path = fixture.repo_path.join("fornacast-ref-cas.lock");
+        let crash_status =
+            Command::new(std::env::current_exe().expect("current native test executable"))
+                .args([
+                    "--exact",
+                    "tests::compare_and_swap_ref_crash_holder_worker",
+                    "--nocapture",
+                ])
+                .env("FORNACAST_CAS_CRASH_HOLDER_REPO", fixture.path())
+                .stdout(Stdio::null())
+                .status()
+                .expect("run crashing CAS lock holder");
+        assert!(crash_status.success());
+        age_file_past_ref_deadline(&marker_path);
+
+        let mut first_worker = spawn_cas_process_worker(&fixture, first, &first_outcome);
+        let mut second_worker = spawn_cas_process_worker(&fixture, second, &second_outcome);
+
+        let first_status = first_worker.wait().expect("wait for first CAS process");
+        let second_status = second_worker.wait().expect("wait for second CAS process");
+        assert!(first_status.success());
+        assert!(second_status.success());
+
+        let outcomes = [
+            std::fs::read_to_string(first_outcome).expect("read first CAS outcome"),
+            std::fs::read_to_string(second_outcome).expect("read second CAS outcome"),
+        ];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome.starts_with("ok:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome.as_str() == "error:ref_exists")
+                .count(),
+            1
+        );
+
+        let recorded = tree_history_git(
+            &[
+                "--git-dir",
+                fixture.path(),
+                "rev-parse",
+                "refs/heads/cas-process",
+            ],
+            None,
+        );
+        assert!(outcomes.contains(&format!("ok:{recorded}")));
+        assert!(!marker_path.exists());
+        assert!(
+            std::fs::read_dir(&fixture.repo_path)
+                .expect("list repository after concurrent reclaim")
+                .all(|entry| !entry
+                    .expect("repository entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("fornacast-ref-cas.quarantine-"))
+        );
+    }
+
+    #[test]
+    fn compare_and_swap_ref_os_process_worker() {
+        let Ok(repo_path) = std::env::var("FORNACAST_CAS_WORKER_REPO") else {
+            return;
+        };
+        let proposed = std::env::var("FORNACAST_CAS_WORKER_PROPOSED")
+            .expect("worker proposed commit environment");
+        let outcome_path =
+            std::env::var("FORNACAST_CAS_WORKER_OUTCOME").expect("worker outcome environment");
+
+        let outcome = match compare_and_swap_ref_impl(
+            repo_path,
+            "refs/heads/cas-process".to_owned(),
+            None,
+            proposed,
+            "fast_forward".to_owned(),
+            5_000,
+        ) {
+            Ok(oid) => format!("ok:{oid}"),
+            Err((kind, _detail)) => format!("error:{kind}"),
+        };
+
+        std::fs::write(outcome_path, outcome).expect("write CAS worker outcome");
+    }
+
+    #[test]
+    fn pull_merge_validates_all_commit_bytes_before_object_work() {
+        assert!(matches!(
+            validated_merge_message(vec![0xff]),
+            Err((kind, _)) if kind == "invalid_input"
+        ));
+        assert!(matches!(
+            validated_merge_signature((b"bad\nname".to_vec(), b"a@b.test".to_vec(), 0, 0)),
+            Err((kind, _)) if kind == "invalid_input"
+        ));
+        assert!(matches!(
+            validated_merge_signature((b"name".to_vec(), b"a@b.test".to_vec(), 0, 1440)),
+            Err((kind, _)) if kind == "invalid_input"
+        ));
+    }
+
+    #[test]
+    fn pull_merge_worker_returns_at_a_positive_deadline_and_discards_late_completion() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let observed_cancellation = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::clone(&finished);
+        let worker_observed_cancellation = Arc::clone(&observed_cancellation);
+        let started = Instant::now();
+
+        let result = run_merge_worker(
+            started + Duration::from_millis(20),
+            false,
+            move |cancelled| {
+                std::thread::sleep(Duration::from_millis(300));
+                worker_observed_cancellation
+                    .store(cancelled.load(Ordering::Acquire), Ordering::Release);
+                worker_finished.store(true, Ordering::Release);
+                Ok(17_u8)
+            },
+        );
+
+        let NativeMergeWorkerResult::Deferred { error, ticket } = result else {
+            panic!("a running worker must return a deferred timeout");
+        };
+        assert_eq!(error.0, "scan_timeout");
+        assert!(started.elapsed() < Duration::from_millis(150));
+        std::thread::sleep(Duration::from_millis(300));
+        await_merge_worker_impl(ticket).expect("the exact timed-out worker is joinable");
+        assert!(finished.load(Ordering::Acquire));
+        assert!(observed_cancellation.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pull_merge_worker_ticket_holds_capacity_until_the_exact_worker_is_joined() {
+        let pool = Arc::new(NativeMergeWorkerPool::new(1));
+        let release = Arc::new(AtomicBool::new(false));
+        let worker_release = Arc::clone(&release);
+
+        let result = run_merge_worker_in_pool(
+            Instant::now() + Duration::from_millis(20),
+            Arc::clone(&pool),
+            move |_| {
+                while !worker_release.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Ok(())
+            },
+        );
+        let NativeMergeWorkerResult::Deferred { error, ticket } = result else {
+            panic!("a running worker must return a deferred timeout");
+        };
+        assert_eq!(error.0, "scan_timeout");
+        assert_eq!(pool.in_use(), 1);
+
+        release.store(true, Ordering::Release);
+        await_merge_worker_impl(ticket).expect("join timed-out worker");
+        assert_eq!(pool.in_use(), 0);
+    }
+
+    #[test]
+    fn pull_merge_worker_slots_remain_held_until_timed_out_workers_exit() {
+        let pool = Arc::new(NativeMergeWorkerPool::new(2));
+        let release = Arc::new(AtomicBool::new(false));
+        let mut tickets = Vec::new();
+
+        for _ in 0..2 {
+            let worker_release = Arc::clone(&release);
+            let result = run_merge_worker_in_pool(
+                Instant::now() + Duration::from_millis(20),
+                Arc::clone(&pool),
+                move |_| {
+                    while !worker_release.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Ok(())
+                },
+            );
+            let NativeMergeWorkerResult::Deferred { error, ticket } = result else {
+                panic!("running workers must return deferred timeouts");
+            };
+            assert_eq!(error.0, "scan_timeout");
+            tickets.push(ticket);
+        }
+        assert_eq!(pool.in_use(), 2);
+
+        let unexpectedly_started = Arc::new(AtomicBool::new(false));
+        let worker_started = Arc::clone(&unexpectedly_started);
+        let result = run_merge_worker_in_pool(
+            Instant::now() + Duration::from_millis(20),
+            Arc::clone(&pool),
+            move |_| {
+                worker_started.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            result,
+            NativeMergeWorkerResult::Complete(Err((kind, _))) if kind == "scan_timeout"
+        ));
+        assert!(!unexpectedly_started.load(Ordering::Acquire));
+        assert_eq!(pool.in_use(), 2);
+
+        release.store(true, Ordering::Release);
+        for ticket in tickets {
+            await_merge_worker_impl(ticket).expect("join released merge worker");
+        }
+        assert_eq!(pool.in_use(), 0);
+
+        let NativeMergeWorkerResult::Complete(Ok(completed)) = run_merge_worker_in_pool(
+            Instant::now() + Duration::from_secs(1),
+            Arc::clone(&pool),
+            |_| Ok(17_u8),
+        ) else {
+            panic!("released native worker capacity is reusable");
+        };
+        assert_eq!(completed.value, 17);
+        drop(completed);
+        assert_eq!(pool.in_use(), 0);
+    }
+
+    #[test]
+    fn pull_merge_rejects_a_blob_over_the_production_byte_limit_without_writes() {
+        let fixture = MergeBoundaryFixture::new("blob-bytes");
+        let commit = fixture.commit_with_single_blob(8 * 1024 * 1024 + 1);
+        let before = fixture.object_and_ref_snapshot();
+
+        let result = bounded_merge(
+            fixture.path(),
+            &commit,
+            &commit,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            u64::MAX,
+            Some(test_merge_commit()),
+        );
+        assert!(matches!(result, Err((kind, _)) if kind == "merge_byte_limit"));
+        assert_eq!(fixture.object_and_ref_snapshot(), before);
+    }
+
+    #[test]
+    fn pull_merge_does_not_recharge_one_eight_mib_blob_referenced_twice() {
+        let fixture = MergeBoundaryFixture::new("unique-blob-bytes");
+        let commit = fixture.commit_with_repeated_blob(MERGE_BLOB_LIMIT as usize, 2);
+
+        bounded_merge(
+            fixture.path(),
+            &commit,
+            &commit,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            u64::MAX,
+            None,
+        )
+        .expect("one unique eight-MiB blob remains within the aggregate byte limit");
+    }
+
+    #[test]
+    fn pull_merge_generated_tree_reuses_the_exact_one_file_object_budget() {
+        let fixture = MergeBoundaryFixture::new("generated-tree-reuse");
+        let commit = fixture.commit_with_flat_tree(1, "one file");
+        let tree_oid = tree_history_git(
+            &[
+                "--git-dir",
+                fixture.path(),
+                "rev-parse",
+                &format!("{commit}^{{tree}}"),
+            ],
+            None,
+        );
+        let commit_oid = gix_hash::ObjectId::from_hex(commit.as_bytes()).expect("commit oid");
+        let tree_oid = gix_hash::ObjectId::from_hex(tree_oid.as_bytes()).expect("tree oid");
+        let blob_oid = gix_hash::ObjectId::from_hex(fixture.blob_oid.as_bytes()).expect("blob oid");
+        let mut repo = open_physical_bare_repository(fixture.path())
+            .expect("open merge fixture")
+            .with_object_memory();
+        let exact_unique_bytes = [commit_oid, tree_oid, blob_oid]
+            .into_iter()
+            .map(|oid| {
+                repo.find_header(oid).expect("object header").size() + MERGE_OBJECT_ENTRY_OVERHEAD
+            })
+            .sum();
+        // Exercise the writer directly: a full merge simultaneously retains three path maps, and
+        // that legitimate path headroom is larger than this duplicate tree's temporary encoding.
+        let byte_budget = MergeByteBudget::new(exact_unique_bytes);
+        for oid in [commit_oid, tree_oid, blob_oid] {
+            charge_merge_object(&repo, oid, &byte_budget).expect("charge unique input object");
+        }
+        let tree_data = repo
+            .find_object(tree_oid)
+            .expect("tree object")
+            .data
+            .clone();
+        let tree =
+            gix_object::TreeRef::from_bytes(&tree_data, repo.object_hash()).expect("one-file tree");
+        let objects = BudgetedMergeObjects {
+            repo: &repo,
+            budget: &byte_budget,
+        };
+
+        assert_eq!(
+            gix_object::Write::write(&objects, &tree)
+                .expect("an identical generated tree must reuse its existing charge"),
+            tree_oid
+        );
+        assert!(
+            take_merge_object_memory(&mut repo)
+                .expect("read merge object memory")
+                .is_empty(),
+            "the already-present tree must not be inserted into merge object memory"
+        );
+    }
+
+    #[test]
+    fn pull_merge_rejects_retained_long_paths_before_the_tree_entry_limit() {
+        let fixture = MergeBoundaryFixture::new("retained-path-bytes");
+        let commit = fixture.commit_with_long_prefix_tree(25_000, 3_900);
+        let before = fixture.object_and_ref_snapshot();
+
+        let result = bounded_merge(
+            fixture.path(),
+            &commit,
+            &commit,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            u64::MAX,
+            Some(test_merge_commit()),
+        );
+        assert!(matches!(result, Err((kind, _)) if kind == "merge_byte_limit"));
+        assert_eq!(fixture.object_and_ref_snapshot(), before);
+    }
+
+    #[test]
+    fn pull_merge_charges_generated_objects_before_in_memory_insertion() {
+        let fixture = MergeBoundaryFixture::new("generated-bytes");
+        let mut repo = open_physical_bare_repository(fixture.path())
+            .expect("open merge fixture")
+            .with_object_memory();
+        let byte_budget = MergeByteBudget::new(4);
+        let objects = BudgetedMergeObjects {
+            repo: &repo,
+            budget: &byte_budget,
+        };
+
+        let result = gix_object::Write::write_buf(&objects, gix_object::Kind::Blob, b"four");
+        assert!(matches!(
+            result,
+            Err(error) if error_chain_contains_merge_byte_limit(error.as_ref())
+        ));
+
+        assert!(
+            take_merge_object_memory(&mut repo)
+                .expect("read merge object memory")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pull_merge_enforces_the_exact_50000_commit_boundary() {
+        let fixture = MergeBoundaryFixture::new("commits");
+        let marks = fixture.fast_import_empty_chain(MERGE_COMMIT_LIMIT + 1);
+
+        let (analysis, merge_oid) = bounded_merge(
+            fixture.path(),
+            &marks[&1],
+            &marks[&MERGE_COMMIT_LIMIT],
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            u64::MAX,
+            None,
+        )
+        .expect("the exact production commit budget is accepted");
+        assert_eq!(analysis.3, (MERGE_COMMIT_LIMIT - 1) as u64);
+        assert_eq!(analysis.5, (MERGE_COMMIT_LIMIT - 1) as u64);
+        assert!(merge_oid.is_none());
+
+        let before = fixture.object_and_ref_snapshot();
+        let result = bounded_merge(
+            fixture.path(),
+            &marks[&1],
+            &marks[&(MERGE_COMMIT_LIMIT + 1)],
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+        assert!(matches!(result, Err((kind, _)) if kind == "commit_limit"));
+        assert_eq!(fixture.object_and_ref_snapshot(), before);
+
+        MERGE_WORKERS_STARTED.store(0, Ordering::Release);
+        let before = fixture.object_and_ref_snapshot();
+        let result = bounded_merge(
+            fixture.path(),
+            &marks[&1],
+            &marks[&MERGE_COMMIT_LIMIT],
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            100,
+            Some(test_merge_commit()),
+        );
+        assert!(matches!(result, Err((kind, _)) if kind == "scan_timeout"));
+        let workers_started = MERGE_WORKERS_STARTED.load(Ordering::Acquire);
+        assert!(
+            workers_started > 0,
+            "the positive deadline must expire after the computation worker starts"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(fixture.object_and_ref_snapshot(), before);
+    }
+
+    #[test]
+    fn pull_merge_enforces_the_exact_100000_tree_entry_boundary() {
+        let fixture = MergeBoundaryFixture::new("tree-entries");
+        let exact = fixture.commit_with_flat_tree(MERGE_TREE_ENTRY_LIMIT / 4, "exact tree");
+        let over = fixture.commit_with_flat_tree(MERGE_TREE_ENTRY_LIMIT / 4 + 1, "over tree");
+
+        bounded_merge(
+            fixture.path(),
+            &exact,
+            &exact,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            u64::MAX,
+            None,
+        )
+        .expect("the exact aggregate tree-entry budget is accepted");
+
+        let before = fixture.object_and_ref_snapshot();
+        let result = bounded_merge(
+            fixture.path(),
+            &over,
+            &over,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+        assert!(matches!(result, Err((kind, _)) if kind == "tree_entry_limit"));
+        assert_eq!(fixture.object_and_ref_snapshot(), before);
+    }
+
+    #[test]
+    fn pull_merge_enforces_the_exact_10000_changed_path_boundary() {
+        let fixture = MergeBoundaryFixture::new("changed-paths");
+        let root = fixture.commit_with_flat_tree(0, "root");
+        let base = fixture.commit_with_flat_tree_and_parent(1, "base", Some(&root));
+        let exact = fixture.commit_with_flat_tree_and_parent(
+            MERGE_CHANGED_PATH_LIMIT,
+            "exact changed paths",
+            Some(&root),
+        );
+        let over = fixture.commit_with_flat_tree_and_parent(
+            MERGE_CHANGED_PATH_LIMIT + 1,
+            "over changed paths",
+            Some(&root),
+        );
+
+        let (analysis, _) = bounded_merge(
+            fixture.path(),
+            &base,
+            &exact,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            u64::MAX,
+            None,
+        )
+        .expect("the exact changed-path budget is accepted");
+        assert_eq!(analysis.6, MERGE_CHANGED_PATH_LIMIT as u64);
+
+        let before = fixture.object_and_ref_snapshot();
+        let result = bounded_merge(
+            fixture.path(),
+            &base,
+            &over,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+        assert!(matches!(result, Err((kind, _)) if kind == "changed_path_limit"));
+        assert_eq!(fixture.object_and_ref_snapshot(), before);
+    }
 
     #[test]
     fn search_reasons_have_one_fixed_serialization_order() {
@@ -4494,6 +8030,289 @@ mod tests {
         temp_path: PathBuf,
         repo_path: PathBuf,
         tip_oid: String,
+    }
+
+    struct MergeBoundaryFixture {
+        temp_path: PathBuf,
+        repo_path: PathBuf,
+        blob_oid: String,
+    }
+
+    fn spawn_cas_process_worker(
+        fixture: &MergeBoundaryFixture,
+        proposed: &str,
+        outcome_path: &Path,
+    ) -> std::process::Child {
+        Command::new(std::env::current_exe().expect("current native test executable"))
+            .args([
+                "--exact",
+                "tests::compare_and_swap_ref_os_process_worker",
+                "--nocapture",
+            ])
+            .env("FORNACAST_CAS_WORKER_REPO", fixture.path())
+            .env("FORNACAST_CAS_WORKER_PROPOSED", proposed)
+            .env("FORNACAST_CAS_WORKER_OUTCOME", outcome_path)
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn CAS process worker")
+    }
+
+    fn age_file_past_ref_deadline(path: &Path) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open stale CAS marker");
+        let modified = std::time::SystemTime::now()
+            .checked_sub(REF_UPDATE_DEADLINE + Duration::from_secs(1))
+            .expect("stale marker timestamp");
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("age CAS marker");
+    }
+
+    fn test_merge_commit() -> PreparedMergeCommit {
+        PreparedMergeCommit {
+            author: validated_merge_signature((
+                b"Boundary Author".to_vec(),
+                b"author@example.com".to_vec(),
+                1_700_000_000,
+                0,
+            ))
+            .expect("valid boundary author"),
+            committer: validated_merge_signature((
+                b"Boundary Committer".to_vec(),
+                b"committer@example.com".to_vec(),
+                1_700_000_001,
+                0,
+            ))
+            .expect("valid boundary committer"),
+            message: "Boundary merge".into(),
+        }
+    }
+
+    impl MergeBoundaryFixture {
+        fn new(name: &str) -> Self {
+            let sequence = MERGE_BOUNDARY_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+            let temp_path = std::env::temp_dir().join(format!(
+                "fornacast-merge-boundary-{name}-{}-{sequence}",
+                std::process::id()
+            ));
+            let repo_path = temp_path.join("repo.git");
+            let _ = std::fs::remove_dir_all(&temp_path);
+            std::fs::create_dir_all(&temp_path).expect("create merge-boundary fixture");
+            tree_history_git(
+                &[
+                    "init",
+                    "--bare",
+                    "--object-format=sha1",
+                    tree_history_path(&repo_path),
+                ],
+                None,
+            );
+            let blob_oid = tree_history_git(
+                &[
+                    "--git-dir",
+                    tree_history_path(&repo_path),
+                    "hash-object",
+                    "-w",
+                    "--stdin",
+                ],
+                Some(b"merge boundary\n"),
+            );
+            Self {
+                temp_path,
+                repo_path,
+                blob_oid,
+            }
+        }
+
+        fn path(&self) -> &str {
+            tree_history_path(&self.repo_path)
+        }
+
+        fn fast_import_empty_chain(&self, count: usize) -> BTreeMap<usize, String> {
+            let marks_path = self.temp_path.join("marks");
+            let mut input = Vec::with_capacity(count.saturating_mul(180));
+            for mark in 1..=count {
+                use std::fmt::Write as _;
+
+                let mut command = String::new();
+                write!(
+                    command,
+                    "commit refs/heads/chain\nmark :{mark}\nauthor Boundary <boundary@example.com> {mark} +0000\ncommitter Boundary <boundary@example.com> {mark} +0000\ndata 1\nx\n"
+                )
+                .expect("format fast-import commit");
+                if mark == 1 {
+                    command.push_str("deleteall\n");
+                } else {
+                    writeln!(command, "from :{}", mark - 1).expect("format fast-import parent");
+                }
+                command.push('\n');
+                input.extend_from_slice(command.as_bytes());
+            }
+            let export_marks = format!("--export-marks={}", tree_history_path(&marks_path));
+            tree_history_git(
+                &[
+                    "--git-dir",
+                    self.path(),
+                    "fast-import",
+                    "--quiet",
+                    &export_marks,
+                ],
+                Some(&input),
+            );
+
+            std::fs::read_to_string(marks_path)
+                .expect("read fast-import marks")
+                .lines()
+                .map(|line| {
+                    let (mark, oid) = line.split_once(' ').expect("valid fast-import mark");
+                    (
+                        mark.trim_start_matches(':')
+                            .parse::<usize>()
+                            .expect("numeric fast-import mark"),
+                        oid.to_owned(),
+                    )
+                })
+                .collect()
+        }
+
+        fn commit_with_flat_tree(&self, entries: usize, message: &str) -> String {
+            self.commit_with_flat_tree_and_parent(entries, message, None)
+        }
+
+        fn commit_with_single_blob(&self, size: usize) -> String {
+            let body = vec![b'x'; size];
+            let blob_oid = tree_history_git(
+                &["--git-dir", self.path(), "hash-object", "-w", "--stdin"],
+                Some(&body),
+            );
+            let tree = format!("100644 blob {blob_oid}\tlarge.bin\n");
+            let tree_oid =
+                tree_history_git(&["--git-dir", self.path(), "mktree"], Some(tree.as_bytes()));
+            tree_history_git(
+                &[
+                    "--git-dir",
+                    self.path(),
+                    "commit-tree",
+                    &tree_oid,
+                    "-m",
+                    "large blob",
+                ],
+                None,
+            )
+        }
+
+        fn commit_with_repeated_blob(&self, size: usize, entries: usize) -> String {
+            let body = vec![b'x'; size];
+            let blob_oid = tree_history_git(
+                &["--git-dir", self.path(), "hash-object", "-w", "--stdin"],
+                Some(&body),
+            );
+            let tree = (0..entries)
+                .map(|index| format!("100644 blob {blob_oid}\tlarge-{index}.bin\n"))
+                .collect::<String>();
+            let tree_oid =
+                tree_history_git(&["--git-dir", self.path(), "mktree"], Some(tree.as_bytes()));
+            tree_history_git(
+                &[
+                    "--git-dir",
+                    self.path(),
+                    "commit-tree",
+                    &tree_oid,
+                    "-m",
+                    "repeated large blob",
+                ],
+                None,
+            )
+        }
+
+        fn commit_with_long_prefix_tree(&self, entries: usize, prefix_len: usize) -> String {
+            let mut inner_tree = String::with_capacity(entries.saturating_mul(80));
+            for index in 0..entries {
+                use std::fmt::Write as _;
+
+                writeln!(
+                    inner_tree,
+                    "100644 blob {}\tfile-{index:05}.txt",
+                    self.blob_oid
+                )
+                .expect("format long-prefix tree entry");
+            }
+            let inner_oid = tree_history_git(
+                &["--git-dir", self.path(), "mktree"],
+                Some(inner_tree.as_bytes()),
+            );
+            let prefix = "p".repeat(prefix_len);
+            let root_tree = format!("040000 tree {inner_oid}\t{prefix}\n");
+            let root_oid = tree_history_git(
+                &["--git-dir", self.path(), "mktree"],
+                Some(root_tree.as_bytes()),
+            );
+            tree_history_git(
+                &[
+                    "--git-dir",
+                    self.path(),
+                    "commit-tree",
+                    &root_oid,
+                    "-m",
+                    "long retained paths",
+                ],
+                None,
+            )
+        }
+
+        fn commit_with_flat_tree_and_parent(
+            &self,
+            entries: usize,
+            message: &str,
+            parent: Option<&str>,
+        ) -> String {
+            let mut tree = String::with_capacity(entries.saturating_mul(80));
+            for index in 0..entries {
+                use std::fmt::Write as _;
+
+                writeln!(tree, "100644 blob {}\tfile-{index:05}.txt", self.blob_oid)
+                    .expect("format merge-boundary tree");
+            }
+            let tree_oid =
+                tree_history_git(&["--git-dir", self.path(), "mktree"], Some(tree.as_bytes()));
+            let mut args = vec!["--git-dir", self.path(), "commit-tree", &tree_oid];
+            if let Some(parent) = parent {
+                args.extend(["-p", parent]);
+            }
+            args.extend(["-m", message]);
+            tree_history_git(&args, None)
+        }
+
+        fn object_and_ref_snapshot(&self) -> (String, String) {
+            (
+                tree_history_git(
+                    &[
+                        "--git-dir",
+                        self.path(),
+                        "cat-file",
+                        "--batch-all-objects",
+                        "--batch-check=%(objectname)",
+                    ],
+                    None,
+                ),
+                tree_history_git(
+                    &[
+                        "--git-dir",
+                        self.path(),
+                        "for-each-ref",
+                        "--format=%(refname) %(objectname)",
+                    ],
+                    None,
+                ),
+            )
+        }
+    }
+
+    impl Drop for MergeBoundaryFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.temp_path);
+        }
     }
 
     struct AnalysisStopFixture {

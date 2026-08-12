@@ -41,6 +41,11 @@ defmodule GitCore.Cache do
     end
   end
 
+  def invalidate_repository(repository_path, opts \\ []) when is_binary(repository_path) do
+    server = Keyword.get(opts, :server, __MODULE__)
+    GenServer.call(server, {:invalidate_repository, repository_path})
+  end
+
   @impl true
   def init(opts) do
     clock = Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end)
@@ -100,6 +105,21 @@ defmodule GitCore.Cache do
 
     {:reply, :ok, state}
   end
+
+  def handle_call({:invalidate_repository, repository_path}, _from, state) do
+    state =
+      Enum.reduce(:ets.tab2list(state.table), state, fn
+        {key, _value, _size, _sequence, _last_access_at}, state ->
+          if repository_key?(key, repository_path), do: remove_existing(state, key), else: state
+      end)
+
+    {:reply, :ok, state}
+  end
+
+  defp repository_key?(key, repository_path) when is_tuple(key) and tuple_size(key) > 0,
+    do: elem(key, 0) == repository_path
+
+  defp repository_key?(_key, _repository_path), do: false
 
   defp cache_success(server, key, {:ok, value}) do
     try do

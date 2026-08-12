@@ -283,6 +283,90 @@ defmodule Fornacast.AccessTest do
              )
   end
 
+  test "authorized fetch by id uses the transaction repo and canonical active records" do
+    owner = active_user_fixture("id-fetch-owner")
+    collaborator = active_user_fixture("id-fetch-collaborator")
+    repository = personal_repository_fixture(owner)
+    collaborator_fixture(repository, collaborator, :read)
+
+    assert {:ok, {:ok, %Repository{id: repository_id}}} =
+             Repo.transaction(fn ->
+               ForgeRepos.fetch_authorized_repository_by_id(
+                 collaborator,
+                 repository.id,
+                 :repository_read
+               )
+             end)
+
+    assert repository_id == repository.id
+
+    collaborator
+    |> Ecto.Changeset.change(state: :disabled)
+    |> Repo.update!()
+
+    assert {:ok, {:error, :not_found}} =
+             Repo.transaction(fn ->
+               ForgeRepos.fetch_authorized_repository_by_id(
+                 collaborator,
+                 repository.id,
+                 :repository_read
+               )
+             end)
+  end
+
+  test "authorized fetch by id accepts active organization owners and masks inactive rows" do
+    organization_owner = active_user_fixture("id-fetch-organization-owner")
+    organization = organization_fixture("id-fetch-organization")
+    organization_owner_fixture(organization, organization_owner)
+    organization_repository = organization_repository_fixture(organization)
+
+    assert {:ok, %Repository{id: organization_repository_id}} =
+             ForgeRepos.fetch_authorized_repository_by_id(
+               organization_owner,
+               organization_repository.id,
+               :repository_read
+             )
+
+    assert organization_repository_id == organization_repository.id
+
+    public_repository =
+      personal_repository_fixture(organization_owner,
+        slug: "public-by-id",
+        visibility: :public
+      )
+
+    assert {:ok, %Repository{id: public_repository_id}} =
+             ForgeRepos.fetch_authorized_repository_by_id(
+               nil,
+               public_repository.id,
+               :repository_read
+             )
+
+    assert public_repository_id == public_repository.id
+
+    organization
+    |> Ecto.Changeset.change(state: :disabled)
+    |> Repo.update!()
+
+    public_repository
+    |> Ecto.Changeset.change(deleted_at: ~U[2026-08-06 12:00:00Z])
+    |> Repo.update!()
+
+    assert {:error, :not_found} =
+             ForgeRepos.fetch_authorized_repository_by_id(
+               organization_owner,
+               organization_repository.id,
+               :repository_read
+             )
+
+    assert {:error, :not_found} =
+             ForgeRepos.fetch_authorized_repository_by_id(
+               nil,
+               public_repository.id,
+               :repository_read
+             )
+  end
+
   defp active_user_fixture(username, attrs \\ []) do
     user_fixture(username, Keyword.put_new(attrs, :state, :active))
   end

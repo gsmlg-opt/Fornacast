@@ -1,5 +1,6 @@
 defmodule FornacastAPI.Serializers.V2026_03_10 do
   alias FornacastAPI.Serializer.Fields
+  alias FornacastAPI.Serializers.V2026_03_10.{Issue, IssueComment, Pull}
 
   @simple_user_keys ~w(
     avatar_url events_url followers_url following_url gists_url gravatar_id html_url id login
@@ -69,6 +70,13 @@ defmodule FornacastAPI.Serializers.V2026_03_10 do
   end
 
   def render(:error, value, _opts), do: Fields.error(value)
+  def render(:issue, value, opts), do: Issue.render(value, opts)
+  def render(:issue_comment, value, opts), do: IssueComment.render(value, opts)
+  def render(:pull, value, opts), do: Pull.render(value, opts)
+  def render(:pull_merge, value, opts), do: Pull.render_merge(value, opts)
+
+  def render(:label, value, opts),
+    do: Issue.render_label(value, Keyword.fetch!(opts, :owner), Keyword.fetch!(opts, :repo))
 
   def render(resource, _value, _opts) do
     raise ArgumentError, "unsupported serializer resource: #{inspect(resource)}"

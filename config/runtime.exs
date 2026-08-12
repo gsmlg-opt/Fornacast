@@ -72,6 +72,35 @@ if config_env() == :prod do
     |> String.split(",", trim: true)
     |> Enum.map(&String.trim/1)
 
+  release_asset_root =
+    System.get_env("FORNACAST_RELEASE_ASSET_STORAGE_ROOT", "/data/release-assets")
+    |> Path.expand()
+
+  parse_positive_integer! = fn name, default, minimum, maximum ->
+    raw = System.get_env(name, Integer.to_string(default))
+
+    case Integer.parse(raw) do
+      {value, ""} when value >= minimum -> min(value, maximum)
+      _ -> raise "#{name} must be a decimal integer >= #{minimum}"
+    end
+  end
+
+  release_asset_max_bytes =
+    parse_positive_integer!.(
+      "FORNACAST_RELEASE_ASSET_MAX_BYTES",
+      2_147_483_648,
+      1,
+      2_147_483_648
+    )
+
+  release_asset_gc_grace_seconds =
+    parse_positive_integer!.(
+      "FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS",
+      86_400,
+      3_600,
+      2_147_483_647
+    )
+
   config :fornacast, :database_adapter, database_adapter
 
   config :fornacast,
@@ -96,16 +125,57 @@ if config_env() == :prod do
         end
     end
 
+  fornacast_config_store_options = [
+    enabled: config_store_enabled,
+    database: System.get_env("FORNACAST_CONFIG_DATABASE_PATH", "/data/fornacast_config.db"),
+    pool_size: String.to_integer(System.get_env("FORNACAST_CONFIG_POOL_SIZE") || "1"),
+    remote_url:
+      System.get_env("FORNACAST_CONFIG_TURSO_DATABASE_URL") ||
+        System.get_env("CONCORD_TURSO_REMOTE_URL"),
+    auth_token: config_store_auth_token
+  ]
+
+  config :fornacast,
+    release_asset_storage_root: release_asset_root,
+    release_asset_max_bytes: release_asset_max_bytes,
+    release_asset_gc_grace_seconds: release_asset_gc_grace_seconds
+
   config :concord,
-    cluster_enabled: false,
-    turso: [
-      enabled: config_store_enabled,
-      database: System.get_env("FORNACAST_CONFIG_DATABASE_PATH", "/data/fornacast_config.db"),
-      pool_size: String.to_integer(System.get_env("FORNACAST_CONFIG_POOL_SIZE") || "1"),
-      remote_url:
-        System.get_env("FORNACAST_CONFIG_TURSO_DATABASE_URL") ||
-          System.get_env("CONCORD_TURSO_REMOTE_URL"),
-      auth_token: config_store_auth_token
+    cluster_enabled: true,
+    data_dir: Path.join(release_asset_root, "concord"),
+    vsr: [
+      group_id: :ex_storage_service_metadata,
+      replica_id: node(),
+      members: [%{id: node(), endpoint: node()}],
+      storage: :file,
+      bootstrap: false
+    ],
+    turso: fornacast_config_store_options
+
+  config :ex_storage_service,
+    data_root: release_asset_root,
+    blob_root: Path.join(release_asset_root, "cas"),
+    tmp_root: Path.join(release_asset_root, "tmp"),
+    ra_root: Path.join(release_asset_root, "ra"),
+    metadata_root: Path.join(release_asset_root, "concord"),
+    instance_config: [
+      instance: :fornacast_release_assets,
+      mode: :standalone,
+      node_role: :data,
+      auto_start: false,
+      web_enabled: false,
+      public_s3_enabled: false,
+      cluster_data_plane_enabled: false,
+      workers: %{
+        multipart_gc: false,
+        content_gc: false,
+        cas_gc: false,
+        packer: false,
+        lifecycle: false,
+        cross_cluster_replication: false,
+        repair: false,
+        scrub: false
+      }
     ]
 
   config :fornacast,

@@ -501,6 +501,16 @@ defmodule FornacastWeb.RepositoryControllerCompositionPage do
   def release(result), do: RepositoryPage.release(result)
 end
 
+defmodule FornacastWeb.RepositoryControllerTestCollaborationPage do
+  def decorate(result) do
+    put_in(result.chrome.collaboration_counts, %{issues: 7, pull_requests: 3})
+  end
+end
+
+defmodule FornacastWeb.RepositoryControllerUnavailableCollaborationPage do
+  def decorate(result), do: result
+end
+
 defmodule FornacastWeb.RepositoryControllerTest do
   use ExUnit.Case, async: false
 
@@ -555,6 +565,34 @@ defmodule FornacastWeb.RepositoryControllerTest do
     end
 
     assert context.public.visibility == :public
+  end
+
+  test "existing repository pages are decorated with collaboration links and graceful counts" do
+    counted =
+      request_conn()
+      |> Plug.Conn.put_private(
+        :repository_collaboration_page,
+        FornacastWeb.RepositoryControllerTestCollaborationPage
+      )
+      |> get("/alice/public-repo")
+
+    assert counted.status == 200
+    assert counted.resp_body =~ "href=\"/alice/public-repo/issues\""
+    assert counted.resp_body =~ "href=\"/alice/public-repo/pulls\""
+    assert counted.resp_body =~ ~r/>\s*7\s*<\/span>/
+    assert counted.resp_body =~ ~r/>\s*3\s*<\/span>/
+
+    unavailable =
+      request_conn()
+      |> Plug.Conn.put_private(
+        :repository_collaboration_page,
+        FornacastWeb.RepositoryControllerUnavailableCollaborationPage
+      )
+      |> get("/alice/public-repo")
+
+    assert unavailable.status == 200
+    assert unavailable.resp_body =~ "href=\"/alice/public-repo/issues\""
+    assert unavailable.resp_body =~ "href=\"/alice/public-repo/pulls\""
   end
 
   test "an authorized viewer can read private repository pages", %{alice: alice} do

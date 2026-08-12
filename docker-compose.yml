@@ -20,10 +20,17 @@ services:
       FORNACAST_API_PORT: 4891
       FORNACAST_API_TRUSTED_PROXIES: 172.30.0.0/24
       FORNACAST_REPO_STORAGE_ROOT: /data/repos
+      FORNACAST_RELEASE_ASSET_STORAGE_ROOT: /data/release-assets
+      FORNACAST_RELEASE_ASSET_MAX_BYTES: ${FORNACAST_RELEASE_ASSET_MAX_BYTES:-2147483648}
+      FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS: ${FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS:-86400}
       FORNACAST_SSH_HOST: ${FORNACAST_SSH_HOST:-localhost}
       FORNACAST_SSH_PORT: ${FORNACAST_SSH_PORT:-2222}
       FORNACAST_SSH_SYSTEM_DIR: /data/ssh
       PORT: 4890
+      ELIXIR_ERL_OPTIONS: -kernel inet_dist_use_interface {127,0,0,1}
+      ERL_EPMD_ADDRESS: 127.0.0.1
+      RELEASE_DISTRIBUTION: name
+      RELEASE_NODE: fornacast@127.0.0.1
     expose:
       - "4890"
       - "4891"
@@ -34,6 +41,7 @@ services:
       - fornacast-data:/data
     networks:
       - fornacast-internal
+    stop_grace_period: 45s
 
   nginx:
     image: nginx:1.29-alpine

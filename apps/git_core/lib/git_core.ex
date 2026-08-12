@@ -9,6 +9,7 @@ defmodule GitCore do
   @inline_blob_limit 1_048_576
   @complete_blob_limit 100_000_000
   @diff_source_limit 200_000
+  @diff_file_page_limit 100
   @diff_scan_deadline_ms 5_000
   @search_file_limit 10_000
   @search_byte_limit 67_108_864
@@ -18,6 +19,15 @@ defmodule GitCore do
   @analysis_byte_limit 536_870_912
   @analysis_deadline_ms 2_000
   @disk_usage_deadline_ms 2_000
+  @merge_commit_limit 50_000
+  @merge_tree_entry_limit 100_000
+  @merge_changed_path_limit 10_000
+  @merge_byte_limit 67_108_864
+  @merge_deadline_ms 30_000
+  @comparison_commit_limit @merge_commit_limit
+  @comparison_tree_entry_limit @merge_tree_entry_limit
+  @comparison_file_limit @search_file_limit
+  @comparison_byte_limit @merge_byte_limit
 
   def init_bare(path) when is_binary(path) do
     GitCore.Native.init_bare(path)
@@ -35,6 +45,23 @@ defmodule GitCore do
 
   def list_refs(path) when is_binary(path) do
     read_refs(path, :list_refs)
+  end
+
+  @doc "Reads one canonical full reference without peeling its direct object target."
+  @spec exact_ref(Path.t(), String.t(), keyword()) ::
+          {:ok, String.t() | nil} | {:error, GitCore.Error.t()}
+  def exact_ref(path, full_name, opts \\ [])
+      when is_binary(path) and is_binary(full_name) and is_list(opts) do
+    deadline_ms = Keyword.get(opts, :deadline_ms, GitCore.Limits.get(:ref_deadline_ms))
+
+    if is_integer(deadline_ms) and deadline_ms > 0 do
+      bounded_deadline_ms = min(deadline_ms, GitCore.Limits.get(:ref_deadline_ms))
+
+      GitCore.Native.exact_ref(path, :binary.bin_to_list(full_name), bounded_deadline_ms)
+      |> wrap_read(:exact_ref)
+    else
+      invalid_input(:exact_ref, "deadline_ms must be a positive integer")
+    end
   end
 
   def ref_summary(path, opts \\ []) when is_binary(path) and is_list(opts) do
@@ -155,6 +182,54 @@ defmodule GitCore do
                  deadline_ms
                ),
                :commit_page
+             ) do
+        total_pages = if total == 0, do: 1, else: div(total + per_page - 1, per_page)
+
+        {:ok,
+         %GitCore.CommitPage{
+           commits: Enum.map(commits, &commit_from_native/1),
+           total: total,
+           page: page,
+           per_page: per_page,
+           total_pages: total_pages
+         }}
+      end
+    end)
+  end
+
+  @doc "Reads one page of commits reachable from an immutable head OID but not a base OID."
+  @spec commit_range_page(Path.t(), String.t(), String.t(), pos_integer(), keyword()) ::
+          {:ok, GitCore.CommitPage.t()} | {:error, GitCore.Error.t()}
+  def commit_range_page(path, base_oid, head_oid, page, opts \\ [])
+      when is_binary(path) and is_binary(base_oid) and is_binary(head_oid) and
+             is_integer(page) and page > 0 and is_list(opts) do
+    per_page = opts |> Keyword.get(:per_page, @commit_page_limit) |> bounded_commit_page_size()
+
+    deadline_ms =
+      opts |> Keyword.get(:deadline_ms, @commit_scan_deadline_ms) |> commit_deadline_ms()
+
+    commit_limit =
+      opts
+      |> Keyword.get(:commit_limit, @comparison_commit_limit)
+      |> comparison_commit_limit()
+
+    byte_limit =
+      opts |> Keyword.get(:byte_limit, @comparison_byte_limit) |> comparison_byte_limit()
+
+    GitCore.ScanLimiter.with_permit(:commit_range_page, fn ->
+      with {:ok, {commits, total}} <-
+             wrap_read(
+               GitCore.Native.commit_range_page(
+                 path,
+                 base_oid,
+                 head_oid,
+                 Integer.to_string(page),
+                 per_page,
+                 commit_limit,
+                 byte_limit,
+                 deadline_ms
+               ),
+               :commit_range_page
              ) do
         total_pages = if total == 0, do: 1, else: div(total + per_page - 1, per_page)
 
@@ -339,6 +414,65 @@ defmodule GitCore do
     end)
   end
 
+  @doc "Reads one path-sorted page of the aggregate diff between two immutable commit OIDs."
+  @spec diff_between(Path.t(), String.t(), String.t(), keyword()) ::
+          {:ok, GitCore.ComparisonDiff.t()} | {:error, GitCore.Error.t()}
+  def diff_between(path, base_oid, head_oid, opts \\ [])
+      when is_binary(path) and is_binary(base_oid) and is_binary(head_oid) and is_list(opts) do
+    page = Keyword.get(opts, :page, 1)
+
+    if is_integer(page) and page > 0 do
+      per_page =
+        opts |> Keyword.get(:per_page, @diff_file_page_limit) |> bounded_diff_file_page_size()
+
+      limit = opts |> Keyword.get(:limit, @diff_source_limit) |> bounded_diff_source_size()
+
+      deadline_ms =
+        opts |> Keyword.get(:deadline_ms, @diff_scan_deadline_ms) |> diff_deadline_ms()
+
+      tree_entry_limit =
+        opts
+        |> Keyword.get(:tree_entry_limit, @comparison_tree_entry_limit)
+        |> comparison_tree_entry_limit()
+
+      file_limit =
+        opts |> Keyword.get(:file_limit, @comparison_file_limit) |> comparison_file_limit()
+
+      byte_limit =
+        opts |> Keyword.get(:byte_limit, @comparison_byte_limit) |> comparison_byte_limit()
+
+      GitCore.ScanLimiter.with_permit(:diff_between, fn ->
+        with {:ok, {files, truncated, changed_files, additions, deletions}} <-
+               wrap_read(
+                 GitCore.Native.diff_between(
+                   path,
+                   base_oid,
+                   head_oid,
+                   Integer.to_string(page),
+                   per_page,
+                   limit,
+                   tree_entry_limit,
+                   file_limit,
+                   byte_limit,
+                   deadline_ms
+                 ),
+                 :diff_between
+               ) do
+          {:ok,
+           %GitCore.ComparisonDiff{
+             files: Enum.map(files, &diff_file_from_native/1),
+             changed_files: changed_files,
+             additions: additions,
+             deletions: deletions,
+             truncated: truncated
+           }}
+        end
+      end)
+    else
+      invalid_input(:diff_between, "page must be a positive integer")
+    end
+  end
+
   def search_tree(path, snapshot_oid, query, opts \\ [])
       when is_binary(path) and is_binary(snapshot_oid) and is_binary(query) and is_list(opts) do
     scope = opts |> Keyword.get(:scope, :path) |> search_scope()
@@ -438,6 +572,177 @@ defmodule GitCore do
     end)
   end
 
+  @doc """
+  Analyzes one immutable base/head commit pair without moving a ref or persisting merge objects.
+
+  The scan visits at most 50,000 commits and 100,000 physical tree entries, retains at most
+  10,000 changed leaf paths, and is capped by one 30-second deadline. Unique decoded/generated
+  object data and retained merge paths are limited to 64 MiB in aggregate, with an 8 MiB cap for
+  any individual blob. Tests may lower these bounds through options, but callers cannot raise the
+  production caps.
+  """
+  @spec merge_analysis(Path.t(), String.t(), String.t(), keyword()) ::
+          {:ok, GitCore.MergeAnalysis.t()} | {:error, GitCore.Error.t()}
+  def merge_analysis(path, base_oid, head_oid, opts \\ [])
+      when is_binary(path) and is_binary(base_oid) and is_binary(head_oid) and is_list(opts) do
+    merge_analysis_with_runtime(path, base_oid, head_oid, opts,
+      limiter: GitCore.ScanLimiter,
+      task_supervisor: GitCore.MergeTaskSupervisor,
+      native_merge: &GitCore.Native.merge_analysis/8,
+      native_await: &GitCore.Native.await_merge_worker/1
+    )
+  end
+
+  @doc false
+  def merge_analysis_with_runtime(path, base_oid, head_oid, opts, runtime)
+      when is_binary(path) and is_binary(base_oid) and is_binary(head_oid) and is_list(opts) and
+             is_list(runtime) do
+    {commit_limit, tree_entry_limit, changed_path_limit, byte_limit, deadline_ms} =
+      merge_bounds(opts)
+
+    limiter = Keyword.fetch!(runtime, :limiter)
+    task_supervisor = Keyword.fetch!(runtime, :task_supervisor)
+    native_merge = Keyword.fetch!(runtime, :native_merge)
+    native_await = Keyword.fetch!(runtime, :native_await)
+
+    GitCore.ScanLimiter.with_deferred_permit(
+      :merge_analysis,
+      fn ->
+        case native_merge.(
+               path,
+               base_oid,
+               head_oid,
+               commit_limit,
+               tree_entry_limit,
+               changed_path_limit,
+               byte_limit,
+               deadline_ms
+             ) do
+          {:deferred, native_error, ticket} ->
+            {:deferred, merge_analysis_result({:error, native_error}),
+             fn ->
+               native_await.(ticket)
+             end}
+
+          native_result ->
+            {:complete, merge_analysis_result(native_result)}
+        end
+      end,
+      server: limiter,
+      task_supervisor: task_supervisor
+    )
+  end
+
+  @doc """
+  Writes the merged tree and its two-parent commit without updating a reference.
+
+  The caller must already hold the repository writer permit. This function deliberately does
+  not acquire another permit, which keeps it composable inside the durable write fence. After
+  the final deadline check, object publication is not cancelled. A storage failure during that
+  phase may leave unreachable content-addressed objects, but this function never updates a ref.
+  """
+  @spec write_merge_commit(
+          Path.t(),
+          String.t(),
+          String.t(),
+          GitCore.Signature.t(),
+          GitCore.Signature.t(),
+          String.t(),
+          keyword()
+        ) :: {:ok, String.t()} | {:error, GitCore.Error.t()}
+  def write_merge_commit(
+        path,
+        base_oid,
+        head_oid,
+        %GitCore.Signature{} = author,
+        %GitCore.Signature{} = committer,
+        message,
+        opts \\ []
+      )
+      when is_binary(path) and is_binary(base_oid) and is_binary(head_oid) and
+             is_binary(message) and is_list(opts) do
+    {commit_limit, tree_entry_limit, changed_path_limit, byte_limit, deadline_ms} =
+      merge_bounds(opts)
+
+    GitCore.Native.write_merge_commit(
+      path,
+      base_oid,
+      head_oid,
+      signature_to_native(author),
+      signature_to_native(committer),
+      :binary.bin_to_list(message),
+      commit_limit,
+      tree_entry_limit,
+      changed_path_limit,
+      byte_limit,
+      deadline_ms
+    )
+    |> wrap_read(:write_merge_commit)
+  end
+
+  @doc """
+  Atomically creates or fast-forwards a canonical full ref from the exact expected target.
+
+  The proposed object must already exist and be a commit. This operation never writes objects,
+  deletes refs, or permits force updates. Branches may fast-forward; tags are create-only. The
+  caller must hold the repository writer fence when non-CAS writers can target the same repository.
+  """
+  @spec compare_and_swap_ref(
+          Path.t(),
+          String.t(),
+          String.t() | nil,
+          String.t(),
+          :fast_forward,
+          keyword()
+        ) :: {:ok, String.t()} | {:error, GitCore.Error.t()}
+  def compare_and_swap_ref(path, full_ref, expected_oid, proposed_oid, :fast_forward, opts)
+      when is_binary(path) and is_binary(full_ref) and
+             (is_nil(expected_oid) or is_binary(expected_oid)) and is_binary(proposed_oid) and
+             is_list(opts) do
+    deadline =
+      if Keyword.keyword?(opts),
+        do: Keyword.get(opts, :deadline_ms, GitCore.Limits.get(:ref_deadline_ms)),
+        else: :invalid
+
+    case deadline do
+      deadline_ms when is_integer(deadline_ms) ->
+        deadline_ms = deadline_ms |> max(0) |> min(GitCore.Limits.get(:ref_deadline_ms))
+
+        GitCore.Native.compare_and_swap_ref(
+          path,
+          full_ref,
+          expected_oid,
+          proposed_oid,
+          "fast_forward",
+          GitCore.Limits.get(:commit_visits),
+          deadline_ms
+        )
+        |> wrap_read(:compare_and_swap_ref)
+
+      _invalid_deadline ->
+        invalid_input(:compare_and_swap_ref, "deadline_ms must be an integer")
+    end
+  end
+
+  def compare_and_swap_ref(_path, _full_ref, _expected_oid, _proposed_oid, _mode, _opts) do
+    invalid_input(:compare_and_swap_ref, "invalid compare-and-swap arguments")
+  end
+
+  @spec invalidate_repository_cache(Path.t()) :: :ok
+  def invalidate_repository_cache(repository_path) when is_binary(repository_path) do
+    invalidate_repository_cache(repository_path, [])
+  end
+
+  @doc false
+  def invalidate_repository_cache(repository_path, opts)
+      when is_binary(repository_path) and is_list(opts) do
+    try do
+      GitCore.Cache.invalidate_repository(repository_path, opts)
+    catch
+      _kind, _reason -> :ok
+    end
+  end
+
   def pack_objects(path, wants) when is_binary(path) and is_list(wants) do
     GitCore.Native.pack_objects(path, wants)
   end
@@ -533,6 +838,24 @@ defmodule GitCore do
     |> min(@diff_source_limit)
   end
 
+  defp bounded_diff_file_page_size(per_page) when is_integer(per_page) do
+    per_page
+    |> max(1)
+    |> min(@diff_file_page_limit)
+  end
+
+  defp comparison_commit_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@comparison_commit_limit)
+
+  defp comparison_tree_entry_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@comparison_tree_entry_limit)
+
+  defp comparison_file_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@comparison_file_limit)
+
+  defp comparison_byte_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@comparison_byte_limit)
+
   defp diff_deadline_ms(deadline_ms) when is_integer(deadline_ms) do
     deadline_ms
     |> max(0)
@@ -571,6 +894,44 @@ defmodule GitCore do
 
   defp disk_usage_deadline_ms(deadline_ms) when is_integer(deadline_ms),
     do: deadline_ms |> max(0) |> min(@disk_usage_deadline_ms)
+
+  defp merge_bounds(opts) do
+    {
+      opts |> Keyword.get(:commit_limit, @merge_commit_limit) |> merge_commit_limit(),
+      opts
+      |> Keyword.get(:tree_entry_limit, @merge_tree_entry_limit)
+      |> merge_tree_entry_limit(),
+      opts
+      |> Keyword.get(:changed_path_limit, @merge_changed_path_limit)
+      |> merge_changed_path_limit(),
+      opts |> Keyword.get(:byte_limit, @merge_byte_limit) |> merge_byte_limit(),
+      opts |> Keyword.get(:deadline_ms, @merge_deadline_ms) |> merge_deadline_ms()
+    }
+  end
+
+  defp merge_commit_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@merge_commit_limit)
+
+  defp merge_tree_entry_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@merge_tree_entry_limit)
+
+  defp merge_changed_path_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@merge_changed_path_limit)
+
+  defp merge_byte_limit(limit) when is_integer(limit),
+    do: limit |> max(0) |> min(@merge_byte_limit)
+
+  defp merge_deadline_ms(deadline_ms) when is_integer(deadline_ms),
+    do: deadline_ms |> max(0) |> min(@merge_deadline_ms)
+
+  defp signature_to_native(%GitCore.Signature{} = signature) do
+    {
+      :binary.bin_to_list(signature.name),
+      :binary.bin_to_list(signature.email),
+      signature.seconds,
+      signature.offset_minutes
+    }
+  end
 
   defp blob_metadata(path, snapshot_oid, blob_path, operation) do
     with {:ok, {name, oid, size}} <-
@@ -752,8 +1113,32 @@ defmodule GitCore do
 
   defp wrap_read({:ok, value}, _operation), do: {:ok, value}
 
+  defp wrap_read({:deferred, native_error, _ticket}, operation),
+    do: wrap_read({:error, native_error}, operation)
+
   defp wrap_read({:error, {kind, detail}}, operation) do
     {:error, %GitCore.Error{kind: native_error_kind(kind), operation: operation, detail: detail}}
+  end
+
+  defp invalid_input(operation, detail) do
+    {:error, %GitCore.Error{kind: :invalid_input, operation: operation, detail: detail}}
+  end
+
+  defp merge_analysis_result(native_result) do
+    with {:ok,
+          {native_base_oid, native_head_oid, mergeable, ahead_by, behind_by, commit_count,
+           changed_paths}} <- wrap_read(native_result, :merge_analysis) do
+      {:ok,
+       %GitCore.MergeAnalysis{
+         base_oid: native_base_oid,
+         head_oid: native_head_oid,
+         mergeable: mergeable,
+         ahead_by: ahead_by,
+         behind_by: behind_by,
+         commit_count: commit_count,
+         changed_paths: changed_paths
+       }}
+    end
   end
 
   defp native_error_kind("empty_repository"), do: :empty_repository
@@ -767,4 +1152,19 @@ defmodule GitCore do
   defp native_error_kind("corrupt_repository"), do: :corrupt_repository
   defp native_error_kind("scan_timeout"), do: :scan_timeout
   defp native_error_kind("scan_busy"), do: :scan_busy
+  defp native_error_kind("commit_limit"), do: :commit_limit
+  defp native_error_kind("tree_entry_limit"), do: :tree_entry_limit
+  defp native_error_kind("diff_file_limit"), do: :diff_file_limit
+  defp native_error_kind("scan_byte_limit"), do: :scan_byte_limit
+  defp native_error_kind("changed_path_limit"), do: :changed_path_limit
+  defp native_error_kind("merge_conflict"), do: :merge_conflict
+  defp native_error_kind("merge_byte_limit"), do: :merge_byte_limit
+  defp native_error_kind("invalid_input"), do: :invalid_input
+  defp native_error_kind("stale_ref"), do: :stale_ref
+  defp native_error_kind("ref_exists"), do: :ref_exists
+  defp native_error_kind("non_fast_forward"), do: :non_fast_forward
+  defp native_error_kind("invalid_ref"), do: :invalid_ref
+  defp native_error_kind("invalid_oid"), do: :invalid_oid
+  defp native_error_kind("target_not_commit"), do: :target_not_commit
+  defp native_error_kind("ref_timeout"), do: :ref_timeout
 end

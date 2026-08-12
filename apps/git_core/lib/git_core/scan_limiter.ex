@@ -3,8 +3,9 @@ defmodule GitCore.ScanLimiter do
 
   use GenServer
 
-  @capacity 4
   @wait_timeout 250
+  @deferred_keeper_shutdown 4_000
+  @task_supervisor GitCore.MergeTaskSupervisor
 
   defmodule State do
     @moduledoc false
@@ -54,13 +55,43 @@ defmodule GitCore.ScanLimiter do
     end
   end
 
+  @doc false
+  def with_deferred_permit(operation, fun, opts \\ []) when is_function(fun, 0) do
+    server = Keyword.get(opts, :server, __MODULE__)
+    task_supervisor = Keyword.get(opts, :task_supervisor, @task_supervisor)
+    caller = self()
+    reply = make_ref()
+
+    case Task.Supervisor.start_child(
+           task_supervisor,
+           fn -> run_deferred_keeper(caller, reply, operation, fun, server) end,
+           shutdown: @deferred_keeper_shutdown
+         ) do
+      {:ok, keeper} ->
+        monitor = Process.monitor(keeper)
+
+        receive do
+          {^reply, result} ->
+            Process.demonitor(monitor, [:flush])
+            result
+
+          {:DOWN, ^monitor, :process, ^keeper, _reason} ->
+            busy_error(operation, "scan keeper is unavailable")
+        end
+
+      {:error, _reason} ->
+        busy_error(operation, "scan keeper supervisor is unavailable")
+    end
+  end
+
   @impl true
   def init(opts) do
-    capacity = Keyword.get(opts, :capacity, @capacity)
+    capacity = Keyword.get(opts, :capacity, GitCore.Limits.get(:scan_concurrency))
     wait_timeout = Keyword.get(opts, :wait_timeout, @wait_timeout)
+    hard_capacity = GitCore.Limits.hard(:scan_concurrency)
 
-    if not (is_integer(capacity) and capacity in 1..@capacity) do
-      raise ArgumentError, "scan limiter capacity must be between 1 and #{@capacity}"
+    if not (is_integer(capacity) and capacity in 1..hard_capacity) do
+      raise ArgumentError, "scan limiter capacity must be between 1 and #{hard_capacity}"
     end
 
     if not (is_integer(wait_timeout) and wait_timeout in 0..@wait_timeout) do
@@ -152,6 +183,32 @@ defmodule GitCore.ScanLimiter do
       GenServer.call(server, {:release, lease}, :infinity)
     catch
       :exit, _reason -> :ok
+    end
+  end
+
+  defp run_deferred_keeper(caller, reply, operation, fun, server) do
+    replied = make_ref()
+
+    result =
+      with_permit(
+        operation,
+        fn ->
+          case fun.() do
+            {:complete, result} ->
+              send(caller, {reply, result})
+              replied
+
+            {:deferred, result, await} when is_function(await, 0) ->
+              send(caller, {reply, result})
+              await.()
+              replied
+          end
+        end,
+        server: server
+      )
+
+    if result != replied do
+      send(caller, {reply, result})
     end
   end
 

@@ -28,12 +28,29 @@ defmodule FornacastAPI.Error do
   end
 
   def from_domain(:invalid_credentials, url), do: new(401, "Bad credentials", url)
+  def from_domain(:requires_authentication, url), do: new(401, "Requires authentication", url)
+
+  def from_domain({:insufficient_scope, accepted_scopes}, url),
+    do:
+      new(403, "Resource not accessible by personal access token", url,
+        accepted_scopes: accepted_scopes
+      )
 
   def from_domain(:insufficient_scope, url),
     do: new(403, "Resource not accessible by personal access token", url)
 
   def from_domain(:forbidden, url), do: new(403, "Forbidden", url)
   def from_domain(:not_found, url), do: new(404, "Not Found", url)
+
+  def from_domain(:issues_disabled, url),
+    do: new(410, "Issues are disabled for this repository", url)
+
+  def from_domain(reason, url) when reason in [:conflict, :merge_commits_disabled],
+    do: new(405, "Pull Request is not mergeable", url)
+
+  def from_domain(reason, url) when reason in [:head_changed, :ref_conflict],
+    do: new(409, "Conflict", url)
+
   def from_domain(:git_initializer_unavailable, url), do: new(503, "Service unavailable", url)
   def from_domain({:conflict, _safe_reason}, url), do: new(409, "Conflict", url)
 

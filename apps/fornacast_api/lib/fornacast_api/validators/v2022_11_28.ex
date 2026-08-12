@@ -1,4 +1,6 @@
 defmodule FornacastAPI.Validators.V2022_11_28 do
+  alias FornacastAPI.Validators.V2022_11_28.{Issue, Pull}
+
   @schemas %{
     create_organization: %{
       resource: "Organization",
@@ -63,6 +65,14 @@ defmodule FornacastAPI.Validators.V2022_11_28 do
     "allow_squash_merge",
     "allow_rebase_merge"
   ]
+
+  def validate(:issue_create, body), do: Issue.validate(:issue_create, body)
+  def validate(:issue_update, body), do: Issue.validate(:issue_update, body)
+  def validate(:issue_comment_create, body), do: Issue.validate(:issue_comment_create, body)
+  def validate(:issue_comment_update, body), do: Issue.validate(:issue_comment_update, body)
+
+  def validate(operation, body) when operation in [:pull_create, :pull_update, :pull_merge],
+    do: Pull.validate(operation, body)
 
   def validate(operation, body) when is_atom(operation) and is_map(body) do
     %{resource: resource, required: required, fields: fields} =

@@ -1,14 +1,14 @@
 # Release Assets on Embedded LocalCAS
 
 **Date:** 2026-08-12
-**Status:** Design approved in discussion; awaiting written-spec review
+**Status:** Approved
 **Scope:** Release-asset byte storage only
 
 ## Context
 
 The approved GitHub-compatible releases plan defines an opaque
 `ForgeReleases.AssetStorage` boundary backed by one ID-addressed file per
-asset. The ExStorageService v0.6.2 embedding probe subsequently proved that:
+asset. The ExStorageService embedding probe subsequently proved that:
 
 - the Hex-published core can be supervised inside Fornacast;
 - LocalCAS stage, commit, stat, ranged open, and verify survive a fresh BEAM
@@ -74,7 +74,7 @@ The first product slice has these boundaries:
 ## Architecture and ownership
 
 `ForgeReleases` is the sole domain owner. It depends directly on the exact Hex
-package `{:ex_storage_service, "== 0.6.2"}` and exposes no ESS type through its
+package `{:ex_storage_service, "== 0.6.4"}` and exposes no ESS type through its
 public API.
 
 The storage boundary consists of focused modules:
@@ -91,13 +91,11 @@ The storage boundary consists of focused modules:
 - `ForgeReleases.Recovery` remains the durable operation reconciler and also
   cleans operation-owned staging directories.
 
-All LocalCAS calls receive adapter-owned options containing explicit roots,
-`pack_module: nil`, and no `:bucket`. This prevents packed-blob metadata lookup
-and legacy bucket fallback. `pack_module: nil` is code-supported but not yet a
-documented public embedding option, so it is exact-pinned, contract-tested, and
-tracked by
-[upstream issue #14](https://github.com/gsmlg-opt/ex_storage_service/issues/14).
-No callsite outside the adapter may invoke LocalCAS.
+All LocalCAS calls receive adapter-owned options from
+`ExStorageService.Context.direct_blob_store_options/1`, with an adapter-owned
+`tmp_dir` and effective `max_size` added for staging. These supported options
+contain explicit roots, disable packed-blob lookup, and omit legacy bucket
+fallback. No callsite outside the adapter may invoke LocalCAS.
 
 ESS starts as an OTP dependency before `ForgeReleases`, so application
 configuration must disable its default instance before dependency startup.
@@ -112,6 +110,11 @@ bounded exponential backoff; failed attempts update readiness but do not crash
 the application supervisor. After a successful boot, request-time I/O faults
 make release-asset operations return `{:error, {:unavailable,
 :asset_storage}}`; unrelated repository and Git operations remain available.
+The adapter gates every LocalCAS call on manager readiness because direct
+LocalCAS functions do not consult the supervised ESS Engine themselves.
+The manager exposes only `status/0 :: :ready | {:not_ready, atom()}` and
+`ready?/0 :: boolean()`; readiness checks occur once per storage operation,
+not once per streamed chunk.
 
 ## Configuration and supervision
 
@@ -161,8 +164,11 @@ The dedicated release-asset root remains configurable through
 - production container: `/data/release-assets`.
 
 CAS and temporary roots are children of that root and must share a filesystem.
-The adapter validates containment, writability, and same-filesystem publication
-at boot. `FORNACAST_RELEASE_ASSET_MAX_BYTES` remains a positive decimal integer
+The adapter validates containment and same-filesystem publication at boot and
+performs a contained write, file sync, close, and remove probe in each mutable
+CAS and temporary root; ESS startup alone does not prove existing directories
+writable.
+`FORNACAST_RELEASE_ASSET_MAX_BYTES` remains a positive decimal integer
 clamped to the immutable 2,147,483,648-byte hard maximum. Its parsed, clamped
 value is the effective limit passed to every request and recovery staging call;
 the hard ceiling is not substituted when an operator configures a lower limit.
@@ -215,7 +221,13 @@ an unexpired lease. Callers thread the returned row; they never reuse a stale
 owner/version handle. This contract is implemented with conditional updates,
 not row locks, and receives Turso and PostgreSQL tests.
 
-Potentially long commit, verify, recovery-copy, and physical-delete calls run
+The third argument to `renew_owned/3` and fourth argument to `update_owned/4`
+is the required keyword pair `[now: utc_datetime, lease_seconds:
+positive_integer]`. Supplying the clock explicitly keeps expiry predicates
+portable and deterministic in both database-adapter tests. The existing
+releasing `update_owned/3` signature remains unchanged.
+
+Potentially long commit, verify, recovered-stage, and physical-delete calls run
 in monitored tasks with fixed deadlines. The owning coordinator renews the SQL
 lease while the task is alive. On the same BEAM, recovery cannot claim an
 expired row until the prior task's `:DOWN` is observed. On a fresh BEAM the old
@@ -280,6 +292,7 @@ Blob states are:
 absent -> pending -> ready -> candidate -> deleting -> absent
 candidate -> pending
 pending | ready -> corrupt
+absent -> corrupt
 ```
 
 Rows are tombstones and are never deleted. Retaining `absent` prevents digest
@@ -319,7 +332,8 @@ The release domain keeps reservation separate from body consumption:
 @spec stream_asset_upload(upload(), reader(), reader_state()) ::
         {:ok, asset(), reader_state()} | {:error, error_reason(), reader_state()}
 
-@spec abort_asset_upload(upload(), error_reason()) :: :ok
+@spec abort_asset_upload(upload(), error_reason()) ::
+        :ok | {:error, error_reason()}
 ```
 
 The API adapter owns the concrete reader state. Authentication plugs consume
@@ -334,6 +348,14 @@ The reader returns `{:more, binary(), state}`, `{:ok, binary(), state}`,
 orchestrator, not the arbitrary reader callback, owns total/idle deadlines,
 byte accounting, monitored tasks, and lease renewal. The final reader state is
 always returned so the controller continues with the latest connection.
+The raw reader has arity two: `reader.(state, read_options)`. The release
+orchestrator supplies the adapter with a domain wrapper; on every invocation
+that wrapper computes fresh bounded `:length`, `:read_length`, and remaining
+`:read_timeout` values before calling the raw reader. The LocalCAS adapter
+converts the domain wrapper to ESS's arity-one reader protocol and supplies
+only fixed bounded ceiling options, which the domain wrapper may tighten but
+never widen. A blocked HTTP body read therefore cannot outlive the domain's
+remaining deadline.
 
 The previous planned `write_asset_chunk/2` and `finish_asset_upload/1` APIs are
 removed. `upload()` remains opaque and redacts lease, deadline, and staging
@@ -361,13 +383,35 @@ commit(staged_ref)
 discard(staged_ref)
 stat(storage_key)
 open(storage_key, expected_size, range)
+recover_stage(staging_key, expected_digest, expected_size)
+read(source, requested_bytes)
+close(source)
+cleanup_staging(staging_key)
 verify(storage_key)
 delete(storage_key)
+capacity()
 ```
 
+Successful staging returns
+`{:ok, staged_ref, %{sha256_digest: digest, storage_key: digest, size: size},
+reader_state}`. Successful commit returns
+`{:ok, %{sha256_digest: digest, storage_key: digest, size: size}}`.
 `staged_ref` is opaque and runtime-only. It may be handed to the monitored
-commit task but is never persisted or returned to the release context. No ESS
-staging path or struct crosses that boundary.
+commit task but is never persisted or returned beyond the release context. No
+ESS staging path or struct crosses the adapter boundary.
+`source` is likewise opaque and owns the already-open descriptor, allowed
+offset, current position, and remaining length. `read/2` returns
+`{:ok, binary, source}`, `:eof`, or a normalized error; `close/1` is idempotent.
+The two recovery-only operations also keep paths private:
+`recover_stage/3` accepts a validated staging key, expected digest, and expected
+size. The adapter locates exactly one direct regular entry, rejects symlinks and
+nested or multiple entries, enforces the effective cap, and passes the private
+path to `LocalCAS.recover_stage/4`. ESS verifies the size, digest,
+same-filesystem constraint, and file identity before the adapter returns an
+opaque `StagedRef`. `cleanup_staging/1` removes only that key's contained
+directory without following symlinks. Operation rows persist only the validated
+staging key so cleanup remains addressable after a crash; they never persist a
+staging path.
 
 The adapter normalizes internal results to a small state-machine algebra:
 
@@ -380,31 +424,38 @@ It preserves enough meaning for the domain to retry, compensate, retain a
 `staged` operation, or mark corruption, while discarding raw ESS and filesystem
 reasons. `open/3` opens the descriptor first and compares `fstat` size to
 `expected_size` before returning the opaque download source.
+`capacity/0` returns only CAS/staging byte and inode totals/available counts;
+it never returns a root, mountpoint, command output, or filesystem error.
 
 ## Upload flow
 
 1. Authorize the repository and release, reserve the asset name and quota, and
    create a leased `staging` operation in one SQL transaction. No request byte
    is read before this succeeds.
-2. Create a new contained staging directory from the operation ID and a random
-   attempt token. Client filenames never appear in storage paths.
-3. Call `LocalCAS.stage_from_reader/3` with that directory and the configured
-   effective limit, which is never above 2 GiB. The release orchestrator
-   enforces the 30-second idle and 30-minute absolute deadlines and renews the
-   operation lease before half-life as reader progress occurs.
+2. Derive a validated staging key from the operation ID and a random attempt
+   token. The adapter alone maps it to a contained directory; client filenames
+   never appear in storage paths.
+3. Call `AssetStorage.stage_from_reader/4` with that key and the configured
+   effective limit, which is never above 2 GiB. Its adapter invokes
+   `LocalCAS.stage_from_reader/3`; the release orchestrator enforces the
+   30-second idle and 30-minute absolute deadlines and renews the operation
+   lease before half-life as reader progress occurs.
 4. At EOF, use `OperationLease.update_owned/4` in a transaction to retain the
    request owner while persisting `staged`, observed size, digest, final key,
    and the blob inventory row. Every attachment conditionally touches and
    increments the blob row version, including `ready -> ready`. `absent`,
    `pending`, or `candidate` becomes or remains `pending`; a size mismatch or
    `corrupt` row fails closed. A `deleting` row rolls back the entire
-   attachment for bounded retry without publishing bytes. Any non-null blob
-   lease also rolls back the attachment until its owning or recovery task
-   resolves it.
-5. Run `LocalCAS.commit/2` in a monitored, deadline-bounded task while the
-   coordinator renews the retained lease. Concurrent identical uploads are
-   safe whether the second commit verifies an already-present blob or both
-   writers observe absence and atomically publish the same digest bytes.
+   attachment for bounded retry without publishing bytes. An unexpired,
+   non-`ready`, or locally fenced blob lease also rolls back the attachment.
+   The only takeover is an expired `ready` download-open lease with no active
+   local task fence; it is reclaimed by exact state/version CAS before the
+   attachment retries.
+5. Run `AssetStorage.commit/1` in a monitored, deadline-bounded task while the
+   coordinator renews the retained lease; the adapter alone invokes
+   `LocalCAS.commit/2`. Concurrent identical uploads are safe whether the
+   second commit verifies an already-present blob or both writers observe
+   absence and atomically publish the same digest bytes.
 6. After successful commit and size confirmation, atomically mark the blob
    `ready`, populate the pending asset's size, digest, and storage key, and use
    `OperationLease.update_owned/4` to move the operation to `metadata_ready`
@@ -416,9 +467,9 @@ reasons. `open/3` opens the descriptor first and compares `fstat` size to
    transition. Return success only after `completed`.
 
 The adapter removes its partial file on every ordinary reader, write, overflow,
-or close error. Only abrupt owner death may leave one file in the primary
-directory. Primary and lease-specific recovery directories are disjoint, and
-terminal cleanup removes both without following symlinks.
+or close error. Only abrupt owner death may leave one file in the operation's
+primary directory, and terminal cleanup removes that contained directory
+without following symlinks.
 
 A commit error is not immediately a failed upload. Rename can succeed before a
 later directory-sync error, so an ambiguous result remains `staged` for
@@ -427,9 +478,17 @@ recovery.
 ## Download flow
 
 `open_asset/3` authorizes an available asset and asks the adapter to resolve its
-digest with `pack_module: nil`. The adapter compares the actual and recorded
+digest with direct loose-CAS options. The adapter compares the actual and recorded
 sizes and opens the real file descriptor before returning the opaque
 `AssetDownload`. It never returns a path to a controller.
+
+Before storage open, the domain claims the exact `ready` blob row with a short
+state/version-qualified lease. It releases that lease before returning the
+descriptor. A request crash can strand only this durable lease; after expiry,
+a fresh opener, attachment, recovery, audit, or unreferenced-GC pass may take
+it over only when no local `TaskFence` is active. A stale slow opener that
+loses this race closes its descriptor and fails instead of returning a handle.
+No non-`ready` state may use this takeover rule.
 
 `read_asset_chunk/2` retains the existing behavior:
 
@@ -456,7 +515,7 @@ Asset deletion remains immediate from the user's perspective:
    blob reference until metadata deletion completes.
 3. Finish metadata deletion, quota/count adjustment, audit, and the terminal
    operation transition through the existing idempotent boundary.
-4. Do not call LocalCAS delete in the foreground.
+4. Do not call `AssetStorage.delete/1` in the foreground.
 
 Release deletion applies the same logical boundary to every asset. The release
 is hidden first; each asset is moved through its durable deleting operation and
@@ -491,9 +550,13 @@ candidate blob survives restart and is eventually reclaimed.
    ownership through `OperationLease.update_owned/4`.
 4. While `deleting` is leased, a same-digest upload may stage bytes but cannot
    attach or commit; it retries after the bounded deletion.
-5. The coordinator runs idempotent `LocalCAS.delete/2` in a monitored task,
-   renews the lease while it is alive, then records `absent` and clears the
-   lease. Missing bytes count as success.
+5. The coordinator runs idempotent `AssetStorage.delete/1` in a monitored task;
+   the adapter alone invokes `LocalCAS.delete/2`. It renews the lease while the
+   task is alive, then records `absent` and clears the lease only after `:ok`.
+   ESS syncs the containing directory after unlink; if that sync is ambiguous,
+   the adapter returns unavailable and the durable `deleting` row retries the
+   idempotent delete. Missing bytes count as success only after the retry's
+   directory sync succeeds.
 6. A crash before or after unlink leaves a durable `deleting` row. Recovery
    repeats deletion and completes the tombstone transition.
 
@@ -519,14 +582,13 @@ task has emitted `:DOWN`.
   task while renewing the recovery lease. If a ready blob with the expected
   size exists, atomically populate the pending asset, mark the blob ready, and
   advance to `metadata_ready` without inspecting temporary files.
-- `staged` with no ready blob: require exactly one contained regular file in
-  the primary operation directory. Reject symlinks, nested entries, or multiple
-  candidates. Open the regular file, confirm its descriptor size equals the
-  persisted size and does not exceed the configured effective cap, then
-  re-stream it through the adapter using `LocalCAS.stage_from_reader/3` and a
-  bounded descriptor reader into a separate lease-specific recovery directory.
-  Compare digest and size, then commit the newly returned opaque staged value
-  in a monitored task.
+- `staged` with no ready blob: call the adapter's `recover_stage/3` with the
+  primary operation key, recorded digest, and recorded size. The adapter
+  requires exactly one contained regular file, rejects symlinks and nested or
+  multiple entries, enforces the configured cap, and calls
+  `LocalCAS.recover_stage/4` without exposing the path. ESS verifies the bytes
+  in place and returns a staged value wrapped as an opaque `StagedRef`; recovery
+  commits that ref directly without descriptor streaming or a second copy.
 - `staged` with a missing or invalid survivor: recheck the ready digest once to
   close a concurrent-commit race. If it remains absent, compensate the pending
   asset and quota once and mark the operation failed. Unexpected stage
@@ -539,54 +601,45 @@ task has emitted `:DOWN`.
   audit, and `completed`. A transient verification failure remains
   nonterminal. Confirmed missing or corrupt content marks the blob `corrupt`,
   compensates the still-invisible asset, and marks the operation failed.
-- terminal operations: clean both primary and lease-specific recovery
-  directories without following symlinks.
+- terminal operations: call `cleanup_staging/1` for the persisted primary key;
+  the adapter removes its contained directory without following symlinks. A
+  bounded terminal-row cleanup pass retries unavailable cleanup and clears the
+  key only after the directory is absent.
 
 Recovery never reconstructs `%ExStorageService.BlobStore.StagedBlob{}` and
-never persists LocalCAS's private filename. Normal uploads write once; only
-crash recovery may perform a second disk copy.
+never persists LocalCAS's private filename. Both normal upload and crash
+recovery publish without a second disk copy.
 
 The pinned-version adapter contract test asserts that one interrupted
 LocalCAS stage creates at most one regular file directly inside the supplied
 empty `tmp_dir`. Recovery depends on that observable behavior only; it does not
 depend on the private filename.
 
-This recovery path is a temporary dependency workaround:
-
-```elixir
-# WORKAROUND(upstream): gsmlg-opt/ex_storage_service#13
-```
-
-[Upstream issue #13](https://github.com/gsmlg-opt/ex_storage_service/issues/13)
-requests a documented API for recovering and committing a completed,
-checksum-verified stage without reconstructing internal structs or copying the
-file again. The workaround remains `needed`, not a blocker, and must be
-contract-tested against the exact ESS pin.
-
-Direct loose-CAS resolution has its own temporary dependency marker:
-
-```elixir
-# WORKAROUND(upstream): gsmlg-opt/ex_storage_service#14
-```
-
-[Upstream issue #14](https://github.com/gsmlg-opt/ex_storage_service/issues/14)
-requests a supported public option that avoids pack and legacy metadata lookup.
+ExStorageService v0.6.4 closes [upstream issues
+#13](https://github.com/gsmlg-opt/ex_storage_service/issues/13),
+[#14](https://github.com/gsmlg-opt/ex_storage_service/issues/14), and
+[#15](https://github.com/gsmlg-opt/ex_storage_service/issues/15) through
+[PR #16](https://github.com/gsmlg-opt/ex_storage_service/pull/16). The pinned
+adapter contract tests the supported `LocalCAS.recover_stage/4`,
+`Context.direct_blob_store_options/1`, and durable idempotent delete behavior.
 
 ## Integrity and error handling
 
 - Validate every digest as lowercase 64-character SHA-256 before adapter use.
 - Reject size or digest disagreement and mark the blob `corrupt`; never
   overwrite or auto-repair it.
-- LocalCAS paths, ESS structs, raw filesystem reasons, request credentials, and
-  authorization data never enter logs, audit metadata, or API responses.
+- Per-object CAS paths, staging paths, ESS structs, raw filesystem reasons,
+  request credentials, and authorization data never enter logs, audit
+  metadata, or API responses. ESS may log the configured storage roots during
+  startup; those operator-provided roots are not object identifiers or secrets.
 - Validation and conflict errors retain the releases plan's existing tagged
   domain shapes. Storage I/O and readiness failures normalize to
   `{:error, {:unavailable, :asset_storage}}` and map to HTTP 503.
 - Private repository authorization continues to collapse to not-found before
   storage lookup.
 - Opening a blob checks size but does not hash the entire object on every
-  download. A bounded Fornacast integrity audit uses `LocalCAS.verify/2` because
-  ESS scrub is disabled.
+  download. A bounded Fornacast integrity audit uses `AssetStorage.verify/1`
+  (whose adapter invokes `LocalCAS.verify/2`) because ESS scrub is disabled.
 
 ## Operations and backup
 
@@ -616,9 +669,18 @@ Readiness and telemetry cover:
 - GC candidates, deletions, retries, and failures; and
 - integrity audit failures.
 
+Both existing `/health` endpoints add a `release_asset_storage` check and keep
+their established rule that any enabled failed check yields HTTP 503. This is
+readiness reporting only: the supervisor remains alive and direct repository
+and Git requests continue to execute while asset operations fail closed.
+
 Operators receive a bounded, dry-run-capable integrity/GC audit. Corruption is
 reported for manual recovery from backup; no destructive automatic repair is
-performed.
+performed. A physically present blob behind an `absent` tombstone is an
+integrity failure and is never automatically deleted, promoted, or repaired.
+Dry run does not change bytes, blob state, integrity metadata, or user-visible
+SQL. It may acquire and release a short blob coordination lease, incrementing
+only the retained fencing version, so a long verification cannot race GC.
 
 Deployment documentation states the first-release constraint explicitly: one
 BEAM, one exclusive volume, and stop-before-start upgrades. S3 ports and
@@ -639,12 +701,14 @@ Implementation is not complete until fresh evidence covers:
 - mandatory blob-version touches for every attachment, conservative
   `candidate -> pending` reactivation, upload-versus-GC fencing, ambiguous
   commit recovery, stale leases, and crash-before/crash-after unlink;
+- an injected delete directory-sync failure, proving the blob remains
+  `deleting` and an idempotent retry completes durability before `absent`;
 - a paused GC worker after ownership check, proving no reclaim or republish can
   occur until that local process emits `:DOWN`;
 - a GC worker paused after claiming a candidate but before its owner-retaining
   transition, proving a same-digest upload remains unattached until the GC task
   emits `:DOWN` and its non-null lease is resolved;
-- commit and recovery-copy tasks held across lease expiry or renewal failure,
+- commit and recovered-stage tasks held across lease expiry or renewal failure,
   proving recovery waits for `:DOWN` and the stale caller neither removes
   staging data nor transitions SQL;
 - recovery with a missing survivor, symlink, nested or multiple entries,
@@ -660,7 +724,7 @@ Implementation is not complete until fresh evidence covers:
 - fresh-BEAM ConfigStore Turso plus Concord VSR coexistence and restart;
 - quiesced backup/restore of SQL, ConfigStore, Concord metadata, CAS, and
   staging roots;
-- `mix deps.get --check-locked` with ESS exactly 0.6.2;
+- `mix deps.get --check-locked` with ESS exactly 0.6.4;
 - a production Elixir 1.20/OTP 29 `mix release` and Docker boot/restart smoke;
   and
 - release inspection proving `ex_storage_service` core is present,
@@ -692,6 +756,8 @@ not a substitute for the production-toolchain acceptance run.
 - `docs/superpowers/specs/2026-08-07-ess-embedded-s3-probe.md`
 - `docs/superpowers/plans/2026-07-21-github-api-releases.md`
 - `docs/superpowers/specs/2026-07-21-github-compatible-api-design.md`
-- [ExStorageService v0.6.2](https://github.com/gsmlg-opt/ex_storage_service/releases/tag/v0.6.2)
-- [Upstream recovery API request #13](https://github.com/gsmlg-opt/ex_storage_service/issues/13)
-- [Upstream direct-LocalCAS option request #14](https://github.com/gsmlg-opt/ex_storage_service/issues/14)
+- [ExStorageService v0.6.4](https://github.com/gsmlg-opt/ex_storage_service/releases/tag/v0.6.4)
+- [ExStorageService PR #16](https://github.com/gsmlg-opt/ex_storage_service/pull/16)
+- [Closed recovery API request #13](https://github.com/gsmlg-opt/ex_storage_service/issues/13)
+- [Closed direct-LocalCAS option request #14](https://github.com/gsmlg-opt/ex_storage_service/issues/14)
+- [Closed durable-delete request #15](https://github.com/gsmlg-opt/ex_storage_service/issues/15)

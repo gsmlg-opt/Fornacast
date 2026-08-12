@@ -50,6 +50,23 @@ defmodule FornacastAPI.Router do
     post "/admin/organizations", OrganizationController, :create
     get "/repos/:owner/:repo", RepositoryController, :show
     patch "/repos/:owner/:repo", RepositoryController, :update
+
+    patch "/repos/:owner/:repo/issues/comments/:comment_id", IssueCommentController, :update
+    delete "/repos/:owner/:repo/issues/comments/:comment_id", IssueCommentController, :delete
+    get "/repos/:owner/:repo/issues", IssueController, :index
+    post "/repos/:owner/:repo/issues", IssueController, :create
+    get "/repos/:owner/:repo/issues/:issue_number", IssueController, :show
+    patch "/repos/:owner/:repo/issues/:issue_number", IssueController, :update
+
+    get "/repos/:owner/:repo/pulls", PullController, :index
+    post "/repos/:owner/:repo/pulls", PullController, :create
+    get "/repos/:owner/:repo/pulls/:pull_number/merge", PullMergeController, :check
+    put "/repos/:owner/:repo/pulls/:pull_number/merge", PullMergeController, :merge
+    get "/repos/:owner/:repo/pulls/:pull_number", PullController, :show
+    patch "/repos/:owner/:repo/pulls/:pull_number", PullController, :update
+
+    get "/repos/:owner/:repo/issues/:issue_number/comments", IssueCommentController, :index
+    post "/repos/:owner/:repo/issues/:issue_number/comments", IssueCommentController, :create
     match :*, "/*path", FallbackController, :not_found
   end
 

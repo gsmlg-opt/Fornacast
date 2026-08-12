@@ -30,9 +30,9 @@ defmodule FornacastAPI.Pagination do
 
     relations =
       [
-        {"next", if(page.page < total_pages, do: page.page + 1)},
+        {"first", if(total_pages > 1 or page.page > 1, do: 1)},
         {"prev", if(page.page > 1, do: min(page.page - 1, total_pages))},
-        {"first", if(page.page > 1, do: 1)},
+        {"next", if(page.page < total_pages, do: page.page + 1)},
         {"last", if(page.page != total_pages, do: total_pages)}
       ]
       |> Enum.reject(fn {_relation, target_page} -> is_nil(target_page) end)

@@ -16,6 +16,7 @@ defmodule GitCore.Native do
   def is_bare_repository(_path), do: :erlang.nif_error(:nif_not_loaded)
   def empty(_path), do: :erlang.nif_error(:nif_not_loaded)
   def list_refs(_path), do: :erlang.nif_error(:nif_not_loaded)
+  def exact_ref(_path, _full_name, _deadline_ms), do: :erlang.nif_error(:nif_not_loaded)
   def ref_summary(_path, _selected_ref), do: :erlang.nif_error(:nif_not_loaded)
 
   def ref_summary_for_route(_path, _route_segments),
@@ -27,6 +28,18 @@ defmodule GitCore.Native do
 
   def commit_page(_path, _snapshot_oid, _page, _per_page, _deadline_ms),
     do: :erlang.nif_error(:nif_not_loaded)
+
+  def commit_range_page(
+        _path,
+        _base_oid,
+        _head_oid,
+        _page,
+        _per_page,
+        _commit_limit,
+        _byte_limit,
+        _deadline_ms
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
 
   def read_tree_with_history(
         _path,
@@ -51,6 +64,20 @@ defmodule GitCore.Native do
 
   def diff_commit(_path, _oid, _limit, _deadline_ms), do: :erlang.nif_error(:nif_not_loaded)
 
+  def diff_between(
+        _path,
+        _base_oid,
+        _head_oid,
+        _page,
+        _per_page,
+        _limit,
+        _tree_entry_limit,
+        _file_limit,
+        _byte_limit,
+        _deadline_ms
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   def search_tree(
         _path,
         _snapshot_oid,
@@ -73,6 +100,46 @@ defmodule GitCore.Native do
       do: :erlang.nif_error(:nif_not_loaded)
 
   def repository_disk_usage(_path, _deadline_ms), do: :erlang.nif_error(:nif_not_loaded)
+
+  def merge_analysis(
+        _path,
+        _base_oid,
+        _head_oid,
+        _commit_limit,
+        _tree_entry_limit,
+        _changed_path_limit,
+        _byte_limit,
+        _deadline_ms
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  def write_merge_commit(
+        _path,
+        _base_oid,
+        _head_oid,
+        _author,
+        _committer,
+        _message,
+        _commit_limit,
+        _tree_entry_limit,
+        _changed_path_limit,
+        _byte_limit,
+        _deadline_ms
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  def await_merge_worker(_ticket), do: :erlang.nif_error(:nif_not_loaded)
+
+  def compare_and_swap_ref(
+        _path,
+        _full_ref,
+        _expected_oid,
+        _proposed_oid,
+        _mode,
+        _commit_limit,
+        _deadline_ms
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
 
   def pack_objects(_path, _wants), do: :erlang.nif_error(:nif_not_loaded)
   def receive_pack(_path, _pack, _commands), do: :erlang.nif_error(:nif_not_loaded)

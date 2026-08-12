@@ -103,8 +103,6 @@ defmodule FornacastWeb.HTML do
           <div class="appbar-left">
             <a class="brand-mark" href="/" aria-label="Fornacast dashboard">Fornacast</a>
             <nav class="appbar-nav" aria-label="Workspace">
-              <a class="nav-link" href="/issues">Issues</a>
-              <a class="nav-link" href="/pulls">Pull Requests</a>
               #{repository_menu(current_user)}
             </nav>
           </div>
@@ -155,8 +153,6 @@ defmodule FornacastWeb.HTML do
         "<div class=\"appbar-left\">",
         "<a class=\"brand-mark\" href=\"/\" aria-label=\"Fornacast dashboard\">Fornacast</a>",
         "<nav class=\"appbar-nav\" aria-label=\"Workspace\">",
-        "<a class=\"nav-link\" href=\"/issues\">Issues</a>",
-        "<a class=\"nav-link\" href=\"/pulls\">Pull Requests</a>",
         repository_menu(current_user),
         "</nav></div>",
         "<div class=\"appbar-actions\">",
