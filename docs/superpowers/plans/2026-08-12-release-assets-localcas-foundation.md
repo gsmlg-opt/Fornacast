@@ -1384,11 +1384,13 @@ git commit -m "feat(releases): validate LocalCAS roots at boot"
 
 **Files:**
 
+- Modify: `mix.exs`
 - Create: `apps/forge_releases/lib/forge_releases/asset_storage/supervisor.ex`
 - Create: `apps/forge_releases/lib/forge_releases/asset_storage/manager.ex`
 - Modify: `apps/forge_releases/lib/forge_releases/application.ex`
 - Modify: `apps/forge_releases/test/forge_releases/application_test.exs`
 - Create: `apps/forge_releases/test/forge_releases/asset_storage/manager_test.exs`
+- Create: `apps/forge_releases/test/support/release_mode_recovery.exs`
 
 - [ ] Add red supervision tests. Run them synchronously because they kill and observe the single application-owned instance:
 
@@ -1456,6 +1458,19 @@ test "forge_releases owns the storage subtree" do
 end
 ```
 
+Also assert the resolved release application list places
+`ex_storage_service: :temporary` immediately before the permanent
+`forge_releases` host. Run an isolated `mix run --no-start --no-compile`
+subprocess which explicitly starts `forge_releases` as permanent and ESS as
+temporary, kills `ExStorageService.Supervisor`, and proves that Manager restarts
+ESS plus its owned instance while the BEAM, `ForgeReleases.Supervisor`, Manager,
+and the Concord VSR supervisor remain alive. Do not rely on Mix's default
+temporary application start mode for this lifecycle assertion. Reload the
+`forge_releases` application spec inside that subprocess without its
+`:fornacast` dependency so the probe starts no Repo and remains independent of
+the compile-time Turso/PostgreSQL matrix; keep the actual release-mode list as a
+separate exact assertion.
+
 - [ ] Run the focused tests before implementing supervision:
 
 ```bash
@@ -1464,6 +1479,25 @@ mix test apps/forge_releases/test/forge_releases/application_test.exs \
 ```
 
 Expected red result: missing `AssetStorage.Supervisor` and `AssetStorage.Manager` modules/processes.
+
+- [ ] Mark the dependency infrastructure temporary in the production release,
+  before its permanent host application:
+
+```elixir
+[
+  applications: [
+    # ...
+    forge_pulls: :permanent,
+    ex_storage_service: :temporary,
+    forge_releases: :permanent
+    # ...
+  ]
+]
+```
+
+The Manager owns recovery of this infrastructure. Leaving ESS inferred as
+permanent would terminate the BEAM on a full ESS application failure before the
+Manager can reconcile it.
 
 - [ ] Make `ForgeReleases.Application` own the storage subtree:
 
@@ -1642,16 +1676,20 @@ mix test apps/forge_releases/test/forge_releases/application_test.exs \
   apps/forge_releases/test/forge_releases/asset_storage/manager_test.exs --repeat-until-failure 3
 ```
 
-Expected green result: all three runs report `0 failures`; killing the temporary child never terminates `ForgeReleases.Supervisor`.
+Expected green result: all three runs report `0 failures`; killing either the
+temporary instance child or the temporary ESS application never terminates the
+permanent host, `ForgeReleases.Supervisor`, Manager, or Concord VSR supervisor.
 
 - [ ] Commit the supervision boundary:
 
 ```bash
-git add apps/forge_releases/lib/forge_releases/application.ex \
+git add mix.exs \
+  apps/forge_releases/lib/forge_releases/application.ex \
   apps/forge_releases/lib/forge_releases/asset_storage/supervisor.ex \
   apps/forge_releases/lib/forge_releases/asset_storage/manager.ex \
   apps/forge_releases/test/forge_releases/application_test.exs \
-  apps/forge_releases/test/forge_releases/asset_storage/manager_test.exs
+  apps/forge_releases/test/forge_releases/asset_storage/manager_test.exs \
+  apps/forge_releases/test/support/release_mode_recovery.exs
 git commit -m "feat(releases): supervise embedded LocalCAS readiness"
 ```
 
@@ -1666,7 +1704,7 @@ git commit -m "feat(releases): supervise embedded LocalCAS readiness"
 - Modify: `apps/forge_releases/lib/forge_releases/asset_storage/local_cas.ex`
 - Modify: `apps/forge_releases/test/forge_releases/asset_storage/local_cas_test.exs`
 
-- [ ] Add end-to-end red tests for the public contract. Use small chunks while proving state threading, digest publication, range reads, expected-size validation, descriptor ownership, idempotent close, lower-limit enforcement, lowercase keys, and normalized errors:
+- [ ] Add end-to-end red tests for the public contract. Use small chunks while proving exact success/error state threading, digest publication, range reads, expected-size validation, descriptor ownership and closure on every failed open, idempotent close, lower-limit enforcement, enforced callback chunk/read-timeout ceilings, lowercase keys, durable staging cleanup, and normalized errors:
 
 ```elixir
 describe "opaque adapter contract" do
@@ -1776,6 +1814,51 @@ describe "opaque adapter contract" do
     assert {:error, :invalid_source} = ForgeReleases.AssetStorage.stat(uppercase)
     assert {:error, :invalid_source} = ForgeReleases.AssetStorage.open(uppercase, 1, :all)
   end
+
+  test "reader ceilings are enforced and the latest classified state is retained", %{
+    staging_key: key
+  } do
+    oversized = fn state, options ->
+      assert options[:length] <= 1_048_576
+      assert options[:read_length] <= options[:length]
+      assert options[:read_timeout] <= 30_000
+      next = %{state | calls: state.calls + 1, reader_error: :reader}
+      {:more, :binary.copy(<<0>>, options[:length] + 1), next}
+    end
+
+    initial = %{calls: 0, reader_error: nil}
+
+    assert {:error, :invalid_source, %{calls: 1, reader_error: :reader}} =
+             ForgeReleases.AssetStorage.stage_from_reader(
+               key,
+               oversized,
+               initial,
+               read_options: [length: 8, read_length: 4, read_timeout: 30_000]
+             )
+
+    for classification <- [:timeout, :lost_lease] do
+      reader = fn state, _options ->
+        next = %{state | calls: state.calls + 1, reader_error: classification}
+        {:error, :deadline, next}
+      end
+
+      assert {:error, _normalized, %{calls: 1, reader_error: ^classification}} =
+               ForgeReleases.AssetStorage.stage_from_reader(
+                 "#{key}-#{classification}",
+                 reader,
+                 initial,
+                 read_options: [length: 8, read_length: 4, read_timeout: 30_000]
+               )
+    end
+
+    assert {:error, :invalid_source, ^initial} =
+             ForgeReleases.AssetStorage.stage_from_reader(
+               "#{key}-timeout",
+               oversized,
+               initial,
+               read_options: [length: 8, read_length: 4, read_timeout: 30_001]
+             )
+  end
 end
 
 describe "staged survivor recovery boundary" do
@@ -1869,7 +1952,7 @@ describe "staged survivor recovery boundary" do
 end
 ```
 
-At the top of this test module, use `async: false` because the cap test temporarily changes one application value:
+At the top of this test module, use `async: false` because the cap test temporarily changes one application value and the injected filesystem tests record ordered fd/directory-sync calls:
 
 ```elixir
 use ExUnit.Case, async: false
@@ -1990,12 +2073,24 @@ defimpl Inspect, for: ForgeReleases.AssetStorage.Source do
 end
 ```
 
-- [ ] Extend `FileSystem` with only the two non-recursive directory operations needed by survivor recovery:
+`@opaque` and the redacted `Inspect` implementations establish a caller convention;
+Elixir structs remain introspectable at runtime. Code outside the adapter must not
+pattern-match either struct or retain its fields. A `Source` is additionally a
+single-owner, controlling-process-affine cursor: one process must thread each
+returned value sequentially through `read/2` and finally `close/1`; it must not be
+shared between tasks. The later domain plan enforces that convention by opening
+and consuming a source in the request process.
+
+- [ ] Extend `FileSystem` with the non-recursive directory operations needed by survivor recovery and durable namespace cleanup:
 
 ```elixir
 def ls(path), do: File.ls(path)
 def rmdir(path), do: File.rmdir(path)
+def open_directory(path), do: :file.open(String.to_charlist(path), [:read, :raw, :directory])
 ```
+
+The existing `sync/1` and `close/1` functions are used for both file and directory
+descriptors. No recursive removal operation belongs in this boundary.
 
 - [ ] Expand `LocalCAS` with the behavior, aliases, fd record, validators, readiness gate, and adapter-owned options. Retain the preflight code from Task 4:
 
@@ -2041,13 +2136,20 @@ def capacity(fs) when is_atom(fs) do
   end
 end
 
-defp validate_digest(storage_key)
-     when is_binary(storage_key) and storage_key =~ @digest_regex,
-     do: :ok
+defp validate_digest(storage_key) when is_binary(storage_key) do
+  if Regex.match?(@digest_regex, storage_key),
+    do: :ok,
+    else: {:error, :invalid_source}
+end
 
 defp validate_digest(_storage_key), do: {:error, :invalid_source}
 
-defp validate_staging_key(key) when is_binary(key) and key =~ @staging_key_regex, do: :ok
+defp validate_staging_key(key) when is_binary(key) do
+  if Regex.match?(@staging_key_regex, key),
+    do: :ok,
+    else: {:error, :invalid_source}
+end
+
 defp validate_staging_key(_key), do: {:error, :invalid_source}
 
 defp stage_options(%Config{} = config, staging_key, options) do
@@ -2076,7 +2178,8 @@ defp validate_read_options(options) do
          Keyword.fetch!(options, :length),
        read_length when is_integer(read_length) and read_length > 0 and read_length <= length <-
          Keyword.fetch!(options, :read_length),
-       timeout when is_integer(timeout) and timeout > 0 <- Keyword.fetch!(options, :read_timeout) do
+       timeout when is_integer(timeout) and timeout > 0 and timeout <= 30_000 <-
+         Keyword.fetch!(options, :read_timeout) do
     :ok
   else
     _ -> {:error, :invalid_source}
@@ -2107,7 +2210,11 @@ def stage_from_reader(staging_key, reader, state, options)
   with :ok <- validate_staging_key(staging_key),
        {:ok, config} <- ready_config(),
        {:ok, cas_options, read_options} <- stage_options(config, staging_key, options) do
-    wrapped_reader = fn reader_state -> reader.(reader_state, read_options) end
+    wrapped_reader = fn reader_state ->
+      reader_state
+      |> reader.(read_options)
+      |> enforce_reader_chunk(read_options[:length])
+    end
 
     case ESSLocalCAS.stage_from_reader(wrapped_reader, state, cas_options) do
       {:ok, staged, final_state} ->
@@ -2130,6 +2237,17 @@ end
 
 def stage_from_reader(_staging_key, _reader, state, _options),
   do: {:error, :invalid_source, state}
+
+defp enforce_reader_chunk({kind, chunk, _next_state} = result, maximum_bytes)
+     when kind in [:more, :ok] and is_binary(chunk) and
+            byte_size(chunk) <= maximum_bytes,
+     do: result
+
+defp enforce_reader_chunk({kind, _chunk, next_state}, _maximum_bytes)
+     when kind in [:more, :ok],
+     do: {:error, :invalid_source, next_state}
+
+defp enforce_reader_chunk(result, _maximum_bytes), do: result
 
 @impl true
 def commit(%StagedRef{} = staged) do
@@ -2211,13 +2329,20 @@ end
 ```elixir
 @impl true
 def open(storage_key, expected_size, range)
+    when is_integer(expected_size) and expected_size >= 0,
+    do: open(storage_key, expected_size, range, FileSystem)
+
+def open(_storage_key, _expected_size, _range), do: {:error, :invalid_source}
+
+@doc false
+def open(storage_key, expected_size, range, fs)
     when is_integer(expected_size) and expected_size >= 0 do
   with :ok <- validate_digest(storage_key),
        {:ok, config} <- ready_config(),
        {:ok, {:file, path, 0, ^expected_size}} <-
          ESSLocalCAS.open(storage_key, nil, blob_options(config)),
-       {:ok, io} <- FileSystem.open(path, [:read, :raw, :binary]) do
-    finish_open(io, expected_size, range)
+       {:ok, io} <- fs.open(path, [:read, :raw, :binary]) do
+    finish_open(fs, io, expected_size, range)
   else
     {:ok, {:file, _path, _offset, _actual_size}} -> {:error, :integrity_mismatch}
     {:error, reason} -> {:error, normalize(:open, reason)}
@@ -2225,24 +2350,27 @@ def open(storage_key, expected_size, range)
   end
 end
 
-def open(_storage_key, _expected_size, _range), do: {:error, :invalid_source}
-
-defp finish_open(io, expected_size, range) do
+defp finish_open(fs, io, expected_size, range) do
   result =
-    with {:ok, info} <- FileSystem.read_file_info(io),
-         :regular <- file_info(info, :type),
-         ^expected_size <- file_info(info, :size),
-         {:ok, offset, length} <- apply_range(expected_size, range) do
-      {:ok, %Source{io: io, offset: offset, position: 0, remaining: length}}
-    else
-      {:error, :invalid_range} -> {:error, :invalid_source}
-      _ -> {:error, :integrity_mismatch}
+    case fs.read_file_info(io) do
+      {:ok, info} ->
+        with :regular <- file_info(info, :type),
+             ^expected_size <- file_info(info, :size),
+             {:ok, offset, length} <- apply_range(expected_size, range) do
+          {:ok, %Source{io: io, offset: offset, position: 0, remaining: length}}
+        else
+          {:error, :invalid_range} -> {:error, :invalid_source}
+          _type_or_size_mismatch -> {:error, :integrity_mismatch}
+        end
+
+      {:error, _os_reason} ->
+        {:error, :unavailable}
     end
 
   case result do
     {:ok, _source} = success -> success
     {:error, _reason} = error ->
-      _ = FileSystem.close(io)
+      _ = fs.close(io)
       error
   end
 end
@@ -2304,24 +2432,33 @@ defp enforce_survivor_cap(size, maximum_size) when size <= maximum_size, do: :ok
 defp enforce_survivor_cap(_size, _maximum_size), do: {:error, :entity_too_large}
 
 @impl true
-def cleanup_staging(staging_key) do
+def cleanup_staging(staging_key), do: cleanup_staging(staging_key, FileSystem)
+
+@doc false
+def cleanup_staging(staging_key, fs) do
   with :ok <- validate_staging_key(staging_key),
        {:ok, config} <- ready_config() do
-    directory = Path.join([config.tmp_root, "uploads", staging_key])
+    uploads_directory = Path.join(config.tmp_root, "uploads")
+    staging_directory = Path.join(uploads_directory, staging_key)
 
-    cleanup_single_survivor(FileSystem, directory)
+    cleanup_single_survivor(fs, uploads_directory, staging_directory)
   end
 end
 
-defp cleanup_single_survivor(fs, directory) do
-  case fs.lstat(directory) do
+defp cleanup_single_survivor(fs, uploads_directory, staging_directory) do
+  case fs.lstat(staging_directory) do
     {:error, :enoent} ->
-      :ok
+      case sync_surviving_parent(fs, uploads_directory) do
+        :ok -> :ok
+        {:error, _reason} -> {:error, :unavailable}
+      end
 
     {:ok, %File.Stat{type: :directory}} ->
-      with {:ok, entries} <- fs.ls(directory),
-           :ok <- remove_direct_entry(fs, directory, entries),
-           :ok <- remove_empty_directory(fs, directory) do
+      with {:ok, entries} <- fs.ls(staging_directory),
+           :ok <- remove_direct_entry(fs, staging_directory, entries),
+           :ok <- sync_directory(fs, staging_directory),
+           :ok <- remove_empty_directory(fs, staging_directory),
+           :ok <- sync_surviving_parent(fs, uploads_directory) do
         :ok
       else
         {:error, reason} when reason in [:invalid_source, :not_found] -> {:error, reason}
@@ -2368,6 +2505,30 @@ defp remove_empty_directory(fs, directory) do
   end
 end
 
+defp sync_surviving_parent(fs, directory) do
+  case sync_directory(fs, directory) do
+    {:error, :enoent} -> :ok
+    result -> result
+  end
+end
+
+defp sync_directory(fs, directory) do
+  case fs.open_directory(directory) do
+    {:ok, io} ->
+      sync_result = fs.sync(io)
+      close_result = fs.close(io)
+
+      case {sync_result, close_result} do
+        {:ok, :ok} -> :ok
+        {{:error, reason}, _close} -> {:error, reason}
+        {_sync, {:error, reason}} -> {:error, reason}
+      end
+
+    {:error, reason} ->
+      {:error, reason}
+  end
+end
+
 @impl true
 def read(%Source{remaining: 0}, requested_bytes)
     when is_integer(requested_bytes) and requested_bytes > 0,
@@ -2410,6 +2571,14 @@ end
 
 def close(_source), do: :ok
 ```
+
+`recover_stage/3` and `cleanup_staging/1` assume exclusive ownership of the
+logical staging key. The adapter validates contents defensively but does not
+linearize two callers mutating the same directory. Plan 2 must hold the matching
+operation lease and local task fence across either call. Cleanup is retry-safe
+and crash-durable: after unlink it fsyncs the staging directory; after `rmdir` it
+fsyncs `uploads`; a retry that observes the staging directory already absent
+still fsyncs the surviving `uploads` parent before reporting success.
 
 - [ ] Add the exhaustive normalizer. No raw ESS, filesystem, exception text, or path may cross the module:
 
@@ -2467,6 +2636,58 @@ test "raw ESS and filesystem errors collapse to the storage algebra" do
   assert LocalCAS.normalize(:delete, {:delete, :eacces}) == :unavailable
 end
 ```
+
+- [ ] Add injected-filesystem tests for descriptor closure and cleanup
+  durability. The test filesystem delegates real open/remove calls and sends
+  ordered events to the test process:
+
+```elixir
+test "failed live fstat always closes the opened descriptor", context do
+  digest = publish_blob!(context, "descriptor")
+
+  assert {:error, :unavailable} =
+           LocalCAS.open(digest, 10, :all, FstatFailureFS)
+
+  assert_receive {:fs_close, _io}
+
+  assert {:error, :integrity_mismatch} =
+           LocalCAS.open(digest, 10, :all, FstatTypeMismatchFS)
+
+  assert_receive {:fs_close, _io}
+end
+
+test "cleanup durably retries after each namespace sync point", context do
+  write_single_survivor!(context)
+  DurabilityFS.fail_once(:staging_directory_sync)
+
+  assert {:error, :unavailable} = LocalCAS.cleanup_staging(context.key, DurabilityFS)
+  refute File.exists?(Path.join(context.directory, "upload-1"))
+  assert File.dir?(context.directory)
+
+  assert :ok = LocalCAS.cleanup_staging(context.key, DurabilityFS)
+  refute File.exists?(context.directory)
+  assert DurabilityFS.sync_order() == [:staging, :staging, :uploads]
+
+  write_single_survivor!(context)
+  DurabilityFS.fail_once(:uploads_directory_sync)
+  assert {:error, :unavailable} = LocalCAS.cleanup_staging(context.key, DurabilityFS)
+  refute File.exists?(context.directory)
+
+  # An already-absent retry still fsyncs the surviving parent and normalizes
+  # a parent-fsync failure before the following retry succeeds.
+  DurabilityFS.fail_once(:uploads_directory_sync)
+  assert {:error, :unavailable} = LocalCAS.cleanup_staging(context.key, DurabilityFS)
+  assert :ok = LocalCAS.cleanup_staging(context.key, DurabilityFS)
+  assert List.ends_with?(DurabilityFS.sync_order(), [:uploads, :uploads, :uploads])
+end
+```
+
+Also cover live type and size mismatches plus an invalid range separately from
+the `fstat` OS failure. Type/size mismatches return `:integrity_mismatch`, the
+range returns `:invalid_source`, only the OS failure returns `:unavailable`, and
+every failed finish-open path observes exactly one close. The durability fake
+must delegate `open_directory/1`, `sync/1`, and `close/1` to real directory
+descriptors so this is not merely a call-order mock.
 
 - [ ] Format and run the adapter test three times. Confirm there are no leaked staging files after ordinary errors:
 

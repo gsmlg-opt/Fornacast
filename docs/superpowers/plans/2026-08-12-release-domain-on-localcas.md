@@ -93,7 +93,7 @@ The arity-two reader receives all three bounded options on every invocation:
 
 ```elixir
 probe_bytes = max(remaining_bytes + 1, 1)
-remaining_read_ms = min(remaining_idle_ms, remaining_total_ms)
+remaining_read_ms = Enum.min([remaining_idle_ms, remaining_total_ms, 30_000])
 
 [
   length: min(1_048_576, probe_bytes),
@@ -102,7 +102,9 @@ remaining_read_ms = min(remaining_idle_ms, remaining_total_ms)
 ]
 ```
 
-Reject any callback result whose bytes exceed `remaining_bytes`; the extra probe byte distinguishes exact-cap EOF from a one-byte overflow without allocating the configured limit.
+Reject any callback result whose bytes exceed the supplied `:length` before
+applying the domain's `remaining_bytes` check; the extra probe byte distinguishes
+exact-cap EOF from a one-byte overflow without allocating the configured limit.
 
 `ForgeReleases` treats reader state as an opaque term and always returns its latest value. The domain never receives an Authorization header or token. The only storage success shapes used by this plan are:
 
@@ -1478,7 +1480,7 @@ test "abort reports unavailable when durable compensation cannot commit", contex
 end
 ```
 
-Use a sparse/counter reader for the immutable 2,147,483,648-byte boundary; never allocate that binary. Assert the callback always receives positive `:length`, `:read_length`, and `:read_timeout`; each is within the domain limit; reader state is never inspected or logged; and every result returns the latest reader state.
+Use a sparse/counter reader for the immutable 2,147,483,648-byte boundary; never allocate that binary. Assert the callback always receives positive `:length`, `:read_length`, and `:read_timeout`; `:length` is at most 1 MiB, `:read_length <= :length`, and `:read_timeout` is at most 30 seconds. Return a chunk one byte larger than the supplied `:length` and assert the domain reader wrapper rejects it while preserving that callback's newest state; Plan 1 independently enforces its adapter-level ceiling. Separately force timeout and lease-loss classifications and assert every result returns the exact latest reader state: timeout compensates and becomes `{:request_timeout, :asset}` (HTTP 408 at the API boundary), while `:lost_lease` returns unavailable without stale discard or compensation. Reader state is never inspected or logged.
 
 - [ ] Run the focused upload suite and confirm the upload domain is absent:
 
@@ -1557,12 +1559,19 @@ defp deadline_reader(raw_reader, %Upload{} = upload, reader_state, clock) do
       read_options = [
         length: length,
         read_length: min(65_536, length),
-        read_timeout: min(total_remaining, idle_remaining)
+        read_timeout: Enum.min([total_remaining, idle_remaining, 30_000])
       ]
 
       with {:ok, state} <- renew_if_due(state, clock),
            result <- safe_reader_call(raw_reader, state.raw_state, read_options) do
-        consume_reader_result(result, state, remaining_bytes, clock.monotonic_ms.(), upload.idle_ms)
+        consume_reader_result(
+          result,
+          state,
+          remaining_bytes,
+          length,
+          clock.monotonic_ms.(),
+          upload.idle_ms
+        )
       else
         {:error, :lost_lease} -> {:error, :lost_lease, %{state | reader_error: :lost_lease}}
       end
@@ -1586,37 +1595,78 @@ defp safe_reader_call(reader, raw_state, read_options) do
   end
 end
 
-defp consume_reader_result({:more, <<>>, raw_state}, state, _remaining, _now_ms, _idle_ms),
+defp consume_reader_result(
+       {:more, <<>>, raw_state},
+       state,
+       _remaining,
+       _maximum_chunk,
+       _now_ms,
+       _idle_ms
+     ),
   do: {:error, :reader_no_progress, %{state | raw_state: raw_state, reader_error: :reader}}
 
-defp consume_reader_result({:ok, <<>>, raw_state}, state, _remaining, _now_ms, _idle_ms),
+defp consume_reader_result(
+       {:ok, <<>>, raw_state},
+       state,
+       _remaining,
+       _maximum_chunk,
+       _now_ms,
+       _idle_ms
+     ),
   do: {:ok, <<>>, %{state | raw_state: raw_state}}
 
-defp consume_reader_result({kind, bytes, raw_state}, state, remaining, now_ms, idle_ms)
+defp consume_reader_result(
+       {kind, bytes, raw_state},
+       state,
+       remaining,
+       maximum_chunk,
+       now_ms,
+       idle_ms
+     )
      when kind in [:more, :ok] and is_binary(bytes) and byte_size(bytes) > 0 do
-  if byte_size(bytes) > remaining do
-    {:error, :entity_too_large,
-     %{state | raw_state: raw_state, reader_error: :entity_too_large}}
-  else
-    next = %{
-      state
-      | raw_state: raw_state,
-        bytes: state.bytes + byte_size(bytes),
-        idle_deadline: now_ms + idle_ms
-    }
+  cond do
+    byte_size(bytes) > maximum_chunk ->
+      {:error, :reader_chunk_too_large,
+       %{state | raw_state: raw_state, reader_error: :reader}}
 
-    {kind, bytes, next}
+    byte_size(bytes) > remaining ->
+      {:error, :entity_too_large,
+       %{state | raw_state: raw_state, reader_error: :entity_too_large}}
+
+    true ->
+      next = %{
+        state
+        | raw_state: raw_state,
+          bytes: state.bytes + byte_size(bytes),
+          idle_deadline: now_ms + idle_ms
+      }
+
+      {kind, bytes, next}
   end
 end
 
-defp consume_reader_result({:done, raw_state}, state, _remaining, _now_ms, _idle_ms),
+defp consume_reader_result(
+       {:done, raw_state},
+       state,
+       _remaining,
+       _maximum_chunk,
+       _now_ms,
+       _idle_ms
+     ),
   do: {:done, %{state | raw_state: raw_state}}
 
-defp consume_reader_result({:error, reason, raw_state}, state, _remaining, _now_ms, _idle_ms),
+defp consume_reader_result(
+       {:error, reason, raw_state},
+       state,
+       _remaining,
+       _maximum_chunk,
+       _now_ms,
+       _idle_ms
+     ),
   do: {:error, reason, %{state | raw_state: raw_state, reader_error: :reader}}
 ```
 
-Catch callback exceptions at this boundary, retain the latest pre-call reader state, mark `reader_error: :reader`, and route it through ordinary compensation. `renew_if_due/2` calls `OperationLease.renew_owned/3`, replaces `state.operation`, and advances `renew_at`; it never reuses a stale row.
+Catch callback exceptions at this boundary, retain the latest pre-call reader state, mark `reader_error: :reader`, and route it through ordinary compensation. `renew_if_due/2` calls `OperationLease.renew_owned/3`, replaces `state.operation`, and advances `renew_at`; it never reuses a stale row. The supplied `:read_timeout` is cooperative input to the raw callback; it does not preempt a callback that ignores the option, so the request/connection owner remains responsible for its outer deadline.
 
 - [ ] Implement stage, blob attach, monitored commit/stat, metadata visibility, and exact success-shape checks. The adapter's arity-one ESS wrapper remains Plan 1's responsibility; this domain wrapper is the arity-two callback it receives:
 
@@ -1632,18 +1682,40 @@ def stream_asset_upload(%Upload{} = upload, reader, reader_state) when is_functi
              wrapped_reader,
              stream_state,
              max_size: upload.max_bytes,
-             read_options: [length: 1_048_576, read_length: 65_536, read_timeout: upload.idle_ms]
+             read_options: [
+               length: 1_048_576,
+               read_length: 65_536,
+               read_timeout: min(upload.idle_ms, 30_000)
+             ]
            ) do
         {:ok, staged_ref, metadata, final_state} ->
           finish_staged_upload(upload, staged_ref, metadata, final_state)
 
         {:error, reason, final_state} ->
-          compensate_stream_error(upload, final_state.operation, reason, final_state.raw_state)
+          finish_stage_error(upload, reason, final_state)
       end
 
     {:error, :lost_lease, latest_reader_state} ->
       {:error, {:unavailable, :asset_storage}, latest_reader_state}
   end
+end
+
+defp finish_stage_error(_upload, _reason, %{reader_error: :lost_lease} = state) do
+  {:error, {:unavailable, :asset_storage}, state.raw_state}
+end
+
+defp finish_stage_error(upload, reason, %{reader_error: :timeout} = state) do
+  compensate_stream_error(
+    upload,
+    state.operation,
+    reason,
+    state.raw_state,
+    {:request_timeout, :asset}
+  )
+end
+
+defp finish_stage_error(upload, reason, state) do
+  compensate_stream_error(upload, state.operation, reason, state.raw_state)
 end
 
 defp finish_staged_upload(upload, staged_ref, metadata, state) do
@@ -1743,6 +1815,16 @@ end
 ```
 
 `persist_metadata_ready/3` atomically marks the blob ready after commit/stat, fills the still-pending asset's size/digest/storage key, and owner-retains the operation at `metadata_ready`. `complete_upload/2` atomically makes the asset available, records `release_asset.created` with `operation_id: "release_asset_operation:<id>"`, and uses releasing `OperationLease.update_owned/3` to mark completed. Success returns only after that commit.
+
+The five-argument `compensate_stream_error/5` performs the same exact-once
+durable compensation as the ordinary four-argument form but returns its supplied
+public error only after that transaction commits; a persistence failure still
+returns `{:unavailable, :release_persistence}`. Inspect `reader_error` before any
+compensation. In particular, a lease-loss final state may contain an obsolete
+operation version, so it returns unavailable immediately and performs no
+discard, staging cleanup, or metadata mutation. Tests must make the fault storage
+return both classifications with distinct newest raw states and assert those
+states are returned unchanged.
 
 The 30-second attachment deadline is monotonic and testable through the existing clock seam. `:busy_deleting` is coordination, not payload failure: after bounded retries it releases only the newest upload lease and returns unavailable, retaining the operation and staging key for recovery. Never route a two-tuple no-row ownership result through compensation. A later request/recovery pass may attach after the competing task is down; routine overlap must not consume or discard staged content.
 
@@ -2522,6 +2604,12 @@ end
 
 `recover_stage/3` is the Plan 1 gate that enforces exactly one direct regular entry, no symlink/nesting/multiple entries, expected size, and effective cap before calling ESS `LocalCAS.recover_stage/4`. ESS then hashes the file, confirms the same filesystem and stable device/inode, and returns a committable stage without copying it. After any missing/invalid survivor, recheck ready CAS exactly once before compensation to close a concurrent-commit race.
 
+Recovery owns the staging key exclusively for the duration of this effect: the
+claimed `AssetOperation` lease and `MonitoredWork` task fence must remain active
+across `recover_stage/3`, commit, stat, and verify. Do not invoke recovery or
+cleanup for the same staging key from a second request, task, or scheduler lane;
+Plan 1 deliberately does not serialize concurrent directory mutation.
+
 - [ ] Put in-place recovery, commit, stat, and verify inside the same `MonitoredWork` effect. It inherits the scheduler's absolute work deadline through the outer timeout and must not reset a fresh 30-minute budget inside the operation:
 
 ```elixir
@@ -2593,6 +2681,13 @@ defp cleanup_key(key), do: storage_module().cleanup_staging(key)
 ```
 
 The query is indexed by `state, id` and includes `completed`, `failed`, and `deleted`. Cleanup failure increments safe retry telemetry and retains the logical key; it never rolls back terminal metadata. Add a fault test where cleanup fails after `completed`, then the next scheduler pass succeeds and clears the column. This bounded terminal scan is mandatory even when no nonterminal operation exists.
+
+The terminal-cleanup claim and local task fence are also the exclusive ownership
+proof for `cleanup_staging/1`. Keep them until Plan 1 has durably fsynced both the
+staging-directory unlink and the `uploads` parent after `rmdir`; clear
+`staging_key` only after that success. A retry after either injected directory
+sync failure must retain the same logical key, reacquire exclusive ownership, and
+complete idempotently.
 
 - [ ] Implement idempotent asset/release deletion recovery. Asset `deleting` finishes the Task 6 metadata boundary. Release `deleting` admits/resumes at most 50 asset deletions; `assets_deleted` requires zero remaining assets before metadata deletion; `metadata_deleted` records the deduplicated audit and completes. Every pass preserves the tag and durable operation rows:
 
