@@ -99,7 +99,12 @@ defmodule ForgeReleases.AssetStorage.ManagerTest do
     old_manager = Process.whereis(Manager)
 
     Process.exit(old_engine, :kill)
-    Process.exit(old_manager, :kill)
+
+    assert :ok =
+             Supervisor.terminate_child(ForgeReleases.AssetStorage.Supervisor, Manager)
+
+    assert {:ok, _manager} =
+             Supervisor.restart_child(ForgeReleases.AssetStorage.Supervisor, Manager)
 
     assert_eventually(fn ->
       manager = Process.whereis(Manager)
