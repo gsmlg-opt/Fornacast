@@ -6,7 +6,7 @@
 
 **Architecture:** SQL is the sole metadata, operation-journal, lease, and blob-inventory authority; LocalCAS stores only immutable bytes addressed by SHA-256. Foreground and recovery coordinators use portable compare-and-swap leases and a same-BEAM task fence around every potentially long filesystem or Git effect. User-visible deletion removes metadata immediately, while retained digest tombstones and reference-aware GC reclaim bytes later. This plan consumes the opaque `ForgeReleases.AssetStorage` contract from Plan 1 and does not expose storage paths or ESS values.
 
-**Tech Stack:** Elixir 1.20, OTP 29, Ecto 3.14, Turso/libSQL, PostgreSQL 17, GitCore/gix, ExStorageService 0.6.2 LocalCAS through Plan 1's adapter, ExUnit, and `:telemetry`.
+**Tech Stack:** Elixir 1.20, OTP 29, Ecto 3.14, Turso/libSQL, PostgreSQL 17, GitCore/gix, ExStorageService 0.6.4 LocalCAS through Plan 1's adapter, ExUnit, and `:telemetry`.
 
 ---
 
@@ -14,10 +14,11 @@
 
 Execute this plan only after both prerequisites are present on the implementation branch:
 
-1. `docs/superpowers/plans/2026-08-12-release-assets-localcas-foundation.md` is fully implemented, including `forge_releases` application wiring, the exact ESS 0.6.2 pin, readiness gating, opaque staging/source wrappers, `AssetStorage.open/3`, `open_staged_survivor/2`, `cleanup_staging/1`, `read/2`, `close/1`, and path-free `capacity/0`, and owner-retaining `Fornacast.OperationLease.renew_owned/3` and `update_owned/4`.
+1. `docs/superpowers/plans/2026-08-12-release-assets-localcas-foundation.md` is fully implemented, including `forge_releases` application wiring, the exact ESS 0.6.4 pin, readiness gating, opaque staging/source wrappers, `AssetStorage.open/3`, `recover_stage/3`, `cleanup_staging/1`, `read/2`, `close/1`, and path-free `capacity/0`, and owner-retaining `Fornacast.OperationLease.renew_owned/3` and `update_owned/4`.
 2. The repository issues/pulls prerequisite work has landed, including `Fornacast.Audit.record_multi/8`, `ForgeRepos.with_write_fence/3`, `ForgeRepos.RepositoryWriteReconcilers`, durable operation rows, and the shared operation-lease implementation. Do not copy files from `.trees/repository-issues-pulls` into this branch.
 
-Upstream ESS issues [#13](https://github.com/gsmlg-opt/ex_storage_service/issues/13), [#14](https://github.com/gsmlg-opt/ex_storage_service/issues/14), and [#15](https://github.com/gsmlg-opt/ex_storage_service/issues/15) remain tracked, non-blocking dependency work. Keep their exact `# WORKAROUND(upstream)` comments at the recovery-restage, direct-loose-CAS, and absent-tombstone re-delete callsites. If a newer ESS release lands those fixes, stop and revise Plans 1 and 2 together instead of silently changing the pinned adapter behavior.
+[ExStorageService v0.6.4](https://github.com/gsmlg-opt/ex_storage_service/releases/tag/v0.6.4)
+closes upstream issues [#13](https://github.com/gsmlg-opt/ex_storage_service/issues/13), [#14](https://github.com/gsmlg-opt/ex_storage_service/issues/14), and [#15](https://github.com/gsmlg-opt/ex_storage_service/issues/15) through [PR #16](https://github.com/gsmlg-opt/ex_storage_service/pull/16). Plans 1 and 2 therefore use the supported recovery, direct-loose-CAS, and durable-delete contracts without temporary workaround markers.
 
 This plan owns release, asset, operation, and blob-ledger persistence; release/tag lifecycle; upload/download/metadata/delete domain APIs; monitored effect fencing; total recovery; BlobGC; integrity telemetry; aggregate capacity/operation/blob-state telemetry; and focused Turso/PostgreSQL acceptance. It explicitly excludes HTTP controllers, serializers, routes, OpenAPI files, client scripts, health endpoint changes, production releases, Docker acceptance, S3, and Git LFS. Those product/API and deployment checks belong to Plan 3.
 
@@ -115,14 +116,16 @@ Reject any callback result whose bytes exceed `remaining_bytes`; the extra probe
 Crash recovery additionally consumes Plan 1's opaque staging APIs:
 
 ```elixir
-AssetStorage.open_staged_survivor(staging_key, expected_size)
-# => {:ok, opaque_source} | {:error, storage_error}
+AssetStorage.recover_stage(staging_key, expected_digest, expected_size)
+# => {:ok, opaque_staged_ref} | {:error, storage_error}
 
 AssetStorage.cleanup_staging(staging_key)
 # => :ok | {:error, storage_error}
 ```
 
-The source is read and closed only with `AssetStorage.read/2` and `close/1`; Plan 2 never derives, opens, lists, logs, or deletes a staging path itself.
+Download sources are read and closed only with `AssetStorage.read/2` and
+`close/1`; Plan 2 never derives, opens, lists, logs, or deletes a staging path
+itself.
 
 Operational telemetry consumes Plan 1's path-free capacity snapshot:
 
@@ -212,11 +215,11 @@ test -f apps/fornacast/lib/fornacast/operation_lease.ex && \
 test -f apps/fornacast/lib/fornacast/audit.ex && \
 test -f apps/forge_repos/lib/forge_repos/repository_write_reconcilers.ex && \
 rg -n 'def (renew_owned|update_owned)' apps/fornacast/lib/fornacast/operation_lease.ex && \
-rg -n 'def (stage_from_reader|commit|discard|stat|open|read|close|verify|delete|open_staged_survivor|cleanup_staging|capacity)' \
+rg -n 'def (stage_from_reader|commit|discard|stat|open|read|close|verify|delete|recover_stage|cleanup_staging|capacity)' \
   apps/forge_releases/lib/forge_releases/asset_storage.ex
 ```
 
-Expected before either prerequisite lands: non-zero exit status. Stop; merge or rebase the approved prerequisite work first. Expected after both land: exit status `0`, matches for `renew_owned/3`, both `update_owned/3` and `update_owned/4`, and every listed opaque adapter operation. In particular, Plan 1 must provide `open_staged_survivor(staging_key, expected_size)`, `cleanup_staging(staging_key)`, and `capacity/0`; Plan 2 must not derive their paths itself.
+Expected before either prerequisite lands: non-zero exit status. Stop; merge or rebase the approved prerequisite work first. Expected after both land: exit status `0`, matches for `renew_owned/3`, both `update_owned/3` and `update_owned/4`, and every listed opaque adapter operation. In particular, Plan 1 must provide `recover_stage(staging_key, expected_digest, expected_size)`, `cleanup_staging(staging_key)`, and `capacity/0`; Plan 2 must not derive their paths itself.
 
 - [ ] Prove the prerequisite contracts are green without broadening scope:
 
@@ -271,7 +274,7 @@ defp deps do
     {:forge_repos, in_umbrella: true},
     {:git_core, in_umbrella: true},
     {:ecto, "~> 3.14"},
-    {:ex_storage_service, "== 0.6.2"}
+    {:ex_storage_service, "== 0.6.4"}
   ]
 end
 ```
@@ -454,7 +457,6 @@ def up do
     add :kind, :string, null: false
     add :state, :string, null: false
     add :staging_key, :string
-    add :recovery_staging_key, :string
     add :storage_key, :string
     add :sha256_digest, :string
     add :size, :bigint
@@ -565,7 +567,7 @@ defmodule ForgeReleases.ReleaseOperation do
 end
 ```
 
-Use the corresponding asset-operation transitions `staging -> staged -> metadata_ready -> completed`, `staging | staged | metadata_ready -> failed`, and `deleting -> deleted`; use blob states `absent | pending | ready | candidate | deleting | corrupt`. `staging_key` and nullable `recovery_staging_key` are sanitized logical keys, never paths. Permit an owner to set `recovery_staging_key` once while `state == :staged`, retain both keys through terminal transition, and permit clearing both only from a terminal state after cleanup succeeds. Do not normalize digest input: require it already matches lowercase `~r/\A[0-9a-f]{64}\z/`, require `storage_key == sha256_digest`, sanitize failure strings to 512 printable characters, and reject every other immutable-field change.
+Use the corresponding asset-operation transitions `staging -> staged -> metadata_ready -> completed`, `staging | staged | metadata_ready -> failed`, and `deleting -> deleted`; use blob states `absent | pending | ready | candidate | deleting | corrupt`. The blob lease changeset permits `deleting -> absent` only after a durable delete result and `absent -> corrupt` only for an owner-retaining maintenance integrity finding; it permits no transition out of `corrupt`. `staging_key` is a sanitized logical key, never a path. Retain it through terminal transition and permit clearing it only from a terminal state after cleanup succeeds. Do not normalize digest input: require it already matches lowercase `~r/\A[0-9a-f]{64}\z/`, require `storage_key == sha256_digest`, sanitize failure strings to 512 printable characters, and reject every other immutable-field change.
 
 Publication operation creation requires `target_ref` matching `refs/tags/<validated tag_name>` and a lowercase 40- or 64-character `proposed_oid`; `expected_oid` is either null or the same OID shape. Release-delete operation creation requires all three ref fields to be null. Upload operation transitions require digest/key/size together at `staged`; delete operations never accept those upload-only fields.
 
@@ -1412,7 +1414,7 @@ defmodule ForgeReleases.FaultAssetStorage do
   def close(source), do: dispatch(:close, [source])
   def verify(key), do: dispatch(:verify, [key])
   def delete(key), do: dispatch(:delete, [key])
-  def open_staged_survivor(key, size), do: dispatch(:open_staged_survivor, [key, size])
+  def recover_stage(key, digest, size), do: dispatch(:recover_stage, [key, digest, size])
   def cleanup_staging(key), do: dispatch(:cleanup_staging, [key])
 
   defp dispatch(function, arguments) do
@@ -1744,7 +1746,7 @@ end
 
 The 30-second attachment deadline is monotonic and testable through the existing clock seam. `:busy_deleting` is coordination, not payload failure: after bounded retries it releases only the newest upload lease and returns unavailable, retaining the operation and staging key for recovery. Never route a two-tuple no-row ownership result through compensation. A later request/recovery pass may attach after the competing task is down; routine overlap must not consume or discard staged content.
 
-The post-terminal `discard/1` is best-effort only. The operation retains both logical staging keys until Task 7's bounded terminal-cleanup pass confirms `cleanup_staging/1` succeeded and clears them; a discard failure must not turn committed visible metadata back into an upload failure.
+The post-terminal `discard/1` is best-effort only. The operation retains its logical staging key until Task 7's bounded terminal-cleanup pass confirms `cleanup_staging/1` succeeded and clears it; a discard failure must not turn committed visible metadata back into an upload failure.
 
 - [ ] Implement exact-once compensation and pre-stream abort. Ordinary reader, timeout, overflow, stage, deterministic commit, and close errors delete the pending asset and decrement quota only if that delete affected one row; ambiguous commit or lost ownership leaves `staged` for recovery and performs no cleanup:
 
@@ -2257,7 +2259,7 @@ end
 
 Add the complete staged-upload matrix: already-ready digest; one valid regular survivor; missing survivor; symlink; nested entry; multiple entries; oversized file; survivor size mismatch; survivor digest mismatch; transient stage/stat/verify failures; ambiguous recovery commit; confirmed metadata-ready missing/corruption; and a concurrent ready blob appearing before the required second stat. Each branch runs twice. Pause each initial staged stat/verify, metadata-ready stat/verify, and post-survivor second stat/verify beyond the original 30-second lease; assert renewal advances `lock_version`, the returned newest row is threaded into the next transition, and no competing owner can mutate the journal. Add exact last-observation races from both `staged` and `metadata_ready`: pause after recovery observes missing/mismatch, let a second operation commit the same correct digest and touch the blob version, resume recovery, and assert the conditional corrupt transition loses, recovery retries from the caller's original state, re-observes ready bytes, and the correct blob is never marked corrupt.
 
-Add lease/task races: unexpired SQL lease; expired lease with active `TaskFence`; an expired `ready` request lease after a fresh supervisor restart; commit held beyond expiry; recovery-copy held beyond expiry; renewal failure; duplicate fence registration; a task dead before fence registration; stale task reply; and a fresh supervisor restart where no old task survives. Assert recovery conditionally reclaims only the expired unfenced `ready` lease, and every no-row `:lost_lease`, `:timeout`, or `:effect_down` return leaves the journal, quota, blob state, and both staging keys untouched.
+Add lease/task races: unexpired SQL lease; expired lease with active `TaskFence`; an expired `ready` request lease after a fresh supervisor restart; commit held beyond expiry; recovered-stage commit held beyond expiry; renewal failure; duplicate fence registration; a task dead before fence registration; stale task reply; and a fresh supervisor restart where no old task survives. Assert recovery conditionally reclaims only the expired unfenced `ready` lease, and every no-row `:lost_lease`, `:timeout`, or `:effect_down` return leaves the journal, quota, blob state, and staging key untouched.
 
 Add fairness fixtures with more than 50 entries in each stream. Keep the first page of tag repositories blocked by unexpected refs, the first page of file operations transiently unavailable, and the first page of terminal cleanups failing. Thread the returned cursors through at least three passes and assert a repository/operation above the original limit is attempted; after `next_cursor: nil`, assert the following pass wraps to the first page.
 
@@ -2357,7 +2359,7 @@ end
 
 For a recorded pre-existing tag (`expected_oid == proposed_oid`), a missing or different ref is unexpected. For `tag_ready` and `metadata_ready`, anything except `proposed_oid` is unexpected. Persist only sanitized `unexpected_ref`, emit one deduplicated safe alert, retain the nonterminal row, and return unavailable. Recovery never creates, moves, peels, or deletes a tag.
 
-- [ ] Implement `staging`, `staged`, and `metadata_ready` upload recovery. `staging` is never inferred complete: clean both contained keys, delete the invisible asset, release quota once, and fail. Every recovery `stat/1` plus full `verify/1` pair—including the initial staged check, metadata-ready check, and post-survivor second check—runs in renewing `MonitoredWork` and returns the newest owned row. For `staged`, verify ready CAS first; only confirmed absence may inspect the primary survivor:
+- [ ] Implement `staging`, `staged`, and `metadata_ready` upload recovery. `staging` is never inferred complete: clean the contained staging key, delete the invisible asset, release quota once, and fail. Every recovery `stat/1` plus full `verify/1` pair—including the initial staged check, metadata-ready check, and post-survivor second check—runs in renewing `MonitoredWork` and returns the newest owned row. For `staged`, verify ready CAS first; only confirmed absence may inspect the primary survivor:
 
 ```elixir
 defp recover_staged(operation, absolute_deadline) do
@@ -2470,22 +2472,21 @@ defp retry_observation(%AssetOperation{state: :metadata_ready} = operation, abso
 
 `remaining_timeout/2` returns `{:ok, min(cap_ms, absolute_deadline - monotonic_ms())}` only when positive. `observe_for_recovery/2` returns the exact blob row/version before the physical observation; if that row is `ready` with an expired lease and no active fence, it first calls `reclaim_expired_ready/2` and returns the refreshed version, while an active fence remains busy. `persist_observed_ready_or_retry/3` and `complete_observed_ready_or_retry/3` couple the version-qualified `pending|ready -> ready` touch and metadata transition in one transaction; `mark_corrupt_observed/3` compares state/version, rejects every remaining non-null blob lease, and rechecks that no different nonterminal operation references the digest before `pending|ready -> corrupt`. `compensate_after_corrupt/2` performs only invisible asset/quota/operation compensation and never attempts a second blob transition. Any stale CAS reloads and reruns the monitored observation. Thus a concurrent correct commit touches the version and wins instead of being overwritten by stale corruption. A transient effect failure remains nonterminal using the newest returned row. Confirmed missing is rechecked once, then conditionally marks the ledger corrupt, compensates the invisible asset/quota, and fails. Confirmed mismatch/verify failure uses the same conditional decision immediately. A no-row ownership failure returns unavailable and performs none of those mutations.
 
-- [ ] Implement survivor restaging solely through Plan 1's opaque recovery contract. Never list or derive a path in this module. Persist one random, sanitized `recovery_staging_key` through an owner-retaining update before opening bytes; never reconstruct it from a later lock version:
+- [ ] Recover a survivor solely through Plan 1's opaque zero-copy contract. Never list or derive a path in this module. Pass only the persisted staging key, digest, and size, then commit the returned opaque `StagedRef` directly:
 
 ```elixir
 defp recover_staged_survivor(operation, absolute_deadline) do
-  with {:ok, operation} <- ensure_recovery_staging_key(operation),
-       {:ok, timeout_ms} <- remaining_timeout(absolute_deadline, 1_800_000) do
+  with {:ok, timeout_ms} <- remaining_timeout(absolute_deadline, 1_800_000) do
     case MonitoredWork.run(AssetOperation, operation, fn ->
-           restage_survivor(operation, absolute_deadline)
+           recover_and_commit_stage(operation)
          end,
            task_supervisor: ForgeReleases.WorkTaskSupervisor,
            lease_seconds: 60,
            renew_after_ms: 30_000,
            timeout_ms: timeout_ms
          ) do
-      {:ok, result, newest} ->
-        finish_recovery_result(newest, result)
+      {:ok, {:ready, metadata}, newest} ->
+        persist_metadata_ready(newest, metadata)
 
       {:error, reason, newest}
       when reason in [:not_found, :invalid_source, :integrity_mismatch, :entity_too_large] ->
@@ -2499,7 +2500,6 @@ defp recover_staged_survivor(operation, absolute_deadline) do
     end
   else
     {:error, :deadline} -> {:error, :unavailable}
-    {:error, :lost_lease} -> {:error, :unavailable}
   end
 end
 
@@ -2518,120 +2518,48 @@ defp recheck_after_survivor_failure(operation, absolute_deadline, survivor_failu
     {:error, reason} when reason in [:lost_lease, :timeout, :effect_down] -> {:error, :unavailable}
   end
 end
-
-defp ensure_recovery_staging_key(%{recovery_staging_key: key} = operation)
-     when is_binary(key),
-     do: {:ok, operation}
-
-defp ensure_recovery_staging_key(operation) do
-  token = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
-  key = "recovery-#{operation.id}-#{token}"
-
-  Fornacast.OperationLease.update_owned(
-    AssetOperation,
-    operation,
-    [recovery_staging_key: key],
-    now: utc_now(),
-    lease_seconds: 60
-  )
-end
 ```
 
-`open_staged_survivor/2` is the Plan 1 gate that enforces exactly one direct regular entry, no symlink/nesting/multiple entries, fstat inode/device/type stability, expected size, and effective cap. After any missing/invalid survivor, recheck ready CAS exactly once before compensation to close a concurrent-commit race.
+`recover_stage/3` is the Plan 1 gate that enforces exactly one direct regular entry, no symlink/nesting/multiple entries, expected size, and effective cap before calling ESS `LocalCAS.recover_stage/4`. ESS then hashes the file, confirms the same filesystem and stable device/inode, and returns a committable stage without copying it. After any missing/invalid survivor, recheck ready CAS exactly once before compensation to close a concurrent-commit race.
 
-- [ ] Put open, descriptor reads, restaging, commit, stat, and verify inside the same `MonitoredWork` effect. The bounded source reader inherits the scheduler's absolute work deadline, recomputes positive options against that same deadline on every call, and closes the newest opaque source in `after`; it must not reset a fresh 30-minute budget inside the operation:
+- [ ] Put in-place recovery, commit, stat, and verify inside the same `MonitoredWork` effect. It inherits the scheduler's absolute work deadline through the outer timeout and must not reset a fresh 30-minute budget inside the operation:
 
 ```elixir
-defp restage_survivor(operation, absolute_deadline) do
-  # WORKAROUND(upstream): gsmlg-opt/ex_storage_service#13
-  with {:ok, source} <-
-         storage_module().open_staged_survivor(operation.staging_key, operation.size) do
-    try do
-      reader = fn %{source: current, remaining: remaining} = state, _adapter_options ->
-        timeout = absolute_deadline - System.monotonic_time(:millisecond)
+defp recover_and_commit_stage(operation) do
+  expected = %{
+    sha256_digest: operation.sha256_digest,
+    storage_key: operation.storage_key,
+    size: operation.size
+  }
 
-        if timeout <= 0 do
-          {:error, :timeout, state}
-        else
-          length = min(1_048_576, max(remaining, 1))
-          read_options = [length: length, read_length: min(65_536, length), read_timeout: timeout]
-
-          case storage_module().read(current, read_options[:length]) do
-            {:ok, bytes, next} when byte_size(bytes) <= remaining ->
-              {:more, bytes,
-               %{state | source: next, remaining: remaining - byte_size(bytes)}}
-
-            {:ok, _bytes, next} ->
-              {:error, :entity_too_large, %{state | source: next}}
-
-            :eof when remaining == 0 ->
-              {:done, state}
-
-            :eof ->
-              {:error, :integrity_mismatch, state}
-
-            {:error, reason} ->
-              {:error, reason, state}
-          end
-        end
-      end
-
-      state = %{source: source, remaining: operation.size}
-
-      with {:ok, staged, metadata, final_state} <-
-             storage_module().stage_from_reader(
-               operation.recovery_staging_key,
-               reader,
-               state,
-               max_size: effective_max_bytes(),
-               read_options: [length: 1_048_576, read_length: 65_536, read_timeout: 30_000]
-             ),
-           :ok <- storage_module().close(final_state.source),
-           :ok <- validate_recovery_metadata(staged, metadata, operation),
-           {:ok, committed} <- storage_module().commit(staged),
-           true <- committed == metadata,
-           {:ok, %{size: size}} when size == operation.size <-
-             storage_module().stat(operation.storage_key),
-           :ok <- storage_module().verify(operation.storage_key) do
-        {:ready, metadata}
-      else
-        false -> {:error, :integrity_mismatch}
-        {:ok, %{size: _other}} -> {:error, :integrity_mismatch}
-        {:error, :ambiguous_commit} -> {:error, :ambiguous_commit}
-        {:error, reason, final_state} ->
-          storage_module().close(final_state.source)
-          {:error, reason}
-        {:error, reason} -> {:error, reason}
-      end
-    after
-      storage_module().close(source)
-    end
-  end
-end
-
-defp validate_recovery_metadata(staged, metadata, operation) do
-  if metadata.sha256_digest == operation.sha256_digest and
-       metadata.storage_key == operation.storage_key and metadata.size == operation.size do
-    :ok
+  with {:ok, staged} <-
+         storage_module().recover_stage(
+           operation.staging_key,
+           operation.sha256_digest,
+           operation.size
+         ),
+       {:ok, ^expected} <- storage_module().commit(staged),
+       {:ok, %{size: size}} when size == operation.size <-
+         storage_module().stat(operation.storage_key),
+       :ok <- storage_module().verify(operation.storage_key) do
+    {:ready, expected}
   else
-    storage_module().discard(staged)
-    {:error, :integrity_mismatch}
+    {:ok, _unexpected} -> {:error, :integrity_mismatch}
+    {:error, :ambiguous_commit} -> {:error, :ambiguous_commit}
+    {:error, reason} -> {:error, reason}
   end
 end
 ```
 
-An ambiguous commit remains `staged`; a mismatch discards only the newly returned staged ref and fails closed. Lost ownership or task timeout leaves all durable state and both staging keys for the next owner.
+An ambiguous commit remains `staged`; the next pass first checks ready CAS, then safely recovers the same caller-owned stage again if it still exists. A mismatch fails closed. Lost ownership or task timeout leaves all durable state and the staging key for the next owner.
 
-- [ ] Make terminal staging cleanup durable and retryable. Every bounded recovery pass additionally selects at most 50 terminal upload operations whose `staging_key` or `recovery_staging_key` remains non-null, claims each only when `TaskFence` is inactive, runs both cleanups in monitored work, and clears the persisted keys only after both succeed:
+- [ ] Make terminal staging cleanup durable and retryable. Every bounded recovery pass additionally selects at most 50 terminal upload operations whose `staging_key` remains non-null, claims each only when `TaskFence` is inactive, runs cleanup in monitored work, and clears the persisted key only after it succeeds:
 
 ```elixir
 defp cleanup_terminal_upload(operation, absolute_deadline) do
   with {:ok, timeout_ms} <- remaining_timeout(absolute_deadline, 30_000) do
     MonitoredWork.run(AssetOperation, operation, fn ->
-      # WORKAROUND(upstream): gsmlg-opt/ex_storage_service#13
-      with :ok <- cleanup_key(operation.staging_key),
-           # WORKAROUND(upstream): gsmlg-opt/ex_storage_service#13
-           :ok <- cleanup_key(operation.recovery_staging_key) do
+      with :ok <- cleanup_key(operation.staging_key) do
         :clean
       end
     end,
@@ -2645,8 +2573,7 @@ defp cleanup_terminal_upload(operation, absolute_deadline) do
         Fornacast.OperationLease.update_owned(
           AssetOperation,
           owned,
-          staging_key: nil,
-          recovery_staging_key: nil
+          staging_key: nil
         )
 
       {:error, _reason, owned} ->
@@ -2665,7 +2592,7 @@ defp cleanup_key(nil), do: :ok
 defp cleanup_key(key), do: storage_module().cleanup_staging(key)
 ```
 
-The query is indexed by `state, id` and includes `completed`, `failed`, and `deleted`. Cleanup failure increments safe retry telemetry and retains both logical keys; it never rolls back terminal metadata. Add a fault test where cleanup fails after `completed`, then the next scheduler pass succeeds and clears both columns. This bounded terminal scan is mandatory even when no nonterminal operation exists.
+The query is indexed by `state, id` and includes `completed`, `failed`, and `deleted`. Cleanup failure increments safe retry telemetry and retains the logical key; it never rolls back terminal metadata. Add a fault test where cleanup fails after `completed`, then the next scheduler pass succeeds and clears the column. This bounded terminal scan is mandatory even when no nonterminal operation exists.
 
 - [ ] Implement idempotent asset/release deletion recovery. Asset `deleting` finishes the Task 6 metadata boundary. Release `deleting` admits/resumes at most 50 asset deletions; `assets_deleted` requires zero remaining assets before metadata deletion; `metadata_deleted` records the deduplicated audit and completes. Every pass preserves the tag and durable operation rows:
 
@@ -2877,7 +2804,7 @@ defp terminal_cleanup_keys(after_id, limit) do
     from operation in AssetOperation,
       where:
         operation.kind == :upload and operation.state in [:completed, :failed] and
-          (not is_nil(operation.staging_key) or not is_nil(operation.recovery_staging_key)),
+          not is_nil(operation.staging_key),
       order_by: [asc: operation.id],
       select: operation.id
 
@@ -2892,7 +2819,7 @@ end
 
 Pass `absolute_deadline` into every file recovery and `cleanup_terminal_upload/2`. Derive each `MonitoredWork.timeout_ms` as `min(effect_cap_ms, absolute_deadline - monotonic_ms())`, require it to be positive, and never create an inner 30-minute deadline. Add a separate `ForgeReleases.RecoveryDispatchSupervisor` before the scheduler in `RecoverySupervisor`; keep `WorkTaskSupervisor` for linked monitored effects. The outer dispatch timeout is exactly 30 seconds larger than the work deadline, so every inner deadline is strictly below it and the coordinator has a fixed completion/cleanup margin. Killing the dispatch coordinator still kills its linked effect and the next pass retries after `TaskFence` observes `:DOWN`.
 
-Add a clock-controlled near-deadline scheduler test: leave just enough work budget for one monitored terminal cleanup, hold it until immediately before the work deadline, then release it. Assert cleanup returns, clears keys with the newest row, and the scheduler consumes the correlated reply before its later outer timer. Also assert no new effect starts after the work deadline and the three cursors survive both partial-error replies and ordinary ticks.
+Add a clock-controlled near-deadline scheduler test: leave just enough work budget for one monitored terminal cleanup, hold it until immediately before the work deadline, then release it. Assert cleanup returns, clears the key with the newest row, and the scheduler consumes the correlated reply before its later outer timer. Also assert no new effect starts after the work deadline and the three cursors survive both partial-error replies and ordinary ticks.
 
 - [ ] Run every recovery branch under deterministic seeds and commit:
 
@@ -2973,7 +2900,7 @@ For an unreferenced `ready` row with an expired request-open lease and no local 
 
 Insert more than 50 due rows whose first 50 deletes fail transiently. Thread `next_due_cursor` into `due_after_id` on the next run and assert a higher-ID row is attempted before the failed low IDs are revisited. Assert each failed owned row receives a bounded `gc_after` retry time, the cursor wraps to `nil` at stream end, and a later wrapped run retries it. Add a clock-controlled near-deadline pass proving the last admitted delete finishes and returns before the scheduler's larger outer deadline, while no new delete starts after the GC work deadline.
 
-- [ ] Add failing integrity tests for ready verification, missing/mismatch corruption, dry-run state/byte immutability, a paused verification that blocks GC and same-digest attachment until `:DOWN`, transient storage unavailability retaining `ready`, an absent blob that physically reappears, maintenance re-delete, re-delete crash/retry, all-state inventory, cursor pagination beyond 500 rows, bounded detail lists, telemetry shape, and absence of paths/digests/raw errors in telemetry. Add two linearization races: attachment changes an observed absent row before audit claim, and maintenance audit claims/detects same-size corruption before a future download open:
+- [ ] Add failing integrity tests for ready verification, missing/mismatch corruption, dry-run state/byte immutability, a paused verification that blocks GC and same-digest attachment until `:DOWN`, transient storage unavailability retaining `ready`, maintenance transition failure and lost-ownership handling, a physically present absent blob reported and marked corrupt without deleting bytes, all-state inventory, cursor pagination beyond 500 rows, bounded detail lists, telemetry shape, and absence of paths/digests/raw errors in telemetry. Add two linearization races: attachment changes an observed absent row before audit claim, and maintenance audit claims/detects same-size corruption before a future download open:
 
 ```elixir
 test "dry run reports but does not delete a physically present absent blob", context do
@@ -2984,7 +2911,6 @@ test "dry run reports but does not delete a physically present absent blob", con
             checked: 1,
             corrupt: 0,
             absent_reappeared: 1,
-            absent_redeleted: 0,
             failures: 0
           }} = IntegrityAudit.run(mode: :dry_run, limit: 50)
 
@@ -2992,14 +2918,14 @@ test "dry run reports but does not delete a physically present absent blob", con
   assert Repo.reload!(absent).state == :absent
 end
 
-test "maintenance re-deletes bytes behind an absent tombstone", context do
+test "maintenance marks present bytes behind an absent tombstone corrupt", context do
   absent = insert_absent_blob_with_bytes!(context, "reappeared")
 
-  assert {:ok, %{absent_reappeared: 1, absent_redeleted: 1}} =
+  assert {:ok, %{corrupt: 1, absent_reappeared: 1}} =
            IntegrityAudit.run(mode: :maintenance, limit: 50)
 
-  assert {:error, :not_found} = AssetStorage.stat(absent.sha256_digest)
-  assert Repo.reload!(absent).state == :absent
+  assert {:ok, _metadata} = AssetStorage.stat(absent.sha256_digest)
+  assert Repo.reload!(absent).state == :corrupt
 end
 
 test "an absent observation changed by attachment is skipped without a false report", context do
@@ -3187,6 +3113,24 @@ defp delete_due(now, limit, after_id, deadline_ms) do
   Map.put(stats, :next_cursor, next_cursor)
 end
 
+defp empty_delete_stats do
+  %{examined: 0, deleted: 0, retries: 0, failures: 0}
+end
+
+defp record_delete_outcome(stats, {:ok, %ReleaseAssetBlob{state: :absent}}) do
+  stats |> Map.update!(:examined, &(&1 + 1)) |> Map.update!(:deleted, &(&1 + 1))
+end
+
+defp record_delete_outcome(stats, outcome)
+     when outcome in [:retry, {:error, :retry}, {:error, :deadline}, {:error, :lost_lease},
+                      {:error, :timeout}, {:error, :effect_down}] do
+  stats |> Map.update!(:examined, &(&1 + 1)) |> Map.update!(:retries, &(&1 + 1))
+end
+
+defp record_delete_outcome(stats, _unexpected) do
+  stats |> Map.update!(:examined, &(&1 + 1)) |> Map.update!(:failures, &(&1 + 1))
+end
+
 defp claim_and_delete_due(blob, now, deadline_ms) do
   if TaskFence.active?({ReleaseAssetBlob, blob.id}) do
     :retry
@@ -3211,7 +3155,7 @@ The reducer tracks the prior attempted cursor explicitly, so a deadline before t
 
 `delete_due/4` queries at most `limit + 1` rows strictly above `due_after_id`, combining due candidates and expired/unowned `deleting` rows ordered by ID. It attempts at most `limit` and stops admitting work at `deadline_ms`; its cursor is the last attempted ID when more rows remain and `nil` only at stream end. A scheduler threads the cursor so retrying low IDs cannot starve later due rows. Candidate discovery remains an independent `limit`-bounded query after deletion, so a run may examine at most `2 * limit` attempted rows. Candidate claims use `BlobInventory.claim_deletion/5`; deleting recovery uses the selected struct with `BlobInventory.claim_deleting/4`, never generic `OperationLease.claim/5`, and only after `TaskFence.active?({ReleaseAssetBlob, id})` is false. The second claim must atomically recheck `state == :deleting`, observed `lock_version`, retry time, lease expiry, and both reachability predicates before any filesystem effect.
 
-- [ ] Run physical deletion in `MonitoredWork`, retain ownership through completion, and treat missing as success. Keep the upstream marker exactly at the production delete call:
+- [ ] Run physical deletion in `MonitoredWork`, retain ownership through completion, and treat a durably confirmed missing blob as success. ESS v0.6.4 syncs the containing directory after both unlink and already-missing retries; any directory-sync error keeps the row `deleting` for another idempotent attempt:
 
 ```elixir
 defp delete_claimed(%ReleaseAssetBlob{} = owned, now, absolute_deadline) do
@@ -3222,7 +3166,6 @@ defp delete_claimed(%ReleaseAssetBlob{} = owned, now, absolute_deadline) do
     {:error, :deadline}
   else
     MonitoredWork.run(ReleaseAssetBlob, owned, fn ->
-      # WORKAROUND(upstream): gsmlg-opt/ex_storage_service#15
       case storage_module().delete(owned.sha256_digest) do
         :ok -> :deleted
         {:error, :not_found} -> :deleted
@@ -3253,7 +3196,7 @@ defp delete_claimed(%ReleaseAssetBlob{} = owned, now, absolute_deadline) do
 end
 ```
 
-`BlobInventory.defer_deletion/2` conditionally keeps the newest owned row `deleting`, stores the supplied `gc_after` as its retry time, releases the lease, and increments the version. Call it immediately if the shared deadline expires after claim but before the delete starts; do not leave that known-owned lease waiting for expiry. A no-row ownership result cannot call it. Candidate marking rechecks the same absolute deadline before every row, so a large candidate page cannot consume the five-second outer margin. The blob schema's lease changeset permits `deleting -> absent`, candidate reactivation only through `BlobInventory.attach/4`, and no transition out of `corrupt`. Attachment remains blocked by every non-ready lease and every unexpired or locally fenced ready lease. Only the observed-version `reclaim_expired_ready/2` path may clear an expired `ready` lease with no active fence before retrying attachment.
+`BlobInventory.defer_deletion/2` conditionally keeps the newest owned row `deleting`, stores the supplied `gc_after` as its retry time, releases the lease, and increments the version. Call it immediately if the shared deadline expires after claim but before the delete starts; do not leave that known-owned lease waiting for expiry. A no-row ownership result cannot call it. Candidate marking rechecks the same absolute deadline before every row, so a large candidate page cannot consume the five-second outer margin. The blob schema's lease changeset permits `deleting -> absent` after durable delete and `absent -> corrupt` only for a claimed maintenance integrity finding; candidate reactivation remains available only through `BlobInventory.attach/4`, and there is no transition out of `corrupt`. Attachment remains blocked by every non-ready lease and every unexpired or locally fenced ready lease. Only the observed-version `reclaim_expired_ready/2` path may clear an expired `ready` lease with no active fence before retrying attachment.
 
 - [ ] Define the exact cursor-based operational audit API consumed by Plan 3. Reject unknown/duplicate options; default to dry run, a limit of 50, and `after_id: nil`; accept a maximum limit of 500. A caller must thread non-null `next_cursor` values until `nil`, then start the next full rotation with `after_id: nil`:
 
@@ -3268,7 +3211,6 @@ defmodule ForgeReleases.IntegrityAudit do
           checked: non_neg_integer(),
           corrupt: non_neg_integer(),
           absent_reappeared: non_neg_integer(),
-          absent_redeleted: non_neg_integer(),
           failures: non_neg_integer(),
           next_cursor: non_neg_integer() | nil,
           blob_states: %{
@@ -3323,7 +3265,6 @@ defmodule ForgeReleases.IntegrityAudit do
           :checked,
           :corrupt,
           :absent_reappeared,
-          :absent_redeleted,
           :failures
         ]),
         %{mode: mode}
@@ -3357,7 +3298,6 @@ defmodule ForgeReleases.IntegrityAudit do
       checked: 0,
       corrupt: 0,
       absent_reappeared: 0,
-      absent_redeleted: 0,
       failures: 0,
       next_cursor: next_cursor,
       blob_states: blob_states,
@@ -3428,41 +3368,46 @@ defp verify_claimed_ready(owned, mode, result) do
 end
 
 defp finish_ready_verification({:ok, :verified, newest}, _mode, result) do
-  :ok = OperationLease.release(ReleaseAssetBlob, newest)
-  increment(result, :checked)
+  release_and_update_result(newest, result, &increment(&1, :checked))
 end
 
 defp finish_ready_verification({:error, :storage_unavailable, newest}, _mode, result) do
-  :ok = OperationLease.release(ReleaseAssetBlob, newest)
-
-  result
-  |> increment(:checked)
-  |> increment(:failures)
-  |> record_integrity_failure(newest.sha256_digest, :storage_unavailable)
+  release_and_update_result(newest, result, fn released ->
+    released
+    |> increment(:checked)
+    |> increment(:failures)
+    |> record_integrity_failure(newest.sha256_digest, :storage_unavailable)
+  end)
 end
 
 defp finish_ready_verification({:error, failure, newest}, :dry_run, result)
      when failure in [:missing, :size_mismatch, :digest_mismatch] do
-  :ok = OperationLease.release(ReleaseAssetBlob, newest)
-
-  result
-  |> increment(:checked)
-  |> increment(:corrupt)
-  |> record_integrity_failure(newest.sha256_digest, failure)
+  release_and_update_result(newest, result, fn released ->
+    released
+    |> increment(:checked)
+    |> increment(:corrupt)
+    |> record_integrity_failure(newest.sha256_digest, failure)
+  end)
 end
 
 defp finish_ready_verification({:error, failure, newest}, :maintenance, result)
      when failure in [:missing, :size_mismatch, :digest_mismatch] do
-  {:ok, _corrupt} =
-    OperationLease.update_owned(ReleaseAssetBlob, newest,
-      state: :corrupt,
-      integrity_failure: Atom.to_string(failure)
-    )
+  case OperationLease.update_owned(ReleaseAssetBlob, newest,
+         state: :corrupt,
+         integrity_failure: Atom.to_string(failure)
+       ) do
+    {:ok, corrupt} ->
+      result
+      |> increment(:checked)
+      |> increment(:corrupt)
+      |> record_integrity_failure(corrupt.sha256_digest, failure)
 
-  result
-  |> increment(:checked)
-  |> increment(:corrupt)
-  |> record_integrity_failure(newest.sha256_digest, failure)
+    {:error, :lost_lease} ->
+      result
+
+    {:error, _reason} ->
+      finish_audit_persistence_failure(result, newest)
+  end
 end
 
 defp finish_ready_verification({:error, ownership_reason}, _mode, result)
@@ -3480,16 +3425,8 @@ defp audit_blob(result, %ReleaseAssetBlob{state: :absent} = blob, mode) do
             {:error, :not_found} ->
               :absent_clean
 
-            {:ok, _metadata} when mode == :dry_run ->
-              :absent_reappeared
-
             {:ok, _metadata} ->
-              # WORKAROUND(upstream): gsmlg-opt/ex_storage_service#15
-              case storage_module().delete(owned.sha256_digest) do
-                :ok -> :absent_redeleted
-                {:error, :not_found} -> :absent_redeleted
-                {:error, _reason} -> {:error, :storage_unavailable}
-              end
+              {:error, :absent_reappeared}
 
             {:error, _reason} ->
               {:error, :storage_unavailable}
@@ -3500,7 +3437,7 @@ defp audit_blob(result, %ReleaseAssetBlob{state: :absent} = blob, mode) do
           renew_after_ms: 30_000,
           timeout_ms: 120_000
         )
-        |> finish_absent_audit(result)
+        |> finish_absent_audit(mode, result)
 
       :stale -> result
       :busy -> result
@@ -3511,42 +3448,85 @@ end
 
 defp audit_blob(result, %ReleaseAssetBlob{}, _mode), do: result
 
-defp finish_absent_audit({:ok, :absent_clean, newest}, result) do
-  :ok = OperationLease.release(ReleaseAssetBlob, newest)
-  increment(result, :checked)
+defp finish_absent_audit({:ok, :absent_clean, newest}, _mode, result) do
+  release_and_update_result(newest, result, &increment(&1, :checked))
 end
 
-defp finish_absent_audit({:ok, :absent_reappeared, newest}, result) do
-  :ok = OperationLease.release(ReleaseAssetBlob, newest)
-
-  result
-  |> increment(:checked)
-  |> increment(:absent_reappeared)
-  |> record_integrity_failure(newest.sha256_digest, :absent_reappeared)
+defp finish_absent_audit({:error, :absent_reappeared, newest}, :dry_run, result) do
+  release_and_update_result(newest, result, fn released ->
+    released
+    |> increment(:checked)
+    |> increment(:absent_reappeared)
+    |> record_integrity_failure(newest.sha256_digest, :absent_reappeared)
+  end)
 end
 
-defp finish_absent_audit({:ok, :absent_redeleted, newest}, result) do
-  :ok = OperationLease.release(ReleaseAssetBlob, newest)
+defp finish_absent_audit({:error, :absent_reappeared, newest}, :maintenance, result) do
+  case OperationLease.update_owned(ReleaseAssetBlob, newest,
+         state: :corrupt,
+         integrity_failure: "absent_reappeared"
+       ) do
+    {:ok, corrupt} ->
+      result
+      |> increment(:checked)
+      |> increment(:corrupt)
+      |> increment(:absent_reappeared)
+      |> record_integrity_failure(corrupt.sha256_digest, :absent_reappeared)
 
-  result
-  |> increment(:checked)
-  |> increment(:absent_reappeared)
-  |> increment(:absent_redeleted)
-  |> record_integrity_failure(newest.sha256_digest, :absent_reappeared)
+    {:error, :lost_lease} ->
+      result
+
+    {:error, _reason} ->
+      finish_absent_audit_persistence_failure(result, newest)
+  end
 end
 
-defp finish_absent_audit({:error, :storage_unavailable, newest}, result) do
-  :ok = OperationLease.release(ReleaseAssetBlob, newest)
-
-  result
-  |> increment(:checked)
-  |> increment(:failures)
-  |> record_integrity_failure(newest.sha256_digest, :storage_unavailable)
+defp finish_absent_audit({:error, :storage_unavailable, newest}, _mode, result) do
+  release_and_update_result(newest, result, fn released ->
+    released
+    |> increment(:checked)
+    |> increment(:failures)
+    |> record_integrity_failure(newest.sha256_digest, :storage_unavailable)
+  end)
 end
 
-defp finish_absent_audit({:error, ownership_reason}, result)
+defp finish_absent_audit({:error, ownership_reason}, _mode, result)
      when ownership_reason in [:lost_lease, :timeout, :effect_down],
      do: result
+
+defp release_and_update_result(newest, result, update) when is_function(update, 1) do
+  case OperationLease.release(ReleaseAssetBlob, newest) do
+    :ok -> update.(result)
+    {:error, :lost_lease} -> result
+  end
+end
+
+defp finish_audit_persistence_failure(result, newest) do
+  case OperationLease.release(ReleaseAssetBlob, newest) do
+    :ok ->
+      result
+      |> increment(:checked)
+      |> increment(:failures)
+      |> record_integrity_failure(newest.sha256_digest, :storage_unavailable)
+
+    {:error, :lost_lease} ->
+      result
+  end
+end
+
+defp finish_absent_audit_persistence_failure(result, newest) do
+  case OperationLease.release(ReleaseAssetBlob, newest) do
+    :ok ->
+      result
+      |> increment(:checked)
+      |> increment(:absent_reappeared)
+      |> increment(:failures)
+      |> record_integrity_failure(newest.sha256_digest, :storage_unavailable)
+
+    {:error, :lost_lease} ->
+      result
+  end
+end
 
 defp record_integrity_failure(result, digest, failure)
      when failure in [
@@ -3559,9 +3539,11 @@ defp record_integrity_failure(result, digest, failure)
   entry = %{digest: digest, failure: failure}
   %{result | integrity_failures: result.integrity_failures ++ [entry]}
 end
+
+defp increment(result, key), do: Map.update!(result, key, &(&1 + 1))
 ```
 
-`BlobInventory.claim_observed/4` compares the page struct's state and `lock_version`, requires no active `TaskFence`, and atomically sets the audit owner when the observed lease is null or expired. This lets a fresh BEAM reclaim an expired `ready` request lease without an unowned gap; any stale opener subsequently loses release ownership and closes/fails. For absent rows, `stat/1` and optional #15 re-delete happen under that same renewing lease and fence; an attachment that wins before the claim changes the version produces no false `absent_reappeared` report. `:ok` and `{:error, :not_found}` deletes both count as re-deleted. Timeout/lost ownership does not clear another owner's lease or change state. A physically present absent blob is deletion work, not corruption. Ready missing/size/verify disagreement becomes `corrupt` only in maintenance; no mode repairs or promotes bytes.
+`BlobInventory.claim_observed/4` compares the page struct's state and `lock_version`, requires no active `TaskFence`, and atomically sets the audit owner when the observed lease is null or expired. This lets a fresh BEAM reclaim an expired `ready` request lease without an unowned gap; any stale opener subsequently loses release ownership and closes/fails. For absent rows, `stat/1` happens under that same renewing lease and fence; an attachment that wins before the claim changes the version produces no false `absent_reappeared` report. Timeout/lost ownership does not clear another owner's lease or change state. A physically present absent blob is an integrity failure: dry run reports it without mutation, while maintenance atomically marks the ledger row `corrupt` and leaves the bytes untouched for operator recovery. Ready missing/size/verify disagreement likewise becomes `corrupt` only in maintenance; no mode deletes, repairs, or promotes bytes.
 
 - [ ] Add failing `StorageTelemetry` tests for CAS/staging byte and inode pressure, all nonterminal upload/delete operation states, all six blob states, storage/persistence unavailability, bounded aggregate query results, the exact callable return shape, and telemetry redaction:
 
@@ -3825,7 +3807,7 @@ Implement `measurements/1` as a fixed flat map with `cas_bytes_*`, `cas_inodes_*
 
 :telemetry.execute(
   [:fornacast, :release_assets, :integrity_audit, :stop],
-  %{checked: checked, corrupt: corrupt, absent_reappeared: reappeared, absent_redeleted: redeleted, failures: failures},
+  %{checked: checked, corrupt: corrupt, absent_reappeared: reappeared, failures: failures},
   %{mode: mode}
 )
 ```
@@ -4019,7 +4001,7 @@ for seed in 0 1 2; do
 done
 ```
 
-Expected: all runs report `0 failures`; a local active delete fences reclaim after lease expiry, candidate attachment/deletion has one winner, absent reappearance is detected/re-deleted, and telemetry contains aggregate safe values only.
+Expected: all runs report `0 failures`; a local active delete fences reclaim after lease expiry, candidate attachment/deletion has one winner, physically present absent bytes are fenced and reported as corruption without automatic deletion, and telemetry contains aggregate safe values only.
 
 ```bash
 git add apps/forge_releases/lib/forge_releases/{blob_gc,blob_gc_scheduler,blob_inventory,integrity_audit,recovery_supervisor,release_asset_blob,storage_telemetry,storage_telemetry_scheduler}.ex \
@@ -4049,7 +4031,7 @@ git commit -m "feat(releases): reclaim and audit LocalCAS blobs"
 | total upload survivor matrix, monitored stat/verify, conditional corruption race, and two-pass idempotence | `recovery_test.exs` |
 | fair tag/file/terminal cursors, terminal cleanup retry, and inner/outer deadline margin | `recovery_test.exs` |
 | GC grace, stale selection, due cursor/wrap fairness, retry time, deadline margin, before/after unlink crash | `blob_gc_test.exs` |
-| #15 absent claim race, cursor-paged dry run, maintenance re-delete, safe telemetry | `integrity_audit_test.exs` |
+| absent claim race, cursor-paged dry run, maintenance corruption transition without byte deletion, safe telemetry | `integrity_audit_test.exs` |
 | CAS/staging byte and inode capacity/pressure, unknown inode support, operation/blob aggregates, scheduler cadence/redaction | `storage_telemetry_test.exs` |
 | fresh Turso schema plus PostgreSQL checks/races | `release_domain_migration_test.exs`, all race files |
 
@@ -4064,10 +4046,10 @@ if rg -n 'TODO|TBD|placeholder|similar to' \
   exit 1
 fi
 
-rg -n 'WORKAROUND\(upstream\): gsmlg-opt/ex_storage_service#13' \
-  apps/forge_releases/lib/forge_releases/recovery.ex
-rg -n 'WORKAROUND\(upstream\): gsmlg-opt/ex_storage_service#15' \
-  apps/forge_releases/lib/forge_releases/{blob_gc,integrity_audit}.ex
+if rg -n 'WORKAROUND\(upstream\): gsmlg-opt/ex_storage_service#(13|14|15)' \
+  apps/forge_releases/lib apps/forge_releases/test; then
+  exit 1
+fi
 
 if rg -n 'ExStorageService|BlobStore\.LocalCAS|send_file|release_assets\.storage_path' \
   apps/forge_releases/lib \
@@ -4076,7 +4058,7 @@ if rg -n 'ExStorageService|BlobStore\.LocalCAS|send_file|release_assets\.storage
 fi
 ```
 
-Expected: the first and last checks print nothing and exit `0`; the #13 and #15 checks print only the intentional production workaround callsites. Confirm no per-object path, fd, ESS struct, reader state, credential, digest, or raw storage error appears in logs, audit metadata, telemetry metadata, or public structs.
+Expected: all checks print nothing and exit `0`; no closed-upstream workaround marker remains. Confirm no per-object path, fd, ESS struct, reader state, credential, digest, or raw storage error appears in logs, audit metadata, telemetry metadata, or public structs.
 
 - [ ] Verify formatting only for files changed by the eight implementation commits:
 

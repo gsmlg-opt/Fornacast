@@ -6,7 +6,12 @@
 
 **Architecture:** Keep the HTTP layer thin: versioned validators and serializers translate the public contract, while `ReleaseController` and `ReleaseAssetController` authorize an already-resolved repository and call `ForgeReleases`. Raw uploads use a credential-free opaque `UploadReader` state passed once to `ForgeReleases.stream_asset_upload/3`; downloads retain the opaque bounded reader from Plan 2. Acceptance runs through the public nginx origin and separately inspects the released OTP system to prove LocalCAS readiness, disabled ESS workers, S3 absence, delayed GC, and cold recovery-set restore.
 
-**Tech Stack:** Elixir 1.20, OTP 29, Phoenix 1.8, Plug/Bandit, Ecto 3.14 with Turso and PostgreSQL, ExStorageService 0.6.2 core, Concord 3, OpenAPI 3.0, Node/npm with Octokit, GitHub CLI, Docker Compose, nginx, and ExUnit.
+**Tech Stack:** Elixir 1.20, OTP 29, Phoenix 1.8, Plug/Bandit, Ecto 3.14 with Turso and PostgreSQL, ExStorageService 0.6.4 core, Concord 3, OpenAPI 3.0, Node/npm with Octokit, GitHub CLI, Docker Compose, nginx, and ExUnit.
+
+Pinned upstream references: [ExStorageService
+v0.6.4](https://github.com/gsmlg-opt/ex_storage_service/releases/tag/v0.6.4)
+and [PR #16](https://github.com/gsmlg-opt/ex_storage_service/pull/16), which
+close recovery #13, direct-options #14, and durable-delete #15.
 
 ---
 
@@ -82,7 +87,6 @@ The predecessor plans must expose these exact contracts before this plan starts:
           checked: non_neg_integer(),
           corrupt: non_neg_integer(),
           absent_reappeared: non_neg_integer(),
-          absent_redeleted: non_neg_integer(),
           failures: non_neg_integer(),
           next_cursor: non_neg_integer() | nil,
           blob_states: map(),
@@ -2706,12 +2710,12 @@ Run:
 mix deps.get --check-locked
 mix deps | rg '^\* ex_storage_service \(Hex package\) \(mix\)$'
 test "$(rg -c '^  "ex_storage_service":' mix.lock)" -eq 1
-rg -n '^  "ex_storage_service": \{:hex, :ex_storage_service, "0\.6\.2",' mix.lock
+rg -n '^  "ex_storage_service": \{:hex, :ex_storage_service, "0\.6\.4",' mix.lock
 ! rg 'ex_storage_service_s3' mix.lock
 git diff --exit-code -- apps/fornacast_api/priv/openapi
 ```
 
-Expected: the lock is complete, `ex_storage_service` resolves exactly to `0.6.2`, `ex_storage_service_s3` is absent from `mix.lock`, and regenerating/reading the pinned contract leaves no unstaged OpenAPI change. Do not upgrade ESS in this plan.
+Expected: the lock is complete, `ex_storage_service` resolves exactly to `0.6.4`, `ex_storage_service_s3` is absent from `mix.lock`, and regenerating/reading the pinned contract leaves no unstaged OpenAPI change. Do not upgrade ESS in this plan.
 
 - [ ] **Step 2: Run the Turso release/API slice**
 
