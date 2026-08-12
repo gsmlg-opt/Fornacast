@@ -8,7 +8,7 @@
 
 The approved GitHub-compatible releases plan defines an opaque
 `ForgeReleases.AssetStorage` boundary backed by one ID-addressed file per
-asset. The ExStorageService v0.6.2 embedding probe subsequently proved that:
+asset. The ExStorageService embedding probe subsequently proved that:
 
 - the Hex-published core can be supervised inside Fornacast;
 - LocalCAS stage, commit, stat, ranged open, and verify survive a fresh BEAM
@@ -74,7 +74,7 @@ The first product slice has these boundaries:
 ## Architecture and ownership
 
 `ForgeReleases` is the sole domain owner. It depends directly on the exact Hex
-package `{:ex_storage_service, "== 0.6.2"}` and exposes no ESS type through its
+package `{:ex_storage_service, "== 0.6.4"}` and exposes no ESS type through its
 public API.
 
 The storage boundary consists of focused modules:
@@ -91,13 +91,11 @@ The storage boundary consists of focused modules:
 - `ForgeReleases.Recovery` remains the durable operation reconciler and also
   cleans operation-owned staging directories.
 
-All LocalCAS calls receive adapter-owned options containing explicit roots,
-`pack_module: nil`, and no `:bucket`. This prevents packed-blob metadata lookup
-and legacy bucket fallback. `pack_module: nil` is code-supported but not yet a
-documented public embedding option, so it is exact-pinned, contract-tested, and
-tracked by
-[upstream issue #14](https://github.com/gsmlg-opt/ex_storage_service/issues/14).
-No callsite outside the adapter may invoke LocalCAS.
+All LocalCAS calls receive adapter-owned options from
+`ExStorageService.Context.direct_blob_store_options/1`, with an adapter-owned
+`tmp_dir` and effective `max_size` added for staging. These supported options
+contain explicit roots, disable packed-blob lookup, and omit legacy bucket
+fallback. No callsite outside the adapter may invoke LocalCAS.
 
 ESS starts as an OTP dependency before `ForgeReleases`, so application
 configuration must disable its default instance before dependency startup.
@@ -229,7 +227,7 @@ positive_integer]`. Supplying the clock explicitly keeps expiry predicates
 portable and deterministic in both database-adapter tests. The existing
 releasing `update_owned/3` signature remains unchanged.
 
-Potentially long commit, verify, recovery-copy, and physical-delete calls run
+Potentially long commit, verify, recovered-stage, and physical-delete calls run
 in monitored tasks with fixed deadlines. The owning coordinator renews the SQL
 lease while the task is alive. On the same BEAM, recovery cannot claim an
 expired row until the prior task's `:DOWN` is observed. On a fresh BEAM the old
@@ -294,6 +292,7 @@ Blob states are:
 absent -> pending -> ready -> candidate -> deleting -> absent
 candidate -> pending
 pending | ready -> corrupt
+absent -> corrupt
 ```
 
 Rows are tombstones and are never deleted. Retaining `absent` prevents digest
@@ -384,7 +383,7 @@ commit(staged_ref)
 discard(staged_ref)
 stat(storage_key)
 open(storage_key, expected_size, range)
-open_staged_survivor(staging_key, expected_size)
+recover_stage(staging_key, expected_digest, expected_size)
 read(source, requested_bytes)
 close(source)
 cleanup_staging(staging_key)
@@ -404,16 +403,15 @@ ESS staging path or struct crosses the adapter boundary.
 offset, current position, and remaining length. `read/2` returns
 `{:ok, binary, source}`, `:eof`, or a normalized error; `close/1` is idempotent.
 The two recovery-only operations also keep paths private:
-`open_staged_survivor/2` accepts a validated derived staging key, requires
-exactly one direct regular entry, rejects symlinks and nested or multiple
-entries, then opens and `fstat`s the descriptor to confirm the same
-device/inode, recorded size, and effective cap. `cleanup_staging/1` removes
-only that key's contained directory without following symlinks. Both callsites
-carry the temporary issue #13 workaround marker.
-Operation rows may persist validated primary and lease-specific staging keys so
-cleanup remains addressable after a crash; they never persist a staging path.
-The recovery key is written before restaging and retained through terminal
-cleanup rather than being reconstructed from a later lease version.
+`recover_stage/3` accepts a validated staging key, expected digest, and expected
+size. The adapter locates exactly one direct regular entry, rejects symlinks and
+nested or multiple entries, enforces the effective cap, and passes the private
+path to `LocalCAS.recover_stage/4`. ESS verifies the size, digest,
+same-filesystem constraint, and file identity before the adapter returns an
+opaque `StagedRef`. `cleanup_staging/1` removes only that key's contained
+directory without following symlinks. Operation rows persist only the validated
+staging key so cleanup remains addressable after a crash; they never persist a
+staging path.
 
 The adapter normalizes internal results to a small state-machine algebra:
 
@@ -469,9 +467,9 @@ it never returns a root, mountpoint, command output, or filesystem error.
    transition. Return success only after `completed`.
 
 The adapter removes its partial file on every ordinary reader, write, overflow,
-or close error. Only abrupt owner death may leave one file in the primary
-directory. Primary and lease-specific recovery directories are disjoint, and
-terminal cleanup removes both without following symlinks.
+or close error. Only abrupt owner death may leave one file in the operation's
+primary directory, and terminal cleanup removes that contained directory
+without following symlinks.
 
 A commit error is not immediately a failed upload. Rename can succeed before a
 later directory-sync error, so an ambiguous result remains `staged` for
@@ -480,7 +478,7 @@ recovery.
 ## Download flow
 
 `open_asset/3` authorizes an available asset and asks the adapter to resolve its
-digest with `pack_module: nil`. The adapter compares the actual and recorded
+digest with direct loose-CAS options. The adapter compares the actual and recorded
 sizes and opens the real file descriptor before returning the opaque
 `AssetDownload`. It never returns a path to a controller.
 
@@ -554,11 +552,11 @@ candidate blob survives restart and is eventually reclaimed.
    attach or commit; it retries after the bounded deletion.
 5. The coordinator runs idempotent `AssetStorage.delete/1` in a monitored task;
    the adapter alone invokes `LocalCAS.delete/2`. It renews the lease while the
-   task is alive, then records `absent` and clears the lease. Missing bytes
-   count as success. Because ESS v0.6.2 does not sync the containing directory
-   after unlink, retained `absent` tombstones remain in a bounded audit set;
-   the audit re-stats and re-deletes any physically present absent blob until
-   upstream provides a durable delete primitive.
+   task is alive, then records `absent` and clears the lease only after `:ok`.
+   ESS syncs the containing directory after unlink; if that sync is ambiguous,
+   the adapter returns unavailable and the durable `deleting` row retries the
+   idempotent delete. Missing bytes count as success only after the retry's
+   directory sync succeeds.
 6. A crash before or after unlink leaves a durable `deleting` row. Recovery
    repeats deletion and completes the tombstone transition.
 
@@ -584,14 +582,13 @@ task has emitted `:DOWN`.
   task while renewing the recovery lease. If a ready blob with the expected
   size exists, atomically populate the pending asset, mark the blob ready, and
   advance to `metadata_ready` without inspecting temporary files.
-- `staged` with no ready blob: call the adapter's
-  `open_staged_survivor/2` for the primary operation key. It requires exactly
-  one contained regular file, rejects symlinks and nested or multiple entries,
-  opens and `fstat`s the descriptor, and confirms the persisted size and
-  configured effective cap without exposing a path. Re-stream the returned
-  opaque source through `stage_from_reader/4` into a separate lease-specific
-  recovery key, compare digest and size, close the source in `after`, then
-  commit the newly returned opaque staged value in a monitored task.
+- `staged` with no ready blob: call the adapter's `recover_stage/3` with the
+  primary operation key, recorded digest, and recorded size. The adapter
+  requires exactly one contained regular file, rejects symlinks and nested or
+  multiple entries, enforces the configured cap, and calls
+  `LocalCAS.recover_stage/4` without exposing the path. ESS verifies the bytes
+  in place and returns a staged value wrapped as an opaque `StagedRef`; recovery
+  commits that ref directly without descriptor streaming or a second copy.
 - `staged` with a missing or invalid survivor: recheck the ready digest once to
   close a concurrent-commit race. If it remains absent, compensate the pending
   asset and quota once and mark the operation failed. Unexpected stage
@@ -604,52 +601,27 @@ task has emitted `:DOWN`.
   audit, and `completed`. A transient verification failure remains
   nonterminal. Confirmed missing or corrupt content marks the blob `corrupt`,
   compensates the still-invisible asset, and marks the operation failed.
-- terminal operations: call `cleanup_staging/1` for both persisted primary and
-  lease-specific recovery keys; the adapter removes their contained
-  directories without following symlinks. A bounded terminal-row cleanup pass
-  retries unavailable cleanup and clears the recovery key only after both
-  directories are absent.
+- terminal operations: call `cleanup_staging/1` for the persisted primary key;
+  the adapter removes its contained directory without following symlinks. A
+  bounded terminal-row cleanup pass retries unavailable cleanup and clears the
+  key only after the directory is absent.
 
 Recovery never reconstructs `%ExStorageService.BlobStore.StagedBlob{}` and
-never persists LocalCAS's private filename. Normal uploads write once; only
-crash recovery may perform a second disk copy.
+never persists LocalCAS's private filename. Both normal upload and crash
+recovery publish without a second disk copy.
 
 The pinned-version adapter contract test asserts that one interrupted
 LocalCAS stage creates at most one regular file directly inside the supplied
 empty `tmp_dir`. Recovery depends on that observable behavior only; it does not
 depend on the private filename.
 
-This recovery path is a temporary dependency workaround:
-
-```elixir
-# WORKAROUND(upstream): gsmlg-opt/ex_storage_service#13
-```
-
-[Upstream issue #13](https://github.com/gsmlg-opt/ex_storage_service/issues/13)
-requests a documented API for recovering and committing a completed,
-checksum-verified stage without reconstructing internal structs or copying the
-file again. The workaround remains `needed`, not a blocker, and must be
-contract-tested against the exact ESS pin.
-
-Direct loose-CAS resolution has its own temporary dependency marker:
-
-```elixir
-# WORKAROUND(upstream): gsmlg-opt/ex_storage_service#14
-```
-
-[Upstream issue #14](https://github.com/gsmlg-opt/ex_storage_service/issues/14)
-requests a supported public option that avoids pack and legacy metadata lookup.
-
-LocalCAS deletion durability has a third temporary dependency marker:
-
-```elixir
-# WORKAROUND(upstream): gsmlg-opt/ex_storage_service#15
-```
-
-[Upstream issue #15](https://github.com/gsmlg-opt/ex_storage_service/issues/15)
-requests parent-directory synchronization for successful LocalCAS deletion.
-Until it lands, the integrity audit must treat a physically present `absent`
-blob as recoverable deletion work rather than corruption.
+ExStorageService v0.6.4 closes [upstream issues
+#13](https://github.com/gsmlg-opt/ex_storage_service/issues/13),
+[#14](https://github.com/gsmlg-opt/ex_storage_service/issues/14), and
+[#15](https://github.com/gsmlg-opt/ex_storage_service/issues/15) through
+[PR #16](https://github.com/gsmlg-opt/ex_storage_service/pull/16). The pinned
+adapter contract tests the supported `LocalCAS.recover_stage/4`,
+`Context.direct_blob_store_options/1`, and durable idempotent delete behavior.
 
 ## Integrity and error handling
 
@@ -704,8 +676,8 @@ and Git requests continue to execute while asset operations fail closed.
 
 Operators receive a bounded, dry-run-capable integrity/GC audit. Corruption is
 reported for manual recovery from backup; no destructive automatic repair is
-performed. The non-dry-run maintenance pass may re-delete bytes found behind an
-`absent` tombstone; it never promotes or repairs them.
+performed. A physically present blob behind an `absent` tombstone is an
+integrity failure and is never automatically deleted, promoted, or repaired.
 Dry run does not change bytes, blob state, integrity metadata, or user-visible
 SQL. It may acquire and release a short blob coordination lease, incrementing
 only the retained fencing version, so a long verification cannot race GC.
@@ -729,14 +701,14 @@ Implementation is not complete until fresh evidence covers:
 - mandatory blob-version touches for every attachment, conservative
   `candidate -> pending` reactivation, upload-versus-GC fencing, ambiguous
   commit recovery, stale leases, and crash-before/crash-after unlink;
-- an injected successful unlink without durable directory persistence, proving
-  the absent-tombstone audit detects and re-deletes the reappearing blob;
+- an injected delete directory-sync failure, proving the blob remains
+  `deleting` and an idempotent retry completes durability before `absent`;
 - a paused GC worker after ownership check, proving no reclaim or republish can
   occur until that local process emits `:DOWN`;
 - a GC worker paused after claiming a candidate but before its owner-retaining
   transition, proving a same-digest upload remains unattached until the GC task
   emits `:DOWN` and its non-null lease is resolved;
-- commit and recovery-copy tasks held across lease expiry or renewal failure,
+- commit and recovered-stage tasks held across lease expiry or renewal failure,
   proving recovery waits for `:DOWN` and the stale caller neither removes
   staging data nor transitions SQL;
 - recovery with a missing survivor, symlink, nested or multiple entries,
@@ -752,7 +724,7 @@ Implementation is not complete until fresh evidence covers:
 - fresh-BEAM ConfigStore Turso plus Concord VSR coexistence and restart;
 - quiesced backup/restore of SQL, ConfigStore, Concord metadata, CAS, and
   staging roots;
-- `mix deps.get --check-locked` with ESS exactly 0.6.2;
+- `mix deps.get --check-locked` with ESS exactly 0.6.4;
 - a production Elixir 1.20/OTP 29 `mix release` and Docker boot/restart smoke;
   and
 - release inspection proving `ex_storage_service` core is present,
@@ -784,7 +756,8 @@ not a substitute for the production-toolchain acceptance run.
 - `docs/superpowers/specs/2026-08-07-ess-embedded-s3-probe.md`
 - `docs/superpowers/plans/2026-07-21-github-api-releases.md`
 - `docs/superpowers/specs/2026-07-21-github-compatible-api-design.md`
-- [ExStorageService v0.6.2](https://github.com/gsmlg-opt/ex_storage_service/releases/tag/v0.6.2)
-- [Upstream recovery API request #13](https://github.com/gsmlg-opt/ex_storage_service/issues/13)
-- [Upstream direct-LocalCAS option request #14](https://github.com/gsmlg-opt/ex_storage_service/issues/14)
-- [Upstream durable-delete request #15](https://github.com/gsmlg-opt/ex_storage_service/issues/15)
+- [ExStorageService v0.6.4](https://github.com/gsmlg-opt/ex_storage_service/releases/tag/v0.6.4)
+- [ExStorageService PR #16](https://github.com/gsmlg-opt/ex_storage_service/pull/16)
+- [Closed recovery API request #13](https://github.com/gsmlg-opt/ex_storage_service/issues/13)
+- [Closed direct-LocalCAS option request #14](https://github.com/gsmlg-opt/ex_storage_service/issues/14)
+- [Closed durable-delete request #15](https://github.com/gsmlg-opt/ex_storage_service/issues/15)

@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Land only the process-embedded ExStorageService 0.6.2 LocalCAS foundation needed by future release assets: portable renewable operation leases, exact dependency/configuration, fail-fast storage-root validation, supervised readiness/restart, and an opaque streaming byte-store adapter with path-free capacity reporting that survives production-release and container restarts.
+**Goal:** Land only the process-embedded ExStorageService 0.6.4 LocalCAS foundation needed by future release assets: portable renewable operation leases, exact dependency/configuration, fail-fast storage-root validation, supervised readiness/restart, and an opaque streaming byte-store adapter with path-free capacity reporting that survives production-release and container restarts.
 
 **Architecture:** `forge_releases` owns one explicitly supervised, listener-free ESS instance and keeps ESS values, file descriptors, paths, and raw errors behind `ForgeReleases.AssetStorage`. Initial configuration/root faults fail application boot; runtime ESS loss changes the manager to not-ready and retries the temporary child with bounded exponential backoff. All LocalCAS operations pass adapter-owned loose-blob options and gate once on manager readiness. This plan deliberately stops before release tables, release-domain workflows, HTTP/API endpoints, recovery, or garbage collection.
 
-**Tech Stack:** Elixir 1.20, OTP 29, Ecto with Turso and PostgreSQL adapters, Concord 3 singleton VSR plus `Concord.Turso`, exact Hex `ex_storage_service` 0.6.2, ExUnit, Mix releases, Docker Compose.
+**Tech Stack:** Elixir 1.20, OTP 29, Ecto with Turso and PostgreSQL adapters, Concord 3 singleton VSR plus `Concord.Turso`, exact Hex `ex_storage_service` 0.6.4, ExUnit, Mix releases, Docker Compose.
 
 ---
 
@@ -14,11 +14,15 @@
 
 This plan implements the approved foundation in `docs/superpowers/specs/2026-08-12-release-assets-localcas-design.md`. It does not implement release records, asset records, blob inventory, recovery journals, GC jobs, controllers, serializers, routes, S3, Git LFS, or an object-service listener.
 
-The repository issues/pulls work is a hard prerequisite. The current branch
-does not contain `Fornacast.OperationLease`, `forge_issues`, or `forge_pulls`;
-they must arrive together through the already-approved repository-work branch
-before Task 1 begins. Do not copy that implementation by hand or bypass this
-gate.
+Pinned upstream references: [ExStorageService
+v0.6.4](https://github.com/gsmlg-opt/ex_storage_service/releases/tag/v0.6.4)
+and [PR #16](https://github.com/gsmlg-opt/ex_storage_service/pull/16), which
+close recovery #13, direct-options #14, and durable-delete #15.
+
+The repository issues/pulls work is a hard prerequisite. At plan revision time
+it was committed on `codex/repository-issues-pulls` but had not landed on
+`main`; the implementation branch must contain that committed history before
+Task 1 begins. Do not copy files from another worktree or bypass this gate.
 
 ## Exact file map
 
@@ -348,7 +352,7 @@ git add apps/fornacast/lib/fornacast/operation_lease.ex \
 git commit -m "feat(operations): retain ownership across lease updates"
 ```
 
-### Task 2: Scaffold `forge_releases` and pin ESS 0.6.2
+### Task 2: Scaffold `forge_releases` and pin ESS 0.6.4
 
 **Files:**
 
@@ -392,7 +396,7 @@ defmodule ForgeReleases.MixProject do
   defp deps do
     [
       {:fornacast, in_umbrella: true},
-      {:ex_storage_service, "== 0.6.2"}
+      {:ex_storage_service, "== 0.6.4"}
     ]
   end
 end
@@ -469,16 +473,16 @@ defmodule ForgeReleases.Application do
 end
 ```
 
-- [ ] Prove the lock resolves only core ESS 0.6.2 and no S3 application:
+- [ ] Prove the lock resolves only core ESS 0.6.4 and no S3 application:
 
 ```bash
 mix deps.get --check-locked
 mix deps.tree | rg 'ex_storage_service'
-rg -n '"ex_storage_service".*0\.6\.2' mix.lock
+rg -n '"ex_storage_service".*0\.6\.4' mix.lock
 ! rg -n 'ex_storage_service_s3' mix.exs apps/*/mix.exs mix.lock
 ```
 
-Expected: the lock check exits `0`; the dependency tree and lock contain `ex_storage_service 0.6.2`; the final negative search exits `0` because no S3 dependency is found. Also add `refute Application.spec(:ex_storage_service_s3)` to `application_test.exs`, which proves the optional application is absent without consulting the network.
+Expected: the lock check exits `0`; the dependency tree and lock contain `ex_storage_service 0.6.4`; the final negative search exits `0` because no S3 dependency is found. Also add `refute Application.spec(:ex_storage_service_s3)` to `application_test.exs`, which proves the optional application is absent without consulting the network.
 
 - [ ] Run formatting and focused wiring tests:
 
@@ -1784,39 +1788,39 @@ describe "staged survivor recovery boundary" do
     %{key: key, directory: directory}
   end
 
-  test "opens one direct regular survivor and cleans it without recursion", context do
+  test "recovers one direct regular survivor and cleans it without recursion", context do
     path = Path.join(context.directory, "upload-1")
     File.write!(path, "survivor")
+    digest = :crypto.hash(:sha256, "survivor") |> Base.encode16(case: :lower)
 
-    assert {:ok, source} =
-             ForgeReleases.AssetStorage.open_staged_survivor(context.key, 8)
+    assert {:ok, staged} =
+             ForgeReleases.AssetStorage.recover_stage(context.key, digest, 8)
 
-    assert inspect(source) == "#ForgeReleases.AssetStorage.Source<redacted>"
-    assert {:ok, "survivor", source} = ForgeReleases.AssetStorage.read(source, 32)
-    assert :eof = ForgeReleases.AssetStorage.read(source, 1)
-    assert :ok = ForgeReleases.AssetStorage.close(source)
+    assert inspect(staged) == "#ForgeReleases.AssetStorage.StagedRef<redacted>"
+    assert {:ok, %{sha256_digest: ^digest, storage_key: ^digest, size: 8}} =
+             ForgeReleases.AssetStorage.commit(staged)
     assert :ok = ForgeReleases.AssetStorage.cleanup_staging(context.key)
     refute File.exists?(context.directory)
     assert :ok = ForgeReleases.AssetStorage.cleanup_staging(context.key)
   end
 
-  test "rejects missing, symlinked, nested, multiple, and size-mismatched survivors", context do
+  test "rejects missing, symlinked, nested, multiple, size, and digest mismatches", context do
     assert :ok = ForgeReleases.AssetStorage.cleanup_staging(context.key)
     assert {:error, :not_found} =
-             ForgeReleases.AssetStorage.open_staged_survivor(context.key, 1)
+             ForgeReleases.AssetStorage.recover_stage(context.key, String.duplicate("a", 64), 1)
 
     File.mkdir_p!(context.directory)
     File.write!(Path.join(context.directory, "one"), "a")
     File.write!(Path.join(context.directory, "two"), "b")
 
     assert {:error, :invalid_source} =
-             ForgeReleases.AssetStorage.open_staged_survivor(context.key, 1)
+             ForgeReleases.AssetStorage.recover_stage(context.key, String.duplicate("a", 64), 1)
 
     File.rm_rf!(context.directory)
     File.mkdir_p!(Path.join(context.directory, "nested"))
 
     assert {:error, :invalid_source} =
-             ForgeReleases.AssetStorage.open_staged_survivor(context.key, 1)
+             ForgeReleases.AssetStorage.recover_stage(context.key, String.duplicate("a", 64), 1)
 
     File.rm_rf!(context.directory)
     File.mkdir_p!(context.directory)
@@ -1826,26 +1830,17 @@ describe "staged survivor recovery boundary" do
     File.rm!(target)
 
     assert {:error, :invalid_source} =
-             ForgeReleases.AssetStorage.open_staged_survivor(context.key, 1)
+             ForgeReleases.AssetStorage.recover_stage(context.key, String.duplicate("a", 64), 1)
 
     File.rm_rf!(context.directory)
     File.mkdir_p!(context.directory)
     File.write!(Path.join(context.directory, "one"), "short")
 
     assert {:error, :integrity_mismatch} =
-             ForgeReleases.AssetStorage.open_staged_survivor(context.key, 99)
-  end
-
-  test "rejects an fd whose inode differs from the lstat survivor", context do
-    survivor = Path.join(context.directory, "upload-1")
-    alternate = Path.join(System.tmp_dir!(), "alternate-#{System.unique_integer([:positive])}")
-    File.write!(survivor, "same-size")
-    File.write!(alternate, "same-size")
-    Process.put(:survivor_alternate, alternate)
-    on_exit(fn -> File.rm(alternate) end)
+             ForgeReleases.AssetStorage.recover_stage(context.key, String.duplicate("a", 64), 99)
 
     assert {:error, :integrity_mismatch} =
-             LocalCAS.open_staged_survivor(context.key, 9, SwappedOpenFS)
+             ForgeReleases.AssetStorage.recover_stage(context.key, String.duplicate("a", 64), 5)
   end
 
   test "effective configured cap applies to survivors", context do
@@ -1855,7 +1850,7 @@ describe "staged survivor recovery boundary" do
     File.write!(Path.join(context.directory, "upload-1"), "12345")
 
     assert {:error, :entity_too_large} =
-             ForgeReleases.AssetStorage.open_staged_survivor(context.key, 5)
+             ForgeReleases.AssetStorage.recover_stage(context.key, String.duplicate("a", 64), 5)
   end
 
   test "cleanup refuses a symlinked staging directory without touching its target", context do
@@ -1874,24 +1869,10 @@ describe "staged survivor recovery boundary" do
 end
 ```
 
-At the top of this test module, use `async: false` because the cap test temporarily changes one application value, and add the controlled fd swap module:
+At the top of this test module, use `async: false` because the cap test temporarily changes one application value:
 
 ```elixir
 use ExUnit.Case, async: false
-
-defmodule SwappedOpenFS do
-  defdelegate lstat(path), to: ForgeReleases.AssetStorage.FileSystem
-  defdelegate ls(path), to: ForgeReleases.AssetStorage.FileSystem
-  defdelegate read_file_info(io), to: ForgeReleases.AssetStorage.FileSystem
-  defdelegate close(io), to: ForgeReleases.AssetStorage.FileSystem
-
-  def open(_path, modes) do
-    ForgeReleases.AssetStorage.FileSystem.open(
-      Process.get(:survivor_alternate) || raise("alternate survivor path is missing"),
-      modes
-    )
-  end
-end
 
 defmodule CapacityFailureFS do
   def filesystem_capacity(_path), do: {:error, :eio}
@@ -1939,8 +1920,8 @@ defmodule ForgeReleases.AssetStorage do
               | {:error, storage_error()}
   @callback open(storage_key(), non_neg_integer(), :all | {non_neg_integer(), non_neg_integer()}) ::
               {:ok, Source.t()} | {:error, storage_error()}
-  @callback open_staged_survivor(String.t(), non_neg_integer()) ::
-              {:ok, Source.t()} | {:error, storage_error()}
+  @callback recover_stage(String.t(), storage_key(), non_neg_integer()) ::
+              {:ok, StagedRef.t()} | {:error, storage_error()}
   @callback cleanup_staging(String.t()) :: :ok | {:error, storage_error()}
   @callback read(Source.t(), pos_integer()) ::
               {:ok, binary(), Source.t()} | :eof | {:error, storage_error()}
@@ -1957,7 +1938,7 @@ defmodule ForgeReleases.AssetStorage do
   defdelegate discard(staged_ref), to: LocalCAS
   defdelegate stat(storage_key), to: LocalCAS
   defdelegate open(storage_key, expected_size, range), to: LocalCAS
-  defdelegate open_staged_survivor(staging_key, expected_size), to: LocalCAS
+  defdelegate recover_stage(staging_key, expected_digest, expected_size), to: LocalCAS
   defdelegate cleanup_staging(staging_key), to: LocalCAS
   defdelegate read(source, requested_bytes), to: LocalCAS
   defdelegate close(source), to: LocalCAS
@@ -2081,13 +2062,8 @@ defp stage_options(%Config{} = config, staging_key, options) do
 
     {:ok,
      config.context
-     |> ExStorageService.Context.blob_store_options()
-     |> Keyword.merge(
-       tmp_dir: tmp_dir,
-       max_size: max_size,
-       # WORKAROUND(upstream): gsmlg-opt/ex_storage_service#14
-       pack_module: nil
-     ), read_options}
+     |> ExStorageService.Context.direct_blob_store_options()
+     |> Keyword.merge(tmp_dir: tmp_dir, max_size: max_size), read_options}
   else
     _ -> {:error, :invalid_source}
   end
@@ -2109,10 +2085,15 @@ end
 
 defp blob_options(%Config{} = config) do
   config.context
-  |> ExStorageService.Context.blob_store_options()
+  |> ExStorageService.Context.direct_blob_store_options()
+end
+
+defp recover_options(%Config{} = config, staging_key) do
+  config.context
+  |> ExStorageService.Context.direct_blob_store_options()
   |> Keyword.merge(
-    # WORKAROUND(upstream): gsmlg-opt/ex_storage_service#14
-    pack_module: nil
+    tmp_dir: Path.join([config.tmp_root, "uploads", staging_key]),
+    max_size: config.max_bytes
   )
 end
 ```
@@ -2128,7 +2109,6 @@ def stage_from_reader(staging_key, reader, state, options)
        {:ok, cas_options, read_options} <- stage_options(config, staging_key, options) do
     wrapped_reader = fn reader_state -> reader.(reader_state, read_options) end
 
-    # WORKAROUND(upstream): gsmlg-opt/ex_storage_service#13
     case ESSLocalCAS.stage_from_reader(wrapped_reader, state, cas_options) do
       {:ok, staged, final_state} ->
         ref = %StagedRef{
@@ -2214,7 +2194,6 @@ end
 def delete(storage_key) do
   with :ok <- validate_digest(storage_key),
        {:ok, config} <- ready_config() do
-    # WORKAROUND(upstream): gsmlg-opt/ex_storage_service#15
     case ESSLocalCAS.delete(storage_key, blob_options(config)) do
       :ok -> :ok
       {:error, reason} -> {:error, normalize(:delete, reason)}
@@ -2278,65 +2257,46 @@ defp apply_range(size, {offset, length})
 defp apply_range(_size, _range), do: {:error, :invalid_range}
 
 @impl true
-def open_staged_survivor(staging_key, expected_size) do
-  open_staged_survivor(staging_key, expected_size, FileSystem)
-end
-
-@doc false
-def open_staged_survivor(staging_key, expected_size, fs)
-    when is_integer(expected_size) and expected_size >= 0 and is_atom(fs) do
+def recover_stage(staging_key, expected_digest, expected_size)
+    when is_integer(expected_size) and expected_size >= 0 do
   with :ok <- validate_staging_key(staging_key),
+       :ok <- validate_digest(expected_digest),
        {:ok, config} <- ready_config(),
-       :ok <- enforce_survivor_cap(expected_size, config.max_bytes) do
-    directory = Path.join([config.tmp_root, "uploads", staging_key])
-
-    # WORKAROUND(upstream): gsmlg-opt/ex_storage_service#13
-    open_single_survivor(fs, directory, expected_size, config.max_bytes)
+       :ok <- enforce_survivor_cap(expected_size, config.max_bytes),
+       {:ok, path} <- locate_single_survivor(FileSystem, config, staging_key, expected_size),
+       options = recover_options(config, staging_key),
+       {:ok, staged} <-
+         ESSLocalCAS.recover_stage(path, expected_digest, expected_size, options) do
+    {:ok,
+     %StagedRef{
+       inner: staged,
+       options: options,
+       storage_key: expected_digest,
+       size: expected_size
+     }}
+  else
+    {:error, reason} -> {:error, normalize(:recover, reason)}
   end
 end
 
-def open_staged_survivor(_staging_key, _expected_size, _fs),
+def recover_stage(_staging_key, _expected_digest, _expected_size),
   do: {:error, :invalid_source}
 
-defp open_single_survivor(fs, directory, expected_size, maximum_size) do
+defp locate_single_survivor(fs, config, staging_key, expected_size) do
+  directory = Path.join([config.tmp_root, "uploads", staging_key])
+
   with {:ok, %File.Stat{type: :directory}} <- fs.lstat(directory),
        {:ok, [entry]} <- fs.ls(directory),
        path = Path.join(directory, entry),
-       {:ok, %File.Stat{type: :regular} = stat} <- fs.lstat(path),
-       :ok <- enforce_survivor_cap(stat.size, maximum_size),
-       true <- stat.size == expected_size,
-       {:ok, io} <- fs.open(path, [:read, :raw, :binary]) do
-    finish_survivor_open(fs, io, stat)
+       {:ok, %File.Stat{type: :regular, size: ^expected_size}} <- fs.lstat(path) do
+    {:ok, path}
   else
     {:error, :enoent} -> {:error, :not_found}
     {:ok, []} -> {:error, :not_found}
-    {:ok, %File.Stat{type: :symlink}} -> {:error, :invalid_source}
+    {:ok, %File.Stat{type: :regular}} -> {:error, :integrity_mismatch}
     {:ok, %File.Stat{}} -> {:error, :invalid_source}
     {:ok, _entries} -> {:error, :invalid_source}
-    false -> {:error, :integrity_mismatch}
-    {:error, reason} when reason in [:entity_too_large, :invalid_source] -> {:error, reason}
     {:error, _reason} -> {:error, :unavailable}
-  end
-end
-
-defp finish_survivor_open(fs, io, stat) do
-  result =
-    with {:ok, info} <- fs.read_file_info(io),
-         :regular <- file_info(info, :type),
-         true <- file_info(info, :size) == stat.size,
-         true <- file_info(info, :inode) == stat.inode,
-         true <- file_info(info, :major_device) == stat.major_device,
-         true <- file_info(info, :minor_device) == stat.minor_device do
-      {:ok, %Source{io: io, offset: 0, position: 0, remaining: stat.size}}
-    else
-      _ -> {:error, :integrity_mismatch}
-    end
-
-  case result do
-    {:ok, _source} = success -> success
-    {:error, _reason} = error ->
-      _ = fs.close(io)
-      error
   end
 end
 
@@ -2349,7 +2309,6 @@ def cleanup_staging(staging_key) do
        {:ok, config} <- ready_config() do
     directory = Path.join([config.tmp_root, "uploads", staging_key])
 
-    # WORKAROUND(upstream): gsmlg-opt/ex_storage_service#13
     cleanup_single_survivor(FileSystem, directory)
   end
 end
@@ -2457,8 +2416,20 @@ def close(_source), do: :ok
 ```elixir
 @doc false
 def normalize(_operation, :not_found), do: :not_found
-def normalize(:stage, :entity_too_large), do: :entity_too_large
+def normalize(_operation, reason)
+    when reason in [:entity_too_large, :invalid_source, :integrity_mismatch, :unavailable],
+    do: reason
+
 def normalize(:commit, {:directory_sync, _reason}), do: :ambiguous_commit
+def normalize(:recover, reason)
+    when reason in [:checksum_mismatch, :size_mismatch, :stage_changed],
+    do: :integrity_mismatch
+
+def normalize(:recover, {:verify, :unexpected_eof}), do: :integrity_mismatch
+
+def normalize(:recover, reason)
+    when reason in [:invalid_hash, :invalid_size, :invalid_stage_path, :not_regular_file],
+    do: :invalid_source
 
 def normalize(_operation, reason)
     when reason in [:checksum_mismatch, :unexpected_eof],
@@ -2486,6 +2457,9 @@ test "raw ESS and filesystem errors collapse to the storage algebra" do
   assert LocalCAS.normalize(:stat, :not_found) == :not_found
   assert LocalCAS.normalize(:stage, :entity_too_large) == :entity_too_large
   assert LocalCAS.normalize(:commit, {:directory_sync, :eio}) == :ambiguous_commit
+  assert LocalCAS.normalize(:recover, :stage_changed) == :integrity_mismatch
+  assert LocalCAS.normalize(:recover, {:verify, :unexpected_eof}) == :integrity_mismatch
+  assert LocalCAS.normalize(:recover, :not_regular_file) == :invalid_source
   assert LocalCAS.normalize(:commit, {:commit, :existing_blob_mismatch}) ==
            :integrity_mismatch
   assert LocalCAS.normalize(:verify, :checksum_mismatch) == :integrity_mismatch
@@ -2522,7 +2496,7 @@ git add apps/forge_releases/lib/forge_releases/asset_storage.ex \
 git commit -m "feat(releases): add opaque LocalCAS byte store"
 ```
 
-### Task 7: Lock the exact-pin seams and prove release/container restart behavior
+### Task 7: Lock the v0.6.4 contracts and prove release/container restart behavior
 
 **Files:**
 
@@ -2535,7 +2509,7 @@ git commit -m "feat(releases): add opaque LocalCAS byte store"
 - Modify: `.github/workflows/e2e.yml`
 - Modify: `apps/fornacast_api/test/release_distribution_contract_test.exs`
 
-- [ ] Add exact-pin contract tests for the three tracked upstream seams. These tests deliberately call ESS directly only to characterize 0.6.2; production code continues to call it only inside the adapter:
+- [ ] Add exact-pin contract tests for the three supported v0.6.4 seams. These tests deliberately call ESS directly only to characterize the pinned dependency; production code continues to call it only inside the adapter:
 
 ```elixir
 defmodule ForgeReleases.AssetStorage.LocalCASContractTest do
@@ -2543,25 +2517,35 @@ defmodule ForgeReleases.AssetStorage.LocalCASContractTest do
 
   alias ExStorageService.BlobStore.LocalCAS
 
-  defmodule BombPack do
-    def locate(_hash), do: raise("pack lookup must remain disabled")
-  end
-
   defmodule RecordingDeleteFS do
     def rm(path) do
-      Process.put(:delete_fs_calls, [:rm | Process.get(:delete_fs_calls, [])])
+      record(:rm)
       File.rm(path)
     end
 
-    def open_directory(_path) do
-      Process.put(:delete_fs_calls, [:open_directory | Process.get(:delete_fs_calls, [])])
-      {:error, :unexpected_directory_open}
+    def open_directory(path) do
+      record(:open_directory)
+      :file.open(String.to_charlist(path), [:read, :raw, :directory])
     end
 
-    def sync(_io) do
-      Process.put(:delete_fs_calls, [:sync | Process.get(:delete_fs_calls, [])])
-      :ok
+    def sync(io) do
+      record(:sync)
+
+      if Process.get(:fail_delete_sync_once, false) do
+        Process.put(:fail_delete_sync_once, false)
+        {:error, :injected}
+      else
+        :file.sync(io)
+      end
     end
+
+    def close(io) do
+      record(:close)
+      :file.close(io)
+    end
+
+    defp record(call),
+      do: Process.put(:delete_fs_calls, [call | Process.get(:delete_fs_calls, [])])
   end
 
   setup do
@@ -2572,16 +2556,21 @@ defmodule ForgeReleases.AssetStorage.LocalCASContractTest do
     %{root: root, tmp_dir: tmp_dir}
   end
 
-  # WORKAROUND(upstream): gsmlg-opt/ex_storage_service#13
   test "abrupt staging death leaves at most one bounded regular survivor", context do
     parent = self()
-    options = [root: context.root, tmp_dir: context.tmp_dir, max_size: 16, pack_module: nil]
+    config = ForgeReleases.AssetStorage.Config.load!()
+
+    options =
+      config.context
+      |> ExStorageService.Context.direct_blob_store_options()
+      |> Keyword.merge(root: context.root, tmp_dir: context.tmp_dir, max_size: 16)
 
     {pid, monitor} =
       spawn_monitor(fn ->
         LocalCAS.stage_from_reader(
           fn state ->
             send(parent, {:reader_entered, self()})
+
             receive do
               {:continue, chunk} -> {:ok, chunk, state}
             end
@@ -2599,52 +2588,76 @@ defmodule ForgeReleases.AssetStorage.LocalCASContractTest do
     assert length(survivors) <= 1
 
     for survivor <- survivors do
-      assert {:ok, %File.Stat{type: :regular, size: size}} = File.stat(survivor)
+      assert {:ok, %File.Stat{type: :regular, size: size}} = File.lstat(survivor)
       assert size <= 16
       assert Path.dirname(survivor) == context.tmp_dir
     end
   end
 
-  # WORKAROUND(upstream): gsmlg-opt/ex_storage_service#14
-  test "pack_module nil bypasses all pack metadata lookup", context do
-    digest = String.duplicate("a", 64)
+  test "direct options and recover_stage publish a caller-owned completed stage", context do
+    config = ForgeReleases.AssetStorage.Config.load!()
 
-    assert_raise RuntimeError, "pack lookup must remain disabled", fn ->
-      LocalCAS.stat(digest, root: context.root, pack_module: BombPack)
-    end
+    options =
+      config.context
+      |> ExStorageService.Context.direct_blob_store_options()
+      |> Keyword.merge(root: context.root, tmp_dir: context.tmp_dir, max_size: 16)
 
-    assert {:error, :not_found} =
-             LocalCAS.stat(digest, root: context.root, pack_module: nil)
+    assert options[:pack_module] == nil
+    refute Keyword.has_key?(options, :bucket)
+
+    payload = "recovered-stage"
+    digest = :crypto.hash(:sha256, payload) |> Base.encode16(case: :lower)
+    assert {:ok, completed_stage} = LocalCAS.stage(payload, options)
+    stage_path = completed_stage.path
+    assert Path.dirname(stage_path) == context.tmp_dir
+    assert {:ok, %File.Stat{type: :regular, size: 15}} = File.lstat(stage_path)
+
+    assert {:ok, staged} = LocalCAS.recover_stage(stage_path, digest, byte_size(payload), options)
+    assert {:ok, %{hash: ^digest, size: 15}} = LocalCAS.commit(staged, options)
+    assert :ok = LocalCAS.verify(digest, options)
+    refute File.exists?(stage_path)
   end
 
-  # WORKAROUND(upstream): gsmlg-opt/ex_storage_service#15
-  test "delete lacks directory sync and an absent audit can re-delete reappearing bytes", context do
+  test "delete syncs its directory and safely retries an ambiguous sync", context do
     payload = "durable-delete-contract"
     digest = :crypto.hash(:sha256, payload) |> Base.encode16(case: :lower)
-    path = LocalCAS.blob_path(digest, root: context.root, pack_module: nil)
+    config = ForgeReleases.AssetStorage.Config.load!()
+
+    options =
+      config.context
+      |> ExStorageService.Context.direct_blob_store_options()
+      |> Keyword.merge(root: context.root, tmp_dir: context.tmp_dir)
+
+    path = LocalCAS.blob_path(digest, options)
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, payload)
     Process.put(:delete_fs_calls, [])
+    Process.put(:fail_delete_sync_once, true)
 
-    assert :ok =
-             LocalCAS.delete(digest,
-               root: context.root,
-               pack_module: nil,
-               fs_module: RecordingDeleteFS
+    assert {:error, {:directory_sync, :injected}} =
+             LocalCAS.delete(
+               digest,
+               Keyword.put(options, :fs_module, RecordingDeleteFS)
              )
 
-    assert Process.delete(:delete_fs_calls) == [:rm]
     refute File.exists?(path)
+    assert Process.get(:delete_fs_calls) |> Enum.reverse() ==
+             [:rm, :open_directory, :sync, :close]
 
-    File.write!(path, payload)
-    assert {:ok, %{size: 23}} = LocalCAS.stat(digest, root: context.root, pack_module: nil)
-    assert :ok = LocalCAS.delete(digest, root: context.root, pack_module: nil)
-    assert {:error, :not_found} = LocalCAS.stat(digest, root: context.root, pack_module: nil)
+    Process.put(:delete_fs_calls, [])
+    assert :ok =
+             LocalCAS.delete(
+               digest,
+               Keyword.put(options, :fs_module, RecordingDeleteFS)
+             )
+    assert Process.delete(:delete_fs_calls) |> Enum.reverse() ==
+             [:rm, :open_directory, :sync, :close]
+    assert {:error, :not_found} = LocalCAS.stat(digest, options)
   end
 end
 ```
 
-The third test is the foundation half of the approved #15 mitigation: it prevents treating ESS 0.6.2 unlink as directory-durable and proves an `absent` audit can safely re-delete a reappearing digest. The SQL tombstone and scheduled audit belong to the later release-domain/GC plan and must not be added here.
+The delete test proves that an error after unlink remains ambiguous, and that an idempotent retry syncs the directory before the domain may record `absent`. The later release-domain plan supplies the durable `deleting` row and retry loop; no absent-object deletion workaround belongs here.
 
 - [ ] Run the exact-pin tests before touching deployment files:
 
@@ -2652,7 +2665,7 @@ The third test is the foundation half of the approved #15 mitigation: it prevent
 mix test apps/forge_releases/test/forge_releases/asset_storage/local_cas_contract_test.exs
 ```
 
-Expected green result against exact 0.6.2: `0 failures`; the #14 bomb raises only when the test intentionally omits the workaround, and #15 records only `:rm`.
+Expected green result against exact 0.6.4: `0 failures`; recovery returns a committable stage without copying, direct options disable packed/legacy lookup, and delete records directory open/sync/close on both the ambiguous attempt and its safe retry.
 
 - [ ] Add the reusable production-release probe. It stores a deterministic blob in `write` mode and proves stat/verify/open/read/idempotent-close after restart in `verify` mode:
 
@@ -2784,7 +2797,7 @@ test "release assets ship core LocalCAS without an S3 listener" do
   assert readme =~ "Treat the Ecto database, ConfigStore database"
   refute dockerfile =~ "EXPOSE 9000"
   refute compose =~ ~r/^\s+- ["']?9000/m
-  assert e2e =~ "ex_storage_service-0.6.2"
+  assert e2e =~ "ex_storage_service-0.6.4"
   assert e2e =~ "release_asset_storage_smoke.sh release/fornacast write"
   assert e2e =~ "release_asset_storage_smoke.sh release/fornacast verify"
   assert e2e =~ "fornacast.localcas.owner"
@@ -2861,7 +2874,7 @@ After the first health check, inspect the release and write the restart marker:
 ```yaml
 - name: Inspect embedded LocalCAS release
   run: |
-    test -d release/fornacast/lib/ex_storage_service-0.6.2
+    test -d release/fornacast/lib/ex_storage_service-0.6.4
     ! compgen -G 'release/fornacast/lib/ex_storage_service_s3-*'
     release/fornacast/bin/fornacast rpc '
       true = ForgeReleases.AssetStorage.Manager.ready?()
@@ -3035,7 +3048,7 @@ done
 sh scripts/release_asset_storage_smoke.sh _build/prod/rel/fornacast verify
 timeout 45 _build/prod/rel/fornacast/bin/fornacast stop
 
-test -d _build/prod/rel/fornacast/lib/ex_storage_service-0.6.2
+test -d _build/prod/rel/fornacast/lib/ex_storage_service-0.6.4
 ! compgen -G '_build/prod/rel/fornacast/lib/ex_storage_service_s3-*'
 ```
 
@@ -3133,16 +3146,19 @@ Expected: only files in the exact file map appear. No database files, release ou
   mix.exs apps/*/mix.exs config
 ! rg -n 'ForgeReleases\.(Release|BlobGC|Recovery)\b|defmodule ForgeReleases\.Asset\b|release_asset_operations|release_blobs' \
   apps/forge_releases/lib
+! rg -n 'WORKAROUND\(upstream\): gsmlg-opt/ex_storage_service#(13|14|15)' \
+  docs/superpowers/plans/2026-08-12-release-assets-localcas-foundation.md \
+  apps/forge_releases
 ```
 
-Expected: all three negative searches exit `0`. Every upstream marker refers only to the explicit #13, #14, or #15 exact-pin contract.
+Expected: all four negative searches exit `0`; no temporary upstream workaround marker remains.
 
 - [ ] Re-run type/surface consistency checks:
 
 ```bash
 rg -U --multiline-dotall -n 'renew_owned\(.{0,600}now:.{0,200}lease_seconds:' \
   apps/fornacast/test/operation_lease_test.exs
-rg -n 'def (stage_from_reader|commit|discard|stat|open|open_staged_survivor|cleanup_staging|read|close|verify|delete|capacity)' \
+rg -n 'def (stage_from_reader|commit|discard|stat|open|recover_stage|cleanup_staging|read|close|verify|delete|capacity)' \
   apps/forge_releases/lib/forge_releases/asset_storage.ex \
   apps/forge_releases/lib/forge_releases/asset_storage/local_cas.ex
 ! rg -n 'ExStorageService|:file\.io_device|path:' \
