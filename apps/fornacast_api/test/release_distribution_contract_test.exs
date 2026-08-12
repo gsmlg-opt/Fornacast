@@ -327,6 +327,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     [runtime_packages, _] = String.split(runtime_stage, "useradd --create-home", parts: 2)
 
     assert dockerfile =~ "FORNACAST_RELEASE_ASSET_STORAGE_ROOT=/data/release-assets"
+    assert runtime_stage =~ "LANG=C.UTF-8"
     assert "coreutils" in String.split(runtime_packages)
     assert File.read!(@releases_mix) =~ ~s({:ex_storage_service, "== 0.6.4"})
     assert dockerfile =~ "scripts/release_asset_storage_smoke.sh"
@@ -365,21 +366,37 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert e2e =~ ~s({{.State.ExitCode}})
     assert e2e =~ ~s({{.State.OOMKilled}})
     assert e2e =~ ~s(docker rm "$container")
-    assert length(:binary.matches(e2e, "Node.self() == :\"fornacast@127.0.0.1\"")) == 2
+    assert length(:binary.matches(e2e, "true = Node.self() == :\"fornacast@127.0.0.1\"")) == 2
 
     assert length(
              :binary.matches(
                e2e,
-               "ExStorageService.Cluster.Readiness.ready?(timeout: 1_000)"
+               "true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000)"
              )
            ) == 4
 
-    assert length(:binary.matches(e2e, "Node.self() == :\"fornacast_e2e@127.0.0.1\"")) ==
+    assert length(
+             :binary.matches(
+               e2e,
+               "true = ForgeReleases.AssetStorage.Manager.ready?()"
+             )
+           ) == 4
+
+    assert length(:binary.matches(e2e, "true = Node.self() == :\"fornacast_e2e@127.0.0.1\"")) ==
              2
 
     assert length(:binary.matches(e2e, ~s(          run_container\n))) == 2
     assert e2e =~ ~s(-v "$volume:/data")
+    assert e2e =~ "-e FORNACAST_SSH_HOST=localhost"
+    assert e2e =~ "-e FORNACAST_SSH_PORT=2222"
+    assert e2e =~ "s3_package=\"$(find release/fornacast/lib"
+    assert e2e =~ "listeners=\"$(ss -ltn)\""
+    assert e2e =~ "published_ports=\"$(docker port \"$container\")\""
+    refute e2e =~ "test -z \"$(find release/fornacast/lib"
+    refute e2e =~ "! ss -ltn |"
+    refute e2e =~ "test -z \"$(docker port \"$container\")\""
     refute e2e =~ "ss -ltnp"
+    refute e2e =~ "| grep true"
     refute e2e =~ "docker restart"
     refute e2e =~ ~s(docker start "$container")
     refute e2e =~ "RELEASE_COOKIE"

@@ -193,7 +193,8 @@ jobs:
       - name: Inspect embedded LocalCAS release
         run: |
           test -d release/fornacast/lib/ex_storage_service-0.6.4
-          test -z "$(find release/fornacast/lib -maxdepth 1 -type d -name 'ex_storage_service_s3-*' -print -quit)"
+          s3_package="$(find release/fornacast/lib -maxdepth 1 -type d -name 'ex_storage_service_s3-*' -print -quit)"
+          test -z "$s3_package"
           release/fornacast/bin/fornacast rpc '
             true = Node.self() == :"fornacast_e2e@127.0.0.1"
             true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000)
@@ -204,7 +205,8 @@ jobs:
             true = is_pid(engine)
           '
           sh scripts/release_asset_storage_smoke.sh release/fornacast write
-          ! ss -ltn | grep -Eq ':(9000|9100)[[:space:]]'
+          listeners="$(ss -ltn)"
+          ! grep -Eq ':(9000|9100)[[:space:]]' <<< "$listeners"
 
       - name: Push repository over SSH
         run: |
@@ -273,7 +275,7 @@ jobs:
 
           for attempt in $(seq 1 60); do
             if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null && \
-               release/fornacast/bin/fornacast rpc 'true = Node.self() == :"fornacast_e2e@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true; then
+               release/fornacast/bin/fornacast rpc 'true = Node.self() == :"fornacast_e2e@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); true = ForgeReleases.AssetStorage.Manager.ready?()'; then
               break
             fi
             if [ "$attempt" = 60 ]; then
@@ -317,6 +319,8 @@ jobs:
               --label "fornacast.localcas.owner=$owner" \
               -e SECRET_KEY_BASE="$secret_key_base" \
               -e FORNACAST_BASE_URL=http://127.0.0.1:4890 \
+              -e FORNACAST_SSH_HOST=localhost \
+              -e FORNACAST_SSH_PORT=2222 \
               -v "$volume:/data" \
               "$image"
           }
@@ -333,7 +337,7 @@ jobs:
 
           for attempt in $(seq 1 60); do
             if docker exec "$container" \
-                 /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true; then
+                 /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); true = ForgeReleases.AssetStorage.Manager.ready?()'; then
               break
             fi
             if [ "$attempt" = 60 ]; then
@@ -357,7 +361,7 @@ jobs:
 
           for attempt in $(seq 1 60); do
             if docker exec "$container" \
-                 /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true; then
+                 /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); true = ForgeReleases.AssetStorage.Manager.ready?()'; then
               break
             fi
             if [ "$attempt" = 60 ]; then
@@ -369,7 +373,8 @@ jobs:
 
           docker exec "$container" \
             /app/bin/release_asset_storage_smoke /app verify
-          test -z "$(docker port "$container")"
+          published_ports="$(docker port "$container")"
+          test -z "$published_ports"
           docker exec "$container" \
             /app/bin/fornacast rpc 'nil = Application.spec(:ex_storage_service_s3)'
 

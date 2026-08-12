@@ -2953,6 +2953,7 @@ FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS=86400
 
 ```dockerfile
 # Dockerfile runtime ENV block
+LANG=C.UTF-8 \
 FORNACAST_RELEASE_ASSET_STORAGE_ROOT=/data/release-assets \
 FORNACAST_RELEASE_ASSET_MAX_BYTES=2147483648 \
 FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS=86400 \
@@ -3066,7 +3067,8 @@ After the first health check, inspect the release and write the restart marker:
 - name: Inspect embedded LocalCAS release
   run: |
     test -d release/fornacast/lib/ex_storage_service-0.6.4
-    test -z "$(find release/fornacast/lib -maxdepth 1 -type d -name 'ex_storage_service_s3-*' -print -quit)"
+    s3_package="$(find release/fornacast/lib -maxdepth 1 -type d -name 'ex_storage_service_s3-*' -print -quit)"
+    test -z "$s3_package"
     release/fornacast/bin/fornacast rpc '
       true = Node.self() == :"fornacast_e2e@127.0.0.1"
       true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000)
@@ -3077,7 +3079,8 @@ After the first health check, inspect the release and write the restart marker:
       true = is_pid(engine)
     '
     sh scripts/release_asset_storage_smoke.sh release/fornacast write
-    ! ss -ltn | grep -Eq ':(9000|9100)[[:space:]]'
+    listeners="$(ss -ltn)"
+    ! grep -Eq ':(9000|9100)[[:space:]]' <<< "$listeners"
 ```
 
 After the existing Git/web checks, stop and restart the same release with the same node identity and root, then verify the descriptor path through the adapter:
@@ -3099,7 +3102,7 @@ After the existing Git/web checks, stop and restart the same release with the sa
 
     for attempt in $(seq 1 60); do
       if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null && \
-         release/fornacast/bin/fornacast rpc 'true = Node.self() == :"fornacast_e2e@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true; then
+         release/fornacast/bin/fornacast rpc 'true = Node.self() == :"fornacast_e2e@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); true = ForgeReleases.AssetStorage.Manager.ready?()'; then
         break
       fi
       if [ "$attempt" = 60 ]; then
@@ -3148,6 +3151,8 @@ Add `fornacast-restart.log` to the failure artifact.
         --label "fornacast.localcas.owner=$owner" \
         -e SECRET_KEY_BASE="$secret_key_base" \
         -e FORNACAST_BASE_URL=http://127.0.0.1:4890 \
+        -e FORNACAST_SSH_HOST=localhost \
+        -e FORNACAST_SSH_PORT=2222 \
         -v "$volume:/data" \
         "$image"
     }
@@ -3164,7 +3169,7 @@ Add `fornacast-restart.log` to the failure artifact.
 
     for attempt in $(seq 1 60); do
       if docker exec "$container" \
-           /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true; then
+           /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); true = ForgeReleases.AssetStorage.Manager.ready?()'; then
         break
       fi
       if [ "$attempt" = 60 ]; then
@@ -3188,7 +3193,7 @@ Add `fornacast-restart.log` to the failure artifact.
 
     for attempt in $(seq 1 60); do
       if docker exec "$container" \
-           /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true; then
+           /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); true = ForgeReleases.AssetStorage.Manager.ready?()'; then
         break
       fi
       if [ "$attempt" = 60 ]; then
@@ -3200,7 +3205,8 @@ Add `fornacast-restart.log` to the failure artifact.
 
     docker exec "$container" \
       /app/bin/release_asset_storage_smoke /app verify
-    test -z "$(docker port "$container")"
+    published_ports="$(docker port "$container")"
+    test -z "$published_ports"
     docker exec "$container" \
       /app/bin/fornacast rpc 'nil = Application.spec(:ex_storage_service_s3)'
 ```
@@ -3250,7 +3256,7 @@ export RELEASE_NODE=fornacast_localcas_smoke@127.0.0.1
 _build/prod/rel/fornacast/bin/fornacast daemon
 for attempt in $(seq 1 60); do
   _build/prod/rel/fornacast/bin/fornacast rpc \
-    'true = Node.self() == :"fornacast_localcas_smoke@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true && break
+    'true = Node.self() == :"fornacast_localcas_smoke@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); true = ForgeReleases.AssetStorage.Manager.ready?()' && break
   test "$attempt" != 60
   sleep 1
 done
@@ -3259,7 +3265,7 @@ timeout 45 _build/prod/rel/fornacast/bin/fornacast stop
 _build/prod/rel/fornacast/bin/fornacast daemon
 for attempt in $(seq 1 60); do
   _build/prod/rel/fornacast/bin/fornacast rpc \
-    'true = Node.self() == :"fornacast_localcas_smoke@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true && break
+    'true = Node.self() == :"fornacast_localcas_smoke@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); true = ForgeReleases.AssetStorage.Manager.ready?()' && break
   test "$attempt" != 60
   sleep 1
 done
@@ -3267,7 +3273,8 @@ sh scripts/release_asset_storage_smoke.sh _build/prod/rel/fornacast verify
 timeout 45 _build/prod/rel/fornacast/bin/fornacast stop
 
 test -d _build/prod/rel/fornacast/lib/ex_storage_service-0.6.4
-test -z "$(find _build/prod/rel/fornacast/lib -maxdepth 1 -type d -name 'ex_storage_service_s3-*' -print -quit)"
+s3_package="$(find _build/prod/rel/fornacast/lib -maxdepth 1 -type d -name 'ex_storage_service_s3-*' -print -quit)"
+test -z "$s3_package"
 ```
 
 Expected: Elixir reports `1.20.x`, Erlang/OTP reports `29`, Rust reports `1.96.x` or newer, compilation has no warnings, both smoke phases exit `0`, the second BEAM reads the first BEAM's blob, ESS core exists, and S3 is absent.
@@ -3302,6 +3309,8 @@ run_container() {
     --label "fornacast.localcas.owner=$owner" \
     -e SECRET_KEY_BASE="$secret_key_base" \
     -e FORNACAST_BASE_URL=http://127.0.0.1:4890 \
+    -e FORNACAST_SSH_HOST=localhost \
+    -e FORNACAST_SSH_PORT=2222 \
     -v "$volume:/data" \
     "$image"
 }
@@ -3317,7 +3326,7 @@ run_container
 test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"
 for attempt in $(seq 1 60); do
   docker exec "$container" \
-    /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true && break
+    /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); true = ForgeReleases.AssetStorage.Manager.ready?()' && break
   test "$attempt" != 60
   sleep 1
 done
@@ -3334,13 +3343,14 @@ run_container
 test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"
 for attempt in $(seq 1 60); do
   docker exec "$container" \
-    /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true && break
+    /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); true = ForgeReleases.AssetStorage.Manager.ready?()' && break
   test "$attempt" != 60
   sleep 1
 done
 docker exec "$container" \
   /app/bin/release_asset_storage_smoke /app verify
-test -z "$(docker port "$container")"
+published_ports="$(docker port "$container")"
+test -z "$published_ports"
 ```
 
 Expected: the image boots, the graceful stop exits `0` without OOM or timeout

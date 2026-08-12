@@ -64,7 +64,8 @@ COPY --chown=fornacast:fornacast \
   scripts/release_asset_storage_smoke.sh \
   /app/bin/release_asset_storage_smoke
 
-ENV HOME=/app \
+ENV LANG=C.UTF-8 \
+    HOME=/app \
     PORT=4890 \
     FORNACAST_API_BIND_IP=0.0.0.0 \
     FORNACAST_API_PORT=4891 \
