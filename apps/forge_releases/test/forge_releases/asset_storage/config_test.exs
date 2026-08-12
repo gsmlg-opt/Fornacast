@@ -1,7 +1,8 @@
 defmodule ForgeReleases.AssetStorage.ConfigTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias ExStorageService.InstanceConfig
+  alias ForgeReleases.AssetStorage.Config, as: AssetStorageConfig
   alias Fornacast.Config
 
   @workers [
@@ -57,5 +58,35 @@ defmodule ForgeReleases.AssetStorage.ConfigTest do
            ]
 
     assert Application.fetch_env!(:concord, :turso)[:enabled]
+  end
+
+  test "storage configuration reports invalid ESS instance configuration" do
+    original = Application.fetch_env!(:ex_storage_service, :instance_config)
+    on_exit(fn -> Application.put_env(:ex_storage_service, :instance_config, original) end)
+
+    Application.put_env(
+      :ex_storage_service,
+      :instance_config,
+      Keyword.put(original, :mode, :invalid)
+    )
+
+    assert_raise ArgumentError,
+                 ~r/invalid ex_storage_service instance configuration:.*mode must be/,
+                 fn -> AssetStorageConfig.load!() end
+  end
+
+  test "storage configuration reports invalid ESS context configuration" do
+    original = Application.fetch_env!(:ex_storage_service, :metadata_root)
+    on_exit(fn -> Application.put_env(:ex_storage_service, :metadata_root, original) end)
+
+    Application.put_env(
+      :ex_storage_service,
+      :metadata_root,
+      Path.join(Path.dirname(original), "other-concord")
+    )
+
+    assert_raise ArgumentError,
+                 ~r/invalid ex_storage_service context:.*metadata_root is application infrastructure/,
+                 fn -> AssetStorageConfig.load!() end
   end
 end
