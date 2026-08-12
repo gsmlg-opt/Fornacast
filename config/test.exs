@@ -83,8 +83,20 @@ config :fornacast,
   ssh_system_dir: "tmp/test/ssh",
   ssh_enabled: false
 
+release_asset_root = Path.expand("tmp/test/release-assets", test_root)
+
+config :fornacast, release_asset_storage_root: release_asset_root
+
 config :concord,
-  cluster_enabled: false,
+  cluster_enabled: true,
+  data_dir: Path.join(release_asset_root, "concord"),
+  vsr: [
+    group_id: :ex_storage_service_metadata,
+    replica_id: node(),
+    members: [%{id: node(), endpoint: node()}],
+    storage: :file,
+    bootstrap: false
+  ],
   turso: [
     enabled: true,
     database:

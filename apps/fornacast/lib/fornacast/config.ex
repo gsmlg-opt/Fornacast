@@ -15,6 +15,20 @@ defmodule Fornacast.Config do
     |> Path.expand()
   end
 
+  def release_asset_storage_root do
+    :fornacast
+    |> Application.fetch_env!(:release_asset_storage_root)
+    |> Path.expand()
+  end
+
+  def release_asset_max_bytes do
+    Application.fetch_env!(:fornacast, :release_asset_max_bytes)
+  end
+
+  def release_asset_gc_grace_seconds do
+    Application.fetch_env!(:fornacast, :release_asset_gc_grace_seconds)
+  end
+
   def ssh_host do
     Application.fetch_env!(:fornacast, :ssh_host)
   end
