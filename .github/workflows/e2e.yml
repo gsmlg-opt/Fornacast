@@ -125,7 +125,7 @@ jobs:
 
       - name: Prepare e2e environment
         run: |
-          mkdir -p e2e-data/repos e2e-data/ssh e2e-work
+          mkdir -p e2e-data/repos e2e-data/ssh e2e-data/release-assets e2e-work
           ssh-keygen -t ed25519 -f e2e-data/id_ed25519 -N "" -C e2e@example.com
           {
             echo "SECRET_KEY_BASE=$(openssl rand -base64 48)"
@@ -133,19 +133,38 @@ jobs:
             echo "FORNACAST_DATABASE_PATH=${GITHUB_WORKSPACE}/e2e-data/fornacast.db"
             echo "FORNACAST_CONFIG_DATABASE_PATH=${GITHUB_WORKSPACE}/e2e-data/fornacast_config.db"
             echo "FORNACAST_REPO_STORAGE_ROOT=${GITHUB_WORKSPACE}/e2e-data/repos"
+            echo "FORNACAST_RELEASE_ASSET_STORAGE_ROOT=${GITHUB_WORKSPACE}/e2e-data/release-assets"
             echo "FORNACAST_SSH_BIND_IP=127.0.0.1"
             echo "FORNACAST_SSH_HOST=127.0.0.1"
             echo "FORNACAST_SSH_SYSTEM_DIR=${GITHUB_WORKSPACE}/e2e-data/ssh"
             echo "E2E_PUBLIC_KEY_PATH=${GITHUB_WORKSPACE}/e2e-data/id_ed25519.pub"
+            echo "ELIXIR_ERL_OPTIONS=-kernel inet_dist_use_interface {127,0,0,1}"
+            echo "ERL_EPMD_ADDRESS=127.0.0.1"
+            echo "RELEASE_DISTRIBUTION=name"
+            echo "RELEASE_NODE=fornacast_e2e@127.0.0.1"
           } >> "$GITHUB_ENV"
+
+      - name: Start release
+        run: |
+          release/fornacast/bin/fornacast start > fornacast.log 2>&1 &
+          echo "$!" > fornacast.pid
+
+      - name: Wait for health
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:${PORT}/health" && \
+               curl -fsS "http://127.0.0.1:${FORNACAST_API_PORT}/health"; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          cat fornacast.log
+          exit 1
 
       - name: Seed release data
         run: |
-          release/fornacast/bin/fornacast eval '
-          Enum.each([:git_core, :fornacast, :forge_accounts, :forge_repos], fn app ->
-            {:ok, _started} = Application.ensure_all_started(app)
-          end)
-
+          release/fornacast/bin/fornacast rpc '
           public_key = File.read!(System.fetch_env!("E2E_PUBLIC_KEY_PATH"))
 
           {:ok, user} =
@@ -171,23 +190,21 @@ jobs:
             })
           '
 
-      - name: Start release
+      - name: Inspect embedded LocalCAS release
         run: |
-          release/fornacast/bin/fornacast start > fornacast.log 2>&1 &
-          echo "$!" > fornacast.pid
-
-      - name: Wait for health
-        run: |
-          for attempt in $(seq 1 60); do
-            if curl -fsS "http://127.0.0.1:${PORT}/health" && \
-               curl -fsS "http://127.0.0.1:${FORNACAST_API_PORT}/health"; then
-              exit 0
-            fi
-            sleep 2
-          done
-
-          cat fornacast.log
-          exit 1
+          test -d release/fornacast/lib/ex_storage_service-0.6.4
+          test -z "$(find release/fornacast/lib -maxdepth 1 -type d -name 'ex_storage_service_s3-*' -print -quit)"
+          release/fornacast/bin/fornacast rpc '
+            true = Node.self() == :"fornacast_e2e@127.0.0.1"
+            true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000)
+            true = ForgeReleases.AssetStorage.Manager.ready?()
+            nil = Application.spec(:ex_storage_service_s3)
+            instance = GenServer.whereis(ExStorageService.Names.instance_supervisor(:fornacast_release_assets))
+            [{_, engine, :worker, [ExStorageService.Storage.Engine]}] = Supervisor.which_children(instance)
+            true = is_pid(engine)
+          '
+          sh scripts/release_asset_storage_smoke.sh release/fornacast write
+          ! ss -ltn | grep -Eq ':(9000|9100)[[:space:]]'
 
       - name: Push repository over SSH
         run: |
@@ -235,6 +252,127 @@ jobs:
           curl -fsS -o /dev/null "http://127.0.0.1:${PORT}${MODULE_SCRIPT_URL}"
           curl -fsS -b e2e-data/cookies.txt "http://127.0.0.1:${PORT}/alice/demo/raw/main/README.md" | grep "E2E release smoke"
 
+      - name: Restart release with persisted LocalCAS bytes
+        run: |
+          old_pid="$(cat fornacast.pid)"
+          timeout 45 release/fornacast/bin/fornacast stop
+
+          for attempt in $(seq 1 45); do
+            if ! kill -0 "$old_pid" 2>/dev/null; then
+              break
+            fi
+            if [ "$attempt" = 45 ]; then
+              echo "release process $old_pid did not exit after a normal stop" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+
+          release/fornacast/bin/fornacast start > fornacast-restart.log 2>&1 &
+          echo "$!" > fornacast.pid
+
+          for attempt in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null && \
+               release/fornacast/bin/fornacast rpc 'true = Node.self() == :"fornacast_e2e@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true; then
+              break
+            fi
+            if [ "$attempt" = 60 ]; then
+              cat fornacast-restart.log
+              exit 1
+            fi
+            sleep 2
+          done
+
+          sh scripts/release_asset_storage_smoke.sh release/fornacast verify
+          GIT_SSH_COMMAND="ssh -F /dev/null -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=${GITHUB_WORKSPACE}/e2e-data/known_hosts -i ${GITHUB_WORKSPACE}/e2e-data/id_ed25519" \
+            git -C e2e-work/demo ls-remote origin refs/heads/main
+
+      - name: Docker LocalCAS boot and recreate smoke
+        if: github.event_name == 'pull_request'
+        run: |
+          owner="$(openssl rand -hex 16)"
+          container="fornacast-localcas-smoke-${owner:0:12}"
+          volume="fornacast-localcas-smoke-data-${owner:0:12}"
+          image="fornacast-localcas-smoke-${owner:0:12}"
+          secret_key_base="$(openssl rand -hex 32)"
+          cleanup() {
+            status=$?
+            trap - EXIT
+            if [ "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container" 2>/dev/null || true)" = "$owner" ]; then
+              if [ "$status" -ne 0 ]; then
+                docker logs "$container" > fornacast-docker.log 2>&1 || true
+              fi
+              docker rm -f "$container" >/dev/null 2>&1 || true
+            fi
+            if [ "$(docker volume inspect -f '{{ index .Labels "fornacast.localcas.owner" }}' "$volume" 2>/dev/null || true)" = "$owner" ]; then
+              docker volume rm "$volume" >/dev/null 2>&1 || true
+            fi
+            if [ "$(docker image inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$image" 2>/dev/null || true)" = "$owner" ]; then
+              docker image rm "$image" >/dev/null 2>&1 || true
+            fi
+            exit "$status"
+          }
+          run_container() {
+            docker run -d --name "$container" \
+              --label "fornacast.localcas.owner=$owner" \
+              -e SECRET_KEY_BASE="$secret_key_base" \
+              -e FORNACAST_BASE_URL=http://127.0.0.1:4890 \
+              -v "$volume:/data" \
+              "$image"
+          }
+          trap cleanup EXIT
+          ! docker container inspect "$container" >/dev/null 2>&1
+          ! docker volume inspect "$volume" >/dev/null 2>&1
+          ! docker image inspect "$image" >/dev/null 2>&1
+          docker build --label "fornacast.localcas.owner=$owner" -t "$image" .
+          test "$(docker image inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$image")" = "$owner"
+          docker volume create --label "fornacast.localcas.owner=$owner" "$volume"
+          test "$(docker volume inspect -f '{{ index .Labels "fornacast.localcas.owner" }}' "$volume")" = "$owner"
+          run_container
+          test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"
+
+          for attempt in $(seq 1 60); do
+            if docker exec "$container" \
+                 /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true; then
+              break
+            fi
+            if [ "$attempt" = 60 ]; then
+              docker logs "$container"
+              exit 1
+            fi
+            sleep 2
+          done
+
+          docker exec "$container" \
+            /app/bin/release_asset_storage_smoke /app write
+          docker stop --time 45 "$container"
+          test "$(docker container inspect -f '{{.State.Running}}' "$container")" = false
+          test "$(docker container inspect -f '{{.State.ExitCode}}' "$container")" = 0
+          test "$(docker container inspect -f '{{.State.OOMKilled}}' "$container")" = false
+          test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"
+          docker rm "$container"
+          ! docker container inspect "$container" >/dev/null 2>&1
+          run_container
+          test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"
+
+          for attempt in $(seq 1 60); do
+            if docker exec "$container" \
+                 /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true; then
+              break
+            fi
+            if [ "$attempt" = 60 ]; then
+              docker logs "$container"
+              exit 1
+            fi
+            sleep 2
+          done
+
+          docker exec "$container" \
+            /app/bin/release_asset_storage_smoke /app verify
+          test -z "$(docker port "$container")"
+          docker exec "$container" \
+            /app/bin/fornacast rpc 'nil = Application.spec(:ex_storage_service_s3)'
+
       - name: Stop release
         if: always()
         run: |
@@ -247,4 +385,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fornacast-e2e-logs
-          path: fornacast.log
+          path: |
+            fornacast.log
+            fornacast-restart.log
+            fornacast-docker.log

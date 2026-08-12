@@ -2729,6 +2729,7 @@ git commit -m "feat(releases): add opaque LocalCAS byte store"
 - Modify: `README.md`
 - Modify: `.github/workflows/e2e.yml`
 - Modify: `apps/fornacast_api/test/release_distribution_contract_test.exs`
+- Modify: `docs/superpowers/plans/2026-08-12-release-assets-localcas-foundation.md`
 
 - [ ] Add exact-pin contract tests for the three supported v0.6.4 seams. These tests deliberately call ESS directly only to characterize the pinned dependency; production code continues to call it only inside the adapter:
 
@@ -2955,6 +2956,10 @@ FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS=86400
 FORNACAST_RELEASE_ASSET_STORAGE_ROOT=/data/release-assets \
 FORNACAST_RELEASE_ASSET_MAX_BYTES=2147483648 \
 FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS=86400 \
+ELIXIR_ERL_OPTIONS="-kernel inet_dist_use_interface {127,0,0,1}" \
+ERL_EPMD_ADDRESS=127.0.0.1 \
+RELEASE_DISTRIBUTION=name \
+RELEASE_NODE=fornacast@127.0.0.1 \
 ```
 
 Keep `coreutils` explicitly in the final image's runtime `apt-get install`
@@ -2964,9 +2969,8 @@ assuming a slim base image happens to contain it.
 Copy the probe into the runtime image without adding a shell dependency:
 
 ```dockerfile
-COPY scripts scripts
-COPY --from=build --chown=fornacast:fornacast \
-  /app/scripts/release_asset_storage_smoke.sh \
+COPY --chown=fornacast:fornacast \
+  scripts/release_asset_storage_smoke.sh \
   /app/bin/release_asset_storage_smoke
 ```
 
@@ -2976,11 +2980,15 @@ Add these entries to the Compose `app.environment` map; the existing `/data` vol
 FORNACAST_RELEASE_ASSET_STORAGE_ROOT: /data/release-assets
 FORNACAST_RELEASE_ASSET_MAX_BYTES: ${FORNACAST_RELEASE_ASSET_MAX_BYTES:-2147483648}
 FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS: ${FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS:-86400}
+ELIXIR_ERL_OPTIONS: -kernel inet_dist_use_interface {127,0,0,1}
+ERL_EPMD_ADDRESS: 127.0.0.1
+RELEASE_DISTRIBUTION: name
+RELEASE_NODE: fornacast@127.0.0.1
 ```
 
 Set `app.stop_grace_period: 45s`. This is strictly longer than the ESS child's
-30-second shutdown bound, so a normal Compose stop cannot escalate to SIGKILL
-before the BEAM finishes its bounded shutdown.
+30-second shutdown bound, and the acceptance smoke empirically verifies that
+the current image exits normally within this window.
 
 Add this operational text to `README.md` beside the existing backup section:
 
@@ -2988,9 +2996,12 @@ Add this operational text to `README.md` beside the existing backup section:
 Release-asset bytes use embedded LocalCAS under
 `FORNACAST_RELEASE_ASSET_STORAGE_ROOT` (default `/data/release-assets` in the
 container). The first release supports one Fornacast BEAM with exclusive use
-of one volume. Keep the Erlang node name and this root stable, and use
-stop-before-start upgrades; do not run rolling or concurrent writers against
-the same root. No S3 listener or S3 credentials are used.
+of one volume. Keep the Erlang node name and this root stable; the release image
+uses `fornacast@127.0.0.1` by default. Use stop-before-start upgrades, and do not
+run rolling or concurrent writers against the same root. Compose gives the BEAM
+a 45-second graceful-stop window, which the release acceptance smoke exercises.
+Erlang distribution and EPMD are bound to loopback and are not published by
+Compose. No S3 listener or S3 credentials are used.
 
 Treat the Ecto database, ConfigStore database, release-asset Concord directory,
 CAS directory, and staging directory as one cold recovery set. Stop Fornacast,
@@ -3001,77 +3012,29 @@ in the same stopped maintenance window.
 
 - [ ] Extend `ReleaseDistributionContractTest` before changing E2E. Assert the release config, exact dependency, container root, no new exposed port, cold-backup text, and both restart phases:
 
-```elixir
-test "release assets ship core LocalCAS without an S3 listener" do
-  dockerfile = File.read!(@dockerfile)
-  compose = File.read!(@compose)
-  env_example = File.read!(@env_example)
-  readme = File.read!(@readme)
-  e2e = File.read!(@e2e_workflow)
+The test is intentionally a checked-in executable contract rather than a
+duplicated full listing here. In addition to the storage limits and exact
+dependency, it must assert all of these deployment invariants:
 
-  assert dockerfile =~ "FORNACAST_RELEASE_ASSET_STORAGE_ROOT=/data/release-assets"
-  assert dockerfile =~ "coreutils"
-  assert compose =~ "FORNACAST_RELEASE_ASSET_STORAGE_ROOT: /data/release-assets"
-  assert compose =~ "stop_grace_period: 45s"
-  assert env_example =~ "FORNACAST_RELEASE_ASSET_MAX_BYTES=2147483648"
-  assert readme =~ "one Fornacast BEAM with exclusive use of one volume"
-  assert readme =~ "Treat the Ecto database, ConfigStore database"
-  refute dockerfile =~ "EXPOSE 9000"
-  refute compose =~ ~r/^\s+- ["']?9000/m
-  assert e2e =~ "ex_storage_service-0.6.4"
-  assert e2e =~ "release_asset_storage_smoke.sh release/fornacast write"
-  assert e2e =~ "release_asset_storage_smoke.sh release/fornacast verify"
-  assert e2e =~ "fornacast.localcas.owner"
-  assert e2e =~ "docker stop --time 45"
-  assert e2e =~ ~s({{.State.ExitCode}})
-  assert e2e =~ ~s({{.State.OOMKilled}})
-  assert e2e =~ ~s(docker start "$container")
-  refute e2e =~ "docker restart"
-  assert_order(e2e, "release/fornacast write", "release/fornacast verify")
-  assert_order(e2e, "docker stop --time 45", ~s(docker start "$container"))
-end
+- the final image and Compose use the stable long node
+  `fornacast@127.0.0.1`;
+- `ERL_EPMD_ADDRESS=127.0.0.1` and
+  `ELIXIR_ERL_OPTIONS=-kernel inet_dist_use_interface {127,0,0,1}` bind EPMD
+  and distribution to loopback, with no distribution port published;
+- host-release checks prove the exact `fornacast_e2e@127.0.0.1` identity and
+  Concord quorum readiness before the write and after restart;
+- Docker checks prove the exact container identity and Concord quorum before
+  the write and after a true remove/recreate on the same owned volume;
+- the Docker sequence verifies exit/OOM state and the ownership label before
+  removal, proves the container is absent, and calls the shared run helper
+  exactly twice; and
+- no fixed `RELEASE_COOKIE`, S3 package/listener, `docker restart`, or
+  `docker start` appears.
 
-test "production validates and clamps release-asset limits" do
-  {output, status} = read_runtime_storage_config("2147483649", "3600")
-  assert status == 0
-  assert output =~ "max=2147483648 grace=3600"
-
-  {invalid_output, invalid_status} = read_runtime_storage_config("0", "3599")
-  assert invalid_status != 0
-  assert invalid_output =~ "FORNACAST_RELEASE_ASSET_MAX_BYTES must be a decimal integer >= 1"
-end
-
-defp read_runtime_storage_config(max_bytes, grace_seconds) do
-  elixir = System.find_executable("elixir") || flunk("elixir executable not found")
-
-  System.cmd(
-    elixir,
-    [
-      "-e",
-      """
-      config = Config.Reader.read!(#{inspect(@runtime_config)}, env: :prod)
-      values = Keyword.fetch!(config, :fornacast)
-      IO.puts("max=\#{values[:release_asset_max_bytes]} grace=\#{values[:release_asset_gc_grace_seconds]}")
-      """
-    ],
-    cd: @root,
-    env: [
-      {"RELEASE_COMMAND", "start"},
-      {"FORNACAST_DATABASE_ADAPTER", "turso"},
-      {"SECRET_KEY_BASE", String.duplicate("s", 64)},
-      {"FORNACAST_BASE_URL", "http://localhost:4890"},
-      {"FORNACAST_REPO_STORAGE_ROOT", "/tmp/fornacast-runtime-config-repos"},
-      {"FORNACAST_SSH_HOST", "localhost"},
-      {"FORNACAST_SSH_PORT", "2222"},
-      {"FORNACAST_SSH_SYSTEM_DIR", "/tmp/fornacast-runtime-config-ssh"},
-      {"FORNACAST_RELEASE_ASSET_STORAGE_ROOT", "/tmp/fornacast-runtime-assets"},
-      {"FORNACAST_RELEASE_ASSET_MAX_BYTES", max_bytes},
-      {"FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS", grace_seconds}
-    ],
-    stderr_to_stdout: true
-  )
-end
-```
+Keep the separate positive/clamped, invalid-maximum, and invalid-GC-grace
+runtime-config cases in the checked-in test. See
+`apps/fornacast_api/test/release_distribution_contract_test.exs` for the exact
+assertions.
 
 - [ ] Run the red source contract before updating the workflow and deployment files:
 
@@ -3086,9 +3049,16 @@ Expected red result: missing LocalCAS env/docs, release inspection, and restart-
 ```yaml
 mkdir -p e2e-data/repos e2e-data/ssh e2e-data/release-assets e2e-work
 echo "FORNACAST_RELEASE_ASSET_STORAGE_ROOT=${GITHUB_WORKSPACE}/e2e-data/release-assets" >> "$GITHUB_ENV"
+echo "ELIXIR_ERL_OPTIONS=-kernel inet_dist_use_interface {127,0,0,1}" >> "$GITHUB_ENV"
+echo "ERL_EPMD_ADDRESS=127.0.0.1" >> "$GITHUB_ENV"
 echo "RELEASE_DISTRIBUTION=name" >> "$GITHUB_ENV"
 echo "RELEASE_NODE=fornacast_e2e@127.0.0.1" >> "$GITHUB_ENV"
 ```
+
+Start the named release and wait for health before seeding. Seed through
+`release/fornacast/bin/fornacast rpc`, without an `eval`-side
+`Application.ensure_all_started/1` loop, so Concord never opens the persistent
+root as `nonode@nohost`.
 
 After the first health check, inspect the release and write the restart marker:
 
@@ -3096,8 +3066,10 @@ After the first health check, inspect the release and write the restart marker:
 - name: Inspect embedded LocalCAS release
   run: |
     test -d release/fornacast/lib/ex_storage_service-0.6.4
-    ! compgen -G 'release/fornacast/lib/ex_storage_service_s3-*'
+    test -z "$(find release/fornacast/lib -maxdepth 1 -type d -name 'ex_storage_service_s3-*' -print -quit)"
     release/fornacast/bin/fornacast rpc '
+      true = Node.self() == :"fornacast_e2e@127.0.0.1"
+      true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000)
       true = ForgeReleases.AssetStorage.Manager.ready?()
       nil = Application.spec(:ex_storage_service_s3)
       instance = GenServer.whereis(ExStorageService.Names.instance_supervisor(:fornacast_release_assets))
@@ -3115,13 +3087,19 @@ After the existing Git/web checks, stop and restart the same release with the sa
   run: |
     old_pid="$(cat fornacast.pid)"
     timeout 45 release/fornacast/bin/fornacast stop
-    wait "$old_pid"
+    for attempt in $(seq 1 45); do
+      if ! kill -0 "$old_pid" 2>/dev/null; then
+        break
+      fi
+      test "$attempt" != 45
+      sleep 1
+    done
     release/fornacast/bin/fornacast start > fornacast-restart.log 2>&1 &
     echo "$!" > fornacast.pid
 
     for attempt in $(seq 1 60); do
       if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null && \
-         release/fornacast/bin/fornacast rpc 'ForgeReleases.AssetStorage.Manager.ready?()' | grep true; then
+         release/fornacast/bin/fornacast rpc 'true = Node.self() == :"fornacast_e2e@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true; then
         break
       fi
       if [ "$attempt" = 60 ]; then
@@ -3137,43 +3115,56 @@ After the existing Git/web checks, stop and restart the same release with the sa
 
 Add `fornacast-restart.log` to the failure artifact.
 
-- [ ] Add a PR-only Docker boot/restart step after the release restart. It uses per-run labeled resources and the same container identity, publishes no ports, and removes resources only after verifying their random ownership label:
+- [ ] Add a PR-only Docker boot/recreate step after the release restart. It uses per-run labeled resources, removes and recreates the same named container against the same exclusively owned volume, publishes no ports, and removes resources only after verifying their random ownership label:
 
 ```yaml
-- name: Docker LocalCAS boot and restart smoke
+- name: Docker LocalCAS boot and recreate smoke
   if: github.event_name == 'pull_request'
   run: |
     owner="$(openssl rand -hex 16)"
     container="fornacast-localcas-smoke-${owner:0:12}"
     volume="fornacast-localcas-smoke-data-${owner:0:12}"
+    image="fornacast-localcas-smoke-${owner:0:12}"
+    secret_key_base="$(openssl rand -hex 32)"
     cleanup() {
       status=$?
       trap - EXIT
       if [ "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container" 2>/dev/null || true)" = "$owner" ]; then
+        if [ "$status" -ne 0 ]; then
+          docker logs "$container" > fornacast-docker.log 2>&1 || true
+        fi
         docker rm -f "$container" >/dev/null 2>&1 || true
       fi
       if [ "$(docker volume inspect -f '{{ index .Labels "fornacast.localcas.owner" }}' "$volume" 2>/dev/null || true)" = "$owner" ]; then
         docker volume rm "$volume" >/dev/null 2>&1 || true
       fi
+      if [ "$(docker image inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$image" 2>/dev/null || true)" = "$owner" ]; then
+        docker image rm "$image" >/dev/null 2>&1 || true
+      fi
       exit "$status"
+    }
+    run_container() {
+      docker run -d --name "$container" \
+        --label "fornacast.localcas.owner=$owner" \
+        -e SECRET_KEY_BASE="$secret_key_base" \
+        -e FORNACAST_BASE_URL=http://127.0.0.1:4890 \
+        -v "$volume:/data" \
+        "$image"
     }
     trap cleanup EXIT
     ! docker container inspect "$container" >/dev/null 2>&1
     ! docker volume inspect "$volume" >/dev/null 2>&1
-    docker build -t fornacast-localcas-smoke .
+    ! docker image inspect "$image" >/dev/null 2>&1
+    docker build --label "fornacast.localcas.owner=$owner" -t "$image" .
+    test "$(docker image inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$image")" = "$owner"
     docker volume create --label "fornacast.localcas.owner=$owner" "$volume"
     test "$(docker volume inspect -f '{{ index .Labels "fornacast.localcas.owner" }}' "$volume")" = "$owner"
-    docker run -d --name "$container" \
-      --label "fornacast.localcas.owner=$owner" \
-      -e SECRET_KEY_BASE="$(openssl rand -hex 32)" \
-      -e FORNACAST_BASE_URL=http://127.0.0.1:4890 \
-      -v "$volume:/data" \
-      fornacast-localcas-smoke
+    run_container
     test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"
 
     for attempt in $(seq 1 60); do
       if docker exec "$container" \
-           /app/bin/fornacast rpc 'ForgeReleases.AssetStorage.Manager.ready?()' | grep true; then
+           /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true; then
         break
       fi
       if [ "$attempt" = 60 ]; then
@@ -3189,11 +3180,15 @@ Add `fornacast-restart.log` to the failure artifact.
     test "$(docker container inspect -f '{{.State.Running}}' "$container")" = false
     test "$(docker container inspect -f '{{.State.ExitCode}}' "$container")" = 0
     test "$(docker container inspect -f '{{.State.OOMKilled}}' "$container")" = false
-    docker start "$container"
+    test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"
+    docker rm "$container"
+    ! docker container inspect "$container" >/dev/null 2>&1
+    run_container
+    test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"
 
     for attempt in $(seq 1 60); do
       if docker exec "$container" \
-           /app/bin/fornacast rpc 'ForgeReleases.AssetStorage.Manager.ready?()' | grep true; then
+           /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true; then
         break
       fi
       if [ "$attempt" = 60 ]; then
@@ -3247,13 +3242,15 @@ export FORNACAST_RELEASE_ASSET_STORAGE_ROOT="$PWD/tmp/localcas-release-smoke/ass
 export FORNACAST_API_BIND_IP=127.0.0.1
 export FORNACAST_API_PORT=4191
 export PORT=4190
+export ELIXIR_ERL_OPTIONS='-kernel inet_dist_use_interface {127,0,0,1}'
+export ERL_EPMD_ADDRESS=127.0.0.1
 export RELEASE_DISTRIBUTION=name
 export RELEASE_NODE=fornacast_localcas_smoke@127.0.0.1
 
 _build/prod/rel/fornacast/bin/fornacast daemon
 for attempt in $(seq 1 60); do
   _build/prod/rel/fornacast/bin/fornacast rpc \
-    'ForgeReleases.AssetStorage.Manager.ready?()' | grep true && break
+    'true = Node.self() == :"fornacast_localcas_smoke@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true && break
   test "$attempt" != 60
   sleep 1
 done
@@ -3262,7 +3259,7 @@ timeout 45 _build/prod/rel/fornacast/bin/fornacast stop
 _build/prod/rel/fornacast/bin/fornacast daemon
 for attempt in $(seq 1 60); do
   _build/prod/rel/fornacast/bin/fornacast rpc \
-    'ForgeReleases.AssetStorage.Manager.ready?()' | grep true && break
+    'true = Node.self() == :"fornacast_localcas_smoke@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true && break
   test "$attempt" != 60
   sleep 1
 done
@@ -3270,7 +3267,7 @@ sh scripts/release_asset_storage_smoke.sh _build/prod/rel/fornacast verify
 timeout 45 _build/prod/rel/fornacast/bin/fornacast stop
 
 test -d _build/prod/rel/fornacast/lib/ex_storage_service-0.6.4
-! compgen -G '_build/prod/rel/fornacast/lib/ex_storage_service_s3-*'
+test -z "$(find _build/prod/rel/fornacast/lib -maxdepth 1 -type d -name 'ex_storage_service_s3-*' -print -quit)"
 ```
 
 Expected: Elixir reports `1.20.x`, Erlang/OTP reports `29`, Rust reports `1.96.x` or newer, compilation has no warnings, both smoke phases exit `0`, the second BEAM reads the first BEAM's blob, ESS core exists, and S3 is absent.
@@ -3281,33 +3278,46 @@ Expected: Elixir reports `1.20.x`, Erlang/OTP reports `29`, Rust reports `1.96.x
 owner="$(openssl rand -hex 16)"
 container="fornacast-localcas-foundation-${owner:0:12}"
 volume="fornacast-localcas-foundation-data-${owner:0:12}"
+image="fornacast-localcas-foundation-${owner:0:12}"
+secret_key_base="$(openssl rand -hex 32)"
 cleanup() {
   status=$?
   trap - EXIT
   if [ "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container" 2>/dev/null || true)" = "$owner" ]; then
+    if [ "$status" -ne 0 ]; then
+      docker logs "$container" > fornacast-docker.log 2>&1 || true
+    fi
     docker rm -f "$container" >/dev/null 2>&1 || true
   fi
   if [ "$(docker volume inspect -f '{{ index .Labels "fornacast.localcas.owner" }}' "$volume" 2>/dev/null || true)" = "$owner" ]; then
     docker volume rm "$volume" >/dev/null 2>&1 || true
   fi
+  if [ "$(docker image inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$image" 2>/dev/null || true)" = "$owner" ]; then
+    docker image rm "$image" >/dev/null 2>&1 || true
+  fi
   exit "$status"
+}
+run_container() {
+  docker run -d --name "$container" \
+    --label "fornacast.localcas.owner=$owner" \
+    -e SECRET_KEY_BASE="$secret_key_base" \
+    -e FORNACAST_BASE_URL=http://127.0.0.1:4890 \
+    -v "$volume:/data" \
+    "$image"
 }
 trap cleanup EXIT
 ! docker container inspect "$container" >/dev/null 2>&1
 ! docker volume inspect "$volume" >/dev/null 2>&1
-docker build -t fornacast-localcas-foundation .
+! docker image inspect "$image" >/dev/null 2>&1
+docker build --label "fornacast.localcas.owner=$owner" -t "$image" .
+test "$(docker image inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$image")" = "$owner"
 docker volume create --label "fornacast.localcas.owner=$owner" "$volume"
 test "$(docker volume inspect -f '{{ index .Labels "fornacast.localcas.owner" }}' "$volume")" = "$owner"
-docker run -d --name "$container" \
-  --label "fornacast.localcas.owner=$owner" \
-  -e SECRET_KEY_BASE="$(openssl rand -hex 32)" \
-  -e FORNACAST_BASE_URL=http://127.0.0.1:4890 \
-  -v "$volume:/data" \
-  fornacast-localcas-foundation
+run_container
 test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"
 for attempt in $(seq 1 60); do
   docker exec "$container" \
-    /app/bin/fornacast rpc 'ForgeReleases.AssetStorage.Manager.ready?()' | grep true && break
+    /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true && break
   test "$attempt" != 60
   sleep 1
 done
@@ -3317,10 +3327,14 @@ docker stop --time 45 "$container"
 test "$(docker container inspect -f '{{.State.Running}}' "$container")" = false
 test "$(docker container inspect -f '{{.State.ExitCode}}' "$container")" = 0
 test "$(docker container inspect -f '{{.State.OOMKilled}}' "$container")" = false
-docker start "$container"
+test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"
+docker rm "$container"
+! docker container inspect "$container" >/dev/null 2>&1
+run_container
+test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"
 for attempt in $(seq 1 60); do
   docker exec "$container" \
-    /app/bin/fornacast rpc 'ForgeReleases.AssetStorage.Manager.ready?()' | grep true && break
+    /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); ForgeReleases.AssetStorage.Manager.ready?()' | grep true && break
   test "$attempt" != 60
   sleep 1
 done
@@ -3340,7 +3354,8 @@ matches this invocation. Do not use a broad Docker prune.
 git add apps/forge_releases/test/forge_releases/asset_storage/local_cas_contract_test.exs \
   scripts/release_asset_storage_smoke.sh .env.example Dockerfile docker-compose.yml \
   README.md .github/workflows/e2e.yml \
-  apps/fornacast_api/test/release_distribution_contract_test.exs
+  apps/fornacast_api/test/release_distribution_contract_test.exs \
+  docs/superpowers/plans/2026-08-12-release-assets-localcas-foundation.md
 git commit -m "test(releases): prove LocalCAS release restart"
 ```
 

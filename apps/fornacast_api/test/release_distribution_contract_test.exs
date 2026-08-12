@@ -13,6 +13,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
   @web_mix Path.join(@root, "apps/fornacast_web/mix.exs")
   @config Path.join(@root, "config/config.exs")
   @runtime_config Path.join(@root, "config/runtime.exs")
+  @releases_mix Path.join(@root, "apps/forge_releases/mix.exs")
 
   test "release version resolver accepts only normalized stable versions" do
     for {input, expected} <- [
@@ -315,6 +316,129 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     refute readme =~ "repeatable production deployment"
   end
 
+  test "release assets ship core LocalCAS without an S3 listener" do
+    dockerfile = File.read!(@dockerfile)
+    compose = File.read!(@compose)
+    env_example = File.read!(@env_example)
+    readme = File.read!(@readme)
+    e2e = File.read!(@e2e_workflow)
+
+    [_, runtime_stage] = String.split(dockerfile, "FROM ${DEBIAN_IMAGE} AS app", parts: 2)
+    [runtime_packages, _] = String.split(runtime_stage, "useradd --create-home", parts: 2)
+
+    assert dockerfile =~ "FORNACAST_RELEASE_ASSET_STORAGE_ROOT=/data/release-assets"
+    assert "coreutils" in String.split(runtime_packages)
+    assert File.read!(@releases_mix) =~ ~s({:ex_storage_service, "== 0.6.4"})
+    assert dockerfile =~ "scripts/release_asset_storage_smoke.sh"
+    refute dockerfile =~ "COPY scripts scripts"
+    assert dockerfile =~ "RELEASE_DISTRIBUTION=name"
+    assert dockerfile =~ "RELEASE_NODE=fornacast@127.0.0.1"
+    assert dockerfile =~ ~s(ELIXIR_ERL_OPTIONS="-kernel inet_dist_use_interface {127,0,0,1}")
+    assert dockerfile =~ "ERL_EPMD_ADDRESS=127.0.0.1"
+    assert compose =~ "FORNACAST_RELEASE_ASSET_STORAGE_ROOT: /data/release-assets"
+    assert compose =~ "stop_grace_period: 45s"
+    assert compose =~ "RELEASE_DISTRIBUTION: name"
+    assert compose =~ "RELEASE_NODE: fornacast@127.0.0.1"
+    assert compose =~ "ELIXIR_ERL_OPTIONS: -kernel inet_dist_use_interface {127,0,0,1}"
+    assert compose =~ "ERL_EPMD_ADDRESS: 127.0.0.1"
+    assert env_example =~ "FORNACAST_RELEASE_ASSET_MAX_BYTES=2147483648"
+    assert readme =~ "one Fornacast BEAM with exclusive use of"
+    assert readme =~ "one volume"
+    assert readme =~ "Treat the Ecto database, ConfigStore database"
+    assert readme =~ "uses `fornacast@127.0.0.1` by default"
+    assert readme =~ "release acceptance smoke"
+    assert readme =~ "exercises"
+    assert readme =~ "Erlang distribution and EPMD are bound to loopback"
+    refute dockerfile =~ "EXPOSE 9000"
+    refute compose =~ ~r/^\s+- ["']?9000/m
+    assert e2e =~ "ex_storage_service-0.6.4"
+    assert e2e =~ "release_asset_storage_smoke.sh release/fornacast write"
+    assert e2e =~ "release_asset_storage_smoke.sh release/fornacast verify"
+    assert e2e =~ ~s(echo "ELIXIR_ERL_OPTIONS=-kernel inet_dist_use_interface {127,0,0,1}")
+    assert e2e =~ ~s(echo "ERL_EPMD_ADDRESS=127.0.0.1")
+    assert e2e =~ "- name: Seed release data"
+    assert e2e =~ "release/fornacast/bin/fornacast rpc '"
+    refute e2e =~ "release/fornacast/bin/fornacast eval '"
+    refute e2e =~ "Enum.each([:git_core, :fornacast, :forge_accounts, :forge_repos]"
+    assert e2e =~ "fornacast.localcas.owner"
+    assert e2e =~ "docker stop --time 45"
+    assert e2e =~ ~s({{.State.ExitCode}})
+    assert e2e =~ ~s({{.State.OOMKilled}})
+    assert e2e =~ ~s(docker rm "$container")
+    assert length(:binary.matches(e2e, "Node.self() == :\"fornacast@127.0.0.1\"")) == 2
+
+    assert length(
+             :binary.matches(
+               e2e,
+               "ExStorageService.Cluster.Readiness.ready?(timeout: 1_000)"
+             )
+           ) == 4
+
+    assert length(:binary.matches(e2e, "Node.self() == :\"fornacast_e2e@127.0.0.1\"")) ==
+             2
+
+    assert length(:binary.matches(e2e, ~s(          run_container\n))) == 2
+    assert e2e =~ ~s(-v "$volume:/data")
+    refute e2e =~ "ss -ltnp"
+    refute e2e =~ "docker restart"
+    refute e2e =~ ~s(docker start "$container")
+    refute e2e =~ "RELEASE_COOKIE"
+    refute dockerfile =~ "RELEASE_COOKIE"
+    refute compose =~ "RELEASE_COOKIE"
+    refute env_example =~ "RELEASE_COOKIE"
+    refute dockerfile =~ ~r/^EXPOSE\b[^\n]*\b4369\b/m
+    refute compose =~ ~r/^\s+- ["']?4369["']?\s*$/m
+    refute compose =~ ~r/^\s+- ["']?(4369|[0-9]+-[0-9]+):/m
+    assert_order(e2e, "release/fornacast write", "release/fornacast verify")
+    assert_order(e2e, "- name: Start release", "- name: Seed release data")
+    assert_order(e2e, "- name: Wait for health", "- name: Seed release data")
+    assert_order(e2e, "docker stop --time 45", ~s(docker rm "$container"))
+
+    [_, recreate_sequence] = String.split(e2e, "docker stop --time 45", parts: 2)
+
+    assert_order(
+      recreate_sequence,
+      ~s({{.State.OOMKilled}}),
+      ~S|test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"|
+    )
+
+    assert_order(
+      recreate_sequence,
+      ~S|test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"|,
+      ~s(docker rm "$container")
+    )
+
+    assert_order(
+      recreate_sequence,
+      ~s(docker rm "$container"),
+      ~s(! docker container inspect "$container" >/dev/null 2>&1)
+    )
+
+    assert_order(
+      recreate_sequence,
+      ~s(! docker container inspect "$container" >/dev/null 2>&1),
+      ~s(          run_container\n)
+    )
+  end
+
+  test "production validates and clamps release-asset limits" do
+    {output, status} = read_runtime_storage_config("2147483649", "3600")
+    assert status == 0
+    assert output =~ "max=2147483648 grace=3600"
+
+    {invalid_max_output, invalid_max_status} = read_runtime_storage_config("0", "3600")
+    assert invalid_max_status != 0
+
+    assert invalid_max_output =~
+             "FORNACAST_RELEASE_ASSET_MAX_BYTES must be a decimal integer >= 1"
+
+    {invalid_grace_output, invalid_grace_status} = read_runtime_storage_config("1", "3599")
+    assert invalid_grace_status != 0
+
+    assert invalid_grace_output =~
+             "FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS must be a decimal integer >= 3600"
+  end
+
   defp assert_order(source, first, second) do
     assert position!(source, first) < position!(source, second),
            "expected #{inspect(first)} to appear before #{inspect(second)}"
@@ -358,6 +482,37 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
         {"FORNACAST_SSH_HOST", "localhost"},
         {"FORNACAST_SSH_PORT", "2222"},
         {"FORNACAST_SSH_SYSTEM_DIR", "/tmp/fornacast-runtime-config-ssh"}
+      ],
+      stderr_to_stdout: true
+    )
+  end
+
+  defp read_runtime_storage_config(max_bytes, grace_seconds) do
+    elixir = System.find_executable("elixir") || flunk("elixir executable not found")
+
+    System.cmd(
+      elixir,
+      [
+        "-e",
+        """
+        config = Config.Reader.read!(#{inspect(@runtime_config)}, env: :prod)
+        values = Keyword.fetch!(config, :fornacast)
+        IO.puts("max=\#{values[:release_asset_max_bytes]} grace=\#{values[:release_asset_gc_grace_seconds]}")
+        """
+      ],
+      cd: @root,
+      env: [
+        {"RELEASE_COMMAND", "start"},
+        {"FORNACAST_DATABASE_ADAPTER", "turso"},
+        {"SECRET_KEY_BASE", String.duplicate("s", 64)},
+        {"FORNACAST_BASE_URL", "http://localhost:4890"},
+        {"FORNACAST_REPO_STORAGE_ROOT", "/tmp/fornacast-runtime-config-repos"},
+        {"FORNACAST_SSH_HOST", "localhost"},
+        {"FORNACAST_SSH_PORT", "2222"},
+        {"FORNACAST_SSH_SYSTEM_DIR", "/tmp/fornacast-runtime-config-ssh"},
+        {"FORNACAST_RELEASE_ASSET_STORAGE_ROOT", "/tmp/fornacast-runtime-assets"},
+        {"FORNACAST_RELEASE_ASSET_MAX_BYTES", max_bytes},
+        {"FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS", grace_seconds}
       ],
       stderr_to_stdout: true
     )

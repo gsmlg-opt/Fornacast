@@ -270,6 +270,9 @@ Production environment variables:
 - `FORNACAST_API_PORT`, default `4891` in the release image
 - `FORNACAST_API_TRUSTED_PROXIES`, comma-separated trusted proxy CIDRs
 - `FORNACAST_REPO_STORAGE_ROOT`
+- `FORNACAST_RELEASE_ASSET_STORAGE_ROOT`, default `/data/release-assets` in the release image
+- `FORNACAST_RELEASE_ASSET_MAX_BYTES`, default `2147483648` (2 GiB)
+- `FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS`, default `86400`
 - `FORNACAST_SSH_HOST`
 - `FORNACAST_SSH_PORT`
 - `FORNACAST_SSH_SYSTEM_DIR`
@@ -295,13 +298,30 @@ The first visit to a fresh instance serves an unauthenticated setup page that cr
 
 Fornacast stores domain state in the configured Ecto database, app-level key/value config in Concord, and bare Git repositories under `FORNACAST_REPO_STORAGE_ROOT`.
 
-Back up both together:
+Release-asset bytes use embedded LocalCAS under
+`FORNACAST_RELEASE_ASSET_STORAGE_ROOT` (default `/data/release-assets` in the
+container). The first release supports one Fornacast BEAM with exclusive use of
+one volume. Keep the Erlang node name and this root stable; the release image
+uses `fornacast@127.0.0.1` by default. Use stop-before-start upgrades, and do
+not run rolling or concurrent writers against the same root. Compose gives the
+BEAM a 45-second graceful-stop window, which the release acceptance smoke
+exercises. Erlang distribution and EPMD are bound to loopback and are not
+published by Compose. No S3 listener or S3 credentials are used.
+
+Treat the Ecto database, ConfigStore database, release-asset Concord directory,
+CAS directory, and staging directory as one cold recovery set. Stop Fornacast,
+back up or restore every member while it remains stopped, then restart. The
+default `/data` volume contains all local members; PostgreSQL must be backed up
+in the same stopped maintenance window.
+
+Back up all local members together while Fornacast is stopped:
 
 ```sh
 cp "$FORNACAST_DATABASE_PATH" fornacast.db
 cp "$FORNACAST_CONFIG_DATABASE_PATH" fornacast_config.db
 tar -C "$FORNACAST_REPO_STORAGE_ROOT" -czf fornacast-repos.tgz .
 tar -C "$FORNACAST_SSH_SYSTEM_DIR" -czf fornacast-ssh.tgz .
+tar -C "$FORNACAST_RELEASE_ASSET_STORAGE_ROOT" -czf fornacast-release-assets.tgz .
 ```
 
 For remote Turso databases, use Turso's backup/export workflow for the database and config store, and back up the repository and SSH directories separately.
@@ -315,7 +335,7 @@ docker run --rm -v fornacast_fornacast-data:/data -v "$PWD":/backup debian:bookw
   tar -C /data -czf /backup/fornacast-data.tgz .
 ```
 
-Restore requires the database dump and the repository/SSH data from the same point in time.
+Restore requires the database dump, repository/SSH data, and release-asset data from the same point in time.
 
 ## Contributing
 
