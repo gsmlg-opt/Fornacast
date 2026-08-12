@@ -59,9 +59,14 @@ defmodule ForgeReleases.AssetStorage.Manager do
       test_observer: nil
     }
 
-    case locate_instance(instance_supervisor, config.instance_config.instance) do
-      :absent -> start_initial_instance(state)
-      {:ok, instance} -> attach_existing_instance(state, instance)
+    with :ok <- ensure_storage_service_started() do
+      case locate_instance(instance_supervisor, config.instance_config.instance) do
+        :absent -> start_initial_instance(state)
+        {:ok, instance} -> attach_existing_instance(state, instance)
+        {:stale_owned, instance} -> replace_stale_initial_instance(state, instance)
+        {:error, reason} -> {:stop, {:asset_storage_start_failed, reason}}
+      end
+    else
       {:error, reason} -> {:stop, {:asset_storage_start_failed, reason}}
     end
   end
@@ -143,18 +148,65 @@ defmodule ForgeReleases.AssetStorage.Manager do
   defp reconcile(state) do
     instance_name = state.config.instance_config.instance
 
-    case locate_instance(state.instance_supervisor, instance_name) do
-      {:ok, instance} ->
-        attach_ready(state, instance)
+    with :ok <- ensure_storage_service_started() do
+      case locate_instance(state.instance_supervisor, instance_name) do
+        {:ok, instance} ->
+          attach_ready(state, instance)
 
-      :absent ->
-        case start_instance(state.instance_supervisor, state.config.instance_config) do
-          {:ok, instance} -> attach_ready(state, instance)
-          {:error, reason} -> {:error, normalize_reason(reason), state}
-        end
+        {:stale_owned, instance} ->
+          replace_stale_instance(state, instance)
 
-      {:error, reason} ->
-        {:error, normalize_reason(reason), state}
+        :absent ->
+          case start_instance(state.instance_supervisor, state.config.instance_config) do
+            {:ok, instance} -> attach_ready(state, instance)
+            {:error, reason} -> {:error, normalize_reason(reason), state}
+          end
+
+        {:error, reason} ->
+          {:error, normalize_reason(reason), state}
+      end
+    else
+      {:error, reason} -> {:error, normalize_reason(reason), state}
+    end
+  end
+
+  defp ensure_storage_service_started do
+    case Application.ensure_all_started(:ex_storage_service) do
+      {:ok, _applications} -> :ok
+      {:error, _reason} -> {:error, :storage_infrastructure_unavailable}
+    end
+  rescue
+    _error -> {:error, :storage_infrastructure_unavailable}
+  catch
+    _kind, _reason -> {:error, :storage_infrastructure_unavailable}
+  end
+
+  defp replace_stale_initial_instance(state, instance) do
+    state = clear_monitors(state)
+
+    case terminate_stale_instance(state.instance_supervisor, instance) do
+      :ok -> start_initial_instance(state)
+      {:error, reason} -> {:stop, {:asset_storage_start_failed, reason}}
+    end
+  end
+
+  defp replace_stale_instance(state, instance) do
+    state = clear_monitors(state)
+
+    with :ok <- terminate_stale_instance(state.instance_supervisor, instance),
+         {:ok, replacement} <-
+           start_instance(state.instance_supervisor, state.config.instance_config) do
+      attach_ready(state, replacement)
+    else
+      {:error, reason} -> {:error, normalize_reason(reason), state}
+    end
+  end
+
+  defp terminate_stale_instance(instance_supervisor, instance) do
+    case terminate_instance(instance_supervisor, instance) do
+      :ok -> :ok
+      {:error, :not_found} -> :ok
+      {:error, _reason} -> {:error, :stale_instance_cleanup_failed}
     end
   end
 
@@ -196,6 +248,9 @@ defmodule ForgeReleases.AssetStorage.Manager do
 
         [pid] when pid == registered and is_pid(pid) ->
           {:ok, pid}
+
+        [pid] when is_nil(registered) and is_pid(pid) ->
+          {:stale_owned, pid}
 
         [] ->
           {:error, :instance_name_conflict}

@@ -93,6 +93,46 @@ defmodule ForgeReleases.AssetStorage.ManagerTest do
     assert Process.whereis(Concord.Engine.VSR.Supervisor) == vsr_supervisor
   end
 
+  test "ESS infrastructure loss recovers without ForgeReleases or Concord loss" do
+    release_supervisor = Process.whereis(ForgeReleases.Supervisor)
+    manager = Process.whereis(Manager)
+    vsr_supervisor = Process.whereis(Concord.Engine.VSR.Supervisor)
+    old_registry = Process.whereis(ExStorageService.Registry)
+    old_instance = instance_pid()
+
+    on_exit(fn ->
+      assert {:ok, _applications} = Application.ensure_all_started(:ex_storage_service)
+    end)
+
+    assert is_pid(release_supervisor)
+    assert is_pid(manager)
+    assert is_pid(vsr_supervisor)
+    assert is_pid(old_registry)
+    assert is_pid(old_instance)
+
+    old_instance_ref = Process.monitor(old_instance)
+    Process.exit(old_registry, :kill)
+
+    assert_receive {:DOWN, ^old_instance_ref, :process, ^old_instance, _reason}, 2_500
+
+    assert_eventually(fn ->
+      registry = Process.whereis(ExStorageService.Registry)
+      instance = instance_pid()
+
+      is_pid(registry) and registry != old_registry and is_pid(instance) and
+        instance != old_instance and Manager.ready?()
+    end)
+
+    assert Process.whereis(ForgeReleases.Supervisor) == release_supervisor
+    assert Process.whereis(Manager) == manager
+    assert Process.whereis(Concord.Engine.VSR.Supervisor) == vsr_supervisor
+
+    replacement = instance_pid()
+
+    assert [{_id, ^replacement, :supervisor, _modules}] =
+             DynamicSupervisor.which_children(ForgeReleases.AssetStorage.InstanceSupervisor)
+  end
+
   test "manager restart during Engine recovery attaches once and becomes ready" do
     instance = fresh_instance()
     old_engine = engine_pid(instance)
@@ -153,6 +193,10 @@ defmodule ForgeReleases.AssetStorage.ManagerTest do
 
   defp instance_pid do
     GenServer.whereis(Names.instance_supervisor(@instance))
+  rescue
+    ArgumentError -> nil
+  catch
+    :exit, _reason -> nil
   end
 
   defp fresh_instance do
