@@ -9,6 +9,9 @@ defmodule ForgeReleases.AssetStorage.FileSystem do
   def sync(io), do: :file.sync(io)
   def close(io), do: :file.close(io)
   def rm(path), do: File.rm(path)
+  def ls(path), do: File.ls(path)
+  def rmdir(path), do: File.rmdir(path)
+  def open_directory(path), do: :file.open(String.to_charlist(path), [:read, :raw, :directory])
   def read_file_info(io), do: :file.read_file_info(io)
   def pread(io, offset, length), do: :file.pread(io, offset, length)
 
