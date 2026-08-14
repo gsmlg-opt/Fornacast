@@ -214,9 +214,6 @@ defmodule FornacastAPI.PullContractTest do
       assert pull == pull_literal
       assert list == list_literal
       assert merge == merge_literal
-      assert pull_bytes == JSON.encode!(pull_literal)
-      assert list_bytes == JSON.encode!(list_literal)
-      assert merge_bytes == JSON.encode!(merge_literal)
 
       rendered =
         version

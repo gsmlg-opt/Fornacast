@@ -38,9 +38,9 @@ defmodule FornacastAPI.PullControllerTest do
       shown = api_conn(nil, version) |> get("/api/v3/repos/alice/example/pulls/8")
       shown_body = json_response(shown, 200)
       assert shown_body["number"] == 8
-      assert shown_body["html_url"] == "http://localhost:4890/api/v3/repos/alice/example/pulls/8"
-      assert shown_body["diff_url"] == shown_body["html_url"]
-      assert shown_body["patch_url"] == shown_body["html_url"]
+      assert shown_body["html_url"] == "http://localhost:4890/alice/example/pulls/8"
+      assert shown_body["diff_url"] == "http://localhost:4890/api/v3/repos/alice/example/pulls/8"
+      assert shown_body["patch_url"] == shown_body["diff_url"]
 
       updated =
         api_conn(nil, version)

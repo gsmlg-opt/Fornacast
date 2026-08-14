@@ -245,7 +245,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
       assert document["x-fornacast-source-commit"] == @source_commit
       assert document["x-fornacast-source-blob"] == source_blob
       assert document["x-github-api-version"] == version
-      assert document["x-fornacast-implemented-through-slice"] == "3"
+      assert document["x-fornacast-implemented-through-slice"] == "4"
       assert MapSet.subset?(@foundation_operations, operations(document))
       assert get_in(document, ["paths", "/repos/{owner}/{repo}", "get"])
       assert document["x-fornacast-delivery-slices"] == @delivery_slices
@@ -322,7 +322,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
     assert overlay["versions"] == ["2022-11-28", "2026-03-10"]
     assert overlay["servers"]["rest"] == "/api/v3"
     assert overlay["servers"]["uploads"] == "/api/uploads"
-    assert overlay["implemented_through_slice"] == "3"
+    assert overlay["implemented_through_slice"] == "4"
     assert overlay["delivery_slices"] == @delivery_slices
     assert overlay["mutation_fields"] == @mutation_fields
     assert overlay["required_mutation_fields"] == @required_mutation_fields
