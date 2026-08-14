@@ -78,6 +78,29 @@ defmodule GitTransportTest do
              GitTransport.parse_exec("git-upload-pack alice/demo.git extra")
   end
 
+  test "upload-pack keeps a standalone negotiation flush distinct from done" do
+    first_oid = String.duplicate("a", 40)
+    second_oid = String.duplicate("b", 40)
+    done_packet = GitTransport.PktLine.encode("done\n")
+
+    request_data =
+      GitTransport.PktLine.encode("want #{first_oid} side-band-64k\n") <>
+        GitTransport.PktLine.encode("want #{second_oid}\n") <>
+        GitTransport.PktLine.flush()
+
+    assert {:flush, "", %{done?: false, flush_count: 1} = request} =
+             GitTransport.UploadPack.parse_request_data(request_data)
+
+    assert {:done, "", %{done?: true} = split_request} =
+             GitTransport.UploadPack.parse_request_data(done_packet, request)
+
+    assert {:done, "", %{done?: true, flush_count: 1} = coalesced_request} =
+             GitTransport.UploadPack.parse_request_data(request_data <> done_packet)
+
+    assert split_request.wants == [first_oid, second_oid]
+    assert split_request.wants == coalesced_request.wants
+  end
+
   test "authenticates SSH public keys through Fornacast accounts" do
     assert {:ok, user} =
              ForgeAccounts.create_user(%{

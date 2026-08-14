@@ -43,7 +43,7 @@ defmodule GitTransport.UploadPack do
   end
 
   def new_request do
-    %{wants: [], haves: [], capabilities: MapSet.new(), done?: false}
+    %{wants: [], haves: [], capabilities: MapSet.new(), done?: false, flush_count: 0}
   end
 
   def parse_request_data(buffer, request \\ new_request())
@@ -137,11 +137,11 @@ defmodule GitTransport.UploadPack do
   end
 
   defp parse_request_buffer(<<"0000">>, request) do
-    {:done, "", normalize_request(request)}
+    {:flush, "", record_flush(request)}
   end
 
   defp parse_request_buffer(<<"0000", rest::binary>>, request) do
-    parse_request_buffer(rest, request)
+    parse_request_buffer(rest, record_flush(request))
   end
 
   defp parse_request_buffer(<<header::binary-size(4), rest::binary>> = buffer, request) do
@@ -247,6 +247,10 @@ defmodule GitTransport.UploadPack do
       | wants: request.wants |> Enum.reverse() |> Enum.uniq(),
         haves: request.haves |> Enum.reverse() |> Enum.uniq()
     }
+  end
+
+  defp record_flush(request) do
+    Map.update!(request, :flush_count, &(&1 + 1))
   end
 
   defp maybe_send_pack(_repository, %{wants: []}), do: :ok

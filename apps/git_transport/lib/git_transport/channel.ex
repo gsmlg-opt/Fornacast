@@ -159,11 +159,45 @@ defmodule GitTransport.Channel do
       {:cont, buffer, request} ->
         {:ok, %{state | buffer: buffer, request: request}}
 
+      {:flush, buffer, request} ->
+        handle_upload_pack_flush(cm, channel_id, buffer, request, state)
+
       {:done, _rest, request} ->
         finish_upload_pack(cm, channel_id, request, state)
 
       {:error, message} ->
         fail_started(cm, channel_id, message, state)
+    end
+  end
+
+  defp handle_upload_pack_flush(cm, channel_id, _buffer, %{wants: []} = request, state) do
+    finish_upload_pack(cm, channel_id, request, state)
+  end
+
+  defp handle_upload_pack_flush(cm, channel_id, buffer, %{flush_count: 1} = request, state) do
+    resume_upload_pack(cm, channel_id, buffer, request, state)
+  end
+
+  defp handle_upload_pack_flush(cm, channel_id, buffer, request, state) do
+    case GitTransport.UploadPack.response(state.repository, request) do
+      {:ok, response} ->
+        with :ok <- send_data(cm, channel_id, response) do
+          resume_upload_pack(cm, channel_id, buffer, request, state)
+        else
+          {:error, _reason} -> fail_started(cm, channel_id, state)
+        end
+
+      {:error, message} ->
+        fail_started(cm, channel_id, message, state)
+    end
+  end
+
+  defp resume_upload_pack(cm, channel_id, buffer, request, state) do
+    state = %{state | buffer: buffer, request: request}
+
+    case buffer do
+      "" -> {:ok, state}
+      _ -> continue_upload_pack(cm, channel_id, "", state)
     end
   end
 

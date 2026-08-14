@@ -254,6 +254,7 @@ defmodule FornacastWeb.GitHTTPController do
   defp parse_upload_pack_request(body) do
     case GitTransport.UploadPack.parse_request_data(body) do
       {:done, _rest, request} -> {:ok, request}
+      {:flush, _rest, request} -> {:ok, request}
       {:cont, _buffer, _request} -> {:error, :incomplete_request}
       {:error, reason} -> {:error, reason}
     end
