@@ -40,8 +40,7 @@ defmodule FornacastWeb.MixProject do
       {:phoenix_ecto, "~> 4.7"},
       {:phoenix_html, "~> 4.3"},
       {:bandit, "~> 1.12"},
-      {:mdex, "~> 0.13.2"},
-      {:html_sanitize_ex, "~> 1.5"}
+      {:mdex, "~> 0.13.2"}
     ]
   end
 end
