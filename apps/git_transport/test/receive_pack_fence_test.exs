@@ -26,6 +26,8 @@ defmodule GitTransport.ReceivePackFenceTest do
   @one_oid String.duplicate("1", 40)
 
   setup %{tmp_dir: tmp_dir} do
+    wait_for_persisted_workers(0)
+
     original_root = Application.fetch_env(:fornacast, :repo_storage_root)
     original_reconcilers = Application.fetch_env(:forge_repos, :repository_write_reconcilers)
     Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
