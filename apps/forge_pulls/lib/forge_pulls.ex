@@ -61,19 +61,19 @@ defmodule ForgePulls.SnapshotRefresh do
 
   import Ecto.Query
 
+  alias Ecto.Multi
   alias ForgePulls.PullRequest
   alias Fornacast.Repo
 
   def persist(%PullRequest{} = expected, attrs) when is_map(attrs) do
-    Repo.transaction(fn ->
-      case persist_in_transaction(Repo, expected, attrs) do
-        {:ok, pull} -> pull
-        {:error, reason} -> Repo.rollback(reason)
-      end
+    Multi.new()
+    |> Multi.run(:pull_request, fn repo, _changes ->
+      persist_in_transaction(repo, expected, attrs)
     end)
+    |> ForgeIssues.transaction()
     |> case do
-      {:ok, pull} -> {:ok, pull}
-      {:error, reason} -> {:error, reason}
+      {:ok, %{pull_request: pull}} -> {:ok, pull}
+      {:error, :pull_request, reason, _changes} -> {:error, reason}
     end
   end
 
@@ -1229,7 +1229,6 @@ defmodule ForgePulls do
         {:cont, {:ok, [pull | loaded]}}
       else
         :error -> {:halt, {:error, :not_found}}
-        {:error, _} = error -> {:halt, error}
       end
     end)
     |> case do
