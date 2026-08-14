@@ -466,6 +466,8 @@ defmodule FornacastAPI.RateLimitTest do
   end
 
   test "invalid authentication is charged anonymously exactly once" do
+    reset_database!()
+
     remote_ip = {192, 0, 2, 32}
 
     response =
