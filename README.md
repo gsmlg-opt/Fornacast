@@ -83,6 +83,20 @@ Run locally:
 mix fornacast.run
 ```
 
+Or start the application and managed PostgreSQL service in the background with
+devenv. Compile once inside the pinned environment after a fresh checkout or a
+BEAM version change, then start and wait until both processes report ready:
+
+```sh
+devenv shell -- mix compile
+devenv processes up -d --strict-ports
+devenv processes wait --timeout 300
+```
+
+The Fornacast process becomes ready only after the REST listener's `/health`
+endpoint returns success. Stop the detached processes with
+`devenv processes down`.
+
 On a fresh install this prints a setup URL. Open `http://localhost:4890/setup` to create the first admin account, then log in.
 
 Default local endpoints:
