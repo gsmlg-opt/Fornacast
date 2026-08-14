@@ -1413,6 +1413,66 @@
     color: var(--color-on-surface-variant);
     font-size: 0.78rem;
   }
+
+  [data-repository-page] [data-issues-page],
+  [data-repository-page] [data-pulls-page],
+  [data-repository-page] [data-issue-form],
+  [data-repository-page] [data-pull-form],
+  [data-repository-page] [data-issue-conversation],
+  [data-repository-page] [data-pull-conversation],
+  [data-repository-page] [data-pull-commits],
+  [data-repository-page] [data-pull-files] {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  [data-repository-page] [data-issue-filters],
+  [data-repository-page] [data-pull-filters] {
+    min-width: 0;
+    align-items: end;
+  }
+
+  [data-repository-page] [data-issue-row],
+  [data-repository-page] [data-pull-row],
+  [data-repository-page] [data-issue-conversation] > :where(header, article, ol, form),
+  [data-repository-page] [data-pull-conversation] > :where(header, article, ol, form, section) {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  [data-repository-page] [data-issue-conversation],
+  [data-repository-page] [data-pull-conversation] {
+    gap: 0.85rem;
+  }
+
+  [data-repository-page] [data-merge-box] {
+    border: 1px solid var(--color-outline-variant);
+    border-left: 4px solid var(--color-primary);
+  }
+
+  [data-repository-page] [data-pull-navigation] {
+    display: flex;
+    max-width: 100%;
+    min-width: 0;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+  }
+
+  [data-repository-page] [data-pull-navigation] > a {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  [data-repository-page] [data-pull-diff] {
+    max-width: 100%;
+    min-width: 0;
+    overflow-x: auto;
+  }
+
+  [data-repository-page] [data-pull-diff] :where(pre, table, [class*="overflow-x-auto"]) {
+    max-width: none;
+  }
 }
 
 @media (max-width: 1023px) {
@@ -1490,6 +1550,34 @@
     align-items: flex-start;
     flex-direction: column;
     gap: 0.2rem;
+  }
+
+  [data-repository-page] [data-issue-filters],
+  [data-repository-page] [data-pull-filters],
+  [data-repository-page] [data-issue-relationships] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  [data-repository-page] [data-issue-form] form > .flex,
+  [data-repository-page] [data-pull-form] form > .flex,
+  [data-repository-page] [data-issue-comment-form],
+  [data-repository-page] [data-pull-conversation] > form,
+  [data-repository-page] [data-merge-box] form {
+    width: 100%;
+    align-items: stretch;
+  }
+
+  [data-repository-page] [data-issue-form] form > .flex,
+  [data-repository-page] [data-pull-form] form > .flex {
+    flex-direction: column;
+  }
+
+  [data-repository-page] [data-issue-form] form > .flex :where(.btn, button.btn, el-dm-button),
+  [data-repository-page] [data-pull-form] form > .flex :where(.btn, button.btn, el-dm-button),
+  [data-repository-page] [data-issue-comment-form] :where(.btn, button.btn, el-dm-button),
+  [data-repository-page] [data-pull-conversation] > form :where(.btn, button.btn, el-dm-button),
+  [data-repository-page] [data-merge-box] form :where(.btn, button.btn, el-dm-button) {
+    width: 100%;
   }
 }
 

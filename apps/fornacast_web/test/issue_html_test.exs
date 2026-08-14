@@ -8,7 +8,7 @@ defmodule FornacastWeb.IssueHTMLTest do
   alias FornacastWeb.{IssueHTML, RepositoryPage}
 
   test "issue list is a dense filtered repository page with one active Issues tab" do
-    issue = issue(7, "Keep the list dense")
+    issue = %{issue(7, "Keep the list dense") | state: :closed}
 
     result =
       result(:issues, %{
@@ -31,6 +31,8 @@ defmodule FornacastWeb.IssueHTMLTest do
     assert html =~ "data-issues-page"
     assert html =~ "data-issue-filters"
     assert html =~ "data-issue-row"
+    [issue_row] = Regex.run(~r/<li\b[^>]*data-issue-row.*?<\/li>/s, html)
+    assert issue_row =~ ~r/>\s*closed\s*</
     assert html =~ "Keep the list dense"
     assert html =~ "1 comment"
     assert html =~ "bug"
@@ -126,9 +128,14 @@ defmodule FornacastWeb.IssueHTMLTest do
     assert html =~ ~r/<option[^>]*value="bob"[^>]*selected/
     assert html =~ "Retained title"
     assert html =~ "Retained body"
+    assert label_text(html, "issue-title") == "Title"
+    assert label_text(html, "issue-body") == "Body"
+    assert label_text(html, "issue-labels") == "Labels"
+    assert label_text(html, "issue-assignees") == "Assignees"
     assert html =~ "Title is invalid"
     assert html =~ "The issue could not be processed"
     assert length(Regex.scan(~r/aria-current="page"/, navigation(html))) == 1
+    assert primary_action_count(html) == 1
   end
 
   test "non-writer author edit form omits relationship controls and uses PATCH override" do
@@ -193,6 +200,7 @@ defmodule FornacastWeb.IssueHTMLTest do
     assert textarea_body(html, "issue-comment-2") =~ "second original"
     assert textarea_body(html, "issue-comment-body") == ""
     assert html =~ "Body is invalid"
+    assert primary_action_count(html) <= 1
 
     create_html =
       render_component(&IssueHTML.show/1,
@@ -351,5 +359,23 @@ defmodule FornacastWeb.IssueHTMLTest do
   defp byte_index(text, pattern) do
     {index, _length} = :binary.match(text, pattern)
     index
+  end
+
+  defp primary_action_count(html) do
+    elements = Regex.scan(~r/<el-dm-button\b[^>]*variant="primary"[^>]*>/, html)
+    links = Regex.scan(~r/<(?:a|button)\b[^>]*class="[^"]*\bbtn-primary\b[^"]*"[^>]*>/, html)
+
+    Enum.count(elements, fn [element] -> primary_color?(element) end) + length(links)
+  end
+
+  defp primary_color?(element), do: not String.contains?(element, "--color-primary:")
+
+  defp label_text(html, id) do
+    [_, content] =
+      Regex.run(~r/<label\b[^>]*for="#{Regex.escape(id)}"[^>]*>(.*?)<\/label>/s, html)
+
+    content
+    |> String.replace(~r/<[^>]+>/, "")
+    |> String.trim()
   end
 end

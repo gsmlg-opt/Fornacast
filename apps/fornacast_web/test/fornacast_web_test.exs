@@ -27,6 +27,41 @@ defmodule FornacastWebTest do
     assert FornacastWeb.HTML.badge("Default") == ~s(<span class="badge">Default</span>)
   end
 
+  test "repository collaboration CSS keeps responsive flow and long diffs local" do
+    css = File.read!(Path.expand("../assets/css/app.css", __DIR__))
+
+    [_, tablet_css] =
+      Regex.run(~r/@media \(max-width: 767px\) \{(.*?)\n\}\n\n@media \(max-width: 639px\)/s, css)
+
+    [_, phone_css] =
+      Regex.run(
+        ~r/@media \(max-width: 639px\) \{(.*?)\n\}\n\n@media \(prefers-reduced-motion/s,
+        css
+      )
+
+    assert css =~ "[data-repository-page] [data-issues-page]"
+    assert css =~ "[data-repository-page] [data-pulls-page]"
+    assert css =~ "[data-repository-page] [data-issue-conversation]"
+    assert css =~ "[data-repository-page] [data-pull-conversation]"
+    assert css =~ "[data-repository-page] [data-merge-box]"
+    assert css =~ "[data-repository-page] [data-pull-navigation]"
+    assert css =~ "[data-repository-page] [data-pull-diff]"
+    assert css =~ ~r/\[data-pull-diff\][^{]*\{[^}]*overflow-x:\s*auto/s
+
+    assert css =~
+             ~r/\[data-issues-page\],[^{]*\[data-pulls-page\][^{]*\{[^}]*max-width:\s*100%[^}]*min-width:\s*0/s
+
+    assert tablet_css =~ "[data-repository-page] .repository-navigation"
+    assert tablet_css =~ "overflow-x: auto"
+    assert phone_css =~ "[data-repository-page] [data-issue-filters]"
+    assert phone_css =~ "[data-repository-page] [data-pull-filters]"
+    assert phone_css =~ "[data-repository-page] [data-issue-comment-form]"
+    assert phone_css =~ "[data-repository-page] [data-merge-box] form"
+    assert phone_css =~ "flex-direction: column"
+    assert phone_css =~ "el-dm-button"
+    assert phone_css =~ "width: 100%"
+  end
+
   @tag :tmp_dir
   test "authenticated shell renders workspace navigation in the appbar", %{tmp_dir: tmp_dir} do
     reset_database!()

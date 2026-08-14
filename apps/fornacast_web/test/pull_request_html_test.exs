@@ -82,10 +82,14 @@ defmodule FornacastWeb.PullRequestHTMLTest do
     assert html =~ ~s(name="pull[body]")
     assert html =~ ~s(name="pull[head]")
     assert html =~ ~s(name="pull[base]")
+    assert label_text(html, "pull-head") == "Head branch"
+    assert label_text(html, "pull-base") == "Base branch"
+    assert label_text(html, "pull-title") == "Title"
+    assert label_text(html, "pull-body") == "Body"
     assert html =~ ~r/<option[^>]*value="main"[^>]*selected/
     assert byte_index(html, ~r/>\s*feature\s*</) < byte_index(html, ~r/>\s*main\s*</)
     assert byte_index(html, ~r/>\s*main\s*</) < byte_index(html, ~r/>\s*release\s*</)
-    assert length(Regex.scan(~r/variant="primary"|btn-primary/, html)) == 1
+    assert primary_action_count(html) == 1
     refute html =~ "data-pull-compare"
   end
 
@@ -177,6 +181,9 @@ defmodule FornacastWeb.PullRequestHTMLTest do
     assert byte_index(nav, ~r/>\s*Conversation\s*</) < byte_index(nav, ~r/>\s*Commits\s*</)
     assert byte_index(nav, ~r/>\s*Commits\s*</) < byte_index(nav, ~r/>\s*Files changed\s*</)
     assert length(Regex.scan(~r/aria-current="page"/, nav)) == 1
+    assert length(Regex.scan(~r/<a\b/, nav)) == 3
+    assert nav =~ ~s(aria-current="page")
+    assert primary_action_count(html) <= 1
   end
 
   test "conversation exposes only capability-gated canonical comment controls and retained errors" do
@@ -507,5 +514,23 @@ defmodule FornacastWeb.PullRequestHTMLTest do
   defp byte_index(string, pattern) do
     {index, _length} = Regex.run(pattern, string, return: :index) |> hd()
     index
+  end
+
+  defp primary_action_count(html) do
+    elements = Regex.scan(~r/<el-dm-button\b[^>]*variant="primary"[^>]*>/, html)
+    links = Regex.scan(~r/<(?:a|button)\b[^>]*class="[^"]*\bbtn-primary\b[^"]*"[^>]*>/, html)
+
+    Enum.count(elements, fn [element] -> primary_color?(element) end) + length(links)
+  end
+
+  defp primary_color?(element), do: not String.contains?(element, "--color-primary:")
+
+  defp label_text(html, id) do
+    [_, content] =
+      Regex.run(~r/<label\b[^>]*for="#{Regex.escape(id)}"[^>]*>(.*?)<\/label>/s, html)
+
+    content
+    |> String.replace(~r/<[^>]+>/, "")
+    |> String.trim()
   end
 end

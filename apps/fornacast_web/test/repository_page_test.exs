@@ -112,7 +112,8 @@ defmodule FornacastWeb.RepositoryPageTest do
       :viewer,
       :ref_summary,
       :snapshot,
-      :clone
+      :clone,
+      :collaboration_counts
     ])
 
     assert_struct_fields(RepositoryPage.Clone, [:https_url, :ssh_url, :push_commands])
