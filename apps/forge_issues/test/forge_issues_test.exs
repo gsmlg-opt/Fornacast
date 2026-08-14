@@ -147,8 +147,7 @@ defmodule ForgeIssuesTest do
     issue = issue_fixture(repository, writer)
 
     assert {:error, {:issue, :relationships},
-            {:validation, [%{resource: "Issue", field: "labels", code: :missing}]},
-            _} =
+            {:validation, [%{resource: "Issue", field: "labels", code: :missing}]}, _} =
              Multi.new()
              |> Multi.run(:issue, fn _repo, _changes -> {:ok, issue} end)
              |> ForgeIssues.put_relationship_operations(
@@ -161,8 +160,7 @@ defmodule ForgeIssuesTest do
              |> ForgeIssues.transaction()
 
     assert {:error, {:issue, :relationships},
-            {:validation, [%{resource: "Issue", field: "assignees", code: :invalid}]},
-            _} =
+            {:validation, [%{resource: "Issue", field: "assignees", code: :invalid}]}, _} =
              Multi.new()
              |> Multi.run(:issue, fn _repo, _changes -> {:ok, issue} end)
              |> ForgeIssues.put_relationship_operations(
@@ -461,8 +459,7 @@ defmodule ForgeIssuesTest do
           %{"labels" => [%{"wrong" => "bug"}]}
         ] do
       assert {:error, {:issue, :relationships},
-              {:validation, [%{resource: "Issue", field: "labels", code: :missing}]},
-              _} =
+              {:validation, [%{resource: "Issue", field: "labels", code: :missing}]}, _} =
                relationship_transaction(issue, repository, writer, attrs)
 
       assert [existing.id] == ForgeIssues.load_labels(issue) |> Enum.map(& &1.id)
@@ -484,8 +481,7 @@ defmodule ForgeIssuesTest do
           %{"assignee" => 123}
         ] do
       assert {:error, {:issue, :relationships},
-              {:validation, [%{resource: "Issue", field: "assignees", code: :invalid}]},
-              _} =
+              {:validation, [%{resource: "Issue", field: "assignees", code: :invalid}]}, _} =
                relationship_transaction(issue, repository, writer, attrs)
 
       assert [existing.id] == ForgeIssues.load_assignees(issue) |> Enum.map(& &1.id)
@@ -2324,8 +2320,7 @@ defmodule ForgeIssuesTest do
     issue = issue_fixture(repository, writer)
 
     assert {:error, {:issue, :relationships},
-            {:validation, [%{resource: "Issue", field: "assignees", code: :invalid}]},
-            _} =
+            {:validation, [%{resource: "Issue", field: "assignees", code: :invalid}]}, _} =
              Multi.new()
              |> Multi.run(:issue, fn _repo, _changes -> {:ok, issue} end)
              |> ForgeIssues.put_relationship_operations(
