@@ -25,6 +25,7 @@ defmodule ForgeReleases.MixProject do
   defp deps do
     [
       {:fornacast, in_umbrella: true},
+      # TODO(upstream): gsmlg-opt/ex_storage_service#17
       {:ex_storage_service, "== 0.6.4"}
     ]
   end
