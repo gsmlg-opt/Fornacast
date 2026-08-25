@@ -10,6 +10,11 @@ defmodule ForgeAccounts do
   alias ForgeAccounts.{APIKey, APIScope, Organization, OrganizationMember, SSHKey, User}
   alias Fornacast.{Audit, Page, Repo}
 
+  @spec validate_namespace_slug(term()) :: {:ok, String.t()} | {:error, :invalid | :reserved}
+  def validate_namespace_slug(value), do: ForgeAccounts.Namespace.validate(value)
+
+  def reserved_namespace?(value), do: ForgeAccounts.Namespace.reserved?(value)
+
   @type validation_error :: %{
           required(:resource) => String.t(),
           required(:field) => String.t(),
