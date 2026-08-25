@@ -527,6 +527,7 @@ defmodule ForgeAccounts.GitHubIdentityTest do
 
   defp reset_tables do
     [
+      "github_credentials",
       "github_identities",
       "audit_events",
       "repository_collaborators",

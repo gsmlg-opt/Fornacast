@@ -11,6 +11,7 @@ defmodule ForgeAccounts do
   alias ForgeAccounts.{
     APIKey,
     APIScope,
+    GitHubAccounts,
     GitHubIdentity,
     GitHubIdentityWrite,
     Organization,
@@ -35,6 +36,39 @@ defmodule ForgeAccounts do
         }
 
   @type api_error :: :forbidden | :not_found | {:validation, [validation_error()]}
+
+  defdelegate list_github_accounts(actor), to: GitHubAccounts
+
+  defdelegate save_github_account(actor, verified_profile, pat, request_metadata),
+    to: GitHubAccounts
+
+  defdelegate replace_github_credential(
+                actor,
+                identity_id,
+                verified_profile,
+                pat,
+                request_metadata
+              ),
+              to: GitHubAccounts
+
+  defdelegate refresh_github_account(actor, identity_id, verified_profile, request_metadata),
+    to: GitHubAccounts
+
+  defdelegate delete_github_credential(actor, identity_id, request_metadata),
+    to: GitHubAccounts
+
+  defdelegate unlink_github_account(actor, identity_id, request_metadata),
+    to: GitHubAccounts
+
+  @doc """
+  Checks a saved PAT out only to a trusted internal callback.
+
+  The callback may perform durable side effects, but it may return only `:ok` or a bounded
+  `{:error, reason}` made from atoms and integers. Public results and exceptions never carry
+  plaintext credentials. Deletion or unlink prevents future checkouts; a callback that already
+  received the credential may finish.
+  """
+  defdelegate with_github_credential(actor, identity_id, callback), to: GitHubAccounts
 
   def get_account(id), do: Repo.get(User, id)
 
