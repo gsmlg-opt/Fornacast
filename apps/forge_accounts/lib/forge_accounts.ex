@@ -7,7 +7,18 @@ defmodule ForgeAccounts do
 
   alias Ecto.Changeset
   alias Ecto.Multi
-  alias ForgeAccounts.{APIKey, APIScope, Organization, OrganizationMember, SSHKey, User}
+
+  alias ForgeAccounts.{
+    APIKey,
+    APIScope,
+    GitHubIdentity,
+    GitHubIdentityWrite,
+    Organization,
+    OrganizationMember,
+    SSHKey,
+    User
+  }
+
   alias Fornacast.{Audit, Page, Repo}
 
   @spec validate_namespace_slug(term()) :: {:ok, String.t()} | {:error, :invalid | :reserved}
@@ -121,6 +132,65 @@ defmodule ForgeAccounts do
       end
     end)
   end
+
+  def observe_github_identity(profile, observed_at)
+      when is_map(profile) and is_struct(observed_at, DateTime) do
+    attrs =
+      profile
+      |> github_profile_attrs()
+      |> Map.put(:last_verified_at, observed_at)
+      |> Map.put(:last_observed_at, observed_at)
+
+    changeset = GitHubIdentity.observed_changeset(%GitHubIdentity{}, attrs)
+
+    if changeset.valid?,
+      do: upsert_github_identity(changeset, attrs.github_user_id),
+      else: {:error, changeset}
+  end
+
+  def observe_github_identity(_profile, _observed_at), do: {:error, :invalid}
+
+  def link_github_identity(local_user, %GitHubIdentity{id: identity_id})
+      when is_integer(identity_id) do
+    with {:ok, %User{id: local_user_id}} <- active_actor(local_user),
+         %GitHubIdentity{kind: :user} = identity <- Repo.get(GitHubIdentity, identity_id) do
+      cond do
+        identity.local_user_id in [nil, local_user_id] ->
+          claim_github_identity(identity_id, local_user_id)
+
+        true ->
+          {:error, :already_linked}
+      end
+    else
+      nil -> {:error, :not_found}
+      %GitHubIdentity{} -> {:error, :forbidden}
+      {:error, reason} -> {:error, reason}
+      {:ok, _} -> {:error, :forbidden}
+    end
+  end
+
+  def link_github_identity(_local_user, _identity), do: {:error, :forbidden}
+
+  def unlink_github_identity(local_user, %GitHubIdentity{id: identity_id})
+      when is_integer(identity_id) do
+    with {:ok, %User{id: local_user_id}} <- active_actor(local_user) do
+      unlink_github_identity_write(identity_id, local_user_id)
+    end
+  end
+
+  def unlink_github_identity(_local_user, _identity), do: {:error, :forbidden}
+
+  def list_github_identities(%User{id: local_user_id}) do
+    GitHubIdentity
+    |> where([identity], identity.local_user_id == ^local_user_id)
+    |> order_by([identity], asc: identity.github_user_id, asc: identity.id)
+    |> Repo.all()
+  end
+
+  def list_github_identities(_local_user), do: []
+
+  def github_deleted_identity,
+    do: GitHubIdentityWrite.with_retry(&fetch_github_deleted_identity/0)
 
   defp create_development_admin(attrs) do
     %User{}
@@ -658,6 +728,242 @@ defmodule ForgeAccounts do
       end
     else
       {:error, {:validation, errors}}
+    end
+  end
+
+  defp upsert_github_identity(changeset, github_user_id) do
+    GitHubIdentityWrite.with_retry(fn ->
+      with {:ok, _identity} <-
+             Repo.insert(changeset,
+               on_conflict: observed_identity_on_conflict(),
+               conflict_target: github_identity_conflict_target()
+             ) do
+        {:ok, Repo.get_by!(GitHubIdentity, github_user_id: github_user_id)}
+      end
+    end)
+  end
+
+  defp observed_identity_on_conflict do
+    if turso?(),
+      do: turso_observed_identity_on_conflict(),
+      else: postgres_observed_identity_on_conflict()
+  end
+
+  defp postgres_observed_identity_on_conflict do
+    from(identity in GitHubIdentity,
+      update: [
+        set: [
+          login:
+            fragment(
+              "CASE WHEN ? IS NULL OR EXCLUDED.last_observed_at >= ? THEN EXCLUDED.login ELSE ? END",
+              identity.last_observed_at,
+              identity.last_observed_at,
+              identity.login
+            ),
+          avatar_url:
+            fragment(
+              "CASE WHEN ? IS NULL OR EXCLUDED.last_observed_at >= ? THEN EXCLUDED.avatar_url ELSE ? END",
+              identity.last_observed_at,
+              identity.last_observed_at,
+              identity.avatar_url
+            ),
+          profile_url:
+            fragment(
+              "CASE WHEN ? IS NULL OR EXCLUDED.last_observed_at >= ? THEN EXCLUDED.profile_url ELSE ? END",
+              identity.last_observed_at,
+              identity.last_observed_at,
+              identity.profile_url
+            ),
+          last_verified_at:
+            fragment(
+              "CASE WHEN ? IS NULL OR EXCLUDED.last_observed_at >= ? THEN EXCLUDED.last_verified_at ELSE ? END",
+              identity.last_observed_at,
+              identity.last_observed_at,
+              identity.last_verified_at
+            ),
+          last_observed_at:
+            fragment(
+              "CASE WHEN ? IS NULL OR EXCLUDED.last_observed_at >= ? THEN EXCLUDED.last_observed_at ELSE ? END",
+              identity.last_observed_at,
+              identity.last_observed_at,
+              identity.last_observed_at
+            ),
+          updated_at:
+            fragment(
+              "CASE WHEN ? IS NULL OR EXCLUDED.last_observed_at >= ? THEN EXCLUDED.updated_at ELSE ? END",
+              identity.last_observed_at,
+              identity.last_observed_at,
+              identity.updated_at
+            )
+        ]
+      ]
+    )
+  end
+
+  defp turso_observed_identity_on_conflict do
+    from(_identity in GitHubIdentity,
+      update: [
+        set: [
+          login:
+            fragment(
+              "CASE WHEN last_observed_at IS NULL OR EXCLUDED.last_observed_at >= last_observed_at THEN EXCLUDED.login ELSE login END"
+            ),
+          avatar_url:
+            fragment(
+              "CASE WHEN last_observed_at IS NULL OR EXCLUDED.last_observed_at >= last_observed_at THEN EXCLUDED.avatar_url ELSE avatar_url END"
+            ),
+          profile_url:
+            fragment(
+              "CASE WHEN last_observed_at IS NULL OR EXCLUDED.last_observed_at >= last_observed_at THEN EXCLUDED.profile_url ELSE profile_url END"
+            ),
+          last_verified_at:
+            fragment(
+              "CASE WHEN last_observed_at IS NULL OR EXCLUDED.last_observed_at >= last_observed_at THEN EXCLUDED.last_verified_at ELSE last_verified_at END"
+            ),
+          last_observed_at:
+            fragment(
+              "CASE WHEN last_observed_at IS NULL OR EXCLUDED.last_observed_at >= last_observed_at THEN EXCLUDED.last_observed_at ELSE last_observed_at END"
+            ),
+          updated_at:
+            fragment(
+              "CASE WHEN last_observed_at IS NULL OR EXCLUDED.last_observed_at >= last_observed_at THEN EXCLUDED.updated_at ELSE updated_at END"
+            )
+        ]
+      ]
+    )
+  end
+
+  defp github_identity_conflict_target do
+    if turso?() do
+      # WORKAROUND(upstream): gsmlg-dev/concord#79 rejects Ecto's exact partial-index target.
+      []
+    else
+      {:unsafe_fragment, "(github_user_id) WHERE github_user_id IS NOT NULL"}
+    end
+  end
+
+  defp turso? do
+    Application.get_env(:fornacast, :database_adapter) in ["libsql", "turso"]
+  end
+
+  defp fetch_github_deleted_identity do
+    case Repo.get_by(GitHubIdentity, kind: :deleted) do
+      %GitHubIdentity{} = identity ->
+        identity
+
+      nil ->
+        %GitHubIdentity{}
+        |> GitHubIdentity.deleted_changeset()
+        |> Repo.insert(on_conflict: :nothing)
+
+        Repo.get_by!(GitHubIdentity, kind: :deleted)
+    end
+  end
+
+  defp claim_github_identity(identity_id, local_user_id) do
+    case claim_github_identity_write(identity_id, local_user_id) do
+      {1, _} -> claimed_github_identity_result(identity_id, local_user_id)
+      {0, _} -> claimed_github_identity_result(identity_id, local_user_id)
+    end
+  end
+
+  defp unlink_github_identity_write(identity_id, local_user_id) do
+    case unlink_github_identity_update(identity_id, local_user_id) do
+      {1, _} -> unlinked_github_identity_result(identity_id)
+      {0, _} -> missing_github_identity_unlink_result(identity_id, local_user_id)
+    end
+  end
+
+  defp claim_github_identity_write(identity_id, local_user_id) do
+    GitHubIdentityWrite.with_retry(fn ->
+      GitHubIdentity
+      |> where(
+        [identity],
+        identity.id == ^identity_id and identity.kind == :user and
+          (is_nil(identity.local_user_id) or identity.local_user_id == ^local_user_id)
+      )
+      |> Repo.update_all(
+        set: [local_user_id: local_user_id, updated_at: DateTime.utc_now(:second)]
+      )
+    end)
+  end
+
+  defp claimed_github_identity_result(identity_id, local_user_id) do
+    case reload_github_identity(identity_id) do
+      %GitHubIdentity{local_user_id: ^local_user_id} = identity -> {:ok, identity}
+      %GitHubIdentity{kind: :user} -> {:error, :already_linked}
+      _ -> {:error, :forbidden}
+    end
+  end
+
+  defp unlink_github_identity_update(identity_id, local_user_id) do
+    GitHubIdentityWrite.with_retry(fn ->
+      GitHubIdentity
+      |> where(
+        [identity],
+        identity.id == ^identity_id and identity.local_user_id == ^local_user_id
+      )
+      |> Repo.update_all(set: [local_user_id: nil, updated_at: DateTime.utc_now(:second)])
+    end)
+  end
+
+  defp unlinked_github_identity_result(identity_id) do
+    case reload_github_identity(identity_id) do
+      %GitHubIdentity{local_user_id: nil} = identity -> {:ok, identity}
+      _ -> {:error, :not_found}
+    end
+  end
+
+  defp missing_github_identity_unlink_result(identity_id, _local_user_id) do
+    case reload_github_identity(identity_id) do
+      %GitHubIdentity{kind: :user} -> {:error, :not_found}
+      %GitHubIdentity{} -> {:error, :forbidden}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  defp reload_github_identity(identity_id) do
+    GitHubIdentityWrite.with_retry(fn ->
+      maybe_inject_github_identity_read_busy()
+      Repo.get(GitHubIdentity, identity_id)
+    end)
+  end
+
+  if Mix.env() == :test do
+    defp maybe_inject_github_identity_read_busy do
+      key = {__MODULE__, :github_identity_read_hook}
+
+      case Process.get(key) do
+        :busy_once ->
+          Process.put(key, :used)
+          raise Turso.Error, code: :busy, message: "database is locked"
+
+        _ ->
+          :ok
+      end
+    end
+  else
+    defp maybe_inject_github_identity_read_busy, do: :ok
+  end
+
+  defp github_profile_attrs(profile) do
+    %{
+      github_user_id:
+        github_profile_value(profile, [:github_user_id, "github_user_id", :id, "id"]),
+      login: github_profile_value(profile, [:login, "login"]),
+      avatar_url: github_profile_value(profile, [:avatar_url, "avatar_url"]),
+      profile_url:
+        github_profile_value(profile, [:profile_url, "profile_url", :html_url, "html_url"])
+    }
+  end
+
+  defp github_profile_value(profile, keys) do
+    Enum.find_value(keys, fn key ->
+      if Map.has_key?(profile, key), do: {:present, Map.fetch!(profile, key)}
+    end)
+    |> case do
+      {:present, value} -> value
+      nil -> nil
     end
   end
 
