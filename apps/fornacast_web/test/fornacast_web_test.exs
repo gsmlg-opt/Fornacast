@@ -129,7 +129,7 @@ defmodule FornacastWebTest do
     assert html =~ ~s(<button type="button" class="theme-menu-item" data-theme-choice="moonlight")
     assert html =~ ~s(<details class="account-menu">)
     assert html =~ ~s(<a class="account-menu-item" href="/alice">Profile</a>)
-    assert html =~ ~s(<a class="account-menu-item" href="/settings/ssh-keys">Settings</a>)
+    assert html =~ ~s(<a class="account-menu-item" href="/settings">Settings</a>)
     assert html =~ ~s(<form action="/logout" method="post" class="account-menu-logout">)
     refute html =~ ~s(<a class="nav-link" href="/">Dashboard</a>)
     refute html =~ ~s(<a class="nav-link" href="/repos/new">New repository</a>)
@@ -142,6 +142,36 @@ defmodule FornacastWebTest do
     refute html =~ ~s(class="account-pill")
     refute html =~ ~s(class="appbar-logout")
     refute html =~ ~s(<aside class="app-rail)
+  end
+
+  test "settings landing page shows the user's profile and settings navigation" do
+    reset_database!()
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-settings@example.com",
+               password: "correct horse battery staple"
+             })
+
+    conn =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+      |> get("/settings")
+
+    html = html_response(conn, 200)
+
+    assert html =~ "<h1>Settings</h1>"
+    assert html =~ ~s(<div class="settings-layout" data-settings-page>)
+
+    assert html =~
+             ~s(<nav class="nested-menu nested-menu-bordered settings-menu" aria-label="User settings">)
+
+    assert html =~ ~s(<a href="/settings" class="active" aria-current="page">Profile</a>)
+    assert html =~ ~s(<a href="/settings/api-keys">Applications</a>)
+    assert html =~ ~s(<a href="/settings/ssh-keys">SSH Keys</a>)
+    assert html =~ "@alice"
+    assert html =~ "alice-settings@example.com"
   end
 
   test "SSH keys are available from settings" do
@@ -162,7 +192,11 @@ defmodule FornacastWebTest do
     html = html_response(conn, 200)
     assert html =~ "<h1>SSH keys</h1>"
     assert html =~ ~s(<form action="/settings/ssh-keys" method="post">)
-    assert html =~ ~s(<a href="/settings/api-keys">API keys</a>)
+
+    assert html =~
+             ~s(<a href="/settings/ssh-keys" class="active" aria-current="page">SSH Keys</a>)
+
+    assert html =~ ~s(<a href="/settings/api-keys">Applications</a>)
   end
 
   test "API key settings create named scoped keys and reveal the secret once" do
@@ -188,6 +222,9 @@ defmodule FornacastWebTest do
 
     html = html_response(conn, 201)
     [secret] = Regex.run(~r/fc_pat_[A-Za-z0-9_-]+/, html)
+
+    assert html =~
+             ~s(<a href="/settings/api-keys" class="active" aria-current="page">Applications</a>)
 
     assert Enum.count(Regex.scan(~r/#{Regex.escape(secret)}/, html)) == 1
     assert html =~ "deploy &amp; release"

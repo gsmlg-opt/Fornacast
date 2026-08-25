@@ -39,15 +39,16 @@ defmodule FornacastWeb.APIKeyController do
       secret_panel(Keyword.get(options, :secret)) <>
         error_message(Keyword.get(options, :errors))
 
-    page(conn, "API keys", """
-    #{settings_navigation()}
+    content = """
     #{section_header("API keys", "Create personal API keys for Git and API access.", "")}
     #{notices}
     <div class="settings-grid">
       #{api_key_form(form)}
       #{api_key_table(keys)}
     </div>
-    """)
+    """
+
+    page(conn, "API keys", settings_layout(:api_keys, content))
   end
 
   defp api_key_attrs(params) do
@@ -87,10 +88,6 @@ defmodule FornacastWeb.APIKeyController do
   end
 
   defp normalize_expiration(attrs), do: attrs
-
-  defp settings_navigation do
-    ~s(<nav aria-label="Settings"><a href="/settings/ssh-keys">SSH keys</a> <a href="/settings/api-keys">API keys</a></nav>)
-  end
 
   defp api_key_form(form) do
     name = escape(Map.get(form, "name", ""))

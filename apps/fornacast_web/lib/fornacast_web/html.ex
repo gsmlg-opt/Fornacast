@@ -264,7 +264,7 @@ defmodule FornacastWeb.HTML do
       </summary>
       <div class="account-menu-list" role="menu">
         <a class="account-menu-item" href="#{escape(account_profile_path(current_user))}">Profile</a>
-        <a class="account-menu-item" href="/settings/ssh-keys">Settings</a>
+        <a class="account-menu-item" href="/settings">Settings</a>
         <form action="/logout" method="post" class="account-menu-logout">
           #{csrf_input()}
           <input type="hidden" name="_method" value="delete">
@@ -319,6 +319,38 @@ defmodule FornacastWeb.HTML do
       </div>
       <div class="section-actions">#{action_html}</div>
     </section>
+    """
+  end
+
+  def settings_layout(active, body) do
+    items = [
+      {:profile, "Profile", "/settings"},
+      {:api_keys, "Applications", "/settings/api-keys"},
+      {:ssh_keys, "SSH Keys", "/settings/ssh-keys"}
+    ]
+
+    navigation =
+      Enum.map_join(items, "\n", fn {key, label, href} ->
+        active_attributes =
+          if key == active,
+            do: ~s( class="active" aria-current="page"),
+            else: ""
+
+        ~s(<li><a href="#{href}"#{active_attributes}>#{label}</a></li>)
+      end)
+
+    """
+    <div class="settings-layout" data-settings-page>
+      <aside class="settings-sidebar">
+        <nav class="nested-menu nested-menu-bordered settings-menu" aria-label="User settings">
+          <ul role="list">
+            <li class="nested-menu-title">User Settings</li>
+            #{navigation}
+          </ul>
+        </nav>
+      </aside>
+      <div class="settings-content">#{body}</div>
+    </div>
     """
   end
 

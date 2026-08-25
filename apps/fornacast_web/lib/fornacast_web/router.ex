@@ -53,6 +53,7 @@ defmodule FornacastWeb.Router do
     get "/ssh-keys", SSHKeyController, :index
     post "/ssh-keys", SSHKeyController, :create
     delete "/ssh-keys/:id", SSHKeyController, :delete
+    get "/settings", SettingsController, :index
     get "/settings/ssh-keys", SSHKeyController, :index
     post "/settings/ssh-keys", SSHKeyController, :create
     delete "/settings/ssh-keys/:id", SSHKeyController, :delete
