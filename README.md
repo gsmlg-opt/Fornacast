@@ -271,6 +271,8 @@ Supported write-side policy for v0.1:
 Production environment variables:
 
 - `SECRET_KEY_BASE`
+- `FORNACAST_GITHUB_CREDENTIAL_KEYS`, a JSON object mapping key IDs to base64-encoded 32-byte keys
+- `FORNACAST_GITHUB_CREDENTIAL_ACTIVE_KEY_ID`, the key ID used for new GitHub credential writes
 - `FORNACAST_DATABASE_ADAPTER`, default `turso`; use `postgres` for PostgreSQL builds
 - `FORNACAST_DATABASE_PATH`, default `/data/fornacast.db` in production Turso mode
 - `TURSO_DATABASE_URL`, optional remote Turso/libSQL URI for the Ecto database
@@ -301,6 +303,34 @@ Development and test also honor:
 - `FORNACAST_TEST_CONFIG_DATABASE_PATH`, default `fornacast_config_test.db`
 - `FORNACAST_SSH_BIND_IP`
 - `FORNACAST_SSH_ENABLED`
+
+GitHub PAT encryption uses a dedicated AES-256-GCM keyring and never derives a
+key from `SECRET_KEY_BASE`. Generate a key with `openssl rand -base64 32`, then
+configure it under a stable key ID, for example:
+
+```sh
+FORNACAST_GITHUB_CREDENTIAL_KEYS='{"2026-08":"<base64-32-byte-key>"}'
+FORNACAST_GITHUB_CREDENTIAL_ACTIVE_KEY_ID=2026-08
+```
+
+Submitted PATs must be nonempty binaries no larger than 4096 bytes.
+The credential vault releases plaintext only to an arity-one callback for the
+duration of one saved or one-time credential operation; it has no public
+plaintext-returning decrypt function.
+
+Saved credentials authenticate their database credential ID, local user ID,
+provider, and GitHub numeric user ID. One-time credentials instead authenticate
+their import run ID, actor ID, provider, and GitHub numeric user ID. Both forms
+also authenticate the envelope purpose and format version.
+
+Missing or malformed keyring configuration disables only credential operations;
+the rest of the forge still starts, and credential access fails closed. Local
+development is unavailable by default unless the two variables above are set.
+Tests use a fixed test-only key.
+
+To rotate keys, first keep both the old and new entries in the key map, then
+switch the active key ID so new writes use the new key. A later credential
+lifecycle task must re-encrypt existing rows before the old key is removed.
 
 The Ecto adapter is selected at compile time. Build or recompile with `FORNACAST_DATABASE_ADAPTER=postgres` to use PostgreSQL; omit it for the default ExTurso/Turso-compatible backend. Concord is used separately for app-level key/value config through `Fornacast.ConfigStore`.
 

@@ -154,4 +154,68 @@ defmodule FornacastTest do
     assert callback.metadata == %{"request_id" => "request-callback"}
     assert callback.request_id == "explicit-callback"
   end
+
+  test "audit metadata recursively removes credential secrets case-insensitively" do
+    secret_keys = [
+      :token,
+      "CONTENT",
+      :Message,
+      "Storage_Path",
+      :pat,
+      "GitHub_PAT",
+      :access_token,
+      "AUTHORIZATION",
+      :credential_envelope,
+      "Credential_Envelopes",
+      :ciphertext,
+      "NONCE",
+      :tag
+    ]
+
+    nested_secrets = Map.new(secret_keys, &{&1, "github_pat_never_print_this_value"})
+
+    assert {:ok, audit} =
+             Audit.record(nil, "credential.redacted", "github_credential", "7", %{
+               safe: "kept",
+               nested: nested_secrets,
+               list: [%{"safe" => "also-kept", "Authorization" => "Bearer secret"}]
+             })
+
+    assert audit.metadata["safe"] == "kept"
+    assert audit.metadata["nested"] == %{}
+    assert audit.metadata["list"] == [%{"safe" => "also-kept"}]
+    refute inspect(audit.metadata) =~ "github_pat_never_print_this_value"
+    refute inspect(audit.metadata) =~ "Bearer secret"
+  end
+
+  test "audit metadata removes sensitive header tuples and nested keyword entries" do
+    assert {:ok, audit} =
+             Audit.record(nil, "credential.tuple_redacted", "github_credential", "8", %{
+               headers: [
+                 {"Authorization", "Bearer tuple-secret"},
+                 {"X-Request-ID", "request-1"}
+               ],
+               nested: [[github_pat: "keyword-secret", safe: "kept"]]
+             })
+
+    refute inspect(audit.metadata) =~ "tuple-secret"
+    refute inspect(audit.metadata) =~ "keyword-secret"
+    assert audit.metadata["headers"] == [%{"X-Request-ID" => "request-1"}]
+    assert audit.metadata["nested"] == [[%{"safe" => "kept"}]]
+  end
+
+  test "Phoenix parameter logging filters every value including mixed-case secrets and paths" do
+    params = %{
+      "GitHub_PAT" => "github-pat-secret",
+      "Authorization" => "authorization-secret",
+      "path" => "/repositories/example",
+      "ordinary" => "not-safe-for-request-logs"
+    }
+
+    filtered = Phoenix.Logger.filter_values(params)
+
+    for key <- Map.keys(params) do
+      assert filtered[key] == "[FILTERED]"
+    end
+  end
 end

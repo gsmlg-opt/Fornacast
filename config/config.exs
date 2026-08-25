@@ -47,10 +47,44 @@ repo_adapter =
     value -> raise "unsupported FORNACAST_DATABASE_ADAPTER=#{inspect(value)}"
   end
 
+github_credential_keyring =
+  if config_env() == :prod do
+    :unavailable
+  else
+    with keys_json when is_binary(keys_json) and keys_json != "" <-
+           System.get_env("FORNACAST_GITHUB_CREDENTIAL_KEYS"),
+         active when is_binary(active) and byte_size(active) in 1..255 <-
+           System.get_env("FORNACAST_GITHUB_CREDENTIAL_ACTIVE_KEY_ID"),
+         {:ok, encoded_keys} when is_map(encoded_keys) and map_size(encoded_keys) > 0 <-
+           JSON.decode(keys_json),
+         {:ok, keys} <-
+           Enum.reduce_while(encoded_keys, {:ok, %{}}, fn
+             {key_id, encoded_key}, {:ok, decoded}
+             when is_binary(key_id) and byte_size(key_id) in 1..255 and
+                    is_binary(encoded_key) ->
+               case Base.decode64(encoded_key) do
+                 {:ok, key} when byte_size(key) == 32 ->
+                   {:cont, {:ok, Map.put(decoded, key_id, key)}}
+
+                 _ ->
+                   {:halt, :error}
+               end
+
+             _, _decoded ->
+               {:halt, :error}
+           end),
+         {:ok, _active_key} <- Map.fetch(keys, active) do
+      %{active: active, keys: keys}
+    else
+      _ -> :unavailable
+    end
+  end
+
 config :fornacast, ecto_repos: [Fornacast.Repo]
 config :fornacast, :database_adapter, database_adapter
 config :fornacast, :repo_adapter, repo_adapter
 config :fornacast, :auto_migrate, true
+config :fornacast, :github_credential_keyring, github_credential_keyring
 
 config :fornacast,
   release_asset_storage_root: release_asset_root,
@@ -207,6 +241,8 @@ config :logger, :console,
   metadata: [:request_id, :repo, :user_id]
 
 config :phoenix, :json_library, JSON
+
+config :phoenix, :filter_parameters, {:keep, []}
 
 fornacast_web_path = Path.expand("../apps/fornacast_web", __DIR__)
 

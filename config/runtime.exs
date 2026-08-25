@@ -55,6 +55,37 @@ if config_env() == :prod do
     raise "environment variable SECRET_KEY_BASE must be at least 64 bytes"
   end
 
+  github_credential_keyring =
+    with keys_json when is_binary(keys_json) and keys_json != "" <-
+           System.get_env("FORNACAST_GITHUB_CREDENTIAL_KEYS"),
+         active when is_binary(active) and byte_size(active) in 1..255 <-
+           System.get_env("FORNACAST_GITHUB_CREDENTIAL_ACTIVE_KEY_ID"),
+         {:ok, encoded_keys} when is_map(encoded_keys) and map_size(encoded_keys) > 0 <-
+           JSON.decode(keys_json),
+         {:ok, keys} <-
+           Enum.reduce_while(encoded_keys, {:ok, %{}}, fn
+             {key_id, encoded_key}, {:ok, decoded}
+             when is_binary(key_id) and byte_size(key_id) in 1..255 and
+                    is_binary(encoded_key) ->
+               case Base.decode64(encoded_key) do
+                 {:ok, key} when byte_size(key) == 32 ->
+                   {:cont, {:ok, Map.put(decoded, key_id, key)}}
+
+                 _ ->
+                   {:halt, :error}
+               end
+
+             _, _decoded ->
+               {:halt, :error}
+           end),
+         {:ok, _active_key} <- Map.fetch(keys, active) do
+      %{active: active, keys: keys}
+    else
+      _ -> :unavailable
+    end
+
+  config :fornacast, :github_credential_keyring, github_credential_keyring
+
   api_bind = System.get_env("FORNACAST_API_BIND_IP", "127.0.0.1")
 
   api_ip =

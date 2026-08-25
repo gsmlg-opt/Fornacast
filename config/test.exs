@@ -77,6 +77,10 @@ config :fornacast, Fornacast.Repo, [pool: Ecto.Adapters.SQL.Sandbox, pool_size: 
 
 config :fornacast,
   auto_migrate: false,
+  github_credential_keyring: %{
+    active: "test-2026-08-25",
+    keys: %{"test-2026-08-25" => :binary.copy(<<42>>, 32)}
+  },
   repo_storage_root: "tmp/test/repos",
   ssh_bind_ip: "127.0.0.1",
   ssh_port: 0,

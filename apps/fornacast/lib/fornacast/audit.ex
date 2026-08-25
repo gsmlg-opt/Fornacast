@@ -3,7 +3,22 @@ defmodule Fornacast.Audit do
   Minimal audit-event writer for first-release repository operations.
   """
 
-  @sensitive_metadata_keys ~w(token content message storage_path)
+  @sensitive_metadata_keys MapSet.new(~w(
+                               token
+                               content
+                               message
+                               storage_path
+                               password
+                               pat
+                               github_pat
+                               access_token
+                               authorization
+                               credential_envelope
+                               credential_envelopes
+                               ciphertext
+                               nonce
+                               tag
+                             ))
 
   alias Fornacast.{AuditEvent, Repo}
 
@@ -121,7 +136,7 @@ defmodule Fornacast.Audit do
 
   defp reject_sensitive_metadata(metadata) when is_map(metadata) do
     Enum.reduce(metadata, %{}, fn {key, value}, safe ->
-      if to_string(key) in @sensitive_metadata_keys do
+      if sensitive_metadata_key?(key) do
         safe
       else
         Map.put(safe, key, reject_sensitive_metadata(value))
@@ -129,10 +144,36 @@ defmodule Fornacast.Audit do
     end)
   end
 
-  defp reject_sensitive_metadata(metadata) when is_list(metadata),
-    do: Enum.map(metadata, &reject_sensitive_metadata/1)
+  defp reject_sensitive_metadata(metadata) when is_list(metadata) do
+    metadata
+    |> Enum.reduce([], fn
+      {key, value}, safe when is_atom(key) or is_binary(key) ->
+        if sensitive_metadata_key?(key) do
+          safe
+        else
+          [%{to_string(key) => reject_sensitive_metadata(value)} | safe]
+        end
+
+      value, safe ->
+        [reject_sensitive_metadata(value) | safe]
+    end)
+    |> Enum.reverse()
+  end
+
+  defp reject_sensitive_metadata({key, value}) when is_atom(key) or is_binary(key) do
+    if sensitive_metadata_key?(key),
+      do: %{},
+      else: %{to_string(key) => reject_sensitive_metadata(value)}
+  end
 
   defp reject_sensitive_metadata(metadata), do: metadata
+
+  defp sensitive_metadata_key?(key) do
+    key
+    |> to_string()
+    |> String.downcase()
+    |> then(&MapSet.member?(@sensitive_metadata_keys, &1))
+  end
 
   defp turso? do
     Application.get_env(:fornacast, :database_adapter) in ["libsql", "turso"]
