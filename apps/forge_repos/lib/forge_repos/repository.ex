@@ -109,6 +109,14 @@ defmodule ForgeRepos.Repository do
 
   def normalize_slug(_), do: ""
 
+  def canonical_slug?(slug) when is_binary(slug) do
+    String.valid?(slug) and slug == normalize_slug(slug) and Regex.match?(@slug_regex, slug) and
+      slug not in [".", ".."] and
+      not String.ends_with?(slug, ".") and not String.ends_with?(slug, ".git")
+  end
+
+  def canonical_slug?(_slug), do: false
+
   defp validate_slug(changeset) do
     changeset
     |> validate_format(:slug, @slug_regex)

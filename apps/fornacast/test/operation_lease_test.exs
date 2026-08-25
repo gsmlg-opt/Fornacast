@@ -1,3 +1,24 @@
+defmodule Fornacast.TerminalAwareLeaseOperation do
+  use Ecto.Schema
+
+  import Ecto.Changeset
+
+  schema "git_write_operations" do
+    field :state, Ecto.Enum,
+      values: [:prepared, :object_written, :ref_advanced, :bookkeeping_complete, :failed]
+
+    field :lease_owner, :string
+    field :lease_expires_at, :utc_datetime
+    field :lock_version, :integer
+  end
+
+  def terminal_states, do: [:bookkeeping_complete, :failed]
+
+  def lease_update_changeset(operation, updates) do
+    cast(operation, Map.new(updates), [:state])
+  end
+end
+
 defmodule Fornacast.OperationLeaseTest do
   use ExUnit.Case, async: false
 
@@ -6,6 +27,7 @@ defmodule Fornacast.OperationLeaseTest do
   alias ForgeAccounts.User
   alias ForgeRepos.{GitWriteOperation, Repository}
   alias Fornacast.{OperationLease, Repo}
+  alias Fornacast.TerminalAwareLeaseOperation
 
   @moduletag :persistence
   @oid String.duplicate("a", 40)
@@ -97,6 +119,38 @@ defmodule Fornacast.OperationLeaseTest do
     assert claimed.lock_version == operation.lock_version + 1
 
     assert :busy = OperationLease.claim(GitWriteOperation, operation.id, "owner-b", now, 30)
+  end
+
+  test "terminal-aware schemas cannot claim or retain a terminal lease", %{
+    operation: operation,
+    now: now
+  } do
+    terminal = Repo.get!(TerminalAwareLeaseOperation, operation.id)
+
+    Repo.update_all(
+      from(item in TerminalAwareLeaseOperation, where: item.id == ^terminal.id),
+      set: [state: :failed]
+    )
+
+    assert :busy =
+             OperationLease.claim(TerminalAwareLeaseOperation, terminal.id, "owner-a", now, 30)
+
+    Repo.update_all(
+      from(item in TerminalAwareLeaseOperation, where: item.id == ^terminal.id),
+      set: [state: :prepared]
+    )
+
+    assert {:ok, claimed} =
+             OperationLease.claim(TerminalAwareLeaseOperation, terminal.id, "owner-a", now, 30)
+
+    assert {:error, :invalid_update} =
+             OperationLease.update_owned(
+               TerminalAwareLeaseOperation,
+               claimed,
+               [state: :failed],
+               now: now,
+               lease_seconds: 30
+             )
   end
 
   test "claim uses the same second-precision UTC instant for availability and expiry", %{

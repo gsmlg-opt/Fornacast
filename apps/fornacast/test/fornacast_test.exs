@@ -22,6 +22,19 @@ defmodule FornacastTest do
     Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
 
     try do
+      assert :ok =
+               Fornacast.Storage.validate_relative_storage_path("@hashed/aa/bb/repo.git")
+
+      for invalid <- [
+            "/srv/fornacast/repositories/repo.git",
+            "@hashed/aa/../repo.git",
+            "C:/private/repo.git",
+            "C:private/repo.git"
+          ] do
+        assert {:error, _reason} =
+                 Fornacast.Storage.validate_relative_storage_path(invalid)
+      end
+
       assert Fornacast.Storage.repository_path!("@hashed/aa/bb/repo.git") ==
                Path.join([tmp_dir, "@hashed", "aa", "bb", "repo.git"])
 

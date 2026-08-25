@@ -13,6 +13,20 @@ defmodule ForgeReposTest do
 
   test "repository slugs are normalized and validated" do
     assert Repository.normalize_slug("Demo Repo.git") == "demo-repo"
+    assert Repository.canonical_slug?("demo")
+    assert Repository.canonical_slug?(String.duplicate("a", 63))
+
+    for noncanonical <- [
+          "Demo",
+          "demo-",
+          "demo.git",
+          "demo.",
+          ".",
+          "..",
+          String.duplicate("a", 64)
+        ] do
+      refute Repository.canonical_slug?(noncanonical)
+    end
 
     changeset =
       Repository.create_changeset(
