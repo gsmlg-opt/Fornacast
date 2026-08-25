@@ -25,6 +25,7 @@ defmodule ForgeImports.MixProject do
       {:forge_accounts, in_umbrella: true},
       {:forge_repos, in_umbrella: true},
       {:ecto, "~> 3.14"},
+      {:mint, "~> 1.9"},
       {:req, "~> 0.7"}
     ]
   end
