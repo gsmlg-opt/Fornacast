@@ -508,6 +508,13 @@ defmodule ForgeAccounts.GitHubCredentialVaultTest do
     refute invalid.valid?
     assert Keyword.has_key?(invalid.errors, :status)
 
+    injected_version =
+      GitHubCredential.changeset(%GitHubCredential{}, Map.put(attrs, :verification_version, 0))
+
+    assert injected_version.valid?
+    assert Changeset.get_field(injected_version, :verification_version) == 1
+    refute Map.has_key?(injected_version.changes, :verification_version)
+
     overlong_key_id =
       GitHubCredential.changeset(%GitHubCredential{}, %{
         attrs
@@ -528,6 +535,7 @@ defmodule ForgeAccounts.GitHubCredentialVaultTest do
                :key_id,
                :status,
                :last_verified_at,
+               :verification_version,
                :inserted_at,
                :updated_at
              ])

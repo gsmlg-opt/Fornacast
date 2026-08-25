@@ -16,6 +16,7 @@ defmodule ForgeAccounts.GitHubCredential do
     field :key_id, :string
     field :status, Ecto.Enum, values: @statuses, default: :valid
     field :last_verified_at, :utc_datetime
+    field :verification_version, :integer, default: 1
 
     timestamps(type: :utc_datetime)
   end
@@ -39,7 +40,8 @@ defmodule ForgeAccounts.GitHubCredential do
       :nonce,
       :tag,
       :key_id,
-      :status
+      :status,
+      :verification_version
     ])
     |> validate_number(:local_user_id, greater_than: 0)
     |> validate_number(:github_identity_id, greater_than: 0)
@@ -48,6 +50,7 @@ defmodule ForgeAccounts.GitHubCredential do
     |> validate_length(:tag, is: 16, count: :bytes)
     |> validate_key_id_byte_size()
     |> validate_inclusion(:status, @statuses)
+    |> validate_number(:verification_version, greater_than: 0)
     |> unique_constraint(:github_identity_id,
       name: ~r/github_credentials_github_identity_id/
     )

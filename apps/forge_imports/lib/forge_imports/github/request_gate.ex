@@ -3,33 +3,43 @@ defmodule ForgeImports.GitHub.RequestGate do
 
   @acquire_timeout 2_000
 
-  @type gate_key :: {:saved_credential, pos_integer()} | {:one_time_run, pos_integer()}
+  @type gate_key ::
+          {:saved_credential, pos_integer()}
+          | {:one_time_run, pos_integer()}
+          | {:account_setup, pos_integer()}
 
   @spec run(gate_key(), (-> result)) :: result | {:error, :invalid_gate_key | :busy}
         when result: term()
   def run({kind, id} = gate_key, fun)
-      when kind in [:saved_credential, :one_time_run] and is_integer(id) and id > 0 and
+      when kind in [:saved_credential, :one_time_run, :account_setup] and is_integer(id) and
+             id > 0 and
              id <= 9_223_372_036_854_775_807 and
              is_function(fun, 0) do
     parent = self()
     reference = make_ref()
-    callers = Process.get(:"$callers", [])
 
     {worker, monitor} =
       spawn_monitor(fn ->
-        Process.put(:"$callers", [parent | callers])
-        acquire_and_run(parent, reference, gate_key, fun)
+        receive do
+          {^reference, :watchdog, watchdog} ->
+            acquire(parent, reference, gate_key, watchdog)
+        end
       end)
 
-    _watchdog = spawn(fn -> watch_caller(parent, worker) end)
+    watchdog = spawn(fn -> watch_caller(parent, worker, reference) end)
+    send(worker, {reference, :watchdog, watchdog})
 
     receive do
       {^reference, :acquired, ^worker} ->
-        send(worker, {reference, :proceed})
-        await_result(reference, worker, monitor)
+        result = execute(fun)
+        send(worker, {reference, :body_finished})
+        await_body_ack(reference, worker, monitor)
+        send(worker, {reference, :release})
+        await_release(reference, worker, monitor)
+        return_result(result)
     after
       @acquire_timeout ->
-        Process.exit(worker, :kill)
+        cancel_watchdog(watchdog, reference, worker)
         await_down(monitor, worker)
         flush(reference)
         {:error, :busy}
@@ -38,7 +48,7 @@ defmodule ForgeImports.GitHub.RequestGate do
 
   def run(_gate_key, _fun), do: {:error, :invalid_gate_key}
 
-  defp acquire_and_run(parent, reference, gate_key, fun) do
+  defp acquire(parent, reference, gate_key, watchdog) do
     parent_monitor = Process.monitor(parent)
     lock = {{__MODULE__, gate_key}, self()}
 
@@ -49,8 +59,20 @@ defmodule ForgeImports.GitHub.RequestGate do
           send(parent, {reference, :acquired, self()})
 
           receive do
-            {^reference, :proceed} -> execute(fun)
-            {:DOWN, ^parent_monitor, :process, ^parent, _reason} -> :caller_stopped
+            {^reference, :body_finished} ->
+              send(parent, {reference, :body_finished_ack, self()})
+
+              receive do
+                {^reference, :release} ->
+                  send(watchdog, {reference, :release_authorized, self()})
+                  :released
+
+                {:DOWN, ^parent_monitor, :process, ^parent, _reason} ->
+                  :caller_stopped
+              end
+
+            {:DOWN, ^parent_monitor, :process, ^parent, _reason} ->
+              :caller_stopped
           end
         end,
         Enum.uniq([node() | Node.list()]),
@@ -68,15 +90,11 @@ defmodule ForgeImports.GitHub.RequestGate do
     end
   end
 
-  defp await_result(reference, worker, monitor) do
+  defp await_release(reference, worker, monitor) do
     receive do
-      {^reference, :finished, {:returned, result}} ->
+      {^reference, :finished, :released} ->
         Process.demonitor(monitor, [:flush])
-        result
-
-      {^reference, :finished, {:raised, kind, reason, stacktrace}} ->
-        Process.demonitor(monitor, [:flush])
-        :erlang.raise(kind, reason, stacktrace)
+        :ok
 
       {^reference, :finished, :aborted} ->
         Process.demonitor(monitor, [:flush])
@@ -84,6 +102,18 @@ defmodule ForgeImports.GitHub.RequestGate do
 
       {:DOWN, ^monitor, :process, ^worker, reason} ->
         exit(reason)
+    end
+  end
+
+  defp return_result({:returned, result}), do: result
+
+  defp return_result({:raised, kind, reason, stacktrace}),
+    do: :erlang.raise(kind, reason, stacktrace)
+
+  defp await_body_ack(reference, worker, monitor) do
+    receive do
+      {^reference, :body_finished_ack, ^worker} -> :ok
+      {:DOWN, ^monitor, :process, ^worker, reason} -> exit(reason)
     end
   end
 
@@ -101,18 +131,35 @@ defmodule ForgeImports.GitHub.RequestGate do
     end
   end
 
-  defp watch_caller(parent, worker) do
+  defp cancel_watchdog(watchdog, reference, worker) do
+    send(watchdog, {reference, :cancel, self()})
+
+    receive do
+      {^reference, :cancelled, ^watchdog, ^worker} -> :ok
+    end
+  end
+
+  defp watch_caller(parent, worker, reference) do
     parent_monitor = Process.monitor(parent)
     worker_monitor = Process.monitor(worker)
 
     receive do
+      {^reference, :release_authorized, ^worker} ->
+        Process.demonitor(parent_monitor, [:flush])
+        await_down(worker_monitor, worker)
+
+      {^reference, :cancel, ^parent} ->
+        Process.exit(worker, :kill)
+        await_down(worker_monitor, worker)
+        Process.demonitor(parent_monitor, [:flush])
+        send(parent, {reference, :cancelled, self(), worker})
+
       {:DOWN, ^parent_monitor, :process, ^parent, _reason} ->
         Process.exit(worker, :kill)
         await_down(worker_monitor, worker)
 
       {:DOWN, ^worker_monitor, :process, ^worker, _reason} ->
-        Process.demonitor(parent_monitor, [:flush])
-        :ok
+        Process.exit(parent, :kill)
     end
   end
 end

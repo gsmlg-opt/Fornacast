@@ -636,6 +636,18 @@ defmodule ForgeImports.GitHub.ClientTest do
     assert {:error, :invalid_gate_key} = RequestGate.run("github_pat_secret", fn -> :ok end)
     assert :ok = RequestGate.run({:saved_credential, 1}, fn -> :ok end)
     assert :ok = RequestGate.run({:one_time_run, 1}, fn -> :ok end)
+    assert :ok = RequestGate.run({:account_setup, 1}, fn -> :ok end)
+  end
+
+  test "the gate keeps the bounded operation in its calling process" do
+    caller = self()
+    key = {:saved_credential, System.unique_integer([:positive])}
+
+    assert :ok =
+             RequestGate.run(key, fn ->
+               assert self() == caller
+               :ok
+             end)
   end
 
   test "gate body failures release the lock and preserve failure semantics" do
@@ -713,6 +725,46 @@ defmodule ForgeImports.GitHub.ClientTest do
 
     assert_receive {:DOWN, ^first_monitor, :process, ^first_child, _reason}, 500
     assert_receive {:DOWN, ^second_monitor, :process, ^second_child, _reason}, 500
+  end
+
+  test "lock-worker loss hard-stops an in-flight body before another holder enters" do
+    key = {:saved_credential, System.unique_integer([:positive])}
+    parent = self()
+
+    caller =
+      spawn(fn ->
+        receive do
+          :go ->
+            RequestGate.run(key, fn ->
+              send(parent, {:lock_body_started, self()})
+
+              receive do
+                :continue_lost_body -> send(parent, :late_lost_body)
+              end
+            end)
+        end
+      end)
+
+    :erlang.trace(caller, true, [:procs, :set_on_spawn])
+    caller_monitor = Process.monitor(caller)
+    send(caller, :go)
+
+    assert_receive {:trace, ^caller, :spawn, lock_worker, _mfa}, 1_000
+    assert_receive {:trace, ^caller, :spawn, _watchdog, _mfa}, 1_000
+    assert_receive {:lock_body_started, ^caller}, 1_000
+
+    Process.exit(lock_worker, :kill)
+    assert_receive {:DOWN, ^caller_monitor, :process, ^caller, :killed}, 1_000
+    send(caller, :continue_lost_body)
+    refute_receive :late_lost_body
+
+    assert :ok =
+             RequestGate.run(key, fn ->
+               send(parent, :replacement_gate_entered)
+               :ok
+             end)
+
+    assert_receive :replacement_gate_entered
   end
 
   test "gate acquisition is bounded and a timed-out callback never starts later" do

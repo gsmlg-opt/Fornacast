@@ -1,11 +1,19 @@
 defmodule ForgeAccounts.GitHubCredentialVault do
   @moduledoc false
 
-  alias ForgeAccounts.{GitHubCredential, GitHubIdentity}
+  alias ForgeAccounts.{GitHubCredential, GitHubIdentity, GitHubProfileSafety}
 
   @aad_version 1
   @max_pat_bytes 4_096
   @service_error {:error, :credential_service_unavailable}
+
+  @spec ready?(term()) :: :ok | {:error, :credential_service_unavailable}
+  def ready?(keyring \\ configured()) do
+    case normalize_keyring(keyring) do
+      {:ok, _normalized} -> :ok
+      @service_error -> @service_error
+    end
+  end
 
   defmodule Envelope do
     @moduledoc false
@@ -71,8 +79,61 @@ defmodule ForgeAccounts.GitHubCredentialVault do
 
   def with_saved_credential(_credential, _identity, _callback, _keyring), do: @service_error
 
+  @doc false
+  @spec validate_actor_owned_profile(
+          GitHubCredential.t(),
+          GitHubIdentity.t(),
+          pos_integer(),
+          map(),
+          term()
+        ) :: :ok | {:error, :invalid_response | :credential_service_unavailable}
+  def validate_actor_owned_profile(
+        credential,
+        identity,
+        actor_id,
+        profile,
+        keyring \\ configured()
+      )
+
+  def validate_actor_owned_profile(
+        %GitHubCredential{} = credential,
+        %GitHubIdentity{} = identity,
+        actor_id,
+        profile,
+        keyring
+      )
+      when is_map(profile) do
+    case decrypt_actor_owned_saved(credential, identity, actor_id, keyring) do
+      {:ok, plaintext} -> GitHubProfileSafety.validate(profile, plaintext)
+      @service_error -> @service_error
+    end
+  end
+
+  def validate_actor_owned_profile(
+        _credential,
+        _identity,
+        _actor_id,
+        _profile,
+        _keyring
+      ),
+      do: @service_error
+
   defp decrypt_saved(%GitHubCredential{} = credential, %GitHubIdentity{} = identity, keyring) do
     with true <- valid_saved_binding?(credential, identity),
+         {:ok, normalized_keyring} <- normalize_keyring(keyring),
+         {:ok, envelope} <- envelope_from_credential(credential) do
+      decrypt(envelope, saved_aad(credential, identity), normalized_keyring)
+    else
+      _ -> @service_error
+    end
+  rescue
+    _ -> @service_error
+  catch
+    _, _ -> @service_error
+  end
+
+  defp decrypt_actor_owned_saved(credential, identity, actor_id, keyring) do
+    with true <- valid_actor_owned_binding?(credential, identity, actor_id),
          {:ok, normalized_keyring} <- normalize_keyring(keyring),
          {:ok, envelope} <- envelope_from_credential(credential) do
       decrypt(envelope, saved_aad(credential, identity), normalized_keyring)
@@ -248,6 +309,13 @@ defmodule ForgeAccounts.GitHubCredentialVault do
       credential.github_identity_id == identity.id and
       credential.local_user_id == identity.local_user_id and identity.kind == :user and
       positive_integer?(identity.github_user_id)
+  end
+
+  defp valid_actor_owned_binding?(credential, identity, actor_id) do
+    positive_integer?(actor_id) and positive_integer?(credential.id) and
+      credential.local_user_id == actor_id and positive_integer?(credential.github_identity_id) and
+      credential.github_identity_id == identity.id and identity.kind == :user and
+      identity.local_user_id in [nil, actor_id] and positive_integer?(identity.github_user_id)
   end
 
   defp valid_one_time_binding?(run_id, actor_id, github_user_id) do

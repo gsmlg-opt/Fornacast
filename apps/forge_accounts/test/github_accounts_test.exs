@@ -345,6 +345,20 @@ defmodule ForgeAccounts.GitHubAccountsTest do
 
     refute_received ^ref
 
+    assert {:error, :credential_service_unavailable} =
+             ForgeAccounts.replace_github_credential(
+               actor,
+               view.identity_id,
+               profile(9_000_000_001, "octocat"),
+               @second_pat,
+               %{}
+             )
+
+    Repo.update_all(
+      from(saved in GitHubCredential, where: saved.id == ^credential.id),
+      set: [tag: credential.tag]
+    )
+
     assert {:ok, _} =
              ForgeAccounts.replace_github_credential(
                actor,
@@ -689,7 +703,7 @@ defmodule ForgeAccounts.GitHubAccountsTest do
     assert Repo.aggregate(AuditEvent, :count, :id) == 0
   end
 
-  test "audit failure rolls replacement back with the old credential unchanged" do
+  test "invalid audit metadata is rejected before replacement" do
     actor = user_fixture("alice")
 
     assert {:ok, view} =
@@ -702,7 +716,7 @@ defmodule ForgeAccounts.GitHubAccountsTest do
 
     before = Repo.get_by!(GitHubCredential, github_identity_id: view.identity_id)
 
-    assert {:error, %Ecto.Changeset{}} =
+    assert {:error, :invalid_request_metadata} =
              ForgeAccounts.replace_github_credential(
                actor,
                view.identity_id,
@@ -730,7 +744,12 @@ defmodule ForgeAccounts.GitHubAccountsTest do
         )
       end)
 
-    assert Enum.all?(results, &match?({:ok, %GitHubAccountView{}}, &1))
+    assert Enum.count(results, &match?({:ok, %GitHubAccountView{}}, &1)) in 1..2
+
+    assert Enum.all?(
+             results,
+             &(match?({:ok, %GitHubAccountView{}}, &1) or &1 == {:error, :stale})
+           )
 
     assert %GitHubIdentity{id: identity_id, local_user_id: actor_id} =
              independent_get_by!(GitHubIdentity, github_user_id: 9_000_000_001)

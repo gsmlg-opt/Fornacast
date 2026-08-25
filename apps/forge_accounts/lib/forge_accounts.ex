@@ -39,8 +39,39 @@ defmodule ForgeAccounts do
 
   defdelegate list_github_accounts(actor), to: GitHubAccounts
 
+  @doc false
+  defdelegate github_account_reference(actor, identity_id), to: GitHubAccounts
+
+  @doc false
+  defdelegate github_account_references(actor), to: GitHubAccounts
+
+  @doc false
+  defdelegate validate_github_link_request(actor, request_metadata), to: GitHubAccounts
+
+  @doc false
+  defdelegate validate_github_account_request(actor, identity_id, request_metadata),
+    to: GitHubAccounts
+
+  @doc false
+  def validate_github_request_metadata(metadata, credential \\ nil),
+    do: ForgeAccounts.GitHubRequestMetadata.validate(metadata, credential)
+
   defdelegate save_github_account(actor, verified_profile, pat, request_metadata),
     to: GitHubAccounts
+
+  @doc false
+  defdelegate save_github_account_if_absent(actor, verified_profile, pat, request_metadata),
+    to: GitHubAccounts
+
+  @doc false
+  defdelegate save_github_credential_if_absent(
+                actor,
+                identity_id,
+                verified_profile,
+                pat,
+                request_metadata
+              ),
+              to: GitHubAccounts
 
   defdelegate replace_github_credential(
                 actor,
@@ -51,13 +82,51 @@ defmodule ForgeAccounts do
               ),
               to: GitHubAccounts
 
+  @doc false
+  defdelegate replace_github_credential_if_current(
+                actor,
+                identity_id,
+                reference,
+                verified_profile,
+                pat,
+                request_metadata
+              ),
+              to: GitHubAccounts
+
   defdelegate refresh_github_account(actor, identity_id, verified_profile, request_metadata),
     to: GitHubAccounts
+
+  @doc false
+  defdelegate refresh_github_account_if_current(
+                actor,
+                identity_id,
+                reference,
+                verified_profile,
+                request_metadata
+              ),
+              to: GitHubAccounts
+
+  @doc false
+  defdelegate mark_github_credential_invalid(
+                actor,
+                identity_id,
+                reference,
+                request_metadata
+              ),
+              to: GitHubAccounts
 
   defdelegate delete_github_credential(actor, identity_id, request_metadata),
     to: GitHubAccounts
 
+  @doc false
+  defdelegate delete_github_credential(actor, identity_id, request_metadata, before_delete),
+    to: GitHubAccounts
+
   defdelegate unlink_github_account(actor, identity_id, request_metadata),
+    to: GitHubAccounts
+
+  @doc false
+  defdelegate unlink_github_account(actor, identity_id, request_metadata, before_unlink),
     to: GitHubAccounts
 
   @doc """
@@ -69,6 +138,10 @@ defmodule ForgeAccounts do
   received the credential may finish.
   """
   defdelegate with_github_credential(actor, identity_id, callback), to: GitHubAccounts
+
+  @doc false
+  defdelegate with_github_credential_for_verification(actor, identity_id, callback),
+    to: GitHubAccounts
 
   def get_account(id), do: Repo.get(User, id)
 

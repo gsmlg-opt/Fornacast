@@ -7,6 +7,7 @@ defmodule ForgeImports do
   alias ForgeAccounts.GitHubCredentialVault.Envelope
 
   alias ForgeImports.{
+    GitHubAccounts,
     ImportRun,
     OneTimeCredential,
     Persistence,
@@ -17,6 +18,25 @@ defmodule ForgeImports do
   alias Fornacast.Repo
 
   def provider, do: :github
+
+  defdelegate list_github_accounts(actor), to: GitHubAccounts, as: :list
+
+  def link_github_account(actor, pat, request_metadata, opts \\ []),
+    do: GitHubAccounts.link(actor, pat, request_metadata, opts)
+
+  def reverify_github_account(actor, identity_id, request_metadata, opts \\ []),
+    do: GitHubAccounts.reverify(actor, identity_id, request_metadata, opts)
+
+  def replace_github_credential(actor, identity_id, pat, request_metadata, opts \\ []),
+    do: GitHubAccounts.replace(actor, identity_id, pat, request_metadata, opts)
+
+  defdelegate delete_github_credential(actor, identity_id, request_metadata),
+    to: GitHubAccounts,
+    as: :delete_credential
+
+  defdelegate unlink_github_account(actor, identity_id, request_metadata),
+    to: GitHubAccounts,
+    as: :unlink
 
   def create_run(%User{} = actor, attrs) when is_map(attrs) do
     transact(fn ->
