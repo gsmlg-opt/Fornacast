@@ -173,6 +173,51 @@ defmodule ForgeImports.ImportPersistenceConcurrencyTest do
     end
   end
 
+  test "discovering-only lease claim racing a terminal transition has one winner", %{
+    actor: actor,
+    identity: identity
+  } do
+    {:ok, run} = database_run(fn -> ForgeImports.create_run(actor, run_attrs(identity)) end)
+    parent = self()
+
+    claim_task =
+      Task.async(fn ->
+        database_run(fn ->
+          OperationLease.with_test_after_write_hook(
+            fn :claim, ImportRun, _id, _version ->
+              send(parent, {:discovery_claim_written, self()})
+              receive do: (:release_discovery_claim -> :ok)
+            end,
+            fn ->
+              OperationLease.claim(ImportRun, run.id, "discovery-racer", @now, 60,
+                allowed_states: [:discovering]
+              )
+            end
+          )
+        end)
+      end)
+
+    assert_receive {:discovery_claim_written, claim_pid}, 5_000
+
+    transition_task =
+      Task.async(fn ->
+        database_run(fn ->
+          ForgeImports.transition_run(actor, run, :failed, %{terminal_at: @now})
+        end)
+      end)
+
+    transition = Task.await(transition_task, 5_000)
+    send(claim_pid, :release_discovery_claim)
+
+    assert {:ok, %ImportRun{state: :discovering}} = Task.await(claim_task, 5_000)
+    assert {:error, reason} = transition
+    assert reason in [:stale, :busy]
+
+    final = database_run(fn -> Repo.get!(ImportRun, run.id) end)
+    assert final.state == :discovering
+    assert final.lease_owner == "discovery-racer"
+  end
+
   defp race(callbacks) do
     parent = self()
 

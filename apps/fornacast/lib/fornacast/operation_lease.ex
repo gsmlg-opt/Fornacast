@@ -23,10 +23,18 @@ defmodule Fornacast.OperationLease do
 
   @spec claim(module(), pos_integer(), String.t(), DateTime.t(), pos_integer()) ::
           {:ok, struct()} | :busy | {:error, :not_found | :invalid_argument}
-  def claim(module, id, owner, %DateTime{} = now, lease_seconds)
+  def claim(module, id, owner, %DateTime{} = now, lease_seconds),
+    do: claim(module, id, owner, now, lease_seconds, [])
+
+  def claim(_module, _id, _owner, _now, _lease_seconds), do: {:error, :invalid_argument}
+
+  @spec claim(module(), pos_integer(), String.t(), DateTime.t(), pos_integer(), keyword()) ::
+          {:ok, struct()} | :busy | {:error, :not_found | :invalid_argument}
+  def claim(module, id, owner, %DateTime{} = now, lease_seconds, options)
       when is_atom(module) and is_integer(id) and id > 0 and is_binary(owner) and owner != "" and
-             is_integer(lease_seconds) and lease_seconds > 0 do
+             is_integer(lease_seconds) and lease_seconds > 0 and is_list(options) do
     with :ok <- validate_utc(now),
+         {:ok, allowed_states} <- claim_allowed_states(module, options),
          %{} = row <- Repo.get(module, id) do
       now = DateTime.truncate(now, :second)
       expires_at = DateTime.add(now, lease_seconds, :second)
@@ -39,6 +47,7 @@ defmodule Fornacast.OperationLease do
               (is_nil(item.lease_expires_at) or item.lease_expires_at <= ^now)
         )
         |> exclude_terminal_states(module)
+        |> include_allowed_states(allowed_states)
 
       case Repo.update_all(query,
              set: [lease_owner: owner, lease_expires_at: expires_at],
@@ -61,7 +70,8 @@ defmodule Fornacast.OperationLease do
     end
   end
 
-  def claim(_module, _id, _owner, _now, _lease_seconds), do: {:error, :invalid_argument}
+  def claim(_module, _id, _owner, _now, _lease_seconds, _options),
+    do: {:error, :invalid_argument}
 
   @spec release(module(), struct()) :: :ok | {:error, :lost_lease}
   def release(module, %{id: id, lease_owner: owner, lock_version: version})
@@ -263,6 +273,28 @@ defmodule Fornacast.OperationLease do
       states -> from item in query, where: item.state not in ^states
     end
   end
+
+  defp claim_allowed_states(_module, []), do: {:ok, nil}
+
+  defp claim_allowed_states(module, allowed_states: states)
+       when is_list(states) and states != [] do
+    valid_states =
+      if Code.ensure_loaded?(module) and function_exported?(module, :states, 0),
+        do: module.states(),
+        else: []
+
+    if Enum.all?(states, &is_atom/1) and length(states) == length(Enum.uniq(states)) and
+         states -- valid_states == [],
+       do: {:ok, states},
+       else: {:error, :invalid_argument}
+  end
+
+  defp claim_allowed_states(_module, _options), do: {:error, :invalid_argument}
+
+  defp include_allowed_states(query, nil), do: query
+
+  defp include_allowed_states(query, states),
+    do: from(item in query, where: item.state in ^states)
 
   defp terminal_states(module) do
     if Code.ensure_loaded?(module) and function_exported?(module, :terminal_states, 0),

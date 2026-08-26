@@ -19,6 +19,42 @@ defmodule ForgeImports.ImportPersistenceConstraintTest do
     %{actor: actor, identity: identity}
   end
 
+  test "database permits provisional discovery IDs but requires verified IDs afterward", %{
+    actor: actor,
+    identity: identity
+  } do
+    params = [
+      actor.id,
+      "repository",
+      identity.id,
+      "one_time",
+      "octocat",
+      "octocat/provisional",
+      "discovering"
+    ]
+
+    assert {:ok, %{num_rows: 1}} =
+             Ecto.Adapters.SQL.query(
+               Repo,
+               "insert into github_import_runs " <>
+                 "(actor_user_id, source_kind, github_identity_id, credential_source, " <>
+                 "source_owner_login, source_repository_full_name, state, inserted_at, updated_at) " <>
+                 "values (#{Enum.join(placeholders(length(params)), ", ")}, " <>
+                 "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+               params
+             )
+
+    assert {:error, error} =
+             Ecto.Adapters.SQL.query(
+               Repo,
+               "update github_import_runs set state = 'awaiting_resolution' " <>
+                 "where source_repository_full_name = " <> List.last(placeholders(1)),
+               ["octocat/provisional"]
+             )
+
+    assert Exception.message(error) =~ "github_import_runs_verified_source_check"
+  end
+
   test "database rejects terminal one-time envelopes", %{actor: actor, identity: identity} do
     params = [
       actor.id,
@@ -450,21 +486,34 @@ defmodule ForgeImports.ImportPersistenceMigrationCycleTest do
   alias Fornacast.Repo
 
   @moduletag :persistence
-  @version 20_260_825_000_300
+  @version 20_260_825_000_360
+  @run_scoped_indexes [
+    {"github_import_items_run_id_index", "github_import_repository_items"},
+    {"github_import_reports_run_id_index", "github_import_report_entries"}
+  ]
 
-  test "Task 6 rollback is pre-DDL guarded on Turso and reversible on PostgreSQL" do
+  test "forward migration installs run-scoped stable-id indexes" do
+    repo = start_migration_repo!()
+
+    assert_run_scoped_indexes!(repo)
+  end
+
+  test "provisional-source rollback is pre-DDL guarded on Turso and reversible on PostgreSQL" do
     repo = start_migration_repo!()
 
     clear_import_rows!(repo)
     assert migration_applied?(repo)
     assert Enum.all?(import_tables(), &table_exists?(repo, &1))
+    assert_run_scoped_indexes!(repo)
 
     if postgres?() do
       assert [@version] =
                Ecto.Migrator.run(repo, migrations_path(), :down, step: 1, log: false)
 
       refute migration_applied?(repo)
-      refute Enum.any?(import_tables(), &table_exists?(repo, &1))
+      assert Enum.all?(import_tables(), &table_exists?(repo, &1))
+      refute column_exists?(repo, "github_import_runs", "source_metadata")
+      refute Enum.any?(@run_scoped_indexes, fn {name, _table} -> index_exists?(repo, name) end)
 
       assert [@version] =
                Ecto.Migrator.run(repo, migrations_path(), :up,
@@ -474,6 +523,8 @@ defmodule ForgeImports.ImportPersistenceMigrationCycleTest do
 
       assert migration_applied?(repo)
       assert Enum.all?(import_tables(), &table_exists?(repo, &1))
+      assert column_exists?(repo, "github_import_runs", "source_metadata")
+      assert_run_scoped_indexes!(repo)
     else
       assert_raise RuntimeError,
                    "Turso rollback is disabled until gsmlg-dev/concord#81 is resolved",
@@ -483,6 +534,60 @@ defmodule ForgeImports.ImportPersistenceMigrationCycleTest do
 
       assert migration_applied?(repo)
       assert Enum.all?(import_tables(), &table_exists?(repo, &1))
+      assert_run_scoped_indexes!(repo)
+    end
+  end
+
+  defp assert_run_scoped_indexes!(repo) do
+    Enum.each(@run_scoped_indexes, fn {name, table} ->
+      assert index_exists?(repo, name)
+      assert index_columns(repo, name, table) == ["import_run_id", "id"]
+    end)
+  end
+
+  defp index_exists?(repo, name) do
+    if postgres?() do
+      %{rows: [[exists?]]} =
+        Ecto.Adapters.SQL.query!(
+          repo,
+          "select exists (select 1 from pg_indexes " <>
+            "where schemaname = current_schema() and indexname = $1)",
+          [name]
+        )
+
+      exists?
+    else
+      %{rows: rows} =
+        Ecto.Adapters.SQL.query!(
+          repo,
+          "select name from sqlite_schema where type = 'index' and name = ?",
+          [name]
+        )
+
+      rows == [[name]]
+    end
+  end
+
+  defp index_columns(repo, name, table) do
+    if postgres?() do
+      %{rows: rows} =
+        Ecto.Adapters.SQL.query!(
+          repo,
+          "select a.attname " <>
+            "from pg_class i " <>
+            "join pg_index ix on i.oid = ix.indexrelid " <>
+            "join pg_class t on t.oid = ix.indrelid " <>
+            "join unnest(ix.indkey) with ordinality as keys(attnum, ord) on true " <>
+            "join pg_attribute a on a.attrelid = t.oid and a.attnum = keys.attnum " <>
+            "where i.relname = $1 and t.relname = $2 " <>
+            "order by keys.ord",
+          [name, table]
+        )
+
+      Enum.map(rows, &List.first/1)
+    else
+      %{rows: rows} = Ecto.Adapters.SQL.query!(repo, "pragma index_info('#{name}')", [])
+      Enum.map(rows, &Enum.at(&1, 2))
     end
   end
 
@@ -503,6 +608,18 @@ defmodule ForgeImports.ImportPersistenceMigrationCycleTest do
       )
 
     rows == [[@version]]
+  end
+
+  defp column_exists?(repo, table, column) do
+    %{rows: rows} =
+      Ecto.Adapters.SQL.query!(
+        repo,
+        "select 1 from information_schema.columns " <>
+          "where table_schema = current_schema() and table_name = $1 and column_name = $2",
+        [table, column]
+      )
+
+    rows != []
   end
 
   defp table_exists?(repo, table) do

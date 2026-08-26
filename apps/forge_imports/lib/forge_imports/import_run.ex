@@ -33,6 +33,7 @@ defmodule ForgeImports.ImportRun do
     :warning_count,
     :failure_count
   ]
+  @source_metadata_keys ~w(name description avatar_url profile_url observed_at)
   @envelope_fields [
     :credential_ciphertext,
     :credential_nonce,
@@ -65,7 +66,16 @@ defmodule ForgeImports.ImportRun do
     :failure_detail
     | @transition_count_fields
   ]
+  @discovery_completion_fields [
+    :source_owner_github_id,
+    :source_owner_login,
+    :source_repository_github_id,
+    :source_repository_full_name,
+    :source_metadata,
+    :selected_count
+  ]
   @lease_fields [:state | @transition_fields]
+  @discovery_lease_fields @lease_fields ++ @discovery_completion_fields
   @transitions %{
     discovering: [:awaiting_resolution, :failed, :canceled],
     awaiting_resolution: [:ready, :awaiting_credential, :canceled],
@@ -90,7 +100,7 @@ defmodule ForgeImports.ImportRun do
   @derive {Inspect,
            except:
              @envelope_fields ++
-               [:request_metadata, :failure_detail, :wait_reason, :failure_kind]}
+               [:request_metadata, :source_metadata, :failure_detail, :wait_reason, :failure_kind]}
   schema "github_import_runs" do
     field :actor_user_id, :integer
     field :predecessor_run_id, :integer
@@ -102,6 +112,7 @@ defmodule ForgeImports.ImportRun do
     field :source_owner_login, :string
     field :source_repository_github_id, :integer
     field :source_repository_full_name, :string
+    field :source_metadata, :map, default: %{}
     field :destination_organization_action, Ecto.Enum, values: @destination_actions
     field :destination_organization_slug, :string
     field :destination_organization_id, :integer
@@ -149,6 +160,7 @@ defmodule ForgeImports.ImportRun do
     |> put_change(:report_finalized_at, nil)
     |> put_change(:failure_kind, nil)
     |> put_change(:failure_detail, nil)
+    |> put_change(:source_metadata, %{})
     |> put_change(:selected_count, 0)
     |> put_change(:published_count, 0)
     |> put_change(:skipped_count, 0)
@@ -188,6 +200,7 @@ defmodule ForgeImports.ImportRun do
       :source_owner_login,
       :source_repository_github_id,
       :source_repository_full_name,
+      :source_metadata,
       :destination_organization_action,
       :destination_organization_slug,
       :destination_organization_id,
@@ -224,8 +237,8 @@ defmodule ForgeImports.ImportRun do
       :source_kind,
       :github_identity_id,
       :credential_source,
-      :source_owner_github_id,
       :source_owner_login,
+      :source_metadata,
       :state,
       :request_metadata,
       :lock_version
@@ -246,6 +259,7 @@ defmodule ForgeImports.ImportRun do
     |> validate_number(:lock_version, greater_than: 0)
     |> validate_strings()
     |> validate_request_metadata()
+    |> validate_source_metadata()
     |> validate_source_shape()
     |> validate_credential_consistency()
     |> validate_envelope()
@@ -285,6 +299,27 @@ defmodule ForgeImports.ImportRun do
 
   def selected_count_changeset(run, _count),
     do: run |> change() |> add_error(:selected_count, "is frozen")
+
+  def destination_changeset(
+        %__MODULE__{state: :awaiting_resolution, source_kind: :organization} = run,
+        attrs
+      )
+      when is_map(attrs) do
+    run
+    |> cast(attrs, [
+      :destination_organization_action,
+      :destination_organization_slug,
+      :destination_organization_id
+    ])
+    |> validate_required([:destination_organization_action])
+    |> validate_inclusion(:destination_organization_action, @destination_actions)
+    |> validate_positive_id(:destination_organization_id)
+    |> validate_strings()
+    |> map_constraints()
+  end
+
+  def destination_changeset(run, _attrs),
+    do: run |> change() |> add_error(:state, "cannot change the destination")
 
   defp build_transition_changeset(run, target, attrs, options) do
     cond do
@@ -344,6 +379,9 @@ defmodule ForgeImports.ImportRun do
 
   def lease_update_changeset(run, updates) when is_list(updates) do
     cond do
+      discovery_completion?(run, updates) and exact_fields?(updates, @discovery_lease_fields) ->
+        build_discovery_completion_changeset(run, updates)
+
       not exact_fields?(updates, @lease_fields) ->
         run |> change() |> add_error(:base, "contains immutable fields")
 
@@ -372,6 +410,29 @@ defmodule ForgeImports.ImportRun do
   end
 
   def lease_update_changeset(run, _updates), do: run |> change() |> add_error(:base, "is invalid")
+
+  defp discovery_completion?(%__MODULE__{state: :discovering}, updates),
+    do: Keyword.get(updates, :state) == :awaiting_resolution
+
+  defp discovery_completion?(_run, _updates), do: false
+
+  defp build_discovery_completion_changeset(run, updates) do
+    attrs = Map.new(updates)
+    source_attrs = Map.take(attrs, @discovery_completion_fields)
+    transition_attrs = attrs |> Map.drop(@discovery_completion_fields) |> Map.delete(:state)
+
+    run
+    |> build_transition_changeset(:awaiting_resolution, transition_attrs, clear_lease?: false)
+    |> cast(source_attrs, @discovery_completion_fields)
+    |> validate_required([:source_owner_github_id, :source_owner_login, :source_metadata])
+    |> validate_positive_id(:source_owner_github_id)
+    |> validate_positive_id(:source_repository_github_id)
+    |> validate_counts()
+    |> validate_strings()
+    |> validate_source_metadata()
+    |> validate_source_shape()
+    |> map_constraints()
+  end
 
   defp maybe_mark_terminal(changeset, target, clear_lease?) when target in @terminal_states do
     changeset
@@ -494,12 +555,22 @@ defmodule ForgeImports.ImportRun do
 
   defp validate_source_shape(changeset) do
     kind = get_field(changeset, :source_kind)
+    state = get_field(changeset, :state)
+    owner_id = get_field(changeset, :source_owner_github_id)
     repository_id = get_field(changeset, :source_repository_github_id)
     full_name = get_field(changeset, :source_repository_full_name)
+    provisional? = state in [:discovering, :failed]
 
     cond do
-      kind == :repository and (is_nil(repository_id) or blank?(full_name)) ->
+      kind == :repository and blank?(full_name) ->
         add_error(changeset, :source_repository_full_name, "repository source is incomplete")
+
+      kind == :repository and not provisional? and (is_nil(owner_id) or is_nil(repository_id)) ->
+        add_error(
+          changeset,
+          :source_repository_github_id,
+          "verified repository source is required"
+        )
 
       kind == :organization and (not is_nil(repository_id) or not is_nil(full_name)) ->
         add_error(
@@ -507,6 +578,9 @@ defmodule ForgeImports.ImportRun do
           :source_repository_full_name,
           "must be absent for organization source"
         )
+
+      kind == :organization and not provisional? and is_nil(owner_id) ->
+        add_error(changeset, :source_owner_github_id, "verified organization source is required")
 
       true ->
         changeset
@@ -542,31 +616,95 @@ defmodule ForgeImports.ImportRun do
 
   defp validate_request_metadata(changeset) do
     validate_change(changeset, :request_metadata, fn :request_metadata, metadata ->
-      allowed = ~w(request_id operation_id user_agent)
+      case ForgeAccounts.GitHubRequestMetadata.validate(metadata) do
+        {:ok, normalized} when normalized == metadata ->
+          if Enum.all?(normalized, &safe_request_metadata_field?/1),
+            do: [],
+            else: [request_metadata: "contains unsafe values"]
 
+        _ ->
+          [request_metadata: "contains unsafe values"]
+      end
+    end)
+  end
+
+  defp safe_request_metadata_field?({"request_id", value}),
+    do: ForgeImports.SafeValue.safe_string?(value, 255, required?: true, classified?: true)
+
+  defp safe_request_metadata_field?({"operation_id", value}),
+    do: ForgeImports.SafeValue.safe_string?(value, 255, required?: true, classified?: true)
+
+  defp safe_request_metadata_field?({"ip_address", value}),
+    do: ForgeImports.SafeValue.safe_string?(value, 64, required?: true, classified?: true)
+
+  defp safe_request_metadata_field?({"user_agent", value}),
+    do: ForgeImports.SafeValue.safe_string?(value, 2_048, required?: true, classified?: true)
+
+  defp safe_request_metadata_field?(_field), do: false
+
+  defp validate_source_metadata(changeset) do
+    validate_change(changeset, :source_metadata, fn :source_metadata, metadata ->
       cond do
         not is_map(metadata) ->
-          [request_metadata: "must be a map"]
+          [source_metadata: "must be a map"]
 
-        map_size(metadata) > 12 ->
-          [request_metadata: "has too many entries"]
+        map_size(metadata) > length(@source_metadata_keys) ->
+          [source_metadata: "has too many entries"]
 
         encoded_size(metadata) > 8_192 ->
-          [request_metadata: "is too large"]
+          [source_metadata: "is too large"]
 
-        Enum.any?(Map.keys(metadata), &(to_string(&1) not in allowed)) ->
-          [request_metadata: "contains unsupported keys"]
+        Enum.any?(Map.keys(metadata), &(to_string(&1) not in @source_metadata_keys)) ->
+          [source_metadata: "contains unsupported keys"]
 
-        Enum.any?(metadata, fn {_key, value} ->
-          not ForgeImports.SafeValue.report_value?(value)
-        end) ->
-          [request_metadata: "contains unsafe values"]
+        not valid_source_metadata?(metadata) ->
+          [source_metadata: "contains unsafe values"]
 
         true ->
           []
       end
     end)
   end
+
+  defp valid_source_metadata?(metadata) do
+    ForgeAccounts.GitHubProfileSafety.validate(metadata) == :ok and
+      Enum.all?(metadata, fn {key, value} ->
+        case to_string(key) do
+          key when key in ["name", "description"] ->
+            is_nil(value) or ForgeImports.SafeValue.github_source_text?(value, 2_048)
+
+          "avatar_url" ->
+            is_nil(value) or trusted_url?(value, ["avatars.githubusercontent.com", "github.com"])
+
+          "profile_url" ->
+            is_nil(value) or trusted_url?(value, ["github.com"])
+
+          "observed_at" ->
+            valid_source_observed_at?(value)
+
+          _ ->
+            false
+        end
+      end)
+  end
+
+  defp trusted_url?(value, hosts) when is_binary(value) do
+    case URI.new(value) do
+      {:ok, %URI{scheme: "https", host: host, userinfo: nil, port: port}}
+      when is_binary(host) and port in [nil, 443] ->
+        String.downcase(host) in hosts
+
+      _invalid ->
+        false
+    end
+  end
+
+  defp trusted_url?(_value, _hosts), do: false
+
+  defp valid_source_observed_at?(value) when is_binary(value),
+    do: match?({:ok, %DateTime{}, 0}, DateTime.from_iso8601(value))
+
+  defp valid_source_observed_at?(_value), do: false
 
   defp map_constraints(changeset) do
     changeset
@@ -576,6 +714,9 @@ defmodule ForgeImports.ImportRun do
     |> foreign_key_constraint(:github_credential_id)
     |> foreign_key_constraint(:destination_organization_id)
     |> check_constraint(:source_kind, name: :github_import_runs_source_kind_check)
+    |> check_constraint(:source_owner_github_id,
+      name: :github_import_runs_verified_source_check
+    )
     |> check_constraint(:credential_source, name: :github_import_runs_credential_source_check)
     |> check_constraint(:credential_source,
       name: :github_import_runs_credential_consistency_check

@@ -27,7 +27,10 @@ defmodule ForgeImports.RepositoryItem do
   @conflict_actions [:skip, :rename, :replace]
   @max_id 9_223_372_036_854_775_807
   @count_fields [:imported_count, :skipped_count, :warning_count, :failure_count]
-  @source_metadata_keys ~w(archived fork visibility default_branch description has_issues disabled)
+  @source_metadata_keys ~w(
+    archived fork visibility default_branch description has_issues allow_merge_commit disabled
+    updated_at pushed_at
+  )
   @discovery_fields [
     :import_run_id,
     :predecessor_item_id,
@@ -37,6 +40,15 @@ defmodule ForgeImports.RepositoryItem do
     :source_metadata,
     :source_observed_at
   ]
+  @planning_fields @discovery_fields ++
+                     [
+                       :destination_owner_id,
+                       :destination_slug,
+                       :destination_visibility,
+                       :state,
+                       :wait_reason,
+                       :warning_count
+                     ]
   @transition_fields [
     :resume_state,
     :wait_reason,
@@ -158,12 +170,28 @@ defmodule ForgeImports.RepositoryItem do
   def transitions, do: @transitions
 
   def discovery_changeset(%__MODULE__{id: nil} = item, attrs) when is_map(attrs) do
+    build_discovery_changeset(item, attrs, @discovery_fields)
+  end
+
+  def discovery_changeset(item, _attrs), do: item |> change() |> add_error(:base, "is invalid")
+
+  @doc false
+  def discovery_plan_changeset(%__MODULE__{id: nil} = item, attrs) when is_map(attrs) do
     item
-    |> cast(attrs, @discovery_fields)
+    |> build_discovery_changeset(attrs, @planning_fields)
+    |> validate_inclusion(:state, [:queued, :awaiting_resolution])
+    |> validate_required([:destination_visibility])
+  end
+
+  def discovery_plan_changeset(item, _attrs),
+    do: item |> change() |> add_error(:base, "is invalid")
+
+  defp build_discovery_changeset(item, attrs, fields) do
+    item
+    |> cast(attrs, fields)
     |> put_change(:selected, true)
-    |> put_change(:state, :queued)
+    |> put_default_change(:state, :queued)
     |> put_change(:resume_state, nil)
-    |> put_change(:wait_reason, nil)
     |> put_change(:next_attempt_at, nil)
     |> put_change(:lease_owner, nil)
     |> put_change(:lease_expires_at, nil)
@@ -176,7 +204,6 @@ defmodule ForgeImports.RepositoryItem do
     |> put_change(:publication_evidence, %{})
     |> put_change(:imported_count, 0)
     |> put_change(:skipped_count, 0)
-    |> put_change(:warning_count, 0)
     |> put_change(:failure_count, 0)
     |> put_change(:cleanup_state, nil)
     |> put_change(:cleanup_eligible_at, nil)
@@ -184,8 +211,6 @@ defmodule ForgeImports.RepositoryItem do
     |> put_change(:cleanup_error, nil)
     |> validate_persistence()
   end
-
-  def discovery_changeset(item, _attrs), do: item |> change() |> add_error(:base, "is invalid")
 
   @doc false
   def persistence_changeset(item, attrs) when is_map(attrs) do
@@ -289,6 +314,30 @@ defmodule ForgeImports.RepositoryItem do
 
   def selection_changeset(item, _attrs),
     do: item |> change() |> add_error(:selected, "is immutable after work starts")
+
+  @doc false
+  def destination_changeset(%__MODULE__{state: state} = item, attrs)
+      when state in [:queued, :awaiting_resolution] and is_map(attrs) do
+    item
+    |> cast(attrs, [
+      :destination_owner_id,
+      :destination_slug,
+      :destination_visibility,
+      :state,
+      :wait_reason
+    ])
+    |> validate_required([:destination_visibility, :state])
+    |> validate_inclusion(:state, [:queued, :awaiting_resolution])
+    |> validate_inclusion(:destination_visibility, @visibilities)
+    |> validate_positive_id(:destination_owner_id)
+    |> validate_strings()
+    |> validate_repository_evidence()
+    |> validate_lifecycle()
+    |> map_constraints()
+  end
+
+  def destination_changeset(item, _attrs),
+    do: item |> change() |> add_error(:state, "cannot change the destination")
 
   def transition_changeset(item, target, attrs) when is_atom(target) and is_map(attrs) do
     build_transition_changeset(item, target, attrs, clear_lease?: true)
@@ -591,12 +640,15 @@ defmodule ForgeImports.RepositoryItem do
   defp typed_source_metadata?(metadata) do
     Enum.all?(metadata, fn {key, value} ->
       case to_string(key) do
-        key when key in ~w(archived fork has_issues disabled) ->
+        key when key in ~w(archived fork has_issues allow_merge_commit disabled) ->
           is_boolean(value)
 
         key when key in ~w(visibility default_branch description) ->
           is_nil(value) or
             valid_source_text?(key, value)
+
+        key when key in ~w(updated_at pushed_at) ->
+          is_nil(value) or valid_source_datetime?(value)
 
         _unsupported ->
           false
@@ -613,7 +665,19 @@ defmodule ForgeImports.RepositoryItem do
   defp valid_source_text?("description", value),
     do: ForgeImports.SafeValue.github_source_text?(value, 2_048)
 
+  defp valid_source_datetime?(value) when is_binary(value) do
+    match?({:ok, %DateTime{}, 0}, DateTime.from_iso8601(value))
+  end
+
+  defp valid_source_datetime?(_value), do: false
+
   defp encoded_size(value), do: value |> :erlang.term_to_binary() |> byte_size()
+
+  defp put_default_change(changeset, field, value) do
+    if Map.has_key?(changeset.changes, field),
+      do: changeset,
+      else: put_change(changeset, field, value)
+  end
 
   defp only_keys?(attrs, allowed) do
     Enum.all?(Map.keys(attrs), fn

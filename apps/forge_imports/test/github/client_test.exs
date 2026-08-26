@@ -876,7 +876,7 @@ defmodule ForgeImports.GitHub.ClientTest do
       "id" => id,
       "name" => name,
       "full_name" => "octocat/#{name}",
-      "owner" => %{"login" => "octocat"},
+      "owner" => %{"id" => 9_000_000_002, "login" => "octocat"},
       "description" => "A repository",
       "visibility" => "public",
       "default_branch" => "main",

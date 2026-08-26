@@ -53,6 +53,10 @@ defmodule ForgeAccounts do
     to: GitHubAccounts
 
   @doc false
+  defdelegate validate_github_import_request(actor, reference, request_metadata, profiles),
+    to: GitHubAccounts
+
+  @doc false
   def validate_github_request_metadata(metadata, credential \\ nil),
     do: ForgeAccounts.GitHubRequestMetadata.validate(metadata, credential)
 
@@ -142,6 +146,16 @@ defmodule ForgeAccounts do
   @doc false
   defdelegate with_github_credential_for_verification(actor, identity_id, callback),
     to: GitHubAccounts
+
+  @doc false
+  defdelegate with_github_import_credential(actor, identity_id, credential_id, callback),
+    to: GitHubAccounts
+
+  @doc false
+  defdelegate validate_github_external_profile(actor, profile), to: GitHubAccounts
+
+  @doc false
+  defdelegate validate_github_external_profiles(actor, profiles), to: GitHubAccounts
 
   def get_account(id), do: Repo.get(User, id)
 

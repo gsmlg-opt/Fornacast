@@ -8,6 +8,7 @@ defmodule ForgeImports.OneTimeCredential do
   alias ForgeAccounts.GitHubCredentialCallback
   alias ForgeAccounts.GitHubAccounts.CredentialCallbackError
   alias ForgeAccounts.GitHubIdentity
+  alias ForgeAccounts.GitHubProfileSafety
   alias ForgeAccounts.User
   alias ForgeImports.ImportRun
   alias Fornacast.Repo
@@ -96,6 +97,44 @@ defmodule ForgeImports.OneTimeCredential do
 
   def verify_envelope(_run, _envelope, _keyring), do: @service_error
 
+  @doc false
+  def validate_profiles(
+        actor,
+        run,
+        profiles,
+        keyring \\ Fornacast.Config.github_credential_keyring()
+      )
+
+  def validate_profiles(
+        %User{id: actor_id},
+        %ImportRun{} = expected,
+        profiles,
+        keyring
+      )
+      when is_integer(actor_id) and is_list(profiles) and length(profiles) <= 16 do
+    with %ImportRun{} = run <- current_validation_run(actor_id, expected),
+         {:ok, envelope} <- from_run(run),
+         %GitHubIdentity{github_user_id: github_user_id}
+         when is_integer(github_user_id) and github_user_id > 0 <-
+           Repo.get(GitHubIdentity, run.github_identity_id),
+         {:ok, result} <-
+           GitHubCredentialVault.with_one_time_credential(
+             envelope,
+             run.id,
+             run.actor_user_id,
+             github_user_id,
+             &validate_profile_values(profiles, &1),
+             keyring
+           ) do
+      result
+    else
+      {:error, :invalid_response} = error -> error
+      _ -> @service_error
+    end
+  end
+
+  def validate_profiles(_actor, _run, _profiles, _keyring), do: @service_error
+
   def clear_changeset(%ImportRun{} = run), do: ImportRun.clear_one_time_credential_changeset(run)
 
   defp checked_out_result(envelope, run, github_user_id, callback, keyring) do
@@ -132,6 +171,34 @@ defmodule ForgeImports.OneTimeCredential do
             run.lease_owner == ^capability.lease_owner and not is_nil(run.lease_expires_at) and
             run.lease_expires_at > ^now
     )
+  end
+
+  defp current_validation_run(actor_id, expected) do
+    terminal_states = ImportRun.terminal_states()
+
+    Repo.one(
+      from run in ImportRun,
+        join: actor in User,
+        on: actor.id == run.actor_user_id,
+        where:
+          run.id == ^expected.id and run.actor_user_id == ^actor_id and
+            actor.kind == :user and actor.state == :active and
+            run.credential_source == :one_time and run.state not in ^terminal_states and
+            run.lock_version == ^expected.lock_version
+    )
+  end
+
+  defp validate_profile_values(profiles, credential) do
+    Enum.reduce_while(profiles, :ok, fn
+      profile, :ok when is_map(profile) ->
+        case GitHubProfileSafety.validate(profile, credential) do
+          :ok -> {:cont, :ok}
+          {:error, :invalid_response} -> {:halt, {:error, :invalid_response}}
+        end
+
+      _invalid, :ok ->
+        {:halt, {:error, :invalid_response}}
+    end)
   end
 
   defp valid_envelope?(%Envelope{} = envelope) do

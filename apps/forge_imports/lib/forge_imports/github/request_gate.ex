@@ -6,12 +6,14 @@ defmodule ForgeImports.GitHub.RequestGate do
   @type gate_key ::
           {:saved_credential, pos_integer()}
           | {:one_time_run, pos_integer()}
+          | {:import_setup, pos_integer()}
           | {:account_setup, pos_integer()}
 
   @spec run(gate_key(), (-> result)) :: result | {:error, :invalid_gate_key | :busy}
         when result: term()
   def run({kind, id} = gate_key, fun)
-      when kind in [:saved_credential, :one_time_run, :account_setup] and is_integer(id) and
+      when kind in [:saved_credential, :one_time_run, :import_setup, :account_setup] and
+             is_integer(id) and
              id > 0 and
              id <= 9_223_372_036_854_775_807 and
              is_function(fun, 0) do

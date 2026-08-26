@@ -6,6 +6,7 @@ defmodule ForgeImports.GitHub.Repository do
   @derive {Inspect,
            only: [
              :id,
+             :owner_id,
              :name,
              :full_name,
              :owner_login,
@@ -22,6 +23,7 @@ defmodule ForgeImports.GitHub.Repository do
            ]}
   @enforce_keys [
     :id,
+    :owner_id,
     :name,
     :full_name,
     :owner_login,
@@ -34,6 +36,7 @@ defmodule ForgeImports.GitHub.Repository do
   ]
   defstruct [
     :id,
+    :owner_id,
     :name,
     :full_name,
     :owner_login,
@@ -52,6 +55,7 @@ defmodule ForgeImports.GitHub.Repository do
   @type visibility :: :public | :private | :internal
   @type t :: %__MODULE__{
           id: pos_integer(),
+          owner_id: pos_integer(),
           name: String.t(),
           full_name: String.t(),
           owner_login: String.t(),
@@ -70,6 +74,7 @@ defmodule ForgeImports.GitHub.Repository do
   @spec from_json(term()) :: {:ok, t()} | {:error, :invalid_response}
   def from_json(%{"owner" => %{} = owner} = value) do
     with {:ok, id} <- User.id(value["id"]),
+         {:ok, owner_id} <- User.id(owner["id"]),
          {:ok, name} <- User.string(value["name"], 100, required?: true),
          {:ok, full_name} <- User.string(value["full_name"], 255, required?: true),
          {:ok, owner_login} <- User.string(owner["login"], 255, required?: true),
@@ -86,6 +91,7 @@ defmodule ForgeImports.GitHub.Repository do
       {:ok,
        %__MODULE__{
          id: id,
+         owner_id: owner_id,
          name: name,
          full_name: full_name,
          owner_login: owner_login,

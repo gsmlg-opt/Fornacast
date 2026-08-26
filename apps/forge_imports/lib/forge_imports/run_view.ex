@@ -1,7 +1,7 @@
 defmodule ForgeImports.RunView do
   @moduledoc "Safe presentation projection for one actor-owned import run."
 
-  alias ForgeImports.{ImportRun, RepositoryItem}
+  alias ForgeImports.{ImportRun, ReportEntry, RepositoryItem}
 
   @derive {Inspect,
            only: [
@@ -18,6 +18,7 @@ defmodule ForgeImports.RunView do
              :report_finalized_at,
              :counts,
              :repositories,
+             :reports,
              :inserted_at,
              :updated_at
            ]}
@@ -35,13 +36,16 @@ defmodule ForgeImports.RunView do
     :report_finalized_at,
     :counts,
     :repositories,
+    :reports,
     :inserted_at,
     :updated_at
   ]
 
   @type t :: %__MODULE__{}
 
-  def from_run(%ImportRun{} = run, items) when is_list(items) do
+  def from_run(run, items, reports \\ [])
+
+  def from_run(%ImportRun{} = run, items, reports) when is_list(items) and is_list(reports) do
     %__MODULE__{
       id: run.id,
       actor_user_id: run.actor_user_id,
@@ -51,7 +55,8 @@ defmodule ForgeImports.RunView do
         owner_github_id: run.source_owner_github_id,
         owner_login: run.source_owner_login,
         repository_github_id: run.source_repository_github_id,
-        repository_full_name: run.source_repository_full_name
+        repository_full_name: run.source_repository_full_name,
+        provenance: safe_provenance(run.source_metadata)
       },
       destination: %{
         organization_action: run.destination_organization_action,
@@ -72,10 +77,29 @@ defmodule ForgeImports.RunView do
         failures: run.failure_count
       },
       repositories: Enum.map(items, &repository_summary/1),
+      reports: Enum.map(reports, &report_summary/1),
       inserted_at: run.inserted_at,
       updated_at: run.updated_at
     }
   end
+
+  defp report_summary(%ReportEntry{} = report) do
+    %{
+      repository_item_id: report.repository_item_id,
+      scope: report.scope,
+      outcome: report.outcome,
+      classification: report.classification,
+      summary: report.summary,
+      metadata: report.metadata,
+      source_count: report.source_count
+    }
+  end
+
+  defp safe_provenance(metadata) when is_map(metadata) do
+    Map.take(metadata, ~w(name description avatar_url profile_url observed_at))
+  end
+
+  defp safe_provenance(_metadata), do: %{}
 
   defp repository_summary(%RepositoryItem{} = item) do
     %{

@@ -158,6 +158,37 @@ defmodule ForgeAccounts.GitHubAccounts do
   def validate_github_account_request(_actor, _identity_id, _request_metadata),
     do: {:error, :forbidden}
 
+  @doc false
+  def validate_github_import_request(
+        %User{} = actor,
+        %GitHubCredentialVerification{} = expected,
+        request_metadata,
+        profiles
+      )
+      when is_map(request_metadata) and is_list(profiles) and length(profiles) <= 10_001 do
+    transact_checked(fn ->
+      with {:ok, safe_metadata} <- GitHubRequestMetadata.validate(request_metadata),
+           {:ok, active_actor} <- active_github_actor(Repo, actor),
+           :ok <- GitHubCredentialVault.ready?(),
+           :ok <- validate_external_profiles(profiles),
+           rows <- external_profile_credentials(active_actor.id),
+           {:ok, {credential, identity}} <- import_credential_row(rows, expected),
+           :ok <- current_import_reference(credential, identity, expected),
+           :ok <- available_credential(credential),
+           {:ok, checked_metadata} <-
+             validate_import_inputs(rows, safe_metadata, profiles) do
+        {:ok,
+         %{
+           request_metadata: checked_metadata,
+           reference: account_reference(active_actor, identity, credential)
+         }}
+      end
+    end)
+  end
+
+  def validate_github_import_request(_actor, _reference, _request_metadata, _profiles),
+    do: {:error, :forbidden}
+
   @spec save_github_account(User.t(), map(), binary(), map()) ::
           {:ok, GitHubAccountView.t()} | {:error, term()}
   def save_github_account(%User{} = actor, verified_profile, pat, request_metadata)
@@ -827,6 +858,134 @@ defmodule ForgeAccounts.GitHubAccounts do
 
   def with_github_credential_for_verification(_actor, _identity_id, _callback),
     do: {:error, :forbidden}
+
+  @doc false
+  def with_github_import_credential(
+        %User{} = actor,
+        identity_id,
+        credential_id,
+        callback
+      )
+      when is_integer(identity_id) and is_integer(credential_id) and is_function(callback, 2) do
+    with {:ok, %User{id: actor_id}} <- active_actor(Repo, actor),
+         {:ok, identity} <- owned_identity(Repo, identity_id, actor_id, lock?: false),
+         %GitHubCredential{} = credential <-
+           Repo.get_by(GitHubCredential,
+             id: credential_id,
+             github_identity_id: identity.id,
+             local_user_id: actor_id
+           ),
+         :ok <- available_credential(credential) do
+      reference = verification_reference(credential, identity)
+      checked_out_result(credential, identity, fn pat -> callback.(pat, reference) end)
+    else
+      nil -> {:error, :not_found}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def with_github_import_credential(_actor, _identity_id, _credential_id, _callback),
+    do: {:error, :forbidden}
+
+  @doc false
+  @spec validate_github_external_profile(User.t(), map()) ::
+          :ok | {:error, :forbidden | :invalid_response | :credential_service_unavailable}
+  def validate_github_external_profile(%User{} = actor, profile) when is_map(profile),
+    do: validate_github_external_profiles(actor, [profile])
+
+  def validate_github_external_profile(_actor, _profile), do: {:error, :forbidden}
+
+  @doc false
+  @spec validate_github_external_profiles(User.t(), [map()]) ::
+          :ok | {:error, :forbidden | :invalid_response | :credential_service_unavailable}
+  def validate_github_external_profiles(%User{} = actor, profiles)
+      when is_list(profiles) and length(profiles) <= 10_001 do
+    with {:ok, %User{id: actor_id}} <- active_actor(Repo, actor),
+         :ok <- validate_external_profiles(profiles) do
+      actor_id
+      |> external_profile_credentials()
+      |> Enum.reduce_while(:ok, fn {credential, identity}, :ok ->
+        case GitHubCredentialVault.with_saved_credential(
+               credential,
+               identity,
+               &validate_external_profiles(profiles, &1)
+             ) do
+          {:ok, :ok} -> {:cont, :ok}
+          {:ok, {:error, :invalid_response}} -> {:halt, {:error, :invalid_response}}
+          {:error, _reason} -> {:halt, {:error, :credential_service_unavailable}}
+          _unsafe -> {:halt, {:error, :invalid_response}}
+        end
+      end)
+    else
+      {:error, :invalid_response} -> {:error, :invalid_response}
+      {:error, _reason} -> {:error, :forbidden}
+    end
+  end
+
+  def validate_github_external_profiles(_actor, _profiles), do: {:error, :forbidden}
+
+  defp external_profile_credentials(actor_id) do
+    GitHubCredential
+    |> join(:inner, [credential], identity in GitHubIdentity,
+      on: identity.id == credential.github_identity_id
+    )
+    |> where([credential, _identity], credential.local_user_id == ^actor_id)
+    |> order_by([credential, _identity], asc: credential.id)
+    |> select([credential, identity], {credential, identity})
+    |> maybe_lock_external_profile_credentials()
+    |> Repo.all()
+  end
+
+  defp maybe_lock_external_profile_credentials(query) do
+    if Repo.in_transaction?() and postgres?(), do: lock(query, "FOR UPDATE"), else: query
+  end
+
+  defp validate_external_profiles(profiles, credential \\ nil) do
+    Enum.reduce_while(profiles, :ok, fn
+      profile, :ok when is_map(profile) ->
+        case GitHubProfileSafety.validate(profile, credential) do
+          :ok -> {:cont, :ok}
+          {:error, :invalid_response} -> {:halt, {:error, :invalid_response}}
+        end
+
+      _invalid, :ok ->
+        {:halt, {:error, :invalid_response}}
+    end)
+  end
+
+  defp import_credential_row(rows, expected) do
+    case Enum.find(rows, fn {credential, identity} ->
+           credential.id == expected.credential_id and identity.id == expected.identity_id and
+             credential.local_user_id == expected.local_user_id
+         end) do
+      nil -> {:error, :not_found}
+      row -> {:ok, row}
+    end
+  end
+
+  defp current_import_reference(credential, identity, expected) do
+    if verification_reference(credential, identity) == expected,
+      do: :ok,
+      else: {:error, :stale}
+  end
+
+  defp validate_import_inputs(rows, request_metadata, profiles) do
+    Enum.reduce_while(rows, {:ok, request_metadata}, fn {credential, identity},
+                                                        {:ok, safe_metadata} ->
+      case GitHubCredentialVault.with_saved_credential(credential, identity, fn pat ->
+             with {:ok, checked_metadata} <-
+                    GitHubRequestMetadata.validate(safe_metadata, pat),
+                  :ok <- validate_external_profiles(profiles, pat) do
+               {:ok, checked_metadata}
+             end
+           end) do
+        {:ok, {:ok, checked_metadata}} -> {:cont, {:ok, checked_metadata}}
+        {:ok, {:error, reason}} -> {:halt, {:error, reason}}
+        {:error, reason} -> {:halt, {:error, reason}}
+        _unsafe -> {:halt, {:error, :invalid_response}}
+      end
+    end)
+  end
 
   defp checked_out_result(credential, identity, callback) do
     case GitHubCredentialVault.with_saved_credential(credential, identity, fn pat ->

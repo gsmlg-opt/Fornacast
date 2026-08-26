@@ -11,13 +11,22 @@ defmodule ForgeImports do
     ImportRun,
     OneTimeCredential,
     Persistence,
+    ReportEntry,
     RepositoryItem,
     RunView
   }
 
   alias Fornacast.Repo
 
+  @run_view_read_attempts 3
+
   def provider, do: :github
+
+  def create_repository_discovery(actor, attrs, request_metadata, opts \\ []),
+    do: ForgeImports.Discovery.create_repository(actor, attrs, request_metadata, opts)
+
+  def create_organization_discovery(actor, attrs, request_metadata, opts \\ []),
+    do: ForgeImports.Discovery.create_organization(actor, attrs, request_metadata, opts)
 
   defdelegate list_github_accounts(actor), to: GitHubAccounts, as: :list
 
@@ -52,23 +61,94 @@ defmodule ForgeImports do
 
   def create_run(_actor, _attrs), do: {:error, :forbidden}
 
-  def get_run(%User{id: actor_id}, id) when is_integer(id) and id > 0 do
-    case Repo.one(from run in ImportRun, where: run.id == ^id and run.actor_user_id == ^actor_id) do
-      %ImportRun{} = run -> {:ok, run}
-      nil -> {:error, :not_found}
-    end
+  def get_run(%User{} = actor, id) when is_integer(id) and id > 0 do
+    read_run_view(actor, id, @run_view_read_attempts)
   end
 
   def get_run(_actor, _id), do: {:error, :not_found}
 
-  def get_run_view(%User{} = actor, id) do
-    with {:ok, run} <- get_run(actor, id),
-         {:ok, items} <- repository_items(actor, run) do
-      {:ok, RunView.from_run(run, items)}
+  def get_run_view(%User{} = actor, id), do: get_run(actor, id)
+
+  def get_run_view(_actor, _id), do: {:error, :not_found}
+
+  defp read_run_view(actor, id, attempts_left) do
+    with {:ok, active_actor} <- active_actor(actor),
+         %ImportRun{} = run <- actor_run(active_actor.id, id),
+         items <- run_repository_items(run.id),
+         reports <- run_reports(run.id),
+         {:ok, current_version} <- active_run_version(active_actor.id, run.id) do
+      if current_version == run.lock_version do
+        {:ok, RunView.from_run(run, items, reports)}
+      else
+        retry_run_view(actor, id, attempts_left)
+      end
+    else
+      _masked -> {:error, :not_found}
     end
   end
 
-  def get_run_view(_actor, _id), do: {:error, :not_found}
+  defp retry_run_view(actor, id, attempts_left) when attempts_left > 1,
+    do: read_run_view(actor, id, attempts_left - 1)
+
+  defp retry_run_view(_actor, _id, _attempts_left), do: {:error, :not_found}
+
+  defp actor_run(actor_id, id) do
+    Repo.one(
+      from run in ImportRun,
+        where: run.id == ^id and run.actor_user_id == ^actor_id
+    )
+  end
+
+  defp run_repository_items(run_id) do
+    RepositoryItem
+    |> where([item], item.import_run_id == ^run_id)
+    |> order_by([item], asc: item.id)
+    |> Repo.all()
+  end
+
+  defp run_reports(run_id) do
+    ReportEntry
+    |> where([report], report.import_run_id == ^run_id)
+    |> order_by([report], asc: report.id)
+    |> Repo.all()
+  end
+
+  defp active_run_version(actor_id, run_id) do
+    case Repo.one(
+           from run in ImportRun,
+             join: actor in User,
+             on: actor.id == run.actor_user_id,
+             where:
+               run.id == ^run_id and run.actor_user_id == ^actor_id and actor.kind == :user and
+                 actor.state == :active,
+             select: run.lock_version
+         ) do
+      version when is_integer(version) -> {:ok, version}
+      _masked -> {:error, :not_found}
+    end
+  end
+
+  def update_repository_selection(%User{} = actor, run_id, selected_ids)
+      when is_integer(run_id) and run_id > 0 and is_list(selected_ids) do
+    with {:ok, normalized_ids} <- normalize_selected_ids(selected_ids),
+         {:ok, _updated} <-
+           transact(fn -> update_selection_transaction(actor, run_id, normalized_ids) end) do
+      get_run(actor, run_id)
+    end
+  end
+
+  def update_repository_selection(_actor, _run_id, _selected_ids), do: {:error, :not_found}
+
+  def update_organization_destination(%User{} = actor, run_id, destination)
+      when is_integer(run_id) and run_id > 0 and is_map(destination) do
+    with {:ok, _updated} <-
+           transact(fn -> update_destination_transaction(actor, run_id, destination) end) do
+      get_run(actor, run_id)
+    end
+  end
+
+  def update_organization_destination(_actor, _run_id, _destination),
+    do: {:error, :not_found}
 
   def create_repository_item(%User{} = actor, %ImportRun{} = expected_run, attrs)
       when is_map(attrs) do
@@ -402,6 +482,247 @@ defmodule ForgeImports do
     value = Map.get(attrs, field) || Map.get(attrs, Atom.to_string(field))
 
     if is_nil(value), do: :absent, else: positive_id(attrs, field)
+  end
+
+  defp normalize_selected_ids(ids) do
+    ids
+    |> Enum.reduce_while({:ok, []}, fn value, {:ok, normalized} ->
+      case Ecto.Type.cast(:integer, value) do
+        {:ok, id} when id > 0 -> {:cont, {:ok, [id | normalized]}}
+        _ -> {:halt, {:error, :invalid_selection}}
+      end
+    end)
+    |> case do
+      {:ok, normalized} ->
+        normalized = Enum.reverse(normalized)
+
+        if length(normalized) == length(Enum.uniq(normalized)),
+          do: {:ok, normalized},
+          else: {:error, :invalid_selection}
+
+      error ->
+        error
+    end
+  end
+
+  defp update_selection_transaction(actor, run_id, selected_ids) do
+    with {:ok, active_actor} <- active_actor(actor, lock?: true),
+         %ImportRun{state: :awaiting_resolution} = run <-
+           Repo.one(
+             from run in ImportRun,
+               where: run.id == ^run_id and run.actor_user_id == ^active_actor.id
+           ),
+         items <-
+           Repo.all(
+             from item in RepositoryItem,
+               where: item.import_run_id == ^run.id,
+               order_by: [asc: item.id]
+           ),
+         true <- selected_ids -- Enum.map(items, & &1.github_repository_id) == [],
+         :ok <- persist_item_selections(items, selected_ids),
+         changeset <- ImportRun.selected_count_changeset(run, length(selected_ids)),
+         {:ok, updated_run} <-
+           Persistence.update_without_lease(run, [:awaiting_resolution], changeset) do
+      {:ok, updated_run}
+    else
+      nil -> {:error, :not_found}
+      %ImportRun{} -> {:error, :stale}
+      false -> {:error, :invalid_selection}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp persist_item_selections(items, selected_ids) do
+    selected = MapSet.new(selected_ids)
+
+    Enum.reduce_while(items, :ok, fn item, :ok ->
+      changeset =
+        RepositoryItem.selection_changeset(item, %{
+          selected: MapSet.member?(selected, item.github_repository_id)
+        })
+
+      case Persistence.update_without_lease(item, [item.state], changeset) do
+        {:ok, _updated} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp update_destination_transaction(actor, run_id, destination) do
+    with {:ok, active_actor} <- active_actor(actor, lock?: true),
+         %ImportRun{state: :awaiting_resolution, source_kind: :organization} = run <-
+           Repo.one(
+             from run in ImportRun,
+               where: run.id == ^run_id and run.actor_user_id == ^active_actor.id
+           ),
+         {:ok, destination_plan} <-
+           ForgeImports.Destination.organization(
+             active_actor,
+             run.source_owner_login,
+             destination
+           ),
+         :ok <- validate_destination_security(active_actor, run, destination_plan),
+         items <-
+           Repo.all(
+             from item in RepositoryItem,
+               where: item.import_run_id == ^run.id,
+               order_by: [asc: item.id]
+           ),
+         :ok <- persist_destination_items(items, destination_plan),
+         changeset <-
+           ImportRun.destination_changeset(run, %{
+             destination_organization_action: destination_plan.action,
+             destination_organization_slug:
+               Map.get(destination_plan, :requested_slug, destination_plan.slug),
+             destination_organization_id: destination_plan.organization_id
+           }),
+         {:ok, updated_run} <-
+           Persistence.update_without_lease(run, [:awaiting_resolution], changeset) do
+      {:ok, updated_run}
+    else
+      nil -> {:error, :not_found}
+      %ImportRun{} -> {:error, :not_found}
+      {:error, :forbidden} -> {:error, :not_found}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp persist_destination_items(items, destination) do
+    duplicate_slugs =
+      items
+      |> Enum.map(&proposed_destination_slug/1)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.frequencies()
+      |> Enum.filter(fn {_slug, count} -> count > 1 end)
+      |> Enum.map(&elem(&1, 0))
+      |> MapSet.new()
+
+    Enum.reduce_while(items, :ok, fn item, :ok ->
+      attrs = destination_item_attrs(item, destination, duplicate_slugs)
+      changeset = RepositoryItem.destination_changeset(item, attrs)
+
+      case Persistence.update_without_lease(item, [item.state], changeset) do
+        {:ok, _updated} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp validate_destination_security(actor, run, destination) do
+    with {:ok, profiles} <- ForgeImports.Destination.safety_profiles(destination),
+         :ok <- ForgeAccounts.validate_github_external_profiles(actor, profiles),
+         :ok <- validate_one_time_destination(actor, run, profiles) do
+      :ok
+    else
+      {:error, :credential_service_unavailable} = error -> error
+      _unsafe -> {:error, :invalid_destination}
+    end
+  end
+
+  defp validate_one_time_destination(
+         actor,
+         %ImportRun{credential_source: :one_time} = run,
+         profiles
+       ),
+       do: OneTimeCredential.validate_profiles(actor, run, profiles)
+
+  defp validate_one_time_destination(_actor, %ImportRun{credential_source: :saved}, _profiles),
+    do: :ok
+
+  defp destination_item_attrs(item, %{status: :invalid} = destination, _duplicates) do
+    destination_item_attrs(
+      item,
+      destination,
+      :awaiting_resolution,
+      destination.classification,
+      nil
+    )
+  end
+
+  defp destination_item_attrs(item, %{status: :conflict} = destination, _duplicates) do
+    destination_item_attrs(
+      item,
+      destination,
+      :awaiting_resolution,
+      destination.classification,
+      proposed_destination_slug(item)
+    )
+  end
+
+  defp destination_item_attrs(item, destination, duplicates) do
+    slug = proposed_destination_slug(item)
+
+    cond do
+      is_nil(slug) ->
+        destination_item_attrs(
+          item,
+          destination,
+          :awaiting_resolution,
+          "invalid_repository_slug",
+          nil
+        )
+
+      MapSet.member?(duplicates, slug) ->
+        destination_item_attrs(
+          item,
+          destination,
+          :awaiting_resolution,
+          "normalized_slug_collision",
+          slug
+        )
+
+      item.source_name != slug ->
+        destination_item_attrs(
+          item,
+          destination,
+          :awaiting_resolution,
+          "repository_slug_normalized",
+          slug
+        )
+
+      local_repository_conflict?(destination.owner_id, slug) ->
+        destination_item_attrs(
+          item,
+          destination,
+          :awaiting_resolution,
+          "repository_conflict",
+          slug
+        )
+
+      true ->
+        destination_item_attrs(item, destination, :queued, nil, slug)
+    end
+  end
+
+  defp destination_item_attrs(item, destination, state, wait_reason, slug) do
+    %{
+      destination_owner_id: destination.owner_id,
+      destination_slug: slug,
+      destination_visibility: item.destination_visibility,
+      state: state,
+      wait_reason: wait_reason
+    }
+  end
+
+  defp local_repository_conflict?(owner_id, slug)
+       when is_integer(owner_id) and is_binary(slug) do
+    Repo.exists?(
+      from repository in ForgeRepos.Repository,
+        where:
+          repository.owner_user_id == ^owner_id and repository.slug == ^slug and
+            is_nil(repository.deleted_at)
+    )
+  end
+
+  defp local_repository_conflict?(_owner_id, _slug), do: false
+
+  defp proposed_destination_slug(%RepositoryItem{destination_slug: slug})
+       when is_binary(slug),
+       do: slug
+
+  defp proposed_destination_slug(%RepositoryItem{source_name: source_name}) do
+    slug = ForgeRepos.Repository.normalize_slug(source_name)
+    if ForgeRepos.Repository.canonical_slug?(slug), do: slug
   end
 
   defp maybe_lock(query, true) do
