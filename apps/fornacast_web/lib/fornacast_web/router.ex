@@ -61,6 +61,14 @@ defmodule FornacastWeb.Router do
            :delete_credential
 
     delete "/settings/github/:identity_id", GitHubSettingsController, :unlink
+
+    get "/repos/import", ImportController, :repository_new
+    post "/repos/import/discover", ImportController, :repository_discover
+    get "/organizations/import", ImportController, :organization_new
+    post "/organizations/import/discover", ImportController, :organization_discover
+    get "/imports/:id", ImportController, :show
+    patch "/imports/:id/destination", ImportController, :destination
+    patch "/imports/:id/selection", ImportController, :selection
   end
 
   scope "/", FornacastWeb do
@@ -83,7 +91,6 @@ defmodule FornacastWeb.Router do
     post "/organizations", OrganizationController, :create
 
     get "/repos/new", RepositoryController, :new
-    get "/repos/import", RepositoryController, :import_new
     post "/repos", RepositoryController, :create
 
     get "/:owner", OrganizationController, :show

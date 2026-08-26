@@ -135,6 +135,7 @@ defmodule FornacastWebTest do
     assert html =~ ~s(<a class="create-menu-item" href="/repos/new">)
     assert html =~ ~s(<a class="create-menu-item" href="/repos/import">)
     assert html =~ ~s(<a class="create-menu-item" href="/organizations/new">)
+    assert html =~ ~s(<a class="create-menu-item" href="/organizations/import">)
     assert html =~ ~s(<details class="theme-menu">)
     assert html =~ ~s(<button type="button" class="theme-menu-item" data-theme-choice="auto")
     assert html =~ ~s(<button type="button" class="theme-menu-item" data-theme-choice="sunshine")
@@ -557,7 +558,7 @@ defmodule FornacastWebTest do
     assert html_response(get(conn, "/pulls"), 200) =~ "<h1>Pull Requests</h1>"
   end
 
-  test "authenticated import repository page is reachable from the create menu" do
+  test "authenticated GitHub import pages are reachable from the create menu" do
     reset_database!()
 
     assert {:ok, user} =
@@ -570,9 +571,14 @@ defmodule FornacastWebTest do
     conn =
       build_conn()
       |> Plug.Test.init_test_session(user_id: user.id)
-      |> get("/repos/import")
 
-    assert html_response(conn, 200) =~ "<h1>Import repository</h1>"
+    repository = get(conn, "/repos/import")
+
+    assert html_response(repository, 200) =~
+             "<h1>Import repository from GitHub</h1>"
+
+    assert html_response(repository |> recycle() |> get("/organizations/import"), 200) =~
+             "<h1>Import organization from GitHub</h1>"
   end
 
   @tag :tmp_dir

@@ -19,6 +19,7 @@ defmodule ForgeImports.ImportRun do
   @source_kinds [:repository, :organization]
   @credential_sources [:saved, :one_time]
   @destination_actions [:new, :existing]
+  @destination_statuses [:clean, :conflict, :invalid]
   @max_id 9_223_372_036_854_775_807
   @count_fields [
     :selected_count,
@@ -53,6 +54,8 @@ defmodule ForgeImports.ImportRun do
     :destination_organization_action,
     :destination_organization_slug,
     :destination_organization_id,
+    :destination_organization_status,
+    :destination_organization_classification,
     :request_metadata
   ]
   @transition_fields [
@@ -100,7 +103,14 @@ defmodule ForgeImports.ImportRun do
   @derive {Inspect,
            except:
              @envelope_fields ++
-               [:request_metadata, :source_metadata, :failure_detail, :wait_reason, :failure_kind]}
+               [
+                 :request_metadata,
+                 :source_metadata,
+                 :destination_organization_classification,
+                 :failure_detail,
+                 :wait_reason,
+                 :failure_kind
+               ]}
   schema "github_import_runs" do
     field :actor_user_id, :integer
     field :predecessor_run_id, :integer
@@ -116,6 +126,12 @@ defmodule ForgeImports.ImportRun do
     field :destination_organization_action, Ecto.Enum, values: @destination_actions
     field :destination_organization_slug, :string
     field :destination_organization_id, :integer
+
+    field :destination_organization_status, Ecto.Enum,
+      values: @destination_statuses,
+      default: :clean
+
+    field :destination_organization_classification, :string
     field :state, Ecto.Enum, values: @states, default: :discovering
     field :resume_state, Ecto.Enum, values: @states
     field :wait_reason, :string
@@ -204,6 +220,8 @@ defmodule ForgeImports.ImportRun do
       :destination_organization_action,
       :destination_organization_slug,
       :destination_organization_id,
+      :destination_organization_status,
+      :destination_organization_classification,
       :state,
       :resume_state,
       :wait_reason,
@@ -240,12 +258,14 @@ defmodule ForgeImports.ImportRun do
       :source_owner_login,
       :source_metadata,
       :state,
+      :destination_organization_status,
       :request_metadata,
       :lock_version
     ])
     |> validate_inclusion(:source_kind, @source_kinds)
     |> validate_inclusion(:credential_source, @credential_sources)
     |> validate_inclusion(:destination_organization_action, @destination_actions)
+    |> validate_inclusion(:destination_organization_status, @destination_statuses)
     |> validate_inclusion(:state, @states)
     |> validate_inclusion(:resume_state, @states)
     |> validate_positive_id(:actor_user_id)
@@ -261,6 +281,7 @@ defmodule ForgeImports.ImportRun do
     |> validate_request_metadata()
     |> validate_source_metadata()
     |> validate_source_shape()
+    |> validate_destination_status()
     |> validate_credential_consistency()
     |> validate_envelope()
     |> validate_lifecycle()
@@ -309,12 +330,16 @@ defmodule ForgeImports.ImportRun do
     |> cast(attrs, [
       :destination_organization_action,
       :destination_organization_slug,
-      :destination_organization_id
+      :destination_organization_id,
+      :destination_organization_status,
+      :destination_organization_classification
     ])
-    |> validate_required([:destination_organization_action])
+    |> validate_required([:destination_organization_action, :destination_organization_status])
     |> validate_inclusion(:destination_organization_action, @destination_actions)
+    |> validate_inclusion(:destination_organization_status, @destination_statuses)
     |> validate_positive_id(:destination_organization_id)
     |> validate_strings()
+    |> validate_destination_status()
     |> map_constraints()
   end
 
@@ -587,6 +612,37 @@ defmodule ForgeImports.ImportRun do
     end
   end
 
+  defp validate_destination_status(changeset) do
+    status = get_field(changeset, :destination_organization_status)
+    classification = get_field(changeset, :destination_organization_classification)
+
+    cond do
+      status == :clean and is_nil(classification) ->
+        changeset
+
+      status in [:conflict, :invalid] and is_binary(classification) and
+          String.trim(classification) != "" ->
+        changeset
+
+      status == :clean ->
+        add_error(
+          changeset,
+          :destination_organization_classification,
+          "must be absent for a clean destination"
+        )
+
+      status in [:conflict, :invalid] ->
+        add_error(
+          changeset,
+          :destination_organization_classification,
+          "is required for a destination conflict"
+        )
+
+      true ->
+        changeset
+    end
+  end
+
   defp validate_counts(changeset) do
     Enum.reduce(@count_fields, changeset, fn field, acc ->
       validate_number(acc, field, greater_than_or_equal_to: 0)
@@ -606,6 +662,13 @@ defmodule ForgeImports.ImportRun do
       Enum.reduce([wait_reason: 120, failure_kind: 120], changeset, fn {field, max}, acc ->
         validate_classified_string(acc, field, max)
       end)
+
+    changeset =
+      validate_classified_string(
+        changeset,
+        :destination_organization_classification,
+        120
+      )
 
     validate_change(changeset, :failure_detail, fn :failure_detail, value ->
       if ForgeImports.SafeValue.safe_string?(value, 1_024, classified?: true),
@@ -720,6 +783,15 @@ defmodule ForgeImports.ImportRun do
     |> check_constraint(:credential_source, name: :github_import_runs_credential_source_check)
     |> check_constraint(:credential_source,
       name: :github_import_runs_credential_consistency_check
+    )
+    |> check_constraint(:destination_organization_status,
+      name: :github_import_runs_destination_status_check
+    )
+    |> check_constraint(:destination_organization_classification,
+      name: :github_import_runs_destination_classification_check
+    )
+    |> check_constraint(:destination_organization_status,
+      name: :github_import_runs_destination_status_coherence_check
     )
     |> check_constraint(:state, name: :github_import_runs_state_check)
     |> check_constraint(:state, name: :github_import_runs_terminal_envelope_check)

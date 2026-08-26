@@ -668,6 +668,81 @@ defmodule ForgeImports.DiscoveryTest do
     assert item.state == :queued
   end
 
+  test "zero-repository organization destination conflicts survive reload and clear atomically",
+       %{
+         actor: actor
+       } do
+    account = saved_account_fixture(actor)
+    namespace_owner = user_fixture("destination-conflict")
+
+    plans = [
+      {"imports", :invalid, "reserved_namespace"},
+      {namespace_owner.username, :conflict, "namespace_conflict"}
+    ]
+
+    views =
+      Enum.map(plans, fn {slug, status, classification} ->
+        assert {:ok,
+                %RunView{
+                  state: :awaiting_resolution,
+                  repositories: [],
+                  destination: %{
+                    organization_status: ^status,
+                    organization_classification: ^classification
+                  }
+                } = view} =
+                 ForgeImports.create_organization_discovery(
+                   actor,
+                   %{
+                     organization: "github",
+                     credential_source: :saved,
+                     github_identity_id: account.identity_id,
+                     destination_organization: %{action: :new, slug: slug}
+                   },
+                   request_metadata(),
+                   dispatch: :inline,
+                   client: __MODULE__.OrganizationClient,
+                   client_options: [repositories: []]
+                 )
+
+        assert {:ok,
+                %RunView{
+                  repositories: [],
+                  destination: %{
+                    organization_status: ^status,
+                    organization_classification: ^classification
+                  }
+                }} = ForgeImports.get_run(actor, view.id)
+
+        raw = Repo.get!(ImportRun, view.id)
+        assert raw.destination_organization_status == status
+        assert raw.destination_organization_classification == classification
+        view
+      end)
+
+    [reserved, _namespace_conflict] = views
+    other = user_fixture("destination-foreign")
+    assert {:error, :not_found} = ForgeImports.get_run(other, reserved.id)
+
+    assert {:ok,
+            %RunView{
+              repositories: [],
+              destination: %{
+                organization_slug: "valid-destination",
+                organization_status: :clean,
+                organization_classification: nil
+              }
+            }} =
+             ForgeImports.update_organization_destination(actor, reserved.id, %{
+               action: :new,
+               slug: "valid-destination"
+             })
+
+    cleaned = Repo.get!(ImportRun, reserved.id)
+    assert cleaned.destination_organization_status == :clean
+    assert cleaned.destination_organization_classification == nil
+  end
+
   test "destination planning masks unowned organizations and persists reserved and local conflicts",
        %{actor: actor} do
     account = saved_account_fixture(actor)

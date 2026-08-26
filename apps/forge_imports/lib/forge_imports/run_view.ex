@@ -61,7 +61,10 @@ defmodule ForgeImports.RunView do
       destination: %{
         organization_action: run.destination_organization_action,
         organization_slug: run.destination_organization_slug,
-        organization_id: run.destination_organization_id
+        organization_id: run.destination_organization_id,
+        organization_status: safe_destination_status(run.destination_organization_status),
+        organization_classification:
+          safe_classification(run.destination_organization_classification)
       },
       state: run.state,
       resume_state: run.resume_state,
@@ -128,4 +131,7 @@ defmodule ForgeImports.RunView do
   end
 
   defp safe_classification(value), do: ForgeImports.SafeValue.classified_or_nil(value, 120)
+
+  defp safe_destination_status(status) when status in [:clean, :conflict, :invalid], do: status
+  defp safe_destination_status(_status), do: nil
 end

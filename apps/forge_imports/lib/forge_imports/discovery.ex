@@ -286,6 +286,8 @@ defmodule ForgeImports.Discovery do
       destination_organization_action: destination.action,
       destination_organization_slug: Map.get(destination, :requested_slug, destination.slug),
       destination_organization_id: destination.organization_id,
+      destination_organization_status: destination.status,
+      destination_organization_classification: destination.classification,
       request_metadata: request_metadata
     })
   end
@@ -298,6 +300,8 @@ defmodule ForgeImports.Discovery do
       destination_organization_action: destination.action,
       destination_organization_slug: Map.get(destination, :requested_slug, destination.slug),
       destination_organization_id: destination.organization_id,
+      destination_organization_status: destination.status,
+      destination_organization_classification: destination.classification,
       request_metadata: request_metadata
     })
   end

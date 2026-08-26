@@ -18,6 +18,7 @@ defmodule ForgeAccounts.GitHubCredentialVerificationMigrationTest do
   @import_version 20_260_825_000_300
   @verification_version 20_260_825_000_350
   @provisional_source_version 20_260_825_000_360
+  @destination_status_version 20_260_825_000_370
   @migrations_path Path.expand("../../fornacast/priv/repo/migrations", __DIR__)
   @credential_migration Path.join(
                           @migrations_path,
@@ -52,34 +53,28 @@ defmodule ForgeAccounts.GitHubCredentialVerificationMigrationTest do
     assert column_exists?(repo, "github_credentials", "verification_version")
 
     if postgres?() do
-      assert [@provisional_source_version] =
-               Ecto.Migrator.run(repo, @migrations_path, :down, step: 1, log: false)
+      ensure_provisional_indexes!(repo)
 
-      assert [@verification_version] =
-               Ecto.Migrator.run(repo, @migrations_path, :down, step: 1, log: false)
-
-      assert_upgrade_baseline(repo, credential_id)
-      migrate_verification_up!(repo)
-      assert_upgraded_credential(repo, credential_id)
-
-      assert [@verification_version] =
-               Ecto.Migrator.run(repo, @migrations_path, :down, step: 1, log: false)
+      assert [@destination_status_version] = migrate_down(repo, @destination_status_version)
+      assert [@provisional_source_version] = migrate_down(repo, @provisional_source_version)
+      assert [@verification_version] = migrate_down(repo, @verification_version)
 
       assert_upgrade_baseline(repo, credential_id)
       migrate_verification_up!(repo)
       assert_upgraded_credential(repo, credential_id)
 
-      assert [@provisional_source_version] =
-               Ecto.Migrator.run(repo, @migrations_path, :up,
-                 to: @provisional_source_version,
-                 log: false
-               )
+      assert [@verification_version] = migrate_down(repo, @verification_version)
+
+      assert_upgrade_baseline(repo, credential_id)
+      migrate_verification_up!(repo)
+      assert_upgraded_credential(repo, credential_id)
+
+      assert [@provisional_source_version] = migrate_up(repo, @provisional_source_version)
+      assert [@destination_status_version] = migrate_up(repo, @destination_status_version)
     else
       assert_raise RuntimeError,
                    "Turso rollback is disabled until gsmlg-dev/concord#81 is resolved",
-                   fn ->
-                     Ecto.Migrator.run(repo, @migrations_path, :down, step: 1, log: false)
-                   end
+                   fn -> migrate_down(repo, @destination_status_version) end
 
       assert migration_applied?(repo, @verification_version)
       assert column_exists?(repo, "github_credentials", "verification_version")
@@ -108,10 +103,12 @@ defmodule ForgeAccounts.GitHubCredentialVerificationMigrationTest do
     assert @credential_version < @import_version
     assert @import_version < @verification_version
     assert @verification_version < @provisional_source_version
+    assert @provisional_source_version < @destination_status_version
     assert migration_applied?(repo, @credential_version)
     assert migration_applied?(repo, @import_version)
     assert migration_applied?(repo, @verification_version)
     assert migration_applied?(repo, @provisional_source_version)
+    assert migration_applied?(repo, @destination_status_version)
     assert column_exists?(repo, "github_credentials", "verification_version")
   end
 
@@ -171,10 +168,34 @@ defmodule ForgeAccounts.GitHubCredentialVerificationMigrationTest do
   end
 
   defp delete_migration_record!(repo, version) do
+    placeholder = if postgres?(), do: "$1", else: "?"
+
     Ecto.Adapters.SQL.query!(
       repo,
-      "delete from schema_migrations where version = ?",
+      "delete from schema_migrations where version = #{placeholder}",
       [version]
+    )
+  end
+
+  defp migrate_down(repo, version),
+    do: Ecto.Migrator.run(repo, @migrations_path, :down, to: version, log: false)
+
+  defp migrate_up(repo, version),
+    do: Ecto.Migrator.run(repo, @migrations_path, :up, to: version, log: false)
+
+  defp ensure_provisional_indexes!(repo) do
+    Ecto.Adapters.SQL.query!(
+      repo,
+      "create index if not exists github_import_items_run_id_index " <>
+        "on github_import_repository_items (import_run_id, id)",
+      []
+    )
+
+    Ecto.Adapters.SQL.query!(
+      repo,
+      "create index if not exists github_import_reports_run_id_index " <>
+        "on github_import_report_entries (import_run_id, id)",
+      []
     )
   end
 

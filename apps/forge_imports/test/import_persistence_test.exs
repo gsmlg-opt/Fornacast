@@ -115,6 +115,8 @@ defmodule ForgeImports.ImportPersistenceTest do
           :destination_organization_action,
           :destination_organization_slug,
           :destination_organization_id,
+          :destination_organization_status,
+          :destination_organization_classification,
           :state,
           :resume_state,
           :wait_reason,
@@ -792,7 +794,12 @@ defmodule ForgeImports.ImportPersistenceTest do
     identity: identity
   } do
     run =
-      run_fixture(actor, identity, state: :running, request_metadata: %{"request_id" => "safe"})
+      run_fixture(actor, identity,
+        state: :running,
+        request_metadata: %{"request_id" => "safe"},
+        destination_organization_status: :invalid,
+        destination_organization_classification: "reserved_namespace"
+      )
 
     item = item_fixture(run, staged_storage_path: "/private/secret/repository.git")
     other = user_fixture()
@@ -805,6 +812,8 @@ defmodule ForgeImports.ImportPersistenceTest do
     inspected = inspect(view)
     assert view.actor_user_id == actor.id
     assert view.source.owner_login == "acme"
+    assert view.destination.organization_status == :invalid
+    assert view.destination.organization_classification == "reserved_namespace"
     assert [%{github_repository_id: 9_000_000_101}] = view.repositories
 
     for forbidden <- [

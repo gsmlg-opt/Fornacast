@@ -574,7 +574,9 @@ defmodule ForgeImports do
              destination_organization_action: destination_plan.action,
              destination_organization_slug:
                Map.get(destination_plan, :requested_slug, destination_plan.slug),
-             destination_organization_id: destination_plan.organization_id
+             destination_organization_id: destination_plan.organization_id,
+             destination_organization_status: destination_plan.status,
+             destination_organization_classification: destination_plan.classification
            }),
          {:ok, updated_run} <-
            Persistence.update_without_lease(run, [:awaiting_resolution], changeset) do

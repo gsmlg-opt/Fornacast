@@ -1,0 +1,86 @@
+<section
+  class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6"
+  data-repository-import
+>
+  <header class="grid gap-2">
+    <p class="text-xs text-on-surface-variant">One-time migration</p>
+    <h2 class="text-2xl font-semibold">Import repository from GitHub</h2>
+    <p class="text-sm text-on-surface-variant max-w-3xl">
+      Discover a GitHub repository and review the migration plan before anything is created locally.
+    </p>
+  </header>
+
+  <.dm_alert :if={@error} id="repository-import-error" variant="error" outlined role="alert">
+    {@error}
+  </.dm_alert>
+
+  <.dm_card id="repository-import-card" variant="bordered" shadow="md" padding="lg">
+    <:title><span class="text-lg font-semibold">Repository source</span></:title>
+    <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#157 --%>
+    <form action="/repos/import/discover" method="post" class="grid gap-4">
+      <input type="hidden" name="_csrf_token" value={csrf_token()} />
+      <.dm_input
+        id="repository-import-source"
+        class="w-full"
+        name="import[source]"
+        type="text"
+        label="GitHub repository"
+        helper="Enter owner/repository or a canonical https://github.com/owner/repository URL."
+        required
+        maxlength="512"
+        autocomplete="off"
+        spellcheck="false"
+        autocapitalize="none"
+      />
+      <fieldset class="grid gap-2">
+        <legend class="font-semibold">Credential</legend>
+        <div class="flex flex-wrap gap-2">
+          <label class="inline-flex items-center gap-2">
+            <input
+              class="radio radio-primary"
+              type="radio"
+              name="import[credential_source]"
+              value="saved"
+              checked={@accounts != []}
+            /> Saved GitHub account
+          </label>
+          <label class="inline-flex items-center gap-2">
+            <input
+              class="radio radio-primary"
+              type="radio"
+              name="import[credential_source]"
+              value="one_time"
+              checked={@accounts == []}
+            /> One-time personal access token
+          </label>
+        </div>
+      </fieldset>
+      <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#158 --%>
+      <.dm_input
+        id="repository-import-github-account"
+        class="w-full"
+        name="import[github_identity_id]"
+        type="select"
+        label="Saved GitHub account"
+        prompt="Choose a linked account"
+        options={account_options(@accounts)}
+        value={nil}
+      />
+      <.dm_input
+        id="repository-import-pat"
+        class="w-full"
+        name="import[pat]"
+        type="password"
+        label="One-time GitHub personal access token"
+        helper="Leave blank when using a saved account. A one-time PAT is never shown again."
+        maxlength="4096"
+        autocomplete="new-password"
+        spellcheck="false"
+        autocapitalize="none"
+      />
+      <div>
+        <button class="btn btn-primary" type="submit">Discover repository</button>
+      </div>
+    </form>
+  </.dm_card>
+</section>

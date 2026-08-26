@@ -216,6 +216,10 @@ defmodule FornacastWeb.HTML do
           <span class="create-menu-icon create-menu-icon-org" aria-hidden="true"></span>
           <span>New organization</span>
         </a>
+        <a class="create-menu-item" href="/organizations/import">
+          <span class="create-menu-icon create-menu-icon-import" aria-hidden="true"></span>
+          <span>Import organization</span>
+        </a>
       </div>
     </details>
     """

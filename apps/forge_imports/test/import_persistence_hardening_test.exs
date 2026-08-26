@@ -1080,6 +1080,21 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
         assert Keyword.has_key?(changeset.errors, field)
       end
 
+      destination_changeset =
+        ImportRun.persistence_changeset(
+          %ImportRun{},
+          persistence_run_attrs(actor, identity)
+          |> Map.put(:destination_organization_status, :invalid)
+          |> Map.put(:destination_organization_classification, unsafe)
+        )
+
+      refute destination_changeset.valid?
+
+      assert Keyword.has_key?(
+               destination_changeset.errors,
+               :destination_organization_classification
+             )
+
       for field <- [:wait_reason, :failure_kind, :cleanup_state, :cleanup_error] do
         changeset =
           RepositoryItem.persistence_changeset(
@@ -1108,14 +1123,23 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
 
     assert ForgeImports.SafeValue.classified_value?("https://github.com/acme/demo/issues/1")
 
-    run = %ImportRun{wait_reason: "github_pat_secret", failure_kind: "Bearer secret"}
+    run = %ImportRun{
+      wait_reason: "github_pat_secret",
+      failure_kind: "Bearer secret",
+      destination_organization_status: :invalid,
+      destination_organization_classification: "github_pat_destination_secret"
+    }
+
     item = %RepositoryItem{wait_reason: "[/var/private]", failure_kind: "ghp_secret"}
     view = RunView.from_run(run, [item])
 
     refute inspect(run) =~ "github_pat_secret"
+    refute inspect(run) =~ "github_pat_destination_secret"
     refute inspect(item) =~ "ghp_secret"
     refute inspect(%ImportAttempt{failure_kind: "github_pat_secret"}) =~ "github_pat_secret"
     assert view.wait_reason == nil
+    assert view.destination.organization_status == :invalid
+    assert view.destination.organization_classification == nil
     assert [%{wait_reason: nil}] = view.repositories
   end
 

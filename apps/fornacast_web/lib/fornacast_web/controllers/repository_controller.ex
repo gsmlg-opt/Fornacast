@@ -14,22 +14,6 @@ defmodule FornacastWeb.RepositoryController do
     )
   end
 
-  def import_new(conn, _params) do
-    page(conn, "Import repository", """
-    <p class="muted">Import an existing Git repository into this Fornacast demo.</p>
-    <form>
-      <label>Clone URL <input name="import[url]" placeholder="https://example.com/owner/repository.git"></label>
-      <label>Owner
-        <select name="import[owner]">
-          #{owner_options(conn.assigns.current_user)}
-        </select>
-      </label>
-      <label>Name <input name="import[name]"></label>
-      <button type="button" disabled>Import repository</button>
-    </form>
-    """)
-  end
-
   def create(%Plug.Conn{assigns: %{current_user: user}} = conn, %{"repository" => attrs}) do
     owner_slug = Map.get(attrs, "owner") || user.username
 
@@ -553,7 +537,7 @@ defmodule FornacastWeb.RepositoryController do
     )
   end
 
-  defp owner_options(user, selected_owner \\ nil) do
+  defp owner_options(user, selected_owner) do
     user
     |> ForgeAccounts.list_repository_owners()
     |> Enum.map(fn owner ->
