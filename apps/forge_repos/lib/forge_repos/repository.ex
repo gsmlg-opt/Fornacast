@@ -4,6 +4,7 @@ defmodule ForgeRepos.Repository do
   import Ecto.Changeset
 
   @visibilities [:private, :public]
+  @lifecycles [:importing, :ready, :tombstoned]
   @slug_regex ~r/^[a-z0-9][a-z0-9._-]{0,62}$/
   @api_fields [
     :slug,
@@ -13,6 +14,15 @@ defmodule ForgeRepos.Repository do
     :default_branch,
     :has_issues,
     :allow_merge_commit
+  ]
+  @import_fields [
+    :owner_user_id,
+    :slug,
+    :name,
+    :visibility,
+    :storage_path,
+    :lifecycle,
+    :generation
   ]
 
   @type t :: %__MODULE__{}
@@ -29,6 +39,9 @@ defmodule ForgeRepos.Repository do
     field :allow_merge_commit, :boolean, default: true
     field :last_pushed_at, :utc_datetime
     field :deleted_at, :utc_datetime
+    field :lifecycle, Ecto.Enum, values: @lifecycles, default: :ready
+    field :generation, :integer, default: 1
+    field :storage_reclaimed_at, :utc_datetime
 
     timestamps(type: :utc_datetime)
   end
@@ -49,6 +62,25 @@ defmodule ForgeRepos.Repository do
     |> validate_repository_fields()
     |> unique_constraint([:owner_user_id, :slug], name: owner_slug_constraint())
     |> unique_constraint(:storage_path, name: storage_path_constraint())
+  end
+
+  def import_changeset(%__MODULE__{id: nil} = repository, attrs) do
+    repository
+    |> cast(attrs, @import_fields)
+    |> validate_required(@import_fields)
+    |> validate_explicit_import_fields(attrs)
+    |> validate_repository_fields()
+    |> validate_import_lifecycle()
+    |> validate_private_import()
+    |> validate_number(:generation, greater_than: 0)
+    |> unique_constraint([:owner_user_id, :slug], name: owner_slug_constraint())
+    |> unique_constraint(:storage_path, name: storage_path_constraint())
+  end
+
+  def import_changeset(%__MODULE__{} = repository, _attrs) do
+    repository
+    |> change()
+    |> add_error(:id, "must be new", validation: :creation_only)
   end
 
   def api_create_changeset(repository, attrs) do
@@ -94,6 +126,32 @@ defmodule ForgeRepos.Repository do
     |> validate_no_nul([:name, :description, :default_branch])
     |> validate_inclusion(:visibility, @visibilities)
     |> validate_format(:default_branch, ~r/^[A-Za-z0-9._\/-]+$/)
+  end
+
+  defp validate_explicit_import_fields(changeset, attrs) do
+    Enum.reduce(@import_fields, changeset, fn field, changeset ->
+      if import_attr_present?(attrs, field) or Keyword.has_key?(changeset.errors, field),
+        do: changeset,
+        else: add_error(changeset, field, "can't be blank", validation: :required)
+    end)
+  end
+
+  defp import_attr_present?(attrs, field) when is_map(attrs) do
+    Map.has_key?(attrs, field) or Map.has_key?(attrs, Atom.to_string(field))
+  end
+
+  defp import_attr_present?(_attrs, _field), do: false
+
+  defp validate_import_lifecycle(changeset) do
+    if get_field(changeset, :lifecycle) == :importing,
+      do: changeset,
+      else: add_error(changeset, :lifecycle, "is invalid", validation: :inclusion)
+  end
+
+  defp validate_private_import(changeset) do
+    if get_field(changeset, :visibility) == :private,
+      do: changeset,
+      else: add_error(changeset, :visibility, "is invalid", validation: :inclusion)
   end
 
   def normalize_slug(value) when is_atom(value), do: value |> Atom.to_string() |> normalize_slug()
