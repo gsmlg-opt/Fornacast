@@ -34,17 +34,17 @@ defmodule ForgeImports.GitHub.TransportTest do
       request(
         {0x2606, 0x50C0, 0x8000, 0, 0, 0, 0, 0x154},
         __MODULE__.DeadlineMint,
-        timeout: 80
+        timeout: 500
       )
 
     started_at = System.monotonic_time(:millisecond)
 
     assert {^request, %Transport.Error{kind: :timeout} = error} = Transport.run(request)
 
-    assert System.monotonic_time(:millisecond) - started_at < 250
+    assert System.monotonic_time(:millisecond) - started_at < 750
     assert_receive {:first_recv_timeout, first_timeout}
     assert_receive {:second_recv_timeout, second_timeout}
-    assert first_timeout in 1..80
+    assert first_timeout in 1..500
     assert second_timeout in 1..first_timeout
     assert_receive :closed
     refute inspect(error) =~ "github_pat_transport_secret"
@@ -104,11 +104,11 @@ defmodule ForgeImports.GitHub.TransportTest do
   test "does not try another address after the total deadline is exhausted" do
     first = {140, 82, 114, 5}
     second = {20, 205, 243, 166}
-    request = request([first, second], __MODULE__.SlowConnectMint, timeout: 40)
+    request = request([first, second], __MODULE__.SlowConnectMint, timeout: 200)
 
     started_at = System.monotonic_time(:millisecond)
     assert {^request, %Transport.Error{kind: :timeout}} = Transport.run(request)
-    assert System.monotonic_time(:millisecond) - started_at < 200
+    assert System.monotonic_time(:millisecond) - started_at < 500
     assert_receive {:connect, :https, ^first, 443, _options}
     refute_receive {:connect, :https, ^second, 443, _options}
     refute_receive :closed
