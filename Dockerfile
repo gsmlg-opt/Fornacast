@@ -48,6 +48,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
       coreutils \
+      git \
       libstdc++6 \
       libsctp1 \
       ncurses-base \
@@ -65,6 +66,7 @@ COPY --chown=fornacast:fornacast \
   /app/bin/release_asset_storage_smoke
 
 ENV LANG=C.UTF-8 \
+    SHELL=/bin/sh \
     HOME=/app \
     PORT=4890 \
     FORNACAST_API_BIND_IP=0.0.0.0 \

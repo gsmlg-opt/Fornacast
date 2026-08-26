@@ -20,7 +20,16 @@ config :git_core, :limits,
   receive_pack_bytes: 104_857_600,
   body_total_timeout_ms: 120_000,
   body_idle_timeout_ms: 15_000,
-  reconcile_interval_ms: 30_000
+  reconcile_interval_ms: 30_000,
+  remote_concurrency: 2,
+  remote_wall_time_ms: 1_800_000,
+  remote_output_bytes: 1_048_576,
+  remote_repository_bytes: 21_474_836_480,
+  remote_refs: 200_000,
+  remote_poll_interval_ms: 100,
+  remote_credential_startup_ms: 10_000,
+  remote_kill_escalation_ms: 5_000,
+  remote_cleanup_wait_ms: 10_000
 
 test_root = Path.expand("..", __DIR__)
 

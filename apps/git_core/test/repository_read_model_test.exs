@@ -3459,16 +3459,21 @@ defmodule GitCore.CacheIntegrationTest do
   test "supervises the production cache after merge keepers and all limiters" do
     assert [
              {GitCore.Cache, cache_pid, :worker, [GitCore.Cache]},
+             {GitCore.RemoteLimiter, remote_pid, :worker, [GitCore.RemoteLimiter]},
              {GitCore.RepositoryWriteLimiter, writer_pid, :worker,
               [GitCore.RepositoryWriteLimiter]},
              {GitCore.BlobLimiter, blob_pid, :worker, [GitCore.BlobLimiter]},
              {GitCore.ScanLimiter, scan_pid, :worker, [GitCore.ScanLimiter]},
+             {GitCore.RemoteTaskSupervisor, remote_supervisor_pid, :supervisor,
+              [Task.Supervisor]},
              {GitCore.MergeTaskSupervisor, merge_supervisor_pid, :supervisor, [Task.Supervisor]}
            ] = Supervisor.which_children(GitCore.Supervisor)
 
     assert is_pid(cache_pid)
     assert is_pid(blob_pid)
     assert is_pid(merge_supervisor_pid)
+    assert is_pid(remote_pid)
+    assert is_pid(remote_supervisor_pid)
     assert is_pid(scan_pid)
     assert is_pid(writer_pid)
   end
