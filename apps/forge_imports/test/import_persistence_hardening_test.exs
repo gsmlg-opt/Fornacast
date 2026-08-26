@@ -202,8 +202,10 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
     assert deselected.lock_version == item.lock_version + 1
     assert {:error, :stale} = ForgeImports.select_repository_item(actor, run, item, true)
 
+    now = DateTime.utc_now(:second)
+
     assert {:ok, claimed} =
-             OperationLease.claim(RepositoryItem, item.id, "worker-a", @now, 60)
+             OperationLease.claim(RepositoryItem, item.id, "worker-a", now, 60)
 
     assert {:error, :busy} =
              ForgeImports.select_repository_item(actor, selection_run, claimed, true)
@@ -234,7 +236,7 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
              ForgeImports.transition_run(actor, lease_run, :awaiting_resolution)
 
     assert {:ok, claimed_run} =
-             OperationLease.claim(ImportRun, lease_run.id, "worker-run", @now, 60)
+             OperationLease.claim(ImportRun, lease_run.id, "worker-run", now, 60)
 
     assert {:error, :busy} =
              ForgeImports.select_repository_item(actor, claimed_run, lease_item, false)
@@ -300,8 +302,10 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
     refute ImportRun.transition_changeset(review, :ready, %{selected_count: 999}).valid?
     refute ImportRun.lease_update_changeset(review, selected_count: 999).valid?
 
+    now = DateTime.utc_now(:second)
+
     assert {:ok, claimed} =
-             OperationLease.claim(ImportRun, review.id, "count-worker", @now, 60)
+             OperationLease.claim(ImportRun, review.id, "count-worker", now, 60)
 
     assert {:error, :invalid_update} =
              OperationLease.update_owned(ImportRun, claimed, selected_count: 999)
