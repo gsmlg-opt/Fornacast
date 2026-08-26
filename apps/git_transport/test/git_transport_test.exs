@@ -28,6 +28,106 @@ defmodule GitTransportTest do
     assert GitTransport.ReceivePack.max_request_bytes() == nil
   end
 
+  test "receive-pack parser rejects commands beyond the hard configured ceiling" do
+    original_limits = Application.get_env(:git_core, :limits)
+
+    limits =
+      Application.get_env(:git_core, :limits, [])
+      |> Keyword.put(:receive_pack_commands, 1)
+
+    Application.put_env(:git_core, :limits, limits)
+
+    on_exit(fn ->
+      if is_nil(original_limits),
+        do: Application.delete_env(:git_core, :limits),
+        else: Application.put_env(:git_core, :limits, original_limits)
+    end)
+
+    zero_oid = String.duplicate("0", 40)
+    first_oid = String.duplicate("1", 40)
+    second_oid = String.duplicate("2", 40)
+
+    data =
+      GitTransport.PktLine.encode("#{zero_oid} #{first_oid} refs/heads/main\0report-status\n") <>
+        GitTransport.PktLine.encode("#{zero_oid} #{second_oid} refs/heads/feature\n")
+
+    assert {:error, "ERROR: Too many Git receive-pack commands.\n"} =
+             GitTransport.ReceivePack.parse_request_data(data)
+  end
+
+  test "receive-pack parser accepts 255-byte refs and rejects longer refs" do
+    zero_oid = String.duplicate("0", 40)
+    proposed_oid = String.duplicate("1", 40)
+    max_ref = "refs/heads/" <> String.duplicate("a", 244)
+    overlong_ref = "refs/heads/" <> String.duplicate("a", 245)
+
+    assert byte_size(max_ref) == 255
+    assert byte_size(overlong_ref) == 256
+
+    data =
+      GitTransport.PktLine.encode("#{zero_oid} #{proposed_oid} #{max_ref}\0report-status\n") <>
+        GitTransport.PktLine.flush()
+
+    assert {:pack, "", %{commands: [%{ref: ^max_ref}]}} =
+             GitTransport.ReceivePack.parse_request_data(data)
+
+    assert {:error, "ERROR: Invalid Git reference.\n"} =
+             GitTransport.ReceivePack.parse_request_data(
+               GitTransport.PktLine.encode(
+                 "#{zero_oid} #{proposed_oid} #{overlong_ref}\0report-status\n"
+               )
+             )
+  end
+
+  test "HTTP operation batches are stable per actor and repository and random when unassigned" do
+    actor = %ForgeAccounts.User{id: 10}
+    other_actor = %ForgeAccounts.User{id: 11}
+    repository = %ForgeRepos.Repository{id: 20}
+    other_repository = %ForgeRepos.Repository{id: 21}
+    external_request_id = "shared-client-request-id-12345"
+
+    batch_id =
+      GitTransport.ReceivePack.http_operation_batch_id(
+        actor,
+        repository,
+        external_request_id
+      )
+
+    assert batch_id ==
+             GitTransport.ReceivePack.http_operation_batch_id(
+               actor,
+               repository,
+               external_request_id
+             )
+
+    refute batch_id ==
+             GitTransport.ReceivePack.http_operation_batch_id(
+               actor,
+               other_repository,
+               external_request_id
+             )
+
+    refute batch_id ==
+             GitTransport.ReceivePack.http_operation_batch_id(
+               other_actor,
+               repository,
+               external_request_id
+             )
+
+    random_ids = [
+      GitTransport.ReceivePack.http_operation_batch_id(actor, repository, nil),
+      GitTransport.ReceivePack.http_operation_batch_id(actor, repository, "unassigned")
+    ]
+
+    assert [first_random, second_random] = random_ids
+    refute first_random == second_random
+
+    for request_id <- [batch_id | random_ids] do
+      assert byte_size(request_id) <= 255
+      refute request_id =~ external_request_id
+    end
+  end
+
   test "GitCore's future API receive-pack ceiling does not configure Git transport" do
     original_git_core_limits = Application.get_env(:git_core, :limits)
     original_transport_limit = Application.fetch_env(:git_transport, :receive_pack_max_bytes)
@@ -707,8 +807,9 @@ defmodule GitTransportTest do
     assert length(push_events) == 4
     assert Enum.all?(push_events, &(&1.actor_user_id == user.id))
     assert Enum.all?(push_events, &(&1.target_id == Integer.to_string(repo.id)))
-    assert Enum.any?(push_events, &("refs/heads/feature/demo" in &1.metadata["refs"]))
-    assert Enum.any?(push_events, &("refs/tags/v0.1" in &1.metadata["refs"]))
+    assert Enum.all?(push_events, &String.starts_with?(&1.request_id, "ssh-"))
+    assert Enum.any?(push_events, &(&1.metadata["ref"] == "refs/heads/feature/demo"))
+    assert Enum.any?(push_events, &(&1.metadata["ref"] == "refs/tags/v0.1"))
   end
 
   defp rsa_sha2_public_key do
@@ -734,6 +835,7 @@ defmodule GitTransportTest do
 
   defp reset_tables do
     [
+      "git_write_operations",
       "audit_events",
       "repository_collaborators",
       "repositories",

@@ -113,6 +113,7 @@ config :git_core, :limits,
   contents_json_bytes: 146_800_640,
   ref_deadline_ms: 10_000,
   content_deadline_ms: 60_000,
+  receive_pack_commands: 1_024,
   # Future bounded API ingestion; GitTransport retains its independent 4 GiB/nil policy.
   receive_pack_bytes: 104_857_600,
   body_total_timeout_ms: 120_000,

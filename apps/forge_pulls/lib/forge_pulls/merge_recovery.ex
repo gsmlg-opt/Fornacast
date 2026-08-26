@@ -407,7 +407,12 @@ defmodule ForgePulls.MergeRecovery do
               candidate.base_ref == ^operation.base_ref and
               is_nil(candidate.merge_commit_sha)
 
-      repository_query = from candidate in Repository, where: candidate.id == ^repository.id
+      repository_query =
+        from candidate in Repository,
+          where:
+            candidate.id == ^repository.id and
+              candidate.generation == ^repository.generation and
+              candidate.lifecycle == :ready and is_nil(candidate.deleted_at)
 
       multi =
         Multi.new()
@@ -440,6 +445,7 @@ defmodule ForgePulls.MergeRecovery do
         |> Multi.update_all(:repository, repository_query,
           set: [last_pushed_at: now, updated_at: now]
         )
+        |> require_one(:repository)
         |> Audit.record_multi(
           :audit,
           actor,

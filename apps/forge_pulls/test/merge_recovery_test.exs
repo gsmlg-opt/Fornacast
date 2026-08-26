@@ -223,6 +223,41 @@ defmodule ForgePulls.MergeRecoveryTest do
     assert Repo.get!(MergeOperation, context.operation.id).state == :completed
   end
 
+  test "completion rejects repository generation, lifecycle, and deletion drift atomically",
+       context do
+    for updates <- [
+          [generation: context.repository.generation + 1],
+          [lifecycle: :tombstoned],
+          [deleted_at: ~U[2026-08-26 00:00:00Z]]
+        ] do
+      assert {:error, :unavailable} =
+               MergeRecovery.with_test_complete_multi_hook(
+                 fn multi, _operation ->
+                   prepend_repository_drift(multi, context.repository, updates)
+                 end,
+                 fn -> locked_reconcile(context) end
+               )
+
+      assert %MergeOperation{state: :ref_advanced, lease_owner: nil} =
+               Repo.get!(MergeOperation, context.operation.id)
+
+      assert %PullRequest{merge_commit_sha: nil, merged_at: nil, merged_by_user_id: nil} =
+               Repo.get!(PullRequest, context.pull.id)
+
+      assert %Issue{state: :open} = Repo.get!(Issue, context.pull.issue_id)
+
+      assert %Repository{
+               generation: generation,
+               lifecycle: :ready,
+               deleted_at: nil,
+               last_pushed_at: nil
+             } = Repo.get!(Repository, context.repository.id)
+
+      assert generation == context.repository.generation
+      refute Repo.get_by(AuditEvent, operation_id: "pull_merge:#{context.operation.id}")
+    end
+  end
+
   test "completion fails closed when canonical pull refs no longer match recorded evidence",
        context do
     context.pull
@@ -878,6 +913,18 @@ defmodule ForgePulls.MergeRecoveryTest do
         |> MergeOperation.ref_advanced_changeset()
         |> Repo.update!()
     end
+  end
+
+  defp prepend_repository_drift(multi, repository, updates) do
+    drift =
+      Ecto.Multi.new()
+      |> Ecto.Multi.update_all(
+        :repository_drift,
+        from(candidate in Repository, where: candidate.id == ^repository.id),
+        set: updates
+      )
+
+    Ecto.Multi.prepend(multi, drift)
   end
 
   defp lightweight_prepared_fixture(context) do

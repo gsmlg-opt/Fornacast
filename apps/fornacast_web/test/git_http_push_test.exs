@@ -2,7 +2,7 @@ defmodule FornacastWeb.GitHTTPPushTest do
   use ExUnit.Case, async: false
 
   import Phoenix.ConnTest
-  import ExUnit.CaptureLog
+  alias ForgeRepos.GitWriteOperation
   alias Fornacast.{AuditEvent, Repo}
 
   @endpoint FornacastWeb.Endpoint
@@ -60,12 +60,185 @@ defmodule FornacastWeb.GitHTTPPushTest do
     assert %DateTime{} = Repo.get!(ForgeRepos.Repository, repository.id).last_pushed_at
     events = Repo.all(AuditEvent)
 
-    assert [%AuditEvent{action: "repository.pushed", actor_user_id: actor_id, metadata: metadata}] =
+    assert [
+             %AuditEvent{
+               action: "repository.pushed",
+               actor_user_id: actor_id,
+               request_id: request_id,
+               operation_id: operation_id,
+               metadata: metadata
+             }
+           ] =
              events
 
     assert actor_id == user.id
-    assert metadata["refs"] == ["refs/heads/main"]
+    assert is_binary(request_id) and request_id != ""
+    assert String.starts_with?(operation_id, "git_write:")
+    assert metadata["ref"] == "refs/heads/main"
+    assert metadata["result"] == "success"
     refute git!(["-C", work_path, "remote", "get-url", "origin"]) =~ secret
+  end
+
+  @tag :tmp_dir
+  test "the same client request ID cannot collide across actors and repositories", %{
+    tmp_dir: tmp_dir
+  } do
+    with_storage_root(tmp_dir)
+    share_database!()
+    {alice, alice_repository} = create_user_and_repository("alice")
+    {bob, bob_repository} = create_user_and_repository("bob", "other")
+    {_alice_key, alice_secret} = insert_legacy_api_key!(alice, "repo:write", "alice push")
+    {_bob_key, bob_secret} = insert_legacy_api_key!(bob, "repo:write", "bob push")
+    alice_oid = create_commit(alice_repository, "alice")
+    bob_oid = create_commit(bob_repository, "bob")
+    external_request_id = "shared-client-request-id-12345"
+    test_pid = self()
+
+    native = fn path, "PACK", [{_old_oid, proposed_oid, target_ref}] ->
+      git!(["--git-dir=#{path}", "update-ref", target_ref, proposed_oid])
+      send(test_pid, {:http_native_invoked, path})
+      {:ok, [{target_ref, "ok", nil}]}
+    end
+
+    [alice_response, bob_response] =
+      GitTransport.ReceivePack.with_test_native(native, fn ->
+        [
+          receive_pack_post(
+            "alice",
+            "demo",
+            alice_secret,
+            external_request_id,
+            receive_pack_body(alice_oid)
+          ),
+          receive_pack_post(
+            "bob",
+            "other",
+            bob_secret,
+            external_request_id,
+            receive_pack_body(bob_oid)
+          )
+        ]
+      end)
+
+    assert response(alice_response, 200) =~ "ok refs/heads/main"
+    assert response(bob_response, 200) =~ "ok refs/heads/main"
+    assert_receive {:http_native_invoked, alice_path}
+    assert_receive {:http_native_invoked, bob_path}
+    assert alice_path == ForgeRepos.absolute_storage_path(alice_repository)
+    assert bob_path == ForgeRepos.absolute_storage_path(bob_repository)
+
+    assert [alice_operation, bob_operation] =
+             GitWriteOperation
+             |> Repo.all()
+             |> Enum.sort_by(& &1.repository_id)
+
+    assert alice_operation.repository_id == alice_repository.id
+    assert bob_operation.repository_id == bob_repository.id
+    refute alice_operation.request_id == bob_operation.request_id
+
+    for operation <- [alice_operation, bob_operation] do
+      assert byte_size(operation.request_id) <= 255
+      refute operation.request_id == external_request_id
+      refute inspect(operation) =~ external_request_id
+    end
+
+    assert [alice_audit, bob_audit] =
+             AuditEvent
+             |> Repo.all()
+             |> Enum.sort_by(& &1.target_id)
+
+    for audit <- [alice_audit, bob_audit] do
+      refute audit.request_id == external_request_id
+      refute audit.operation_id == external_request_id
+      refute JSON.encode!(audit.metadata) =~ external_request_id
+      refute inspect(audit) =~ external_request_id
+    end
+  end
+
+  test "HTTP batch metadata distinguishes a client request ID from a generated response ID" do
+    request_id = "client-request-id-12345"
+
+    assert request_id ==
+             build_conn()
+             |> Plug.Conn.put_req_header("x-request-id", request_id)
+             |> FornacastWeb.RequestMetadata.external_request_id()
+
+    generated = Plug.RequestId.call(build_conn(), Plug.RequestId.init([]))
+    assert [_generated_response_id] = Plug.Conn.get_resp_header(generated, "x-request-id")
+    assert is_nil(FornacastWeb.RequestMetadata.external_request_id(generated))
+
+    assert is_nil(
+             build_conn()
+             |> Plug.Conn.put_req_header("x-request-id", "too-short")
+             |> FornacastWeb.RequestMetadata.external_request_id()
+           )
+  end
+
+  @tag :tmp_dir
+  test "the same actor and repository replay the client request as one durable batch", %{
+    tmp_dir: tmp_dir
+  } do
+    with_storage_root(tmp_dir)
+    share_database!()
+    {alice, repository} = create_user_and_repository("alice")
+    {_api_key, secret} = insert_legacy_api_key!(alice, "repo:write", "replay push")
+    first_oid = create_commit(repository, "first")
+    second_oid = create_commit(repository, "second")
+    external_request_id = "replayed-client-request-id-123"
+    path = ForgeRepos.absolute_storage_path(repository)
+    test_pid = self()
+
+    native = fn ^path, "PACK", [{_old_oid, proposed_oid, target_ref}] ->
+      git!(["--git-dir=#{path}", "update-ref", target_ref, proposed_oid])
+      send(test_pid, {:replay_native_invoked, proposed_oid})
+      {:ok, [{target_ref, "ok", nil}]}
+    end
+
+    first_response =
+      GitTransport.ReceivePack.with_test_native(native, fn ->
+        receive_pack_post(
+          "alice",
+          "demo",
+          secret,
+          external_request_id,
+          receive_pack_body(first_oid)
+        )
+      end)
+
+    assert response(first_response, 200) =~ "ok refs/heads/main"
+    assert_receive {:replay_native_invoked, ^first_oid}
+
+    assert %GitWriteOperation{request_id: operation_batch_id} =
+             Repo.one!(GitWriteOperation)
+
+    assert {:error, :conflict} =
+             ForgeRepos.prepare_receive_pack_operations(
+               alice,
+               repository,
+               operation_batch_id,
+               [{first_oid, second_oid, "refs/heads/main"}],
+               System.monotonic_time(:millisecond) + 10_000
+             )
+
+    second_response =
+      GitTransport.ReceivePack.with_test_native(native, fn ->
+        receive_pack_post(
+          "alice",
+          "demo",
+          secret,
+          external_request_id,
+          receive_pack_body(second_oid, first_oid)
+        )
+      end)
+
+    assert response(second_response, 200) =~ "ng refs/heads/main Git receive-pack unavailable"
+    refute_receive {:replay_native_invoked, _proposed_oid}
+
+    assert [%GitWriteOperation{request_id: ^operation_batch_id, proposed_oid: ^first_oid}] =
+             Repo.all(GitWriteOperation)
+
+    assert [%AuditEvent{request_id: ^operation_batch_id}] = Repo.all(AuditEvent)
+    assert {:ok, ^first_oid} = GitCore.exact_ref(path, "refs/heads/main")
   end
 
   test "receive-pack advertisement requires a valid repo:write API key" do
@@ -237,24 +410,6 @@ defmodule FornacastWeb.GitHTTPPushTest do
     assert response(response, 400) == "Incomplete Git request.\n"
   end
 
-  test "push bookkeeping rolls back when its audit event cannot be written" do
-    {_user, repository} = create_user_and_repository("alice")
-
-    log =
-      capture_log(fn ->
-        assert :ok =
-                 GitTransport.ReceivePack.record_push(
-                   %{id: "not-an-integer"},
-                   repository,
-                   [{"refs/heads/main", "ok", nil}]
-                 )
-      end)
-
-    assert Repo.get!(ForgeRepos.Repository, repository.id).last_pushed_at == nil
-    assert Repo.all(AuditEvent) == []
-    assert log =~ "Git receive-pack audit update failed"
-  end
-
   defp create_user_and_repository(username, repo_slug \\ "demo") do
     assert {:ok, user} =
              ForgeAccounts.create_user(%{
@@ -271,6 +426,27 @@ defmodule FornacastWeb.GitHTTPPushTest do
              })
 
     {user, repository}
+  end
+
+  defp create_commit(repository, message) do
+    path = ForgeRepos.absolute_storage_path(repository)
+    tree = git!(["--git-dir=#{path}", "hash-object", "-t", "tree", "-w", "/dev/null"])
+    git!(["--git-dir=#{path}", "commit-tree", tree, "-m", message])
+  end
+
+  defp receive_pack_post(username, repo_slug, secret, request_id, body) do
+    build_conn()
+    |> maybe_authorize({username, secret})
+    |> Plug.Conn.put_req_header("content-type", "application/x-git-receive-pack-request")
+    |> Plug.Conn.put_req_header("x-request-id", request_id)
+    |> post("/#{username}/#{repo_slug}.git/git-receive-pack", body)
+  end
+
+  defp receive_pack_body(proposed_oid, expected_oid \\ String.duplicate("0", 40)) do
+    GitTransport.PktLine.encode(
+      "#{expected_oid} #{proposed_oid} refs/heads/main\0report-status\n"
+    ) <>
+      GitTransport.PktLine.flush() <> "PACK"
   end
 
   defp insert_legacy_api_key!(user, scope, name) do
@@ -355,7 +531,7 @@ esac
 
       value when value in ["libsql", "turso"] ->
         Enum.each(
-          ~w(audit_events repository_collaborators repositories organization_members api_keys ssh_keys users),
+          ~w(git_write_operations audit_events repository_collaborators repositories organization_members api_keys ssh_keys users),
           fn table ->
             Ecto.Adapters.SQL.query!(Repo, "delete from #{table}", [])
           end

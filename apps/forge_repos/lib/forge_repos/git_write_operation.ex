@@ -14,6 +14,7 @@ defmodule ForgeRepos.GitWriteOperation do
   @states [:prepared, :object_written, :ref_advanced, :bookkeeping_complete, :failed]
   @failure_reasons ~w(effect_not_started ref_not_advanced unexpected_ref)
   @oid_regex ~r/\A[0-9a-f]{40}(?:[0-9a-f]{24})?\z/
+  @max_target_ref_bytes 255
   @lease_mutable_fields [:state, :failure_reason, :result_blob_oid]
   @transitions %{
     prepared: [:object_written, :failed],
@@ -70,7 +71,8 @@ defmodule ForgeRepos.GitWriteOperation do
     |> validate_initial_lifecycle()
     |> validate_number(:lock_version, greater_than_or_equal_to: 0)
     |> unique_constraint([:request_id, :kind, :target_ref],
-      name: :git_write_operations_request_ref_index
+      # WORKAROUND(upstream): gsmlg-dev/concord#83
+      name: request_ref_constraint()
     )
   end
 
@@ -280,10 +282,14 @@ defmodule ForgeRepos.GitWriteOperation do
     keys != [] and length(keys) == length(Enum.uniq(keys)) and Enum.all?(keys, &(&1 in allowed))
   end
 
+  defp request_ref_constraint do
+    ~r/^git_write_operations_(?:request_ref|request_id_kind_target_ref|\(request_id_kind_target_ref\))(?: \(\d+\))?_index$/
+  end
+
   defp canonical_full_ref?(ref) when is_binary(ref) do
     components = String.split(ref, "/")
 
-    String.starts_with?(ref, "refs/") and
+    byte_size(ref) <= @max_target_ref_bytes and String.starts_with?(ref, "refs/") and
       byte_size(ref) > byte_size("refs/") and
       not String.ends_with?(ref, "/") and
       not String.ends_with?(ref, ".") and

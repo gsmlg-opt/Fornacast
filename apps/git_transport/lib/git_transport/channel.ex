@@ -12,7 +12,8 @@ defmodule GitTransport.Channel do
             repository: nil,
             buffer: "",
             request: nil,
-            receive_pack_bytes: 0
+            receive_pack_bytes: 0,
+            receive_pack_request_id: nil
 
   @impl :ssh_server_channel
   def init(_args) do
@@ -140,7 +141,8 @@ defmodule GitTransport.Channel do
                repository: repository,
                buffer: "",
                request: GitTransport.ReceivePack.new_request(),
-               receive_pack_bytes: 0
+               receive_pack_bytes: 0,
+               receive_pack_request_id: ssh_request_id()
            }}
         else
           {:error, _reason} -> fail_started(cm, channel_id, state)
@@ -262,10 +264,15 @@ defmodule GitTransport.Channel do
   end
 
   defp finish_receive_pack(cm, channel_id, %{phase: :pack} = request, pack, state) do
-    with {:ok, response, statuses} <-
-           GitTransport.ReceivePack.response(state.repository, request, pack),
-         :ok <- send_data(cm, channel_id, response),
-         :ok <- GitTransport.ReceivePack.record_push(state.actor, state.repository, statuses) do
+    with {:ok, response, _statuses} <-
+           GitTransport.ReceivePack.response(
+             state.actor,
+             state.repository,
+             request,
+             pack,
+             state.receive_pack_request_id
+           ),
+         :ok <- send_data(cm, channel_id, response) do
       exit_success(cm, channel_id, state)
     else
       {:error, _reason} -> fail_started(cm, channel_id, state)
@@ -274,6 +281,10 @@ defmodule GitTransport.Channel do
 
   defp finish_receive_pack(cm, channel_id, _request, _pack, state) do
     fail_started(cm, channel_id, "ERROR: Incomplete Git receive-pack request.\n", state)
+  end
+
+  defp ssh_request_id do
+    "ssh-" <> Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
   end
 
   defp reject(cm, channel_id, want_reply, message, state) do

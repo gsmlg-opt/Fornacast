@@ -74,9 +74,20 @@ defmodule FornacastWeb.GitHTTPController do
          {:ok, body, conn} <-
            read_full_body(conn, GitTransport.ReceivePack.max_request_bytes()),
          {:ok, request, pack} <- parse_receive_pack_request(body),
-         {:ok, response, statuses} <-
-           GitTransport.ReceivePack.response(repository, request, pack),
-         :ok <- GitTransport.ReceivePack.record_push(actor, repository, statuses) do
+         operation_batch_id =
+           GitTransport.ReceivePack.http_operation_batch_id(
+             actor,
+             repository,
+             FornacastWeb.RequestMetadata.external_request_id(conn)
+           ),
+         {:ok, response, _statuses} <-
+           GitTransport.ReceivePack.response(
+             actor,
+             repository,
+             request,
+             pack,
+             operation_batch_id
+           ) do
       send_git_response(conn, @receive_pack_result_type, response)
     else
       {:error, reason} -> send_git_error(conn, reason)

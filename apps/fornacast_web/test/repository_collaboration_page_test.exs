@@ -304,6 +304,65 @@ defmodule FornacastWeb.RepositoryCollaborationPageTest do
     assert String.valid?(request_id)
   end
 
+  test "external request IDs require whole valid UTF-8 before deterministic derivation" do
+    actor = owner()
+    repository = repository()
+    shared_prefix = String.duplicate("a", 20)
+
+    invalid_headers = [shared_prefix <> <<0xFF>>, shared_prefix <> <<0xFE>>]
+
+    extracted =
+      Enum.map(invalid_headers, fn header ->
+        refute String.valid?(header)
+
+        build_conn()
+        |> put_req_header("x-request-id", header)
+        |> RequestMetadata.external_request_id()
+      end)
+
+    assert extracted == [nil, nil]
+
+    assert [first_random, second_random] =
+             Enum.map(extracted, fn request_id ->
+               GitTransport.ReceivePack.http_operation_batch_id(
+                 actor,
+                 repository,
+                 request_id
+               )
+             end)
+
+    refute first_random == second_random
+
+    invalid_twentieth_byte = String.duplicate("b", 19) <> <<0xFF>>
+    assert byte_size(invalid_twentieth_byte) == 20
+
+    assert is_nil(
+             build_conn()
+             |> put_req_header("x-request-id", invalid_twentieth_byte)
+             |> RequestMetadata.external_request_id()
+           )
+
+    for byte_count <- [20, 200] do
+      valid_header = String.duplicate("c", byte_count)
+
+      assert valid_header ==
+               build_conn()
+               |> put_req_header("x-request-id", valid_header)
+               |> RequestMetadata.external_request_id()
+
+      assert GitTransport.ReceivePack.http_operation_batch_id(
+               actor,
+               repository,
+               valid_header
+             ) ==
+               GitTransport.ReceivePack.http_operation_batch_id(
+                 actor,
+                 repository,
+                 valid_header
+               )
+    end
+  end
+
   defp owner do
     %User{id: 1, username: "alice", kind: :user, state: :active}
   end

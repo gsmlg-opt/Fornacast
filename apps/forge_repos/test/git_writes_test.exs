@@ -29,6 +29,16 @@ defmodule ForgeRepos.GitWritesTest do
     assert Ecto.Changeset.get_change(changeset, :expected_oid) == String.downcase(@oid40)
     assert Ecto.Changeset.get_change(changeset, :proposed_oid) == String.downcase(@oid64)
 
+    assert %{constraint: constraint, type: :unique} =
+             Enum.find(changeset.constraints, &(&1.type == :unique))
+
+    assert Regex.match?(constraint, "git_write_operations_request_ref_index")
+
+    assert Regex.match?(
+             constraint,
+             "git_write_operations_(request_id_kind_target_ref) (19)_index"
+           )
+
     assert GitWriteOperation.changeset(%GitWriteOperation{}, Map.put(attrs, :expected_oid, nil)).valid?
 
     for field <- ~w(repository_id request_id kind state target_ref proposed_oid)a do

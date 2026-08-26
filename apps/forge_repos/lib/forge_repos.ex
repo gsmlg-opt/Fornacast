@@ -9,10 +9,21 @@ defmodule ForgeRepos do
   alias Ecto.Changeset
   alias Ecto.Multi
   alias ForgeAccounts.{AccountView, Organization, OrganizationMember, User}
-  alias ForgeRepos.{Collaborator, Repository, RepositoryView, RepositoryWriteReconcilers}
+
+  alias ForgeRepos.{
+    Collaborator,
+    GitWriteOperation,
+    Repository,
+    RepositoryView,
+    RepositoryWriteReconcilers
+  }
+
   alias Fornacast.{Audit, Page, Repo, Storage}
 
   @repository_permissions [:repository_read, :repository_write, :repository_admin]
+  @receive_pack_busy_attempts 12
+  @receive_pack_busy_backoff_ms 5
+  @zero_oid String.duplicate("0", 40)
   @unsupported_features ~w(
     has_projects
     has_wiki
@@ -348,12 +359,33 @@ defmodule ForgeRepos do
       when is_integer(repository_id) and
              class in [:ref, :content, :merge, :tag, :receive_pack] and
              is_function(fun, 2) do
+    with_repository_fence(repository, class, fun, :writer)
+  end
+
+  @spec with_import_publication_fence(
+          Repository.t(),
+          :ref | :content | :merge | :tag | :receive_pack,
+          (Path.t(), non_neg_integer() -> term())
+        ) :: term()
+  def with_import_publication_fence(
+        %Repository{id: repository_id} = repository,
+        class,
+        fun
+      )
+      when is_integer(repository_id) and
+             class in [:ref, :content, :merge, :tag, :receive_pack] and
+             is_function(fun, 2) do
+    with_repository_fence(repository, class, fun, :publication)
+  end
+
+  defp with_repository_fence(repository, class, fun, mismatch_mode) do
     absolute_deadline = System.monotonic_time(:millisecond) + write_deadline(class)
 
-    case GitCore.RepositoryWriteLimiter.acquire(repository_id, absolute_deadline) do
+    case GitCore.RepositoryWriteLimiter.acquire(repository.id, absolute_deadline) do
       {:ok, lease} ->
         try do
-          with {:ok, repository_path} <- safe_absolute_storage_path(repository),
+          with {:ok, repository} <- reload_fenced_repository(repository),
+               {:ok, repository_path} <- safe_absolute_storage_path(repository),
                :ok <-
                  RepositoryWriteReconcilers.reconcile_locked(
                    repository,
@@ -363,6 +395,7 @@ defmodule ForgeRepos do
             remaining = max(absolute_deadline - System.monotonic_time(:millisecond), 0)
             fun.(repository_path, remaining)
           else
+            {:error, :stale_repository} -> fence_mismatch(mismatch_mode)
             {:error, :storage_unavailable} -> {:error, {:unavailable, :storage}}
             {:error, :unavailable} -> {:error, {:unavailable, :write_fence}}
           end
@@ -377,6 +410,26 @@ defmodule ForgeRepos do
         {:error, {:unavailable, :write_limiter}}
     end
   end
+
+  defp reload_fenced_repository(%Repository{id: repository_id, generation: generation})
+       when is_integer(repository_id) and repository_id > 0 and is_integer(generation) and
+              generation > 0 do
+    repository =
+      Repository
+      |> where(
+        [repository],
+        repository.id == ^repository_id and repository.generation == ^generation and
+          repository.lifecycle == :ready and is_nil(repository.deleted_at)
+      )
+      |> Repo.one()
+
+    if repository, do: {:ok, repository}, else: {:error, :stale_repository}
+  end
+
+  defp reload_fenced_repository(%Repository{}), do: {:error, :stale_repository}
+
+  defp fence_mismatch(:writer), do: {:error, {:unavailable, :stale_repository}}
+  defp fence_mismatch(:publication), do: {:error, :destination_changed}
 
   defp write_deadline(class) when class in [:ref, :tag], do: GitCore.Limits.get(:ref_deadline_ms)
 
@@ -402,6 +455,316 @@ defmodule ForgeRepos do
     repository
     |> change(last_pushed_at: pushed_at)
     |> Repo.update()
+  end
+
+  @spec prepare_receive_pack_operations(
+          User.t(),
+          Repository.t(),
+          String.t(),
+          [tuple()],
+          integer()
+        ) ::
+          {:ok, [GitWriteOperation.t()]}
+          | {:error, :conflict | :invalid | :stale_repository | :unavailable}
+  def prepare_receive_pack_operations(
+        %User{id: actor_id, kind: :user, state: :active},
+        %Repository{id: repository_id, generation: generation} = repository,
+        request_id,
+        commands,
+        absolute_deadline
+      )
+      when is_integer(repository_id) and repository_id > 0 and is_integer(generation) and
+             generation > 0 and is_integer(actor_id) and actor_id > 0 and is_binary(request_id) and
+             byte_size(request_id) in 1..255 and is_list(commands) and commands != [] and
+             is_integer(absolute_deadline) do
+    with :ok <- validate_receive_pack_command_count(commands),
+         :ok <- receive_pack_deadline(absolute_deadline),
+         {:ok, operation_attrs} <-
+           receive_pack_operation_attrs(
+             repository,
+             actor_id,
+             request_id,
+             commands,
+             absolute_deadline
+           ) do
+      multi =
+        Multi.new()
+        |> Multi.run(:repository, fn repo, _changes ->
+          fetch_receive_pack_repository(repo, repository)
+        end)
+        |> Multi.run(:operations, fn repo, _changes ->
+          insert_receive_pack_operations(repo, operation_attrs, absolute_deadline)
+        end)
+
+      multi
+      |> transact_receive_pack(@receive_pack_busy_attempts, absolute_deadline)
+      |> case do
+        {:ok, %{operations: operations}} ->
+          case receive_pack_deadline(absolute_deadline) do
+            :ok -> {:ok, operations}
+            {:error, :unavailable} = error -> error
+          end
+
+        {:error, _step, reason, _changes} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  def prepare_receive_pack_operations(
+        _actor,
+        _repository,
+        _request_id,
+        _commands,
+        _absolute_deadline
+      ),
+      do: {:error, :invalid}
+
+  @spec receive_pack_operation_statuses([GitWriteOperation.t()]) ::
+          {:ok, [{String.t(), String.t(), nil | String.t()}]} | {:error, :unavailable}
+  def receive_pack_operation_statuses([%GitWriteOperation{} | _] = operations) do
+    ids = Enum.map(operations, & &1.id)
+
+    if Enum.all?(ids, &(is_integer(&1) and &1 > 0)) and length(Enum.uniq(ids)) == length(ids) do
+      persisted_by_id =
+        GitWriteOperation
+        |> where([operation], operation.id in ^ids)
+        |> Repo.all()
+        |> Map.new(&{&1.id, &1})
+
+      operations
+      |> Enum.reduce_while({:ok, []}, fn expected, {:ok, statuses} ->
+        case Map.fetch(persisted_by_id, expected.id) do
+          {:ok, persisted} ->
+            case receive_pack_terminal_status(expected, persisted) do
+              {:ok, status} -> {:cont, {:ok, [status | statuses]}}
+              {:error, :unavailable} = error -> {:halt, error}
+            end
+
+          :error ->
+            {:halt, {:error, :unavailable}}
+        end
+      end)
+      |> case do
+        {:ok, statuses} -> {:ok, Enum.reverse(statuses)}
+        {:error, :unavailable} = error -> error
+      end
+    else
+      {:error, :unavailable}
+    end
+  end
+
+  def receive_pack_operation_statuses(_operations), do: {:error, :unavailable}
+
+  defp validate_receive_pack_command_count(commands) do
+    limit = GitCore.Limits.get(:receive_pack_commands)
+
+    commands
+    |> Enum.reduce_while(0, fn _command, count ->
+      if count < limit, do: {:cont, count + 1}, else: {:halt, :too_many}
+    end)
+    |> case do
+      count when is_integer(count) -> :ok
+      :too_many -> {:error, :unavailable}
+    end
+  end
+
+  if Mix.env() == :test do
+    @receive_pack_transaction_hook_key {__MODULE__, :receive_pack_transaction_hook}
+
+    @doc false
+    def with_test_receive_pack_transaction_hook(hook, fun)
+        when is_function(hook, 2) and is_function(fun, 0) do
+      previous = Process.get(@receive_pack_transaction_hook_key)
+      Process.put(@receive_pack_transaction_hook_key, hook)
+
+      try do
+        fun.()
+      after
+        if previous == nil,
+          do: Process.delete(@receive_pack_transaction_hook_key),
+          else: Process.put(@receive_pack_transaction_hook_key, previous)
+      end
+    end
+
+    defp execute_receive_pack_transaction(multi, timeout) do
+      case Process.get(@receive_pack_transaction_hook_key) do
+        hook when is_function(hook, 2) -> hook.(multi, timeout)
+        nil -> Repo.transaction(multi, timeout: timeout)
+      end
+    end
+  else
+    defp execute_receive_pack_transaction(multi, timeout),
+      do: Repo.transaction(multi, timeout: timeout)
+  end
+
+  defp receive_pack_operation_attrs(
+         repository,
+         actor_id,
+         request_id,
+         commands,
+         absolute_deadline
+       ) do
+    commands
+    |> Enum.reduce_while({:ok, [], MapSet.new()}, fn
+      {old_oid, new_oid, target_ref}, {:ok, attrs, refs}
+      when is_binary(old_oid) and is_binary(new_oid) and is_binary(target_ref) ->
+        case receive_pack_deadline(absolute_deadline) do
+          :ok ->
+            if MapSet.member?(refs, target_ref) do
+              {:halt, {:error, :invalid}}
+            else
+              operation_attrs = %{
+                repository_id: repository.id,
+                actor_user_id: actor_id,
+                request_id: request_id,
+                kind: :receive_pack,
+                state: :prepared,
+                target_ref: target_ref,
+                expected_oid: normalize_receive_pack_expected_oid(old_oid),
+                proposed_oid: String.downcase(new_oid),
+                result_blob_oid: nil,
+                failure_reason: nil,
+                lease_owner: nil,
+                lease_expires_at: nil,
+                lock_version: 0
+              }
+
+              changeset = GitWriteOperation.changeset(%GitWriteOperation{}, operation_attrs)
+
+              if changeset.valid? do
+                {:cont, {:ok, [operation_attrs | attrs], MapSet.put(refs, target_ref)}}
+              else
+                {:halt, {:error, :invalid}}
+              end
+            end
+
+          {:error, :unavailable} = error ->
+            {:halt, error}
+        end
+
+      _invalid, _acc ->
+        {:halt, {:error, :invalid}}
+    end)
+    |> case do
+      {:ok, attrs, _refs} -> {:ok, Enum.reverse(attrs)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp normalize_receive_pack_expected_oid(@zero_oid), do: nil
+  defp normalize_receive_pack_expected_oid(oid), do: String.downcase(oid)
+
+  defp fetch_receive_pack_repository(repo, repository) do
+    query =
+      from candidate in Repository,
+        where:
+          candidate.id == ^repository.id and candidate.generation == ^repository.generation and
+            candidate.lifecycle == :ready and is_nil(candidate.deleted_at)
+
+    case repo.one(query) do
+      %Repository{} = repository -> {:ok, repository}
+      nil -> {:error, :stale_repository}
+    end
+  end
+
+  defp insert_receive_pack_operations(repo, operation_attrs, absolute_deadline) do
+    operation_attrs
+    |> Enum.reduce_while({:ok, []}, fn attrs, {:ok, operations} ->
+      case receive_pack_deadline(absolute_deadline) do
+        :ok ->
+          changeset = GitWriteOperation.changeset(%GitWriteOperation{}, attrs)
+
+          case repo.insert(changeset) do
+            {:ok, operation} -> {:cont, {:ok, [operation | operations]}}
+            {:error, %Changeset{}} -> {:halt, {:error, :conflict}}
+          end
+
+        {:error, :unavailable} = error ->
+          {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, operations} -> {:ok, Enum.reverse(operations)}
+      {:error, _reason} = error -> error
+    end
+  rescue
+    error in Turso.Error -> reraise error, __STACKTRACE__
+  end
+
+  defp transact_receive_pack(multi, attempts_remaining, absolute_deadline) do
+    case receive_pack_timeout(absolute_deadline) do
+      {:ok, timeout} ->
+        case execute_receive_pack_transaction(multi, timeout) do
+          :busy -> retry_receive_pack_transaction(multi, attempts_remaining, absolute_deadline)
+          result -> result
+        end
+
+      {:error, :unavailable} ->
+        receive_pack_transaction_error()
+    end
+  rescue
+    error in Turso.Error ->
+      if error.code == :busy do
+        retry_receive_pack_transaction(multi, attempts_remaining, absolute_deadline)
+      else
+        receive_pack_transaction_error()
+      end
+  end
+
+  defp retry_receive_pack_transaction(multi, attempts_remaining, absolute_deadline) do
+    remaining = absolute_deadline - System.monotonic_time(:millisecond)
+
+    if turso_adapter?() and attempts_remaining > 1 and remaining > 1 do
+      attempt = @receive_pack_busy_attempts - attempts_remaining + 1
+      backoff = min(attempt * @receive_pack_busy_backoff_ms, remaining - 1)
+      Process.sleep(backoff)
+      transact_receive_pack(multi, attempts_remaining - 1, absolute_deadline)
+    else
+      receive_pack_transaction_error()
+    end
+  end
+
+  defp receive_pack_terminal_status(expected, persisted) do
+    if receive_pack_operation_identity?(expected, persisted) do
+      case persisted.state do
+        :bookkeeping_complete -> {:ok, {persisted.target_ref, "ok", nil}}
+        :failed -> {:ok, {persisted.target_ref, "ng", "Git receive-pack failed"}}
+        _nonterminal -> {:error, :unavailable}
+      end
+    else
+      {:error, :unavailable}
+    end
+  end
+
+  defp receive_pack_operation_identity?(expected, persisted) do
+    persisted.id == expected.id and persisted.repository_id == expected.repository_id and
+      persisted.actor_user_id == expected.actor_user_id and
+      persisted.request_id == expected.request_id and persisted.kind == :receive_pack and
+      persisted.target_ref == expected.target_ref and
+      persisted.expected_oid == expected.expected_oid and
+      persisted.proposed_oid == expected.proposed_oid
+  end
+
+  defp receive_pack_timeout(absolute_deadline) do
+    case absolute_deadline - System.monotonic_time(:millisecond) do
+      remaining when remaining > 0 -> {:ok, remaining}
+      _expired -> {:error, :unavailable}
+    end
+  end
+
+  defp receive_pack_deadline(absolute_deadline) do
+    case receive_pack_timeout(absolute_deadline) do
+      {:ok, _remaining} -> :ok
+      {:error, :unavailable} = error -> error
+    end
+  end
+
+  defp receive_pack_transaction_error,
+    do: {:error, :operations, :unavailable, %{}}
+
+  defp turso_adapter? do
+    Application.get_env(:fornacast, :database_adapter) in ["libsql", "turso"]
   end
 
   def ssh_clone_url(%Repository{} = repository, owner, actor \\ nil) do

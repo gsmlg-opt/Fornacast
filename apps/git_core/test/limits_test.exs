@@ -17,6 +17,7 @@ defmodule GitCore.LimitsTest do
     contents_json_bytes: 146_800_640,
     ref_deadline_ms: 10_000,
     content_deadline_ms: 60_000,
+    receive_pack_commands: 1_024,
     receive_pack_bytes: 104_857_600,
     body_total_timeout_ms: 120_000,
     body_idle_timeout_ms: 15_000,
