@@ -332,7 +332,8 @@ defmodule FornacastWeb.HTML do
     items = [
       {:profile, "Profile", "/settings"},
       {:api_keys, "Applications", "/settings/api-keys"},
-      {:ssh_keys, "SSH Keys", "/settings/ssh-keys"}
+      {:ssh_keys, "SSH Keys", "/settings/ssh-keys"},
+      {:github, "GitHub", "/settings/github"}
     ]
 
     navigation =

@@ -1,6 +1,7 @@
 defmodule FornacastWeb.APIKeyController do
   use FornacastWeb, :controller
 
+  plug :put_private_no_store
   plug :require_active_user
 
   def index(%Plug.Conn{assigns: %{current_user: user}} = conn, _params) do
@@ -15,8 +16,6 @@ defmodule FornacastWeb.APIKeyController do
       {:ok, _key, secret} ->
         conn
         |> put_status(:created)
-        |> put_resp_header("cache-control", "private, no-store")
-        |> put_resp_header("pragma", "no-cache")
         |> render_index(user, secret: secret)
 
       {:error, changeset} ->
@@ -226,5 +225,11 @@ defmodule FornacastWeb.APIKeyController do
     |> delete_session(:user_id)
     |> redirect(to: "/login")
     |> halt()
+  end
+
+  defp put_private_no_store(conn, _opts) do
+    conn
+    |> put_resp_header("cache-control", "private, no-store")
+    |> put_resp_header("pragma", "no-cache")
   end
 end

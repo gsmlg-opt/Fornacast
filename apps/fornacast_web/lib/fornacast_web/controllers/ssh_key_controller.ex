@@ -1,6 +1,8 @@
 defmodule FornacastWeb.SSHKeyController do
   use FornacastWeb, :controller
 
+  plug :put_private_no_store
+
   def index(%Plug.Conn{assigns: %{current_user: user}} = conn, _params) do
     keys = ForgeAccounts.list_user_ssh_keys(user)
     path = ssh_keys_path(conn)
@@ -102,5 +104,10 @@ defmodule FornacastWeb.SSHKeyController do
       </form>
       """
     )
+  end
+  defp put_private_no_store(conn, _opts) do
+    conn
+    |> put_resp_header("cache-control", "private, no-store")
+    |> put_resp_header("pragma", "no-cache")
   end
 end

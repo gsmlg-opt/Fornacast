@@ -21,6 +21,10 @@ defmodule FornacastWeb.Router do
     plug FornacastWeb.Plugs.RequireUser
   end
 
+  pipeline :private_no_store do
+    plug :put_private_no_store
+  end
+
   scope "/", FornacastWeb do
     get "/health", HealthController, :show
 
@@ -45,6 +49,21 @@ defmodule FornacastWeb.Router do
   end
 
   scope "/", FornacastWeb do
+    pipe_through [:private_no_store, :browser, :authenticated]
+
+    get "/settings/github", GitHubSettingsController, :index
+    post "/settings/github", GitHubSettingsController, :create
+    post "/settings/github/:identity_id/reverify", GitHubSettingsController, :reverify
+    put "/settings/github/:identity_id/credential", GitHubSettingsController, :replace
+
+    delete "/settings/github/:identity_id/credential",
+           GitHubSettingsController,
+           :delete_credential
+
+    delete "/settings/github/:identity_id", GitHubSettingsController, :unlink
+  end
+
+  scope "/", FornacastWeb do
     pipe_through [:browser, :authenticated]
 
     get "/", DashboardController, :index
@@ -60,7 +79,6 @@ defmodule FornacastWeb.Router do
     get "/settings/api-keys", APIKeyController, :index
     post "/settings/api-keys", APIKeyController, :create
     delete "/settings/api-keys/:id", APIKeyController, :delete
-
     get "/organizations/new", OrganizationController, :new
     post "/organizations", OrganizationController, :create
 
@@ -101,5 +119,11 @@ defmodule FornacastWeb.Router do
     get "/:owner/:repo/search", RepositoryController, :search
     get "/:owner/:repo/src/*segments", RepositoryController, :src
     get "/:owner/:repo/raw/*segments", RepositoryController, :raw
+  end
+
+  defp put_private_no_store(conn, _opts) do
+    conn
+    |> put_resp_header("cache-control", "private, no-store")
+    |> put_resp_header("pragma", "no-cache")
   end
 end
