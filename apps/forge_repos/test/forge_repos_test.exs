@@ -528,6 +528,92 @@ defmodule ForgeReposTest do
   end
 
   @tag :tmp_dir
+  test "every ordinary repository query hides importing, tombstoned, and deleted rows", %{
+    tmp_dir: tmp_dir
+  } do
+    use_storage_root(tmp_dir)
+    owner = user_fixture("ready-only-owner")
+
+    ready_public =
+      repository_fixture(owner, slug: "ready-public", visibility: :public, storage: true)
+
+    ready_private = repository_fixture(owner, slug: "ready-private", storage: true)
+
+    importing =
+      repository_fixture(owner, slug: "importing", visibility: :public)
+      |> hide_repository(:importing, "../importing.git")
+
+    tombstoned =
+      repository_fixture(owner, slug: "tombstoned")
+      |> hide_repository(:tombstoned, "../tombstoned.git")
+
+    ready_deleted =
+      repository_fixture(owner, slug: "ready-deleted", visibility: :public)
+      |> hide_repository(:ready, "../ready-deleted.git", ~U[2026-08-26 00:00:00Z])
+
+    importing_deleted =
+      repository_fixture(owner, slug: "importing-deleted", visibility: :public)
+      |> hide_repository(:importing, "../importing-deleted.git", ~U[2026-08-26 00:00:00Z])
+
+    expected_ids = MapSet.new([ready_public.id, ready_private.id])
+
+    assert MapSet.new(ForgeRepos.list_owner_repositories(owner), & &1.id) == expected_ids
+    assert MapSet.new(ForgeRepos.list_accessible_repositories(owner), & &1.id) == expected_ids
+
+    assert {:ok, %Page{entries: accessible_entries, total: 2}} =
+             ForgeRepos.list_accessible_repository_views(owner, page: 1, per_page: 100)
+
+    assert MapSet.new(accessible_entries, & &1.repository.id) == expected_ids
+
+    assert {:ok, %Page{entries: account_entries, total: 2}} =
+             ForgeRepos.list_account_repository_views(owner, owner,
+               visibility_ceiling: :all,
+               page: 1,
+               per_page: 100
+             )
+
+    assert MapSet.new(account_entries, & &1.repository.id) == expected_ids
+
+    assert %AccountView{public_repos: 1, private_repos: 1} =
+             ForgeRepos.account_view(owner, owner)
+
+    for hidden <- [importing, tombstoned, ready_deleted, importing_deleted] do
+      assert ForgeRepos.get_repository(owner.username, hidden.slug) == nil
+
+      assert {:error, :not_found} =
+               ForgeRepos.resolve_git_path("#{owner.username}/#{hidden.slug}.git")
+
+      assert {:error, :not_found} = ForgeRepos.repository_view(owner, hidden)
+
+      assert {:error, :not_found} =
+               ForgeRepos.update_api_repository(
+                 owner,
+                 hidden,
+                 %{"description" => "must not update"},
+                 request_metadata("hidden-update-#{hidden.id}"),
+                 expected_visibility: hidden.visibility
+               )
+    end
+
+    assert {:ok, %Repository{id: importing_id, lifecycle: :importing}} =
+             ForgeRepos.fetch_importing_repository(importing.id)
+
+    assert importing_id == importing.id
+
+    for unavailable <- [
+          ready_public,
+          ready_private,
+          tombstoned,
+          ready_deleted,
+          importing_deleted
+        ] do
+      assert {:error, :not_found} = ForgeRepos.fetch_importing_repository(unavailable.id)
+    end
+
+    assert {:error, :not_found} = ForgeRepos.fetch_importing_repository(-1)
+  end
+
+  @tag :tmp_dir
   test "accessible repository views include every affiliation once with deterministic pagination",
        %{tmp_dir: tmp_dir} do
     use_storage_root(tmp_dir)
@@ -1549,6 +1635,17 @@ defmodule ForgeReposTest do
 
     if Keyword.get(attrs, :storage, false), do: write_repository_bytes(repository, "fixture")
     repository
+  end
+
+  defp hide_repository(repository, lifecycle, storage_path, deleted_at \\ nil) do
+    {1, nil} =
+      Repository
+      |> where(id: ^repository.id)
+      |> Repo.update_all(
+        set: [lifecycle: lifecycle, storage_path: storage_path, deleted_at: deleted_at]
+      )
+
+    Repo.get!(Repository, repository.id)
   end
 
   defp request_metadata(request_id) do

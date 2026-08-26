@@ -4,6 +4,7 @@ defmodule FornacastAPI.UsersOrganizationsTest do
   import Ecto.Query
 
   alias ForgeAccounts.User
+  alias ForgeRepos.Repository
   alias Fornacast.{AuditEvent, Repo}
 
   @versions ["2022-11-28", "2026-03-10"]
@@ -62,6 +63,44 @@ defmodule FornacastAPI.UsersOrganizationsTest do
 
     invalid = api_conn(secret: "fc_pat_invalid") |> get("/api/v3/user")
     assert_error(invalid, 401, "Bad credentials", @authentication_url, "")
+  end
+
+  test "user and organization repository counts exclude every non-ready shape", %{alice: alice} do
+    _ready_public = repository(alice, "ready-public", visibility: :public)
+    _ready_private = repository(alice, "ready-private", visibility: :private)
+
+    for {slug, lifecycle, visibility, deleted_at} <- [
+          {"importing-public", :importing, :public, nil},
+          {"importing-private", :importing, :private, nil},
+          {"tombstoned-public", :tombstoned, :public, nil},
+          {"tombstoned-private", :tombstoned, :private, nil},
+          {"ready-deleted", :ready, :public, ~U[2026-08-26 00:00:00Z]}
+        ] do
+      alice
+      |> repository(slug, visibility: visibility)
+      |> Ecto.Changeset.change(lifecycle: lifecycle, deleted_at: deleted_at)
+      |> Repo.update!()
+    end
+
+    organization = organization(alice, "count-org")
+    _organization_ready = repository(organization, "ready", visibility: :public)
+
+    organization
+    |> repository("importing", visibility: :public)
+    |> Ecto.Changeset.change(lifecycle: :importing)
+    |> Repo.update!()
+
+    {_key, secret} = pat(alice, ["repo"])
+    private_body = api_conn(secret: secret) |> get("/api/v3/user") |> json_response(200)
+    assert private_body["public_repos"] == 1
+    assert private_body["owned_private_repos"] == 1
+    assert private_body["total_private_repos"] == 1
+
+    public_body = api_conn() |> get("/api/v3/users/alice") |> json_response(200)
+    assert public_body["public_repos"] == 1
+
+    organization_body = api_conn() |> get("/api/v3/orgs/count-org") |> json_response(200)
+    assert organization_body["public_repos"] == 1
   end
 
   test "GET /users/:username is anonymous, typed, active, and versioned", %{alice: alice} do
@@ -499,4 +538,15 @@ defmodule FornacastAPI.UsersOrganizationsTest do
   end
 
   defp audit_count, do: Repo.aggregate(AuditEvent, :count, :id)
+
+  defp repository(owner, slug, opts) do
+    %Repository{owner_user_id: owner.id, storage_path: "@test/#{owner.id}/#{slug}.git"}
+    |> Repository.create_changeset(%{
+      slug: slug,
+      name: slug,
+      visibility: Keyword.get(opts, :visibility, :private),
+      default_branch: "main"
+    })
+    |> Repo.insert!()
+  end
 end

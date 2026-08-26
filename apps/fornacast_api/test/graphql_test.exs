@@ -1,6 +1,8 @@
 defmodule FornacastAPI.GraphQLTest do
   use FornacastAPI.ConnCase, async: false
 
+  alias Fornacast.Repo
+
   @moduletag :tmp_dir
 
   @user_agent "fornacast-graphql-test/1.0"
@@ -144,6 +146,40 @@ defmodule FornacastAPI.GraphQLTest do
 
     missing = graphql(query: ~s|{ repository(owner: "alice", name: "nope") { name } }|)
     assert missing["data"]["repository"] == nil
+  end
+
+  test "repository returns null for importing, tombstoned, and ready-deleted rows", %{
+    alice: alice
+  } do
+    for {slug, lifecycle, deleted_at} <- [
+          {"graphql-importing", :importing, nil},
+          {"graphql-tombstoned", :tombstoned, nil},
+          {"graphql-ready-deleted", :ready, ~U[2026-08-26 00:00:00Z]}
+        ] do
+      {:ok, repository} =
+        ForgeRepos.create_repository(alice, %{
+          name: slug,
+          slug: slug,
+          visibility: :public
+        })
+
+      repository
+      |> Ecto.Changeset.change(lifecycle: lifecycle, deleted_at: deleted_at)
+      |> Repo.update!()
+
+      body = graphql(query: ~s|{ repository(owner: "alice", name: "#{slug}") { name } }|)
+      assert body["data"]["repository"] == nil
+
+      {_key, secret} = pat(alice, ["repo"], name: "graphql-#{slug}")
+
+      owner_body =
+        graphql(
+          secret: secret,
+          query: ~s|{ repository(owner: "alice", name: "#{slug}") { name } }|
+        )
+
+      assert owner_body["data"]["repository"] == nil
+    end
   end
 
   test "GraphQL requires User-Agent and does not require API version", %{alice: alice} do

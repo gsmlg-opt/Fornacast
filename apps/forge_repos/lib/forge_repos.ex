@@ -59,12 +59,11 @@ defmodule ForgeRepos do
       {:error, :not_found}
     else
       repository =
-        Repository
+        ready_repository()
         |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
         |> where(
-          [repository, owner],
-          is_nil(repository.deleted_at) and owner.state == :active and
-            owner.kind in [:user, :organization]
+          [_repository, owner],
+          owner.state == :active and owner.kind in [:user, :organization]
         )
         |> where([_repository, owner], owner.username == ^normalize_account_slug(owner_slug))
         |> where(
@@ -87,12 +86,12 @@ defmodule ForgeRepos do
       when is_integer(repository_id) and repository_id > 0 and
              permission in @repository_permissions do
     repository =
-      Repository
+      ready_repository()
       |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
       |> where(
         [repository, owner],
-        repository.id == ^repository_id and is_nil(repository.deleted_at) and
-          owner.state == :active and owner.kind in [:user, :organization]
+        repository.id == ^repository_id and owner.state == :active and
+          owner.kind in [:user, :organization]
       )
       |> select([repository, _owner], repository)
       |> Repo.one()
@@ -102,6 +101,27 @@ defmodule ForgeRepos do
 
   def fetch_authorized_repository_by_id(_actor, _repository_id, _permission),
     do: {:error, :forbidden}
+
+  @spec fetch_importing_repository(pos_integer()) ::
+          {:ok, Repository.t()} | {:error, :not_found}
+  def fetch_importing_repository(repository_id)
+      when is_integer(repository_id) and repository_id > 0 do
+    repository =
+      Repository
+      |> where(
+        [repository],
+        repository.id == ^repository_id and repository.lifecycle == :importing and
+          is_nil(repository.deleted_at)
+      )
+      |> Repo.one()
+
+    case repository do
+      %Repository{} = repository -> {:ok, repository}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  def fetch_importing_repository(_repository_id), do: {:error, :not_found}
 
   @spec repository_view(User.t() | nil, Repository.t()) ::
           {:ok, RepositoryView.t()} | {:error, :not_found | {:unavailable, atom()}}
@@ -251,8 +271,8 @@ defmodule ForgeRepos do
     do: {:error, :forbidden}
 
   def list_owner_repositories(%{id: owner_user_id}) do
-    Repository
-    |> where([repo], repo.owner_user_id == ^owner_user_id and is_nil(repo.deleted_at))
+    ready_repository()
+    |> where([repo], repo.owner_user_id == ^owner_user_id)
     |> order_by([repo], asc: repo.slug)
     |> Repo.all()
   end
@@ -262,8 +282,8 @@ defmodule ForgeRepos do
       [user | ForgeAccounts.list_user_organizations(user)]
       |> Enum.map(& &1.id)
 
-    Repository
-    |> where([repo], repo.owner_user_id in ^owner_ids and is_nil(repo.deleted_at))
+    ready_repository()
+    |> where([repo], repo.owner_user_id in ^owner_ids)
     |> order_by([repo], asc: repo.slug)
     |> Repo.all()
   end
@@ -292,10 +312,9 @@ defmodule ForgeRepos do
 
   def get_repository(owner_slug, repo_slug) when is_binary(owner_slug) and is_binary(repo_slug) do
     with %User{id: owner_user_id} <- ForgeAccounts.get_account_by_username(owner_slug) do
-      Repository
+      ready_repository()
       |> where([repo], repo.owner_user_id == ^owner_user_id)
       |> where([repo], repo.slug == ^Repository.normalize_slug(repo_slug))
-      |> where([repo], is_nil(repo.deleted_at))
       |> Repo.one()
     end
   end
@@ -445,9 +464,8 @@ defmodule ForgeRepos do
 
   defp directly_owned_repository_counts(owner_id) do
     counts =
-      Repository
+      ready_repository()
       |> where([repository], repository.owner_user_id == ^owner_id)
-      |> where([repository], is_nil(repository.deleted_at))
       |> group_by([repository], repository.visibility)
       |> select([repository], {repository.visibility, count(repository.id)})
       |> Repo.all()
@@ -794,7 +812,7 @@ defmodule ForgeRepos do
   defp accessible_repository_query(actor, params) do
     ids = accessible_repository_ids(actor, params.affiliations)
 
-    Repository
+    ready_repository()
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
     |> where([repository, _owner], repository.id in subquery(ids))
     |> apply_visibility_ceiling(params.visibility_ceiling)
@@ -807,7 +825,7 @@ defmodule ForgeRepos do
   defp accessible_repository_ids(%User{id: actor_id}, affiliations) do
     relationship = affiliation_dynamic(affiliations, actor_id)
 
-    Repository
+    ready_repository()
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
     |> join(:left, [repository, _owner], membership in OrganizationMember,
       on:
@@ -817,8 +835,8 @@ defmodule ForgeRepos do
       on: collaborator.repository_id == repository.id and collaborator.user_id == ^actor_id
     )
     |> where(
-      [repository, owner, _membership, _collaborator],
-      is_nil(repository.deleted_at) and owner.state == :active
+      [_repository, owner, _membership, _collaborator],
+      owner.state == :active
     )
     |> where(^relationship)
     |> select([repository, _owner, _membership, _collaborator], repository.id)
@@ -877,7 +895,7 @@ defmodule ForgeRepos do
 
   defp apply_accessible_type_filter(query, %User{id: actor_id}, :member) do
     member_ids =
-      Repository
+      ready_repository()
       |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
       |> join(:inner, [repository, _owner], membership in OrganizationMember,
         on:
@@ -907,13 +925,13 @@ defmodule ForgeRepos do
     candidate_ids = account_repository_ids(account, params.type)
     visible_ids = visible_repository_ids(candidate_ids, actor, params.visibility_ceiling)
 
-    Repository
+    ready_repository()
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
     |> where([repository, _owner], repository.id in subquery(visible_ids))
   end
 
   defp account_repository_ids(%User{id: account_id}, type) do
-    Repository
+    ready_repository()
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
     |> join(:left, [repository, _owner], membership in OrganizationMember,
       on:
@@ -921,8 +939,8 @@ defmodule ForgeRepos do
           membership.user_id == ^account_id
     )
     |> where(
-      [repository, owner, _membership],
-      is_nil(repository.deleted_at) and owner.state == :active
+      [_repository, owner, _membership],
+      owner.state == :active
     )
     |> where(^user_account_type_dynamic(type, account_id))
     |> select([repository, _owner, _membership], repository.id)
@@ -930,12 +948,12 @@ defmodule ForgeRepos do
   end
 
   defp account_repository_ids(%Organization{id: organization_id}, type) do
-    Repository
+    ready_repository()
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
     |> where(
       [repository, owner],
-      repository.owner_user_id == ^organization_id and is_nil(repository.deleted_at) and
-        owner.kind == :organization and owner.state == :active
+      repository.owner_user_id == ^organization_id and owner.kind == :organization and
+        owner.state == :active
     )
     |> apply_organization_account_type(type)
     |> select([repository, _owner], repository.id)
@@ -977,7 +995,7 @@ defmodule ForgeRepos do
   end
 
   defp visible_repository_ids(candidate_ids, _actor, :public) do
-    Repository
+    ready_repository()
     |> where([repository], repository.id in subquery(candidate_ids))
     |> where([repository], repository.visibility == :public)
     |> select([repository], repository.id)
@@ -988,13 +1006,13 @@ defmodule ForgeRepos do
   end
 
   defp visible_repository_ids(candidate_ids, %User{role: :admin}, :all) do
-    Repository
+    ready_repository()
     |> where([repository], repository.id in subquery(candidate_ids))
     |> select([repository], repository.id)
   end
 
   defp visible_repository_ids(candidate_ids, %User{id: actor_id}, :all) do
-    Repository
+    ready_repository()
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
     |> join(:left, [repository, _owner], membership in OrganizationMember,
       on:
@@ -1137,7 +1155,7 @@ defmodule ForgeRepos do
   end
 
   defp repository_context_query(repository_ids) do
-    Repository
+    ready_repository()
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
     |> join(:left, [_repository, owner], organization in Organization,
       on:
@@ -1146,8 +1164,8 @@ defmodule ForgeRepos do
     )
     |> where(
       [repository, owner, _organization],
-      repository.id in ^repository_ids and is_nil(repository.deleted_at) and
-        owner.state == :active and owner.kind in [:user, :organization]
+      repository.id in ^repository_ids and owner.state == :active and
+        owner.kind in [:user, :organization]
     )
   end
 
@@ -1287,11 +1305,10 @@ defmodule ForgeRepos do
   defp guard_repository_visibility(repo, repository_id, expected_visibility)
        when expected_visibility in [:public, :private] do
     guarded_query =
-      Repository
+      ready_repository()
       |> where(
         [repository],
-        repository.id == ^repository_id and is_nil(repository.deleted_at) and
-          repository.visibility == ^expected_visibility
+        repository.id == ^repository_id and repository.visibility == ^expected_visibility
       )
 
     case repo.update_all(guarded_query, set: [visibility: expected_visibility]) do
@@ -1301,15 +1318,23 @@ defmodule ForgeRepos do
   end
 
   defp active_repository_for_update(repo, repository_id) do
-    Repository
+    ready_repository()
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
     |> where(
       [repository, owner],
-      repository.id == ^repository_id and is_nil(repository.deleted_at) and
-        owner.state == :active and owner.kind in [:user, :organization]
+      repository.id == ^repository_id and owner.state == :active and
+        owner.kind in [:user, :organization]
     )
     |> select([repository, _owner], repository)
     |> repo.one()
+  end
+
+  defp ready_repository(query \\ Repository) do
+    where(
+      query,
+      [repository],
+      repository.lifecycle == :ready and is_nil(repository.deleted_at)
+    )
   end
 
   defp map_update_authorization(actor, permission, repository) do

@@ -630,6 +630,38 @@ defmodule FornacastWeb.RepositoryControllerTest do
     assert TestPage.calls() == []
   end
 
+  test "every repository route masks non-ready rows before page or storage access", %{
+    alice: alice
+  } do
+    hidden = [
+      insert_repository!(alice, "importing-repo", :public)
+      |> hide_repository(:importing, "../importing.git"),
+      insert_repository!(alice, "tombstoned-repo", :private)
+      |> hide_repository(:tombstoned, "../tombstoned.git"),
+      insert_repository!(alice, "ready-deleted-repo", :public)
+      |> hide_repository(:ready, "../ready-deleted.git", ~U[2026-08-26 00:00:00Z])
+    ]
+
+    for repository <- hidden,
+        suffix <- [
+          "",
+          "/branches",
+          "/tags",
+          "/commits/main",
+          "/commit/deadbeef",
+          "/src/main",
+          "/raw/main/README.md",
+          "/search"
+        ] do
+      conn = request_conn(alice) |> get("/alice/#{repository.slug}#{suffix}")
+      assert html_response(conn, 404) =~ "Repository not found"
+      refute conn.resp_body =~ repository.slug
+      assert_private_no_store(conn)
+    end
+
+    assert TestPage.calls() == []
+  end
+
   test "create and import stay authenticated while dynamic public reads do not" do
     assert redirected_to(request_conn() |> get("/repos/new")) == "/login"
     assert redirected_to(request_conn() |> get("/repos/import")) == "/login"
@@ -1346,6 +1378,16 @@ defmodule FornacastWeb.RepositoryControllerTest do
       storage_path: "@test/#{slug}.git",
       default_branch: "main"
     })
+  end
+
+  defp hide_repository(repository, lifecycle, storage_path, deleted_at \\ nil) do
+    repository
+    |> Ecto.Changeset.change(
+      lifecycle: lifecycle,
+      storage_path: storage_path,
+      deleted_at: deleted_at
+    )
+    |> Fornacast.Repo.update!()
   end
 
   defp reset_database! do

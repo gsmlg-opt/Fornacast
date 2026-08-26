@@ -183,8 +183,48 @@ defmodule FornacastWebTest do
     assert html =~ ~s(<a href="/settings" class="active" aria-current="page">Profile</a>)
     assert html =~ ~s(<a href="/settings/api-keys">Applications</a>)
     assert html =~ ~s(<a href="/settings/ssh-keys">SSH Keys</a>)
+    assert html =~ ~s(<a href="/settings/github">GitHub</a>)
     assert html =~ "@alice"
     assert html =~ "alice-settings@example.com"
+  end
+
+  @tag :tmp_dir
+  test "dashboard and namespace pages omit non-ready repositories", %{tmp_dir: tmp_dir} do
+    reset_database!()
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "lifecycle-pages",
+               email: "lifecycle-pages@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, _ready} =
+             ForgeRepos.create_repository(user, %{name: "Visible ready", slug: "visible-ready"})
+
+    for {slug, lifecycle} <- [
+          {"hidden-importing", :importing},
+          {"hidden-tombstoned", :tombstoned}
+        ] do
+      assert {:ok, repository} =
+               ForgeRepos.create_repository(user, %{name: slug, slug: slug})
+
+      repository
+      |> Ecto.Changeset.change(lifecycle: lifecycle)
+      |> Fornacast.Repo.update!()
+    end
+
+    conn = build_conn() |> Plug.Test.init_test_session(user_id: user.id)
+
+    for path <- ["/", "/lifecycle-pages"] do
+      body = conn |> get(path) |> html_response(200)
+      assert body =~ "visible-ready"
+      refute body =~ "hidden-importing"
+      refute body =~ "hidden-tombstoned"
+    end
   end
 
   test "SSH keys are available from settings" do
@@ -1151,6 +1191,49 @@ defmodule FornacastWebTest do
 
     assert ["application/x-git-upload-pack-advertisement"] =
              Plug.Conn.get_resp_header(authorized, "content-type")
+  end
+
+  @tag :tmp_dir
+  test "smart HTTP masks non-ready repositories for upload and receive", %{tmp_dir: tmp_dir} do
+    reset_database!()
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
+
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "hidden-http",
+               email: "hidden-http@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, repository} =
+             ForgeRepos.create_repository(user, %{
+               name: "Hidden",
+               slug: "hidden",
+               visibility: :public
+             })
+
+    repository
+    |> Ecto.Changeset.change(lifecycle: :importing, storage_path: "../hidden.git")
+    |> Fornacast.Repo.update!()
+
+    assert {:ok, _api_key, secret} =
+             ForgeAccounts.create_api_key(user, %{name: "Hidden Git", scopes: ["repo"]})
+
+    authenticated =
+      build_conn()
+      |> Plug.Conn.put_req_header(
+        "authorization",
+        "Basic " <> Base.encode64("hidden-http:#{secret}")
+      )
+
+    for service <- ["git-upload-pack", "git-receive-pack"] do
+      path = "/hidden-http/hidden.git/info/refs?service=#{service}"
+      assert response(get(build_conn(), path), 401) == "Authentication required.\n"
+      assert response(get(authenticated, path), 404) == "Repository not found.\n"
+    end
   end
 
   defp git!(args), do: git!(args, [])

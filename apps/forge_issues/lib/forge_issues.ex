@@ -715,8 +715,9 @@ defmodule ForgeIssues do
       )
       |> where(
         [repository, owner],
-        repository.id == ^repository_id and is_nil(repository.deleted_at) and
-          owner.state == :active and owner.kind in [:user, :organization]
+        repository.id == ^repository_id and repository.lifecycle == :ready and
+          is_nil(repository.deleted_at) and owner.state == :active and
+          owner.kind in [:user, :organization]
       )
       |> select([repository, _owner], repository)
       |> repo.one()

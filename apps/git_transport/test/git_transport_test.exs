@@ -185,6 +185,45 @@ defmodule GitTransportTest do
   end
 
   @tag :tmp_dir
+  test "SSH upload-pack and receive-pack mask non-ready repositories", %{tmp_dir: tmp_dir} do
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "hidden-ssh",
+               email: "hidden-ssh@example.com",
+               password: "correct horse battery staple"
+             })
+
+    for {slug, lifecycle, deleted_at} <- [
+          {"importing", :importing, nil},
+          {"tombstoned", :tombstoned, nil},
+          {"ready-deleted", :ready, ~U[2026-08-26 00:00:00Z]}
+        ] do
+      assert {:ok, repository} =
+               ForgeRepos.create_repository(user, %{name: slug, slug: slug})
+
+      repository
+      |> Ecto.Changeset.change(
+        lifecycle: lifecycle,
+        deleted_at: deleted_at,
+        storage_path: "../#{slug}.git"
+      )
+      |> Repo.update!()
+
+      for command <- [
+            "git-upload-pack 'hidden-ssh/#{slug}.git'",
+            "git-receive-pack 'hidden-ssh/#{slug}.git'"
+          ] do
+        assert {:error, "ERROR: Repository not found.\n"} =
+                 GitTransport.handle_exec("hidden-ssh", command)
+      end
+    end
+  end
+
+  @tag :tmp_dir
   test "starts supervised OTP SSH daemon with explicit Git-only policy", %{tmp_dir: tmp_dir} do
     system_dir = Path.join(tmp_dir, "ssh")
 
