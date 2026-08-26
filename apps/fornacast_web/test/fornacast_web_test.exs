@@ -27,6 +27,16 @@ defmodule FornacastWebTest do
     assert FornacastWeb.HTML.badge("Default") == ~s(<span class="badge">Default</span>)
   end
 
+  test "serves the logo and favicon" do
+    for path <- ["/images/logo.png", "/favicon.ico"] do
+      conn = get(build_conn(), path)
+
+      assert byte_size(response(conn, 200)) > 0
+      assert [content_type] = Plug.Conn.get_resp_header(conn, "content-type")
+      assert String.starts_with?(content_type, "image/")
+    end
+  end
+
   test "repository collaboration CSS keeps responsive flow and long diffs local" do
     css = File.read!(Path.expand("../assets/css/app.css", __DIR__))
 
@@ -104,8 +114,10 @@ defmodule FornacastWebTest do
 
     html = html_response(conn, 200)
 
+    assert html =~ ~s(<link rel="icon" href="/favicon.ico" sizes="any">)
+
     assert html =~
-             ~s(<a class="brand-mark" href="/" aria-label="Fornacast dashboard">Fornacast</a>)
+             ~s(<a class="brand-mark" href="/" aria-label="Fornacast dashboard"><img class="brand-logo" src="/images/logo.png" alt="" aria-hidden="true"><span>Fornacast</span></a>)
 
     assert html =~ ~s(<nav class="appbar-nav" aria-label="Workspace">)
     refute html =~ ~s(<a class="nav-link" href="/issues">Issues</a>)

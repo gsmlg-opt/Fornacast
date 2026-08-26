@@ -619,6 +619,8 @@ defmodule FornacastWeb.RepositoryControllerTest do
 
     assert inaccessible.status == 404
     assert missing.status == 404
+    assert inaccessible.resp_body =~ ~s(<link rel="icon" href="/favicon.ico" sizes="any">)
+    assert inaccessible.resp_body =~ ~s(<img class="brand-logo" src="/images/logo.png")
     assert inaccessible.resp_body == missing.resp_body
     assert normalized_headers(inaccessible) == normalized_headers(missing)
     assert_private_no_store(inaccessible)

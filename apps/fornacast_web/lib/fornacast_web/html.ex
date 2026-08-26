@@ -29,6 +29,7 @@ defmodule FornacastWeb.HTML do
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="csrf-token" content="#{Plug.CSRFProtection.get_csrf_token()}">
         <title>#{escaped_title} - Fornacast</title>
+        <link rel="icon" href="/favicon.ico" sizes="any">
         #{preload_tags}
         <link rel="stylesheet" href="#{escape(css_path)}">
         <script type="module" src="#{escape(js_path)}"></script>
@@ -67,6 +68,7 @@ defmodule FornacastWeb.HTML do
       "<title>",
       escape(title),
       " - Fornacast</title>",
+      "<link rel=\"icon\" href=\"/favicon.ico\" sizes=\"any\">",
       preload_tags(),
       "<link rel=\"stylesheet\" href=\"",
       escape(css_path),
@@ -101,7 +103,7 @@ defmodule FornacastWeb.HTML do
       <div class="app-shell">
         <header class="appbar appbar-primary appbar-sticky">
           <div class="appbar-left">
-            <a class="brand-mark" href="/" aria-label="Fornacast dashboard">Fornacast</a>
+            #{brand_mark("Fornacast dashboard")}
             <nav class="appbar-nav" aria-label="Workspace">
               #{repository_menu(current_user)}
             </nav>
@@ -125,7 +127,7 @@ defmodule FornacastWeb.HTML do
       """
       <div class="auth-shell">
         <header class="appbar auth-appbar">
-          <a class="brand-mark" href="/" aria-label="Fornacast home">Fornacast</a>
+          #{brand_mark("Fornacast home")}
           <nav class="app-nav" aria-label="Primary">
             <a class="nav-link" href="/login">Login</a>
             #{theme_menu()}
@@ -151,7 +153,7 @@ defmodule FornacastWeb.HTML do
         "<div class=\"app-shell repository-shell\" data-repository-shell=\"authenticated\">",
         "<header class=\"appbar appbar-primary appbar-sticky\">",
         "<div class=\"appbar-left\">",
-        "<a class=\"brand-mark\" href=\"/\" aria-label=\"Fornacast dashboard\">Fornacast</a>",
+        brand_mark("Fornacast dashboard"),
         "<nav class=\"appbar-nav\" aria-label=\"Workspace\">",
         repository_menu(current_user),
         "</nav></div>",
@@ -168,7 +170,7 @@ defmodule FornacastWeb.HTML do
       [
         "<div class=\"repository-shell\" data-repository-shell=\"anonymous\">",
         "<header class=\"appbar appbar-primary appbar-sticky\">",
-        "<a class=\"brand-mark\" href=\"/\" aria-label=\"Fornacast home\">Fornacast</a>",
+        brand_mark("Fornacast home"),
         "<nav class=\"app-nav\" aria-label=\"Repository actions\">",
         "<a class=\"nav-link\" href=\"/login\">Login</a>",
         theme_menu(),
@@ -189,6 +191,10 @@ defmodule FornacastWeb.HTML do
 
   defp repository_safe_iodata(item) when is_binary(item), do: item
   defp repository_safe_iodata(item) when is_integer(item), do: <<item>>
+
+  def brand_mark(label) do
+    ~s(<a class="brand-mark" href="/" aria-label="#{escape(label)}"><img class="brand-logo" src="/images/logo.png" alt="" aria-hidden="true"><span>Fornacast</span></a>)
+  end
 
   defp create_menu do
     """

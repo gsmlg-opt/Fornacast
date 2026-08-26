@@ -263,14 +263,11 @@
     text-decoration: none;
   }
 
-  .brand-mark::before {
-    content: "";
-    width: 0.7rem;
-    height: 1.5rem;
-    margin-right: 0.55rem;
-    border-radius: 999px;
-    background-color: var(--color-tertiary);
-    box-shadow: 0 0 0 0.28rem var(--color-tertiary-container);
+  .brand-logo {
+    width: 2rem;
+    height: 2rem;
+    margin-right: 0.35rem;
+    object-fit: contain;
   }
 
   .brand-mark:hover {
