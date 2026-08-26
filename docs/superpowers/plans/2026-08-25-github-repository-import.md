@@ -205,17 +205,24 @@ git commit -m "fix(repos): hide non-ready repositories"
 
 - Modify: `apps/forge_repos/test/repository_write_fence_test.exs`
 - Modify: `apps/forge_repos/lib/forge_repos.ex`
+- Modify: `apps/forge_repos/lib/forge_repos/git_write_operation.ex`
 - Modify: `apps/forge_repos/lib/forge_repos/git_write_recovery.ex`
+- Modify: `apps/forge_repos/test/git_writes_test.exs`
 - Modify: `apps/forge_repos/test/git_write_recovery_test.exs`
 - Modify: `apps/forge_pulls/lib/forge_pulls/merge_recovery.ex`
 - Modify: `apps/forge_pulls/test/merge_recovery_test.exs`
+- Modify: `apps/git_core/lib/git_core/limits.ex`
+- Modify: `apps/git_core/test/limits_test.exs`
 - Modify: `apps/git_transport/lib/git_transport/receive_pack.ex`
 - Modify: `apps/git_transport/lib/git_transport/receive_pack_worker.ex`
 - Modify: `apps/git_transport/lib/git_transport/channel.ex`
 - Modify: `apps/git_transport/test/receive_pack_fence_test.exs`
 - Modify: `apps/git_transport/test/git_transport_test.exs`
 - Modify: `apps/fornacast_web/lib/fornacast_web/controllers/git_http_controller.ex`
+- Modify: `apps/fornacast_web/lib/fornacast_web/request_metadata.ex`
 - Modify: `apps/fornacast_web/test/git_http_push_test.exs`
+- Modify: `config/config.exs`
+- Modify: `config/test.exs`
 
 - [ ] **Step 1: Write the stale-writer regression**
 
@@ -260,10 +267,14 @@ Use the reloaded row/path for reconciliation and the existing arity-two callback
 
 Receive-pack passes the actor into its supervised worker. While holding the reloaded repository fence, persist one prepared `GitWriteOperation` intent per validated ref command before invoking the native effect, then run locked Git-write recovery for those durable facts before releasing the fence. HTTP and SSH must not perform a later out-of-fence `record_push/3`. A worker/VM loss after the native effect therefore leaves recoverable intent, and publication's normal pre-callback reconciliation observes the completed local push before comparing its destination fingerprint. Bookkeeping failure returns an unavailable result while retaining recovery evidence; never silently swallow it.
 
+Before persisting intent, require each exact ref to equal the client's expected OID. Cap receive-pack at 1,024 ref commands and target refs at 255 bytes at parser, response, worker, changeset, and context boundaries. Carry the fence's absolute deadline through ref preflight and the bounded intent transaction, retry Turso busy responses only within that deadline, and recheck before entering the non-cancellable native call. Final protocol statuses come from the exact terminal operation rows, never native status strings alone. A live lease on the oldest nonterminal operation blocks the next writer or publication fence until it expires and can be reconciled.
+
+HTTP derives a bounded opaque operation-batch ID from a domain-separated hash of repository ID, actor ID, and a wholly valid 20–200 byte external request ID. Missing, generated, invalid, or incomplete values use cryptographic randomness; raw client IDs are not retained. This prevents global `(request_id, kind, ref)` collisions while preserving same-repository replay detection. SSH continues using a server-random batch ID.
+
 - [ ] **Step 4: Run every affected writer/recovery suite**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/repository_write_fence_test.exs apps/forge_repos/test/git_write_recovery_test.exs apps/forge_pulls/test/merge_recovery_test.exs apps/git_transport/test/receive_pack_fence_test.exs apps/git_transport/test/git_transport_test.exs apps/fornacast_web/test/git_http_push_test.exs --max-cases 1
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/repository_write_fence_test.exs apps/forge_repos/test/git_writes_test.exs apps/forge_repos/test/git_write_recovery_test.exs apps/forge_pulls/test/merge_recovery_test.exs apps/git_core/test/limits_test.exs apps/git_transport/test/receive_pack_fence_test.exs apps/git_transport/test/git_transport_test.exs apps/fornacast_web/test/git_http_push_test.exs --max-cases 1
 ```
 
 Expected: all tests pass and no callback observes the tombstoned path.
@@ -272,8 +283,10 @@ Expected: all tests pass and no callback observes the tombstoned path.
 
 ```bash
 git add apps/forge_repos apps/forge_pulls apps/git_transport \
+  apps/git_core/lib/git_core/limits.ex apps/git_core/test/limits_test.exs \
   apps/fornacast_web/lib/fornacast_web/controllers/git_http_controller.ex \
-  apps/fornacast_web/test/git_http_push_test.exs
+  apps/fornacast_web/lib/fornacast_web/request_metadata.ex \
+  apps/fornacast_web/test/git_http_push_test.exs config/config.exs config/test.exs
 git commit -m "fix(git): reject stale repository writers"
 ```
 
@@ -286,12 +299,15 @@ git commit -m "fix(git): reject stale repository writers"
 - Create: `apps/git_core/lib/git_core/remote/credential_cache.ex`
 - Create: `apps/git_core/lib/git_core/remote/credential_reaper.ex`
 - Create: `apps/git_core/lib/git_core/remote/host_policy.ex`
+- Create: `apps/git_core/lib/git_core/remote_limiter.ex`
 - Create: `apps/git_core/test/remote_test.exs`
 - Modify: `apps/git_core/mix.exs`
 - Modify: `apps/git_core/lib/git_core/application.ex`
 - Modify: `apps/git_core/lib/git_core/limits.ex`
+- Modify: `apps/git_core/test/limits_test.exs`
 - Modify: `config/config.exs`
 - Modify: `config/test.exs`
+- Modify: `Dockerfile`
 - Modify: `mix.lock`
 
 - [ ] **Step 1: Write process/credential/security tests around a fake git executable**
@@ -303,6 +319,7 @@ request = %GitCore.Remote.Request{
   provider: :github,
   owner: "octocat",
   repository: "hello-world",
+  credential_login: "verified-octocat",
   destination: destination,
   default_branch: "main"
 }
@@ -321,13 +338,13 @@ Expected: FAIL with undefined module.
 
 - [ ] **Step 3: Add verified `erlexec` 2.3 and the remote runner**
 
-Add `{:erlexec, "~> 2.3.4"}`. Use argument-list execution, process groups, monitor/link behavior, stdin, bounded stdout/stderr, `kill_group`, and configured SIGTERM-to-SIGKILL timeout. Do not invoke a shell.
+Add `{:erlexec, "~> 2.3.4"}`. Use argument-list execution, process groups, monitor/link behavior, stdin, bounded stdout/stderr, `kill_group`, and configured SIGTERM-to-SIGKILL timeout. Do not invoke a shell. Start the dependency application normally; do not add a second `:exec` manager child.
 
 Public structs:
 
 ```elixir
 defmodule GitCore.Remote.Request do
-  @enforce_keys [:provider, :owner, :repository, :destination, :default_branch]
+  @enforce_keys [:provider, :owner, :repository, :credential_login, :destination, :default_branch]
   defstruct @enforce_keys
 end
 
@@ -351,14 +368,20 @@ refresh(request, pat, opts \\ [])
 
 Both operations accept `:cancel?` and `:heartbeat` callbacks. The process owner polls them while receiving output/checking disk; cancellation or heartbeat failure terminates the entire managed process group before returning a typed error. Linked owner exit performs the same termination without requiring an external operation handle.
 
-Start an operation-local `git credential-cache--daemon <0700-dir>/credential.sock` under the same erlexec-managed OS process group as Git; approve `protocol=https`, `host=github.com`, verified username, and PAT over stdin. Link the owning BEAM process to the managed group so worker/supervisor/VM termination kills both daemon and Git descendants. Always send `credential-cache exit` and remove the socket directory in normal `after` cleanup. On `GitCore` startup, a reaper removes private operation socket directories whose registered owner/group no longer exists; socket files contain no credential bytes.
+Start an operation-local `git credential-cache--daemon <0700-dir>/credential.sock` under the same erlexec-managed OS process group as Git; approve `protocol=https`, `host=github.com`, the request's verified `credential_login`, and PAT over stdin. Reject invalid UTF-8, NUL, newline, empty, or oversized credential fields. Link the owning BEAM process to the managed group so worker/supervisor/VM termination kills both daemon and Git descendants. Always send `credential-cache exit` and remove the socket directory in normal `after` cleanup. On `GitCore` startup, a synchronous reaper removes private operation socket directories whose registered group leader is absent from `:exec.which_children/0`; socket files and bounded `0600` metadata contain no credential bytes.
 
-Clone with a sanitized config/environment, no prompt, no checkout/submodules/hooks/local optimization, `http.followRedirects=false`, disabled `file`/`ext` protocols, and a fixed `https://github.com/<owner>/<repo>.git` URL. `HostPolicy` resolves `github.com` and rejects every non-public address before Git starts. Remove `origin`, fetch config, and all refs except heads/tags. Validate physical bare storage, objects, limits, and default branch; set bare `HEAD`. Empty repositories remain valid. `refresh/3` performs one bounded authenticated refetch into an existing validated importing repository for the metadata-drift path.
+Clone with a cleared and allowlisted environment, sanitized config, no prompt, no checkout/submodules/hooks/local optimization, `http.followRedirects=false`, disabled `file`/`ext` protocols, and a fixed `https://github.com/<owner>/<repo>.git` URL. `HostPolicy` resolves both A and AAAA records for `github.com`, rejects the operation if any answer is non-public, and pins every validated `github.com:443` answer into libcurl with `http.curloptResolve`; keep the hostname for TLS/SNI and never rely on a second DNS lookup. Remove `origin`, fetch/credential/http config, and all refs except heads/tags. Reject alternates, shallow state, symlinks, hooks, corruption, and remaining synchronization config. Validate physical bare storage, objects, limits, and default branch; set bare `HEAD`. Empty repositories remain valid. `refresh/3` fetches only explicit heads/tags into an already validated importing repository, never removes that repository on failure, and requires full revalidation before reuse.
+
+Add dedicated hard ceilings and lower-only configuration for remote concurrency `2`, wall time `1_800_000ms`, combined retained output `1_048_576` bytes, staged repository bytes `21_474_836_480`, refs `200_000`, poll interval `100ms`, credential startup `10_000ms`, process kill escalation `5_000ms`, and cleanup/reaper wait `10_000ms`. `GitCore.RemoteLimiter` owns remote concurrency; do not couple it to `ScanLimiter`.
+
+Each credential operation directory has a strict non-symlink name beneath one canonical root and a bounded atomic `0600` metadata file containing only version, erlexec group-leader OS PID, and creation time. The startup reaper preserves live registered leaders, removes only canonical orphan directories, and fails closed on invalid metadata, unresolved paths, or symlinks.
+
+Install `git` in the final Docker image and set `SHELL=/bin/sh` for erlexec. Prove the release contains the erlexec port executable and the runtime image can execute Git. In this unit task, kill the operation owner or isolated GitCore supervisor; the ForgeImports recovery-supervisor integration belongs to Task 6.
 
 - [ ] **Step 4: Run remote tests and existing GitCore smoke tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/git_core/test/remote_test.exs apps/git_core/test/git_core_test.exs --max-cases 1
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/git_core/test/remote_test.exs apps/git_core/test/git_core_test.exs apps/git_core/test/limits_test.exs --max-cases 1
 ```
 
 Expected: all tests pass; cancellation kills the fake descendant.
@@ -366,7 +389,7 @@ Expected: all tests pass; cancellation kills the fake descendant.
 - [ ] **Step 5: Commit the remote boundary**
 
 ```bash
-git add apps/git_core config/config.exs config/test.exs mix.lock
+git add apps/git_core config/config.exs config/test.exs Dockerfile mix.lock
 git commit -m "feat(git): add supervised GitHub mirror"
 ```
 
