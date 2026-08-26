@@ -129,6 +129,7 @@ git commit -m "feat(repos): add import repository lifecycle"
 - Modify: `apps/forge_pulls/lib/forge_pulls/merge_reconciler.ex`
 - Create: `apps/forge_pulls/test/merge_reconciler_test.exs`
 - Modify: `apps/fornacast_api/test/repositories_test.exs`
+- Modify: `apps/fornacast_api/test/users_organizations_test.exs`
 - Modify: `apps/fornacast_api/test/graphql_test.exs`
 - Modify: `apps/fornacast_web/test/repository_controller_test.exs`
 - Modify: `apps/fornacast_web/test/fornacast_web_test.exs`
@@ -136,20 +137,20 @@ git commit -m "feat(repos): add import repository lifecycle"
 
 - [ ] **Step 1: Add failing visibility tests**
 
-Create ready, importing, and tombstoned rows directly. Assert only ready rows appear through owner lists, accessible lists, views, ID/slug fetches, Git path resolution, issue repository resolution, access checks, pull recovery scans, REST repository lists/detail, GraphQL, browser namespace/repository pages, and SSH/HTTP Git path resolution.
+Create ready, importing, and tombstoned rows directly. Assert only ready rows appear through owner lists, accessible lists, views, ID/slug fetches, Git path resolution, issue repository resolution, access checks, pull recovery scans, REST repository lists/detail and user/organization repository counts, GraphQL, browser namespace/repository pages, and SSH/HTTP Git path resolution.
 
 ```elixir
 for hidden <- [importing_repository_fixture(), tombstoned_repository_fixture()] do
   assert {:error, :not_found} = ForgeRepos.fetch_authorized_repository(actor, owner.username, hidden.slug, :repository_read)
   refute hidden.id in Enum.map(ForgeRepos.list_owner_repositories(owner), & &1.id)
-  refute Fornacast.Access.allowed?(actor, hidden, :repository_admin)
+  refute Fornacast.Access.allowed?(actor, :repository_admin, hidden)
 end
 ```
 
 - [ ] **Step 2: Run focused domain tests and observe hidden rows leaking**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/forge_repos_test.exs apps/forge_repos/test/access_test.exs apps/forge_issues/test/forge_issues_test.exs apps/forge_pulls/test/merge_reconciler_test.exs apps/fornacast_api/test/repositories_test.exs apps/fornacast_api/test/graphql_test.exs apps/fornacast_web/test/repository_controller_test.exs apps/fornacast_web/test/fornacast_web_test.exs apps/git_transport/test/git_transport_test.exs --max-cases 1
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/forge_repos_test.exs apps/forge_repos/test/access_test.exs apps/forge_issues/test/forge_issues_test.exs apps/forge_pulls/test/merge_reconciler_test.exs apps/fornacast_api/test/repositories_test.exs apps/fornacast_api/test/users_organizations_test.exs apps/fornacast_api/test/graphql_test.exs apps/fornacast_web/test/repository_controller_test.exs apps/fornacast_web/test/fornacast_web_test.exs apps/git_transport/test/git_transport_test.exs --max-cases 1
 ```
 
 Expected: FAIL where queries currently filter only `deleted_at`.
@@ -180,7 +181,7 @@ Direct `Fornacast.Access.allowed?/3` rejects a non-ready/deleted struct before r
 - [ ] **Step 4: Run the visibility matrix**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/forge_repos_test.exs apps/forge_repos/test/access_test.exs apps/forge_issues/test/forge_issues_test.exs apps/forge_pulls/test/merge_reconciler_test.exs apps/fornacast_api/test/repositories_test.exs apps/fornacast_api/test/graphql_test.exs apps/fornacast_web/test/repository_controller_test.exs apps/fornacast_web/test/fornacast_web_test.exs apps/git_transport/test/git_transport_test.exs --max-cases 1
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/forge_repos_test.exs apps/forge_repos/test/access_test.exs apps/forge_issues/test/forge_issues_test.exs apps/forge_pulls/test/merge_reconciler_test.exs apps/fornacast_api/test/repositories_test.exs apps/fornacast_api/test/users_organizations_test.exs apps/fornacast_api/test/graphql_test.exs apps/fornacast_web/test/repository_controller_test.exs apps/fornacast_web/test/fornacast_web_test.exs apps/git_transport/test/git_transport_test.exs --max-cases 1
 ```
 
 Expected: all tests pass.
@@ -188,7 +189,13 @@ Expected: all tests pass.
 - [ ] **Step 5: Commit ready-only boundaries**
 
 ```bash
-git add apps/forge_repos apps/forge_issues apps/forge_pulls
+git add apps/forge_repos apps/forge_issues apps/forge_pulls \
+  apps/fornacast_api/test/repositories_test.exs \
+  apps/fornacast_api/test/users_organizations_test.exs \
+  apps/fornacast_api/test/graphql_test.exs \
+  apps/fornacast_web/test/repository_controller_test.exs \
+  apps/fornacast_web/test/fornacast_web_test.exs \
+  apps/git_transport/test/git_transport_test.exs
 git commit -m "fix(repos): hide non-ready repositories"
 ```
 
