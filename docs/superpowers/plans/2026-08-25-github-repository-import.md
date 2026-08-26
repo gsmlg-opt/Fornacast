@@ -203,13 +203,19 @@ git commit -m "fix(repos): hide non-ready repositories"
 
 **Files:**
 
-- Create: `apps/forge_repos/test/repository_write_fence_test.exs`
+- Modify: `apps/forge_repos/test/repository_write_fence_test.exs`
 - Modify: `apps/forge_repos/lib/forge_repos.ex`
 - Modify: `apps/forge_repos/lib/forge_repos/git_write_recovery.ex`
 - Modify: `apps/forge_repos/test/git_write_recovery_test.exs`
 - Modify: `apps/forge_pulls/lib/forge_pulls/merge_recovery.ex`
 - Modify: `apps/forge_pulls/test/merge_recovery_test.exs`
+- Modify: `apps/git_transport/lib/git_transport/receive_pack.ex`
+- Modify: `apps/git_transport/lib/git_transport/receive_pack_worker.ex`
+- Modify: `apps/git_transport/lib/git_transport/channel.ex`
 - Modify: `apps/git_transport/test/receive_pack_fence_test.exs`
+- Modify: `apps/git_transport/test/git_transport_test.exs`
+- Modify: `apps/fornacast_web/lib/fornacast_web/controllers/git_http_controller.ex`
+- Modify: `apps/fornacast_web/test/git_http_push_test.exs`
 
 - [ ] **Step 1: Write the stale-writer regression**
 
@@ -222,13 +228,15 @@ assert {:error, {:unavailable, :stale_repository}} =
          end)
 ```
 
+Also block receive-pack after its native ref update and prove publication cannot acquire until durable push bookkeeping completes. Inject a worker crash after the native effect and prove a prepared per-ref `GitWriteOperation` remains for the next fence to reconcile.
+
 - [ ] **Step 2: Run and verify the stale writer reaches the old path**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/repository_write_fence_test.exs --max-cases 1
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/repository_write_fence_test.exs apps/git_transport/test/receive_pack_fence_test.exs apps/fornacast_web/test/git_http_push_test.exs --max-cases 1
 ```
 
-Expected: FAIL because `with_write_fence/3` trusts the preloaded struct.
+Expected: FAIL because `with_write_fence/3` trusts the preloaded struct and receive-pack records its push only after releasing the fence.
 
 - [ ] **Step 3: Reload after acquisition and add a publication fence**
 
@@ -248,12 +256,14 @@ defp reload_fenced_repository(%Repository{id: id, generation: generation}) do
 end
 ```
 
-Use the reloaded row/path for reconciliation and the callback. Add `with_import_publication_fence/3`, which shares acquisition/reconciliation but returns `{:error, :destination_changed}` for an exact-target mismatch. Update Git-write, pull-merge, receive-pack, and content/ref callers to preserve their existing error mapping.
+Use the reloaded row/path for reconciliation and the existing arity-two callback. Add `with_import_publication_fence/3`, which shares acquisition/reconciliation but returns `{:error, :destination_changed}` for an exact-target mismatch. Update the current pull-merge/update/recovery and receive-pack callers to preserve their existing error mapping.
+
+Receive-pack passes the actor into its supervised worker. While holding the reloaded repository fence, persist one prepared `GitWriteOperation` intent per validated ref command before invoking the native effect, then run locked Git-write recovery for those durable facts before releasing the fence. HTTP and SSH must not perform a later out-of-fence `record_push/3`. A worker/VM loss after the native effect therefore leaves recoverable intent, and publication's normal pre-callback reconciliation observes the completed local push before comparing its destination fingerprint. Bookkeeping failure returns an unavailable result while retaining recovery evidence; never silently swallow it.
 
 - [ ] **Step 4: Run every affected writer/recovery suite**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/repository_write_fence_test.exs apps/forge_repos/test/git_write_recovery_test.exs apps/forge_pulls/test/merge_recovery_test.exs apps/git_transport/test/receive_pack_fence_test.exs --max-cases 1
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/repository_write_fence_test.exs apps/forge_repos/test/git_write_recovery_test.exs apps/forge_pulls/test/merge_recovery_test.exs apps/git_transport/test/receive_pack_fence_test.exs apps/git_transport/test/git_transport_test.exs apps/fornacast_web/test/git_http_push_test.exs --max-cases 1
 ```
 
 Expected: all tests pass and no callback observes the tombstoned path.
@@ -261,7 +271,9 @@ Expected: all tests pass and no callback observes the tombstoned path.
 - [ ] **Step 5: Commit fence hardening**
 
 ```bash
-git add apps/forge_repos apps/forge_pulls apps/git_transport/test/receive_pack_fence_test.exs
+git add apps/forge_repos apps/forge_pulls apps/git_transport \
+  apps/fornacast_web/lib/fornacast_web/controllers/git_http_controller.ex \
+  apps/fornacast_web/test/git_http_push_test.exs
 git commit -m "fix(git): reject stale repository writers"
 ```
 
