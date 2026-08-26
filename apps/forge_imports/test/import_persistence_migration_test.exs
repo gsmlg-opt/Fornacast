@@ -563,6 +563,42 @@ defmodule ForgeImports.ImportPersistenceMigrationTestSupport do
   def postgres? do
     Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"]
   end
+
+  def foreign_key_states(repo, count) do
+    parent = self()
+
+    tasks =
+      for _index <- 1..count do
+        Task.async(fn ->
+          repo.checkout(
+            fn ->
+              send(parent, {:foreign_key_connection_ready, self()})
+
+              receive do
+                :read_foreign_key_state ->
+                  %{rows: [[state]]} =
+                    Ecto.Adapters.SQL.query!(repo, "PRAGMA foreign_keys", [], log: false)
+
+                  state
+              end
+            end,
+            timeout: :infinity
+          )
+        end)
+      end
+
+    ready =
+      for _index <- 1..count do
+        receive do
+          {:foreign_key_connection_ready, pid} -> pid
+        after
+          5_000 -> raise "timed out waiting for a migration connection"
+        end
+      end
+
+    Enum.each(ready, &send(&1, :read_foreign_key_state))
+    Task.await_many(tasks, 5_000)
+  end
 end
 
 defmodule ForgeImports.ImportPersistenceMigrationRepo do
@@ -582,6 +618,7 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
   alias Fornacast.Repo
 
   @moduletag :persistence
+  @pre_provisional_version 20_260_825_000_350
   @provisional_version 20_260_825_000_360
   @destination_version 20_260_825_000_370
   @run_scoped_indexes [
@@ -602,13 +639,25 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
       refute column_exists?(repo, "github_import_runs", "source_metadata")
       refute Enum.any?(@run_scoped_indexes, fn {name, _table} -> index_exists?(repo, name) end)
 
+      seeded = seed_pre_00360_children!(repo)
       assert [@provisional_version] = migrate_up(repo, @provisional_version)
       assert_provisional_schema!(repo)
+      assert_seeded_children!(repo, seeded)
       assert [@destination_version] = migrate_up(repo, @destination_version)
+      clear_import_rows!(repo)
+      delete_seed_accounts!(repo, seeded)
     else
       repo = start_scratch_repo!(context.tmp_dir, "provisional")
-      assert Enum.member?(migrate_up(repo, @provisional_version), @provisional_version)
+      assert Enum.member?(migrate_up(repo, @pre_provisional_version), @pre_provisional_version)
+      seeded = seed_pre_00360_children!(repo)
+
+      assert [@provisional_version] = migrate_up(repo, @provisional_version)
       assert_provisional_schema!(repo)
+      assert_seeded_children!(repo, seeded)
+
+      assert Enum.sort(
+               ForgeImports.ImportPersistenceMigrationTestSupport.foreign_key_states(repo, 2)
+             ) == [1, 1]
 
       assert_raise RuntimeError,
                    "Turso rollback is disabled until gsmlg-dev/concord#81 is resolved",
@@ -626,6 +675,204 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
       assert index_exists?(repo, name)
       assert index_columns(repo, name, table) == ["import_run_id", "id"]
     end)
+  end
+
+  defp seed_pre_00360_children!(repo) do
+    suffix = System.unique_integer([:positive])
+    actor_username = "provisional-actor-#{suffix}"
+    actor_id = insert_user!(repo, actor_username, "provisional-#{suffix}@example.test")
+    identity_id = insert_identity!(repo, actor_id, suffix)
+    run_id = insert_run!(repo, actor_id, identity_id, actor_username, suffix)
+    item_id = insert_item!(repo, run_id, suffix)
+    report_id = insert_report!(repo, run_id, item_id, suffix)
+
+    %{
+      run_id: run_id,
+      item_id: item_id,
+      report_id: report_id,
+      identity_ids: [identity_id],
+      user_ids: [actor_id]
+    }
+  end
+
+  defp insert_user!(repo, username, email) do
+    now = database_datetime(DateTime.utc_now(:second))
+    params = [username, email, "not-used", "user", "active", "user", now, now]
+
+    Ecto.Adapters.SQL.query!(
+      repo,
+      "insert into users " <>
+        "(username, email, password_hash, role, state, kind, inserted_at, updated_at) " <>
+        "values (#{Enum.join(placeholders(length(params)), ", ")})",
+      params
+    )
+
+    select_id!(repo, "users", "username", username)
+  end
+
+  defp insert_identity!(repo, actor_id, suffix) do
+    now = database_datetime(DateTime.utc_now(:second))
+    github_id = 8_600_000_000 + suffix
+    params = ["user", github_id, "provisional-identity-#{suffix}", actor_id, now, now, now, now]
+
+    Ecto.Adapters.SQL.query!(
+      repo,
+      "insert into github_identities " <>
+        "(kind, github_user_id, login, local_user_id, last_verified_at, last_observed_at, " <>
+        "inserted_at, updated_at) values (#{Enum.join(placeholders(length(params)), ", ")})",
+      params
+    )
+
+    select_id!(repo, "github_identities", "github_user_id", github_id)
+  end
+
+  defp insert_run!(repo, actor_id, identity_id, actor_username, suffix) do
+    now = database_datetime(DateTime.utc_now(:second))
+    source_login = "provisional-source-#{suffix}"
+
+    params = [
+      actor_id,
+      "repository",
+      identity_id,
+      "one_time",
+      8_600_000_000 + suffix,
+      source_login,
+      9_600_000_000 + suffix,
+      "#{source_login}/repository",
+      "existing",
+      actor_username,
+      "awaiting_resolution",
+      now,
+      now
+    ]
+
+    Ecto.Adapters.SQL.query!(
+      repo,
+      "insert into github_import_runs " <>
+        "(actor_user_id, source_kind, github_identity_id, credential_source, " <>
+        "source_owner_github_id, source_owner_login, source_repository_github_id, " <>
+        "source_repository_full_name, destination_organization_action, " <>
+        "destination_organization_slug, state, inserted_at, updated_at) " <>
+        "values (#{Enum.join(placeholders(length(params)), ", ")})",
+      params
+    )
+
+    select_id!(repo, "github_import_runs", "source_owner_login", source_login)
+  end
+
+  defp insert_item!(repo, run_id, suffix) do
+    now = database_datetime(DateTime.utc_now(:second))
+    github_repository_id = 9_700_000_000 + suffix
+
+    params = [
+      run_id,
+      github_repository_id,
+      "github/provisional-#{suffix}",
+      "provisional-#{suffix}",
+      now,
+      "awaiting_resolution",
+      now,
+      now
+    ]
+
+    Ecto.Adapters.SQL.query!(
+      repo,
+      "insert into github_import_repository_items " <>
+        "(import_run_id, github_repository_id, source_full_name, source_name, " <>
+        "source_observed_at, state, inserted_at, updated_at) " <>
+        "values (#{Enum.join(placeholders(length(params)), ", ")})",
+      params
+    )
+
+    select_id!(
+      repo,
+      "github_import_repository_items",
+      "github_repository_id",
+      github_repository_id
+    )
+  end
+
+  defp insert_report!(repo, run_id, item_id, suffix) do
+    now = database_datetime(DateTime.utc_now(:second))
+    idempotency_key = "provisional-report-#{suffix}"
+
+    params = [
+      run_id,
+      item_id,
+      idempotency_key,
+      "repository",
+      "warning",
+      "provisional_warning",
+      "Preserve this report during the source migration.",
+      1,
+      now,
+      now
+    ]
+
+    Ecto.Adapters.SQL.query!(
+      repo,
+      "insert into github_import_report_entries " <>
+        "(import_run_id, repository_item_id, idempotency_key, scope, outcome, " <>
+        "classification, summary, source_count, inserted_at, updated_at) " <>
+        "values (#{Enum.join(placeholders(length(params)), ", ")})",
+      params
+    )
+
+    select_id!(repo, "github_import_report_entries", "idempotency_key", idempotency_key)
+  end
+
+  defp assert_seeded_children!(repo, seeded) do
+    assert row_exists?(repo, "github_import_runs", seeded.run_id)
+    assert row_exists?(repo, "github_import_repository_items", seeded.item_id)
+    assert row_exists?(repo, "github_import_report_entries", seeded.report_id)
+  end
+
+  defp row_exists?(repo, table, id) do
+    placeholder = List.first(placeholders(1))
+
+    %{rows: rows} =
+      Ecto.Adapters.SQL.query!(repo, "select id from #{table} where id = #{placeholder}", [id])
+
+    rows == [[id]]
+  end
+
+  defp select_id!(repo, table, field, value) do
+    placeholder = List.first(placeholders(1))
+
+    %{rows: [[id]]} =
+      Ecto.Adapters.SQL.query!(
+        repo,
+        "select id from #{table} where #{field} = #{placeholder}",
+        [value]
+      )
+
+    id
+  end
+
+  defp delete_seed_accounts!(repo, seeded) do
+    delete_ids!(repo, "github_identities", seeded.identity_ids)
+    delete_ids!(repo, "users", seeded.user_ids)
+  end
+
+  defp delete_ids!(_repo, _table, []), do: :ok
+
+  defp delete_ids!(repo, table, ids) do
+    Ecto.Adapters.SQL.query!(
+      repo,
+      "delete from #{table} where id in (#{Enum.join(placeholders(length(ids)), ", ")})",
+      ids
+    )
+
+    :ok
+  end
+
+  defp placeholders(count) do
+    if postgres?(), do: Enum.map(1..count, &"$#{&1}"), else: List.duplicate("?", count)
+  end
+
+  defp database_datetime(%DateTime{} = value) do
+    naive = DateTime.to_naive(value)
+    if postgres?(), do: naive, else: NaiveDateTime.to_iso8601(naive)
   end
 
   defp ensure_up!(repo, version) do
@@ -863,7 +1110,10 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
 
     unless postgres?() do
       assert repository_item_count(repo, seeded.runs.organization_evidence) == 1
-      assert Enum.sort(foreign_key_states(repo, 2)) == [1, 1]
+
+      assert Enum.sort(
+               ForgeImports.ImportPersistenceMigrationTestSupport.foreign_key_states(repo, 2)
+             ) == [1, 1]
     end
 
     if postgres?() do
@@ -1102,39 +1352,6 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
       )
 
     count
-  end
-
-  defp foreign_key_states(repo, count) do
-    parent = self()
-
-    tasks =
-      for _index <- 1..count do
-        Task.async(fn ->
-          repo.checkout(
-            fn ->
-              send(parent, {:foreign_key_connection_ready, self()})
-
-              receive do
-                :read_foreign_key_state ->
-                  %{rows: [[state]]} =
-                    Ecto.Adapters.SQL.query!(repo, "PRAGMA foreign_keys", [], log: false)
-
-                  state
-              end
-            end,
-            timeout: :infinity
-          )
-        end)
-      end
-
-    ready =
-      for _index <- 1..count do
-        assert_receive {:foreign_key_connection_ready, pid}, 5_000
-        pid
-      end
-
-    Enum.each(ready, &send(&1, :read_foreign_key_state))
-    Task.await_many(tasks, 5_000)
   end
 
   defp select_id!(repo, table, field, value) do
