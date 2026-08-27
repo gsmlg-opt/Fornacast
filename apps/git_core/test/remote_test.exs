@@ -852,6 +852,29 @@ defmodule GitCore.RemoteTest do
     assert identity.mode == 0o700
     refute inspect(identity) =~ request.destination
 
+    assert {:ok, {:present, %{root: root_identity, target: target_identity}}} =
+             GitCore.contained_tree_identity(
+               tmp_dir,
+               [Path.basename(quarantine)],
+               5_000
+             )
+
+    assert target_identity == identity
+
+    assert root_identity == %{
+             mode: Bitwise.band(File.lstat!(tmp_dir).mode, 0o777),
+             major_device: target_identity.major_device,
+             minor_device: target_identity.minor_device,
+             inode: File.lstat!(tmp_dir).inode
+           }
+
+    assert JSON.decode!(JSON.encode!(%{root: root_identity, target: target_identity})) == %{
+             "root" =>
+               Map.new(root_identity, fn {key, value} -> {Atom.to_string(key), value} end),
+             "target" =>
+               Map.new(target_identity, fn {key, value} -> {Atom.to_string(key), value} end)
+           }
+
     File.mkdir!(request.destination)
     File.chmod!(request.destination, 0o700)
 
@@ -1952,17 +1975,18 @@ defmodule GitCore.RemoteTest do
             %File.Stat{
               type: :directory,
               mode: mode,
-              major_device: major_device,
-              minor_device: minor_device,
               inode: inode
             }} = File.lstat(quarantine_path)
 
-    assert identity == %{
-             mode: Bitwise.band(mode, 0o777),
-             major_device: major_device,
-             minor_device: minor_device,
-             inode: inode
-           }
+    assert identity.mode == Bitwise.band(mode, 0o777)
+    assert identity.inode == inode
+
+    assert {:ok, {:present, %{target: ^identity}}} =
+             GitCore.contained_tree_identity(
+               Path.dirname(quarantine_path),
+               [Path.basename(quarantine_path)],
+               5_000
+             )
 
     refute inspect(error) =~ quarantine_path
     refute inspect(error) =~ "github_pat"

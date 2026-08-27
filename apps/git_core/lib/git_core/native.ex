@@ -101,6 +101,12 @@ defmodule GitCore.Native do
 
   def repository_disk_usage(_path, _deadline_ms), do: :erlang.nif_error(:nif_not_loaded)
 
+  def contained_tree_identity(_storage_root, _relative_segments, _deadline_ms),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def remove_contained_tree(_storage_root, _relative_segments, _expected_proof, _deadline_ms),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def merge_analysis(
         _path,
         _base_oid,

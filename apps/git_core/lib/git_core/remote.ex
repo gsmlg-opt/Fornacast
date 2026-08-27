@@ -155,12 +155,14 @@ defmodule GitCore.Remote do
          :ok <- GitCore.Remote.CredentialReaper.safe_existing_directory_path(quarantine),
          {:ok, ^parent_identity} <- directory_identity(parent),
          {:error, :enoent} <- File.lstat(destination),
+         {:ok, ^identity} <- private_directory_identity(quarantine),
+         {:ok, anchored_identity} <- anchored_cleanup_identity(quarantine),
          {:ok, ^identity} <- private_directory_identity(quarantine) do
       {:ok,
        %CleanupPending{
          original_kind: :previous_failure,
          quarantine_path: quarantine,
-         identity: identity_projection(identity)
+         identity: anchored_identity
        }}
     else
       _changed -> remote_error(:unsafe_cleanup_state)
@@ -1078,8 +1080,10 @@ defmodule GitCore.Remote do
            ),
          {:error, :enoent} <- File.lstat(destination),
          :ok <- GitCore.Remote.CredentialReaper.safe_existing_directory_path(quarantine),
+         {:ok, ^expected_identity} <- private_directory_identity(quarantine),
+         {:ok, anchored_identity} <- anchored_cleanup_identity(quarantine),
          {:ok, ^expected_identity} <- private_directory_identity(quarantine) do
-      {:ok, {quarantine, expected_identity}}
+      {:ok, {quarantine, anchored_identity}}
     else
       _unsafe -> remote_error(:unsafe_cleanup_state)
     end
@@ -1111,8 +1115,10 @@ defmodule GitCore.Remote do
           with {:ok, identity} <- private_directory_identity(quarantine),
                :ok <- GitCore.Remote.CredentialReaper.safe_existing_directory_path(quarantine),
                {:ok, ^parent_identity} <- directory_identity(parent),
+               {:ok, ^identity} <- private_directory_identity(quarantine),
+               {:ok, anchored_identity} <- anchored_cleanup_identity(quarantine),
                {:ok, ^identity} <- private_directory_identity(quarantine) do
-            cleanup_pending(:previous_failure, quarantine, identity)
+            cleanup_pending(:previous_failure, quarantine, anchored_identity)
           else
             _unsafe -> remote_error(:unsafe_cleanup_state)
           end
@@ -1129,16 +1135,34 @@ defmodule GitCore.Remote do
     cleanup_pending(original_kind, quarantine, identity)
   end
 
-  defp cleanup_pending(original_kind, quarantine, identity) when is_atom(original_kind) do
+  defp cleanup_pending(
+         original_kind,
+         quarantine,
+         %{mode: 0o700, major_device: _, minor_device: _, inode: _} = identity
+       )
+       when is_atom(original_kind) do
     {:error,
      %Error{
        kind: :cleanup_pending,
        detail: %CleanupPending{
          original_kind: original_kind,
          quarantine_path: quarantine,
-         identity: identity_projection(identity)
+         identity: identity
        }
      }}
+  end
+
+  defp anchored_cleanup_identity(quarantine) do
+    parent = Path.dirname(quarantine)
+
+    case GitCore.contained_tree_identity(
+           parent,
+           [Path.basename(quarantine)],
+           GitCore.Limits.get(:remote_cleanup_wait_ms)
+         ) do
+      {:ok, {:present, %{target: %{mode: 0o700} = identity}}} -> {:ok, identity}
+      _unsafe -> {:error, :unsafe_path}
+    end
   end
 
   defp directory_identity(path) do
@@ -1172,15 +1196,6 @@ defmodule GitCore.Remote do
        do: true
 
   defp same_directory?(_before, _after), do: false
-
-  defp identity_projection({mode, major_device, minor_device, inode}) do
-    %{
-      mode: mode,
-      major_device: major_device,
-      minor_device: minor_device,
-      inode: inode
-    }
-  end
 
   defp cleanup_slot(destination) do
     digest =
