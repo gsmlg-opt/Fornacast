@@ -1394,12 +1394,9 @@ Expose an opaque handle rather than a repository/path tuple:
 
 ```elixir
 defmodule ForgeRepos.RepositoryReadHandle do
-  @opaque t :: %__MODULE__{
-            repository: ForgeRepos.Repository.t(),
-            path: Path.t(),
-            lease: GitCore.RepositoryReadLimiter.lease()
-          }
-  defstruct [:repository, :path, :lease]
+  @opaque t :: %__MODULE__{}
+  @enforce_keys [:repository, :path, :lease]
+  defstruct @enforce_keys
 end
 
 @spec ForgeRepos.open_repository_read(Repository.t(), integer()) ::
@@ -1407,6 +1404,11 @@ end
         | {:error, :not_found | :deadline_exceeded | :unavailable}
 
 @spec ForgeRepos.close_repository_read(RepositoryReadHandle.t()) :: :ok
+
+@spec ForgeRepos.repository_read_repository(RepositoryReadHandle.t()) ::
+        Repository.t()
+
+@spec ForgeRepos.repository_read_path(RepositoryReadHandle.t()) :: Path.t()
 
 @spec ForgeRepos.with_repository_read(
         Repository.t(),
@@ -1421,10 +1423,18 @@ reloads that exact ID, and requires exact input generation, `lifecycle: :ready`,
 `deleted_at: nil`, `storage_reclaimed_at: nil`, and a canonical contained storage
 path. Release immediately on every reload/path mismatch. The returned handle owns
 the reloaded repository and absolute path. `close_repository_read/1` is
-idempotent. `with_repository_read/3` calls `open_repository_read/2`, invokes the
+idempotent. `RepositoryReadHandle` exports no constructor, field accessor, or
+lease accessor. `ForgeRepos.open_repository_read/2` alone constructs it;
+`ForgeRepos` alone pattern-matches it for the two projections and close.
+`close_repository_read/1` is the only function that reads/releases the private
+limiter lease, and repeated close remains safe.
+
+`repository_read_repository/1` and `repository_read_path/1` are the only public
+projections. `with_repository_read/3` calls `open_repository_read/2`, invokes the
 one-arity function with the opaque handle, and always closes in `after`; it catches
-neither returned errors nor exceptions. These are the only read-side APIs that may
-cross publication/deletion boundaries.
+neither returned errors nor exceptions. The callback does not receive a struct
+shape or lease. These functions are the only read-side APIs that may cross
+publication/deletion boundaries.
 
 - [ ] **Step 8B.4: Move every ready-repository GitCore read behind the handle**
 
@@ -1432,7 +1442,9 @@ Change `GitTransport.UploadPack.advertise_refs/1`, `response/2`, and `serve/1`
 repository wrappers to acquire/release a handle. Add internal
 `advertise_refs_handle/1` and `response_handle/2` functions that accept only the
 opaque handle so a long-lived caller can retain one lease across multiple protocol
-phases.
+phases. They obtain the reloaded repository/path only through
+`ForgeRepos.repository_read_repository/1` and
+`ForgeRepos.repository_read_path/1`.
 
 `GitTransport.Exec` and Git-over-HTTP use the same wrapper seam with
 `try ... after ForgeRepos.close_repository_read(handle) end`. Repository lookup
@@ -1450,19 +1462,23 @@ Wrap every production ready-repository GitCore read for its complete native/cach
 sequence, not merely upload-pack:
 
 - in `ForgeRepos`, run `repository_view/2` and list-view disk-usage reads through
-  `with_repository_read/3`, using `handle.repository` and `handle.path`; also wrap
-  the default-branch `resolve_snapshot` validation that is not already inside a
-  writer fence;
+  `with_repository_read/3`, using `repository_read_repository/1` and
+  `repository_read_path/1`; also wrap the default-branch `resolve_snapshot`
+  validation that is not already inside a writer fence;
 - in `ForgePulls`, wrap public `branch_options/2`, `compare/5`,
   `list_commits/4`, `changed_files/4`, ref resolution, comparison/diff, commit
   paging, and merge-analysis refreshes that are not already inside the existing
   writer fence. A multi-call comparison uses one handle for its whole snapshot;
 - in `FornacastWeb.RepositoryPage` and `RepositoryController`, acquire once around
-  each page/raw request and pass `handle.repository`/`handle.path` through code,
-  tree, blob/raw, refs, commits/history, commit, search, analysis, and disk-usage
-  reads. Page-result cleanup remains responsible only for its existing blob/scan
-  permits; the repository read lease closes after the complete GitCore result is
-  materialized.
+  each page/raw request and pass values returned by the two ForgeRepos accessors
+  through code, tree, blob/raw, refs, commits/history, commit, search, analysis,
+  and disk-usage reads. Page-result cleanup remains responsible only for its
+  existing blob/scan permits; the repository read lease closes after the complete
+  GitCore result is materialized.
+
+`GitTransport.UploadPack`, `ForgePulls`, and every web module treat the callback
+argument as opaque: they call the two ForgeRepos projections or a deeper
+handle-taking API and never pattern-match, destructure, inspect, or access fields.
 
 Reads already enclosed by `GitCore.RepositoryWriteLimiter` are explicitly exempt:
 receive-pack, `GitWriteRecovery`, `MergeRecovery`, and final merge
@@ -1476,7 +1492,10 @@ for every `GitCore.*` invocation. Maintain an exact allowlist containing only
 handle-based ready reads, the writer-fenced calls above, and identified
 importing-shadow calls with their owning import lease. Fail on any unclassified
 callsite or any allowlist entry that disappears, so a new ready read cannot bypass
-the lease silently.
+the lease silently. The same audit rejects external
+`%RepositoryReadHandle{}` patterns, field access, `Map.get/fetch` on handles,
+`Kernel.get_in`, and any lease accessor. The handle module only declares the
+opaque struct; only `ForgeRepos` may construct or destructure it.
 
 Add integration assertions that an old reader opened before replacement continues
 using the old inode and blocks cleanup, while a post-publication lookup opens the
@@ -1488,6 +1507,10 @@ pull branch/commit/diff/compare/analysis, HTTP, and SSH paths and prove an exclu
 cleanup grant waits for each. Conversely, hold cleanup, queue each reader, perform
 strict invalidation and removal, then prove no queued read executes GitCore or
 repopulates `GitCore.Cache` after invalidation.
+
+In `repository_read_handle_test.exs`, assert both accessors return the reloaded
+repository/path, no public lease accessor exists, external code never sees the
+lease, and close is idempotent across success, raised callback, and owner death.
 
 - [ ] **Step 8B.5: Run GREEN read-path tests**
 
@@ -1504,11 +1527,15 @@ devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
   apps/fornacast_web/test/repository_controller_test.exs \
   apps/fornacast_web/test/repository_page_test.exs \
   --max-cases 1
+devenv shell -- mix dialyzer --format raw
 ```
 
 Expected: all tests pass; cleanup cannot overlap repository view/size, pull,
 browser, SSH, Exec, HTTP, or blocked DirtyIo reads; limiter failure denies new
-reads; and no read runs or repopulates cache after strict invalidation.
+reads; and no read runs or repopulates cache after strict invalidation. Dialyzer
+reports no `:opaque_match`, `:call_without_opaque`, or other opaque-type warning;
+adding external field access to the audit fixture must make the audit and Dialyzer
+expectation fail.
 
 - [ ] **Step 8B.6: Commit reader leasing**
 
