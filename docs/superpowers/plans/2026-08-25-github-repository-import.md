@@ -1486,8 +1486,9 @@ complete has no lease, `next_attempt_at`, or `last_error` and requires
 `effect_started_at`, `effect_finished_at`, and `completed_at` in timestamp order.
 Only pending may carry a lease, and `effect_finished_at` never exists without
 `effect_started_at`. Every evidence map passes the exact per-kind version/key/type
-validator below; once `effect_started_at` is present, `anchored_identity` is
-required and immutable.
+validator below. Once `effect_started_at` is present, the evidence contains
+exactly one immutable anchored outcome: `anchored_identity` or
+`anchored_absence`, never both.
 
 The same migration adds named checks to `git_write_operations` and
 `pull_merge_operations`: `lease_owner` and `lease_expires_at` are both null or
@@ -1501,7 +1502,10 @@ levels on Turso and PostgreSQL. `Inspect` must redact `evidence`, `last_error`, 
 every path-bearing field. Add `states/0` and `terminal_states/0` to
 `GitWriteOperation` and `MergeOperation` so `OperationLease.claim/5` returns
 `:busy` for terminal rows. Verify existing live nonterminal claims still work and
-one-sided or terminal retained leases are rejected by both databases.
+one-sided or terminal retained leases are rejected by both databases. Include
+valid initial-absence evidence, identity/absence mutual-exclusion failures, forged
+root/path projections, absence without ordered effect timestamps, and complete
+absence-proof rows in both adapter migration/schema matrices.
 
 - [ ] **Step 8C.2: Run the Turso RED suite**
 
@@ -1529,9 +1533,10 @@ def kinds, do: [:remote_quarantine, :unpublished_shadow, :replacement_tombstone]
 
 Its creation changeset accepts immutable identity/evidence fields plus scheduling
 fields only. Its `lease_update_changeset/2` permits exact transitions from pending
-to pending/blocked/complete, attempt/backoff/error updates, identity enrichment,
-effect timestamps, and completion; it never permits changing repository, item,
-source version, kind, operation ID, or original evidence facts.
+to pending/blocked/complete, attempt/backoff/error updates, anchored-outcome
+enrichment, effect timestamps, and completion; enrichment chooses exactly one
+immutable anchored identity-or-absence outcome. It never permits changing
+repository, item, source version, kind, operation ID, or original evidence facts.
 
 Use these deterministic operation IDs:
 
@@ -1560,9 +1565,37 @@ Use version `1` evidence maps with exact keys:
   item_id, item_lock_version, requested_path, quarantine_path, mode, device,
   inode, remote_failure_kind`.
 
-After anchored observation, enrich the same evidence with
-`"anchored_identity" => %{"device" => device, "inode" => inode, "mode" => mode}`
-before deletion. The original path/evidence keys remain immutable.
+After anchored observation, enrich the same evidence with exactly one of:
+
+```elixir
+%{
+  "anchored_identity" => %{
+    "device" => device,
+    "inode" => inode,
+    "mode" => mode
+  }
+}
+
+%{
+  "anchored_absence" => %{
+    "version" => 1,
+    "observed_at" => DateTime.to_iso8601(observed_at),
+    "root_projection" => root_projection,
+    "path_projection" => path_projection
+  }
+}
+```
+
+`root_projection` is lowercase hex SHA-256 of
+`:erlang.term_to_binary({:fornacast_cleanup_root, 1, storage_root})`.
+`path_projection` is lowercase hex SHA-256 of
+`:erlang.term_to_binary({:fornacast_cleanup_path, 1, storage_root,
+relative_segments})`. The configured storage root and canonical relative segments
+come from the immutable journal evidence; finalization recomputes both projections
+and rejects a forged marker or path drift. The original path/evidence keys and the
+chosen anchored outcome remain immutable. An absence outcome is valid only after
+the read-only anchored NIF returned `:missing` under both permits; it is not
+permission to call removal.
 `publication_marker` is the full committed marker already validated by
 `RepositoryPublisher`. `attempt_fingerprint` is lowercase hex SHA-256 of the
 canonical Erlang external-term encoding of
@@ -1596,6 +1629,12 @@ or an expired paired lease returns claimable-operation blocked; any one-sided le
 or terminal retained lease returns inconsistent-lease blocked. Only zero blocking
 rows returns `:safe`. Tombstoned repositories are inspected only through this
 safety callback; do not invoke normal reconciliation on a tombstone.
+
+The import-domain preflight in Task 8D is independently fail-closed. Its only
+nonterminal exception is the exact source chain of a `remote_quarantine` cleanup
+operation; replacement-tombstone and unpublished-shadow cleanup have no import
+exception. The exception contract is specified in Steps 8D.1 and 8D.5 and does not
+weaken either repository-write safety callback.
 
 - [ ] **Step 8C.5: Fence predecessor/successor adoption against cleanup intent**
 
@@ -1719,13 +1758,25 @@ In `repository_cleanup_test.exs` cover every true/false branch for all three kin
   version. A future paired item lease reschedules just after expiry without
   creating/destructively attempting intent, and a one-sided item lease blocks.
 
+For Remote quarantine, add paired RED cases proving the exact source-chain
+exception and its boundary. The exact journal item may remain `:staging_git` with
+`cleanup_pending`, its exact current attempt may remain `:running`, and its parent
+run may be `:running`, `:cancel_requested`, `:awaiting_credential`, or any terminal
+recovery state, provided journal/evidence/item/source lock version all match and
+item/run leases are paired-null or expired. Change each fact independently and
+assert blocking. Add any second nonterminal item, attempt, or run associated with
+the repository and assert blocking even when the source chain itself is valid.
+
 Also cover grace at one second before/exactly at the boundary; nonterminal,
 claimable, live, expired, and malformed leases in import/Git-write/merge domains;
 successor-intent races; changed publication marker/path/identity/audit; symlinks at
-every layer; special files; missing before and after durable identity; strict cache
+every layer; special files; initial anchored missing, missing after durable
+identity, forged absence, and absence/path-projection mismatch; strict cache
 failure; limiter absence/crash; old-reader blocking; claimable operations blocking;
-crashes after journal creation, identity persistence, deletion, audit insertion,
-and final CAS; two-pass replay; no premature audit/marker; audit collision;
+crashes after journal creation, identity persistence, absence-proof persistence,
+deletion, audit insertion, and final CAS; two-pass replay; exact
+`effect: "missing"` audit metadata for initial absence; no premature audit/marker;
+audit collision;
 round-robin fairness; backoff; Remote retry restoration; and later terminal
 settlement/unpublished cleanup.
 
@@ -1811,9 +1862,42 @@ or load the deterministic journal using the source item lock version. Use
 `OperationLease.claim(CleanupOperation, id, owner, now, lease_seconds,
 allowed_states: [:cleanup_pending])`.
 
-Before any effect, reject any associated nonterminal or claimable import work, any
-live or malformed import lease, any nonterminal Git-write/merge operation, any
-successor/adopter, and any drifted marker, path, identity, or audit. Call both
+Before any effect, `RepositoryCleanup.import_safety_locked/2` rejects associated
+nonterminal or claimable import work, live/malformed import leases,
+successors/adopters, and drifted journal/evidence/source facts. It permits exactly
+one exception, and only when `operation.kind == :remote_quarantine`:
+
+```elixir
+item.id == operation.repository_item_id and
+  item.lock_version == operation.source_lock_version and
+  item.state == :staging_git and
+  item.cleanup_state == "cleanup_pending" and
+  exact_remote_evidence?(operation.evidence, item) and
+  paired_null_or_expired?(item.lease_owner, item.lease_expires_at, now) and
+  attempt.repository_item_id == item.id and
+  attempt.attempt_number == item.attempt_count and
+  attempt.state == :running and
+  run.id == item.import_run_id and
+  run.state in [
+    :running,
+    :cancel_requested,
+    :awaiting_credential,
+    :completed,
+    :completed_with_warnings,
+    :canceled,
+    :failed
+  ] and
+  paired_null_or_expired?(run.lease_owner, run.lease_expires_at, now)
+```
+
+`exact_remote_evidence?/2` compares the operation ID, kind, repository/item IDs,
+source lock version, requested/canonical quarantine paths, and persisted
+mode/device/inode. A live or one-sided source item/run lease, mismatched evidence,
+non-current or non-running source attempt, any other source state, or any second
+nonterminal item/attempt/run for the repository blocks. No exception exists for a
+successor/adopter or for replacement/unpublished cleanup.
+
+The same preflight rejects any nonterminal Git-write/merge operation and calls both
 `cleanup_safety_locked/2` ports while the SQL rows are locked. A claimable
 Git/merge operation is a slow retry, never permission to delete.
 
@@ -1837,20 +1921,26 @@ read limiter, so this ordering introduces no cycle.
 The effect state machine is:
 
 1. The journal exists and is leased.
-2. For replacement/unpublished storage, call
-   `GitCore.contained_tree_identity/3` under both permits and persist that exact
-   identity into journal evidence before any destructive call. Remote quarantine
-   already has exact durable mode/device/inode evidence, which must equal a fresh
-   anchored observation before deletion.
-3. Call `GitCore.invalidate_repository_cache_strict/1`. Cache failure retains
-   `cleanup_pending` and performs no deletion.
-4. Call `GitCore.remove_contained_tree/4` with the exact persisted identity.
-   Partial removal, timeout, or I/O error retains pending state and backoff; replay
-   uses the same identity. A path/symlink/identity/evidence/audit mismatch moves the
-   row to `cleanup_blocked` for manual intervention.
-5. After `{:removed, identity}`, or `:missing` proven from the same anchored parent
-   after durable intent, run a final transaction that re-locks and CAS-checks the
-   exact repository/item/journal fingerprint.
+2. Call `GitCore.contained_tree_identity/3` under both permits. On an identity
+   result, persist exact `anchored_identity` and `effect_started_at` before any
+   destructive call. Remote quarantine already has mode/device/inode evidence,
+   which must equal this fresh identity. On `:missing`, persist exact
+   `anchored_absence` plus `effect_started_at` and `effect_finished_at` in one
+   lease-owned transaction before finalization. A crash after that transaction
+   replays by recomputing projections and requiring a second anchored `:missing`.
+3. For either outcome, call `GitCore.invalidate_repository_cache_strict/1`.
+   Cache failure retains `cleanup_pending` and performs no deletion or
+   finalization.
+4. Only for identity-backed work, call `GitCore.remove_contained_tree/4` with that
+   exact persisted identity. Removal is never called from an absence proof or
+   without identity. Partial removal, timeout, or I/O error retains pending state
+   and backoff; replay uses the same identity. After removed, or after identity
+   replay safely returns missing, persist `effect_finished_at`.
+5. Finalize only one of two mutually exclusive proofs:
+   `anchored_identity + (removed | safely missing replay)`, or
+   `anchored_absence + safely missing`. Re-lock and CAS-check the exact
+   repository/item/journal fingerprint and recompute the anchored root/path
+   projections before committing.
 
 For replacement/unpublished cleanup, the final transaction sets
 `Repository.storage_reclaimed_at`, inserts or verifies the deterministic
@@ -1866,6 +1956,11 @@ marks the journal complete. It does not set repository
 `storage_reclaimed_at`. The existing worker later settles the terminal run; if the
 shadow then qualifies, unpublished-shadow cleanup creates a separate journal.
 
+Both deterministic cleanup audit actions record `"effect" => "missing"` only for
+a validated initial `anchored_absence`. Identity-backed removal records
+`"effect" => "removed"` even when crash replay proves the post-removal path
+missing.
+
 - [ ] **Step 8D.7: Apply exact retry policy**
 
 Use these outcomes:
@@ -1878,8 +1973,11 @@ Use these outcomes:
 - claimable Git/merge/import operation: retry after `30` seconds without deleting;
 - evidence/path/identity/symlink/special-file/audit mismatch or malformed lease:
   `cleanup_blocked` with redacted classified `last_error`;
-- anchored missing after exact durable intent: run finalization, never recreate or
-  rediscover the path.
+- anchored missing before an outcome exists: persist `anchored_absence` and both
+  effect timestamps, then finalize only after the exact proof revalidates;
+- anchored missing with durable identity: treat only as removal replay; anchored
+  missing with durable absence: recompute projections and revalidate. Never
+  recreate or rediscover the path.
 
 - [ ] **Step 8D.8: Run focused Turso cleanup and read/write race suites**
 
