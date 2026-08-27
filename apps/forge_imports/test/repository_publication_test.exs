@@ -753,6 +753,121 @@ defmodule ForgeImports.RepositoryPublicationTest do
     assert Repo.get!(Repository, fixture.shadow.id).lifecycle == :importing
   end
 
+  test "admin loses organization publication authority when owner membership is removed",
+       context do
+    assert {1, _rows} =
+             Repo.update_all(
+               from(user in ForgeAccounts.User, where: user.id == ^context.actor.id),
+               set: [role: :admin]
+             )
+
+    admin = Repo.get!(ForgeAccounts.User, context.actor.id)
+    suffix = System.unique_integer([:positive])
+
+    assert {:ok, organization} =
+             ForgeAccounts.create_organization(admin, %{
+               username: "admin-publication-org-#{suffix}",
+               display_name: "Admin publication organization"
+             })
+
+    fixture = ready_publication_fixture(%{context | actor: admin}, owner: organization)
+
+    assert {:error, :destination_changed} =
+             ForgeImports.RepositoryPublisher.with_test_after_admission_hook(
+               fn _capability ->
+                 Repo.get_by!(OrganizationMember,
+                   organization_id: organization.id,
+                   user_id: admin.id
+                 )
+                 |> Repo.delete!()
+
+                 :ok
+               end,
+               fn -> ForgeImports.publish_repository(admin, fixture.item.id, %{}) end
+             )
+
+    assert Repo.get!(RepositoryItem, fixture.item.id).state == :awaiting_resolution
+    assert Repo.get!(Repository, fixture.shadow.id).lifecycle == :importing
+    assert Repo.get!(ImportRun, fixture.run.id).published_count == 0
+  end
+
+  test "deleted namespace history is allowed while every undeleted non-target lifecycle conflicts",
+       context do
+    deleted = ready_publication_fixture(context, slug: "deleted-history")
+    history = repository_fixture(context.actor, deleted.item.destination_slug)
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(repository in Repository, where: repository.id == ^history.id),
+               set: [lifecycle: :tombstoned, deleted_at: @now]
+             )
+
+    assert {:ok, %{repository: published}} =
+             ForgeImports.publish_repository(context.actor, deleted.item.id, %{})
+
+    assert published.id == deleted.shadow.id
+
+    for lifecycle <- [:importing, :tombstoned] do
+      slug = "undeleted-#{lifecycle}"
+      fixture = ready_publication_fixture(context, slug: slug)
+
+      conflict =
+        %Repository{}
+        |> Repository.import_changeset(%{
+          owner_user_id: context.actor.id,
+          slug: slug,
+          name: "Conflicting import",
+          visibility: :private,
+          storage_path: "@test/conflict-#{lifecycle}-#{fixture.item.id}.git",
+          lifecycle: :importing,
+          generation: 1
+        })
+        |> Repo.insert!()
+
+      if lifecycle == :tombstoned do
+        assert {1, _rows} =
+                 Repo.update_all(
+                   from(repository in Repository, where: repository.id == ^conflict.id),
+                   set: [lifecycle: :tombstoned]
+                 )
+      end
+
+      assert {:error, :destination_changed} =
+               ForgeImports.publish_repository(context.actor, fixture.item.id, %{})
+
+      assert Repo.get!(RepositoryItem, fixture.item.id).state == :awaiting_resolution
+      assert Repo.get!(Repository, fixture.shadow.id).lifecycle == :importing
+    end
+  end
+
+  test "owner slug collision injected after namespace precheck maps to destination drift",
+       context do
+    fixture = ready_publication_fixture(context, slug: "injected-namespace-race")
+
+    assert {:error, :destination_changed} =
+             ForgeRepos.with_test_after_import_namespace_check_hook(
+               fn spec ->
+                 %Repository{owner_user_id: spec.owner_user_id, storage_path: "@test/race.git"}
+                 |> Repository.create_changeset(%{
+                   slug: spec.slug,
+                   name: "Racing repository",
+                   visibility: :private,
+                   default_branch: "main",
+                   has_issues: true,
+                   allow_merge_commit: true
+                 })
+                 |> Repo.insert!()
+
+                 :ok
+               end,
+               fn -> ForgeImports.publish_repository(context.actor, fixture.item.id, %{}) end
+             )
+
+    assert Repo.get!(RepositoryItem, fixture.item.id).state == :awaiting_resolution
+    assert Repo.get!(Repository, fixture.shadow.id).lifecycle == :importing
+    assert Repo.get!(ImportRun, fixture.run.id).published_count == 0
+  end
+
   test "destination resolution derives ready and git-staged successors from durable proof",
        context do
     for {mode, expected_state} <- [complete: :ready_to_publish, incomplete: :git_staged] do

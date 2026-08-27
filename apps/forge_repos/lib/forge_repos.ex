@@ -415,6 +415,7 @@ defmodule ForgeRepos do
 
   if Mix.env() == :test do
     @import_publication_hook_key {__MODULE__, :import_publication_hook}
+    @import_namespace_hook_key {__MODULE__, :import_namespace_hook}
 
     @doc false
     def with_test_after_import_tombstone_hook(hook, fun)
@@ -431,14 +432,37 @@ defmodule ForgeRepos do
       end
     end
 
+    @doc false
+    def with_test_after_import_namespace_check_hook(hook, fun)
+        when is_function(hook, 1) and is_function(fun, 0) do
+      previous = Process.get(@import_namespace_hook_key)
+      Process.put(@import_namespace_hook_key, hook)
+
+      try do
+        fun.()
+      after
+        if is_nil(previous),
+          do: Process.delete(@import_namespace_hook_key),
+          else: Process.put(@import_namespace_hook_key, previous)
+      end
+    end
+
     defp after_import_tombstone(repository) do
       case Process.get(@import_publication_hook_key) do
         hook when is_function(hook, 1) -> hook.(repository)
         nil -> :ok
       end
     end
+
+    defp after_import_namespace_check(spec) do
+      case Process.get(@import_namespace_hook_key) do
+        hook when is_function(hook, 1) -> hook.(spec)
+        nil -> :ok
+      end
+    end
   else
     defp after_import_tombstone(_repository), do: :ok
+    defp after_import_namespace_check(_spec), do: :ok
   end
 
   defp authorize_import_publication(repo, actor_id, owner_id) do
@@ -462,9 +486,6 @@ defmodule ForgeRepos do
   end
 
   defp import_destination_authorized?(_repo, %User{id: id}, %User{id: id, kind: :user}), do: true
-
-  defp import_destination_authorized?(_repo, %User{role: :admin}, %User{kind: :organization}),
-    do: true
 
   defp import_destination_authorized?(repo, %User{id: actor_id}, %User{
          id: organization_id,
@@ -503,6 +524,8 @@ defmodule ForgeRepos do
 
     with :ok <- validate_import_shadow(repo, shadow, spec),
          :ok <- validate_import_target(repo, replaced, expected_replacement, spec),
+         :ok <- validate_import_namespace(repo, spec, expected_replacement),
+         :ok <- after_import_namespace_check(spec),
          {:ok, collaborators} <- locked_import_collaborators(repo, replaced),
          {:ok, tombstoned} <- tombstone_import_target(repo, replaced, spec.timestamp),
          :ok <- after_import_tombstone(tombstoned),
@@ -520,6 +543,11 @@ defmodule ForgeRepos do
       {:error, _reason} -> {:error, :persistence_unavailable}
       _changed -> {:error, :destination_changed}
     end
+  rescue
+    error ->
+      if import_namespace_collision?(error),
+        do: {:error, :destination_changed},
+        else: reraise(error, __STACKTRACE__)
   end
 
   defp validate_import_shadow(repo, %Repository{} = shadow, spec) do
@@ -529,22 +557,12 @@ defmodule ForgeRepos do
           where: collaborator.repository_id == ^shadow.id
       )
 
-    active_slug_conflict? =
-      repo.exists?(
-        from repository in Repository,
-          where:
-            repository.id != ^shadow.id and repository.owner_user_id == ^spec.owner_user_id and
-              repository.slug == ^spec.slug and repository.lifecycle == :ready and
-              is_nil(repository.deleted_at)
-      )
-
     if shadow.owner_user_id == spec.owner_user_id and
          shadow.slug == spec.expected_internal_slug and shadow.storage_path == spec.storage_path and
          shadow.write_version == spec.shadow_write_version and shadow.write_version == 0 and
          shadow.lifecycle == :importing and is_nil(shadow.deleted_at) and
          valid_canonical_import_shadow?(shadow, spec.expected_internal_slug) and
-         is_nil(shadow.storage_reclaimed_at) and not collaborators? and
-         (not active_slug_conflict? or (is_integer(spec.generation) and spec.generation > 1)) do
+         is_nil(shadow.storage_reclaimed_at) and not collaborators? do
       :ok
     else
       {:error, :destination_changed}
@@ -586,6 +604,45 @@ defmodule ForgeRepos do
 
   defp validate_import_target(_repo, _target, _expected, _spec),
     do: {:error, :destination_changed}
+
+  defp validate_import_namespace(repo, spec, expected_replacement) do
+    allowed_ids =
+      [spec.hidden_repository_id, expected_replacement && expected_replacement.repository_id]
+      |> Enum.reject(&is_nil/1)
+
+    conflict =
+      Repository
+      |> where(
+        [repository],
+        repository.owner_user_id == ^spec.owner_user_id and repository.slug == ^spec.slug and
+          is_nil(repository.deleted_at) and repository.id not in ^allowed_ids
+      )
+      |> order_by([repository], asc: repository.id)
+      |> publication_lock()
+      |> repo.one()
+
+    if is_nil(conflict), do: :ok, else: {:error, :destination_changed}
+  end
+
+  defp import_namespace_collision?(error) do
+    postgres = Map.get(error, :postgres) || %{}
+
+    constraint =
+      (Map.get(error, :constraint) || Map.get(postgres, :constraint) ||
+         Map.get(postgres, "constraint"))
+      |> to_string()
+      |> String.downcase()
+
+    message = Exception.message(error) |> String.downcase()
+
+    String.contains?(constraint, "repositories_owner_user_id_slug") or
+      String.contains?(message, "repositories_owner_user_id_slug") or
+      (String.contains?(message, "unique") and
+         String.contains?(message, "repositories.owner_user_id") and
+         String.contains?(message, "repositories.slug"))
+  rescue
+    _error -> false
+  end
 
   defp locked_import_collaborators(_repo, nil), do: {:ok, []}
 
