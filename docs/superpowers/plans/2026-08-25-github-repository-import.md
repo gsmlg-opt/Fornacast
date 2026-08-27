@@ -1056,6 +1056,7 @@ root, or a shared directory; every destructive test uses ExUnit `tmp_dir`.
 - Create: `apps/git_core/test/anchored_remove_test.exs`
 - Modify: `apps/git_core/lib/git_core.ex`
 - Modify: `apps/git_core/lib/git_core/native.ex`
+- Modify: `apps/git_core/lib/git_core/remote.ex`
 - Modify: `apps/git_core/native/fornacast_git_core/Cargo.toml`
 - Modify: `apps/git_core/native/fornacast_git_core/Cargo.lock`
 - Modify: `apps/git_core/native/fornacast_git_core/src/lib.rs`
@@ -1116,16 +1117,21 @@ mount/filesystem-device crossing when the test host permits an unprivileged moun
 If the mount cannot be created, explicitly assert the test is skipped for that
 host; do not weaken the production `major_device/minor_device` check.
 
-In `remote_test.exs`, create one real deterministic quarantine and assert
-`GitCore.Remote.cleanup_evidence/1` returns the exact same
-`%{mode:, major_device:, minor_device:, inode:}` as the `target` in the
-`{:present, %{root: root_identity, target: target_identity}}` result from
-`GitCore.contained_tree_identity/3` for that quarantine under the canonical
-storage root and relative segments. Also assert `root_identity` is the final
-nofollow-opened configured storage-root directory. Assert both atom-key public
-maps round-trip to persisted JSON string-key maps without value conversion. This
-is a test-only addition: `GitCore.Remote` and `RepositoryWorker` already emit the
-canonical target fields and require no production change.
+In `remote_test.exs`, exercise three real-filesystem paths: a mirror failure that
+renames into its deterministic quarantine, `GitCore.Remote.cleanup_evidence/1`
+rediscovery, and prior-slot discovery on the next mirror attempt. For the same
+quarantine, assert every returned `CleanupPending.identity` equals the `target` in
+the `{:present, %{root: root_identity, target: target_identity}}` result from
+`GitCore.contained_tree_identity(parent, [leaf], deadline_ms)`. Require exact
+`%{mode: 0o700, major_device:, minor_device:, inode:}` equality across all three
+paths. Also assert `root_identity` is the final nofollow-opened parent directory
+and both atom-key public maps round-trip to persisted JSON string-key maps without
+value conversion.
+
+These tests are RED against the current Remote implementation because OTP
+`File.Stat.major_device/minor_device` expose platform raw `st_dev/st_rdev` fields;
+they are not the canonical `major(st_dev)/minor(st_dev)` pair. Do not change
+`RepositoryWorker` persistence, which already stores the desired four key names.
 
 Add source assertions that `anchored_remove.rs` uses descriptor-relative
 `openat`/`statat`/`unlinkat` operations, contains no path fallback, compiles an
@@ -1147,7 +1153,8 @@ devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
 ```
 
 Expected: FAIL because the two anchored APIs and strict invalidation API do not
-exist.
+exist; once those compile, the Remote cases still fail until raw File.Stat cleanup
+identity is replaced by anchored canonicalization.
 
 - [ ] **Step 8A.3: Implement one anchored DirtyIo NIF per public call**
 
@@ -1204,6 +1211,22 @@ Use these rustix platform helpers rather than copying or casting raw `st_dev`.
 Compare descendant filesystem membership by the root `major_device/minor_device`
 pair while retaining the full stat mode separately for directory/special-file
 classification.
+
+In `GitCore.Remote`, keep the existing private `File.Stat` tuple only for immediate
+same-path race checks such as comparing a directory immediately before and after a
+rename/validation step. Name those values as raw stat fields; never expose them,
+persist them, compare them with canonical identities, or relabel them as
+`major_device/minor_device`.
+
+After a quarantine rename and safe-path validation, call
+`GitCore.contained_tree_identity(parent, [leaf], deadline_ms)`, require
+`{:present, %{target: %{mode: 0o700} = canonical_target}}`, and build
+`CleanupPending.identity` from that canonical target. Apply the same anchored
+canonicalization in `cleanup_evidence/1` and every prior deterministic-slot
+discovery path before returning cleanup-pending evidence. Missing, non-`0700`,
+root/target mismatch, or typed anchored error remains
+`GitCore.Remote.Error{kind: :unsafe_cleanup_state}`. No Remote branch may derive a
+public/persisted identity directly from `File.lstat/1`.
 
 `contained_tree_identity/3` is read-only and returns the exact target
 as `{:present, %{root: root_identity, target: target_identity}}`, where
@@ -1290,8 +1313,9 @@ devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
 
 Expected: all tests pass, the success case reports the same root+target proof
 observed before removal, root/target mismatch cases leave the target untouched,
-and partial-timeout replay removes only the original target under the original
-root.
+partial-timeout replay removes only the original target under the original root,
+and mirror-failure, cleanup-evidence, and prior-slot Remote results all expose the
+same anchored canonical target identity.
 
 - [ ] **Step 8A.6: Commit the anchored primitive**
 
@@ -1300,6 +1324,7 @@ git diff --check
 git add \
   apps/git_core/lib/git_core.ex \
   apps/git_core/lib/git_core/native.ex \
+  apps/git_core/lib/git_core/remote.ex \
   apps/git_core/native/fornacast_git_core/Cargo.toml \
   apps/git_core/native/fornacast_git_core/Cargo.lock \
   apps/git_core/native/fornacast_git_core/src/lib.rs \
