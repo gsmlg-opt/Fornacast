@@ -179,6 +179,7 @@ defmodule ForgeImports.RepositoryPublicationTest do
 
     storage_path = fixture.shadow.storage_path
     target_path = ForgeRepos.absolute_storage_path(target)
+    File.rm_rf!(target_path)
     File.mkdir_p!(Path.dirname(target_path))
     assert {:ok, ^target_path} = GitCore.init_bare(target_path)
 
@@ -953,6 +954,7 @@ defmodule ForgeImports.RepositoryPublicationTest do
        context do
     target = repository_fixture(context.actor, "durable-fence")
     path = ForgeRepos.absolute_storage_path(target)
+    File.rm_rf!(path)
     File.mkdir_p!(Path.dirname(path))
     assert {:ok, ^path} = GitCore.init_bare(path)
     %{base: base_oid, head: head_oid, merge: merge_oid} = create_merge_graph!(path)
@@ -1186,6 +1188,150 @@ defmodule ForgeImports.RepositoryPublicationTest do
            ] == Reconciler.runnable_repository_item_ids(10, now)
 
     refute cleanup.item.id in Reconciler.runnable_repository_item_ids(10, now)
+  end
+
+  test "reopen samples lease time only after all capability locks", context do
+    target = repository_fixture(context.actor, "reopen-lock-expiry")
+
+    fixture =
+      ready_publication_fixture(context, action: :replace, target: target, slug: target.slug)
+
+    run_before = Repo.get!(ImportRun, fixture.run.id)
+
+    assert {:error, :persistence_unavailable} =
+             ForgeImports.Conflicts.with_test_reopen_publication_locks_hook(
+               fn -> Process.sleep(2_000) end,
+               fn ->
+                 ForgeImports.RepositoryPublisher.with_test_after_admission_hook(
+                   fn _capability ->
+                     assert {1, _rows} =
+                              Repo.update_all(
+                                from(item in RepositoryItem,
+                                  where: item.id == ^fixture.item.id
+                                ),
+                                set: [
+                                  lease_expires_at:
+                                    DateTime.add(DateTime.utc_now(:second), 1, :second)
+                                ]
+                              )
+
+                     assert {1, _rows} =
+                              Repo.update_all(
+                                from(repository in Repository,
+                                  where: repository.id == ^fixture.shadow.id
+                                ),
+                                set: [name: "force destination drift"]
+                              )
+
+                     :ok
+                   end,
+                   fn -> ForgeImports.publish_repository(context.actor, fixture.item.id, %{}) end
+                 )
+               end
+             )
+
+    assert Repo.get!(RepositoryItem, fixture.item.id).state == :publishing
+    assert Repo.get!(ImportAttempt, fixture.attempt.id).state == :running
+    assert Repo.get!(ImportRun, fixture.run.id).lock_version == run_before.lock_version
+  end
+
+  test "final commit samples lease time after item and attempt locks", context do
+    fixture = ready_publication_fixture(context, slug: "final-lock-expiry")
+
+    assert {:error, :persistence_unavailable} =
+             ForgeImports.RepositoryPublisher.with_test_final_locks_hook(
+               fn -> Process.sleep(2_000) end,
+               fn ->
+                 ForgeImports.RepositoryPublisher.with_test_after_admission_hook(
+                   fn _capability ->
+                     assert {1, _rows} =
+                              Repo.update_all(
+                                from(item in RepositoryItem,
+                                  where: item.id == ^fixture.item.id
+                                ),
+                                set: [
+                                  lease_expires_at:
+                                    DateTime.add(DateTime.utc_now(:second), 1, :second)
+                                ]
+                              )
+
+                     :ok
+                   end,
+                   fn -> ForgeImports.publish_repository(context.actor, fixture.item.id, %{}) end
+                 )
+               end
+             )
+
+    assert Repo.get!(RepositoryItem, fixture.item.id).state == :publishing
+    assert Repo.get!(Repository, fixture.shadow.id).lifecycle == :importing
+    assert Repo.get!(ImportRun, fixture.run.id).published_count == 0
+  end
+
+  test "final transaction timestamps are refreshed after replacement fence", context do
+    target = repository_fixture(context.actor, "post-fence-timestamps")
+
+    fixture =
+      ready_publication_fixture(context, action: :replace, target: target, slug: target.slug)
+
+    pre_fence = ~U[2026-08-28 03:00:00Z]
+    post_fence = ~U[2026-08-28 03:00:10Z]
+    key = {__MODULE__, make_ref()}
+    Process.put(key, 0)
+
+    clock = fn ->
+      calls = Process.get(key, 0)
+      Process.put(key, calls + 1)
+      if calls == 0, do: pre_fence, else: post_fence
+    end
+
+    assert {:ok, %{repository: published, replaced: replaced}} =
+             ForgeImports.RepositoryPublisher.with_test_publication_clock(clock, fn ->
+               ForgeImports.publish_repository(context.actor, fixture.item.id, %{})
+             end)
+
+    assert replaced.deleted_at == post_fence
+    assert published.updated_at == post_fence
+    assert Repo.get!(ImportRun, fixture.run.id).updated_at == post_fence
+    assert Repo.get!(RepositoryItem, fixture.item.id).updated_at == post_fence
+    assert Repo.get!(ImportAttempt, fixture.attempt.id).terminal_at == post_fence
+    assert Process.get(key) >= 2
+    Process.delete(key)
+  end
+
+  test "replay malformed evidence always reports inconsistency", context do
+    fixture = ready_publication_fixture(context, slug: "total-replay-guard")
+    assert {:ok, _result} = ForgeImports.publish_repository(context.actor, fixture.item.id, %{})
+    committed = Repo.get!(RepositoryItem, fixture.item.id).publication_evidence
+
+    corruptions = [
+      {"version", "1"},
+      {"state", "intent"},
+      {"attempt_number", "1"},
+      {"hidden_repository_id", 0},
+      {"repository_id", "bad"},
+      {"owner_user_id", 0},
+      {"run_id", "bad"},
+      {"generation", 0},
+      {"run_lock_version_after", 0},
+      {"published_count_after", -1},
+      {"replaced_repository_id", 0},
+      {"action", "skip"},
+      {"slug", "Not Canonical"},
+      {"operation_id", "caller-operation"},
+      {"request_metadata", %{"request_id" => "/private/path"}}
+    ]
+
+    for {field, value} <- corruptions do
+      assert {1, _rows} =
+               Repo.update_all(
+                 from(item in RepositoryItem, where: item.id == ^fixture.item.id),
+                 set: [publication_evidence: Map.put(committed, field, value)]
+               )
+
+      assert {:error, :publication_inconsistent} =
+               ForgeImports.publish_repository(context.actor, fixture.item.id, %{}),
+             "expected malformed #{field} to be inconsistent"
+    end
   end
 
   defp ready_publication_fixture(context, opts \\ []) do

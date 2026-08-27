@@ -20,6 +20,34 @@ defmodule ForgeImports.Conflicts do
   @max_id 9_223_372_036_854_775_807
   @max_decisions 10_000
 
+  if Mix.env() == :test do
+    @reopen_publication_locks_hook_key {__MODULE__, :reopen_publication_locks_hook}
+
+    @doc false
+    def with_test_reopen_publication_locks_hook(hook, fun)
+        when is_function(hook, 0) and is_function(fun, 0) do
+      previous = Process.get(@reopen_publication_locks_hook_key)
+      Process.put(@reopen_publication_locks_hook_key, hook)
+
+      try do
+        fun.()
+      after
+        if is_nil(previous),
+          do: Process.delete(@reopen_publication_locks_hook_key),
+          else: Process.put(@reopen_publication_locks_hook_key, previous)
+      end
+    end
+
+    defp after_reopen_publication_locks do
+      case Process.get(@reopen_publication_locks_hook_key) do
+        hook when is_function(hook, 0) -> hook.()
+        nil -> :ok
+      end
+    end
+  else
+    defp after_reopen_publication_locks, do: :ok
+  end
+
   @spec resolve(User.t(), pos_integer(), map(), map()) ::
           {:ok, ForgeImports.RunView.t()} | {:error, atom()}
   def resolve(%User{} = actor, run_id, decisions, request_metadata)
@@ -81,12 +109,12 @@ defmodule ForgeImports.Conflicts do
   def reopen_publication(capability) when is_map(capability) do
     transaction = fn ->
       Repo.transaction(fn ->
-        now = DateTime.utc_now(:second)
-
         with %User{} <- locked_persisted_actor(capability.actor_id),
              %ImportRun{} = run <- locked_publication_run(capability),
              %RepositoryItem{} = item <- locked_publication_item(capability),
              %ImportAttempt{} = attempt <- locked_publication_attempt(capability),
+             :ok <- after_reopen_publication_locks(),
+             now <- DateTime.utc_now(:second),
              true <- valid_publication_capability?(capability, item, attempt, now),
              {:ok, action} <- running_decision_action(attempt),
              {:ok, updated_run} <- touch_publication_run(run, now),
