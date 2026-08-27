@@ -372,6 +372,8 @@ Start an operation-local `git credential-cache--daemon <0700-dir>/credential.soc
 
 Clone with a cleared and allowlisted environment, sanitized config, no prompt, no checkout/submodules/hooks/local optimization, `http.followRedirects=false`, disabled `file`/`ext` protocols, and a fixed `https://github.com/<owner>/<repo>.git` URL. `HostPolicy` resolves both A and AAAA records for `github.com`, rejects the operation if any answer is non-public, and pins every validated `github.com:443` answer into libcurl with `http.curloptResolve`; keep the hostname for TLS/SNI and never rely on a second DNS lookup. Remove `origin`, fetch/credential/http config, and all refs except heads/tags. Reject alternates, shallow state, symlinks, hooks, corruption, and remaining synchronization config. Validate physical bare storage, objects, limits, and default branch; set bare `HEAD`. Empty repositories remain valid. `refresh/3` fetches only explicit heads/tags into an already validated importing repository, never removes that repository on failure, and requires full revalidation before reuse.
 
+Mirror failure is fail-closed: atomically move the exact private destination into one deterministic, domain-separated, same-parent `.fornacast-cleanup-v1-*` slot and return redacted `cleanup_pending` evidence. Preflight rediscovery blocks same-destination retries before resolver/credential/Git work, including when the original caller died before receiving the result. `GitCore.Remote` never recursively deletes repository storage. Task 6 persists the cleanup evidence and Task 8 owns delayed, fenced reclamation.
+
 Add dedicated hard ceilings and lower-only configuration for remote concurrency `2`, wall time `1_800_000ms`, combined retained output `1_048_576` bytes, staged repository bytes `21_474_836_480`, refs `200_000`, poll interval `100ms`, credential startup `10_000ms`, process kill escalation `5_000ms`, and cleanup/reaper wait `10_000ms`. `GitCore.RemoteLimiter` owns remote concurrency; do not couple it to `ScanLimiter`.
 
 Each credential operation directory has a strict non-symlink name beneath one canonical root and a bounded atomic `0600` metadata file containing only version, erlexec group-leader OS PID, and creation time. The startup reaper preserves live registered leaders, removes only canonical orphan directories, and fails closed on invalid metadata, unresolved paths, or symlinks.
@@ -397,14 +399,26 @@ git commit -m "feat(git): add supervised GitHub mirror"
 
 **Files:**
 
+- Create: `apps/fornacast/priv/repo/migrations/20260825000410_add_repository_write_version.exs`
 - Create: `apps/forge_imports/lib/forge_imports/conflicts.ex`
 - Create: `apps/forge_imports/test/conflicts_test.exs`
 - Modify: `apps/forge_imports/lib/forge_imports.ex`
+- Modify: `apps/forge_imports/lib/forge_imports/import_attempt.ex`
 - Modify: `apps/forge_imports/lib/forge_imports/repository_item.ex`
+- Modify: `apps/forge_imports/lib/forge_imports/run_view.ex`
+- Modify: `apps/forge_imports/test/import_persistence_concurrency_test.exs`
+- Modify: `apps/forge_imports/test/run_view_consistency_test.exs`
+- Modify: `apps/forge_repos/lib/forge_repos.ex`
+- Modify: `apps/forge_repos/lib/forge_repos/repository.ex`
+- Modify: `apps/forge_repos/lib/forge_repos/git_write_recovery.ex`
+- Modify: `apps/forge_repos/test/repository_lifecycle_test.exs`
+- Modify: `apps/forge_repos/test/git_write_recovery_test.exs`
+- Modify: `apps/forge_pulls/lib/forge_pulls/merge_recovery.ex`
+- Modify: `apps/forge_pulls/test/merge_recovery_test.exs`
 
 - [ ] **Step 1: Write conflict/start tests**
 
-Cover skip, rename, replace, apply-to-similar expansion, full-name confirmation, destination admin permission, complete fingerprint, no selected items, frozen attempt decisions, and drift returning to resolution.
+Cover create, skip, rename, replace, skip-only apply-to-similar expansion, full-name confirmation, destination admin permission, complete fingerprint, no selected items, frozen attempt decisions, and item-level drift returning to resolution while the run remains running.
 
 ```elixir
 assert {:ok, frozen} =
@@ -433,12 +447,20 @@ resolve_repository_conflicts(actor, run_id, decisions, request_metadata)
 start_import(actor, run_id, request_metadata, opts \\ [])
 ```
 
-Fingerprint exact repository ID, owner ID, storage path, generation, `updated_at`, and `last_pushed_at`. Rename revalidates owner/slug. Skip becomes a terminal item without a shadow. Starting requires at least one selected item, freezes a new attempt revision, and commits `github_import.conflicts_frozen` plus `github_import.started` audits with `awaiting_resolution -> ready -> running` before dispatch. If destination drift is detected later, transactionally close the frozen attempt with `destination_changed`, create the next attempt/decision revision, clear its unresolved decision fields, and return the item to `awaiting_resolution` without mutating the predecessor attempt.
+Add a monotonic repository `write_version` as the exact Git-write observation: existing/ordinary/import repositories default to zero, callers cannot set it, and every durable Git-write or pull-merge completion increments it atomically in the same repository CAS transaction. Add nullable `replacement_write_version` to import items. Use adapter-portable nonnegative checks, exact PostgreSQL down/up coverage, and the existing pre-DDL Turso rollback guard for `concord#81`.
+
+Fingerprint exact repository ID, owner ID, storage path, generation, write version, `updated_at`, and `last_pushed_at`. Timestamp/generation equality alone is insufficient because multiple pushes may commit in one second. Rename revalidates owner/slug. Skip becomes terminal only when start freezes its immutable attempt; conflict-free items freeze as `%{"action" => "create", "slug" => slug}`. Add this exact `create` decision to `ImportAttempt` validation without changing the decision-map database shape. Apply-to-similar means selected items in the same run with the same destination owner and `wait_reason`; explicit item decisions win, expansion is deterministic by item ID, and only skip may use the shorthand—rename/replace require complete per-item payloads.
+
+Every resolution transaction updates all selected items plus the parent run lock version atomically so `RunView` cannot observe torn item plans. The safe view may expose replacement repository ID, owner ID, generation, write version, `updated_at`, and `last_pushed_at`, but never replacement storage path or full immutable decision maps.
+
+Starting requires an active actor, an actor-owned `awaiting_resolution` run, at least one actually selected item, a clean organization destination, no live run/item lease, unique final slugs, current destination authorization/availability, and exact replacement fingerprints. In deterministic item order, one transaction creates attempt `n + 1` for every selected item, copies the full immutable decision, increments `attempt_count`, transitions skips to `skipped`, transitions the run `awaiting_resolution -> ready -> running`, and records `github_import.conflicts_frozen` plus `github_import.started`. Dispatch happens only after commit; dispatch failure leaves durable running work for recovery.
+
+Destination drift later closes only the exact running attempt as `destination_changed`, clears the item's current decision/fingerprint fields, returns that item to `awaiting_resolution`, and bumps the still-running parent run version. Do not create an empty successor attempt. When the user resolves that running item, atomically create/freeze attempt `n + 1`, queue the item, and redispatch it while preserving the immutable predecessor. New organization creation remains deferred: Task 6 activates the frozen destination organization before it creates any shadow.
 
 - [ ] **Step 4: Run conflict and persistence tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/conflicts_test.exs apps/forge_imports/test/import_persistence_test.exs --max-cases 1
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/conflicts_test.exs apps/forge_imports/test/import_persistence_test.exs apps/forge_imports/test/import_persistence_concurrency_test.exs apps/forge_imports/test/run_view_consistency_test.exs apps/forge_repos/test/repository_lifecycle_test.exs apps/forge_repos/test/git_write_recovery_test.exs apps/forge_pulls/test/merge_recovery_test.exs --max-cases 1
 ```
 
 Expected: all tests pass.
@@ -446,7 +468,8 @@ Expected: all tests pass.
 - [ ] **Step 5: Commit conflict decisions**
 
 ```bash
-git add apps/forge_imports
+git add apps/fornacast/priv/repo/migrations/20260825000410_add_repository_write_version.exs \
+  apps/forge_imports apps/forge_repos apps/forge_pulls
 git commit -m "feat(import): freeze repository conflicts"
 ```
 
@@ -465,7 +488,7 @@ git commit -m "feat(import): freeze repository conflicts"
 
 - [ ] **Step 1: Write worker phase and secret-custody tests**
 
-Test transactional shadow insertion, generated internal slug, private visibility, intended generation, no `GitCore.init_bare`, saved/one-time callback checkout, `staging_git -> git_staged`, no production `ready_to_publish` transition before metadata, fully validated retry reuse, ambiguous staging rejection, failure cleanup intent, LFS/submodule warning entries, and zero public lookup/list visibility.
+Test transactional activation of a frozen new organization before any shadow, shadow insertion, generated internal slug, private visibility, intended generation, no `GitCore.init_bare`, saved/one-time callback checkout, `staging_git -> git_staged`, no production `ready_to_publish` transition before metadata, fully validated retry reuse, ambiguous staging rejection, persisted `cleanup_pending` quarantine evidence after mirror failure/owner loss, LFS/submodule warning entries, and zero public lookup/list visibility.
 
 - [ ] **Step 2: Run the worker tests before implementation**
 
@@ -478,6 +501,8 @@ Expected: FAIL with missing stager/worker.
 - [ ] **Step 3: Extend the existing reconciler and add the worker**
 
 Add `{:git_core, in_umbrella: true}` to `apps/forge_imports/mix.exs`. Reuse M1's `ForgeImports.TaskSupervisor`. Extend the reconciler to claim runnable repository items as well as discovery runs, while preserving one bounded scan task. `ForgeRepos.create_import_shadow/4` inserts `lifecycle: :importing` with a generated valid internal slug and opaque path but performs no filesystem operation.
+
+For a frozen `destination_organization_action: :new`, activate the organization transactionally under the initiating actor before creating the first shadow; persist the owner ID on the run/items and make replay exact and idempotent. Never create the organization during conflict resolution. Build `GitCore.Remote.Request.credential_login` from the verified linked GitHub identity, not the source organization login.
 
 Worker contract:
 
@@ -493,6 +518,8 @@ end
 ```
 
 Use `Task.Supervisor.async_nolink` from the existing recovery supervisor. Persist phase intent before each external effect and proof afterward. Inspect the staged default tree for `.gitattributes` LFS filters/pointer blobs and `.gitmodules`; record bounded unsupported report categories without recursively fetching anything. End this milestone at durable `git_staged`; only the metadata plan may advance to `staging_metadata` and `ready_to_publish`. Never persist the PAT.
+
+If `GitCore.Remote` returns `cleanup_pending`, validate and persist the deterministic quarantine path, private identity projection, and original failure classification as secret-free cleanup evidence before releasing the item lease. The requested staging path must be absent, retries must rediscover the same slot without invoking Git, and no successor may choose a new storage path while that evidence is unresolved. Caller death is recoverable because the slot name is deterministic; Task 8 scans/reclaims only evidence-backed strict slots.
 
 - [ ] **Step 4: Run worker, remote, and visibility tests**
 
@@ -581,7 +608,7 @@ git commit -m "feat(import): publish imported repositories"
 
 - [ ] **Step 1: Write cleanup safety/idempotency tests**
 
-Test grace period, live/claimable import/write/merge leases, limiter acquisition, path containment, symlink rejection, missing directory idempotency, cache invalidation, crash after remove/before SQL proof, failed/canceled importing shadow abandonment, successor-adoption exclusion, and `storage_reclaimed_at` plus audit.
+Test grace period, live/claimable import/write/merge leases, limiter acquisition, path containment, symlink rejection, missing directory idempotency, cache invalidation, crash after remove/before SQL proof, failed/canceled importing shadow abandonment, successor-adoption exclusion, deterministic `.fornacast-cleanup-v1-*` discovery only from persisted `cleanup_pending` evidence, malformed/unowned quarantine rejection, and `storage_reclaimed_at` plus audit.
 
 - [ ] **Step 2: Run and verify no cleanup boundary exists**
 
@@ -615,6 +642,8 @@ end
 ```
 
 Use durable proof and make replay safe if the directory was already removed. Never abandon a retryable shadow until the run/item cleanup eligibility is terminal and no successor owns or may adopt it.
+
+Quarantined Remote failures are delayed cleanup inputs, not anonymous filesystem garbage. Recompute the deterministic slot from the canonical intended destination, require it to match persisted path plus `0700`/device/inode evidence, and acquire the same cleanup fence/grace checks before reclamation. Never use a separate path identity check followed by `File.rm_rf`; if an anchored deletion primitive is not available or any identity changes, retain the slot as cleanup-pending and retry later. Reclamation audit and SQL proof commit only after the anchored effect is proven.
 
 - [ ] **Step 4: Run cleanup and recovery suites**
 
