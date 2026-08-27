@@ -643,6 +643,12 @@ The RED matrix must prove:
 - a crashed/expired `publishing` worker reclaims the same persisted intent,
   operation ID, attempt number, action, hidden ID, and request metadata; it never
   creates a second intent;
+- fresh `ready_to_publish` admission requires an active personal actor and a
+  `running` run, while expired/due `publishing` recovery remains schedulable with a
+  disabled actor and with the run in `running`, `cancel_requested`, or
+  `awaiting_credential`; cancellation and credential wait do not interrupt an
+  admitted publication, disabled-actor/authorization drift reopens only the item,
+  and a terminal parent run returns `:publication_inconsistent` without recovery;
 - create and rename publish with generation `1`; replacement loads the numeric ID
   from `ImportAttempt.decision`, preserves the owner/slug URL, creates a new numeric
   repository ID, sets generation to old generation plus one, and records old/new
@@ -669,6 +675,9 @@ The RED matrix must prove:
   item succeeds read-only even though the current aggregate is higher, while a
   lowered or mismatched marker snapshot, changed audit snapshot/core, or current
   aggregate lower than the agreed snapshot returns `:publication_inconsistent`;
+- terminal replay first proves that the caller is the active personal actor owning
+  the exact run/item; foreign and disabled actors receive `:not_found` before any
+  evidence/audit/repository lookup, with no fact leakage and no writes;
 - destination drift closes only the current attempt, clears publication intent and
   lease, preserves that predecessor, and creates attempt `n + 1` on resolution;
   the successor resumes at `ready_to_publish` with an exact hidden repository, Git
@@ -737,28 +746,47 @@ resource-kind set to equal exactly
 `~w(labels issues comments pull_requests number_sequence)` and every row to be
 committed. A merely `git_staged` item returns `:metadata_not_ready`.
 
-An active publication lease returns `:busy`. An expired `publishing` lease is
-reclaimed only when its persisted intent has exactly the shape above and still
-matches the same item/current attempt; use the persisted intent and metadata rather
-than the retry caller's values. Change the ordinary `RepositoryItem` transition
-matrix so `publishing` advances only to `published`; it cannot become
-awaiting-credential, cancel-requested, canceled, or failed. Destination drift uses
-the dedicated capability-checked reopening path in Step 5, not that ordinary
-transition matrix. Cancellation therefore linearizes at the admission transaction:
-it wins before intent, while a committed intent must finish or recover publication.
-Fresh admission requires a `running` parent run; recovery of an admitted
-`publishing` intent also permits `cancel_requested`, because cancellation has lost
-that item's race. A recoverable fence/reconciliation failure keeps the item
-`publishing`, preserves the exact intent, clears only its own lease, and writes a
-bounded `next_attempt_at`; failure to persist that release is
+Split admission from recovery. `RepositoryPublisher.publish/3` is the fresh/public
+path: it point-locks an active personal actor who owns the exact run/item, requires
+the run to be `running`, and admits only `ready_to_publish`. An active publication
+lease returns `:busy`. `RepositoryPublisher.recover/1` is an internal capability
+path used for an already admitted `publishing` item: it requires no caller, GitHub
+identity, saved credential, one-time envelope, or credential checkout. It may claim
+only an expired/due lease whose persisted intent has exactly the shape above and
+still matches the same item/current running attempt; it uses the persisted intent
+and request metadata rather than new caller values.
+
+Recovery accepts parent-run states `running`, `cancel_requested`, and
+`awaiting_credential` and accepts either active or disabled persisted actor state,
+so every durable intent remains schedulable. A `publishing` item under a terminal
+run is inconsistent: return `:publication_inconsistent`, do not acquire a
+publication fence, and do not reopen or mutate it. Change the ordinary
+`RepositoryItem` transition matrix so `publishing` advances only to `published`; it
+cannot become awaiting-credential, cancel-requested, canceled, or failed.
+Cancellation therefore linearizes at the admission transaction: it wins before
+intent, while a committed intent must finish or recover publication.
+
+Immediately before any live repository mutation, the final transaction must reload
+and lock the actor and destination authorization. If both are still active/valid,
+finish publication even when the run is `cancel_requested` or
+`awaiting_credential`. If actor state, namespace, target authorization, or other
+destination facts drifted, roll back the publication Multi and call the dedicated
+capability-owned reopening transaction in Step 5; never route recovery through the
+active-user public drift path. A recoverable fence/reconciliation failure keeps the
+item `publishing`, preserves the exact intent, clears only its own lease, and writes
+a bounded `next_attempt_at`; failure to persist that release is
 `:persistence_unavailable`.
 
-Extend the existing serial `Reconciler` query to select due
-`ready_to_publish` items and expired due `publishing` items with an active actor,
-eligible parent run, and exact current running attempt. Order expired `publishing`
-recovery first, then fresh (`next_attempt_at IS NULL`) and oldest due work, then item
-ID. Invoke `RepositoryPublisher` from the existing one bounded scan task. Do not add
-a task, process, supervisor, or publication concurrency.
+Extend the existing serial `Reconciler` with two explicit eligibility branches.
+Fresh due `ready_to_publish` requires an active personal actor, a `running` run,
+and the exact current running attempt. Expired/due `publishing` requires the exact
+current running attempt and a run state in
+`[:running, :cancel_requested, :awaiting_credential]`, but deliberately does not
+filter actor state or join any GitHub credential. Order `publishing` recovery first, then fresh
+(`next_attempt_at IS NULL`) and oldest due work, then item ID. Invoke
+`RepositoryPublisher.recover/1` for recovery and the fresh publisher path for new
+admission from the existing one bounded scan task. Do not add a task, process,
+supervisor, or publication concurrency.
 
 - [ ] **Step 4: Add the deep repository publication contributor and final Multi**
 
@@ -789,13 +817,20 @@ never by slug. It validates the active actor's destination authorization, canoni
 final settings, an exact undeleted `importing` shadow/internal slug/storage/
 `write_version`, and zero shadow collaborators. For replacement it validates the
 exact ready/undeleted target fingerprint and locks its collaborators in stable
-user-ID order. Insert every collaborator user/role strictly—no `on_conflict:
-:nothing` and no partial copy. Mutate the old row to `tombstoned` with `deleted_at`
-first, run the test-only after-tombstone hook, and only then activate the shadow.
+user-ID order. Insert every collaborator user/role strictly; do not use
+`on_conflict: :nothing` or permit a partial copy. Mutate the old row to `tombstoned`
+with `deleted_at` first, run the test-only after-tombstone hook, and only then
+activate the shadow.
 Activation keeps the opaque storage path but may set generation from the current
 immutable decision: `1` for create/rename or target generation plus one for replace.
 That update is required so a drift successor can reuse already proven hidden Git
 and metadata without recloning.
+
+Make the locked active-actor and destination-authorization checks the contributor's
+first `Multi.run` step. They execute immediately before any tombstone, collaborator,
+or activation write. Thus a recovery scan may claim an intent owned by a now-disabled
+actor to keep it schedulable, but it cannot touch either live repository before the
+capability-owned drift path safely reopens the item.
 
 For replacement, load the target only from the current decision and acquire
 `ForgeRepos.with_import_publication_fence(target, :content, ...)`. Its existing
@@ -864,9 +899,14 @@ database or audit failure to `:persistence_unavailable`.
 
 - [ ] **Step 5: Make replay and destination-drift recovery exact**
 
-For `published` and `completed`, take the read-only replay branch before admission.
-By evidence, attempt number, new repository ID, and optional old repository ID,
-perform indexed point reads and verify the exact decision, active new repository
+For `published` and `completed`, take the read-only replay branch before admission,
+but actor scope comes first. Point-read and require an active `kind: :user` actor,
+then the exact actor-owned run and run-owned item; a stale struct, foreign actor, or
+disabled actor returns `:not_found` before reading `publication_evidence`, attempt,
+audit, replacement, or repository facts. This masking branch performs no writes.
+Only after scope succeeds, use evidence, attempt number, new repository ID, and
+optional old repository ID to perform indexed point reads and verify the exact
+decision, active new repository
 settings/generation, old tombstone/deletion and unchanged replacement facts, and
 audit. Point-read the marker's `run_id`; require marker and audit to have the same
 `published_count_after`, and require the current run's `published_count` to be
@@ -877,12 +917,15 @@ item count. Return the original `%{repository:, replaced:}` without a write. Any
 missing, lowered, or mismatched marker/audit/run fact returns
 `:publication_inconsistent`; never repair a committed marker heuristically.
 
-On destination drift, use a dedicated `Conflicts` transaction that locks the same
-actor/run/item/current-attempt capability, closes only that running attempt as
-`destination_changed`, clears publication intent/lease/backoff, and returns the item
-to `awaiting_resolution` while preserving hidden repository, Git evidence, metadata
-checkpoints, and the immutable predecessor. Do not search by slug and do not mutate
-an older attempt.
+On destination drift, use an internal capability containing exact run ID, item ID,
+attempt number, publication operation ID, lease owner, and item lock version. A
+dedicated `Conflicts` transaction locks that actor row without requiring it to be
+active, then locks the exact run/item/current attempt; verifies the same admitted
+intent and lease; closes only that running attempt as `destination_changed`; clears
+publication intent/lease/backoff; and returns the item to `awaiting_resolution`
+while preserving hidden repository, Git evidence, metadata checkpoints, and the
+immutable predecessor. This is not the active-user public drift path and it performs
+no live-repository write. Do not search by slug and do not mutate an older attempt.
 
 When the user resolves the drifted item, create immutable attempt `n + 1` and derive
 its resume state only from durable proof: `ready_to_publish` for the exact importing
