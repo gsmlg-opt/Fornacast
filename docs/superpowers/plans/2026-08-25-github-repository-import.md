@@ -1321,16 +1321,23 @@ git commit -m "feat(git): remove repository trees by anchored identity"
 - Create: `apps/git_core/test/repository_read_limiter_test.exs`
 - Create: `apps/forge_repos/lib/forge_repos/repository_read_handle.ex`
 - Create: `apps/forge_repos/test/repository_read_handle_test.exs`
+- Create: `apps/forge_repos/test/repository_read_callsite_audit_test.exs`
 - Modify: `apps/git_core/lib/git_core/application.ex`
 - Modify: `apps/forge_repos/lib/forge_repos.ex`
+- Modify: `apps/forge_repos/test/forge_repos_test.exs`
+- Modify: `apps/forge_pulls/lib/forge_pulls.ex`
+- Modify: `apps/forge_pulls/test/forge_pulls_test.exs`
 - Modify: `apps/git_transport/lib/git_transport/upload_pack.ex`
 - Modify: `apps/git_transport/lib/git_transport/exec.ex`
 - Modify: `apps/git_transport/lib/git_transport/channel.ex`
 - Modify: `apps/git_transport/test/git_transport_test.exs`
 - Modify: `apps/git_transport/test/test_dirty_io_native_test.exs`
+- Modify: `apps/fornacast_web/lib/fornacast_web/repository_page.ex`
+- Modify: `apps/fornacast_web/lib/fornacast_web/controllers/repository_controller.ex`
 - Modify: `apps/fornacast_web/lib/fornacast_web/controllers/git_http_controller.ex`
 - Modify: `apps/fornacast_web/test/git_http_auth_test.exs`
 - Modify: `apps/fornacast_web/test/repository_controller_test.exs`
+- Modify: `apps/fornacast_web/test/repository_page_test.exs`
 
 - [ ] **Step 8B.1: Write the RED read/cleanup lease matrix**
 
@@ -1400,6 +1407,13 @@ end
         | {:error, :not_found | :deadline_exceeded | :unavailable}
 
 @spec ForgeRepos.close_repository_read(RepositoryReadHandle.t()) :: :ok
+
+@spec ForgeRepos.with_repository_read(
+        Repository.t(),
+        integer(),
+        (RepositoryReadHandle.t() -> result)
+      ) :: result | {:error, :not_found | :deadline_exceeded | :unavailable}
+      when result: term()
 ```
 
 `open_repository_read/2` acquires the read lease for the input repository ID,
@@ -1407,10 +1421,12 @@ reloads that exact ID, and requires exact input generation, `lifecycle: :ready`,
 `deleted_at: nil`, `storage_reclaimed_at: nil`, and a canonical contained storage
 path. Release immediately on every reload/path mismatch. The returned handle owns
 the reloaded repository and absolute path. `close_repository_read/1` is
-idempotent. This is the only read-side API that may cross publication/deletion
-boundaries.
+idempotent. `with_repository_read/3` calls `open_repository_read/2`, invokes the
+one-arity function with the opaque handle, and always closes in `after`; it catches
+neither returned errors nor exceptions. These are the only read-side APIs that may
+cross publication/deletion boundaries.
 
-- [ ] **Step 8B.4: Move every upload-pack reader behind the handle**
+- [ ] **Step 8B.4: Move every ready-repository GitCore read behind the handle**
 
 Change `GitTransport.UploadPack.advertise_refs/1`, `response/2`, and `serve/1`
 repository wrappers to acquire/release a handle. Add internal
@@ -1430,11 +1446,48 @@ clear it on every normal completion, protocol error, send error, EOF, closed
 message, rejection after acquisition, and `terminate/2`; repeated cleanup is safe.
 The limiter owner monitor is the final fallback if the channel dies.
 
+Wrap every production ready-repository GitCore read for its complete native/cache
+sequence, not merely upload-pack:
+
+- in `ForgeRepos`, run `repository_view/2` and list-view disk-usage reads through
+  `with_repository_read/3`, using `handle.repository` and `handle.path`; also wrap
+  the default-branch `resolve_snapshot` validation that is not already inside a
+  writer fence;
+- in `ForgePulls`, wrap public `branch_options/2`, `compare/5`,
+  `list_commits/4`, `changed_files/4`, ref resolution, comparison/diff, commit
+  paging, and merge-analysis refreshes that are not already inside the existing
+  writer fence. A multi-call comparison uses one handle for its whole snapshot;
+- in `FornacastWeb.RepositoryPage` and `RepositoryController`, acquire once around
+  each page/raw request and pass `handle.repository`/`handle.path` through code,
+  tree, blob/raw, refs, commits/history, commit, search, analysis, and disk-usage
+  reads. Page-result cleanup remains responsible only for its existing blob/scan
+  permits; the repository read lease closes after the complete GitCore result is
+  materialized.
+
+Reads already enclosed by `GitCore.RepositoryWriteLimiter` are explicitly exempt:
+receive-pack, `GitWriteRecovery`, `MergeRecovery`, and final merge
+analysis/write/ref-advance. Cleanup also holds that writer limiter, so they cannot
+overlap deletion. Importing-shadow reads are exempt only while their exact
+run/item/attempt lease and cleanup-journal rules make the shadow ineligible; no
+ready repository may use that exemption.
+
+Create `repository_read_callsite_audit_test.exs` to scan production Elixir sources
+for every `GitCore.*` invocation. Maintain an exact allowlist containing only
+handle-based ready reads, the writer-fenced calls above, and identified
+importing-shadow calls with their owning import lease. Fail on any unclassified
+callsite or any allowlist entry that disappears, so a new ready read cannot bypass
+the lease silently.
+
 Add integration assertions that an old reader opened before replacement continues
 using the old inode and blocks cleanup, while a post-publication lookup opens the
 new repository. Hold the read lease across a deliberately blocked DirtyIo pack NIF
 for SSH and HTTP, prove cleanup waits, then release and prove cleanup wins. Also
 prove `Exec.upload_pack/3` and `upload_pack_stream/3` use the same handle seam.
+Block GitCore test doubles inside repository view/size, web browse/search/blob,
+pull branch/commit/diff/compare/analysis, HTTP, and SSH paths and prove an exclusive
+cleanup grant waits for each. Conversely, hold cleanup, queue each reader, perform
+strict invalidation and removal, then prove no queued read executes GitCore or
+repopulates `GitCore.Cache` after invalidation.
 
 - [ ] **Step 8B.5: Run GREEN read-path tests**
 
@@ -1442,15 +1495,20 @@ prove `Exec.upload_pack/3` and `upload_pack_stream/3` use the same handle seam.
 devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
   apps/git_core/test/repository_read_limiter_test.exs \
   apps/forge_repos/test/repository_read_handle_test.exs \
+  apps/forge_repos/test/repository_read_callsite_audit_test.exs \
+  apps/forge_repos/test/forge_repos_test.exs \
+  apps/forge_pulls/test/forge_pulls_test.exs \
   apps/git_transport/test/git_transport_test.exs \
   apps/git_transport/test/test_dirty_io_native_test.exs \
   apps/fornacast_web/test/git_http_auth_test.exs \
   apps/fornacast_web/test/repository_controller_test.exs \
+  apps/fornacast_web/test/repository_page_test.exs \
   --max-cases 1
 ```
 
-Expected: all tests pass; cleanup cannot overlap an SSH, Exec, HTTP, or blocked
-DirtyIo read, and limiter failure denies new reads.
+Expected: all tests pass; cleanup cannot overlap repository view/size, pull,
+browser, SSH, Exec, HTTP, or blocked DirtyIo reads; limiter failure denies new
+reads; and no read runs or repopulates cache after strict invalidation.
 
 - [ ] **Step 8B.6: Commit reader leasing**
 
@@ -1463,14 +1521,21 @@ git add \
   apps/forge_repos/lib/forge_repos.ex \
   apps/forge_repos/lib/forge_repos/repository_read_handle.ex \
   apps/forge_repos/test/repository_read_handle_test.exs \
+  apps/forge_repos/test/repository_read_callsite_audit_test.exs \
+  apps/forge_repos/test/forge_repos_test.exs \
+  apps/forge_pulls/lib/forge_pulls.ex \
+  apps/forge_pulls/test/forge_pulls_test.exs \
   apps/git_transport/lib/git_transport/upload_pack.ex \
   apps/git_transport/lib/git_transport/exec.ex \
   apps/git_transport/lib/git_transport/channel.ex \
   apps/git_transport/test/git_transport_test.exs \
   apps/git_transport/test/test_dirty_io_native_test.exs \
+  apps/fornacast_web/lib/fornacast_web/repository_page.ex \
+  apps/fornacast_web/lib/fornacast_web/controllers/repository_controller.ex \
   apps/fornacast_web/lib/fornacast_web/controllers/git_http_controller.ex \
   apps/fornacast_web/test/git_http_auth_test.exs \
-  apps/fornacast_web/test/repository_controller_test.exs
+  apps/fornacast_web/test/repository_controller_test.exs \
+  apps/fornacast_web/test/repository_page_test.exs
 git commit -m "feat(git): lease repository readers"
 ```
 
@@ -1855,6 +1920,11 @@ recovery state, provided journal/evidence/item/source lock version all match and
 item/run leases are paired-null or expired. Change each fact independently and
 assert blocking. Add any second nonterminal item, attempt, or run associated with
 the repository and assert blocking even when the source chain itself is valid.
+Pass the complete `CleanupOperation` to the verifier: prove a valid operation
+passes without duplicating `operation_id` inside evidence, while a forged column
+operation ID, wrong kind/repository/item/source version, operation borrowed from
+another item, evidence with an extra operation-ID key, shadow mismatch, path
+mismatch, or four-field identity mismatch blocks.
 
 Also cover grace at one second before/exactly at the boundary; nonterminal,
 claimable, live, expired, and malformed leases in import/Git-write/merge domains;
@@ -1867,9 +1937,10 @@ crashes after journal creation, identity persistence, absence-proof persistence,
 deletion, deletion followed by storage-root replacement, audit insertion, and
 final CAS; two-pass replay; exact
 `effect: "missing"` audit metadata for initial absence; no premature audit/marker;
-audit collision;
-round-robin fairness; backoff; Remote retry restoration; and later terminal
-settlement/unpublished cleanup.
+audit collision; journal-less first discovery for every kind; due-journal replay
+priority over a raw candidate; duplicate discovery/materialization races; raw
+candidate disappearance; round-robin fairness; backoff; Remote retry restoration;
+and later terminal settlement/unpublished cleanup.
 
 In `cleanup_reconciler_test.exs` prove one operation per task/tick, independent task
 supervisor capacity, hard runtime cancellation, due/keyset ordering, and
@@ -1935,21 +2006,51 @@ scan, and new `ForgeImports.CleanupTaskSupervisor` is `max_children: 1` solely f
 long import scan consumes the other's slot.
 
 Each cleanup tick selects at most one operation, starts at the kind after the last
-attempted kind, scans kinds round-robin, and uses
-`state/next_attempt_at/eligible_at/id` keyset order within a kind. The task runtime
-and anchored deletion share the configured hard deadline. Persist the rotation
-cursor even when a selected row blocks, so continually arriving work of one kind
-cannot starve the other two.
+attempted kind, and scans the three kinds round-robin. For each visited kind:
+
+1. Query the oldest existing due `cleanup_pending` journal first, requiring
+   `eligible_at <= now`, `next_attempt_at <= now`, and no live lease, ordered by
+   `next_attempt_at, eligible_at, id`. If found, select it and do not inspect raw
+   sources of that kind.
+2. If no due journal exists, query exactly one raw source candidate that has no
+   journal for its current `kind/source_lock_version`:
+   - Remote quarantine: join the exact shadow and select `RepositoryItem` rows
+     with `state: :staging_git`, `cleanup_state: "cleanup_pending"`,
+     `cleanup_eligible_at <= now`, and the permitted lease shape; order by
+     `cleanup_eligible_at, item.id`.
+   - unpublished shadow: join the canonical importing private shadow, terminal
+     item/run/current-attempt facts, empty publication evidence, zero write
+     version/no last push, paired-null leases, and no successor/adopter; order by
+     `COALESCE(item.cleanup_eligible_at, item.updated_at), item.id`.
+   - replacement tombstone: join a tombstoned unreclaimed repository with
+     `deleted_at <= now - grace` to the exact published/completed item, completed
+     current attempt, committed replacement marker, ready successor, and audit;
+     order by `repository.deleted_at, repository.id`.
+3. The raw query uses `NOT EXISTS` on
+   `repository_item_id/kind/source_lock_version` across pending, blocked, and
+   complete journals. The unique index remains the race authority. After acquiring
+   cleanup then writer permits, lock/revalidate the source and insert or load its
+   deterministic journal. Process it in the same tick only if it is due.
+
+At most one filesystem effect occurs per task/tick. An existing due journal always
+wins over a new raw candidate of the same kind. If the raw row disappears or fails
+CAS after selection, perform no write/effect and end the tick. Advance the
+round-robin cursor after selection even when safety blocks, materialization loses a
+race, the raw candidate disappears, or the new journal is not due. The task runtime
+and anchored deletion share the configured hard deadline; continually arriving
+same-kind work cannot starve the other kinds.
 
 - [ ] **Step 8D.5: Materialize and claim exact cleanup intent**
 
-Candidate selection is read-only. After it yields a repository ID, first acquire
-the exclusive read-cleanup permit and then the existing writer permit. Only under
-both permits enter SQL and re-evaluate every eligibility fact listed in Step
-8D.1. Lock repository rows by ID ascending, then import runs, repository items,
-current attempts, and cleanup journal. For unpublished shadow, the tombstone and
-intent insert are one transaction. For replacement and Remote quarantine, insert
-or load the deterministic journal using the source item lock version. Use
+Candidate/journal discovery in Step 8D.4 is read-only. After it yields a
+repository ID, first acquire the exclusive read-cleanup permit and then the
+existing writer permit. Only under both permits enter SQL and re-evaluate every
+eligibility fact listed in Step 8D.1. Lock repository rows by ID ascending, then
+import runs, repository items, current attempts, and cleanup journal. For a raw
+unpublished shadow, the tombstone and intent insert are one transaction. For raw
+replacement and Remote candidates, insert or load the deterministic journal using
+the source item lock version; `NOT EXISTS` plus the unique index prevents
+duplicates. A vanished/drifted raw candidate is a no-op, not an error. Use
 `OperationLease.claim(CleanupOperation, id, owner, now, lease_seconds,
 allowed_states: [:cleanup_pending])`.
 
@@ -1963,7 +2064,7 @@ item.id == operation.repository_item_id and
   item.lock_version == operation.source_lock_version and
   item.state == :staging_git and
   item.cleanup_state == "cleanup_pending" and
-  exact_remote_evidence?(operation.evidence, item) and
+  exact_remote_evidence?(operation, item, shadow) and
   paired_null_or_expired?(item.lease_owner, item.lease_expires_at, now) and
   attempt.repository_item_id == item.id and
   attempt.attempt_number == item.attempt_count and
@@ -1981,12 +2082,34 @@ item.id == operation.repository_item_id and
   paired_null_or_expired?(run.lease_owner, run.lease_expires_at, now)
 ```
 
-`exact_remote_evidence?/2` compares the operation ID, kind, repository/item IDs,
-source lock version, requested/canonical quarantine paths, and persisted
-`mode/major_device/minor_device/inode`. A live or one-sided source item/run lease,
-mismatched evidence, non-current or non-running source attempt, any other source
-state, or any second nonterminal item/attempt/run for the repository blocks. No
-exception exists for a successor/adopter or for replacement/unpublished cleanup.
+Define the verifier with the complete authoritative context:
+
+```elixir
+@spec exact_remote_evidence?(
+        CleanupOperation.t(),
+        RepositoryItem.t(),
+        ForgeRepos.Repository.t()
+      ) :: boolean()
+defp exact_remote_evidence?(
+       %CleanupOperation{} = operation,
+       %RepositoryItem{} = item,
+       %ForgeRepos.Repository{} = shadow
+     )
+```
+
+It requires `operation.kind == :remote_quarantine`, exact operation
+repository/item/source-lock columns, and
+`operation.operation_id ==
+deterministic_cleanup_operation_id(:remote_quarantine, shadow.id, item.id,
+operation.source_lock_version)`. Then compare operation evidence with the locked
+shadow identity/generation/canonical path, the item's requested/quarantine path and
+narrow cleanup evidence, and exact `mode/major_device/minor_device/inode`. The
+`operation_id` column is authoritative and is not duplicated in evidence; an
+`operation_id` evidence key violates the exact-key validator. A live or one-sided
+source item/run lease, mismatched context/evidence, non-current or non-running
+source attempt, any other source state, or any second nonterminal
+item/attempt/run for the repository blocks. No exception exists for a
+successor/adopter or for replacement/unpublished cleanup.
 
 The same preflight rejects any nonterminal Git-write/merge operation and calls both
 `cleanup_safety_locked/2` ports while the SQL rows are locked. A claimable
@@ -2098,10 +2221,14 @@ devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
   apps/git_core/test/native_surface_test.exs \
   apps/git_core/test/repository_read_model_test.exs \
   apps/forge_repos/test/repository_read_handle_test.exs \
+  apps/forge_repos/test/repository_read_callsite_audit_test.exs \
+  apps/forge_repos/test/forge_repos_test.exs \
+  apps/forge_pulls/test/forge_pulls_test.exs \
   apps/git_transport/test/git_transport_test.exs \
   apps/git_transport/test/test_dirty_io_native_test.exs \
   apps/fornacast_web/test/git_http_auth_test.exs \
   apps/fornacast_web/test/repository_controller_test.exs \
+  apps/fornacast_web/test/repository_page_test.exs \
   --max-cases 1
 devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
   apps/forge_imports/test/cleanup_operation_test.exs \
