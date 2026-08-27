@@ -82,7 +82,11 @@ defmodule ForgeImports.Reconciler do
                 :completed_with_warnings
               ] and (run.state != :running or actor.state != :active))) and actor.kind == :user
     )
-    |> order_by([item, _run, _attempt, _actor], asc: item.id)
+    |> order_by([item, _run, _attempt, _actor],
+      desc: is_nil(item.next_attempt_at),
+      asc: item.next_attempt_at,
+      asc: item.id
+    )
     |> limit(^limit)
     |> select([item, _run, _attempt, _actor], item.id)
     |> Repo.all()

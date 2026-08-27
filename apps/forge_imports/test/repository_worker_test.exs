@@ -1037,6 +1037,44 @@ defmodule ForgeImports.RepositoryWorkerTest do
     assert :ok = stop_supervised(RecoverySupervisor)
   end
 
+  test "a full due retry batch cannot starve a higher never-attempted item", context do
+    additional_lows =
+      for index <- 1..24 do
+        item =
+          queued_item_fixture(context.run, context.actor,
+            github_repository_id: next_github_id(),
+            source_full_name: "acme/retry-#{index}",
+            source_name: "retry-#{index}",
+            destination_slug: "retry-#{index}"
+          )
+
+        attempt_fixture(item)
+        item
+      end
+
+    low_ids = Enum.map([context.item | additional_lows], & &1.id)
+    due_at = DateTime.add(@now, -1, :second)
+
+    assert {25, _rows} =
+             Repo.update_all(
+               from(item in RepositoryItem, where: item.id in ^low_ids),
+               set: [next_attempt_at: due_at, failure_kind: "staging_unavailable"]
+             )
+
+    fresh =
+      queued_item_fixture(context.run, context.actor,
+        github_repository_id: next_github_id(),
+        source_full_name: "acme/fresh-after-full-retry-batch",
+        source_name: "fresh-after-full-retry-batch",
+        destination_slug: "fresh-after-full-retry-batch"
+      )
+
+    attempt_fixture(fresh)
+
+    assert [fresh.id | Enum.take(low_ids, 24)] ==
+             Reconciler.runnable_repository_item_ids(25, @now)
+  end
+
   test "terminal no-slot cleanup backoff preserves the run and lets another run progress",
        context do
     assert {:error, :staging_unavailable} =
