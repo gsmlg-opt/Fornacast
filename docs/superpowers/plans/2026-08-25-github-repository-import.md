@@ -577,6 +577,7 @@ git commit -m "feat(import): stage hidden Git repositories"
 - Modify: `apps/forge_imports/test/conflicts_test.exs`
 - Modify: `apps/forge_imports/test/import_persistence_test.exs`
 - Modify: `apps/forge_imports/test/import_persistence_concurrency_test.exs`
+- Modify: `apps/forge_imports/test/run_view_consistency_test.exs`
 - Modify: `apps/forge_imports/test/repository_worker_test.exs`
 - Modify: `apps/forge_repos/test/repository_lifecycle_test.exs`
 - Modify: `apps/forge_repos/test/repository_write_fence_test.exs`
@@ -625,7 +626,8 @@ assert old.lifecycle == :tombstoned
 The public result is `%{repository: repository, replaced: nil | old_repository}`.
 Its typed errors are exactly `:metadata_not_ready`, `:busy`,
 `:destination_changed`, `:cancelled`, `:not_found`, `:publication_unavailable`,
-`:persistence_unavailable`, and `:publication_inconsistent`.
+`:persistence_unavailable`, `:publication_inconsistent`, and
+`:invalid_request_metadata`.
 
 The RED matrix must prove:
 
@@ -637,6 +639,11 @@ The RED matrix must prove:
 - active actor/run/item/attempt locking, a live foreign lease returning `:busy`,
   expired-lease reclamation, lease theft before the final CAS, concurrent callers,
   and exactly one winner; the winner increments `published_count` exactly once;
+- invalid request metadata returns `:invalid_request_metadata` before actor, run,
+  item, attempt, evidence, audit, or repository reads and before lease acquisition;
+  attach to the existing Repo query telemetry event and assert zero queries, then
+  prove no invalid request can reveal item existence or change a
+  lock/version/timestamp;
 - cancellation before intent returns `:cancelled` without publication, while
   cancellation after intent cannot move `publishing` to canceled, failed, or
   awaiting-credential and cannot interrupt recovery;
@@ -672,12 +679,19 @@ The RED matrix must prove:
 - response loss followed by `published` or `completed` replay performs zero writes,
   returns the same new/old rows by ID, and verifies marker, repository, replacement,
   audit, and run-count facts; after publishing sibling items, replay of an earlier
-  item succeeds read-only even though the current aggregate is higher, while a
-  lowered or mismatched marker snapshot, changed audit snapshot/core, or current
-  aggregate lower than the agreed snapshot returns `:publication_inconsistent`;
+  item succeeds read-only even though the current count and `lock_version` are
+  higher, while a lowered or mismatched count/version marker snapshot, changed audit
+  snapshot/core, or current count/version lower than the agreed snapshots returns
+  `:publication_inconsistent`;
 - terminal replay first proves that the caller is the active personal actor owning
   the exact run/item; foreign and disabled actors receive `:not_found` before any
   evidence/audit/repository lookup, with no fact leakage and no writes;
+- concurrent `get_run/2` reads around publication and capability-owned destination
+  drift never combine an old parent count/state with a newly published or reopened
+  child: in `run_view_consistency_test.exs`, reuse the Repo telemetry pause after the
+  parent-run read, commit publication or drift before releasing the reader, and
+  assert the final parent `lock_version` check retries to the wholly new view on
+  both adapters;
 - destination drift closes only the current attempt, clears publication intent and
   lease, preserves that predecessor, and creates attempt `n + 1` on resolution;
   the successor resumes at `ready_to_publish` with an exact hidden repository, Git
@@ -712,14 +726,17 @@ Expose only this context seam:
            | :not_found
            | :publication_unavailable
            | :persistence_unavailable
-           | :publication_inconsistent}
+           | :publication_inconsistent
+           | :invalid_request_metadata}
 def publish_repository(actor, item_id, request_metadata),
   do: RepositoryPublisher.publish(actor, item_id, request_metadata)
 ```
 
-Normalize request metadata through the existing GitHub request-metadata safety
-boundary, retain only its safe allowlisted projection, delete its `operation_id`,
-and never honor the caller's value. Use
+The first operation in `publish/3`, before any actor/item/evidence lookup or lease
+transaction, is `ForgeAccounts.validate_github_request_metadata/1`. Return
+`:invalid_request_metadata` unchanged on validation failure. For valid metadata,
+retain only that normalized allowlisted projection, delete its `operation_id`, and
+never honor the caller's value. Use
 `github-import-publication-#{item.id}-#{attempt.attempt_number}` instead. Before any
 repository fence, one retryable database transaction locks the active actor, its
 run, item, and current attempt in that order; verifies run ownership/state,
@@ -842,8 +859,11 @@ ID and compares the full fingerprint, including `write_version` and nullable
 That final Multi must atomically compose:
 
 1. `ForgeRepos.publish_import_shadow/5`;
-2. one `published_count` increment on the locked parent run, returning that exact
-   row's `id` and `published_count` as `run_id` and `published_count_after`;
+2. one CAS on the exact locked parent-run ID, allowed state, and `lock_version` that
+   atomically sets `updated_at` and increments both `published_count` and
+   `lock_version`, returning the post-update run with `run_id`,
+   `published_count_after`, and
+   `run_lock_version_after`;
 3. a lease-owner/expiry/lock-version CAS from `publishing -> published`, closing the
    exact current attempt as completed and replacing intent with exact committed
    evidence constructed from the run-update result;
@@ -867,13 +887,14 @@ only these publication facts:
   "generation" => published.generation,
   "replaced_repository_id" => replaced && replaced.id,
   "run_id" => updated_run.id,
-  "published_count_after" => updated_run.published_count
+  "published_count_after" => updated_run.published_count,
+  "run_lock_version_after" => updated_run.lock_version
 }
 ```
 
 Merge those facts into the v1 intent rather than constructing an unrelated marker;
 the resulting committed-evidence keyset is exactly the intent keyset with `state`
-replaced plus the seven publication keys shown above. Construct exact audit core
+replaced plus the eight publication keys shown above. Construct exact audit core
 metadata before merging the already normalized safe request metadata:
 
 ```elixir
@@ -882,6 +903,7 @@ imported_core = %{
   "attempt_number" => attempt.attempt_number,
   "run_id" => updated_run.id,
   "published_count_after" => updated_run.published_count,
+  "run_lock_version_after" => updated_run.lock_version,
   "new_repository_id" => published.id
 }
 
@@ -892,6 +914,10 @@ replaced_core = Map.put(imported_core, "old_repository_id", replaced.id)
 exactly `replaced_core`. The stored audit metadata is exactly that core map merged
 with the intent's safe request-metadata projection, and the collision verifier
 compares the same projection.
+Implement the run CAS as one adapter-neutral Multi step: PostgreSQL may use
+`RETURNING`, while Turso performs the same guarded update then point-reads the row by
+the exact incremented `lock_version` inside the transaction. Both branches return
+the same post-update `%ImportRun{}` and a zero-row CAS aborts the whole Multi.
 All five Multi contributions roll back together. Map destination namespace,
 fingerprint, authorization, or shadow drift to `:destination_changed`; limiter,
 fence, or writer/merge reconciliation failure to `:publication_unavailable`; and
@@ -899,33 +925,39 @@ database or audit failure to `:persistence_unavailable`.
 
 - [ ] **Step 5: Make replay and destination-drift recovery exact**
 
-For `published` and `completed`, take the read-only replay branch before admission,
-but actor scope comes first. Point-read and require an active `kind: :user` actor,
+For `published` and `completed`, take the read-only replay branch before admission.
+After request metadata validation has succeeded, actor scope comes first: point-read
+and require an active `kind: :user` actor,
 then the exact actor-owned run and run-owned item; a stale struct, foreign actor, or
 disabled actor returns `:not_found` before reading `publication_evidence`, attempt,
 audit, replacement, or repository facts. This masking branch performs no writes.
 Only after scope succeeds, use evidence, attempt number, new repository ID, and
 optional old repository ID to perform indexed point reads and verify the exact
-decision, active new repository
-settings/generation, old tombstone/deletion and unchanged replacement facts, and
+decision, active new repository settings/generation, old tombstone/deletion and
+unchanged replacement facts, and
 audit. Point-read the marker's `run_id`; require marker and audit to have the same
-`published_count_after`, and require the current run's `published_count` to be
-greater than or equal to that snapshot. A higher current value is expected after
-sibling publications and must not invalidate replay. The lease/item CAS plus the
-atomic transaction is the exactly-once authority: replay never recomputes an O(n)
-item count. Return the original `%{repository:, replaced:}` without a write. Any
-missing, lowered, or mismatched marker/audit/run fact returns
+`published_count_after` and `run_lock_version_after`, and require the current run's
+`published_count` and `lock_version` each to be greater than or equal to their
+snapshot. Higher current values are expected after sibling publications or later
+run touches and must not invalidate replay. The lease/item CAS plus the atomic
+transaction is the exactly-once authority: replay never recomputes an O(n) item
+count. Return the original `%{repository:, replaced:}` without a write. Any missing,
+lowered, or mismatched marker/audit/run fact returns
 `:publication_inconsistent`; never repair a committed marker heuristically.
 
-On destination drift, use an internal capability containing exact run ID, item ID,
-attempt number, publication operation ID, lease owner, and item lock version. A
-dedicated `Conflicts` transaction locks that actor row without requiring it to be
-active, then locks the exact run/item/current attempt; verifies the same admitted
-intent and lease; closes only that running attempt as `destination_changed`; clears
-publication intent/lease/backoff; and returns the item to `awaiting_resolution`
-while preserving hidden repository, Git evidence, metadata checkpoints, and the
-immutable predecessor. This is not the active-user public drift path and it performs
-no live-repository write. Do not search by slug and do not mutate an older attempt.
+On destination drift, use an internal capability containing exact run ID, run lock
+version, item ID, attempt number, publication operation ID, lease owner, and item
+lock version. A dedicated `Conflicts` transaction locks that actor row without
+requiring it to be active, then locks the exact run/item/current attempt; verifies
+the same admitted intent and lease; CAS-touches that exact parent-run ID, allowed
+state, and `lock_version` by setting `updated_at` and incrementing `lock_version`
+without changing `published_count`; closes only that running attempt as
+`destination_changed`; clears publication intent/lease/backoff; and returns the item
+to `awaiting_resolution`. The run touch, attempt close, and item reopen commit in the
+same transaction so `get_run/2` cannot accept a torn parent/child view. Preserve the
+hidden repository, Git evidence, metadata checkpoints, and immutable predecessor.
+This is not the active-user public drift path and it performs no live-repository
+write. Do not search by slug and do not mutate an older attempt.
 
 When the user resolves the drifted item, create immutable attempt `n + 1` and derive
 its resume state only from durable proof: `ready_to_publish` for the exact importing
@@ -944,6 +976,7 @@ devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
   apps/forge_imports/test/conflicts_test.exs \
   apps/forge_imports/test/import_persistence_test.exs \
   apps/forge_imports/test/import_persistence_concurrency_test.exs \
+  apps/forge_imports/test/run_view_consistency_test.exs \
   apps/forge_imports/test/repository_worker_test.exs \
   apps/forge_repos/test/repository_lifecycle_test.exs \
   apps/forge_repos/test/repository_write_fence_test.exs \
@@ -965,6 +998,7 @@ devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres \
   apps/forge_imports/test/conflicts_test.exs \
   apps/forge_imports/test/import_persistence_test.exs \
   apps/forge_imports/test/import_persistence_concurrency_test.exs \
+  apps/forge_imports/test/run_view_consistency_test.exs \
   apps/forge_imports/test/repository_worker_test.exs \
   apps/forge_repos/test/repository_lifecycle_test.exs \
   apps/forge_repos/test/repository_write_fence_test.exs \
