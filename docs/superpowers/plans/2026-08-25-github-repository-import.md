@@ -1061,6 +1061,7 @@ root, or a shared directory; every destructive test uses ExUnit `tmp_dir`.
 - Modify: `apps/git_core/native/fornacast_git_core/src/lib.rs`
 - Modify: `apps/git_core/test/native_surface_test.exs`
 - Modify: `apps/git_core/test/repository_read_model_test.exs`
+- Modify: `apps/git_core/test/remote_test.exs`
 
 - [ ] **Step 8A.1: Write the RED anchored-removal contract**
 
@@ -1069,14 +1070,15 @@ exact public surface:
 
 ```elixir
 @type contained_tree_identity :: %{
-        device: non_neg_integer(),
-        inode: non_neg_integer(),
-        mode: non_neg_integer()
+        mode: non_neg_integer(),
+        major_device: non_neg_integer(),
+        minor_device: non_neg_integer(),
+        inode: pos_integer()
       }
 
 @spec GitCore.contained_tree_identity(Path.t(), [String.t()], non_neg_integer()) ::
         {:ok, contained_tree_identity()}
-        | {:ok, :missing}
+        | {:ok, {:missing, contained_tree_identity()}}
         | {:error, atom()}
 
 @spec GitCore.remove_contained_tree(
@@ -1086,19 +1088,36 @@ exact public surface:
         non_neg_integer()
       ) ::
         {:ok, {:removed, contained_tree_identity()}}
-        | {:ok, :missing}
+        | {:ok, {:missing, contained_tree_identity()}}
         | {:error, atom()}
 ```
 
-Cover exact identity success and replay, expected inode/device/mode mismatch,
+This is the only directory-identity shape in Task 8. Public GitCore maps use the
+four atom keys above; persisted JSON uses exactly `"mode"`,
+`"major_device"`, `"minor_device"`, and `"inode"` with the same integer
+values. Reject missing/extra keys, non-integers, negative mode/major/minor values,
+and zero/negative inode. No API, Rust struct, journal evidence, or comparison
+stores raw `st_dev` or a `device` field.
+
+Cover exact identity success and replay; independent expected `mode`,
+`major_device`, `minor_device`, and `inode` mismatch;
 missing target reached through an anchored parent, root symlink, ancestor symlink,
 target symlink, nested symlink, a target-name swap between observation and removal,
-FIFO/socket/device/special-file rejection, regular nested files and directories,
+FIFO/socket/device-node/special-file rejection, regular nested files and directories,
 absolute/empty/`.`/`..` segments, NUL, backslash, segment/count/depth/entry bounds,
 deadline zero, partial timeout followed by exact-identity replay, and a descendant
-mount/device crossing when the test host permits an unprivileged mount. If the
-mount cannot be created, explicitly assert the test is skipped for that host; do
-not weaken the production device check.
+mount/filesystem-device crossing when the test host permits an unprivileged mount.
+If the mount cannot be created, explicitly assert the test is skipped for that
+host; do not weaken the production `major_device/minor_device` check.
+
+In `remote_test.exs`, create one real deterministic quarantine and assert
+`GitCore.Remote.cleanup_evidence/1` returns the exact same
+`%{mode:, major_device:, minor_device:, inode:}` as
+`GitCore.contained_tree_identity/3` for that quarantine under the canonical
+storage root and relative segments. Assert the atom-key public map round-trips to
+the persisted JSON string-key map without value conversion. This is a test-only
+addition: `GitCore.Remote` and `RepositoryWorker` already emit the canonical four
+fields and require no production change.
 
 Add source assertions that `anchored_remove.rs` uses descriptor-relative
 `openat`/`statat`/`unlinkat` operations, contains no path fallback, compiles an
@@ -1115,6 +1134,7 @@ devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
   apps/git_core/test/anchored_remove_test.exs \
   apps/git_core/test/native_surface_test.exs \
   apps/git_core/test/repository_read_model_test.exs \
+  apps/git_core/test/remote_test.exs \
   --max-cases 1
 ```
 
@@ -1145,9 +1165,13 @@ fn remove_contained_tree(
 ) -> Result<RemoveResult, AnchoredRemoveError>;
 ```
 
-`IdentityResult` is exactly `Directory(ContainedTreeIdentity) | Missing` and
-`RemoveResult` is exactly `Removed(ContainedTreeIdentity) | Missing`; Rustler
-encodes them to the public Elixir tuples from Step 8A.1.
+`ContainedTreeIdentity` has exactly `mode: u32`, `major_device: u32`,
+`minor_device: u32`, and positive `inode: u64`. `IdentityResult` is exactly
+`Directory(ContainedTreeIdentity) | Missing(ContainedTreeIdentity)` and
+`RemoveResult` is exactly
+`Removed(ContainedTreeIdentity) | Missing(ContainedTreeIdentity)`. The companion
+on `Missing` is the anchored storage-root identity. Rustler encodes these to the
+public Elixir tuples from Step 8A.1.
 
 Register matching stubs in `GitCore.Native` and wrappers in `GitCore`. The wrappers
 accept only a non-root absolute `storage_root`, a non-empty list of canonical
@@ -1159,21 +1183,32 @@ For both NIFs, open the absolute storage root by walking from `/` one component 
 a time with `openat(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`. Then walk every
 relative component from the anchored root descriptor with the same flags. At each
 hop use `fstat` plus `statat(..., AT_SYMLINK_NOFOLLOW)` and reject a symlink,
-non-directory, identity/mode disagreement, device crossing, or deadline expiry.
+non-directory, four-field identity disagreement, filesystem-device crossing, or
+deadline expiry.
 Reject absolute, empty, `.`, `..`, embedded-NUL, backslash, oversized, over-depth,
 and over-count input before traversal.
 
+On Linux and macOS, construct every directory identity as permission
+`mode = st_mode & 0o777`, `major_device = rustix::fs::major(st_dev)`,
+`minor_device = rustix::fs::minor(st_dev)`, and positive `inode = st_ino`.
+Use these rustix platform helpers rather than copying or casting raw `st_dev`.
+Compare descendant filesystem membership by the root `major_device/minor_device`
+pair while retaining the full stat mode separately for directory/special-file
+classification.
+
 `contained_tree_identity/3` is read-only and returns the exact target
-`%{device:, inode:, mode:}` or `:missing` only after safely reaching the anchored
-parent. `remove_contained_tree/4` has no observe mode: it first rechecks the target
+`%{mode:, major_device:, minor_device:, inode:}` or
+`{:missing, root_identity}` only after safely reaching the anchored parent.
+`remove_contained_tree/4` has no observe mode: it first rechecks all four fields
 against `expected_identity`, preflights the complete tree descriptor-relatively
-within depth/entry/deadline/device limits, then removes regular files with
-`unlinkat` and directories with `unlinkat(..., AT_REMOVEDIR)` without following
-links. Recompare the anchored root identity and target name before the final
+within depth/entry/deadline/filesystem-device limits, then removes regular files
+with `unlinkat` and directories with `unlinkat(..., AT_REMOVEDIR)` without
+following links. Recompare the anchored root identity and target name before the final
 `AT_REMOVEDIR`. Remove the target root last. On a partial timeout/error, preserve
 the target root inode whenever possible so replay with the same identity can
-finish. Return `:missing` only after anchored-parent proof; never translate an
-unsafe lookup failure into missing.
+finish. Return `{:missing, root_identity}` only after anchored-parent proof and
+exactly revalidate all four root fields; never translate an unsafe lookup failure
+into missing.
 
 The typed error atoms are:
 
@@ -1184,7 +1219,7 @@ The typed error atoms are:
   :not_found,
   :symlink,
   :special_file,
-  :device_changed,
+  :filesystem_device_changed,
   :identity_mismatch,
   :mode_mismatch,
   :root_changed,
@@ -1231,6 +1266,7 @@ devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
   apps/git_core/test/anchored_remove_test.exs \
   apps/git_core/test/native_surface_test.exs \
   apps/git_core/test/repository_read_model_test.exs \
+  apps/git_core/test/remote_test.exs \
   --max-cases 1
 ```
 
@@ -1251,7 +1287,8 @@ git add \
   apps/git_core/native/fornacast_git_core/src/anchored_remove.rs \
   apps/git_core/test/anchored_remove_test.exs \
   apps/git_core/test/native_surface_test.exs \
-  apps/git_core/test/repository_read_model_test.exs
+  apps/git_core/test/repository_read_model_test.exs \
+  apps/git_core/test/remote_test.exs
 git commit -m "feat(git): remove repository trees by anchored identity"
 ```
 
@@ -1562,17 +1599,24 @@ Use version `1` evidence maps with exact keys:
   successor_item_id, adopter_item_id`;
 - Remote quarantine:
   `version, kind, repository_id, repository_generation, repository_storage_path,
-  item_id, item_lock_version, requested_path, quarantine_path, mode, device,
-  inode, remote_failure_kind`.
+  item_id, item_lock_version, requested_path, quarantine_path, mode, major_device,
+  minor_device, inode, remote_failure_kind`.
+
+Every persisted target or root identity validator accepts only the canonical
+string-key JSON shape
+`%{"mode" => nonnegative, "major_device" => nonnegative,
+"minor_device" => nonnegative, "inode" => positive}`. It rejects raw `device`,
+unknown keys, and lossy numeric conversion.
 
 After anchored observation, enrich the same evidence with exactly one of:
 
 ```elixir
 %{
   "anchored_identity" => %{
-    "device" => device,
-    "inode" => inode,
-    "mode" => mode
+    "mode" => mode,
+    "major_device" => major_device,
+    "minor_device" => minor_device,
+    "inode" => inode
   }
 }
 
@@ -1580,6 +1624,12 @@ After anchored observation, enrich the same evidence with exactly one of:
   "anchored_absence" => %{
     "version" => 1,
     "observed_at" => DateTime.to_iso8601(observed_at),
+    "root_identity" => %{
+      "mode" => root_mode,
+      "major_device" => root_major_device,
+      "minor_device" => root_minor_device,
+      "inode" => root_inode
+    },
     "root_projection" => root_projection,
     "path_projection" => path_projection
   }
@@ -1587,15 +1637,20 @@ After anchored observation, enrich the same evidence with exactly one of:
 ```
 
 `root_projection` is lowercase hex SHA-256 of
-`:erlang.term_to_binary({:fornacast_cleanup_root, 1, storage_root})`.
+`:erlang.term_to_binary({:fornacast_cleanup_root, 1, storage_root,
+root_identity})`.
 `path_projection` is lowercase hex SHA-256 of
 `:erlang.term_to_binary({:fornacast_cleanup_path, 1, storage_root,
-relative_segments})`. The configured storage root and canonical relative segments
-come from the immutable journal evidence; finalization recomputes both projections
-and rejects a forged marker or path drift. The original path/evidence keys and the
-chosen anchored outcome remain immutable. An absence outcome is valid only after
-the read-only anchored NIF returned `:missing` under both permits; it is not
-permission to call removal.
+relative_segments, root_identity})`. `root_identity` is the canonical four-field
+atom-key companion returned with `{:missing, root_identity}`, converted without
+value changes to the JSON string-key shape shown above. The configured storage
+root and canonical relative segments come from the immutable journal evidence;
+finalization re-observes the same four-field root identity, recomputes both
+projections, and rejects a forged marker or path drift. The original path/evidence
+keys and the chosen anchored outcome remain immutable. An absence outcome is valid
+only after the read-only anchored NIF returned
+`{:missing, root_identity}` under both permits; it is not permission to call
+removal.
 `publication_marker` is the full committed marker already validated by
 `RepositoryPublisher`. `attempt_fingerprint` is lowercase hex SHA-256 of the
 canonical Erlang external-term encoding of
@@ -1754,9 +1809,10 @@ In `repository_cleanup_test.exs` cover every true/false branch for all three kin
   `cleanup_state: "cleanup_pending"`, due eligibility, paired-null or paired
   expired item lease, exact deterministic
   `GitCore.Remote.cleanup_evidence/1` matching the persisted requested/quarantine
-  path and mode/device/inode, and an operation keyed by the locked source item
-  version. A future paired item lease reschedules just after expiry without
-  creating/destructively attempting intent, and a one-sided item lease blocks.
+  path and `mode/major_device/minor_device/inode`, and an operation keyed by the
+  locked source item version. A future paired item lease reschedules just after
+  expiry without creating/destructively attempting intent, and a one-sided item
+  lease blocks.
 
 For Remote quarantine, add paired RED cases proving the exact source-chain
 exception and its boundary. The exact journal item may remain `:staging_git` with
@@ -1892,10 +1948,10 @@ item.id == operation.repository_item_id and
 
 `exact_remote_evidence?/2` compares the operation ID, kind, repository/item IDs,
 source lock version, requested/canonical quarantine paths, and persisted
-mode/device/inode. A live or one-sided source item/run lease, mismatched evidence,
-non-current or non-running source attempt, any other source state, or any second
-nonterminal item/attempt/run for the repository blocks. No exception exists for a
-successor/adopter or for replacement/unpublished cleanup.
+`mode/major_device/minor_device/inode`. A live or one-sided source item/run lease,
+mismatched evidence, non-current or non-running source attempt, any other source
+state, or any second nonterminal item/attempt/run for the repository blocks. No
+exception exists for a successor/adopter or for replacement/unpublished cleanup.
 
 The same preflight rejects any nonterminal Git-write/merge operation and calls both
 `cleanup_safety_locked/2` ports while the SQL rows are locked. A claimable
@@ -1923,11 +1979,14 @@ The effect state machine is:
 1. The journal exists and is leased.
 2. Call `GitCore.contained_tree_identity/3` under both permits. On an identity
    result, persist exact `anchored_identity` and `effect_started_at` before any
-   destructive call. Remote quarantine already has mode/device/inode evidence,
-   which must equal this fresh identity. On `:missing`, persist exact
-   `anchored_absence` plus `effect_started_at` and `effect_finished_at` in one
-   lease-owned transaction before finalization. A crash after that transaction
-   replays by recomputing projections and requiring a second anchored `:missing`.
+   destructive call. Remote quarantine already has
+   `mode/major_device/minor_device/inode` evidence, which must equal this fresh
+   identity field-for-field. On `{:missing, root_identity}`, persist exact
+   `anchored_absence` with that canonical root companion plus
+   `effect_started_at` and `effect_finished_at` in one lease-owned transaction
+   before finalization. A crash after that transaction replays by recomputing
+   projections and requiring a second anchored `{:missing, root_identity}` with
+   all four root fields unchanged.
 3. For either outcome, call `GitCore.invalidate_repository_cache_strict/1`.
    Cache failure retains `cleanup_pending` and performs no deletion or
    finalization.
@@ -1935,12 +1994,13 @@ The effect state machine is:
    exact persisted identity. Removal is never called from an absence proof or
    without identity. Partial removal, timeout, or I/O error retains pending state
    and backoff; replay uses the same identity. After removed, or after identity
-   replay safely returns missing, persist `effect_finished_at`.
+   replay safely returns `{:missing, root_identity}`, persist
+   `effect_finished_at` after validating all four root fields.
 5. Finalize only one of two mutually exclusive proofs:
-   `anchored_identity + (removed | safely missing replay)`, or
-   `anchored_absence + safely missing`. Re-lock and CAS-check the exact
-   repository/item/journal fingerprint and recompute the anchored root/path
-   projections before committing.
+   `anchored_identity + (removed | safely missing replay with root identity)`, or
+   `anchored_absence + safely missing with the same root identity`. Re-lock and
+   CAS-check the exact repository/item/journal fingerprint and recompute the
+   anchored root/path projections before committing.
 
 For replacement/unpublished cleanup, the final transaction sets
 `Repository.storage_reclaimed_at`, inserts or verifies the deterministic
