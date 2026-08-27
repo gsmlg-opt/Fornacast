@@ -1019,72 +1019,976 @@ git commit -m "feat(import): publish imported repositories"
 
 ### Task 8: Reclaim failed shadows and old tombstones safely
 
+Task 8 is four ordered, independently committed slices. The scope expansion is
+mandatory: cleanup deletes storage, while the current tree has neither an anchored
+recursive-delete primitive nor a read lease covering the complete upload-pack
+lifetime. A path check followed by `File.rm_rf/1` is a time-of-check/time-of-use
+vulnerability and is forbidden.
+
+The implementation must also reject all of these designs:
+
+- path-based recursive deletion, including `File.rm_rf/1` after a containment,
+  `lstat`, realpath, or identity check;
+- cleanup without a `GitCore.RepositoryReadLimiter` exclusive cleanup permit;
+- destructive observe mode: every delete requires an exact identity durably
+  persisted before the destructive NIF call;
+- sharing `ForgeImports.TaskSupervisor`, the sole import scan task, with cleanup;
+- storing tombstone or unpublished-shadow intent in the narrow
+  `RepositoryItem.cleanup_*` fields reserved for Remote quarantine recovery;
+- deleting while a Git write, pull merge, or import operation is claimable;
+- recording `repository.storage_reclaimed` or
+  `github_import.quarantine_reclaimed` before the filesystem effect is proven;
+- any Windows path fallback. Unsupported targets return a typed error without
+  touching storage.
+
+The filesystem threat model is Unix on Linux/macOS, with the service account
+owning the repository tree under a same-UID, non-writable-by-other-users private
+parent. No cleanup test may target the workspace, repository root, filesystem
+root, or a shared directory; every destructive test uses ExUnit `tmp_dir`.
+
+#### Task 8A: Add anchored filesystem identity and removal primitives
+
+**Commit:** `feat(git): remove repository trees by anchored identity`
+
 **Files:**
 
-- Create: `apps/forge_imports/lib/forge_imports/repository_cleanup.ex`
-- Create: `apps/forge_imports/test/repository_cleanup_test.exs`
-- Modify: `apps/forge_imports/lib/forge_imports/reconciler.ex`
+- Create: `apps/git_core/native/fornacast_git_core/src/anchored_remove.rs`
+- Create: `apps/git_core/test/anchored_remove_test.exs`
+- Modify: `apps/git_core/lib/git_core.ex`
+- Modify: `apps/git_core/lib/git_core/native.ex`
+- Modify: `apps/git_core/native/fornacast_git_core/Cargo.toml`
+- Modify: `apps/git_core/native/fornacast_git_core/Cargo.lock`
+- Modify: `apps/git_core/native/fornacast_git_core/src/lib.rs`
+- Modify: `apps/git_core/test/native_surface_test.exs`
+- Modify: `apps/git_core/test/repository_read_model_test.exs`
+
+- [ ] **Step 8A.1: Write the RED anchored-removal contract**
+
+In `anchored_remove_test.exs`, create only private `tmp_dir` trees and assert this
+exact public surface:
+
+```elixir
+@type contained_tree_identity :: %{
+        device: non_neg_integer(),
+        inode: non_neg_integer(),
+        mode: non_neg_integer()
+      }
+
+@spec GitCore.contained_tree_identity(Path.t(), [String.t()], non_neg_integer()) ::
+        {:ok, contained_tree_identity()}
+        | {:ok, :missing}
+        | {:error, atom()}
+
+@spec GitCore.remove_contained_tree(
+        Path.t(),
+        [String.t()],
+        contained_tree_identity(),
+        non_neg_integer()
+      ) ::
+        {:ok, {:removed, contained_tree_identity()}}
+        | {:ok, :missing}
+        | {:error, atom()}
+```
+
+Cover exact identity success and replay, expected inode/device/mode mismatch,
+missing target reached through an anchored parent, root symlink, ancestor symlink,
+target symlink, nested symlink, a target-name swap between observation and removal,
+FIFO/socket/device/special-file rejection, regular nested files and directories,
+absolute/empty/`.`/`..` segments, NUL, backslash, segment/count/depth/entry bounds,
+deadline zero, partial timeout followed by exact-identity replay, and a descendant
+mount/device crossing when the test host permits an unprivileged mount. If the
+mount cannot be created, explicitly assert the test is skipped for that host; do
+not weaken the production device check.
+
+Add source assertions that `anchored_remove.rs` uses descriptor-relative
+`openat`/`statat`/`unlinkat` operations, contains no path fallback, compiles an
+unsupported-platform branch that returns `:unsupported_platform`, and that no
+production Task 8 module contains `File.rm_rf`. Add strict cache tests showing the
+existing `invalidate_repository_cache/1` remains fail-open for read callers while
+`invalidate_repository_cache_strict/1` returns `{:error, :cache_unavailable}` when
+the cache process is absent or crashes.
+
+- [ ] **Step 8A.2: Run the RED tests**
+
+```bash
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+  apps/git_core/test/anchored_remove_test.exs \
+  apps/git_core/test/native_surface_test.exs \
+  apps/git_core/test/repository_read_model_test.exs \
+  --max-cases 1
+```
+
+Expected: FAIL because the two anchored APIs and strict invalidation API do not
+exist.
+
+- [ ] **Step 8A.3: Implement one anchored DirtyIo NIF per public call**
+
+Add direct `rustix = { version = "1.1.4", features = ["fs"] }` to `Cargo.toml`;
+the exact version is already transitively locked, so `Cargo.lock` must retain
+`rustix 1.1.4` without a second rustix version. Export exactly two Rustler
+`schedule = "DirtyIo"` NIFs from `lib.rs`:
+
+```rust
+#[rustler::nif(schedule = "DirtyIo")]
+fn contained_tree_identity(
+    storage_root: String,
+    relative_segments: Vec<String>,
+    deadline_ms: u64,
+) -> Result<IdentityResult, AnchoredRemoveError>;
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn remove_contained_tree(
+    storage_root: String,
+    relative_segments: Vec<String>,
+    expected_identity: ContainedTreeIdentity,
+    deadline_ms: u64,
+) -> Result<RemoveResult, AnchoredRemoveError>;
+```
+
+`IdentityResult` is exactly `Directory(ContainedTreeIdentity) | Missing` and
+`RemoveResult` is exactly `Removed(ContainedTreeIdentity) | Missing`; Rustler
+encodes them to the public Elixir tuples from Step 8A.1.
+
+Register matching stubs in `GitCore.Native` and wrappers in `GitCore`. The wrappers
+accept only a non-root absolute `storage_root`, a non-empty list of canonical
+relative segments, an exact identity map for removal, and a nonnegative integer
+deadline. Invalid Elixir terms return `{:error, :invalid_argument}` without
+entering Rust.
+
+For both NIFs, open the absolute storage root by walking from `/` one component at
+a time with `openat(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`. Then walk every
+relative component from the anchored root descriptor with the same flags. At each
+hop use `fstat` plus `statat(..., AT_SYMLINK_NOFOLLOW)` and reject a symlink,
+non-directory, identity/mode disagreement, device crossing, or deadline expiry.
+Reject absolute, empty, `.`, `..`, embedded-NUL, backslash, oversized, over-depth,
+and over-count input before traversal.
+
+`contained_tree_identity/3` is read-only and returns the exact target
+`%{device:, inode:, mode:}` or `:missing` only after safely reaching the anchored
+parent. `remove_contained_tree/4` has no observe mode: it first rechecks the target
+against `expected_identity`, preflights the complete tree descriptor-relatively
+within depth/entry/deadline/device limits, then removes regular files with
+`unlinkat` and directories with `unlinkat(..., AT_REMOVEDIR)` without following
+links. Recompare the anchored root identity and target name before the final
+`AT_REMOVEDIR`. Remove the target root last. On a partial timeout/error, preserve
+the target root inode whenever possible so replay with the same identity can
+finish. Return `:missing` only after anchored-parent proof; never translate an
+unsafe lookup failure into missing.
+
+The typed error atoms are:
+
+```elixir
+[
+  :invalid_argument,
+  :unsupported_platform,
+  :not_found,
+  :symlink,
+  :special_file,
+  :device_changed,
+  :identity_mismatch,
+  :mode_mismatch,
+  :root_changed,
+  :depth_limit,
+  :entry_limit,
+  :deadline_exceeded,
+  :permission_denied,
+  :io_error
+]
+```
+
+On non-Unix targets and Unix targets other than Linux/macOS, both NIFs return
+`:unsupported_platform` before opening anything. There is no Rust standard-library
+path recursion and no Elixir fallback.
+
+- [ ] **Step 8A.4: Implement strict cache invalidation**
+
+Add:
+
+```elixir
+@spec invalidate_repository_cache_strict(Path.t()) ::
+        :ok | {:error, :cache_unavailable}
+def invalidate_repository_cache_strict(repository_path)
+    when is_binary(repository_path) do
+  case GitCore.Cache.invalidate_repository(repository_path) do
+    :ok -> :ok
+    _ -> {:error, :cache_unavailable}
+  end
+catch
+  _kind, _reason -> {:error, :cache_unavailable}
+end
+```
+
+Keep `invalidate_repository_cache/1` unchanged. Cleanup is the only initial caller
+of the strict form.
+
+- [ ] **Step 8A.5: Run GREEN native and Elixir checks**
+
+```bash
+devenv shell -- cargo test \
+  --manifest-path apps/git_core/native/fornacast_git_core/Cargo.toml \
+  anchored_remove -- --nocapture
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+  apps/git_core/test/anchored_remove_test.exs \
+  apps/git_core/test/native_surface_test.exs \
+  apps/git_core/test/repository_read_model_test.exs \
+  --max-cases 1
+```
+
+Expected: all tests pass, the success case reports the same identity observed
+before removal, mismatch cases leave the target untouched, and partial-timeout
+replay removes only the original target.
+
+- [ ] **Step 8A.6: Commit the anchored primitive**
+
+```bash
+git diff --check
+git add \
+  apps/git_core/lib/git_core.ex \
+  apps/git_core/lib/git_core/native.ex \
+  apps/git_core/native/fornacast_git_core/Cargo.toml \
+  apps/git_core/native/fornacast_git_core/Cargo.lock \
+  apps/git_core/native/fornacast_git_core/src/lib.rs \
+  apps/git_core/native/fornacast_git_core/src/anchored_remove.rs \
+  apps/git_core/test/anchored_remove_test.exs \
+  apps/git_core/test/native_surface_test.exs \
+  apps/git_core/test/repository_read_model_test.exs
+git commit -m "feat(git): remove repository trees by anchored identity"
+```
+
+#### Task 8B: Lease repository readers and cleanup
+
+**Commit:** `feat(git): lease repository readers`
+
+**Files:**
+
+- Create: `apps/git_core/lib/git_core/repository_read_limiter.ex`
+- Create: `apps/git_core/test/repository_read_limiter_test.exs`
+- Create: `apps/forge_repos/lib/forge_repos/repository_read_handle.ex`
+- Create: `apps/forge_repos/test/repository_read_handle_test.exs`
+- Modify: `apps/git_core/lib/git_core/application.ex`
+- Modify: `apps/forge_repos/lib/forge_repos.ex`
+- Modify: `apps/git_transport/lib/git_transport/upload_pack.ex`
+- Modify: `apps/git_transport/lib/git_transport/exec.ex`
+- Modify: `apps/git_transport/lib/git_transport/channel.ex`
+- Modify: `apps/git_transport/test/git_transport_test.exs`
+- Modify: `apps/git_transport/test/test_dirty_io_native_test.exs`
+- Modify: `apps/fornacast_web/lib/fornacast_web/controllers/git_http_controller.ex`
+- Modify: `apps/fornacast_web/test/git_http_auth_test.exs`
+- Modify: `apps/fornacast_web/test/repository_controller_test.exs`
+
+- [ ] **Step 8B.1: Write the RED read/cleanup lease matrix**
+
+Define the limiter interface exactly:
+
+```elixir
+@spec GitCore.RepositoryReadLimiter.acquire_read(
+        pos_integer(),
+        integer()
+      ) :: {:ok, lease()} | {:error, :deadline_exceeded | :unavailable}
+
+@spec GitCore.RepositoryReadLimiter.acquire_cleanup(
+        pos_integer(),
+        integer()
+      ) :: {:ok, lease()} | {:error, :deadline_exceeded | :unavailable}
+
+@spec GitCore.RepositoryReadLimiter.release(lease()) :: :ok
+```
+
+The deadline is an absolute monotonic millisecond deadline used only while
+acquiring. A granted lease lives until explicit release or owner-process death.
+Test multiple shared readers, one exclusive cleanup grant, cleanup waiting for
+existing readers, writer-priority behavior where readers arriving after queued
+cleanup wait behind it, acquisition deadline expiry, independent repositories,
+owner death, idempotent release, limiter absence, limiter crash, and recovery.
+
+The limiter uses a pending/confirmed production registry around the GenServer
+call, monitors every owner, has `restart: :temporary`, and fails closed when absent
+or during a crash. On restart it restores only confirmed grants whose owner PIDs
+are still alive, discards pending/dead grants, and rebuilds monitors and
+per-repository queues. Match the established
+`RepositoryWriteLimiter` crash-window tests, but do not change its semantics or
+make ordinary writers acquire the new limiter.
+
+- [ ] **Step 8B.2: Run the limiter RED tests**
+
+```bash
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+  apps/git_core/test/repository_read_limiter_test.exs \
+  --max-cases 1
+```
+
+Expected: FAIL because `RepositoryReadLimiter` does not exist.
+
+- [ ] **Step 8B.3: Implement the limiter and deep ForgeRepos read handle**
+
+Add `GitCore.RepositoryReadLimiter` to `GitCore.Application.child_specs/0` after
+`RepositoryWriteLimiter`. Use per-repository FIFO queues with this grant rule:
+shared reads may co-exist only before cleanup is queued; one cleanup lease requires
+zero readers; after cleanup is queued, later reads remain queued; a grant on one
+repository never blocks another repository.
+
+Expose an opaque handle rather than a repository/path tuple:
+
+```elixir
+defmodule ForgeRepos.RepositoryReadHandle do
+  @opaque t :: %__MODULE__{
+            repository: ForgeRepos.Repository.t(),
+            path: Path.t(),
+            lease: GitCore.RepositoryReadLimiter.lease()
+          }
+  defstruct [:repository, :path, :lease]
+end
+
+@spec ForgeRepos.open_repository_read(Repository.t(), integer()) ::
+        {:ok, RepositoryReadHandle.t()}
+        | {:error, :not_found | :deadline_exceeded | :unavailable}
+
+@spec ForgeRepos.close_repository_read(RepositoryReadHandle.t()) :: :ok
+```
+
+`open_repository_read/2` acquires the read lease for the input repository ID,
+reloads that exact ID, and requires exact input generation, `lifecycle: :ready`,
+`deleted_at: nil`, `storage_reclaimed_at: nil`, and a canonical contained storage
+path. Release immediately on every reload/path mismatch. The returned handle owns
+the reloaded repository and absolute path. `close_repository_read/1` is
+idempotent. This is the only read-side API that may cross publication/deletion
+boundaries.
+
+- [ ] **Step 8B.4: Move every upload-pack reader behind the handle**
+
+Change `GitTransport.UploadPack.advertise_refs/1`, `response/2`, and `serve/1`
+repository wrappers to acquire/release a handle. Add internal
+`advertise_refs_handle/1` and `response_handle/2` functions that accept only the
+opaque handle so a long-lived caller can retain one lease across multiple protocol
+phases.
+
+`GitTransport.Exec` and Git-over-HTTP use the same wrapper seam with
+`try ... after ForgeRepos.close_repository_read(handle) end`. Repository lookup
+still happens before the tombstone race, but handle acquisition after a tombstone
+must fail without touching storage.
+
+For SSH, `GitTransport.Channel` acquires the handle before advertisement, stores it
+in a new `repository_read_handle` field, and uses that same handle through
+advertisement, negotiation, pack generation, and send completion. Release and
+clear it on every normal completion, protocol error, send error, EOF, closed
+message, rejection after acquisition, and `terminate/2`; repeated cleanup is safe.
+The limiter owner monitor is the final fallback if the channel dies.
+
+Add integration assertions that an old reader opened before replacement continues
+using the old inode and blocks cleanup, while a post-publication lookup opens the
+new repository. Hold the read lease across a deliberately blocked DirtyIo pack NIF
+for SSH and HTTP, prove cleanup waits, then release and prove cleanup wins. Also
+prove `Exec.upload_pack/3` and `upload_pack_stream/3` use the same handle seam.
+
+- [ ] **Step 8B.5: Run GREEN read-path tests**
+
+```bash
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+  apps/git_core/test/repository_read_limiter_test.exs \
+  apps/forge_repos/test/repository_read_handle_test.exs \
+  apps/git_transport/test/git_transport_test.exs \
+  apps/git_transport/test/test_dirty_io_native_test.exs \
+  apps/fornacast_web/test/git_http_auth_test.exs \
+  apps/fornacast_web/test/repository_controller_test.exs \
+  --max-cases 1
+```
+
+Expected: all tests pass; cleanup cannot overlap an SSH, Exec, HTTP, or blocked
+DirtyIo read, and limiter failure denies new reads.
+
+- [ ] **Step 8B.6: Commit reader leasing**
+
+```bash
+git diff --check
+git add \
+  apps/git_core/lib/git_core/application.ex \
+  apps/git_core/lib/git_core/repository_read_limiter.ex \
+  apps/git_core/test/repository_read_limiter_test.exs \
+  apps/forge_repos/lib/forge_repos.ex \
+  apps/forge_repos/lib/forge_repos/repository_read_handle.ex \
+  apps/forge_repos/test/repository_read_handle_test.exs \
+  apps/git_transport/lib/git_transport/upload_pack.ex \
+  apps/git_transport/lib/git_transport/exec.ex \
+  apps/git_transport/lib/git_transport/channel.ex \
+  apps/git_transport/test/git_transport_test.exs \
+  apps/git_transport/test/test_dirty_io_native_test.exs \
+  apps/fornacast_web/lib/fornacast_web/controllers/git_http_controller.ex \
+  apps/fornacast_web/test/git_http_auth_test.exs \
+  apps/fornacast_web/test/repository_controller_test.exs
+git commit -m "feat(git): lease repository readers"
+```
+
+#### Task 8C: Persist cleanup intent and expose fail-closed safety ports
+
+**Commit:** `feat(import): persist repository cleanup intent`
+
+**Files:**
+
+- Create: `apps/fornacast/priv/repo/migrations/20260825000430_add_import_cleanup_recovery.exs`
+- Create: `apps/forge_imports/lib/forge_imports/cleanup_operation.ex`
+- Create: `apps/forge_imports/test/cleanup_operation_test.exs`
+- Create: `apps/forge_imports/test/cleanup_recovery_migration_test.exs`
+- Modify: `apps/fornacast/lib/fornacast/operation_lease.ex`
+- Modify: `apps/forge_repos/lib/forge_repos/git_write_operation.ex`
+- Modify: `apps/forge_pulls/lib/forge_pulls/merge_operation.ex`
 - Modify: `apps/forge_repos/lib/forge_repos/repository_write_reconcilers.ex`
 - Modify: `apps/forge_repos/lib/forge_repos/git_write_recovery.ex`
 - Modify: `apps/forge_pulls/lib/forge_pulls/merge_recovery.ex`
+- Modify: `apps/forge_imports/lib/forge_imports/persistence.ex`
+- Modify: `apps/forge_imports/lib/forge_imports/conflicts.ex`
+- Modify: `apps/forge_imports/lib/forge_imports/repository_publisher.ex`
+- Modify: `apps/forge_imports/test/import_persistence_test.exs`
+- Modify: `apps/forge_imports/test/import_persistence_concurrency_test.exs`
+- Modify: `apps/forge_imports/test/conflicts_test.exs`
+- Modify: `apps/forge_imports/test/repository_publication_test.exs`
+- Modify: `apps/forge_repos/test/git_writes_test.exs`
 - Modify: `apps/forge_repos/test/git_write_recovery_test.exs`
 - Modify: `apps/forge_pulls/test/merge_recovery_test.exs`
 - Modify: `config/config.exs`
-- Modify: `config/runtime.exs`
-- Modify: `config/test.exs`
 
-- [ ] **Step 1: Write cleanup safety/idempotency tests**
+- [ ] **Step 8C.1: Write the RED migration, schema, lease, and port tests**
 
-Test grace period, live/claimable import/write/merge leases, limiter acquisition, path containment, symlink rejection, missing directory idempotency, cache invalidation, crash after remove/before SQL proof, failed/canceled importing shadow abandonment, successor-adoption exclusion, deterministic `.fornacast-cleanup-v1-*` discovery only from persisted `cleanup_pending` evidence, malformed/unowned quarantine rejection, and `storage_reclaimed_at` plus audit.
+The migration creates `github_import_repository_cleanups` with:
 
-- [ ] **Step 2: Run and verify no cleanup boundary exists**
-
-```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/repository_cleanup_test.exs --max-cases 1
+```text
+repository_id              bigint, required
+repository_item_id         bigint, required
+source_lock_version        bigint, required
+kind                       remote_quarantine | unpublished_shadow | replacement_tombstone
+state                      cleanup_pending | cleanup_blocked | cleanup_complete
+operation_id               string, required
+evidence                   map/json, required
+eligible_at                utc_datetime, required
+next_attempt_at            utc_datetime, nullable
+attempt_count              integer, required, default 0
+last_error                 string, nullable
+effect_started_at          utc_datetime, nullable
+effect_finished_at         utc_datetime, nullable
+completed_at               utc_datetime, nullable
+lease_owner                string, nullable
+lease_expires_at           utc_datetime, nullable
+lock_version               integer, required, default 0
+inserted_at/updated_at      utc_datetime, required
 ```
 
-Expected: FAIL with missing cleanup module.
+Add named checks for the three enums, positive IDs/source version, nonnegative
+attempt/version, paired leases, state/completion/effect timestamps, and exact
+state/evidence/lease coherence. Add foreign keys to repositories and repository
+items, a unique `operation_id` index, a unique
+`repository_item_id/kind/source_lock_version` index, and recovery index
+`state/next_attempt_at/eligible_at/id`.
 
-- [ ] **Step 3: Implement delayed cleanup**
+The exact lifecycle coherence is: pending requires `next_attempt_at`, has no
+`completed_at`, and may have no effect timestamps, only `effect_started_at`, or
+both effect timestamps; blocked requires classified `last_error`, has no lease,
+`next_attempt_at`, or `completed_at`, and may retain ordered effect timestamps;
+complete has no lease, `next_attempt_at`, or `last_error` and requires
+`effect_started_at`, `effect_finished_at`, and `completed_at` in timestamp order.
+Only pending may carry a lease, and `effect_finished_at` never exists without
+`effect_started_at`. Every evidence map passes the exact per-kind version/key/type
+validator below; once `effect_started_at` is present, `anchored_identity` is
+required and immutable.
 
-Add a configurable grace period with a minimum greater than every bounded Git operation. Extend `RepositoryWriteReconcilers` with a cleanup-safety query so `forge_repos` does not depend directly on `forge_pulls`.
+The same migration adds named checks to `git_write_operations` and
+`pull_merge_operations`: `lease_owner` and `lease_expires_at` are both null or
+both non-null, and terminal rows retain neither. Implement exact adapter-specific
+`up/0` and `down/0`. On Turso, use the repository's established table-rebuild
+rollback guard required by `gsmlg-dev/concord#81`; do not open a new upstream issue
+for this approved slice.
+
+Test every cleanup state/evidence/lease combination at the changeset and database
+levels on Turso and PostgreSQL. `Inspect` must redact `evidence`, `last_error`, and
+every path-bearing field. Add `states/0` and `terminal_states/0` to
+`GitWriteOperation` and `MergeOperation` so `OperationLease.claim/5` returns
+`:busy` for terminal rows. Verify existing live nonterminal claims still work and
+one-sided or terminal retained leases are rejected by both databases.
+
+- [ ] **Step 8C.2: Run the Turso RED suite**
+
+```bash
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+  apps/forge_imports/test/cleanup_operation_test.exs \
+  apps/forge_imports/test/cleanup_recovery_migration_test.exs \
+  apps/forge_repos/test/git_writes_test.exs \
+  apps/forge_pulls/test/merge_recovery_test.exs \
+  --max-cases 1
+```
+
+Expected: FAIL because migration `00430` and `CleanupOperation` are absent and the
+two existing operation schemas do not expose terminal states.
+
+- [ ] **Step 8C.3: Implement the cleanup journal schema and exact evidence**
+
+`CleanupOperation` exposes:
 
 ```elixir
-def reclaim_tombstone(%Repository{lifecycle: :tombstoned} = repository, now, opts \\ []) do
-  with :ok <- grace_elapsed(repository, now, opts),
-       :ok <- RepositoryWriteReconcilers.cleanup_safe?(repository, now),
-       :ok <- with_cleanup_fence(repository, &remove_contained_path/1),
-       {:ok, _} <- mark_reclaimed(repository, now) do
-    :ok
-  end
-end
-
-def abandon_importing_shadow(item, now, opts \\ []) do
-  with :ok <- terminal_unpublished_item?(item),
-       :ok <- no_successor_adoption?(item),
-       :ok <- import_lease_free?(item, now),
-       {:ok, shadow} <- tombstone_shadow(item.hidden_repository_id, now),
-       do: reclaim_tombstone(shadow, now, opts)
-end
+def states, do: [:cleanup_pending, :cleanup_blocked, :cleanup_complete]
+def terminal_states, do: [:cleanup_blocked, :cleanup_complete]
+def kinds, do: [:remote_quarantine, :unpublished_shadow, :replacement_tombstone]
 ```
 
-Use durable proof and make replay safe if the directory was already removed. Never abandon a retryable shadow until the run/item cleanup eligibility is terminal and no successor owns or may adopt it.
+Its creation changeset accepts immutable identity/evidence fields plus scheduling
+fields only. Its `lease_update_changeset/2` permits exact transitions from pending
+to pending/blocked/complete, attempt/backoff/error updates, identity enrichment,
+effect timestamps, and completion; it never permits changing repository, item,
+source version, kind, operation ID, or original evidence facts.
 
-Quarantined Remote failures are delayed cleanup inputs, not anonymous filesystem garbage. Recompute the deterministic slot from the canonical intended destination, require it to match persisted path plus `0700`/device/inode evidence, and acquire the same cleanup fence/grace checks before reclamation. Never use a separate path identity check followed by `File.rm_rf`; if an anchored deletion primitive is not available or any identity changes, retain the slot as cleanup-pending and retry later. Reclamation audit and SQL proof commit only after the anchored effect is proven.
+Use these deterministic operation IDs:
 
-- [ ] **Step 4: Run cleanup and recovery suites**
-
-```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/repository_cleanup_test.exs apps/forge_repos/test/git_write_recovery_test.exs apps/forge_pulls/test/merge_recovery_test.exs --max-cases 1
+```elixir
+"github-import-cleanup:remote_quarantine:#{repository_id}:#{item_id}:#{source_lock_version}"
+"github-import-cleanup:unpublished_shadow:#{repository_id}:#{item_id}:#{source_lock_version}"
+"github-import-cleanup:replacement_tombstone:#{repository_id}:#{item_id}:#{source_lock_version}"
 ```
 
-Expected: all tests pass.
+Use version `1` evidence maps with exact keys:
 
-- [ ] **Step 5: Commit cleanup**
+- replacement tombstone:
+  `version, kind, repository_id, repository_generation, repository_write_version,
+  repository_storage_path, repository_deleted_at, repository_updated_at, item_id,
+  item_lock_version, attempt_number, attempt_decision, attempt_fingerprint,
+  publication_operation_id, publication_marker, new_repository_id,
+  new_repository_generation, publication_audit_id`;
+- unpublished shadow:
+  `version, kind, repository_id, repository_generation, repository_write_version,
+  repository_storage_path, repository_updated_at, item_id, item_lock_version,
+  item_state, run_id, run_state, attempt_number, attempt_state, attempt_decision,
+  attempt_fingerprint, publication_evidence, predecessor_item_id,
+  successor_item_id, adopter_item_id`;
+- Remote quarantine:
+  `version, kind, repository_id, repository_generation, repository_storage_path,
+  item_id, item_lock_version, requested_path, quarantine_path, mode, device,
+  inode, remote_failure_kind`.
+
+After anchored observation, enrich the same evidence with
+`"anchored_identity" => %{"device" => device, "inode" => inode, "mode" => mode}`
+before deletion. The original path/evidence keys remain immutable.
+`publication_marker` is the full committed marker already validated by
+`RepositoryPublisher`. `attempt_fingerprint` is lowercase hex SHA-256 of the
+canonical Erlang external-term encoding of
+`{item_id, attempt_number, attempt.decision}`. Deterministic reclamation audits use
+the cleanup `operation_id` and exact action, target type, target ID, actor, and
+evidence fingerprint; an existing row with any mismatch is a collision, not
+success.
+
+- [ ] **Step 8C.4: Add the fail-closed cleanup safety port**
+
+Extend the callback and configuration contract:
+
+```elixir
+@callback cleanup_safety_locked(ForgeRepos.Repository.t(), DateTime.t()) ::
+            :safe
+            | {:blocked, :live_lease}
+            | {:blocked, :claimable_operation}
+            | {:blocked, :inconsistent_lease}
+            | {:error, :unavailable}
+```
+
+`RepositoryWriteReconcilers.entries/0` now requires every configured module to
+export both `reconcile_repository_locked/3` and `cleanup_safety_locked/2`; missing,
+raising, exiting, throwing, or unknown callback results become
+`{:error, :unavailable}`.
+
+`GitWriteRecovery` owns inspection of `git_write_operations` and `MergeRecovery`
+owns `pull_merge_operations`. For the target repository, any nonterminal row with
+a future paired lease returns live-lease blocked; any nonterminal row with no lease
+or an expired paired lease returns claimable-operation blocked; any one-sided lease
+or terminal retained lease returns inconsistent-lease blocked. Only zero blocking
+rows returns `:safe`. Tombstoned repositories are inspected only through this
+safety callback; do not invoke normal reconciliation on a tombstone.
+
+- [ ] **Step 8C.5: Fence predecessor/successor adoption against cleanup intent**
+
+In the existing `Persistence`/`Conflicts`/`RepositoryPublisher` transactions,
+creation or adoption of a successor must lock the predecessor item first and
+reject if its repository has a pending, blocked, or complete cleanup journal or a
+non-null `storage_reclaimed_at`. Cleanup-intent creation locks the same predecessor
+before inserting its journal. This makes adoption and cleanup intent mutually
+exclusive rather than relying on a pre-transaction lookup.
+
+Test both race winners: adoption first prevents intent; intent first prevents
+successor creation/adoption. A complete journal remains a permanent adoption
+barrier.
+
+- [ ] **Step 8C.6: Run both-adapter GREEN persistence suites**
 
 ```bash
-git add apps/forge_imports apps/forge_repos apps/forge_pulls config
-git commit -m "feat(import): reclaim replaced repository storage"
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+  apps/forge_imports/test/cleanup_operation_test.exs \
+  apps/forge_imports/test/cleanup_recovery_migration_test.exs \
+  apps/forge_imports/test/import_persistence_test.exs \
+  apps/forge_imports/test/import_persistence_concurrency_test.exs \
+  apps/forge_imports/test/conflicts_test.exs \
+  apps/forge_imports/test/repository_publication_test.exs \
+  apps/forge_repos/test/git_writes_test.exs \
+  apps/forge_repos/test/git_write_recovery_test.exs \
+  apps/forge_pulls/test/merge_recovery_test.exs \
+  --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres \
+  MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 \
+  nix shell nixpkgs#expect -c unbuffer mix test \
+  apps/forge_imports/test/cleanup_operation_test.exs \
+  apps/forge_imports/test/cleanup_recovery_migration_test.exs \
+  apps/forge_imports/test/import_persistence_test.exs \
+  apps/forge_imports/test/import_persistence_concurrency_test.exs \
+  apps/forge_imports/test/conflicts_test.exs \
+  apps/forge_imports/test/repository_publication_test.exs \
+  apps/forge_repos/test/git_writes_test.exs \
+  apps/forge_repos/test/git_write_recovery_test.exs \
+  apps/forge_pulls/test/merge_recovery_test.exs \
+  --max-cases 1
+```
+
+Expected: both commands pass the schema/check/index lifecycle, terminal-claim
+rejection, exact evidence, safety-port failure, and adoption-intent race matrix.
+
+- [ ] **Step 8C.7: Commit durable cleanup intent**
+
+```bash
+git diff --check
+git add \
+  apps/fornacast/priv/repo/migrations/20260825000430_add_import_cleanup_recovery.exs \
+  apps/fornacast/lib/fornacast/operation_lease.ex \
+  apps/forge_imports/lib/forge_imports/cleanup_operation.ex \
+  apps/forge_imports/lib/forge_imports/persistence.ex \
+  apps/forge_imports/lib/forge_imports/conflicts.ex \
+  apps/forge_imports/lib/forge_imports/repository_publisher.ex \
+  apps/forge_imports/test/cleanup_operation_test.exs \
+  apps/forge_imports/test/cleanup_recovery_migration_test.exs \
+  apps/forge_imports/test/import_persistence_test.exs \
+  apps/forge_imports/test/import_persistence_concurrency_test.exs \
+  apps/forge_imports/test/conflicts_test.exs \
+  apps/forge_imports/test/repository_publication_test.exs \
+  apps/forge_repos/lib/forge_repos/git_write_operation.ex \
+  apps/forge_repos/lib/forge_repos/repository_write_reconcilers.ex \
+  apps/forge_repos/lib/forge_repos/git_write_recovery.ex \
+  apps/forge_repos/test/git_writes_test.exs \
+  apps/forge_repos/test/git_write_recovery_test.exs \
+  apps/forge_pulls/lib/forge_pulls/merge_operation.ex \
+  apps/forge_pulls/lib/forge_pulls/merge_recovery.ex \
+  apps/forge_pulls/test/merge_recovery_test.exs \
+  config/config.exs
+git commit -m "feat(import): persist repository cleanup intent"
+```
+
+#### Task 8D: Reconcile cleanup intent through anchored effects
+
+**Commit:** `feat(import): reclaim repository storage safely`
+
+**Files:**
+
+- Create: `apps/forge_imports/lib/forge_imports/repository_cleanup.ex`
+- Create: `apps/forge_imports/lib/forge_imports/cleanup_reconciler.ex`
+- Create: `apps/forge_imports/test/repository_cleanup_test.exs`
+- Create: `apps/forge_imports/test/cleanup_reconciler_test.exs`
+- Modify: `apps/forge_imports/lib/forge_imports/recovery_supervisor.ex`
+- Modify: `apps/forge_imports/lib/forge_imports/repository_worker.ex`
+- Modify: `apps/forge_imports/test/repository_worker_test.exs`
+- Modify: `apps/fornacast/lib/fornacast/config.ex`
+- Modify: `apps/git_core/lib/git_core/limits.ex`
+- Modify: `apps/git_core/test/limits_test.exs`
+- Modify: `apps/forge_repos/test/git_write_recovery_test.exs`
+- Modify: `apps/forge_pulls/test/merge_recovery_test.exs`
+- Modify: `apps/git_transport/test/git_transport_test.exs`
+- Modify: `apps/fornacast_web/test/git_http_auth_test.exs`
+- Modify: `config/config.exs`
+- Modify: `config/runtime.exs`
+- Modify: `config/test.exs`
+- Modify: `.env.example`
+- Modify: `README.md`
+
+- [ ] **Step 8D.1: Write RED eligibility, recovery, and scheduling tests**
+
+In `repository_cleanup_test.exs` cover every true/false branch for all three kinds:
+
+- replacement tombstone requires the exact old repository to be tombstoned and
+  deleted, grace elapsed, `storage_reclaimed_at: nil`, item
+  published/completed, current attempt completed, exact committed replacement
+  marker and attempt fingerprint, exact ready new repository, and exact publication
+  audit;
+- unpublished shadow requires the canonical private importing repository,
+  `write_version: 0`, `last_pushed_at: nil`, failed/canceled item, terminal run,
+  compatible terminal current attempt, empty publication evidence, paired-null
+  run/item leases, and no successor, adopter, or journal. Tombstone the shadow and
+  create intent in one transaction; set eligibility to tombstone time plus grace;
+- Remote quarantine requires item `state: :staging_git`,
+  `cleanup_state: "cleanup_pending"`, due eligibility, paired-null or paired
+  expired item lease, exact deterministic
+  `GitCore.Remote.cleanup_evidence/1` matching the persisted requested/quarantine
+  path and mode/device/inode, and an operation keyed by the locked source item
+  version. A future paired item lease reschedules just after expiry without
+  creating/destructively attempting intent, and a one-sided item lease blocks.
+
+Also cover grace at one second before/exactly at the boundary; nonterminal,
+claimable, live, expired, and malformed leases in import/Git-write/merge domains;
+successor-intent races; changed publication marker/path/identity/audit; symlinks at
+every layer; special files; missing before and after durable identity; strict cache
+failure; limiter absence/crash; old-reader blocking; claimable operations blocking;
+crashes after journal creation, identity persistence, deletion, audit insertion,
+and final CAS; two-pass replay; no premature audit/marker; audit collision;
+round-robin fairness; backoff; Remote retry restoration; and later terminal
+settlement/unpublished cleanup.
+
+In `cleanup_reconciler_test.exs` prove one operation per task/tick, independent task
+supervisor capacity, hard runtime cancellation, due/keyset ordering, and
+round-robin progress among the three kinds with no new same-kind work starving the
+other kinds.
+
+- [ ] **Step 8D.2: Run the cleanup RED tests**
+
+```bash
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+  apps/forge_imports/test/repository_cleanup_test.exs \
+  apps/forge_imports/test/cleanup_reconciler_test.exs \
+  --max-cases 1
+```
+
+Expected: FAIL because `RepositoryCleanup` and `CleanupReconciler` do not exist.
+
+- [ ] **Step 8D.3: Add bounded configuration with a derived safety floor**
+
+Add these exact settings:
+
+```elixir
+config :forge_imports,
+  repository_cleanup_grace_seconds: 86_400,
+  repository_cleanup_interval_ms: 30_000,
+  repository_cleanup_deadline_ms: 60_000,
+  repository_cleanup_lease_seconds: 120,
+  repository_cleanup_backoff_min_seconds: 30,
+  repository_cleanup_backoff_max_seconds: 21_600
+```
+
+`GitCore.Limits.minimum_repository_cleanup_grace_seconds/0` computes:
+
+```elixir
+div(
+  GitCore.Limits.get(:remote_wall_time_ms) +
+    GitCore.Limits.get(:remote_kill_escalation_ms) +
+    GitCore.Limits.get(:remote_cleanup_wait_ms) +
+    999,
+  1_000
+) + 1
+```
+
+With current hard limits this is `1816` seconds. Do not copy `1816` into runtime
+validation. `Fornacast.Config` validates grace as an integer at least that derived
+minimum and strictly greater than the three component durations; interval in
+`1_000..300_000` ms; deletion deadline in `1_000..300_000` ms; lease seconds
+strictly greater than ceiling(deadline/1000) and at most `3_600`; and backoff
+`30 <= min <= max <= 21_600` seconds.
+
+Read `FORNACAST_IMPORT_REPOSITORY_CLEANUP_GRACE_SECONDS` in `runtime.exs` with
+default `86400` and fail startup on invalid input. Document that variable and the
+same-UID/private-parent/single-node-exclusive-volume assumptions in
+`.env.example` and `README.md`. VM restart recovery assumes one BEAM node owns the
+repository volume exclusively.
+
+- [ ] **Step 8D.4: Add a dedicated cleanup scheduler**
+
+`RecoverySupervisor` starts two different `Task.Supervisor` children:
+`ForgeImports.TaskSupervisor` remains `max_children: 1` for the existing import
+scan, and new `ForgeImports.CleanupTaskSupervisor` is `max_children: 1` solely for
+`CleanupReconciler`. Run the two reconcilers independently; neither crash nor a
+long import scan consumes the other's slot.
+
+Each cleanup tick selects at most one operation, starts at the kind after the last
+attempted kind, scans kinds round-robin, and uses
+`state/next_attempt_at/eligible_at/id` keyset order within a kind. The task runtime
+and anchored deletion share the configured hard deadline. Persist the rotation
+cursor even when a selected row blocks, so continually arriving work of one kind
+cannot starve the other two.
+
+- [ ] **Step 8D.5: Materialize and claim exact cleanup intent**
+
+Candidate selection is read-only. After it yields a repository ID, first acquire
+the exclusive read-cleanup permit and then the existing writer permit. Only under
+both permits enter SQL and re-evaluate every eligibility fact listed in Step
+8D.1. Lock repository rows by ID ascending, then import runs, repository items,
+current attempts, and cleanup journal. For unpublished shadow, the tombstone and
+intent insert are one transaction. For replacement and Remote quarantine, insert
+or load the deterministic journal using the source item lock version. Use
+`OperationLease.claim(CleanupOperation, id, owner, now, lease_seconds,
+allowed_states: [:cleanup_pending])`.
+
+Before any effect, reject any associated nonterminal or claimable import work, any
+live or malformed import lease, any nonterminal Git-write/merge operation, any
+successor/adopter, and any drifted marker, path, identity, or audit. Call both
+`cleanup_safety_locked/2` ports while the SQL rows are locked. A claimable
+Git/merge operation is a slow retry, never permission to delete.
+
+Outside SQL, acquire permits in this exact order:
+
+```text
+GitCore.RepositoryReadLimiter.acquire_cleanup(repository_id, deadline)
+GitCore.RepositoryWriteLimiter.acquire(repository_id, deadline)
+SQL verification/claim transaction
+anchored filesystem effect
+SQL finalization transaction
+release writer permit
+release cleanup permit
+```
+
+Readers never acquire the writer limiter, and ordinary writers never acquire the
+read limiter, so this ordering introduces no cycle.
+
+- [ ] **Step 8D.6: Execute and replay the anchored effect**
+
+The effect state machine is:
+
+1. The journal exists and is leased.
+2. For replacement/unpublished storage, call
+   `GitCore.contained_tree_identity/3` under both permits and persist that exact
+   identity into journal evidence before any destructive call. Remote quarantine
+   already has exact durable mode/device/inode evidence, which must equal a fresh
+   anchored observation before deletion.
+3. Call `GitCore.invalidate_repository_cache_strict/1`. Cache failure retains
+   `cleanup_pending` and performs no deletion.
+4. Call `GitCore.remove_contained_tree/4` with the exact persisted identity.
+   Partial removal, timeout, or I/O error retains pending state and backoff; replay
+   uses the same identity. A path/symlink/identity/evidence/audit mismatch moves the
+   row to `cleanup_blocked` for manual intervention.
+5. After `{:removed, identity}`, or `:missing` proven from the same anchored parent
+   after durable intent, run a final transaction that re-locks and CAS-checks the
+   exact repository/item/journal fingerprint.
+
+For replacement/unpublished cleanup, the final transaction sets
+`Repository.storage_reclaimed_at`, inserts or verifies the deterministic
+`repository.storage_reclaimed` audit, and marks the journal complete. No marker or
+audit is written before absence. If DB/audit finalization fails after deletion,
+the next pass observes anchored missing and finishes idempotently. An existing
+audit with mismatched actor/action/target/metadata/operation ID blocks cleanup.
+
+For Remote quarantine, finalization instead inserts or verifies
+`github_import.quarantine_reclaimed`, clears only the narrow item cleanup evidence,
+restores the canonical staged destination path, schedules an immediate retry, and
+marks the journal complete. It does not set repository
+`storage_reclaimed_at`. The existing worker later settles the terminal run; if the
+shadow then qualifies, unpublished-shadow cleanup creates a separate journal.
+
+- [ ] **Step 8D.7: Apply exact retry policy**
+
+Use these outcomes:
+
+- live lease: set `next_attempt_at` just after expiry plus deterministic
+  per-operation jitter; do not increment destructive `attempt_count`;
+- limiter unavailable, DB unavailable, cache unavailable, delete timeout, or
+  delete I/O error: increment `attempt_count` and use exponential
+  `min(30 * 2^(attempt_count - 1), 21_600)` seconds;
+- claimable Git/merge/import operation: retry after `30` seconds without deleting;
+- evidence/path/identity/symlink/special-file/audit mismatch or malformed lease:
+  `cleanup_blocked` with redacted classified `last_error`;
+- anchored missing after exact durable intent: run finalization, never recreate or
+  rediscover the path.
+
+- [ ] **Step 8D.8: Run focused Turso cleanup and read/write race suites**
+
+Run these commands serially:
+
+```bash
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+  apps/git_core/test/anchored_remove_test.exs \
+  apps/git_core/test/repository_read_limiter_test.exs \
+  apps/git_core/test/limits_test.exs \
+  apps/git_core/test/native_surface_test.exs \
+  apps/git_core/test/repository_read_model_test.exs \
+  apps/forge_repos/test/repository_read_handle_test.exs \
+  apps/git_transport/test/git_transport_test.exs \
+  apps/git_transport/test/test_dirty_io_native_test.exs \
+  apps/fornacast_web/test/git_http_auth_test.exs \
+  apps/fornacast_web/test/repository_controller_test.exs \
+  --max-cases 1
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+  apps/forge_imports/test/cleanup_operation_test.exs \
+  apps/forge_imports/test/cleanup_recovery_migration_test.exs \
+  apps/forge_imports/test/repository_cleanup_test.exs \
+  apps/forge_imports/test/cleanup_reconciler_test.exs \
+  apps/forge_imports/test/repository_worker_test.exs \
+  apps/forge_imports/test/repository_publication_test.exs \
+  apps/forge_imports/test/import_persistence_test.exs \
+  apps/forge_imports/test/import_persistence_concurrency_test.exs \
+  apps/forge_imports/test/conflicts_test.exs \
+  apps/forge_repos/test/repository_lifecycle_test.exs \
+  apps/forge_repos/test/git_writes_test.exs \
+  apps/forge_repos/test/git_write_recovery_test.exs \
+  apps/forge_pulls/test/merge_recovery_test.exs \
+  --max-cases 1
+```
+
+Expected: both commands exit zero. The matrix proves all path/identity cases,
+lease and limiter races, old-reader behavior, strict cache invalidation, crash
+replay, fairness/backoff, Remote retry/terminal settlement, and no premature
+audit/reclaimed marker.
+
+- [ ] **Step 8D.9: Run the same database suites on PostgreSQL**
+
+```bash
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres \
+  MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 \
+  nix shell nixpkgs#expect -c unbuffer mix test \
+  apps/forge_imports/test/cleanup_operation_test.exs \
+  apps/forge_imports/test/cleanup_recovery_migration_test.exs \
+  apps/forge_imports/test/repository_cleanup_test.exs \
+  apps/forge_imports/test/cleanup_reconciler_test.exs \
+  apps/forge_imports/test/repository_worker_test.exs \
+  apps/forge_imports/test/repository_publication_test.exs \
+  apps/forge_imports/test/import_persistence_test.exs \
+  apps/forge_imports/test/import_persistence_concurrency_test.exs \
+  apps/forge_imports/test/conflicts_test.exs \
+  apps/forge_repos/test/repository_lifecycle_test.exs \
+  apps/forge_repos/test/git_writes_test.exs \
+  apps/forge_repos/test/git_write_recovery_test.exs \
+  apps/forge_pulls/test/merge_recovery_test.exs \
+  --max-cases 1
+```
+
+Expected: zero failures with the isolated PostgreSQL build; migration up/down,
+checks, indexes, OperationLease exclusion, locking, replay, audits, and cleanup
+state transitions match Turso.
+
+- [ ] **Step 8D.10: Run final scoped static verification**
+
+```bash
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix format --check-formatted
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix compile --warnings-as-errors
+git diff --check
+git diff --stat HEAD~3
+git diff HEAD~3 -- \
+  apps/git_core apps/git_transport apps/forge_repos apps/forge_pulls \
+  apps/forge_imports apps/fornacast/lib/fornacast/config.ex \
+  apps/fornacast/lib/fornacast/operation_lease.ex \
+  apps/fornacast/priv/repo/migrations/20260825000430_add_import_cleanup_recovery.exs \
+  apps/fornacast_web/lib/fornacast_web/controllers/git_http_controller.ex \
+  apps/fornacast_web/test/git_http_auth_test.exs \
+  apps/fornacast_web/test/repository_controller_test.exs \
+  config .env.example README.md
+```
+
+Expected: format, warnings-as-errors, and diff checks pass. Do not run broad
+unrelated suites. If an existing out-of-scope warning or failure appears, record
+its exact command and output and stop without modifying unrelated files.
+
+- [ ] **Step 8D.11: Commit cleanup orchestration**
+
+```bash
+git add \
+  apps/forge_imports/lib/forge_imports/repository_cleanup.ex \
+  apps/forge_imports/lib/forge_imports/cleanup_reconciler.ex \
+  apps/forge_imports/lib/forge_imports/recovery_supervisor.ex \
+  apps/forge_imports/lib/forge_imports/repository_worker.ex \
+  apps/forge_imports/test/repository_cleanup_test.exs \
+  apps/forge_imports/test/cleanup_reconciler_test.exs \
+  apps/forge_imports/test/repository_worker_test.exs \
+  apps/fornacast/lib/fornacast/config.ex \
+  apps/git_core/lib/git_core/limits.ex \
+  apps/git_core/test/limits_test.exs \
+  apps/forge_repos/test/git_write_recovery_test.exs \
+  apps/forge_pulls/test/merge_recovery_test.exs \
+  apps/git_transport/test/git_transport_test.exs \
+  apps/fornacast_web/test/git_http_auth_test.exs \
+  config/config.exs config/runtime.exs config/test.exs \
+  .env.example README.md
+git commit -m "feat(import): reclaim repository storage safely"
 ```
 
 ### Task 9: Extend the unified import web flow through conflict review
