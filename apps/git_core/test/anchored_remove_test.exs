@@ -64,6 +64,22 @@ defmodule GitCore.AnchoredRemoveTest do
              )
   end
 
+  test "removes and replays an owned unreadable regular file", %{tmp_dir: tmp_dir} do
+    storage_root = Path.join(tmp_dir, "storage")
+    target = Path.join(storage_root, "target")
+    unreadable = Path.join(target, "unreadable")
+    File.mkdir_p!(target)
+    File.write!(unreadable, "private")
+    File.chmod!(unreadable, 0o000)
+    %{root: root_identity} = proof = observe!(storage_root, ["target"])
+
+    assert {:ok, {:removed, ^proof}} =
+             GitCore.remove_contained_tree(storage_root, ["target"], proof, 5_000)
+
+    assert {:ok, {:missing, ^root_identity}} =
+             GitCore.remove_contained_tree(storage_root, ["target"], proof, 5_000)
+  end
+
   test "reports a missing target only after reaching its anchored parent", %{tmp_dir: tmp_dir} do
     storage_root = Path.join(tmp_dir, "storage")
     File.mkdir_p!(Path.join(storage_root, "quarantine"))
@@ -479,6 +495,8 @@ defmodule GitCore.AnchoredRemoveTest do
     assert source =~ "unlinkat("
     assert source =~ ~s(target_os = "linux")
     assert source =~ ~s(target_os = "macos")
+    assert source =~ "OFlags::PATH"
+    assert source =~ "libc::O_EVTONLY"
     assert source =~ "UnsupportedPlatform"
     assert source =~ "DirectoryManifest"
     assert source =~ "ManifestEntry"

@@ -154,9 +154,16 @@ mod platform {
         .union(OFlags::DIRECTORY)
         .union(OFlags::NOFOLLOW)
         .union(OFlags::CLOEXEC);
-    const REGULAR_FILE_OPEN_FLAGS: OFlags = OFlags::RDONLY
-        .union(OFlags::NOFOLLOW)
-        .union(OFlags::CLOEXEC);
+
+    #[cfg(target_os = "linux")]
+    fn regular_file_open_flags() -> OFlags {
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC
+    }
+
+    #[cfg(target_os = "macos")]
+    fn regular_file_open_flags() -> OFlags {
+        OFlags::from_bits_retain(libc::O_EVTONLY as u32) | OFlags::NOFOLLOW | OFlags::CLOEXEC
+    }
 
     struct Deadline {
         started_at: Instant,
@@ -691,8 +698,13 @@ mod platform {
         deadline: &Deadline,
     ) -> Result<(OwnedFd, u64), AnchoredRemoveError> {
         deadline.check()?;
-        let opened = openat(parent, &entry.name, REGULAR_FILE_OPEN_FLAGS, Mode::empty())
-            .map_err(map_manifest_io_error)?;
+        let opened = openat(
+            parent,
+            &entry.name,
+            regular_file_open_flags(),
+            Mode::empty(),
+        )
+        .map_err(map_manifest_io_error)?;
         let opened_stat = fstat(&opened).map_err(map_io_error)?;
         verify_manifest_entry(&opened_stat, root_identity, entry)?;
         let links_before = link_count(&opened_stat);
