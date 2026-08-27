@@ -19,6 +19,11 @@ defmodule GitCore.AnchoredRemoveTest do
                       _unsupported ->
                         false
                     end)
+  @effective_uid (case System.cmd("id", ["-u"]) do
+                    {uid, 0} -> uid |> String.trim() |> String.to_integer()
+                    _error -> -1
+                  end)
+  @owner_change_supported @effective_uid == 0
 
   test "observes and removes a regular nested tree by exact anchored identity", %{
     tmp_dir: tmp_dir
@@ -310,6 +315,65 @@ defmodule GitCore.AnchoredRemoveTest do
     assert File.dir?(target)
   end
 
+  test "rejects group or world writable root, ancestor, target, and nested directories", %{
+    tmp_dir: tmp_dir
+  } do
+    root = Path.join(tmp_dir, "unsafe-root")
+    File.mkdir_p!(Path.join(root, "target"))
+    File.chmod!(root, 0o770)
+    assert {:error, :mode_mismatch} = GitCore.contained_tree_identity(root, ["target"], 5_000)
+
+    storage_root = Path.join(tmp_dir, "storage")
+    ancestor = Path.join(storage_root, "ancestor")
+    target = Path.join(ancestor, "target")
+    File.mkdir_p!(target)
+    File.chmod!(ancestor, 0o757)
+
+    assert {:error, :mode_mismatch} =
+             GitCore.contained_tree_identity(storage_root, ["ancestor", "target"], 5_000)
+
+    File.chmod!(ancestor, 0o755)
+    File.chmod!(target, 0o772)
+
+    assert {:error, :mode_mismatch} =
+             GitCore.contained_tree_identity(storage_root, ["ancestor", "target"], 5_000)
+
+    File.chmod!(target, 0o755)
+    nested = Path.join(target, "nested")
+    File.mkdir!(nested)
+    File.chmod!(nested, 0o777)
+    proof = observe!(storage_root, ["ancestor", "target"])
+
+    assert {:error, :mode_mismatch} =
+             GitCore.remove_contained_tree(
+               storage_root,
+               ["ancestor", "target"],
+               proof,
+               5_000
+             )
+
+    assert File.dir?(nested)
+    assert File.dir?(target)
+  end
+
+  unless @owner_change_supported do
+    @tag skip: "host cannot create a different-owner tmp fixture"
+  end
+
+  test "rejects a directory not owned by the effective UID", %{tmp_dir: tmp_dir} do
+    storage_root = Path.join(tmp_dir, "storage")
+    target = Path.join(storage_root, "target")
+    File.mkdir_p!(target)
+    :ok = File.chown(target, 65_534)
+
+    try do
+      assert {:error, :permission_denied} =
+               GitCore.contained_tree_identity(storage_root, ["target"], 5_000)
+    after
+      :ok = File.chown(target, @effective_uid)
+    end
+  end
+
   test "enforces recursive depth and entry limits during read-only preflight", %{
     tmp_dir: tmp_dir
   } do
@@ -422,6 +486,24 @@ defmodule GitCore.AnchoredRemoveTest do
     refute source =~ "remove_dir_all"
     refute source =~ "File.rm_rf"
     refute source =~ "canonicalize("
+  end
+
+  test "no production module outside repository cleanup calls destructive removal" do
+    callers =
+      __DIR__
+      |> Path.join("../../*")
+      |> Path.expand()
+      |> Path.join("lib/**/*.ex")
+      |> Path.wildcard()
+      |> Enum.reject(fn path ->
+        path in [
+          Path.expand("../lib/git_core.ex", __DIR__),
+          Path.expand("../lib/git_core/native.ex", __DIR__)
+        ] or String.ends_with?(path, "/repository_cleanup.ex")
+      end)
+      |> Enum.filter(&(File.read!(&1) =~ "remove_contained_tree("))
+
+    assert callers == []
   end
 
   defp observe!(storage_root, segments) do

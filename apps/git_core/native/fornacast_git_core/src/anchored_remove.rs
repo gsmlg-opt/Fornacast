@@ -50,6 +50,50 @@ const MAX_RELATIVE_SEGMENTS: usize = 128;
 const MAX_TREE_DEPTH: usize = 128;
 const MAX_TREE_ENTRIES: usize = 10_000;
 
+fn regular_unlink_postcheck(
+    links_before: u64,
+    links_after: u64,
+) -> Result<(), AnchoredRemoveError> {
+    if links_before > 0 && links_after.checked_add(1) == Some(links_before) {
+        Ok(())
+    } else {
+        Err(AnchoredRemoveError::IdentityMismatch)
+    }
+}
+
+fn directory_policy_check(
+    effective_uid: u32,
+    owner_uid: u32,
+    permission_mode: u32,
+) -> Result<(), AnchoredRemoveError> {
+    if owner_uid != effective_uid {
+        Err(AnchoredRemoveError::PermissionDenied)
+    } else if permission_mode & 0o022 != 0 {
+        Err(AnchoredRemoveError::ModeMismatch)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn directory_unlink_postcheck(links_after: u64) -> Result<(), AnchoredRemoveError> {
+    if links_after == 0 {
+        Ok(())
+    } else {
+        Err(AnchoredRemoveError::IdentityMismatch)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn directory_unlink_postcheck(links_after: u64) -> Result<(), AnchoredRemoveError> {
+    // Darwin, like Linux, reports zero links for a held descriptor after rmdir.
+    if links_after == 0 {
+        Ok(())
+    } else {
+        Err(AnchoredRemoveError::IdentityMismatch)
+    }
+}
+
 fn validate_request(
     storage_root: &str,
     relative_segments: &[String],
@@ -93,7 +137,8 @@ fn invalid_segment(segment: &str) -> bool {
 mod platform {
     use super::{
         AnchoredRemoveError, ContainedTreeIdentity, ContainedTreeProof, IdentityResult,
-        MAX_TREE_DEPTH, MAX_TREE_ENTRIES, RemoveResult, validate_request,
+        MAX_TREE_DEPTH, MAX_TREE_ENTRIES, RemoveResult, directory_policy_check,
+        directory_unlink_postcheck, regular_unlink_postcheck, validate_request,
     };
     use rustix::fd::OwnedFd;
     use rustix::fs::{
@@ -101,11 +146,15 @@ mod platform {
         unlinkat,
     };
     use rustix::io::{Errno, dup};
+    use rustix::process::geteuid;
     use std::ffi::{CStr, CString};
     use std::time::{Duration, Instant};
 
     const DIRECTORY_OPEN_FLAGS: OFlags = OFlags::RDONLY
         .union(OFlags::DIRECTORY)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::CLOEXEC);
+    const REGULAR_FILE_OPEN_FLAGS: OFlags = OFlags::RDONLY
         .union(OFlags::NOFOLLOW)
         .union(OFlags::CLOEXEC);
 
@@ -139,6 +188,22 @@ mod platform {
         entries: usize,
     }
 
+    // POSIX cannot condition unlinkat on inode. Safety therefore depends on the approved
+    // cooperative threat model: every mutable directory below the configured root is owned by
+    // this effective UID and is not writable by its group or by other users. R8D additionally
+    // serializes repository readers and writers before calling the destructive NIF.
+    struct TraversalPolicy {
+        effective_uid: u32,
+    }
+
+    impl TraversalPolicy {
+        fn current() -> Self {
+            Self {
+                effective_uid: geteuid().as_raw(),
+            }
+        }
+    }
+
     struct DirectoryManifest {
         entries: Vec<ManifestEntry>,
     }
@@ -161,14 +226,27 @@ mod platform {
     ) -> Result<IdentityResult, AnchoredRemoveError> {
         validate_request(&storage_root, &relative_segments)?;
         let deadline = Deadline::new(deadline_ms)?;
-        let (root_fd, root_identity) = open_storage_root(&storage_root, &deadline)?;
-        let parent_fd =
-            open_relative_parent(&root_fd, &root_identity, &relative_segments, &deadline)?;
+        let policy = TraversalPolicy::current();
+        let (root_fd, root_identity) = open_storage_root(&storage_root, &policy, &deadline)?;
+        let parent_fd = open_relative_parent(
+            &root_fd,
+            &root_identity,
+            &relative_segments,
+            &policy,
+            &deadline,
+        )?;
         let target_name = relative_segments
             .last()
             .ok_or(AnchoredRemoveError::InvalidArgument)?;
 
-        match open_named_directory(&parent_fd, target_name, &root_identity, &deadline, true)? {
+        match open_named_directory(
+            &parent_fd,
+            target_name,
+            &root_identity,
+            &policy,
+            &deadline,
+            true,
+        )? {
             Some((_target_fd, target_identity)) => {
                 Ok(IdentityResult::Present(ContainedTreeProof {
                     root: root_identity,
@@ -207,39 +285,61 @@ mod platform {
         validate_request(&storage_root, &relative_segments)?;
         validate_proof(&expected_proof)?;
         let deadline = Deadline::new(deadline_ms)?;
-        let (root_fd, root_identity) = open_storage_root(&storage_root, &deadline)?;
+        let policy = TraversalPolicy::current();
+        let (root_fd, root_identity) = open_storage_root(&storage_root, &policy, &deadline)?;
         compare_root(root_identity, expected_proof.root)?;
 
-        let parent_fd =
-            open_relative_parent(&root_fd, &root_identity, &relative_segments, &deadline)?;
+        let parent_fd = open_relative_parent(
+            &root_fd,
+            &root_identity,
+            &relative_segments,
+            &policy,
+            &deadline,
+        )?;
         let target_name = relative_segments
             .last()
             .ok_or(AnchoredRemoveError::InvalidArgument)?;
-        let Some((target_fd, target_identity)) =
-            open_named_directory(&parent_fd, target_name, &root_identity, &deadline, true)?
+        let Some((target_fd, target_identity)) = open_named_directory(
+            &parent_fd,
+            target_name,
+            &root_identity,
+            &policy,
+            &deadline,
+            true,
+        )?
         else {
             return Ok(RemoveResult::Missing(root_identity));
         };
         compare_target(target_identity, expected_proof.target)?;
 
         let mut budget = TreeBudget { entries: 0 };
-        let manifest = preflight_directory(&target_fd, &root_identity, 0, &mut budget, &deadline)?;
+        let manifest = preflight_directory(
+            &target_fd,
+            &root_identity,
+            &policy,
+            0,
+            &mut budget,
+            &deadline,
+        )?;
         before_delete();
-        remove_manifest(&target_fd, &root_identity, &manifest, 0, &deadline)?;
+        remove_manifest(&target_fd, &root_identity, &policy, &manifest, 0, &deadline)?;
 
         deadline.check()?;
-        let (current_root_fd, current_root_identity) = open_storage_root(&storage_root, &deadline)?;
+        let (current_root_fd, current_root_identity) =
+            open_storage_root(&storage_root, &policy, &deadline)?;
         compare_root(current_root_identity, expected_proof.root)?;
         let current_parent = open_relative_parent(
             &current_root_fd,
             &current_root_identity,
             &relative_segments,
+            &policy,
             &deadline,
         )?;
-        let Some((_current_target_fd, current_target_identity)) = open_named_directory(
+        let Some((current_target_fd, current_target_identity)) = open_named_directory(
             &current_parent,
             target_name,
             &current_root_identity,
+            &policy,
             &deadline,
             false,
         )?
@@ -249,6 +349,12 @@ mod platform {
         compare_target(current_target_identity, expected_proof.target)?;
         deadline.check()?;
         unlinkat(&current_parent, target_name, AtFlags::REMOVEDIR).map_err(map_io_error)?;
+        let removed_target_stat = fstat(&current_target_fd).map_err(map_io_error)?;
+        compare_target(
+            identity_from_stat(&removed_target_stat)?,
+            expected_proof.target,
+        )?;
+        directory_unlink_postcheck(link_count(&removed_target_stat))?;
 
         Ok(RemoveResult::Removed(expected_proof))
     }
@@ -263,6 +369,7 @@ mod platform {
 
     fn open_storage_root(
         storage_root: &str,
+        policy: &TraversalPolicy,
         deadline: &Deadline,
     ) -> Result<(OwnedFd, ContainedTreeIdentity), AnchoredRemoveError> {
         deadline.check()?;
@@ -273,7 +380,9 @@ mod platform {
             current = next;
         }
 
-        let identity = identity_from_stat(&fstat(&current).map_err(map_io_error)?)?;
+        let root_stat = fstat(&current).map_err(map_io_error)?;
+        enforce_directory_policy(&root_stat, policy)?;
+        let identity = identity_from_stat(&root_stat)?;
         Ok((current, identity))
     }
 
@@ -281,6 +390,7 @@ mod platform {
         root_fd: &OwnedFd,
         root_identity: &ContainedTreeIdentity,
         relative_segments: &[String],
+        policy: &TraversalPolicy,
         deadline: &Deadline,
     ) -> Result<OwnedFd, AnchoredRemoveError> {
         let mut current = dup(root_fd).map_err(map_io_error)?;
@@ -288,6 +398,7 @@ mod platform {
         for component in relative_segments.iter().take(relative_segments.len() - 1) {
             let (next, identity) = open_named_directory_required(&current, component, deadline)?;
             ensure_same_filesystem(root_identity, &identity)?;
+            enforce_opened_directory_policy(&next, policy)?;
             current = next;
         }
 
@@ -306,12 +417,14 @@ mod platform {
         parent: &OwnedFd,
         name: &str,
         root_identity: &ContainedTreeIdentity,
+        policy: &TraversalPolicy,
         deadline: &Deadline,
         allow_missing: bool,
     ) -> Result<Option<(OwnedFd, ContainedTreeIdentity)>, AnchoredRemoveError> {
         let opened = open_named_directory_unchecked(parent, name, deadline)?;
-        if let Some((_fd, identity)) = &opened {
+        if let Some((fd, identity)) = &opened {
             ensure_same_filesystem(root_identity, identity)?;
+            enforce_opened_directory_policy(fd, policy)?;
         }
         if opened.is_none() && !allow_missing {
             return Ok(None);
@@ -428,6 +541,7 @@ mod platform {
     fn preflight_directory(
         directory: &OwnedFd,
         root_identity: &ContainedTreeIdentity,
+        policy: &TraversalPolicy,
         depth: usize,
         budget: &mut TreeBudget,
         deadline: &Deadline,
@@ -465,10 +579,11 @@ mod platform {
                     if depth == MAX_TREE_DEPTH {
                         return Err(AnchoredRemoveError::DepthLimit);
                     }
-                    let child = open_child_directory(directory, name, identity, deadline)?;
+                    let child = open_child_directory(directory, name, identity, policy, deadline)?;
                     ManifestEntryKind::Directory(preflight_directory(
                         &child,
                         root_identity,
+                        policy,
                         depth + 1,
                         budget,
                         deadline,
@@ -493,6 +608,7 @@ mod platform {
     fn remove_manifest(
         directory: &OwnedFd,
         root_identity: &ContainedTreeIdentity,
+        policy: &TraversalPolicy,
         manifest: &DirectoryManifest,
         depth: usize,
         deadline: &Deadline,
@@ -510,20 +626,37 @@ mod platform {
 
             match &entry.kind {
                 ManifestEntryKind::RegularFile => {
+                    let (opened, links_before) =
+                        open_manifest_regular_file(directory, root_identity, entry, deadline)?;
                     unlinkat(directory, &entry.name, AtFlags::empty()).map_err(map_io_error)?;
+                    let unlinked_stat = fstat(&opened).map_err(map_io_error)?;
+                    verify_manifest_entry(&unlinked_stat, root_identity, entry)?;
+                    regular_unlink_postcheck(links_before, link_count(&unlinked_stat))?;
                 }
                 ManifestEntryKind::Directory(children) => {
-                    let child =
-                        open_child_directory(directory, &entry.name, entry.identity, deadline)?;
-                    remove_manifest(&child, root_identity, children, depth + 1, deadline)?;
+                    let child = open_child_directory(
+                        directory,
+                        &entry.name,
+                        entry.identity,
+                        policy,
+                        deadline,
+                    )?;
+                    remove_manifest(&child, root_identity, policy, children, depth + 1, deadline)?;
                     deadline.check()?;
                     let current = statat(directory, &entry.name, AtFlags::SYMLINK_NOFOLLOW)
                         .map_err(map_manifest_io_error)?;
                     verify_manifest_entry(&current, root_identity, entry)?;
-                    let reopened =
-                        open_child_directory(directory, &entry.name, entry.identity, deadline)?;
-                    drop(reopened);
+                    let reopened = open_child_directory(
+                        directory,
+                        &entry.name,
+                        entry.identity,
+                        policy,
+                        deadline,
+                    )?;
                     unlinkat(directory, &entry.name, AtFlags::REMOVEDIR).map_err(map_io_error)?;
+                    let unlinked_stat = fstat(&reopened).map_err(map_io_error)?;
+                    verify_manifest_entry(&unlinked_stat, root_identity, entry)?;
+                    directory_unlink_postcheck(link_count(&unlinked_stat))?;
                 }
             }
         }
@@ -551,10 +684,29 @@ mod platform {
         compare_observation(current_identity, entry.identity)
     }
 
+    fn open_manifest_regular_file(
+        parent: &OwnedFd,
+        root_identity: &ContainedTreeIdentity,
+        entry: &ManifestEntry,
+        deadline: &Deadline,
+    ) -> Result<(OwnedFd, u64), AnchoredRemoveError> {
+        deadline.check()?;
+        let opened = openat(parent, &entry.name, REGULAR_FILE_OPEN_FLAGS, Mode::empty())
+            .map_err(map_manifest_io_error)?;
+        let opened_stat = fstat(&opened).map_err(map_io_error)?;
+        verify_manifest_entry(&opened_stat, root_identity, entry)?;
+        let links_before = link_count(&opened_stat);
+        if links_before == 0 {
+            return Err(AnchoredRemoveError::IdentityMismatch);
+        }
+        Ok((opened, links_before))
+    }
+
     fn open_child_directory(
         parent: &OwnedFd,
         name: &CStr,
         named_identity: ContainedTreeIdentity,
+        policy: &TraversalPolicy,
         deadline: &Deadline,
     ) -> Result<OwnedFd, AnchoredRemoveError> {
         deadline.check()?;
@@ -562,8 +714,34 @@ mod platform {
             openat(parent, name, DIRECTORY_OPEN_FLAGS, Mode::empty()).map_err(map_io_error)?;
         let opened_stat = fstat(&child).map_err(map_io_error)?;
         classify_directory(&opened_stat)?;
+        enforce_directory_policy(&opened_stat, policy)?;
         compare_observation(identity_from_stat(&opened_stat)?, named_identity)?;
         Ok(child)
+    }
+
+    fn enforce_opened_directory_policy(
+        directory: &OwnedFd,
+        policy: &TraversalPolicy,
+    ) -> Result<(), AnchoredRemoveError> {
+        let stat = fstat(directory).map_err(map_io_error)?;
+        enforce_directory_policy(&stat, policy)
+    }
+
+    fn enforce_directory_policy(
+        stat: &Stat,
+        policy: &TraversalPolicy,
+    ) -> Result<(), AnchoredRemoveError> {
+        directory_policy_check(policy.effective_uid, stat.st_uid, permission_mode(stat))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn link_count(stat: &Stat) -> u64 {
+        stat.st_nlink
+    }
+
+    #[cfg(target_os = "macos")]
+    fn link_count(stat: &Stat) -> u64 {
+        u64::from(stat.st_nlink)
     }
 
     fn is_dot_entry(name: &CStr) -> bool {
@@ -627,7 +805,7 @@ pub(crate) fn remove_contained_tree(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn remove_contained_tree_with_pre_delete<F>(
     storage_root: String,
     relative_segments: Vec<String>,
@@ -647,7 +825,7 @@ where
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod anchored_remove_tests {
     use super::{AnchoredRemoveError, IdentityResult, RemoveResult};
     use std::fs;
@@ -863,6 +1041,34 @@ mod anchored_remove_tests {
         fs::remove_dir(root).expect("remove fixture root");
     }
 
+    #[test]
+    fn anchored_remove_unlink_postchecks_require_exact_link_transitions() {
+        assert_eq!(super::regular_unlink_postcheck(2, 1), Ok(()));
+        assert_eq!(super::regular_unlink_postcheck(1, 0), Ok(()));
+        assert_eq!(
+            super::regular_unlink_postcheck(2, 2),
+            Err(AnchoredRemoveError::IdentityMismatch)
+        );
+        assert_eq!(
+            super::regular_unlink_postcheck(1, 1),
+            Err(AnchoredRemoveError::IdentityMismatch)
+        );
+        assert_eq!(super::directory_unlink_postcheck(0), Ok(()));
+        assert_eq!(
+            super::directory_unlink_postcheck(1),
+            Err(AnchoredRemoveError::IdentityMismatch)
+        );
+        assert_eq!(super::directory_policy_check(1_000, 1_000, 0o755), Ok(()));
+        assert_eq!(
+            super::directory_policy_check(1_000, 2_000, 0o755),
+            Err(AnchoredRemoveError::PermissionDenied)
+        );
+        assert_eq!(
+            super::directory_policy_check(1_000, 1_000, 0o775),
+            Err(AnchoredRemoveError::ModeMismatch)
+        );
+    }
+
     fn present_proof(root: &str, segments: &[String]) -> super::ContainedTreeProof {
         match super::contained_tree_identity(root.to_string(), segments.to_vec(), 5_000)
             .expect("observe tree")
@@ -870,5 +1076,36 @@ mod anchored_remove_tests {
             IdentityResult::Present(proof) => proof,
             IdentityResult::Missing(_) => panic!("expected present tree"),
         }
+    }
+}
+
+#[cfg(all(test, not(any(target_os = "linux", target_os = "macos"))))]
+mod unsupported_platform_tests {
+    use super::{
+        AnchoredRemoveError, ContainedTreeIdentity, ContainedTreeProof, contained_tree_identity,
+        remove_contained_tree,
+    };
+
+    #[test]
+    fn public_fallbacks_compile_and_return_unsupported_without_platform_module() {
+        let identity = ContainedTreeIdentity {
+            mode: 0o700,
+            major_device: 0,
+            minor_device: 0,
+            inode: 1,
+        };
+        let proof = ContainedTreeProof {
+            root: identity,
+            target: identity,
+        };
+
+        assert!(matches!(
+            contained_tree_identity("/missing".to_string(), vec!["target".to_string()], 1),
+            Err(AnchoredRemoveError::UnsupportedPlatform)
+        ));
+        assert!(matches!(
+            remove_contained_tree("/missing".to_string(), vec!["target".to_string()], proof, 1),
+            Err(AnchoredRemoveError::UnsupportedPlatform)
+        ));
     }
 }

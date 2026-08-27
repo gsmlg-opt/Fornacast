@@ -771,6 +771,9 @@ defmodule GitCore do
           {:ok, {:removed, contained_tree_proof()}}
           | {:ok, {:missing, contained_tree_identity()}}
           | {:error, atom()}
+  @doc false
+  # Safety precondition: the caller holds both the repository read-cleanup exclusive permit and
+  # the repository writer permit. RepositoryCleanup introduced by R8D is the sole intended caller.
   def remove_contained_tree(storage_root, relative_segments, expected_proof, deadline_ms) do
     cond do
       not valid_contained_tree_request?(storage_root, relative_segments, deadline_ms) or
