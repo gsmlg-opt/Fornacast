@@ -502,6 +502,71 @@ defmodule ForgeImports.ImportPersistenceTest do
     end
   end
 
+  test "publication changesets enforce exact canonical intent and committed evidence" do
+    item = %RepositoryItem{
+      id: 71,
+      import_run_id: 81,
+      selected: true,
+      state: :ready_to_publish,
+      hidden_repository_id: 91,
+      publication_evidence: %{},
+      cleanup_state: nil,
+      lock_version: 1,
+      cleanup_attempt_count: 0
+    }
+
+    intent = %{
+      "version" => 1,
+      "state" => "intent",
+      "attempt_number" => 1,
+      "action" => "create",
+      "hidden_repository_id" => 91,
+      "operation_id" => "github-import-publication-71-1",
+      "request_metadata" => %{"request_id" => "publication-shape"}
+    }
+
+    expires_at = DateTime.add(@now, 30, :second)
+    valid_intent = RepositoryItem.publication_intent_changeset(item, intent, "owner", expires_at)
+    assert valid_intent.valid?
+
+    refute RepositoryItem.publication_intent_changeset(
+             item,
+             Map.put(intent, "extra", true),
+             "owner",
+             expires_at
+           ).valid?
+
+    refute RepositoryItem.publication_intent_changeset(
+             item,
+             put_in(intent, ["request_metadata"], %{"request_id" => "/private/path"}),
+             "owner",
+             expires_at
+           ).valid?
+
+    publishing = Ecto.Changeset.apply_changes(valid_intent)
+
+    committed =
+      intent
+      |> Map.put("state", "committed")
+      |> Map.merge(%{
+        "repository_id" => 91,
+        "owner_user_id" => 1,
+        "slug" => "published",
+        "generation" => 1,
+        "replaced_repository_id" => nil,
+        "run_id" => 81,
+        "published_count_after" => 1,
+        "run_lock_version_after" => 2
+      })
+
+    assert RepositoryItem.publication_commit_changeset(publishing, committed).valid?
+
+    refute RepositoryItem.publication_commit_changeset(
+             publishing,
+             Map.put(committed, "state", "intent")
+           ).valid?
+  end
+
   test "positive signed 64-bit IDs and nonnegative counts are enforced", %{
     actor: actor,
     identity: identity

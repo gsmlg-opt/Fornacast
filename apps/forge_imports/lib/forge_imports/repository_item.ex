@@ -36,6 +36,9 @@ defmodule ForgeImports.RepositoryItem do
   @conflict_actions [:skip, :rename, :replace]
   @max_id 9_223_372_036_854_775_807
   @count_fields [:imported_count, :skipped_count, :warning_count, :failure_count]
+  @publication_intent_keys ~w(version state attempt_number action hidden_repository_id operation_id request_metadata)
+  @publication_committed_keys @publication_intent_keys ++
+                                ~w(repository_id owner_user_id slug generation replaced_repository_id run_id published_count_after run_lock_version_after)
   @source_metadata_keys ~w(
     archived fork visibility default_branch description has_issues allow_merge_commit disabled
     updated_at pushed_at
@@ -326,6 +329,7 @@ defmodule ForgeImports.RepositoryItem do
     |> validate_repository_evidence()
     |> validate_staged_storage_path()
     |> validate_maps()
+    |> validate_publication_evidence_shape()
     |> validate_source_metadata()
     |> validate_conflict_fingerprint()
     |> validate_cleanup_coherence()
@@ -493,6 +497,7 @@ defmodule ForgeImports.RepositoryItem do
       failure_detail: nil
     )
     |> validate_maps()
+    |> validate_publication_evidence_shape()
     |> validate_lifecycle()
   end
 
@@ -517,6 +522,7 @@ defmodule ForgeImports.RepositoryItem do
       failure_detail: nil
     )
     |> validate_maps()
+    |> validate_publication_evidence_shape()
     |> validate_lifecycle()
   end
 
@@ -960,6 +966,70 @@ defmodule ForgeImports.RepositoryItem do
       end)
     end)
   end
+
+  defp validate_publication_evidence_shape(changeset) do
+    state = get_field(changeset, :state)
+    evidence = get_field(changeset, :publication_evidence)
+    item = changeset.data
+
+    valid? =
+      case state do
+        :publishing ->
+          valid_publication_intent?(evidence, item)
+
+        state when state in [:published, :completed] ->
+          valid_committed_publication?(evidence, item)
+
+        _other ->
+          true
+      end
+
+    if valid?,
+      do: changeset,
+      else: add_error(changeset, :publication_evidence, "is inconsistent with publication state")
+  end
+
+  defp valid_publication_intent?(evidence, item) do
+    is_map(evidence) and exact_map_keys?(evidence, @publication_intent_keys) and
+      evidence["version"] == 1 and evidence["state"] == "intent" and
+      positive_integer?(evidence["attempt_number"]) and
+      evidence["action"] in ["create", "rename", "replace"] and
+      evidence["hidden_repository_id"] == item.hidden_repository_id and
+      evidence["operation_id"] ==
+        "github-import-publication-#{item.id}-#{evidence["attempt_number"]}" and
+      canonical_request_metadata?(evidence["request_metadata"])
+  end
+
+  defp valid_committed_publication?(evidence, item) do
+    valid_publication_intent?(
+      Map.put(evidence || %{}, "state", "intent")
+      |> Map.drop(@publication_committed_keys -- @publication_intent_keys),
+      item
+    ) and
+      exact_map_keys?(evidence, @publication_committed_keys) and evidence["state"] == "committed" and
+      evidence["repository_id"] == item.hidden_repository_id and
+      positive_integer?(evidence["owner_user_id"]) and
+      ForgeRepos.Repository.canonical_slug?(evidence["slug"]) and
+      positive_integer?(evidence["generation"]) and
+      (is_nil(evidence["replaced_repository_id"]) or
+         positive_integer?(evidence["replaced_repository_id"])) and
+      positive_integer?(evidence["run_id"]) and
+      nonnegative_integer?(evidence["published_count_after"]) and
+      positive_integer?(evidence["run_lock_version_after"])
+  end
+
+  defp canonical_request_metadata?(metadata) when is_map(metadata) do
+    case ForgeAccounts.validate_github_request_metadata(metadata) do
+      {:ok, normalized} -> Map.delete(normalized, "operation_id") == metadata
+      {:error, :invalid_request_metadata} -> false
+    end
+  end
+
+  defp canonical_request_metadata?(_metadata), do: false
+
+  defp exact_map_keys?(map, keys), do: Enum.sort(Map.keys(map)) == Enum.sort(keys)
+  defp positive_integer?(value), do: is_integer(value) and value > 0
+  defp nonnegative_integer?(value), do: is_integer(value) and value >= 0
 
   defp validate_counts(changeset) do
     Enum.reduce(@count_fields, changeset, fn field, acc ->

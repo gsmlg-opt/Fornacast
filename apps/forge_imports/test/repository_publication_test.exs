@@ -15,6 +15,7 @@ defmodule ForgeImports.RepositoryPublicationTest do
     RepositoryItem
   }
 
+  alias ForgePulls.{MergeOperation, PullRequest}
   alias ForgeRepos.{Collaborator, GitWriteOperation, Repository}
   alias Fornacast.{AuditEvent, Repo}
 
@@ -877,6 +878,316 @@ defmodule ForgeImports.RepositoryPublicationTest do
     assert Repo.get!(Repository, fixture.shadow.id).lifecycle == :importing
   end
 
+  test "recovery rejects persisted intents with noncanonical request metadata", context do
+    invalid_metadata = [
+      %{"extra" => "not-allowlisted"},
+      %{"request_id" => "/absolute/private/path"},
+      %{"user_agent" => "github_pat_persisted_secret"}
+    ]
+
+    for {metadata, index} <- Enum.with_index(invalid_metadata) do
+      fixture = ready_publication_fixture(context, slug: "intent-corruption-#{index}")
+      admitted = admit_without_finish!(context.actor, fixture.item)
+      corrupted = put_in(admitted.publication_evidence, ["request_metadata"], metadata)
+
+      assert {1, _rows} =
+               Repo.update_all(
+                 from(item in RepositoryItem, where: item.id == ^fixture.item.id),
+                 set: [publication_evidence: corrupted]
+               )
+
+      make_publication_due!(fixture.item.id)
+
+      assert {:error, :publication_inconsistent} =
+               ForgeImports.RepositoryPublisher.recover(fixture.item.id)
+
+      assert Repo.get!(Repository, fixture.shadow.id).lifecycle == :importing
+    end
+  end
+
+  test "replay rejects committed evidence with noncanonical request metadata", context do
+    fixture = ready_publication_fixture(context, slug: "replay-metadata-corruption")
+    assert {:ok, _result} = ForgeImports.publish_repository(context.actor, fixture.item.id, %{})
+    committed = Repo.get!(RepositoryItem, fixture.item.id)
+
+    corrupted =
+      put_in(committed.publication_evidence, ["request_metadata"], %{
+        "request_id" => "/private/replay/path"
+      })
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(item in RepositoryItem, where: item.id == ^fixture.item.id),
+               set: [publication_evidence: corrupted]
+             )
+
+    assert {:error, :publication_inconsistent} =
+             ForgeImports.publish_repository(context.actor, fixture.item.id, %{})
+  end
+
+  test "different-action audit collision rolls back and corrupts replay", context do
+    rollback = ready_publication_fixture(context, slug: "cross-action-rollback")
+    operation_id = "github-import-publication-#{rollback.item.id}-1"
+
+    audit_fixture(context.actor, operation_id, "repository.unrelated", rollback.shadow.id)
+
+    assert {:error, :persistence_unavailable} =
+             ForgeImports.publish_repository(context.actor, rollback.item.id, %{})
+
+    assert Repo.get!(Repository, rollback.shadow.id).lifecycle == :importing
+    assert Repo.get!(ImportRun, rollback.run.id).published_count == 0
+
+    replay = ready_publication_fixture(context, slug: "cross-action-replay")
+
+    assert {:ok, %{repository: repository}} =
+             ForgeImports.publish_repository(context.actor, replay.item.id, %{})
+
+    evidence = Repo.get!(RepositoryItem, replay.item.id).publication_evidence
+    audit_fixture(context.actor, evidence["operation_id"], "repository.corrupt", repository.id)
+
+    assert {:error, :publication_inconsistent} =
+             ForgeImports.publish_repository(context.actor, replay.item.id, %{})
+  end
+
+  test "replacement fence durably reconciles persisted Git writes and pull merges before drift",
+       context do
+    target = repository_fixture(context.actor, "durable-fence")
+    path = ForgeRepos.absolute_storage_path(target)
+    File.mkdir_p!(Path.dirname(path))
+    assert {:ok, ^path} = GitCore.init_bare(path)
+    %{base: base_oid, head: head_oid, merge: merge_oid} = create_merge_graph!(path)
+
+    assert {:ok, pull} =
+             ForgePulls.create_pull_request(
+               target,
+               context.actor,
+               %{title: "Pending import merge", head: "feature", base: "main"},
+               %{"request_id" => "publication-pending-pull"}
+             )
+
+    merge_operation =
+      %MergeOperation{}
+      |> MergeOperation.prepare_changeset(%{
+        pull_request_id: pull.id,
+        repository_id: target.id,
+        actor_user_id: context.actor.id,
+        request_id: "publication-pending-merge",
+        api_version: "2026-03-10",
+        ip_address: "203.0.113.82",
+        user_agent: "publication-fence-test",
+        token_id: "test-token",
+        base_ref: pull.base_ref,
+        head_ref: pull.head_ref,
+        expected_base_oid: base_oid,
+        expected_head_oid: head_oid,
+        state: :prepared
+      })
+      |> Repo.insert!()
+      |> Ecto.Changeset.change(state: :merge_written, merge_oid: merge_oid)
+      |> Repo.update!()
+      |> Ecto.Changeset.change(state: :ref_advanced)
+      |> Repo.update!()
+
+    update_ref!(path, merge_oid, pull.base_ref)
+    pending_ref = "refs/heads/pending-import-write"
+    update_ref!(path, merge_oid, pending_ref)
+
+    git_operation =
+      %GitWriteOperation{}
+      |> GitWriteOperation.changeset(%{
+        repository_id: target.id,
+        actor_user_id: context.actor.id,
+        request_id: "publication-pending-write",
+        kind: :ref_create,
+        state: :ref_advanced,
+        target_ref: pending_ref,
+        expected_oid: nil,
+        proposed_oid: merge_oid,
+        lock_version: 0
+      })
+      |> Repo.insert!()
+
+    fixture =
+      ready_publication_fixture(context, action: :replace, target: target, slug: target.slug)
+
+    assert {:error, :destination_changed} =
+             ForgeImports.publish_repository(context.actor, fixture.item.id, %{})
+
+    assert Repo.get!(GitWriteOperation, git_operation.id).state == :bookkeeping_complete
+    assert Repo.get!(MergeOperation, merge_operation.id).state == :completed
+    assert %PullRequest{merge_commit_sha: ^merge_oid} = Repo.get!(PullRequest, pull.id)
+    assert Repo.get!(Repository, target.id).write_version == 2
+    assert Repo.get_by!(AuditEvent, operation_id: "git_write:#{git_operation.id}")
+    assert Repo.get_by!(AuditEvent, operation_id: "pull_merge:#{merge_operation.id}")
+    assert Repo.get!(RepositoryItem, fixture.item.id).state == :awaiting_resolution
+    assert Repo.get!(Repository, fixture.shadow.id).lifecycle == :importing
+  end
+
+  test "fresh direct publication respects a future due time without writing intent", context do
+    fixture = ready_publication_fixture(context, slug: "future-due")
+    due_at = DateTime.add(DateTime.utc_now(:second), 60, :second)
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(item in RepositoryItem, where: item.id == ^fixture.item.id),
+               set: [next_attempt_at: due_at]
+             )
+
+    assert {:error, :busy} =
+             ForgeImports.publish_repository(context.actor, fixture.item.id, %{})
+
+    assert %RepositoryItem{state: :ready_to_publish, publication_evidence: %{}} =
+             Repo.get!(RepositoryItem, fixture.item.id)
+  end
+
+  test "public publishing under every terminal run is inconsistent rather than busy", context do
+    for state <- [:completed, :completed_with_warnings, :canceled, :failed] do
+      fixture = ready_publication_fixture(context, slug: "terminal-public-#{state}")
+      _admitted = admit_without_finish!(context.actor, fixture.item)
+      terminal_run!(fixture.run, state)
+
+      assert {:error, :publication_inconsistent} =
+               ForgeImports.publish_repository(context.actor, fixture.item.id, %{})
+
+      assert Repo.get!(RepositoryItem, fixture.item.id).state == :publishing
+    end
+  end
+
+  test "successor proof rejects noncanonical shadows and terminal-only partial evidence",
+       context do
+    for {field, value} <- [
+          name: "changed shadow name",
+          description: "unexpected",
+          visibility: :public,
+          default_branch: "changed",
+          has_issues: false,
+          allow_merge_commit: false,
+          last_pushed_at: @now,
+          storage_reclaimed_at: @now
+        ] do
+      target = repository_fixture(context.actor, "proof-#{field}")
+
+      fixture =
+        ready_publication_fixture(context, action: :replace, target: target, slug: target.slug)
+
+      reopen_with_drift!(context.actor, fixture, fn ->
+        Repo.update_all(
+          from(repository in Repository, where: repository.id == ^fixture.shadow.id),
+          set: [{field, value}]
+        )
+      end)
+
+      assert {:error, :stale} =
+               ForgeImports.resolve_repository_conflicts(
+                 context.actor,
+                 fixture.run.id,
+                 %{fixture.item.id => %{action: :rename, slug: "proof-fixed-#{field}"}},
+                 request_metadata("proof-#{field}")
+               )
+    end
+
+    target = repository_fixture(context.actor, "terminal-only-proof")
+
+    fixture =
+      ready_publication_fixture(context, action: :replace, target: target, slug: target.slug)
+
+    reopen_with_drift!(context.actor, fixture, fn -> {1, nil} end)
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(item in RepositoryItem, where: item.id == ^fixture.item.id),
+               set: [
+                 hidden_repository_id: nil,
+                 staged_storage_path: nil,
+                 source_git: %{},
+                 checkpoint: %{}
+               ]
+             )
+
+    assert {:error, :stale} =
+             ForgeImports.resolve_repository_conflicts(
+               context.actor,
+               fixture.run.id,
+               %{fixture.item.id => %{action: :rename, slug: "terminal-only-fixed"}},
+               request_metadata("terminal-only")
+             )
+  end
+
+  test "admission due clock is sampled after blocking capability locks", context do
+    fixture = ready_publication_fixture(context, slug: "post-lock-clock")
+    due_at = DateTime.add(DateTime.utc_now(:second), 1, :second)
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(item in RepositoryItem, where: item.id == ^fixture.item.id),
+               set: [next_attempt_at: due_at]
+             )
+
+    assert {:ok, %{repository: repository}} =
+             ForgeImports.RepositoryPublisher.with_test_after_admission_locks_hook(
+               fn -> Process.sleep(2_000) end,
+               fn -> ForgeImports.publish_repository(context.actor, fixture.item.id, %{}) end
+             )
+
+    assert repository.id == fixture.shadow.id
+  end
+
+  test "final item CAS rejects a lease that expires while replacement waits on its fence",
+       context do
+    target = repository_fixture(context.actor, "fence-expiry")
+
+    fixture =
+      ready_publication_fixture(context, action: :replace, target: target, slug: target.slug)
+
+    deadline = System.monotonic_time(:millisecond) + 10_000
+    assert {:ok, lease} = GitCore.RepositoryWriteLimiter.acquire(target.id, deadline)
+
+    publisher =
+      Task.async(fn -> ForgeImports.publish_repository(context.actor, fixture.item.id, %{}) end)
+
+    wait_for_write_waiters(1)
+    expires_at = DateTime.add(DateTime.utc_now(:second), 1, :second)
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(item in RepositoryItem, where: item.id == ^fixture.item.id),
+               set: [lease_expires_at: expires_at]
+             )
+
+    Process.sleep(2_000)
+    assert :ok = GitCore.RepositoryWriteLimiter.release(lease)
+    assert {:error, :persistence_unavailable} = Task.await(publisher, 5_000)
+    assert Repo.get!(Repository, target.id).lifecycle == :ready
+    assert Repo.get!(Repository, fixture.shadow.id).lifecycle == :importing
+    assert Repo.get!(ImportRun, fixture.run.id).published_count == 0
+  end
+
+  test "reconciler orders publishing then all never-attempted work then oldest due", context do
+    queued = ready_publication_fixture(context, slug: "order-queued")
+    make_unstaged_queued!(queued)
+    fresh = ready_publication_fixture(context, slug: "order-fresh")
+    newer_retry = ready_publication_fixture(context, slug: "order-newer-retry")
+    older_retry = ready_publication_fixture(context, slug: "order-older-retry")
+    cleanup = ready_publication_fixture(context, slug: "order-cleanup")
+    publishing = ready_publication_fixture(context, slug: "order-publishing")
+    _admitted = admit_without_finish!(context.actor, publishing.item)
+    now = DateTime.utc_now(:second)
+    make_publication_due!(publishing.item.id)
+    make_staging_retry!(newer_retry.item.id, DateTime.add(now, -10, :second))
+    make_staging_retry!(older_retry.item.id, DateTime.add(now, -20, :second))
+    make_cleanup_pending!(cleanup.item.id, now)
+
+    assert [
+             publishing.item.id,
+             queued.item.id,
+             fresh.item.id,
+             older_retry.item.id,
+             newer_retry.item.id
+           ] == Reconciler.runnable_repository_item_ids(10, now)
+
+    refute cleanup.item.id in Reconciler.runnable_repository_item_ids(10, now)
+  end
+
   defp ready_publication_fixture(context, opts \\ []) do
     owner = Keyword.get(opts, :owner, context.actor)
     run = running_run_fixture(context.actor, context.identity, owner)
@@ -1092,6 +1403,30 @@ defmodule ForgeImports.RepositoryPublicationTest do
              )
   end
 
+  defp create_merge_graph!(path) do
+    tree = git!(path, ["hash-object", "-t", "tree", "-w", "/dev/null"])
+    base = git!(path, ["commit-tree", tree, "-m", "base"])
+    head = git!(path, ["commit-tree", tree, "-p", base, "-m", "head"])
+    merge = git!(path, ["commit-tree", tree, "-p", base, "-p", head, "-m", "merge"])
+    update_ref!(path, base, "refs/heads/main")
+    update_ref!(path, head, "refs/heads/feature")
+    %{base: base, head: head, merge: merge}
+  end
+
+  defp update_ref!(path, oid, ref), do: git!(path, ["update-ref", ref, oid])
+
+  defp git!(path, args) do
+    env = [
+      {"GIT_AUTHOR_NAME", "Publication Test"},
+      {"GIT_AUTHOR_EMAIL", "publication@example.test"},
+      {"GIT_COMMITTER_NAME", "Publication Test"},
+      {"GIT_COMMITTER_EMAIL", "publication@example.test"}
+    ]
+
+    {output, 0} = System.cmd("git", ["--git-dir", path | args], env: env, stderr_to_stdout: true)
+    String.trim(output)
+  end
+
   defp user_fixture(prefix) do
     suffix = System.unique_integer([:positive])
 
@@ -1139,6 +1474,115 @@ defmodule ForgeImports.RepositoryPublicationTest do
                  next_attempt_at: nil
                ]
              )
+  end
+
+  defp make_unstaged_queued!(fixture) do
+    assert {1, _rows} =
+             Repo.update_all(
+               from(item in RepositoryItem, where: item.id == ^fixture.item.id),
+               set: [
+                 state: :queued,
+                 hidden_repository_id: nil,
+                 staged_storage_path: nil,
+                 source_git: %{},
+                 checkpoint: %{},
+                 next_attempt_at: nil
+               ]
+             )
+
+    PageCheckpoint
+    |> where([checkpoint], checkpoint.repository_item_id == ^fixture.item.id)
+    |> Repo.all()
+    |> Enum.each(&Repo.delete!/1)
+
+    Repo.delete!(fixture.shadow)
+    :ok
+  end
+
+  defp make_staging_retry!(item_id, due_at) do
+    assert {1, _rows} =
+             Repo.update_all(
+               from(item in RepositoryItem, where: item.id == ^item_id),
+               set: [state: :staging_git, next_attempt_at: due_at]
+             )
+  end
+
+  defp make_cleanup_pending!(item_id, now) do
+    cleanup_identity = %{
+      "mode" => 0o700,
+      "major_device" => 1,
+      "minor_device" => 1,
+      "inode" => item_id
+    }
+
+    item = Repo.get!(RepositoryItem, item_id)
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(candidate in RepositoryItem, where: candidate.id == ^item_id),
+               set: [
+                 state: :staging_git,
+                 next_attempt_at: nil,
+                 cleanup_state: "cleanup_pending",
+                 cleanup_eligible_at: now,
+                 cleanup_error: "publication_test",
+                 checkpoint: Map.put(item.checkpoint, "cleanup_identity", cleanup_identity)
+               ]
+             )
+  end
+
+  defp audit_fixture(actor, operation_id, action, target_id) do
+    %AuditEvent{}
+    |> AuditEvent.changeset(%{
+      actor_user_id: actor.id,
+      action: action,
+      target_type: "repository",
+      target_id: Integer.to_string(target_id),
+      operation_id: operation_id,
+      metadata: %{"corrupt" => true}
+    })
+    |> Repo.insert!()
+  end
+
+  defp terminal_run!(run, state) do
+    now = DateTime.utc_now(:second)
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(candidate in ImportRun, where: candidate.id == ^run.id),
+               set: [
+                 state: state,
+                 terminal_at: now,
+                 lease_owner: nil,
+                 lease_expires_at: nil,
+                 credential_ciphertext: nil,
+                 credential_nonce: nil,
+                 credential_tag: nil,
+                 credential_key_id: nil
+               ],
+               inc: [lock_version: 1]
+             )
+  end
+
+  defp reopen_with_drift!(actor, fixture, mutate) do
+    assert {:error, :destination_changed} =
+             ForgeImports.RepositoryPublisher.with_test_after_admission_hook(
+               fn _capability ->
+                 assert {1, _rows} =
+                          Repo.update_all(
+                            from(repository in Repository,
+                              where: repository.id == ^fixture.target.id
+                            ),
+                            inc: [write_version: 1]
+                          )
+
+                 assert match?({1, _rows}, mutate.())
+                 :ok
+               end,
+               fn -> ForgeImports.publish_repository(actor, fixture.item.id, %{}) end
+             )
+
+    assert Repo.get!(RepositoryItem, fixture.item.id).state == :awaiting_resolution
   end
 
   defp admit_without_finish!(actor, item) do

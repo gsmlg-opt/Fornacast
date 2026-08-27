@@ -8,10 +8,10 @@ defmodule ForgeImports.Conflicts do
   alias ForgeImports.{
     ImportAttempt,
     ImportRun,
-    PageCheckpoint,
     Persistence,
     Reconciler,
-    RepositoryItem
+    RepositoryItem,
+    RepositoryPublisher
   }
 
   alias Fornacast.{Audit, Repo}
@@ -504,65 +504,10 @@ defmodule ForgeImports.Conflicts do
   end
 
   defp durable_resume_state(%RepositoryItem{} = item) do
-    hidden? = is_integer(item.hidden_repository_id) and item.hidden_repository_id > 0
-    staged? = is_binary(item.staged_storage_path)
-    git_evidence? = map_size(item.source_git || %{}) > 0 or map_size(item.checkpoint || %{}) > 0
-
-    cond do
-      not hidden? and not staged? and not git_evidence? ->
-        {:ok, :queued}
-
-      hidden? and staged? and reusable_git_proof?(item) ->
-        if complete_terminal_metadata?(item.id),
-          do: {:ok, :ready_to_publish},
-          else: {:ok, :git_staged}
-
-      true ->
-        {:error, :stale}
+    case RepositoryPublisher.durable_proof_state(item) do
+      {:ok, state} -> {:ok, state}
+      {:error, :inconsistent} -> {:error, :stale}
     end
-  end
-
-  defp reusable_git_proof?(item) do
-    checkpoint = item.checkpoint
-    source = item.source_git
-
-    with %ForgeRepos.Repository{} = shadow <-
-           Repo.get(ForgeRepos.Repository, item.hidden_repository_id),
-         true <- shadow.lifecycle == :importing and is_nil(shadow.deleted_at),
-         true <- shadow.owner_user_id == item.destination_owner_id and shadow.write_version == 0,
-         true <- ForgeRepos.absolute_storage_path(shadow) == item.staged_storage_path,
-         true <- checkpoint["git_staged"] == true,
-         true <- checkpoint["unsupported_scan"] in ["complete", "truncated"],
-         true <- is_boolean(source["empty"]),
-         true <- is_binary(source["default_branch"]) and source["default_branch"] != "",
-         true <- is_integer(source["refs"]) and source["refs"] >= 0,
-         true <- is_integer(source["bytes"]) and source["bytes"] >= 0,
-         true <- is_boolean(source["lfs_detected"]),
-         true <- is_boolean(source["submodules_detected"]),
-         true <- is_boolean(source["scan_truncated"]) do
-      true
-    else
-      _invalid -> false
-    end
-  rescue
-    _error -> false
-  end
-
-  defp complete_terminal_metadata?(item_id) do
-    resources = ~w(labels issues comments pull_requests number_sequence)
-
-    rows =
-      Repo.all(
-        from checkpoint in PageCheckpoint,
-          where:
-            checkpoint.repository_item_id == ^item_id and
-              checkpoint.page_key == "__terminal_v1__",
-          select: {checkpoint.resource_kind, checkpoint.committed_at}
-      )
-
-    length(rows) == length(resources) and
-      Enum.sort(Enum.map(rows, &elem(&1, 0))) == Enum.sort(resources) and
-      Enum.all?(rows, &match?({_kind, %DateTime{}}, &1))
   end
 
   defp locked_persisted_actor(actor_id) do

@@ -59,6 +59,7 @@ defmodule ForgeImports.Reconciler do
             is_nil(item.staged_storage_path)) or
            (item.state == :staging_git and not is_nil(item.hidden_repository_id) and
               not is_nil(item.staged_storage_path))) and
+          is_nil(item.cleanup_state) and
           ((run.state == :running and actor.state == :active and
               (is_nil(run.lease_expires_at) or run.lease_expires_at <= ^now)) or
              (item.state == :staging_git and
@@ -113,7 +114,6 @@ defmodule ForgeImports.Reconciler do
     |> where(^eligible_branch)
     |> order_by([item, _run, _attempt, _actor],
       desc: item.state == :publishing,
-      desc: item.state == :ready_to_publish,
       desc: is_nil(item.next_attempt_at),
       asc: item.next_attempt_at,
       asc: item.id

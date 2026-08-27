@@ -49,8 +49,8 @@ defmodule ForgeImports.RepositoryPublisher do
         {:ok, %{state: state}} when state in [:published, :completed] ->
           replay(actor, item_id)
 
-        {:ok, %{state: :publishing}} ->
-          {:error, :busy}
+        {:ok, %{state: :publishing, run_id: run_id}} ->
+          public_publishing_status(run_id)
 
         {:ok, _scope} ->
           with {:ok, capability} <- admit(actor, item_id, safe_metadata),
@@ -82,6 +82,7 @@ defmodule ForgeImports.RepositoryPublisher do
 
   if Mix.env() == :test do
     @after_admission_hook_key {__MODULE__, :after_admission_hook}
+    @after_admission_locks_hook_key {__MODULE__, :after_admission_locks_hook}
     @after_commit_hook_key {__MODULE__, :after_commit_hook}
 
     @doc false
@@ -96,6 +97,21 @@ defmodule ForgeImports.RepositoryPublisher do
         if is_nil(previous),
           do: Process.delete(@after_admission_hook_key),
           else: Process.put(@after_admission_hook_key, previous)
+      end
+    end
+
+    @doc false
+    def with_test_after_admission_locks_hook(hook, fun)
+        when is_function(hook, 0) and is_function(fun, 0) do
+      previous = Process.get(@after_admission_locks_hook_key)
+      Process.put(@after_admission_locks_hook_key, hook)
+
+      try do
+        fun.()
+      after
+        if is_nil(previous),
+          do: Process.delete(@after_admission_locks_hook_key),
+          else: Process.put(@after_admission_locks_hook_key, previous)
       end
     end
 
@@ -121,6 +137,13 @@ defmodule ForgeImports.RepositoryPublisher do
       end
     end
 
+    defp after_admission_locks do
+      case Process.get(@after_admission_locks_hook_key) do
+        hook when is_function(hook, 0) -> hook.()
+        nil -> :ok
+      end
+    end
+
     defp after_commit(result) do
       case Process.get(@after_commit_hook_key) do
         hook when is_function(hook, 1) -> hook.(result)
@@ -129,6 +152,7 @@ defmodule ForgeImports.RepositoryPublisher do
     end
   else
     defp after_admission(_capability), do: :ok
+    defp after_admission_locks, do: :ok
     defp after_commit(_result), do: :ok
   end
 
@@ -161,17 +185,31 @@ defmodule ForgeImports.RepositoryPublisher do
 
   defp publication_scope(_actor, _item_id), do: {:error, :not_found}
 
+  defp public_publishing_status(run_id) do
+    case Repo.get(ImportRun, run_id) do
+      %ImportRun{state: state}
+      when state in [:completed, :completed_with_warnings, :canceled, :failed] ->
+        {:error, :publication_inconsistent}
+
+      %ImportRun{} ->
+        {:error, :busy}
+
+      nil ->
+        {:error, :publication_inconsistent}
+    end
+  end
+
   defp admit(%User{id: actor_id}, item_id, safe_metadata)
        when is_integer(actor_id) and actor_id > 0 and is_integer(item_id) and item_id > 0 do
     transaction = fn ->
       Repo.transaction(fn ->
-        now = DateTime.utc_now(:second)
-
         with %User{} = actor <- locked_active_actor(actor_id),
              run_id when is_integer(run_id) <- actor_owned_run_id(actor.id, item_id),
              %ImportRun{} = run <- locked_run(run_id),
              %RepositoryItem{} = item <- locked_run_item(run.id, item_id),
              %ImportAttempt{} = attempt <- locked_current_attempt(item),
+             :ok <- after_admission_locks(),
+             now <- DateTime.utc_now(:second),
              :ok <- validate_fresh_run(run, now),
              :ok <- validate_publication_gate(actor, run, item, attempt, now),
              {:ok, intent} <- publication_intent(item, attempt, safe_metadata),
@@ -195,14 +233,13 @@ defmodule ForgeImports.RepositoryPublisher do
   defp reclaim(item_id) do
     transaction = fn ->
       Repo.transaction(fn ->
-        now = DateTime.utc_now(:second)
-
         with run_id when is_integer(run_id) <- item_run_id(item_id),
              actor_id when is_integer(actor_id) <- run_actor_id(run_id),
              %User{} = actor <- locked_persisted_actor(actor_id),
              %ImportRun{} = run <- locked_run(run_id),
              %RepositoryItem{} = item <- locked_run_item(run.id, item_id),
              %ImportAttempt{} = attempt <- locked_current_attempt(item),
+             now <- DateTime.utc_now(:second),
              :ok <- validate_recovery_run(run),
              :ok <- validate_recovery_item(item, attempt, now),
              {:ok, claimed} <- persist_recovery_claim(item, now) do
@@ -329,6 +366,7 @@ defmodule ForgeImports.RepositoryPublisher do
   defp commit_item(repo, context, %{repository: repository_result, run: updated_run}) do
     capability = context.capability
     now = context.publication_spec.timestamp
+    lease_now = DateTime.utc_now(:second)
 
     item =
       RepositoryItem
@@ -336,7 +374,7 @@ defmodule ForgeImports.RepositoryPublisher do
         [item],
         item.id == ^capability.item_id and item.import_run_id == ^capability.run_id and
           item.lock_version == ^capability.item_lock_version and item.state == :publishing and
-          item.lease_owner == ^capability.lease_owner and item.lease_expires_at > ^now
+          item.lease_owner == ^capability.lease_owner and item.lease_expires_at > ^lease_now
       )
       |> publication_lock()
       |> repo.one()
@@ -356,7 +394,7 @@ defmodule ForgeImports.RepositoryPublisher do
          %ImportAttempt{} = attempt <- attempt,
          evidence <- committed_evidence(capability.intent, repository_result, updated_run),
          :ok <- close_publication_attempt(repo, attempt, now),
-         {:ok, published_item} <- publish_owned_item(repo, item, evidence, now) do
+         {:ok, published_item} <- publish_owned_item(repo, item, evidence, now, lease_now) do
       {:ok, published_item}
     else
       _stale -> {:error, :persistence_unavailable}
@@ -379,7 +417,7 @@ defmodule ForgeImports.RepositoryPublisher do
     end
   end
 
-  defp publish_owned_item(repo, item, evidence, now) do
+  defp publish_owned_item(repo, item, evidence, now, lease_now) do
     changeset = RepositoryItem.publication_commit_changeset(item, evidence)
 
     if changeset.valid? do
@@ -396,7 +434,7 @@ defmodule ForgeImports.RepositoryPublisher do
               candidate.lock_version == ^item.lock_version and candidate.state == :publishing and
               candidate.lease_owner == ^item.lease_owner and
               candidate.lease_expires_at == ^item.lease_expires_at and
-              candidate.lease_expires_at > ^now
+              candidate.lease_expires_at > ^lease_now
 
       case repo.update_all(query, set: updates, inc: [lock_version: 1]) do
         {1, _rows} ->
@@ -423,12 +461,13 @@ defmodule ForgeImports.RepositoryPublisher do
     rows =
       repo.all(
         from event in AuditEvent,
-          where: event.operation_id == ^operation_id and event.action == ^context.audit_action
+          where: event.operation_id == ^operation_id
       )
 
     case rows do
       [%AuditEvent{} = event] ->
-        if event.id == audit.id and event.actor_user_id == actor_id and
+        if event.id == audit.id and event.action == context.audit_action and
+             event.actor_user_id == actor_id and
              event.target_type == "repository" and event.target_id == target_id and
              event.metadata == expected_metadata and
              audit_request_fields_match?(event, context.capability.intent["request_metadata"]) do
@@ -655,6 +694,9 @@ defmodule ForgeImports.RepositoryPublisher do
       live_lease?(item, now) ->
         {:error, :busy}
 
+      not is_nil(item.next_attempt_at) and DateTime.compare(item.next_attempt_at, now) == :gt ->
+        {:error, :busy}
+
       not is_nil(item.cleanup_state) or not is_nil(item.cleanup_eligible_at) or
         not is_nil(item.cleanup_error) or item.cleanup_attempt_count != 0 or
           Map.has_key?(item.checkpoint || %{}, "cleanup_identity") ->
@@ -666,16 +708,36 @@ defmodule ForgeImports.RepositoryPublisher do
       run.actor_user_id != actor.id ->
         {:error, :not_found}
 
-      not valid_git_proof?(item) ->
-        {:error, :metadata_not_ready}
-
-      not terminal_metadata?(item.id) ->
+      durable_proof_state(item) != {:ok, :ready_to_publish} ->
         {:error, :metadata_not_ready}
 
       true ->
         :ok
     end
   end
+
+  @doc false
+  def durable_proof_state(%RepositoryItem{} = item) do
+    hidden? = is_integer(item.hidden_repository_id) and item.hidden_repository_id > 0
+    staged? = is_binary(item.staged_storage_path)
+    git_evidence? = map_size(item.source_git || %{}) > 0 or map_size(item.checkpoint || %{}) > 0
+    terminal? = terminal_metadata_present?(item.id)
+
+    cond do
+      not hidden? and not staged? and not git_evidence? and not terminal? ->
+        {:ok, :queued}
+
+      hidden? and staged? and valid_git_proof?(item) ->
+        if terminal_metadata?(item.id),
+          do: {:ok, :ready_to_publish},
+          else: {:ok, :git_staged}
+
+      true ->
+        {:error, :inconsistent}
+    end
+  end
+
+  def durable_proof_state(_item), do: {:error, :inconsistent}
 
   defp valid_git_proof?(item) do
     source = item.source_git
@@ -692,6 +754,7 @@ defmodule ForgeImports.RepositoryPublisher do
          true <- is_boolean(source["scan_truncated"]),
          %Repository{} = shadow <- Repo.get(Repository, item.hidden_repository_id),
          true <- shadow.lifecycle == :importing and is_nil(shadow.deleted_at),
+         true <- is_nil(shadow.storage_reclaimed_at) and is_nil(shadow.last_pushed_at),
          true <- shadow.owner_user_id == item.destination_owner_id,
          true <- shadow.visibility == :private and shadow.write_version == 0,
          true <- shadow.generation > 0 and canonical_shadow?(shadow, item.id),
@@ -715,6 +778,15 @@ defmodule ForgeImports.RepositoryPublisher do
     length(rows) == length(@terminal_resources) and
       Enum.sort(Enum.map(rows, &elem(&1, 0))) == Enum.sort(@terminal_resources) and
       Enum.all?(rows, &match?({_kind, %DateTime{}}, &1))
+  end
+
+  defp terminal_metadata_present?(item_id) do
+    Repo.exists?(
+      from checkpoint in PageCheckpoint,
+        where:
+          checkpoint.repository_item_id == ^item_id and
+            checkpoint.page_key == ^@terminal_page_key
+    )
   end
 
   defp publication_intent(item, attempt, safe_metadata) do
@@ -754,6 +826,7 @@ defmodule ForgeImports.RepositoryPublisher do
             candidate.id == ^item.id and candidate.lock_version == ^item.lock_version and
               candidate.state == :ready_to_publish and candidate.selected == true and
               is_nil(candidate.cleanup_state) and
+              (is_nil(candidate.next_attempt_at) or candidate.next_attempt_at <= ^now) and
               (is_nil(candidate.lease_expires_at) or candidate.lease_expires_at <= ^now)
 
       case Repo.update_all(query, set: updates, inc: [lock_version: 1]) do
@@ -848,8 +921,7 @@ defmodule ForgeImports.RepositoryPublisher do
       intent["hidden_repository_id"] == item.hidden_repository_id and
       intent["operation_id"] ==
         "github-import-publication-#{item.id}-#{attempt.attempt_number}" and
-      is_map(intent["request_metadata"]) and
-      not Map.has_key?(intent["request_metadata"], "operation_id")
+      canonical_request_metadata?(intent["request_metadata"])
   end
 
   defp replay(actor, item_id) do
@@ -888,8 +960,7 @@ defmodule ForgeImports.RepositoryPublisher do
       evidence["hidden_repository_id"] == item.hidden_repository_id and
       evidence["operation_id"] ==
         "github-import-publication-#{item.id}-#{attempt.attempt_number}" and
-      is_map(evidence["request_metadata"]) and
-      not Map.has_key?(evidence["request_metadata"], "operation_id")
+      canonical_request_metadata?(evidence["request_metadata"])
   end
 
   defp replay_replacement(%{"replaced_repository_id" => nil}, %ImportAttempt{
@@ -965,10 +1036,11 @@ defmodule ForgeImports.RepositoryPublisher do
 
     case Repo.all(
            from event in AuditEvent,
-             where: event.operation_id == ^evidence["operation_id"] and event.action == ^action
+             where: event.operation_id == ^evidence["operation_id"]
          ) do
       [%AuditEvent{} = event] ->
-        if event.actor_user_id == actor_id and event.target_type == "repository" and
+        if event.action == action and event.actor_user_id == actor_id and
+             event.target_type == "repository" and
              event.target_id == target_id and event.metadata == metadata and
              audit_request_fields_match?(event, evidence["request_metadata"]) do
           :ok
@@ -986,6 +1058,15 @@ defmodule ForgeImports.RepositoryPublisher do
       event.ip_address == metadata["ip_address"] and
       event.user_agent == metadata["user_agent"]
   end
+
+  defp canonical_request_metadata?(metadata) when is_map(metadata) do
+    case ForgeAccounts.validate_github_request_metadata(metadata) do
+      {:ok, normalized} -> Map.delete(normalized, "operation_id") == metadata
+      {:error, :invalid_request_metadata} -> false
+    end
+  end
+
+  defp canonical_request_metadata?(_metadata), do: false
 
   defp settle_finish_result({:ok, result}, _capability) do
     :ok = after_commit(result)
