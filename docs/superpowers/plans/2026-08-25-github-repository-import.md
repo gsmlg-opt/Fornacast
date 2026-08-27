@@ -568,12 +568,47 @@ git commit -m "feat(import): stage hidden Git repositories"
 - Create: `apps/forge_imports/lib/forge_imports/repository_publisher.ex`
 - Create: `apps/forge_imports/test/repository_publication_test.exs`
 - Modify: `apps/forge_imports/lib/forge_imports.ex`
+- Modify: `apps/forge_imports/lib/forge_imports/repository_item.ex`
+- Modify: `apps/forge_imports/lib/forge_imports/reconciler.ex`
+- Modify: `apps/forge_imports/lib/forge_imports/conflicts.ex`
 - Modify: `apps/forge_repos/lib/forge_repos.ex`
+- Modify: `apps/forge_repos/lib/forge_repos/repository.ex`
 - Modify: `apps/forge_repos/lib/forge_repos/collaborator.ex`
+- Modify: `apps/forge_imports/test/conflicts_test.exs`
+- Modify: `apps/forge_imports/test/import_persistence_test.exs`
+- Modify: `apps/forge_imports/test/import_persistence_concurrency_test.exs`
+- Modify: `apps/forge_imports/test/repository_worker_test.exs`
+- Modify: `apps/forge_repos/test/repository_lifecycle_test.exs`
+- Modify: `apps/forge_repos/test/repository_write_fence_test.exs`
+- Modify: `apps/forge_repos/test/git_write_recovery_test.exs`
+- Modify: `apps/forge_pulls/test/merge_recovery_test.exs`
+
+**Persistence boundary:** Add no migration and no index. The existing partial unique
+`(owner_user_id, slug) WHERE deleted_at IS NULL`, unique storage-path,
+repository-collaborator, and audit operation/action indexes are sufficient. The
+replacement transaction must tombstone the old row and set `deleted_at` before it
+activates the shadow.
 
 - [ ] **Step 1: Write publication and rollback tests**
 
-Test new activation, exact-target replacement, collaborator copy, old/new audit IDs, partial active-index handoff, new numeric ID, URL stability, drift with immutable attempt rollover, audit failure rollback, database failure rollback, queued stale writer, metadata-gate refusal, and publication markers.
+Use exact `PageCheckpoint` fixtures for these five terminal sentinels and no others
+with that terminal key:
+
+```elixir
+for resource_kind <- ~w(labels issues comments pull_requests number_sequence) do
+  page_checkpoint_fixture(item,
+    resource_kind: resource_kind,
+    page_key: "__terminal_v1__",
+    committed_at: now
+  )
+end
+```
+
+R7 tests fabricate those sentinels. Metadata Task 7 creates each sentinel in the
+same transaction that makes its phase terminal; R7 must not infer metadata
+completion from the item state or from ordinary page checkpoints.
+
+Exercise the public contract exactly:
 
 ```elixir
 assert {:ok, %{repository: published, replaced: old}} =
@@ -586,6 +621,62 @@ assert published.generation == old.generation + 1
 assert old.lifecycle == :tombstoned
 ```
 
+The public result is `%{repository: repository, replaced: nil | old_repository}`.
+Its typed errors are exactly `:metadata_not_ready`, `:busy`,
+`:destination_changed`, `:cancelled`, `:not_found`, `:publication_unavailable`,
+`:persistence_unavailable`, and `:publication_inconsistent`.
+
+The RED matrix must prove:
+
+- the gate rejects every missing terminal sentinel and any wrong terminal
+  `resource_kind`/`page_key`, `git_staged`, stale/non-running attempts, non-importing
+  or changed shadows, and cleanup evidence; admission requires a selected
+  `ready_to_publish` item, exact R6 Git proof, the current immutable running
+  attempt, the importing hidden repository, and all five sentinels;
+- active actor/run/item/attempt locking, a live foreign lease returning `:busy`,
+  expired-lease reclamation, lease theft before the final CAS, concurrent callers,
+  and exactly one winner; the winner increments `published_count` exactly once;
+- cancellation before intent returns `:cancelled` without publication, while
+  cancellation after intent cannot move `publishing` to canceled, failed, or
+  awaiting-credential and cannot interrupt recovery;
+- a crashed/expired `publishing` worker reclaims the same persisted intent,
+  operation ID, attempt number, action, hidden ID, and request metadata; it never
+  creates a second intent;
+- create and rename publish with generation `1`; replacement loads the numeric ID
+  from `ImportAttempt.decision`, preserves the owner/slug URL, creates a new numeric
+  repository ID, sets generation to old generation plus one, and records old/new
+  IDs;
+- replacement drift for every fingerprint field: target ID, owner ID, slug,
+  storage path, lifecycle/deletion, generation, `write_version`, `updated_at`, and
+  nullable `last_pushed_at` in both nil-to-value and value-to-nil directions;
+- destination namespace, authorization, exact shadow/internal slug/storage/
+  `write_version`, final setting, and pre-existing shadow-collaborator drift all
+  fail closed; collaborators copy with exact user/role rows and no conflict skip;
+- the exact settings are source name/description, destination visibility, staged
+  default branch, `has_issues`, and `allow_merge_commit`; storage path and Git bytes
+  never move during activation;
+- the existing content fence reconciles durable Git-write and pull-merge rows; a
+  writer queued before replacement either commits before the final fingerprint
+  check and causes drift or reloads after activation and cannot write the
+  tombstoned target;
+- audit collision, injected database/audit failure, and a test-only hook after old
+  tombstoning but before shadow activation roll back repository, collaborators,
+  item evidence/state, attempt state, run count, and audit together;
+- response loss followed by `published` or `completed` replay performs zero writes,
+  returns the same new/old rows by ID, and verifies marker, repository, replacement,
+  audit, and run-count facts; corrupt committed evidence returns
+  `:publication_inconsistent`;
+- destination drift closes only the current attempt, clears publication intent and
+  lease, preserves that predecessor, and creates attempt `n + 1` on resolution;
+  the successor resumes at `ready_to_publish` with an exact hidden repository, Git
+  proof, and all five sentinels, at `git_staged` with reusable Git proof but
+  incomplete metadata, or at `queued` only when no hidden/Git proof exists;
+- request metadata, evidence, audit metadata, `Inspect`, errors, and public return
+  values expose no PAT, authorization header, credential envelope, absolute storage
+  path, or caller-controlled operation ID; and
+- all admission, rollback, replay, audit-collision, and concurrency cases run on
+  Turso and PostgreSQL.
+
 - [ ] **Step 2: Run before publisher exists**
 
 ```bash
@@ -594,24 +685,226 @@ devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports
 
 Expected: FAIL with missing publication API.
 
-- [ ] **Step 3: Implement fenced publication transactions**
+- [ ] **Step 3: Add the public boundary, durable admission, and serial recovery**
 
-Both publication paths first require `ready_to_publish` plus durable terminal metadata-phase checkpoints; a merely `git_staged` item returns `{:error, :metadata_not_ready}`. For new publication: recheck actor/destination, lock shadow, recheck slug, set final owner/slug/settings and `ready`, then commit publication marker, `repository.imported` audit, and item state together.
+Expose only this context seam:
 
-For replacement: acquire the exact target's publication fence; reconcile pending Git writes/merges; lock target/shadow; compare the complete fingerprint; copy local collaborators; set old `tombstoned` and `deleted_at`; activate shadow under owner/slug with target generation + 1; record old/new IDs, `repository.replaced` audit, and item evidence in the same transaction. Return drift to `awaiting_resolution` without searching by slug.
-
-- [ ] **Step 4: Run publication and fence tests**
-
-```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/repository_publication_test.exs apps/forge_repos/test/repository_write_fence_test.exs --max-cases 1
+```elixir
+@spec publish_repository(User.t(), pos_integer(), map()) ::
+        {:ok, %{repository: Repository.t(), replaced: Repository.t() | nil}}
+        | {:error,
+           :metadata_not_ready
+           | :busy
+           | :destination_changed
+           | :cancelled
+           | :not_found
+           | :publication_unavailable
+           | :persistence_unavailable
+           | :publication_inconsistent}
+def publish_repository(actor, item_id, request_metadata),
+  do: RepositoryPublisher.publish(actor, item_id, request_metadata)
 ```
 
-Expected: all tests pass; failed publication leaves the old repository ready.
+Normalize request metadata through the existing GitHub request-metadata safety
+boundary, retain only its safe allowlisted projection, delete its `operation_id`,
+and never honor the caller's value. Use
+`github-import-publication-#{item.id}-#{attempt.attempt_number}` instead. Before any
+repository fence, one retryable database transaction locks the active actor, its
+run, item, and current attempt in that order; verifies run ownership/state,
+cancellation, due time, and the complete gate; claims the item lease; writes
+`ready_to_publish -> publishing`; and persists this exact v1 intent:
 
-- [ ] **Step 5: Commit publication**
+```elixir
+%{
+  "version" => 1,
+  "state" => "intent",
+  "attempt_number" => attempt.attempt_number,
+  "action" => attempt.decision["action"],
+  "hidden_repository_id" => item.hidden_repository_id,
+  "operation_id" => "github-import-publication-#{item.id}-#{attempt.attempt_number}",
+  "request_metadata" => safe_request_metadata
+}
+```
+
+Treat `ImportAttempt.decision` as authoritative; do not rebuild it from mutable
+item conflict columns. Validate R6 Git evidence structurally (`checkpoint` proof,
+source Git counters/flags/default branch, staged absolute path, and exact shadow)
+and query all `page_key == "__terminal_v1__"` rows for the item, requiring the
+resource-kind set to equal exactly
+`~w(labels issues comments pull_requests number_sequence)` and every row to be
+committed. A merely `git_staged` item returns `:metadata_not_ready`.
+
+An active publication lease returns `:busy`. An expired `publishing` lease is
+reclaimed only when its persisted intent has exactly the shape above and still
+matches the same item/current attempt; use the persisted intent and metadata rather
+than the retry caller's values. Change the ordinary `RepositoryItem` transition
+matrix so `publishing` advances only to `published`; it cannot become
+awaiting-credential, cancel-requested, canceled, or failed. Destination drift uses
+the dedicated capability-checked reopening path in Step 5, not that ordinary
+transition matrix. Cancellation therefore linearizes at the admission transaction:
+it wins before intent, while a committed intent must finish or recover publication.
+Fresh admission requires a `running` parent run; recovery of an admitted
+`publishing` intent also permits `cancel_requested`, because cancellation has lost
+that item's race. A recoverable fence/reconciliation failure keeps the item
+`publishing`, preserves the exact intent, clears only its own lease, and writes a
+bounded `next_attempt_at`; failure to persist that release is
+`:persistence_unavailable`.
+
+Extend the existing serial `Reconciler` query to select due
+`ready_to_publish` items and expired due `publishing` items with an active actor,
+eligible parent run, and exact current running attempt. Order expired `publishing`
+recovery first, then fresh (`next_attempt_at IS NULL`) and oldest due work, then item
+ID. Invoke `RepositoryPublisher` from the existing one bounded scan task. Do not add
+a task, process, supervisor, or publication concurrency.
+
+- [ ] **Step 4: Add the deep repository publication contributor and final Multi**
+
+Add this context-owned contributor; it must not alias or accept any
+`ForgeImports` type:
+
+```elixir
+@spec publish_import_shadow(
+        Ecto.Multi.t(),
+        Ecto.Multi.name(),
+        User.t(),
+        map(),
+        map() | nil
+      ) :: Ecto.Multi.t()
+def publish_import_shadow(multi, key, actor, publication_spec, expected_replacement_or_nil)
+```
+
+`publication_spec` is a plain, exact-key map containing hidden repository ID,
+expected internal slug, storage path and shadow `write_version`; final owner ID,
+slug, name, description, visibility, default branch, `has_issues`,
+`allow_merge_commit`, generation, and transaction timestamp.
+`expected_replacement_or_nil` is either `nil` or the exact immutable decision
+projection: repository ID, owner ID, slug, storage path, generation,
+`write_version`, `updated_at`, and nullable `last_pushed_at`.
+
+The contributor locks shadow and replacement by numeric ID in ascending order,
+never by slug. It validates the active actor's destination authorization, canonical
+final settings, an exact undeleted `importing` shadow/internal slug/storage/
+`write_version`, and zero shadow collaborators. For replacement it validates the
+exact ready/undeleted target fingerprint and locks its collaborators in stable
+user-ID order. Insert every collaborator user/role strictly—no `on_conflict:
+:nothing` and no partial copy. Mutate the old row to `tombstoned` with `deleted_at`
+first, run the test-only after-tombstone hook, and only then activate the shadow.
+Activation keeps the opaque storage path but may set generation from the current
+immutable decision: `1` for create/rename or target generation plus one for replace.
+That update is required so a drift successor can reuse already proven hidden Git
+and metadata without recloning.
+
+For replacement, load the target only from the current decision and acquire
+`ForgeRepos.with_import_publication_fence(target, :content, ...)`. Its existing
+reconciler must settle durable Git writes and merges. Inside the callback, build one
+final `Ecto.Multi`; its repository contributor again locks target/shadow by numeric
+ID and compares the full fingerprint, including `write_version` and nullable
+`last_pushed_at`. Never re-resolve the destination by slug.
+
+That final Multi must atomically compose:
+
+1. `ForgeRepos.publish_import_shadow/5`;
+2. a lease-owner/expiry/lock-version CAS from `publishing -> published`, closing the
+   exact current attempt as completed and replacing intent with exact committed
+   evidence;
+3. one `published_count` increment on the locked parent run;
+4. `repository.imported` or `repository.replaced` audit with operation ID
+   `github-import-publication-<item>-<attempt>` and, for replacement, exact old/new
+   repository IDs; and
+5. an audit verifier that reloads the operation-ID rows and requires exactly one
+   row with the expected actor, action, target type/ID, safe request metadata, and
+   replacement metadata. A conflicting audit row aborts the whole Multi.
+
+Committed evidence retains the exact intent fields, replaces its state, and adds
+only these publication facts:
+
+```elixir
+%{
+  "state" => "committed",
+  "repository_id" => published.id,
+  "owner_user_id" => published.owner_user_id,
+  "slug" => published.slug,
+  "generation" => published.generation,
+  "replaced_repository_id" => replaced && replaced.id
+}
+```
+
+Merge those facts into the v1 intent rather than constructing an unrelated marker.
+All five Multi contributions roll back together. Map destination namespace,
+fingerprint, authorization, or shadow drift to `:destination_changed`; limiter,
+fence, or writer/merge reconciliation failure to `:publication_unavailable`; and
+database or audit failure to `:persistence_unavailable`.
+
+- [ ] **Step 5: Make replay and destination-drift recovery exact**
+
+For `published` and `completed`, take the read-only replay branch before admission.
+By evidence, attempt number, new repository ID, and optional old repository ID,
+perform indexed point reads and verify the exact decision, active new repository
+settings/generation, old tombstone/deletion and unchanged replacement facts, audit,
+and run count. Return the original `%{repository:, replaced:}` without a write. Any
+missing or mismatched fact returns `:publication_inconsistent`; never repair a
+committed marker heuristically.
+
+On destination drift, use a dedicated `Conflicts` transaction that locks the same
+actor/run/item/current-attempt capability, closes only that running attempt as
+`destination_changed`, clears publication intent/lease/backoff, and returns the item
+to `awaiting_resolution` while preserving hidden repository, Git evidence, metadata
+checkpoints, and the immutable predecessor. Do not search by slug and do not mutate
+an older attempt.
+
+When the user resolves the drifted item, create immutable attempt `n + 1` and derive
+its resume state only from durable proof: `ready_to_publish` for the exact importing
+shadow plus valid Git proof plus all five terminal sentinels; `git_staged` for the
+exact shadow plus valid Git proof but incomplete metadata; `queued` only when both
+hidden-repository and Git proof are absent. Contradictory partial evidence fails
+closed. The current successor decision controls activation generation, so a changed
+create/rename/replace choice can reuse the same valid shadow. Preserve every prior
+attempt.
+
+- [ ] **Step 6: Run the focused Turso publication suite**
 
 ```bash
-git add apps/forge_imports apps/forge_repos
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+  apps/forge_imports/test/repository_publication_test.exs \
+  apps/forge_imports/test/conflicts_test.exs \
+  apps/forge_imports/test/import_persistence_test.exs \
+  apps/forge_imports/test/import_persistence_concurrency_test.exs \
+  apps/forge_imports/test/repository_worker_test.exs \
+  apps/forge_repos/test/repository_lifecycle_test.exs \
+  apps/forge_repos/test/repository_write_fence_test.exs \
+  apps/forge_repos/test/git_write_recovery_test.exs \
+  apps/forge_pulls/test/merge_recovery_test.exs \
+  --max-cases 1
+```
+
+Expected: all focused tests pass; every failed publication leaves the old repository
+ready and the shadow importing, and committed replay performs no writes.
+
+- [ ] **Step 7: Run the same publication suite on PostgreSQL**
+
+```bash
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres \
+  MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 \
+  nix shell nixpkgs#expect -c unbuffer mix test \
+  apps/forge_imports/test/repository_publication_test.exs \
+  apps/forge_imports/test/conflicts_test.exs \
+  apps/forge_imports/test/import_persistence_test.exs \
+  apps/forge_imports/test/import_persistence_concurrency_test.exs \
+  apps/forge_imports/test/repository_worker_test.exs \
+  apps/forge_repos/test/repository_lifecycle_test.exs \
+  apps/forge_repos/test/repository_write_fence_test.exs \
+  apps/forge_repos/test/git_write_recovery_test.exs \
+  apps/forge_pulls/test/merge_recovery_test.exs \
+  --max-cases 1
+```
+
+Expected: the same lease, lock, rollback, audit, replay, and handoff assertions pass
+on PostgreSQL.
+
+- [ ] **Step 8: Commit publication**
+
+```bash
+git add apps/forge_imports apps/forge_repos apps/forge_pulls/test/merge_recovery_test.exs
 git commit -m "feat(import): publish imported repositories"
 ```
 
