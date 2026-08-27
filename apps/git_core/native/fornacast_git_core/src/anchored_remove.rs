@@ -139,6 +139,21 @@ mod platform {
         entries: usize,
     }
 
+    struct DirectoryManifest {
+        entries: Vec<ManifestEntry>,
+    }
+
+    struct ManifestEntry {
+        name: CString,
+        identity: ContainedTreeIdentity,
+        kind: ManifestEntryKind,
+    }
+
+    enum ManifestEntryKind {
+        RegularFile,
+        Directory(DirectoryManifest),
+    }
+
     pub(super) fn contained_tree_identity(
         storage_root: String,
         relative_segments: Vec<String>,
@@ -170,6 +185,25 @@ mod platform {
         expected_proof: ContainedTreeProof,
         deadline_ms: u64,
     ) -> Result<RemoveResult, AnchoredRemoveError> {
+        remove_contained_tree_with_pre_delete(
+            storage_root,
+            relative_segments,
+            expected_proof,
+            deadline_ms,
+            || {},
+        )
+    }
+
+    pub(super) fn remove_contained_tree_with_pre_delete<F>(
+        storage_root: String,
+        relative_segments: Vec<String>,
+        expected_proof: ContainedTreeProof,
+        deadline_ms: u64,
+        before_delete: F,
+    ) -> Result<RemoveResult, AnchoredRemoveError>
+    where
+        F: FnOnce(),
+    {
         validate_request(&storage_root, &relative_segments)?;
         validate_proof(&expected_proof)?;
         let deadline = Deadline::new(deadline_ms)?;
@@ -189,8 +223,9 @@ mod platform {
         compare_target(target_identity, expected_proof.target)?;
 
         let mut budget = TreeBudget { entries: 0 };
-        preflight_directory(&target_fd, &root_identity, 0, &mut budget, &deadline)?;
-        remove_directory_contents(&target_fd, &root_identity, 0, &deadline)?;
+        let manifest = preflight_directory(&target_fd, &root_identity, 0, &mut budget, &deadline)?;
+        before_delete();
+        remove_manifest(&target_fd, &root_identity, &manifest, 0, &deadline)?;
 
         deadline.check()?;
         let (current_root_fd, current_root_identity) = open_storage_root(&storage_root, &deadline)?;
@@ -396,13 +431,14 @@ mod platform {
         depth: usize,
         budget: &mut TreeBudget,
         deadline: &Deadline,
-    ) -> Result<(), AnchoredRemoveError> {
+    ) -> Result<DirectoryManifest, AnchoredRemoveError> {
         deadline.check()?;
         if depth > MAX_TREE_DEPTH {
             return Err(AnchoredRemoveError::DepthLimit);
         }
 
         let mut entries = Dir::read_from(directory).map_err(map_io_error)?;
+        let mut manifest_entries = Vec::new();
         while let Some(entry) = entries.read() {
             deadline.check()?;
             let entry = entry.map_err(map_io_error)?;
@@ -423,26 +459,41 @@ mod platform {
             let identity = identity_from_stat(&stat)?;
             ensure_same_filesystem(root_identity, &identity)?;
 
-            match FileType::from_raw_mode(stat.st_mode) {
-                FileType::RegularFile => {}
+            let kind = match FileType::from_raw_mode(stat.st_mode) {
+                FileType::RegularFile => ManifestEntryKind::RegularFile,
                 FileType::Directory => {
                     if depth == MAX_TREE_DEPTH {
                         return Err(AnchoredRemoveError::DepthLimit);
                     }
                     let child = open_child_directory(directory, name, identity, deadline)?;
-                    preflight_directory(&child, root_identity, depth + 1, budget, deadline)?;
+                    ManifestEntryKind::Directory(preflight_directory(
+                        &child,
+                        root_identity,
+                        depth + 1,
+                        budget,
+                        deadline,
+                    )?)
                 }
                 FileType::Symlink => return Err(AnchoredRemoveError::Symlink),
                 _ => return Err(AnchoredRemoveError::SpecialFile),
-            }
+            };
+
+            manifest_entries.push(ManifestEntry {
+                name: name.to_owned(),
+                identity,
+                kind,
+            });
         }
 
-        Ok(())
+        Ok(DirectoryManifest {
+            entries: manifest_entries,
+        })
     }
 
-    fn remove_directory_contents(
+    fn remove_manifest(
         directory: &OwnedFd,
         root_identity: &ContainedTreeIdentity,
+        manifest: &DirectoryManifest,
         depth: usize,
         deadline: &Deadline,
     ) -> Result<(), AnchoredRemoveError> {
@@ -451,52 +502,53 @@ mod platform {
             return Err(AnchoredRemoveError::DepthLimit);
         }
 
-        let names = directory_entry_names(directory, deadline)?;
-        for name in names {
+        for entry in &manifest.entries {
             deadline.check()?;
-            let stat = statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW).map_err(map_io_error)?;
-            let identity = identity_from_stat(&stat)?;
-            ensure_same_filesystem(root_identity, &identity)?;
+            let stat = statat(directory, &entry.name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(map_manifest_io_error)?;
+            verify_manifest_entry(&stat, root_identity, entry)?;
 
-            match FileType::from_raw_mode(stat.st_mode) {
-                FileType::RegularFile => {
-                    unlinkat(directory, &name, AtFlags::empty()).map_err(map_io_error)?;
+            match &entry.kind {
+                ManifestEntryKind::RegularFile => {
+                    unlinkat(directory, &entry.name, AtFlags::empty()).map_err(map_io_error)?;
                 }
-                FileType::Directory => {
-                    let child = open_child_directory(directory, &name, identity, deadline)?;
-                    remove_directory_contents(&child, root_identity, depth + 1, deadline)?;
+                ManifestEntryKind::Directory(children) => {
+                    let child =
+                        open_child_directory(directory, &entry.name, entry.identity, deadline)?;
+                    remove_manifest(&child, root_identity, children, depth + 1, deadline)?;
                     deadline.check()?;
-                    let current = statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW)
-                        .map_err(map_io_error)?;
-                    classify_directory(&current)?;
-                    compare_observation(identity_from_stat(&current)?, identity)?;
-                    unlinkat(directory, &name, AtFlags::REMOVEDIR).map_err(map_io_error)?;
+                    let current = statat(directory, &entry.name, AtFlags::SYMLINK_NOFOLLOW)
+                        .map_err(map_manifest_io_error)?;
+                    verify_manifest_entry(&current, root_identity, entry)?;
+                    let reopened =
+                        open_child_directory(directory, &entry.name, entry.identity, deadline)?;
+                    drop(reopened);
+                    unlinkat(directory, &entry.name, AtFlags::REMOVEDIR).map_err(map_io_error)?;
                 }
-                FileType::Symlink => return Err(AnchoredRemoveError::Symlink),
-                _ => return Err(AnchoredRemoveError::SpecialFile),
             }
         }
 
         Ok(())
     }
 
-    fn directory_entry_names(
-        directory: &OwnedFd,
-        deadline: &Deadline,
-    ) -> Result<Vec<CString>, AnchoredRemoveError> {
-        let mut names = Vec::new();
-        let mut entries = Dir::read_from(directory).map_err(map_io_error)?;
-        while let Some(entry) = entries.read() {
-            deadline.check()?;
-            let entry = entry.map_err(map_io_error)?;
-            if !is_dot_entry(entry.file_name()) {
-                if names.len() == MAX_TREE_ENTRIES {
-                    return Err(AnchoredRemoveError::EntryLimit);
-                }
-                names.push(entry.file_name().to_owned());
-            }
+    fn verify_manifest_entry(
+        stat: &Stat,
+        root_identity: &ContainedTreeIdentity,
+        entry: &ManifestEntry,
+    ) -> Result<(), AnchoredRemoveError> {
+        let current_identity = identity_from_stat(stat)?;
+        ensure_same_filesystem(root_identity, &current_identity)?;
+
+        let kind_matches = matches!(
+            (&entry.kind, FileType::from_raw_mode(stat.st_mode)),
+            (ManifestEntryKind::RegularFile, FileType::RegularFile)
+                | (ManifestEntryKind::Directory(_), FileType::Directory)
+        );
+        if !kind_matches {
+            return Err(AnchoredRemoveError::IdentityMismatch);
         }
-        Ok(names)
+
+        compare_observation(current_identity, entry.identity)
     }
 
     fn open_child_directory(
@@ -524,6 +576,13 @@ mod platform {
             Errno::LOOP => AnchoredRemoveError::Symlink,
             Errno::ACCESS | Errno::PERM => AnchoredRemoveError::PermissionDenied,
             _ => AnchoredRemoveError::IoError,
+        }
+    }
+
+    fn map_manifest_io_error(error: Errno) -> AnchoredRemoveError {
+        match error {
+            Errno::NOENT | Errno::LOOP | Errno::NOTDIR => AnchoredRemoveError::IdentityMismatch,
+            _ => map_io_error(error),
         }
     }
 }
@@ -566,6 +625,26 @@ pub(crate) fn remove_contained_tree(
         let _ = (storage_root, relative_segments, expected_proof, deadline_ms);
         Err(AnchoredRemoveError::UnsupportedPlatform)
     }
+}
+
+#[cfg(test)]
+fn remove_contained_tree_with_pre_delete<F>(
+    storage_root: String,
+    relative_segments: Vec<String>,
+    expected_proof: ContainedTreeProof,
+    deadline_ms: u64,
+    before_delete: F,
+) -> Result<RemoveResult, AnchoredRemoveError>
+where
+    F: FnOnce(),
+{
+    platform::remove_contained_tree_with_pre_delete(
+        storage_root,
+        relative_segments,
+        expected_proof,
+        deadline_ms,
+        before_delete,
+    )
 }
 
 #[cfg(test)]
@@ -640,5 +719,156 @@ mod anchored_remove_tests {
 
         fs::remove_dir(target).expect("remove target");
         fs::remove_dir(root).expect("remove temp fixture root");
+    }
+
+    #[test]
+    fn anchored_remove_manifest_does_not_delete_a_new_entry() {
+        let root = fixture_root("manifest-new-entry");
+        let target = root.join("target");
+        fs::create_dir_all(&target).expect("create temp fixture");
+        fs::write(target.join("old"), b"old").expect("write old entry");
+        let root_string = root.to_str().expect("UTF-8 temp path").to_string();
+        let segments = vec!["target".to_string()];
+        let proof = present_proof(&root_string, &segments);
+
+        let result = super::remove_contained_tree_with_pre_delete(
+            root_string.clone(),
+            segments.clone(),
+            proof,
+            5_000,
+            || fs::write(target.join("new"), b"new").expect("insert post-preflight entry"),
+        );
+
+        assert!(matches!(result, Err(AnchoredRemoveError::IoError)));
+        assert_eq!(
+            fs::read(target.join("new")).expect("new entry remains"),
+            b"new"
+        );
+        assert!(matches!(
+            super::remove_contained_tree(root_string, segments, proof, 5_000),
+            Ok(RemoveResult::Removed(removed)) if removed == proof
+        ));
+        fs::remove_dir(root).expect("remove fixture root");
+    }
+
+    #[test]
+    fn anchored_remove_manifest_rejects_a_regular_file_swap() {
+        let root = fixture_root("manifest-regular-swap");
+        let target = root.join("target");
+        let saved = root.join("saved");
+        fs::create_dir_all(&target).expect("create temp fixture");
+        fs::write(target.join("entry"), b"original").expect("write original entry");
+        let root_string = root.to_str().expect("UTF-8 temp path").to_string();
+        let segments = vec!["target".to_string()];
+        let proof = present_proof(&root_string, &segments);
+
+        let result = super::remove_contained_tree_with_pre_delete(
+            root_string.clone(),
+            segments.clone(),
+            proof,
+            5_000,
+            || {
+                fs::rename(target.join("entry"), &saved).expect("move observed entry");
+                fs::write(target.join("entry"), b"replacement").expect("write replacement");
+            },
+        );
+
+        assert!(matches!(result, Err(AnchoredRemoveError::IdentityMismatch)));
+        assert_eq!(
+            fs::read(target.join("entry")).expect("replacement remains"),
+            b"replacement"
+        );
+        assert_eq!(fs::read(&saved).expect("original remains"), b"original");
+        assert!(matches!(
+            super::remove_contained_tree(root_string, segments, proof, 5_000),
+            Ok(RemoveResult::Removed(removed)) if removed == proof
+        ));
+        fs::remove_file(saved).expect("remove saved original");
+        fs::remove_dir(root).expect("remove fixture root");
+    }
+
+    #[test]
+    fn anchored_remove_manifest_rejects_a_directory_swap() {
+        let root = fixture_root("manifest-directory-swap");
+        let target = root.join("target");
+        let child = target.join("child");
+        let saved = root.join("saved-child");
+        fs::create_dir_all(&child).expect("create observed child");
+        fs::write(child.join("original"), b"original").expect("write original child");
+        let root_string = root.to_str().expect("UTF-8 temp path").to_string();
+        let segments = vec!["target".to_string()];
+        let proof = present_proof(&root_string, &segments);
+
+        let result = super::remove_contained_tree_with_pre_delete(
+            root_string.clone(),
+            segments.clone(),
+            proof,
+            5_000,
+            || {
+                fs::rename(&child, &saved).expect("move observed directory");
+                fs::create_dir(&child).expect("create replacement directory");
+                fs::write(child.join("replacement"), b"replacement")
+                    .expect("write replacement child");
+            },
+        );
+
+        assert!(matches!(result, Err(AnchoredRemoveError::IdentityMismatch)));
+        assert_eq!(
+            fs::read(child.join("replacement")).expect("replacement remains"),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read(saved.join("original")).expect("original remains"),
+            b"original"
+        );
+        assert!(matches!(
+            super::remove_contained_tree(root_string, segments, proof, 5_000),
+            Ok(RemoveResult::Removed(removed)) if removed == proof
+        ));
+        fs::remove_file(saved.join("original")).expect("remove saved child file");
+        fs::remove_dir(saved).expect("remove saved child");
+        fs::remove_dir(root).expect("remove fixture root");
+    }
+
+    #[test]
+    fn anchored_remove_manifest_uses_one_global_entry_limit() {
+        let root = fixture_root("manifest-global-limit");
+        let target = root.join("target");
+        fs::create_dir_all(&target).expect("create target");
+
+        for directory_index in 0..2 {
+            let directory = target.join(format!("directory-{directory_index}"));
+            fs::create_dir(&directory).expect("create directory");
+            for file_index in 0..5_000 {
+                fs::write(directory.join(file_index.to_string()), b"").expect("write entry");
+            }
+        }
+
+        let root_string = root.to_str().expect("UTF-8 temp path").to_string();
+        let segments = vec!["target".to_string()];
+        let proof = present_proof(&root_string, &segments);
+        assert!(matches!(
+            super::remove_contained_tree(root_string, segments, proof, 30_000),
+            Err(AnchoredRemoveError::EntryLimit)
+        ));
+
+        for directory_index in 0..2 {
+            let directory = target.join(format!("directory-{directory_index}"));
+            for file_index in 0..5_000 {
+                fs::remove_file(directory.join(file_index.to_string())).expect("remove entry");
+            }
+            fs::remove_dir(directory).expect("remove directory");
+        }
+        fs::remove_dir(target).expect("remove target");
+        fs::remove_dir(root).expect("remove fixture root");
+    }
+
+    fn present_proof(root: &str, segments: &[String]) -> super::ContainedTreeProof {
+        match super::contained_tree_identity(root.to_string(), segments.to_vec(), 5_000)
+            .expect("observe tree")
+        {
+            IdentityResult::Present(proof) => proof,
+            IdentityResult::Missing(_) => panic!("expected present tree"),
+        }
     }
 }

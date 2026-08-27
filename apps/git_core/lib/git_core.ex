@@ -757,9 +757,6 @@ defmodule GitCore do
       not anchored_remove_platform?() ->
         {:error, :unsupported_platform}
 
-      not File.exists?(storage_root) ->
-        {:error, :invalid_argument}
-
       true ->
         GitCore.Native.contained_tree_identity(storage_root, relative_segments, deadline_ms)
     end
@@ -782,9 +779,6 @@ defmodule GitCore do
 
       not anchored_remove_platform?() ->
         {:error, :unsupported_platform}
-
-      not File.exists?(storage_root) ->
-        {:error, :invalid_argument}
 
       true ->
         GitCore.Native.remove_contained_tree(

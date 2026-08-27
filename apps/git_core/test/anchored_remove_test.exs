@@ -73,6 +73,23 @@ defmodule GitCore.AnchoredRemoveTest do
              GitCore.contained_tree_identity(storage_root, ["missing-parent", "target"], 5_000)
   end
 
+  test "a valid missing absolute storage root reaches the NIF and returns not_found", %{
+    tmp_dir: tmp_dir
+  } do
+    missing_root = Path.join(tmp_dir, "missing-storage")
+
+    proof = %{
+      root: %{mode: 0o700, major_device: 0, minor_device: 0, inode: 1},
+      target: %{mode: 0o700, major_device: 0, minor_device: 0, inode: 1}
+    }
+
+    assert {:error, :not_found} =
+             GitCore.contained_tree_identity(missing_root, ["target"], 5_000)
+
+    assert {:error, :not_found} =
+             GitCore.remove_contained_tree(missing_root, ["target"], proof, 5_000)
+  end
+
   test "rejects every mismatched root and target proof field without removing the target", %{
     tmp_dir: tmp_dir
   } do
@@ -229,7 +246,6 @@ defmodule GitCore.AnchoredRemoveTest do
     invalid_identity_requests = [
       {"/", ["target"], 1},
       {"relative", ["target"], 1},
-      {Path.join(tmp_dir, "missing"), ["target"], 1},
       {storage_root <> "/", ["target"], 1},
       {storage_root <> "\\unsafe", ["target"], 1},
       {storage_root <> <<0>>, ["target"], 1},
@@ -400,6 +416,9 @@ defmodule GitCore.AnchoredRemoveTest do
     assert source =~ ~s(target_os = "linux")
     assert source =~ ~s(target_os = "macos")
     assert source =~ "UnsupportedPlatform"
+    assert source =~ "DirectoryManifest"
+    assert source =~ "ManifestEntry"
+    refute source =~ "directory_entry_names"
     refute source =~ "remove_dir_all"
     refute source =~ "File.rm_rf"
     refute source =~ "canonicalize("
