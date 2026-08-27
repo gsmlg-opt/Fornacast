@@ -158,6 +158,7 @@ defmodule ForgeImports.ImportPersistenceTest do
           :replacement_owner_id,
           :replacement_storage_path,
           :replacement_generation,
+          :replacement_write_version,
           :replacement_updated_at,
           :replacement_last_pushed_at,
           :hidden_repository_id,
@@ -186,6 +187,27 @@ defmodule ForgeImports.ImportPersistenceTest do
         ] do
       assert field in RepositoryItem.__schema__(:fields)
     end
+  end
+
+  test "database rejects a negative replacement write version", %{
+    actor: actor,
+    identity: identity
+  } do
+    run = run_fixture(actor, identity)
+    item = item_fixture(run)
+    [value_placeholder, id_placeholder] = database_placeholders(2)
+
+    assert {:error, error} =
+             Ecto.Adapters.SQL.query(
+               Repo,
+               "update github_import_repository_items " <>
+                 "set replacement_write_version = #{value_placeholder} " <>
+                 "where id = #{id_placeholder}",
+               [-1, item.id]
+             )
+
+    assert Exception.message(error) =~
+             "github_import_items_replacement_write_version_nonnegative_check"
   end
 
   test "saved and one-time credentials are mutually consistent", %{

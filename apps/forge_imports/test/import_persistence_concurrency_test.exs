@@ -1,8 +1,8 @@
 defmodule ForgeImports.ImportPersistenceConcurrencyTest do
   use ExUnit.Case, async: false
 
-  alias ForgeImports.{ImportRun, RepositoryItem}
-  alias Fornacast.{OperationLease, Repo}
+  alias ForgeImports.{ImportAttempt, ImportRun, Persistence, RepositoryItem, RunView}
+  alias Fornacast.{AuditEvent, OperationLease, Repo}
 
   @moduletag :persistence
   @now ~U[2026-08-26 00:00:00Z]
@@ -173,6 +173,77 @@ defmodule ForgeImports.ImportPersistenceConcurrencyTest do
     end
   end
 
+  test "selection racing start commits one coherent selected plan", %{
+    actor: actor,
+    identity: identity
+  } do
+    {run, item} = database_run(fn -> start_fixture(actor, identity, 9_620_000_001) end)
+
+    [start_result, selection_result] =
+      race([
+        fn ->
+          ForgeImports.start_import(actor, run.id, request_metadata("selection-start"),
+            dispatch: :manual
+          )
+        end,
+        fn -> ForgeImports.update_repository_selection(actor, run.id, []) end
+      ])
+
+    final_run = database_run(fn -> Repo.get!(ImportRun, run.id) end)
+    final_item = database_run(fn -> Repo.get!(RepositoryItem, item.id) end)
+    attempt_count = database_run(fn -> Repo.aggregate(ImportAttempt, :count, :id) end)
+    audit_count = database_run(fn -> Repo.aggregate(AuditEvent, :count, :id) end)
+
+    case {start_result, selection_result} do
+      {{:ok, %RunView{state: :running}}, {:error, :stale}} ->
+        assert final_run.state == :running
+        assert final_run.selected_count == 1
+        assert final_item.selected
+        assert final_item.attempt_count == 1
+        assert attempt_count == 1
+        assert audit_count == 2
+
+      {{:error, :invalid_selection}, {:ok, %RunView{state: :awaiting_resolution}}} ->
+        assert final_run.state == :awaiting_resolution
+        assert final_run.selected_count == 0
+        refute final_item.selected
+        assert final_item.attempt_count == 0
+        assert attempt_count == 0
+        assert audit_count == 0
+    end
+  end
+
+  test "duplicate starts freeze exactly one attempt and one audit pair", %{
+    actor: actor,
+    identity: identity
+  } do
+    {run, item} = database_run(fn -> start_fixture(actor, identity, 9_630_000_001) end)
+
+    results =
+      race([
+        fn ->
+          ForgeImports.start_import(actor, run.id, request_metadata("duplicate-start-a"),
+            dispatch: :manual
+          )
+        end,
+        fn ->
+          ForgeImports.start_import(actor, run.id, request_metadata("duplicate-start-b"),
+            dispatch: :manual
+          )
+        end
+      ])
+
+    assert Enum.count(results, &match?({:ok, %RunView{state: :running}}, &1)) == 1
+    assert Enum.count(results, &(&1 == {:error, :stale})) == 1
+
+    final_run = database_run(fn -> Repo.get!(ImportRun, run.id) end)
+    final_item = database_run(fn -> Repo.get!(RepositoryItem, item.id) end)
+    assert final_run.state == :running
+    assert final_item.attempt_count == 1
+    assert database_run(fn -> Repo.aggregate(ImportAttempt, :count, :id) end) == 1
+    assert database_run(fn -> Repo.aggregate(AuditEvent, :count, :id) end) == 2
+  end
+
   test "discovering-only lease claim racing a terminal transition has one winner", %{
     actor: actor,
     identity: identity
@@ -270,6 +341,58 @@ defmodule ForgeImports.ImportPersistenceConcurrencyTest do
     {:ok, run} = ForgeImports.transition_run(actor, run, :awaiting_resolution)
     {run, item}
   end
+
+  defp start_fixture(actor, identity, github_repository_id) do
+    run =
+      %{
+        actor_user_id: actor.id,
+        source_kind: :repository,
+        github_identity_id: identity.id,
+        credential_source: :one_time,
+        source_owner_github_id: 8_800_000_000 + github_repository_id - 9_600_000_000,
+        source_owner_login: "acme",
+        source_repository_github_id: github_repository_id,
+        source_repository_full_name: "acme/start-#{github_repository_id}",
+        destination_organization_action: :existing,
+        destination_organization_slug: actor.username,
+        destination_organization_status: :clean,
+        state: :awaiting_resolution,
+        selected_count: 1,
+        request_metadata: %{}
+      }
+      |> Persistence.insert_run()
+      |> unwrap!()
+
+    item =
+      %{
+        import_run_id: run.id,
+        github_repository_id: github_repository_id,
+        source_full_name: "acme/start-#{github_repository_id}",
+        source_name: "start-#{github_repository_id}",
+        source_metadata: %{},
+        source_observed_at: @now,
+        selected: true,
+        destination_owner_id: actor.id,
+        destination_slug: "start-#{github_repository_id}",
+        destination_visibility: :private,
+        state: :queued
+      }
+      |> Persistence.insert_repository_item()
+      |> unwrap!()
+
+    {run, item}
+  end
+
+  defp request_metadata(operation) do
+    %{
+      "request_id" => "#{operation}-request",
+      "operation_id" => "#{operation}-operation",
+      "ip_address" => "203.0.113.81",
+      "user_agent" => "import-persistence-concurrency-test"
+    }
+  end
+
+  defp unwrap!({:ok, value}), do: value
 
   defp run_attrs(identity) do
     %{

@@ -1,6 +1,8 @@
 defmodule ForgeRepos.RepositoryLifecycleTest do
   use ExUnit.Case, async: false
 
+  import Ecto.Query
+
   alias Ecto.Adapters.SQL
   alias ForgeRepos.Repository
   alias Fornacast.Repo
@@ -146,6 +148,36 @@ defmodule ForgeRepos.RepositoryLifecycleTest do
     assert repository.storage_reclaimed_at == nil
   end
 
+  test "repository write version defaults to zero and cannot be injected by create changesets" do
+    assert :write_version in Repository.__schema__(:fields)
+
+    base = %Repository{
+      owner_user_id: 41,
+      storage_path: "@test/41/write-version.git",
+      write_version: 77
+    }
+
+    attrs = %{
+      slug: "write-version",
+      name: "Write version",
+      visibility: :private,
+      default_branch: "main",
+      write_version: 99
+    }
+
+    for changeset <- [
+          Repository.create_changeset(base, attrs),
+          Repository.api_create_changeset(base, attrs),
+          Repository.import_changeset(
+            %Repository{write_version: 77},
+            valid_import_attrs() |> Map.put(:write_version, 99)
+          )
+        ] do
+      assert Ecto.Changeset.get_field(changeset, :write_version) == 0
+      assert Ecto.Changeset.get_change(changeset, :write_version) == 0
+    end
+  end
+
   test "database rejects an unknown repository lifecycle" do
     {_owner, repository} = repository_fixture("invalid-lifecycle")
     placeholder = placeholder(1)
@@ -172,6 +204,129 @@ defmodule ForgeRepos.RepositoryLifecycleTest do
              )
 
     assert Exception.message(error) =~ "repositories_generation_positive_check"
+  end
+
+  test "database rejects a negative repository write version" do
+    {_owner, repository} = repository_fixture("invalid-write-version")
+    placeholder = placeholder(1)
+
+    assert {:error, error} =
+             SQL.query(
+               Repo,
+               "update repositories set write_version = #{placeholder} " <>
+                 "where id = #{placeholder(2)}",
+               [-1, repository.id]
+             )
+
+    assert Exception.message(error) =~ "repositories_write_version_nonnegative_check"
+  end
+
+  test "mark pushed atomically advances write version for the same observed repository" do
+    {_owner, repository} = repository_fixture("mark-pushed-version")
+    pushed_at = repository.updated_at
+
+    {first, second} =
+      ForgeRepos.with_test_mark_pushed_clock(fn -> pushed_at end, fn ->
+        assert {:ok, first} = ForgeRepos.mark_pushed(repository, pushed_at)
+        assert {:ok, second} = ForgeRepos.mark_pushed(repository, pushed_at)
+        {first, second}
+      end)
+
+    assert first.write_version >= 1
+    assert second.write_version == 2
+
+    assert %Repository{
+             write_version: 2,
+             last_pushed_at: ^pushed_at,
+             updated_at: ^pushed_at
+           } = Repo.get!(Repository, repository.id)
+  end
+
+  test "mark pushed rolls back before retrying a post-update busy reload" do
+    {_owner, repository} = repository_fixture("mark-pushed-busy-reload")
+    pushed_at = repository.updated_at
+    hook_key = {__MODULE__, make_ref()}
+    Process.put(hook_key, :busy)
+
+    try do
+      hook = fn ->
+        if Process.get(hook_key) == :busy do
+          Process.put(hook_key, :ready)
+          raise Turso.Error, code: :busy, message: "injected post-update busy"
+        end
+      end
+
+      result =
+        ForgeRepos.with_test_mark_pushed_after_update_hook(hook, fn ->
+          ForgeRepos.mark_pushed(repository, pushed_at)
+        end)
+
+      {expected_write_version, expected_pushed_at} =
+        if postgres?() do
+          assert {:error, :unavailable} = result
+          {0, nil}
+        else
+          assert {:ok, %Repository{write_version: 1}} = result
+          {1, pushed_at}
+        end
+
+      assert %Repository{
+               write_version: ^expected_write_version,
+               last_pushed_at: ^expected_pushed_at
+             } = Repo.get!(Repository, repository.id)
+    after
+      Process.delete(hook_key)
+    end
+  end
+
+  test "mark pushed rolls back when the post-update reload stays unavailable" do
+    {_owner, repository} = repository_fixture("mark-pushed-unavailable-reload")
+    pushed_at = DateTime.add(repository.updated_at, 10, :second)
+
+    hook = fn ->
+      raise Turso.Error, code: :busy, message: "injected persistent post-update busy"
+    end
+
+    assert {:error, :unavailable} =
+             ForgeRepos.with_test_mark_pushed_after_update_hook(hook, fn ->
+               ForgeRepos.mark_pushed(repository, pushed_at)
+             end)
+
+    assert %Repository{
+             lifecycle: :ready,
+             write_version: 0,
+             last_pushed_at: nil,
+             updated_at: original_updated_at
+           } = Repo.get!(Repository, repository.id)
+
+    assert original_updated_at == repository.updated_at
+  end
+
+  test "mark pushed rolls back and reports stale when lifecycle changes before reload" do
+    {_owner, repository} = repository_fixture("mark-pushed-stale-reload")
+    pushed_at = DateTime.add(repository.updated_at, 10, :second)
+
+    hook = fn ->
+      assert {1, _rows} =
+               Repo.update_all(
+                 from(candidate in Repository, where: candidate.id == ^repository.id),
+                 set: [lifecycle: :tombstoned]
+               )
+    end
+
+    assert {:error, :stale_repository} =
+             ForgeRepos.with_test_mark_pushed_after_update_hook(hook, fn ->
+               ForgeRepos.mark_pushed(repository, pushed_at)
+             end)
+
+    assert %Repository{
+             lifecycle: :ready,
+             write_version: 0,
+             last_pushed_at: nil,
+             updated_at: original_updated_at
+           } = Repo.get!(Repository, repository.id)
+
+    assert original_updated_at == repository.updated_at
   end
 
   defp valid_import_attrs do
@@ -250,15 +405,29 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
   alias Fornacast.Repo
 
   @version 20_260_825_000_400
+  @write_version 20_260_825_000_410
   @pre_version 20_260_825_000_370
   @migrations_path Path.expand("../../fornacast/priv/repo/migrations", __DIR__)
   @migration_path Path.join(
                     @migrations_path,
                     "20260825000400_add_repository_import_lifecycle.exs"
                   )
+  @write_migration_path Path.join(
+                          @migrations_path,
+                          "20260825000410_add_repository_write_version.exs"
+                        )
 
   test "00400 declares explicit adapter-safe up and down paths" do
     source = File.read!(@migration_path)
+
+    assert source =~ "def up do"
+    assert source =~ "def down do"
+    assert source =~ "# TODO(upstream): gsmlg-dev/concord#81"
+    refute source =~ "def change do"
+  end
+
+  test "00410 declares explicit adapter-safe up and down paths" do
+    source = File.read!(@write_migration_path)
 
     assert source =~ "def up do"
     assert source =~ "def down do"
@@ -273,6 +442,10 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
     seed = repository_seed()
 
     try do
+      if postgres?() and migration_applied?(migration_repo, @write_version) do
+        assert [@write_version] = migrate_down(migration_repo, @write_version)
+      end
+
       if postgres?() and migration_applied?(migration_repo, @version) do
         assert [@version] = migrate_down(migration_repo, @version)
       end
@@ -286,6 +459,7 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
     after
       if postgres?() do
         ensure_up!(migration_repo, @version)
+        ensure_up!(migration_repo, @write_version)
         delete_seed!(migration_repo, seed)
       end
     end
@@ -294,6 +468,11 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
   @tag :tmp_dir
   test "00400 rollback is pre-DDL guarded on Turso and exact on PostgreSQL", context do
     migration_repo = start_migration_repo!(context)
+
+    if postgres?() and migration_applied?(migration_repo, @write_version) do
+      assert [@write_version] = migrate_down(migration_repo, @write_version)
+    end
+
     ensure_up!(migration_repo, @version)
 
     try do
@@ -319,7 +498,83 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
         assert_final_schema!(migration_repo)
       end
     after
-      if postgres?(), do: ensure_up!(migration_repo, @version)
+      if postgres?() do
+        ensure_up!(migration_repo, @version)
+        ensure_up!(migration_repo, @write_version)
+      end
+    end
+  end
+
+  @tag :tmp_dir
+  test "00410 upgrades existing repository and import-item write observations", context do
+    migration_repo = start_migration_repo!(context)
+    seed = write_version_seed()
+
+    try do
+      if postgres?() and migration_applied?(migration_repo, @write_version) do
+        assert [@write_version] = migrate_down(migration_repo, @write_version)
+      end
+
+      ensure_up!(migration_repo, @version)
+      refute table_column_exists?(migration_repo, "repositories", "write_version")
+
+      refute table_column_exists?(
+               migration_repo,
+               "github_import_repository_items",
+               "replacement_write_version"
+             )
+
+      seeded = seed_pre_00410_rows!(migration_repo, seed)
+
+      assert [@write_version] = migrate_up(migration_repo, @write_version)
+      assert write_version_projection(migration_repo, seeded) == {0, nil}
+      assert_write_version_schema!(migration_repo)
+    after
+      if postgres?() do
+        ensure_up!(migration_repo, @write_version)
+        delete_write_version_seed!(migration_repo, seed)
+      end
+    end
+  end
+
+  @tag :tmp_dir
+  test "00410 rollback is pre-DDL guarded on Turso and exact on PostgreSQL", context do
+    migration_repo = start_migration_repo!(context)
+    ensure_up!(migration_repo, @version)
+    ensure_up!(migration_repo, @write_version)
+
+    try do
+      if postgres?() do
+        assert [@write_version] = migrate_down(migration_repo, @write_version)
+        refute migration_applied?(migration_repo, @write_version)
+        refute table_column_exists?(migration_repo, "repositories", "write_version")
+
+        refute table_column_exists?(
+                 migration_repo,
+                 "github_import_repository_items",
+                 "replacement_write_version"
+               )
+
+        refute constraint_exists?(migration_repo, "repositories_write_version_nonnegative_check")
+
+        refute constraint_exists?(
+                 migration_repo,
+                 "github_import_repository_items",
+                 "github_import_items_replacement_write_version_nonnegative_check"
+               )
+
+        assert [@write_version] = migrate_up(migration_repo, @write_version)
+        assert_write_version_schema!(migration_repo)
+      else
+        assert_raise RuntimeError,
+                     "Turso rollback is disabled until gsmlg-dev/concord#81 is resolved",
+                     fn -> migrate_down(migration_repo, @write_version) end
+
+        assert migration_applied?(migration_repo, @write_version)
+        assert_write_version_schema!(migration_repo)
+      end
+    after
+      if postgres?(), do: ensure_up!(migration_repo, @write_version)
     end
   end
 
@@ -348,6 +603,105 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
   defp repository_seed do
     suffix = System.unique_integer([:positive])
     %{username: "lifecycle-upgrade-#{suffix}", slug: "upgrade-#{suffix}"}
+  end
+
+  defp write_version_seed do
+    suffix = System.unique_integer([:positive])
+
+    %{
+      suffix: suffix,
+      username: "write-version-upgrade-#{suffix}",
+      slug: "write-version-#{suffix}"
+    }
+  end
+
+  defp seed_pre_00410_rows!(repo, seed) do
+    %{repository_id: repository_id} = seed_pre_00400_repository!(repo, seed)
+    now = database_datetime(DateTime.utc_now(:second))
+    user_id = select_id!(repo, "users", "username", seed.username)
+
+    identity_params = [
+      "user",
+      8_900_000_000 + seed.suffix,
+      seed.username,
+      user_id,
+      now,
+      now
+    ]
+
+    SQL.query!(
+      repo,
+      "insert into github_identities " <>
+        "(kind, github_user_id, login, local_user_id, inserted_at, updated_at) " <>
+        "values (#{Enum.join(placeholders(length(identity_params)), ", ")})",
+      identity_params
+    )
+
+    identity_id = select_id!(repo, "github_identities", "login", seed.username)
+
+    run_params = [
+      user_id,
+      "repository",
+      identity_id,
+      "one_time",
+      8_900_000_000 + seed.suffix,
+      seed.username,
+      9_900_000_000 + seed.suffix,
+      "#{seed.username}/#{seed.slug}",
+      "existing",
+      seed.username,
+      "awaiting_resolution",
+      now,
+      now
+    ]
+
+    SQL.query!(
+      repo,
+      "insert into github_import_runs " <>
+        "(actor_user_id, source_kind, github_identity_id, credential_source, " <>
+        "source_owner_github_id, source_owner_login, source_repository_github_id, " <>
+        "source_repository_full_name, destination_organization_action, " <>
+        "destination_organization_slug, state, inserted_at, updated_at) " <>
+        "values (#{Enum.join(placeholders(length(run_params)), ", ")})",
+      run_params
+    )
+
+    run_id = select_id!(repo, "github_import_runs", "source_owner_login", seed.username)
+
+    item_params = [
+      run_id,
+      9_900_000_000 + seed.suffix,
+      "#{seed.username}/#{seed.slug}",
+      seed.slug,
+      now,
+      "queued",
+      now,
+      now
+    ]
+
+    SQL.query!(
+      repo,
+      "insert into github_import_repository_items " <>
+        "(import_run_id, github_repository_id, source_full_name, source_name, " <>
+        "source_observed_at, state, inserted_at, updated_at) " <>
+        "values (#{Enum.join(placeholders(length(item_params)), ", ")})",
+      item_params
+    )
+
+    item_id =
+      select_id!(
+        repo,
+        "github_import_repository_items",
+        "github_repository_id",
+        9_900_000_000 + seed.suffix
+      )
+
+    %{
+      repository_id: repository_id,
+      item_id: item_id,
+      run_id: run_id,
+      identity_id: identity_id
+    }
   end
 
   defp seed_pre_00400_repository!(repo, seed) do
@@ -417,6 +771,46 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
     assert active_owner_slug_index_preserved?(repo)
   end
 
+  defp assert_write_version_schema!(repo) do
+    assert table_column_contract(repo, "repositories", "write_version") == {false, "0"}
+
+    assert table_column_contract(
+             repo,
+             "github_import_repository_items",
+             "replacement_write_version"
+           ) == {true, nil}
+
+    assert constraint_exists?(repo, "repositories_write_version_nonnegative_check")
+
+    assert constraint_exists?(
+             repo,
+             "github_import_repository_items",
+             "github_import_items_replacement_write_version_nonnegative_check"
+           )
+  end
+
+  defp write_version_projection(repo, seeded) do
+    repository_placeholder = List.first(placeholders(1))
+    item_placeholder = List.first(placeholders(1))
+
+    %{rows: [[write_version]]} =
+      SQL.query!(
+        repo,
+        "select write_version from repositories where id = #{repository_placeholder}",
+        [seeded.repository_id]
+      )
+
+    %{rows: [[replacement_write_version]]} =
+      SQL.query!(
+        repo,
+        "select replacement_write_version from github_import_repository_items " <>
+          "where id = #{item_placeholder}",
+        [seeded.item_id]
+      )
+
+    {write_version, replacement_write_version}
+  end
+
   defp repository_projection(repo, repository_id) do
     placeholder = List.first(placeholders(1))
 
@@ -432,18 +826,22 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
   end
 
   defp column_contract(repo, column) do
+    table_column_contract(repo, "repositories", column)
+  end
+
+  defp table_column_contract(repo, table, column) do
     if postgres?() do
       %{rows: [[nullable, default]]} =
         SQL.query!(
           repo,
           "select is_nullable, column_default from information_schema.columns " <>
             "where table_schema = current_schema() and table_name = $1 and column_name = $2",
-          ["repositories", column]
+          [table, column]
         )
 
       {nullable == "YES", normalize_default(default)}
     else
-      %{rows: rows} = SQL.query!(repo, "pragma table_info('repositories')", [])
+      %{rows: rows} = SQL.query!(repo, "pragma table_info('#{table}')", [])
       row = Enum.find(rows, &(Enum.at(&1, 1) == column))
       {Enum.at(row, 3) == 0, normalize_default(Enum.at(row, 4))}
     end
@@ -461,7 +859,9 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
     |> String.trim("'")
   end
 
-  defp constraint_exists?(repo, name) do
+  defp constraint_exists?(repo, name), do: constraint_exists?(repo, "repositories", name)
+
+  defp constraint_exists?(repo, table, name) do
     if postgres?() do
       %{rows: [[exists?]]} =
         SQL.query!(repo, "select exists (select 1 from pg_constraint where conname = $1)", [
@@ -474,7 +874,7 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
         SQL.query!(
           repo,
           "select sql from sqlite_schema where type = 'table' and name = ?",
-          ["repositories"]
+          [table]
         )
 
       String.contains?(sql, name)
@@ -558,18 +958,22 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
   end
 
   defp column_exists?(repo, column) do
+    table_column_exists?(repo, "repositories", column)
+  end
+
+  defp table_column_exists?(repo, table, column) do
     if postgres?() do
       %{rows: [[exists?]]} =
         SQL.query!(
           repo,
           "select exists (select 1 from information_schema.columns " <>
             "where table_schema = current_schema() and table_name = $1 and column_name = $2)",
-          ["repositories", column]
+          [table, column]
         )
 
       exists?
     else
-      %{rows: rows} = SQL.query!(repo, "pragma table_info('repositories')", [])
+      %{rows: rows} = SQL.query!(repo, "pragma table_info('#{table}')", [])
       Enum.any?(rows, &(Enum.at(&1, 1) == column))
     end
   end
@@ -605,6 +1009,23 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
   end
 
   defp delete_seed!(repo, seed) do
+    SQL.query!(repo, "delete from repositories where slug = $1", [seed.slug])
+    SQL.query!(repo, "delete from users where username = $1", [seed.username])
+  end
+
+  defp delete_write_version_seed!(repo, seed) do
+    SQL.query!(
+      repo,
+      "delete from github_import_repository_items where import_run_id in " <>
+        "(select id from github_import_runs where source_owner_login = $1)",
+      [seed.username]
+    )
+
+    SQL.query!(repo, "delete from github_import_runs where source_owner_login = $1", [
+      seed.username
+    ])
+
+    SQL.query!(repo, "delete from github_identities where login = $1", [seed.username])
     SQL.query!(repo, "delete from repositories where slug = $1", [seed.slug])
     SQL.query!(repo, "delete from users where username = $1", [seed.username])
   end

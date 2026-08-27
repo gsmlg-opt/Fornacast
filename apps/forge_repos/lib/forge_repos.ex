@@ -4,7 +4,6 @@ defmodule ForgeRepos do
   """
 
   import Ecto.Query
-  import Ecto.Changeset, only: [change: 2]
 
   alias Ecto.Changeset
   alias Ecto.Multi
@@ -451,10 +450,110 @@ defmodule ForgeRepos do
 
   def mark_pushed(%Repository{} = repository, pushed_at \\ DateTime.utc_now()) do
     pushed_at = DateTime.truncate(pushed_at, :second)
+    mark_pushed(repository, pushed_at, mark_pushed_now(), @receive_pack_busy_attempts)
+  end
 
-    repository
-    |> change(last_pushed_at: pushed_at)
-    |> Repo.update()
+  if Mix.env() == :test do
+    @mark_pushed_clock_key {__MODULE__, :mark_pushed_clock}
+    @mark_pushed_after_update_hook_key {__MODULE__, :mark_pushed_after_update_hook}
+
+    @doc false
+    def with_test_mark_pushed_clock(clock, fun)
+        when is_function(clock, 0) and is_function(fun, 0) do
+      previous = Process.get(@mark_pushed_clock_key)
+      Process.put(@mark_pushed_clock_key, clock)
+
+      try do
+        fun.()
+      after
+        if previous == nil,
+          do: Process.delete(@mark_pushed_clock_key),
+          else: Process.put(@mark_pushed_clock_key, previous)
+      end
+    end
+
+    @doc false
+    def with_test_mark_pushed_after_update_hook(hook, fun)
+        when is_function(hook, 0) and is_function(fun, 0) do
+      previous = Process.get(@mark_pushed_after_update_hook_key)
+      Process.put(@mark_pushed_after_update_hook_key, hook)
+
+      try do
+        fun.()
+      after
+        if previous == nil,
+          do: Process.delete(@mark_pushed_after_update_hook_key),
+          else: Process.put(@mark_pushed_after_update_hook_key, previous)
+      end
+    end
+
+    defp mark_pushed_now do
+      case Process.get(@mark_pushed_clock_key) do
+        clock when is_function(clock, 0) -> clock.()
+        nil -> DateTime.utc_now()
+      end
+      |> DateTime.truncate(:second)
+    end
+
+    defp mark_pushed_after_update do
+      case Process.get(@mark_pushed_after_update_hook_key) do
+        hook when is_function(hook, 0) -> hook.()
+        nil -> :ok
+      end
+    end
+  else
+    defp mark_pushed_now, do: DateTime.utc_now(:second)
+    defp mark_pushed_after_update, do: :ok
+  end
+
+  defp mark_pushed(repository, pushed_at, updated_at, attempts_remaining) do
+    query =
+      from candidate in Repository,
+        where:
+          candidate.id == ^repository.id and candidate.generation == ^repository.generation and
+            candidate.lifecycle == :ready and is_nil(candidate.deleted_at)
+
+    Multi.new()
+    |> Multi.update_all(:mutation, query,
+      set: [last_pushed_at: pushed_at, updated_at: updated_at],
+      inc: [write_version: 1]
+    )
+    |> Multi.run(:mutation_guard, fn _repo, %{mutation: mutation} ->
+      case mutation do
+        {1, _rows} -> {:ok, :updated}
+        {0, _rows} -> {:error, :stale_repository}
+      end
+    end)
+    |> Multi.run(:after_update, fn _repo, _changes ->
+      mark_pushed_after_update()
+      {:ok, :complete}
+    end)
+    |> Multi.run(:repository, fn repo, _changes ->
+      case repo.one(query) do
+        %Repository{} = updated -> {:ok, updated}
+        nil -> {:error, :stale_repository}
+      end
+    end)
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{repository: updated}} ->
+        {:ok, updated}
+
+      {:error, _step, :stale_repository, _changes} ->
+        {:error, :stale_repository}
+
+      {:error, _step, _reason, _changes} ->
+        {:error, :unavailable}
+    end
+  rescue
+    error in Turso.Error ->
+      if turso_adapter?() and error.code == :busy and attempts_remaining > 1 do
+        attempt = @receive_pack_busy_attempts - attempts_remaining + 1
+        Process.sleep(attempt * @receive_pack_busy_backoff_ms)
+        mark_pushed(repository, pushed_at, updated_at, attempts_remaining - 1)
+      else
+        {:error, :unavailable}
+      end
   end
 
   @spec prepare_receive_pack_operations(

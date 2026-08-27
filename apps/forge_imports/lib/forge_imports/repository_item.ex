@@ -23,6 +23,15 @@ defmodule ForgeImports.RepositoryItem do
     :failed
   ]
   @terminal_states [:completed, :skipped, :canceled, :failed]
+  @destination_drift_states [
+    :queued,
+    :staging_git,
+    :git_staged,
+    :staging_metadata,
+    :ready_to_publish,
+    :publishing,
+    :awaiting_credential
+  ]
   @visibilities [:private, :public]
   @conflict_actions [:skip, :rename, :replace]
   @max_id 9_223_372_036_854_775_807
@@ -49,6 +58,19 @@ defmodule ForgeImports.RepositoryItem do
                        :wait_reason,
                        :warning_count
                      ]
+  @conflict_resolution_fields [
+    :destination_slug,
+    :conflict_action,
+    :replacement_repository_id,
+    :replacement_owner_id,
+    :replacement_storage_path,
+    :replacement_generation,
+    :replacement_write_version,
+    :replacement_updated_at,
+    :replacement_last_pushed_at,
+    :state,
+    :wait_reason
+  ]
   @transition_fields [
     :resume_state,
     :wait_reason,
@@ -136,6 +158,7 @@ defmodule ForgeImports.RepositoryItem do
     field :replacement_owner_id, :integer
     field :replacement_storage_path, :string, redact: true
     field :replacement_generation, :integer
+    field :replacement_write_version, :integer
     field :replacement_updated_at, :utc_datetime
     field :replacement_last_pushed_at, :utc_datetime
     field :hidden_repository_id, :integer
@@ -164,6 +187,8 @@ defmodule ForgeImports.RepositoryItem do
 
     timestamps(type: :utc_datetime)
   end
+
+  @type t :: %__MODULE__{}
 
   def states, do: @states
   def terminal_states, do: @terminal_states
@@ -232,6 +257,7 @@ defmodule ForgeImports.RepositoryItem do
       :replacement_owner_id,
       :replacement_storage_path,
       :replacement_generation,
+      :replacement_write_version,
       :replacement_updated_at,
       :replacement_last_pushed_at,
       :hidden_repository_id,
@@ -291,6 +317,7 @@ defmodule ForgeImports.RepositoryItem do
     |> validate_positive_id(:replacement_owner_id)
     |> validate_positive_id(:hidden_repository_id)
     |> validate_number(:replacement_generation, greater_than: 0)
+    |> validate_number(:replacement_write_version, greater_than_or_equal_to: 0)
     |> validate_number(:lock_version, greater_than: 0)
     |> validate_number(:attempt_count, greater_than_or_equal_to: 0)
     |> validate_number(:cleanup_attempt_count, greater_than_or_equal_to: 0)
@@ -338,6 +365,104 @@ defmodule ForgeImports.RepositoryItem do
 
   def destination_changeset(item, _attrs),
     do: item |> change() |> add_error(:state, "cannot change the destination")
+
+  @doc false
+  def conflict_resolution_changeset(
+        %__MODULE__{selected: true, state: state} = item,
+        attrs
+      )
+      when state in [:queued, :awaiting_resolution] and is_map(attrs) do
+    if only_keys?(attrs, @conflict_resolution_fields) do
+      item
+      |> cast(attrs, @conflict_resolution_fields)
+      |> validate_required([:state])
+      |> validate_inclusion(:state, [:queued])
+      |> validate_inclusion(:conflict_action, @conflict_actions)
+      |> validate_positive_id(:replacement_repository_id)
+      |> validate_positive_id(:replacement_owner_id)
+      |> validate_number(:replacement_generation, greater_than: 0)
+      |> validate_number(:replacement_write_version, greater_than_or_equal_to: 0)
+      |> validate_strings()
+      |> validate_repository_evidence()
+      |> validate_conflict_fingerprint()
+      |> validate_conflict_resolution()
+      |> map_constraints()
+    else
+      item |> change() |> add_error(:base, "contains immutable fields")
+    end
+  end
+
+  def conflict_resolution_changeset(item, _attrs),
+    do: item |> change() |> add_error(:state, "cannot resolve this repository")
+
+  @doc false
+  def freeze_attempt_changeset(
+        %__MODULE__{selected: true, state: :queued} = item,
+        action,
+        attempt_number
+      )
+      when action in [:create, :skip, :rename, :replace] and is_integer(attempt_number) do
+    cond do
+      attempt_number != item.attempt_count + 1 ->
+        item |> change() |> add_error(:attempt_count, "is stale")
+
+      not coherent_frozen_action?(item, action) ->
+        item |> change() |> add_error(:conflict_action, "does not match the resolved decision")
+
+      true ->
+        item
+        |> change(
+          state: if(action == :skip, do: :skipped, else: :queued),
+          attempt_count: attempt_number,
+          wait_reason: nil,
+          next_attempt_at: nil,
+          lease_owner: nil,
+          lease_expires_at: nil
+        )
+        |> validate_number(:attempt_count, greater_than: 0)
+        |> validate_lifecycle()
+    end
+  end
+
+  def freeze_attempt_changeset(item, _action, _attempt_number),
+    do: item |> change() |> add_error(:state, "cannot freeze this repository")
+
+  @doc false
+  def destination_drift_changeset(
+        %__MODULE__{selected: true, state: state} = item,
+        action
+      )
+      when state in @destination_drift_states and action in [:create, :rename, :replace] do
+    if coherent_frozen_action?(item, action) do
+      item
+      |> change(
+        conflict_action: nil,
+        replacement_repository_id: nil,
+        replacement_owner_id: nil,
+        replacement_storage_path: nil,
+        replacement_generation: nil,
+        replacement_write_version: nil,
+        replacement_updated_at: nil,
+        replacement_last_pushed_at: nil,
+        state: :awaiting_resolution,
+        resume_state: nil,
+        wait_reason: "destination_changed",
+        next_attempt_at: nil,
+        lease_owner: nil,
+        lease_expires_at: nil,
+        failure_kind: nil,
+        failure_detail: nil
+      )
+      |> validate_conflict_fingerprint()
+      |> validate_lifecycle()
+      |> validate_resume_state()
+    else
+      item |> change() |> add_error(:conflict_action, "does not match the frozen decision")
+    end
+  end
+
+  def destination_drift_changeset(item, _action),
+    do: item |> change() |> add_error(:state, "cannot reopen this repository")
 
   def transition_changeset(item, target, attrs) when is_atom(target) and is_map(attrs) do
     build_transition_changeset(item, target, attrs, clear_lease?: true)
@@ -489,6 +614,7 @@ defmodule ForgeImports.RepositoryItem do
       :replacement_owner_id,
       :replacement_storage_path,
       :replacement_generation,
+      :replacement_write_version,
       :replacement_updated_at
     ]
 
@@ -507,6 +633,26 @@ defmodule ForgeImports.RepositoryItem do
         changeset
     end
   end
+
+  defp validate_conflict_resolution(changeset) do
+    action = get_field(changeset, :conflict_action)
+    slug = get_field(changeset, :destination_slug)
+
+    cond do
+      action == :skip ->
+        changeset
+
+      action in [nil, :rename, :replace] and Repository.canonical_slug?(slug) ->
+        changeset
+
+      true ->
+        add_error(changeset, :destination_slug, "is required for this decision")
+    end
+  end
+
+  defp coherent_frozen_action?(%__MODULE__{conflict_action: nil}, :create), do: true
+  defp coherent_frozen_action?(%__MODULE__{conflict_action: action}, action), do: true
+  defp coherent_frozen_action?(_item, _action), do: false
 
   defp validate_repository_evidence(changeset) do
     changeset
@@ -611,6 +757,9 @@ defmodule ForgeImports.RepositoryItem do
     )
     |> check_constraint(:github_repository_id,
       name: :github_import_items_repository_id_positive_check
+    )
+    |> check_constraint(:replacement_write_version,
+      name: :github_import_items_replacement_write_version_nonnegative_check
     )
   end
 

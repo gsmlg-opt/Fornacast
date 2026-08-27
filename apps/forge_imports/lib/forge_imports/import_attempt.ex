@@ -131,6 +131,9 @@ defmodule ForgeImports.ImportAttempt do
   defp valid_decision?(%{"action" => "skip"} = decision),
     do: exact_keys?(decision, ~w(action))
 
+  defp valid_decision?(%{"action" => "create", "slug" => slug} = decision),
+    do: exact_keys?(decision, ~w(action slug)) and valid_slug?(slug)
+
   defp valid_decision?(%{"action" => "rename", "slug" => slug} = decision),
     do: exact_keys?(decision, ~w(action slug)) and valid_slug?(slug)
 
@@ -142,6 +145,7 @@ defmodule ForgeImports.ImportAttempt do
            "replacement_owner_id" => owner_id,
            "replacement_storage_path" => storage_path,
            "replacement_generation" => generation,
+           "replacement_write_version" => write_version,
            "replacement_updated_at" => updated_at,
            "replacement_last_pushed_at" => last_pushed_at
          } = decision
@@ -153,10 +157,12 @@ defmodule ForgeImports.ImportAttempt do
       "replacement_owner_id",
       "replacement_storage_path",
       "replacement_generation",
+      "replacement_write_version",
       "replacement_updated_at",
       "replacement_last_pushed_at"
     ]) and valid_slug?(slug) and positive_id?(repository_id) and positive_id?(owner_id) and
-      positive_id?(generation) and valid_storage_path?(storage_path) and
+      positive_id?(generation) and nonnegative_integer?(write_version) and
+      valid_storage_path?(storage_path) and
       valid_timestamp?(updated_at) and valid_optional_timestamp?(last_pushed_at)
   end
 
@@ -171,6 +177,7 @@ defmodule ForgeImports.ImportAttempt do
   end
 
   defp positive_id?(value), do: is_integer(value) and value > 0
+  defp nonnegative_integer?(value), do: is_integer(value) and value >= 0
 
   defp valid_storage_path?(value) do
     ForgeImports.SafeValue.safe_string?(value, 1_024, required?: true) and

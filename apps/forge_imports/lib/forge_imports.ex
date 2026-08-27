@@ -7,6 +7,7 @@ defmodule ForgeImports do
   alias ForgeAccounts.GitHubCredentialVault.Envelope
 
   alias ForgeImports.{
+    Conflicts,
     GitHubAccounts,
     ImportRun,
     OneTimeCredential,
@@ -70,6 +71,15 @@ defmodule ForgeImports do
   def get_run_view(%User{} = actor, id), do: get_run(actor, id)
 
   def get_run_view(_actor, _id), do: {:error, :not_found}
+
+  def resolve_repository_conflicts(actor, run_id, decisions, request_metadata),
+    do: Conflicts.resolve(actor, run_id, decisions, request_metadata)
+
+  def start_import(actor, run_id, request_metadata, opts \\ []),
+    do: Conflicts.start(actor, run_id, request_metadata, opts)
+
+  def mark_destination_changed(actor, run_id, item_reference, request_metadata),
+    do: Conflicts.destination_changed(actor, run_id, item_reference, request_metadata)
 
   defp read_run_view(actor, id, attempts_left) do
     with {:ok, active_actor} <- active_actor(actor),

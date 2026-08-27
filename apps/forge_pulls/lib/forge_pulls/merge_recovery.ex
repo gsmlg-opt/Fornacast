@@ -15,6 +15,7 @@ defmodule ForgePulls.MergeRecovery do
   @lease_seconds 30
   @terminal_states [:completed, :failed]
   @iteration_clock_key {__MODULE__, :iteration_clock}
+  @completion_clock_key {__MODULE__, :completion_clock}
   @lease_owner_key {__MODULE__, :lease_owner}
   @claim_observer_key {__MODULE__, :claim_observer}
 
@@ -34,6 +35,19 @@ defmodule ForgePulls.MergeRecovery do
         if previous == nil,
           do: Process.delete(@complete_multi_hook_key),
           else: Process.put(@complete_multi_hook_key, previous)
+      end
+    end
+
+    @doc false
+    def with_test_completion_clock(clock, fun)
+        when is_function(clock, 0) and is_function(fun, 0) do
+      previous = Process.get(@completion_clock_key)
+      Process.put(@completion_clock_key, clock)
+
+      try do
+        fun.()
+      after
+        restore_process_value(@completion_clock_key, previous)
       end
     end
 
@@ -385,7 +399,7 @@ defmodule ForgePulls.MergeRecovery do
   end
 
   defp complete_transaction(repository, operation) do
-    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    now = completion_now()
     actor = load_actor(operation.actor_user_id)
     pull = Repo.get!(PullRequest, operation.pull_request_id)
 
@@ -443,7 +457,8 @@ defmodule ForgePulls.MergeRecovery do
           "state_reason" => "completed"
         })
         |> Multi.update_all(:repository, repository_query,
-          set: [last_pushed_at: now, updated_at: now]
+          set: [last_pushed_at: now, updated_at: now],
+          inc: [write_version: 1]
         )
         |> require_one(:repository)
         |> Audit.record_multi(
@@ -499,6 +514,14 @@ defmodule ForgePulls.MergeRecovery do
       owner when is_binary(owner) and owner != "" -> owner
       nil -> "pull-merge-recovery:#{node()}:#{inspect(self())}:#{repository_id}"
     end
+  end
+
+  defp completion_now do
+    case Process.get(@completion_clock_key) do
+      clock when is_function(clock, 0) -> clock.()
+      nil -> DateTime.utc_now()
+    end
+    |> DateTime.truncate(:second)
   end
 
   defp iteration_now do

@@ -920,6 +920,7 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
       "replacement_owner_id" => actor.id,
       "replacement_storage_path" => "@hashed/aa/bb/demo.git",
       "replacement_generation" => 3,
+      "replacement_write_version" => 7,
       "replacement_updated_at" => @now,
       "replacement_last_pushed_at" => nil
     }
@@ -986,6 +987,7 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
           Map.put(valid_replace_decision, "slug", "demo."),
           Map.put(valid_replace_decision, "slug", String.duplicate("a", 64)),
           Map.put(valid_replace_decision, "replacement_updated_at", "not-a-time"),
+          Map.put(valid_replace_decision, "replacement_write_version", -1),
           Map.put(valid_replace_decision, "replacement_last_pushed_at", "not-a-time"),
           Map.delete(valid_replace_decision, "replacement_owner_id"),
           Map.delete(valid_replace_decision, "replacement_last_pushed_at"),
@@ -1008,6 +1010,7 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
         replacement_owner_id: actor.id,
         replacement_storage_path: "@hashed/aa/bb/demo.git",
         replacement_generation: 3,
+        replacement_write_version: 7,
         replacement_updated_at: @now,
         replacement_last_pushed_at: nil
       })
@@ -1033,6 +1036,7 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
           :replacement_owner_id,
           :replacement_storage_path,
           :replacement_generation,
+          :replacement_write_version,
           :replacement_updated_at
         ] do
       changeset =

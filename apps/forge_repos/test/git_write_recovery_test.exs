@@ -87,6 +87,45 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
              )
   end
 
+  test "same-second multi-ref completions advance the monotonic write version", context do
+    completed_at = ~U[2026-08-27 01:45:00Z]
+    first_ref = "refs/heads/same-second-first"
+    second_ref = "refs/heads/same-second-second"
+    update_ref(context.path, context.proposed_oid, first_ref)
+    update_ref(context.path, context.proposed_oid, second_ref)
+
+    first =
+      operation!(context, :ref_advanced,
+        kind: :receive_pack,
+        actor_user_id: context.owner.id,
+        request_id: "same-second-receive",
+        target_ref: first_ref
+      )
+
+    second =
+      operation!(context, :ref_advanced,
+        kind: :receive_pack,
+        actor_user_id: context.owner.id,
+        request_id: "same-second-receive",
+        target_ref: second_ref
+      )
+
+    assert :ok =
+             GitWriteRecovery.with_test_completion_clock(
+               fn -> completed_at end,
+               fn -> locked_reconcile(context) end
+             )
+
+    assert Repo.get!(GitWriteOperation, first.id).state == :bookkeeping_complete
+    assert Repo.get!(GitWriteOperation, second.id).state == :bookkeeping_complete
+
+    assert %Repository{
+             write_version: 2,
+             last_pushed_at: ^completed_at,
+             updated_at: ^completed_at
+           } = Repo.get!(Repository, context.repository.id)
+  end
+
   test "prepared receive-pack refs reconcile proposed and expected outcomes idempotently",
        context do
     proposed_ref = "refs/heads/receive-proposed"
@@ -157,7 +196,9 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
     assert %GitWriteOperation{state: :ref_advanced, failure_reason: nil} =
              Repo.get!(GitWriteOperation, operation.id)
 
-    assert is_nil(Repo.get!(Repository, context.repository.id).last_pushed_at)
+    assert %Repository{last_pushed_at: nil, write_version: 0} =
+             Repo.get!(Repository, context.repository.id)
+
     refute Repo.get_by(AuditEvent, operation_id: "git_write:#{operation.id}")
   end
 
@@ -375,7 +416,9 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
     assert %{state: :ref_advanced, lease_owner: nil} =
              Repo.get!(GitWriteOperation, operation.id)
 
-    assert is_nil(Repo.get!(Repository, context.repository.id).last_pushed_at)
+    assert %Repository{last_pushed_at: nil, write_version: 0} =
+             Repo.get!(Repository, context.repository.id)
+
     assert Repo.aggregate(AuditEvent, :count, :id) == 0
 
     assert {:ok, :cached} =

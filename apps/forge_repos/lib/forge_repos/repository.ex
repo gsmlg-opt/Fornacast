@@ -41,6 +41,7 @@ defmodule ForgeRepos.Repository do
     field :deleted_at, :utc_datetime
     field :lifecycle, Ecto.Enum, values: @lifecycles, default: :ready
     field :generation, :integer, default: 1
+    field :write_version, :integer, default: 0
     field :storage_reclaimed_at, :utc_datetime
 
     timestamps(type: :utc_datetime)
@@ -49,6 +50,7 @@ defmodule ForgeRepos.Repository do
   def create_changeset(repository, attrs) do
     repository
     |> cast(attrs, @api_fields)
+    |> put_change(:write_version, 0)
     |> validate_required([
       :owner_user_id,
       :slug,
@@ -67,6 +69,7 @@ defmodule ForgeRepos.Repository do
   def import_changeset(%__MODULE__{id: nil} = repository, attrs) do
     repository
     |> cast(attrs, @import_fields)
+    |> put_change(:write_version, 0)
     |> validate_required(@import_fields)
     |> validate_explicit_import_fields(attrs)
     |> validate_repository_fields()
@@ -86,6 +89,7 @@ defmodule ForgeRepos.Repository do
   def api_create_changeset(repository, attrs) do
     repository
     |> cast(attrs, @api_fields)
+    |> put_change(:write_version, 0)
     |> validate_required([
       :owner_user_id,
       :slug,
@@ -125,7 +129,9 @@ defmodule ForgeRepos.Repository do
     |> validate_length(:description, max: 500)
     |> validate_no_nul([:name, :description, :default_branch])
     |> validate_inclusion(:visibility, @visibilities)
+    |> validate_number(:write_version, greater_than_or_equal_to: 0)
     |> validate_format(:default_branch, ~r/^[A-Za-z0-9._\/-]+$/)
+    |> check_constraint(:write_version, name: :repositories_write_version_nonnegative_check)
   end
 
   defp validate_explicit_import_fields(changeset, attrs) do

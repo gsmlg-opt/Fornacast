@@ -6,7 +6,7 @@ defmodule ForgePulls.MergeRecoveryTest do
   alias Ecto.Adapters.SQL
   alias ForgeIssues.Issue
   alias ForgePulls.{MergeOperation, MergeReconciler, MergeRecovery, PullRequest}
-  alias ForgeRepos.Repository
+  alias ForgeRepos.{GitWriteOperation, GitWriteRecovery, Repository, RepositoryWriteReconcilers}
   alias Fornacast.{AuditEvent, OperationLease, Repo}
 
   setup do
@@ -142,6 +142,49 @@ defmodule ForgePulls.MergeRecoveryTest do
     assert {:ok, :refreshed} = GitCore.Cache.fetch(cache_key, fn -> {:ok, :refreshed} end)
   end
 
+  test "same-second pending Git then merge completions each advance write version", context do
+    completed_at = ~U[2026-08-27 01:46:00Z]
+    target_ref = "refs/heads/pending-before-merge"
+    update_ref(context.path, context.merge_oid, target_ref)
+
+    git_operation =
+      %GitWriteOperation{}
+      |> GitWriteOperation.changeset(%{
+        repository_id: context.repository.id,
+        actor_user_id: context.owner.id,
+        request_id: unique("pending-git"),
+        kind: :ref_create,
+        state: :ref_advanced,
+        target_ref: target_ref,
+        expected_oid: nil,
+        proposed_oid: context.merge_oid,
+        lock_version: 0
+      })
+      |> Repo.insert!()
+
+    deadline = System.monotonic_time(:millisecond) + 10_000
+
+    assert :ok =
+             GitWriteRecovery.with_test_completion_clock(fn -> completed_at end, fn ->
+               MergeRecovery.with_test_completion_clock(fn -> completed_at end, fn ->
+                 RepositoryWriteReconcilers.reconcile_locked(
+                   context.repository,
+                   context.path,
+                   deadline
+                 )
+               end)
+             end)
+
+    assert Repo.get!(GitWriteOperation, git_operation.id).state == :bookkeeping_complete
+    assert Repo.get!(MergeOperation, context.operation.id).state == :completed
+
+    assert %Repository{
+             write_version: 2,
+             last_pushed_at: ^completed_at,
+             updated_at: ^completed_at
+           } = Repo.get!(Repository, context.repository.id)
+  end
+
   test "reading a pull synchronously reconciles its proven nonterminal merge", context do
     assert {:ok,
             %PullRequest{
@@ -205,7 +248,10 @@ defmodule ForgePulls.MergeRecoveryTest do
              Repo.get!(PullRequest, context.pull.id)
 
     assert %Issue{state: :open} = Repo.get!(Issue, context.pull.issue_id)
-    assert %Repository{last_pushed_at: nil} = Repo.get!(Repository, context.repository.id)
+
+    assert %Repository{last_pushed_at: nil, write_version: 0} =
+             Repo.get!(Repository, context.repository.id)
+
     refute Repo.get_by(AuditEvent, operation_id: "pull_merge:#{context.operation.id}")
 
     assert {:ok, :cached} =

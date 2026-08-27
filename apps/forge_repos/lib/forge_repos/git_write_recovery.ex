@@ -13,6 +13,7 @@ defmodule ForgeRepos.GitWriteRecovery do
   @lease_seconds 30
   @terminal_states [:bookkeeping_complete, :failed]
   @complete_multi_hook_key {__MODULE__, :complete_multi_hook}
+  @completion_clock_key {__MODULE__, :completion_clock}
   @iteration_clock_key {__MODULE__, :iteration_clock}
   @claim_observer_key {__MODULE__, :claim_observer}
 
@@ -28,6 +29,19 @@ defmodule ForgeRepos.GitWriteRecovery do
       if previous == nil,
         do: Process.delete(@complete_multi_hook_key),
         else: Process.put(@complete_multi_hook_key, previous)
+    end
+  end
+
+  @doc false
+  def with_test_completion_clock(clock, fun)
+      when is_function(clock, 0) and is_function(fun, 0) do
+    previous = Process.get(@completion_clock_key)
+    Process.put(@completion_clock_key, clock)
+
+    try do
+      fun.()
+    after
+      restore_process_value(@completion_clock_key, previous)
     end
   end
 
@@ -290,7 +304,7 @@ defmodule ForgeRepos.GitWriteRecovery do
   end
 
   defp complete_transaction(repository, operation) do
-    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    now = completion_now()
     actor = load_actor(operation.actor_user_id)
 
     operation_query =
@@ -321,7 +335,8 @@ defmodule ForgeRepos.GitWriteRecovery do
       )
       |> require_one(:operation)
       |> Multi.update_all(:repository, repository_query,
-        set: [last_pushed_at: now, updated_at: now]
+        set: [last_pushed_at: now, updated_at: now],
+        inc: [write_version: 1]
       )
       |> require_one(:repository)
       |> Audit.record_multi(
@@ -368,6 +383,14 @@ defmodule ForgeRepos.GitWriteRecovery do
   defp load_actor(actor_user_id), do: Repo.get(User, actor_user_id)
 
   defp operation_id(operation), do: "git_write:" <> Integer.to_string(operation.id)
+
+  defp completion_now do
+    case Process.get(@completion_clock_key) do
+      clock when is_function(clock, 0) -> clock.()
+      nil -> DateTime.utc_now()
+    end
+    |> DateTime.truncate(:second)
+  end
 
   defp check_deadline(absolute_deadline) do
     if System.monotonic_time(:millisecond) < absolute_deadline,

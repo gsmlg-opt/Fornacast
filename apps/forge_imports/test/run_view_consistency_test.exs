@@ -1,8 +1,11 @@
 defmodule ForgeImports.RunViewConsistencyTest do
   use ExUnit.Case, async: false
 
-  alias ForgeImports.{DiscoveryWorker, RunView}
+  import Ecto.Query
+
+  alias ForgeImports.{DiscoveryWorker, ImportRun, RunView}
   alias ForgeImports.GitHub.Repository
+  alias ForgeRepos.Repository, as: LocalRepository
   alias Fornacast.Repo
 
   @telemetry_event [:fornacast, :repo, :query]
@@ -28,6 +31,9 @@ defmodule ForgeImports.RunViewConsistencyTest do
         github_credential_id: reference.credential.credential_id,
         source_owner_login: "octocat",
         source_repository_full_name: "octocat/coherent-view",
+        destination_organization_action: :existing,
+        destination_organization_slug: actor.username,
+        destination_organization_status: :clean,
         request_metadata: request_metadata()
       })
 
@@ -73,6 +79,75 @@ defmodule ForgeImports.RunViewConsistencyTest do
               state: :awaiting_resolution,
               counts: %{selected: 1},
               repositories: [%{source_full_name: "octocat/coherent-view"}]
+            }} = Task.await(reader, 5_000)
+  end
+
+  test "run view retries when a conflict plan commits between the run and item queries", %{
+    actor: actor,
+    run: run
+  } do
+    collision_repository_fixture(actor, "coherent-view")
+
+    assert {:ok, :awaiting_resolution} =
+             DiscoveryWorker.perform(run.id,
+               owner: "coherent-conflict-worker",
+               lease_seconds: 60,
+               client: __MODULE__.RepositoryClient,
+               client_options: []
+             )
+
+    old_updated_at = ~U[2026-08-26 09:00:00Z]
+
+    ImportRun
+    |> where([candidate], candidate.id == ^run.id)
+    |> Repo.update_all(set: [updated_at: old_updated_at])
+
+    {:ok, before_view} = ForgeImports.get_run(actor, run.id)
+    assert [%{id: item_id, state: :awaiting_resolution}] = before_view.repositories
+
+    handler_id = {__MODULE__, self(), System.unique_integer([:positive])}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        @telemetry_event,
+        &__MODULE__.pause_after_run_read/4,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    reader =
+      Task.async(fn ->
+        Process.put({__MODULE__, :coherent_reader}, true)
+        ForgeImports.get_run(actor, run.id)
+      end)
+
+    assert_receive {:run_view_paused, reader_pid}, 2_000
+
+    assert {:ok, %RunView{repositories: [%{destination_slug: "resolved-view"}]}} =
+             ForgeImports.resolve_repository_conflicts(
+               actor,
+               run.id,
+               %{item_id => %{action: :rename, slug: "resolved-view"}},
+               request_metadata()
+             )
+
+    committed_updated_at = Repo.get!(ImportRun, run.id).updated_at
+    refute committed_updated_at == old_updated_at
+    send(reader_pid, :continue_run_view)
+
+    assert {:ok,
+            %RunView{
+              updated_at: ^committed_updated_at,
+              repositories: [
+                %{
+                  id: ^item_id,
+                  destination_slug: "resolved-view",
+                  conflict_action: :rename,
+                  state: :queued
+                }
+              ]
             }} = Task.await(reader, 5_000)
   end
 
@@ -131,6 +206,19 @@ defmodule ForgeImports.RunViewConsistencyTest do
              )
 
     account
+  end
+
+  defp collision_repository_fixture(actor, slug) do
+    %LocalRepository{owner_user_id: actor.id, storage_path: "@test/#{slug}.git"}
+    |> LocalRepository.create_changeset(%{
+      slug: slug,
+      name: slug,
+      visibility: :private,
+      default_branch: "main",
+      has_issues: true,
+      allow_merge_commit: true
+    })
+    |> Repo.insert!()
   end
 
   defp user_fixture do
