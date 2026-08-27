@@ -61,6 +61,7 @@ defmodule GitCore.Remote do
     @moduledoc false
     @enforce_keys [:original_kind, :quarantine_path, :identity]
     defstruct @enforce_keys
+    @type t :: %__MODULE__{}
   end
 
   defimpl Inspect, for: Error do
@@ -104,6 +105,69 @@ defmodule GitCore.Remote do
       end)
     end
   end
+
+  @doc "Returns validated deterministic quarantine evidence without requiring a credential."
+  @spec cleanup_evidence(Path.t()) ::
+          {:ok, CleanupPending.t()} | {:error, Error.t()}
+  def cleanup_evidence(destination) when is_binary(destination) do
+    if destination?(destination) do
+      parent = Path.dirname(destination)
+
+      case File.lstat(parent) do
+        {:error, :enoent} -> cleanup_not_found()
+        {:ok, %File.Stat{type: :directory}} -> cleanup_evidence_in_parent(destination, parent)
+        _unsafe -> remote_error(:unsafe_cleanup_state)
+      end
+    else
+      remote_error(:invalid_destination)
+    end
+  rescue
+    _error -> remote_error(:unsafe_cleanup_state)
+  end
+
+  def cleanup_evidence(_destination), do: remote_error(:invalid_destination)
+
+  defp cleanup_evidence_in_parent(destination, parent) do
+    quarantine = cleanup_slot(destination)
+
+    with :ok <- GitCore.Remote.CredentialReaper.safe_existing_directory_path(parent),
+         {:ok, parent_identity} <- directory_identity(parent) do
+      case {File.lstat(destination), File.lstat(quarantine)} do
+        {{:error, :enoent}, {:error, :enoent}} ->
+          cleanup_not_found()
+
+        {{:ok, _destination}, {:error, :enoent}} ->
+          cleanup_not_found()
+
+        {{:error, :enoent}, {:ok, %File.Stat{type: :directory}}} ->
+          validate_cleanup_slot(destination, quarantine, parent, parent_identity)
+
+        _ambiguous ->
+          remote_error(:unsafe_cleanup_state)
+      end
+    else
+      _unsafe -> remote_error(:unsafe_cleanup_state)
+    end
+  end
+
+  defp validate_cleanup_slot(destination, quarantine, parent, parent_identity) do
+    with {:ok, identity} <- private_directory_identity(quarantine),
+         :ok <- GitCore.Remote.CredentialReaper.safe_existing_directory_path(quarantine),
+         {:ok, ^parent_identity} <- directory_identity(parent),
+         {:error, :enoent} <- File.lstat(destination),
+         {:ok, ^identity} <- private_directory_identity(quarantine) do
+      {:ok,
+       %CleanupPending{
+         original_kind: :previous_failure,
+         quarantine_path: quarantine,
+         identity: identity_projection(identity)
+       }}
+    else
+      _changed -> remote_error(:unsafe_cleanup_state)
+    end
+  end
+
+  defp cleanup_not_found, do: remote_error(:cleanup_not_found)
 
   defp do_mirror(operation, parent_monitor, supervisor_pid) do
     destination = operation.request.destination

@@ -823,7 +823,8 @@ defmodule ForgeImports.ImportPersistenceTest do
         destination_organization_classification: "reserved_namespace"
       )
 
-    item = item_fixture(run, staged_storage_path: "/private/secret/repository.git")
+    staged_path = Path.join(Fornacast.Config.repo_storage_root(), "private/secret/repository.git")
+    item = item_fixture(run, staged_storage_path: staged_path)
     other = user_fixture()
 
     assert {:ok, owned} = ForgeImports.get_run(actor, run.id)
@@ -844,7 +845,7 @@ defmodule ForgeImports.ImportPersistenceTest do
           "credential_tag",
           "credential_key_id",
           "github_credential_id",
-          "/private/secret",
+          staged_path,
           "storage_path"
         ] do
       refute inspected =~ forbidden

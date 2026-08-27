@@ -20,6 +20,15 @@ defmodule ForgeImports do
   alias Fornacast.Repo
 
   @run_view_read_attempts 3
+  @worker_repository_item_targets [
+    :staging_git,
+    :git_staged,
+    :staging_metadata,
+    :ready_to_publish,
+    :publishing,
+    :published,
+    :completed
+  ]
 
   def provider, do: :github
 
@@ -227,6 +236,16 @@ defmodule ForgeImports do
   def transition_repository_item(actor, run, item, target, attrs \\ %{})
 
   def transition_repository_item(
+        %User{},
+        %ImportRun{},
+        %RepositoryItem{},
+        target,
+        attrs
+      )
+      when target in @worker_repository_item_targets and is_map(attrs),
+      do: {:error, :invalid_transition}
+
+  def transition_repository_item(
         %User{} = actor,
         %ImportRun{} = expected_run,
         %RepositoryItem{} = expected_item,
@@ -234,9 +253,13 @@ defmodule ForgeImports do
         attrs
       )
       when is_atom(target) and is_map(attrs) do
-    mutate_item(actor, expected_run, expected_item, fn ->
-      changeset = RepositoryItem.transition_changeset(expected_item, target, attrs)
-      persist_changeset(expected_item, [expected_item.state], changeset, :invalid_transition)
+    mutate_item(actor, expected_run, expected_item, fn current_item ->
+      if current_item.attempt_count > 0 do
+        {:error, :invalid_transition}
+      else
+        changeset = RepositoryItem.transition_changeset(current_item, target, attrs)
+        persist_changeset(current_item, [current_item.state], changeset, :invalid_transition)
+      end
     end)
   end
 
@@ -278,10 +301,17 @@ defmodule ForgeImports do
     transact(fn ->
       with {:ok, active_actor} <- active_actor(actor, lock?: true),
            {:ok, current_run} <- scoped_run(active_actor, expected_run),
-           {:ok, _current_item} <- scoped_item(current_run, expected_item) do
-        callback.()
+           {:ok, current_item} <- scoped_item(current_run, expected_item),
+           :ok <- exact_item_capability(current_item, expected_item) do
+        callback.(current_item)
       end
     end)
+  end
+
+  defp exact_item_capability(current, expected) do
+    if current.lock_version == expected.lock_version and current.state == expected.state,
+      do: :ok,
+      else: {:error, :stale}
   end
 
   defp persist_changeset(row, allowed_states, %Ecto.Changeset{valid?: true} = changeset, _error) do
@@ -426,7 +456,8 @@ defmodule ForgeImports do
 
   defp retryable_unpublished_predecessor?(%RepositoryItem{
          state: state,
-         publication_evidence: evidence
+         publication_evidence: evidence,
+         cleanup_state: nil
        })
        when state in [:failed, :canceled] and is_map(evidence) do
     map_size(evidence) == 0

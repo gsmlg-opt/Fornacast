@@ -4,7 +4,8 @@ defmodule ForgeAccountsTest do
   import Ecto.Query
   import ExUnit.CaptureIO
 
-  alias ForgeAccounts.{Organization, SSHKey, User}
+  alias Ecto.Multi
+  alias ForgeAccounts.{Organization, OrganizationMember, SSHKey, User}
   alias Fornacast.{AuditEvent, Page, Repo}
 
   @ed25519_public_key "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINUKfpNn72l8H0YnXfbkh6s4aAcrMmVsBWPfyPppa1i8 gao@mac-mini"
@@ -653,6 +654,65 @@ defmodule ForgeAccountsTest do
     refute ForgeAccounts.get_account_by_username("rolled-back")
     assert ForgeAccounts.list_user_organizations(actor) == []
     assert Repo.aggregate(AuditEvent, :count, :id) == 0
+  end
+
+  test "GitHub import organization contributor owns membership and audit rollback" do
+    actor = user!("import-owner")
+
+    assert {:ok, %{organization: organization}} =
+             Multi.new()
+             |> ForgeAccounts.github_import_organization_multi(
+               :organization,
+               actor,
+               %{
+                 username: "import-tools",
+                 display_name: "Import Tools",
+                 description: "Imported from GitHub",
+                 state: :active
+               },
+               %{},
+               "github-import-organization-101"
+             )
+             |> Repo.transaction()
+
+    assert [
+             %OrganizationMember{
+               organization_id: organization_id,
+               user_id: actor_id,
+               role: :owner
+             }
+           ] = Repo.all(OrganizationMember)
+
+    assert {organization_id, actor_id} == {organization.id, actor.id}
+
+    assert %AuditEvent{
+             action: "organization.created",
+             actor_user_id: ^actor_id,
+             target_id: target_id,
+             operation_id: "github-import-organization-101"
+           } = Repo.one!(from audit in AuditEvent, where: audit.action == "organization.created")
+
+    assert target_id == Integer.to_string(organization.id)
+
+    assert {:error, :forced_rollback, :injected, _changes} =
+             Multi.new()
+             |> ForgeAccounts.github_import_organization_multi(
+               :organization,
+               actor,
+               %{
+                 username: "rolled-back-import",
+                 display_name: "Rolled back import",
+                 state: :active
+               },
+               %{},
+               "github-import-organization-102"
+             )
+             |> Multi.error(:forced_rollback, :injected)
+             |> Repo.transaction()
+
+    refute ForgeAccounts.get_organization_by_slug("rolled-back-import")
+    assert Repo.aggregate(OrganizationMember, :count) == 1
+    assert Repo.aggregate(AuditEvent, :count) == 1
   end
 
   test "admin create mix task creates the first admin" do

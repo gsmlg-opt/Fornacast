@@ -346,6 +346,28 @@ defmodule ForgeImports.ImportRun do
   def destination_changeset(run, _attrs),
     do: run |> change() |> add_error(:state, "cannot change the destination")
 
+  @doc false
+  def organization_activation_changeset(
+        %__MODULE__{
+          source_kind: :organization,
+          destination_organization_action: :new,
+          destination_organization_status: :clean,
+          destination_organization_id: nil,
+          state: :running
+        } = run,
+        organization_id
+      )
+      when is_integer(organization_id) and organization_id > 0 do
+    run
+    |> change(destination_organization_id: organization_id)
+    |> validate_positive_id(:destination_organization_id)
+    |> validate_destination_status()
+    |> map_constraints()
+  end
+
+  def organization_activation_changeset(run, _organization_id),
+    do: run |> change() |> add_error(:destination_organization_id, "cannot be activated")
+
   defp build_transition_changeset(run, target, attrs, options) do
     cond do
       run.state in @terminal_states ->

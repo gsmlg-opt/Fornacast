@@ -320,6 +320,42 @@ defmodule ForgeRepos do
     end
   end
 
+  @doc false
+  @spec create_import_shadow(Multi.t(), Multi.name(), pos_integer(), map()) :: Multi.t()
+  def create_import_shadow(%Multi{} = multi, key, owner_id, attrs)
+      when is_integer(owner_id) and owner_id > 0 and is_map(attrs) do
+    with {:ok, item_id} <- positive_integer(Map.get(attrs, :item_id)),
+         {:ok, generation} <- positive_integer(Map.get(attrs, :generation)) do
+      internal_slug = import_shadow_slug(item_id)
+      storage_path = generate_storage_path(owner_id, internal_slug)
+
+      multi
+      |> Multi.run({key, :owner}, fn repo, _changes ->
+        case repo.get_by(User, id: owner_id, state: :active) do
+          %User{kind: kind} = owner when kind in [:user, :organization] -> {:ok, owner}
+          _missing -> {:error, :invalid_owner}
+        end
+      end)
+      |> Multi.insert(key, fn _changes ->
+        %Repository{}
+        |> Repository.import_changeset(%{
+          owner_user_id: owner_id,
+          slug: internal_slug,
+          name: "GitHub import #{item_id}",
+          visibility: :private,
+          storage_path: storage_path,
+          lifecycle: :importing,
+          generation: generation
+        })
+      end)
+    else
+      _invalid -> Multi.error(multi, key, :invalid_shadow)
+    end
+  end
+
+  def create_import_shadow(%Multi{} = multi, key, _owner_id, _attrs),
+    do: Multi.error(multi, key, :invalid_shadow)
+
   def get_repository(owner_slug, repo_slug) when is_binary(owner_slug) and is_binary(repo_slug) do
     with %User{id: owner_user_id} <- ForgeAccounts.get_account_by_username(owner_slug) do
       ready_repository()
@@ -2210,6 +2246,18 @@ defmodule ForgeRepos do
       digest <> ".git"
     ])
   end
+
+  defp import_shadow_slug(item_id) do
+    suffix =
+      12
+      |> :crypto.strong_rand_bytes()
+      |> Base.encode16(case: :lower)
+
+    "import-#{item_id}-#{suffix}"
+  end
+
+  defp positive_integer(value) when is_integer(value) and value > 0, do: {:ok, value}
+  defp positive_integer(_value), do: :error
 
   defp init_repository_storage(%Repository{} = repository) do
     path = absolute_storage_path(repository)

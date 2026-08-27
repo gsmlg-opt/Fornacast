@@ -584,11 +584,16 @@ defmodule ForgeImports.Conflicts do
   defp normalize_drift_item(_item_reference), do: {:error, :invalid_selection}
 
   defp validate_drift_capability(item, nil, now) do
-    if active_lease?(item, now), do: {:error, :busy}, else: {:ok, :without_lease}
+    cond do
+      staging_owned?(item) -> {:error, :stale}
+      active_lease?(item, now) -> {:error, :busy}
+      true -> {:ok, :without_lease}
+    end
   end
 
   defp validate_drift_capability(item, %RepositoryItem{} = capability, now) do
     cond do
+      staging_owned?(item) -> {:error, :stale}
       capability.id != item.id -> {:error, :stale}
       capability.import_run_id != item.import_run_id -> {:error, :stale}
       capability.state != item.state -> {:error, :stale}
@@ -597,6 +602,10 @@ defmodule ForgeImports.Conflicts do
       not active_lease?(item, now) -> {:error, :stale}
       true -> {:ok, {:owned_lease, capability.lease_owner}}
     end
+  end
+
+  defp staging_owned?(item) do
+    item.state == :staging_git or not is_nil(item.cleanup_state)
   end
 
   defp update_drift_item(item, action, :without_lease, now) do

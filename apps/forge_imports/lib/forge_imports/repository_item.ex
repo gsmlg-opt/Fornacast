@@ -324,9 +324,11 @@ defmodule ForgeImports.RepositoryItem do
     |> validate_counts()
     |> validate_strings()
     |> validate_repository_evidence()
+    |> validate_staged_storage_path()
     |> validate_maps()
     |> validate_source_metadata()
     |> validate_conflict_fingerprint()
+    |> validate_cleanup_coherence()
     |> validate_lifecycle()
     |> validate_resume_state()
     |> map_constraints()
@@ -429,10 +431,11 @@ defmodule ForgeImports.RepositoryItem do
 
   @doc false
   def destination_drift_changeset(
-        %__MODULE__{selected: true, state: state} = item,
+        %__MODULE__{selected: true, state: state, cleanup_state: nil} = item,
         action
       )
-      when state in @destination_drift_states and action in [:create, :rename, :replace] do
+      when state in @destination_drift_states and state != :staging_git and
+             action in [:create, :rename, :replace] do
     if coherent_frozen_action?(item, action) do
       item
       |> change(
@@ -464,6 +467,100 @@ defmodule ForgeImports.RepositoryItem do
   def destination_drift_changeset(item, _action),
     do: item |> change() |> add_error(:state, "cannot reopen this repository")
 
+  @doc false
+  def staging_intent_changeset(
+        %__MODULE__{
+          selected: true,
+          state: :queued,
+          hidden_repository_id: nil,
+          staged_storage_path: nil,
+          cleanup_state: nil,
+          attempt_count: attempt_count
+        } = item,
+        hidden_repository_id,
+        staged_storage_path
+      )
+      when is_integer(attempt_count) and attempt_count > 0 and is_integer(hidden_repository_id) and
+             hidden_repository_id > 0 and is_binary(staged_storage_path) do
+    item
+    |> change(
+      hidden_repository_id: hidden_repository_id,
+      staged_storage_path: staged_storage_path,
+      state: :staging_git,
+      wait_reason: nil,
+      next_attempt_at: nil,
+      failure_kind: nil,
+      failure_detail: nil
+    )
+    |> validate_positive_id(:hidden_repository_id)
+    |> validate_strings()
+    |> validate_staged_storage_path()
+    |> validate_lifecycle()
+    |> map_constraints()
+  end
+
+  def staging_intent_changeset(item, _hidden_repository_id, _staged_storage_path),
+    do: item |> change() |> add_error(:state, "cannot stage this repository")
+
+  @doc false
+  def destination_owner_activation_changeset(
+        %__MODULE__{destination_owner_id: nil, hidden_repository_id: nil} = item,
+        organization_id
+      )
+      when is_integer(organization_id) and organization_id > 0 do
+    item
+    |> change(destination_owner_id: organization_id)
+    |> validate_positive_id(:destination_owner_id)
+    |> map_constraints()
+  end
+
+  def destination_owner_activation_changeset(item, _organization_id),
+    do: item |> change() |> add_error(:destination_owner_id, "cannot be activated")
+
+  @doc false
+  def cleanup_pending_changeset(
+        %__MODULE__{
+          state: :staging_git,
+          hidden_repository_id: hidden_repository_id,
+          cleanup_state: nil
+        } = item,
+        attrs
+      )
+      when is_integer(hidden_repository_id) and hidden_repository_id > 0 and is_map(attrs) do
+    item
+    |> cast(attrs, [
+      :staged_storage_path,
+      :checkpoint,
+      :cleanup_state,
+      :cleanup_eligible_at,
+      :cleanup_attempt_count,
+      :cleanup_error
+    ])
+    |> put_change(:next_attempt_at, nil)
+    |> put_change(:failure_kind, nil)
+    |> put_change(:failure_detail, nil)
+    |> validate_required([
+      :staged_storage_path,
+      :checkpoint,
+      :cleanup_state,
+      :cleanup_eligible_at,
+      :cleanup_attempt_count,
+      :cleanup_error
+    ])
+    |> validate_inclusion(:cleanup_state, ["cleanup_pending"])
+    |> validate_number(:cleanup_attempt_count, equal_to: 0)
+    |> validate_strings()
+    |> validate_staged_storage_path()
+    |> validate_maps()
+    |> validate_cleanup_checkpoint()
+    |> validate_cleanup_coherence()
+    |> validate_lifecycle()
+    |> map_constraints()
+  end
+
+  def cleanup_pending_changeset(item, _attrs),
+    do: item |> change() |> add_error(:cleanup_state, "cannot retain cleanup evidence")
+
   def transition_changeset(item, target, attrs) when is_atom(target) and is_map(attrs) do
     build_transition_changeset(item, target, attrs, clear_lease?: true)
   end
@@ -493,9 +590,11 @@ defmodule ForgeImports.RepositoryItem do
         |> validate_number(:cleanup_attempt_count, greater_than_or_equal_to: 0)
         |> validate_counts()
         |> validate_strings()
+        |> validate_staged_storage_path()
         |> validate_maps()
         |> normalize_resume_state(item.state, target)
         |> maybe_clear_terminal_lease(target, Keyword.fetch!(options, :clear_lease?))
+        |> validate_cleanup_coherence()
         |> validate_lifecycle()
         |> validate_resume_state()
         |> map_constraints()
@@ -528,7 +627,9 @@ defmodule ForgeImports.RepositoryItem do
         |> validate_number(:cleanup_attempt_count, greater_than_or_equal_to: 0)
         |> validate_counts()
         |> validate_strings()
+        |> validate_staged_storage_path()
         |> validate_maps()
+        |> validate_cleanup_coherence()
         |> validate_lifecycle()
         |> validate_resume_state()
     end
@@ -668,6 +769,91 @@ defmodule ForgeImports.RepositoryItem do
          do: [],
          else: [replacement_storage_path: "must be a safe relative repository path"]
     end)
+  end
+
+  defp validate_staged_storage_path(changeset) do
+    validate_change(changeset, :staged_storage_path, fn :staged_storage_path, path ->
+      root = Fornacast.Config.repo_storage_root()
+      expanded = if is_binary(path), do: Path.expand(path), else: nil
+
+      if ForgeImports.SafeValue.safe_string?(path, 1_024, required?: true) and
+           ForgeImports.SafeValue.github_secret_free?(path) and Path.type(path) == :absolute and
+           expanded == path and String.starts_with?(path, root <> "/"),
+         do: [],
+         else: [staged_storage_path: "must be a contained absolute staging path"]
+    end)
+  end
+
+  defp validate_cleanup_checkpoint(changeset) do
+    validate_change(changeset, :checkpoint, fn :checkpoint, checkpoint ->
+      case checkpoint do
+        %{
+          "cleanup_identity" => %{
+            "mode" => 0o700,
+            "major_device" => major_device,
+            "minor_device" => minor_device,
+            "inode" => inode
+          }
+        }
+        when is_integer(major_device) and major_device >= 0 and is_integer(minor_device) and
+               minor_device >= 0 and is_integer(inode) and inode > 0 ->
+          []
+
+        _invalid ->
+          [checkpoint: "must contain exact cleanup identity evidence"]
+      end
+    end)
+  end
+
+  defp validate_cleanup_coherence(changeset) do
+    cleanup_state = get_field(changeset, :cleanup_state)
+    cleanup_error = get_field(changeset, :cleanup_error)
+    cleanup_eligible_at = get_field(changeset, :cleanup_eligible_at)
+    cleanup_attempt_count = get_field(changeset, :cleanup_attempt_count)
+    checkpoint = get_field(changeset, :checkpoint) || %{}
+    staged_path = get_field(changeset, :staged_storage_path)
+    cleanup_identity? = valid_cleanup_identity?(Map.get(checkpoint, "cleanup_identity"))
+
+    cond do
+      is_nil(cleanup_state) and
+          (not is_nil(cleanup_error) or not is_nil(cleanup_eligible_at) or
+             cleanup_attempt_count != 0 or Map.has_key?(checkpoint, "cleanup_identity")) ->
+        add_error(changeset, :cleanup_state, "is required for cleanup evidence")
+
+      cleanup_state == "cleanup_pending" and
+          (get_field(changeset, :state) != :staging_git or
+             not is_integer(get_field(changeset, :hidden_repository_id)) or
+             not is_binary(staged_path) or not cleanup_slot_name?(staged_path) or
+             not ForgeImports.SafeValue.safe_string?(cleanup_error, 1_024,
+               required?: true,
+               classified?: true
+             ) or not match?(%DateTime{}, cleanup_eligible_at) or
+             not is_integer(cleanup_attempt_count) or cleanup_attempt_count < 0 or
+             not cleanup_identity?) ->
+        add_error(changeset, :cleanup_state, "has malformed cleanup evidence")
+
+      cleanup_state not in [nil, "cleanup_pending"] ->
+        add_error(changeset, :cleanup_state, "is invalid")
+
+      true ->
+        changeset
+    end
+  end
+
+  defp valid_cleanup_identity?(%{
+         "mode" => 0o700,
+         "major_device" => major_device,
+         "minor_device" => minor_device,
+         "inode" => inode
+       }) do
+    is_integer(major_device) and major_device >= 0 and is_integer(minor_device) and
+      minor_device >= 0 and is_integer(inode) and inode > 0
+  end
+
+  defp valid_cleanup_identity?(_identity), do: false
+
+  defp cleanup_slot_name?(path) do
+    Path.basename(path) =~ ~r/\A\.fornacast-cleanup-v1-[A-Za-z0-9_-]{43}\z/
   end
 
   defp validate_source_metadata(changeset) do

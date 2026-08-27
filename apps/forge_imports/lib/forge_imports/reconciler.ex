@@ -5,7 +5,16 @@ defmodule ForgeImports.Reconciler do
 
   import Ecto.Query
 
-  alias ForgeImports.{DiscoveryWorker, ImportRun}
+  alias ForgeAccounts.User
+
+  alias ForgeImports.{
+    DiscoveryWorker,
+    ImportAttempt,
+    ImportRun,
+    RepositoryItem,
+    RepositoryWorker
+  }
+
   alias Fornacast.Repo
 
   @default_interval_ms 30_000
@@ -37,16 +46,60 @@ defmodule ForgeImports.Reconciler do
     |> Repo.all()
   end
 
+  @doc false
+  def runnable_repository_item_ids(limit, %DateTime{} = now)
+      when is_integer(limit) and limit in 1..100 do
+    now = DateTime.truncate(now, :second)
+
+    RepositoryItem
+    |> join(:inner, [item], run in ImportRun, on: run.id == item.import_run_id)
+    |> join(:inner, [item, _run], attempt in ImportAttempt,
+      on:
+        attempt.repository_item_id == item.id and
+          attempt.attempt_number == item.attempt_count
+    )
+    |> join(:inner, [_item, run, _attempt], actor in User, on: actor.id == run.actor_user_id)
+    |> where(
+      [item, run, attempt, actor],
+      item.selected == true and item.state in [:queued, :staging_git] and
+        item.attempt_count > 0 and
+        (is_nil(item.next_attempt_at) or item.next_attempt_at <= ^now) and
+        is_nil(item.cleanup_state) and
+        (is_nil(item.lease_expires_at) or item.lease_expires_at <= ^now) and
+        ((item.state == :queued and is_nil(item.hidden_repository_id) and
+            is_nil(item.staged_storage_path)) or
+           (item.state == :staging_git and not is_nil(item.hidden_repository_id) and
+              not is_nil(item.staged_storage_path))) and
+        ((run.state == :running and actor.state == :active and attempt.state == :running and
+            (is_nil(run.lease_expires_at) or run.lease_expires_at <= ^now)) or
+           (item.state == :staging_git and
+              run.state in [
+                :running,
+                :cancel_requested,
+                :canceled,
+                :failed,
+                :completed,
+                :completed_with_warnings
+              ] and (run.state != :running or actor.state != :active))) and actor.kind == :user
+    )
+    |> order_by([item, _run, _attempt, _actor], asc: item.id)
+    |> limit(^limit)
+    |> select([item, _run, _attempt, _actor], item.id)
+    |> Repo.all()
+  end
+
   @impl true
   def init(opts) do
     state = %{
       enabled: Keyword.get(opts, :enabled, true),
       interval_ms: clamp(Keyword.get(opts, :interval_ms, @default_interval_ms), 50, 60_000),
       batch_size: clamp(Keyword.get(opts, :batch_size, @default_batch_size), 1, 100),
-      lease_seconds: clamp(Keyword.get(opts, :lease_seconds, @default_lease_seconds), 1, 2_400),
+      lease_seconds: clamp(Keyword.get(opts, :lease_seconds, @default_lease_seconds), 2, 2_400),
       client: Keyword.get(opts, :client, ForgeImports.GitHub.Client),
       client_options: Keyword.get(opts, :client_options, []),
       keyring: Keyword.get(opts, :keyring, Fornacast.Config.github_credential_keyring()),
+      repository_worker: Keyword.get(opts, :repository_worker, RepositoryWorker),
+      repository_worker_options: Keyword.get(opts, :repository_worker_options, []),
       task_supervisor: Keyword.get(opts, :task_supervisor, ForgeImports.TaskSupervisor),
       task: nil,
       timer: nil,
@@ -116,16 +169,44 @@ defmodule ForgeImports.Reconciler do
   def handle_info(_message, state), do: {:noreply, state}
 
   defp reconcile_batch(state) do
-    state.batch_size
-    |> discovering_run_ids(DateTime.utc_now(:second))
-    |> Enum.map(fn run_id ->
-      DiscoveryWorker.perform(run_id,
-        lease_seconds: state.lease_seconds,
-        client: state.client,
-        client_options: state.client_options,
-        keyring: state.keyring
-      )
-    end)
+    now = DateTime.utc_now(:second)
+
+    discovery_results =
+      state.batch_size
+      |> discovering_run_ids(now)
+      |> Enum.map(fn run_id ->
+        DiscoveryWorker.perform(run_id,
+          lease_seconds: state.lease_seconds,
+          client: state.client,
+          client_options: state.client_options,
+          keyring: state.keyring
+        )
+      end)
+
+    repository_results =
+      state.batch_size
+      |> runnable_repository_item_ids(now)
+      |> Enum.map(fn item_id ->
+        options = repository_worker_options(state)
+
+        state.repository_worker.stage(item_id, options)
+      end)
+
+    discovery_results ++ repository_results
+  end
+
+  defp repository_worker_options(state) do
+    minimum = max(state.lease_seconds, 2)
+
+    Keyword.update(
+      state.repository_worker_options,
+      :lease_seconds,
+      minimum,
+      fn
+        value when is_integer(value) -> max(value, 2)
+        value -> value
+      end
+    )
   end
 
   defp start_scan(state) do

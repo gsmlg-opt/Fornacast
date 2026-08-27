@@ -476,10 +476,11 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
     )
 
     disallowed_items =
-      for {state, evidence} <- [
-            {:completed, %{}},
-            {:published, %{}},
-            {:failed, %{"published_repository_id" => hidden.id}}
+      for updates <- [
+            [state: :completed, publication_evidence: %{}],
+            [state: :published, publication_evidence: %{}],
+            [state: :failed, publication_evidence: %{"published_repository_id" => hidden.id}],
+            [state: :failed, publication_evidence: %{}, cleanup_state: "cleanup_pending"]
           ] do
         assert {:ok, disallowed_item} =
                  ForgeImports.create_repository_item(
@@ -492,7 +493,7 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
 
         Repo.update_all(
           from(item in RepositoryItem, where: item.id == ^disallowed_item_id),
-          set: [state: state, publication_evidence: evidence]
+          set: updates
         )
 
         Repo.get!(RepositoryItem, disallowed_item.id)
@@ -1202,6 +1203,83 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
 
       refute changeset.valid?
       assert Keyword.has_key?(changeset.errors, :source_metadata)
+    end
+  end
+
+  test "repository item changesets require strict secret-free cleanup evidence" do
+    base = persistence_item_attrs(1)
+    root = Fornacast.Config.repo_storage_root()
+
+    quarantine =
+      Path.join(
+        Path.join([root, "@hashed", "aa", "bb"]),
+        ".fornacast-cleanup-v1-#{String.duplicate("A", 43)}"
+      )
+
+    valid =
+      base
+      |> Map.merge(%{
+        state: :staging_git,
+        attempt_count: 1,
+        hidden_repository_id: 1,
+        staged_storage_path: quarantine,
+        cleanup_state: "cleanup_pending",
+        cleanup_eligible_at: @now,
+        cleanup_attempt_count: 0,
+        cleanup_error: "source_validation",
+        checkpoint: %{
+          "cleanup_identity" => %{
+            "mode" => 0o700,
+            "major_device" => 1,
+            "minor_device" => 2,
+            "inode" => 3
+          }
+        }
+      })
+
+    assert RepositoryItem.persistence_changeset(%RepositoryItem{}, valid).valid?
+
+    cleanup_item = %RepositoryItem{
+      state: :staging_git,
+      hidden_repository_id: 1,
+      staged_storage_path: quarantine,
+      checkpoint: %{},
+      cleanup_attempt_count: 0
+    }
+
+    cleanup_attrs =
+      Map.take(valid, [
+        :staged_storage_path,
+        :cleanup_state,
+        :cleanup_eligible_at,
+        :cleanup_attempt_count,
+        :cleanup_error,
+        :checkpoint
+      ])
+
+    for unsafe_checkpoint <- [
+          Map.put(valid.checkpoint, "secret", "github_pat_cleanup_secret"),
+          Map.put(valid.checkpoint, "extra", String.duplicate("x", 32_769))
+        ] do
+      changeset =
+        RepositoryItem.cleanup_pending_changeset(
+          cleanup_item,
+          Map.put(cleanup_attrs, :checkpoint, unsafe_checkpoint)
+        )
+
+      refute changeset.valid?
+      assert Keyword.has_key?(changeset.errors, :checkpoint)
+    end
+
+    for invalid <- [
+          Map.put(valid, :staged_storage_path, "/tmp/github_pat_secret"),
+          Map.put(valid, :cleanup_error, "github_pat_secret"),
+          Map.put(valid, :cleanup_state, "pending"),
+          put_in(valid, [:checkpoint, "cleanup_identity", "mode"], 0o755),
+          Map.put(valid, :state, :git_staged),
+          valid |> Map.put(:cleanup_state, nil) |> Map.put(:cleanup_error, "source_validation")
+        ] do
+      refute RepositoryItem.persistence_changeset(%RepositoryItem{}, invalid).valid?
     end
   end
 

@@ -336,6 +336,54 @@ defmodule ForgeAccounts do
 
   def create_organization(_owner, _attrs), do: {:error, :unauthorized}
 
+  @doc false
+  @spec github_import_organization_multi(
+          Multi.t(),
+          Multi.name(),
+          User.t(),
+          map(),
+          map(),
+          String.t()
+        ) :: Multi.t()
+  def github_import_organization_multi(
+        %Multi{} = multi,
+        key,
+        %User{kind: :user, state: :active, id: owner_id} = actor,
+        attrs,
+        request_metadata,
+        operation_id
+      )
+      when is_map(attrs) and is_map(request_metadata) and is_binary(operation_id) do
+    multi
+    |> Multi.insert(key, Organization.changeset(%Organization{}, attrs))
+    |> Multi.insert({key, :owner_membership}, fn %{^key => organization} ->
+      OrganizationMember.changeset(%OrganizationMember{}, %{
+        organization_id: organization.id,
+        user_id: owner_id,
+        role: :owner
+      })
+    end)
+    |> Audit.record_multi(
+      {key, :audit},
+      actor,
+      "organization.created",
+      "organization",
+      fn %{^key => organization} -> organization.id end,
+      fn %{^key => organization} ->
+        %{
+          "login" => organization.username,
+          "admin" => actor.username,
+          "result" => "success"
+        }
+      end,
+      request_metadata: request_metadata,
+      operation_id: operation_id
+    )
+  end
+
+  def github_import_organization_multi(%Multi{} = multi, key, _actor, _attrs, _metadata, _id),
+    do: Multi.error(multi, key, :forbidden)
+
   defp insert_organization(owner_id, changeset) do
     Multi.new()
     |> Multi.insert(:organization, changeset)

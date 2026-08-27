@@ -1132,6 +1132,176 @@ defmodule ForgeImports.ConflictsTest do
            end)
   end
 
+  test "destination drift cannot reopen an item with unresolved cleanup evidence", %{
+    actor: actor,
+    identity: identity
+  } do
+    {run, item} = started_create_fixture(actor, identity, 9_700_000_110, "cleanup-fenced")
+    hidden = repository_fixture(actor, "cleanup-hidden")
+    root = Fornacast.Config.repo_storage_root()
+    destination = Path.join([root, "@hashed", "aa", "bb", "cleanup-hidden.git"])
+
+    digest =
+      :sha256
+      |> :crypto.hash("fornacast.git-core.remote.cleanup-slot.v1\0" <> destination)
+      |> Base.url_encode64(padding: false)
+
+    quarantine = Path.join(Path.dirname(destination), ".fornacast-cleanup-v1-" <> digest)
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(candidate in RepositoryItem, where: candidate.id == ^item.id),
+               set: [
+                 state: :staging_git,
+                 hidden_repository_id: hidden.id,
+                 staged_storage_path: quarantine,
+                 cleanup_state: "cleanup_pending",
+                 cleanup_eligible_at: @now,
+                 cleanup_attempt_count: 0,
+                 cleanup_error: "previous_failure",
+                 checkpoint: %{
+                   "cleanup_identity" => %{
+                     "mode" => 0o700,
+                     "major_device" => 1,
+                     "minor_device" => 2,
+                     "inode" => 3
+                   }
+                 }
+               ]
+             )
+
+    attempt = Repo.get_by!(ImportAttempt, repository_item_id: item.id, attempt_number: 1)
+    run_before = Repo.get!(ImportRun, run.id)
+
+    assert {:error, :stale} =
+             ForgeImports.mark_destination_changed(
+               actor,
+               run.id,
+               item.id,
+               request_metadata("cleanup-fenced-drift")
+             )
+
+    assert %RepositoryItem{state: :staging_git, cleanup_state: "cleanup_pending"} =
+             Repo.get!(RepositoryItem, item.id)
+
+    assert %ImportAttempt{state: :running, terminal_at: nil} =
+             Repo.get!(ImportAttempt, attempt.id)
+
+    assert Repo.get!(ImportRun, run.id).lock_version == run_before.lock_version
+  end
+
+  test "destination drift cannot abandon staged ownership before cleanup evidence persists", %{
+    actor: actor,
+    identity: identity
+  } do
+    {run, item} = started_create_fixture(actor, identity, 9_700_000_119, "staging-owned")
+    hidden = repository_fixture(actor, "staging-owned-hidden")
+    destination = Path.join(Fornacast.Config.repo_storage_root(), hidden.storage_path)
+
+    digest =
+      :sha256
+      |> :crypto.hash("fornacast.git-core.remote.cleanup-slot.v1\0" <> destination)
+      |> Base.url_encode64(padding: false)
+
+    quarantine = Path.join(Path.dirname(destination), ".fornacast-cleanup-v1-" <> digest)
+    File.mkdir_p!(quarantine)
+    File.chmod!(quarantine, 0o700)
+    on_exit(fn -> File.rm_rf(quarantine) end)
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(candidate in RepositoryItem, where: candidate.id == ^item.id),
+               set: [
+                 state: :staging_git,
+                 hidden_repository_id: hidden.id,
+                 staged_storage_path: destination,
+                 cleanup_state: nil
+               ]
+             )
+
+    attempt = Repo.get_by!(ImportAttempt, repository_item_id: item.id, attempt_number: 1)
+    run_before = Repo.get!(ImportRun, run.id)
+
+    assert {:error, :stale} =
+             ForgeImports.mark_destination_changed(
+               actor,
+               run.id,
+               item.id,
+               request_metadata("staging-owned-drift")
+             )
+
+    assert %RepositoryItem{
+             state: :staging_git,
+             hidden_repository_id: hidden_id,
+             staged_storage_path: ^destination,
+             cleanup_state: nil
+           } = Repo.get!(RepositoryItem, item.id)
+
+    assert hidden_id == hidden.id
+
+    assert %ImportAttempt{state: :running, terminal_at: nil} =
+             Repo.get!(ImportAttempt, attempt.id)
+
+    assert Repo.get!(ImportRun, run.id).lock_version == run_before.lock_version
+    assert File.dir?(quarantine)
+  end
+
+  test "git-staged destination drift remains available to an exact owned capability", %{
+    actor: actor,
+    identity: identity
+  } do
+    {run, item} = started_create_fixture(actor, identity, 9_700_000_120, "git-staged-drift")
+    hidden = repository_fixture(actor, "git-staged-hidden")
+    destination = Path.join(Fornacast.Config.repo_storage_root(), hidden.storage_path)
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(candidate in RepositoryItem, where: candidate.id == ^item.id),
+               set: [
+                 state: :git_staged,
+                 hidden_repository_id: hidden.id,
+                 staged_storage_path: destination,
+                 source_git: %{"empty" => false},
+                 checkpoint: %{"git_staged" => true}
+               ]
+             )
+
+    current = Repo.get!(RepositoryItem, item.id)
+
+    assert {:ok, capability} =
+             OperationLease.claim(
+               RepositoryItem,
+               current.id,
+               "git-staged-drift-owner",
+               DateTime.utc_now(:second),
+               60,
+               allowed_states: [:git_staged]
+             )
+
+    assert {:ok, %RunView{repositories: [view]}} =
+             ForgeImports.mark_destination_changed(
+               actor,
+               run.id,
+               capability,
+               request_metadata("git-staged-owned-drift")
+             )
+
+    assert view.state == :awaiting_resolution
+    assert view.wait_reason == "destination_changed"
+
+    assert %RepositoryItem{
+             state: :awaiting_resolution,
+             hidden_repository_id: hidden_id,
+             staged_storage_path: ^destination,
+             source_git: %{"empty" => false},
+             checkpoint: %{"git_staged" => true},
+             lease_owner: nil,
+             lease_expires_at: nil
+           } = Repo.get!(RepositoryItem, item.id)
+
+    assert hidden_id == hidden.id
+  end
+
   test "an exact live item lease can mark drift while forged stale and expired capabilities cannot",
        %{
          actor: actor,

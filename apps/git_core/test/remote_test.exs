@@ -827,6 +827,59 @@ defmodule GitCore.RemoteTest do
   end
 
   @tag :tmp_dir
+  test "cleanup evidence rediscovers only the exact private deterministic slot", %{
+    tmp_dir: tmp_dir
+  } do
+    fake_git = write_fake_git!(tmp_dir)
+    request = request_fixture(tmp_dir, %{destination: Path.join(tmp_dir, "evidence.git")})
+
+    result =
+      GitCore.Remote.mirror(request, "github_pat_secret",
+        git: fake_git.git,
+        resolver: fn _host, _family -> {:error, :unavailable} end,
+        credential_root: Path.join(tmp_dir, "evidence-credentials")
+      )
+
+    quarantine = assert_cleanup_pending(result, :host_policy, request.destination)
+
+    assert {:ok,
+            %GitCore.Remote.CleanupPending{
+              original_kind: :previous_failure,
+              quarantine_path: ^quarantine,
+              identity: identity
+            }} = GitCore.Remote.cleanup_evidence(request.destination)
+
+    assert identity.mode == 0o700
+    refute inspect(identity) =~ request.destination
+
+    File.mkdir!(request.destination)
+    File.chmod!(request.destination, 0o700)
+
+    assert {:error, %GitCore.Remote.Error{kind: :unsafe_cleanup_state}} =
+             GitCore.Remote.cleanup_evidence(request.destination)
+
+    assert File.dir?(quarantine)
+  end
+
+  @tag :tmp_dir
+  test "cleanup evidence reports no slot when a fresh destination parent is absent", %{
+    tmp_dir: tmp_dir
+  } do
+    destination = Path.join([tmp_dir, "new", "hashed", "repository.git"])
+    refute File.exists?(Path.dirname(destination))
+
+    assert {:error, %GitCore.Remote.Error{kind: :cleanup_not_found}} =
+             GitCore.Remote.cleanup_evidence(destination)
+
+    File.mkdir_p!(Path.dirname(destination))
+    File.mkdir!(destination)
+    File.chmod!(destination, 0o700)
+
+    assert {:error, %GitCore.Remote.Error{kind: :cleanup_not_found}} =
+             GitCore.Remote.cleanup_evidence(destination)
+  end
+
+  @tag :tmp_dir
   test "credential daemon startup is bounded and leaves no socket state", %{tmp_dir: tmp_dir} do
     fake_git = write_fake_git!(tmp_dir)
     request = request_fixture(tmp_dir)

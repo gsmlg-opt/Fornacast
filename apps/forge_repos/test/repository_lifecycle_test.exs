@@ -3,7 +3,7 @@ defmodule ForgeRepos.RepositoryLifecycleTest do
 
   import Ecto.Query
 
-  alias Ecto.Adapters.SQL
+  alias Ecto.{Adapters.SQL, Multi}
   alias ForgeRepos.Repository
   alias Fornacast.Repo
 
@@ -329,6 +329,60 @@ defmodule ForgeRepos.RepositoryLifecycleTest do
     assert original_updated_at == repository.updated_at
   end
 
+  test "import shadow contributor is SQL-only private and rolls back with its caller" do
+    {owner, _ordinary} = repository_fixture("import-shadow-contributor")
+    item_id = System.unique_integer([:positive])
+
+    assert {:ok, %{shadow: shadow}} =
+             Multi.new()
+             |> ForgeRepos.create_import_shadow(:shadow, owner.id, %{
+               item_id: item_id,
+               generation: 2
+             })
+             |> Repo.transaction()
+
+    assert %Repository{
+             owner_user_id: owner_id,
+             lifecycle: :importing,
+             visibility: :private,
+             generation: 2,
+             write_version: 0,
+             deleted_at: nil
+           } = shadow
+
+    assert owner_id == owner.id
+    assert Repository.canonical_slug?(shadow.slug)
+    assert shadow.slug != "import-shadow-contributor"
+    assert Fornacast.Storage.validate_relative_storage_path(shadow.storage_path) == :ok
+
+    staged_path =
+      Path.expand(Path.join(Fornacast.Config.repo_storage_root(), shadow.storage_path))
+
+    refute File.exists?(staged_path)
+
+    importing_before =
+      Repo.aggregate(
+        from(repository in Repository, where: repository.lifecycle == :importing),
+        :count
+      )
+
+    assert {:error, :injected_failure, :rollback, _changes} =
+             Multi.new()
+             |> ForgeRepos.create_import_shadow(:shadow, owner.id, %{
+               item_id: item_id + 1,
+               generation: 1
+             })
+             |> Multi.error(:injected_failure, :rollback)
+             |> Repo.transaction()
+
+    assert Repo.aggregate(
+             from(repository in Repository, where: repository.lifecycle == :importing),
+             :count
+           ) == importing_before
+
+    Repo.delete!(shadow)
+  end
+
   defp valid_import_attrs do
     %{
       owner_user_id: 41,
@@ -406,6 +460,7 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
 
   @version 20_260_825_000_400
   @write_version 20_260_825_000_410
+  @staged_path_version 20_260_825_000_420
   @pre_version 20_260_825_000_370
   @migrations_path Path.expand("../../fornacast/priv/repo/migrations", __DIR__)
   @migration_path Path.join(
@@ -416,6 +471,10 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
                           @migrations_path,
                           "20260825000410_add_repository_write_version.exs"
                         )
+  @staged_path_migration_path Path.join(
+                                @migrations_path,
+                                "20260825000420_expand_github_import_staged_storage_path.exs"
+                              )
 
   test "00400 declares explicit adapter-safe up and down paths" do
     source = File.read!(@migration_path)
@@ -435,6 +494,17 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
     refute source =~ "def change do"
   end
 
+  test "00420 declares the PostgreSQL text expansion and pre-DDL Turso rollback guard" do
+    source = File.read!(@staged_path_migration_path)
+
+    assert source =~ "def up do"
+    assert source =~ "def down do"
+    assert source =~ "ALTER COLUMN staged_storage_path TYPE text"
+    assert source =~ "ALTER COLUMN staged_storage_path TYPE varchar(255)"
+    assert source =~ "# TODO(upstream): gsmlg-dev/concord#81"
+    refute source =~ "def change do"
+  end
+
   @tag :tmp_dir
   test "00400 upgrades an existing repository and preserves repository index contracts",
        context do
@@ -442,6 +512,10 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
     seed = repository_seed()
 
     try do
+      if postgres?() and migration_applied?(migration_repo, @staged_path_version) do
+        assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
+      end
+
       if postgres?() and migration_applied?(migration_repo, @write_version) do
         assert [@write_version] = migrate_down(migration_repo, @write_version)
       end
@@ -460,6 +534,7 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
       if postgres?() do
         ensure_up!(migration_repo, @version)
         ensure_up!(migration_repo, @write_version)
+        ensure_up!(migration_repo, @staged_path_version)
         delete_seed!(migration_repo, seed)
       end
     end
@@ -468,6 +543,10 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
   @tag :tmp_dir
   test "00400 rollback is pre-DDL guarded on Turso and exact on PostgreSQL", context do
     migration_repo = start_migration_repo!(context)
+
+    if postgres?() and migration_applied?(migration_repo, @staged_path_version) do
+      assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
+    end
 
     if postgres?() and migration_applied?(migration_repo, @write_version) do
       assert [@write_version] = migrate_down(migration_repo, @write_version)
@@ -501,6 +580,7 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
       if postgres?() do
         ensure_up!(migration_repo, @version)
         ensure_up!(migration_repo, @write_version)
+        ensure_up!(migration_repo, @staged_path_version)
       end
     end
   end
@@ -511,6 +591,10 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
     seed = write_version_seed()
 
     try do
+      if postgres?() and migration_applied?(migration_repo, @staged_path_version) do
+        assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
+      end
+
       if postgres?() and migration_applied?(migration_repo, @write_version) do
         assert [@write_version] = migrate_down(migration_repo, @write_version)
       end
@@ -532,6 +616,7 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
     after
       if postgres?() do
         ensure_up!(migration_repo, @write_version)
+        ensure_up!(migration_repo, @staged_path_version)
         delete_write_version_seed!(migration_repo, seed)
       end
     end
@@ -542,6 +627,10 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
     migration_repo = start_migration_repo!(context)
     ensure_up!(migration_repo, @version)
     ensure_up!(migration_repo, @write_version)
+
+    if postgres?() and migration_applied?(migration_repo, @staged_path_version) do
+      assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
+    end
 
     try do
       if postgres?() do
@@ -574,7 +663,70 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
         assert_write_version_schema!(migration_repo)
       end
     after
-      if postgres?(), do: ensure_up!(migration_repo, @write_version)
+      if postgres?() do
+        ensure_up!(migration_repo, @write_version)
+        ensure_up!(migration_repo, @staged_path_version)
+      end
+    end
+  end
+
+  @tag :tmp_dir
+  test "00420 preserves long staged paths and has an exact adapter lifecycle", context do
+    migration_repo = start_migration_repo!(context)
+    ensure_up!(migration_repo, @version)
+    ensure_up!(migration_repo, @write_version)
+
+    if postgres?() and migration_applied?(migration_repo, @staged_path_version) do
+      assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
+    end
+
+    if postgres?() do
+      assert staged_path_column_type(migration_repo) == {"character varying", 255}
+    else
+      assert staged_path_column_type(migration_repo) == {"TEXT", nil}
+    end
+
+    assert [@staged_path_version] = migrate_up(migration_repo, @staged_path_version)
+
+    assert staged_path_column_type(migration_repo) ==
+             if(postgres?(), do: {"text", nil}, else: {"TEXT", nil})
+
+    if postgres?() do
+      seed = write_version_seed()
+      seeded = seed_pre_00410_rows!(migration_repo, seed)
+      long_path = "/staging/" <> String.duplicate("a", 300) <> ".git"
+
+      try do
+        update_staged_path!(migration_repo, seeded.item_id, long_path)
+        assert staged_path_value(migration_repo, seeded.item_id) == long_path
+
+        assert_raise Postgrex.Error, ~r/staged_storage_path exceeds varchar\(255\)/, fn ->
+          migrate_down(migration_repo, @staged_path_version)
+        end
+
+        assert migration_applied?(migration_repo, @staged_path_version)
+        assert staged_path_column_type(migration_repo) == {"text", nil}
+        assert staged_path_value(migration_repo, seeded.item_id) == long_path
+
+        update_staged_path!(migration_repo, seeded.item_id, nil)
+        assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
+        assert staged_path_column_type(migration_repo) == {"character varying", 255}
+
+        assert [@staged_path_version] = migrate_up(migration_repo, @staged_path_version)
+        assert staged_path_column_type(migration_repo) == {"text", nil}
+        update_staged_path!(migration_repo, seeded.item_id, long_path)
+        assert staged_path_value(migration_repo, seeded.item_id) == long_path
+      after
+        ensure_up!(migration_repo, @staged_path_version)
+        delete_write_version_seed!(migration_repo, seed)
+      end
+    else
+      assert_raise RuntimeError,
+                   "Turso rollback is disabled until gsmlg-dev/concord#81 is resolved",
+                   fn -> migrate_down(migration_repo, @staged_path_version) end
+
+      assert migration_applied?(migration_repo, @staged_path_version)
+      assert staged_path_column_type(migration_repo) == {"TEXT", nil}
     end
   end
 
@@ -809,6 +961,53 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
       )
 
     {write_version, replacement_write_version}
+  end
+
+  defp staged_path_column_type(repo) do
+    if postgres?() do
+      %{rows: [[type, length]]} =
+        SQL.query!(
+          repo,
+          "select data_type, character_maximum_length from information_schema.columns " <>
+            "where table_schema = current_schema() and " <>
+            "table_name = 'github_import_repository_items' and " <>
+            "column_name = 'staged_storage_path'",
+          []
+        )
+
+      {type, length}
+    else
+      %{rows: rows} =
+        SQL.query!(repo, "pragma table_info('github_import_repository_items')", [])
+
+      row = Enum.find(rows, &(Enum.at(&1, 1) == "staged_storage_path"))
+      {Enum.at(row, 2), nil}
+    end
+  end
+
+  defp update_staged_path!(repo, item_id, value) do
+    [value_placeholder, id_placeholder] = placeholders(2)
+
+    SQL.query!(
+      repo,
+      "update github_import_repository_items " <>
+        "set staged_storage_path = #{value_placeholder} where id = #{id_placeholder}",
+      [value, item_id]
+    )
+  end
+
+  defp staged_path_value(repo, item_id) do
+    placeholder = List.first(placeholders(1))
+
+    %{rows: [[value]]} =
+      SQL.query!(
+        repo,
+        "select staged_storage_path from github_import_repository_items " <>
+          "where id = #{placeholder}",
+        [item_id]
+      )
+
+    value
   end
 
   defp repository_projection(repo, repository_id) do

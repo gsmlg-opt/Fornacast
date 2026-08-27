@@ -10,7 +10,7 @@ defmodule ForgeImports.OneTimeCredential do
   alias ForgeAccounts.GitHubIdentity
   alias ForgeAccounts.GitHubProfileSafety
   alias ForgeAccounts.User
-  alias ForgeImports.ImportRun
+  alias ForgeImports.{ImportAttempt, ImportRun, RepositoryItem}
   alias Fornacast.Repo
 
   @service_error {:error, :credential_service_unavailable}
@@ -75,6 +75,33 @@ defmodule ForgeImports.OneTimeCredential do
   end
 
   def with_credential(_actor, _run, _callback, _keyring), do: @service_error
+
+  @doc false
+  @spec with_item_credential(User.t(), RepositoryItem.t(), (binary() -> term()), term()) ::
+          {:ok, :acknowledged}
+          | {:error, :credential_service_unavailable | :unsafe_credential_result}
+  def with_item_credential(actor, item, callback, keyring)
+
+  def with_item_credential(
+        %User{id: actor_id},
+        %RepositoryItem{lease_owner: owner, lock_version: version} = capability,
+        callback,
+        keyring
+      )
+      when is_integer(actor_id) and is_binary(owner) and owner != "" and is_integer(version) and
+             is_function(callback, 1) do
+    with {%ImportRun{} = run, %RepositoryItem{}} <- current_owned_item(actor_id, capability),
+         {:ok, envelope} <- from_run(run),
+         %GitHubIdentity{kind: :user, github_user_id: github_user_id}
+         when is_integer(github_user_id) and github_user_id > 0 <-
+           Repo.get(GitHubIdentity, run.github_identity_id) do
+      checked_out_result(envelope, run, github_user_id, callback, keyring)
+    else
+      _ -> @service_error
+    end
+  end
+
+  def with_item_credential(_actor, _item, _callback, _keyring), do: @service_error
 
   def verify_envelope(%ImportRun{} = run, %Envelope{} = envelope, keyring) do
     with %GitHubIdentity{github_user_id: github_user_id}
@@ -170,6 +197,31 @@ defmodule ForgeImports.OneTimeCredential do
             run.lock_version == ^capability.lock_version and
             run.lease_owner == ^capability.lease_owner and not is_nil(run.lease_expires_at) and
             run.lease_expires_at > ^now
+    )
+  end
+
+  defp current_owned_item(actor_id, capability) do
+    now = DateTime.utc_now(:second)
+
+    Repo.one(
+      from item in RepositoryItem,
+        join: run in ImportRun,
+        on: run.id == item.import_run_id,
+        join: actor in User,
+        on: actor.id == run.actor_user_id,
+        join: attempt in ImportAttempt,
+        on:
+          attempt.repository_item_id == item.id and
+            attempt.attempt_number == item.attempt_count,
+        where:
+          item.id == ^capability.id and item.import_run_id == ^capability.import_run_id and
+            item.lock_version == ^capability.lock_version and
+            item.lease_owner == ^capability.lease_owner and not is_nil(item.lease_expires_at) and
+            item.lease_expires_at > ^now and item.selected == true and item.state == :staging_git and
+            is_nil(item.cleanup_state) and run.actor_user_id == ^actor_id and
+            run.state == :running and
+            actor.kind == :user and actor.state == :active and attempt.state == :running,
+        select: {run, item}
     )
   end
 

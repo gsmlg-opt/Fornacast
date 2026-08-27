@@ -327,7 +327,8 @@ defmodule ForgeImports.DiscoveryRecoveryTest do
                  )
 
         assert eventually(fn -> Agent.get(state, & &1.organization_calls) == 1 end)
-        Process.sleep(1_100)
+        # Reconciler clamps worker leases to the shared two-second safety minimum.
+        Process.sleep(2_100)
 
         assert {:ok, :awaiting_resolution} =
                  DiscoveryWorker.perform(run_id,
