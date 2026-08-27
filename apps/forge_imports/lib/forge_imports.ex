@@ -14,9 +14,11 @@ defmodule ForgeImports do
     Persistence,
     ReportEntry,
     RepositoryItem,
+    RepositoryPublisher,
     RunView
   }
 
+  alias ForgeRepos.Repository
   alias Fornacast.Repo
 
   @run_view_read_attempts 3
@@ -89,6 +91,21 @@ defmodule ForgeImports do
 
   def mark_destination_changed(actor, run_id, item_reference, request_metadata),
     do: Conflicts.destination_changed(actor, run_id, item_reference, request_metadata)
+
+  @spec publish_repository(User.t(), pos_integer(), map()) ::
+          {:ok, %{repository: Repository.t(), replaced: Repository.t() | nil}}
+          | {:error,
+             :metadata_not_ready
+             | :busy
+             | :destination_changed
+             | :cancelled
+             | :not_found
+             | :publication_unavailable
+             | :persistence_unavailable
+             | :publication_inconsistent
+             | :invalid_request_metadata}
+  def publish_repository(actor, item_id, request_metadata),
+    do: RepositoryPublisher.publish(actor, item_id, request_metadata)
 
   defp read_run_view(actor, id, attempts_left) do
     with {:ok, active_actor} <- active_actor(actor),

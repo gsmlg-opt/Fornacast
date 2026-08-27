@@ -63,7 +63,7 @@ defmodule ForgeImports.ImportPersistenceTest do
     git_staged: [:staging_metadata, :awaiting_credential, :cancel_requested, :failed],
     staging_metadata: [:ready_to_publish, :awaiting_credential, :cancel_requested, :failed],
     ready_to_publish: [:publishing, :awaiting_credential, :cancel_requested, :failed],
-    publishing: [:published, :awaiting_credential, :cancel_requested, :failed],
+    publishing: [:published],
     published: [:completed],
     awaiting_credential: [
       :queued,
@@ -621,7 +621,7 @@ defmodule ForgeImports.ImportPersistenceTest do
     identity: identity
   } do
     run = run_fixture(actor, identity)
-    item = item_fixture(run, state: :publishing)
+    item = item_fixture(run, state: :ready_to_publish)
     assert {:ok, claimed} = OperationLease.claim(RepositoryItem, item.id, "worker-a", @now, 30)
 
     assert {:ok, terminal} =

@@ -110,7 +110,7 @@ defmodule ForgeImports.RepositoryItem do
     git_staged: [:staging_metadata, :awaiting_credential, :cancel_requested, :failed],
     staging_metadata: [:ready_to_publish, :awaiting_credential, :cancel_requested, :failed],
     ready_to_publish: [:publishing, :awaiting_credential, :cancel_requested, :failed],
-    publishing: [:published, :awaiting_credential, :cancel_requested, :failed],
+    publishing: [:published],
     published: [:completed],
     awaiting_credential: [
       :queued,
@@ -454,7 +454,8 @@ defmodule ForgeImports.RepositoryItem do
         lease_owner: nil,
         lease_expires_at: nil,
         failure_kind: nil,
-        failure_detail: nil
+        failure_detail: nil,
+        publication_evidence: %{}
       )
       |> validate_conflict_fingerprint()
       |> validate_lifecycle()
@@ -466,6 +467,72 @@ defmodule ForgeImports.RepositoryItem do
 
   def destination_drift_changeset(item, _action),
     do: item |> change() |> add_error(:state, "cannot reopen this repository")
+
+  @doc false
+  def publication_intent_changeset(
+        %__MODULE__{
+          selected: true,
+          state: :ready_to_publish,
+          cleanup_state: nil,
+          publication_evidence: evidence
+        } = item,
+        intent,
+        owner,
+        %DateTime{} = expires_at
+      )
+      when is_map(evidence) and map_size(evidence) == 0 and is_map(intent) and is_binary(owner) do
+    item
+    |> change(
+      state: :publishing,
+      publication_evidence: intent,
+      lease_owner: owner,
+      lease_expires_at: DateTime.truncate(expires_at, :second),
+      next_attempt_at: nil,
+      wait_reason: nil,
+      failure_kind: nil,
+      failure_detail: nil
+    )
+    |> validate_maps()
+    |> validate_lifecycle()
+  end
+
+  def publication_intent_changeset(item, _intent, _owner, _expires_at),
+    do: item |> change() |> add_error(:state, "cannot admit publication")
+
+  @doc false
+  def publication_commit_changeset(
+        %__MODULE__{state: :publishing} = item,
+        evidence
+      )
+      when is_map(evidence) do
+    item
+    |> change(
+      state: :published,
+      publication_evidence: evidence,
+      lease_owner: nil,
+      lease_expires_at: nil,
+      next_attempt_at: nil,
+      wait_reason: nil,
+      failure_kind: nil,
+      failure_detail: nil
+    )
+    |> validate_maps()
+    |> validate_lifecycle()
+  end
+
+  def publication_commit_changeset(item, _evidence),
+    do: item |> change() |> add_error(:state, "cannot commit publication")
+
+  @doc false
+  def frozen_resume_changeset(%__MODULE__{state: :queued} = item, target)
+      when target in [:queued, :git_staged, :ready_to_publish] do
+    item
+    |> change(state: target, next_attempt_at: nil, wait_reason: nil)
+    |> validate_lifecycle()
+  end
+
+  def frozen_resume_changeset(item, _target),
+    do: item |> change() |> add_error(:state, "cannot resume this repository")
 
   @doc false
   def staging_intent_changeset(

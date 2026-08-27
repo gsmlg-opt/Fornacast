@@ -12,6 +12,7 @@ defmodule ForgeImports.Reconciler do
     ImportAttempt,
     ImportRun,
     RepositoryItem,
+    RepositoryPublisher,
     RepositoryWorker
   }
 
@@ -51,6 +52,47 @@ defmodule ForgeImports.Reconciler do
       when is_integer(limit) and limit in 1..100 do
     now = DateTime.truncate(now, :second)
 
+    staging_branch =
+      dynamic(
+        [item, run, _attempt, actor],
+        ((item.state == :queued and is_nil(item.hidden_repository_id) and
+            is_nil(item.staged_storage_path)) or
+           (item.state == :staging_git and not is_nil(item.hidden_repository_id) and
+              not is_nil(item.staged_storage_path))) and
+          ((run.state == :running and actor.state == :active and
+              (is_nil(run.lease_expires_at) or run.lease_expires_at <= ^now)) or
+             (item.state == :staging_git and
+                run.state in [
+                  :running,
+                  :cancel_requested,
+                  :canceled,
+                  :failed,
+                  :completed,
+                  :completed_with_warnings
+                ] and (run.state != :running or actor.state != :active)))
+      )
+
+    fresh_publication_branch =
+      dynamic(
+        [item, run, _attempt, actor],
+        item.state == :ready_to_publish and is_nil(item.cleanup_state) and
+          run.state == :running and actor.state == :active and
+          (is_nil(run.lease_expires_at) or run.lease_expires_at <= ^now)
+      )
+
+    recovery_publication_branch =
+      dynamic(
+        [item, run, _attempt, _actor],
+        item.state == :publishing and
+          run.state in [:running, :cancel_requested, :awaiting_credential]
+      )
+
+    eligible_branch =
+      dynamic(
+        [item, run, attempt, actor],
+        ^staging_branch or ^fresh_publication_branch or ^recovery_publication_branch
+      )
+
     RepositoryItem
     |> join(:inner, [item], run in ImportRun, on: run.id == item.import_run_id)
     |> join(:inner, [item, _run], attempt in ImportAttempt,
@@ -61,28 +103,17 @@ defmodule ForgeImports.Reconciler do
     |> join(:inner, [_item, run, _attempt], actor in User, on: actor.id == run.actor_user_id)
     |> where(
       [item, run, attempt, actor],
-      item.selected == true and item.state in [:queued, :staging_git] and
+      item.selected == true and
+        item.state in [:queued, :staging_git, :ready_to_publish, :publishing] and
         item.attempt_count > 0 and
         (is_nil(item.next_attempt_at) or item.next_attempt_at <= ^now) and
-        is_nil(item.cleanup_state) and
         (is_nil(item.lease_expires_at) or item.lease_expires_at <= ^now) and
-        ((item.state == :queued and is_nil(item.hidden_repository_id) and
-            is_nil(item.staged_storage_path)) or
-           (item.state == :staging_git and not is_nil(item.hidden_repository_id) and
-              not is_nil(item.staged_storage_path))) and
-        ((run.state == :running and actor.state == :active and attempt.state == :running and
-            (is_nil(run.lease_expires_at) or run.lease_expires_at <= ^now)) or
-           (item.state == :staging_git and
-              run.state in [
-                :running,
-                :cancel_requested,
-                :canceled,
-                :failed,
-                :completed,
-                :completed_with_warnings
-              ] and (run.state != :running or actor.state != :active))) and actor.kind == :user
+        attempt.state == :running and actor.kind == :user
     )
+    |> where(^eligible_branch)
     |> order_by([item, _run, _attempt, _actor],
+      desc: item.state == :publishing,
+      desc: item.state == :ready_to_publish,
       desc: is_nil(item.next_attempt_at),
       asc: item.next_attempt_at,
       asc: item.id
@@ -191,12 +222,31 @@ defmodule ForgeImports.Reconciler do
       state.batch_size
       |> runnable_repository_item_ids(now)
       |> Enum.map(fn item_id ->
-        options = repository_worker_options(state)
-
-        state.repository_worker.stage(item_id, options)
+        reconcile_repository_item(state, item_id)
       end)
 
     discovery_results ++ repository_results
+  end
+
+  defp reconcile_repository_item(state, item_id) do
+    case Repo.get(RepositoryItem, item_id) do
+      %RepositoryItem{state: :publishing} ->
+        RepositoryPublisher.recover(item_id)
+
+      %RepositoryItem{state: :ready_to_publish, import_run_id: run_id} ->
+        with %ImportRun{} = run <- Repo.get(ImportRun, run_id),
+             %User{} = actor <- Repo.get(User, run.actor_user_id) do
+          RepositoryPublisher.publish(actor, item_id, run.request_metadata)
+        else
+          _missing -> {:error, :not_found}
+        end
+
+      %RepositoryItem{} ->
+        state.repository_worker.stage(item_id, repository_worker_options(state))
+
+      nil ->
+        {:error, :not_found}
+    end
   end
 
   defp repository_worker_options(state) do

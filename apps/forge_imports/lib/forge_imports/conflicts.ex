@@ -4,7 +4,16 @@ defmodule ForgeImports.Conflicts do
   import Ecto.Query
 
   alias ForgeAccounts.{Namespace, User}
-  alias ForgeImports.{ImportAttempt, ImportRun, Persistence, Reconciler, RepositoryItem}
+
+  alias ForgeImports.{
+    ImportAttempt,
+    ImportRun,
+    PageCheckpoint,
+    Persistence,
+    Reconciler,
+    RepositoryItem
+  }
+
   alias Fornacast.{Audit, Repo}
 
   @allow_test_options Mix.env() == :test
@@ -67,6 +76,38 @@ defmodule ForgeImports.Conflicts do
 
   def destination_changed(_actor, _run_id, _item_id, _request_metadata),
     do: {:error, :invalid_selection}
+
+  @doc false
+  def reopen_publication(capability) when is_map(capability) do
+    transaction = fn ->
+      Repo.transaction(fn ->
+        now = DateTime.utc_now(:second)
+
+        with %User{} <- locked_persisted_actor(capability.actor_id),
+             %ImportRun{} = run <- locked_publication_run(capability),
+             %RepositoryItem{} = item <- locked_publication_item(capability),
+             %ImportAttempt{} = attempt <- locked_publication_attempt(capability),
+             true <- valid_publication_capability?(capability, item, attempt, now),
+             {:ok, action} <- running_decision_action(attempt),
+             {:ok, updated_run} <- touch_publication_run(run, now),
+             :ok <- close_publication_attempt(attempt, now),
+             {:ok, reopened} <- reopen_publication_item(item, action, now) do
+          %{run: updated_run, item: reopened}
+        else
+          _stale -> Repo.rollback(:stale)
+        end
+      end)
+    end
+
+    case Persistence.with_retry(transaction) do
+      {:ok, %{item: item}} -> {:ok, item}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    _error -> {:error, :persistence_unavailable}
+  end
+
+  def reopen_publication(_capability), do: {:error, :stale}
 
   defp resolve_transaction(actor, run_id, decisions, request_metadata) do
     with_actor_run(actor, run_id, fn active_actor, run, now ->
@@ -431,8 +472,9 @@ defmodule ForgeImports.Conflicts do
                [:queued],
                RepositoryItem.freeze_attempt_changeset(item, plan.action, attempt_number),
                now
-             ) do
-        {:cont, {:ok, [updated_item | frozen]}}
+             ),
+           {:ok, resumed_item} <- resume_frozen_item(updated_item, plan.action, now) do
+        {:cont, {:ok, [resumed_item | frozen]}}
       else
         {:error, %Ecto.Changeset{}} -> {:halt, {:error, :stale}}
         {:error, reason} -> {:halt, {:error, reason}}
@@ -441,6 +483,207 @@ defmodule ForgeImports.Conflicts do
     |> case do
       {:ok, frozen} -> {:ok, Enum.reverse(frozen)}
       error -> error
+    end
+  end
+
+  defp resume_frozen_item(item, :skip, _now), do: {:ok, item}
+
+  defp resume_frozen_item(item, action, now) when action in [:create, :rename, :replace] do
+    with {:ok, target} <- durable_resume_state(item) do
+      if target == :queued do
+        {:ok, item}
+      else
+        Persistence.update_without_lease(
+          item,
+          [:queued],
+          RepositoryItem.frozen_resume_changeset(item, target),
+          now
+        )
+      end
+    end
+  end
+
+  defp durable_resume_state(%RepositoryItem{} = item) do
+    hidden? = is_integer(item.hidden_repository_id) and item.hidden_repository_id > 0
+    staged? = is_binary(item.staged_storage_path)
+    git_evidence? = map_size(item.source_git || %{}) > 0 or map_size(item.checkpoint || %{}) > 0
+
+    cond do
+      not hidden? and not staged? and not git_evidence? ->
+        {:ok, :queued}
+
+      hidden? and staged? and reusable_git_proof?(item) ->
+        if complete_terminal_metadata?(item.id),
+          do: {:ok, :ready_to_publish},
+          else: {:ok, :git_staged}
+
+      true ->
+        {:error, :stale}
+    end
+  end
+
+  defp reusable_git_proof?(item) do
+    checkpoint = item.checkpoint
+    source = item.source_git
+
+    with %ForgeRepos.Repository{} = shadow <-
+           Repo.get(ForgeRepos.Repository, item.hidden_repository_id),
+         true <- shadow.lifecycle == :importing and is_nil(shadow.deleted_at),
+         true <- shadow.owner_user_id == item.destination_owner_id and shadow.write_version == 0,
+         true <- ForgeRepos.absolute_storage_path(shadow) == item.staged_storage_path,
+         true <- checkpoint["git_staged"] == true,
+         true <- checkpoint["unsupported_scan"] in ["complete", "truncated"],
+         true <- is_boolean(source["empty"]),
+         true <- is_binary(source["default_branch"]) and source["default_branch"] != "",
+         true <- is_integer(source["refs"]) and source["refs"] >= 0,
+         true <- is_integer(source["bytes"]) and source["bytes"] >= 0,
+         true <- is_boolean(source["lfs_detected"]),
+         true <- is_boolean(source["submodules_detected"]),
+         true <- is_boolean(source["scan_truncated"]) do
+      true
+    else
+      _invalid -> false
+    end
+  rescue
+    _error -> false
+  end
+
+  defp complete_terminal_metadata?(item_id) do
+    resources = ~w(labels issues comments pull_requests number_sequence)
+
+    rows =
+      Repo.all(
+        from checkpoint in PageCheckpoint,
+          where:
+            checkpoint.repository_item_id == ^item_id and
+              checkpoint.page_key == "__terminal_v1__",
+          select: {checkpoint.resource_kind, checkpoint.committed_at}
+      )
+
+    length(rows) == length(resources) and
+      Enum.sort(Enum.map(rows, &elem(&1, 0))) == Enum.sort(resources) and
+      Enum.all?(rows, &match?({_kind, %DateTime{}}, &1))
+  end
+
+  defp locked_persisted_actor(actor_id) do
+    User
+    |> where([actor], actor.id == ^actor_id and actor.kind == :user)
+    |> maybe_lock()
+    |> Repo.one()
+  end
+
+  defp locked_publication_run(capability) do
+    ImportRun
+    |> where(
+      [run],
+      run.id == ^capability.run_id and run.actor_user_id == ^capability.actor_id and
+        run.lock_version == ^capability.run_lock_version and
+        run.state in [:running, :cancel_requested, :awaiting_credential]
+    )
+    |> maybe_lock()
+    |> Repo.one()
+  end
+
+  defp locked_publication_item(capability) do
+    RepositoryItem
+    |> where(
+      [item],
+      item.id == ^capability.item_id and item.import_run_id == ^capability.run_id and
+        item.lock_version == ^capability.item_lock_version and item.state == :publishing and
+        item.lease_owner == ^capability.lease_owner
+    )
+    |> maybe_lock()
+    |> Repo.one()
+  end
+
+  defp locked_publication_attempt(capability) do
+    ImportAttempt
+    |> where(
+      [attempt],
+      attempt.repository_item_id == ^capability.item_id and
+        attempt.attempt_number == ^capability.attempt_number and attempt.state == :running
+    )
+    |> maybe_lock()
+    |> Repo.one()
+  end
+
+  defp valid_publication_capability?(capability, item, attempt, now) do
+    (item.lease_expires_at && DateTime.compare(item.lease_expires_at, now) == :gt) and
+      item.publication_evidence == capability.intent and
+      capability.operation_id == capability.intent["operation_id"] and
+      capability.attempt_number == attempt.attempt_number and
+      capability.intent["attempt_number"] == attempt.attempt_number and
+      capability.intent["action"] == attempt.decision["action"]
+  end
+
+  defp touch_publication_run(run, now) do
+    case Repo.update_all(
+           from(candidate in ImportRun,
+             where:
+               candidate.id == ^run.id and candidate.lock_version == ^run.lock_version and
+                 candidate.state == ^run.state
+           ),
+           set: [updated_at: now],
+           inc: [lock_version: 1]
+         ) do
+      {1, _rows} -> {:ok, %{run | lock_version: run.lock_version + 1, updated_at: now}}
+      {0, _rows} -> {:error, :stale}
+    end
+  end
+
+  defp reopen_publication_item(item, action, now) do
+    changeset = RepositoryItem.destination_drift_changeset(item, action)
+
+    if changeset.valid? do
+      updates =
+        changeset.changes
+        |> Map.drop([:lock_version])
+        |> Map.put(:updated_at, now)
+        |> Map.to_list()
+
+      query =
+        from candidate in RepositoryItem,
+          where:
+            candidate.id == ^item.id and candidate.import_run_id == ^item.import_run_id and
+              candidate.lock_version == ^item.lock_version and candidate.state == :publishing and
+              candidate.lease_owner == ^item.lease_owner and
+              candidate.lease_expires_at == ^item.lease_expires_at and
+              candidate.lease_expires_at > ^now
+
+      case Repo.update_all(query, set: updates, inc: [lock_version: 1]) do
+        {1, _rows} ->
+          {:ok,
+           changeset
+           |> Ecto.Changeset.apply_changes()
+           |> Map.put(:lock_version, item.lock_version + 1)
+           |> Map.put(:updated_at, now)}
+
+        {0, _rows} ->
+          {:error, :stale}
+      end
+    else
+      {:error, :stale}
+    end
+  end
+
+  defp close_publication_attempt(attempt, now) do
+    case Repo.update_all(
+           from(candidate in ImportAttempt,
+             where:
+               candidate.id == ^attempt.id and
+                 candidate.repository_item_id == ^attempt.repository_item_id and
+                 candidate.attempt_number == ^attempt.attempt_number and
+                 candidate.state == :running
+           ),
+           set: [
+             state: :destination_changed,
+             terminal_at: now,
+             failure_kind: "destination_changed",
+             updated_at: now
+           ]
+         ) do
+      {1, _rows} -> :ok
+      {0, _rows} -> {:error, :stale}
     end
   end
 

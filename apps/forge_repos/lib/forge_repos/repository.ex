@@ -24,6 +24,17 @@ defmodule ForgeRepos.Repository do
     :lifecycle,
     :generation
   ]
+  @publication_fields [
+    :owner_user_id,
+    :slug,
+    :name,
+    :description,
+    :visibility,
+    :default_branch,
+    :has_issues,
+    :allow_merge_commit,
+    :generation
+  ]
 
   @type t :: %__MODULE__{}
 
@@ -86,6 +97,51 @@ defmodule ForgeRepos.Repository do
     |> add_error(:id, "must be new", validation: :creation_only)
   end
 
+  @doc false
+  def import_publication_changeset(
+        %__MODULE__{lifecycle: :importing, deleted_at: nil, write_version: 0} = repository,
+        attrs
+      )
+      when is_map(attrs) do
+    if exact_fields?(attrs, @publication_fields) do
+      repository
+      |> cast(attrs, @publication_fields)
+      |> put_change(:lifecycle, :ready)
+      |> put_change(:deleted_at, nil)
+      |> validate_required([
+        :owner_user_id,
+        :slug,
+        :name,
+        :visibility,
+        :default_branch,
+        :has_issues,
+        :allow_merge_commit,
+        :generation
+      ])
+      |> validate_repository_fields()
+      |> validate_number(:owner_user_id, greater_than: 0)
+      |> validate_number(:generation, greater_than: 0)
+      |> unique_constraint([:owner_user_id, :slug], name: owner_slug_constraint())
+    else
+      repository |> change() |> add_error(:base, "contains invalid publication fields")
+    end
+  end
+
+  def import_publication_changeset(%__MODULE__{} = repository, _attrs),
+    do: repository |> change() |> add_error(:lifecycle, "is not an importing shadow")
+
+  @doc false
+  def import_tombstone_changeset(
+        %__MODULE__{lifecycle: :ready, deleted_at: nil} = repository,
+        %DateTime{} = deleted_at
+      ) do
+    repository
+    |> change(lifecycle: :tombstoned, deleted_at: DateTime.truncate(deleted_at, :second))
+  end
+
+  def import_tombstone_changeset(%__MODULE__{} = repository, _deleted_at),
+    do: repository |> change() |> add_error(:lifecycle, "cannot be tombstoned")
+
   def api_create_changeset(repository, attrs) do
     repository
     |> cast(attrs, @api_fields)
@@ -147,6 +203,17 @@ defmodule ForgeRepos.Repository do
   end
 
   defp import_attr_present?(_attrs, _field), do: false
+
+  defp exact_fields?(attrs, fields) do
+    keys =
+      Enum.map(Map.keys(attrs), fn
+        key when is_atom(key) -> key
+        key when is_binary(key) -> Enum.find(fields, &(Atom.to_string(&1) == key))
+        _key -> nil
+      end)
+
+    Enum.sort(keys) == Enum.sort(fields)
+  end
 
   defp validate_import_lifecycle(changeset) do
     if get_field(changeset, :lifecycle) == :importing,

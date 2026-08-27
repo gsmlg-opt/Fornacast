@@ -356,6 +356,355 @@ defmodule ForgeRepos do
   def create_import_shadow(%Multi{} = multi, key, _owner_id, _attrs),
     do: Multi.error(multi, key, :invalid_shadow)
 
+  @publication_spec_keys [
+    :hidden_repository_id,
+    :expected_internal_slug,
+    :storage_path,
+    :shadow_write_version,
+    :owner_user_id,
+    :slug,
+    :name,
+    :description,
+    :visibility,
+    :default_branch,
+    :has_issues,
+    :allow_merge_commit,
+    :generation,
+    :timestamp
+  ]
+  @replacement_spec_keys [
+    :repository_id,
+    :owner_user_id,
+    :slug,
+    :storage_path,
+    :generation,
+    :write_version,
+    :updated_at,
+    :last_pushed_at
+  ]
+
+  @doc false
+  @spec publish_import_shadow(Multi.t(), Multi.name(), User.t(), map(), map() | nil) ::
+          Multi.t()
+  def publish_import_shadow(
+        %Multi{} = multi,
+        key,
+        %User{id: actor_id},
+        publication_spec,
+        expected_replacement
+      )
+      when is_integer(actor_id) and actor_id > 0 and is_map(publication_spec) and
+             (is_nil(expected_replacement) or is_map(expected_replacement)) do
+    if exact_map_keys?(publication_spec, @publication_spec_keys) and
+         (is_nil(expected_replacement) or
+            exact_map_keys?(expected_replacement, @replacement_spec_keys)) do
+      multi
+      |> Multi.run({key, :authorization}, fn repo, _changes ->
+        authorize_import_publication(repo, actor_id, publication_spec.owner_user_id)
+      end)
+      |> Multi.run(key, fn repo, _changes ->
+        mutate_import_shadow(repo, publication_spec, expected_replacement)
+      end)
+    else
+      Multi.error(multi, key, :destination_changed)
+    end
+  end
+
+  def publish_import_shadow(%Multi{} = multi, key, _actor, _spec, _replacement),
+    do: Multi.error(multi, key, :destination_changed)
+
+  if Mix.env() == :test do
+    @import_publication_hook_key {__MODULE__, :import_publication_hook}
+
+    @doc false
+    def with_test_after_import_tombstone_hook(hook, fun)
+        when is_function(hook, 1) and is_function(fun, 0) do
+      previous = Process.get(@import_publication_hook_key)
+      Process.put(@import_publication_hook_key, hook)
+
+      try do
+        fun.()
+      after
+        if is_nil(previous),
+          do: Process.delete(@import_publication_hook_key),
+          else: Process.put(@import_publication_hook_key, previous)
+      end
+    end
+
+    defp after_import_tombstone(repository) do
+      case Process.get(@import_publication_hook_key) do
+        hook when is_function(hook, 1) -> hook.(repository)
+        nil -> :ok
+      end
+    end
+  else
+    defp after_import_tombstone(_repository), do: :ok
+  end
+
+  defp authorize_import_publication(repo, actor_id, owner_id) do
+    actor_query =
+      from actor in User,
+        where: actor.id == ^actor_id and actor.kind == :user and actor.state == :active
+
+    owner_query =
+      from owner in User,
+        where:
+          owner.id == ^owner_id and owner.state == :active and
+            owner.kind in [:user, :organization]
+
+    with %User{} = actor <- actor_query |> publication_lock() |> repo.one(),
+         %User{} = owner <- owner_query |> publication_lock() |> repo.one(),
+         true <- import_destination_authorized?(repo, actor, owner) do
+      {:ok, %{actor: actor, owner: owner}}
+    else
+      _changed -> {:error, :destination_changed}
+    end
+  end
+
+  defp import_destination_authorized?(_repo, %User{id: id}, %User{id: id, kind: :user}), do: true
+
+  defp import_destination_authorized?(_repo, %User{role: :admin}, %User{kind: :organization}),
+    do: true
+
+  defp import_destination_authorized?(repo, %User{id: actor_id}, %User{
+         id: organization_id,
+         kind: :organization
+       }) do
+    membership_query =
+      from membership in OrganizationMember,
+        where:
+          membership.user_id == ^actor_id and
+            membership.organization_id == ^organization_id and membership.role == :owner
+
+    not is_nil(membership_query |> publication_lock() |> repo.one())
+  end
+
+  defp import_destination_authorized?(_repo, _actor, _owner), do: false
+
+  defp mutate_import_shadow(repo, spec, expected_replacement) do
+    ids =
+      [spec.hidden_repository_id, expected_replacement && expected_replacement.repository_id]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.sort()
+
+    repositories =
+      Repository
+      |> where([repository], repository.id in ^ids)
+      |> order_by([repository], asc: repository.id)
+      |> publication_lock()
+      |> repo.all()
+
+    shadow = Enum.find(repositories, &(&1.id == spec.hidden_repository_id))
+
+    replaced =
+      if expected_replacement,
+        do: Enum.find(repositories, &(&1.id == expected_replacement.repository_id)),
+        else: nil
+
+    with :ok <- validate_import_shadow(repo, shadow, spec),
+         :ok <- validate_import_target(repo, replaced, expected_replacement, spec),
+         {:ok, collaborators} <- locked_import_collaborators(repo, replaced),
+         {:ok, tombstoned} <- tombstone_import_target(repo, replaced, spec.timestamp),
+         :ok <- after_import_tombstone(tombstoned),
+         :ok <- copy_import_collaborators(repo, collaborators, shadow.id, spec.timestamp),
+         {:ok, published} <- activate_import_shadow(repo, shadow, spec) do
+      {:ok,
+       %{
+         repository: published,
+         replaced: tombstoned,
+         collaborator_count: length(collaborators)
+       }}
+    else
+      {:error, :destination_changed} -> {:error, :destination_changed}
+      {:error, %Changeset{}} -> {:error, :destination_changed}
+      {:error, _reason} -> {:error, :persistence_unavailable}
+      _changed -> {:error, :destination_changed}
+    end
+  end
+
+  defp validate_import_shadow(repo, %Repository{} = shadow, spec) do
+    collaborators? =
+      repo.exists?(
+        from collaborator in Collaborator,
+          where: collaborator.repository_id == ^shadow.id
+      )
+
+    active_slug_conflict? =
+      repo.exists?(
+        from repository in Repository,
+          where:
+            repository.id != ^shadow.id and repository.owner_user_id == ^spec.owner_user_id and
+              repository.slug == ^spec.slug and repository.lifecycle == :ready and
+              is_nil(repository.deleted_at)
+      )
+
+    if shadow.owner_user_id == spec.owner_user_id and
+         shadow.slug == spec.expected_internal_slug and shadow.storage_path == spec.storage_path and
+         shadow.write_version == spec.shadow_write_version and shadow.write_version == 0 and
+         shadow.lifecycle == :importing and is_nil(shadow.deleted_at) and
+         valid_canonical_import_shadow?(shadow, spec.expected_internal_slug) and
+         is_nil(shadow.storage_reclaimed_at) and not collaborators? and
+         (not active_slug_conflict? or (is_integer(spec.generation) and spec.generation > 1)) do
+      :ok
+    else
+      {:error, :destination_changed}
+    end
+  end
+
+  defp validate_import_shadow(_repo, _shadow, _spec), do: {:error, :destination_changed}
+
+  defp valid_canonical_import_shadow?(shadow, internal_slug) do
+    case Regex.run(~r/\Aimport-([1-9][0-9]*)-[0-9a-f]{24}\z/, internal_slug) do
+      [_slug, item_id] ->
+        shadow.name == "GitHub import #{item_id}" and shadow.description == nil and
+          shadow.visibility == :private and shadow.default_branch == "main" and
+          shadow.has_issues == true and shadow.allow_merge_commit == true and
+          is_nil(shadow.last_pushed_at)
+
+      _invalid ->
+        false
+    end
+  end
+
+  defp validate_import_target(_repo, nil, nil, %{generation: 1}), do: :ok
+
+  defp validate_import_target(_repo, %Repository{} = target, expected, spec)
+       when is_map(expected) do
+    if target.id == expected.repository_id and target.owner_user_id == expected.owner_user_id and
+         target.owner_user_id == spec.owner_user_id and target.slug == expected.slug and
+         target.slug == spec.slug and target.storage_path == expected.storage_path and
+         target.generation == expected.generation and spec.generation == target.generation + 1 and
+         target.write_version == expected.write_version and
+         target.updated_at == expected.updated_at and
+         target.last_pushed_at == expected.last_pushed_at and target.lifecycle == :ready and
+         is_nil(target.deleted_at) and is_nil(target.storage_reclaimed_at) do
+      :ok
+    else
+      {:error, :destination_changed}
+    end
+  end
+
+  defp validate_import_target(_repo, _target, _expected, _spec),
+    do: {:error, :destination_changed}
+
+  defp locked_import_collaborators(_repo, nil), do: {:ok, []}
+
+  defp locked_import_collaborators(repo, %Repository{id: repository_id}) do
+    collaborators =
+      Collaborator
+      |> where([collaborator], collaborator.repository_id == ^repository_id)
+      |> order_by([collaborator], asc: collaborator.user_id)
+      |> publication_lock()
+      |> repo.all()
+
+    {:ok, collaborators}
+  end
+
+  defp tombstone_import_target(_repo, nil, _timestamp), do: {:ok, nil}
+
+  defp tombstone_import_target(repo, %Repository{} = repository, timestamp) do
+    changeset = Repository.import_tombstone_changeset(repository, timestamp)
+
+    query =
+      from candidate in Repository,
+        where:
+          candidate.id == ^repository.id and
+            candidate.owner_user_id == ^repository.owner_user_id and
+            candidate.slug == ^repository.slug and
+            candidate.storage_path == ^repository.storage_path and
+            candidate.generation == ^repository.generation and
+            candidate.write_version == ^repository.write_version and
+            candidate.updated_at == ^repository.updated_at and candidate.lifecycle == :ready and
+            is_nil(candidate.deleted_at)
+
+    query = nullable_last_pushed(query, repository.last_pushed_at)
+
+    case repo.update_all(query,
+           set: [lifecycle: :tombstoned, deleted_at: timestamp, updated_at: repository.updated_at]
+         ) do
+      {1, _rows} ->
+        {:ok,
+         %{
+           Ecto.Changeset.apply_changes(changeset)
+           | updated_at: repository.updated_at
+         }}
+
+      {0, _rows} ->
+        {:error, :destination_changed}
+    end
+  end
+
+  defp copy_import_collaborators(repo, collaborators, repository_id, timestamp) do
+    Enum.reduce_while(collaborators, :ok, fn collaborator, :ok ->
+      changeset =
+        Collaborator.changeset(%Collaborator{}, %{
+          repository_id: repository_id,
+          user_id: collaborator.user_id,
+          role: collaborator.role
+        })
+        |> Changeset.put_change(:inserted_at, timestamp)
+        |> Changeset.put_change(:updated_at, timestamp)
+
+      case repo.insert(changeset) do
+        {:ok, _copied} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp activate_import_shadow(repo, shadow, spec) do
+    attrs =
+      Map.take(
+        spec,
+        ~w(owner_user_id slug name description visibility default_branch has_issues allow_merge_commit generation)a
+      )
+
+    changeset = Repository.import_publication_changeset(shadow, attrs)
+
+    if changeset.valid? do
+      published = Ecto.Changeset.apply_changes(changeset)
+
+      query =
+        from candidate in Repository,
+          where:
+            candidate.id == ^shadow.id and candidate.owner_user_id == ^shadow.owner_user_id and
+              candidate.slug == ^shadow.slug and candidate.storage_path == ^shadow.storage_path and
+              candidate.generation == ^shadow.generation and
+              candidate.write_version == ^shadow.write_version and
+              candidate.updated_at == ^shadow.updated_at and candidate.lifecycle == :importing and
+              is_nil(candidate.deleted_at) and is_nil(candidate.last_pushed_at)
+
+      updates =
+        published
+        |> Map.from_struct()
+        |> Map.take(
+          ~w(owner_user_id slug name description visibility default_branch has_issues allow_merge_commit lifecycle generation deleted_at)a
+        )
+        |> Map.put(:updated_at, spec.timestamp)
+        |> Map.to_list()
+
+      case repo.update_all(query, set: updates) do
+        {1, _rows} -> {:ok, %{published | updated_at: spec.timestamp}}
+        {0, _rows} -> {:error, :destination_changed}
+      end
+    else
+      {:error, changeset}
+    end
+  end
+
+  defp nullable_last_pushed(query, nil),
+    do: where(query, [repository], is_nil(repository.last_pushed_at))
+
+  defp nullable_last_pushed(query, last_pushed_at),
+    do: where(query, [repository], repository.last_pushed_at == ^last_pushed_at)
+
+  defp exact_map_keys?(map, expected) when is_map(map),
+    do: Enum.sort(Map.keys(map)) == Enum.sort(expected)
+
+  defp publication_lock(query) do
+    if turso_adapter?(), do: query, else: lock(query, "FOR UPDATE")
+  end
+
   def get_repository(owner_slug, repo_slug) when is_binary(owner_slug) and is_binary(repo_slug) do
     with %User{id: owner_user_id} <- ForgeAccounts.get_account_by_username(owner_slug) do
       ready_repository()
