@@ -583,8 +583,9 @@ git commit -m "feat(import): stage hidden Git repositories"
 - Modify: `apps/forge_repos/test/git_write_recovery_test.exs`
 - Modify: `apps/forge_pulls/test/merge_recovery_test.exs`
 
-**Persistence boundary:** Add no migration and no index. The existing partial unique
-`(owner_user_id, slug) WHERE deleted_at IS NULL`, unique storage-path,
+**Persistence boundary:** Add no migration, column, schema, or index. Keep the
+publication-count snapshot in the existing evidence/audit maps. The existing
+partial unique `(owner_user_id, slug) WHERE deleted_at IS NULL`, unique storage-path,
 repository-collaborator, and audit operation/action indexes are sufficient. The
 replacement transaction must tombstone the old row and set `deleted_at` before it
 activates the shadow.
@@ -664,8 +665,10 @@ The RED matrix must prove:
   item evidence/state, attempt state, run count, and audit together;
 - response loss followed by `published` or `completed` replay performs zero writes,
   returns the same new/old rows by ID, and verifies marker, repository, replacement,
-  audit, and run-count facts; corrupt committed evidence returns
-  `:publication_inconsistent`;
+  audit, and run-count facts; after publishing sibling items, replay of an earlier
+  item succeeds read-only even though the current aggregate is higher, while a
+  lowered or mismatched marker snapshot, changed audit snapshot/core, or current
+  aggregate lower than the agreed snapshot returns `:publication_inconsistent`;
 - destination drift closes only the current attempt, clears publication intent and
   lease, preserves that predecessor, and creates attempt `n + 1` on resolution;
   the successor resumes at `ready_to_publish` with an exact hidden repository, Git
@@ -804,11 +807,13 @@ ID and compares the full fingerprint, including `write_version` and nullable
 That final Multi must atomically compose:
 
 1. `ForgeRepos.publish_import_shadow/5`;
-2. a lease-owner/expiry/lock-version CAS from `publishing -> published`, closing the
+2. one `published_count` increment on the locked parent run, returning that exact
+   row's `id` and `published_count` as `run_id` and `published_count_after`;
+3. a lease-owner/expiry/lock-version CAS from `publishing -> published`, closing the
    exact current attempt as completed and replacing intent with exact committed
-   evidence;
-3. one `published_count` increment on the locked parent run;
-4. `repository.imported` or `repository.replaced` audit with operation ID
+   evidence constructed from the run-update result;
+4. `repository.imported` or `repository.replaced` audit constructed from that same
+   run-update result, with operation ID
    `github-import-publication-<item>-<attempt>` and, for replacement, exact old/new
    repository IDs; and
 5. an audit verifier that reloads the operation-ID rows and requires exactly one
@@ -825,11 +830,33 @@ only these publication facts:
   "owner_user_id" => published.owner_user_id,
   "slug" => published.slug,
   "generation" => published.generation,
-  "replaced_repository_id" => replaced && replaced.id
+  "replaced_repository_id" => replaced && replaced.id,
+  "run_id" => updated_run.id,
+  "published_count_after" => updated_run.published_count
 }
 ```
 
-Merge those facts into the v1 intent rather than constructing an unrelated marker.
+Merge those facts into the v1 intent rather than constructing an unrelated marker;
+the resulting committed-evidence keyset is exactly the intent keyset with `state`
+replaced plus the seven publication keys shown above. Construct exact audit core
+metadata before merging the already normalized safe request metadata:
+
+```elixir
+imported_core = %{
+  "item_id" => item.id,
+  "attempt_number" => attempt.attempt_number,
+  "run_id" => updated_run.id,
+  "published_count_after" => updated_run.published_count,
+  "new_repository_id" => published.id
+}
+
+replaced_core = Map.put(imported_core, "old_repository_id", replaced.id)
+```
+
+`repository.imported` uses exactly `imported_core`; `repository.replaced` uses
+exactly `replaced_core`. The stored audit metadata is exactly that core map merged
+with the intent's safe request-metadata projection, and the collision verifier
+compares the same projection.
 All five Multi contributions roll back together. Map destination namespace,
 fingerprint, authorization, or shadow drift to `:destination_changed`; limiter,
 fence, or writer/merge reconciliation failure to `:publication_unavailable`; and
@@ -840,10 +867,15 @@ database or audit failure to `:persistence_unavailable`.
 For `published` and `completed`, take the read-only replay branch before admission.
 By evidence, attempt number, new repository ID, and optional old repository ID,
 perform indexed point reads and verify the exact decision, active new repository
-settings/generation, old tombstone/deletion and unchanged replacement facts, audit,
-and run count. Return the original `%{repository:, replaced:}` without a write. Any
-missing or mismatched fact returns `:publication_inconsistent`; never repair a
-committed marker heuristically.
+settings/generation, old tombstone/deletion and unchanged replacement facts, and
+audit. Point-read the marker's `run_id`; require marker and audit to have the same
+`published_count_after`, and require the current run's `published_count` to be
+greater than or equal to that snapshot. A higher current value is expected after
+sibling publications and must not invalidate replay. The lease/item CAS plus the
+atomic transaction is the exactly-once authority: replay never recomputes an O(n)
+item count. Return the original `%{repository:, replaced:}` without a write. Any
+missing, lowered, or mismatched marker/audit/run fact returns
+`:publication_inconsistent`; never repair a committed marker heuristically.
 
 On destination drift, use a dedicated `Conflicts` transaction that locks the same
 actor/run/item/current-attempt capability, closes only that running attempt as
