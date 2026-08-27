@@ -455,7 +455,7 @@ Every resolution transaction updates all selected items plus the parent run lock
 
 Starting requires an active actor, an actor-owned `awaiting_resolution` run, at least one actually selected item, a clean organization destination, no live run/item lease, unique final slugs, current destination authorization/availability, and exact replacement fingerprints. In deterministic item order, one transaction creates attempt `n + 1` for every selected item, copies the full immutable decision, increments `attempt_count`, transitions skips to `skipped`, transitions the run `awaiting_resolution -> ready -> running`, and records `github_import.conflicts_frozen` plus `github_import.started`. Dispatch happens only after commit; dispatch failure leaves durable running work for recovery.
 
-Destination drift later closes only the exact running attempt as `destination_changed`, clears the item's current decision/fingerprint fields, returns that item to `awaiting_resolution`, and bumps the still-running parent run version. Do not create an empty successor attempt. When the user resolves that running item, atomically create/freeze attempt `n + 1`, queue the item, and redispatch it while preserving the immutable predecessor. New organization creation remains deferred: Task 6 activates the frozen destination organization before it creates any shadow.
+Destination drift later closes only the exact running attempt as `destination_changed`, clears the item's current decision/fingerprint fields, returns that item to `awaiting_resolution`, and bumps the still-running parent run version. Do not create an empty successor attempt. Drift is blocked while the item is `staging_git` or has cleanup evidence because a late Remote quarantine may still appear; the worker must first settle the item to `git_staged` or cleanup-pending. Drift remains available for queued pre-staging work and `git_staged` or later durable-proof states. When the user resolves that running item, atomically create/freeze attempt `n + 1`, queue the item, and redispatch it while preserving the immutable predecessor. New organization creation remains deferred: Task 6 activates the frozen destination organization before it creates any shadow.
 
 - [ ] **Step 4: Run conflict and persistence tests**
 
@@ -477,14 +477,23 @@ git commit -m "feat(import): freeze repository conflicts"
 
 **Files:**
 
+- Create: `apps/fornacast/priv/repo/migrations/20260825000420_expand_github_import_staged_storage_path.exs`
 - Create: `apps/forge_imports/lib/forge_imports/repository_stager.ex`
 - Create: `apps/forge_imports/lib/forge_imports/repository_worker.ex`
 - Create: `apps/forge_imports/test/repository_worker_test.exs`
 - Modify: `apps/forge_imports/lib/forge_imports/reconciler.ex`
 - Modify: `apps/forge_imports/lib/forge_imports/recovery_supervisor.ex`
 - Modify: `apps/forge_imports/lib/forge_imports.ex`
+- Modify: `apps/forge_imports/lib/forge_imports/import_run.ex`
+- Modify: `apps/forge_imports/lib/forge_imports/repository_item.ex`
+- Modify: `apps/forge_imports/lib/forge_imports/one_time_credential.ex`
+- Modify: `apps/forge_imports/lib/forge_imports/persistence.ex`
 - Modify: `apps/forge_imports/mix.exs`
+- Modify: `apps/forge_accounts/lib/forge_accounts.ex`
+- Modify: `apps/forge_accounts/test/forge_accounts_test.exs`
 - Modify: `apps/forge_repos/lib/forge_repos.ex`
+- Modify: `apps/git_core/lib/git_core/remote.ex`
+- Modify: `apps/git_core/test/remote_test.exs`
 
 - [ ] **Step 1: Write worker phase and secret-custody tests**
 
@@ -502,7 +511,11 @@ Expected: FAIL with missing stager/worker.
 
 Add `{:git_core, in_umbrella: true}` to `apps/forge_imports/mix.exs`. Reuse M1's `ForgeImports.TaskSupervisor`. Extend the reconciler to claim runnable repository items as well as discovery runs, while preserving one bounded scan task. `ForgeRepos.create_import_shadow/4` inserts `lifecycle: :importing` with a generated valid internal slug and opaque path but performs no filesystem operation.
 
+Keep R6 worker execution serial inside the existing one supervised scan task and retain `Task.Supervisor max_children: 1`; do not introduce detached item tasks or same-node overlap in this milestone. The scan processes due discovery runs and runnable repository items in deterministic order. A later task may deliberately raise concurrency only with live-item tracking and explicit Turso/PG proof.
+
 For a frozen `destination_organization_action: :new`, activate the organization transactionally under the initiating actor before creating the first shadow; persist the owner ID on the run/items and make replay exact and idempotent. Never create the organization during conflict resolution. Build `GitCore.Remote.Request.credential_login` from the verified linked GitHub identity, not the source organization login.
+
+Add a context-owned `ForgeAccounts` Multi contribution for organization, sole owner membership, and the existing `organization.created` audit so activation can commit with the run/items. Also record `github_import.organization_activated`. Replay must prove the exact active organization slug, owner membership, actor, and audits; a namespace race rolls back before item claim or shadow insertion.
 
 Worker contract:
 
@@ -519,12 +532,22 @@ end
 
 Use `Task.Supervisor.async_nolink` from the existing recovery supervisor. Persist phase intent before each external effect and proof afterward. Inspect the staged default tree for `.gitattributes` LFS filters/pointer blobs and `.gitmodules`; record bounded unsupported report categories without recursively fetching anything. End this milestone at durable `git_staged`; only the metadata plan may advance to `staging_metadata` and `ready_to_publish`. Never persist the PAT.
 
+Claim only selected `queued` or recoverable `staging_git` items whose parent run is running, current attempt is the exact running `attempt_count`, due time has arrived, no cleanup evidence is unresolved, and no live lease exists. For a fresh item, one lease-owned transaction adds the importing shadow and sets `hidden_repository_id`, intended absolute staging path, and `queued -> staging_git`; retain/renew the item lease. `create_import_shadow/4` contributes only SQL to that transaction. Create safe hashed parent directories after commit, while the Remote destination itself remains absent.
+
+Credential custody is item-owned. Saved checkout must verify actor, identity, saved credential binding, item lease, and current running run. Add a one-time item-capability checkout that joins the exact leased item to its encrypted active run rather than claiming the whole run. The credential callback returns only acknowledgment; PAT values never enter task options, messages, errors, checkpoints, or reports. Remote heartbeat reloads/renews the item lease before half-life and fails on actor/run/lease loss; cancellation polls durable run/item intent.
+
+For `staging_git` recovery: absent destination/no slot uses `mirror`; an exact private validated existing bare staging repository uses `refresh`; a deterministic cleanup slot is persisted without credential checkout; partial, wrong-mode, symlinked, or ambiguous state fails closed. A crash after Remote success but before SQL proof recovers through `refresh`, never a second mirror.
+
 If `GitCore.Remote` returns `cleanup_pending`, validate and persist the deterministic quarantine path, private identity projection, and original failure classification as secret-free cleanup evidence before releasing the item lease. The requested staging path must be absent, retries must rediscover the same slot without invoking Git, and no successor may choose a new storage path while that evidence is unresolved. Caller death is recoverable because the slot name is deterministic; Task 8 scans/reclaims only evidence-backed strict slots.
+
+Add a narrow no-PAT `GitCore.Remote.cleanup_evidence(destination)` interface that recomputes and validates the deterministic slot, containment, `0700` mode, device/inode, and requested-path absence. Persist canonical evidence using existing typed fields: quarantine in `staged_storage_path`, `cleanup_state: "cleanup_pending"`, classified original error in `cleanup_error`, exact identity in `checkpoint["cleanup_identity"]`, plus eligibility/attempt counters. Schema changesets must reject malformed evidence and keep it out of `Inspect`, RunView, audits, and reports.
+
+On Remote success, recheck cancellation and lease, run bounded default-tree LFS/submodule detection, then atomically persist `source_git`/checkpoint proof, idempotent warning reports/counts, clear transient failure/cleanup fields and lease, and transition only `staging_git -> git_staged`. Empty repositories skip tree inspection. Any truncated LFS/submodule scan records an explicit `unsupported_scan_truncated` warning rather than claiming absence. Restrict the generic public item-transition interface so post-start Git/metadata/publication phases can only move through lease-owned workers.
 
 - [ ] **Step 4: Run worker, remote, and visibility tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/repository_worker_test.exs apps/git_core/test/remote_test.exs apps/forge_repos/test/repository_lifecycle_test.exs --max-cases 1
+devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/repository_worker_test.exs apps/forge_imports/test/discovery_recovery_test.exs apps/forge_accounts/test/forge_accounts_test.exs apps/git_core/test/remote_test.exs apps/forge_repos/test/repository_lifecycle_test.exs --max-cases 1
 ```
 
 Expected: all tests pass.
@@ -532,7 +555,9 @@ Expected: all tests pass.
 - [ ] **Step 5: Commit staging**
 
 ```bash
-git add apps/forge_imports apps/forge_repos/lib/forge_repos.ex
+git add apps/fornacast/priv/repo/migrations/20260825000420_expand_github_import_staged_storage_path.exs \
+  apps/forge_imports apps/forge_accounts apps/forge_repos/lib/forge_repos.ex \
+  apps/git_core/lib/git_core/remote.ex apps/git_core/test/remote_test.exs
 git commit -m "feat(import): stage hidden Git repositories"
 ```
 
