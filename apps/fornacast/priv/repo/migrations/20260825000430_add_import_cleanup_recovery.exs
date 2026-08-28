@@ -540,9 +540,12 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
 
   defp cleanup_leaf_check(:turso) do
     value = json_text(:turso, "relative_path")
-    leaf = "substr(#{value}, -65)"
+    prefix_length = "length(#{value}) - 65"
+    leaf = "substr(#{value}, #{prefix_length} + 1)"
 
-    "length(cast(#{leaf} as blob)) = 65 and " <>
+    "#{prefix_length} >= 0 and " <>
+      "(#{prefix_length} = 0 or substr(#{value}, #{prefix_length}, 1) = '/') and " <>
+      "length(cast(#{leaf} as blob)) = 65 and instr(#{leaf}, '/') = 0 and " <>
       "substr(#{leaf}, 1, 22) = '.fornacast-cleanup-v1-' and " <>
       "length(cast(substr(#{leaf}, 23) as blob)) = 43 and " <>
       "substr(#{leaf}, 23) not glob '*[^A-Za-z0-9_-]*'"

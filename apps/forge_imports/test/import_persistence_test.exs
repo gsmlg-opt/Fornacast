@@ -679,6 +679,87 @@ defmodule ForgeImports.ImportPersistenceTest do
              })
   end
 
+  test "only the current cleanup lease owner can complete a claimed cleanup", %{
+    actor: actor,
+    identity: identity
+  } do
+    cleanup = cleanup_fixture(actor, identity)
+
+    assert {:ok, stale} =
+             OperationLease.claim(CleanupOperation, cleanup.id, "cleanup-worker-a", @now, 5)
+
+    assert {:ok, claimed} =
+             OperationLease.claim(
+               CleanupOperation,
+               cleanup.id,
+               "cleanup-worker-b",
+               DateTime.add(@now, 6, :second),
+               30
+             )
+
+    assert {:error, :lost_lease} =
+             OperationLease.update_owned(CleanupOperation, stale,
+               state: :cleanup_blocked,
+               next_attempt_at: nil,
+               last_error: "identity_mismatch"
+             )
+
+    finished = DateTime.add(@now, 7, :second)
+
+    evidence =
+      Map.put(claimed.evidence, "anchored_absence", %{
+        "version" => 1,
+        "observed_at" => DateTime.to_iso8601(finished),
+        "root_identity" => %{
+          "mode" => 16_384,
+          "major_device" => 8,
+          "minor_device" => 1,
+          "inode" => 16
+        }
+      })
+
+    assert {:ok, complete} =
+             OperationLease.update_owned(CleanupOperation, claimed,
+               state: :cleanup_complete,
+               evidence: evidence,
+               next_attempt_at: nil,
+               effect_started_at: finished,
+               effect_finished_at: finished,
+               completed_at: finished
+             )
+
+    assert complete.state == :cleanup_complete
+    assert complete.lease_owner == nil
+    assert complete.lease_expires_at == nil
+  end
+
+  test "claimed cleanup can block after the live storage root changes", %{
+    actor: actor,
+    identity: identity
+  } do
+    cleanup = cleanup_fixture(actor, identity)
+    original_evidence = cleanup.evidence
+
+    assert {:ok, claimed} =
+             OperationLease.claim(CleanupOperation, cleanup.id, "cleanup-worker", @now, 30)
+
+    original_root = Application.fetch_env!(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, Path.join(original_root, "moved"))
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, blocked} =
+             OperationLease.update_owned(CleanupOperation, claimed,
+               state: :cleanup_blocked,
+               next_attempt_at: nil,
+               last_error: "storage_root_changed"
+             )
+
+    assert blocked.state == :cleanup_blocked
+    assert blocked.evidence == original_evidence
+    assert blocked.lease_owner == nil
+    assert blocked.lease_expires_at == nil
+  end
+
   test "repository items default selected and selection is mutable only before work", %{
     actor: actor,
     identity: identity
@@ -1170,6 +1251,22 @@ defmodule ForgeImports.ImportPersistenceTest do
       allow_merge_commit: true
     })
     |> Repo.insert!()
+  end
+
+  defp cleanup_fixture(actor, identity) do
+    run = run_fixture(actor, identity, state: :failed, terminal_at: @now)
+    repository = repository_fixture(actor)
+    item = item_fixture(run, state: :failed)
+
+    Repo.update_all(
+      from(candidate in RepositoryItem, where: candidate.id == ^item.id),
+      set: [hidden_repository_id: repository.id]
+    )
+
+    item = Repo.get!(RepositoryItem, item.id)
+
+    Persistence.create_cleanup_operation(item, remote_cleanup_attrs(repository, item))
+    |> unwrap_or_raise()
   end
 
   defp credential_fixture(actor, identity) do

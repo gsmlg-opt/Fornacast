@@ -750,6 +750,54 @@ defmodule ForgeImports.ConflictsTest do
     assert Repo.aggregate(AuditEvent, :count, :id) == 0
   end
 
+  test "start propagates adoption safety database failures without freezing work", %{
+    actor: actor,
+    identity: identity
+  } do
+    for {suffix, failure} <- [
+          {"dbconnection",
+           fn -> raise DBConnection.ConnectionError, "injected adoption query failure" end},
+          {"turso",
+           fn -> raise Turso.Error, code: :io, message: "injected adoption query failure" end}
+        ] do
+      run =
+        awaiting_resolution_run_fixture(actor, identity,
+          source_owner_github_id: System.unique_integer([:positive])
+        )
+
+      item =
+        repository_item_fixture(run, actor,
+          github_repository_id: System.unique_integer([:positive]),
+          destination_slug: "adoption-failure-#{suffix}"
+        )
+
+      assert {:error, :persistence_unavailable} =
+               Persistence.with_test_after_adoption_safety_hook(failure, fn ->
+                 ForgeImports.start_import(
+                   actor,
+                   run.id,
+                   request_metadata("adoption-failure-#{suffix}"),
+                   dispatch: :manual
+                 )
+               end)
+
+      assert %ImportRun{state: :awaiting_resolution, lock_version: run_lock_version} =
+               Repo.get!(ImportRun, run.id)
+
+      assert %RepositoryItem{state: :queued, attempt_count: 0, lock_version: item_lock_version} =
+               Repo.get!(RepositoryItem, item.id)
+
+      assert run_lock_version == run.lock_version
+      assert item_lock_version == item.lock_version
+
+      assert Repo.aggregate(
+               from(attempt in ImportAttempt, where: attempt.repository_item_id == ^item.id),
+               :count,
+               :id
+             ) == 0
+    end
+  end
+
   test "Turso busy retries replay the whole start transaction without duplicate work", %{
     actor: actor,
     identity: identity

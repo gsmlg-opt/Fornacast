@@ -112,7 +112,7 @@ defmodule ForgeImports.CleanupOperation do
     |> put_change(:lease_owner, nil)
     |> put_change(:lease_expires_at, nil)
     |> put_change(:lock_version, 0)
-    |> validate_contract()
+    |> validate_contract(:live_storage_root)
     |> unique_constraint(:operation_id)
     |> unique_constraint([:repository_item_id, :kind, :source_lock_version],
       name: :github_import_cleanups_item_kind_version_index
@@ -128,9 +128,10 @@ defmodule ForgeImports.CleanupOperation do
     if exact_update_fields?(updates) do
       operation
       |> cast(Map.new(updates), @lease_mutable_fields)
+      |> normalize_terminal_lease()
       |> validate_enrichment_immutable(operation)
       |> validate_transition(operation)
-      |> validate_contract()
+      |> validate_contract(:persisted_storage_root)
     else
       operation |> change() |> add_error(:base, "contains immutable fields")
     end
@@ -139,7 +140,7 @@ defmodule ForgeImports.CleanupOperation do
   def lease_update_changeset(operation, _updates),
     do: operation |> change() |> add_error(:base, "is invalid")
 
-  defp validate_contract(changeset) do
+  defp validate_contract(changeset, storage_root_policy) do
     changeset
     |> validate_required([
       :repository_id,
@@ -160,7 +161,7 @@ defmodule ForgeImports.CleanupOperation do
     |> validate_number(:lock_version, greater_than_or_equal_to: 0)
     |> validate_operation_id()
     |> validate_error()
-    |> validate_evidence()
+    |> validate_evidence(storage_root_policy)
     |> validate_lifecycle()
   end
 
@@ -186,13 +187,13 @@ defmodule ForgeImports.CleanupOperation do
     end)
   end
 
-  defp validate_evidence(changeset) do
-    if valid_evidence?(changeset, get_field(changeset, :evidence)),
+  defp validate_evidence(changeset, storage_root_policy) do
+    if valid_evidence?(changeset, get_field(changeset, :evidence), storage_root_policy),
       do: changeset,
       else: add_error(changeset, :evidence, "is invalid")
   end
 
-  defp valid_evidence?(changeset, evidence) when is_map(evidence) do
+  defp valid_evidence?(changeset, evidence, storage_root_policy) when is_map(evidence) do
     kind = get_field(changeset, :kind)
     base_keys = base_keys(kind)
 
@@ -201,19 +202,21 @@ defmodule ForgeImports.CleanupOperation do
       evidence["repository_id"] == get_field(changeset, :repository_id) and
       evidence["item_id"] == get_field(changeset, :repository_item_id) and
       evidence["item_lock_version"] == get_field(changeset, :source_lock_version) and
-      valid_base_evidence?(kind, evidence) and valid_outcome?(changeset, evidence)
+      valid_base_evidence?(kind, evidence, storage_root_policy) and
+      valid_outcome?(changeset, evidence)
   end
 
-  defp valid_evidence?(_changeset, _evidence), do: false
+  defp valid_evidence?(_changeset, _evidence, _storage_root_policy), do: false
 
-  defp valid_base_evidence?(:remote_quarantine, evidence) do
+  defp valid_base_evidence?(:remote_quarantine, evidence, storage_root_policy) do
     root = evidence["storage_root"]
     repository_path = evidence["repository_storage_path"]
     relative_path = evidence["relative_path"]
     requested_path = evidence["requested_path"]
     quarantine_path = evidence["quarantine_path"]
 
-    valid_live_storage_root?(root) and positive?(evidence["repository_generation"]) and
+    valid_storage_root?(root, storage_root_policy) and
+      positive?(evidence["repository_generation"]) and
       valid_repository_path?(repository_path) and valid_relative_path?(relative_path) and
       valid_absolute_path?(requested_path) and valid_absolute_path?(quarantine_path) and
       requested_path == Path.join(root, repository_path) and
@@ -230,8 +233,8 @@ defmodule ForgeImports.CleanupOperation do
       classified?(evidence["remote_failure_kind"])
   end
 
-  defp valid_base_evidence?(:unpublished_shadow, evidence) do
-    valid_live_storage_root?(evidence["storage_root"]) and
+  defp valid_base_evidence?(:unpublished_shadow, evidence, storage_root_policy) do
+    valid_storage_root?(evidence["storage_root"], storage_root_policy) and
       evidence["relative_path"] == evidence["repository_storage_path"] and
       valid_repository_path?(evidence["repository_storage_path"]) and
       positive?(evidence["repository_generation"]) and
@@ -253,11 +256,11 @@ defmodule ForgeImports.CleanupOperation do
       end)
   end
 
-  defp valid_base_evidence?(:replacement_tombstone, evidence) do
+  defp valid_base_evidence?(:replacement_tombstone, evidence, storage_root_policy) do
     marker = evidence["publication_marker"]
     decision = evidence["attempt_decision"]
 
-    valid_live_storage_root?(evidence["storage_root"]) and
+    valid_storage_root?(evidence["storage_root"], storage_root_policy) and
       evidence["relative_path"] == evidence["repository_storage_path"] and
       valid_repository_path?(evidence["repository_storage_path"]) and
       positive?(evidence["repository_generation"]) and
@@ -295,7 +298,7 @@ defmodule ForgeImports.CleanupOperation do
       positive?(evidence["publication_audit_id"])
   end
 
-  defp valid_base_evidence?(_kind, _evidence), do: false
+  defp valid_base_evidence?(_kind, _evidence, _storage_root_policy), do: false
 
   defp valid_outcome?(changeset, evidence) do
     started? = not is_nil(get_field(changeset, :effect_started_at))
@@ -378,6 +381,16 @@ defmodule ForgeImports.CleanupOperation do
       operation.state != :cleanup_pending -> add_error(changeset, :state, "is terminal")
       target not in @states -> add_error(changeset, :state, "is invalid")
       true -> changeset
+    end
+  end
+
+  defp normalize_terminal_lease(changeset) do
+    if get_field(changeset, :state) in @terminal_states do
+      changeset
+      |> put_change(:lease_owner, nil)
+      |> put_change(:lease_expires_at, nil)
+    else
+      changeset
     end
   end
 
@@ -472,8 +485,12 @@ defmodule ForgeImports.CleanupOperation do
 
   defp valid_absolute_path?(_value), do: false
 
-  defp valid_live_storage_root?(value) do
+  defp valid_storage_root?(value, :live_storage_root) do
     valid_absolute_path?(value) and value != "/" and value == Fornacast.Config.repo_storage_root()
+  end
+
+  defp valid_storage_root?(value, :persisted_storage_root) do
+    valid_absolute_path?(value) and value != "/"
   end
 
   defp classified?(value),

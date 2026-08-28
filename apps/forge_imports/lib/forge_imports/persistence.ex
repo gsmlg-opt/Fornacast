@@ -92,7 +92,7 @@ defmodule ForgeImports.Persistence do
       :ok
     end
   rescue
-    _error -> {:error, :cleanup_conflict}
+    _error -> {:error, :persistence_unavailable}
   end
 
   @doc false

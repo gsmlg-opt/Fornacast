@@ -328,6 +328,47 @@ defmodule ForgeImports.RepositoryPublicationTest do
     assert Repo.get!(ImportRun, fixture.run.id).published_count == 0
   end
 
+  test "admitted publication retains intent for retry when adoption safety storage fails",
+       context do
+    for {suffix, failure} <- [
+          {"dbconnection",
+           fn -> raise DBConnection.ConnectionError, "injected adoption query failure" end},
+          {"turso",
+           fn -> raise Turso.Error, code: :io, message: "injected adoption query failure" end}
+        ] do
+      fixture =
+        ready_publication_fixture(context,
+          slug: "adoption-storage-failure-#{suffix}"
+        )
+
+      assert {:error, :persistence_unavailable} =
+               Persistence.with_test_after_adoption_safety_hook(failure, fn ->
+                 ForgeImports.publish_repository(
+                   context.actor,
+                   fixture.item.id,
+                   request_metadata("adoption-storage-failure-#{suffix}")
+                 )
+               end)
+
+      assert %RepositoryItem{
+               state: :publishing,
+               wait_reason: nil,
+               lease_owner: nil,
+               lease_expires_at: nil,
+               next_attempt_at: %DateTime{},
+               publication_evidence: %{
+                 "state" => "intent",
+                 "operation_id" => operation_id
+               }
+             } = Repo.get!(RepositoryItem, fixture.item.id)
+
+      assert is_binary(operation_id)
+      assert %ImportAttempt{state: :running} = Repo.get!(ImportAttempt, fixture.attempt.id)
+      assert Repo.get!(Repository, fixture.shadow.id).lifecycle == :importing
+      assert Repo.get!(ImportRun, fixture.run.id).published_count == 0
+    end
+  end
+
   test "expired intent recovers without credential checkout under cancel requested", context do
     fixture = ready_publication_fixture(context)
     admitted = admit_without_finish!(context.actor, fixture.item)

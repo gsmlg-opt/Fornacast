@@ -191,6 +191,37 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
     end
   end
 
+  test "database requires the quarantine reservation to occupy the entire basename" do
+    cleanup = cleanup_fixture()
+    root = cleanup.evidence["storage_root"]
+    leaf = ".fornacast-cleanup-v1-#{String.duplicate("a", 43)}"
+
+    root_evidence =
+      remote_paths(cleanup.evidence, root, "repo.git", leaf)
+
+    assert {:ok, cleanup} =
+             cleanup
+             |> Ecto.Changeset.change(evidence: root_evidence)
+             |> Repo.update()
+
+    nested_evidence =
+      remote_paths(cleanup.evidence, root, "foo/repo.git", "foo/#{leaf}")
+
+    assert {:ok, cleanup} =
+             cleanup
+             |> Ecto.Changeset.change(evidence: nested_evidence)
+             |> Repo.update()
+
+    malicious =
+      remote_paths(cleanup.evidence, root, "foo/xrepo.git", "foo/x#{leaf}")
+
+    assert_update_rejected(
+      cleanup,
+      [evidence: malicious],
+      "github_import_cleanups_evidence_check"
+    )
+  end
+
   test "database identity numbers use exact textual integers" do
     cleanup = cleanup_fixture()
     started_at = ~U[2026-08-28 12:00:00Z]
@@ -408,6 +439,14 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
 
   defp identity(inode) do
     %{"mode" => 16_384, "major_device" => 8, "minor_device" => 1, "inode" => inode}
+  end
+
+  defp remote_paths(evidence, root, repository_storage_path, relative_path) do
+    evidence
+    |> Map.put("repository_storage_path", repository_storage_path)
+    |> Map.put("relative_path", relative_path)
+    |> Map.put("requested_path", Path.join(root, repository_storage_path))
+    |> Map.put("quarantine_path", Path.join(root, relative_path))
   end
 
   defp unpublished_attrs(context) do

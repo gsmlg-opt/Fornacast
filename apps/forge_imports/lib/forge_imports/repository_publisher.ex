@@ -400,6 +400,7 @@ defmodule ForgeImports.RepositoryPublisher do
         case Persistence.ensure_adoption_safe_locked(repo, item) do
           :ok -> {:ok, item.id}
           {:error, :cleanup_conflict} -> {:error, :destination_changed}
+          {:error, :persistence_unavailable} -> {:error, :persistence_unavailable}
         end
 
       nil ->

@@ -215,6 +215,45 @@ defmodule ForgeImports.CleanupOperationTest do
     end
   end
 
+  test "terminal lease updates normalize the claimed lease" do
+    operation =
+      %CleanupOperation{}
+      |> CleanupOperation.create_changeset(remote_attrs())
+      |> Ecto.Changeset.apply_changes()
+      |> Map.merge(%{
+        lease_owner: "cleanup-worker",
+        lease_expires_at: DateTime.add(@now, 30, :second)
+      })
+
+    blocked =
+      CleanupOperation.lease_update_changeset(operation,
+        state: :cleanup_blocked,
+        next_attempt_at: nil,
+        last_error: "identity_mismatch"
+      )
+
+    assert blocked.valid?
+    assert Ecto.Changeset.get_field(blocked, :lease_owner) == nil
+    assert Ecto.Changeset.get_field(blocked, :lease_expires_at) == nil
+
+    finished = DateTime.add(@now, 1, :second)
+    evidence = Map.put(operation.evidence, "anchored_absence", absence_marker())
+
+    complete =
+      CleanupOperation.lease_update_changeset(operation,
+        state: :cleanup_complete,
+        evidence: evidence,
+        next_attempt_at: nil,
+        effect_started_at: @now,
+        effect_finished_at: finished,
+        completed_at: finished
+      )
+
+    assert complete.valid?
+    assert Ecto.Changeset.get_field(complete, :lease_owner) == nil
+    assert Ecto.Changeset.get_field(complete, :lease_expires_at) == nil
+  end
+
   test "inspect redacts cleanup evidence and errors" do
     inspected =
       inspect(%CleanupOperation{

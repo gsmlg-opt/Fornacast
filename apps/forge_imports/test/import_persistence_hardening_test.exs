@@ -11,6 +11,7 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
     ObjectMapping,
     OneTimeCredential,
     PageCheckpoint,
+    Persistence,
     ReportEntry,
     RepositoryItem,
     RunView
@@ -576,6 +577,80 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
                successor,
                item_attrs(predecessor_item_id: foreign_item.id)
              )
+  end
+
+  test "adoption safety database failures remain persistence unavailable", %{
+    actor: actor,
+    identity: identity
+  } do
+    assert {:ok, predecessor} = ForgeImports.create_run(actor, run_attrs(identity))
+    assert {:ok, item} = ForgeImports.create_repository_item(actor, predecessor, item_attrs())
+
+    for failure <- [
+          fn -> raise DBConnection.ConnectionError, "injected adoption query failure" end,
+          fn -> raise Turso.Error, code: :io, message: "injected adoption query failure" end
+        ] do
+      assert {:error, :persistence_unavailable} =
+               Persistence.with_test_after_adoption_safety_hook(failure, fn ->
+                 Persistence.ensure_adoption_safe_locked(Repo, item)
+               end)
+    end
+  end
+
+  test "successor creation propagates adoption safety database failures", %{
+    actor: actor,
+    identity: identity
+  } do
+    assert {:ok, predecessor} = ForgeImports.create_run(actor, run_attrs(identity))
+    assert {:ok, item} = ForgeImports.create_repository_item(actor, predecessor, item_attrs())
+    hidden = repository_fixture(actor)
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(candidate in RepositoryItem, where: candidate.id == ^item.id),
+               set: [state: :failed, hidden_repository_id: hidden.id]
+             )
+
+    item = Repo.get!(RepositoryItem, item.id)
+    assert {:ok, predecessor} = ForgeImports.transition_run(actor, predecessor, :failed)
+
+    for {suffix, failure} <- [
+          {"dbconnection",
+           fn -> raise DBConnection.ConnectionError, "injected adoption query failure" end},
+          {"turso",
+           fn -> raise Turso.Error, code: :io, message: "injected adoption query failure" end}
+        ] do
+      assert {:ok, successor} =
+               ForgeImports.create_run(
+                 actor,
+                 run_attrs(identity,
+                   predecessor_run_id: predecessor.id,
+                   source_owner_github_id: System.unique_integer([:positive])
+                 )
+               )
+
+      assert {:error, :persistence_unavailable} =
+               Persistence.with_test_after_adoption_safety_hook(failure, fn ->
+                 ForgeImports.create_repository_item(
+                   actor,
+                   successor,
+                   item_attrs(
+                     predecessor_item_id: item.id,
+                     github_repository_id: System.unique_integer([:positive]),
+                     source_full_name: "acme/#{suffix}",
+                     source_name: suffix
+                   )
+                 )
+               end)
+
+      assert Repo.aggregate(
+               from(candidate in RepositoryItem,
+                 where: candidate.import_run_id == ^successor.id
+               ),
+               :count,
+               :id
+             ) == 0
+    end
   end
 
   test "terminal import rows cannot be claimed renewed or retained as leased", %{
