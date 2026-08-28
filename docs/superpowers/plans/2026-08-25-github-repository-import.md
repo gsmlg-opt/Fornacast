@@ -1602,6 +1602,8 @@ git commit -m "feat(git): lease repository readers"
 - Create: `apps/forge_imports/test/cleanup_operation_test.exs`
 - Create: `apps/forge_imports/test/cleanup_recovery_migration_test.exs`
 - Modify: `apps/fornacast/lib/fornacast/operation_lease.ex`
+- Modify: `apps/git_core/lib/git_core/remote.ex`
+- Modify: `apps/git_core/test/remote_test.exs`
 - Modify: `apps/forge_repos/lib/forge_repos/git_write_operation.ex`
 - Modify: `apps/forge_pulls/lib/forge_pulls/merge_operation.ex`
 - Modify: `apps/forge_repos/lib/forge_repos/repository_write_reconcilers.ex`
@@ -1683,6 +1685,10 @@ failures, mismatched absolute/relative joins, malformed canonical segments,
 absence without ordered effect timestamps, and complete present/absence-proof rows
 in both adapter migration/schema matrices. Application tests separately cover
 live-config root drift because the database does not own runtime configuration.
+In `remote_test.exs`, prove two canonical absolute requested destinations with the
+same basename under different parents produce different slots, a real Remote
+quarantine round-trips through the helper, and a slot derived from basename alone
+is rejected by CleanupOperation application validation.
 
 - [ ] **Step 8C.2: Run the Turso RED suite**
 
@@ -1690,6 +1696,7 @@ live-config root drift because the database does not own runtime configuration.
 devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
   apps/forge_imports/test/cleanup_operation_test.exs \
   apps/forge_imports/test/cleanup_recovery_migration_test.exs \
+  apps/git_core/test/remote_test.exs \
   apps/forge_repos/test/git_writes_test.exs \
   apps/forge_pulls/test/merge_recovery_test.exs \
   --max-cases 1
@@ -1707,6 +1714,20 @@ def states, do: [:cleanup_pending, :cleanup_blocked, :cleanup_complete]
 def terminal_states, do: [:cleanup_blocked, :cleanup_complete]
 def kinds, do: [:remote_quarantine, :unpublished_shadow, :replacement_tombstone]
 ```
+
+Expose the existing Remote slot authority narrowly:
+
+```elixir
+@doc false
+@spec GitCore.Remote.cleanup_slot_path(Path.t()) :: Path.t()
+```
+
+`cleanup_slot_path/1` is pure and has no filesystem effect. For a canonical
+absolute requested destination it applies the existing exact domain-separated hash
+to the full absolute destination and returns the deterministic absolute
+`.fornacast-cleanup-v1-*` sibling. The mirror failure/rename path,
+`cleanup_evidence/1`, and prior-slot discovery all call this helper; no second slot
+algorithm remains.
 
 Its creation changeset accepts immutable identity/evidence fields plus scheduling
 fields only. Its `lease_update_changeset/2` permits exact transitions from pending
@@ -1752,15 +1773,16 @@ target. Replacement/unpublished evidence requires
 ```elixir
 requested_path == Path.join(storage_root, repository_storage_path)
 quarantine_path == Path.join(storage_root, relative_path)
-Path.dirname(relative_path) == Path.dirname(repository_storage_path)
-Path.basename(relative_path) ==
-  GitCore.Remote.cleanup_slot_basename(Path.basename(repository_storage_path))
+quarantine_path == GitCore.Remote.cleanup_slot_path(requested_path)
+relative_path == Path.relative_to(quarantine_path, storage_root)
 ```
 
 The Remote leaf is the deterministic `.fornacast-cleanup-v1-*` sibling under the
-same relative parent. The application recomputes the exact slot; database checks
-enforce the equivalent persisted join, parent equality, reserved prefix,
-length/character shape, and canonical path structure without a digest UDF.
+same relative parent. CleanupOperation application validation calls
+`cleanup_slot_path(requested_path)` at creation and rejects basename-only hashing
+or any other slot. Database checks enforce the persisted absolute joins, same
+root/parent, reserved cleanup-leaf prefix, length/character syntax, and canonical
+path structure; they do not recompute the SHA.
 
 Every persisted target or root identity validator accepts only the canonical
 string-key JSON shape
@@ -1889,6 +1911,7 @@ barrier.
 devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
   apps/forge_imports/test/cleanup_operation_test.exs \
   apps/forge_imports/test/cleanup_recovery_migration_test.exs \
+  apps/git_core/test/remote_test.exs \
   apps/forge_imports/test/import_persistence_test.exs \
   apps/forge_imports/test/import_persistence_concurrency_test.exs \
   apps/forge_imports/test/conflicts_test.exs \
@@ -1902,6 +1925,7 @@ devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres \
   nix shell nixpkgs#expect -c unbuffer mix test \
   apps/forge_imports/test/cleanup_operation_test.exs \
   apps/forge_imports/test/cleanup_recovery_migration_test.exs \
+  apps/git_core/test/remote_test.exs \
   apps/forge_imports/test/import_persistence_test.exs \
   apps/forge_imports/test/import_persistence_concurrency_test.exs \
   apps/forge_imports/test/conflicts_test.exs \
@@ -1922,6 +1946,8 @@ git diff --check
 git add \
   apps/fornacast/priv/repo/migrations/20260825000430_add_import_cleanup_recovery.exs \
   apps/fornacast/lib/fornacast/operation_lease.ex \
+  apps/git_core/lib/git_core/remote.ex \
+  apps/git_core/test/remote_test.exs \
   apps/forge_imports/lib/forge_imports/cleanup_operation.ex \
   apps/forge_imports/lib/forge_imports/persistence.ex \
   apps/forge_imports/lib/forge_imports/conflicts.ex \
@@ -2005,7 +2031,7 @@ Pass the complete `CleanupOperation` to the verifier: prove a valid operation
 passes without duplicating `operation_id` inside evidence, while a forged column
 operation ID, wrong kind/repository/item/source version, operation borrowed from
 another item, evidence with an extra operation-ID key, shadow mismatch, path
-mismatch, or four-field identity mismatch blocks.
+mismatch, basename-only slot hash, or four-field identity mismatch blocks.
 
 Also cover grace at one second before/exactly at the boundary; nonterminal,
 claimable, live, expired, and malformed leases in import/Git-write/merge domains;
@@ -2188,7 +2214,8 @@ operation.source_lock_version)`. Then compare operation evidence with the locked
 shadow identity/generation/canonical path, persisted `storage_root/relative_path`,
 the item's requested/quarantine path and narrow cleanup evidence, and exact
 `mode/major_device/minor_device/inode`. Recompute all Remote sibling/join
-relationships from the persisted base. The
+relationships from the persisted base and require
+`quarantine_path == GitCore.Remote.cleanup_slot_path(requested_path)`. The
 `operation_id` column is authoritative and is not duplicated in evidence; an
 `operation_id` evidence key violates the exact-key validator. A live or one-sided
 source item/run lease, mismatched context/evidence, non-current or non-running
@@ -2202,10 +2229,11 @@ Before the kind-specific safety check, require the live canonical
 `relative_path` segments and every per-kind equality from Task 8C, then derive
 `relative_segments = String.split(relative_path, "/", trim: false)`. Any config
 drift, empty/dot/dotdot/backslash/NUL segment, absolute relative path, reconstructed
-path mismatch, Remote sibling mismatch, or raw-SQL-forged root/path moves the row
-to `cleanup_blocked` before cache or filesystem access. The database proves
-internal persisted relationships; this application check supplies the external
-live-config fact.
+path mismatch, Remote sibling mismatch, or Remote helper mismatch moves the row to
+`cleanup_blocked` before cache or filesystem access. Raw-SQL-forged root/path and
+basename-only slot evidence therefore fail here even if structurally valid in the
+database. The database proves internal persisted relationships; this application
+check supplies the external live-config and exact-hash facts.
 
 The same preflight rejects any nonterminal Git-write/merge operation and calls both
 `cleanup_safety_locked/2` ports while the SQL rows are locked. A claimable
@@ -2266,7 +2294,9 @@ The effect state machine is:
    `anchored_absence + safely missing with the same root identity`. Re-lock and
    CAS-check the exact repository/item/journal fingerprint, require the live
    config root still equals persisted `storage_root`, and revalidate/derive the
-   same persisted relative segments before committing.
+   same persisted relative segments before committing. For Remote, call
+   `cleanup_slot_path(requested_path)` again and require exact quarantine/relative
+   equality before audit or completion.
 
 For replacement/unpublished cleanup, the final transaction sets
 `Repository.storage_reclaimed_at`, inserts or verifies the deterministic
