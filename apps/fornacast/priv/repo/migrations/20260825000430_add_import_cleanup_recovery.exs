@@ -108,6 +108,7 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
         )
       )
 
+      # TODO(upstream): gsmlg-dev/concord#90
       add(
         :evidence,
         :map,
