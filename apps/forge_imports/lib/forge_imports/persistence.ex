@@ -3,11 +3,40 @@ defmodule ForgeImports.Persistence do
 
   import Ecto.Query
 
-  alias ForgeImports.{ImportRun, RepositoryItem}
+  alias ForgeImports.{CleanupOperation, ImportRun, RepositoryItem}
+  alias ForgeRepos.Repository
   alias Fornacast.Repo
 
   @turso_busy_attempts 12
   @turso_busy_backoff_ms 5
+
+  if Mix.env() == :test do
+    @adoption_safety_hook_key {__MODULE__, :adoption_safety_hook}
+
+    @doc false
+    def with_test_after_adoption_safety_hook(hook, fun)
+        when is_function(hook, 0) and is_function(fun, 0) do
+      previous = Process.get(@adoption_safety_hook_key)
+      Process.put(@adoption_safety_hook_key, hook)
+
+      try do
+        fun.()
+      after
+        if is_nil(previous),
+          do: Process.delete(@adoption_safety_hook_key),
+          else: Process.put(@adoption_safety_hook_key, previous)
+      end
+    end
+
+    defp after_adoption_safety do
+      case Process.get(@adoption_safety_hook_key) do
+        hook when is_function(hook, 0) -> hook.()
+        nil -> :ok
+      end
+    end
+  else
+    defp after_adoption_safety, do: :ok
+  end
 
   @type mutation_error :: :not_found | :stale | :busy
 
@@ -24,10 +53,87 @@ defmodule ForgeImports.Persistence do
   end
 
   def create_repository_item(%ImportRun{id: run_id}, attrs) when is_map(attrs) do
-    %RepositoryItem{}
-    |> RepositoryItem.discovery_changeset(Map.put(attrs, :import_run_id, run_id))
-    |> Repo.insert()
+    with {:ok, predecessor} <- lock_predecessor(attrs),
+         :ok <- ensure_optional_adoption_safe(predecessor) do
+      %RepositoryItem{}
+      |> RepositoryItem.discovery_changeset(Map.put(attrs, :import_run_id, run_id))
+      |> Repo.insert()
+    else
+      {:error, :cleanup_conflict} -> {:error, :invalid_predecessor}
+      {:error, reason} -> {:error, reason}
+    end
   end
+
+  @doc false
+  def ensure_adoption_safe_locked(repo, %RepositoryItem{} = item) when is_atom(repo) do
+    repository_ids =
+      [item.hidden_repository_id, item.replacement_repository_id]
+      |> Enum.filter(&(is_integer(&1) and &1 > 0))
+
+    cleanup? =
+      repo.exists?(
+        from cleanup in CleanupOperation,
+          where:
+            cleanup.repository_item_id == ^item.id or cleanup.repository_id in ^repository_ids
+      )
+
+    reclaimed? =
+      repository_ids != [] and
+        repo.exists?(
+          from repository in Repository,
+            where:
+              repository.id in ^repository_ids and not is_nil(repository.storage_reclaimed_at)
+        )
+
+    if cleanup? or reclaimed? do
+      {:error, :cleanup_conflict}
+    else
+      :ok = after_adoption_safety()
+      :ok
+    end
+  rescue
+    _error -> {:error, :cleanup_conflict}
+  end
+
+  @doc false
+  def create_cleanup_operation(%RepositoryItem{id: item_id}, attrs)
+      when is_integer(item_id) and item_id > 0 and is_map(attrs) do
+    transaction = fn ->
+      Repo.transaction(fn ->
+        item =
+          RepositoryItem
+          |> where([candidate], candidate.id == ^item_id)
+          |> maybe_lock()
+          |> Repo.one()
+
+        with %RepositoryItem{} = item <- item,
+             :ok <- cleanup_identity_matches?(item, attrs),
+             false <- successor_or_adopter_exists?(item),
+             :ok <- ensure_adoption_safe_locked(Repo, item),
+             changeset <- CleanupOperation.create_changeset(%CleanupOperation{}, attrs),
+             {:ok, cleanup} <- Repo.insert(changeset) do
+          cleanup
+        else
+          nil -> Repo.rollback(:not_found)
+          true -> Repo.rollback(:adopted)
+          {:error, :cleanup_conflict} -> Repo.rollback(:cleanup_conflict)
+          {:error, %Ecto.Changeset{} = changeset} -> Repo.rollback(changeset)
+          false -> Repo.rollback(:stale)
+          _invalid -> Repo.rollback(:stale)
+        end
+      end)
+    end
+
+    case with_retry(transaction) do
+      {:ok, %CleanupOperation{} = cleanup} -> {:ok, cleanup}
+      {:error, reason} -> {:error, reason}
+      _other -> {:error, :stale}
+    end
+  rescue
+    _error -> {:error, :persistence_unavailable}
+  end
+
+  def create_cleanup_operation(_item, _attrs), do: {:error, :stale}
 
   def select_repository_item(%ImportRun{} = run, %RepositoryItem{} = item, selected)
       when is_boolean(selected) do
@@ -126,6 +232,59 @@ defmodule ForgeImports.Persistence do
       _row ->
         {:error, :stale}
     end
+  end
+
+  defp cleanup_identity_matches?(item, attrs) do
+    item_id = Map.get(attrs, :repository_item_id) || Map.get(attrs, "repository_item_id")
+    version = Map.get(attrs, :source_lock_version) || Map.get(attrs, "source_lock_version")
+
+    if item_id == item.id and version == item.lock_version,
+      do: :ok,
+      else: {:error, :stale}
+  end
+
+  defp lock_predecessor(attrs) do
+    predecessor_id = Map.get(attrs, :predecessor_item_id) || Map.get(attrs, "predecessor_item_id")
+
+    case predecessor_id do
+      nil ->
+        {:ok, nil}
+
+      id when is_integer(id) and id > 0 ->
+        case RepositoryItem |> where([item], item.id == ^id) |> maybe_lock() |> Repo.one() do
+          %RepositoryItem{} = item -> {:ok, item}
+          nil -> {:error, :invalid_predecessor}
+        end
+
+      _invalid ->
+        {:error, :invalid_predecessor}
+    end
+  end
+
+  defp ensure_optional_adoption_safe(nil), do: :ok
+  defp ensure_optional_adoption_safe(item), do: ensure_adoption_safe_locked(Repo, item)
+
+  defp successor_or_adopter_exists?(item) do
+    predecessor? =
+      Repo.exists?(
+        from candidate in RepositoryItem,
+          where: candidate.predecessor_item_id == ^item.id
+      )
+
+    adopter? =
+      is_integer(item.hidden_repository_id) and
+        Repo.exists?(
+          from candidate in RepositoryItem,
+            where:
+              candidate.id != ^item.id and
+                candidate.hidden_repository_id == ^item.hidden_repository_id
+        )
+
+    predecessor? or adopter?
+  end
+
+  defp maybe_lock(query) do
+    if turso?(), do: query, else: lock(query, "FOR UPDATE")
   end
 
   defp retry(callback, attempts_remaining) do

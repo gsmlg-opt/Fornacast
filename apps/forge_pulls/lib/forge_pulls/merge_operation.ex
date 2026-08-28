@@ -16,6 +16,9 @@ defmodule ForgePulls.MergeOperation do
 
   @type t :: %__MODULE__{}
 
+  def states, do: @states
+  def terminal_states, do: [:completed, :failed]
+
   schema "pull_merge_operations" do
     field :pull_request_id, :integer
     field :repository_id, :integer
@@ -69,6 +72,7 @@ defmodule ForgePulls.MergeOperation do
       :state
     ])
     |> validate_inclusion(:state, [:prepared])
+    |> validate_lease_coherence()
   end
 
   def lease_update_changeset(operation, updates) when is_list(updates) do
@@ -93,7 +97,7 @@ defmodule ForgePulls.MergeOperation do
 
   def transition_changeset(operation, state) when is_atom(state) do
     if state in Map.get(@transitions, operation.state, []) do
-      change(operation, state: state)
+      operation |> change(state: state) |> validate_lease_coherence()
     else
       invalid_transition_changeset(operation)
     end
@@ -108,6 +112,7 @@ defmodule ForgePulls.MergeOperation do
     |> change(state: :merge_written, merge_oid: normalize_oid_value(merge_oid))
     |> validate_required([:merge_oid])
     |> validate_oid(:merge_oid)
+    |> validate_lease_coherence()
   end
 
   def merge_written_changeset(operation, _merge_oid), do: invalid_transition_changeset(operation)
@@ -121,6 +126,7 @@ defmodule ForgePulls.MergeOperation do
     operation
     |> change(state: :failed, failure_reason: sanitize_failure_reason(reason))
     |> validate_required([:failure_reason])
+    |> validate_lease_coherence()
   end
 
   def failed_changeset(operation, _reason), do: invalid_transition_changeset(operation)
@@ -255,6 +261,20 @@ defmodule ForgePulls.MergeOperation do
   end
 
   defp valid_oid?(oid), do: is_binary(oid) and Regex.match?(@oid_regex, oid)
+
+  defp validate_lease_coherence(changeset) do
+    state = get_field(changeset, :state)
+    owner = get_field(changeset, :lease_owner)
+    expires_at = get_field(changeset, :lease_expires_at)
+
+    valid_pair? =
+      (is_nil(owner) and is_nil(expires_at)) or
+        (is_binary(owner) and owner != "" and match?(%DateTime{}, expires_at))
+
+    if valid_pair? and (state not in terminal_states() or is_nil(owner)),
+      do: changeset,
+      else: add_error(changeset, :lease_owner, "has inconsistent lease fields")
+  end
 
   defp normalize_oid_value(oid) when is_binary(oid), do: String.downcase(oid)
   defp normalize_oid_value(oid), do: oid

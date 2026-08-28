@@ -1892,6 +1892,7 @@ defmodule ForgeImports.RepositoryPublicationTest do
 
   defp reset_database! do
     for table <- [
+          "github_import_repository_cleanups",
           "github_import_report_entries",
           "github_import_page_checkpoints",
           "github_import_object_mappings",

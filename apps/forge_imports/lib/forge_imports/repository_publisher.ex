@@ -345,7 +345,7 @@ defmodule ForgeImports.RepositoryPublisher do
         {:ok, %{repository: repository_result.repository, replaced: repository_result.replaced}}
 
       {:error, step, :destination_changed, _changes}
-      when step in [:repository, {:repository, :authorization}] ->
+      when step in [:cleanup_fence, :repository, {:repository, :authorization}] ->
         {:error, :destination_changed}
 
       {:error, _step, :publication_unavailable, _changes} ->
@@ -360,6 +360,7 @@ defmodule ForgeImports.RepositoryPublisher do
 
   defp publication_multi(context) do
     Multi.new()
+    |> Multi.run(:cleanup_fence, fn repo, _changes -> cleanup_fence(repo, context) end)
     |> ForgeRepos.publish_import_shadow(
       :repository,
       context.capability.actor,
@@ -379,6 +380,31 @@ defmodule ForgeImports.RepositoryPublisher do
       operation_id: context.capability.intent["operation_id"]
     )
     |> Multi.run(:audit_verifier, fn repo, changes -> verify_audit(repo, context, changes) end)
+  end
+
+  defp cleanup_fence(repo, context) do
+    capability = context.capability
+
+    item =
+      RepositoryItem
+      |> where(
+        [item],
+        item.id == ^capability.item_id and item.import_run_id == ^capability.run_id and
+          item.state == :publishing and item.lease_owner == ^capability.lease_owner
+      )
+      |> publication_lock()
+      |> repo.one()
+
+    case item do
+      %RepositoryItem{} = item ->
+        case Persistence.ensure_adoption_safe_locked(repo, item) do
+          :ok -> {:ok, item.id}
+          {:error, :cleanup_conflict} -> {:error, :destination_changed}
+        end
+
+      nil ->
+        {:error, :destination_changed}
+    end
   end
 
   defp update_run_count(repo, context) do

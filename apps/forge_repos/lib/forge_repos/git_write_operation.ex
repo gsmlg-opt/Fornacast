@@ -24,6 +24,9 @@ defmodule ForgeRepos.GitWriteOperation do
 
   @type t :: %__MODULE__{}
 
+  def states, do: @states
+  def terminal_states, do: [:bookkeeping_complete, :failed]
+
   schema "git_write_operations" do
     field :repository_id, :integer
     field :actor_user_id, :integer
@@ -69,6 +72,7 @@ defmodule ForgeRepos.GitWriteOperation do
     |> validate_target_ref()
     |> validate_inclusion(:failure_reason, @failure_reasons)
     |> validate_initial_lifecycle()
+    |> validate_lease_coherence()
     |> validate_number(:lock_version, greater_than_or_equal_to: 0)
     |> unique_constraint([:request_id, :kind, :target_ref],
       # WORKAROUND(upstream): gsmlg-dev/concord#83
@@ -127,6 +131,20 @@ defmodule ForgeRepos.GitWriteOperation do
     changeset
     |> validate_initial_result(content?, state, oid, reason)
     |> validate_initial_failure(state, reason)
+  end
+
+  defp validate_lease_coherence(changeset) do
+    state = get_field(changeset, :state)
+    owner = get_field(changeset, :lease_owner)
+    expires_at = get_field(changeset, :lease_expires_at)
+
+    valid_pair? =
+      (is_nil(owner) and is_nil(expires_at)) or
+        (is_binary(owner) and owner != "" and match?(%DateTime{}, expires_at))
+
+    if valid_pair? and (state not in terminal_states() or is_nil(owner)),
+      do: changeset,
+      else: add_error(changeset, :lease_owner, "has inconsistent lease fields")
   end
 
   defp validate_initial_result(changeset, true, state, oid, reason) do

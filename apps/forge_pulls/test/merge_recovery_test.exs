@@ -142,6 +142,89 @@ defmodule ForgePulls.MergeRecoveryTest do
     assert {:ok, :refreshed} = GitCore.Cache.fetch(cache_key, fn -> {:ok, :refreshed} end)
   end
 
+  test "merge schema exposes terminal states and terminal rows cannot be claimed", context do
+    assert MergeOperation.states() == [
+             :prepared,
+             :merge_written,
+             :ref_advanced,
+             :completed,
+             :failed
+           ]
+
+    assert MergeOperation.terminal_states() == [:completed, :failed]
+
+    Repo.update_all(
+      from(candidate in MergeOperation, where: candidate.id == ^context.operation.id),
+      set: [state: :completed]
+    )
+
+    assert :busy =
+             OperationLease.claim(
+               MergeOperation,
+               context.operation.id,
+               "terminal-claim",
+               ~U[2026-08-28 12:00:00Z],
+               30
+             )
+  end
+
+  test "cleanup safety classifies claimable live and terminal merge operations", context do
+    now = ~U[2026-08-28 12:00:00Z]
+
+    assert {:blocked, :claimable_operation} =
+             MergeRecovery.cleanup_safety_locked(context.repository, now)
+
+    Repo.update_all(
+      from(candidate in MergeOperation, where: candidate.id == ^context.operation.id),
+      set: [lease_owner: "cleanup-safety", lease_expires_at: DateTime.add(now, 30, :second)]
+    )
+
+    assert {:blocked, :live_lease} =
+             MergeRecovery.cleanup_safety_locked(context.repository, now)
+
+    Repo.update_all(
+      from(candidate in MergeOperation, where: candidate.id == ^context.operation.id),
+      set: [state: :completed, lease_owner: nil, lease_expires_at: nil]
+    )
+
+    assert :safe = MergeRecovery.cleanup_safety_locked(context.repository, now)
+  end
+
+  test "database rejects one-sided and terminal retained merge leases", context do
+    expires_at = ~U[2026-08-28 12:01:00Z]
+
+    assert_operation_update_rejected(
+      context.operation.id,
+      [lease_owner: "worker"],
+      "pull_merge_operations_lease_pair_check"
+    )
+
+    assert_operation_update_rejected(
+      context.operation.id,
+      [state: :completed, lease_owner: "worker", lease_expires_at: expires_at],
+      "pull_merge_operations_terminal_lease_check"
+    )
+  end
+
+  test "cleanup safety dispatcher fails closed for malformed callbacks", context do
+    original = Application.fetch_env!(:forge_repos, :repository_write_reconcilers)
+    on_exit(fn -> Application.put_env(:forge_repos, :repository_write_reconcilers, original) end)
+
+    for module <- [
+          ForgePulls.MissingCleanupSafety,
+          ForgePulls.RaisingCleanupSafety,
+          ForgePulls.UnknownCleanupSafety
+        ] do
+      Application.put_env(:forge_repos, :repository_write_reconcilers, [{1, :test, module}])
+
+      assert {:error, :unavailable} =
+               RepositoryWriteReconcilers.cleanup_safety_locked(
+                 context.repository,
+                 ~U[2026-08-28 12:00:00Z]
+               )
+    end
+  end
+
   test "same-second pending Git then merge completions each advance write version", context do
     completed_at = ~U[2026-08-27 01:46:00Z]
     target_ref = "refs/heads/pending-before-merge"
@@ -927,6 +1010,27 @@ defmodule ForgePulls.MergeRecoveryTest do
     )
   end
 
+  defp assert_operation_update_rejected(id, updates, constraint) do
+    assert {:error, {:constraint, error}} =
+             Repo.transaction(
+               fn ->
+                 try do
+                   Repo.update_all(
+                     from(candidate in MergeOperation, where: candidate.id == ^id),
+                     set: updates
+                   )
+
+                   Repo.rollback(:unexpected_success)
+                 rescue
+                   error -> Repo.rollback({:constraint, error})
+                 end
+               end,
+               mode: :savepoint
+             )
+
+    assert Exception.message(error) =~ constraint
+  end
+
   defp operation!(context, state, overrides) do
     operation =
       %MergeOperation{}
@@ -1104,4 +1208,18 @@ defmodule ForgePulls.MergeRecoveryTest do
     counter = System.unique_integer([:positive, :monotonic]) |> Integer.to_string(36)
     "#{prefix}-#{stamp}-#{counter}"
   end
+end
+
+defmodule ForgePulls.MissingCleanupSafety do
+  def reconcile_repository_locked(_repository, _path, _deadline), do: :ok
+end
+
+defmodule ForgePulls.RaisingCleanupSafety do
+  def reconcile_repository_locked(_repository, _path, _deadline), do: :ok
+  def cleanup_safety_locked(_repository, _now), do: raise("unavailable")
+end
+
+defmodule ForgePulls.UnknownCleanupSafety do
+  def reconcile_repository_locked(_repository, _path, _deadline), do: :ok
+  def cleanup_safety_locked(_repository, _now), do: :unknown
 end

@@ -1,7 +1,15 @@
 defmodule ForgeImports.ImportPersistenceConcurrencyTest do
   use ExUnit.Case, async: false
 
-  alias ForgeImports.{ImportAttempt, ImportRun, Persistence, RepositoryItem, RunView}
+  alias ForgeImports.{
+    CleanupOperation,
+    ImportAttempt,
+    ImportRun,
+    Persistence,
+    RepositoryItem,
+    RunView
+  }
+
   alias Fornacast.{AuditEvent, OperationLease, Repo}
 
   @moduletag :persistence
@@ -289,6 +297,83 @@ defmodule ForgeImports.ImportPersistenceConcurrencyTest do
     assert final.lease_owner == "discovery-racer"
   end
 
+  test "predecessor adoption and cleanup intent are mutually exclusive", context do
+    adoption_first = database_run(fn -> adoption_cleanup_fixture(context, "adoption-first") end)
+    parent = self()
+
+    adoption_task =
+      Task.async(fn ->
+        database_run(fn ->
+          Persistence.with_test_after_adoption_safety_hook(
+            fn ->
+              send(parent, {:adoption_fenced, self()})
+              receive do: (:release_fence -> :ok)
+            end,
+            fn ->
+              ForgeImports.create_repository_item(
+                context.actor,
+                adoption_first.successor_run,
+                adoption_first.adoption_attrs
+              )
+            end
+          )
+        end)
+      end)
+
+    assert_receive {:adoption_fenced, adoption_pid}, 5_000
+
+    cleanup_task =
+      Task.async(fn ->
+        database_run(fn ->
+          Persistence.create_cleanup_operation(
+            adoption_first.item,
+            adoption_first.cleanup_attrs
+          )
+        end)
+      end)
+
+    send(adoption_pid, :release_fence)
+    assert {:ok, %RepositoryItem{}} = Task.await(adoption_task, 15_000)
+    assert {:error, :adopted} = Task.await(cleanup_task, 15_000)
+
+    cleanup_first = database_run(fn -> adoption_cleanup_fixture(context, "cleanup-first") end)
+
+    cleanup_task =
+      Task.async(fn ->
+        database_run(fn ->
+          Persistence.with_test_after_adoption_safety_hook(
+            fn ->
+              send(parent, {:cleanup_fenced, self()})
+              receive do: (:release_fence -> :ok)
+            end,
+            fn ->
+              Persistence.create_cleanup_operation(
+                cleanup_first.item,
+                cleanup_first.cleanup_attrs
+              )
+            end
+          )
+        end)
+      end)
+
+    assert_receive {:cleanup_fenced, cleanup_pid}, 5_000
+
+    adoption_task =
+      Task.async(fn ->
+        database_run(fn ->
+          ForgeImports.create_repository_item(
+            context.actor,
+            cleanup_first.successor_run,
+            cleanup_first.adoption_attrs
+          )
+        end)
+      end)
+
+    send(cleanup_pid, :release_fence)
+    assert {:ok, %CleanupOperation{}} = Task.await(cleanup_task, 15_000)
+    assert {:error, :invalid_predecessor} = Task.await(adoption_task, 15_000)
+  end
+
   defp race(callbacks) do
     parent = self()
 
@@ -383,6 +468,99 @@ defmodule ForgeImports.ImportPersistenceConcurrencyTest do
     {run, item}
   end
 
+  defp adoption_cleanup_fixture(context, suffix) do
+    predecessor_run =
+      context.identity
+      |> run_attrs()
+      |> Map.merge(%{
+        actor_user_id: context.actor.id,
+        state: :failed,
+        terminal_at: @now,
+        source_owner_github_id: System.unique_integer([:positive]) + 8_900_000_000
+      })
+      |> Persistence.insert_run()
+      |> unwrap!()
+
+    successor_run =
+      context.identity
+      |> run_attrs()
+      |> Map.merge(%{
+        actor_user_id: context.actor.id,
+        predecessor_run_id: predecessor_run.id,
+        source_owner_github_id: System.unique_integer([:positive]) + 8_900_000_000
+      })
+      |> Persistence.insert_run()
+      |> unwrap!()
+
+    slug = "cleanup-race-#{suffix}-#{System.unique_integer([:positive])}"
+    {:ok, repository} = ForgeRepos.create_repository(context.actor, %{name: slug, slug: slug})
+
+    item =
+      %{
+        import_run_id: predecessor_run.id,
+        github_repository_id: System.unique_integer([:positive]) + 9_900_000_000,
+        source_full_name: "acme/#{slug}",
+        source_name: slug,
+        source_metadata: %{},
+        source_observed_at: @now,
+        state: :failed
+      }
+      |> Persistence.insert_repository_item()
+      |> unwrap!()
+      |> Ecto.Changeset.change(hidden_repository_id: repository.id)
+      |> Repo.update!()
+
+    cleanup_attrs = remote_cleanup_attrs(repository, item)
+
+    %{
+      item: item,
+      successor_run: successor_run,
+      cleanup_attrs: cleanup_attrs,
+      adoption_attrs: %{
+        predecessor_item_id: item.id,
+        github_repository_id: System.unique_integer([:positive]) + 9_900_000_000,
+        source_full_name: "acme/#{slug}-successor",
+        source_name: "#{slug}-successor",
+        source_metadata: %{},
+        source_observed_at: @now
+      }
+    }
+  end
+
+  defp remote_cleanup_attrs(repository, item) do
+    %{
+      repository_id: repository.id,
+      repository_item_id: item.id,
+      source_lock_version: item.lock_version,
+      kind: :remote_quarantine,
+      operation_id:
+        CleanupOperation.deterministic_operation_id(
+          :remote_quarantine,
+          repository.id,
+          item.id,
+          item.lock_version
+        ),
+      evidence: %{
+        "version" => 1,
+        "kind" => "remote_quarantine",
+        "repository_id" => repository.id,
+        "repository_generation" => repository.generation,
+        "repository_storage_path" => repository.storage_path,
+        "item_id" => item.id,
+        "item_lock_version" => item.lock_version,
+        "requested_path" => repository.storage_path,
+        "quarantine_path" => "quarantine/#{repository.id}-#{item.id}.git",
+        "mode" => 16_384,
+        "major_device" => 8,
+        "minor_device" => 1,
+        "inode" => 99,
+        "remote_failure_kind" => "remote_clone_failed"
+      },
+      eligible_at: @now,
+      next_attempt_at: @now
+    }
+  end
+
   defp request_metadata(operation) do
     %{
       "request_id" => "#{operation}-request",
@@ -442,6 +620,7 @@ defmodule ForgeImports.ImportPersistenceConcurrencyTest do
 
   defp reset_database! do
     for table <- [
+          "github_import_repository_cleanups",
           "github_import_report_entries",
           "github_import_page_checkpoints",
           "github_import_object_mappings",

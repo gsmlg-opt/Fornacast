@@ -46,6 +46,34 @@ defmodule ForgeRepos.GitWritesTest do
     end
   end
 
+  test "schema exposes terminal states and rejects incoherent leases" do
+    assert GitWriteOperation.states() == [
+             :prepared,
+             :object_written,
+             :ref_advanced,
+             :bookkeeping_complete,
+             :failed
+           ]
+
+    assert GitWriteOperation.terminal_states() == [:bookkeeping_complete, :failed]
+
+    refute GitWriteOperation.changeset(
+             %GitWriteOperation{},
+             Map.put(valid_attrs(), :lease_owner, "worker")
+           ).valid?
+
+    refute GitWriteOperation.changeset(
+             %GitWriteOperation{},
+             valid_attrs()
+             |> Map.merge(%{
+               state: :bookkeeping_complete,
+               result_blob_oid: @oid40,
+               lease_owner: "worker",
+               lease_expires_at: ~U[2026-08-28 12:01:00Z]
+             })
+           ).valid?
+  end
+
   test "changeset rejects unknown enums, noncanonical refs, unsafe reasons, OIDs, and versions" do
     invalid = [
       {:kind, :unknown},

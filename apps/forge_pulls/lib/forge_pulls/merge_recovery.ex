@@ -128,6 +128,23 @@ defmodule ForgePulls.MergeRecovery do
     _kind, _reason -> {:error, :unavailable}
   end
 
+  @impl true
+  def cleanup_safety_locked(%Repository{id: repository_id}, %DateTime{} = now)
+      when is_integer(repository_id) and repository_id > 0 do
+    MergeOperation
+    |> where([operation], operation.repository_id == ^repository_id)
+    |> order_by([operation], asc: operation.id)
+    |> maybe_lock()
+    |> Repo.all()
+    |> classify_cleanup_safety(now, MergeOperation.terminal_states())
+  rescue
+    _error -> {:error, :unavailable}
+  catch
+    _kind, _reason -> {:error, :unavailable}
+  end
+
+  def cleanup_safety_locked(_repository, _now), do: {:error, :unavailable}
+
   defp reconcile_next(repository, repository_path, absolute_deadline, owner, after_id) do
     with :ok <- check_deadline(absolute_deadline) do
       now = iteration_now()
@@ -169,6 +186,49 @@ defmodule ForgePulls.MergeRecovery do
     |> order_by([operation], asc: operation.id)
     |> limit(1)
     |> Repo.one()
+  end
+
+  defp classify_cleanup_safety(operations, now, terminal_states) do
+    flags =
+      Enum.reduce(operations, MapSet.new(), fn operation, flags ->
+        terminal? = operation.state in terminal_states
+        owner = operation.lease_owner
+        expires_at = operation.lease_expires_at
+
+        cond do
+          terminal? and (not is_nil(owner) or not is_nil(expires_at)) ->
+            MapSet.put(flags, :inconsistent_lease)
+
+          (is_nil(owner) and not is_nil(expires_at)) or
+            (not is_nil(owner) and is_nil(expires_at)) or owner == "" ->
+            MapSet.put(flags, :inconsistent_lease)
+
+          terminal? ->
+            flags
+
+          is_nil(owner) ->
+            MapSet.put(flags, :claimable_operation)
+
+          DateTime.compare(expires_at, now) == :gt ->
+            MapSet.put(flags, :live_lease)
+
+          true ->
+            MapSet.put(flags, :claimable_operation)
+        end
+      end)
+
+    cond do
+      MapSet.member?(flags, :inconsistent_lease) -> {:blocked, :inconsistent_lease}
+      MapSet.member?(flags, :live_lease) -> {:blocked, :live_lease}
+      MapSet.member?(flags, :claimable_operation) -> {:blocked, :claimable_operation}
+      true -> :safe
+    end
+  end
+
+  defp maybe_lock(query) do
+    if Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"],
+      do: lock(query, "FOR UPDATE"),
+      else: query
   end
 
   defp reconcile_operation(

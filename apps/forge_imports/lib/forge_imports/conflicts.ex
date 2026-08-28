@@ -490,7 +490,8 @@ defmodule ForgeImports.Conflicts do
         terminal_at: if(terminal?, do: now)
       }
 
-      with {:ok, _attempt} <-
+      with :ok <- ensure_plan_adoption_safe(plan.action, item),
+           {:ok, _attempt} <-
              %ImportAttempt{}
              |> ImportAttempt.create_changeset(attempt_attrs)
              |> Repo.insert(),
@@ -504,6 +505,7 @@ defmodule ForgeImports.Conflicts do
            {:ok, resumed_item} <- resume_frozen_item(updated_item, plan.action, now) do
         {:cont, {:ok, [resumed_item | frozen]}}
       else
+        {:error, :cleanup_conflict} -> {:halt, {:error, :stale}}
         {:error, %Ecto.Changeset{}} -> {:halt, {:error, :stale}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
@@ -530,6 +532,11 @@ defmodule ForgeImports.Conflicts do
       end
     end
   end
+
+  defp ensure_plan_adoption_safe(:skip, _item), do: :ok
+
+  defp ensure_plan_adoption_safe(_action, item),
+    do: Persistence.ensure_adoption_safe_locked(Repo, item)
 
   defp durable_resume_state(%RepositoryItem{} = item) do
     case RepositoryPublisher.durable_proof_state(item) do

@@ -87,6 +87,82 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
              )
   end
 
+  test "terminal Git write operations cannot be claimed", context do
+    operation = operation!(context, :prepared)
+
+    Repo.update_all(
+      from(candidate in GitWriteOperation, where: candidate.id == ^operation.id),
+      set: [state: :failed, failure_reason: "effect_not_started"]
+    )
+
+    assert :busy =
+             OperationLease.claim(
+               GitWriteOperation,
+               operation.id,
+               "terminal-claim",
+               ~U[2026-08-28 12:00:00Z],
+               30
+             )
+  end
+
+  test "cleanup safety classifies claimable live and terminal Git write operations", context do
+    now = ~U[2026-08-28 12:00:00Z]
+    operation = operation!(context, :prepared)
+
+    assert {:blocked, :claimable_operation} =
+             GitWriteRecovery.cleanup_safety_locked(context.repository, now)
+
+    Repo.update_all(
+      from(candidate in GitWriteOperation, where: candidate.id == ^operation.id),
+      set: [lease_owner: "cleanup-safety", lease_expires_at: DateTime.add(now, 30, :second)]
+    )
+
+    assert {:blocked, :live_lease} =
+             GitWriteRecovery.cleanup_safety_locked(context.repository, now)
+
+    Repo.update_all(
+      from(candidate in GitWriteOperation, where: candidate.id == ^operation.id),
+      set: [lease_expires_at: now]
+    )
+
+    assert {:blocked, :claimable_operation} =
+             GitWriteRecovery.cleanup_safety_locked(context.repository, now)
+
+    Repo.update_all(
+      from(candidate in GitWriteOperation, where: candidate.id == ^operation.id),
+      set: [
+        state: :failed,
+        failure_reason: "effect_not_started",
+        lease_owner: nil,
+        lease_expires_at: nil
+      ]
+    )
+
+    assert :safe = GitWriteRecovery.cleanup_safety_locked(context.repository, now)
+  end
+
+  test "database rejects one-sided and terminal retained Git write leases", context do
+    operation = operation!(context, :prepared)
+    expires_at = ~U[2026-08-28 12:01:00Z]
+
+    assert_operation_update_rejected(
+      operation.id,
+      [lease_owner: "worker"],
+      "git_write_operations_lease_pair_check"
+    )
+
+    assert_operation_update_rejected(
+      operation.id,
+      [
+        state: :failed,
+        failure_reason: "effect_not_started",
+        lease_owner: "worker",
+        lease_expires_at: expires_at
+      ],
+      "git_write_operations_terminal_lease_check"
+    )
+  end
+
   test "same-second multi-ref completions advance the monotonic write version", context do
     completed_at = ~U[2026-08-27 01:45:00Z]
     first_ref = "refs/heads/same-second-first"
@@ -552,6 +628,27 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
       context.path,
       System.monotonic_time(:millisecond) + 10_000
     )
+  end
+
+  defp assert_operation_update_rejected(id, updates, constraint) do
+    assert {:error, {:constraint, error}} =
+             Repo.transaction(
+               fn ->
+                 try do
+                   Repo.update_all(
+                     from(candidate in GitWriteOperation, where: candidate.id == ^id),
+                     set: updates
+                   )
+
+                   Repo.rollback(:unexpected_success)
+                 rescue
+                   error -> Repo.rollback({:constraint, error})
+                 end
+               end,
+               mode: :savepoint
+             )
+
+    assert Exception.message(error) =~ constraint
   end
 
   defp operation!(context, state, overrides \\ []) do

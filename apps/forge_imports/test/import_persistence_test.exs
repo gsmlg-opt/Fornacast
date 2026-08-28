@@ -1,9 +1,12 @@
 defmodule ForgeImports.ImportPersistenceTest do
   use ExUnit.Case, async: false
 
+  import Ecto.Query
+
   alias ForgeAccounts.GitHubCredential
 
   alias ForgeImports.{
+    CleanupOperation,
     ImportAttempt,
     ImportRun,
     ObjectMapping,
@@ -620,6 +623,74 @@ defmodule ForgeImports.ImportPersistenceTest do
     assert Repo.get!(ImportRun, successor.id).predecessor_run_id == nil
   end
 
+  test "cleanup intent permanently fences successor adoption", %{actor: actor, identity: identity} do
+    predecessor = run_fixture(actor, identity, state: :failed, terminal_at: @now)
+    repository = repository_fixture(actor)
+    item = item_fixture(predecessor, state: :failed)
+
+    Repo.update_all(
+      from(candidate in RepositoryItem, where: candidate.id == ^item.id),
+      set: [hidden_repository_id: repository.id]
+    )
+
+    item = Repo.get!(RepositoryItem, item.id)
+    attrs = remote_cleanup_attrs(repository, item)
+
+    assert {:ok, cleanup} = Persistence.create_cleanup_operation(item, attrs)
+
+    root = %{"mode" => 16_384, "major_device" => 8, "minor_device" => 1, "inode" => 16}
+    atom_root = %{mode: 16_384, major_device: 8, minor_device: 1, inode: 16}
+
+    storage_root =
+      Application.get_env(:fornacast, :repo_storage_root, "tmp/repos") |> Path.expand()
+
+    finished = DateTime.add(@now, 1, :second)
+
+    evidence =
+      Map.put(cleanup.evidence, "anchored_absence", %{
+        "version" => 1,
+        "observed_at" => DateTime.to_iso8601(@now),
+        "root_identity" => root,
+        "root_projection" => CleanupOperation.root_projection(storage_root, atom_root),
+        "path_projection" =>
+          CleanupOperation.path_projection(
+            storage_root,
+            Path.split(cleanup.evidence["quarantine_path"]),
+            atom_root
+          )
+      })
+
+    cleanup =
+      cleanup
+      |> CleanupOperation.lease_update_changeset(
+        state: :cleanup_complete,
+        evidence: evidence,
+        next_attempt_at: nil,
+        effect_started_at: @now,
+        effect_finished_at: finished,
+        completed_at: finished
+      )
+      |> Repo.update!()
+
+    assert cleanup.state == :cleanup_complete
+
+    successor =
+      run_fixture(actor, identity,
+        predecessor_run_id: predecessor.id,
+        source_owner_github_id: 9_000_000_002
+      )
+
+    assert {:error, :invalid_predecessor} =
+             ForgeImports.create_repository_item(actor, successor, %{
+               predecessor_item_id: item.id,
+               github_repository_id: 9_000_000_102,
+               source_full_name: "acme/successor",
+               source_name: "successor",
+               source_metadata: %{},
+               source_observed_at: @now
+             })
+  end
+
   test "repository items default selected and selection is mutable only before work", %{
     actor: actor,
     identity: identity
@@ -981,6 +1052,40 @@ defmodule ForgeImports.ImportPersistenceTest do
     end
   end
 
+  defp remote_cleanup_attrs(repository, item) do
+    %{
+      repository_id: repository.id,
+      repository_item_id: item.id,
+      source_lock_version: item.lock_version,
+      kind: :remote_quarantine,
+      operation_id:
+        CleanupOperation.deterministic_operation_id(
+          :remote_quarantine,
+          repository.id,
+          item.id,
+          item.lock_version
+        ),
+      evidence: %{
+        "version" => 1,
+        "kind" => "remote_quarantine",
+        "repository_id" => repository.id,
+        "repository_generation" => repository.generation,
+        "repository_storage_path" => repository.storage_path,
+        "item_id" => item.id,
+        "item_lock_version" => item.lock_version,
+        "requested_path" => repository.storage_path,
+        "quarantine_path" => "quarantine/#{repository.id}-#{item.id}.git",
+        "mode" => 16_384,
+        "major_device" => 8,
+        "minor_device" => 1,
+        "inode" => 99,
+        "remote_failure_kind" => "remote_clone_failed"
+      },
+      eligible_at: @now,
+      next_attempt_at: @now
+    }
+  end
+
   defp insert_item(run, overrides) do
     attrs =
       %{
@@ -1136,6 +1241,7 @@ defmodule ForgeImports.ImportPersistenceTest do
 
   defp reset_database! do
     for table <- [
+          "github_import_repository_cleanups",
           "github_import_report_entries",
           "github_import_page_checkpoints",
           "github_import_object_mappings",
