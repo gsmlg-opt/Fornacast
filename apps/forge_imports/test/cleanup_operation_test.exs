@@ -159,6 +159,14 @@ defmodule ForgeImports.CleanupOperationTest do
              last_error: "identity_mismatch"
            ).valid?
 
+    for last_error <- ["cleanup_timeout", "storage_unavailable"] do
+      assert CleanupOperation.lease_update_changeset(operation,
+               state: :cleanup_blocked,
+               next_attempt_at: nil,
+               last_error: last_error
+             ).valid?
+    end
+
     refute CleanupOperation.lease_update_changeset(operation,
              state: :cleanup_complete,
              next_attempt_at: nil,
@@ -170,6 +178,19 @@ defmodule ForgeImports.CleanupOperationTest do
              next_attempt_at: nil,
              last_error: "/srv/private.git token=secret"
            ).valid?
+
+    for last_error <- [
+          "cleanup failed: /srv/private.git",
+          "cleanup failed (/srv/private.git)",
+          "cleanup failed: \\\\private\\repo.git",
+          "cleanup failed: C:\\secret"
+        ] do
+      refute CleanupOperation.lease_update_changeset(operation,
+               state: :cleanup_blocked,
+               next_attempt_at: nil,
+               last_error: last_error
+             ).valid?
+    end
 
     lease_expires_at = DateTime.add(@now, 30, :second)
 

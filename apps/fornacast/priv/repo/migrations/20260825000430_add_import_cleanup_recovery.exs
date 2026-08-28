@@ -954,7 +954,8 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
         Enum.map_join(prefixes, " and ", &"#{position}(lower(last_error), '#{&1}') = 0") <>
         " and #{position}(lower(last_error), 'bearer ') = 0 and " <>
         "#{position}(lower(last_error), 'file:///') = 0 and " <>
-        "substr(last_error, 1, 1) not in ('/', '\\')"
+        "substr(last_error, 1, 1) not in ('/', '\\') and " <>
+        "#{position}(last_error, '/') = 0"
 
     if turso?() do
       controls =
@@ -965,11 +966,12 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
         )
 
       common <>
-        " and #{controls} and last_error not glob '*[A-Za-z]:[/\\]*' and " <>
+        " and instr(last_error, char(92)) = 0 and #{controls} and " <>
+        "last_error not glob '*[A-Za-z]:[/\\]*' and " <>
         "instr(last_error, '\\\\') = 0"
     else
       common <>
-        " and last_error !~ '[[:cntrl:]]' and " <>
+        " and strpos(last_error, chr(92)) = 0 and last_error !~ '[[:cntrl:]]' and " <>
         "last_error !~* '(^|[[:space:]\"''(<\\[,{;=])[a-z]:[\\\\/]' and " <>
         "strpos(last_error, '\\\\') = 0"
     end

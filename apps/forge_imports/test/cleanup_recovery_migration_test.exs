@@ -246,21 +246,29 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
   end
 
   test "database blocked errors retain only safe classifications" do
-    cleanup = cleanup_fixture()
+    for value <- ["cleanup_timeout", "storage_unavailable"] do
+      cleanup = cleanup_fixture()
 
-    assert {:ok, _blocked} =
-             cleanup
-             |> Ecto.Changeset.change(
-               state: :cleanup_blocked,
-               next_attempt_at: nil,
-               last_error: "identity_mismatch"
-             )
-             |> Repo.update()
+      assert {:ok, _blocked} =
+               cleanup
+               |> Ecto.Changeset.change(
+                 state: :cleanup_blocked,
+                 next_attempt_at: nil,
+                 last_error: value
+               )
+               |> Repo.update()
+    end
 
     invalid = [
       "/srv/private.git",
+      "cleanup failed: /srv/private.git",
+      "cleanup failed (/srv/private.git)",
+      "cleanup failed=/srv/private.git",
+      "cleanup failed, /srv/private.git",
       "C:\\private\\repo.git",
+      "cleanup failed: C:\\secret",
       "\\\\server\\share",
+      "cleanup failed: \\\\private\\repo.git",
       "file:///srv/private.git",
       "Bearer secret-token",
       "github_pat_secret",
