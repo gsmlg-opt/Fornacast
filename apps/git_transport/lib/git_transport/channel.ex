@@ -4,6 +4,23 @@ defmodule GitTransport.Channel do
   @behaviour :ssh_server_channel
 
   require Logger
+  @connection_value_hook_key {__MODULE__, :connection_value_hook}
+
+  if Mix.env() == :test do
+    @doc false
+    def with_test_connection_value(value, fun) when is_function(fun, 0) do
+      previous = Process.get(@connection_value_hook_key)
+      Process.put(@connection_value_hook_key, value)
+
+      try do
+        fun.()
+      after
+        if previous,
+          do: Process.put(@connection_value_hook_key, previous),
+          else: Process.delete(@connection_value_hook_key)
+      end
+    end
+  end
 
   defstruct cm: nil,
             channel_id: nil,
@@ -29,6 +46,22 @@ defmodule GitTransport.Channel do
   def handle_msg(_message, state), do: {:ok, state}
 
   @impl :ssh_server_channel
+  def handle_ssh_msg(
+        {:ssh_cm, cm, {:exec, channel_id, want_reply, _command}},
+        %{operation: operation} = state
+      )
+      when not is_nil(operation) do
+    reject_duplicate_exec(cm, channel_id, want_reply, state)
+  end
+
+  def handle_ssh_msg(
+        {:ssh_cm, cm, {:exec, channel_id, want_reply, _command}},
+        %{repository_read_handle: handle} = state
+      )
+      when not is_nil(handle) do
+    reject_duplicate_exec(cm, channel_id, want_reply, state)
+  end
+
   def handle_ssh_msg({:ssh_cm, cm, {:exec, channel_id, want_reply, command}}, state) do
     username = connection_value(cm, :user) |> to_string()
     command = to_string(command)
@@ -305,10 +338,10 @@ defmodule GitTransport.Channel do
   end
 
   defp reject(cm, channel_id, want_reply, message, state) do
-    :ssh_connection.reply_request(cm, want_reply, :success, channel_id)
-    send_error(cm, channel_id, message)
-    :ssh_connection.exit_status(cm, channel_id, 255)
-    :ssh_connection.send_eof(cm, channel_id)
+    best_effort(fn -> :ssh_connection.reply_request(cm, want_reply, :success, channel_id) end)
+    best_effort(fn -> send_error(cm, channel_id, message) end)
+    best_effort(fn -> :ssh_connection.exit_status(cm, channel_id, 255) end)
+    best_effort(fn -> :ssh_connection.send_eof(cm, channel_id) end)
     {:stop, channel_id, close_repository_read(%{state | cm: cm, channel_id: channel_id})}
   end
 
@@ -343,11 +376,31 @@ defmodule GitTransport.Channel do
     :ssh_connection.send(cm, channel_id, 1, message)
   end
 
+  defp reject_duplicate_exec(cm, channel_id, want_reply, state) do
+    best_effort(fn -> :ssh_connection.reply_request(cm, want_reply, :failure, channel_id) end)
+    best_effort(fn -> send_error(cm, channel_id, "ERROR: Duplicate SSH exec request.\n") end)
+    best_effort(fn -> :ssh_connection.exit_status(cm, channel_id, 255) end)
+    best_effort(fn -> :ssh_connection.send_eof(cm, channel_id) end)
+    {:stop, channel_id, close_repository_read(%{state | cm: cm, channel_id: channel_id})}
+  end
+
+  defp best_effort(fun) do
+    try do
+      fun.()
+    catch
+      _kind, _reason -> :ok
+    end
+  end
+
   defp connection_value(cm, key) do
-    case :ssh.connection_info(cm, [key]) do
-      [{^key, value}] -> value
-      {^key, value} -> value
-      _ -> nil
+    if Mix.env() == :test and Process.get(@connection_value_hook_key) do
+      Process.get(@connection_value_hook_key)
+    else
+      case :ssh.connection_info(cm, [key]) do
+        [{^key, value}] -> value
+        {^key, value} -> value
+        _ -> nil
+      end
     end
   end
 

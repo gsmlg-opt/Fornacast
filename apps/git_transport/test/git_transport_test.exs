@@ -273,6 +273,67 @@ defmodule GitTransportTest do
     end
   end
 
+  @tag :tmp_dir
+  test "duplicate SSH exec never overwrites an existing repository read", %{tmp_dir: tmp_dir} do
+    share_database!()
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, Path.join(tmp_dir, "repos"))
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "duplicate-exec",
+               email: "duplicate-exec@example.com",
+               password: "correct horse battery staple"
+             })
+
+    for {index, operation, command} <- [
+          {1, :upload_pack, "git-upload-pack '/duplicate-exec/new-1.git'"},
+          {2, :upload_pack, "git-receive-pack '/duplicate-exec/new-2.git'"},
+          {3, nil, "git-upload-pack '/duplicate-exec/new-3.git'"}
+        ] do
+      assert {:ok, old_repository} =
+               ForgeRepos.create_repository(user, %{
+                 name: "Old #{index}",
+                 slug: "old-#{index}"
+               })
+
+      assert {:ok, new_repository} =
+               ForgeRepos.create_repository(user, %{
+                 name: "New #{index}",
+                 slug: "new-#{index}"
+               })
+
+      deadline = System.monotonic_time(:millisecond) + 2_000
+      assert {:ok, handle} = ForgeRepos.open_repository_read(old_repository, deadline)
+
+      state = %GitTransport.Channel{
+        operation: operation,
+        repository: if(operation, do: old_repository),
+        repository_read_handle: handle
+      }
+
+      result =
+        GitTransport.Channel.with_test_connection_value("duplicate-exec", fn ->
+          GitTransport.Channel.handle_ssh_msg(
+            {:ssh_cm, self(), {:exec, 7, true, command}},
+            state
+          )
+        end)
+
+      assert {:stop, 7, %{repository_read_handle: nil}} = result
+
+      for repository <- [old_repository, new_repository] do
+        assert {:ok, cleanup} =
+                 GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
+
+        assert :ok = GitCore.RepositoryReadLimiter.release(cleanup)
+      end
+    end
+
+    assert :sys.get_state(GitCore.RepositoryReadLimiter).grants == %{}
+  end
+
   test "GitCore's future API receive-pack ceiling does not configure Git transport" do
     original_git_core_limits = Application.get_env(:git_core, :limits)
     original_transport_limit = Application.fetch_env(:git_transport, :receive_pack_max_bytes)
@@ -427,6 +488,68 @@ defmodule GitTransportTest do
 
     assert {:error, "ERROR: You do not have access to this repository.\n"} =
              GitTransport.handle_exec("bob", "git-upload-pack 'alice/demo.git'")
+  end
+
+  @tag :tmp_dir
+  test "receive-pack fence failures stay bounded in Exec and Channel", %{tmp_dir: tmp_dir} do
+    share_database!()
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    original_limits = Application.get_env(:git_core, :limits)
+    Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
+
+    on_exit(fn ->
+      Application.put_env(:fornacast, :repo_storage_root, original_root)
+
+      if original_limits,
+        do: Application.put_env(:git_core, :limits, original_limits),
+        else: Application.delete_env(:git_core, :limits)
+
+      restart_git_core_if_needed()
+    end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "receive-fence-error",
+               email: "receive-fence-error@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, repository} =
+             ForgeRepos.create_repository(user, %{name: "Demo", slug: "demo"})
+
+    writer = Process.whereis(GitCore.RepositoryWriteLimiter)
+    monitor = Process.monitor(writer)
+    Process.exit(writer, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^writer, :killed}
+
+    assert {:error, "ERROR: Git receive-pack failed.\n"} =
+             GitTransport.handle_exec(
+               "receive-fence-error",
+               "git-receive-pack 'receive-fence-error/demo.git'"
+             )
+
+    restart_git_core_if_needed()
+    limits = Keyword.put(original_limits || [], :content_deadline_ms, 20)
+    Application.put_env(:git_core, :limits, limits)
+    deadline = System.monotonic_time(:millisecond) + 2_000
+    assert {:ok, holder} = GitCore.RepositoryWriteLimiter.acquire(repository.id, deadline)
+
+    assert {:error, "ERROR: Git receive-pack failed.\n"} =
+             GitTransport.handle_exec(
+               "receive-fence-error",
+               "git-receive-pack 'receive-fence-error/demo.git'"
+             )
+
+    assert {:stop, 9, _state} =
+             GitTransport.Channel.with_test_connection_value("receive-fence-error", fn ->
+               GitTransport.Channel.handle_ssh_msg(
+                 {:ssh_cm, self(),
+                  {:exec, 9, true, "git-receive-pack 'receive-fence-error/demo.git'"}},
+                 %GitTransport.Channel{}
+               )
+             end)
+
+    assert :ok = GitCore.RepositoryWriteLimiter.release(holder)
   end
 
   @tag :tmp_dir
@@ -1086,6 +1209,13 @@ defmodule GitTransportTest do
   end
 
   defp wait_for_file!(path, 0), do: flunk("expected #{path} to exist")
+
+  defp restart_git_core_if_needed do
+    if Process.whereis(GitCore.RepositoryWriteLimiter) == nil do
+      Application.stop(:git_core)
+      {:ok, _started} = Application.ensure_all_started(:git_core)
+    end
+  end
 
   defp populate_bare_repository!(tmp_dir, repo_path) do
     work_path = Path.join([tmp_dir, "work-#{System.unique_integer([:positive])}"])

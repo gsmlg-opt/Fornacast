@@ -9,6 +9,12 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
     read_tree_with_history ref_page ref_summary ref_summary_for_route release_blob
     repository_analysis repository_disk_usage resolve_snapshot search_tree tags
   )a)
+  @duplicate_classifications %{
+    {"apps/git_transport/lib/git_transport/upload_pack.ex", :pack_objects, :pack_objects} => 2,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :load_context, :ref_summary} => 2,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :optional_chrome_snapshot,
+     :resolve_snapshot} => 2
+  }
   @git_core_classification %{
     {"apps/forge_pulls/lib/forge_pulls.ex", :branch_option_pages, :ref_page} => :read_handle,
     {"apps/forge_pulls/lib/forge_pulls.ex", :list_commits, :commit_range_page} => :read_handle,
@@ -44,6 +50,8 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
       :read_handle,
     {"apps/git_transport/lib/git_transport/upload_pack.ex", :pack_objects, :pack_objects} =>
       :read_handle,
+    # RepositoryPage private helpers receive only the path created inside the
+    # public operation's with_repository_read callback; they never open paths.
     {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :collaboration, :ref_summary} =>
       :read_handle,
     {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :code, :ref_summary} =>
@@ -88,6 +96,8 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
      :resolve_snapshot} => :read_handle,
     {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :with_optional_chrome_context,
      :ref_summary} => :read_handle,
+    # Remote reads operate on the importing operation's private staged
+    # destination and remain owned by that operation until publication.
     {"apps/git_core/lib/git_core/remote.ex", :validate_repository, :is_bare_repository?} =>
       :import_lease,
     {"apps/git_core/lib/git_core/remote.ex", :validate_repository, :empty?} => :import_lease,
@@ -178,10 +188,12 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
       end
       |> MapSet.new()
 
-    assert calls == MapSet.new(Map.keys(@git_core_classification)),
-           "classification mismatch: #{inspect(MapSet.difference(calls, MapSet.new(Map.keys(@git_core_classification))) |> MapSet.to_list())}"
+    classifications = classification_occurrences()
 
-    assert Enum.all?(@git_core_classification, fn {_call, classification} ->
+    assert calls == MapSet.new(Map.keys(classifications)),
+           "classification mismatch: missing=#{inspect(MapSet.difference(calls, MapSet.new(Map.keys(classifications))) |> MapSet.to_list())} stale=#{inspect(MapSet.difference(MapSet.new(Map.keys(classifications)), calls) |> MapSet.to_list())}"
+
+    assert Enum.all?(classifications, fn {_call, classification} ->
              classification in [:read_handle, :writer_fence, :import_lease]
            end)
   end
@@ -193,10 +205,38 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
     end
     """
 
-    assert [{"apps/future_forge/lib/reader.ex", :refs, :list_refs} = call] =
+    assert [{"apps/future_forge/lib/reader.ex", :refs, :list_refs, 1} = call] =
              git_core_calls_from_source(source, "apps/future_forge/lib/reader.ex")
 
-    refute Map.has_key?(@git_core_classification, call)
+    refute Map.has_key?(classification_occurrences(), call)
+  end
+
+  test "detector preserves duplicate callsites and resolves high-level aliases" do
+    source = """
+    defmodule FutureForge.Reader do
+      alias GitCore, as: Core
+
+      def refs(path) do
+        Core.list_refs(path)
+        Core.list_refs(path)
+      end
+    end
+    """
+
+    assert [
+             {"apps/another_future/lib/reader.ex", :refs, :list_refs, 1},
+             {"apps/another_future/lib/reader.ex", :refs, :list_refs, 2}
+           ] = git_core_calls_from_source(source, "apps/another_future/lib/reader.ex")
+
+    classified = %{
+      {"apps/another_future/lib/reader.ex", :refs, :list_refs, 1} => :read_handle
+    }
+
+    assert [{"apps/another_future/lib/reader.ex", :refs, :list_refs, 2}] =
+             unclassified_calls(
+               git_core_calls_from_source(source, "apps/another_future/lib/reader.ex"),
+               classified
+             )
   end
 
   defp git_core_calls(path) do
@@ -206,13 +246,14 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
 
   defp git_core_calls_from_source(source, relative) do
     {:ok, ast} = Code.string_to_quoted(source, file: relative)
+    aliases = git_core_aliases(ast)
 
     {_ast, calls} =
       Macro.prewalk(ast, [], fn
         {kind, _, [head, body]} = node, calls when kind in [:def, :defp] ->
           case definition_name(head) do
             name when is_atom(name) and not is_nil(name) ->
-              {node, collect_function_calls(body, relative, name, calls)}
+              {node, collect_function_calls(body, relative, name, aliases, calls)}
 
             nil ->
               {node, calls}
@@ -223,6 +264,32 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
       end)
 
     calls
+    |> Enum.reverse()
+    |> Enum.map_reduce(%{}, fn {file, function, call}, counts ->
+      key = {file, function, call}
+      occurrence = Map.get(counts, key, 0) + 1
+      {{file, function, call, occurrence}, Map.put(counts, key, occurrence)}
+    end)
+    |> elem(0)
+  end
+
+  defp git_core_aliases(ast) do
+    {_ast, aliases} =
+      Macro.prewalk(ast, MapSet.new([:GitCore]), fn
+        {:alias, _, [{:__aliases__, _, [:GitCore]}, opts]} = node, aliases ->
+          alias_name =
+            case Keyword.get(opts, :as) do
+              {:__aliases__, _, [name]} -> name
+              nil -> :GitCore
+            end
+
+          {node, MapSet.put(aliases, alias_name)}
+
+        node, aliases ->
+          {node, aliases}
+      end)
+
+    aliases
   end
 
   defp definition_name({:when, _, [head | _guards]}), do: definition_name(head)
@@ -233,11 +300,12 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
 
   defp definition_name(_head), do: nil
 
-  defp collect_function_calls(ast, relative, function, calls) do
+  defp collect_function_calls(ast, relative, function, aliases, calls) do
     {_ast, calls} =
       Macro.prewalk(ast, calls, fn
         {{:., _, [receiver, call]}, _, _args} = node, calls when is_atom(call) ->
-          if git_core_receiver?(receiver) and MapSet.member?(@repository_storage_reads, call) do
+          if git_core_receiver?(receiver, aliases) and
+               MapSet.member?(@repository_storage_reads, call) do
             {node, [{relative, function, call} | calls]}
           else
             {node, calls}
@@ -250,8 +318,29 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
     calls
   end
 
-  defp git_core_receiver?({:__aliases__, _, [:GitCore]}), do: true
-  defp git_core_receiver?({:git_core, _, _}), do: true
-  defp git_core_receiver?({{:., _, [_context, :git_core]}, _, []}), do: true
-  defp git_core_receiver?(_receiver), do: false
+  defp git_core_receiver?({:__aliases__, _, [name]}, aliases),
+    do: MapSet.member?(aliases, name)
+
+  defp git_core_receiver?({:git_core, _, _}, _aliases), do: true
+  defp git_core_receiver?({{:., _, [_context, :git_core]}, _, []}, _aliases), do: true
+  defp git_core_receiver?(_receiver, _aliases), do: false
+
+  defp classification_occurrences do
+    Map.new(@git_core_classification, fn {call = {file, function, callee}, classification} ->
+      count = Map.get(@duplicate_classifications, call, 1)
+
+      entries =
+        for occurrence <- 1..count,
+            do: {{file, function, callee, occurrence}, classification}
+
+      {call, entries}
+    end)
+    |> Map.values()
+    |> List.flatten()
+    |> Map.new()
+  end
+
+  defp unclassified_calls(calls, classifications) do
+    Enum.reject(calls, &Map.has_key?(classifications, &1))
+  end
 end

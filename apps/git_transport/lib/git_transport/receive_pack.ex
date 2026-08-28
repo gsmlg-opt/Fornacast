@@ -33,16 +33,22 @@ defmodule GitTransport.ReceivePack do
   ]
 
   def advertise_refs(%Repository{} = repository) do
-    ForgeRepos.with_write_fence(repository, :receive_pack, fn path, _remaining ->
-      with {:ok, refs} <- GitCore.list_refs(path) do
-        refs =
-          refs
-          |> Enum.filter(&advertisable_ref?/1)
-          |> Enum.sort_by(& &1.name)
+    result =
+      ForgeRepos.with_write_fence(repository, :receive_pack, fn path, _remaining ->
+        with {:ok, refs} <- GitCore.list_refs(path) do
+          refs =
+            refs
+            |> Enum.filter(&advertisable_ref?/1)
+            |> Enum.sort_by(& &1.name)
 
-        {:ok, render_advertisement(refs)}
-      end
-    end)
+          {:ok, render_advertisement(refs)}
+        end
+      end)
+
+    case result do
+      {:error, _reason} -> {:error, "ERROR: Git receive-pack failed.\n"}
+      result -> result
+    end
   end
 
   def new_request do
