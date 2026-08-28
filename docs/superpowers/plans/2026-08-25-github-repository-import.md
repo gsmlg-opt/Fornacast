@@ -1679,8 +1679,10 @@ every path-bearing field. Add `states/0` and `terminal_states/0` to
 one-sided or terminal retained leases are rejected by both databases. Include
 valid present root+target evidence, valid initial-absence evidence, missing
 present-root or present-target failures, present/absence mutual-exclusion
-failures, forged root/path projections, absence without ordered effect timestamps,
-and complete present/absence-proof rows in both adapter migration/schema matrices.
+failures, mismatched absolute/relative joins, malformed canonical segments,
+absence without ordered effect timestamps, and complete present/absence-proof rows
+in both adapter migration/schema matrices. Application tests separately cover
+live-config root drift because the database does not own runtime configuration.
 
 - [ ] **Step 8C.2: Run the Turso RED suite**
 
@@ -1724,21 +1726,41 @@ Use these deterministic operation IDs:
 Use version `1` evidence maps with exact keys:
 
 - replacement tombstone:
-  `version, kind, repository_id, repository_generation, repository_write_version,
-  repository_storage_path, repository_deleted_at, repository_updated_at, item_id,
-  item_lock_version, attempt_number, attempt_decision, attempt_fingerprint,
-  publication_operation_id, publication_marker, new_repository_id,
-  new_repository_generation, publication_audit_id`;
+  `version, kind, storage_root, relative_path, repository_id,
+  repository_generation, repository_write_version, repository_storage_path,
+  repository_deleted_at, repository_updated_at, item_id, item_lock_version,
+  attempt_number, attempt_decision, attempt_fingerprint, publication_operation_id,
+  publication_marker, new_repository_id, new_repository_generation,
+  publication_audit_id`;
 - unpublished shadow:
-  `version, kind, repository_id, repository_generation, repository_write_version,
-  repository_storage_path, repository_updated_at, item_id, item_lock_version,
-  item_state, run_id, run_state, attempt_number, attempt_state, attempt_decision,
-  attempt_fingerprint, publication_evidence, predecessor_item_id,
-  successor_item_id, adopter_item_id`;
+  `version, kind, storage_root, relative_path, repository_id,
+  repository_generation, repository_write_version, repository_storage_path,
+  repository_updated_at, item_id, item_lock_version, item_state, run_id, run_state,
+  attempt_number, attempt_state, attempt_decision, attempt_fingerprint,
+  publication_evidence, predecessor_item_id, successor_item_id, adopter_item_id`;
 - Remote quarantine:
-  `version, kind, repository_id, repository_generation, repository_storage_path,
-  item_id, item_lock_version, requested_path, quarantine_path, mode, major_device,
-  minor_device, inode, remote_failure_kind`.
+  `version, kind, storage_root, relative_path, repository_id,
+  repository_generation, repository_storage_path, item_id, item_lock_version,
+  requested_path, quarantine_path, mode, major_device, minor_device, inode,
+  remote_failure_kind`.
+
+`storage_root` is the canonical absolute configured repository root and
+`relative_path` is the canonical relative slash path from that root to the cleanup
+target. Replacement/unpublished evidence requires
+`relative_path == repository_storage_path`. Remote evidence requires:
+
+```elixir
+requested_path == Path.join(storage_root, repository_storage_path)
+quarantine_path == Path.join(storage_root, relative_path)
+Path.dirname(relative_path) == Path.dirname(repository_storage_path)
+Path.basename(relative_path) ==
+  GitCore.Remote.cleanup_slot_basename(Path.basename(repository_storage_path))
+```
+
+The Remote leaf is the deterministic `.fornacast-cleanup-v1-*` sibling under the
+same relative parent. The application recomputes the exact slot; database checks
+enforce the equivalent persisted join, parent equality, reserved prefix,
+length/character shape, and canonical path structure without a digest UDF.
 
 Every persisted target or root identity validator accepts only the canonical
 string-key JSON shape
@@ -1773,9 +1795,7 @@ After anchored observation, enrich the same evidence with exactly one of:
       "major_device" => root_major_device,
       "minor_device" => root_minor_device,
       "inode" => root_inode
-    },
-    "root_projection" => root_projection,
-    "path_projection" => path_projection
+    }
   }
 }
 ```
@@ -1785,22 +1805,31 @@ The present branch is the persisted form of
 `anchored_identity` are inserted in one lease-owned update and are jointly
 immutable; neither is valid without the other.
 
-`root_projection` is lowercase hex SHA-256 of
-`:erlang.term_to_binary({:fornacast_cleanup_root, 1, storage_root,
-root_identity})`.
-`path_projection` is lowercase hex SHA-256 of
-`:erlang.term_to_binary({:fornacast_cleanup_path, 1, storage_root,
-relative_segments, root_identity})`. `root_identity` is the canonical four-field
-atom-key companion returned with `{:missing, root_identity}`, converted without
-value changes to the JSON string-key shape shown above. The configured storage
-root and canonical relative segments come from the immutable journal evidence;
-finalization re-observes the same four-field root identity, recomputes both
-projections, and rejects a forged marker or path drift. The original path/evidence
-keys and the chosen anchored outcome remain immutable. A present outcome is valid
-only after the read-only anchored NIF returned a full root+target proof. An absence
-outcome is valid only after that NIF returned
-`{:missing, root_identity}` under both permits; it is not permission to call
-removal.
+`anchored_absence` has exactly `version, observed_at, root_identity`. It inherits
+root/path exclusively from immutable base `storage_root` and `relative_path`;
+neither anchored branch duplicates or hashes path evidence. `root_identity` is the
+canonical four-field atom-key companion returned with
+`{:missing, root_identity}`, converted without value changes to the JSON string-key
+shape shown above. The original base/path evidence and chosen anchored outcome
+remain immutable. A present outcome is valid only after the read-only anchored NIF
+returned a full root+target proof. An absence outcome is valid only after that NIF
+returned `{:missing, root_identity}` under both permits; it is not permission to
+call removal.
+
+At journal creation, application validation requires
+`storage_root == Fornacast.Config.repo_storage_root()` after canonical expansion,
+validates `relative_path` as nonempty canonical slash segments, reconstructs the
+contained absolute target, and enforces the per-kind relationships above.
+Enrichment revalidates the immutable base and cannot change it.
+
+Both adapter migrations/checks enforce exact evidence/anchored keysets, JSON field
+types, identity numeric ranges, kind/state enums, timestamp ordering, canonical
+absolute/relative string shape, and all internal path equalities expressible from
+persisted inputs. They do not hash ETF, call a digest/UDF, or claim to authenticate
+application configuration. The database cannot know the current runtime root;
+Task 8D supplies that external fact before every effect/finalization. A row forged
+with raw SQL may satisfy internal DB relationships, but live-config/path preflight
+must still reject it before filesystem access.
 `publication_marker` is the full committed marker already validated by
 `RepositoryPublisher`. `attempt_fingerprint` is lowercase hex SHA-256 of the
 canonical Erlang external-term encoding of
@@ -1983,8 +2012,10 @@ claimable, live, expired, and malformed leases in import/Git-write/merge domains
 successor-intent races; changed publication marker/path/identity/audit; root
 replacement after observation; symlinks at every layer; special files; initial
 anchored missing, missing after durable identity, forged absence, and
-absence/path-projection mismatch; strict cache
-failure; limiter absence/crash; old-reader blocking; claimable operations blocking;
+absence/base-path mismatch; mismatched relative/absolute joins; runtime config-root
+drift before observation and before finalization; raw-SQL internally consistent
+but wrong-root evidence; strict cache failure; limiter absence/crash; old-reader
+blocking; claimable operations blocking;
 crashes after journal creation, identity persistence, absence-proof persistence,
 deletion, deletion followed by storage-root replacement, audit insertion, and
 final CAS; two-pass replay; exact
@@ -2154,14 +2185,27 @@ repository/item/source-lock columns, and
 `operation.operation_id ==
 deterministic_cleanup_operation_id(:remote_quarantine, shadow.id, item.id,
 operation.source_lock_version)`. Then compare operation evidence with the locked
-shadow identity/generation/canonical path, the item's requested/quarantine path and
-narrow cleanup evidence, and exact `mode/major_device/minor_device/inode`. The
+shadow identity/generation/canonical path, persisted `storage_root/relative_path`,
+the item's requested/quarantine path and narrow cleanup evidence, and exact
+`mode/major_device/minor_device/inode`. Recompute all Remote sibling/join
+relationships from the persisted base. The
 `operation_id` column is authoritative and is not duplicated in evidence; an
 `operation_id` evidence key violates the exact-key validator. A live or one-sided
 source item/run lease, mismatched context/evidence, non-current or non-running
 source attempt, any other source state, or any second nonterminal
 item/attempt/run for the repository blocks. No exception exists for a
 successor/adopter or for replacement/unpublished cleanup.
+
+Before the kind-specific safety check, require the live canonical
+`Fornacast.Config.repo_storage_root()` to equal immutable
+`operation.evidence["storage_root"]` byte-for-byte. Revalidate canonical
+`relative_path` segments and every per-kind equality from Task 8C, then derive
+`relative_segments = String.split(relative_path, "/", trim: false)`. Any config
+drift, empty/dot/dotdot/backslash/NUL segment, absolute relative path, reconstructed
+path mismatch, Remote sibling mismatch, or raw-SQL-forged root/path moves the row
+to `cleanup_blocked` before cache or filesystem access. The database proves
+internal persisted relationships; this application check supplies the external
+live-config fact.
 
 The same preflight rejects any nonterminal Git-write/merge operation and calls both
 `cleanup_safety_locked/2` ports while the SQL rows are locked. A claimable
@@ -2187,7 +2231,9 @@ read limiter, so this ordering introduces no cycle.
 The effect state machine is:
 
 1. The journal exists and is leased.
-2. Call `GitCore.contained_tree_identity/3` under both permits. On
+2. Using only persisted `storage_root` and segments derived from persisted
+   `relative_path` after the live-config check, call
+   `GitCore.contained_tree_identity/3` under both permits. On
    `{:present, %{root: root_identity, target: target_identity}}`, persist exact
    `root_identity`, `anchored_identity = target_identity`, and
    `effect_started_at` in one lease-owned transaction before any destructive call.
@@ -2197,9 +2243,9 @@ The effect state machine is:
    `{:missing, root_identity}`, persist exact
    `anchored_absence` with that canonical root companion plus
    `effect_started_at` and `effect_finished_at` in one lease-owned transaction
-   before finalization. A crash after that transaction replays by recomputing
-   projections and requiring a second anchored `{:missing, root_identity}` with
-   all four root fields unchanged.
+   before finalization. A crash after that transaction replays by revalidating the
+   immutable base/live root and requiring a second anchored
+   `{:missing, root_identity}` with all four root fields unchanged.
 3. For either outcome, call `GitCore.invalidate_repository_cache_strict/1`.
    Cache failure retains `cleanup_pending` and performs no deletion or
    finalization.
@@ -2218,8 +2264,9 @@ The effect state machine is:
    (matching removed proof | safely missing replay with the same root identity)`,
    or
    `anchored_absence + safely missing with the same root identity`. Re-lock and
-   CAS-check the exact repository/item/journal fingerprint and recompute the
-   anchored root/path projections before committing.
+   CAS-check the exact repository/item/journal fingerprint, require the live
+   config root still equals persisted `storage_root`, and revalidate/derive the
+   same persisted relative segments before committing.
 
 For replacement/unpublished cleanup, the final transaction sets
 `Repository.storage_reclaimed_at`, inserts or verifies the deterministic
@@ -2258,8 +2305,9 @@ Use these outcomes:
   effect timestamps, then finalize only after the exact proof revalidates;
 - anchored missing with a durable present proof: treat only as removal replay and
   require current root to equal persisted pre-delete root; anchored missing with
-  durable absence: require the same root and recompute projections. Any root
-  mismatch is `cleanup_blocked`. Never recreate or rediscover the path.
+  durable absence: require the same root and revalidate immutable base path/live
+  config. Any root or config/path mismatch is `cleanup_blocked`. Never recreate or
+  rediscover the path.
 
 - [ ] **Step 8D.8: Run focused Turso cleanup and read/write race suites**
 
