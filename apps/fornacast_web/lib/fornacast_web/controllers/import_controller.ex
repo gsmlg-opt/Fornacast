@@ -15,6 +15,7 @@ defmodule FornacastWeb.ImportController do
   @max_repository_reference_bytes 512
   @max_organization_login_bytes 39
   @max_destination_slug_bytes 255
+  @max_replacement_confirmation_bytes 512
   @max_selection_size 10_000
   @canonical_id ~r/\A[1-9][0-9]*\z/
   @recoverable_turso_codes [:busy, :io, :corrupt]
@@ -87,6 +88,83 @@ defmodule FornacastWeb.ImportController do
     end
   end
 
+  def conflicts(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
+    with {:ok, run_id} <- canonical_id(Map.get(params, "id")),
+         {:ok, run} <- fetch_run_view(conn, actor, run_id) do
+      cond do
+        not clean_destination?(run) -> redirect_to_run(conn, run_id)
+        not conflict_resolution_state?(run) -> redirect_to_run(conn, run_id)
+        unresolved_conflicts?(run) -> render_conflicts(conn, run)
+        true -> redirect_to_review(conn, run_id)
+      end
+    else
+      {:error, reason} -> render_run_lookup_error(conn, reason)
+    end
+  end
+
+  def resolve_conflicts(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
+    with {:ok, run_id} <- canonical_id(Map.get(params, "id")),
+         {:ok, run} <- fetch_run_view(conn, actor, run_id) do
+      cond do
+        not clean_destination?(run) ->
+          redirect_to_run(conn, run_id)
+
+        not conflict_resolution_state?(run) ->
+          redirect_to_run(conn, run_id)
+
+        not unresolved_conflicts?(run) ->
+          redirect_to_review(conn, run_id)
+
+        true ->
+          case conflict_decisions(run, params) do
+            {:ok, decisions} ->
+              result =
+                service_call(fn ->
+                  imports(conn).resolve_repository_conflicts(
+                    actor,
+                    run_id,
+                    decisions,
+                    RequestMetadata.from_conn(conn)
+                  )
+                end)
+
+              handle_conflict_resolution(conn, actor, run, run_id, result)
+
+            {:error, _reason} ->
+              conn
+              |> put_status(:unprocessable_entity)
+              |> render_conflicts(run, conflict_choices_message())
+          end
+      end
+    else
+      {:error, reason} -> render_run_lookup_error(conn, reason)
+    end
+  end
+
+  def review(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
+    with {:ok, run_id} <- canonical_id(Map.get(params, "id")),
+         {:ok, run} <- fetch_run_view(conn, actor, run_id) do
+      cond do
+        not clean_destination?(run) ->
+          redirect_to_run(conn, run_id)
+
+        not reviewable_state?(run) ->
+          redirect_to_run(conn, run_id)
+
+        unresolved_conflicts?(run) and conflict_resolution_state?(run) ->
+          redirect_to_conflicts(conn, run_id)
+
+        unresolved_conflicts?(run) ->
+          redirect_to_run(conn, run_id)
+
+        true ->
+          render_review(conn, run)
+      end
+    else
+      {:error, reason} -> render_run_lookup_error(conn, reason)
+    end
+  end
+
   def selection(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
     with {:ok, run_id} <- canonical_id(Map.get(params, "id")),
          {:ok, repository_ids} <- selection_params(params),
@@ -141,10 +219,55 @@ defmodule FornacastWeb.ImportController do
   defp handle_update_result(conn, _actor, _run_id, _unexpected),
     do: render_fixed_error(conn, :unavailable)
 
+  defp handle_conflict_resolution(conn, actor, _run, run_id, {:ok, %RunView{} = resolved}) do
+    case validate_run_view(resolved, actor, run_id) do
+      :ok -> redirect_to_review(conn, run_id)
+      {:error, :not_found} -> render_fixed_error(conn, :not_found)
+      {:error, :invalid_view} -> render_fixed_error(conn, :unavailable)
+    end
+  end
+
+  defp handle_conflict_resolution(conn, _actor, run, _run_id, {:error, reason}) do
+    case error_kind(reason) do
+      :not_found ->
+        render_fixed_error(conn, :not_found)
+
+      :invalid ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> render_conflicts(run, conflict_choices_message())
+
+      :conflict ->
+        conn
+        |> put_status(:conflict)
+        |> render_conflicts(run, conflict_message())
+
+      :unavailable ->
+        conn
+        |> put_status(:service_unavailable)
+        |> render_conflicts(run, unavailable_message())
+    end
+  end
+
+  defp handle_conflict_resolution(conn, _actor, _run, _run_id, _unexpected),
+    do: render_fixed_error(conn, :unavailable)
+
   defp redirect_to_run(conn, run_id) when is_integer(run_id) and run_id in 1..@max_id do
     conn
     |> put_status(:see_other)
     |> redirect(to: "/imports/#{run_id}")
+  end
+
+  defp redirect_to_review(conn, run_id) when is_integer(run_id) and run_id in 1..@max_id do
+    conn
+    |> put_status(:see_other)
+    |> redirect(to: "/imports/#{run_id}/review")
+  end
+
+  defp redirect_to_conflicts(conn, run_id) when is_integer(run_id) and run_id in 1..@max_id do
+    conn
+    |> put_status(:see_other)
+    |> redirect(to: "/imports/#{run_id}/conflicts")
   end
 
   defp render_entry(conn, actor, kind, error \\ nil) do
@@ -193,6 +316,22 @@ defmodule FornacastWeb.ImportController do
     render_component_page(conn, "GitHub import", rendered)
   end
 
+  defp render_conflicts(conn, %RunView{} = run, error \\ nil) do
+    rendered =
+      ImportHTML.conflicts(%{
+        run: run,
+        error: error,
+        __changed__: nil
+      })
+
+    render_component_page(conn, "Resolve GitHub import conflicts", rendered)
+  end
+
+  defp render_review(conn, %RunView{} = run) do
+    rendered = ImportHTML.review(%{run: run, __changed__: nil})
+    render_component_page(conn, "Review GitHub import", rendered)
+  end
+
   defp render_component_page(conn, title, rendered) do
     page(conn, title, rendered |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary())
   end
@@ -223,6 +362,10 @@ defmodule FornacastWeb.ImportController do
       :unavailable -> render_fixed_error(conn, :unavailable)
     end
   end
+
+  defp render_run_lookup_error(conn, :not_found), do: render_fixed_error(conn, :not_found)
+  defp render_run_lookup_error(conn, :invalid_view), do: render_fixed_error(conn, :unavailable)
+  defp render_run_lookup_error(conn, reason), do: render_update_error(conn, reason)
 
   defp render_fixed_error(conn, :not_found) do
     conn
@@ -275,6 +418,7 @@ defmodule FornacastWeb.ImportController do
   defp invalid_message, do: "Check the GitHub source, credential, and destination."
   defp conflict_message, do: "The import changed. Refresh and try again."
   defp unavailable_message, do: "GitHub discovery is temporarily unavailable."
+  defp conflict_choices_message, do: "Check each repository conflict choice and try again."
 
   defp error_kind(reason) when reason in [:not_found, :forbidden], do: :not_found
 
@@ -363,6 +507,120 @@ defmodule FornacastWeb.ImportController do
   end
 
   defp selection_params(_params), do: {:error, :invalid_selection}
+
+  defp clean_destination?(%RunView{destination: %{organization_status: :clean}}), do: true
+  defp clean_destination?(_run), do: false
+
+  defp conflict_resolution_state?(%RunView{state: state})
+       when state in [:awaiting_resolution, :running],
+       do: true
+
+  defp conflict_resolution_state?(_run), do: false
+
+  defp reviewable_state?(%RunView{state: state})
+       when state in [
+              :awaiting_resolution,
+              :running,
+              :cancel_requested,
+              :completed,
+              :completed_with_warnings,
+              :canceled,
+              :failed
+            ],
+       do: true
+
+  defp reviewable_state?(_run), do: false
+
+  defp unresolved_conflicts?(%RunView{repositories: repositories}) do
+    Enum.any?(repositories, fn repository ->
+      repository.selected and repository.state == :awaiting_resolution
+    end)
+  end
+
+  defp conflict_decisions(%RunView{} = run, %{"decisions" => decisions})
+       when is_map(decisions) and map_size(decisions) in 1..@max_selection_size do
+    allowed_item_ids =
+      run.repositories
+      |> Enum.filter(&(&1.selected and &1.state == :awaiting_resolution))
+      |> MapSet.new(& &1.id)
+
+    submitted =
+      Enum.reject(decisions, fn {_raw_id, raw_decision} -> blank_decision?(raw_decision) end)
+
+    if submitted == [] do
+      {:error, :invalid_selection}
+    else
+      Enum.reduce_while(submitted, {:ok, %{}}, fn {raw_id, raw_decision}, {:ok, normalized} ->
+        with {:ok, item_id} <- canonical_id(raw_id),
+             true <- MapSet.member?(allowed_item_ids, item_id),
+             false <- Map.has_key?(normalized, item_id),
+             {:ok, decision} <- conflict_decision(raw_decision) do
+          {:cont, {:ok, Map.put(normalized, item_id, decision)}}
+        else
+          _invalid -> {:halt, {:error, :invalid_selection}}
+        end
+      end)
+    end
+  end
+
+  defp conflict_decisions(_run, _params), do: {:error, :invalid_selection}
+
+  defp conflict_decision(%{"action" => "skip"} = raw) do
+    with :ok <- exact_keys(raw, ~w(action apply_to_similar slug confirmation)),
+         :ok <- blank_field(raw, "slug"),
+         :ok <- blank_field(raw, "confirmation") do
+      case Map.get(raw, "apply_to_similar") do
+        nil -> {:ok, %{action: :skip}}
+        "" -> {:ok, %{action: :skip}}
+        "true" -> {:ok, %{action: :skip, apply_to_similar: true}}
+        _invalid -> {:error, :invalid_selection}
+      end
+    end
+  end
+
+  defp conflict_decision(%{"action" => "rename"} = raw) do
+    with :ok <- exact_keys(raw, ~w(action apply_to_similar slug confirmation)),
+         :ok <- blank_field(raw, "apply_to_similar"),
+         :ok <- blank_field(raw, "confirmation"),
+         {:ok, slug} <- bounded_text(Map.get(raw, "slug"), @max_destination_slug_bytes) do
+      {:ok, %{action: :rename, slug: slug}}
+    end
+  end
+
+  defp conflict_decision(%{"action" => "replace"} = raw) do
+    with :ok <- exact_keys(raw, ~w(action apply_to_similar slug confirmation)),
+         :ok <- blank_field(raw, "apply_to_similar"),
+         :ok <- blank_field(raw, "slug"),
+         {:ok, confirmation} <- replacement_confirmation(Map.get(raw, "confirmation")) do
+      {:ok, %{action: :replace, confirmation: confirmation}}
+    end
+  end
+
+  defp conflict_decision(_raw), do: {:error, :invalid_selection}
+
+  defp blank_decision?(raw) when is_map(raw) do
+    exact_keys(raw, ~w(action apply_to_similar slug confirmation)) == :ok and
+      Enum.all?(~w(action apply_to_similar slug confirmation), fn key ->
+        Map.get(raw, key) in [nil, ""]
+      end)
+  end
+
+  defp blank_decision?(_raw), do: false
+
+  defp blank_field(map, key) do
+    if Map.get(map, key) in [nil, ""],
+      do: :ok,
+      else: {:error, :invalid_selection}
+  end
+
+  defp replacement_confirmation(value)
+       when is_binary(value) and byte_size(value) in 1..@max_replacement_confirmation_bytes do
+    if String.valid?(value) and :binary.match(value, <<0>>) == :nomatch,
+      do: {:ok, value},
+      else: {:error, :invalid_selection}
+  end
+
+  defp replacement_confirmation(_value), do: {:error, :invalid_selection}
 
   defp destination_params(organizations, %{"destination" => destination}, opts)
        when is_list(organizations) and is_map(destination) do
@@ -554,6 +812,22 @@ defmodule FornacastWeb.ImportController do
       end
   end
 
+  defp fetch_run_view(conn, actor, run_id) do
+    case service_call(fn -> imports(conn).get_run_view(actor, run_id) end) do
+      {:ok, %RunView{} = run} ->
+        case validate_run_view(run, actor, run_id) do
+          :ok -> {:ok, run}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _unexpected ->
+        {:error, :unavailable}
+    end
+  end
+
   defp validate_run_view(
          %RunView{id: id, actor_user_id: actor_id} = run,
          %User{id: actor_id},
@@ -639,6 +913,8 @@ defmodule FornacastWeb.ImportController do
 
   defp valid_repository_projection?(repository) when is_map(repository) do
     repository[:state] in RepositoryItem.states() and is_boolean(repository[:selected]) and
+      repository[:conflict_action] in [nil, :skip, :rename, :replace] and
+      repository[:destination_visibility] in [:public, :private] and
       is_integer(repository[:id]) and repository[:id] in 1..@max_id and
       is_integer(repository[:github_repository_id]) and
       repository[:github_repository_id] in 1..@max_id and

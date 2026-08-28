@@ -104,6 +104,7 @@ defmodule FornacastWeb.ImportHTMLTest do
     assert html =~ ~s(id="repository-selection-9001")
     assert html =~ ~s(for="repository-selection-9001")
     assert html =~ ~s(href="/imports/91")
+    assert html =~ ~s(href="/imports/91/conflicts")
 
     refute html =~ "github_pat_projection_secret"
     refute html =~ "/srv/fornacast/private/import-91"
@@ -115,6 +116,21 @@ defmodule FornacastWeb.ImportHTMLTest do
     refute html =~ ~r/\bgap-(?:1|3|5|6|7|8|9|10|11|12)\b/
     refute html =~ ~r/(?:bg|text|border)-(?:red|blue|green|gray|slate|zinc)-\d+/
     refute html =~ "daisy"
+
+    [clean, conflicted] = view.repositories
+
+    drift_html =
+      render_component(&ImportHTML.conflicts/1,
+        run: %{
+          view
+          | state: :running,
+            repositories: [clean, %{conflicted | wait_reason: "destination_changed"}]
+        },
+        error: nil
+      )
+
+    assert drift_html =~ ~s(name="decisions[302][confirmation]")
+    assert drift_html =~ "octo-local/beta"
   end
 
   test "show respects persisted selection and renders stable empty/error states" do
@@ -182,6 +198,13 @@ defmodule FornacastWeb.ImportHTMLTest do
 
       assert html =~ ~s(href="/imports/91")
       refute html =~ ~r/>\s*(?:Start|Cancel|Retry)(?: import)?\s*</i
+
+      if state in [:awaiting_resolution, :running] do
+        assert html =~ ~s(href="/imports/91/conflicts")
+      else
+        refute html =~ ~s(href="/imports/91/conflicts")
+        refute html =~ ~s(href="/imports/91/review")
+      end
 
       if state == :awaiting_resolution do
         assert html =~ ~s(action="/imports/91/destination")
@@ -291,6 +314,101 @@ defmodule FornacastWeb.ImportHTMLTest do
     refute clean =~ "data-destination-warning"
     refute clean =~ "Reserved namespace"
     refute clean =~ "Namespace conflict"
+  end
+
+  test "conflicts renders action-specific no-JavaScript choices and typed replacement evidence" do
+    view = run_view()
+
+    html =
+      render_component(&ImportHTML.conflicts/1,
+        run: view,
+        error: nil
+      )
+
+    assert html =~ "Resolve repository conflicts"
+    assert html =~ ~s(action="/imports/91/conflicts" method="post")
+    assert html =~ ~s(name="_method" value="patch")
+    assert html =~ ~s(data-conflict-item="302")
+    assert html =~ ~s(name="decisions[302][action]")
+    assert html =~ ~s(name="decisions[302][apply_to_similar]")
+    assert html =~ ~s(name="decisions[302][slug]")
+    assert html =~ ~s(name="decisions[302][confirmation]")
+    assert html =~ "octo-local/beta"
+    assert html =~ "Apply skip to similar conflicts"
+
+    [confirmation_input] =
+      Regex.run(~r/<input\b[^>]*name="decisions\[302\]\[confirmation\]"[^>]*>/, html)
+
+    assert confirmation_input =~ ~s(maxlength="512")
+    assert confirmation_input =~ ~s(autocomplete="off")
+    assert confirmation_input =~ ~s(spellcheck="false")
+    refute confirmation_input =~ ~r/\bvalue=/
+    refute html =~ ~s(data-conflict-item="301")
+    refute html =~ "github_pat_projection_secret"
+    refute html =~ "opaque-internal-evidence"
+    refute html =~ ~r/>\s*Start(?: import)?\s*</i
+    refute html =~ ~r/(?:bg|text|border)-(?:red|blue|green|gray|slate|zinc)-\d+/
+    refute html =~ "daisy"
+  end
+
+  test "review summarizes the persisted plan without exposing a start action or unsafe metadata" do
+    view = run_view()
+    [created, conflicted] = view.repositories
+
+    view = %{
+      view
+      | repositories: [
+          created,
+          %{
+            conflicted
+            | state: :queued,
+              wait_reason: nil,
+              conflict_action: :rename,
+              destination_slug: "renamed-beta"
+          }
+        ]
+    }
+
+    html = render_component(&ImportHTML.review/1, run: view)
+
+    assert html =~ "Review import plan"
+    assert html =~ "octo/alpha"
+    assert html =~ "Create"
+    assert html =~ "octo/beta"
+    assert html =~ "Rename"
+    assert html =~ "renamed-beta"
+    assert html =~ "Import start is unavailable until metadata import support is installed."
+    assert html =~ "GitHub releases are not imported"
+    assert html =~ "data-import-start-unavailable"
+    assert html =~ ~s(href="/imports/91")
+    refute html =~ ~s(action="/imports/91/start")
+    refute html =~ ~r/>\s*Start(?: import)?\s*</i
+    refute html =~ "github_pat_projection_secret"
+    refute html =~ "opaque-internal-evidence"
+  end
+
+  test "show with a dirty organization destination does not offer repository conflict workflow" do
+    run = run_view()
+
+    run = %{
+      run
+      | destination: %{
+          run.destination
+          | organization_status: :conflict,
+            organization_classification: "namespace_conflict"
+        }
+    }
+
+    html =
+      render_component(&ImportHTML.show/1,
+        run: run,
+        organizations: [],
+        error: nil
+      )
+
+    assert html =~ ~s(data-destination-warning="conflict")
+    refute html =~ ~s(href="/imports/91/conflicts")
+    refute html =~ ~s(href="/imports/91/review")
   end
 
   defp run_view do

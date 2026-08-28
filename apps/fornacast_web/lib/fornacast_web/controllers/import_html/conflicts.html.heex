@@ -1,0 +1,135 @@
+<% conflicts = conflict_repositories(@run) %>
+<section
+  class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6"
+  data-import-conflicts={@run.id}
+>
+  <header class="grid gap-2">
+    <p class="text-xs text-on-surface-variant">GitHub migration plan</p>
+    <div class="flex flex-wrap items-center gap-2">
+      <h2 class="text-2xl font-semibold">Resolve repository conflicts</h2>
+      <.dm_badge variant={state_variant(@run.state)} soft pill>
+        {humanize(@run.state)}
+      </.dm_badge>
+    </div>
+    <p class="text-sm text-on-surface-variant">
+      Choose one explicit action for every selected repository that conflicts with its destination.
+    </p>
+  </header>
+
+  <.dm_alert :if={@error} id="import-conflict-error" variant="error" outlined role="alert">
+    {@error}
+  </.dm_alert>
+
+  <.dm_alert :if={conflicts == []} variant="info" outlined role="status">
+    There are no unresolved repository conflicts in this import plan.
+  </.dm_alert>
+
+  <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#157 --%>
+  <form
+    :if={conflicts != []}
+    action={"/imports/#{@run.id}/conflicts"}
+    method="post"
+    class="grid gap-4"
+  >
+    <input type="hidden" name="_csrf_token" value={csrf_token()} />
+    <input type="hidden" name="_method" value="patch" />
+
+    <fieldset
+      :for={repository <- conflicts}
+      class="grid gap-4 bg-surface-container text-on-surface rounded-xl border border-outline-variant p-4"
+      data-conflict-item={repository.id}
+    >
+      <legend class="px-2 text-lg font-semibold">{repository.source_full_name}</legend>
+
+      <dl class="grid gap-2 text-sm">
+        <div class="flex flex-wrap items-center gap-2">
+          <dt class="font-semibold">Destination</dt>
+          <dd>{replacement_confirmation(@run, repository)}</dd>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <dt class="font-semibold">Conflict</dt>
+          <dd>{humanize(repository.wait_reason)}</dd>
+        </div>
+      </dl>
+
+      <div class="grid gap-2">
+        <p class="font-semibold">Action</p>
+        <label class="inline-flex items-center gap-2">
+          <input
+            class="radio radio-primary"
+            type="radio"
+            name={"decisions[#{repository.id}][action]"}
+            value="skip"
+          /> Skip this source repository
+        </label>
+        <label class="inline-flex items-center gap-2">
+          <input
+            class="radio radio-primary"
+            type="radio"
+            name={"decisions[#{repository.id}][action]"}
+            value="rename"
+          /> Import with another local slug
+        </label>
+        <label :if={replace_available?(repository)} class="inline-flex items-center gap-2">
+          <input
+            class="radio radio-primary"
+            type="radio"
+            name={"decisions[#{repository.id}][action]"}
+            value="replace"
+          /> Replace the exact existing repository
+        </label>
+      </div>
+
+      <label class="inline-flex items-center gap-2">
+        <input
+          class="checkbox checkbox-primary"
+          type="checkbox"
+          name={"decisions[#{repository.id}][apply_to_similar]"}
+          value="true"
+        /> Apply skip to similar conflicts
+      </label>
+
+      <.dm_input
+        id={"conflict-rename-#{repository.id}"}
+        class="w-full"
+        name={"decisions[#{repository.id}][slug]"}
+        type="text"
+        label="New local repository slug"
+        maxlength="255"
+        autocomplete="off"
+        spellcheck="false"
+        autocapitalize="none"
+      />
+
+      <.dm_input
+        :if={replace_available?(repository)}
+        id={"conflict-replace-#{repository.id}"}
+        class="w-full"
+        name={"decisions[#{repository.id}][confirmation]"}
+        type="text"
+        label={"Type #{replacement_confirmation(@run, repository)} to confirm replacement"}
+        maxlength="512"
+        autocomplete="off"
+        spellcheck="false"
+        autocapitalize="none"
+      />
+      <input
+        :if={!replace_available?(repository)}
+        type="hidden"
+        name={"decisions[#{repository.id}][confirmation]"}
+        value=""
+      />
+    </fieldset>
+
+    <div class="flex flex-wrap items-center gap-2">
+      <.dm_link href={"/imports/#{@run.id}"} class="btn btn-ghost">Back to import plan</.dm_link>
+      <button class="btn btn-primary" type="submit">Save conflict choices</button>
+    </div>
+  </form>
+
+  <div :if={conflicts == []}>
+    <.dm_link href={"/imports/#{@run.id}/review"} class="btn btn-primary">
+      Review import plan
+    </.dm_link>
+  </div>
+</section>

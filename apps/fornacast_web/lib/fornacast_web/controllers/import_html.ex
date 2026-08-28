@@ -67,6 +67,64 @@ defmodule FornacastWeb.ImportHTML do
     """
   end
 
+  def conflict_repositories(%{repositories: repositories}) when is_list(repositories) do
+    Enum.filter(repositories, fn repository ->
+      repository.selected and repository.state == :awaiting_resolution
+    end)
+  end
+
+  def conflict_repositories(_run), do: []
+
+  def replace_available?(%{wait_reason: reason})
+      when reason in ["repository_conflict", "destination_changed"],
+      do: true
+
+  def replace_available?(_repository), do: false
+
+  def replacement_confirmation(run, repository) do
+    "#{destination_label(run.destination)}/#{repository.destination_slug}"
+  end
+
+  def decision_label(%{selected: false}), do: "Not selected"
+  def decision_label(%{conflict_action: nil}), do: "Create"
+  def decision_label(%{conflict_action: action}), do: humanize(action)
+
+  def decision_variant(%{selected: false}), do: "secondary"
+  def decision_variant(%{conflict_action: :skip}), do: "secondary"
+  def decision_variant(%{conflict_action: :rename}), do: "primary"
+  def decision_variant(%{conflict_action: :replace}), do: "warning"
+  def decision_variant(_repository), do: "info"
+
+  def workflow_available?(%{
+        state: state,
+        destination: %{organization_status: :clean},
+        repositories: [_first | _rest]
+      })
+      when state in [:awaiting_resolution, :running],
+      do: true
+
+  def workflow_available?(
+        %{
+          state: state,
+          destination: %{organization_status: :clean},
+          repositories: [_first | _rest]
+        } = run
+      )
+      when state in [:cancel_requested, :completed, :completed_with_warnings, :canceled, :failed],
+      do: conflict_repositories(run) == []
+
+  def workflow_available?(_run), do: false
+
+  def workflow_path(run) do
+    if run.state in [:awaiting_resolution, :running] and conflict_repositories(run) != [],
+      do: "/imports/#{run.id}/conflicts",
+      else: "/imports/#{run.id}/review"
+  end
+
+  def workflow_label(run) do
+    if conflict_repositories(run) == [], do: "Review import plan", else: "Resolve conflicts"
+  end
+
   def csrf_token, do: Plug.CSRFProtection.get_csrf_token()
 
   def resolution_editable?(%{state: :awaiting_resolution}), do: true

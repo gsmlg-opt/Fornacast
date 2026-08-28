@@ -1,6 +1,8 @@
 defmodule FornacastWeb.OrganizationController do
   use FornacastWeb, :controller
 
+  plug :put_private_no_store
+
   def new(conn, _params) do
     page(conn, "New organization", """
     <form action="/organizations" method="post">
@@ -36,33 +38,50 @@ defmodule FornacastWeb.OrganizationController do
     |> page("New organization", ~s(<p class="error">Organization parameters are required.</p>))
   end
 
-  def show(conn, %{"owner" => owner_slug}) do
+  def show(%Plug.Conn{assigns: %{current_user: current_user}} = conn, %{"owner" => owner_slug}) do
     case ForgeAccounts.get_account_by_username(owner_slug) do
       nil ->
-        conn
-        |> put_status(:not_found)
-        |> page("Not found", ~s(<p class="error">Namespace not found.</p>))
+        render_namespace_not_found(conn)
 
       owner ->
-        repos = ForgeRepos.list_owner_repositories(owner)
+        case ForgeRepos.list_account_repository_views(current_user, owner,
+               page: 1,
+               per_page: 100
+             ) do
+          {:ok, %Fornacast.Page{entries: repository_views}} ->
+            render_namespace(conn, owner, repository_views)
 
-        rows =
-          repos
-          |> Enum.map(fn repo ->
-            ~s(<tr><td><a href="/#{escape(owner.username)}/#{escape(repo.slug)}">#{escape(repo.name)}</a></td><td>#{escape(repo.visibility)}</td><td>#{escape(repo.default_branch)}</td></tr>)
-          end)
-          |> Enum.join("\n")
-
-        body = """
-        <p class="muted">#{escape(namespace_description(owner))}</p>
-        <table>
-          <thead><tr><th>Repository</th><th>Visibility</th><th>Default branch</th></tr></thead>
-          <tbody>#{rows}</tbody>
-        </table>
-        """
-
-        page(conn, namespace_title(owner), body)
+          {:error, _masked} ->
+            render_namespace_not_found(conn)
+        end
     end
+  end
+
+  defp render_namespace(conn, owner, repository_views) do
+    rows =
+      repository_views
+      |> Enum.map(fn view ->
+        repo = view.repository
+
+        ~s(<tr><td><a href="/#{escape(owner.username)}/#{escape(repo.slug)}">#{escape(repo.name)}</a></td><td>#{escape(repo.visibility)}</td><td>#{escape(repo.default_branch)}</td></tr>)
+      end)
+      |> Enum.join("\n")
+
+    body = """
+    <p class="muted">#{escape(namespace_description(owner))}</p>
+    <table>
+      <thead><tr><th>Repository</th><th>Visibility</th><th>Default branch</th></tr></thead>
+      <tbody>#{rows}</tbody>
+    </table>
+    """
+
+    page(conn, namespace_title(owner), body)
+  end
+
+  defp render_namespace_not_found(conn) do
+    conn
+    |> put_status(:not_found)
+    |> page("Not found", ~s(<p class="error">Namespace not found.</p>))
   end
 
   defp namespace_title(%{kind: :organization, display_name: display_name, username: username}) do
@@ -76,4 +95,10 @@ defmodule FornacastWeb.OrganizationController do
 
   defp namespace_description(%{kind: :organization}), do: "Organization"
   defp namespace_description(_owner), do: "User"
+
+  defp put_private_no_store(conn, _opts) do
+    conn
+    |> put_resp_header("cache-control", "private, no-store")
+    |> put_resp_header("pragma", "no-cache")
+  end
 end

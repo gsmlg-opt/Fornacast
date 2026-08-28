@@ -13,7 +13,16 @@
     <p class="text-sm text-on-surface-variant">
       {run_guidance(@run)}
     </p>
-    <.dm_link href={"/imports/#{@run.id}"} class="text-sm text-primary">Refresh status</.dm_link>
+    <div class="flex flex-wrap items-center gap-2">
+      <.dm_link href={"/imports/#{@run.id}"} class="text-sm text-primary">Refresh status</.dm_link>
+      <.dm_link
+        :if={workflow_available?(@run)}
+        href={workflow_path(@run)}
+        class="btn btn-primary"
+      >
+        {workflow_label(@run)}
+      </.dm_link>
+    </div>
   </header>
 
   <.dm_alert :if={@error} id="import-run-error" variant="error" outlined role="alert">
