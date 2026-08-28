@@ -12,17 +12,7 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
                       "(lease_owner is not null and length(trim(lease_owner)) > 0 and lease_expires_at is not null)"
   @effect_order_check "(effect_finished_at is null or " <>
                         "(effect_started_at is not null and effect_started_at <= effect_finished_at))"
-  @lifecycle_check "(" <>
-                     "state = 'cleanup_pending' and next_attempt_at is not null and completed_at is null" <>
-                     ") or (" <>
-                     "state = 'cleanup_blocked' and last_error is not null and length(trim(last_error)) between 1 and 120 and " <>
-                     "lease_owner is null and lease_expires_at is null and next_attempt_at is null and completed_at is null" <>
-                     ") or (" <>
-                     "state = 'cleanup_complete' and lease_owner is null and lease_expires_at is null and " <>
-                     "next_attempt_at is null and last_error is null and effect_started_at is not null and " <>
-                     "effect_finished_at is not null and completed_at is not null and " <>
-                     "effect_started_at <= effect_finished_at and effect_finished_at <= completed_at" <>
-                     ")"
+  @max_integer 9_223_372_036_854_775_807
   @operation_id_check "operation_id = 'github-import-cleanup:' || kind || ':' || " <>
                         "repository_id || ':' || repository_item_id || ':' || source_lock_version"
   @git_pair_check "(lease_owner is null and lease_expires_at is null) or " <>
@@ -133,7 +123,7 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
       add(
         :next_attempt_at,
         :utc_datetime,
-        column_options([], :github_import_cleanups_lifecycle_check, @lifecycle_check)
+        column_options([], :github_import_cleanups_lifecycle_check, lifecycle_check())
       )
 
       add(
@@ -223,7 +213,7 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
     postgres_check(
       :github_import_repository_cleanups,
       :github_import_cleanups_lifecycle_check,
-      @lifecycle_check
+      lifecycle_check()
     )
 
     postgres_check(
@@ -907,10 +897,10 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
 
   defp identity_check(:turso, path) do
     "json_type(evidence, '#{path}') = 'object' and " <>
-      "json_type(evidence, '#{path}.mode') = 'integer' and json_extract(evidence, '#{path}.mode') >= 0 and " <>
-      "json_type(evidence, '#{path}.major_device') = 'integer' and json_extract(evidence, '#{path}.major_device') >= 0 and " <>
-      "json_type(evidence, '#{path}.minor_device') = 'integer' and json_extract(evidence, '#{path}.minor_device') >= 0 and " <>
-      "json_type(evidence, '#{path}.inode') = 'integer' and json_extract(evidence, '#{path}.inode') > 0 and " <>
+      "json_type(evidence, '#{path}.mode') = 'integer' and json_extract(evidence, '#{path}.mode') between 0 and #{@max_integer} and " <>
+      "json_type(evidence, '#{path}.major_device') = 'integer' and json_extract(evidence, '#{path}.major_device') between 0 and #{@max_integer} and " <>
+      "json_type(evidence, '#{path}.minor_device') = 'integer' and json_extract(evidence, '#{path}.minor_device') between 0 and #{@max_integer} and " <>
+      "json_type(evidence, '#{path}.inode') = 'integer' and json_extract(evidence, '#{path}.inode') between 1 and #{@max_integer} and " <>
       "json_remove(json_extract(evidence, '#{path}'), '$.mode', '$.major_device', '$.minor_device', '$.inode') = '{}'"
   end
 
@@ -918,11 +908,71 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
     expression = "(evidence #> '{#{path}}')"
 
     "jsonb_typeof(#{expression}) = 'object' and " <>
-      "jsonb_typeof(evidence #> '{#{path},mode}') = 'number' and (evidence #>> '{#{path},mode}')::numeric >= 0 and mod((evidence #>> '{#{path},mode}')::numeric, 1) = 0 and " <>
-      "jsonb_typeof(evidence #> '{#{path},major_device}') = 'number' and (evidence #>> '{#{path},major_device}')::numeric >= 0 and mod((evidence #>> '{#{path},major_device}')::numeric, 1) = 0 and " <>
-      "jsonb_typeof(evidence #> '{#{path},minor_device}') = 'number' and (evidence #>> '{#{path},minor_device}')::numeric >= 0 and mod((evidence #>> '{#{path},minor_device}')::numeric, 1) = 0 and " <>
-      "jsonb_typeof(evidence #> '{#{path},inode}') = 'number' and (evidence #>> '{#{path},inode}')::numeric > 0 and mod((evidence #>> '{#{path},inode}')::numeric, 1) = 0 and " <>
+      pg_identity_integer_check(path, "mode", 0) <>
+      " and " <>
+      pg_identity_integer_check(path, "major_device", 0) <>
+      " and " <>
+      pg_identity_integer_check(path, "minor_device", 0) <>
+      " and " <>
+      pg_identity_integer_check(path, "inode", 1) <>
+      " and " <>
       "(#{expression} - array['mode','major_device','minor_device','inode']::text[]) = '{}'::jsonb"
+  end
+
+  defp pg_identity_integer_check(path, field, minimum) do
+    type = "jsonb_typeof(evidence #> '{#{path},#{field}}')"
+    value = "evidence #>> '{#{path},#{field}}'"
+
+    "case when #{type} = 'number' and #{value} ~ '^-?[0-9]+$' " <>
+      "then (#{value})::numeric between #{minimum} and #{@max_integer} else false end"
+  end
+
+  defp lifecycle_check do
+    "(" <>
+      "state = 'cleanup_pending' and next_attempt_at is not null and completed_at is null" <>
+      ") or (" <>
+      "state = 'cleanup_blocked' and #{classified_last_error_check()} and " <>
+      "lease_owner is null and lease_expires_at is null and next_attempt_at is null and completed_at is null" <>
+      ") or (" <>
+      "state = 'cleanup_complete' and lease_owner is null and lease_expires_at is null and " <>
+      "next_attempt_at is null and last_error is null and effect_started_at is not null and " <>
+      "effect_finished_at is not null and completed_at is not null and " <>
+      "effect_started_at <= effect_finished_at and effect_finished_at <= completed_at" <>
+      ")"
+  end
+
+  defp classified_last_error_check do
+    aliases =
+      ~w(token password pat github_pat access_token authorization credential credential_envelope credential_envelopes ciphertext nonce tag key_id raw_body request_body response_body storage_path staged_storage_path replacement_storage_path)
+
+    prefixes = ~w(github_pat_ ghp_ gho_ ghu_ ghs_ ghr_)
+    position = if turso?(), do: "instr", else: "strpos"
+
+    common =
+      "last_error is not null and length(trim(last_error)) between 1 and 120 and " <>
+        "lower(trim(last_error)) not in (#{Enum.map_join(aliases, ", ", &"'#{&1}'")}) and " <>
+        Enum.map_join(prefixes, " and ", &"#{position}(lower(last_error), '#{&1}') = 0") <>
+        " and #{position}(lower(last_error), 'bearer ') = 0 and " <>
+        "#{position}(lower(last_error), 'file:///') = 0 and " <>
+        "substr(last_error, 1, 1) not in ('/', '\\')"
+
+    if turso?() do
+      controls =
+        Enum.map_join(
+          [0 | Enum.to_list(1..31)] ++ [127],
+          " and ",
+          &"instr(last_error, char(#{&1})) = 0"
+        )
+
+      common <>
+        " and #{controls} and last_error not glob '*[A-Za-z]:[/\\]*' and " <>
+        "instr(last_error, '\\\\') = 0"
+    else
+      common <>
+        " and last_error !~ '[[:cntrl:]]' and " <>
+        "last_error !~* '(^|[[:space:]\"''(<\\[,{;=])[a-z]:[\\\\/]' and " <>
+        "strpos(last_error, '\\\\') = 0"
+    end
   end
 
   defp absence_check(:turso) do

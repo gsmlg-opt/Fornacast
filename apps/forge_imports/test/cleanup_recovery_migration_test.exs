@@ -191,6 +191,102 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
     end
   end
 
+  test "database identity numbers use exact textual integers" do
+    cleanup = cleanup_fixture()
+    started_at = ~U[2026-08-28 12:00:00Z]
+
+    present =
+      cleanup.evidence
+      |> Map.put("root_identity", identity(16))
+      |> Map.put("anchored_identity", identity(32))
+
+    cleanup =
+      cleanup
+      |> CleanupOperation.lease_update_changeset(
+        evidence: present,
+        effect_started_at: started_at
+      )
+      |> Repo.update!()
+
+    for branch <- ~w(root_identity anchored_identity),
+        field <- ~w(mode major_device minor_device inode),
+        literal <- ["1.0", "-0.0", "\"1\"", "9223372036854775808"] do
+      assert_identity_literal_rejected(cleanup, branch, field, literal)
+    end
+  end
+
+  test "postgres jsonb normalizes exponent integer notation before validation" do
+    if postgres?() do
+      cleanup = cleanup_fixture()
+      started_at = ~U[2026-08-28 12:00:00Z]
+
+      present =
+        cleanup.evidence
+        |> Map.put("root_identity", identity(16))
+        |> Map.put("anchored_identity", identity(32))
+
+      cleanup =
+        cleanup
+        |> CleanupOperation.lease_update_changeset(
+          evidence: present,
+          effect_started_at: started_at
+        )
+        |> Repo.update!()
+
+      assert {:ok, _result} =
+               Ecto.Adapters.SQL.query(
+                 Repo,
+                 "update github_import_repository_cleanups set evidence = " <>
+                   "jsonb_set(evidence, '{root_identity,mode}', '1e0'::jsonb) where id = $1",
+                 [cleanup.id]
+               )
+
+      assert Repo.reload!(cleanup).evidence["root_identity"]["mode"] == 1
+    end
+  end
+
+  test "database blocked errors retain only safe classifications" do
+    cleanup = cleanup_fixture()
+
+    assert {:ok, _blocked} =
+             cleanup
+             |> Ecto.Changeset.change(
+               state: :cleanup_blocked,
+               next_attempt_at: nil,
+               last_error: "identity_mismatch"
+             )
+             |> Repo.update()
+
+    invalid = [
+      "/srv/private.git",
+      "C:\\private\\repo.git",
+      "\\\\server\\share",
+      "file:///srv/private.git",
+      "Bearer secret-token",
+      "github_pat_secret",
+      "GHP_SECRET",
+      "token",
+      "password",
+      "access_token",
+      "authorization",
+      "credential_envelope",
+      "line\nbreak",
+      String.duplicate("x", 121)
+    ]
+
+    for value <- invalid do
+      fresh = cleanup_fixture()
+
+      assert_update_rejected(
+        fresh,
+        [state: :cleanup_blocked, next_attempt_at: nil, last_error: value],
+        "github_import_cleanups_lifecycle_check"
+      )
+    end
+
+    assert_nul_error_rejected(cleanup_fixture())
+  end
+
   defp table_lookup_sql do
     if postgres?(),
       do: "select table_name from information_schema.tables where table_name = $1",
@@ -447,6 +543,58 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
              )
 
     assert Exception.message(error) =~ constraint
+  end
+
+  defp assert_identity_literal_rejected(cleanup, branch, field, literal) do
+    sql =
+      if postgres?() do
+        "update github_import_repository_cleanups set evidence = " <>
+          "jsonb_set(evidence, '{#{branch},#{field}}', '#{literal}'::jsonb) where id = $1"
+      else
+        "update github_import_repository_cleanups set evidence = " <>
+          "json_set(evidence, '$.#{branch}.#{field}', json('#{literal}')) where id = ?"
+      end
+
+    assert {:error, {:constraint, error}} =
+             Repo.transaction(
+               fn ->
+                 case Ecto.Adapters.SQL.query(Repo, sql, [cleanup.id]) do
+                   {:ok, _result} -> Repo.rollback(:unexpected_success)
+                   {:error, error} -> Repo.rollback({:constraint, error})
+                 end
+               end,
+               mode: :savepoint
+             )
+
+    assert Exception.message(error) =~ "github_import_cleanups_evidence_check"
+  end
+
+  defp assert_nul_error_rejected(cleanup) do
+    sql =
+      if postgres?() do
+        "update github_import_repository_cleanups set state = 'cleanup_blocked', " <>
+          "next_attempt_at = null, last_error = chr(0) where id = $1"
+      else
+        "update github_import_repository_cleanups set state = 'cleanup_blocked', " <>
+          "next_attempt_at = null, last_error = char(0) where id = ?"
+      end
+
+    assert {:error, {:rejected, error}} =
+             Repo.transaction(
+               fn ->
+                 case Ecto.Adapters.SQL.query(Repo, sql, [cleanup.id]) do
+                   {:ok, _result} -> Repo.rollback(:unexpected_success)
+                   {:error, error} -> Repo.rollback({:rejected, error})
+                 end
+               end,
+               mode: :savepoint
+             )
+
+    message = Exception.message(error)
+
+    if postgres?(),
+      do: assert(message =~ "null character" or message =~ "0x00"),
+      else: assert(message =~ "github_import_cleanups_lifecycle_check")
   end
 
   defp index_definitions(table) do
