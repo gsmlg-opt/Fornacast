@@ -1997,6 +1997,7 @@ defmodule GitCore.RemoteTest do
   end
 
   defp assert_private_quarantine(quarantine_path, destination) do
+    assert quarantine_path == GitCore.Remote.cleanup_slot_path(destination)
     assert Path.dirname(quarantine_path) == Path.dirname(destination)
 
     assert Path.basename(quarantine_path) =~
@@ -2007,6 +2008,20 @@ defmodule GitCore.RemoteTest do
     :ok
   end
 
+  test "cleanup slot authority hashes the full canonical destination" do
+    first = "/srv/repos/owner-a/shared.git"
+    second = "/srv/repos/owner-b/shared.git"
+
+    first_slot = GitCore.Remote.cleanup_slot_path(first)
+    second_slot = GitCore.Remote.cleanup_slot_path(second)
+
+    assert first_slot != second_slot
+    assert Path.dirname(first_slot) == Path.dirname(first)
+    assert Path.dirname(second_slot) == Path.dirname(second)
+    assert Path.basename(first_slot) =~ ~r/\A\.fornacast-cleanup-v1-[A-Za-z0-9_-]{43}\z/
+    assert Path.basename(second_slot) =~ ~r/\A\.fornacast-cleanup-v1-[A-Za-z0-9_-]{43}\z/
+  end
+
   defp cleanup_quarantines(parent) do
     parent
     |> Path.join(".fornacast-cleanup-*")
@@ -2015,12 +2030,7 @@ defmodule GitCore.RemoteTest do
   end
 
   defp expected_cleanup_slot(destination) do
-    digest =
-      :sha256
-      |> :crypto.hash("fornacast.git-core.remote.cleanup-slot.v1\0" <> destination)
-      |> Base.url_encode64(padding: false)
-
-    Path.join(Path.dirname(destination), ".fornacast-cleanup-v1-" <> digest)
+    GitCore.Remote.cleanup_slot_path(destination)
   end
 
   defp new_cleanup_quarantines(parent, before) do

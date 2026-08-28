@@ -88,6 +88,9 @@ defmodule ForgeRepos.RepositoryWriteReconcilers do
 
   defp safety_result(results) do
     cond do
+      results == [] ->
+        {:error, :unavailable}
+
       Enum.any?(results, &(&1 == {:error, :unavailable})) ->
         {:error, :unavailable}
 

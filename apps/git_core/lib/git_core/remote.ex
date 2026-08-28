@@ -128,7 +128,7 @@ defmodule GitCore.Remote do
   def cleanup_evidence(_destination), do: remote_error(:invalid_destination)
 
   defp cleanup_evidence_in_parent(destination, parent) do
-    quarantine = cleanup_slot(destination)
+    quarantine = cleanup_slot_path(destination)
 
     with :ok <- GitCore.Remote.CredentialReaper.safe_existing_directory_path(parent),
          {:ok, parent_identity} <- directory_identity(parent) do
@@ -1057,7 +1057,7 @@ defmodule GitCore.Remote do
 
   defp quarantine_created_destination(destination, expected_identity) do
     parent = Path.dirname(destination)
-    quarantine = cleanup_slot(destination)
+    quarantine = cleanup_slot_path(destination)
 
     with {:ok, ^expected_identity} <- directory_identity(destination),
          :ok <- GitCore.Remote.CredentialReaper.safe_existing_directory_path(parent),
@@ -1098,7 +1098,7 @@ defmodule GitCore.Remote do
 
   defp ensure_cleanup_slot_available(destination) do
     parent = Path.dirname(destination)
-    quarantine = cleanup_slot(destination)
+    quarantine = cleanup_slot_path(destination)
 
     with :ok <- GitCore.Remote.CredentialReaper.safe_existing_directory_path(parent),
          {:ok, parent_identity} <- directory_identity(parent) do
@@ -1197,7 +1197,9 @@ defmodule GitCore.Remote do
 
   defp same_directory?(_before, _after), do: false
 
-  defp cleanup_slot(destination) do
+  @doc false
+  @spec cleanup_slot_path(Path.t()) :: Path.t()
+  def cleanup_slot_path(destination) when is_binary(destination) do
     digest =
       :sha256
       |> :crypto.hash(@cleanup_slot_domain <> destination)

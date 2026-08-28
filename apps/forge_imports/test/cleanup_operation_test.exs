@@ -111,7 +111,7 @@ defmodule ForgeImports.CleanupOperationTest do
              effect_started_at: started
            ).valid?
 
-    forged = put_in(absence, ["anchored_absence", "path_projection"], String.duplicate("f", 64))
+    forged = put_in(absence, ["anchored_absence", "relative_path"], "forged.git")
 
     refute CleanupOperation.lease_update_changeset(operation,
              evidence: forged,
@@ -205,7 +205,81 @@ defmodule ForgeImports.CleanupOperationTest do
     refute inspected =~ "secret-error"
   end
 
+  test "creation binds the live root and exact remote absolute joins" do
+    attrs = remote_attrs()
+    evidence = attrs.evidence
+
+    assert evidence["requested_path"] ==
+             Path.join(evidence["storage_root"], evidence["repository_storage_path"])
+
+    assert evidence["quarantine_path"] ==
+             Path.join(evidence["storage_root"], evidence["relative_path"])
+
+    assert evidence["quarantine_path"] ==
+             GitCore.Remote.cleanup_slot_path(evidence["requested_path"])
+
+    basename_digest =
+      :sha256
+      |> :crypto.hash(
+        "fornacast.git-core.remote.cleanup-slot.v1\0" <>
+          Path.basename(evidence["requested_path"])
+      )
+      |> Base.url_encode64(padding: false)
+
+    basename_slot =
+      Path.join(
+        Path.dirname(evidence["requested_path"]),
+        ".fornacast-cleanup-v1-" <> basename_digest
+      )
+
+    for forged <- [
+          Map.put(evidence, "storage_root", "/different/live/root"),
+          Map.put(evidence, "requested_path", evidence["repository_storage_path"]),
+          Map.put(evidence, "quarantine_path", basename_slot),
+          Map.put(evidence, "relative_path", evidence["quarantine_path"]),
+          Map.put(evidence, "repository_storage_path", "/absolute/repository.git")
+        ] do
+      refute CleanupOperation.create_changeset(
+               %CleanupOperation{},
+               %{attrs | evidence: forged}
+             ).valid?
+    end
+  end
+
+  test "replacement cleanup reuses the exact committed publication authority" do
+    attrs = replacement_attrs()
+    marker = attrs.evidence["publication_marker"]
+    item = %{item_id: 22, hidden_repository_id: 66}
+
+    assert ForgeImports.RepositoryPublisher.valid_committed_evidence?(marker, item)
+
+    corruptions = [
+      put_in(marker, ["action"], "create"),
+      put_in(marker, ["repository_id"], 67),
+      put_in(marker, ["hidden_repository_id"], 67),
+      put_in(marker, ["replaced_repository_id"], 12),
+      put_in(marker, ["attempt_number"], 5),
+      put_in(marker, ["operation_id"], "github-import-publication-22-5"),
+      put_in(marker, ["run_id"], 0),
+      put_in(marker, ["request_metadata"], %{"request_id" => "/secret/path"})
+    ]
+
+    for corrupted_marker <- corruptions do
+      evidence = %{attrs.evidence | "publication_marker" => corrupted_marker}
+
+      refute CleanupOperation.create_changeset(
+               %CleanupOperation{},
+               %{attrs | evidence: evidence}
+             ).valid?
+    end
+  end
+
   defp remote_attrs do
+    storage_root = storage_root()
+    repository_storage_path = "11/repository.git"
+    requested_path = Path.join(storage_root, repository_storage_path)
+    quarantine_path = GitCore.Remote.cleanup_slot_path(requested_path)
+
     %{
       repository_id: 11,
       repository_item_id: 22,
@@ -215,14 +289,16 @@ defmodule ForgeImports.CleanupOperationTest do
       evidence: %{
         "version" => 1,
         "kind" => "remote_quarantine",
+        "storage_root" => storage_root,
+        "relative_path" => Path.relative_to(quarantine_path, storage_root),
         "repository_id" => 11,
         "repository_generation" => 2,
-        "repository_storage_path" => "11/repository.git",
+        "repository_storage_path" => repository_storage_path,
         "item_id" => 22,
         "item_lock_version" => 3,
-        "requested_path" => "11/repository.git",
-        "quarantine_path" => "quarantine/11-22.git",
-        "mode" => 16_384,
+        "requested_path" => requested_path,
+        "quarantine_path" => quarantine_path,
+        "mode" => 0o700,
         "major_device" => 8,
         "minor_device" => 1,
         "inode" => 99,
@@ -235,6 +311,8 @@ defmodule ForgeImports.CleanupOperationTest do
 
   defp unpublished_attrs do
     decision = %{"action" => "rename", "slug" => "demo"}
+    storage_root = storage_root()
+    repository_storage_path = "11/repository.git"
 
     %{
       repository_id: 11,
@@ -245,10 +323,12 @@ defmodule ForgeImports.CleanupOperationTest do
       evidence: %{
         "version" => 1,
         "kind" => "unpublished_shadow",
+        "storage_root" => storage_root,
+        "relative_path" => repository_storage_path,
         "repository_id" => 11,
         "repository_generation" => 2,
         "repository_write_version" => 0,
-        "repository_storage_path" => "11/repository.git",
+        "repository_storage_path" => repository_storage_path,
         "repository_updated_at" => DateTime.to_iso8601(@now),
         "item_id" => 22,
         "item_lock_version" => 3,
@@ -270,12 +350,15 @@ defmodule ForgeImports.CleanupOperationTest do
   end
 
   defp replacement_attrs do
+    storage_root = storage_root()
+    repository_storage_path = "11/repository.git"
+
     decision = %{
       "action" => "replace",
       "slug" => "demo",
       "replacement_repository_id" => 11,
       "replacement_owner_id" => 77,
-      "replacement_storage_path" => "11/repository.git",
+      "replacement_storage_path" => repository_storage_path,
       "replacement_generation" => 2,
       "replacement_write_version" => 7,
       "replacement_updated_at" => DateTime.to_iso8601(@now),
@@ -287,7 +370,7 @@ defmodule ForgeImports.CleanupOperationTest do
       "state" => "committed",
       "attempt_number" => 4,
       "action" => "replace",
-      "hidden_repository_id" => 55,
+      "hidden_repository_id" => 66,
       "operation_id" => "github-import-publication-22-4",
       "request_metadata" => %{},
       "repository_id" => 66,
@@ -309,10 +392,12 @@ defmodule ForgeImports.CleanupOperationTest do
       evidence: %{
         "version" => 1,
         "kind" => "replacement_tombstone",
+        "storage_root" => storage_root,
+        "relative_path" => repository_storage_path,
         "repository_id" => 11,
         "repository_generation" => 2,
         "repository_write_version" => 7,
-        "repository_storage_path" => "11/repository.git",
+        "repository_storage_path" => repository_storage_path,
         "repository_deleted_at" => DateTime.to_iso8601(@now),
         "repository_updated_at" => DateTime.to_iso8601(@now),
         "item_id" => 22,
@@ -336,23 +421,12 @@ defmodule ForgeImports.CleanupOperationTest do
   end
 
   defp absence_marker do
-    root_identity = identity(16)
-    atom_identity = %{mode: 16_384, major_device: 8, minor_device: 1, inode: 16}
-
-    storage_root =
-      Application.get_env(:fornacast, :repo_storage_root, "tmp/repos") |> Path.expand()
-
     %{
       "version" => 1,
       "observed_at" => DateTime.to_iso8601(@now),
-      "root_identity" => root_identity,
-      "root_projection" => CleanupOperation.root_projection(storage_root, atom_identity),
-      "path_projection" =>
-        CleanupOperation.path_projection(
-          storage_root,
-          Path.split("quarantine/11-22.git"),
-          atom_identity
-        )
+      "root_identity" => identity(16)
     }
   end
+
+  defp storage_root, do: Fornacast.Config.repo_storage_root() |> Path.expand()
 end

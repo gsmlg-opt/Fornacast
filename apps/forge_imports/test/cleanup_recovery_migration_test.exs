@@ -89,9 +89,7 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
       |> Map.put("anchored_absence", %{
         "version" => 1,
         "observed_at" => DateTime.to_iso8601(cleanup.eligible_at),
-        "root_identity" => identity(16),
-        "root_projection" => String.duplicate("a", 64),
-        "path_projection" => String.duplicate("b", 64)
+        "root_identity" => identity(16)
       })
 
     assert_update_rejected(
@@ -104,10 +102,8 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
       cleanup.evidence
       |> Map.put("anchored_absence", %{
         "version" => 1,
-        "observed_at" => DateTime.to_iso8601(cleanup.eligible_at),
-        "root_identity" => identity(16),
-        "root_projection" => String.duplicate("A", 64),
-        "path_projection" => String.duplicate("b", 64)
+        "observed_at" => "not-a-utc-timestamp",
+        "root_identity" => identity(16)
       })
 
     assert_update_rejected(
@@ -119,6 +115,80 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
       ],
       "github_import_cleanups_evidence_check"
     )
+
+    for forged <- [
+          Map.put(cleanup.evidence, "repository_generation", "1"),
+          Map.put(cleanup.evidence, "mode", 0o755),
+          Map.put(
+            cleanup.evidence,
+            "requested_path",
+            cleanup.evidence["repository_storage_path"]
+          ),
+          Map.put(cleanup.evidence, "quarantine_path", cleanup.evidence["requested_path"]),
+          Map.put(
+            cleanup.evidence,
+            "relative_path",
+            "other/.fornacast-cleanup-v1-#{String.duplicate("a", 43)}"
+          ),
+          Map.put(cleanup.evidence, "remote_failure_kind", "Remote Failure"),
+          Map.put(cleanup.evidence, "unknown", true)
+        ] do
+      assert_update_rejected(
+        cleanup,
+        [evidence: forged],
+        "github_import_cleanups_evidence_check"
+      )
+    end
+  end
+
+  test "database accepts every exact kind and rejects replacement authority drift" do
+    unpublished_context = cleanup_context("unpublished")
+    unpublished_attrs = unpublished_attrs(unpublished_context)
+
+    assert {:ok, %CleanupOperation{kind: :unpublished_shadow}} =
+             %CleanupOperation{}
+             |> CleanupOperation.create_changeset(unpublished_attrs)
+             |> Repo.insert()
+
+    replacement_context = cleanup_context("replacement")
+
+    {:ok, new_repository} =
+      ForgeRepos.create_repository(replacement_context.actor, %{
+        name: "cleanup-new-#{replacement_context.suffix}",
+        slug: "cleanup-new-#{replacement_context.suffix}"
+      })
+
+    replacement_attrs = replacement_attrs(replacement_context, new_repository)
+
+    assert {:ok, replacement} =
+             %CleanupOperation{}
+             |> CleanupOperation.create_changeset(replacement_attrs)
+             |> Repo.insert()
+
+    marker = replacement.evidence["publication_marker"]
+
+    corruptions = [
+      put_in(marker, ["action"], "create"),
+      put_in(marker, ["repository_id"], new_repository.id + 1),
+      put_in(marker, ["hidden_repository_id"], new_repository.id + 1),
+      put_in(marker, ["replaced_repository_id"], replacement_context.repository.id + 1),
+      put_in(marker, ["attempt_number"], 2),
+      put_in(
+        marker,
+        ["operation_id"],
+        "github-import-publication-#{replacement_context.item.id}-2"
+      ),
+      put_in(marker, ["owner_user_id"], replacement_context.actor.id + 1),
+      put_in(marker, ["generation"], marker["generation"] + 1)
+    ]
+
+    for corrupted_marker <- corruptions do
+      assert_update_rejected(
+        replacement,
+        [evidence: %{replacement.evidence | "publication_marker" => corrupted_marker}],
+        "github_import_cleanups_evidence_check"
+      )
+    end
   end
 
   defp table_lookup_sql do
@@ -134,12 +204,19 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
   end
 
   defp cleanup_fixture do
+    context = cleanup_context("remote")
+    attrs = remote_attrs(context.repository, context.item)
+    {:ok, cleanup} = Persistence.create_cleanup_operation(context.item, attrs)
+    cleanup
+  end
+
+  defp cleanup_context(label) do
     suffix = System.unique_integer([:positive])
 
     {:ok, actor} =
       ForgeAccounts.create_user(%{
-        username: "cleanup-migration-#{suffix}",
-        email: "cleanup-migration-#{suffix}@example.test",
+        username: "cleanup-#{label}-#{suffix}",
+        email: "cleanup-#{label}-#{suffix}@example.test",
         password: "correct horse battery staple"
       })
 
@@ -147,7 +224,7 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
       ForgeAccounts.observe_github_identity(
         %{
           github_user_id: 9_910_000_000 + suffix,
-          login: "cleanup-migration-#{suffix}",
+          login: "cleanup-#{label}-#{suffix}",
           avatar_url: nil,
           profile_url: nil
         },
@@ -181,13 +258,14 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
         slug: "cleanup-#{suffix}"
       })
 
-    attrs = remote_attrs(repository, item)
-    {:ok, cleanup} = Persistence.create_cleanup_operation(item, attrs)
-    cleanup
+    %{actor: actor, run: run, item: item, repository: repository, suffix: suffix}
   end
 
   defp remote_attrs(repository, item) do
     now = ~U[2026-08-28 12:00:00Z]
+    storage_root = Fornacast.Config.repo_storage_root()
+    requested_path = Path.join(storage_root, repository.storage_path)
+    quarantine_path = GitCore.Remote.cleanup_slot_path(requested_path)
 
     %{
       repository_id: repository.id,
@@ -204,14 +282,16 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
       evidence: %{
         "version" => 1,
         "kind" => "remote_quarantine",
+        "storage_root" => storage_root,
+        "relative_path" => Path.relative_to(quarantine_path, storage_root),
         "repository_id" => repository.id,
         "repository_generation" => repository.generation,
         "repository_storage_path" => repository.storage_path,
         "item_id" => item.id,
         "item_lock_version" => item.lock_version,
-        "requested_path" => repository.storage_path,
-        "quarantine_path" => "quarantine/#{repository.id}-#{item.id}.git",
-        "mode" => 16_384,
+        "requested_path" => requested_path,
+        "quarantine_path" => quarantine_path,
+        "mode" => 0o700,
         "major_device" => 8,
         "minor_device" => 1,
         "inode" => 99,
@@ -224,6 +304,128 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
 
   defp identity(inode) do
     %{"mode" => 16_384, "major_device" => 8, "minor_device" => 1, "inode" => inode}
+  end
+
+  defp unpublished_attrs(context) do
+    now = ~U[2026-08-28 12:00:00Z]
+    decision = %{"action" => "rename", "slug" => "cleanup-renamed"}
+    repository = context.repository
+    item = context.item
+
+    cleanup_attrs(
+      :unpublished_shadow,
+      repository,
+      item,
+      %{
+        "version" => 1,
+        "kind" => "unpublished_shadow",
+        "storage_root" => Fornacast.Config.repo_storage_root(),
+        "relative_path" => repository.storage_path,
+        "repository_id" => repository.id,
+        "repository_generation" => repository.generation,
+        "repository_write_version" => repository.write_version,
+        "repository_storage_path" => repository.storage_path,
+        "repository_updated_at" => DateTime.to_iso8601(now),
+        "item_id" => item.id,
+        "item_lock_version" => item.lock_version,
+        "item_state" => "failed",
+        "run_id" => context.run.id,
+        "run_state" => "failed",
+        "attempt_number" => 1,
+        "attempt_state" => "failed",
+        "attempt_decision" => decision,
+        "attempt_fingerprint" => CleanupOperation.attempt_fingerprint(item.id, 1, decision),
+        "publication_evidence" => %{},
+        "predecessor_item_id" => nil,
+        "successor_item_id" => nil,
+        "adopter_item_id" => nil
+      }
+    )
+  end
+
+  defp replacement_attrs(context, new_repository) do
+    now = ~U[2026-08-28 12:00:00Z]
+    old = context.repository
+    item = context.item
+
+    decision = %{
+      "action" => "replace",
+      "slug" => new_repository.slug,
+      "replacement_repository_id" => old.id,
+      "replacement_owner_id" => context.actor.id,
+      "replacement_storage_path" => old.storage_path,
+      "replacement_generation" => old.generation,
+      "replacement_write_version" => old.write_version,
+      "replacement_updated_at" => DateTime.to_iso8601(now),
+      "replacement_last_pushed_at" => nil
+    }
+
+    marker = %{
+      "version" => 1,
+      "state" => "committed",
+      "attempt_number" => 1,
+      "action" => "replace",
+      "hidden_repository_id" => new_repository.id,
+      "operation_id" => "github-import-publication-#{item.id}-1",
+      "request_metadata" => %{},
+      "repository_id" => new_repository.id,
+      "owner_user_id" => context.actor.id,
+      "slug" => new_repository.slug,
+      "generation" => old.generation + 1,
+      "replaced_repository_id" => old.id,
+      "run_id" => context.run.id,
+      "published_count_after" => 1,
+      "run_lock_version_after" => 2
+    }
+
+    cleanup_attrs(
+      :replacement_tombstone,
+      old,
+      item,
+      %{
+        "version" => 1,
+        "kind" => "replacement_tombstone",
+        "storage_root" => Fornacast.Config.repo_storage_root(),
+        "relative_path" => old.storage_path,
+        "repository_id" => old.id,
+        "repository_generation" => old.generation,
+        "repository_write_version" => old.write_version,
+        "repository_storage_path" => old.storage_path,
+        "repository_deleted_at" => DateTime.to_iso8601(now),
+        "repository_updated_at" => DateTime.to_iso8601(now),
+        "item_id" => item.id,
+        "item_lock_version" => item.lock_version,
+        "attempt_number" => 1,
+        "attempt_decision" => decision,
+        "attempt_fingerprint" => CleanupOperation.attempt_fingerprint(item.id, 1, decision),
+        "publication_operation_id" => marker["operation_id"],
+        "publication_marker" => marker,
+        "new_repository_id" => new_repository.id,
+        "new_repository_generation" => old.generation + 1,
+        "publication_audit_id" => 1
+      }
+    )
+  end
+
+  defp cleanup_attrs(kind, repository, item, evidence) do
+    now = ~U[2026-08-28 12:00:00Z]
+
+    %{
+      repository_id: repository.id,
+      repository_item_id: item.id,
+      source_lock_version: item.lock_version,
+      kind: kind,
+      operation_id:
+        CleanupOperation.deterministic_operation_id(
+          kind,
+          repository.id,
+          item.id,
+          item.lock_version
+        ),
+      evidence: evidence,
+      eligible_at: now,
+      next_attempt_at: now
+    }
   end
 
   defp assert_update_rejected(cleanup, updates, constraint) do

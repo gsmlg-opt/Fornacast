@@ -639,25 +639,13 @@ defmodule ForgeImports.ImportPersistenceTest do
     assert {:ok, cleanup} = Persistence.create_cleanup_operation(item, attrs)
 
     root = %{"mode" => 16_384, "major_device" => 8, "minor_device" => 1, "inode" => 16}
-    atom_root = %{mode: 16_384, major_device: 8, minor_device: 1, inode: 16}
-
-    storage_root =
-      Application.get_env(:fornacast, :repo_storage_root, "tmp/repos") |> Path.expand()
-
     finished = DateTime.add(@now, 1, :second)
 
     evidence =
       Map.put(cleanup.evidence, "anchored_absence", %{
         "version" => 1,
         "observed_at" => DateTime.to_iso8601(@now),
-        "root_identity" => root,
-        "root_projection" => CleanupOperation.root_projection(storage_root, atom_root),
-        "path_projection" =>
-          CleanupOperation.path_projection(
-            storage_root,
-            Path.split(cleanup.evidence["quarantine_path"]),
-            atom_root
-          )
+        "root_identity" => root
       })
 
     cleanup =
@@ -1053,6 +1041,10 @@ defmodule ForgeImports.ImportPersistenceTest do
   end
 
   defp remote_cleanup_attrs(repository, item) do
+    storage_root = Fornacast.Config.repo_storage_root()
+    requested_path = Path.join(storage_root, repository.storage_path)
+    quarantine_path = GitCore.Remote.cleanup_slot_path(requested_path)
+
     %{
       repository_id: repository.id,
       repository_item_id: item.id,
@@ -1068,14 +1060,16 @@ defmodule ForgeImports.ImportPersistenceTest do
       evidence: %{
         "version" => 1,
         "kind" => "remote_quarantine",
+        "storage_root" => storage_root,
+        "relative_path" => Path.relative_to(quarantine_path, storage_root),
         "repository_id" => repository.id,
         "repository_generation" => repository.generation,
         "repository_storage_path" => repository.storage_path,
         "item_id" => item.id,
         "item_lock_version" => item.lock_version,
-        "requested_path" => repository.storage_path,
-        "quarantine_path" => "quarantine/#{repository.id}-#{item.id}.git",
-        "mode" => 16_384,
+        "requested_path" => requested_path,
+        "quarantine_path" => quarantine_path,
+        "mode" => 0o700,
         "major_device" => 8,
         "minor_device" => 1,
         "inode" => 99,

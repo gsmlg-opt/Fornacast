@@ -528,6 +528,10 @@ defmodule ForgeImports.ImportPersistenceConcurrencyTest do
   end
 
   defp remote_cleanup_attrs(repository, item) do
+    storage_root = Fornacast.Config.repo_storage_root()
+    requested_path = Path.join(storage_root, repository.storage_path)
+    quarantine_path = GitCore.Remote.cleanup_slot_path(requested_path)
+
     %{
       repository_id: repository.id,
       repository_item_id: item.id,
@@ -543,14 +547,16 @@ defmodule ForgeImports.ImportPersistenceConcurrencyTest do
       evidence: %{
         "version" => 1,
         "kind" => "remote_quarantine",
+        "storage_root" => storage_root,
+        "relative_path" => Path.relative_to(quarantine_path, storage_root),
         "repository_id" => repository.id,
         "repository_generation" => repository.generation,
         "repository_storage_path" => repository.storage_path,
         "item_id" => item.id,
         "item_lock_version" => item.lock_version,
-        "requested_path" => repository.storage_path,
-        "quarantine_path" => "quarantine/#{repository.id}-#{item.id}.git",
-        "mode" => 16_384,
+        "requested_path" => requested_path,
+        "quarantine_path" => quarantine_path,
+        "mode" => 0o700,
         "major_device" => 8,
         "minor_device" => 1,
         "inode" => 99,

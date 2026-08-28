@@ -1010,7 +1010,11 @@ defmodule ForgeImports.RepositoryPublisher do
            Repo.get_by(RepositoryItem, id: item_id, import_run_id: run_id),
          true <- item.state in [:published, :completed],
          evidence when is_map(evidence) <- item.publication_evidence,
-         true <- valid_committed_evidence?(evidence, item),
+         true <-
+           valid_committed_evidence?(evidence, %{
+             item_id: item.id,
+             hidden_repository_id: item.hidden_repository_id
+           }),
          %ImportRun{} = run <- Repo.get(ImportRun, run_id),
          %ImportAttempt{} = attempt <-
            Repo.get_by(ImportAttempt,
@@ -1033,13 +1037,21 @@ defmodule ForgeImports.RepositoryPublisher do
     end
   end
 
-  defp valid_committed_evidence?(evidence, item) do
+  @doc false
+  @spec valid_committed_evidence?(term(), %{
+          item_id: pos_integer(),
+          hidden_repository_id: pos_integer()
+        }) :: boolean()
+  def valid_committed_evidence?(
+        evidence,
+        %{item_id: item_id, hidden_repository_id: hidden_repository_id}
+      ) do
     is_map(evidence) and Enum.sort(Map.keys(evidence)) == Enum.sort(@committed_keys) and
       evidence["version"] == 1 and evidence["state"] == "committed" and
       positive_integer?(evidence["attempt_number"]) and
       evidence["action"] in ["create", "rename", "replace"] and
       positive_integer?(evidence["hidden_repository_id"]) and
-      evidence["hidden_repository_id"] == item.hidden_repository_id and
+      evidence["hidden_repository_id"] == hidden_repository_id and
       positive_integer?(evidence["repository_id"]) and
       evidence["repository_id"] == evidence["hidden_repository_id"] and
       positive_integer?(evidence["owner_user_id"]) and
@@ -1050,9 +1062,11 @@ defmodule ForgeImports.RepositoryPublisher do
       nonnegative_integer?(evidence["published_count_after"]) and
       positive_integer?(evidence["run_lock_version_after"]) and
       evidence["operation_id"] ==
-        "github-import-publication-#{item.id}-#{evidence["attempt_number"]}" and
+        "github-import-publication-#{item_id}-#{evidence["attempt_number"]}" and
       canonical_request_metadata?(evidence["request_metadata"])
   end
+
+  def valid_committed_evidence?(_evidence, _context), do: false
 
   defp replay_intent_matches?(item, attempt, evidence) do
     evidence["attempt_number"] == attempt.attempt_number and

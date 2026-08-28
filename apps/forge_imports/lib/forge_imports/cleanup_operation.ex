@@ -31,27 +31,22 @@ defmodule ForgeImports.CleanupOperation do
   ]
 
   @replacement_keys ~w(
-    version kind repository_id repository_generation repository_write_version
+    version kind storage_root relative_path repository_id repository_generation repository_write_version
     repository_storage_path repository_deleted_at repository_updated_at item_id
     item_lock_version attempt_number attempt_decision attempt_fingerprint
     publication_operation_id publication_marker new_repository_id
     new_repository_generation publication_audit_id
   )
   @unpublished_keys ~w(
-    version kind repository_id repository_generation repository_write_version
+    version kind storage_root relative_path repository_id repository_generation repository_write_version
     repository_storage_path repository_updated_at item_id item_lock_version item_state
     run_id run_state attempt_number attempt_state attempt_decision attempt_fingerprint
     publication_evidence predecessor_item_id successor_item_id adopter_item_id
   )
   @remote_keys ~w(
-    version kind repository_id repository_generation repository_storage_path item_id
+    version kind storage_root relative_path repository_id repository_generation repository_storage_path item_id
     item_lock_version requested_path quarantine_path mode major_device minor_device inode
     remote_failure_kind
-  )
-  @committed_marker_keys ~w(
-    version state attempt_number action hidden_repository_id operation_id request_metadata
-    repository_id owner_user_id slug generation replaced_repository_id run_id
-    published_count_after run_lock_version_after
   )
   @terminal_item_states ~w(completed skipped canceled failed published)
   @terminal_run_states ~w(completed completed_with_warnings canceled failed)
@@ -103,16 +98,6 @@ defmodule ForgeImports.CleanupOperation do
   end
 
   def attempt_fingerprint(_item_id, _attempt_number, _decision), do: nil
-
-  def root_projection(storage_root, identity)
-      when is_binary(storage_root) and is_map(identity) do
-    sha256({:fornacast_cleanup_root, 1, storage_root, identity})
-  end
-
-  def path_projection(storage_root, relative_segments, identity)
-      when is_binary(storage_root) and is_list(relative_segments) and is_map(identity) do
-    sha256({:fornacast_cleanup_path, 1, storage_root, relative_segments, identity})
-  end
 
   def create_changeset(%__MODULE__{id: nil} = operation, attrs) when is_map(attrs) do
     operation
@@ -222,18 +207,35 @@ defmodule ForgeImports.CleanupOperation do
   defp valid_evidence?(_changeset, _evidence), do: false
 
   defp valid_base_evidence?(:remote_quarantine, evidence) do
-    positive?(evidence["repository_generation"]) and
-      valid_path?(evidence["repository_storage_path"]) and
-      valid_path?(evidence["requested_path"]) and valid_path?(evidence["quarantine_path"]) and
-      nonnegative?(evidence["mode"]) and nonnegative?(evidence["major_device"]) and
+    root = evidence["storage_root"]
+    repository_path = evidence["repository_storage_path"]
+    relative_path = evidence["relative_path"]
+    requested_path = evidence["requested_path"]
+    quarantine_path = evidence["quarantine_path"]
+
+    valid_live_storage_root?(root) and positive?(evidence["repository_generation"]) and
+      valid_repository_path?(repository_path) and valid_relative_path?(relative_path) and
+      valid_absolute_path?(requested_path) and valid_absolute_path?(quarantine_path) and
+      requested_path == Path.join(root, repository_path) and
+      quarantine_path == Path.join(root, relative_path) and
+      quarantine_path == GitCore.Remote.cleanup_slot_path(requested_path) and
+      relative_path == Path.relative_to(quarantine_path, root) and
+      Path.dirname(quarantine_path) == Path.dirname(requested_path) and
+      Regex.match?(
+        ~r/\A\.fornacast-cleanup-v1-[A-Za-z0-9_-]{43}\z/,
+        Path.basename(quarantine_path)
+      ) and
+      evidence["mode"] == 0o700 and nonnegative?(evidence["major_device"]) and
       nonnegative?(evidence["minor_device"]) and positive?(evidence["inode"]) and
       classified?(evidence["remote_failure_kind"])
   end
 
   defp valid_base_evidence?(:unpublished_shadow, evidence) do
-    positive?(evidence["repository_generation"]) and
+    valid_live_storage_root?(evidence["storage_root"]) and
+      evidence["relative_path"] == evidence["repository_storage_path"] and
+      valid_repository_path?(evidence["repository_storage_path"]) and
+      positive?(evidence["repository_generation"]) and
       nonnegative?(evidence["repository_write_version"]) and
-      valid_path?(evidence["repository_storage_path"]) and
       timestamp?(evidence["repository_updated_at"]) and
       evidence["item_state"] in @terminal_item_states and positive?(evidence["run_id"]) and
       evidence["run_state"] in @terminal_run_states and positive?(evidence["attempt_number"]) and
@@ -253,10 +255,13 @@ defmodule ForgeImports.CleanupOperation do
 
   defp valid_base_evidence?(:replacement_tombstone, evidence) do
     marker = evidence["publication_marker"]
+    decision = evidence["attempt_decision"]
 
-    positive?(evidence["repository_generation"]) and
+    valid_live_storage_root?(evidence["storage_root"]) and
+      evidence["relative_path"] == evidence["repository_storage_path"] and
+      valid_repository_path?(evidence["repository_storage_path"]) and
+      positive?(evidence["repository_generation"]) and
       nonnegative?(evidence["repository_write_version"]) and
-      valid_path?(evidence["repository_storage_path"]) and
       timestamp?(evidence["repository_deleted_at"]) and
       timestamp?(evidence["repository_updated_at"]) and
       positive?(evidence["attempt_number"]) and valid_attempt_decision?(evidence) and
@@ -266,31 +271,31 @@ defmodule ForgeImports.CleanupOperation do
           evidence["attempt_number"],
           evidence["attempt_decision"]
         ) and
-      valid_committed_marker?(marker) and
+      ForgeImports.RepositoryPublisher.valid_committed_evidence?(marker, %{
+        item_id: evidence["item_id"],
+        hidden_repository_id: evidence["new_repository_id"]
+      }) and
+      marker["action"] == "replace" and
+      marker["replaced_repository_id"] == evidence["repository_id"] and
+      marker["repository_id"] == marker["hidden_repository_id"] and
       evidence["publication_operation_id"] == marker["operation_id"] and
       evidence["new_repository_id"] == marker["repository_id"] and
       evidence["new_repository_generation"] == marker["generation"] and
       marker["attempt_number"] == evidence["attempt_number"] and
-      marker["action"] == evidence["attempt_decision"]["action"] and
+      decision["action"] == "replace" and
+      decision["replacement_repository_id"] == evidence["repository_id"] and
+      decision["replacement_generation"] == evidence["repository_generation"] and
+      decision["replacement_write_version"] == evidence["repository_write_version"] and
+      decision["replacement_storage_path"] == evidence["repository_storage_path"] and
+      decision["replacement_updated_at"] == evidence["repository_updated_at"] and
+      marker["slug"] == decision["slug"] and
+      marker["owner_user_id"] == decision["replacement_owner_id"] and
+      marker["generation"] == decision["replacement_generation"] + 1 and
+      evidence["new_repository_id"] != evidence["repository_id"] and
       positive?(evidence["publication_audit_id"])
   end
 
   defp valid_base_evidence?(_kind, _evidence), do: false
-
-  defp valid_committed_marker?(marker) when is_map(marker) do
-    Map.keys(marker) |> Enum.sort() == Enum.sort(@committed_marker_keys) and
-      marker["version"] == 1 and marker["state"] == "committed" and
-      positive?(marker["attempt_number"]) and marker["action"] in ~w(create rename replace) and
-      positive?(marker["hidden_repository_id"]) and safe_text?(marker["operation_id"], 255) and
-      is_map(marker["request_metadata"]) and positive?(marker["repository_id"]) and
-      positive?(marker["owner_user_id"]) and safe_text?(marker["slug"], 63) and
-      positive?(marker["generation"]) and
-      (is_nil(marker["replaced_repository_id"]) or positive?(marker["replaced_repository_id"])) and
-      positive?(marker["run_id"]) and nonnegative?(marker["published_count_after"]) and
-      positive?(marker["run_lock_version_after"])
-  end
-
-  defp valid_committed_marker?(_marker), do: false
 
   defp valid_outcome?(changeset, evidence) do
     started? = not is_nil(get_field(changeset, :effect_started_at))
@@ -310,20 +315,16 @@ defmodule ForgeImports.CleanupOperation do
 
   defp valid_absence?(changeset, evidence, absence) when is_map(absence) do
     identity = absence["root_identity"]
-    relative_path = cleanup_relative_path(evidence)
-    storage_root = cleanup_storage_root()
     observed_at = parse_timestamp(absence["observed_at"])
     started_at = get_field(changeset, :effect_started_at)
     finished_at = get_field(changeset, :effect_finished_at)
 
     Map.keys(absence) |> Enum.sort() ==
-      Enum.sort(~w(version observed_at root_identity root_projection path_projection)) and
+      Enum.sort(~w(version observed_at root_identity)) and
       absence["version"] == 1 and match?(%DateTime{}, observed_at) and
       DateTime.compare(started_at, observed_at) in [:lt, :eq] and
       DateTime.compare(observed_at, finished_at) in [:lt, :eq] and valid_identity?(identity) and
-      absence["root_projection"] == root_projection(storage_root, atom_identity(identity)) and
-      absence["path_projection"] ==
-        path_projection(storage_root, Path.split(relative_path), atom_identity(identity))
+      valid_relative_path?(evidence["relative_path"])
   end
 
   defp valid_absence?(_changeset, _evidence, _absence), do: false
@@ -429,25 +430,6 @@ defmodule ForgeImports.CleanupOperation do
   defp base_keys(:replacement_tombstone), do: @replacement_keys
   defp base_keys(_kind), do: []
 
-  defp cleanup_relative_path(%{"kind" => "remote_quarantine", "quarantine_path" => path}),
-    do: path
-
-  defp cleanup_relative_path(%{"repository_storage_path" => path}), do: path
-  defp cleanup_relative_path(_evidence), do: ""
-
-  defp cleanup_storage_root do
-    Application.get_env(:fornacast, :repo_storage_root, "tmp/repos") |> Path.expand()
-  end
-
-  defp atom_identity(identity) do
-    %{
-      mode: identity["mode"],
-      major_device: identity["major_device"],
-      minor_device: identity["minor_device"],
-      inode: identity["inode"]
-    }
-  end
-
   defp ordered?(nil, nil, nil), do: true
   defp ordered?(%DateTime{}, nil, nil), do: true
 
@@ -465,9 +447,33 @@ defmodule ForgeImports.CleanupOperation do
   defp paired?(owner, %DateTime{}) when is_binary(owner) and owner != "", do: true
   defp paired?(_owner, _expires), do: false
 
-  defp valid_path?(value) do
-    safe_text?(value, 1_024) and ForgeImports.SafeValue.github_secret_free?(value) and
+  defp valid_repository_path?(value) do
+    valid_relative_path?(value) and String.ends_with?(value, ".git") and
       Storage.validate_relative_storage_path(value) == :ok
+  end
+
+  defp valid_relative_path?(value) when is_binary(value) do
+    segments = Path.split(value)
+
+    safe_text?(value, 1_024) and ForgeImports.SafeValue.github_secret_free?(value) and
+      Path.type(value) == :relative and segments != [] and length(segments) <= 128 and
+      Enum.all?(segments, &(&1 not in ["", ".", ".."] and byte_size(&1) <= 255)) and
+      not Regex.match?(~r/\A[A-Za-z]:/, value) and
+      not String.contains?(value, "\\") and Path.join(segments) == value
+  end
+
+  defp valid_relative_path?(_value), do: false
+
+  defp valid_absolute_path?(value) when is_binary(value) do
+    safe_text?(value, 4_096) and ForgeImports.SafeValue.github_secret_free?(value) and
+      Path.type(value) == :absolute and not String.contains?(value, "\\") and
+      Path.expand(value) == value
+  end
+
+  defp valid_absolute_path?(_value), do: false
+
+  defp valid_live_storage_root?(value) do
+    valid_absolute_path?(value) and value != "/" and value == Fornacast.Config.repo_storage_root()
   end
 
   defp classified?(value),

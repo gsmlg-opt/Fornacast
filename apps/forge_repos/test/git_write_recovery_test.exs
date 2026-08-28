@@ -11,7 +11,25 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
     if Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"] do
       :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
     else
-      for table <- ~w(git_write_operations audit_events repositories users) do
+      for table <- ~w(
+        github_import_repository_cleanups
+        github_import_report_entries
+        github_import_page_checkpoints
+        github_import_object_mappings
+        github_import_attempts
+        github_import_repository_items
+        github_import_runs
+        github_credentials
+        github_identities
+        git_write_operations
+        audit_events
+        repository_collaborators
+        repositories
+        organization_members
+        api_keys
+        ssh_keys
+        users
+      ) do
         Ecto.Adapters.SQL.query!(Repo, "delete from #{table}", [])
       end
     end

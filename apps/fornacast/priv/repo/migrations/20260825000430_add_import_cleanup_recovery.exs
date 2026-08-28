@@ -31,9 +31,11 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
                         "(lease_owner is null and lease_expires_at is null)"
   @merge_terminal_check "state not in ('completed', 'failed') or " <>
                           "(lease_owner is null and lease_expires_at is null)"
-  @replacement_keys ~w(version kind repository_id repository_generation repository_write_version repository_storage_path repository_deleted_at repository_updated_at item_id item_lock_version attempt_number attempt_decision attempt_fingerprint publication_operation_id publication_marker new_repository_id new_repository_generation publication_audit_id)
-  @unpublished_keys ~w(version kind repository_id repository_generation repository_write_version repository_storage_path repository_updated_at item_id item_lock_version item_state run_id run_state attempt_number attempt_state attempt_decision attempt_fingerprint publication_evidence predecessor_item_id successor_item_id adopter_item_id)
-  @remote_keys ~w(version kind repository_id repository_generation repository_storage_path item_id item_lock_version requested_path quarantine_path mode major_device minor_device inode remote_failure_kind)
+  @replacement_keys ~w(version kind storage_root relative_path repository_id repository_generation repository_write_version repository_storage_path repository_deleted_at repository_updated_at item_id item_lock_version attempt_number attempt_decision attempt_fingerprint publication_operation_id publication_marker new_repository_id new_repository_generation publication_audit_id)
+  @unpublished_keys ~w(version kind storage_root relative_path repository_id repository_generation repository_write_version repository_storage_path repository_updated_at item_id item_lock_version item_state run_id run_state attempt_number attempt_state attempt_decision attempt_fingerprint publication_evidence predecessor_item_id successor_item_id adopter_item_id)
+  @remote_keys ~w(version kind storage_root relative_path repository_id repository_generation repository_storage_path item_id item_lock_version requested_path quarantine_path mode major_device minor_device inode remote_failure_kind)
+  @marker_keys ~w(version state attempt_number action hidden_repository_id operation_id request_metadata repository_id owner_user_id slug generation replaced_repository_id run_id published_count_after run_lock_version_after)
+  @replacement_decision_keys ~w(action slug replacement_repository_id replacement_owner_id replacement_storage_path replacement_generation replacement_write_version replacement_updated_at replacement_last_pushed_at)
 
   def up do
     create_cleanup_table()
@@ -267,14 +269,576 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
         "json_extract(evidence, '$.repository_id') = repository_id and " <>
         "json_extract(evidence, '$.item_id') = repository_item_id and " <>
         "json_extract(evidence, '$.item_lock_version') = source_lock_version and " <>
-        exact_kind_keys_check(:turso) <> " and " <> anchor_check(:turso)
+        exact_kind_keys_check(:turso) <>
+        " and " <> base_kind_check(:turso) <> " and " <> anchor_check(:turso)
     else
       "jsonb_typeof(evidence) = 'object' and evidence @> jsonb_build_object(" <>
         "'version', 1, 'kind', kind, 'repository_id', repository_id, " <>
         "'item_id', repository_item_id, 'item_lock_version', source_lock_version) and " <>
-        exact_kind_keys_check(:postgres) <> " and " <> anchor_check(:postgres)
+        exact_kind_keys_check(:postgres) <>
+        " and " <> base_kind_check(:postgres) <> " and " <> anchor_check(:postgres)
     end
   end
+
+  defp base_kind_check(adapter) do
+    "((kind = 'remote_quarantine' and #{remote_evidence_check(adapter)}) or " <>
+      "(kind = 'unpublished_shadow' and #{unpublished_evidence_check(adapter)}) or " <>
+      "(kind = 'replacement_tombstone' and #{replacement_evidence_check(adapter)}))"
+  end
+
+  defp remote_evidence_check(adapter) do
+    root = json_text(adapter, "storage_root")
+    relative = json_text(adapter, "relative_path")
+    repository_path = json_text(adapter, "repository_storage_path")
+    requested = json_text(adapter, "requested_path")
+    quarantine = json_text(adapter, "quarantine_path")
+
+    [
+      canonical_absolute_check(adapter, "storage_root"),
+      canonical_relative_check(adapter, "relative_path", 4_096),
+      repository_path_check(adapter),
+      canonical_absolute_check(adapter, "requested_path"),
+      canonical_absolute_check(adapter, "quarantine_path"),
+      positive_json_integer_check(adapter, "repository_generation"),
+      exact_json_integer_check(adapter, "mode", 448),
+      nonnegative_json_integer_check(adapter, "major_device"),
+      nonnegative_json_integer_check(adapter, "minor_device"),
+      positive_json_integer_check(adapter, "inode"),
+      classified_string_check(adapter, "remote_failure_kind"),
+      "#{requested} = #{root} || '/' || #{repository_path}",
+      "#{quarantine} = #{root} || '/' || #{relative}",
+      cleanup_leaf_check(adapter),
+      same_relative_parent_check(adapter)
+    ]
+    |> Enum.join(" and ")
+  end
+
+  defp unpublished_evidence_check(adapter) do
+    [
+      canonical_absolute_check(adapter, "storage_root"),
+      canonical_relative_check(adapter, "relative_path", 1_024),
+      repository_path_check(adapter),
+      "#{json_text(adapter, "relative_path")} = #{json_text(adapter, "repository_storage_path")}",
+      positive_json_integer_check(adapter, "repository_generation"),
+      nonnegative_json_integer_check(adapter, "repository_write_version"),
+      utc_timestamp_check(adapter, "repository_updated_at"),
+      enum_string_check(adapter, "item_state", ~w(completed skipped canceled failed published)),
+      positive_json_integer_check(adapter, "run_id"),
+      enum_string_check(
+        adapter,
+        "run_state",
+        ~w(completed completed_with_warnings canceled failed)
+      ),
+      positive_json_integer_check(adapter, "attempt_number"),
+      enum_string_check(
+        adapter,
+        "attempt_state",
+        ~w(completed failed canceled destination_changed)
+      ),
+      decision_check(adapter),
+      lowercase_hex_check(adapter, "attempt_fingerprint"),
+      empty_object_check(adapter, "publication_evidence"),
+      optional_positive_json_integer_check(adapter, "predecessor_item_id"),
+      optional_positive_json_integer_check(adapter, "successor_item_id"),
+      optional_positive_json_integer_check(adapter, "adopter_item_id")
+    ]
+    |> Enum.join(" and ")
+  end
+
+  defp replacement_evidence_check(adapter) do
+    marker = marker_check(adapter)
+    decision = replacement_decision_check(adapter)
+    old_id = json_text(adapter, "repository_id")
+    old_generation = json_text(adapter, "repository_generation")
+    old_generation_number = json_number(adapter, "repository_generation")
+    old_write_version = json_text(adapter, "repository_write_version")
+    old_path = json_text(adapter, "repository_storage_path")
+    old_updated_at = json_text(adapter, "repository_updated_at")
+    item_id = json_text(adapter, "item_id")
+    attempt_number = json_text(adapter, "attempt_number")
+    publication_operation = json_text(adapter, "publication_operation_id")
+    new_id = json_text(adapter, "new_repository_id")
+    new_generation = json_text(adapter, "new_repository_generation")
+    marker_value = fn key -> nested_text(adapter, "publication_marker", key) end
+    decision_value = fn key -> nested_text(adapter, "attempt_decision", key) end
+
+    [
+      canonical_absolute_check(adapter, "storage_root"),
+      canonical_relative_check(adapter, "relative_path", 1_024),
+      repository_path_check(adapter),
+      "#{json_text(adapter, "relative_path")} = #{old_path}",
+      positive_json_integer_check(adapter, "repository_generation"),
+      nonnegative_json_integer_check(adapter, "repository_write_version"),
+      utc_timestamp_check(adapter, "repository_deleted_at"),
+      utc_timestamp_check(adapter, "repository_updated_at"),
+      "#{json_text(adapter, "repository_deleted_at")} <= #{old_updated_at}",
+      positive_json_integer_check(adapter, "attempt_number"),
+      decision,
+      lowercase_hex_check(adapter, "attempt_fingerprint"),
+      nonempty_string_check(adapter, "publication_operation_id", 255),
+      marker,
+      positive_json_integer_check(adapter, "new_repository_id"),
+      positive_json_integer_check(adapter, "new_repository_generation"),
+      positive_json_integer_check(adapter, "publication_audit_id"),
+      "#{marker_value.("action")} = 'replace'",
+      "#{decision_value.("action")} = 'replace'",
+      "#{marker_value.("attempt_number")} = #{attempt_number}",
+      "#{publication_operation} = 'github-import-publication-' || #{item_id} || '-' || #{attempt_number}",
+      "#{marker_value.("operation_id")} = #{publication_operation}",
+      "#{marker_value.("repository_id")} = #{marker_value.("hidden_repository_id")}",
+      "#{marker_value.("repository_id")} = #{new_id}",
+      "#{marker_value.("replaced_repository_id")} = #{old_id}",
+      "#{marker_value.("generation")} = #{new_generation}",
+      "#{marker_value.("slug")} = #{decision_value.("slug")}",
+      "#{marker_value.("owner_user_id")} = #{decision_value.("replacement_owner_id")}",
+      "#{decision_value.("replacement_repository_id")} = #{old_id}",
+      "#{decision_value.("replacement_generation")} = #{old_generation}",
+      "#{decision_value.("replacement_write_version")} = #{old_write_version}",
+      "#{decision_value.("replacement_storage_path")} = #{old_path}",
+      "#{decision_value.("replacement_updated_at")} = #{old_updated_at}",
+      "#{nested_number(adapter, "publication_marker", "generation")} = #{old_generation_number} + 1",
+      "#{new_id} != #{old_id}"
+    ]
+    |> Enum.join(" and ")
+  end
+
+  defp marker_check(adapter) do
+    checks =
+      [
+        exact_nested_integer_check(adapter, "publication_marker", "version", 1),
+        nested_exact_string_check(adapter, "publication_marker", "state", "committed"),
+        nested_positive_integer_check(adapter, "publication_marker", "attempt_number"),
+        nested_enum_string_check(
+          adapter,
+          "publication_marker",
+          "action",
+          ~w(create rename replace)
+        ),
+        nested_positive_integer_check(adapter, "publication_marker", "hidden_repository_id"),
+        nested_nonempty_string_check(adapter, "publication_marker", "operation_id", 255),
+        nested_object_check(adapter, "publication_marker", "request_metadata"),
+        nested_positive_integer_check(adapter, "publication_marker", "repository_id"),
+        nested_positive_integer_check(adapter, "publication_marker", "owner_user_id"),
+        nested_canonical_slug_check(adapter, "publication_marker", "slug"),
+        nested_positive_integer_check(adapter, "publication_marker", "generation"),
+        nested_positive_integer_check(adapter, "publication_marker", "replaced_repository_id"),
+        nested_positive_integer_check(adapter, "publication_marker", "run_id"),
+        nested_nonnegative_integer_check(adapter, "publication_marker", "published_count_after"),
+        nested_positive_integer_check(adapter, "publication_marker", "run_lock_version_after")
+      ]
+      |> Enum.join(" and ")
+
+    exact_nested_keys_check(adapter, "publication_marker", @marker_keys) <>
+      " and " <> checks
+  end
+
+  defp decision_check(adapter) do
+    action = nested_text(adapter, "attempt_decision", "action")
+
+    ("(#{exact_nested_keys_check(adapter, "attempt_decision", ["action"])} and #{action} = 'skip') or " <>
+       "(#{exact_nested_keys_check(adapter, "attempt_decision", ~w(action slug))} and " <>
+       "#{action} in ('create', 'rename') and #{nested_canonical_slug_check(adapter, "attempt_decision", "slug")}) or " <>
+       "(#{replacement_decision_check(adapter)})")
+    |> then(&"(#{&1})")
+  end
+
+  defp replacement_decision_check(adapter) do
+    checks =
+      [
+        nested_exact_string_check(adapter, "attempt_decision", "action", "replace"),
+        nested_canonical_slug_check(adapter, "attempt_decision", "slug"),
+        nested_positive_integer_check(adapter, "attempt_decision", "replacement_repository_id"),
+        nested_positive_integer_check(adapter, "attempt_decision", "replacement_owner_id"),
+        nested_repository_path_check(adapter, "attempt_decision", "replacement_storage_path"),
+        nested_positive_integer_check(adapter, "attempt_decision", "replacement_generation"),
+        nested_nonnegative_integer_check(
+          adapter,
+          "attempt_decision",
+          "replacement_write_version"
+        ),
+        nested_utc_timestamp_check(adapter, "attempt_decision", "replacement_updated_at"),
+        nested_optional_utc_timestamp_check(
+          adapter,
+          "attempt_decision",
+          "replacement_last_pushed_at"
+        )
+      ]
+      |> Enum.join(" and ")
+
+    exact_nested_keys_check(adapter, "attempt_decision", @replacement_decision_keys) <>
+      " and " <> checks
+  end
+
+  defp json_text(:turso, key), do: "json_extract(evidence, '$.#{key}')"
+  defp json_text(:postgres, key), do: "(evidence->>'#{key}')"
+
+  defp json_type(:turso, key), do: "json_type(evidence, '$.#{key}')"
+  defp json_type(:postgres, key), do: "jsonb_typeof(evidence->'#{key}')"
+
+  defp json_number(:turso, key), do: json_text(:turso, key)
+  defp json_number(:postgres, key), do: "(#{json_text(:postgres, key)})::numeric"
+
+  defp nested_text(:turso, object, key),
+    do: "json_extract(evidence, '$.#{object}.#{key}')"
+
+  defp nested_text(:postgres, object, key), do: "(evidence #>> '{#{object},#{key}}')"
+
+  defp nested_type(:turso, object, key),
+    do: "json_type(evidence, '$.#{object}.#{key}')"
+
+  defp nested_type(:postgres, object, key),
+    do: "jsonb_typeof(evidence #> '{#{object},#{key}}')"
+
+  defp nested_number(:turso, object, key), do: nested_text(:turso, object, key)
+
+  defp nested_number(:postgres, object, key),
+    do: "(#{nested_text(:postgres, object, key)})::numeric"
+
+  defp canonical_absolute_check(adapter, key) do
+    value = json_text(adapter, key)
+
+    base =
+      "#{json_type(adapter, key)} = #{string_type(adapter)} and " <>
+        byte_length_check(adapter, value, 2, 4_096) <>
+        " and #{value} != '/' and #{first_character(adapter, value)} = '/' and " <>
+        "#{last_character(adapter, value)} != '/' and " <>
+        "#{contains(adapter, value, "//")} = false and " <>
+        "#{contains(adapter, value, "\\")} = false and " <>
+        "#{contains(adapter, value, "/./")} = false and " <>
+        "#{contains(adapter, value, "/../")} = false and " <>
+        "#{value} not like '%/.' and #{value} not like '%/..'"
+
+    base <> nul_free_check(adapter, value)
+  end
+
+  defp canonical_relative_check(adapter, key, maximum) do
+    value = json_text(adapter, key)
+    canonical_relative_expression(adapter, json_type(adapter, key), value, maximum)
+  end
+
+  defp canonical_relative_expression(adapter, type, value, maximum) do
+    type <>
+      " = " <>
+      string_type(adapter) <>
+      " and " <>
+      byte_length_check(adapter, value, 1, maximum) <>
+      " and #{first_character(adapter, value)} != '/' and " <>
+      "#{last_character(adapter, value)} != '/' and " <>
+      "#{contains(adapter, value, "//")} = false and " <>
+      "#{contains(adapter, value, "\\")} = false and " <>
+      "#{contains(adapter, value, "/./")} = false and " <>
+      "#{contains(adapter, value, "/../")} = false and " <>
+      "#{value} not in ('.', '..') and #{value} not like './%' and " <>
+      "#{value} not like '../%' and #{value} not like '%/.' and #{value} not like '%/..' and " <>
+      drive_prefix_check(adapter, value) <>
+      nul_free_check(adapter, value) <> segment_count_check(adapter, value)
+  end
+
+  defp repository_path_check(adapter) do
+    canonical_relative_check(adapter, "repository_storage_path", 1_024) <>
+      " and #{json_text(adapter, "repository_storage_path")} like '%.git'"
+  end
+
+  defp nested_repository_path_check(adapter, object, key) do
+    canonical_relative_expression(
+      adapter,
+      nested_type(adapter, object, key),
+      nested_text(adapter, object, key),
+      1_024
+    ) <> " and #{nested_text(adapter, object, key)} like '%.git'"
+  end
+
+  defp cleanup_leaf_check(:turso) do
+    value = json_text(:turso, "relative_path")
+    leaf = "substr(#{value}, -65)"
+
+    "length(cast(#{leaf} as blob)) = 65 and " <>
+      "substr(#{leaf}, 1, 22) = '.fornacast-cleanup-v1-' and " <>
+      "length(cast(substr(#{leaf}, 23) as blob)) = 43 and " <>
+      "substr(#{leaf}, 23) not glob '*[^A-Za-z0-9_-]*'"
+  end
+
+  defp cleanup_leaf_check(:postgres) do
+    value = json_text(:postgres, "relative_path")
+    "regexp_replace(#{value}, '^.*/', '') ~ '^\\.fornacast-cleanup-v1-[A-Za-z0-9_-]{43}$'"
+  end
+
+  defp same_relative_parent_check(:turso) do
+    relative = json_text(:turso, "relative_path")
+    repository = json_text(:turso, "repository_storage_path")
+    prefix_length = "length(#{relative}) - 65"
+
+    "substr(#{repository}, 1, #{prefix_length}) = substr(#{relative}, 1, #{prefix_length}) and " <>
+      "instr(substr(#{repository}, #{prefix_length} + 1), '/') = 0"
+  end
+
+  defp same_relative_parent_check(:postgres) do
+    relative = json_text(:postgres, "relative_path")
+    repository = json_text(:postgres, "repository_storage_path")
+    "regexp_replace(#{relative}, '[^/]+$', '') = regexp_replace(#{repository}, '[^/]+$', '')"
+  end
+
+  defp positive_json_integer_check(adapter, key),
+    do: json_integer_check(adapter, json_type(adapter, key), json_text(adapter, key), :positive)
+
+  defp nonnegative_json_integer_check(adapter, key),
+    do:
+      json_integer_check(adapter, json_type(adapter, key), json_text(adapter, key), :nonnegative)
+
+  defp exact_json_integer_check(adapter, key, expected),
+    do:
+      json_integer_check(
+        adapter,
+        json_type(adapter, key),
+        json_text(adapter, key),
+        {:exact, expected}
+      )
+
+  defp optional_positive_json_integer_check(:turso, key) do
+    type = json_type(:turso, key)
+    value = json_text(:turso, key)
+    "(#{type} = 'null' or (#{type} = 'integer' and #{value} > 0))"
+  end
+
+  defp optional_positive_json_integer_check(:postgres, key) do
+    type = json_type(:postgres, key)
+
+    "(#{type} = 'null' or #{json_integer_check(:postgres, type, json_text(:postgres, key), :positive)})"
+  end
+
+  defp nested_positive_integer_check(adapter, object, key),
+    do:
+      json_integer_check(
+        adapter,
+        nested_type(adapter, object, key),
+        nested_text(adapter, object, key),
+        :positive
+      )
+
+  defp nested_nonnegative_integer_check(adapter, object, key),
+    do:
+      json_integer_check(
+        adapter,
+        nested_type(adapter, object, key),
+        nested_text(adapter, object, key),
+        :nonnegative
+      )
+
+  defp exact_nested_integer_check(adapter, object, key, expected),
+    do:
+      json_integer_check(
+        adapter,
+        nested_type(adapter, object, key),
+        nested_text(adapter, object, key),
+        {:exact, expected}
+      )
+
+  defp json_integer_check(:turso, type, value, :positive),
+    do: "#{type} = 'integer' and #{value} > 0"
+
+  defp json_integer_check(:turso, type, value, :nonnegative),
+    do: "#{type} = 'integer' and #{value} >= 0"
+
+  defp json_integer_check(:turso, type, value, {:exact, expected}),
+    do: "#{type} = 'integer' and #{value} = #{expected}"
+
+  defp json_integer_check(:postgres, type, value, comparison) do
+    predicate =
+      case comparison do
+        :positive -> "(#{value})::numeric > 0"
+        :nonnegative -> "(#{value})::numeric >= 0"
+        {:exact, expected} -> "(#{value})::numeric = #{expected}"
+      end
+
+    "case when #{type} = 'number' and #{value} ~ '^-?[0-9]+$' " <>
+      "then #{predicate} else false end"
+  end
+
+  defp enum_string_check(adapter, key, values) do
+    encoded = Enum.map_join(values, ", ", &"'#{&1}'")
+
+    "#{json_type(adapter, key)} = #{string_type(adapter)} and #{json_text(adapter, key)} in (#{encoded})"
+  end
+
+  defp nested_enum_string_check(adapter, object, key, values) do
+    encoded = Enum.map_join(values, ", ", &"'#{&1}'")
+
+    "#{nested_type(adapter, object, key)} = #{string_type(adapter)} and " <>
+      "#{nested_text(adapter, object, key)} in (#{encoded})"
+  end
+
+  defp nested_exact_string_check(adapter, object, key, expected) do
+    "#{nested_type(adapter, object, key)} = #{string_type(adapter)} and " <>
+      "#{nested_text(adapter, object, key)} = '#{expected}'"
+  end
+
+  defp nonempty_string_check(adapter, key, maximum) do
+    value = json_text(adapter, key)
+
+    "#{json_type(adapter, key)} = #{string_type(adapter)} and " <>
+      byte_length_check(adapter, value, 1, maximum)
+  end
+
+  defp nested_nonempty_string_check(adapter, object, key, maximum) do
+    value = nested_text(adapter, object, key)
+
+    "#{nested_type(adapter, object, key)} = #{string_type(adapter)} and " <>
+      byte_length_check(adapter, value, 1, maximum)
+  end
+
+  defp classified_string_check(:turso, key) do
+    value = json_text(:turso, key)
+
+    nonempty_string_check(:turso, key, 120) <>
+      " and #{value} not glob '*[^a-z0-9_]*'"
+  end
+
+  defp classified_string_check(:postgres, key) do
+    value = json_text(:postgres, key)
+    nonempty_string_check(:postgres, key, 120) <> " and #{value} ~ '^[a-z0-9_]+$'"
+  end
+
+  defp lowercase_hex_check(:turso, key) do
+    value = json_text(:turso, key)
+
+    "#{json_type(:turso, key)} = 'text' and length(cast(#{value} as blob)) = 64 and " <>
+      "#{value} not glob '*[^0-9a-f]*'"
+  end
+
+  defp lowercase_hex_check(:postgres, key) do
+    value = json_text(:postgres, key)
+    "#{json_type(:postgres, key)} = 'string' and #{value} ~ '^[0-9a-f]{64}$'"
+  end
+
+  defp utc_timestamp_check(:turso, key) do
+    value = json_text(:turso, key)
+
+    "#{json_type(:turso, key)} = 'text' and " <>
+      "coalesce(strftime('%Y-%m-%dT%H:%M:%SZ', #{value}) = #{value}, 0)"
+  end
+
+  defp utc_timestamp_check(:postgres, key) do
+    value =
+      if String.contains?(key, "."),
+        do: nested_path_text(:postgres, key),
+        else: json_text(:postgres, key)
+
+    type =
+      if String.contains?(key, "."),
+        do: nested_path_type(:postgres, key),
+        else: json_type(:postgres, key)
+
+    "#{type} = 'string' and #{value} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'"
+  end
+
+  defp nested_utc_timestamp_check(:turso, object, key) do
+    value = nested_text(:turso, object, key)
+
+    "#{nested_type(:turso, object, key)} = 'text' and " <>
+      "coalesce(strftime('%Y-%m-%dT%H:%M:%SZ', #{value}) = #{value}, 0)"
+  end
+
+  defp nested_utc_timestamp_check(:postgres, object, key),
+    do: utc_timestamp_check(:postgres, "#{object}.#{key}")
+
+  defp nested_optional_utc_timestamp_check(:turso, object, key) do
+    type = nested_type(:turso, object, key)
+    "(#{type} = 'null' or (#{nested_utc_timestamp_check(:turso, object, key)}))"
+  end
+
+  defp nested_optional_utc_timestamp_check(:postgres, object, key) do
+    type = nested_type(:postgres, object, key)
+    "(#{type} = 'null' or (#{nested_utc_timestamp_check(:postgres, object, key)}))"
+  end
+
+  defp empty_object_check(:turso, key),
+    do: "#{json_type(:turso, key)} = 'object' and json_extract(evidence, '$.#{key}') = '{}'"
+
+  defp empty_object_check(:postgres, key),
+    do: "#{json_type(:postgres, key)} = 'object' and evidence->'#{key}' = '{}'::jsonb"
+
+  defp exact_nested_keys_check(:turso, object, keys) do
+    required =
+      Enum.map_join(keys, " and ", &"json_type(evidence, '$.#{object}.#{&1}') is not null")
+
+    removals = Enum.map_join(keys, ", ", &"'$.#{&1}'")
+
+    "json_type(evidence, '$.#{object}') = 'object' and #{required} and " <>
+      "json_remove(json_extract(evidence, '$.#{object}'), #{removals}) = '{}'"
+  end
+
+  defp exact_nested_keys_check(:postgres, object, keys) do
+    encoded = Enum.map_join(keys, ", ", &"'#{&1}'")
+    expression = "(evidence->'#{object}')"
+
+    "jsonb_typeof(#{expression}) = 'object' and #{expression} ?& array[#{encoded}] and " <>
+      "(#{expression} - array[#{encoded}]::text[]) = '{}'::jsonb"
+  end
+
+  defp nested_object_check(adapter, object, key),
+    do: "#{nested_type(adapter, object, key)} = #{object_type(adapter)}"
+
+  defp nested_canonical_slug_check(:turso, object, key) do
+    value = nested_text(:turso, object, key)
+
+    "#{nested_type(:turso, object, key)} = 'text' and " <>
+      byte_length_check(:turso, value, 1, 63) <>
+      " and #{value} not glob '*[^a-z0-9._-]*' and #{value} glob '[a-z0-9]*' and " <>
+      "#{value} not in ('.', '..') and #{value} not like '%.' and #{value} not like '%.git'"
+  end
+
+  defp nested_canonical_slug_check(:postgres, object, key) do
+    value = nested_text(:postgres, object, key)
+
+    "#{nested_type(:postgres, object, key)} = 'string' and " <>
+      "#{value} ~ '^[a-z0-9][a-z0-9._-]{0,62}$' and " <>
+      "#{value} not in ('.', '..') and #{value} not like '%.' and #{value} not like '%.git'"
+  end
+
+  defp nested_path_text(:postgres, path) do
+    [object, key] = String.split(path, ".", parts: 2)
+    nested_text(:postgres, object, key)
+  end
+
+  defp nested_path_type(:postgres, path) do
+    [object, key] = String.split(path, ".", parts: 2)
+    nested_type(:postgres, object, key)
+  end
+
+  defp string_type(:turso), do: "'text'"
+  defp string_type(:postgres), do: "'string'"
+  defp object_type(:turso), do: "'object'"
+  defp object_type(:postgres), do: "'object'"
+
+  defp byte_length_check(:turso, value, minimum, maximum),
+    do: "length(cast(#{value} as blob)) between #{minimum} and #{maximum}"
+
+  defp byte_length_check(:postgres, value, minimum, maximum),
+    do: "octet_length(#{value}) between #{minimum} and #{maximum}"
+
+  defp first_character(:turso, value), do: "substr(#{value}, 1, 1)"
+  defp first_character(:postgres, value), do: "left(#{value}, 1)"
+  defp last_character(:turso, value), do: "substr(#{value}, -1)"
+  defp last_character(:postgres, value), do: "right(#{value}, 1)"
+
+  defp contains(:turso, value, needle), do: "(instr(#{value}, '#{escape_sql(needle)}') > 0)"
+  defp contains(:postgres, value, needle), do: "(strpos(#{value}, '#{escape_sql(needle)}') > 0)"
+
+  defp nul_free_check(:turso, value),
+    do: " and instr(cast(#{value} as blob), x'00') = 0"
+
+  defp nul_free_check(:postgres, _value), do: ""
+
+  defp drive_prefix_check(:turso, value), do: "#{value} not glob '[A-Za-z]:*'"
+  defp drive_prefix_check(:postgres, value), do: "#{value} !~ '^[A-Za-z]:'"
+
+  defp segment_count_check(:turso, value),
+    do: " and length(#{value}) - length(replace(#{value}, '/', '')) <= 127"
+
+  defp segment_count_check(:postgres, value),
+    do: " and length(#{value}) - length(replace(#{value}, '/', '')) <= 127"
+
+  defp escape_sql(value), do: String.replace(value, "'", "''")
 
   defp anchor_check(:turso) do
     root = "json_type(evidence, '$.root_identity') is not null"
@@ -298,9 +862,9 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
 
     "((effect_started_at is null and not (#{root}) and not (#{target}) and not (#{absence})) or " <>
       "(effect_started_at is not null and (((#{root}) and (#{target}) and not (#{absence}) and " <>
-      identity_check(:postgres, "evidence->'root_identity'") <>
+      identity_check(:postgres, "root_identity") <>
       " and " <>
-      identity_check(:postgres, "evidence->'anchored_identity'") <>
+      identity_check(:postgres, "anchored_identity") <>
       ") or " <>
       "(not (#{root}) and not (#{target}) and (#{absence}) and effect_finished_at is not null and " <>
       absence_check(:postgres) <> "))))"
@@ -350,14 +914,14 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
       "json_remove(json_extract(evidence, '#{path}'), '$.mode', '$.major_device', '$.minor_device', '$.inode') = '{}'"
   end
 
-  defp identity_check(:postgres, expression) do
-    expression = "(#{expression})"
+  defp identity_check(:postgres, path) do
+    expression = "(evidence #> '{#{path}}')"
 
     "jsonb_typeof(#{expression}) = 'object' and " <>
-      "jsonb_typeof(#{expression}->'mode') = 'number' and (#{expression}->>'mode')::numeric >= 0 and mod((#{expression}->>'mode')::numeric, 1) = 0 and " <>
-      "jsonb_typeof(#{expression}->'major_device') = 'number' and (#{expression}->>'major_device')::numeric >= 0 and mod((#{expression}->>'major_device')::numeric, 1) = 0 and " <>
-      "jsonb_typeof(#{expression}->'minor_device') = 'number' and (#{expression}->>'minor_device')::numeric >= 0 and mod((#{expression}->>'minor_device')::numeric, 1) = 0 and " <>
-      "jsonb_typeof(#{expression}->'inode') = 'number' and (#{expression}->>'inode')::numeric > 0 and mod((#{expression}->>'inode')::numeric, 1) = 0 and " <>
+      "jsonb_typeof(evidence #> '{#{path},mode}') = 'number' and (evidence #>> '{#{path},mode}')::numeric >= 0 and mod((evidence #>> '{#{path},mode}')::numeric, 1) = 0 and " <>
+      "jsonb_typeof(evidence #> '{#{path},major_device}') = 'number' and (evidence #>> '{#{path},major_device}')::numeric >= 0 and mod((evidence #>> '{#{path},major_device}')::numeric, 1) = 0 and " <>
+      "jsonb_typeof(evidence #> '{#{path},minor_device}') = 'number' and (evidence #>> '{#{path},minor_device}')::numeric >= 0 and mod((evidence #>> '{#{path},minor_device}')::numeric, 1) = 0 and " <>
+      "jsonb_typeof(evidence #> '{#{path},inode}') = 'number' and (evidence #>> '{#{path},inode}')::numeric > 0 and mod((evidence #>> '{#{path},inode}')::numeric, 1) = 0 and " <>
       "(#{expression} - array['mode','major_device','minor_device','inode']::text[]) = '{}'::jsonb"
   end
 
@@ -368,11 +932,12 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
       "json_type(evidence, '#{path}.observed_at') = 'text' and " <>
       identity_check(:turso, "#{path}.root_identity") <>
       " and " <>
-      projection_check(:turso, "#{path}.root_projection") <>
-      " and " <>
-      projection_check(:turso, "#{path}.path_projection") <>
-      " and " <>
-      "json_remove(json_extract(evidence, '#{path}'), '$.version', '$.observed_at', '$.root_identity', '$.root_projection', '$.path_projection') = '{}'"
+      utc_timestamp_check(:turso, "#{path}.observed_at") <>
+      " and coalesce(strftime('%s', json_extract(evidence, '#{path}.observed_at')) >= " <>
+      "strftime('%s', effect_started_at) and " <>
+      "strftime('%s', json_extract(evidence, '#{path}.observed_at')) <= " <>
+      "strftime('%s', effect_finished_at), 0) and " <>
+      "json_remove(json_extract(evidence, '#{path}'), '$.version', '$.observed_at', '$.root_identity') = '{}'"
   end
 
   defp absence_check(:postgres) do
@@ -381,22 +946,12 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
 
     "jsonb_typeof(#{nested}) = 'object' and #{nested}->'version' = '1'::jsonb and " <>
       "jsonb_typeof(#{nested}->'observed_at') = 'string' and " <>
-      identity_check(:postgres, "#{nested}->'root_identity'") <>
+      identity_check(:postgres, "anchored_absence,root_identity") <>
       " and " <>
-      projection_check(:postgres, "#{nested}->>'root_projection'") <>
-      " and " <>
-      projection_check(:postgres, "#{nested}->>'path_projection'") <>
-      " and " <>
-      "(#{nested} - array['version','observed_at','root_identity','root_projection','path_projection']::text[]) = '{}'::jsonb"
-  end
-
-  defp projection_check(:turso, path) do
-    "json_type(evidence, '#{path}') = 'text' and length(json_extract(evidence, '#{path}')) = 64 and " <>
-      "json_extract(evidence, '#{path}') not glob '*[^0-9a-f]*'"
-  end
-
-  defp projection_check(:postgres, expression) do
-    "#{expression} ~ '^[0-9a-f]{64}$'"
+      utc_timestamp_check(:postgres, "anchored_absence.observed_at") <>
+      " and evidence #>> '{anchored_absence,observed_at}' >= to_char(effect_started_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') and " <>
+      "evidence #>> '{anchored_absence,observed_at}' <= to_char(effect_finished_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') and " <>
+      "(#{nested} - array['version','observed_at','root_identity']::text[]) = '{}'::jsonb"
   end
 
   defp add_postgres_operation_checks do

@@ -225,6 +225,25 @@ defmodule ForgePulls.MergeRecoveryTest do
     end
   end
 
+  test "cleanup safety dispatcher fails closed when no reconcilers are configured", context do
+    original = Application.fetch_env!(:forge_repos, :repository_write_reconcilers)
+    on_exit(fn -> Application.put_env(:forge_repos, :repository_write_reconcilers, original) end)
+    Application.put_env(:forge_repos, :repository_write_reconcilers, [])
+
+    assert {:error, :unavailable} =
+             RepositoryWriteReconcilers.cleanup_safety_locked(
+               context.repository,
+               ~U[2026-08-28 12:00:00Z]
+             )
+
+    assert :ok =
+             RepositoryWriteReconcilers.reconcile_locked(
+               context.repository,
+               context.path,
+               System.monotonic_time(:millisecond) + 10_000
+             )
+  end
+
   test "same-second pending Git then merge completions each advance write version", context do
     completed_at = ~U[2026-08-27 01:46:00Z]
     target_ref = "refs/heads/pending-before-merge"
