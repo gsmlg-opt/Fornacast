@@ -20,9 +20,9 @@ defmodule GitCore.RepositoryReadLimiterTest do
   end
 
   test "readers share a repository while cleanup remains exclusive" do
-    assert {:ok, first} = RepositoryReadLimiter.acquire_read(:same, deadline())
-    assert {:ok, second} = RepositoryReadLimiter.acquire_read(:same, deadline())
-    cleanup = start_waiter(:cleanup, :same)
+    assert {:ok, first} = RepositoryReadLimiter.acquire_read(1_001, deadline())
+    assert {:ok, second} = RepositoryReadLimiter.acquire_read(1_001, deadline())
+    cleanup = start_waiter(:cleanup, 1_001)
     refute_receive {:acquired, ^cleanup, _lease}, 30
 
     assert :ok = RepositoryReadLimiter.release(first)
@@ -30,7 +30,7 @@ defmodule GitCore.RepositoryReadLimiterTest do
     assert :ok = RepositoryReadLimiter.release(second)
     assert_receive {:acquired, ^cleanup, cleanup_lease}, 500
 
-    reader = start_waiter(:read, :same)
+    reader = start_waiter(:read, 1_001)
     refute_receive {:acquired, ^reader, _lease}, 30
     send(cleanup, {:release, cleanup_lease})
     assert_receive {:released, ^cleanup}
@@ -40,11 +40,11 @@ defmodule GitCore.RepositoryReadLimiterTest do
   end
 
   test "queued cleanup has priority over later readers and readers resume as a batch" do
-    assert {:ok, holder} = RepositoryReadLimiter.acquire_read(:same, deadline())
-    cleanup = start_waiter(:cleanup, :same)
+    assert {:ok, holder} = RepositoryReadLimiter.acquire_read(1_002, deadline())
+    cleanup = start_waiter(:cleanup, 1_002)
     wait_for_waiters(1)
-    first = start_waiter(:read, :same)
-    second = start_waiter(:read, :same)
+    first = start_waiter(:read, 1_002)
+    second = start_waiter(:read, 1_002)
     wait_for_waiters(3)
 
     assert :ok = RepositoryReadLimiter.release(holder)
@@ -62,11 +62,11 @@ defmodule GitCore.RepositoryReadLimiterTest do
   end
 
   test "a queued cleanup does not block another repository" do
-    assert {:ok, reader} = RepositoryReadLimiter.acquire_read(:first, deadline())
-    cleanup = start_waiter(:cleanup, :first)
+    assert {:ok, reader} = RepositoryReadLimiter.acquire_read(1_003, deadline())
+    cleanup = start_waiter(:cleanup, 1_003)
     wait_for_waiters(1)
 
-    assert {:ok, other_cleanup} = RepositoryReadLimiter.acquire_cleanup(:second, deadline())
+    assert {:ok, other_cleanup} = RepositoryReadLimiter.acquire_cleanup(1_004, deadline())
     assert :ok = RepositoryReadLimiter.release(other_cleanup)
     assert :ok = RepositoryReadLimiter.release(reader)
     assert_receive {:acquired, ^cleanup, cleanup_lease}, 500
@@ -75,11 +75,11 @@ defmodule GitCore.RepositoryReadLimiterTest do
   end
 
   test "expired acquisition returns deadline_exceeded and removes the waiter" do
-    assert {:ok, cleanup} = RepositoryReadLimiter.acquire_cleanup(:deadline, deadline())
+    assert {:ok, cleanup} = RepositoryReadLimiter.acquire_cleanup(1_005, deadline())
 
     assert {:error, :deadline_exceeded} =
              RepositoryReadLimiter.acquire_read(
-               :deadline,
+               1_005,
                System.monotonic_time(:millisecond) + 20
              )
 
@@ -88,13 +88,13 @@ defmodule GitCore.RepositoryReadLimiterTest do
   end
 
   test "owner death releases grants and release is idempotent" do
-    owner = start_waiter(:cleanup, :owner_death)
+    owner = start_waiter(:cleanup, 1_006)
     assert_receive {:acquired, ^owner, lease}, 500
     monitor = Process.monitor(owner)
     Process.exit(owner, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^owner, :killed}
 
-    assert {:ok, replacement} = RepositoryReadLimiter.acquire_cleanup(:owner_death, deadline())
+    assert {:ok, replacement} = RepositoryReadLimiter.acquire_cleanup(1_006, deadline())
     assert :ok = RepositoryReadLimiter.release(lease)
     assert :ok = RepositoryReadLimiter.release(replacement)
     assert :ok = RepositoryReadLimiter.release(replacement)
@@ -102,7 +102,7 @@ defmodule GitCore.RepositoryReadLimiterTest do
 
   test "public acquire returns only confirmed production leases" do
     assert {:ok, {{RepositoryReadLimiter, :read_lease}, RepositoryReadLimiter, lease_ref} = lease} =
-             RepositoryReadLimiter.acquire_read(:confirmed, deadline())
+             RepositoryReadLimiter.acquire_read(1_007, deadline())
 
     assert %{status: :confirmed, type: :read} =
              @production_registry_key |> :persistent_term.get() |> Map.fetch!(lease_ref)
@@ -111,23 +111,23 @@ defmodule GitCore.RepositoryReadLimiterTest do
   end
 
   test "application restart recovers confirmed live grants and owner monitoring" do
-    {holder, _lease} = start_holder(:read, :recover)
+    {holder, _lease} = start_holder(:read, 1_008)
     crash_limiter()
-    assert {:error, :unavailable} = RepositoryReadLimiter.acquire_cleanup(:recover, deadline())
+    assert {:error, :unavailable} = RepositoryReadLimiter.acquire_cleanup(1_008, deadline())
     restart_git_core()
     assert map_size(:sys.get_state(RepositoryReadLimiter).grants) == 1
 
     assert {:error, :deadline_exceeded} =
-             RepositoryReadLimiter.acquire_cleanup(:recover, short_deadline())
+             RepositoryReadLimiter.acquire_cleanup(1_008, short_deadline())
 
     release_holder(holder)
-    assert {:ok, cleanup} = RepositoryReadLimiter.acquire_cleanup(:recover, deadline())
+    assert {:ok, cleanup} = RepositoryReadLimiter.acquire_cleanup(1_008, deadline())
     assert :ok = RepositoryReadLimiter.release(cleanup)
   end
 
   test "restart discards pending grants after a crash window" do
     set_fault(:after_pending_persist)
-    assert {:error, :unavailable} = RepositoryReadLimiter.acquire_read(:pending, deadline())
+    assert {:error, :unavailable} = RepositoryReadLimiter.acquire_read(1_009, deadline())
     assert Process.whereis(RepositoryReadLimiter) == nil
 
     assert [%{status: :pending}] =
@@ -136,14 +136,20 @@ defmodule GitCore.RepositoryReadLimiterTest do
     clear_fault()
     restart_git_core()
     assert :persistent_term.get(@production_registry_key, %{}) == %{}
-    assert {:ok, cleanup} = RepositoryReadLimiter.acquire_cleanup(:pending, deadline())
+    assert {:ok, cleanup} = RepositoryReadLimiter.acquire_cleanup(1_009, deadline())
     assert :ok = RepositoryReadLimiter.release(cleanup)
   end
 
   test "crashes after internal and confirmed persistence never publish a lease" do
-    for phase <- [:after_internal_reply, :after_confirmed_persist] do
+    for {phase, repository_id} <- [
+          after_internal_reply: 1_010,
+          after_confirmed_persist: 1_011
+        ] do
       set_fault(phase)
-      assert {:error, :unavailable} = RepositoryReadLimiter.acquire_read(phase, deadline())
+
+      assert {:error, :unavailable} =
+               RepositoryReadLimiter.acquire_read(repository_id, deadline())
+
       assert Process.whereis(RepositoryReadLimiter) == nil
       assert :persistent_term.get(@production_registry_key, %{}) == %{}
       clear_fault()
@@ -154,10 +160,20 @@ defmodule GitCore.RepositoryReadLimiterTest do
   test "production and isolated child specs are temporary and registries stay separate" do
     assert RepositoryReadLimiter.child_spec([]).restart == :temporary
     assert RepositoryReadLimiter.child_spec(server: nil).restart == :temporary
-    assert {:ok, lease} = RepositoryReadLimiter.acquire_read(:production_only, deadline())
+    assert {:ok, lease} = RepositoryReadLimiter.acquire_read(1_012, deadline())
     isolated = start_supervised!({RepositoryReadLimiter, server: nil}, id: make_ref())
     assert :sys.get_state(isolated).grants == %{}
     assert :ok = RepositoryReadLimiter.release(lease)
+  end
+
+  test "invalid repository ids fail closed" do
+    for repository_id <- [nil, 0, -1, :repository] do
+      assert {:error, :unavailable} =
+               RepositoryReadLimiter.acquire_read(repository_id, deadline())
+
+      assert {:error, :unavailable} =
+               RepositoryReadLimiter.acquire_cleanup(repository_id, deadline())
+    end
   end
 
   defp start_holder(type, key) do

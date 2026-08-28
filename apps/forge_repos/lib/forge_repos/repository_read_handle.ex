@@ -15,21 +15,4 @@ defmodule ForgeRepos.RepositoryReadHandle do
             path: Path.t(),
             lease: GitCore.RepositoryReadLimiter.lease()
           }
-
-  @doc false
-  @spec new(ForgeRepos.Repository.t(), Path.t(), GitCore.RepositoryReadLimiter.lease()) :: t()
-  def new(repository, path, lease),
-    do: %__MODULE__{repository: repository, path: path, lease: lease}
-
-  @doc false
-  @spec repository(t()) :: ForgeRepos.Repository.t()
-  def repository(%__MODULE__{repository: repository}), do: repository
-
-  @doc false
-  @spec path(t()) :: Path.t()
-  def path(%__MODULE__{path: path}), do: path
-
-  @doc false
-  @spec close(t()) :: :ok
-  def close(%__MODULE__{lease: lease}), do: GitCore.RepositoryReadLimiter.release(lease)
 end

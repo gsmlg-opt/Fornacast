@@ -33,10 +33,8 @@ defmodule GitTransport.ReceivePack do
   ]
 
   def advertise_refs(%Repository{} = repository) do
-    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:content_deadline_ms)
-
-    ForgeRepos.with_repository_read(repository, deadline, fn handle ->
-      with {:ok, refs} <- GitCore.list_refs(ForgeRepos.repository_read_path(handle)) do
+    ForgeRepos.with_write_fence(repository, :receive_pack, fn path, _remaining ->
+      with {:ok, refs} <- GitCore.list_refs(path) do
         refs =
           refs
           |> Enum.filter(&advertisable_ref?/1)

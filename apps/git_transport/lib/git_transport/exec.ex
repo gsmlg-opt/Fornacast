@@ -92,6 +92,10 @@ defmodule GitTransport.Exec do
     "ERROR: Git transport protocol is not implemented yet.\n"
   end
 
+  def error_message(reason) when reason in [:unavailable, :deadline_exceeded] do
+    "ERROR: Git upload-pack failed.\n"
+  end
+
   def error_message(reason) when is_binary(reason), do: reason
 
   defp normalize_result(result) do

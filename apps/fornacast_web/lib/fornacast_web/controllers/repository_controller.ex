@@ -202,6 +202,11 @@ defmodule FornacastWeb.RepositoryController do
     handle_git_error(conn, repository, error, context)
   end
 
+  defp handle_page_result({:error, reason}, conn, repository, _context)
+       when reason in [:not_found, :unavailable, :deadline_exceeded] do
+    handle_repository_read_error(conn, repository, reason)
+  end
+
   defp handle_raw_result(
          {:ok, %RepositoryPage.Result{kind: :raw} = result},
          conn,
@@ -230,6 +235,20 @@ defmodule FornacastWeb.RepositoryController do
          repository
        ) do
     handle_git_error(conn, repository, error, :raw)
+  end
+
+  defp handle_raw_result({:error, reason}, conn, repository)
+       when reason in [:not_found, :unavailable, :deadline_exceeded] do
+    handle_repository_read_error(conn, repository, reason)
+  end
+
+  defp handle_repository_read_error(conn, repository, :not_found) do
+    repository_content_not_found(conn, repository, "Repository content not found")
+  end
+
+  defp handle_repository_read_error(conn, _repository, reason)
+       when reason in [:unavailable, :deadline_exceeded] do
+    repository_error_page(conn, :service_unavailable, "Repository temporarily unavailable")
   end
 
   defp handle_git_error(conn, repository, %GitCore.Error{} = error, context) do

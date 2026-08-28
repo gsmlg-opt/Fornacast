@@ -173,6 +173,22 @@ defmodule ForgePullsTest do
 
     assert {:ok, pull} = create_pull(repository, reader, "Comparison", "feature", "main")
 
+    for {name, operation} <- [
+          compare: fn -> ForgePulls.compare(repository, reader, "feature", "main", []) end,
+          commits: fn -> ForgePulls.list_commits(repository, pull, reader, []) end,
+          files: fn -> ForgePulls.changed_files(repository, pull, reader, []) end
+        ] do
+      deadline = System.monotonic_time(:millisecond) + 2_000
+
+      assert {:ok, cleanup} =
+               GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
+
+      task = Task.async(operation)
+      assert Task.yield(task, 30) == nil, "#{name} bypassed cleanup"
+      assert :ok = GitCore.RepositoryReadLimiter.release(cleanup)
+      assert {:ok, _result} = Task.await(task)
+    end
+
     assert {:ok, %Fornacast.Page{entries: commits, total: 3, page: 1, per_page: 2}} =
              ForgePulls.list_commits(repository, pull, reader, page: 1, per_page: 2)
 
@@ -224,6 +240,36 @@ defmodule ForgePullsTest do
 
     assert moved.oid == moved_head
     assert {:error, :not_found} = ForgePulls.changed_files(repository, pull, outsider, [])
+  end
+
+  test "comparison holds one repository read handle across every Git phase" do
+    owner = user_fixture(unique("pull-single-read-owner"))
+    repository = repository_fixture(owner)
+    create_comparison_branches!(repository)
+
+    {result, query_count} =
+      count_repo_queries(fn ->
+        ForgePulls.with_test_read_phase_hook(
+          fn ->
+            cleanup =
+              Task.async(fn ->
+                deadline = System.monotonic_time(:millisecond) + 2_000
+                GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
+              end)
+
+            Process.put({__MODULE__, :queued_cleanup}, cleanup)
+            assert Task.yield(cleanup, 30) == nil
+          end,
+          fn -> ForgePulls.compare(repository, owner, "feature", "main", []) end
+        )
+      end)
+
+    assert {:ok, %ForgePulls.Comparison{}} = result
+    # Authorization/context plus one exact repository-generation reload.
+    assert query_count <= 4
+    cleanup = Process.delete({__MODULE__, :queued_cleanup})
+    assert {:ok, cleanup_lease} = Task.await(cleanup)
+    assert :ok = GitCore.RepositoryReadLimiter.release(cleanup_lease)
   end
 
   test "fully loaded pulls expose canonical issues analysis and reader-specific capabilities" do

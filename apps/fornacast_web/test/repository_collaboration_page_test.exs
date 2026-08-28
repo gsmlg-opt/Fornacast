@@ -1,4 +1,6 @@
 defmodule FornacastWeb.RepositoryCollaborationPageTestGit do
+  def with_repository_read(repository, fun), do: fun.(repository, "/test/repository.git")
+
   def ref_summary(_path, _opts) do
     {:ok,
      %GitCore.RefSummary{

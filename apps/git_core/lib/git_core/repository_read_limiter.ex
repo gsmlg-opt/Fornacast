@@ -55,15 +55,20 @@ defmodule GitCore.RepositoryReadLimiter do
   end
 
   @spec acquire_read(term(), integer()) :: {:ok, lease()} | {:error, acquire_error()}
-  def acquire_read(repository_id, absolute_deadline_ms) when is_integer(absolute_deadline_ms) do
+  def acquire_read(repository_id, absolute_deadline_ms)
+      when is_integer(repository_id) and repository_id > 0 and is_integer(absolute_deadline_ms) do
     acquire(:read, repository_id, absolute_deadline_ms)
   end
 
+  def acquire_read(_repository_id, _absolute_deadline_ms), do: {:error, :unavailable}
+
   @spec acquire_cleanup(term(), integer()) :: {:ok, lease()} | {:error, acquire_error()}
   def acquire_cleanup(repository_id, absolute_deadline_ms)
-      when is_integer(absolute_deadline_ms) do
+      when is_integer(repository_id) and repository_id > 0 and is_integer(absolute_deadline_ms) do
     acquire(:cleanup, repository_id, absolute_deadline_ms)
   end
+
+  def acquire_cleanup(_repository_id, _absolute_deadline_ms), do: {:error, :unavailable}
 
   @spec release(lease()) :: :ok
   def release({tag, server, lease})

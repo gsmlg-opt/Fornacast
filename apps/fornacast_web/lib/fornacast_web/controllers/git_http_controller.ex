@@ -334,6 +334,12 @@ defmodule FornacastWeb.GitHTTPController do
   defp send_git_error(conn, :unsupported_media_type),
     do: send_resp(conn, 415, "Unsupported Git content type.\n")
 
+  defp send_git_error(conn, reason) when reason in [:unavailable, :deadline_exceeded],
+    do: send_resp(conn, 503, "Git service temporarily unavailable.\n")
+
+  defp send_git_error(conn, {:unavailable, _reason}),
+    do: send_resp(conn, 503, "Git service temporarily unavailable.\n")
+
   defp send_git_error(conn, reason) when is_binary(reason), do: send_resp(conn, 400, reason)
   defp send_git_error(conn, _reason), do: send_resp(conn, 500, "Git HTTP request failed.\n")
 end

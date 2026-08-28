@@ -22,6 +22,7 @@ defmodule GitTransport.UploadPack do
 
   if Mix.env() == :test do
     @pack_objects_hook_key {__MODULE__, :pack_objects_hook}
+    @global_pack_objects_hook_key {__MODULE__, :global_pack_objects_hook}
 
     @doc false
     def with_test_pack_objects(adapter, fun)
@@ -38,8 +39,27 @@ defmodule GitTransport.UploadPack do
       end
     end
 
+    @doc false
+    def with_test_global_pack_objects(adapter, fun)
+        when is_function(adapter, 2) and is_function(fun, 0) do
+      previous = :persistent_term.get(@global_pack_objects_hook_key, nil)
+      :persistent_term.put(@global_pack_objects_hook_key, adapter)
+
+      try do
+        fun.()
+      after
+        if previous,
+          do: :persistent_term.put(@global_pack_objects_hook_key, previous),
+          else: :persistent_term.erase(@global_pack_objects_hook_key)
+      end
+    end
+
     defp pack_objects(path, wants) do
-      Process.get(@pack_objects_hook_key, &GitCore.pack_objects/2).(path, wants)
+      adapter =
+        Process.get(@pack_objects_hook_key) ||
+          :persistent_term.get(@global_pack_objects_hook_key, &GitCore.pack_objects/2)
+
+      adapter.(path, wants)
     end
   else
     defp pack_objects(path, wants), do: GitCore.pack_objects(path, wants)

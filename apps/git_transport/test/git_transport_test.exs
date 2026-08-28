@@ -212,6 +212,67 @@ defmodule GitTransportTest do
     assert :ok = GitCore.RepositoryReadLimiter.release(cleanup_lease)
   end
 
+  @tag :tmp_dir
+  test "channel closed terminate and owner death release repository reads", %{tmp_dir: tmp_dir} do
+    share_database!()
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, Path.join(tmp_dir, "repos"))
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "channel-release",
+               email: "channel-release@example.com",
+               password: "correct horse battery staple"
+             })
+
+    for path <- [:closed, :terminate, :owner_death] do
+      assert {:ok, repository} =
+               ForgeRepos.create_repository(user, %{
+                 name: "Channel #{path}",
+                 slug: "channel-#{path}"
+               })
+
+      deadline = System.monotonic_time(:millisecond) + 2_000
+
+      case path do
+        :owner_death ->
+          parent = self()
+
+          owner =
+            spawn(fn ->
+              {:ok, _handle} = ForgeRepos.open_repository_read(repository, deadline)
+              send(parent, {:channel_owner_acquired, self()})
+              Process.sleep(:infinity)
+            end)
+
+          assert_receive {:channel_owner_acquired, ^owner}
+          Process.exit(owner, :kill)
+
+        path ->
+          assert {:ok, handle} = ForgeRepos.open_repository_read(repository, deadline)
+          state = %GitTransport.Channel{repository_read_handle: handle}
+
+          case path do
+            :closed ->
+              assert {:stop, 7, %{repository_read_handle: nil}} =
+                       GitTransport.Channel.handle_ssh_msg(
+                         {:ssh_cm, self(), {:closed, 7}},
+                         state
+                       )
+
+            :terminate ->
+              assert :ok = GitTransport.Channel.terminate(:normal, state)
+          end
+      end
+
+      assert {:ok, cleanup} =
+               GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
+
+      assert :ok = GitCore.RepositoryReadLimiter.release(cleanup)
+    end
+  end
+
   test "GitCore's future API receive-pack ceiling does not configure Git transport" do
     original_git_core_limits = Application.get_env(:git_core, :limits)
     original_transport_limit = Application.fetch_env(:git_transport, :receive_pack_max_bytes)
@@ -679,6 +740,89 @@ defmodule GitTransportTest do
 
     assert clone_status == 0, clone_output
     assert File.read!(Path.join(clone_path, "README.md")) == "# Demo\n"
+
+    dirty_clone_path = Path.join(tmp_dir, "dirty-clone")
+    dirty_entered = Path.join(tmp_dir, "ssh-dirty-entered")
+    dirty_release = Path.join(tmp_dir, "ssh-dirty-release")
+
+    GitTransport.UploadPack.with_test_global_pack_objects(
+      fn path, wants ->
+        {:ok, {}} =
+          GitTransport.TestDirtyIoNative.test_dirty_io_wait(dirty_entered, dirty_release)
+
+        GitCore.pack_objects(path, wants)
+      end,
+      fn ->
+        clone =
+          Task.async(fn ->
+            System.cmd(
+              "git",
+              ["clone", "ssh://alice@127.0.0.1:#{port}/alice/demo.git", dirty_clone_path],
+              env: [
+                {"GIT_SSH_COMMAND",
+                 Enum.join(
+                   [
+                     "ssh",
+                     "-F /dev/null",
+                     "-o IdentitiesOnly=yes",
+                     "-o KbdInteractiveAuthentication=no",
+                     "-o LogLevel=ERROR",
+                     "-o PasswordAuthentication=no",
+                     "-o PreferredAuthentications=publickey",
+                     "-o StrictHostKeyChecking=no",
+                     "-o UserKnownHostsFile=#{Path.join(tmp_dir, "dirty-known-hosts")}",
+                     "-i #{key_path}"
+                   ],
+                   " "
+                 )}
+              ],
+              stderr_to_stdout: true
+            )
+          end)
+
+        wait_for_file!(dirty_entered)
+
+        cleanup =
+          Task.async(fn ->
+            deadline = System.monotonic_time(:millisecond) + 2_000
+            GitCore.RepositoryReadLimiter.acquire_cleanup(repo.id, deadline)
+          end)
+
+        assert Task.yield(cleanup, 30) == nil
+        File.touch!(dirty_release)
+        assert {_output, 0} = Task.await(clone)
+        assert {:ok, cleanup_lease} = Task.await(cleanup)
+        assert :ok = GitCore.RepositoryReadLimiter.release(cleanup_lease)
+      end
+    )
+
+    failed_clone_path = Path.join(tmp_dir, "failed-clone")
+
+    GitTransport.UploadPack.with_test_global_pack_objects(
+      fn _path, _wants -> {:error, :simulated_pack_failure} end,
+      fn ->
+        {_output, status} =
+          System.cmd(
+            "git",
+            ["clone", "ssh://alice@127.0.0.1:#{port}/alice/demo.git", failed_clone_path],
+            env: [
+              {"GIT_SSH_COMMAND",
+               "ssh -F /dev/null -o IdentitiesOnly=yes -o LogLevel=ERROR " <>
+                 "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i #{key_path}"}
+            ],
+            stderr_to_stdout: true
+          )
+
+        refute status == 0
+      end
+    )
+
+    cleanup_deadline = System.monotonic_time(:millisecond) + 2_000
+
+    assert {:ok, cleanup_after_error} =
+             GitCore.RepositoryReadLimiter.acquire_cleanup(repo.id, cleanup_deadline)
+
+    assert :ok = GitCore.RepositoryReadLimiter.release(cleanup_after_error)
 
     {fetch_output, fetch_status} =
       System.cmd(

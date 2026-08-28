@@ -2,6 +2,100 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
   use ExUnit.Case, async: true
 
   @root Path.expand("../../..", __DIR__)
+  @git_core_classification %{
+    {"apps/forge_pulls/lib/forge_pulls.ex", :branch_option_pages, :ref_page} => :read_handle,
+    {"apps/forge_pulls/lib/forge_pulls.ex", :list_commits, :commit_range_page} => :read_handle,
+    {"apps/forge_pulls/lib/forge_pulls.ex", :changed_files, :diff_between} => :read_handle,
+    {"apps/forge_pulls/lib/forge_pulls.ex", :resolve_ref_path, :resolve_snapshot} => :read_handle,
+    {"apps/forge_pulls/lib/forge_pulls.ex", :pull_analysis_path, :merge_analysis} => :read_handle,
+    {"apps/forge_pulls/lib/forge_pulls.ex", :exact_ref, :exact_ref} => :writer_fence,
+    {"apps/forge_pulls/lib/forge_pulls.ex", :merge_analysis, :merge_analysis} => :writer_fence,
+    {"apps/forge_pulls/lib/forge_pulls.ex", :write_merge_commit, :write_merge_commit} =>
+      :writer_fence,
+    {"apps/forge_pulls/lib/forge_pulls.ex", :compare_and_swap, :compare_and_swap_ref} =>
+      :writer_fence,
+    {"apps/forge_pulls/lib/forge_pulls/merge_recovery.ex", :read_base_ref, :exact_ref} =>
+      :writer_fence,
+    {"apps/forge_pulls/lib/forge_pulls/merge_recovery.ex", :complete,
+     :invalidate_repository_cache} => :writer_fence,
+    {"apps/forge_repos/lib/forge_repos.ex", :build_repository_view_with_handle,
+     :repository_disk_usage} => :read_handle,
+    {"apps/forge_repos/lib/forge_repos.ex", :empty?, :empty?} => :read_handle,
+    {"apps/forge_repos/lib/forge_repos.ex", :validate_changed_default_branch, :resolve_snapshot} =>
+      :read_handle,
+    {"apps/forge_repos/lib/forge_repos.ex", :init_repository_storage, :init_bare} =>
+      :import_lease,
+    {"apps/forge_repos/lib/forge_repos/git_write_recovery.ex", :read_current_ref, :exact_ref} =>
+      :writer_fence,
+    {"apps/forge_repos/lib/forge_repos/git_write_recovery.ex", :complete,
+     :invalidate_repository_cache} => :writer_fence,
+    {"apps/forge_imports/lib/forge_imports/repository_stager.ex", :scan_attribute_paths,
+     :read_blob} => :import_lease,
+    {"apps/forge_imports/lib/forge_imports/repository_stager.ex", :scan_attribute_paths,
+     :release_blob} => :import_lease,
+    {"apps/forge_imports/lib/forge_imports/repository_stager.ex", :scan_unsupported, :exact_ref} =>
+      :import_lease,
+    {"apps/forge_imports/lib/forge_imports/repository_stager.ex", :search, :search_tree} =>
+      :import_lease,
+    {"apps/forge_imports/lib/forge_imports/repository_worker.ex", :choose_staging_action,
+     :is_bare_repository?} => :import_lease,
+    {"apps/git_transport/lib/git_transport/receive_pack.ex", :advertise_refs, :list_refs} =>
+      :writer_fence,
+    {"apps/git_transport/lib/git_transport/receive_pack.ex", :native_adapter, :receive_pack} =>
+      :writer_fence,
+    {"apps/git_transport/lib/git_transport/receive_pack_worker.ex", :validate_expected_refs,
+     :exact_ref} => :writer_fence,
+    {"apps/git_transport/lib/git_transport/upload_pack.ex", :advertise_refs_handle, :list_refs} =>
+      :read_handle,
+    {"apps/git_transport/lib/git_transport/upload_pack.ex", :pack_objects, :pack_objects} =>
+      :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :collaboration, :ref_summary} =>
+      :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :code, :ref_summary} =>
+      :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :build_code, :resolve_snapshot} =>
+      :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :build_code, :commit_summary} =>
+      :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :build_code,
+     :read_tree_with_history} => :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :build_code, :repository_analysis} =>
+      :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :build_code,
+     :repository_disk_usage} => :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :tree, :read_tree_with_history} =>
+      :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :commit, :commit} => :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :commit, :diff_commit} =>
+      :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :commits, :commit_page} =>
+      :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :refs, :ref_page} => :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :search, :search_tree} =>
+      :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :raw, :read_blob_complete} =>
+      :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :read_blob_result, :read_blob} =>
+      :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :read_readme, :read_blob} =>
+      :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :release_leases, :release_blob} =>
+      :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :empty_result,
+     :repository_disk_usage} => :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :load_context, :ref_summary} =>
+      :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :load_context,
+     :ref_summary_for_route} => :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :finish_context,
+     :resolve_snapshot} => :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :optional_chrome_snapshot,
+     :resolve_snapshot} => :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :with_optional_chrome_context,
+     :ref_summary} => :read_handle,
+    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :with_repository_read,
+     :with_repository_read} => :read_handle
+  }
 
   test "ready-repository consumers do not resolve storage before a read or write permit" do
     for relative <- [
@@ -51,4 +145,97 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
 
     assert offenders == []
   end
+
+  test "opaque handle module has no helpers and only ForgeRepos mentions its struct" do
+    handle_source =
+      File.read!(Path.join(@root, "apps/forge_repos/lib/forge_repos/repository_read_handle.ex"))
+
+    refute handle_source =~ ~r/\bdef\s+(new|repository|path|close)\b/
+
+    offenders =
+      @root
+      |> Path.join("apps/*/lib/**/*.ex")
+      |> Path.wildcard()
+      |> Enum.reject(&String.ends_with?(&1, "/forge_repos.ex"))
+      |> Enum.reject(&String.ends_with?(&1, "/repository_read_handle.ex"))
+      |> Enum.filter(fn path ->
+        source = File.read!(path)
+
+        source =~ ~r/%(?:ForgeRepos\.)?RepositoryReadHandle\{/ or
+          source =~ ~r/(?:Map\.(?:get|fetch)|get_in)\([^\n]*repository_read_handle/ or
+          source =~ ~r/repository_read_handle\.(?:repository|path|lease)\b/
+      end)
+      |> Enum.map(&Path.relative_to(&1, @root))
+
+    assert offenders == []
+  end
+
+  test "every production GitCore call has an explicit lease classification" do
+    calls =
+      for app <- ~w(forge_repos forge_pulls forge_imports fornacast_web git_transport),
+          path <- Path.wildcard(Path.join(@root, "apps/#{app}/lib/**/*.ex")),
+          call <- git_core_calls(path) do
+        call
+      end
+      |> MapSet.new()
+
+    assert calls == MapSet.new(Map.keys(@git_core_classification)),
+           "classification mismatch: #{inspect(MapSet.difference(calls, MapSet.new(Map.keys(@git_core_classification))) |> MapSet.to_list())}"
+
+    assert Enum.all?(@git_core_classification, fn {_call, classification} ->
+             classification in [:read_handle, :writer_fence, :import_lease]
+           end)
+  end
+
+  defp git_core_calls(path) do
+    relative = Path.relative_to(path, @root)
+    {:ok, ast} = path |> File.read!() |> Code.string_to_quoted(file: path)
+
+    {_ast, calls} =
+      Macro.prewalk(ast, [], fn
+        {kind, _, [head, body]} = node, calls when kind in [:def, :defp] ->
+          case definition_name(head) do
+            name when is_atom(name) and not is_nil(name) ->
+              {node, collect_function_calls(body, relative, name, calls)}
+
+            nil ->
+              {node, calls}
+          end
+
+        node, calls ->
+          {node, calls}
+      end)
+
+    calls
+  end
+
+  defp definition_name({:when, _, [head | _guards]}), do: definition_name(head)
+
+  defp definition_name({name, _, args})
+       when is_atom(name) and (is_list(args) or is_nil(args)),
+       do: name
+
+  defp definition_name(_head), do: nil
+
+  defp collect_function_calls(ast, relative, function, calls) do
+    {_ast, calls} =
+      Macro.prewalk(ast, calls, fn
+        {{:., _, [receiver, call]}, _, _args} = node, calls when is_atom(call) ->
+          if git_core_receiver?(receiver) do
+            {node, [{relative, function, call} | calls]}
+          else
+            {node, calls}
+          end
+
+        node, calls ->
+          {node, calls}
+      end)
+
+    calls
+  end
+
+  defp git_core_receiver?({:__aliases__, _, [:GitCore]}), do: true
+  defp git_core_receiver?({:git_core, _, _}), do: true
+  defp git_core_receiver?({{:., _, [_context, :git_core]}, _, []}), do: true
+  defp git_core_receiver?(_receiver), do: false
 end

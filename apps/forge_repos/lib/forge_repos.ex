@@ -794,7 +794,7 @@ defmodule ForgeRepos do
 
   @spec open_repository_read(Repository.t(), integer()) ::
           {:ok, RepositoryReadHandle.t()}
-          | {:error, :stale_repository | :storage_unavailable | :deadline_exceeded | :unavailable}
+          | {:error, :not_found | :deadline_exceeded | :unavailable}
   def open_repository_read(
         %Repository{id: repository_id, generation: generation} = repository,
         absolute_deadline_ms
@@ -807,11 +807,11 @@ defmodule ForgeRepos do
           {:ok, reloaded} ->
             case safe_absolute_storage_path(reloaded) do
               {:ok, path} ->
-                {:ok, RepositoryReadHandle.new(reloaded, path, lease)}
+                {:ok, %RepositoryReadHandle{repository: reloaded, path: path, lease: lease}}
 
-              {:error, reason} ->
+              {:error, _reason} ->
                 GitCore.RepositoryReadLimiter.release(lease)
-                {:error, reason}
+                {:error, :unavailable}
             end
 
           {:error, reason} ->
@@ -825,10 +825,12 @@ defmodule ForgeRepos do
   end
 
   def open_repository_read(%Repository{}, _absolute_deadline_ms),
-    do: {:error, :stale_repository}
+    do: {:error, :not_found}
 
   @spec close_repository_read(RepositoryReadHandle.t()) :: :ok
-  def close_repository_read(handle), do: RepositoryReadHandle.close(handle)
+  def close_repository_read(%RepositoryReadHandle{lease: lease}) do
+    GitCore.RepositoryReadLimiter.release(lease)
+  end
 
   @spec with_repository_read(Repository.t(), integer(), (RepositoryReadHandle.t() -> result)) ::
           result | {:error, atom()}
@@ -849,13 +851,15 @@ defmodule ForgeRepos do
   end
 
   @spec repository_read_repository(RepositoryReadHandle.t()) :: Repository.t()
-  def repository_read_repository(handle), do: RepositoryReadHandle.repository(handle)
+  def repository_read_repository(%RepositoryReadHandle{repository: repository}), do: repository
 
   @spec repository_read_path(RepositoryReadHandle.t()) :: Path.t()
-  def repository_read_path(handle), do: RepositoryReadHandle.path(handle)
+  def repository_read_path(%RepositoryReadHandle{path: path}), do: path
 
   defp with_repository_reads(repositories, absolute_deadline_ms, fun) do
-    case acquire_repository_reads(repositories, absolute_deadline_ms, []) do
+    ordered_repositories = repositories |> Enum.uniq_by(& &1.id) |> Enum.sort_by(& &1.id)
+
+    case acquire_repository_reads(ordered_repositories, absolute_deadline_ms, []) do
       {:ok, grants} ->
         case reload_repository_reads(grants) do
           {:ok, handles} ->
@@ -915,15 +919,15 @@ defmodule ForgeRepos do
         {:ok, %{generation: generation} = repository} when generation == input.generation ->
           case safe_absolute_storage_path(repository) do
             {:ok, path} ->
-              handle = RepositoryReadHandle.new(repository, path, lease)
+              handle = %RepositoryReadHandle{repository: repository, path: path, lease: lease}
               {:cont, {:ok, [handle | handles]}}
 
-            {:error, reason} ->
-              {:halt, {:error, reason}}
+            {:error, _reason} ->
+              {:halt, {:error, :unavailable}}
           end
 
         _missing_or_changed ->
-          {:halt, {:error, :stale_repository}}
+          {:halt, {:error, :not_found}}
       end
     end)
     |> case do
@@ -1021,7 +1025,7 @@ defmodule ForgeRepos do
       )
       |> Repo.one()
 
-    if repository, do: {:ok, repository}, else: {:error, :stale_repository}
+    if repository, do: {:ok, repository}, else: {:error, :not_found}
   end
 
   defp fence_mismatch(:writer), do: {:error, {:unavailable, :stale_repository}}
@@ -2657,8 +2661,11 @@ defmodule ForgeRepos do
       end
     end)
     |> case do
-      {:error, :storage_unavailable} ->
+      {:error, reason} when reason in [:storage_unavailable, :unavailable] ->
         {:error, {:unavailable, :storage_unavailable}}
+
+      {:error, :deadline_exceeded} ->
+        {:error, {:unavailable, :read_timeout}}
 
       result ->
         result

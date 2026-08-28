@@ -69,6 +69,20 @@ defmodule GitTransport.ReceivePackFenceTest do
   end
 
   @tag :tmp_dir
+  test "receive-pack advertisement waits behind repository writer cleanup", %{
+    repository: repository
+  } do
+    deadline = System.monotonic_time(:millisecond) + 2_000
+    assert {:ok, writer} = GitCore.RepositoryWriteLimiter.acquire(repository.id, deadline)
+
+    advertisement = Task.async(fn -> ReceivePack.advertise_refs(repository) end)
+    assert Task.yield(advertisement, 30) == nil
+    assert :ok = GitCore.RepositoryWriteLimiter.release(writer)
+    assert {:ok, response} = Task.await(advertisement)
+    assert is_binary(response)
+  end
+
+  @tag :tmp_dir
   test "prepared receive-pack intents are transactional and reject request replay", %{
     owner: owner,
     repository: repository

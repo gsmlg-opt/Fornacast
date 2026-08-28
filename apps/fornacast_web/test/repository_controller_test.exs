@@ -1091,6 +1091,20 @@ defmodule FornacastWeb.RepositoryControllerTest do
     assert oid == String.duplicate("a", 40)
   end
 
+  test "repository read-handle atoms map to masked HTTP responses" do
+    TestPage.respond(:code, {:error, :not_found})
+    assert request_conn() |> get("/alice/public-repo") |> html_response(404) =~ "not found"
+
+    for reason <- [:unavailable, :deadline_exceeded] do
+      TestPage.reset()
+      TestPage.respond(:code, {:error, reason})
+
+      assert request_conn()
+             |> get("/alice/public-repo")
+             |> html_response(503) =~ "temporarily unavailable"
+    end
+  end
+
   test "a push after resolution cannot mix OIDs and the next HTTP request uses the new cache key" do
     old_oid = String.duplicate("a", 40)
     new_oid = String.duplicate("b", 40)
