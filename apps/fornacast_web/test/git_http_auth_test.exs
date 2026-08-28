@@ -224,6 +224,12 @@ esac
     oid = git!(["-C", work_path, "rev-parse", "HEAD"])
     selector = %GitCore.RefSelector{kind: :branch, full_name: "refs/heads/main"}
 
+    on_exit(fn ->
+      refute GitTransport.UploadPack.test_serve_handle_hook?()
+      refute GitTransport.UploadPack.test_global_pack_objects_hook?()
+      assert :sys.get_state(GitCore.RepositoryReadLimiter).grants == %{}
+    end)
+
     operations = [
       {:view, fn -> ForgeRepos.repository_view(nil, repository) end, :forge_repos},
       {:list_views, fn -> ForgeRepos.list_accessible_repository_views(owner, per_page: 10) end,
@@ -277,7 +283,17 @@ esac
       {:http, fn -> build_conn() |> get("/alice/demo.git/info/refs?service=git-upload-pack") end,
        :none},
       {:exec, fn -> GitTransport.Exec.upload_pack(owner, repository) end, :none},
-      {:exec_stream, fn -> GitTransport.Exec.upload_pack_stream(owner, repository) end, :none}
+      {:exec_stream,
+       fn ->
+         GitTransport.UploadPack.with_test_serve_handle(
+           fn handle ->
+             assert ForgeRepos.repository_read_repository(handle).id == repository.id
+             assert ForgeRepos.repository_read_path(handle) == path
+             :ok
+           end,
+           fn -> GitTransport.Exec.upload_pack_stream(owner, repository) end
+         )
+       end, :none}
     ]
 
     for {name, operation, hook} <- operations do
@@ -319,6 +335,7 @@ esac
       if hook != :none, do: assert_receive({:git_read_entered, ^name})
 
       refute match?({:error, :deadline_exceeded}, Task.await(task, 2_000)), inspect(name)
+      refute Process.alive?(task.pid), "#{name} task leaked"
 
       if hook != :none, do: refute_receive({:git_read_entered, ^name}, 10)
     end
@@ -331,6 +348,7 @@ esac
     assert cache_keys_for(path) == MapSet.new()
     assert :ok = GitCore.RepositoryReadLimiter.release(cleanup)
     assert {:ok, _result} = Task.await(browse)
+    refute Process.alive?(browse.pid)
 
     assert upload_pack_request(build_conn(), "/alice/demo.git", "bad") |> response(400) != ""
 

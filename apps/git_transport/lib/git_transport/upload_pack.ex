@@ -8,6 +8,7 @@ defmodule GitTransport.UploadPack do
 
   alias ForgeRepos.Repository
   require Logger
+  @serve_handle_hook_key {__MODULE__, :serve_handle_hook}
 
   @zero_oid String.duplicate("0", 40)
   @object_id_pattern ~r/\A[0-9a-fA-F]{40}\z/
@@ -23,6 +24,28 @@ defmodule GitTransport.UploadPack do
   if Mix.env() == :test do
     @pack_objects_hook_key {__MODULE__, :pack_objects_hook}
     @global_pack_objects_hook_key {__MODULE__, :global_pack_objects_hook}
+
+    @doc false
+    def with_test_serve_handle(adapter, fun)
+        when is_function(adapter, 1) and is_function(fun, 0) do
+      previous = Process.get(@serve_handle_hook_key)
+      Process.put(@serve_handle_hook_key, adapter)
+
+      try do
+        fun.()
+      after
+        if previous,
+          do: Process.put(@serve_handle_hook_key, previous),
+          else: Process.delete(@serve_handle_hook_key)
+      end
+    end
+
+    @doc false
+    def test_serve_handle_hook?, do: not is_nil(Process.get(@serve_handle_hook_key))
+
+    @doc false
+    def test_global_pack_objects_hook?,
+      do: not is_nil(:persistent_term.get(@global_pack_objects_hook_key, nil))
 
     @doc false
     def with_test_pack_objects(adapter, fun)
@@ -98,6 +121,14 @@ defmodule GitTransport.UploadPack do
 
   @spec serve_handle(ForgeRepos.RepositoryReadHandle.t()) :: :ok | {:error, term()}
   def serve_handle(handle) do
+    if Mix.env() == :test and Process.get(@serve_handle_hook_key) do
+      Process.get(@serve_handle_hook_key).(handle)
+    else
+      serve_handle_stdio(handle)
+    end
+  end
+
+  defp serve_handle_stdio(handle) do
     with {:ok, advertisement} <- advertise_refs_handle(handle),
          :ok <- write(advertisement),
          {:ok, request} <- read_client_request(),

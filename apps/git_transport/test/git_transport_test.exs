@@ -79,6 +79,26 @@ defmodule GitTransportTest do
              )
   end
 
+  test "upload-pack serve-handle test adapter is process local and restored" do
+    refute GitTransport.UploadPack.test_serve_handle_hook?()
+    refute GitTransport.UploadPack.test_global_pack_objects_hook?()
+
+    assert :served =
+             GitTransport.UploadPack.with_test_serve_handle(
+               fn :opaque_handle -> :served end,
+               fn ->
+                 assert GitTransport.UploadPack.test_serve_handle_hook?()
+
+                 child = Task.async(fn -> GitTransport.UploadPack.test_serve_handle_hook?() end)
+                 refute Task.await(child)
+                 GitTransport.UploadPack.serve_handle(:opaque_handle)
+               end
+             )
+
+    refute GitTransport.UploadPack.test_serve_handle_hook?()
+    refute GitTransport.UploadPack.test_global_pack_objects_hook?()
+  end
+
   test "HTTP operation batches are stable per actor and repository and random when unassigned" do
     actor = %ForgeAccounts.User{id: 10}
     other_actor = %ForgeAccounts.User{id: 11}
