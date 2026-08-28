@@ -198,8 +198,8 @@ defmodule GitTransport.Channel do
           {:error, _reason} -> fail_started(cm, channel_id, state)
         end
 
-      {:error, reason} ->
-        Logger.error("Git receive-pack advertisement failed: #{inspect(reason)}")
+      {:error, _reason} ->
+        Logger.error("Git receive-pack advertisement failed")
         reject(cm, channel_id, want_reply, "ERROR: Git receive-pack failed.\n", state)
     end
   end

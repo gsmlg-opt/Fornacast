@@ -45,10 +45,7 @@ defmodule GitTransport.ReceivePack do
         end
       end)
 
-    case result do
-      {:error, _reason} -> {:error, "ERROR: Git receive-pack failed.\n"}
-      result -> result
-    end
+    result
   end
 
   def new_request do

@@ -522,6 +522,9 @@ defmodule GitTransportTest do
     Process.exit(writer, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^writer, :killed}
 
+    assert {:error, {:unavailable, :write_limiter}} =
+             GitTransport.ReceivePack.advertise_refs(repository)
+
     assert {:error, "ERROR: Git receive-pack failed.\n"} =
              GitTransport.handle_exec(
                "receive-fence-error",
@@ -533,6 +536,9 @@ defmodule GitTransportTest do
     Application.put_env(:git_core, :limits, limits)
     deadline = System.monotonic_time(:millisecond) + 2_000
     assert {:ok, holder} = GitCore.RepositoryWriteLimiter.acquire(repository.id, deadline)
+
+    assert {:error, {:unavailable, :write_timeout}} =
+             GitTransport.ReceivePack.advertise_refs(repository)
 
     assert {:error, "ERROR: Git receive-pack failed.\n"} =
              GitTransport.handle_exec(
@@ -550,6 +556,12 @@ defmodule GitTransportTest do
              end)
 
     assert :ok = GitCore.RepositoryWriteLimiter.release(holder)
+
+    assert GitTransport.Exec.error_message(%GitCore.Error{
+             kind: :storage_unavailable,
+             operation: :list_refs,
+             detail: "/secret/path"
+           }) == "ERROR: Git receive-pack failed.\n"
   end
 
   @tag :tmp_dir

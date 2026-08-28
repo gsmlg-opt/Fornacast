@@ -158,6 +158,62 @@ esac
   end
 
   @tag :tmp_dir
+  test "receive-pack discovery maps writer fence failures to safe HTTP responses", %{
+    tmp_dir: tmp_dir
+  } do
+    with_storage_root(tmp_dir)
+    share_database!()
+    {_user, repository} = create_user_and_repository(:public)
+    original_limits = Application.get_env(:git_core, :limits)
+
+    on_exit(fn ->
+      if original_limits,
+        do: Application.put_env(:git_core, :limits, original_limits),
+        else: Application.delete_env(:git_core, :limits)
+
+      restart_git_core_if_needed()
+    end)
+
+    writer = Process.whereis(GitCore.RepositoryWriteLimiter)
+    monitor = Process.monitor(writer)
+    Process.exit(writer, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^writer, :killed}
+
+    assert request_info_refs(
+             "alice",
+             "correct horse battery staple",
+             "/alice/demo.git",
+             "git-receive-pack"
+           )
+           |> response(503) =~ "temporarily unavailable"
+
+    restart_git_core_if_needed()
+
+    Application.put_env(
+      :git_core,
+      :limits,
+      Keyword.put(original_limits || [], :content_deadline_ms, 20)
+    )
+
+    deadline = System.monotonic_time(:millisecond) + 2_000
+    assert {:ok, holder} = GitCore.RepositoryWriteLimiter.acquire(repository.id, deadline)
+
+    assert request_info_refs(
+             "alice",
+             "correct horse battery staple",
+             "/alice/demo.git",
+             "git-receive-pack"
+           )
+           |> response(503) =~ "temporarily unavailable"
+
+    assert :ok = GitCore.RepositoryWriteLimiter.release(holder)
+
+    assert build_conn()
+           |> get("/alice/demo.git/info/refs?service=malformed")
+           |> response(400) =~ "Unsupported Git service"
+  end
+
+  @tag :tmp_dir
   test "cleanup blocks repository views pages HTTP and Exec read entrypoints", %{tmp_dir: tmp_dir} do
     with_storage_root(tmp_dir)
     share_database!()
@@ -813,6 +869,13 @@ esac
   end
 
   defp wait_for_file!(path, 0), do: flunk("expected #{path} to exist")
+
+  defp restart_git_core_if_needed do
+    if Process.whereis(GitCore.RepositoryWriteLimiter) == nil do
+      Application.stop(:git_core)
+      {:ok, _started} = Application.ensure_all_started(:git_core)
+    end
+  end
 
   defp reset_tables do
     [

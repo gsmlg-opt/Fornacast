@@ -96,6 +96,9 @@ defmodule GitTransport.Exec do
     "ERROR: Git upload-pack failed.\n"
   end
 
+  def error_message({:unavailable, _reason}), do: "ERROR: Git receive-pack failed.\n"
+  def error_message(%GitCore.Error{}), do: "ERROR: Git receive-pack failed.\n"
+
   def error_message(reason) when is_binary(reason), do: reason
 
   defp normalize_result(result) do
