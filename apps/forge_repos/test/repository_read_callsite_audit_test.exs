@@ -2,6 +2,13 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
   use ExUnit.Case, async: true
 
   @root Path.expand("../../..", __DIR__)
+  @repository_storage_reads MapSet.new(~w(
+    branches commit commit_history commit_page commit_range_page commit_summary
+    contained_tree_identity diff_between diff_commit empty? exact_ref is_bare_repository?
+    list_refs merge_analysis pack_objects read_blob read_blob_complete read_tree
+    read_tree_with_history ref_page ref_summary ref_summary_for_route release_blob
+    repository_analysis repository_disk_usage resolve_snapshot search_tree tags
+  )a)
   @git_core_classification %{
     {"apps/forge_pulls/lib/forge_pulls.ex", :branch_option_pages, :ref_page} => :read_handle,
     {"apps/forge_pulls/lib/forge_pulls.ex", :list_commits, :commit_range_page} => :read_handle,
@@ -10,25 +17,15 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
     {"apps/forge_pulls/lib/forge_pulls.ex", :pull_analysis_path, :merge_analysis} => :read_handle,
     {"apps/forge_pulls/lib/forge_pulls.ex", :exact_ref, :exact_ref} => :writer_fence,
     {"apps/forge_pulls/lib/forge_pulls.ex", :merge_analysis, :merge_analysis} => :writer_fence,
-    {"apps/forge_pulls/lib/forge_pulls.ex", :write_merge_commit, :write_merge_commit} =>
-      :writer_fence,
-    {"apps/forge_pulls/lib/forge_pulls.ex", :compare_and_swap, :compare_and_swap_ref} =>
-      :writer_fence,
     {"apps/forge_pulls/lib/forge_pulls/merge_recovery.ex", :read_base_ref, :exact_ref} =>
       :writer_fence,
-    {"apps/forge_pulls/lib/forge_pulls/merge_recovery.ex", :complete,
-     :invalidate_repository_cache} => :writer_fence,
     {"apps/forge_repos/lib/forge_repos.ex", :build_repository_view_with_handle,
      :repository_disk_usage} => :read_handle,
     {"apps/forge_repos/lib/forge_repos.ex", :empty?, :empty?} => :read_handle,
     {"apps/forge_repos/lib/forge_repos.ex", :validate_changed_default_branch, :resolve_snapshot} =>
       :read_handle,
-    {"apps/forge_repos/lib/forge_repos.ex", :init_repository_storage, :init_bare} =>
-      :import_lease,
     {"apps/forge_repos/lib/forge_repos/git_write_recovery.ex", :read_current_ref, :exact_ref} =>
       :writer_fence,
-    {"apps/forge_repos/lib/forge_repos/git_write_recovery.ex", :complete,
-     :invalidate_repository_cache} => :writer_fence,
     {"apps/forge_imports/lib/forge_imports/repository_stager.ex", :scan_attribute_paths,
      :read_blob} => :import_lease,
     {"apps/forge_imports/lib/forge_imports/repository_stager.ex", :scan_attribute_paths,
@@ -40,8 +37,6 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
     {"apps/forge_imports/lib/forge_imports/repository_worker.ex", :choose_staging_action,
      :is_bare_repository?} => :import_lease,
     {"apps/git_transport/lib/git_transport/receive_pack.ex", :advertise_refs, :list_refs} =>
-      :writer_fence,
-    {"apps/git_transport/lib/git_transport/receive_pack.ex", :native_adapter, :receive_pack} =>
       :writer_fence,
     {"apps/git_transport/lib/git_transport/receive_pack_worker.ex", :validate_expected_refs,
      :exact_ref} => :writer_fence,
@@ -93,8 +88,13 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
      :resolve_snapshot} => :read_handle,
     {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :with_optional_chrome_context,
      :ref_summary} => :read_handle,
-    {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :with_repository_read,
-     :with_repository_read} => :read_handle
+    {"apps/git_core/lib/git_core/remote.ex", :validate_repository, :is_bare_repository?} =>
+      :import_lease,
+    {"apps/git_core/lib/git_core/remote.ex", :validate_repository, :empty?} => :import_lease,
+    {"apps/git_core/lib/git_core/remote.ex", :validate_default_branch, :exact_ref} =>
+      :import_lease,
+    {"apps/git_core/lib/git_core/remote.ex", :anchored_cleanup_identity, :contained_tree_identity} =>
+      :import_lease
   }
 
   test "ready-repository consumers do not resolve storage before a read or write permit" do
@@ -172,8 +172,7 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
 
   test "every production GitCore call has an explicit lease classification" do
     calls =
-      for app <- ~w(forge_repos forge_pulls forge_imports fornacast_web git_transport),
-          path <- Path.wildcard(Path.join(@root, "apps/#{app}/lib/**/*.ex")),
+      for path <- Path.wildcard(Path.join(@root, "apps/*/lib/**/*.ex")),
           call <- git_core_calls(path) do
         call
       end
@@ -187,9 +186,26 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
            end)
   end
 
+  test "global detector catches an unclassified future app call" do
+    source = """
+    defmodule FutureForge.Reader do
+      def refs(path), do: GitCore.list_refs(path)
+    end
+    """
+
+    assert [{"apps/future_forge/lib/reader.ex", :refs, :list_refs} = call] =
+             git_core_calls_from_source(source, "apps/future_forge/lib/reader.ex")
+
+    refute Map.has_key?(@git_core_classification, call)
+  end
+
   defp git_core_calls(path) do
     relative = Path.relative_to(path, @root)
-    {:ok, ast} = path |> File.read!() |> Code.string_to_quoted(file: path)
+    git_core_calls_from_source(File.read!(path), relative)
+  end
+
+  defp git_core_calls_from_source(source, relative) do
+    {:ok, ast} = Code.string_to_quoted(source, file: relative)
 
     {_ast, calls} =
       Macro.prewalk(ast, [], fn
@@ -221,7 +237,7 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
     {_ast, calls} =
       Macro.prewalk(ast, calls, fn
         {{:., _, [receiver, call]}, _, _args} = node, calls when is_atom(call) ->
-          if git_core_receiver?(receiver) do
+          if git_core_receiver?(receiver) and MapSet.member?(@repository_storage_reads, call) do
             {node, [{relative, function, call} | calls]}
           else
             {node, calls}

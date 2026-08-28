@@ -32,6 +32,32 @@ defmodule ForgeRepos do
     allow_rebase_merge
   )a
 
+  if Mix.env() == :test do
+    @read_phase_hook_key {__MODULE__, :read_phase_hook}
+
+    @doc false
+    def with_test_read_phase_hook(hook, fun)
+        when is_function(hook, 0) and is_function(fun, 0) do
+      previous = Process.get(@read_phase_hook_key)
+      Process.put(@read_phase_hook_key, hook)
+
+      try do
+        fun.()
+      after
+        if previous,
+          do: Process.put(@read_phase_hook_key, previous),
+          else: Process.delete(@read_phase_hook_key)
+      end
+    end
+
+    defp run_read_phase_hook do
+      Process.get(@read_phase_hook_key, fn -> :ok end).()
+      :ok
+    end
+  else
+    defp run_read_phase_hook, do: :ok
+  end
+
   @type validation_error :: %{
           required(:resource) => String.t(),
           required(:field) => String.t(),
@@ -840,6 +866,7 @@ defmodule ForgeRepos do
     case open_repository_read(repository, absolute_deadline_ms) do
       {:ok, handle} ->
         try do
+          :ok = run_read_phase_hook()
           fun.(handle)
         after
           close_repository_read(handle)
@@ -864,6 +891,7 @@ defmodule ForgeRepos do
         case reload_repository_reads(grants) do
           {:ok, handles} ->
             try do
+              :ok = run_read_phase_hook()
               fun.(handles)
             after
               Enum.each(handles, &close_repository_read/1)

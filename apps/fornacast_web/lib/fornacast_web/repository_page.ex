@@ -88,6 +88,32 @@ defmodule FornacastWeb.RepositoryPage do
 
   @collaboration_kinds [:issues, :issue, :pulls, :pull, :pull_commits, :pull_files]
 
+  if Mix.env() == :test do
+    @read_phase_hook_key {__MODULE__, :read_phase_hook}
+
+    @doc false
+    def with_test_read_phase_hook(hook, fun)
+        when is_function(hook, 0) and is_function(fun, 0) do
+      previous = Process.get(@read_phase_hook_key)
+      Process.put(@read_phase_hook_key, hook)
+
+      try do
+        fun.()
+      after
+        if previous,
+          do: Process.put(@read_phase_hook_key, previous),
+          else: Process.delete(@read_phase_hook_key)
+      end
+    end
+
+    defp run_read_phase_hook do
+      Process.get(@read_phase_hook_key, fn -> :ok end).()
+      :ok
+    end
+  else
+    defp run_read_phase_hook, do: :ok
+  end
+
   def collaboration(repository, owner, viewer, kind, content, opts \\ [])
 
   def collaboration(%Repository{} = repository, owner, viewer, kind, content, opts)
@@ -680,6 +706,8 @@ defmodule FornacastWeb.RepositoryPage do
     deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:content_deadline_ms)
 
     ForgeRepos.with_repository_read(repository, deadline, fn handle ->
+      :ok = run_read_phase_hook()
+
       fun.(
         ForgeRepos.repository_read_repository(handle),
         ForgeRepos.repository_read_path(handle)

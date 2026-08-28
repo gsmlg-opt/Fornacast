@@ -174,19 +174,39 @@ defmodule ForgePullsTest do
     assert {:ok, pull} = create_pull(repository, reader, "Comparison", "feature", "main")
 
     for {name, operation} <- [
+          branches: fn -> ForgePulls.branch_options(repository, reader) end,
           compare: fn -> ForgePulls.compare(repository, reader, "feature", "main", []) end,
           commits: fn -> ForgePulls.list_commits(repository, pull, reader, []) end,
-          files: fn -> ForgePulls.changed_files(repository, pull, reader, []) end
+          files: fn -> ForgePulls.changed_files(repository, pull, reader, []) end,
+          list_refresh: fn -> ForgePulls.list_pull_requests(repository, reader, []) end,
+          detail_refresh: fn ->
+            ForgePulls.get_pull_request(repository, pull.issue.number, reader)
+          end
         ] do
       deadline = System.monotonic_time(:millisecond) + 2_000
 
       assert {:ok, cleanup} =
                GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
 
-      task = Task.async(operation)
+      path = ForgeRepos.absolute_storage_path(repository)
+      assert :ok = GitCore.invalidate_repository_cache_strict(path)
+      parent = self()
+
+      task =
+        Task.async(fn ->
+          ForgePulls.with_test_read_phase_hook(
+            fn -> send(parent, {:git_read_entered, name}) end,
+            operation
+          )
+        end)
+
       assert Task.yield(task, 30) == nil, "#{name} bypassed cleanup"
+      refute_received {:git_read_entered, ^name}
+      assert cache_keys_for(path) == MapSet.new(), "#{name} repopulated cache during cleanup"
       assert :ok = GitCore.RepositoryReadLimiter.release(cleanup)
+      assert_receive {:git_read_entered, ^name}
       assert {:ok, _result} = Task.await(task)
+      refute_receive {:git_read_entered, ^name}, 10
     end
 
     assert {:ok, %Fornacast.Page{entries: commits, total: 3, page: 1, per_page: 2}} =
@@ -3004,6 +3024,23 @@ defmodule ForgePullsTest do
     after
       0 -> count
     end
+  end
+
+  defp cache_keys_for(path) do
+    parent = self()
+    ref = make_ref()
+
+    :sys.replace_state(GitCore.Cache, fn state ->
+      send(parent, {ref, :ets.tab2list(state.table)})
+      state
+    end)
+
+    assert_receive {^ref, entries}
+
+    entries
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.filter(&(is_tuple(&1) and tuple_size(&1) > 0 and elem(&1, 0) == path))
+    |> MapSet.new()
   end
 
   defp database_contract do

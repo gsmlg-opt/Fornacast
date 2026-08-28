@@ -219,7 +219,6 @@ defmodule ForgePulls do
                {:ok, base_ref} <- branch_ref(base, :invalid_base),
                :ok <- distinct_refs(head_ref, base_ref),
                {:ok, head_snapshot} <- resolve_ref_path(path, head_ref, :invalid_head),
-               :ok <- run_read_phase_hook(),
                {:ok, base_snapshot} <- resolve_ref_path(path, base_ref, :invalid_base),
                {:ok, analysis} <- pull_analysis_path(path, base_snapshot, head_snapshot, opts) do
             {:ok,
@@ -1385,6 +1384,7 @@ defmodule ForgePulls do
     deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:content_deadline_ms)
 
     ForgeRepos.with_repository_read(repository, deadline, fn handle ->
+      :ok = run_read_phase_hook()
       fun.(ForgeRepos.repository_read_path(handle))
     end)
     |> case do
