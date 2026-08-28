@@ -33,16 +33,18 @@ defmodule GitTransport.ReceivePack do
   ]
 
   def advertise_refs(%Repository{} = repository) do
-    path = ForgeRepos.absolute_storage_path(repository)
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:content_deadline_ms)
 
-    with {:ok, refs} <- GitCore.list_refs(path) do
-      refs =
-        refs
-        |> Enum.filter(&advertisable_ref?/1)
-        |> Enum.sort_by(& &1.name)
+    ForgeRepos.with_repository_read(repository, deadline, fn handle ->
+      with {:ok, refs} <- GitCore.list_refs(ForgeRepos.repository_read_path(handle)) do
+        refs =
+          refs
+          |> Enum.filter(&advertisable_ref?/1)
+          |> Enum.sort_by(& &1.name)
 
-      {:ok, render_advertisement(refs)}
-    end
+        {:ok, render_advertisement(refs)}
+      end
+    end)
   end
 
   def new_request do

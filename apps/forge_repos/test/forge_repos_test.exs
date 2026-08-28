@@ -714,7 +714,8 @@ defmodule ForgeReposTest do
     assert Enum.map(views, & &1.permissions) ==
              List.duplicate(%{admin: false, push: false, pull: true}, 30)
 
-    assert query_count <= 5
+    # Batch read-handle validation adds one exact-generation reload for the page.
+    assert query_count <= 6
   end
 
   @tag :tmp_dir

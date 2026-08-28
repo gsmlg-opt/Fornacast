@@ -1126,7 +1126,8 @@ defmodule ForgePullsTest do
       end)
 
     assert {:ok, %{entries: [_, _], total: 2}} = result
-    assert query_count <= 11
+    # One exact repository-generation reload is part of opening the read lease.
+    assert query_count <= 12
 
     for {field, filters} <- [
           {"state", [state: :merged]},

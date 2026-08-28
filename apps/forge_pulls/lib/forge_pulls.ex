@@ -158,7 +158,7 @@ defmodule ForgePulls do
   def branch_options(%ForgeRepos.Repository{} = repository, actor) do
     with {:ok, repository} <- canonical_read_repository(repository, actor),
          {:ok, branches} <-
-           branch_option_pages(ForgeRepos.absolute_storage_path(repository), 1, []) do
+           with_read_path(repository, fn path -> branch_option_pages(path, 1, []) end) do
       {:ok, branches}
     else
       {:error, %GitCore.Error{kind: kind}} -> {:error, {:unavailable, kind}}
@@ -225,13 +225,9 @@ defmodule ForgePulls do
 
     with {:ok, repository, head, base} <- resolve_pull_pair(repository, pull, actor),
          {:ok, commit_page} <-
-           GitCore.commit_range_page(
-             ForgeRepos.absolute_storage_path(repository),
-             base.oid,
-             head.oid,
-             page,
-             per_page: per_page
-           ) do
+           with_read_path(repository, fn path ->
+             GitCore.commit_range_page(path, base.oid, head.oid, page, per_page: per_page)
+           end) do
       {:ok,
        %Page{
          entries: commit_page.commits,
@@ -263,13 +259,12 @@ defmodule ForgePulls do
 
     with {:ok, repository, head, base} <- resolve_pull_pair(repository, pull, actor),
          {:ok, diff} <-
-           GitCore.diff_between(
-             ForgeRepos.absolute_storage_path(repository),
-             base.oid,
-             head.oid,
-             page: page,
-             per_page: per_page
-           ) do
+           with_read_path(repository, fn path ->
+             GitCore.diff_between(path, base.oid, head.oid,
+               page: page,
+               per_page: per_page
+             )
+           end) do
       {:ok,
        %ForgePulls.ChangedFilePage{
          entries: diff.files,
@@ -897,10 +892,13 @@ defmodule ForgePulls do
   defp branch_ref(_value, error), do: {:error, error}
 
   defp resolve_ref(repository, ref, error) do
-    case GitCore.resolve_snapshot(
-           ForgeRepos.absolute_storage_path(repository),
-           %GitCore.RefSelector{kind: :branch, full_name: ref}
-         ) do
+    with_read_path(repository, &resolve_ref_path(&1, ref, error))
+  end
+
+  defp resolve_ref_path(path, ref, error) do
+    result = GitCore.resolve_snapshot(path, %GitCore.RefSelector{kind: :branch, full_name: ref})
+
+    case result do
       {:ok, snapshot} ->
         {:ok, snapshot}
 
@@ -1222,19 +1220,33 @@ defmodule ForgePulls do
       |> ForgeIssues.load_issue_metadata_by_ids(repository, actor)
       |> Map.new(&{&1.id, &1})
 
+    load_issues_with_analysis(pulls, issues_by_id, repository, absolute_deadline)
+    |> case do
+      {:ok, loaded} -> {:ok, Enum.reverse(loaded)}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp load_issues_with_analysis(pulls, issues_by_id, repository, absolute_deadline) do
+    if Enum.any?(pulls, &is_nil(&1.analysis)) do
+      with_read_path(repository, fn path ->
+        reduce_loaded_issues(pulls, issues_by_id, repository, absolute_deadline, path)
+      end)
+    else
+      reduce_loaded_issues(pulls, issues_by_id, repository, absolute_deadline, nil)
+    end
+  end
+
+  defp reduce_loaded_issues(pulls, issues_by_id, repository, absolute_deadline, path) do
     Enum.reduce_while(pulls, {:ok, []}, fn pull, {:ok, loaded} ->
       with {:ok, issue} <- Map.fetch(issues_by_id, pull.issue_id),
-           {:ok, analyzed} <- ensure_analysis(pull, repository, absolute_deadline) do
+           {:ok, analyzed} <- ensure_analysis(pull, repository, absolute_deadline, path) do
         pull = attach_issue_and_capabilities(analyzed, issue, repository)
         {:cont, {:ok, [pull | loaded]}}
       else
         :error -> {:halt, {:error, :not_found}}
       end
     end)
-    |> case do
-      {:ok, loaded} -> {:ok, Enum.reverse(loaded)}
-      {:error, _} = error -> error
-    end
   end
 
   defp load_issue_result(pull, repository, actor) do
@@ -1265,20 +1277,29 @@ defmodule ForgePulls do
     end
   end
 
+  defp ensure_analysis(pull, repository, absolute_deadline, path)
+
   defp ensure_analysis(
          %PullRequest{analysis: %GitCore.MergeAnalysis{}} = pull,
          _repository,
-         _absolute_deadline
+         _absolute_deadline,
+         _path
        ),
        do: {:ok, pull}
 
-  defp ensure_analysis(pull, repository, absolute_deadline) do
+  defp ensure_analysis(pull, repository, absolute_deadline, nil) do
+    with_read_path(repository, fn path ->
+      ensure_analysis(pull, repository, absolute_deadline, path)
+    end)
+  end
+
+  defp ensure_analysis(pull, _repository, absolute_deadline, path) when is_binary(path) do
     with true <- absolute_deadline > System.monotonic_time(:millisecond),
-         {:ok, head} <- resolve_ref(repository, pull.head_ref, :invalid_head),
-         {:ok, base} <- resolve_ref(repository, pull.base_ref, :invalid_base),
+         {:ok, head} <- resolve_ref_path(path, pull.head_ref, :invalid_head),
+         {:ok, base} <- resolve_ref_path(path, pull.base_ref, :invalid_base),
          remaining when remaining > 0 <-
            absolute_deadline - System.monotonic_time(:millisecond),
-         {:ok, analysis} <- pull_analysis(repository, base, head, deadline_ms: remaining) do
+         {:ok, analysis} <- pull_analysis_path(path, base, head, deadline_ms: remaining) do
       {:ok, %{pull | analysis: analysis}}
     else
       _ -> {:ok, %{pull | analysis: unknown_analysis(pull)}}
@@ -1298,12 +1319,18 @@ defmodule ForgePulls do
   end
 
   defp pull_analysis(repository, base, head, opts) do
-    case GitCore.merge_analysis(
-           ForgeRepos.absolute_storage_path(repository),
-           base.oid,
-           head.oid,
-           opts
-         ) do
+    result = with_read_path(repository, &pull_analysis_path(&1, base, head, opts))
+
+    normalize_pull_analysis(result, base, head)
+  end
+
+  defp pull_analysis_path(path, base, head, opts) do
+    GitCore.merge_analysis(path, base.oid, head.oid, opts)
+    |> normalize_pull_analysis(base, head)
+  end
+
+  defp normalize_pull_analysis(result, base, head) do
+    case result do
       {:ok, analysis} ->
         {:ok, analysis}
 
@@ -1322,6 +1349,14 @@ defmodule ForgePulls do
       {:error, _} = error ->
         error
     end
+  end
+
+  defp with_read_path(repository, fun) do
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:content_deadline_ms)
+
+    ForgeRepos.with_repository_read(repository, deadline, fn handle ->
+      fun.(ForgeRepos.repository_read_path(handle))
+    end)
   end
 
   defp attach_issue_and_capabilities(pull, issue, repository) do

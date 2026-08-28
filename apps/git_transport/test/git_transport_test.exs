@@ -128,6 +128,90 @@ defmodule GitTransportTest do
     end
   end
 
+  @tag :tmp_dir
+  test "upload-pack advertisement waits behind repository cleanup", %{tmp_dir: tmp_dir} do
+    share_database!()
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, Path.join(tmp_dir, "repos"))
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "reader-fence",
+               email: "reader-fence@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, repository} =
+             ForgeRepos.create_repository(user, %{name: "Reader fence", slug: "reader-fence"})
+
+    deadline = System.monotonic_time(:millisecond) + 2_000
+
+    assert {:ok, cleanup} =
+             GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
+
+    task = Task.async(fn -> GitTransport.UploadPack.advertise_refs(repository) end)
+    assert Task.yield(task, 30) == nil
+    assert :ok = GitCore.RepositoryReadLimiter.release(cleanup)
+    assert {:ok, advertisement} = Task.await(task)
+    assert is_binary(advertisement)
+  end
+
+  @tag :tmp_dir
+  test "cleanup waits for a dirty-I/O upload-pack response", %{tmp_dir: tmp_dir} do
+    share_database!()
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, Path.join(tmp_dir, "repos"))
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "dirty-reader",
+               email: "dirty-reader@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, repository} =
+             ForgeRepos.create_repository(user, %{name: "Dirty reader", slug: "dirty-reader"})
+
+    entered_path = Path.join(tmp_dir, "upload-pack-entered")
+    release_path = Path.join(tmp_dir, "upload-pack-release")
+
+    request = %{
+      GitTransport.UploadPack.new_request()
+      | wants: [String.duplicate("1", 40)],
+        done?: true
+    }
+
+    response =
+      Task.async(fn ->
+        GitTransport.UploadPack.with_test_pack_objects(
+          fn _path, _wants ->
+            {:ok, {}} =
+              GitTransport.TestDirtyIoNative.test_dirty_io_wait(entered_path, release_path)
+
+            {:ok, "PACK"}
+          end,
+          fn -> GitTransport.UploadPack.response(repository, request) end
+        )
+      end)
+
+    wait_for_file!(entered_path)
+
+    cleanup =
+      Task.async(fn ->
+        deadline = System.monotonic_time(:millisecond) + 2_000
+        GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
+      end)
+
+    assert Task.yield(cleanup, 30) == nil
+    File.touch!(release_path)
+    assert {:ok, response_body} = Task.await(response)
+    assert is_binary(response_body)
+    assert {:ok, cleanup_lease} = Task.await(cleanup)
+    assert :ok = GitCore.RepositoryReadLimiter.release(cleanup_lease)
+  end
+
   test "GitCore's future API receive-pack ceiling does not configure Git transport" do
     original_git_core_limits = Application.get_env(:git_core, :limits)
     original_transport_limit = Application.fetch_env(:git_transport, :receive_pack_max_bytes)
@@ -845,6 +929,19 @@ defmodule GitTransportTest do
       "users"
     ]
   end
+
+  defp wait_for_file!(path, attempts \\ 200)
+
+  defp wait_for_file!(path, attempts) when attempts > 0 do
+    if File.exists?(path) do
+      :ok
+    else
+      Process.sleep(5)
+      wait_for_file!(path, attempts - 1)
+    end
+  end
+
+  defp wait_for_file!(path, 0), do: flunk("expected #{path} to exist")
 
   defp populate_bare_repository!(tmp_dir, repo_path) do
     work_path = Path.join([tmp_dir, "work-#{System.unique_integer([:positive])}"])

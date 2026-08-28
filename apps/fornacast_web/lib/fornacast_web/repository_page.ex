@@ -93,12 +93,13 @@ defmodule FornacastWeb.RepositoryPage do
   def collaboration(%Repository{} = repository, owner, viewer, kind, content, opts)
       when kind in @collaboration_kinds and is_list(opts) do
     git_core = Keyword.get(opts, :git_core, GitCore)
-    path = ForgeRepos.absolute_storage_path(repository)
 
-    with {:ok, ref_summary} <-
-           git_core.ref_summary(path, selected_ref: default_ref(repository)) do
-      result(kind, chrome(repository, owner, viewer, ref_summary, nil), content)
-    end
+    with_repository_read(repository, git_core, fn repository, path ->
+      with {:ok, ref_summary} <-
+             git_core.ref_summary(path, selected_ref: default_ref(repository)) do
+        result(kind, chrome(repository, owner, viewer, ref_summary, nil), content)
+      end
+    end)
   end
 
   def code(
@@ -110,31 +111,32 @@ defmodule FornacastWeb.RepositoryPage do
       )
       when (is_nil(selector) or is_struct(selector, GitCore.RefSelector)) and is_list(opts) do
     git_core = Keyword.get(opts, :git_core, GitCore)
-    path = ForgeRepos.absolute_storage_path(repository)
 
-    with {:ok, ref_summary} <-
-           git_core.ref_summary(path,
-             selected_ref: selector_full_name(repository, selector)
-           ) do
-      cond do
-        empty?(ref_summary) ->
-          {:ok, empty_result(repository, owner, viewer, ref_summary, path, git_core)}
+    with_repository_read(repository, git_core, fn repository, path ->
+      with {:ok, ref_summary} <-
+             git_core.ref_summary(path,
+               selected_ref: selector_full_name(repository, selector)
+             ) do
+        cond do
+          empty?(ref_summary) ->
+            {:ok, empty_result(repository, owner, viewer, ref_summary, path, git_core)}
 
-        missing_configured_default?(repository, selector, ref_summary) ->
-          {:ok, missing_default_result(repository, owner, viewer, ref_summary)}
+          missing_configured_default?(repository, selector, ref_summary) ->
+            {:ok, missing_default_result(repository, owner, viewer, ref_summary)}
 
-        true ->
-          build_code(
-            repository,
-            owner,
-            viewer,
-            ref_summary,
-            path,
-            selector || default_selector(repository),
-            git_core
-          )
+          true ->
+            build_code(
+              repository,
+              owner,
+              viewer,
+              ref_summary,
+              path,
+              selector || default_selector(repository),
+              git_core
+            )
+        end
       end
-    end
+    end)
   end
 
   def tree(%Repository{} = repository, owner, viewer, route, page, opts \\ [])
@@ -378,13 +380,14 @@ defmodule FornacastWeb.RepositoryPage do
 
   defp with_context(repository, owner, viewer, route, opts, fun) do
     git_core = Keyword.get(opts, :git_core, GitCore)
-    path = ForgeRepos.absolute_storage_path(repository)
 
-    case load_context(repository, owner, viewer, route, path, git_core) do
-      {:ok, context} -> fun.(context)
-      {:page, result} -> {:ok, result}
-      {:error, error} -> {:error, error}
-    end
+    with_repository_read(repository, git_core, fn repository, path ->
+      case load_context(repository, owner, viewer, route, path, git_core) do
+        {:ok, context} -> fun.(context)
+        {:page, result} -> {:ok, result}
+        {:error, error} -> {:error, error}
+      end
+    end)
   end
 
   defp with_optional_chrome_context(
@@ -397,33 +400,35 @@ defmodule FornacastWeb.RepositoryPage do
          fun
        ) do
     git_core = Keyword.get(opts, :git_core, GitCore)
-    path = ForgeRepos.absolute_storage_path(repository)
-    selected_ref = selector_full_name(repository, selector)
 
-    with {:ok, ref_summary} <- git_core.ref_summary(path, selected_ref: selected_ref) do
-      cond do
-        empty?(ref_summary) ->
-          {:ok, empty_result(repository, owner, viewer, ref_summary, path, git_core)}
+    with_repository_read(repository, git_core, fn repository, path ->
+      selected_ref = selector_full_name(repository, selector)
 
-        true ->
-          with {:ok, snapshot} <-
-                 optional_chrome_snapshot(
-                   repository,
-                   selector,
-                   ref_summary,
-                   path,
-                   git_core,
-                   resolve_snapshot?
-                 ) do
-            fun.(%{
-              path: path,
-              snapshot: snapshot,
-              git_core: git_core,
-              chrome: chrome(repository, owner, viewer, ref_summary, snapshot)
-            })
-          end
+      with {:ok, ref_summary} <- git_core.ref_summary(path, selected_ref: selected_ref) do
+        cond do
+          empty?(ref_summary) ->
+            {:ok, empty_result(repository, owner, viewer, ref_summary, path, git_core)}
+
+          true ->
+            with {:ok, snapshot} <-
+                   optional_chrome_snapshot(
+                     repository,
+                     selector,
+                     ref_summary,
+                     path,
+                     git_core,
+                     resolve_snapshot?
+                   ) do
+              fun.(%{
+                path: path,
+                snapshot: snapshot,
+                git_core: git_core,
+                chrome: chrome(repository, owner, viewer, ref_summary, snapshot)
+              })
+            end
+        end
       end
-    end
+    end)
   end
 
   defp optional_chrome_snapshot(
@@ -661,5 +666,24 @@ defmodule FornacastWeb.RepositoryPage do
     end)
 
     :ok
+  end
+
+  defp with_repository_read(repository, git_core, fun) do
+    if function_exported?(git_core, :with_repository_read, 2) do
+      git_core.with_repository_read(repository, fun)
+    else
+      with_real_repository_read(repository, fun)
+    end
+  end
+
+  defp with_real_repository_read(repository, fun) do
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:content_deadline_ms)
+
+    ForgeRepos.with_repository_read(repository, deadline, fn handle ->
+      fun.(
+        ForgeRepos.repository_read_repository(handle),
+        ForgeRepos.repository_read_path(handle)
+      )
+    end)
   end
 end

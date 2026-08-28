@@ -20,8 +20,40 @@ defmodule GitTransport.UploadPack do
     "agent=fornacast/0.1"
   ]
 
+  if Mix.env() == :test do
+    @pack_objects_hook_key {__MODULE__, :pack_objects_hook}
+
+    @doc false
+    def with_test_pack_objects(adapter, fun)
+        when is_function(adapter, 2) and is_function(fun, 0) do
+      previous = Process.get(@pack_objects_hook_key)
+      Process.put(@pack_objects_hook_key, adapter)
+
+      try do
+        fun.()
+      after
+        if previous,
+          do: Process.put(@pack_objects_hook_key, previous),
+          else: Process.delete(@pack_objects_hook_key)
+      end
+    end
+
+    defp pack_objects(path, wants) do
+      Process.get(@pack_objects_hook_key, &GitCore.pack_objects/2).(path, wants)
+    end
+  else
+    defp pack_objects(path, wants), do: GitCore.pack_objects(path, wants)
+  end
+
   def advertise_refs(%Repository{} = repository) do
-    path = ForgeRepos.absolute_storage_path(repository)
+    with_read_handle(repository, &advertise_refs_handle/1)
+  end
+
+  @spec advertise_refs_handle(ForgeRepos.RepositoryReadHandle.t()) ::
+          {:ok, binary()} | {:error, term()}
+  def advertise_refs_handle(handle) do
+    path = ForgeRepos.repository_read_path(handle)
+    repository = ForgeRepos.repository_read_repository(handle)
 
     with {:ok, refs} <- GitCore.list_refs(path) do
       refs =
@@ -34,10 +66,22 @@ defmodule GitTransport.UploadPack do
   end
 
   def serve(%Repository{} = repository) do
-    with {:ok, advertisement} <- advertise_refs(repository),
+    with_read_handle(repository, fn handle ->
+      with {:ok, advertisement} <- advertise_refs_handle(handle),
+           :ok <- write(advertisement),
+           {:ok, request} <- read_client_request(),
+           :ok <- maybe_send_pack(handle, request) do
+        :ok
+      end
+    end)
+  end
+
+  @spec serve_handle(ForgeRepos.RepositoryReadHandle.t()) :: :ok | {:error, term()}
+  def serve_handle(handle) do
+    with {:ok, advertisement} <- advertise_refs_handle(handle),
          :ok <- write(advertisement),
          {:ok, request} <- read_client_request(),
-         :ok <- maybe_send_pack(repository, request) do
+         :ok <- maybe_send_pack(handle, request) do
       :ok
     end
   end
@@ -52,7 +96,13 @@ defmodule GitTransport.UploadPack do
   end
 
   def response(%Repository{} = repository, request) when is_map(request) do
-    build_pack_response(repository, normalize_request(request))
+    with_read_handle(repository, fn handle -> response_handle(handle, request) end)
+  end
+
+  @spec response_handle(ForgeRepos.RepositoryReadHandle.t(), map()) ::
+          {:ok, binary()} | {:error, term()}
+  def response_handle(handle, request) when is_map(request) do
+    build_pack_response(handle, normalize_request(request))
   end
 
   defp render_advertisement([], _default_branch) do
@@ -253,24 +303,24 @@ defmodule GitTransport.UploadPack do
     Map.update!(request, :flush_count, &(&1 + 1))
   end
 
-  defp maybe_send_pack(_repository, %{wants: []}), do: :ok
+  defp maybe_send_pack(_handle, %{wants: []}), do: :ok
 
-  defp maybe_send_pack(repository, request) do
-    with {:ok, response} <- build_pack_response(repository, request) do
+  defp maybe_send_pack(handle, request) do
+    with {:ok, response} <- build_pack_response(handle, request) do
       write(response)
     end
   end
 
-  defp build_pack_response(_repository, %{wants: []}), do: {:ok, ""}
+  defp build_pack_response(_handle, %{wants: []}), do: {:ok, ""}
 
-  defp build_pack_response(_repository, %{done?: false}) do
+  defp build_pack_response(_handle, %{done?: false}) do
     {:ok, GitTransport.PktLine.encode("NAK\n")}
   end
 
-  defp build_pack_response(repository, request) do
-    path = ForgeRepos.absolute_storage_path(repository)
+  defp build_pack_response(handle, request) do
+    path = ForgeRepos.repository_read_path(handle)
 
-    case GitCore.pack_objects(path, request.wants) do
+    case pack_objects(path, request.wants) do
       {:ok, pack} ->
         {:ok, pack_response(pack, request.capabilities)}
 
@@ -307,5 +357,10 @@ defmodule GitTransport.UploadPack do
   defp write(data) do
     IO.binwrite(:stdio, data)
     :ok
+  end
+
+  defp with_read_handle(repository, fun) do
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:content_deadline_ms)
+    ForgeRepos.with_repository_read(repository, deadline, fun)
   end
 end

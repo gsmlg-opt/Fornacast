@@ -13,6 +13,7 @@ defmodule ForgeRepos do
     Collaborator,
     GitWriteOperation,
     Repository,
+    RepositoryReadHandle,
     RepositoryView,
     RepositoryWriteReconcilers
   }
@@ -791,6 +792,146 @@ defmodule ForgeRepos do
     |> Storage.repository_path!()
   end
 
+  @spec open_repository_read(Repository.t(), integer()) ::
+          {:ok, RepositoryReadHandle.t()}
+          | {:error, :stale_repository | :storage_unavailable | :deadline_exceeded | :unavailable}
+  def open_repository_read(
+        %Repository{id: repository_id, generation: generation} = repository,
+        absolute_deadline_ms
+      )
+      when is_integer(repository_id) and repository_id > 0 and is_integer(generation) and
+             generation > 0 and is_integer(absolute_deadline_ms) do
+    case GitCore.RepositoryReadLimiter.acquire_read(repository_id, absolute_deadline_ms) do
+      {:ok, lease} ->
+        case reload_read_repository(repository) do
+          {:ok, reloaded} ->
+            case safe_absolute_storage_path(reloaded) do
+              {:ok, path} ->
+                {:ok, RepositoryReadHandle.new(reloaded, path, lease)}
+
+              {:error, reason} ->
+                GitCore.RepositoryReadLimiter.release(lease)
+                {:error, reason}
+            end
+
+          {:error, reason} ->
+            GitCore.RepositoryReadLimiter.release(lease)
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  def open_repository_read(%Repository{}, _absolute_deadline_ms),
+    do: {:error, :stale_repository}
+
+  @spec close_repository_read(RepositoryReadHandle.t()) :: :ok
+  def close_repository_read(handle), do: RepositoryReadHandle.close(handle)
+
+  @spec with_repository_read(Repository.t(), integer(), (RepositoryReadHandle.t() -> result)) ::
+          result | {:error, atom()}
+        when result: term()
+  def with_repository_read(%Repository{} = repository, absolute_deadline_ms, fun)
+      when is_integer(absolute_deadline_ms) and is_function(fun, 1) do
+    case open_repository_read(repository, absolute_deadline_ms) do
+      {:ok, handle} ->
+        try do
+          fun.(handle)
+        after
+          close_repository_read(handle)
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  @spec repository_read_repository(RepositoryReadHandle.t()) :: Repository.t()
+  def repository_read_repository(handle), do: RepositoryReadHandle.repository(handle)
+
+  @spec repository_read_path(RepositoryReadHandle.t()) :: Path.t()
+  def repository_read_path(handle), do: RepositoryReadHandle.path(handle)
+
+  defp with_repository_reads(repositories, absolute_deadline_ms, fun) do
+    case acquire_repository_reads(repositories, absolute_deadline_ms, []) do
+      {:ok, grants} ->
+        case reload_repository_reads(grants) do
+          {:ok, handles} ->
+            try do
+              fun.(handles)
+            after
+              Enum.each(handles, &close_repository_read/1)
+            end
+
+          {:error, reason} ->
+            Enum.each(grants, fn {_repository, lease} ->
+              GitCore.RepositoryReadLimiter.release(lease)
+            end)
+
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp acquire_repository_reads([], _deadline, grants), do: {:ok, Enum.reverse(grants)}
+
+  defp acquire_repository_reads([repository | rest], deadline, grants) do
+    case GitCore.RepositoryReadLimiter.acquire_read(repository.id, deadline) do
+      {:ok, lease} ->
+        acquire_repository_reads(rest, deadline, [{repository, lease} | grants])
+
+      {:error, reason} ->
+        Enum.each(grants, fn {_repository, lease} ->
+          GitCore.RepositoryReadLimiter.release(lease)
+        end)
+
+        {:error, reason}
+    end
+  end
+
+  defp reload_repository_reads([]), do: {:ok, []}
+
+  defp reload_repository_reads(grants) do
+    expected =
+      Map.new(grants, fn {repository, _lease} -> {repository.id, repository.generation} end)
+
+    reloaded =
+      Repository
+      |> where(
+        [repository],
+        repository.id in ^Map.keys(expected) and repository.lifecycle == :ready and
+          is_nil(repository.deleted_at) and is_nil(repository.storage_reclaimed_at)
+      )
+      |> Repo.all()
+      |> Map.new(&{&1.id, &1})
+
+    Enum.reduce_while(grants, {:ok, []}, fn {input, lease}, {:ok, handles} ->
+      case Map.fetch(reloaded, input.id) do
+        {:ok, %{generation: generation} = repository} when generation == input.generation ->
+          case safe_absolute_storage_path(repository) do
+            {:ok, path} ->
+              handle = RepositoryReadHandle.new(repository, path, lease)
+              {:cont, {:ok, [handle | handles]}}
+
+            {:error, reason} ->
+              {:halt, {:error, reason}}
+          end
+
+        _missing_or_changed ->
+          {:halt, {:error, :stale_repository}}
+      end
+    end)
+    |> case do
+      {:ok, handles} -> {:ok, Enum.reverse(handles)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @spec with_write_fence(
           Repository.t(),
           :ref | :content | :merge | :tag | :receive_pack,
@@ -869,6 +1010,20 @@ defmodule ForgeRepos do
 
   defp reload_fenced_repository(%Repository{}), do: {:error, :stale_repository}
 
+  defp reload_read_repository(%Repository{id: repository_id, generation: generation}) do
+    repository =
+      Repository
+      |> where(
+        [repository],
+        repository.id == ^repository_id and repository.generation == ^generation and
+          repository.lifecycle == :ready and is_nil(repository.deleted_at) and
+          is_nil(repository.storage_reclaimed_at)
+      )
+      |> Repo.one()
+
+    if repository, do: {:ok, repository}, else: {:error, :stale_repository}
+  end
+
   defp fence_mismatch(:writer), do: {:error, {:unavailable, :stale_repository}}
   defp fence_mismatch(:publication), do: {:error, :destination_changed}
 
@@ -882,12 +1037,13 @@ defmodule ForgeRepos do
   rescue
     File.Error -> {:error, :storage_unavailable}
     ArgumentError -> {:error, :storage_unavailable}
+    FunctionClauseError -> {:error, :storage_unavailable}
   end
 
   def empty?(%Repository{} = repository) do
-    repository
-    |> absolute_storage_path()
-    |> GitCore.empty?()
+    with_repository_read(repository, repository_read_deadline(), fn handle ->
+      handle |> repository_read_path() |> GitCore.empty?()
+    end)
   end
 
   def mark_pushed(%Repository{} = repository, pushed_at \\ DateTime.utc_now()) do
@@ -1408,20 +1564,34 @@ defmodule ForgeRepos do
   end
 
   defp build_repository_view(actor, %{repository: repository, owner: owner} = context) do
-    with :ok <- mask_repository_read(actor, context),
-         {:ok, path} <- safe_absolute_storage_path(repository),
-         {:ok, bytes} <- GitCore.repository_disk_usage(path) do
+    result =
+      with :ok <- mask_repository_read(actor, context) do
+        with_repository_read(repository, repository_read_deadline(), fn handle ->
+          build_repository_view_with_handle(actor, context, owner, handle)
+        end)
+      end
+
+    normalize_repository_view_result(result)
+  end
+
+  defp build_repository_view_with_handle(actor, context, owner, handle) do
+    with {:ok, bytes} <- GitCore.repository_disk_usage(repository_read_path(handle)) do
       {:ok,
        %RepositoryView{
-         repository: repository,
+         repository: repository_read_repository(handle),
          owner: owner,
          permissions: repository_permissions(actor, context),
          size_kib: div(bytes + 1023, 1024)
        }}
-    else
+    end
+  end
+
+  defp normalize_repository_view_result(result) do
+    case result do
       {:error, %GitCore.Error{kind: kind}} -> {:error, {:unavailable, kind}}
       {:error, :not_found} -> {:error, :not_found}
       {:error, _reason} -> {:error, {:unavailable, :storage_unavailable}}
+      result -> result
     end
   end
 
@@ -1977,22 +2147,26 @@ defmodule ForgeRepos do
       |> Enum.map(& &1.id)
       |> load_repository_contexts(actor)
 
-    Enum.reduce_while(repositories, {:ok, []}, fn repository, {:ok, views} ->
-      case Map.fetch(contexts, repository.id) do
-        {:ok, context} ->
-          case build_repository_view(actor, context) do
-            {:ok, view} -> {:cont, {:ok, [view | views]}}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
+    with_repository_reads(repositories, repository_read_deadline(), fn handles ->
+      handles = Map.new(handles, &{repository_read_repository(&1).id, &1})
 
-        :error ->
-          {:halt, {:error, :not_found}}
+      Enum.reduce_while(repositories, {:ok, []}, fn repository, {:ok, views} ->
+        with {:ok, context} <- Map.fetch(contexts, repository.id),
+             {:ok, handle} <- Map.fetch(handles, repository.id),
+             :ok <- mask_repository_read(actor, context),
+             {:ok, view} <-
+               build_repository_view_with_handle(actor, context, context.owner, handle) do
+          {:cont, {:ok, [view | views]}}
+        else
+          :error -> {:halt, {:error, :not_found}}
+          {:error, reason} -> {:halt, normalize_repository_view_result({:error, reason})}
+        end
+      end)
+      |> case do
+        {:ok, views} -> {:ok, Enum.reverse(views)}
+        error -> error
       end
     end)
-    |> case do
-      {:ok, views} -> {:ok, Enum.reverse(views)}
-      error -> error
-    end
   end
 
   defp load_repository_contexts([], _actor), do: %{}
@@ -2470,8 +2644,8 @@ defmodule ForgeRepos do
   defp validate_changed_default_branch(repository, branch, changeset) do
     selector = %GitCore.RefSelector{kind: :branch, full_name: "refs/heads/#{branch}"}
 
-    with {:ok, path} <- safe_absolute_storage_path(repository) do
-      case GitCore.resolve_snapshot(path, selector) do
+    with_repository_read(repository, repository_read_deadline(), fn handle ->
+      case GitCore.resolve_snapshot(repository_read_path(handle), selector) do
         {:ok, %GitCore.Snapshot{}} ->
           {:ok, changeset}
 
@@ -2481,10 +2655,18 @@ defmodule ForgeRepos do
         {:error, %GitCore.Error{kind: kind}} ->
           {:error, {:unavailable, kind}}
       end
-    else
+    end)
+    |> case do
       {:error, :storage_unavailable} ->
         {:error, {:unavailable, :storage_unavailable}}
+
+      result ->
+        result
     end
+  end
+
+  defp repository_read_deadline do
+    System.monotonic_time(:millisecond) + GitCore.Limits.get(:content_deadline_ms)
   end
 
   defp map_create_api_result({:ok, %{repository: repository}}, _storage_path),

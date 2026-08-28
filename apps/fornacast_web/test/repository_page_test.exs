@@ -9,6 +9,10 @@ defmodule FornacastWeb.RepositoryPageTest.FakeGitCore do
     Process.get({__MODULE__, :calls}, [])
   end
 
+  def with_repository_read(repository, fun) do
+    fun.(repository, ForgeRepos.absolute_storage_path(repository))
+  end
+
   def ref_summary(path, opts \\ []) do
     reply({:ref_summary, path, opts}, :ref_summary)
   end
