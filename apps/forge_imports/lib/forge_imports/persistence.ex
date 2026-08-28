@@ -117,6 +117,7 @@ defmodule ForgeImports.Persistence do
           nil -> Repo.rollback(:not_found)
           true -> Repo.rollback(:adopted)
           {:error, :cleanup_conflict} -> Repo.rollback(:cleanup_conflict)
+          {:error, :persistence_unavailable} -> Repo.rollback(:persistence_unavailable)
           {:error, %Ecto.Changeset{} = changeset} -> Repo.rollback(changeset)
           false -> Repo.rollback(:stale)
           _invalid -> Repo.rollback(:stale)

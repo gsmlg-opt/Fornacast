@@ -679,6 +679,44 @@ defmodule ForgeImports.ImportPersistenceTest do
              })
   end
 
+  test "cleanup intent preserves persistence outages without mutating its item", %{
+    actor: actor,
+    identity: identity
+  } do
+    run = run_fixture(actor, identity, state: :failed, terminal_at: @now)
+    repository = repository_fixture(actor)
+    item = item_fixture(run, state: :failed)
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(candidate in RepositoryItem, where: candidate.id == ^item.id),
+               set: [hidden_repository_id: repository.id]
+             )
+
+    item = Repo.get!(RepositoryItem, item.id)
+    attrs = remote_cleanup_attrs(repository, item)
+
+    for failure <- [
+          fn -> raise DBConnection.ConnectionError, "injected cleanup intent query failure" end,
+          fn -> raise Turso.Error, code: :io, message: "injected cleanup intent query failure" end
+        ] do
+      assert {:error, :persistence_unavailable} =
+               Persistence.with_test_after_adoption_safety_hook(failure, fn ->
+                 Persistence.create_cleanup_operation(item, attrs)
+               end)
+
+      assert Repo.get!(RepositoryItem, item.id) == item
+
+      assert Repo.aggregate(
+               from(cleanup in CleanupOperation,
+                 where: cleanup.repository_item_id == ^item.id
+               ),
+               :count,
+               :id
+             ) == 0
+    end
+  end
+
   test "only the current cleanup lease owner can complete a claimed cleanup", %{
     actor: actor,
     identity: identity
