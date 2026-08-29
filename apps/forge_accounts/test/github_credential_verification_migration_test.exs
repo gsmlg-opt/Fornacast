@@ -19,6 +19,10 @@ defmodule ForgeAccounts.GitHubCredentialVerificationMigrationTest do
   @verification_version 20_260_825_000_350
   @provisional_source_version 20_260_825_000_360
   @destination_status_version 20_260_825_000_370
+  @repository_lifecycle_version 20_260_825_000_400
+  @repository_write_version 20_260_825_000_410
+  @staged_path_version 20_260_825_000_420
+  @cleanup_recovery_version 20_260_825_000_430
   @migrations_path Path.expand("../../fornacast/priv/repo/migrations", __DIR__)
   @credential_migration Path.join(
                           @migrations_path,
@@ -55,22 +59,43 @@ defmodule ForgeAccounts.GitHubCredentialVerificationMigrationTest do
     if postgres?() do
       ensure_provisional_indexes!(repo)
 
-      assert [@destination_status_version] = migrate_down(repo, @destination_status_version)
-      assert [@provisional_source_version] = migrate_down(repo, @provisional_source_version)
-      assert [@verification_version] = migrate_down(repo, @verification_version)
+      try do
+        assert [@cleanup_recovery_version] = migrate_down(repo, @cleanup_recovery_version)
+        assert [@staged_path_version] = migrate_down(repo, @staged_path_version)
+        assert [@repository_write_version] = migrate_down(repo, @repository_write_version)
 
-      assert_upgrade_baseline(repo, credential_id)
-      migrate_verification_up!(repo)
-      assert_upgraded_credential(repo, credential_id)
+        assert [@repository_lifecycle_version] =
+                 migrate_down(repo, @repository_lifecycle_version)
 
-      assert [@verification_version] = migrate_down(repo, @verification_version)
+        assert [@destination_status_version] = migrate_down(repo, @destination_status_version)
+        assert [@provisional_source_version] = migrate_down(repo, @provisional_source_version)
+        assert [@verification_version] = migrate_down(repo, @verification_version)
 
-      assert_upgrade_baseline(repo, credential_id)
-      migrate_verification_up!(repo)
-      assert_upgraded_credential(repo, credential_id)
+        assert_upgrade_baseline(repo, credential_id)
+        migrate_verification_up!(repo)
+        assert_upgraded_credential(repo, credential_id)
 
-      assert [@provisional_source_version] = migrate_up(repo, @provisional_source_version)
-      assert [@destination_status_version] = migrate_up(repo, @destination_status_version)
+        assert [@verification_version] = migrate_down(repo, @verification_version)
+
+        assert_upgrade_baseline(repo, credential_id)
+        migrate_verification_up!(repo)
+        assert_upgraded_credential(repo, credential_id)
+
+        assert [@provisional_source_version] = migrate_up(repo, @provisional_source_version)
+        assert [@destination_status_version] = migrate_up(repo, @destination_status_version)
+        assert [@repository_lifecycle_version] = migrate_up(repo, @repository_lifecycle_version)
+        assert [@repository_write_version] = migrate_up(repo, @repository_write_version)
+        assert [@staged_path_version] = migrate_up(repo, @staged_path_version)
+        assert [@cleanup_recovery_version] = migrate_up(repo, @cleanup_recovery_version)
+      after
+        ensure_up!(repo, @verification_version)
+        ensure_up!(repo, @provisional_source_version)
+        ensure_up!(repo, @destination_status_version)
+        ensure_up!(repo, @repository_lifecycle_version)
+        ensure_up!(repo, @repository_write_version)
+        ensure_up!(repo, @staged_path_version)
+        ensure_up!(repo, @cleanup_recovery_version)
+      end
     else
       assert_raise RuntimeError,
                    "Turso rollback is disabled until gsmlg-dev/concord#81 is resolved",
@@ -182,6 +207,10 @@ defmodule ForgeAccounts.GitHubCredentialVerificationMigrationTest do
 
   defp migrate_up(repo, version),
     do: Ecto.Migrator.run(repo, @migrations_path, :up, to: version, log: false)
+
+  defp ensure_up!(repo, version) do
+    unless migration_applied?(repo, version), do: migrate_up(repo, version)
+  end
 
   defp ensure_provisional_indexes!(repo) do
     Ecto.Adapters.SQL.query!(

@@ -3480,6 +3480,8 @@ defmodule GitCore.CacheIntegrationTest do
     assert [
              {GitCore.Cache, cache_pid, :worker, [GitCore.Cache]},
              {GitCore.RemoteLimiter, remote_pid, :worker, [GitCore.RemoteLimiter]},
+             {GitCore.RepositoryReadLimiter, reader_pid, :worker,
+              [GitCore.RepositoryReadLimiter]},
              {GitCore.RepositoryWriteLimiter, writer_pid, :worker,
               [GitCore.RepositoryWriteLimiter]},
              {GitCore.BlobLimiter, blob_pid, :worker, [GitCore.BlobLimiter]},
@@ -3492,6 +3494,7 @@ defmodule GitCore.CacheIntegrationTest do
     assert is_pid(cache_pid)
     assert is_pid(blob_pid)
     assert is_pid(merge_supervisor_pid)
+    assert is_pid(reader_pid)
     assert is_pid(remote_pid)
     assert is_pid(remote_supervisor_pid)
     assert is_pid(scan_pid)
