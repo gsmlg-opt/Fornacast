@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-29
 
-**Status:** Approved design, pending written-spec review
+**Status:** Approved
 
 ## Context
 
@@ -107,7 +107,8 @@ uses TCP. The default database is `fornacast_dev`.
 Developer documentation must make process readiness and database setup explicit:
 
 ```sh
-devenv processes up postgres -d
+devenv processes up -d --strict-ports postgres
+devenv processes wait --timeout 120
 devenv shell -- mix ecto.setup
 devenv shell -- mix fornacast.run
 ```
