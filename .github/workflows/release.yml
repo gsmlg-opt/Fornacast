@@ -25,7 +25,7 @@ env:
   OTP_VERSION: "29.0"
   RUST_VERSION: 1.96.0
   MIX_ENV: prod
-  FORNACAST_DATABASE_ADAPTER: turso
+  FORNACAST_DATABASE_ADAPTER: postgres
 
 jobs:
   release:
@@ -80,9 +80,9 @@ jobs:
             ~/.cache/rebar3
             ~/.cargo/git
             ~/.cargo/registry
-          key: ${{ runner.os }}-release-${{ env.MIX_ENV }}-${{ hashFiles('mix.lock', 'apps/git_core/native/fornacast_git_core/Cargo.lock', 'package-lock.json') }}
+          key: ${{ runner.os }}-release-postgres-${{ env.MIX_ENV }}-${{ hashFiles('mix.lock', 'apps/git_core/native/fornacast_git_core/Cargo.lock', 'package-lock.json') }}
           restore-keys: |
-            ${{ runner.os }}-release-${{ env.MIX_ENV }}-
+            ${{ runner.os }}-release-postgres-${{ env.MIX_ENV }}-
 
       - name: Install Hex and Rebar
         run: |
@@ -183,8 +183,10 @@ jobs:
           tags: |
             ghcr.io/gsmlg-dev/fornacast:latest
             ghcr.io/gsmlg-dev/fornacast:${{ steps.version.outputs.version }}
-          cache-from: type=gha,scope=fornacast-release
-          cache-to: type=gha,mode=max,scope=fornacast-release
+          build-args: |
+            FORNACAST_DATABASE_ADAPTER=postgres
+          cache-from: type=gha,scope=fornacast-release-postgres
+          cache-to: type=gha,mode=max,scope=fornacast-release-postgres
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
@@ -198,8 +200,25 @@ jobs:
           <!-- FORNACAST_DEPLOY_NOTES_START -->
           ## Deploy with Docker Compose
 
-          This release publishes an image that supports Turso/libSQL only.
-          PostgreSQL requires a source build with `FORNACAST_DATABASE_ADAPTER=postgres`.
+          This release image uses PostgreSQL 17 as the supported domain database.
+          Default Compose uses complete PostgreSQL component mode. Copy `.env.example`
+          to `.env`, then set `POSTGRES_DB`, `POSTGRES_USER`, and
+          `POSTGRES_PASSWORD`; Compose supplies the database host and port.
+
+          For Non-Compose deployments and external PostgreSQL providers, configure
+          exactly one PostgreSQL connection mode:
+
+          - URL mode uses one nonempty `DATABASE_URL`.
+          - Component mode requires nonempty `POSTGRES_HOST`, `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD`. `POSTGRES_PORT` is optional and defaults to `5432` when absent.
+
+          URL mode and component mode are mutually exclusive. Never mix them and
+          never provide only part of component mode.
+
+          Concord's separate embedded Turso/VSR configuration store remains
+          supported and is not the Ecto domain database. The Turso/libSQL Ecto
+          adapter is dormant compile-only source compatibility; it is not a
+          supported runtime or release database and is not a release acceptance
+          gate.
 
           - `ghcr.io/gsmlg-dev/fornacast:{{VERSION}}` (release tag)
           - `ghcr.io/gsmlg-dev/fornacast:latest` (latest release)
@@ -228,6 +247,15 @@ jobs:
           `FORNACAST_BASE_URL` to the public base URL and `FORNACAST_SSH_HOST` to
           the public SSH hostname.
 
+          `FORNACAST_LEGACY_TURSO_DATABASE_PATH` defaults to
+          `/data/fornacast.db`. If that path contains a legacy Turso domain
+          database, this release does not automatically migrate or import it into
+          PostgreSQL. Back up the legacy file and `fornacast-data`, then complete
+          the decision to migrate it or explicitly abandon it. Set the acknowledgement
+          only after the legacy database was intentionally migrated or abandoned;
+          planning alone is insufficient:
+          `FORNACAST_ACKNOWLEDGE_LEGACY_TURSO_DATA=true`.
+
           Before deployment, keep public port `4000` blocked in the firewall or
           security group while initializing the instance. Deploy the image by its
           immutable digest:
@@ -238,13 +266,27 @@ jobs:
           docker compose up -d --no-build
           ```
 
+          Treat recovery as a paired backup: the PostgreSQL dump and
+          `fornacast-data` must come from the same maintenance window. Create and
+          restore the recovery set with:
+
+          ```sh
+          scripts/compose_backup.sh BACKUP_DIR
+          scripts/compose_restore.sh BACKUP_DIR --confirm-destroy
+          ```
+
+          Restore is destructive: it replaces the PostgreSQL database and the
+          persisted `fornacast-data` contents with that paired recovery set.
+
           Complete `/setup` locally or through an SSH tunnel, then open public port
           `4000` in the firewall or security group.
 
           The public ports are `4000` for HTTP and `2222` for SSH.
           Do not publish ports `4890` or `4891` directly.
 
-          The `fornacast-data` volume is mounted at `/data` and persists the Ecto database, Concord config, repositories, and SSH keys.
+          The `postgres-data` volume persists the PostgreSQL domain database. The
+          separate `fornacast-data` volume persists repositories, SSH keys,
+          LocalCAS release assets, and Concord configuration state.
           <!-- FORNACAST_DEPLOY_NOTES_END -->
           EOF
 

@@ -19,22 +19,16 @@ env:
   ELIXIR_VERSION: 1.20.1
   OTP_VERSION: "29.0"
   RUST_VERSION: 1.96.0
-  MIX_ENV: test
 
 jobs:
   unit:
-    name: Unit Tests (${{ matrix.database_adapter }})
+    name: Unit Tests (PostgreSQL)
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        database_adapter:
-          - turso
-          - postgres
     env:
-      FORNACAST_DATABASE_ADAPTER: ${{ matrix.database_adapter }}
-      POSTGRES_HOST: localhost
-      POSTGRES_PORT: 5432
+      MIX_ENV: test
+      FORNACAST_DATABASE_ADAPTER: postgres
+      PGHOST: localhost
+      PGPORT: "5432"
       POSTGRES_DB: fornacast_test
       POSTGRES_TEST_DB: fornacast_test
       POSTGRES_USER: postgres
@@ -82,9 +76,9 @@ jobs:
             ~/.cache/rebar3
             ~/.cargo/git
             ~/.cargo/registry
-          key: ${{ runner.os }}-test-${{ matrix.database_adapter }}-${{ env.MIX_ENV }}-${{ hashFiles('mix.lock', 'apps/git_core/native/fornacast_git_core/Cargo.lock') }}
+          key: ${{ runner.os }}-test-postgres-${{ env.MIX_ENV }}-${{ hashFiles('mix.lock', 'apps/git_core/native/fornacast_git_core/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-test-${{ matrix.database_adapter }}-${{ env.MIX_ENV }}-
+            ${{ runner.os }}-test-postgres-${{ env.MIX_ENV }}-
 
       - name: Install Hex and Rebar
         run: |

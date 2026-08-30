@@ -102,6 +102,11 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert workflow =~
              ~r/- name: Build and publish Docker image.*?uses: docker\/build-push-action@v6.*?context: \.\s+file: \.\/Dockerfile\s+push: true\s+tags: \|\s+ghcr\.io\/gsmlg-dev\/fornacast:latest\s+ghcr\.io\/gsmlg-dev\/fornacast:\$\{\{ steps\.version\.outputs\.version \}\}/s
 
+    assert workflow =~
+             ~r/- name: Build and publish Docker image.*?build-args: \|\s+FORNACAST_DATABASE_ADAPTER=postgres/s
+
+    assert workflow =~ "scope=fornacast-release-postgres"
+
     assert length(:binary.matches(workflow, ~s(${{ secrets.GHCR_TOKEN }}))) == 1
     assert length(:binary.matches(workflow, ~s(${{ github.token }}))) == 1
     assert_order(workflow, "Log in to GHCR", "Push release commit and tag")
@@ -196,6 +201,274 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
       "cp -a _build/prod/rel/fornacast release/fornacast",
       "rm -rf apps/fornacast_web/priv/static"
     )
+  end
+
+  test "release and E2E builds compile PostgreSQL with adapter-qualified caches" do
+    for path <- [@workflow, @e2e_workflow] do
+      workflow = File.read!(path)
+
+      assert workflow =~ "FORNACAST_DATABASE_ADAPTER: postgres"
+      assert workflow =~ ~r/key:.*-postgres-.*hashFiles/s
+      assert workflow =~ ~r/restore-keys:\s*\|\s*\n\s*.*-postgres-/
+      refute workflow =~ "FORNACAST_DATABASE_ADAPTER: turso"
+    end
+  end
+
+  test "installed-release E2E uses PostgreSQL component mode and preserves protocol probes" do
+    workflow = File.read!(@e2e_workflow)
+    prepare_step = workflow_step!(workflow, "Prepare e2e environment", "Start release")
+
+    assert workflow =~ ~r/^run-name:.*inputs\.version/m
+    assert workflow =~ ~r/^permissions:\n  contents: read\n  packages: read\n/m
+    assert workflow =~ "FORNACAST_DATABASE_ADAPTER: postgres"
+    refute workflow =~ "FORNACAST_DATABASE_PATH"
+
+    assert workflow =~
+             ~r/release-smoke:\s*\n\s+name: Release Smoke\s*\n\s+runs-on: ubuntu-24\.04\s*\n\s+services:\s*\n\s+postgres:\s*\n\s+image: postgres:17\s*\n\s+env:\s*\n\s+POSTGRES_DB: fornacast_e2e\s*\n\s+POSTGRES_USER: fornacast\s*\n\s+POSTGRES_PASSWORD: fornacast_e2e_password\s*\n\s+ports:\s*\n\s+- 5432:5432\s*\n\s+options: >-\s*\n\s+--health-cmd "pg_isready -U fornacast -d fornacast_e2e"\s*\n\s+--health-interval 5s\s*\n\s+--health-timeout 5s\s*\n\s+--health-retries 20/s
+
+    assert workflow =~ "POSTGRES_HOST: 127.0.0.1"
+    assert workflow =~ ~r/POSTGRES_PORT: ["']5432["']/
+    assert workflow =~ "POSTGRES_DB: fornacast_e2e"
+    assert workflow =~ "POSTGRES_USER: fornacast"
+    assert workflow =~ "POSTGRES_PASSWORD: fornacast_e2e_password"
+
+    assert workflow =~
+             "FORNACAST_CONFIG_DATABASE_PATH=${GITHUB_WORKSPACE}/e2e-data/fornacast_config.db"
+
+    assert prepare_step =~
+             ~S|legacy_turso_path="${GITHUB_WORKSPACE}/e2e-data/missing-legacy.db"|
+
+    assert prepare_step =~ ~S|test ! -e "$legacy_turso_path"|
+
+    assert prepare_step =~
+             ~S|echo "FORNACAST_LEGACY_TURSO_DATABASE_PATH=$legacy_turso_path"|
+
+    refute workflow =~ "FORNACAST_ACKNOWLEDGE_LEGACY_TURSO_DATA"
+
+    assert_order(
+      prepare_step,
+      ~S|test ! -e "$legacy_turso_path"|,
+      "FORNACAST_LEGACY_TURSO_DATABASE_PATH"
+    )
+
+    assert_order(workflow, ~S|test ! -e "$legacy_turso_path"|, "- name: Start release")
+
+    assert workflow =~ "mix release fornacast --overwrite"
+    assert workflow =~ "gh release download \"v${VERSION}\""
+    assert workflow =~ "release/fornacast/bin/fornacast start"
+    assert workflow =~ ~s(curl -fsS "http://127.0.0.1:${PORT}/health")
+    assert workflow =~ ~s(curl -fsS "http://127.0.0.1:${FORNACAST_API_PORT}/health")
+    assert workflow =~ "release/fornacast/bin/fornacast rpc '"
+    assert workflow =~ "ssh://alice@127.0.0.1:${FORNACAST_SSH_PORT}/alice/demo.git"
+    assert workflow =~ ~s(grep -oE '<link[^>]*rel="stylesheet"[^>]*>')
+    assert workflow =~ ~s(grep -oE '<script[^>]*type="module"[^>]*>')
+    assert workflow =~ "timeout 45 release/fornacast/bin/fornacast stop"
+    assert workflow =~ "release/fornacast/bin/fornacast start > fornacast-restart.log"
+    assert workflow =~ "release_asset_storage_smoke.sh release/fornacast write"
+    assert workflow =~ "release_asset_storage_smoke.sh release/fornacast verify"
+  end
+
+  test "workflow dispatch normalizes one version for every published artifact selector" do
+    workflow = File.read!(@e2e_workflow)
+
+    resolve_step =
+      workflow_step!(workflow, "Resolve published release version", "Download release artifact")
+
+    download_step =
+      workflow_step!(workflow, "Download release artifact", "Extract release artifact")
+
+    extract_step = workflow_step!(workflow, "Extract release artifact", "Prepare e2e environment")
+
+    compose_step =
+      workflow_step!(workflow, "Verify default Compose distribution", "Stop release")
+
+    assert resolve_step =~ "if: github.event_name == 'workflow_dispatch'"
+    assert resolve_step =~ "id: dispatch_version"
+    assert resolve_step =~ ~s(VERSION_INPUT: ${{ inputs.version }})
+    assert resolve_step =~ ~S|version="$(scripts/resolve_release_version.sh "$VERSION_INPUT")"|
+    assert resolve_step =~ ~S|echo "version=$version" >> "$GITHUB_OUTPUT"|
+
+    assert length(:binary.matches(workflow, "scripts/resolve_release_version.sh")) == 1
+    assert length(:binary.matches(workflow, "inputs.version")) == 2
+
+    normalized_version = ~s(VERSION: ${{ steps.dispatch_version.outputs.version }})
+
+    assert length(:binary.matches(workflow, normalized_version)) == 3
+
+    for step <- [download_step, extract_step, compose_step] do
+      assert step =~ normalized_version
+      refute step =~ "inputs.version"
+    end
+
+    assert download_step =~ ~s(gh release download "v${VERSION}")
+    assert download_step =~ ~s(--pattern "fornacast-${VERSION}-linux-x86_64.tar.gz")
+
+    assert extract_step =~
+             ~s(tar -xzf "artifacts/fornacast-${VERSION}-linux-x86_64.tar.gz" -C release)
+
+    assert compose_step =~ ~s(export FORNACAST_IMAGE="ghcr.io/gsmlg-dev/fornacast:${VERSION}")
+    refute compose_step =~ "scripts/resolve_release_version.sh"
+  end
+
+  test "E2E proves the default Compose distribution independently" do
+    workflow = File.read!(@e2e_workflow)
+    compose_step = workflow_step!(workflow, "Verify default Compose distribution", "Stop release")
+
+    assert workflow =~
+             ~r/- name: Log in to GHCR for published image\s+if: github\.event_name == 'workflow_dispatch'\s+uses: docker\/login-action@v3\s+with:\s+registry: ghcr\.io\s+username: \$\{\{ github\.actor \}\}\s+password: \$\{\{ github\.token \}\}/s
+
+    assert compose_step =~
+             ~s(compose_project="fornacast-e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")
+
+    assert compose_step =~ "^fornacast-e2e-[0-9]+-[0-9]+$"
+    assert compose_step =~ "export COMPOSE_PROJECT_NAME=$compose_project"
+    assert compose_step =~ ~S|export SECRET_KEY_BASE="$(openssl rand -hex 32)"|
+    assert compose_step =~ "export POSTGRES_DB=fornacast_compose_e2e"
+    assert compose_step =~ "export POSTGRES_USER=fornacast"
+    assert compose_step =~ ~S|export POSTGRES_PASSWORD="$(openssl rand -hex 24)"|
+    assert compose_step =~ "trap cleanup EXIT"
+    assert compose_step =~ "docker compose down -v --remove-orphans"
+
+    assert compose_step =~ ~S|case "$GITHUB_EVENT_NAME" in|
+    assert compose_step =~ "pull_request)"
+    assert compose_step =~ "workflow_dispatch)"
+
+    assert compose_step =~ "docker build \\\n"
+    assert compose_step =~ "--build-arg FORNACAST_DATABASE_ADAPTER=postgres"
+    assert compose_step =~ ~s(--tag "fornacast-e2e:${GITHUB_SHA}")
+    assert compose_step =~ ~s(export FORNACAST_IMAGE="fornacast-e2e:${GITHUB_SHA}")
+    assert compose_step =~ ~s(export FORNACAST_IMAGE="ghcr.io/gsmlg-dev/fornacast:${VERSION}")
+
+    assert length(
+             :binary.matches(
+               compose_step,
+               "docker compose up -d --no-build --wait --wait-timeout 180"
+             )
+           ) == 2
+
+    assert length(
+             :binary.matches(compose_step, "scripts/api_proxy_smoke.sh http://127.0.0.1:4000")
+           ) ==
+             2
+
+    assert compose_step =~ "docker compose exec -T app /app/bin/fornacast rpc '"
+    assert compose_step =~ "ForgeAccounts.create_first_admin"
+    assert compose_step =~ "ForgeAccounts.create_api_key"
+    assert compose_step =~ "ForgeAccounts.create_ssh_key"
+    assert compose_step =~ "ForgeRepos.create_repository"
+    assert compose_step =~ "ssh://compose@127.0.0.1:2222/compose/compose-demo.git"
+    assert compose_step =~ "git -C compose-e2e/compose-demo push -u origin main"
+
+    assert compose_step =~
+             "docker compose exec -T app /app/bin/release_asset_storage_smoke /app write"
+
+    assert compose_step =~ ~S|mapfile -t old_app_ids < <(docker compose ps -q app)|
+    assert compose_step =~ ~S|test "${#old_app_ids[@]}" -eq 1|
+    assert compose_step =~ ~S|old_app_id="${old_app_ids[0]}"|
+    assert compose_step =~ "docker compose stop --timeout 45 app"
+
+    assert compose_step =~
+             ~S|test "$(docker container inspect -f '{{.State.Running}}' "$old_app_id")" = false|
+
+    assert compose_step =~
+             ~S|test "$(docker container inspect -f '{{.State.ExitCode}}' "$old_app_id")" = 0|
+
+    assert compose_step =~
+             ~S|test "$(docker container inspect -f '{{.State.OOMKilled}}' "$old_app_id")" = false|
+
+    assert compose_step =~ "docker compose rm -f app"
+    assert compose_step =~ ~S|! docker container inspect "$old_app_id" >/dev/null 2>&1|
+    assert compose_step =~ "docker compose up -d --no-build --wait --wait-timeout 180 app"
+    assert compose_step =~ "docker compose restart nginx"
+    assert compose_step =~ ~S|mapfile -t new_app_ids < <(docker compose ps -q app)|
+    assert compose_step =~ ~S|test "${#new_app_ids[@]}" -eq 1|
+    assert compose_step =~ ~S|new_app_id="${new_app_ids[0]}"|
+    assert compose_step =~ ~S|test "$new_app_id" != "$old_app_id"|
+    refute compose_step =~ "docker compose restart app"
+
+    assert compose_step =~
+             "docker compose exec -T app /app/bin/release_asset_storage_smoke /app verify"
+
+    refute compose_step =~ "docker run"
+
+    assert_order(compose_step, "esac", "docker compose up -d --no-build")
+    assert_order(compose_step, "create_api_key", "git -C compose-e2e/compose-demo push")
+    assert_order(compose_step, "git -C compose-e2e/compose-demo push", "/app write")
+    assert_order(compose_step, "/app write", "old_app_id=")
+    assert_order(compose_step, "old_app_id=", "docker compose stop --timeout 45 app")
+    assert_order(compose_step, ".State.OOMKilled", "docker compose rm -f app")
+
+    assert_order(
+      compose_step,
+      "docker compose rm -f app",
+      ~S|! docker container inspect "$old_app_id"|
+    )
+
+    assert_order(
+      compose_step,
+      ~S|! docker container inspect "$old_app_id"|,
+      "docker compose up -d --no-build --wait --wait-timeout 180 app"
+    )
+
+    [_, recreated_app] =
+      String.split(
+        compose_step,
+        "docker compose up -d --no-build --wait --wait-timeout 180 app",
+        parts: 2
+      )
+
+    assert_order(recreated_app, "docker compose restart nginx", "scripts/api_proxy_smoke.sh")
+    assert_order(compose_step, ~S|test "$new_app_id" != "$old_app_id"|, "/app verify")
+    assert_order(compose_step, "/app verify", "StrictHostKeyChecking=yes")
+  end
+
+  test "Compose image selection is mutually exclusive and fails closed by event" do
+    workflow = File.read!(@e2e_workflow)
+    compose_step = workflow_step!(workflow, "Verify default Compose distribution", "Stop release")
+
+    [selection, _running_proof] =
+      String.split(
+        compose_step,
+        "docker compose up -d --no-build --wait --wait-timeout 180\n",
+        parts: 2
+      )
+
+    [_, event_case] = String.split(selection, ~S|case "$GITHUB_EVENT_NAME" in|, parts: 2)
+
+    [pull_request_arm, dispatch_and_fallback] =
+      String.split(event_case, "workflow_dispatch)", parts: 2)
+
+    [dispatch_arm, fallback_arm] = String.split(dispatch_and_fallback, "*)", parts: 2)
+
+    assert pull_request_arm =~ "pull_request)"
+    assert pull_request_arm =~ "docker build"
+    assert pull_request_arm =~ ~s(export FORNACAST_IMAGE="fornacast-e2e:${GITHUB_SHA}")
+    refute pull_request_arm =~ "ghcr.io/gsmlg-dev/fornacast"
+
+    assert dispatch_arm =~ ~s(export FORNACAST_IMAGE="ghcr.io/gsmlg-dev/fornacast:${VERSION}")
+    refute dispatch_arm =~ "docker build"
+    refute dispatch_arm =~ "fornacast-e2e:${GITHUB_SHA}"
+
+    assert fallback_arm =~ "exit 64"
+    assert length(:binary.matches(compose_step, "docker build")) == 1
+
+    assert length(
+             :binary.matches(
+               compose_step,
+               ~s(export FORNACAST_IMAGE="fornacast-e2e:${GITHUB_SHA}")
+             )
+           ) == 1
+
+    assert length(
+             :binary.matches(
+               compose_step,
+               ~s(export FORNACAST_IMAGE="ghcr.io/gsmlg-dev/fornacast:${VERSION}")
+             )
+           ) == 1
+
+    assert_order(selection, "pull_request)", "workflow_dispatch)")
+    assert_order(selection, "workflow_dispatch)", "*)")
+    assert_order(selection, "*)", "esac")
   end
 
   test "Compose env template requires a generated 64-byte cookie secret" do
@@ -374,17 +647,28 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert workflow =~
              ~s(FORNACAST_IMAGE=ghcr.io/gsmlg-dev/fornacast@${{ steps.docker.outputs.digest }})
 
-    assert workflow =~ "supports Turso/libSQL only"
-    assert workflow =~ "PostgreSQL requires a source build"
-    assert workflow =~ "`FORNACAST_DATABASE_ADAPTER=postgres`"
+    assert workflow =~ "PostgreSQL 17"
+    assert workflow =~ "supported domain database"
+    assert workflow =~ "POSTGRES_DB"
+    assert workflow =~ "POSTGRES_USER"
+    assert workflow =~ "POSTGRES_PASSWORD"
+    assert workflow =~ "FORNACAST_ACKNOWLEDGE_LEGACY_TURSO_DATA=true"
+    assert workflow =~ "does not automatically migrate"
+    assert workflow =~ "scripts/compose_backup.sh"
+    assert workflow =~ "scripts/compose_restore.sh"
+    assert workflow =~ "paired backup"
     assert workflow =~ "docker compose pull app nginx"
     assert workflow =~ "docker compose up -d --no-build"
     assert workflow =~ "keep public port `4000` blocked"
     assert workflow =~ "locally or through an SSH tunnel"
     assert workflow =~ "Do not publish ports `4890` or `4891` directly."
 
-    assert workflow =~
-             "The `fornacast-data` volume is mounted at `/data` and persists the Ecto database, Concord config, repositories, and SSH keys."
+    assert workflow =~ "`postgres-data`"
+    assert workflow =~ "PostgreSQL domain database"
+    assert workflow =~ "`fornacast-data`"
+    assert workflow =~ "repositories, SSH keys, LocalCAS release assets, and Concord"
+    refute workflow =~ "supports Turso/libSQL only"
+    refute workflow =~ "PostgreSQL requires a source build"
 
     assert workflow =~ "`/setup`"
     assert_order(workflow, "keep public port `4000` blocked", "docker compose up -d --no-build")
@@ -472,44 +756,38 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert e2e =~ "release/fornacast/bin/fornacast rpc '"
     refute e2e =~ "release/fornacast/bin/fornacast eval '"
     refute e2e =~ "Enum.each([:git_core, :fornacast, :forge_accounts, :forge_repos]"
-    assert e2e =~ "fornacast.localcas.owner"
-    assert e2e =~ "docker stop --time 45"
-    assert e2e =~ ~s({{.State.ExitCode}})
-    assert e2e =~ ~s({{.State.OOMKilled}})
-    assert e2e =~ ~s(docker rm "$container")
-    assert length(:binary.matches(e2e, "true = Node.self() == :\"fornacast@127.0.0.1\"")) == 2
+    assert e2e =~ "docker compose exec -T app /app/bin/release_asset_storage_smoke /app write"
+    assert e2e =~ "docker compose exec -T app /app/bin/release_asset_storage_smoke /app verify"
+    assert e2e =~ "docker compose stop --timeout 45 app"
+    assert e2e =~ "docker compose rm -f app"
+    assert e2e =~ "docker compose up -d --no-build --wait --wait-timeout 180 app"
+    refute e2e =~ "docker compose restart app"
+    assert e2e =~ "docker compose down -v --remove-orphans"
 
     assert length(
              :binary.matches(
                e2e,
                "true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000)"
              )
-           ) == 4
+           ) == 2
 
     assert length(
              :binary.matches(
                e2e,
                "true = ForgeReleases.AssetStorage.Manager.ready?()"
              )
-           ) == 4
+           ) == 2
 
     assert length(:binary.matches(e2e, "true = Node.self() == :\"fornacast_e2e@127.0.0.1\"")) ==
              2
 
-    assert length(:binary.matches(e2e, ~s(          run_container\n))) == 2
-    assert e2e =~ ~s(-v "$volume:/data")
-    assert e2e =~ "-e FORNACAST_SSH_HOST=localhost"
-    assert e2e =~ "-e FORNACAST_SSH_PORT=2222"
     assert e2e =~ "s3_package=\"$(find release/fornacast/lib"
     assert e2e =~ "listeners=\"$(ss -ltn)\""
-    assert e2e =~ "published_ports=\"$(docker port \"$container\")\""
     refute e2e =~ "test -z \"$(find release/fornacast/lib"
     refute e2e =~ "! ss -ltn |"
-    refute e2e =~ "test -z \"$(docker port \"$container\")\""
     refute e2e =~ "ss -ltnp"
     refute e2e =~ "| grep true"
-    refute e2e =~ "docker restart"
-    refute e2e =~ ~s(docker start "$container")
+    refute e2e =~ "docker run"
     refute e2e =~ "RELEASE_COOKIE"
     refute dockerfile =~ "RELEASE_COOKIE"
     refute compose =~ "RELEASE_COOKIE"
@@ -520,32 +798,12 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert_order(e2e, "release/fornacast write", "release/fornacast verify")
     assert_order(e2e, "- name: Start release", "- name: Seed release data")
     assert_order(e2e, "- name: Wait for health", "- name: Seed release data")
-    assert_order(e2e, "docker stop --time 45", ~s(docker rm "$container"))
-
-    [_, recreate_sequence] = String.split(e2e, "docker stop --time 45", parts: 2)
+    assert_order(e2e, "/app write", "docker compose stop --timeout 45 app")
 
     assert_order(
-      recreate_sequence,
-      ~s({{.State.OOMKilled}}),
-      ~S|test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"|
-    )
-
-    assert_order(
-      recreate_sequence,
-      ~S|test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"|,
-      ~s(docker rm "$container")
-    )
-
-    assert_order(
-      recreate_sequence,
-      ~s(docker rm "$container"),
-      ~s(! docker container inspect "$container" >/dev/null 2>&1)
-    )
-
-    assert_order(
-      recreate_sequence,
-      ~s(! docker container inspect "$container" >/dev/null 2>&1),
-      ~s(          run_container\n)
+      e2e,
+      "docker compose up -d --no-build --wait --wait-timeout 180 app",
+      "/app verify"
     )
   end
 
@@ -570,6 +828,11 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
   defp assert_order(source, first, second) do
     assert position!(source, first) < position!(source, second),
            "expected #{inspect(first)} to appear before #{inspect(second)}"
+  end
+
+  defp workflow_step!(workflow, name, next_name) do
+    [_, step] = String.split(workflow, "- name: #{name}", parts: 2)
+    step |> String.split("- name: #{next_name}", parts: 2) |> hd()
   end
 
   defp compose_service!(compose, name) do
