@@ -6,13 +6,22 @@
 
 **Architecture:** Git transfer runs through a supervised `GitCore.Remote` process-group boundary and writes only to an `importing` shadow repository with a new opaque storage path. Publication atomically activates that row; replacement tombstones the exact approved repository, preserves local authorization, and never mutates live Git storage in place.
 
-**Tech Stack:** Elixir 1.20, OTP 29, Ecto 3.14, git CLI, erlexec 2.3.4, Turso/PostgreSQL, Phoenix 1.8, PhoenixDuskmoon 9.12
+**Tech Stack:** Elixir 1.20, OTP 29, Ecto 3.14, git CLI, erlexec 2.3.4, PostgreSQL 17, dormant compile-only Turso Ecto compatibility, Phoenix 1.8, PhoenixDuskmoon 9.12
 
 ---
 
 **Prerequisite:** Complete `docs/superpowers/plans/2026-08-25-github-import-foundation.md` first.
 
 **Design:** `docs/superpowers/specs/2026-08-25-github-repository-organization-import-design.md`
+
+**Database acceptance boundary (2026-08-29):** PostgreSQL 17 is the required
+domain database for all remaining implementation and release gates. Use
+`FORNACAST_DATABASE_ADAPTER=postgres` with an isolated `MIX_BUILD_PATH` and
+`PGPORT=55432` for every database-backed command. Turso Ecto support is dormant
+compile-only compatibility: do not run it as milestone acceptance and do not
+weaken migrations or tests for it. Historical completed Turso evidence below is
+retained only as history; every remaining unchecked gate in this plan is
+PostgreSQL-only.
 
 **Milestone boundary:** This plan implements and tests publication mechanics, but no production item reaches `ready_to_publish` and the web start action remains unavailable. `2026-08-25-github-metadata-import.md` stages supported metadata, enables start, and opens the publication gate so a code-only import can never become visible.
 
@@ -22,7 +31,7 @@
 devenv shell -- nix shell nixpkgs#expect -c unbuffer mix <task-and-arguments>
 ```
 
-Run focused database suites with `--max-cases 1` to avoid unrelated Turso file-lock contention.
+Run focused PostgreSQL database suites with `--max-cases 1`.
 
 `erlexec` 2.3.4 was verified from its current Hex package and is used specifically for process-group monitoring, stdin, timeout, and descendant termination: [erlexec documentation](https://hexdocs.pm/erlexec/readme.html).
 
@@ -62,12 +71,13 @@ test "import changeset requires importing lifecycle and a positive generation" d
 end
 ```
 
-Also assert database rejection for an unknown lifecycle and generation zero on both adapters.
+Also assert PostgreSQL 17 rejection for an unknown lifecycle and generation zero
+using the isolated PostgreSQL acceptance build.
 
 - [ ] **Step 2: Run before migration**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/repository_lifecycle_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/repository_lifecycle_test.exs --max-cases 1
 ```
 
 Expected: FAIL because the fields are absent.
@@ -103,8 +113,8 @@ field :storage_reclaimed_at, :utc_datetime
 - [ ] **Step 4: Migrate and test**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix ecto.migrate
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/repository_lifecycle_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix ecto.migrate
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/repository_lifecycle_test.exs --max-cases 1
 ```
 
 Expected: all lifecycle tests pass.
@@ -150,7 +160,7 @@ end
 - [ ] **Step 2: Run focused domain tests and observe hidden rows leaking**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/forge_repos_test.exs apps/forge_repos/test/access_test.exs apps/forge_issues/test/forge_issues_test.exs apps/forge_pulls/test/merge_reconciler_test.exs apps/fornacast_api/test/repositories_test.exs apps/fornacast_api/test/users_organizations_test.exs apps/fornacast_api/test/graphql_test.exs apps/fornacast_web/test/repository_controller_test.exs apps/fornacast_web/test/fornacast_web_test.exs apps/git_transport/test/git_transport_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/forge_repos_test.exs apps/forge_repos/test/access_test.exs apps/forge_issues/test/forge_issues_test.exs apps/forge_pulls/test/merge_reconciler_test.exs apps/fornacast_api/test/repositories_test.exs apps/fornacast_api/test/users_organizations_test.exs apps/fornacast_api/test/graphql_test.exs apps/fornacast_web/test/repository_controller_test.exs apps/fornacast_web/test/fornacast_web_test.exs apps/git_transport/test/git_transport_test.exs --max-cases 1
 ```
 
 Expected: FAIL where queries currently filter only `deleted_at`.
@@ -181,7 +191,7 @@ Direct `Fornacast.Access.allowed?/3` rejects a non-ready/deleted struct before r
 - [ ] **Step 4: Run the visibility matrix**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/forge_repos_test.exs apps/forge_repos/test/access_test.exs apps/forge_issues/test/forge_issues_test.exs apps/forge_pulls/test/merge_reconciler_test.exs apps/fornacast_api/test/repositories_test.exs apps/fornacast_api/test/users_organizations_test.exs apps/fornacast_api/test/graphql_test.exs apps/fornacast_web/test/repository_controller_test.exs apps/fornacast_web/test/fornacast_web_test.exs apps/git_transport/test/git_transport_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/forge_repos_test.exs apps/forge_repos/test/access_test.exs apps/forge_issues/test/forge_issues_test.exs apps/forge_pulls/test/merge_reconciler_test.exs apps/fornacast_api/test/repositories_test.exs apps/fornacast_api/test/users_organizations_test.exs apps/fornacast_api/test/graphql_test.exs apps/fornacast_web/test/repository_controller_test.exs apps/fornacast_web/test/fornacast_web_test.exs apps/git_transport/test/git_transport_test.exs --max-cases 1
 ```
 
 Expected: all tests pass.
@@ -240,7 +250,7 @@ Also block receive-pack after its native ref update and prove publication cannot
 - [ ] **Step 2: Run and verify the stale writer reaches the old path**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/repository_write_fence_test.exs apps/git_transport/test/receive_pack_fence_test.exs apps/fornacast_web/test/git_http_push_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/repository_write_fence_test.exs apps/git_transport/test/receive_pack_fence_test.exs apps/fornacast_web/test/git_http_push_test.exs --max-cases 1
 ```
 
 Expected: FAIL because `with_write_fence/3` trusts the preloaded struct and receive-pack records its push only after releasing the fence.
@@ -274,7 +284,7 @@ HTTP derives a bounded opaque operation-batch ID from a domain-separated hash of
 - [ ] **Step 4: Run every affected writer/recovery suite**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/repository_write_fence_test.exs apps/forge_repos/test/git_writes_test.exs apps/forge_repos/test/git_write_recovery_test.exs apps/forge_pulls/test/merge_recovery_test.exs apps/git_core/test/limits_test.exs apps/git_transport/test/receive_pack_fence_test.exs apps/git_transport/test/git_transport_test.exs apps/fornacast_web/test/git_http_push_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test/repository_write_fence_test.exs apps/forge_repos/test/git_writes_test.exs apps/forge_repos/test/git_write_recovery_test.exs apps/forge_pulls/test/merge_recovery_test.exs apps/git_core/test/limits_test.exs apps/git_transport/test/receive_pack_fence_test.exs apps/git_transport/test/git_transport_test.exs apps/fornacast_web/test/git_http_push_test.exs --max-cases 1
 ```
 
 Expected: all tests pass and no callback observes the tombstoned path.
@@ -331,7 +341,7 @@ assert {:ok, %GitCore.Remote.Result{empty?: false}} =
 - [ ] **Step 2: Run and verify `GitCore.Remote` is missing**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/git_core/test/remote_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/git_core/test/remote_test.exs --max-cases 1
 ```
 
 Expected: FAIL with undefined module.
@@ -383,7 +393,7 @@ Install `git` in the final Docker image and set `SHELL=/bin/sh` for erlexec. Pro
 - [ ] **Step 4: Run remote tests and existing GitCore smoke tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/git_core/test/remote_test.exs apps/git_core/test/git_core_test.exs apps/git_core/test/limits_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/git_core/test/remote_test.exs apps/git_core/test/git_core_test.exs apps/git_core/test/limits_test.exs --max-cases 1
 ```
 
 Expected: all tests pass; cancellation kills the fake descendant.
@@ -433,7 +443,7 @@ assert frozen.repositories |> hd() |> Map.take([:replacement_repository_id, :rep
 - [ ] **Step 2: Run and verify conflict APIs are absent**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/conflicts_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/conflicts_test.exs --max-cases 1
 ```
 
 Expected: FAIL with missing conflict functions.
@@ -460,7 +470,7 @@ Destination drift later closes only the exact running attempt as `destination_ch
 - [ ] **Step 4: Run conflict and persistence tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/conflicts_test.exs apps/forge_imports/test/import_persistence_test.exs apps/forge_imports/test/import_persistence_concurrency_test.exs apps/forge_imports/test/run_view_consistency_test.exs apps/forge_repos/test/repository_lifecycle_test.exs apps/forge_repos/test/git_write_recovery_test.exs apps/forge_pulls/test/merge_recovery_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/conflicts_test.exs apps/forge_imports/test/import_persistence_test.exs apps/forge_imports/test/import_persistence_concurrency_test.exs apps/forge_imports/test/run_view_consistency_test.exs apps/forge_repos/test/repository_lifecycle_test.exs apps/forge_repos/test/git_write_recovery_test.exs apps/forge_pulls/test/merge_recovery_test.exs --max-cases 1
 ```
 
 Expected: all tests pass.
@@ -502,7 +512,7 @@ Test transactional activation of a frozen new organization before any shadow, sh
 - [ ] **Step 2: Run the worker tests before implementation**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/repository_worker_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/repository_worker_test.exs --max-cases 1
 ```
 
 Expected: FAIL with missing stager/worker.
@@ -547,7 +557,7 @@ On Remote success, recheck cancellation and lease, run bounded default-tree LFS/
 - [ ] **Step 4: Run worker, remote, and visibility tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/repository_worker_test.exs apps/forge_imports/test/discovery_recovery_test.exs apps/forge_accounts/test/forge_accounts_test.exs apps/git_core/test/remote_test.exs apps/forge_repos/test/repository_lifecycle_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/repository_worker_test.exs apps/forge_imports/test/discovery_recovery_test.exs apps/forge_accounts/test/forge_accounts_test.exs apps/git_core/test/remote_test.exs apps/forge_repos/test/repository_lifecycle_test.exs --max-cases 1
 ```
 
 Expected: all tests pass.
@@ -690,8 +700,8 @@ The RED matrix must prove:
   drift never combine an old parent count/state with a newly published or reopened
   child: in `run_view_consistency_test.exs`, reuse the Repo telemetry pause after the
   parent-run read, commit publication or drift before releasing the reader, and
-  assert the final parent `lock_version` check retries to the wholly new view on
-  both adapters;
+  assert the final parent `lock_version` check retries to the wholly new view
+  under concurrent PostgreSQL reads;
 - destination drift closes only the current attempt, clears publication intent and
   lease, preserves that predecessor, and creates attempt `n + 1` on resolution;
   the successor resumes at `ready_to_publish` with an exact hidden repository, Git
@@ -700,13 +710,13 @@ The RED matrix must prove:
 - request metadata, evidence, audit metadata, `Inspect`, errors, and public return
   values expose no PAT, authorization header, credential envelope, absolute storage
   path, or caller-controlled operation ID; and
-- all admission, rollback, replay, audit-collision, and concurrency cases run on
-  Turso and PostgreSQL.
+- all admission, rollback, replay, audit-collision, and concurrency cases prove
+  PostgreSQL locking, transaction, constraint, and replay behavior.
 
 - [ ] **Step 2: Run before publisher exists**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/repository_publication_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/repository_publication_test.exs --max-cases 1
 ```
 
 Expected: FAIL with missing publication API.
@@ -968,27 +978,7 @@ closed. The current successor decision controls activation generation, so a chan
 create/rename/replace choice can reuse the same valid shadow. Preserve every prior
 attempt.
 
-- [ ] **Step 6: Run the focused Turso publication suite**
-
-```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
-  apps/forge_imports/test/repository_publication_test.exs \
-  apps/forge_imports/test/conflicts_test.exs \
-  apps/forge_imports/test/import_persistence_test.exs \
-  apps/forge_imports/test/import_persistence_concurrency_test.exs \
-  apps/forge_imports/test/run_view_consistency_test.exs \
-  apps/forge_imports/test/repository_worker_test.exs \
-  apps/forge_repos/test/repository_lifecycle_test.exs \
-  apps/forge_repos/test/repository_write_fence_test.exs \
-  apps/forge_repos/test/git_write_recovery_test.exs \
-  apps/forge_pulls/test/merge_recovery_test.exs \
-  --max-cases 1
-```
-
-Expected: all focused tests pass; every failed publication leaves the old repository
-ready and the shadow importing, and committed replay performs no writes.
-
-- [ ] **Step 7: Run the same publication suite on PostgreSQL**
+- [ ] **Step 6: Run the focused PostgreSQL publication suite**
 
 ```bash
 devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres \
@@ -1007,10 +997,12 @@ devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres \
   --max-cases 1
 ```
 
-Expected: the same lease, lock, rollback, audit, replay, and handoff assertions pass
-on PostgreSQL.
+Expected: all focused tests pass on PostgreSQL; every failed publication leaves
+the old repository ready and the shadow importing, committed replay performs no
+writes, and PostgreSQL lease, row-lock, rollback, audit, replay, and handoff
+behavior is proven.
 
-- [ ] **Step 8: Commit publication**
+- [ ] **Step 7: Commit publication**
 
 ```bash
 git add apps/forge_imports apps/forge_repos apps/forge_pulls/test/merge_recovery_test.exs
@@ -1144,7 +1136,9 @@ the cache process is absent or crashes.
 - [ ] **Step 8A.2: Run the RED tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres \
+  MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 \
+  nix shell nixpkgs#expect -c unbuffer mix test \
   apps/git_core/test/anchored_remove_test.exs \
   apps/git_core/test/native_surface_test.exs \
   apps/git_core/test/repository_read_model_test.exs \
@@ -1303,7 +1297,7 @@ of the strict form.
 devenv shell -- cargo test \
   --manifest-path apps/git_core/native/fornacast_git_core/Cargo.toml \
   anchored_remove -- --nocapture
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test \
   apps/git_core/test/anchored_remove_test.exs \
   apps/git_core/test/native_surface_test.exs \
   apps/git_core/test/repository_read_model_test.exs \
@@ -1400,7 +1394,7 @@ make ordinary writers acquire the new limiter.
 - [ ] **Step 8B.2: Run the limiter RED tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test \
   apps/git_core/test/repository_read_limiter_test.exs \
   --max-cases 1
 ```
@@ -1540,7 +1534,7 @@ lease, and close is idempotent across success, raised callback, and owner death.
 - [ ] **Step 8B.5: Run GREEN read-path tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test \
   apps/git_core/test/repository_read_limiter_test.exs \
   apps/forge_repos/test/repository_read_handle_test.exs \
   apps/forge_repos/test/repository_read_callsite_audit_test.exs \
@@ -1673,27 +1667,30 @@ both non-null, and terminal rows retain neither. Implement exact adapter-specifi
 rollback guard required by `gsmlg-dev/concord#81`; do not open a new upstream issue
 for this approved slice.
 
-Test every cleanup state/evidence/lease combination at the changeset and database
-levels on Turso and PostgreSQL. `Inspect` must redact `evidence`, `last_error`, and
+Test every cleanup state/evidence/lease combination at the changeset and PostgreSQL
+17 database levels using the isolated PostgreSQL acceptance build. `Inspect` must
+redact `evidence`, `last_error`, and
 every path-bearing field. Add `states/0` and `terminal_states/0` to
 `GitWriteOperation` and `MergeOperation` so `OperationLease.claim/5` returns
 `:busy` for terminal rows. Verify existing live nonterminal claims still work and
-one-sided or terminal retained leases are rejected by both databases. Include
-valid present root+target evidence, valid initial-absence evidence, missing
+one-sided or terminal retained leases are rejected by PostgreSQL constraints.
+Include valid present root+target evidence, valid initial-absence evidence, missing
 present-root or present-target failures, present/absence mutual-exclusion
 failures, mismatched absolute/relative joins, malformed canonical segments,
 absence without ordered effect timestamps, and complete present/absence-proof rows
-in both adapter migration/schema matrices. Application tests separately cover
+in the PostgreSQL migration/schema matrix. Application tests separately cover
 live-config root drift because the database does not own runtime configuration.
 In `remote_test.exs`, prove two canonical absolute requested destinations with the
 same basename under different parents produce different slots, a real Remote
 quarantine round-trips through the helper, and a slot derived from basename alone
 is rejected by CleanupOperation application validation.
 
-- [ ] **Step 8C.2: Run the Turso RED suite**
+- [ ] **Step 8C.2: Run the PostgreSQL RED suite**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres \
+  MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 \
+  nix shell nixpkgs#expect -c unbuffer mix test \
   apps/forge_imports/test/cleanup_operation_test.exs \
   apps/forge_imports/test/cleanup_recovery_migration_test.exs \
   apps/git_core/test/remote_test.exs \
@@ -1905,21 +1902,9 @@ Test both race winners: adoption first prevents intent; intent first prevents
 successor creation/adoption. A complete journal remains a permanent adoption
 barrier.
 
-- [ ] **Step 8C.6: Run both-adapter GREEN persistence suites**
+- [ ] **Step 8C.6: Run the PostgreSQL GREEN persistence suite**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
-  apps/forge_imports/test/cleanup_operation_test.exs \
-  apps/forge_imports/test/cleanup_recovery_migration_test.exs \
-  apps/git_core/test/remote_test.exs \
-  apps/forge_imports/test/import_persistence_test.exs \
-  apps/forge_imports/test/import_persistence_concurrency_test.exs \
-  apps/forge_imports/test/conflicts_test.exs \
-  apps/forge_imports/test/repository_publication_test.exs \
-  apps/forge_repos/test/git_writes_test.exs \
-  apps/forge_repos/test/git_write_recovery_test.exs \
-  apps/forge_pulls/test/merge_recovery_test.exs \
-  --max-cases 1
 devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres \
   MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 \
   nix shell nixpkgs#expect -c unbuffer mix test \
@@ -1936,8 +1921,9 @@ devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres \
   --max-cases 1
 ```
 
-Expected: both commands pass the schema/check/index lifecycle, terminal-claim
-rejection, exact evidence, safety-port failure, and adoption-intent race matrix.
+Expected: the PostgreSQL suite proves migration up/down, schema checks, index
+lifecycle, terminal-claim rejection, locking, exact evidence, safety-port failure,
+audit/replay behavior, and the adoption-intent state-transition race matrix.
 
 - [ ] **Step 8C.7: Commit durable cleanup intent**
 
@@ -2059,7 +2045,7 @@ other kinds.
 - [ ] **Step 8D.2: Run the cleanup RED tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test \
   apps/forge_imports/test/repository_cleanup_test.exs \
   apps/forge_imports/test/cleanup_reconciler_test.exs \
   --max-cases 1
@@ -2339,12 +2325,14 @@ Use these outcomes:
   config. Any root or config/path mismatch is `cleanup_blocked`. Never recreate or
   rediscover the path.
 
-- [ ] **Step 8D.8: Run focused Turso cleanup and read/write race suites**
+- [ ] **Step 8D.8: Run the focused PostgreSQL cleanup and read/write race suites**
 
 Run these commands serially:
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres \
+  MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 \
+  nix shell nixpkgs#expect -c unbuffer mix test \
   apps/git_core/test/anchored_remove_test.exs \
   apps/git_core/test/repository_read_limiter_test.exs \
   apps/git_core/test/limits_test.exs \
@@ -2360,31 +2348,6 @@ devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
   apps/fornacast_web/test/repository_controller_test.exs \
   apps/fornacast_web/test/repository_page_test.exs \
   --max-cases 1
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test \
-  apps/forge_imports/test/cleanup_operation_test.exs \
-  apps/forge_imports/test/cleanup_recovery_migration_test.exs \
-  apps/forge_imports/test/repository_cleanup_test.exs \
-  apps/forge_imports/test/cleanup_reconciler_test.exs \
-  apps/forge_imports/test/repository_worker_test.exs \
-  apps/forge_imports/test/repository_publication_test.exs \
-  apps/forge_imports/test/import_persistence_test.exs \
-  apps/forge_imports/test/import_persistence_concurrency_test.exs \
-  apps/forge_imports/test/conflicts_test.exs \
-  apps/forge_repos/test/repository_lifecycle_test.exs \
-  apps/forge_repos/test/git_writes_test.exs \
-  apps/forge_repos/test/git_write_recovery_test.exs \
-  apps/forge_pulls/test/merge_recovery_test.exs \
-  --max-cases 1
-```
-
-Expected: both commands exit zero. The matrix proves all path/identity cases,
-lease and limiter races, old-reader behavior, strict cache invalidation, crash
-replay, fairness/backoff, Remote retry/terminal settlement, and no premature
-audit/reclaimed marker.
-
-- [ ] **Step 8D.9: Run the same database suites on PostgreSQL**
-
-```bash
 devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres \
   MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 \
   nix shell nixpkgs#expect -c unbuffer mix test \
@@ -2404,15 +2367,17 @@ devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres \
   --max-cases 1
 ```
 
-Expected: zero failures with the isolated PostgreSQL build; migration up/down,
-checks, indexes, OperationLease exclusion, locking, replay, audits, and cleanup
-state transitions match Turso.
+Expected: both PostgreSQL commands exit zero. The matrix proves migration up/down,
+checks, indexes, OperationLease exclusion, row locking, all path/identity cases,
+lease and limiter races, old-reader behavior, strict cache invalidation, crash
+replay, audit exactness, cleanup state transitions, fairness/backoff, Remote
+retry/terminal settlement, and no premature audit/reclaimed marker.
 
-- [ ] **Step 8D.10: Run final scoped static verification**
+- [ ] **Step 8D.9: Run final scoped static verification**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix format --check-formatted
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix compile --warnings-as-errors
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix format --check-formatted
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix compile --warnings-as-errors
 git diff --check
 git diff --stat HEAD~3
 git diff HEAD~3 -- \
@@ -2430,7 +2395,7 @@ Expected: format, warnings-as-errors, and diff checks pass. Do not run broad
 unrelated suites. If an existing out-of-scope warning or failure appears, record
 its exact command and output and stop without modifying unrelated files.
 
-- [ ] **Step 8D.11: Commit cleanup orchestration**
+- [ ] **Step 8D.10: Commit cleanup orchestration**
 
 ```bash
 git add \
@@ -2475,7 +2440,7 @@ Cover typed replacement confirmation, rename/skip, review summary, explicit abse
 - [ ] **Step 2: Run web tests before actions/routes exist**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/fornacast_web/test/repository_import_controller_test.exs apps/fornacast_web/test/organization_controller_test.exs apps/fornacast_web/test/import_html_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/fornacast_web/test/repository_import_controller_test.exs apps/fornacast_web/test/organization_controller_test.exs apps/fornacast_web/test/import_html_test.exs --max-cases 1
 ```
 
 Expected: FAIL for missing conflict/review actions and current private namespace listing.
@@ -2493,7 +2458,7 @@ Show the frozen review with a clear unavailable start state until metadata impor
 - [ ] **Step 4: Run the focused web matrix**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/fornacast_web/test/repository_import_controller_test.exs apps/fornacast_web/test/organization_controller_test.exs apps/fornacast_web/test/import_html_test.exs apps/fornacast_web/test/repository_controller_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/fornacast_web/test/repository_import_controller_test.exs apps/fornacast_web/test/organization_controller_test.exs apps/fornacast_web/test/import_html_test.exs apps/fornacast_web/test/repository_controller_test.exs --max-cases 1
 ```
 
 Expected: all tests pass.
@@ -2519,25 +2484,24 @@ Use an injected GitHub client plus local Git source fixture. Prove saved/one-tim
 - [ ] **Step 2: Run the integration test and close only milestone defects**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/repository_import_integration_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/repository_import_integration_test.exs --max-cases 1
 ```
 
 Expected: 0 failures.
 
-- [ ] **Step 3: Run all focused Turso suites serially**
+- [ ] **Step 3: Run all focused PostgreSQL suites serially**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/git_core/test/remote_test.exs apps/forge_repos/test apps/forge_imports/test apps/fornacast_web/test/repository_import_controller_test.exs apps/fornacast_web/test/organization_controller_test.exs apps/fornacast_web/test/repository_controller_test.exs apps/fornacast_api/test/repositories_test.exs apps/fornacast_api/test/graphql_test.exs apps/git_transport/test --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/git_core/test/remote_test.exs apps/forge_repos/test apps/forge_imports/test apps/fornacast_web/test/repository_import_controller_test.exs apps/fornacast_web/test/organization_controller_test.exs apps/fornacast_web/test/repository_controller_test.exs apps/fornacast_api/test/repositories_test.exs apps/fornacast_api/test/graphql_test.exs apps/git_transport/test --max-cases 1
 ```
 
 Expected: 0 failures.
 
-- [ ] **Step 4: Run formatter, compile, and PostgreSQL persistence/publication suites**
+- [ ] **Step 4: Run formatter and warnings-as-errors**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix format --check-formatted
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix compile --warnings-as-errors
-devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres nix shell nixpkgs#expect -c unbuffer mix test apps/forge_repos/test apps/forge_imports/test apps/fornacast_web/test/repository_import_controller_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix format --check-formatted
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix compile --warnings-as-errors
 ```
 
 Expected: every command exits 0.

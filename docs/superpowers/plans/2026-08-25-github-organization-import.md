@@ -6,13 +6,22 @@
 
 **Architecture:** The database is authoritative for every run/item phase and terminal report. A small reconciler GenServer schedules bounded `Task.Supervisor.async_nolink` workers that claim item leases; organization imports aggregate per-repository outcomes without making the whole organization atomic.
 
-**Tech Stack:** Elixir 1.20, OTP 29, Ecto 3.14, Task.Supervisor, Fornacast.OperationLease, Req 0.7/Req.Test, git/erlexec, Turso/PostgreSQL, Phoenix 1.8, PhoenixDuskmoon 9.12, telemetry 1.4
+**Tech Stack:** Elixir 1.20, OTP 29, Ecto 3.14, Task.Supervisor, Fornacast.OperationLease, Req 0.7/Req.Test, git/erlexec, PostgreSQL 17, dormant compile-only Turso Ecto compatibility, Phoenix 1.8, PhoenixDuskmoon 9.12, telemetry 1.4
 
 ---
 
 **Prerequisite:** Complete `2026-08-25-github-metadata-import.md` first.
 
 **Design:** `docs/superpowers/specs/2026-08-25-github-repository-organization-import-design.md`
+
+**Database acceptance boundary (2026-08-29):** PostgreSQL 17 is the required
+domain database for all remaining implementation and release gates. Use
+`FORNACAST_DATABASE_ADAPTER=postgres` with an isolated `MIX_BUILD_PATH` and
+`PGPORT=55432` for every database-backed command. Turso Ecto support is dormant
+compile-only compatibility: do not run it as milestone acceptance and do not
+weaken migrations or tests for it. Historical completed Turso evidence below is
+retained only as history; every remaining unchecked gate in this plan is
+PostgreSQL-only.
 
 **Command convention:** Prefix Mix commands with:
 
@@ -62,7 +71,7 @@ assert ForgeAccounts.list_user_organizations(other_github_member) == []
 - [ ] **Step 2: Run the organization orchestration test before implementation**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/organization_orchestration_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/organization_orchestration_test.exs --max-cases 1
 ```
 
 Expected: FAIL because organization plan activation is absent.
@@ -86,7 +95,7 @@ Each repository remains an independent item. A later item failure never deletes 
 - [ ] **Step 4: Run organization and account tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/organization_orchestration_test.exs apps/forge_accounts/test/forge_accounts_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/organization_orchestration_test.exs apps/forge_accounts/test/forge_accounts_test.exs --max-cases 1
 ```
 
 Expected: all tests pass.
@@ -129,7 +138,7 @@ assert eventually(fn -> recovered_from_checkpoint?(item.id) end)
 - [ ] **Step 2: Run recovery tests and expose current one-scan limitations**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/recovery_supervisor_test.exs apps/forge_imports/test/reconciler_test.exs apps/forge_imports/test/worker_recovery_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/recovery_supervisor_test.exs apps/forge_imports/test/reconciler_test.exs apps/forge_imports/test/worker_recovery_test.exs --max-cases 1
 ```
 
 Expected: FAIL for unhandled phases and missing bounded worker tracking.
@@ -153,7 +162,7 @@ Recovery classifies from staged bare validation, committed mappings/checkpoints,
 - [ ] **Step 4: Run recovery and operation-lease suites**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/recovery_supervisor_test.exs apps/forge_imports/test/reconciler_test.exs apps/forge_imports/test/worker_recovery_test.exs apps/fornacast/test/operation_lease_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/recovery_supervisor_test.exs apps/forge_imports/test/reconciler_test.exs apps/forge_imports/test/worker_recovery_test.exs apps/fornacast/test/operation_lease_test.exs --max-cases 1
 ```
 
 Expected: all tests pass.
@@ -189,7 +198,7 @@ assert Scheduler.claimable?(waiting, ~U[2026-08-25 11:00:00Z])
 - [ ] **Step 2: Run and verify wait transitions are incomplete**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/waits_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/waits_test.exs --max-cases 1
 ```
 
 Expected: FAIL because `Waits` is missing.
@@ -210,7 +219,7 @@ Replacement credentials must verify the same GitHub numeric account before resum
 - [ ] **Step 4: Run waits, accounts, and scheduler tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/waits_test.exs apps/forge_imports/test/github_accounts_test.exs apps/forge_imports/test/reconciler_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/waits_test.exs apps/forge_imports/test/github_accounts_test.exs apps/forge_imports/test/reconciler_test.exs --max-cases 1
 ```
 
 Expected: all tests pass.
@@ -241,7 +250,7 @@ Cover discovery, queued, Git, metadata page, ready-to-publish, publishing race, 
 - [ ] **Step 2: Run cancellation tests before public control exists**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/cancellation_test.exs apps/forge_imports/test/cleanup_reconciler_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/cancellation_test.exs apps/forge_imports/test/cleanup_reconciler_test.exs --max-cases 1
 ```
 
 Expected: FAIL for missing cancellation/cleanup orchestration.
@@ -262,7 +271,7 @@ Cleanup processes only unpublished staging or grace-expired tombstones after pro
 - [ ] **Step 4: Run cancellation, remote, publication, and cleanup tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/cancellation_test.exs apps/forge_imports/test/cleanup_reconciler_test.exs apps/git_core/test/remote_test.exs apps/forge_imports/test/repository_publication_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/cancellation_test.exs apps/forge_imports/test/cleanup_reconciler_test.exs apps/git_core/test/remote_test.exs apps/forge_imports/test/repository_publication_test.exs --max-cases 1
 ```
 
 Expected: all tests pass.
@@ -299,7 +308,7 @@ assert Repo.reload!(predecessor).state == :completed_with_warnings
 - [ ] **Step 2: Run and verify terminal rows currently cannot retry**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/retry_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/retry_test.exs --max-cases 1
 ```
 
 Expected: FAIL with no successor API.
@@ -316,7 +325,7 @@ Copy only retryable unpublished items. Validate every adopted shadow, staging di
 - [ ] **Step 4: Run retry and persistence tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/retry_test.exs apps/forge_imports/test/import_persistence_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/retry_test.exs apps/forge_imports/test/import_persistence_test.exs --max-cases 1
 ```
 
 Expected: all tests pass.
@@ -347,7 +356,7 @@ Cover all success, mixed success/failure, warning, all-intentional-skip, nothing
 - [ ] **Step 2: Run and verify current count fields are insufficient**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/report_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/report_test.exs --max-cases 1
 ```
 
 Expected: FAIL for missing report finalization/aggregation.
@@ -377,7 +386,7 @@ Order the real implementation so a committed publication remains successful when
 - [ ] **Step 4: Run reports, cancellation, and metadata accounting tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/report_test.exs apps/forge_imports/test/cancellation_test.exs apps/forge_imports/test/github/metadata_importer_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/report_test.exs apps/forge_imports/test/cancellation_test.exs apps/forge_imports/test/github/metadata_importer_test.exs --max-cases 1
 ```
 
 Expected: all tests pass.
@@ -419,7 +428,7 @@ refute inspect(body) =~ "github_pat_"
 - [ ] **Step 2: Run web tests before routes/controls exist**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/fornacast_web/test/import_status_controller_test.exs apps/fornacast_web/test/import_controller_test.exs apps/fornacast_web/test/import_html_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/fornacast_web/test/import_status_controller_test.exs apps/fornacast_web/test/import_controller_test.exs apps/fornacast_web/test/import_html_test.exs --max-cases 1
 ```
 
 Expected: FAIL for missing status/cancel/retry/credential routes.
@@ -441,8 +450,8 @@ Delegate `get_status(actor, run_id)` and `get_report(actor, run_id)` from `Forge
 - [ ] **Step 4: Run web, router-contract, and asset tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/fornacast_web/test/import_status_controller_test.exs apps/fornacast_web/test/import_controller_test.exs apps/fornacast_web/test/import_html_test.exs apps/fornacast_api/test/openapi_contract_test.exs --max-cases 1
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix assets.build
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/fornacast_web/test/import_status_controller_test.exs apps/fornacast_web/test/import_controller_test.exs apps/fornacast_web/test/import_html_test.exs apps/fornacast_api/test/openapi_contract_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix assets.build
 ```
 
 Expected: all tests pass, assets build, and API operation manifests remain unchanged.
@@ -475,7 +484,7 @@ Assert bounded events for phase duration, GitHub outcome, rate pause, staged byt
 - [ ] **Step 2: Run and inspect current missing/unbounded events**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/telemetry_test.exs apps/forge_imports/test/import_security_test.exs apps/fornacast_web/test/organization_controller_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/telemetry_test.exs apps/forge_imports/test/import_security_test.exs apps/fornacast_web/test/organization_controller_test.exs --max-cases 1
 ```
 
 Expected: FAIL for missing telemetry and any remaining unsafe metadata.
@@ -494,7 +503,7 @@ Allow only numeric IDs/counts, bounded phase/error atoms, booleans, and duration
 - [ ] **Step 4: Run telemetry/security tests**
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/telemetry_test.exs apps/forge_imports/test/import_security_test.exs apps/fornacast_web/test/organization_controller_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/telemetry_test.exs apps/forge_imports/test/import_security_test.exs apps/fornacast_web/test/organization_controller_test.exs --max-cases 1
 ```
 
 Expected: all tests pass with no secret-bearing captured term.
@@ -526,7 +535,7 @@ Prove saved/one-time repository import, organization selection with success/skip
 - [ ] **Step 2: Run the isolated E2E test and close only in-scope failures**
 
 ```bash
-devenv shell -- env FORNACAST_TEST_DATABASE_PATH=/tmp/fornacast-github-import-e2e.db nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/github_import_e2e_test.exs --max-cases 1
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/forge_imports/test/github_import_e2e_test.exs --max-cases 1
 ```
 
 Expected: 0 failures.
@@ -546,15 +555,7 @@ Expected: 0 failures.
 
 Update README and `.env.example` with links and non-secret example shapes only.
 
-- [ ] **Step 4: Run the complete scoped Turso/PostgreSQL and browser acceptance matrix**
-
-Turso:
-
-```bash
-devenv shell -- env FORNACAST_DATABASE_ADAPTER=turso FORNACAST_TEST_DATABASE_PATH=/tmp/fornacast-github-import-final.db nix shell nixpkgs#expect -c unbuffer mix test apps/fornacast/test apps/forge_accounts/test apps/forge_repos/test apps/forge_issues/test apps/forge_pulls/test apps/git_core/test apps/git_transport/test apps/forge_imports/test apps/fornacast_web/test apps/fornacast_api/test/issue_contract_test.exs apps/fornacast_api/test/pull_contract_test.exs apps/fornacast_api/test/openapi_contract_test.exs --max-cases 1
-```
-
-PostgreSQL:
+- [ ] **Step 4: Run the complete scoped PostgreSQL automated, static, and browser acceptance matrix**
 
 ```bash
 devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix test apps/fornacast/test apps/forge_accounts/test apps/forge_repos/test apps/forge_issues/test apps/forge_pulls/test apps/git_core/test apps/git_transport/test apps/forge_imports/test apps/fornacast_web/test apps/fornacast_api/test/issue_contract_test.exs apps/fornacast_api/test/pull_contract_test.exs apps/fornacast_api/test/openapi_contract_test.exs --max-cases 1
@@ -563,12 +564,22 @@ devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/gi
 Then run:
 
 ```bash
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix format --check-formatted
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix compile --warnings-as-errors
-devenv shell -- nix shell nixpkgs#expect -c unbuffer mix assets.build
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix format --check-formatted
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix compile --warnings-as-errors
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix assets.build
 ```
 
-Start the dev service and use Chrome DevTools to verify `/settings/github`, `/repos/import`, `/organizations/import`, conflict review, progress, awaiting-credential, and final report at 1440×900, 768×1024, and 390×844. Verify keyboard focus, labels, status announcements, polling fallback, no overflow, and no secret in DOM/network/logs.
+In a separate terminal, start the PostgreSQL-backed dev service:
+
+```bash
+devenv shell -- env FORNACAST_DATABASE_ADAPTER=postgres MIX_BUILD_PATH=_build/github-import-postgres PGPORT=55432 nix shell nixpkgs#expect -c unbuffer mix fornacast.run
+```
+
+Wait for the web and API listeners to report readiness, then use Chrome DevTools
+to verify `/settings/github`, `/repos/import`, `/organizations/import`, conflict
+review, progress, awaiting-credential, and final report at 1440×900, 768×1024,
+and 390×844. Verify keyboard focus, labels, status announcements, polling fallback,
+no overflow, and no secret in DOM/network/logs.
 
 - [ ] **Step 5: Commit final acceptance/docs corrections**
 
