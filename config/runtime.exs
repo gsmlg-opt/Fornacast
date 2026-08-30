@@ -54,6 +54,10 @@ if config_env() == :prod do
       compiled_database_adapter
     end
 
+  config :fornacast,
+    legacy_turso_preflight:
+      require_runtime_env? and database_adapter in ["postgres", "postgresql"]
+
   postgres_runtime_config = fn ->
     database_url = System.get_env("DATABASE_URL")
 

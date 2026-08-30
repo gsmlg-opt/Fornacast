@@ -84,6 +84,7 @@ config :fornacast, ecto_repos: [Fornacast.Repo]
 config :fornacast, :database_adapter, database_adapter
 config :fornacast, :repo_adapter, repo_adapter
 config :fornacast, :auto_migrate, true
+config :fornacast, :legacy_turso_preflight, false
 config :fornacast, :github_credential_keyring, github_credential_keyring
 
 config :fornacast,
