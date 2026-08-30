@@ -3,7 +3,12 @@
 [![GitHub Release](https://img.shields.io/github/v/release/gsmlg-opt/Fornacast)](https://github.com/gsmlg-opt/Fornacast/releases/latest)
 [![GHCR](https://img.shields.io/badge/GHCR-gsmlg--dev%2Ffornacast-2496ED?logo=docker&logoColor=white)](https://github.com/orgs/gsmlg-dev/packages/container/package/fornacast)
 
-Fornacast is a small self-hosted Git forge built with Elixir, Phoenix, Erlang/OTP SSH, Ecto on ExTurso/Turso by default, Concord-backed key/value app config, optional PostgreSQL, and Rust NIFs over gitoxide.
+Fornacast is a small self-hosted Git forge built with Elixir, Phoenix,
+Erlang/OTP SSH, Ecto, Concord, and Rust NIFs over gitoxide. PostgreSQL 17 is
+the supported/default Fornacast domain database in development, test, Docker
+Compose, CI, E2E, and releases. Concord's separate embedded Turso/VSR
+configuration store remains supported infrastructure; it is not the Ecto
+domain database.
 
 The first release target is intentionally narrow: create users and repositories, authenticate Git over SSH (and HTTP) with user credentials or SSH keys, push/clone/fetch with a normal Git client, browse repositories in the web UI, and support the documented GitHub-compatible REST workflow.
 
@@ -54,33 +59,40 @@ Prerequisites:
 - Node.js 18+ (frontend workspace install via Mix npm tasks; CI uses `mix npm.ci`).
 - Git and OpenSSH client tools for compatibility tests.
 
-Optional: use [`devenv.nix`](./devenv.nix) for pinned BEAM, Rust, and a local Postgres 17 instance (port `55432`).
+[`devenv.nix`](./devenv.nix) pins the BEAM and Rust toolchains and manages the
+standard local PostgreSQL 17 service. PostgreSQL listens only on the configured
+Unix socket at port `55432` and provisions both `fornacast_dev` and
+`fornacast_test`.
 
 Setup:
 
 ```sh
-mix deps.get
-mix ecto.setup
-mix npm.ci
-mix test
+devenv processes up -d --strict-ports postgres
+devenv processes wait --timeout 120
+devenv shell -- mix deps.get
+devenv shell -- mix ecto.setup
+devenv shell -- mix npm.ci
+devenv shell -- mix test
 ```
 
 `mix npm.ci` installs the npm workspace under `apps/*` from `package-lock.json`. Use `mix npm.install` when intentionally updating frontend dependencies.
+An equivalent locally managed PostgreSQL 17 installation can use the standard
+`PG*` variables documented under [Configuration](#configuration).
 
 Useful Mix aliases:
 
 ```sh
-mix format                  # format Elixir / HEEx / asset sources
-mix format --check-formatted
-mix assets.build            # duskmoon_bundler + Tailwind
-mix assets.deploy           # minify + phx.digest (production/CI)
-mix compile --warnings-as-errors
+devenv shell -- mix format                  # format Elixir / HEEx / asset sources
+devenv shell -- mix format --check-formatted
+devenv shell -- mix assets.build            # duskmoon_bundler + Tailwind
+devenv shell -- mix assets.deploy           # minify + phx.digest (production/CI)
+devenv shell -- mix compile --warnings-as-errors
 ```
 
 Run locally:
 
 ```sh
-mix fornacast.run
+devenv shell -- mix fornacast.run
 ```
 
 Or start the application and managed PostgreSQL service in the background with
@@ -107,12 +119,15 @@ Default local endpoints:
 - Discovery: `http://localhost:4891/.well-known/fornacast`
 - SSH: `ssh://USER@localhost:2222/USER/REPO.git`
 
-The Ecto adapter is selected at **compile time**. Default is Turso/libSQL file databases. To use PostgreSQL, set `FORNACAST_DATABASE_ADAPTER=postgres` and recompile (see [Configuration](#configuration)).
+The Ecto adapter is selected at **compile time**, and the default is PostgreSQL.
+Normal development needs no adapter override. If an explicit source-compatibility
+build changes the adapter, run `mix clean` and recompile before switching back;
+never reuse one adapter's build artifacts with another adapter.
 
 Alternatively, create the first admin headlessly without the web wizard:
 
 ```sh
-mix fornacast.admin.create \
+devenv shell -- mix fornacast.admin.create \
   --username alice \
   --email alice@example.com \
   --password "correct horse battery staple"
@@ -128,13 +143,21 @@ mix phx.gen.secret
 ```
 
 Set `SECRET_KEY_BASE` in `.env` to the generated value.
-By default Docker Compose uses a local Turso-compatible Ecto database file at `/data/fornacast.db` and a separate Concord key/value config database at `/data/fornacast_config.db`.
-Replace `POSTGRES_PASSWORD` only when using the optional PostgreSQL profile.
+Set a strong `POSTGRES_PASSWORD`; keep the non-secret `POSTGRES_DB` and
+`POSTGRES_USER` defaults or change all three values intentionally. Default
+Compose requires `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` from
+`.env`, uses PostgreSQL 17 component mode, and does not read `DATABASE_URL` from
+that file.
+
+The app waits for the PostgreSQL health check before booting. Its health check
+requires both internal health endpoints on `4890` and `4891`; nginx waits for
+the app health check before accepting traffic. The public ports are `4000` for
+HTTP and `2222` for SSH. Application ports `4890` and `4891` remain unpublished.
 
 ### Deploy a prebuilt release image
 
-The published image supports Turso/libSQL only. PostgreSQL requires a source
-build with the `FORNACAST_DATABASE_ADAPTER=postgres` build argument.
+The published image is compiled for the supported PostgreSQL 17 domain
+database. Its runtime adapter must match the compiled PostgreSQL adapter.
 
 For deployment, anonymous pulls work only when the package is public.
 If the package is private, create a separate read-only PAT with `read:packages`
@@ -147,15 +170,19 @@ export GHCR_READ_TOKEN=your-read-only-token
 printf '%s' "$GHCR_READ_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
 ```
 
-Choose the release tag to deploy:
+Choose a PostgreSQL-first GitHub release and copy its published image digest.
+The placeholder below is intentionally invalid so deployment fails safely until
+you replace it with that release's exact digest:
 
 ```sh
-export FORNACAST_IMAGE=ghcr.io/gsmlg-dev/fornacast:0.1.3
+export FORNACAST_IMAGE='ghcr.io/gsmlg-dev/fornacast@sha256:REPLACE_WITH_POSTGRESQL_FIRST_RELEASE_DIGEST'
 docker compose pull app nginx
 ```
 
-Version tags are convenient but can move. For a truly immutable pin, replace
-the tag with `@sha256:<digest>` using the digest printed on the GitHub release page.
+Replace the placeholder with the digest printed on the GitHub release page for
+that PostgreSQL-first GitHub release. A version tag from the same release can be
+used for convenience, but tags can move. `latest` is mutable and must not be
+treated as an immutable deployment pin.
 
 Before deployment, keep public port `4000` blocked in the firewall or security
 group while starting the instance:
@@ -170,21 +197,16 @@ application ports `4890` or `4891` directly.
 
 ### Build from source
 
-Build and start the default Turso-backed image from source:
+Build and start the PostgreSQL-backed image from source:
 
 ```sh
 docker compose up --build -d
 ```
 
-To build and run a PostgreSQL-backed image instead, set `FORNACAST_DATABASE_ADAPTER=postgres` and `DATABASE_URL`, then start the optional Postgres profile:
-
-```sh
-FORNACAST_DATABASE_ADAPTER=postgres \
-DATABASE_URL=ecto://fornacast:$POSTGRES_PASSWORD@db/fornacast_prod \
-docker compose --profile postgres up --build -d
-```
-
-Migrations run automatically on container start. Open `http://localhost:4000/setup` to create the first admin account.
+The PostgreSQL release preflight runs before automatic migrations. Container
+readiness succeeds only after migrations, the supervised services, and both
+application health endpoints are ready. Open `http://localhost:4000/setup` to
+create the first admin account.
 Nginx is the Compose deployment's only public HTTP service. It serves the web application and the API from the same origin: use `http://localhost:4000/api/v3` for REST resources, `http://localhost:4000/api/uploads` for release-asset uploads, `http://localhost:4000/api/graphql` for GraphQL, and `http://localhost:4000/.well-known/fornacast` for service discovery. The application container's web listener on port `4890` and API listener on port `4891` remain internal to the Compose network.
 
 Alternatively, create the first admin headlessly in the running container without the web wizard:
@@ -273,14 +295,14 @@ Production environment variables:
 - `SECRET_KEY_BASE`
 - `FORNACAST_GITHUB_CREDENTIAL_KEYS`, a JSON object mapping key IDs to base64-encoded 32-byte keys
 - `FORNACAST_GITHUB_CREDENTIAL_ACTIVE_KEY_ID`, the key ID used for new GitHub credential writes
-- `FORNACAST_DATABASE_ADAPTER`, default `turso`; use `postgres` for PostgreSQL builds
-- `FORNACAST_DATABASE_PATH`, default `/data/fornacast.db` in production Turso mode
-- `TURSO_DATABASE_URL`, optional remote Turso/libSQL URI for the Ecto database
-- `TURSO_AUTH_TOKEN`, optional Turso auth token for the Ecto database
+- `FORNACAST_DATABASE_ADAPTER`, which must be omitted or match the compiled PostgreSQL adapter
+- `DATABASE_URL` for PostgreSQL URL mode
+- `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` for PostgreSQL component mode
+- `FORNACAST_LEGACY_TURSO_DATABASE_PATH`, the legacy Ecto file checked by the release preflight
+- `FORNACAST_ACKNOWLEDGE_LEGACY_TURSO_DATA`, the explicit legacy transition acknowledgement
 - `FORNACAST_CONFIG_DATABASE_PATH`, default `/data/fornacast_config.db` for the Concord key/value config database
 - `FORNACAST_CONFIG_TURSO_DATABASE_URL`, optional remote Turso/libSQL URI for Concord-backed app config
 - `FORNACAST_CONFIG_TURSO_AUTH_TOKEN`, optional Turso auth token for Concord-backed app config
-- `DATABASE_URL`, required only when built with `FORNACAST_DATABASE_ADAPTER=postgres`
 - `FORNACAST_BASE_URL`
 - `FORNACAST_API_BIND_IP`, default `0.0.0.0` in the release image
 - `FORNACAST_API_PORT`, default `4891` in the release image
@@ -295,14 +317,73 @@ Production environment variables:
 - `PORT` for the web HTTP listener, default `4890`
 - `POOL_SIZE`, optional, default `10`
 
-Development and test also honor:
+### Development database connection
 
-- `FORNACAST_DATABASE_PATH`, default `fornacast_dev.db`
-- `FORNACAST_TEST_DATABASE_PATH`, default `fornacast_test.db`
-- `FORNACAST_CONFIG_DATABASE_PATH`, default `fornacast_config_dev.db`
-- `FORNACAST_TEST_CONFIG_DATABASE_PATH`, default `fornacast_config_test.db`
-- `FORNACAST_SSH_BIND_IP`
-- `FORNACAST_SSH_ENABLED`
+Development honors the standard PostgreSQL variables, preferring each `PG*`
+form before its `POSTGRES_*` fallback:
+
+- `PGHOST` / `POSTGRES_HOST` (an absolute `PGHOST` is a Unix socket directory)
+- `PGPORT` / `POSTGRES_PORT`
+- `PGDATABASE` / `POSTGRES_DB` (default `fornacast_dev`)
+- `PGUSER` / `POSTGRES_USER`
+- `PGPASSWORD` / `POSTGRES_PASSWORD`
+
+### Test database connection
+
+Tests use the same connection variables but an intentionally separate database
+name:
+
+- `PGHOST` / `POSTGRES_HOST` (an absolute `PGHOST` is a Unix socket directory)
+- `PGPORT` / `POSTGRES_PORT`
+- `PGUSER` / `POSTGRES_USER`
+- `PGPASSWORD` / `POSTGRES_PASSWORD`
+- `POSTGRES_TEST_DB`, default `fornacast_test`
+
+Tests do not use `PGDATABASE` or `POSTGRES_DB` as the database name. Development
+and test additionally honor `FORNACAST_CONFIG_DATABASE_PATH`,
+`FORNACAST_TEST_CONFIG_DATABASE_PATH`, `FORNACAST_SSH_BIND_IP`, and
+`FORNACAST_SSH_ENABLED` for their separate configuration-store and service
+settings.
+
+### PostgreSQL connection modes
+
+Non-Compose releases and external PostgreSQL providers must configure exactly
+one PostgreSQL connection mode:
+
+1. **URL mode:** set a nonempty `DATABASE_URL` and leave every `POSTGRES_*`
+   connection variable unset.
+2. **Component mode:** leave `DATABASE_URL` unset and set nonempty
+   `POSTGRES_HOST`, `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD`;
+   `POSTGRES_PORT` defaults to `5432` when it is unset.
+
+Mixed, partial, and explicitly blank configurations are invalid and fail before
+the Repo starts. In component mode the password is passed as the exact component
+value, so reserved URI characters need no encoding. Do not reconstruct a URI
+from component values. URL mode remains appropriate for hosted providers and
+uses their normal URI encoding rules. The runtime adapter must match the
+compiled PostgreSQL adapter.
+
+### Legacy Turso transition
+
+`FORNACAST_LEGACY_TURSO_DATABASE_PATH` has default `/data/fornacast.db` in the
+release image. The PostgreSQL release preflight checks that path before
+automatic migrations. If the file exists, back up the legacy file and the
+matching `fornacast-data` contents, then intentionally migrate or abandon its
+data, and only set `FORNACAST_ACKNOWLEDGE_LEGACY_TURSO_DATA=true` after making that
+decision. No automatic Turso-to-PostgreSQL migration or import is performed;
+the acknowledgement is not an import tool. Remove or archive the legacy file
+after the transition so the acknowledgement is no longer needed.
+
+### Dormant Turso Ecto compatibility
+
+The explicit Turso/libSQL Ecto build remains as dormant compile-only source
+compatibility. It is not a supported runtime, release, or acceptance database:
+the current full schema cannot be installed until the upstream
+[`concord#90`](https://github.com/gsmlg-dev/concord/issues/90) compatibility
+issue is resolved. Concord's separate embedded Turso/VSR configuration store is
+still supported and must not be confused with the Fornacast Ecto domain
+database. There are intentionally no operator instructions for running the
+current release with the Turso Ecto adapter.
 
 GitHub PAT encryption uses a dedicated AES-256-GCM keyring and never derives a
 key from `SECRET_KEY_BASE`. Generate a key with `openssl rand -base64 32`, then
@@ -332,7 +413,10 @@ To rotate keys, first keep both the old and new entries in the key map, then
 switch the active key ID so new writes use the new key. A later credential
 lifecycle task must re-encrypt existing rows before the old key is removed.
 
-The Ecto adapter is selected at compile time. Build or recompile with `FORNACAST_DATABASE_ADAPTER=postgres` to use PostgreSQL; omit it for the default ExTurso/Turso-compatible backend. Concord is used separately for app-level key/value config through `Fornacast.ConfigStore`.
+The Ecto adapter is selected at compile time. PostgreSQL is the default and the
+only supported release build. Changing an explicit source build's adapter
+requires `mix clean` followed by a complete recompile. Concord is used
+separately for app-level key/value config through `Fornacast.ConfigStore`.
 
 ### Initialization
 
@@ -340,7 +424,10 @@ The first visit to a fresh instance serves an unauthenticated setup page that cr
 
 ## Storage And Backup
 
-Fornacast stores domain state in the configured Ecto database, app-level key/value config in Concord, and bare Git repositories under `FORNACAST_REPO_STORAGE_ROOT`.
+Fornacast stores authoritative domain state in PostgreSQL. The `postgres-data`
+volume stores the PostgreSQL domain database. The separate `fornacast-data`
+volume stores Git repositories, SSH material, LocalCAS release assets,
+staging data, and Concord's separate embedded Turso/VSR configuration store.
 
 Release-asset bytes use embedded LocalCAS under
 `FORNACAST_RELEASE_ASSET_STORAGE_ROOT` (default `/data/release-assets` in the
@@ -352,40 +439,57 @@ BEAM a 45-second graceful-stop window, which the release acceptance smoke
 exercises. Erlang distribution and EPMD are bound to loopback and are not
 published by Compose. No S3 listener or S3 credentials are used.
 
-Treat the Ecto database, ConfigStore database, release-asset Concord directory,
-CAS directory, and staging directory as one cold recovery set. Stop Fornacast,
-back up or restore every member while it remains stopped, then restart. The
-default `/data` volume contains all local members; PostgreSQL must be backed up
-in the same stopped maintenance window.
-
-Back up all local members together while Fornacast is stopped:
+For the default Compose deployment, always back up PostgreSQL and
+`fornacast-data` together in the same maintenance window:
 
 ```sh
-cp "$FORNACAST_DATABASE_PATH" fornacast.db
-cp "$FORNACAST_CONFIG_DATABASE_PATH" fornacast_config.db
-tar -C "$FORNACAST_REPO_STORAGE_ROOT" -czf fornacast-repos.tgz .
-tar -C "$FORNACAST_SSH_SYSTEM_DIR" -czf fornacast-ssh.tgz .
-tar -C "$FORNACAST_RELEASE_ASSET_STORAGE_ROOT" -czf fornacast-release-assets.tgz .
+scripts/compose_backup.sh BACKUP_DIR
 ```
 
-For remote Turso databases, use Turso's backup/export workflow for the database and config store, and back up the repository and SSH directories separately.
+The backup script takes a recovery lock, stops `app` and `nginx` so there are no
+application writers, leaves `db` available for `pg_dump`, and creates exactly
+`fornacast.dump`, `fornacast-data.tgz`, and `SHA256SUMS`. It restarts the writers
+only after both artifacts are durable. Concurrent backup or restore attempts and
+partial failures fail closed; inspect any reported recovery lock or stopped
+writers before intervening.
 
-For PostgreSQL deployments, use `pg_dump "$DATABASE_URL" > fornacast.sql`.
+`compose_backup.sh` captures only the paired PostgreSQL domain dump and local
+`fornacast-data` volume. It does not capture `.env` or external secrets.
+Preserve the following separately in a secure secrets system; never store them
+as plaintext in `BACKUP_DIR`:
 
-For default Docker Compose deployments, back up the named data volume:
+- `FORNACAST_GITHUB_CREDENTIAL_KEYS` and
+  `FORNACAST_GITHUB_CREDENTIAL_ACTIVE_KEY_ID`, which are required to decrypt
+  saved GitHub PATs;
+- `SECRET_KEY_BASE`;
+- PostgreSQL connection credentials such as `DATABASE_URL` or
+  `POSTGRES_PASSWORD`; and
+- Concord/Turso connection credentials such as
+  `FORNACAST_CONFIG_TURSO_DATABASE_URL` and
+  `FORNACAST_CONFIG_TURSO_AUTH_TOKEN`.
+
+When remote Concord/Turso state is configured, take a provider-native backup or
+snapshot of that remote Concord/Turso state in the same maintenance window. The
+local archive cannot capture provider-hosted data.
+
+Restore is destructive and requires explicit confirmation:
 
 ```sh
-docker run --rm -v fornacast_fornacast-data:/data -v "$PWD":/backup debian:bookworm-slim \
-  tar -C /data -czf /backup/fornacast-data.tgz .
+scripts/compose_restore.sh BACKUP_DIR --confirm-destroy
 ```
 
-Restore requires the database dump, repository/SSH data, and release-asset data from the same point in time.
+The restore script verifies the checksums, PostgreSQL dump, and filesystem
+archive before mutation, then stops the writers, replaces the PostgreSQL
+database and `fornacast-data`, restarts the application, and verifies the public
+health path. A dump or archive from a different maintenance window is not a
+supported recovery set.
 
 ## Contributing
 
 - Follow the conventions in [`AGENTS.md`](./AGENTS.md) and the DuskMoon UI rules in [`CLAUDE.md`](./CLAUDE.md).
-- Keep changes scoped; run `mix format` and relevant `mix test` paths before opening a PR.
-- CI runs format checks, `mix compile --warnings-as-errors`, unit tests (Turso + Postgres), and release smoke/e2e workflows.
+- Keep changes scoped; run `devenv shell -- mix format --check-formatted` and
+  relevant `devenv shell -- mix test ... --max-cases 1` paths before opening a PR.
+- CI runs format checks, `mix compile --warnings-as-errors`, PostgreSQL unit tests, and release smoke/E2E workflows.
 
 ## Dogfood Gate
 

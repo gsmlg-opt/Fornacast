@@ -9,11 +9,26 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
   @dockerfile Path.join(@root, "Dockerfile")
   @env_example Path.join(@root, ".env.example")
   @readme Path.join(@root, "README.md")
+  @agents Path.join(@root, "AGENTS.md")
   @version_resolver Path.join(@root, "scripts/resolve_release_version.sh")
   @web_mix Path.join(@root, "apps/fornacast_web/mix.exs")
   @config Path.join(@root, "config/config.exs")
   @runtime_config Path.join(@root, "config/runtime.exs")
   @releases_mix Path.join(@root, "apps/forge_releases/mix.exs")
+  @deploy_notes_start "<!-- FORNACAST_DEPLOY_NOTES_START -->"
+  @deploy_notes_end "<!-- FORNACAST_DEPLOY_NOTES_END -->"
+  @obsolete_database_claims [
+    ~r/\bdefault(?:\s+(?:domain\s+)?database)?\s+(?:is|uses?)\s+turso(?:\/libsql)?\b/i,
+    ~r/\bturso(?:\/libsql)?\s+is\s+the\s+default(?:\s+(?:domain\s+)?database)?\b/i,
+    ~r/\bdefault\s+turso(?:\/libsql)?(?:-backed)?\b/i,
+    ~r/\b(?:supports?\s+)?turso\/libsql\s+only\b/i,
+    ~r/\bonly\s+(?:supports?\s+)?turso\/libsql\b/i,
+    ~r/\bturso[- ]only\b/i,
+    ~r/\bpostgresql[\s:,-]+(?:is[\s:,-]+)?optional\b/i,
+    ~r/\boptional[\s:,-]+postgresql\b/i,
+    ~r/\bpostgresql\s+requires?\s+(?:a\s+)?source\s+build\b/i,
+    ~r/\bsource\s+build(?:\s+\w+){0,2}\s+required\s+for\s+postgresql\b/i
+  ]
 
   @runtime_database_env ~w(
     RELEASE_COMMAND FORNACAST_DATABASE_ADAPTER DATABASE_URL
@@ -580,7 +595,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert env_example =~ ~r/^FORNACAST_ACKNOWLEDGE_LEGACY_TURSO_DATA=$/m
 
     assert env_example =~
-             "Set to true only after intentionally backing up and planning the legacy Turso transition."
+             "Leave acknowledgement blank. Set it to true only after intentionally backing up and completing the legacy Turso transition."
   end
 
   test "release commit, tag, and page operations are safe to retry" do
@@ -620,58 +635,96 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
 
   test "release page receives safe Compose deployment instructions" do
     workflow = File.read!(@workflow)
+    deploy_notes = release_deploy_notes!(workflow)
 
     assert workflow =~ "cat > release-notes.md <<'EOF'"
 
     assert_order(
       workflow,
-      "<!-- FORNACAST_DEPLOY_NOTES_START -->",
+      @deploy_notes_start,
       "## Deploy with Docker Compose"
     )
 
     assert_order(
       workflow,
       "## Deploy with Docker Compose",
-      "<!-- FORNACAST_DEPLOY_NOTES_END -->"
+      @deploy_notes_end
     )
 
-    assert workflow =~ "## Deploy with Docker Compose"
-    assert workflow =~ "ghcr.io/gsmlg-dev/fornacast:{{VERSION}}"
-    assert workflow =~ "ghcr.io/gsmlg-dev/fornacast:latest"
-    assert workflow =~ "anonymous pulls work only when the package is public"
-    assert workflow =~ "`read:packages`"
-    assert workflow =~ "GHCR_USERNAME"
-    assert workflow =~ "GHCR_READ_TOKEN"
-    assert workflow =~ ~s(docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin)
+    assert deploy_notes =~ "## Deploy with Docker Compose"
+    assert deploy_notes =~ "ghcr.io/gsmlg-dev/fornacast:{{VERSION}}"
+    assert deploy_notes =~ "ghcr.io/gsmlg-dev/fornacast:latest"
+    assert deploy_notes =~ "anonymous pulls work only when the package is public"
+    assert deploy_notes =~ "`read:packages`"
+    assert deploy_notes =~ "GHCR_USERNAME"
+    assert deploy_notes =~ "GHCR_READ_TOKEN"
+    assert deploy_notes =~ ~s(docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin)
 
-    assert workflow =~
+    assert deploy_notes =~
              ~s(FORNACAST_IMAGE=ghcr.io/gsmlg-dev/fornacast@${{ steps.docker.outputs.digest }})
 
-    assert workflow =~ "PostgreSQL 17"
-    assert workflow =~ "supported domain database"
-    assert workflow =~ "POSTGRES_DB"
-    assert workflow =~ "POSTGRES_USER"
-    assert workflow =~ "POSTGRES_PASSWORD"
-    assert workflow =~ "FORNACAST_ACKNOWLEDGE_LEGACY_TURSO_DATA=true"
-    assert workflow =~ "does not automatically migrate"
-    assert workflow =~ "scripts/compose_backup.sh"
-    assert workflow =~ "scripts/compose_restore.sh"
-    assert workflow =~ "paired backup"
-    assert workflow =~ "docker compose pull app nginx"
-    assert workflow =~ "docker compose up -d --no-build"
-    assert workflow =~ "keep public port `4000` blocked"
-    assert workflow =~ "locally or through an SSH tunnel"
-    assert workflow =~ "Do not publish ports `4890` or `4891` directly."
+    assert_contains_all(deploy_notes, [
+      "PostgreSQL 17",
+      "supported domain database",
+      "Default Compose uses complete PostgreSQL component mode",
+      "POSTGRES_DB",
+      "POSTGRES_USER",
+      "POSTGRES_PASSWORD",
+      "exactly one PostgreSQL connection mode",
+      "Non-Compose",
+      "external PostgreSQL providers",
+      "URL mode",
+      "nonempty `DATABASE_URL`",
+      "component mode",
+      "POSTGRES_HOST",
+      "POSTGRES_PORT",
+      "mutually exclusive",
+      "Concord's separate embedded Turso/VSR configuration store",
+      "not the Ecto domain database",
+      "dormant compile-only",
+      "not a supported runtime or release database",
+      "FORNACAST_LEGACY_TURSO_DATABASE_PATH",
+      "FORNACAST_ACKNOWLEDGE_LEGACY_TURSO_DATA=true",
+      "does not automatically migrate",
+      "scripts/compose_backup.sh BACKUP_DIR",
+      "scripts/compose_restore.sh BACKUP_DIR --confirm-destroy",
+      "paired backup",
+      "PostgreSQL dump",
+      "`fornacast-data`",
+      "`postgres-data`",
+      "PostgreSQL domain database",
+      "repositories, SSH keys, LocalCAS release assets",
+      "ports `4890` or `4891` directly"
+    ])
 
-    assert workflow =~ "`postgres-data`"
-    assert workflow =~ "PostgreSQL domain database"
-    assert workflow =~ "`fornacast-data`"
-    assert workflow =~ "repositories, SSH keys, LocalCAS release assets, and Concord"
-    refute workflow =~ "supports Turso/libSQL only"
-    refute workflow =~ "PostgreSQL requires a source build"
+    assert deploy_notes =~ "docker compose pull app nginx"
+    assert deploy_notes =~ "docker compose up -d --no-build"
+    assert deploy_notes =~ "keep public port `4000` blocked"
+    assert deploy_notes =~ "locally or through an SSH tunnel"
+    assert deploy_notes =~ "`/setup`"
+    refute_obsolete_database_claims(deploy_notes)
 
-    assert workflow =~ "`/setup`"
-    assert_order(workflow, "keep public port `4000` blocked", "docker compose up -d --no-build")
+    assert_order(
+      deploy_notes,
+      "keep public port `4000` blocked",
+      "docker compose up -d --no-build"
+    )
+  end
+
+  test "release note block documents complete external PostgreSQL component mode" do
+    deploy_notes = @workflow |> File.read!() |> release_deploy_notes!()
+
+    assert_contains_all(deploy_notes, [
+      "Component mode requires nonempty `POSTGRES_HOST`, `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD`",
+      "`POSTGRES_PORT` is optional and defaults to `5432`"
+    ])
+  end
+
+  test "release note block acknowledges legacy data only after a completed decision" do
+    deploy_notes = @workflow |> File.read!() |> release_deploy_notes!()
+
+    assert deploy_notes =~
+             "only after the legacy database was intentionally migrated or abandoned"
   end
 
   test "Compose and README advertise the published release image" do
@@ -696,19 +749,214 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
              "https://github.com/orgs/gsmlg-dev/packages/container/package/fornacast"
 
     assert readme =~
-             "FORNACAST_IMAGE=ghcr.io/gsmlg-dev/fornacast:"
+             "FORNACAST_IMAGE='ghcr.io/gsmlg-dev/fornacast@sha256:REPLACE_WITH_POSTGRESQL_FIRST_RELEASE_DIGEST'"
 
-    assert readme =~ "digest printed on the GitHub release page"
+    assert_contains_all(readme, [
+      "digest printed on the GitHub release page",
+      "PostgreSQL-first GitHub release",
+      "`latest` is mutable and must not be treated as an immutable deployment pin"
+    ])
+
     assert readme =~ "anonymous pulls work only when the package is public"
     assert readme =~ "`read:packages`"
     assert readme =~ "GHCR_USERNAME"
     assert readme =~ "GHCR_READ_TOKEN"
     assert readme =~ ~s(docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin)
-    assert readme =~ "supports Turso/libSQL only"
+    refute readme =~ "supports Turso/libSQL only"
     assert readme =~ "keep public port `4000` blocked"
     assert readme =~ "locally or through an SSH tunnel"
     refute readme =~ "immutable versioned image"
     refute readme =~ "repeatable production deployment"
+    refute readme =~ ":0.1.3"
+
+    refute readme =~
+             ~r/FORNACAST_IMAGE=["']?ghcr\.io\/gsmlg-dev\/fornacast:\d+\.\d+\.\d+/
+  end
+
+  test "operator and contributor docs make PostgreSQL 17 the supported default" do
+    readme = File.read!(@readme)
+    agents = File.read!(@agents)
+    release_notes = @workflow |> File.read!() |> release_deploy_notes!()
+
+    assert_contains_all(readme, [
+      "PostgreSQL 17 is the supported/default Fornacast domain database",
+      "development, test, Docker Compose, CI, E2E, and releases",
+      "Concord's separate embedded Turso/VSR configuration store",
+      "not the Ecto domain database"
+    ])
+
+    assert_contains_all(agents, [
+      "PostgreSQL 17",
+      "supported/default domain database",
+      "Concord's separate embedded Turso/VSR configuration store",
+      "not the Ecto domain database"
+    ])
+
+    for source <- [readme, agents, release_notes] do
+      refute_obsolete_database_claims(source)
+      refute source =~ ~r/^\s*FORNACAST_DATABASE_ADAPTER=turso\b/m
+    end
+
+    for source <- [readme, release_notes] do
+      assert_contains_all(source, [
+        "PostgreSQL 17",
+        "POSTGRES_DB",
+        "POSTGRES_USER",
+        "POSTGRES_PASSWORD",
+        "FORNACAST_ACKNOWLEDGE_LEGACY_TURSO_DATA=true",
+        "scripts/compose_backup.sh",
+        "scripts/compose_restore.sh",
+        "`postgres-data`",
+        "`fornacast-data`"
+      ])
+
+      refute source =~ "supports Turso/libSQL only"
+      refute source =~ "PostgreSQL requires a source build"
+    end
+  end
+
+  test "README documents local and external PostgreSQL operation" do
+    readme = File.read!(@readme)
+
+    assert_contains_all(readme, [
+      "devenv processes up -d --strict-ports postgres",
+      "devenv processes wait --timeout 120",
+      "devenv shell -- mix ecto.setup",
+      "devenv shell -- mix fornacast.run",
+      "Unix socket",
+      "55432",
+      "`fornacast_dev`",
+      "`fornacast_test`",
+      "`mix clean`",
+      "exactly one PostgreSQL connection mode",
+      "**URL mode:**",
+      "**Component mode:**",
+      "nonempty `DATABASE_URL`",
+      "nonempty `POSTGRES_HOST`, `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD`",
+      "`POSTGRES_PORT` defaults to `5432`",
+      "Mixed, partial, and explicitly blank configurations are invalid",
+      "password is passed as the exact component value",
+      "Do not reconstruct a URI from component values",
+      "runtime adapter must match the compiled PostgreSQL adapter",
+      "preflight runs before automatic migrations",
+      "readiness succeeds only after migrations"
+    ])
+  end
+
+  test "README separates development and test PostgreSQL database selection" do
+    readme = File.read!(@readme)
+
+    development =
+      markdown_section!(
+        readme,
+        "### Development database connection",
+        "### Test database connection"
+      )
+
+    test =
+      markdown_section!(
+        readme,
+        "### Test database connection",
+        "### PostgreSQL connection modes"
+      )
+
+    assert_contains_all(development, [
+      "`PGHOST` / `POSTGRES_HOST`",
+      "`PGPORT` / `POSTGRES_PORT`",
+      "`PGDATABASE` / `POSTGRES_DB`",
+      "`PGUSER` / `POSTGRES_USER`",
+      "`PGPASSWORD` / `POSTGRES_PASSWORD`"
+    ])
+
+    assert_contains_all(test, [
+      "`PGHOST` / `POSTGRES_HOST`",
+      "`PGPORT` / `POSTGRES_PORT`",
+      "`PGUSER` / `POSTGRES_USER`",
+      "`PGPASSWORD` / `POSTGRES_PASSWORD`",
+      "`POSTGRES_TEST_DB`, default `fornacast_test`",
+      "Tests do not use `PGDATABASE` or `POSTGRES_DB` as the database name"
+    ])
+
+    refute test =~ "`PGDATABASE` / `POSTGRES_DB`"
+  end
+
+  test "README documents Compose topology and paired recovery" do
+    readme = File.read!(@readme)
+
+    assert_contains_all(readme, [
+      "app waits for the PostgreSQL health check",
+      "nginx waits for the app health check",
+      "both internal health endpoints on `4890` and `4891`",
+      "Compose requires `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` from `.env`",
+      "public ports are `4000` for HTTP and `2222` for SSH",
+      "ports `4890` and `4891` remain unpublished",
+      "scripts/compose_backup.sh BACKUP_DIR",
+      "scripts/compose_restore.sh BACKUP_DIR --confirm-destroy",
+      "`fornacast.dump`",
+      "`fornacast-data.tgz`",
+      "`SHA256SUMS`",
+      "same maintenance window",
+      "recovery lock",
+      "fail closed",
+      "Restore is destructive",
+      "`postgres-data` volume stores the PostgreSQL domain database",
+      "`fornacast-data` volume stores Git repositories, SSH material, LocalCAS release assets",
+      "back up PostgreSQL and `fornacast-data` together",
+      "captures only the paired PostgreSQL domain dump and local `fornacast-data` volume",
+      "does not capture `.env` or external secrets",
+      "never store them as plaintext in `BACKUP_DIR`",
+      "FORNACAST_GITHUB_CREDENTIAL_KEYS",
+      "FORNACAST_GITHUB_CREDENTIAL_ACTIVE_KEY_ID",
+      "required to decrypt saved GitHub PATs",
+      "SECRET_KEY_BASE",
+      "PostgreSQL connection credentials",
+      "Concord/Turso connection credentials",
+      "provider-native backup or snapshot",
+      "remote Concord/Turso state"
+    ])
+
+    refute readme =~ "fornacast_fornacast-data:/data"
+    refute readme =~ "docker run --rm -v"
+  end
+
+  test "README documents dormant Turso compatibility and the legacy transition" do
+    readme = File.read!(@readme)
+
+    assert_contains_all(readme, [
+      "dormant compile-only source compatibility",
+      "not a supported runtime, release, or acceptance database",
+      "current full schema cannot be installed",
+      "concord#90",
+      "FORNACAST_LEGACY_TURSO_DATABASE_PATH",
+      "default `/data/fornacast.db`",
+      "PostgreSQL release preflight",
+      "before automatic migrations",
+      "back up the legacy file",
+      "only set `FORNACAST_ACKNOWLEDGE_LEGACY_TURSO_DATA=true`",
+      "No automatic Turso-to-PostgreSQL migration or import is performed",
+      "Remove or archive the legacy file"
+    ])
+  end
+
+  test "environment example is secret-free and separates the two database roles" do
+    env_example = File.read!(@env_example)
+
+    assert env_example =~ ~r/^SECRET_KEY_BASE=$/m
+    assert env_example =~ ~r/^FORNACAST_GITHUB_CREDENTIAL_KEYS=$/m
+    assert env_example =~ ~r/^FORNACAST_GITHUB_CREDENTIAL_ACTIVE_KEY_ID=$/m
+    assert env_example =~ ~r/^POSTGRES_DB=fornacast_prod$/m
+    assert env_example =~ ~r/^POSTGRES_USER=fornacast$/m
+    assert env_example =~ ~r/^POSTGRES_PASSWORD=$/m
+    assert env_example =~ ~r/^FORNACAST_ACKNOWLEDGE_LEGACY_TURSO_DATA=$/m
+
+    assert_contains_all(env_example, [
+      "PostgreSQL domain database used by the default Compose deployment",
+      "Concord config store (separate from the PostgreSQL domain database)",
+      "embedded Turso/VSR configuration store",
+      "legacy Ecto path defaults to /data/fornacast.db"
+    ])
+
+    refute env_example =~ ~r/^DATABASE_URL=/m
   end
 
   test "release assets ship core LocalCAS without an S3 listener" do
@@ -740,7 +988,8 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert env_example =~ "FORNACAST_RELEASE_ASSET_MAX_BYTES=2147483648"
     assert readme =~ "one Fornacast BEAM with exclusive use of"
     assert readme =~ "one volume"
-    assert readme =~ "Treat the Ecto database, ConfigStore database"
+    assert readme =~ "back up PostgreSQL and"
+    assert readme =~ "`fornacast-data` together"
     assert readme =~ "uses `fornacast@127.0.0.1` by default"
     assert readme =~ "release acceptance smoke"
     assert readme =~ "exercises"
@@ -829,6 +1078,58 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert position!(source, first) < position!(source, second),
            "expected #{inspect(first)} to appear before #{inspect(second)}"
   end
+
+  defp release_deploy_notes!(workflow) do
+    lines = String.split(workflow, "\n")
+
+    start_indexes = marker_indexes(lines, @deploy_notes_start)
+    end_indexes = marker_indexes(lines, @deploy_notes_end)
+
+    assert [start_index] = start_indexes
+    assert [end_index] = end_indexes
+    assert start_index < end_index
+
+    lines
+    |> Enum.slice(start_index + 1, end_index - start_index - 1)
+    |> Enum.join("\n")
+  end
+
+  defp marker_indexes(lines, marker) do
+    lines
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {line, index} ->
+      if String.trim(line) == marker, do: [index], else: []
+    end)
+  end
+
+  defp markdown_section!(source, start_heading, end_heading) do
+    with [_, after_start] <- String.split(source, start_heading, parts: 2),
+         [section, _after_end] <- String.split(after_start, end_heading, parts: 2) do
+      section
+    else
+      _missing -> flunk("missing Markdown section from #{start_heading} to #{end_heading}")
+    end
+  end
+
+  defp refute_obsolete_database_claims(source) do
+    normalized_source = normalize_whitespace(source)
+
+    for pattern <- @obsolete_database_claims do
+      refute normalized_source =~ pattern,
+             "found obsolete database claim matching #{inspect(pattern)}"
+    end
+  end
+
+  defp assert_contains_all(source, values) do
+    normalized_source = normalize_whitespace(source)
+
+    for value <- values do
+      assert normalized_source =~ normalize_whitespace(value),
+             "expected to find #{inspect(value)}"
+    end
+  end
+
+  defp normalize_whitespace(value), do: String.replace(value, ~r/\s+/, " ")
 
   defp workflow_step!(workflow, name, next_name) do
     [_, step] = String.split(workflow, "- name: #{name}", parts: 2)
