@@ -1535,7 +1535,8 @@ probe_root=$(mktemp -d)
 probe_log="$probe_root/release.log"
 sentinel_password='postgres-live-secret-sentinel'
 cleanup_probe() {
-  rm -rf -- "$probe_root"
+  find "$probe_root" -mindepth 1 -depth -delete
+  rmdir "$probe_root"
 }
 trap cleanup_probe EXIT
 
@@ -1555,7 +1556,10 @@ timeout 30 env \
   POSTGRES_DB=fornacast_probe \
   POSTGRES_USER=fornacast_probe \
   POSTGRES_PASSWORD="$sentinel_password" \
-  SECRET_KEY_BASE='release-probe-secret-key-base-000000000000000000000000000000000' \
+  SECRET_KEY_BASE='0000000000000000000000000000000000000000000000000000000000000000' \
+  RELEASE_DISTRIBUTION=name \
+  ERL_EPMD_ADDRESS=127.0.0.1 \
+  ELIXIR_ERL_OPTIONS='-kernel inet_dist_use_interface {127,0,0,1}' \
   RELEASE_NODE="fornacast_probe_$$@127.0.0.1" \
   _build/postgresql-first-prod/rel/fornacast/bin/fornacast start \
   >"$probe_log" 2>&1
@@ -1581,7 +1585,7 @@ path from `mktemp -d`; never point this probe at `/data` or an operator path.
 Use a unique project so cleanup cannot touch operator volumes:
 
 ```bash
-set -eu -o pipefail
+bash -eu -o pipefail <<'BASH'
 
 smoke_owner=$(openssl rand -hex 12)
 printf '%s\n' "$smoke_owner" | grep -Eq '^[0-9a-f]{24}$'
@@ -1602,7 +1606,7 @@ test -z "$(docker network ls -q --filter "label=com.docker.compose.project=$COMP
 ! docker image inspect "$FORNACAST_IMAGE" >/dev/null 2>&1
 
 cleanup_smoke() {
-  status=$?
+  exit_status=$?
   trap - EXIT
   if printf '%s\n' "$COMPOSE_PROJECT_NAME" \
        | grep -Eq '^fornacast-postgresql-first-smoke-[0-9a-f]{24}$'; then
@@ -1611,12 +1615,14 @@ cleanup_smoke() {
   if [ "$(docker image inspect -f '{{ index .Config.Labels "fornacast.smoke.owner" }}' "$FORNACAST_IMAGE" 2>/dev/null || true)" = "$smoke_owner" ]; then
       docker image rm "$FORNACAST_IMAGE" >/dev/null 2>&1 || true
   fi
-  rm -rf -- "$smoke_tmp"
-  exit "$status"
+  find "$smoke_tmp" -mindepth 1 -depth -delete || exit_status=1
+  rmdir "$smoke_tmp" || exit_status=1
+  exit "$exit_status"
 }
 trap cleanup_smoke EXIT
 
 docker build \
+  --network host \
   --build-arg FORNACAST_DATABASE_ADAPTER=postgres \
   --label "fornacast.smoke.owner=$smoke_owner" \
   --tag "$FORNACAST_IMAGE" \
@@ -1657,6 +1663,7 @@ docker compose exec -T app /app/bin/release_asset_storage_smoke /app verify
 docker compose restart app
 scripts/api_proxy_smoke.sh http://127.0.0.1:4000
 docker compose exec -T app /app/bin/release_asset_storage_smoke /app verify
+BASH
 ```
 
 Expected: database health precedes app readiness; the bounded public API/health
@@ -1726,7 +1733,7 @@ for attempt in $(seq 1 20); do
     --event workflow_dispatch \
     --limit 20 \
     --json databaseId,displayTitle,createdAt \
-    --jq ".[] | select(.displayTitle == \"E2E ${RELEASE_VERSION}\" and .createdAt >= \"${dispatch_started}\") | .databaseId" \
+    --jq ".[] | select(.displayTitle == \"E2E release ${RELEASE_VERSION}\" and .createdAt >= \"${dispatch_started}\") | .databaseId" \
     | head -n 1)
   [ -n "$published_run_id" ] && break
   sleep 3
