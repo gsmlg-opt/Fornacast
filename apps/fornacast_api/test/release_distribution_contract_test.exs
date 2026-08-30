@@ -15,6 +15,12 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
   @runtime_config Path.join(@root, "config/runtime.exs")
   @releases_mix Path.join(@root, "apps/forge_releases/mix.exs")
 
+  @runtime_database_env ~w(
+    RELEASE_COMMAND FORNACAST_DATABASE_ADAPTER DATABASE_URL
+    PGUSER PGPASSWORD PGHOST PGPORT PGDATABASE
+    POSTGRES_USER POSTGRES_PASSWORD POSTGRES_HOST POSTGRES_PORT POSTGRES_DB
+  )
+
   test "release version resolver accepts only normalized stable versions" do
     for {input, expected} <- [
           {"0.1.0", "0.1.0"},
@@ -470,12 +476,19 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
 
   defp read_runtime_config(secret_key_base, api_port \\ "4891") do
     elixir = System.find_executable("elixir") || flunk("elixir executable not found")
+    ecto_ebin = Ecto.Repo.Supervisor |> :code.which() |> to_string() |> Path.dirname()
 
     System.cmd(
       elixir,
       [
+        "-pa",
+        ecto_ebin,
         "-e",
         """
+        defmodule Fornacast.Repo do
+          def __adapter__, do: Ecto.Adapters.Postgres
+        end
+
         config = Config.Reader.read!(#{inspect(@runtime_config)}, env: :prod)
 
         port =
@@ -489,49 +502,73 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
         """
       ],
       cd: @root,
-      env: [
-        {"RELEASE_COMMAND", "start"},
-        {"FORNACAST_DATABASE_ADAPTER", "turso"},
-        {"SECRET_KEY_BASE", secret_key_base},
-        {"FORNACAST_API_PORT", api_port},
-        {"FORNACAST_BASE_URL", "http://localhost:4890"},
-        {"FORNACAST_REPO_STORAGE_ROOT", "/tmp/fornacast-runtime-config-repos"},
-        {"FORNACAST_SSH_HOST", "localhost"},
-        {"FORNACAST_SSH_PORT", "2222"},
-        {"FORNACAST_SSH_SYSTEM_DIR", "/tmp/fornacast-runtime-config-ssh"}
-      ],
+      env:
+        runtime_config_env(
+          SECRET_KEY_BASE: secret_key_base,
+          FORNACAST_API_PORT: api_port,
+          FORNACAST_BASE_URL: "http://localhost:4890",
+          FORNACAST_REPO_STORAGE_ROOT: "/tmp/fornacast-runtime-config-repos",
+          FORNACAST_SSH_HOST: "localhost",
+          FORNACAST_SSH_PORT: "2222",
+          FORNACAST_SSH_SYSTEM_DIR: "/tmp/fornacast-runtime-config-ssh"
+        ),
       stderr_to_stdout: true
     )
   end
 
   defp read_runtime_storage_config(max_bytes, grace_seconds) do
     elixir = System.find_executable("elixir") || flunk("elixir executable not found")
+    ecto_ebin = Ecto.Repo.Supervisor |> :code.which() |> to_string() |> Path.dirname()
 
     System.cmd(
       elixir,
       [
+        "-pa",
+        ecto_ebin,
         "-e",
         """
+        defmodule Fornacast.Repo do
+          def __adapter__, do: Ecto.Adapters.Postgres
+        end
+
         config = Config.Reader.read!(#{inspect(@runtime_config)}, env: :prod)
         values = Keyword.fetch!(config, :fornacast)
         IO.puts("max=\#{values[:release_asset_max_bytes]} grace=\#{values[:release_asset_gc_grace_seconds]}")
         """
       ],
       cd: @root,
-      env: [
-        {"RELEASE_COMMAND", "start"},
-        {"FORNACAST_DATABASE_ADAPTER", "turso"},
-        {"SECRET_KEY_BASE", String.duplicate("s", 64)},
-        {"FORNACAST_BASE_URL", "http://localhost:4890"},
-        {"FORNACAST_REPO_STORAGE_ROOT", "/tmp/fornacast-runtime-config-repos"},
-        {"FORNACAST_SSH_HOST", "localhost"},
-        {"FORNACAST_SSH_PORT", "2222"},
-        {"FORNACAST_SSH_SYSTEM_DIR", "/tmp/fornacast-runtime-config-ssh"},
-        {"FORNACAST_RELEASE_ASSET_STORAGE_ROOT", "/tmp/fornacast-runtime-assets"},
-        {"FORNACAST_RELEASE_ASSET_MAX_BYTES", max_bytes},
-        {"FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS", grace_seconds}
-      ],
+      env:
+        runtime_config_env(
+          SECRET_KEY_BASE: String.duplicate("s", 64),
+          FORNACAST_BASE_URL: "http://localhost:4890",
+          FORNACAST_REPO_STORAGE_ROOT: "/tmp/fornacast-runtime-config-repos",
+          FORNACAST_SSH_HOST: "localhost",
+          FORNACAST_SSH_PORT: "2222",
+          FORNACAST_SSH_SYSTEM_DIR: "/tmp/fornacast-runtime-config-ssh",
+          FORNACAST_RELEASE_ASSET_STORAGE_ROOT: "/tmp/fornacast-runtime-assets",
+          FORNACAST_RELEASE_ASSET_MAX_BYTES: max_bytes,
+          FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS: grace_seconds
+        ),
       stderr_to_stdout: true
     )
+  end
+
+  defp runtime_config_env(overrides) do
+    @runtime_database_env
+    |> Map.new(&{&1, nil})
+    |> Map.merge(
+      Map.new(
+        [
+          RELEASE_COMMAND: "start",
+          POSTGRES_HOST: "127.0.0.1",
+          POSTGRES_PORT: "5432",
+          POSTGRES_DB: "fornacast_test",
+          POSTGRES_USER: "fornacast_runtime_test",
+          POSTGRES_PASSWORD: "fornacast_runtime_test_password"
+        ] ++ overrides,
+        fn {key, value} -> {to_string(key), value} end
+      )
+    )
+    |> Map.to_list()
   end
 end

@@ -10,6 +10,12 @@ defmodule ForgeAccounts.GitHubCredentialVaultTest do
   @old_key :binary.copy(<<23>>, 32)
   @keyring %{active: "active", keys: %{"active" => @active_key, "old" => @old_key}}
 
+  @runtime_database_env ~w(
+    RELEASE_COMMAND FORNACAST_DATABASE_ADAPTER DATABASE_URL
+    PGUSER PGPASSWORD PGHOST PGPORT PGDATABASE
+    POSTGRES_USER POSTGRES_PASSWORD POSTGRES_HOST POSTGRES_PORT POSTGRES_DB
+  )
+
   setup do
     case Application.get_env(:fornacast, :database_adapter) do
       value when value in ["postgres", "postgresql"] ->
@@ -695,26 +701,79 @@ defmodule ForgeAccounts.GitHubCredentialVaultTest do
 
   defp read_keyring_config(config_path, env, keys_json, active, expected_key) do
     project_root = Path.expand("../../..", __DIR__)
+    runtime_config? = config_path == "config/runtime.exs"
     config_path = Path.join(project_root, config_path)
+    elixir = System.find_executable("elixir") || flunk("elixir executable not found")
+
+    {elixir_args, repo_setup, repo_assertion} =
+      if runtime_config? do
+        ecto_ebin = Ecto.Repo.Supervisor |> :code.which() |> to_string() |> Path.dirname()
+
+        {
+          ["-pa", ecto_ebin, "-e"],
+          """
+          defmodule Fornacast.Repo do
+            def __adapter__, do: Ecto.Adapters.Postgres
+          end
+          """,
+          ""
+        }
+      else
+        {["-e"], ":non_existing = :code.which(Fornacast.Repo)",
+         ":non_existing = :code.which(Fornacast.Repo)"}
+      end
 
     script = """
+    #{repo_setup}
+
     config = Config.Reader.read!(#{inspect(config_path)}, env: #{inspect(env)}, target: :host)
+    #{repo_assertion}
     keyring = get_in(config, [:fornacast, :github_credential_keyring])
     expected_key = System.fetch_env!("FORNACAST_TEST_EXPECTED_CREDENTIAL_KEY") |> Base.decode64!()
     embedded? = :binary.match(:erlang.term_to_binary(config), expected_key) != :nomatch
     IO.write(Base.encode64(:erlang.term_to_binary({keyring, embedded?})))
     """
 
+    runtime_overrides =
+      if runtime_config? do
+        [
+          RELEASE_COMMAND: "start",
+          POSTGRES_HOST: "127.0.0.1",
+          POSTGRES_PORT: "5432",
+          POSTGRES_DB: "fornacast_test",
+          POSTGRES_USER: "fornacast_runtime_test",
+          POSTGRES_PASSWORD: "fornacast_runtime_test_password",
+          SECRET_KEY_BASE: String.duplicate("s", 64),
+          FORNACAST_BASE_URL: "http://localhost:4890",
+          FORNACAST_REPO_STORAGE_ROOT: "/tmp/fornacast-keyring-config-repos",
+          FORNACAST_SSH_HOST: "localhost",
+          FORNACAST_SSH_PORT: "2222",
+          FORNACAST_SSH_SYSTEM_DIR: "/tmp/fornacast-keyring-config-ssh"
+        ]
+      else
+        [RELEASE_COMMAND: nil, FORNACAST_DATABASE_ADAPTER: "postgres"]
+      end
+
+    env =
+      @runtime_database_env
+      |> Map.new(&{&1, nil})
+      |> Map.merge(
+        Map.new(
+          runtime_overrides ++
+            [
+              FORNACAST_GITHUB_CREDENTIAL_KEYS: keys_json,
+              FORNACAST_GITHUB_CREDENTIAL_ACTIVE_KEY_ID: active,
+              FORNACAST_TEST_EXPECTED_CREDENTIAL_KEY: Base.encode64(expected_key)
+            ],
+          fn {key, value} -> {to_string(key), value} end
+        )
+      )
+      |> Map.to_list()
+
     {encoded_result, 0} =
-      System.cmd("elixir", ["-e", script],
+      System.cmd(elixir, elixir_args ++ [script],
         cd: project_root,
-        env: [
-          {"FORNACAST_DATABASE_ADAPTER", "turso"},
-          {"FORNACAST_GITHUB_CREDENTIAL_KEYS", keys_json},
-          {"FORNACAST_GITHUB_CREDENTIAL_ACTIVE_KEY_ID", active},
-          {"FORNACAST_TEST_EXPECTED_CREDENTIAL_KEY", Base.encode64(expected_key)},
-          {"RELEASE_COMMAND", ""}
-        ],
+        env: env,
         stderr_to_stdout: true
       )
 
