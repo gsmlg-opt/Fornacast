@@ -4,7 +4,7 @@ ARG RUST_VERSION=1.96.0
 
 FROM ${ELIXIR_IMAGE} AS build
 
-ARG FORNACAST_DATABASE_ADAPTER=turso
+ARG FORNACAST_DATABASE_ADAPTER=postgres
 ARG RUST_VERSION
 ENV MIX_ENV=prod \
     FORNACAST_DATABASE_ADAPTER=${FORNACAST_DATABASE_ADAPTER} \
@@ -48,6 +48,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
       coreutils \
+      curl \
       git \
       libstdc++6 \
       libsctp1 \
@@ -71,9 +72,9 @@ ENV LANG=C.UTF-8 \
     PORT=4890 \
     FORNACAST_API_BIND_IP=0.0.0.0 \
     FORNACAST_API_PORT=4891 \
-    FORNACAST_DATABASE_ADAPTER=turso \
-    FORNACAST_DATABASE_PATH=/data/fornacast.db \
+    FORNACAST_DATABASE_ADAPTER=postgres \
     FORNACAST_CONFIG_DATABASE_PATH=/data/fornacast_config.db \
+    FORNACAST_LEGACY_TURSO_DATABASE_PATH=/data/fornacast.db \
     FORNACAST_REPO_STORAGE_ROOT=/data/repos \
     FORNACAST_RELEASE_ASSET_STORAGE_ROOT=/data/release-assets \
     FORNACAST_RELEASE_ASSET_MAX_BYTES=2147483648 \

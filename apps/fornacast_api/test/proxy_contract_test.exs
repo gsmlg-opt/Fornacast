@@ -95,9 +95,17 @@ defmodule FornacastAPI.ProxyContractTest do
     refute app =~ ~r/["']4000:(?:4000|4890)["']/
     assert app =~ ~r/networks:\s*\n\s+- fornacast-internal/s
 
+    assert app =~
+             ~r/depends_on:\s*\n\s+db:\s*\n\s+condition: service_healthy/s
+
+    assert app =~
+             "curl -fsS http://127.0.0.1:4890/health >/dev/null && curl -fsS http://127.0.0.1:4891/health >/dev/null"
+
     nginx = service!(compose, "nginx")
     assert nginx =~ "image: nginx:1.29-alpine"
-    assert nginx =~ ~r/depends_on:\s*\n\s+- app/s
+
+    assert nginx =~
+             ~r/depends_on:\s*\n\s+app:\s*\n\s+condition: service_healthy/s
 
     assert nginx =~
              ~r/["']?\.\/deploy\/nginx\/fornacast\.conf:\/etc\/nginx\/conf\.d\/default\.conf:ro["']?/

@@ -205,6 +205,111 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert env_example =~ "openssl rand -hex 32"
   end
 
+  test "published image and default Compose deployment use PostgreSQL component mode" do
+    dockerfile = File.read!(@dockerfile)
+    compose = File.read!(@compose)
+    env_example = File.read!(@env_example)
+
+    assert dockerfile =~ "ARG FORNACAST_DATABASE_ADAPTER=postgres"
+
+    [_, runtime_stage] = String.split(dockerfile, "FROM ${DEBIAN_IMAGE} AS app", parts: 2)
+    [runtime_packages, _] = String.split(runtime_stage, "useradd --create-home", parts: 2)
+
+    assert "curl" in String.split(runtime_packages)
+    assert runtime_stage =~ ~r/^[ \t]+FORNACAST_DATABASE_ADAPTER=postgres \\$/m
+
+    assert runtime_stage =~
+             ~r/^[ \t]+FORNACAST_CONFIG_DATABASE_PATH=\/data\/fornacast_config\.db \\$/m
+
+    assert runtime_stage =~
+             ~r/^[ \t]+FORNACAST_LEGACY_TURSO_DATABASE_PATH=\/data\/fornacast\.db \\$/m
+
+    refute runtime_stage =~ ~r/^[ \t]+FORNACAST_DATABASE_PATH=/m
+
+    app = compose_service!(compose, "app")
+    db = compose_service!(compose, "db")
+    nginx = compose_service!(compose, "nginx")
+
+    assert_order(compose, "  app:\n", "  db:\n")
+    assert_order(compose, "  db:\n", "  nginx:\n")
+
+    assert app =~
+             ~r/build:\s*\n\s+context: \.\s*\n\s+args:\s*\n\s+FORNACAST_DATABASE_ADAPTER: postgres/s
+
+    assert app =~ ~r/environment:\s*\n\s+FORNACAST_DATABASE_ADAPTER: postgres/s
+    assert app =~ "POSTGRES_HOST: db"
+    assert app =~ "POSTGRES_PORT: 5432"
+    assert app =~ ~S|POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}|
+    assert app =~ ~S|POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}|
+    assert app =~ ~S|POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}|
+    assert app =~ "FORNACAST_CONFIG_DATABASE_PATH:"
+    assert app =~ "FORNACAST_CONFIG_TURSO_DATABASE_URL:"
+    assert app =~ "FORNACAST_CONFIG_TURSO_AUTH_TOKEN:"
+    refute app =~ ~r/^\s+DATABASE_URL:/m
+    refute app =~ ~r/^\s+FORNACAST_DATABASE_PATH:/m
+    refute app =~ ~r/^\s+TURSO_DATABASE_URL:/m
+    refute app =~ ~r/^\s+TURSO_AUTH_TOKEN:/m
+    assert app =~ ~r/depends_on:\s*\n\s+db:\s*\n\s+condition: service_healthy/s
+
+    assert app =~
+             "curl -fsS http://127.0.0.1:4890/health >/dev/null && curl -fsS http://127.0.0.1:4891/health >/dev/null"
+
+    assert db =~ "image: postgres:17"
+    refute db =~ "profiles:"
+    assert db =~ ~S|POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}|
+    assert db =~ ~S|POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}|
+    assert db =~ ~S|POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}|
+    assert db =~ ~S|pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}|
+    assert nginx =~ ~r/depends_on:\s*\n\s+app:\s*\n\s+condition: service_healthy/s
+
+    assert length(:binary.matches(compose, ~S|POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}|)) ==
+             2
+
+    assert length(
+             :binary.matches(compose, ~S|POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}|)
+           ) == 2
+
+    assert length(
+             :binary.matches(
+               compose,
+               ~S|POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}|
+             )
+           ) == 2
+
+    assert compose =~ ~r/^  fornacast-data:\s*$/m
+    assert compose =~ ~r/^  postgres-data:\s*$/m
+
+    assert env_example =~ ~r/^SECRET_KEY_BASE=$/m
+    assert env_example =~ ~r/^POSTGRES_DB=fornacast_prod$/m
+    assert env_example =~ ~r/^POSTGRES_USER=fornacast$/m
+    assert env_example =~ ~r/^POSTGRES_PASSWORD=$/m
+
+    assert env_example =~
+             "# Concord config store (separate from the PostgreSQL domain database)."
+
+    assert env_example =~ ~r/^FORNACAST_CONFIG_DATABASE_PATH=\/data\/fornacast_config\.db$/m
+    assert env_example =~ ~r/^FORNACAST_CONFIG_TURSO_DATABASE_URL=$/m
+    assert env_example =~ ~r/^FORNACAST_CONFIG_TURSO_AUTH_TOKEN=$/m
+    refute env_example =~ ~r/^FORNACAST_DATABASE_PATH=/m
+    refute env_example =~ ~r/^TURSO_DATABASE_URL=/m
+    refute env_example =~ ~r/^TURSO_AUTH_TOKEN=/m
+    refute env_example =~ ~r/^DATABASE_URL=/m
+  end
+
+  test "Compose propagates the legacy Turso acknowledgement only when explicitly set" do
+    blank_environment = compose_app_environment(nil)
+    acknowledged_environment = compose_app_environment("true")
+
+    assert blank_environment["FORNACAST_ACKNOWLEDGE_LEGACY_TURSO_DATA"] == ""
+    assert acknowledged_environment["FORNACAST_ACKNOWLEDGE_LEGACY_TURSO_DATA"] == "true"
+
+    env_example = File.read!(@env_example)
+    assert env_example =~ ~r/^FORNACAST_ACKNOWLEDGE_LEGACY_TURSO_DATA=$/m
+
+    assert env_example =~
+             "Set to true only after intentionally backing up and planning the legacy Turso transition."
+  end
+
   test "release commit, tag, and page operations are safe to retry" do
     workflow = File.read!(@workflow)
 
@@ -465,6 +570,43 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
   defp assert_order(source, first, second) do
     assert position!(source, first) < position!(source, second),
            "expected #{inspect(first)} to appear before #{inspect(second)}"
+  end
+
+  defp compose_service!(compose, name) do
+    case Regex.run(
+           ~r/^  #{Regex.escape(name)}:\n(?<body>(?: {4}.*(?:\n|\z))*)/m,
+           compose,
+           capture: ["body"]
+         ) do
+      [body] -> body
+      _ -> flunk("missing Compose service #{name}")
+    end
+  end
+
+  defp compose_app_environment(acknowledgement) do
+    docker = System.find_executable("docker") || flunk("docker executable not found")
+
+    {output, status} =
+      System.cmd(
+        docker,
+        ["compose", "-f", @compose, "config", "--format", "json"],
+        cd: @root,
+        env: [
+          {"SECRET_KEY_BASE",
+           "compose-contract-secret-key-base-00000000000000000000000000000000"},
+          {"POSTGRES_DB", "fornacast_prod"},
+          {"POSTGRES_USER", "fornacast"},
+          {"POSTGRES_PASSWORD", "compose-contract-password"},
+          {"FORNACAST_ACKNOWLEDGE_LEGACY_TURSO_DATA", acknowledgement}
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, output
+
+    output
+    |> JSON.decode!()
+    |> get_in(["services", "app", "environment"])
   end
 
   defp position!(source, value) do
