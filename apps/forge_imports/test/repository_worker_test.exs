@@ -2141,28 +2141,12 @@ defmodule ForgeImports.RepositoryWorkerTest do
       quarantine = cleanup_slot(request.destination)
       File.mkdir!(quarantine)
       File.chmod!(quarantine, 0o700)
-
-      {:ok,
-       %File.Stat{
-         mode: mode,
-         major_device: major_device,
-         minor_device: minor_device,
-         inode: inode
-       }} = File.lstat(quarantine)
+      {:ok, evidence} = GitCore.Remote.cleanup_evidence(request.destination)
 
       {:error,
        %GitCore.Remote.Error{
          kind: :cleanup_pending,
-         detail: %GitCore.Remote.CleanupPending{
-           original_kind: :source_validation,
-           quarantine_path: quarantine,
-           identity: %{
-             mode: Bitwise.band(mode, 0o777),
-             major_device: major_device,
-             minor_device: minor_device,
-             inode: inode
-           }
-         }
+         detail: %{evidence | original_kind: :source_validation}
        }}
     end
 
@@ -2394,22 +2378,13 @@ defmodule ForgeImports.RepositoryWorkerTest do
       quarantine = cleanup_slot(request.destination)
       File.mkdir!(quarantine)
       File.chmod!(quarantine, 0o700)
-      {:ok, stat} = File.lstat(quarantine)
+      {:ok, evidence} = GitCore.Remote.cleanup_evidence(request.destination)
       send(Keyword.fetch!(opts, :test_pid), {:cancel_cleanup_pending, request.destination})
 
       {:error,
        %GitCore.Remote.Error{
          kind: :cleanup_pending,
-         detail: %GitCore.Remote.CleanupPending{
-           original_kind: :cancelled,
-           quarantine_path: quarantine,
-           identity: %{
-             mode: Bitwise.band(stat.mode, 0o777),
-             major_device: stat.major_device,
-             minor_device: stat.minor_device,
-             inode: stat.inode
-           }
-         }
+         detail: %{evidence | original_kind: :cancelled}
        }}
     end
 
@@ -2432,21 +2407,12 @@ defmodule ForgeImports.RepositoryWorkerTest do
       quarantine = cleanup_slot(request.destination)
       File.mkdir!(quarantine)
       File.chmod!(quarantine, 0o700)
-      {:ok, stat} = File.lstat(quarantine)
+      {:ok, evidence} = GitCore.Remote.cleanup_evidence(request.destination)
 
       {:error,
        %GitCore.Remote.Error{
          kind: :cleanup_pending,
-         detail: %GitCore.Remote.CleanupPending{
-           original_kind: Keyword.fetch!(opts, :kind),
-           quarantine_path: quarantine,
-           identity: %{
-             mode: Bitwise.band(stat.mode, 0o777),
-             major_device: stat.major_device,
-             minor_device: stat.minor_device,
-             inode: stat.inode
-           }
-         }
+         detail: %{evidence | original_kind: Keyword.fetch!(opts, :kind)}
        }}
     end
 
