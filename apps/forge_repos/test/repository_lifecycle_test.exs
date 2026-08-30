@@ -451,16 +451,55 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationRepo do
     adapter: @adapter
 end
 
+defmodule ForgeRepos.RepositoryLifecycleMigrationTestSupport do
+  @moduledoc false
+
+  @dual_failure_diagnostic "PostgreSQL migration restore failed after test body failure; preserving original failure"
+
+  def with_restore(body, restore) when is_function(body, 0) and is_function(restore, 0) do
+    body_outcome = capture_outcome(body)
+    restore_outcome = capture_outcome(restore)
+
+    case {body_outcome, restore_outcome} do
+      {{:ok, result}, {:ok, _restore_result}} ->
+        result
+
+      {{:error, kind, reason, stacktrace}, {:ok, _restore_result}} ->
+        :erlang.raise(kind, reason, stacktrace)
+
+      {{:ok, _result}, {:error, kind, reason, stacktrace}} ->
+        :erlang.raise(kind, reason, stacktrace)
+
+      {{:error, kind, reason, stacktrace},
+       {:error, _restore_kind, _restore_reason, _restore_stack}} ->
+        IO.puts(:stderr, @dual_failure_diagnostic)
+        :erlang.raise(kind, reason, stacktrace)
+    end
+  end
+
+  def dual_failure_diagnostic, do: @dual_failure_diagnostic
+
+  defp capture_outcome(fun) do
+    try do
+      {:ok, fun.()}
+    catch
+      kind, reason -> {:error, kind, reason, __STACKTRACE__}
+    end
+  end
+end
+
 defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
   use ExUnit.Case, async: false
 
   alias Ecto.Adapters.SQL
   alias ForgeRepos.RepositoryLifecycleMigrationRepo, as: MigrationRepo
+  alias ForgeRepos.RepositoryLifecycleMigrationTestSupport, as: MigrationTestSupport
   alias Fornacast.Repo
 
   @version 20_260_825_000_400
   @write_version 20_260_825_000_410
   @staged_path_version 20_260_825_000_420
+  @cleanup_recovery_version 20_260_825_000_430
   @pre_version 20_260_825_000_370
   @migrations_path Path.expand("../../fornacast/priv/repo/migrations", __DIR__)
   @migration_path Path.join(
@@ -505,13 +544,77 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
     refute source =~ "def change do"
   end
 
+  test "migration restore reports its failure without masking the original failure" do
+    original = RuntimeError.exception("original migration test failure")
+    restore = RuntimeError.exception("sensitive restore failure detail")
+    original_stacktrace = [{__MODULE__, :original_migration_failure, 0, []}]
+
+    diagnostic =
+      ExUnit.CaptureIO.capture_io(:stderr, fn ->
+        result =
+          try do
+            MigrationTestSupport.with_restore(
+              fn -> :erlang.raise(:error, original, original_stacktrace) end,
+              fn -> raise restore end
+            )
+          rescue
+            exception -> {exception, __STACKTRACE__}
+          end
+
+        assert {^original, ^original_stacktrace} = result
+      end)
+
+    assert diagnostic =~ MigrationTestSupport.dual_failure_diagnostic()
+    refute diagnostic =~ restore.message
+  end
+
   @tag :tmp_dir
   test "00400 upgrades an existing repository and preserves repository index contracts",
        context do
     migration_repo = start_migration_repo!(context)
     seed = repository_seed()
 
-    try do
+    with_complete_restore(
+      migration_repo,
+      fn ->
+        if postgres?() and migration_applied?(migration_repo, @cleanup_recovery_version) do
+          assert [@cleanup_recovery_version] =
+                   migrate_down(migration_repo, @cleanup_recovery_version)
+        end
+
+        if postgres?() and migration_applied?(migration_repo, @staged_path_version) do
+          assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
+        end
+
+        if postgres?() and migration_applied?(migration_repo, @write_version) do
+          assert [@write_version] = migrate_down(migration_repo, @write_version)
+        end
+
+        if postgres?() and migration_applied?(migration_repo, @version) do
+          assert [@version] = migrate_down(migration_repo, @version)
+        end
+
+        refute column_exists?(migration_repo, "lifecycle")
+        seeded = seed_pre_00400_repository!(migration_repo, seed)
+
+        assert [@version] = migrate_up(migration_repo, @version)
+        assert repository_projection(migration_repo, seeded.repository_id) == {"ready", 1, nil}
+        assert_final_schema!(migration_repo)
+      end,
+      fn -> delete_seed!(migration_repo, seed) end
+    )
+  end
+
+  @tag :tmp_dir
+  test "00400 rollback is pre-DDL guarded on Turso and exact on PostgreSQL", context do
+    migration_repo = start_migration_repo!(context)
+
+    with_complete_restore(migration_repo, fn ->
+      if postgres?() and migration_applied?(migration_repo, @cleanup_recovery_version) do
+        assert [@cleanup_recovery_version] =
+                 migrate_down(migration_repo, @cleanup_recovery_version)
+      end
+
       if postgres?() and migration_applied?(migration_repo, @staged_path_version) do
         assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
       end
@@ -520,41 +623,8 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
         assert [@write_version] = migrate_down(migration_repo, @write_version)
       end
 
-      if postgres?() and migration_applied?(migration_repo, @version) do
-        assert [@version] = migrate_down(migration_repo, @version)
-      end
+      ensure_up!(migration_repo, @version)
 
-      refute column_exists?(migration_repo, "lifecycle")
-      seeded = seed_pre_00400_repository!(migration_repo, seed)
-
-      assert [@version] = migrate_up(migration_repo, @version)
-      assert repository_projection(migration_repo, seeded.repository_id) == {"ready", 1, nil}
-      assert_final_schema!(migration_repo)
-    after
-      if postgres?() do
-        ensure_up!(migration_repo, @version)
-        ensure_up!(migration_repo, @write_version)
-        ensure_up!(migration_repo, @staged_path_version)
-        delete_seed!(migration_repo, seed)
-      end
-    end
-  end
-
-  @tag :tmp_dir
-  test "00400 rollback is pre-DDL guarded on Turso and exact on PostgreSQL", context do
-    migration_repo = start_migration_repo!(context)
-
-    if postgres?() and migration_applied?(migration_repo, @staged_path_version) do
-      assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
-    end
-
-    if postgres?() and migration_applied?(migration_repo, @write_version) do
-      assert [@write_version] = migrate_down(migration_repo, @write_version)
-    end
-
-    ensure_up!(migration_repo, @version)
-
-    try do
       if postgres?() do
         assert [@version] = migrate_down(migration_repo, @version)
         refute migration_applied?(migration_repo, @version)
@@ -576,13 +646,7 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
         assert migration_applied?(migration_repo, @version)
         assert_final_schema!(migration_repo)
       end
-    after
-      if postgres?() do
-        ensure_up!(migration_repo, @version)
-        ensure_up!(migration_repo, @write_version)
-        ensure_up!(migration_repo, @staged_path_version)
-      end
-    end
+    end)
   end
 
   @tag :tmp_dir
@@ -590,49 +654,58 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
     migration_repo = start_migration_repo!(context)
     seed = write_version_seed()
 
-    try do
-      if postgres?() and migration_applied?(migration_repo, @staged_path_version) do
-        assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
-      end
+    with_complete_restore(
+      migration_repo,
+      fn ->
+        if postgres?() and migration_applied?(migration_repo, @cleanup_recovery_version) do
+          assert [@cleanup_recovery_version] =
+                   migrate_down(migration_repo, @cleanup_recovery_version)
+        end
 
-      if postgres?() and migration_applied?(migration_repo, @write_version) do
-        assert [@write_version] = migrate_down(migration_repo, @write_version)
-      end
+        if postgres?() and migration_applied?(migration_repo, @staged_path_version) do
+          assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
+        end
 
-      ensure_up!(migration_repo, @version)
-      refute table_column_exists?(migration_repo, "repositories", "write_version")
+        if postgres?() and migration_applied?(migration_repo, @write_version) do
+          assert [@write_version] = migrate_down(migration_repo, @write_version)
+        end
 
-      refute table_column_exists?(
-               migration_repo,
-               "github_import_repository_items",
-               "replacement_write_version"
-             )
+        ensure_up!(migration_repo, @version)
+        refute table_column_exists?(migration_repo, "repositories", "write_version")
 
-      seeded = seed_pre_00410_rows!(migration_repo, seed)
+        refute table_column_exists?(
+                 migration_repo,
+                 "github_import_repository_items",
+                 "replacement_write_version"
+               )
 
-      assert [@write_version] = migrate_up(migration_repo, @write_version)
-      assert write_version_projection(migration_repo, seeded) == {0, nil}
-      assert_write_version_schema!(migration_repo)
-    after
-      if postgres?() do
-        ensure_up!(migration_repo, @write_version)
-        ensure_up!(migration_repo, @staged_path_version)
-        delete_write_version_seed!(migration_repo, seed)
-      end
-    end
+        seeded = seed_pre_00410_rows!(migration_repo, seed)
+
+        assert [@write_version] = migrate_up(migration_repo, @write_version)
+        assert write_version_projection(migration_repo, seeded) == {0, nil}
+        assert_write_version_schema!(migration_repo)
+      end,
+      fn -> delete_write_version_seed!(migration_repo, seed) end
+    )
   end
 
   @tag :tmp_dir
   test "00410 rollback is pre-DDL guarded on Turso and exact on PostgreSQL", context do
     migration_repo = start_migration_repo!(context)
-    ensure_up!(migration_repo, @version)
-    ensure_up!(migration_repo, @write_version)
 
-    if postgres?() and migration_applied?(migration_repo, @staged_path_version) do
-      assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
-    end
+    with_complete_restore(migration_repo, fn ->
+      ensure_up!(migration_repo, @version)
+      ensure_up!(migration_repo, @write_version)
 
-    try do
+      if postgres?() and migration_applied?(migration_repo, @cleanup_recovery_version) do
+        assert [@cleanup_recovery_version] =
+                 migrate_down(migration_repo, @cleanup_recovery_version)
+      end
+
+      if postgres?() and migration_applied?(migration_repo, @staged_path_version) do
+        assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
+      end
+
       if postgres?() do
         assert [@write_version] = migrate_down(migration_repo, @write_version)
         refute migration_applied?(migration_repo, @write_version)
@@ -662,72 +735,78 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
         assert migration_applied?(migration_repo, @write_version)
         assert_write_version_schema!(migration_repo)
       end
-    after
-      if postgres?() do
-        ensure_up!(migration_repo, @write_version)
-        ensure_up!(migration_repo, @staged_path_version)
-      end
-    end
+    end)
   end
 
   @tag :tmp_dir
   test "00420 preserves long staged paths and has an exact adapter lifecycle", context do
     migration_repo = start_migration_repo!(context)
-    ensure_up!(migration_repo, @version)
-    ensure_up!(migration_repo, @write_version)
 
-    if postgres?() and migration_applied?(migration_repo, @staged_path_version) do
-      assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
-    end
+    with_complete_restore(migration_repo, fn ->
+      ensure_up!(migration_repo, @version)
+      ensure_up!(migration_repo, @write_version)
 
-    if postgres?() do
-      assert staged_path_column_type(migration_repo) == {"character varying", 255}
-    else
-      assert staged_path_column_type(migration_repo) == {"TEXT", nil}
-    end
+      if postgres?() and migration_applied?(migration_repo, @cleanup_recovery_version) do
+        assert [@cleanup_recovery_version] =
+                 migrate_down(migration_repo, @cleanup_recovery_version)
+      end
 
-    assert [@staged_path_version] = migrate_up(migration_repo, @staged_path_version)
+      if postgres?() and migration_applied?(migration_repo, @staged_path_version) do
+        assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
+      end
 
-    assert staged_path_column_type(migration_repo) ==
-             if(postgres?(), do: {"text", nil}, else: {"TEXT", nil})
+      if postgres?() do
+        assert staged_path_column_type(migration_repo) == {"character varying", 255}
+      else
+        assert staged_path_column_type(migration_repo) == {"TEXT", nil}
+      end
 
-    if postgres?() do
-      seed = write_version_seed()
-      seeded = seed_pre_00410_rows!(migration_repo, seed)
-      long_path = "/staging/" <> String.duplicate("a", 300) <> ".git"
+      assert [@staged_path_version] = migrate_up(migration_repo, @staged_path_version)
 
-      try do
-        update_staged_path!(migration_repo, seeded.item_id, long_path)
-        assert staged_path_value(migration_repo, seeded.item_id) == long_path
+      assert staged_path_column_type(migration_repo) ==
+               if(postgres?(), do: {"text", nil}, else: {"TEXT", nil})
 
-        assert_raise Postgrex.Error, ~r/staged_storage_path exceeds varchar\(255\)/, fn ->
-          migrate_down(migration_repo, @staged_path_version)
-        end
+      if postgres?() do
+        seed = write_version_seed()
+        seeded = seed_pre_00410_rows!(migration_repo, seed)
+        long_path = "/staging/" <> String.duplicate("a", 300) <> ".git"
+
+        MigrationTestSupport.with_restore(
+          fn ->
+            update_staged_path!(migration_repo, seeded.item_id, long_path)
+            assert staged_path_value(migration_repo, seeded.item_id) == long_path
+
+            assert_raise Postgrex.Error, ~r/staged_storage_path exceeds varchar\(255\)/, fn ->
+              migrate_down(migration_repo, @staged_path_version)
+            end
+
+            assert migration_applied?(migration_repo, @staged_path_version)
+            assert staged_path_column_type(migration_repo) == {"text", nil}
+            assert staged_path_value(migration_repo, seeded.item_id) == long_path
+
+            update_staged_path!(migration_repo, seeded.item_id, nil)
+            assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
+            assert staged_path_column_type(migration_repo) == {"character varying", 255}
+
+            assert [@staged_path_version] = migrate_up(migration_repo, @staged_path_version)
+            assert staged_path_column_type(migration_repo) == {"text", nil}
+            update_staged_path!(migration_repo, seeded.item_id, long_path)
+            assert staged_path_value(migration_repo, seeded.item_id) == long_path
+          end,
+          fn ->
+            ensure_up!(migration_repo, @staged_path_version)
+            delete_write_version_seed!(migration_repo, seed)
+          end
+        )
+      else
+        assert_raise RuntimeError,
+                     "Turso rollback is disabled until gsmlg-dev/concord#81 is resolved",
+                     fn -> migrate_down(migration_repo, @staged_path_version) end
 
         assert migration_applied?(migration_repo, @staged_path_version)
-        assert staged_path_column_type(migration_repo) == {"text", nil}
-        assert staged_path_value(migration_repo, seeded.item_id) == long_path
-
-        update_staged_path!(migration_repo, seeded.item_id, nil)
-        assert [@staged_path_version] = migrate_down(migration_repo, @staged_path_version)
-        assert staged_path_column_type(migration_repo) == {"character varying", 255}
-
-        assert [@staged_path_version] = migrate_up(migration_repo, @staged_path_version)
-        assert staged_path_column_type(migration_repo) == {"text", nil}
-        update_staged_path!(migration_repo, seeded.item_id, long_path)
-        assert staged_path_value(migration_repo, seeded.item_id) == long_path
-      after
-        ensure_up!(migration_repo, @staged_path_version)
-        delete_write_version_seed!(migration_repo, seed)
+        assert staged_path_column_type(migration_repo) == {"TEXT", nil}
       end
-    else
-      assert_raise RuntimeError,
-                   "Turso rollback is disabled until gsmlg-dev/concord#81 is resolved",
-                   fn -> migrate_down(migration_repo, @staged_path_version) end
-
-      assert migration_applied?(migration_repo, @staged_path_version)
-      assert staged_path_column_type(migration_repo) == {"TEXT", nil}
-    end
+    end)
   end
 
   defp start_migration_repo!(context) do
@@ -1196,6 +1275,20 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
 
   defp ensure_up!(repo, version) do
     unless migration_applied?(repo, version), do: migrate_up(repo, version)
+  end
+
+  defp with_complete_restore(repo, body, cleanup \\ fn -> :ok end) do
+    if postgres?() do
+      MigrationTestSupport.with_restore(body, fn ->
+        ensure_up!(repo, @version)
+        ensure_up!(repo, @write_version)
+        ensure_up!(repo, @staged_path_version)
+        ensure_up!(repo, @cleanup_recovery_version)
+        cleanup.()
+      end)
+    else
+      body.()
+    end
   end
 
   defp select_id!(repo, table, field, value) do

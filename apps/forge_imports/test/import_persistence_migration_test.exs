@@ -558,11 +558,36 @@ defmodule ForgeImports.ImportPersistenceMigrationTestSupport do
     "github_import_runs"
   ]
 
+  @dual_failure_diagnostic "PostgreSQL migration restore failed after test body failure; preserving original failure"
+
   def import_tables, do: @import_tables
 
   def postgres? do
     Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"]
   end
+
+  def with_restore(body, restore) when is_function(body, 0) and is_function(restore, 0) do
+    body_outcome = capture_outcome(body)
+    restore_outcome = capture_outcome(restore)
+
+    case {body_outcome, restore_outcome} do
+      {{:ok, result}, {:ok, _restore_result}} ->
+        result
+
+      {{:error, kind, reason, stacktrace}, {:ok, _restore_result}} ->
+        :erlang.raise(kind, reason, stacktrace)
+
+      {{:ok, _result}, {:error, kind, reason, stacktrace}} ->
+        :erlang.raise(kind, reason, stacktrace)
+
+      {{:error, kind, reason, stacktrace},
+       {:error, _restore_kind, _restore_reason, _restore_stack}} ->
+        IO.puts(:stderr, @dual_failure_diagnostic)
+        :erlang.raise(kind, reason, stacktrace)
+    end
+  end
+
+  def dual_failure_diagnostic, do: @dual_failure_diagnostic
 
   def foreign_key_states(repo, count) do
     parent = self()
@@ -599,6 +624,14 @@ defmodule ForgeImports.ImportPersistenceMigrationTestSupport do
     Enum.each(ready, &send(&1, :read_foreign_key_state))
     Task.await_many(tasks, 5_000)
   end
+
+  defp capture_outcome(fun) do
+    try do
+      {:ok, fun.()}
+    catch
+      kind, reason -> {:error, kind, reason, __STACKTRACE__}
+    end
+  end
 end
 
 defmodule ForgeImports.ImportPersistenceMigrationRepo do
@@ -621,31 +654,81 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
   @pre_provisional_version 20_260_825_000_350
   @provisional_version 20_260_825_000_360
   @destination_version 20_260_825_000_370
+  @repository_lifecycle_version 20_260_825_000_400
+  @repository_write_version 20_260_825_000_410
+  @staged_path_version 20_260_825_000_420
+  @cleanup_recovery_version 20_260_825_000_430
   @run_scoped_indexes [
     {"github_import_items_run_id_index", "github_import_repository_items"},
     {"github_import_reports_run_id_index", "github_import_report_entries"}
   ]
 
+  test "migration restore reports its failure without masking the original failure" do
+    original = RuntimeError.exception("original migration test failure")
+    restore = RuntimeError.exception("sensitive restore failure detail")
+    original_stacktrace = [{__MODULE__, :original_migration_failure, 0, []}]
+
+    diagnostic =
+      ExUnit.CaptureIO.capture_io(:stderr, fn ->
+        result =
+          try do
+            ForgeImports.ImportPersistenceMigrationTestSupport.with_restore(
+              fn -> :erlang.raise(:error, original, original_stacktrace) end,
+              fn -> raise restore end
+            )
+          rescue
+            exception -> {exception, __STACKTRACE__}
+          end
+
+        assert {^original, ^original_stacktrace} = result
+      end)
+
+    assert diagnostic =~
+             ForgeImports.ImportPersistenceMigrationTestSupport.dual_failure_diagnostic()
+
+    refute diagnostic =~ restore.message
+  end
+
   @tag :tmp_dir
   test "00360 independently preserves index shape and has an exact lifecycle", context do
     if postgres?() do
       repo = start_migration_repo!()
-      clear_import_rows!(repo)
-      ensure_up!(repo, @destination_version)
 
-      assert [@destination_version] = migrate_down(repo, @destination_version)
-      assert_provisional_schema!(repo)
-      assert [@provisional_version] = migrate_down(repo, @provisional_version)
-      refute column_exists?(repo, "github_import_runs", "source_metadata")
-      refute Enum.any?(@run_scoped_indexes, fn {name, _table} -> index_exists?(repo, name) end)
+      with_complete_restore(repo, fn ->
+        clear_import_rows!(repo)
+        ensure_up!(repo, @provisional_version)
+        ensure_up!(repo, @destination_version)
+        ensure_up!(repo, @repository_lifecycle_version)
+        ensure_up!(repo, @repository_write_version)
+        ensure_up!(repo, @staged_path_version)
+        ensure_up!(repo, @cleanup_recovery_version)
 
-      seeded = seed_pre_00360_children!(repo)
-      assert [@provisional_version] = migrate_up(repo, @provisional_version)
-      assert_provisional_schema!(repo)
-      assert_seeded_children!(repo, seeded)
-      assert [@destination_version] = migrate_up(repo, @destination_version)
-      clear_import_rows!(repo)
-      delete_seed_accounts!(repo, seeded)
+        assert [@cleanup_recovery_version] = migrate_down(repo, @cleanup_recovery_version)
+        assert [@staged_path_version] = migrate_down(repo, @staged_path_version)
+        assert [@repository_write_version] = migrate_down(repo, @repository_write_version)
+
+        assert [@repository_lifecycle_version] =
+                 migrate_down(repo, @repository_lifecycle_version)
+
+        assert [@destination_version] = migrate_down(repo, @destination_version)
+        assert_provisional_schema!(repo)
+        assert [@provisional_version] = migrate_down(repo, @provisional_version)
+        refute column_exists?(repo, "github_import_runs", "source_metadata")
+        refute Enum.any?(@run_scoped_indexes, fn {name, _table} -> index_exists?(repo, name) end)
+
+        seeded = seed_pre_00360_children!(repo)
+        assert [@provisional_version] = migrate_up(repo, @provisional_version)
+        assert_provisional_schema!(repo)
+        assert_seeded_children!(repo, seeded)
+        assert [@destination_version] = migrate_up(repo, @destination_version)
+        clear_import_rows!(repo)
+        delete_seed_accounts!(repo, seeded)
+
+        assert [@repository_lifecycle_version] = migrate_up(repo, @repository_lifecycle_version)
+        assert [@repository_write_version] = migrate_up(repo, @repository_write_version)
+        assert [@staged_path_version] = migrate_up(repo, @staged_path_version)
+        assert [@cleanup_recovery_version] = migrate_up(repo, @cleanup_recovery_version)
+      end)
     else
       repo = start_scratch_repo!(context.tmp_dir, "provisional")
       assert Enum.member?(migrate_up(repo, @pre_provisional_version), @pre_provisional_version)
@@ -879,6 +962,17 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
     if migration_applied?(repo, version), do: [], else: migrate_up(repo, version)
   end
 
+  defp with_complete_restore(repo, body) do
+    ForgeImports.ImportPersistenceMigrationTestSupport.with_restore(body, fn ->
+      ensure_up!(repo, @provisional_version)
+      ensure_up!(repo, @destination_version)
+      ensure_up!(repo, @repository_lifecycle_version)
+      ensure_up!(repo, @repository_write_version)
+      ensure_up!(repo, @staged_path_version)
+      ensure_up!(repo, @cleanup_recovery_version)
+    end)
+  end
+
   defp migrate_down(repo, version),
     do: Ecto.Migrator.run(repo, migrations_path(), :down, to: version, log: false)
 
@@ -1002,6 +1096,10 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
 
   @moduletag :persistence
   @version 20_260_825_000_370
+  @repository_lifecycle_version 20_260_825_000_400
+  @repository_write_version 20_260_825_000_410
+  @staged_path_version 20_260_825_000_420
+  @cleanup_recovery_version 20_260_825_000_430
   @migration_file Path.expand(
                     "../../fornacast/priv/repo/migrations/20260825000370_add_github_import_destination_status.exs",
                     __DIR__
@@ -1023,39 +1121,48 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
   test "destination-status rollback is pre-DDL guarded on Turso and reversible on PostgreSQL" do
     repo = start_migration_repo!()
 
-    clear_import_rows!(repo)
-    assert migration_applied?(repo)
-    assert Enum.all?(import_tables(), &table_exists?(repo, &1))
-
     if postgres?() do
-      assert [@version] =
-               Ecto.Migrator.run(repo, migrations_path(), :down,
-                 to: @version,
-                 log: false
+      with_complete_restore(repo, fn ->
+        clear_import_rows!(repo)
+        assert migration_applied?(repo)
+        assert Enum.all?(import_tables(), &table_exists?(repo, &1))
+        ensure_latest_migrations_up!(repo)
+        assert [@cleanup_recovery_version] = migrate_down(repo, @cleanup_recovery_version)
+        assert [@staged_path_version] = migrate_down(repo, @staged_path_version)
+        assert [@repository_write_version] = migrate_down(repo, @repository_write_version)
+
+        assert [@repository_lifecycle_version] =
+                 migrate_down(repo, @repository_lifecycle_version)
+
+        assert [@version] = migrate_down(repo, @version)
+
+        refute migration_applied?(repo)
+        assert Enum.all?(import_tables(), &table_exists?(repo, &1))
+        assert column_exists?(repo, "github_import_runs", "source_metadata")
+        refute column_exists?(repo, "github_import_runs", "destination_organization_status")
+
+        refute column_exists?(
+                 repo,
+                 "github_import_runs",
+                 "destination_organization_classification"
                )
 
-      refute migration_applied?(repo)
-      assert Enum.all?(import_tables(), &table_exists?(repo, &1))
-      assert column_exists?(repo, "github_import_runs", "source_metadata")
-      refute column_exists?(repo, "github_import_runs", "destination_organization_status")
+        assert [@version] = migrate_up(repo, @version)
+        assert [@repository_lifecycle_version] = migrate_up(repo, @repository_lifecycle_version)
+        assert [@repository_write_version] = migrate_up(repo, @repository_write_version)
+        assert [@staged_path_version] = migrate_up(repo, @staged_path_version)
+        assert [@cleanup_recovery_version] = migrate_up(repo, @cleanup_recovery_version)
 
-      refute column_exists?(
-               repo,
-               "github_import_runs",
-               "destination_organization_classification"
-             )
-
-      assert [@version] =
-               Ecto.Migrator.run(repo, migrations_path(), :up,
-                 to: @version,
-                 log: false
-               )
-
+        assert migration_applied?(repo)
+        assert Enum.all?(import_tables(), &table_exists?(repo, &1))
+        assert column_exists?(repo, "github_import_runs", "source_metadata")
+        assert_destination_projection!(repo)
+      end)
+    else
+      clear_import_rows!(repo)
       assert migration_applied?(repo)
       assert Enum.all?(import_tables(), &table_exists?(repo, &1))
-      assert column_exists?(repo, "github_import_runs", "source_metadata")
-      assert_destination_projection!(repo)
-    else
+
       assert_raise RuntimeError,
                    "Turso rollback is disabled until gsmlg-dev/concord#81 is resolved",
                    fn ->
@@ -1074,19 +1181,34 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
   @tag :tmp_dir
   test "00370 backfills every pre-existing destination shape before installing coherence",
        context do
-    repo =
-      if postgres?() do
-        repo = start_migration_repo!()
-        clear_import_rows!(repo)
-        ensure_up!(repo, @version)
-        assert [@version] = migrate_down(repo, @version)
-        repo
-      else
-        repo = start_scratch_repo!(context.tmp_dir, "destination-upgrade")
-        assert Enum.member?(migrate_up(repo, 20_260_825_000_360), 20_260_825_000_360)
-        repo
-      end
+    if postgres?() do
+      repo = start_migration_repo!()
 
+      with_complete_restore(repo, fn ->
+        clear_import_rows!(repo)
+        ensure_latest_migrations_up!(repo)
+        assert [@cleanup_recovery_version] = migrate_down(repo, @cleanup_recovery_version)
+        assert [@staged_path_version] = migrate_down(repo, @staged_path_version)
+        assert [@repository_write_version] = migrate_down(repo, @repository_write_version)
+
+        assert [@repository_lifecycle_version] =
+                 migrate_down(repo, @repository_lifecycle_version)
+
+        assert [@version] = migrate_down(repo, @version)
+        assert_destination_backfill!(repo)
+        assert [@repository_lifecycle_version] = migrate_up(repo, @repository_lifecycle_version)
+        assert [@repository_write_version] = migrate_up(repo, @repository_write_version)
+        assert [@staged_path_version] = migrate_up(repo, @staged_path_version)
+        assert [@cleanup_recovery_version] = migrate_up(repo, @cleanup_recovery_version)
+      end)
+    else
+      repo = start_scratch_repo!(context.tmp_dir, "destination-upgrade")
+      assert Enum.member?(migrate_up(repo, 20_260_825_000_360), 20_260_825_000_360)
+      assert_destination_backfill!(repo)
+    end
+  end
+
+  defp assert_destination_backfill!(repo) do
     refute column_exists?(repo, "github_import_runs", "destination_organization_status")
     seeded = seed_pre_00370_runs!(repo)
 
@@ -1406,23 +1528,37 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
     end)
   end
 
-  defp migration_applied?(repo) do
+  defp migration_applied?(repo, version \\ @version) do
     placeholder = if postgres?(), do: "$1", else: "?"
 
     %{rows: rows} =
       Ecto.Adapters.SQL.query!(
         repo,
         "select version from schema_migrations where version = #{placeholder}",
-        [@version]
+        [version]
       )
 
-    rows == [[@version]]
+    rows == [[version]]
   end
 
   defp ensure_up!(repo, version) do
-    unless migration_applied?(repo) do
+    unless migration_applied?(repo, version) do
       Ecto.Migrator.run(repo, migrations_path(), :up, to: version, log: false)
     end
+  end
+
+  defp ensure_latest_migrations_up!(repo) do
+    ensure_up!(repo, @version)
+    ensure_up!(repo, @repository_lifecycle_version)
+    ensure_up!(repo, @repository_write_version)
+    ensure_up!(repo, @staged_path_version)
+    ensure_up!(repo, @cleanup_recovery_version)
+  end
+
+  defp with_complete_restore(repo, body) do
+    ForgeImports.ImportPersistenceMigrationTestSupport.with_restore(body, fn ->
+      ensure_latest_migrations_up!(repo)
+    end)
   end
 
   defp column_exists?(repo, table, column) do
