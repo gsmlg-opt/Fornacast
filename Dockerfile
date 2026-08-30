@@ -35,6 +35,9 @@ COPY config config
 COPY apps/fornacast_web/package.json apps/fornacast_web/package.json
 COPY apps apps
 
+ENV HEX_HTTP_CONCURRENCY=1 \
+    HEX_HTTP_TIMEOUT=300
+
 RUN mix deps.get --only prod && \
     mix deps.compile && \
     mix npm.ci && \

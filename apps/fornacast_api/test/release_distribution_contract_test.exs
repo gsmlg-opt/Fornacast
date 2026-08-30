@@ -174,6 +174,21 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert "libsctp1" in String.split(runtime_packages)
   end
 
+  test "release image scopes Hex retry tuning to the build stage" do
+    dockerfile = File.read!(@dockerfile)
+
+    [build_stage, runtime_stage] =
+      String.split(dockerfile, "FROM ${DEBIAN_IMAGE} AS app", parts: 2)
+
+    assert build_stage =~ ~r/^ENV HEX_HTTP_CONCURRENCY=1 \\$/m
+    assert build_stage =~ ~r/^[ \t]+HEX_HTTP_TIMEOUT=300$/m
+    assert_order(build_stage, "HEX_HTTP_CONCURRENCY=1", "mix deps.get --only prod")
+    assert_order(build_stage, "HEX_HTTP_TIMEOUT=300", "mix deps.get --only prod")
+
+    refute runtime_stage =~ "HEX_HTTP_CONCURRENCY"
+    refute runtime_stage =~ "HEX_HTTP_TIMEOUT"
+  end
+
   test "production rejects cookie secrets shorter than 64 bytes" do
     {short_output, short_status} = read_runtime_config(String.duplicate("s", 63))
 
