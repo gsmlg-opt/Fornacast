@@ -22,4 +22,14 @@ defmodule FornacastAPI.DevenvProcessContractTest do
              };
            """
   end
+
+  test "devenv provisions the PostgreSQL development and test databases" do
+    source = File.read!(@devenv)
+
+    assert source =~ ~s(package = pkgs-stable.postgresql_17)
+    assert source =~ ~s(port = 55432)
+    assert source =~ ~s(listen_addresses = "")
+    assert source =~ ~s({name = "fornacast_dev";})
+    assert source =~ ~s({name = "fornacast_test";})
+  end
 end

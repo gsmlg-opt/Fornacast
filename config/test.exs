@@ -34,7 +34,7 @@ config :git_core, :limits,
 test_root = Path.expand("..", __DIR__)
 
 database_adapter =
-  System.get_env("FORNACAST_DATABASE_ADAPTER", "turso")
+  System.get_env("FORNACAST_DATABASE_ADAPTER", "postgres")
   |> String.downcase()
 
 repo_config =

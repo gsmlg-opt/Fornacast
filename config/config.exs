@@ -37,7 +37,7 @@ release_asset_gc_grace_seconds =
   )
 
 database_adapter =
-  System.get_env("FORNACAST_DATABASE_ADAPTER", "turso")
+  System.get_env("FORNACAST_DATABASE_ADAPTER", "postgres")
   |> String.downcase()
 
 repo_adapter =
@@ -129,6 +129,40 @@ config :git_core, :limits,
   remote_kill_escalation_ms: 5_000,
   remote_cleanup_wait_ms: 10_000
 
+parse_postgres_port! = fn raw ->
+  case Integer.parse(raw) do
+    {port, ""} when port in 1..65_535 -> port
+    _ -> raise "PGPORT/POSTGRES_PORT must be a decimal integer from 1 through 65535"
+  end
+end
+
+postgres_connection = fn default_database ->
+  host = System.get_env("PGHOST") || System.get_env("POSTGRES_HOST", "localhost")
+  port = System.get_env("PGPORT") || System.get_env("POSTGRES_PORT", "5432")
+
+  unless is_binary(host) and byte_size(host) in 1..4096 and String.valid?(host) and
+           String.printable?(host) and not Regex.match?(~r/[\p{Cc}\p{Cf}]/u, host) and
+           :binary.match(host, <<0>>) == :nomatch do
+    raise "PGHOST/POSTGRES_HOST must be a printable nonempty host or socket path"
+  end
+
+  connection =
+    if Path.type(host) == :absolute do
+      [hostname: nil, socket_dir: host]
+    else
+      [hostname: host, socket_dir: nil]
+    end
+
+  [
+    username:
+      System.get_env("PGUSER") || System.get_env("POSTGRES_USER") ||
+        System.get_env("USER", "postgres"),
+    password: System.get_env("PGPASSWORD") || System.get_env("POSTGRES_PASSWORD"),
+    database: System.get_env("PGDATABASE") || System.get_env("POSTGRES_DB", default_database),
+    port: parse_postgres_port!.(port)
+  ] ++ connection
+end
+
 repo_config =
   case database_adapter do
     value when value in ["libsql", "turso"] ->
@@ -144,19 +178,23 @@ repo_config =
       |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
 
     value when value in ["postgres", "postgresql"] ->
-      [
-        username: System.get_env("POSTGRES_USER", "postgres"),
-        password: System.get_env("POSTGRES_PASSWORD", "postgres"),
-        hostname: System.get_env("POSTGRES_HOST", "localhost"),
-        database: System.get_env("POSTGRES_DB", "fornacast_dev")
-      ]
+      if config_env() == :prod do
+        [
+          hostname: "127.0.0.1",
+          socket_dir: nil,
+          port: 5432,
+          database: "fornacast_build"
+        ]
+      else
+        postgres_connection.("fornacast_dev")
+      end
   end
 
 config :fornacast,
        Fornacast.Repo,
        [
          stacktrace: true,
-         show_sensitive_data_on_connection_error: true,
+         show_sensitive_data_on_connection_error: config_env() != :prod,
          pool_size: String.to_integer(System.get_env("POOL_SIZE", "10"))
        ] ++ repo_config
 
