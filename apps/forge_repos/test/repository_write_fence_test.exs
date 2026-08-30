@@ -1,4 +1,6 @@
 defmodule ForgeRepos.RepositoryWriteFenceTest.First do
+  def cleanup_safety_locked(_repository, _now), do: :safe
+
   def reconcile_repository_locked(_repository, _path, deadline) do
     send(self(), {:first, deadline})
     :ok
@@ -6,6 +8,8 @@ defmodule ForgeRepos.RepositoryWriteFenceTest.First do
 end
 
 defmodule ForgeRepos.RepositoryWriteFenceTest.Second do
+  def cleanup_safety_locked(_repository, _now), do: :safe
+
   def reconcile_repository_locked(_repository, _path, deadline) do
     send(self(), {:second, deadline})
     :ok
@@ -13,6 +17,8 @@ defmodule ForgeRepos.RepositoryWriteFenceTest.Second do
 end
 
 defmodule ForgeRepos.RepositoryWriteFenceTest.ReloadObserver do
+  def cleanup_safety_locked(_repository, _now), do: :safe
+
   def reconcile_repository_locked(repository, path, _deadline) do
     send(self(), {:reloaded_repository, repository, path})
     :ok
@@ -20,6 +26,8 @@ defmodule ForgeRepos.RepositoryWriteFenceTest.ReloadObserver do
 end
 
 defmodule ForgeRepos.RepositoryWriteFenceTest.Unavailable do
+  def cleanup_safety_locked(_repository, _now), do: :safe
+
   def reconcile_repository_locked(_repository, _path, _deadline),
     do: {:error, :unavailable}
 end
@@ -45,12 +53,27 @@ defmodule ForgeRepos.RepositoryWriteFenceTest do
       end
     end
 
-    original = Application.get_env(:forge_repos, :repository_write_reconcilers)
+    original = {
+      Application.fetch_env(:forge_repos, :repository_write_reconcilers),
+      Application.fetch_env(:forge_repos, :repository_write_limiter)
+    }
+
     original_root = Application.get_env(:fornacast, :repo_storage_root)
     Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
 
     on_exit(fn ->
-      Application.put_env(:forge_repos, :repository_write_reconcilers, original)
+      {original_reconcilers, original_limiter} = original
+
+      for {key, value} <- [
+            repository_write_reconcilers: original_reconcilers,
+            repository_write_limiter: original_limiter
+          ] do
+        case value do
+          {:ok, value} -> Application.put_env(:forge_repos, key, value)
+          :error -> Application.delete_env(:forge_repos, key)
+        end
+      end
+
       Application.put_env(:fornacast, :repo_storage_root, original_root)
     end)
 

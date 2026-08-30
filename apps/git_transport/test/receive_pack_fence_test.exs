@@ -2,6 +2,9 @@ defmodule GitTransport.ReceivePackFenceTest.Reconciler do
   @behaviour ForgeRepos.RepositoryWriteReconcilers
 
   @impl true
+  def cleanup_safety_locked(_repository, _now), do: :safe
+
+  @impl true
   def reconcile_repository_locked(_repository, path, _deadline) do
     send(self(), {:reconciled, path})
     :ok
@@ -10,6 +13,9 @@ end
 
 defmodule GitTransport.ReceivePackFenceTest.BlockedRecovery do
   @behaviour ForgeRepos.RepositoryWriteReconcilers
+
+  @impl true
+  def cleanup_safety_locked(_repository, _now), do: :safe
 
   @impl true
   def reconcile_repository_locked(_repository, _path, _deadline),
