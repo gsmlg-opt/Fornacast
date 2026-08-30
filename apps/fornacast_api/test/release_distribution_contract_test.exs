@@ -174,6 +174,24 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert "libsctp1" in String.split(runtime_packages)
   end
 
+  test "release image installs CMake only for native dependency builds" do
+    dockerfile = File.read!(@dockerfile)
+
+    [build_stage, runtime_stage] =
+      String.split(dockerfile, "FROM ${DEBIAN_IMAGE} AS app", parts: 2)
+
+    cmake_install = """
+    RUN apt-get update && \\
+        apt-get install -y --no-install-recommends cmake && \\
+        rm -rf /var/lib/apt/lists/*
+    """
+
+    assert build_stage =~ cmake_install
+
+    assert_order(build_stage, "cmake", "mix deps.compile")
+    refute "cmake" in String.split(runtime_stage)
+  end
+
   test "release image scopes Hex retry tuning to the build stage" do
     dockerfile = File.read!(@dockerfile)
 

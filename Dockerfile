@@ -25,6 +25,10 @@ RUN apt-get update && \
       sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION} && \
     rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends cmake && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 RUN mix local.hex --force && mix local.rebar --force
