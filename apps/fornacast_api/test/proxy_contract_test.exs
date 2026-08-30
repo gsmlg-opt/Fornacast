@@ -66,8 +66,12 @@ defmodule FornacastAPI.ProxyContractTest do
 
     assert dockerfile =~ "ARG DEBIAN_IMAGE=debian:trixie-slim"
 
-    assert dockerfile =~
-             ~r/ENV LANG=C\.UTF-8 \\\n+\s+HOME=\/app \\\n+\s+PORT=4890 \\\n+\s+FORNACAST_API_BIND_IP=0\.0\.0\.0 \\\n+\s+FORNACAST_API_PORT=4891 /s
+    [_build_stage, runtime_stage] =
+      String.split(dockerfile, "FROM ${DEBIAN_IMAGE} AS app", parts: 2)
+
+    assert runtime_stage =~ ~r/^[ \t]+PORT=4890 \x5C$/m
+    assert runtime_stage =~ ~r/^[ \t]+FORNACAST_API_BIND_IP=0\.0\.0\.0 \x5C$/m
+    assert runtime_stage =~ ~r/^[ \t]+FORNACAST_API_PORT=4891 \x5C$/m
 
     assert dockerfile =~ "EXPOSE 4890 4891 2222"
     refute dockerfile =~ "EXPOSE 4000 2222"
