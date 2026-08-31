@@ -195,3 +195,9 @@ If a needed UI capability is missing from DuskMoon packages, open a GitHub issue
 - Operator / deploy: [`README.md`](./README.md)
 - UI library rules: [`CLAUDE.md`](./CLAUDE.md)
 - Design specs & plans: [`docs/superpowers/`](./docs/superpowers/)
+
+## Agent note
+
+After we add new feature, change architecture or fix issues we write agent note.
+When save note to agent-note, should add label:
+- `project: fornacast`
