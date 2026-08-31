@@ -105,6 +105,7 @@ defmodule FornacastWeb.SSHKeyController do
       """
     )
   end
+
   defp put_private_no_store(conn, _opts) do
     conn
     |> put_resp_header("cache-control", "private, no-store")
