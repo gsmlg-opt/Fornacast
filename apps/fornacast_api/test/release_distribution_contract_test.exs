@@ -260,6 +260,11 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
       assert workflow =~ ~r/restore-keys:\s*\|\s*\n\s*.*-postgres-/
       refute workflow =~ "FORNACAST_DATABASE_ADAPTER: turso"
     end
+
+    e2e_workflow = File.read!(@e2e_workflow)
+
+    assert e2e_workflow =~
+             ~r/- name: Fetch dependencies\s+if: github\.event_name == 'pull_request'\s+run: mix deps\.get --only prod\s+- name: Clean cached project artifacts\s+if: github\.event_name == 'pull_request'\s+run: mix clean\s+- name: Compile dependencies/s
   end
 
   test "installed-release E2E uses PostgreSQL component mode and preserves protocol probes" do

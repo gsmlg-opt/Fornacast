@@ -110,6 +110,10 @@ jobs:
         if: github.event_name == 'pull_request'
         run: mix deps.get --only prod
 
+      - name: Clean cached project artifacts
+        if: github.event_name == 'pull_request'
+        run: mix clean
+
       - name: Compile dependencies
         if: github.event_name == 'pull_request'
         run: mix deps.compile
