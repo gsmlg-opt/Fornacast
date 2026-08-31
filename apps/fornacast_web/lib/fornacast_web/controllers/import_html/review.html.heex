@@ -1,0 +1,101 @@
+<section
+  class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6"
+  data-import-review={@run.id}
+>
+  <header class="grid gap-2">
+    <p class="text-xs text-on-surface-variant">GitHub migration plan</p>
+    <div class="flex flex-wrap items-center gap-2">
+      <h2 class="text-2xl font-semibold">Review import plan</h2>
+      <.dm_badge variant={state_variant(@run.state)} soft pill>
+        {humanize(@run.state)}
+      </.dm_badge>
+    </div>
+    <p class="text-sm text-on-surface-variant">
+      Confirm the persisted destination and per-repository decisions before import execution becomes available.
+    </p>
+  </header>
+
+  <.dm_alert
+    id="import-start-unavailable"
+    variant="info"
+    outlined
+    role="status"
+    data-import-start-unavailable
+  >
+    Import start is unavailable until metadata import support is installed.
+  </.dm_alert>
+
+  <.dm_card id="import-review-overview" variant="bordered" shadow="sm" padding="lg">
+    <:title><span class="text-lg font-semibold">Overview</span></:title>
+    <dl class="grid gap-2">
+      <div class="flex flex-wrap items-center gap-2">
+        <dt class="font-semibold">Source</dt>
+        <dd>{source_label(@run.source)}</dd>
+      </div>
+      <div class="flex flex-wrap items-center gap-2">
+        <dt class="font-semibold">Destination</dt>
+        <dd>{destination_label(@run.destination)}</dd>
+      </div>
+      <div class="flex flex-wrap items-center gap-2">
+        <dt class="font-semibold">Selected</dt>
+        <dd>{@run.counts.selected}</dd>
+      </div>
+      <div class="flex flex-wrap items-center gap-2">
+        <dt class="font-semibold">Published</dt>
+        <dd>{@run.counts.published}</dd>
+      </div>
+    </dl>
+  </.dm_card>
+
+  <.dm_card id="import-review-repositories" variant="bordered" shadow="sm" padding="lg">
+    <:title><span class="text-lg font-semibold">Repository decisions</span></:title>
+    <div class="overflow-x-auto">
+      <table class="table" aria-label="Repository import decisions">
+        <caption class="sr-only">Repository import decisions</caption>
+        <thead>
+          <tr>
+            <th scope="col">GitHub repository</th>
+            <th scope="col">Destination</th>
+            <th scope="col">Visibility</th>
+            <th scope="col">Decision</th>
+            <th scope="col">State</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr :for={repository <- @run.repositories} data-review-item={repository.id}>
+            <th scope="row">{repository.source_full_name}</th>
+            <td>{repository.destination_slug || "No destination"}</td>
+            <td>{humanize(repository.destination_visibility)}</td>
+            <td>
+              <.dm_badge variant={decision_variant(repository)} soft size="sm">
+                {decision_label(repository)}
+              </.dm_badge>
+            </td>
+            <td>{humanize(repository.state)}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </.dm_card>
+
+  <.dm_card id="import-review-reports" variant="bordered" shadow="sm" padding="lg">
+    <:title><span class="text-lg font-semibold">Import report</span></:title>
+    <p :if={@run.reports == []} class="text-sm text-on-surface-variant">
+      No discovery warnings were reported.
+    </p>
+    <ul :if={@run.reports != []} class="grid gap-2" role="list">
+      <li :for={report <- @run.reports}>
+        <.dm_alert variant={outcome_variant(report.outcome)} outlined>
+          <span class="font-semibold">{humanize(report.classification)}</span>
+          <span>{report.summary}</span>
+        </.dm_alert>
+      </li>
+    </ul>
+  </.dm_card>
+
+  <div>
+    <.dm_link href={"/imports/#{@run.id}"} class="btn btn-secondary">
+      View import progress
+    </.dm_link>
+  </div>
+</section>

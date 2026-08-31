@@ -73,14 +73,30 @@ defmodule ForgePulls.MergeReconciler do
   @doc false
   def reconcile_pending_repositories do
     MergeOperation
-    |> where([operation], operation.state not in ^@terminal_states)
-    |> group_by([operation], operation.repository_id)
-    |> order_by([operation], desc: operation.repository_id)
+    |> join(:inner, [operation], repository in Repository,
+      on: repository.id == operation.repository_id
+    )
+    |> where(
+      [operation, repository],
+      operation.state not in ^@terminal_states and repository.lifecycle == :ready and
+        is_nil(repository.deleted_at)
+    )
+    |> group_by([operation, _repository], operation.repository_id)
+    |> order_by([operation, _repository], desc: operation.repository_id)
     |> limit(@batch_size)
-    |> select([operation], operation.repository_id)
+    |> select([operation, _repository], operation.repository_id)
     |> Repo.all()
     |> Enum.each(fn repository_id ->
-      case Repo.get(Repository, repository_id) do
+      repository =
+        Repository
+        |> where(
+          [repository],
+          repository.id == ^repository_id and repository.lifecycle == :ready and
+            is_nil(repository.deleted_at)
+        )
+        |> Repo.one()
+
+      case repository do
         %Repository{} = repository -> _result = ForgePulls.reconcile_repository(repository, [])
         nil -> :ok
       end

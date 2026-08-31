@@ -11,7 +11,25 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
     if Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"] do
       :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
     else
-      for table <- ~w(git_write_operations audit_events repositories users) do
+      for table <- ~w(
+        github_import_repository_cleanups
+        github_import_report_entries
+        github_import_page_checkpoints
+        github_import_object_mappings
+        github_import_attempts
+        github_import_repository_items
+        github_import_runs
+        github_credentials
+        github_identities
+        git_write_operations
+        audit_events
+        repository_collaborators
+        repositories
+        organization_members
+        api_keys
+        ssh_keys
+        users
+      ) do
         Ecto.Adapters.SQL.query!(Repo, "delete from #{table}", [])
       end
     end
@@ -40,6 +58,7 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
     {expected_oid, proposed_oid, third_oid} = create_commits(path)
 
     {:ok,
+     owner: owner,
      repository: repository,
      path: path,
      expected_oid: expected_oid,
@@ -86,6 +105,197 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
              )
   end
 
+  test "terminal Git write operations cannot be claimed", context do
+    operation = operation!(context, :prepared)
+
+    Repo.update_all(
+      from(candidate in GitWriteOperation, where: candidate.id == ^operation.id),
+      set: [state: :failed, failure_reason: "effect_not_started"]
+    )
+
+    assert :busy =
+             OperationLease.claim(
+               GitWriteOperation,
+               operation.id,
+               "terminal-claim",
+               ~U[2026-08-28 12:00:00Z],
+               30
+             )
+  end
+
+  test "cleanup safety classifies claimable live and terminal Git write operations", context do
+    now = ~U[2026-08-28 12:00:00Z]
+    operation = operation!(context, :prepared)
+
+    assert {:blocked, :claimable_operation} =
+             GitWriteRecovery.cleanup_safety_locked(context.repository, now)
+
+    Repo.update_all(
+      from(candidate in GitWriteOperation, where: candidate.id == ^operation.id),
+      set: [lease_owner: "cleanup-safety", lease_expires_at: DateTime.add(now, 30, :second)]
+    )
+
+    assert {:blocked, :live_lease} =
+             GitWriteRecovery.cleanup_safety_locked(context.repository, now)
+
+    Repo.update_all(
+      from(candidate in GitWriteOperation, where: candidate.id == ^operation.id),
+      set: [lease_expires_at: now]
+    )
+
+    assert {:blocked, :claimable_operation} =
+             GitWriteRecovery.cleanup_safety_locked(context.repository, now)
+
+    Repo.update_all(
+      from(candidate in GitWriteOperation, where: candidate.id == ^operation.id),
+      set: [
+        state: :failed,
+        failure_reason: "effect_not_started",
+        lease_owner: nil,
+        lease_expires_at: nil
+      ]
+    )
+
+    assert :safe = GitWriteRecovery.cleanup_safety_locked(context.repository, now)
+  end
+
+  test "database rejects one-sided and terminal retained Git write leases", context do
+    operation = operation!(context, :prepared)
+    expires_at = ~U[2026-08-28 12:01:00Z]
+
+    assert_operation_update_rejected(
+      operation.id,
+      [lease_owner: "worker"],
+      "git_write_operations_lease_pair_check"
+    )
+
+    assert_operation_update_rejected(
+      operation.id,
+      [
+        state: :failed,
+        failure_reason: "effect_not_started",
+        lease_owner: "worker",
+        lease_expires_at: expires_at
+      ],
+      "git_write_operations_terminal_lease_check"
+    )
+  end
+
+  test "same-second multi-ref completions advance the monotonic write version", context do
+    completed_at = ~U[2026-08-27 01:45:00Z]
+    first_ref = "refs/heads/same-second-first"
+    second_ref = "refs/heads/same-second-second"
+    update_ref(context.path, context.proposed_oid, first_ref)
+    update_ref(context.path, context.proposed_oid, second_ref)
+
+    first =
+      operation!(context, :ref_advanced,
+        kind: :receive_pack,
+        actor_user_id: context.owner.id,
+        request_id: "same-second-receive",
+        target_ref: first_ref
+      )
+
+    second =
+      operation!(context, :ref_advanced,
+        kind: :receive_pack,
+        actor_user_id: context.owner.id,
+        request_id: "same-second-receive",
+        target_ref: second_ref
+      )
+
+    assert :ok =
+             GitWriteRecovery.with_test_completion_clock(
+               fn -> completed_at end,
+               fn -> locked_reconcile(context) end
+             )
+
+    assert Repo.get!(GitWriteOperation, first.id).state == :bookkeeping_complete
+    assert Repo.get!(GitWriteOperation, second.id).state == :bookkeeping_complete
+
+    assert %Repository{
+             write_version: 2,
+             last_pushed_at: ^completed_at,
+             updated_at: ^completed_at
+           } = Repo.get!(Repository, context.repository.id)
+  end
+
+  test "prepared receive-pack refs reconcile proposed and expected outcomes idempotently",
+       context do
+    proposed_ref = "refs/heads/receive-proposed"
+    expected_ref = "refs/heads/receive-expected"
+    update_ref(context.path, context.proposed_oid, proposed_ref)
+    update_ref(context.path, context.expected_oid, expected_ref)
+
+    proposed =
+      operation!(context, :prepared,
+        kind: :receive_pack,
+        actor_user_id: context.owner.id,
+        request_id: "receive-recovery",
+        target_ref: proposed_ref
+      )
+
+    expected =
+      operation!(context, :prepared,
+        kind: :receive_pack,
+        actor_user_id: context.owner.id,
+        request_id: "receive-recovery",
+        target_ref: expected_ref
+      )
+
+    assert :ok = locked_reconcile(context)
+    assert :ok = locked_reconcile(context)
+
+    assert Repo.get!(GitWriteOperation, proposed.id).state == :bookkeeping_complete
+
+    assert %GitWriteOperation{state: :failed, failure_reason: "effect_not_started"} =
+             Repo.get!(GitWriteOperation, expected.id)
+
+    assert [
+             %AuditEvent{
+               action: "repository.pushed",
+               actor_user_id: actor_id,
+               request_id: "receive-recovery",
+               operation_id: operation_id
+             }
+           ] = Repo.all(AuditEvent)
+
+    assert actor_id == context.owner.id
+    assert operation_id == "git_write:#{proposed.id}"
+  end
+
+  test "public recovery reloads the exact repository instead of trusting a hostile path",
+       context do
+    update_ref(context.path, context.proposed_oid)
+    operation = operation!(context, :ref_advanced)
+    hostile = %{context.repository | storage_path: "../hostile.git"}
+
+    assert :ok = GitWriteRecovery.reconcile_repository(hostile)
+    assert Repo.get!(GitWriteOperation, operation.id).state == :bookkeeping_complete
+  end
+
+  test "public recovery rejects generation drift before reading repository storage", context do
+    update_ref(context.path, context.third_oid)
+    operation = operation!(context, :ref_advanced)
+
+    assert {1, nil} =
+             Repo.update_all(
+               from(candidate in Repository, where: candidate.id == ^context.repository.id),
+               set: [generation: context.repository.generation + 1]
+             )
+
+    assert {:error, {:unavailable, :git_write_recovery}} =
+             GitWriteRecovery.reconcile_repository(context.repository)
+
+    assert %GitWriteOperation{state: :ref_advanced, failure_reason: nil} =
+             Repo.get!(GitWriteOperation, operation.id)
+
+    assert %Repository{last_pushed_at: nil, write_version: 0} =
+             Repo.get!(Repository, context.repository.id)
+
+    refute Repo.get_by(AuditEvent, operation_id: "git_write:#{operation.id}")
+  end
+
   test "third refs stay nonterminal, alert once, and block every retry", context do
     update_ref(context.path, context.third_oid)
     operation = operation!(context, :ref_advanced)
@@ -111,7 +321,7 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
              )
   end
 
-  test "older live leases are skipped while later proposed, expected, and expired rows recover",
+  test "an older live lease blocks every later row until it is released",
        context do
     update_ref(context.path, context.expected_oid)
     live = operation!(context, :prepared, request_id: "live")
@@ -152,21 +362,25 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
                5
              )
 
-    assert :ok = locked_reconcile(context)
+    assert {:error, :unavailable} = locked_reconcile(context)
 
     assert %{state: :prepared, lease_owner: "live"} = Repo.get!(GitWriteOperation, live.id)
-    assert Repo.get!(GitWriteOperation, proposed.id).state == :bookkeeping_complete
-
-    assert %{state: :failed, failure_reason: "effect_not_started"} =
-             Repo.get!(GitWriteOperation, expected.id)
-
-    assert %{state: :failed, failure_reason: "effect_not_started", lease_owner: nil} =
-             Repo.get!(GitWriteOperation, expired.id)
+    assert Repo.get!(GitWriteOperation, proposed.id).state == :ref_advanced
+    assert Repo.get!(GitWriteOperation, expected.id).state == :prepared
+    assert Repo.get!(GitWriteOperation, expired.id).state == :prepared
 
     assert :ok = OperationLease.release(GitWriteOperation, claimed_live)
+    assert :ok = locked_reconcile(context)
+
+    assert Repo.get!(GitWriteOperation, proposed.id).state == :bookkeeping_complete
+
+    for operation <- [live, expected, expired] do
+      assert %{state: :failed, failure_reason: "effect_not_started", lease_owner: nil} =
+               Repo.get!(GitWriteOperation, operation.id)
+    end
   end
 
-  test "a claim race advances the cursor without looping or starving later rows", context do
+  test "a claim race fails closed without advancing to later rows", context do
     update_ref(context.path, context.expected_oid)
     raced = operation!(context, :prepared, request_id: "raced")
     later_ref = "refs/heads/later"
@@ -193,13 +407,22 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
         fn -> locked_reconcile(context) end
       )
 
-    assert :ok = result
+    assert {:error, :unavailable} = result
 
     assert %{state: :prepared, lease_owner: "stolen"} =
+             stolen =
              Repo.get!(GitWriteOperation, raced.id)
 
-    assert %{state: :failed, failure_reason: "effect_not_started"} =
+    assert %{state: :prepared, failure_reason: nil, lease_owner: nil} =
              Repo.get!(GitWriteOperation, later.id)
+
+    assert :ok = OperationLease.release(GitWriteOperation, stolen)
+    assert :ok = locked_reconcile(context)
+
+    for operation <- [raced, later] do
+      assert %{state: :failed, failure_reason: "effect_not_started"} =
+               Repo.get!(GitWriteOperation, operation.id)
+    end
   end
 
   test "each cursor iteration shares a fresh wall clock between selection and claim", context do
@@ -287,7 +510,9 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
     assert %{state: :ref_advanced, lease_owner: nil} =
              Repo.get!(GitWriteOperation, operation.id)
 
-    assert is_nil(Repo.get!(Repository, context.repository.id).last_pushed_at)
+    assert %Repository{last_pushed_at: nil, write_version: 0} =
+             Repo.get!(Repository, context.repository.id)
+
     assert Repo.aggregate(AuditEvent, :count, :id) == 0
 
     assert {:ok, :cached} =
@@ -298,6 +523,45 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
     assert :ok = locked_reconcile(context)
     assert Repo.get!(GitWriteOperation, operation.id).state == :bookkeeping_complete
     assert {:ok, :refreshed} = GitCore.Cache.fetch(cache_key, fn -> {:ok, :refreshed} end)
+  end
+
+  test "completion rejects repository generation, lifecycle, and deletion drift atomically",
+       context do
+    for {suffix, updates} <- [
+          {"generation", [generation: context.repository.generation + 1]},
+          {"lifecycle", [lifecycle: :tombstoned]},
+          {"deletion", [deleted_at: ~U[2026-08-26 00:00:00Z]]}
+        ] do
+      target_ref = "refs/heads/drift-#{suffix}"
+      update_ref(context.path, context.proposed_oid, target_ref)
+
+      operation =
+        operation!(context, :ref_advanced,
+          request_id: "drift-#{suffix}",
+          target_ref: target_ref
+        )
+
+      assert {:error, :unavailable} =
+               GitWriteRecovery.with_test_complete_multi_hook(
+                 fn multi, _operation ->
+                   prepend_repository_drift(multi, context.repository, updates)
+                 end,
+                 fn -> locked_reconcile(context) end
+               )
+
+      assert %GitWriteOperation{state: :ref_advanced, lease_owner: nil} =
+               Repo.get!(GitWriteOperation, operation.id)
+
+      assert %Repository{
+               generation: generation,
+               lifecycle: :ready,
+               deleted_at: nil,
+               last_pushed_at: nil
+             } = Repo.get!(Repository, context.repository.id)
+
+      assert generation == context.repository.generation
+      refute Repo.get_by(AuditEvent, operation_id: "git_write:#{operation.id}")
+    end
   end
 
   test "on-touch fence clears expected evidence before callback and blocks third evidence",
@@ -332,6 +596,50 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
     assert Repo.get!(GitWriteOperation, blocked.id).failure_reason == "unexpected_ref"
   end
 
+  test "on-touch fence blocks on the earliest live lease until it expires", context do
+    original = Application.get_env(:forge_repos, :repository_write_reconcilers)
+
+    Application.put_env(:forge_repos, :repository_write_reconcilers, [
+      {100, :git_writes, GitWriteRecovery}
+    ])
+
+    on_exit(fn -> Application.put_env(:forge_repos, :repository_write_reconcilers, original) end)
+    update_ref(context.path, context.expected_oid)
+    live = operation!(context, :prepared, request_id: "live-fence")
+    later_ref = "refs/heads/live-fence-later"
+    update_ref(context.path, context.expected_oid, later_ref)
+    later = operation!(context, :prepared, request_id: "live-fence-later", target_ref: later_ref)
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    assert {:ok, _claimed} = OperationLease.claim(GitWriteOperation, live.id, "crashed", now, 30)
+
+    assert {:error, {:unavailable, :write_fence}} =
+             ForgeRepos.with_write_fence(context.repository, :ref, fn _path, _remaining ->
+               flunk("live durable operation allowed a new writer")
+             end)
+
+    assert %GitWriteOperation{state: :prepared, lease_owner: "crashed"} =
+             Repo.get!(GitWriteOperation, live.id)
+
+    assert %GitWriteOperation{state: :prepared, lease_owner: nil} =
+             Repo.get!(GitWriteOperation, later.id)
+
+    assert {1, nil} =
+             Repo.update_all(
+               from(operation in GitWriteOperation, where: operation.id == ^live.id),
+               set: [lease_expires_at: DateTime.add(now, -1, :second)]
+             )
+
+    assert :entered =
+             ForgeRepos.with_write_fence(context.repository, :ref, fn _path, _remaining ->
+               :entered
+             end)
+
+    for operation <- [live, later] do
+      assert %GitWriteOperation{state: :failed, failure_reason: "effect_not_started"} =
+               Repo.get!(GitWriteOperation, operation.id)
+    end
+  end
+
   defp locked_reconcile(context) do
     GitWriteRecovery.reconcile_repository_locked(
       context.repository,
@@ -340,13 +648,34 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
     )
   end
 
+  defp assert_operation_update_rejected(id, updates, constraint) do
+    assert {:error, {:constraint, error}} =
+             Repo.transaction(
+               fn ->
+                 try do
+                   Repo.update_all(
+                     from(candidate in GitWriteOperation, where: candidate.id == ^id),
+                     set: updates
+                   )
+
+                   Repo.rollback(:unexpected_success)
+                 rescue
+                   error -> Repo.rollback({:constraint, error})
+                 end
+               end,
+               mode: :savepoint
+             )
+
+    assert Exception.message(error) =~ constraint
+  end
+
   defp operation!(context, state, overrides \\ []) do
     attrs = %{
       repository_id: context.repository.id,
-      actor_user_id: nil,
+      actor_user_id: Keyword.get(overrides, :actor_user_id),
       request_id:
         Keyword.get(overrides, :request_id, "request-#{System.unique_integer([:positive])}"),
-      kind: :ref_update,
+      kind: Keyword.get(overrides, :kind, :ref_update),
       state: state,
       target_ref: Keyword.get(overrides, :target_ref, "refs/heads/main"),
       expected_oid: Keyword.get(overrides, :expected_oid, context.expected_oid),
@@ -361,6 +690,18 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
     %GitWriteOperation{}
     |> GitWriteOperation.changeset(attrs)
     |> Repo.insert!()
+  end
+
+  defp prepend_repository_drift(multi, repository, updates) do
+    drift =
+      Ecto.Multi.new()
+      |> Ecto.Multi.update_all(
+        :repository_drift,
+        from(candidate in Repository, where: candidate.id == ^repository.id),
+        set: updates
+      )
+
+    Ecto.Multi.prepend(multi, drift)
   end
 
   defp create_commits(path) do

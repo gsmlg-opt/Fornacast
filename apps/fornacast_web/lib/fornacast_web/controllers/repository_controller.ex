@@ -14,22 +14,6 @@ defmodule FornacastWeb.RepositoryController do
     )
   end
 
-  def import_new(conn, _params) do
-    page(conn, "Import repository", """
-    <p class="muted">Import an existing Git repository into this Fornacast demo.</p>
-    <form>
-      <label>Clone URL <input name="import[url]" placeholder="https://example.com/owner/repository.git"></label>
-      <label>Owner
-        <select name="import[owner]">
-          #{owner_options(conn.assigns.current_user)}
-        </select>
-      </label>
-      <label>Name <input name="import[name]"></label>
-      <button type="button" disabled>Import repository</button>
-    </form>
-    """)
-  end
-
   def create(%Plug.Conn{assigns: %{current_user: user}} = conn, %{"repository" => attrs}) do
     owner_slug = Map.get(attrs, "owner") || user.username
 
@@ -218,6 +202,11 @@ defmodule FornacastWeb.RepositoryController do
     handle_git_error(conn, repository, error, context)
   end
 
+  defp handle_page_result({:error, reason}, conn, repository, _context)
+       when reason in [:not_found, :unavailable, :deadline_exceeded] do
+    handle_repository_read_error(conn, repository, reason)
+  end
+
   defp handle_raw_result(
          {:ok, %RepositoryPage.Result{kind: :raw} = result},
          conn,
@@ -246,6 +235,20 @@ defmodule FornacastWeb.RepositoryController do
          repository
        ) do
     handle_git_error(conn, repository, error, :raw)
+  end
+
+  defp handle_raw_result({:error, reason}, conn, repository)
+       when reason in [:not_found, :unavailable, :deadline_exceeded] do
+    handle_repository_read_error(conn, repository, reason)
+  end
+
+  defp handle_repository_read_error(conn, repository, :not_found) do
+    repository_content_not_found(conn, repository, "Repository content not found")
+  end
+
+  defp handle_repository_read_error(conn, _repository, reason)
+       when reason in [:unavailable, :deadline_exceeded] do
+    repository_error_page(conn, :service_unavailable, "Repository temporarily unavailable")
   end
 
   defp handle_git_error(conn, repository, %GitCore.Error{} = error, context) do
@@ -401,6 +404,7 @@ defmodule FornacastWeb.RepositoryController do
       "<meta charset=\"utf-8\">",
       "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
       "<title>Repository not found - Fornacast</title>",
+      "<link rel=\"icon\" href=\"/favicon.ico\" sizes=\"any\">",
       "<link rel=\"stylesheet\" href=\"",
       FornacastWeb.HTML.escape(css_path),
       "\">",
@@ -410,7 +414,7 @@ defmodule FornacastWeb.RepositoryController do
       "<body class=\"app-body bg-surface text-on-surface\">",
       "<div class=\"repository-shell\" data-repository-shell=\"not-found\">",
       "<header class=\"appbar appbar-primary appbar-sticky\">",
-      "<a class=\"brand-mark\" href=\"/\" aria-label=\"Fornacast home\">Fornacast</a>",
+      FornacastWeb.HTML.brand_mark("Fornacast home"),
       "</header><main class=\"repository-main\" data-repository-main>",
       "<article class=\"repository-page repository-not-found\" ",
       "data-repository-kind=\"not-found\">",
@@ -552,7 +556,7 @@ defmodule FornacastWeb.RepositoryController do
     )
   end
 
-  defp owner_options(user, selected_owner \\ nil) do
+  defp owner_options(user, selected_owner) do
     user
     |> ForgeAccounts.list_repository_owners()
     |> Enum.map(fn owner ->

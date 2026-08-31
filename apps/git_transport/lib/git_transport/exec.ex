@@ -92,6 +92,13 @@ defmodule GitTransport.Exec do
     "ERROR: Git transport protocol is not implemented yet.\n"
   end
 
+  def error_message(reason) when reason in [:unavailable, :deadline_exceeded] do
+    "ERROR: Git upload-pack failed.\n"
+  end
+
+  def error_message({:unavailable, _reason}), do: "ERROR: Git receive-pack failed.\n"
+  def error_message(%GitCore.Error{}), do: "ERROR: Git receive-pack failed.\n"
+
   def error_message(reason) when is_binary(reason), do: reason
 
   defp normalize_result(result) do
@@ -139,14 +146,19 @@ defmodule GitTransport.Exec do
   end
 
   def upload_pack(_actor, repository, _peer \\ nil) do
-    GitTransport.UploadPack.advertise_refs(repository)
+    with_repository_read(repository, &GitTransport.UploadPack.advertise_refs_handle/1)
   end
 
   def upload_pack_stream(_actor, repository, _peer \\ nil) do
-    GitTransport.UploadPack.serve(repository)
+    with_repository_read(repository, &GitTransport.UploadPack.serve_handle/1)
   end
 
   def receive_pack(_actor, repository, _peer \\ nil) do
     GitTransport.ReceivePack.advertise_refs(repository)
+  end
+
+  defp with_repository_read(repository, fun) do
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:content_deadline_ms)
+    ForgeRepos.with_repository_read(repository, deadline, fun)
   end
 end

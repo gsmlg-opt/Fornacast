@@ -9,7 +9,7 @@ defmodule Fornacast.Application do
 
   @impl true
   def start(_type, _args) do
-    :ok = prepare_boot()
+    :ok = prepare_start()
 
     children = [
       Fornacast.Repo,
@@ -27,6 +27,13 @@ defmodule Fornacast.Application do
       other ->
         other
     end
+  end
+
+  @doc false
+  @spec prepare_start() :: :ok
+  def prepare_start do
+    :ok = Fornacast.LegacyTursoPreflight.verify!()
+    prepare_boot()
   end
 
   @doc """

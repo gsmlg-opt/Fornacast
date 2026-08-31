@@ -29,11 +29,49 @@ defmodule ForgeRepos.GitWritesTest do
     assert Ecto.Changeset.get_change(changeset, :expected_oid) == String.downcase(@oid40)
     assert Ecto.Changeset.get_change(changeset, :proposed_oid) == String.downcase(@oid64)
 
+    assert %{constraint: constraint, type: :unique} =
+             Enum.find(changeset.constraints, &(&1.type == :unique))
+
+    assert Regex.match?(constraint, "git_write_operations_request_ref_index")
+
+    assert Regex.match?(
+             constraint,
+             "git_write_operations_(request_id_kind_target_ref) (19)_index"
+           )
+
     assert GitWriteOperation.changeset(%GitWriteOperation{}, Map.put(attrs, :expected_oid, nil)).valid?
 
     for field <- ~w(repository_id request_id kind state target_ref proposed_oid)a do
       refute GitWriteOperation.changeset(%GitWriteOperation{}, Map.delete(attrs, field)).valid?
     end
+  end
+
+  test "schema exposes terminal states and rejects incoherent leases" do
+    assert GitWriteOperation.states() == [
+             :prepared,
+             :object_written,
+             :ref_advanced,
+             :bookkeeping_complete,
+             :failed
+           ]
+
+    assert GitWriteOperation.terminal_states() == [:bookkeeping_complete, :failed]
+
+    refute GitWriteOperation.changeset(
+             %GitWriteOperation{},
+             Map.put(valid_attrs(), :lease_owner, "worker")
+           ).valid?
+
+    refute GitWriteOperation.changeset(
+             %GitWriteOperation{},
+             valid_attrs()
+             |> Map.merge(%{
+               state: :bookkeeping_complete,
+               result_blob_oid: @oid40,
+               lease_owner: "worker",
+               lease_expires_at: ~U[2026-08-28 12:01:00Z]
+             })
+           ).valid?
   end
 
   test "changeset rejects unknown enums, noncanonical refs, unsafe reasons, OIDs, and versions" do

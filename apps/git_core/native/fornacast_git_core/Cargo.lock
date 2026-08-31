@@ -276,6 +276,8 @@ dependencies = [
  "gix-pack",
  "gix-quote",
  "gix-ref",
+ "libc",
+ "rustix",
  "rustler",
 ]
 

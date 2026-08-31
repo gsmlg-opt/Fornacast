@@ -4,15 +4,26 @@ defmodule ForgeRepos do
   """
 
   import Ecto.Query
-  import Ecto.Changeset, only: [change: 2]
 
   alias Ecto.Changeset
   alias Ecto.Multi
   alias ForgeAccounts.{AccountView, Organization, OrganizationMember, User}
-  alias ForgeRepos.{Collaborator, Repository, RepositoryView, RepositoryWriteReconcilers}
+
+  alias ForgeRepos.{
+    Collaborator,
+    GitWriteOperation,
+    Repository,
+    RepositoryReadHandle,
+    RepositoryView,
+    RepositoryWriteReconcilers
+  }
+
   alias Fornacast.{Audit, Page, Repo, Storage}
 
   @repository_permissions [:repository_read, :repository_write, :repository_admin]
+  @receive_pack_busy_attempts 12
+  @receive_pack_busy_backoff_ms 5
+  @zero_oid String.duplicate("0", 40)
   @unsupported_features ~w(
     has_projects
     has_wiki
@@ -20,6 +31,32 @@ defmodule ForgeRepos do
     allow_squash_merge
     allow_rebase_merge
   )a
+
+  if Mix.env() == :test do
+    @read_phase_hook_key {__MODULE__, :read_phase_hook}
+
+    @doc false
+    def with_test_read_phase_hook(hook, fun)
+        when is_function(hook, 0) and is_function(fun, 0) do
+      previous = Process.get(@read_phase_hook_key)
+      Process.put(@read_phase_hook_key, hook)
+
+      try do
+        fun.()
+      after
+        if previous,
+          do: Process.put(@read_phase_hook_key, previous),
+          else: Process.delete(@read_phase_hook_key)
+      end
+    end
+
+    defp run_read_phase_hook do
+      Process.get(@read_phase_hook_key, fn -> :ok end).()
+      :ok
+    end
+  else
+    defp run_read_phase_hook, do: :ok
+  end
 
   @type validation_error :: %{
           required(:resource) => String.t(),
@@ -59,12 +96,11 @@ defmodule ForgeRepos do
       {:error, :not_found}
     else
       repository =
-        Repository
+        ready_repository()
         |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
         |> where(
-          [repository, owner],
-          is_nil(repository.deleted_at) and owner.state == :active and
-            owner.kind in [:user, :organization]
+          [_repository, owner],
+          owner.state == :active and owner.kind in [:user, :organization]
         )
         |> where([_repository, owner], owner.username == ^normalize_account_slug(owner_slug))
         |> where(
@@ -87,12 +123,12 @@ defmodule ForgeRepos do
       when is_integer(repository_id) and repository_id > 0 and
              permission in @repository_permissions do
     repository =
-      Repository
+      ready_repository()
       |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
       |> where(
         [repository, owner],
-        repository.id == ^repository_id and is_nil(repository.deleted_at) and
-          owner.state == :active and owner.kind in [:user, :organization]
+        repository.id == ^repository_id and owner.state == :active and
+          owner.kind in [:user, :organization]
       )
       |> select([repository, _owner], repository)
       |> Repo.one()
@@ -102,6 +138,27 @@ defmodule ForgeRepos do
 
   def fetch_authorized_repository_by_id(_actor, _repository_id, _permission),
     do: {:error, :forbidden}
+
+  @spec fetch_importing_repository(pos_integer()) ::
+          {:ok, Repository.t()} | {:error, :not_found}
+  def fetch_importing_repository(repository_id)
+      when is_integer(repository_id) and repository_id > 0 do
+    repository =
+      Repository
+      |> where(
+        [repository],
+        repository.id == ^repository_id and repository.lifecycle == :importing and
+          is_nil(repository.deleted_at)
+      )
+      |> Repo.one()
+
+    case repository do
+      %Repository{} = repository -> {:ok, repository}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  def fetch_importing_repository(_repository_id), do: {:error, :not_found}
 
   @spec repository_view(User.t() | nil, Repository.t()) ::
           {:ok, RepositoryView.t()} | {:error, :not_found | {:unavailable, atom()}}
@@ -251,8 +308,8 @@ defmodule ForgeRepos do
     do: {:error, :forbidden}
 
   def list_owner_repositories(%{id: owner_user_id}) do
-    Repository
-    |> where([repo], repo.owner_user_id == ^owner_user_id and is_nil(repo.deleted_at))
+    ready_repository()
+    |> where([repo], repo.owner_user_id == ^owner_user_id)
     |> order_by([repo], asc: repo.slug)
     |> Repo.all()
   end
@@ -262,8 +319,8 @@ defmodule ForgeRepos do
       [user | ForgeAccounts.list_user_organizations(user)]
       |> Enum.map(& &1.id)
 
-    Repository
-    |> where([repo], repo.owner_user_id in ^owner_ids and is_nil(repo.deleted_at))
+    ready_repository()
+    |> where([repo], repo.owner_user_id in ^owner_ids)
     |> order_by([repo], asc: repo.slug)
     |> Repo.all()
   end
@@ -290,12 +347,453 @@ defmodule ForgeRepos do
     end
   end
 
+  @doc false
+  @spec create_import_shadow(Multi.t(), Multi.name(), pos_integer(), map()) :: Multi.t()
+  def create_import_shadow(%Multi{} = multi, key, owner_id, attrs)
+      when is_integer(owner_id) and owner_id > 0 and is_map(attrs) do
+    with {:ok, item_id} <- positive_integer(Map.get(attrs, :item_id)),
+         {:ok, generation} <- positive_integer(Map.get(attrs, :generation)) do
+      internal_slug = import_shadow_slug(item_id)
+      storage_path = generate_storage_path(owner_id, internal_slug)
+
+      multi
+      |> Multi.run({key, :owner}, fn repo, _changes ->
+        case repo.get_by(User, id: owner_id, state: :active) do
+          %User{kind: kind} = owner when kind in [:user, :organization] -> {:ok, owner}
+          _missing -> {:error, :invalid_owner}
+        end
+      end)
+      |> Multi.insert(key, fn _changes ->
+        %Repository{}
+        |> Repository.import_changeset(%{
+          owner_user_id: owner_id,
+          slug: internal_slug,
+          name: "GitHub import #{item_id}",
+          visibility: :private,
+          storage_path: storage_path,
+          lifecycle: :importing,
+          generation: generation
+        })
+      end)
+    else
+      _invalid -> Multi.error(multi, key, :invalid_shadow)
+    end
+  end
+
+  def create_import_shadow(%Multi{} = multi, key, _owner_id, _attrs),
+    do: Multi.error(multi, key, :invalid_shadow)
+
+  @publication_spec_keys [
+    :hidden_repository_id,
+    :expected_internal_slug,
+    :storage_path,
+    :shadow_write_version,
+    :owner_user_id,
+    :slug,
+    :name,
+    :description,
+    :visibility,
+    :default_branch,
+    :has_issues,
+    :allow_merge_commit,
+    :generation,
+    :timestamp
+  ]
+  @replacement_spec_keys [
+    :repository_id,
+    :owner_user_id,
+    :slug,
+    :storage_path,
+    :generation,
+    :write_version,
+    :updated_at,
+    :last_pushed_at
+  ]
+
+  @doc false
+  @spec publish_import_shadow(Multi.t(), Multi.name(), User.t(), map(), map() | nil) ::
+          Multi.t()
+  def publish_import_shadow(
+        %Multi{} = multi,
+        key,
+        %User{id: actor_id},
+        publication_spec,
+        expected_replacement
+      )
+      when is_integer(actor_id) and actor_id > 0 and is_map(publication_spec) and
+             (is_nil(expected_replacement) or is_map(expected_replacement)) do
+    if exact_map_keys?(publication_spec, @publication_spec_keys) and
+         (is_nil(expected_replacement) or
+            exact_map_keys?(expected_replacement, @replacement_spec_keys)) do
+      multi
+      |> Multi.run({key, :authorization}, fn repo, _changes ->
+        authorize_import_publication(repo, actor_id, publication_spec.owner_user_id)
+      end)
+      |> Multi.run(key, fn repo, _changes ->
+        mutate_import_shadow(repo, publication_spec, expected_replacement)
+      end)
+    else
+      Multi.error(multi, key, :destination_changed)
+    end
+  end
+
+  def publish_import_shadow(%Multi{} = multi, key, _actor, _spec, _replacement),
+    do: Multi.error(multi, key, :destination_changed)
+
+  if Mix.env() == :test do
+    @import_publication_hook_key {__MODULE__, :import_publication_hook}
+    @import_namespace_hook_key {__MODULE__, :import_namespace_hook}
+
+    @doc false
+    def with_test_after_import_tombstone_hook(hook, fun)
+        when is_function(hook, 1) and is_function(fun, 0) do
+      previous = Process.get(@import_publication_hook_key)
+      Process.put(@import_publication_hook_key, hook)
+
+      try do
+        fun.()
+      after
+        if is_nil(previous),
+          do: Process.delete(@import_publication_hook_key),
+          else: Process.put(@import_publication_hook_key, previous)
+      end
+    end
+
+    @doc false
+    def with_test_after_import_namespace_check_hook(hook, fun)
+        when is_function(hook, 1) and is_function(fun, 0) do
+      previous = Process.get(@import_namespace_hook_key)
+      Process.put(@import_namespace_hook_key, hook)
+
+      try do
+        fun.()
+      after
+        if is_nil(previous),
+          do: Process.delete(@import_namespace_hook_key),
+          else: Process.put(@import_namespace_hook_key, previous)
+      end
+    end
+
+    defp after_import_tombstone(repository) do
+      case Process.get(@import_publication_hook_key) do
+        hook when is_function(hook, 1) -> hook.(repository)
+        nil -> :ok
+      end
+    end
+
+    defp after_import_namespace_check(spec) do
+      case Process.get(@import_namespace_hook_key) do
+        hook when is_function(hook, 1) -> hook.(spec)
+        nil -> :ok
+      end
+    end
+  else
+    defp after_import_tombstone(_repository), do: :ok
+    defp after_import_namespace_check(_spec), do: :ok
+  end
+
+  defp authorize_import_publication(repo, actor_id, owner_id) do
+    actor_query =
+      from actor in User,
+        where: actor.id == ^actor_id and actor.kind == :user and actor.state == :active
+
+    owner_query =
+      from owner in User,
+        where:
+          owner.id == ^owner_id and owner.state == :active and
+            owner.kind in [:user, :organization]
+
+    with %User{} = actor <- actor_query |> publication_lock() |> repo.one(),
+         %User{} = owner <- owner_query |> publication_lock() |> repo.one(),
+         true <- import_destination_authorized?(repo, actor, owner) do
+      {:ok, %{actor: actor, owner: owner}}
+    else
+      _changed -> {:error, :destination_changed}
+    end
+  end
+
+  defp import_destination_authorized?(_repo, %User{id: id}, %User{id: id, kind: :user}), do: true
+
+  defp import_destination_authorized?(repo, %User{id: actor_id}, %User{
+         id: organization_id,
+         kind: :organization
+       }) do
+    membership_query =
+      from membership in OrganizationMember,
+        where:
+          membership.user_id == ^actor_id and
+            membership.organization_id == ^organization_id and membership.role == :owner
+
+    not is_nil(membership_query |> publication_lock() |> repo.one())
+  end
+
+  defp import_destination_authorized?(_repo, _actor, _owner), do: false
+
+  defp mutate_import_shadow(repo, spec, expected_replacement) do
+    ids =
+      [spec.hidden_repository_id, expected_replacement && expected_replacement.repository_id]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.sort()
+
+    repositories =
+      Repository
+      |> where([repository], repository.id in ^ids)
+      |> order_by([repository], asc: repository.id)
+      |> publication_lock()
+      |> repo.all()
+
+    shadow = Enum.find(repositories, &(&1.id == spec.hidden_repository_id))
+
+    replaced =
+      if expected_replacement,
+        do: Enum.find(repositories, &(&1.id == expected_replacement.repository_id)),
+        else: nil
+
+    with :ok <- validate_import_shadow(repo, shadow, spec),
+         :ok <- validate_import_target(repo, replaced, expected_replacement, spec),
+         :ok <- validate_import_namespace(repo, spec, expected_replacement),
+         :ok <- after_import_namespace_check(spec),
+         {:ok, collaborators} <- locked_import_collaborators(repo, replaced),
+         {:ok, tombstoned} <- tombstone_import_target(repo, replaced, spec.timestamp),
+         :ok <- after_import_tombstone(tombstoned),
+         :ok <- copy_import_collaborators(repo, collaborators, shadow.id, spec.timestamp),
+         {:ok, published} <- activate_import_shadow(repo, shadow, spec) do
+      {:ok,
+       %{
+         repository: published,
+         replaced: tombstoned,
+         collaborator_count: length(collaborators)
+       }}
+    else
+      {:error, :destination_changed} -> {:error, :destination_changed}
+      {:error, %Changeset{}} -> {:error, :destination_changed}
+      {:error, _reason} -> {:error, :persistence_unavailable}
+      _changed -> {:error, :destination_changed}
+    end
+  rescue
+    error ->
+      if import_namespace_collision?(error),
+        do: {:error, :destination_changed},
+        else: reraise(error, __STACKTRACE__)
+  end
+
+  defp validate_import_shadow(repo, %Repository{} = shadow, spec) do
+    collaborators? =
+      repo.exists?(
+        from collaborator in Collaborator,
+          where: collaborator.repository_id == ^shadow.id
+      )
+
+    if shadow.owner_user_id == spec.owner_user_id and
+         shadow.slug == spec.expected_internal_slug and shadow.storage_path == spec.storage_path and
+         shadow.write_version == spec.shadow_write_version and shadow.write_version == 0 and
+         shadow.lifecycle == :importing and is_nil(shadow.deleted_at) and
+         valid_canonical_import_shadow?(shadow, spec.expected_internal_slug) and
+         is_nil(shadow.storage_reclaimed_at) and not collaborators? do
+      :ok
+    else
+      {:error, :destination_changed}
+    end
+  end
+
+  defp validate_import_shadow(_repo, _shadow, _spec), do: {:error, :destination_changed}
+
+  defp valid_canonical_import_shadow?(shadow, internal_slug) do
+    case Regex.run(~r/\Aimport-([1-9][0-9]*)-[0-9a-f]{24}\z/, internal_slug) do
+      [_slug, item_id] ->
+        shadow.name == "GitHub import #{item_id}" and shadow.description == nil and
+          shadow.visibility == :private and shadow.default_branch == "main" and
+          shadow.has_issues == true and shadow.allow_merge_commit == true and
+          is_nil(shadow.last_pushed_at)
+
+      _invalid ->
+        false
+    end
+  end
+
+  defp validate_import_target(_repo, nil, nil, %{generation: 1}), do: :ok
+
+  defp validate_import_target(_repo, %Repository{} = target, expected, spec)
+       when is_map(expected) do
+    if target.id == expected.repository_id and target.owner_user_id == expected.owner_user_id and
+         target.owner_user_id == spec.owner_user_id and target.slug == expected.slug and
+         target.slug == spec.slug and target.storage_path == expected.storage_path and
+         target.generation == expected.generation and spec.generation == target.generation + 1 and
+         target.write_version == expected.write_version and
+         target.updated_at == expected.updated_at and
+         target.last_pushed_at == expected.last_pushed_at and target.lifecycle == :ready and
+         is_nil(target.deleted_at) and is_nil(target.storage_reclaimed_at) do
+      :ok
+    else
+      {:error, :destination_changed}
+    end
+  end
+
+  defp validate_import_target(_repo, _target, _expected, _spec),
+    do: {:error, :destination_changed}
+
+  defp validate_import_namespace(repo, spec, expected_replacement) do
+    allowed_ids =
+      [spec.hidden_repository_id, expected_replacement && expected_replacement.repository_id]
+      |> Enum.reject(&is_nil/1)
+
+    conflict =
+      Repository
+      |> where(
+        [repository],
+        repository.owner_user_id == ^spec.owner_user_id and repository.slug == ^spec.slug and
+          is_nil(repository.deleted_at) and repository.id not in ^allowed_ids
+      )
+      |> order_by([repository], asc: repository.id)
+      |> publication_lock()
+      |> repo.one()
+
+    if is_nil(conflict), do: :ok, else: {:error, :destination_changed}
+  end
+
+  defp import_namespace_collision?(error) do
+    postgres = Map.get(error, :postgres) || %{}
+
+    constraint =
+      (Map.get(error, :constraint) || Map.get(postgres, :constraint) ||
+         Map.get(postgres, "constraint"))
+      |> to_string()
+      |> String.downcase()
+
+    message = Exception.message(error) |> String.downcase()
+
+    String.contains?(constraint, "repositories_owner_user_id_slug") or
+      String.contains?(message, "repositories_owner_user_id_slug") or
+      (String.contains?(message, "unique") and
+         String.contains?(message, "repositories.owner_user_id") and
+         String.contains?(message, "repositories.slug"))
+  rescue
+    _error -> false
+  end
+
+  defp locked_import_collaborators(_repo, nil), do: {:ok, []}
+
+  defp locked_import_collaborators(repo, %Repository{id: repository_id}) do
+    collaborators =
+      Collaborator
+      |> where([collaborator], collaborator.repository_id == ^repository_id)
+      |> order_by([collaborator], asc: collaborator.user_id)
+      |> publication_lock()
+      |> repo.all()
+
+    {:ok, collaborators}
+  end
+
+  defp tombstone_import_target(_repo, nil, _timestamp), do: {:ok, nil}
+
+  defp tombstone_import_target(repo, %Repository{} = repository, timestamp) do
+    changeset = Repository.import_tombstone_changeset(repository, timestamp)
+
+    query =
+      from candidate in Repository,
+        where:
+          candidate.id == ^repository.id and
+            candidate.owner_user_id == ^repository.owner_user_id and
+            candidate.slug == ^repository.slug and
+            candidate.storage_path == ^repository.storage_path and
+            candidate.generation == ^repository.generation and
+            candidate.write_version == ^repository.write_version and
+            candidate.updated_at == ^repository.updated_at and candidate.lifecycle == :ready and
+            is_nil(candidate.deleted_at)
+
+    query = nullable_last_pushed(query, repository.last_pushed_at)
+
+    case repo.update_all(query,
+           set: [lifecycle: :tombstoned, deleted_at: timestamp, updated_at: repository.updated_at]
+         ) do
+      {1, _rows} ->
+        {:ok,
+         %{
+           Ecto.Changeset.apply_changes(changeset)
+           | updated_at: repository.updated_at
+         }}
+
+      {0, _rows} ->
+        {:error, :destination_changed}
+    end
+  end
+
+  defp copy_import_collaborators(repo, collaborators, repository_id, timestamp) do
+    Enum.reduce_while(collaborators, :ok, fn collaborator, :ok ->
+      changeset =
+        Collaborator.changeset(%Collaborator{}, %{
+          repository_id: repository_id,
+          user_id: collaborator.user_id,
+          role: collaborator.role
+        })
+        |> Changeset.put_change(:inserted_at, timestamp)
+        |> Changeset.put_change(:updated_at, timestamp)
+
+      case repo.insert(changeset) do
+        {:ok, _copied} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp activate_import_shadow(repo, shadow, spec) do
+    attrs =
+      Map.take(
+        spec,
+        ~w(owner_user_id slug name description visibility default_branch has_issues allow_merge_commit generation)a
+      )
+
+    changeset = Repository.import_publication_changeset(shadow, attrs)
+
+    if changeset.valid? do
+      published = Ecto.Changeset.apply_changes(changeset)
+
+      query =
+        from candidate in Repository,
+          where:
+            candidate.id == ^shadow.id and candidate.owner_user_id == ^shadow.owner_user_id and
+              candidate.slug == ^shadow.slug and candidate.storage_path == ^shadow.storage_path and
+              candidate.generation == ^shadow.generation and
+              candidate.write_version == ^shadow.write_version and
+              candidate.updated_at == ^shadow.updated_at and candidate.lifecycle == :importing and
+              is_nil(candidate.deleted_at) and is_nil(candidate.last_pushed_at)
+
+      updates =
+        published
+        |> Map.from_struct()
+        |> Map.take(
+          ~w(owner_user_id slug name description visibility default_branch has_issues allow_merge_commit lifecycle generation deleted_at)a
+        )
+        |> Map.put(:updated_at, spec.timestamp)
+        |> Map.to_list()
+
+      case repo.update_all(query, set: updates) do
+        {1, _rows} -> {:ok, %{published | updated_at: spec.timestamp}}
+        {0, _rows} -> {:error, :destination_changed}
+      end
+    else
+      {:error, changeset}
+    end
+  end
+
+  defp nullable_last_pushed(query, nil),
+    do: where(query, [repository], is_nil(repository.last_pushed_at))
+
+  defp nullable_last_pushed(query, last_pushed_at),
+    do: where(query, [repository], repository.last_pushed_at == ^last_pushed_at)
+
+  defp exact_map_keys?(map, expected) when is_map(map),
+    do: Enum.sort(Map.keys(map)) == Enum.sort(expected)
+
+  defp publication_lock(query) do
+    if turso_adapter?(), do: query, else: lock(query, "FOR UPDATE")
+  end
+
   def get_repository(owner_slug, repo_slug) when is_binary(owner_slug) and is_binary(repo_slug) do
     with %User{id: owner_user_id} <- ForgeAccounts.get_account_by_username(owner_slug) do
-      Repository
+      ready_repository()
       |> where([repo], repo.owner_user_id == ^owner_user_id)
       |> where([repo], repo.slug == ^Repository.normalize_slug(repo_slug))
-      |> where([repo], is_nil(repo.deleted_at))
       |> Repo.one()
     end
   end
@@ -320,6 +818,152 @@ defmodule ForgeRepos do
     |> Storage.repository_path!()
   end
 
+  @spec open_repository_read(Repository.t(), integer()) ::
+          {:ok, RepositoryReadHandle.t()}
+          | {:error, :not_found | :deadline_exceeded | :unavailable}
+  def open_repository_read(
+        %Repository{id: repository_id, generation: generation} = repository,
+        absolute_deadline_ms
+      )
+      when is_integer(repository_id) and repository_id > 0 and is_integer(generation) and
+             generation > 0 and is_integer(absolute_deadline_ms) do
+    case GitCore.RepositoryReadLimiter.acquire_read(repository_id, absolute_deadline_ms) do
+      {:ok, lease} ->
+        case reload_read_repository(repository) do
+          {:ok, reloaded} ->
+            case safe_absolute_storage_path(reloaded) do
+              {:ok, path} ->
+                {:ok, %RepositoryReadHandle{repository: reloaded, path: path, lease: lease}}
+
+              {:error, _reason} ->
+                GitCore.RepositoryReadLimiter.release(lease)
+                {:error, :unavailable}
+            end
+
+          {:error, reason} ->
+            GitCore.RepositoryReadLimiter.release(lease)
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  def open_repository_read(%Repository{}, _absolute_deadline_ms),
+    do: {:error, :not_found}
+
+  @spec close_repository_read(RepositoryReadHandle.t()) :: :ok
+  def close_repository_read(%RepositoryReadHandle{lease: lease}) do
+    GitCore.RepositoryReadLimiter.release(lease)
+  end
+
+  @spec with_repository_read(Repository.t(), integer(), (RepositoryReadHandle.t() -> result)) ::
+          result | {:error, atom()}
+        when result: term()
+  def with_repository_read(%Repository{} = repository, absolute_deadline_ms, fun)
+      when is_integer(absolute_deadline_ms) and is_function(fun, 1) do
+    case open_repository_read(repository, absolute_deadline_ms) do
+      {:ok, handle} ->
+        try do
+          :ok = run_read_phase_hook()
+          fun.(handle)
+        after
+          close_repository_read(handle)
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  @spec repository_read_repository(RepositoryReadHandle.t()) :: Repository.t()
+  def repository_read_repository(%RepositoryReadHandle{repository: repository}), do: repository
+
+  @spec repository_read_path(RepositoryReadHandle.t()) :: Path.t()
+  def repository_read_path(%RepositoryReadHandle{path: path}), do: path
+
+  defp with_repository_reads(repositories, absolute_deadline_ms, fun) do
+    ordered_repositories = repositories |> Enum.uniq_by(& &1.id) |> Enum.sort_by(& &1.id)
+
+    case acquire_repository_reads(ordered_repositories, absolute_deadline_ms, []) do
+      {:ok, grants} ->
+        case reload_repository_reads(grants) do
+          {:ok, handles} ->
+            try do
+              :ok = run_read_phase_hook()
+              fun.(handles)
+            after
+              Enum.each(handles, &close_repository_read/1)
+            end
+
+          {:error, reason} ->
+            Enum.each(grants, fn {_repository, lease} ->
+              GitCore.RepositoryReadLimiter.release(lease)
+            end)
+
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp acquire_repository_reads([], _deadline, grants), do: {:ok, Enum.reverse(grants)}
+
+  defp acquire_repository_reads([repository | rest], deadline, grants) do
+    case GitCore.RepositoryReadLimiter.acquire_read(repository.id, deadline) do
+      {:ok, lease} ->
+        acquire_repository_reads(rest, deadline, [{repository, lease} | grants])
+
+      {:error, reason} ->
+        Enum.each(grants, fn {_repository, lease} ->
+          GitCore.RepositoryReadLimiter.release(lease)
+        end)
+
+        {:error, reason}
+    end
+  end
+
+  defp reload_repository_reads([]), do: {:ok, []}
+
+  defp reload_repository_reads(grants) do
+    expected =
+      Map.new(grants, fn {repository, _lease} -> {repository.id, repository.generation} end)
+
+    reloaded =
+      Repository
+      |> where(
+        [repository],
+        repository.id in ^Map.keys(expected) and repository.lifecycle == :ready and
+          is_nil(repository.deleted_at) and is_nil(repository.storage_reclaimed_at)
+      )
+      |> Repo.all()
+      |> Map.new(&{&1.id, &1})
+
+    Enum.reduce_while(grants, {:ok, []}, fn {input, lease}, {:ok, handles} ->
+      case Map.fetch(reloaded, input.id) do
+        {:ok, %{generation: generation} = repository} when generation == input.generation ->
+          case safe_absolute_storage_path(repository) do
+            {:ok, path} ->
+              handle = %RepositoryReadHandle{repository: repository, path: path, lease: lease}
+              {:cont, {:ok, [handle | handles]}}
+
+            {:error, _reason} ->
+              {:halt, {:error, :unavailable}}
+          end
+
+        _missing_or_changed ->
+          {:halt, {:error, :not_found}}
+      end
+    end)
+    |> case do
+      {:ok, handles} -> {:ok, Enum.reverse(handles)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @spec with_write_fence(
           Repository.t(),
           :ref | :content | :merge | :tag | :receive_pack,
@@ -329,12 +973,33 @@ defmodule ForgeRepos do
       when is_integer(repository_id) and
              class in [:ref, :content, :merge, :tag, :receive_pack] and
              is_function(fun, 2) do
+    with_repository_fence(repository, class, fun, :writer)
+  end
+
+  @spec with_import_publication_fence(
+          Repository.t(),
+          :ref | :content | :merge | :tag | :receive_pack,
+          (Path.t(), non_neg_integer() -> term())
+        ) :: term()
+  def with_import_publication_fence(
+        %Repository{id: repository_id} = repository,
+        class,
+        fun
+      )
+      when is_integer(repository_id) and
+             class in [:ref, :content, :merge, :tag, :receive_pack] and
+             is_function(fun, 2) do
+    with_repository_fence(repository, class, fun, :publication)
+  end
+
+  defp with_repository_fence(repository, class, fun, mismatch_mode) do
     absolute_deadline = System.monotonic_time(:millisecond) + write_deadline(class)
 
-    case GitCore.RepositoryWriteLimiter.acquire(repository_id, absolute_deadline) do
+    case GitCore.RepositoryWriteLimiter.acquire(repository.id, absolute_deadline) do
       {:ok, lease} ->
         try do
-          with {:ok, repository_path} <- safe_absolute_storage_path(repository),
+          with {:ok, repository} <- reload_fenced_repository(repository),
+               {:ok, repository_path} <- safe_absolute_storage_path(repository),
                :ok <-
                  RepositoryWriteReconcilers.reconcile_locked(
                    repository,
@@ -344,6 +1009,7 @@ defmodule ForgeRepos do
             remaining = max(absolute_deadline - System.monotonic_time(:millisecond), 0)
             fun.(repository_path, remaining)
           else
+            {:error, :stale_repository} -> fence_mismatch(mismatch_mode)
             {:error, :storage_unavailable} -> {:error, {:unavailable, :storage}}
             {:error, :unavailable} -> {:error, {:unavailable, :write_fence}}
           end
@@ -359,6 +1025,40 @@ defmodule ForgeRepos do
     end
   end
 
+  defp reload_fenced_repository(%Repository{id: repository_id, generation: generation})
+       when is_integer(repository_id) and repository_id > 0 and is_integer(generation) and
+              generation > 0 do
+    repository =
+      Repository
+      |> where(
+        [repository],
+        repository.id == ^repository_id and repository.generation == ^generation and
+          repository.lifecycle == :ready and is_nil(repository.deleted_at)
+      )
+      |> Repo.one()
+
+    if repository, do: {:ok, repository}, else: {:error, :stale_repository}
+  end
+
+  defp reload_fenced_repository(%Repository{}), do: {:error, :stale_repository}
+
+  defp reload_read_repository(%Repository{id: repository_id, generation: generation}) do
+    repository =
+      Repository
+      |> where(
+        [repository],
+        repository.id == ^repository_id and repository.generation == ^generation and
+          repository.lifecycle == :ready and is_nil(repository.deleted_at) and
+          is_nil(repository.storage_reclaimed_at)
+      )
+      |> Repo.one()
+
+    if repository, do: {:ok, repository}, else: {:error, :not_found}
+  end
+
+  defp fence_mismatch(:writer), do: {:error, {:unavailable, :stale_repository}}
+  defp fence_mismatch(:publication), do: {:error, :destination_changed}
+
   defp write_deadline(class) when class in [:ref, :tag], do: GitCore.Limits.get(:ref_deadline_ms)
 
   defp write_deadline(class) when class in [:content, :merge, :receive_pack],
@@ -369,20 +1069,431 @@ defmodule ForgeRepos do
   rescue
     File.Error -> {:error, :storage_unavailable}
     ArgumentError -> {:error, :storage_unavailable}
+    FunctionClauseError -> {:error, :storage_unavailable}
   end
 
   def empty?(%Repository{} = repository) do
-    repository
-    |> absolute_storage_path()
-    |> GitCore.empty?()
+    with_repository_read(repository, repository_read_deadline(), fn handle ->
+      handle |> repository_read_path() |> GitCore.empty?()
+    end)
   end
 
   def mark_pushed(%Repository{} = repository, pushed_at \\ DateTime.utc_now()) do
     pushed_at = DateTime.truncate(pushed_at, :second)
+    mark_pushed(repository, pushed_at, mark_pushed_now(), @receive_pack_busy_attempts)
+  end
 
-    repository
-    |> change(last_pushed_at: pushed_at)
-    |> Repo.update()
+  if Mix.env() == :test do
+    @mark_pushed_clock_key {__MODULE__, :mark_pushed_clock}
+    @mark_pushed_after_update_hook_key {__MODULE__, :mark_pushed_after_update_hook}
+
+    @doc false
+    def with_test_mark_pushed_clock(clock, fun)
+        when is_function(clock, 0) and is_function(fun, 0) do
+      previous = Process.get(@mark_pushed_clock_key)
+      Process.put(@mark_pushed_clock_key, clock)
+
+      try do
+        fun.()
+      after
+        if previous == nil,
+          do: Process.delete(@mark_pushed_clock_key),
+          else: Process.put(@mark_pushed_clock_key, previous)
+      end
+    end
+
+    @doc false
+    def with_test_mark_pushed_after_update_hook(hook, fun)
+        when is_function(hook, 0) and is_function(fun, 0) do
+      previous = Process.get(@mark_pushed_after_update_hook_key)
+      Process.put(@mark_pushed_after_update_hook_key, hook)
+
+      try do
+        fun.()
+      after
+        if previous == nil,
+          do: Process.delete(@mark_pushed_after_update_hook_key),
+          else: Process.put(@mark_pushed_after_update_hook_key, previous)
+      end
+    end
+
+    defp mark_pushed_now do
+      case Process.get(@mark_pushed_clock_key) do
+        clock when is_function(clock, 0) -> clock.()
+        nil -> DateTime.utc_now()
+      end
+      |> DateTime.truncate(:second)
+    end
+
+    defp mark_pushed_after_update do
+      case Process.get(@mark_pushed_after_update_hook_key) do
+        hook when is_function(hook, 0) -> hook.()
+        nil -> :ok
+      end
+    end
+  else
+    defp mark_pushed_now, do: DateTime.utc_now(:second)
+    defp mark_pushed_after_update, do: :ok
+  end
+
+  defp mark_pushed(repository, pushed_at, updated_at, attempts_remaining) do
+    query =
+      from candidate in Repository,
+        where:
+          candidate.id == ^repository.id and candidate.generation == ^repository.generation and
+            candidate.lifecycle == :ready and is_nil(candidate.deleted_at)
+
+    Multi.new()
+    |> Multi.update_all(:mutation, query,
+      set: [last_pushed_at: pushed_at, updated_at: updated_at],
+      inc: [write_version: 1]
+    )
+    |> Multi.run(:mutation_guard, fn _repo, %{mutation: mutation} ->
+      case mutation do
+        {1, _rows} -> {:ok, :updated}
+        {0, _rows} -> {:error, :stale_repository}
+      end
+    end)
+    |> Multi.run(:after_update, fn _repo, _changes ->
+      mark_pushed_after_update()
+      {:ok, :complete}
+    end)
+    |> Multi.run(:repository, fn repo, _changes ->
+      case repo.one(query) do
+        %Repository{} = updated -> {:ok, updated}
+        nil -> {:error, :stale_repository}
+      end
+    end)
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{repository: updated}} ->
+        {:ok, updated}
+
+      {:error, _step, :stale_repository, _changes} ->
+        {:error, :stale_repository}
+
+      {:error, _step, _reason, _changes} ->
+        {:error, :unavailable}
+    end
+  rescue
+    error in Turso.Error ->
+      if turso_adapter?() and error.code == :busy and attempts_remaining > 1 do
+        attempt = @receive_pack_busy_attempts - attempts_remaining + 1
+        Process.sleep(attempt * @receive_pack_busy_backoff_ms)
+        mark_pushed(repository, pushed_at, updated_at, attempts_remaining - 1)
+      else
+        {:error, :unavailable}
+      end
+  end
+
+  @spec prepare_receive_pack_operations(
+          User.t(),
+          Repository.t(),
+          String.t(),
+          [tuple()],
+          integer()
+        ) ::
+          {:ok, [GitWriteOperation.t()]}
+          | {:error, :conflict | :invalid | :stale_repository | :unavailable}
+  def prepare_receive_pack_operations(
+        %User{id: actor_id, kind: :user, state: :active},
+        %Repository{id: repository_id, generation: generation} = repository,
+        request_id,
+        commands,
+        absolute_deadline
+      )
+      when is_integer(repository_id) and repository_id > 0 and is_integer(generation) and
+             generation > 0 and is_integer(actor_id) and actor_id > 0 and is_binary(request_id) and
+             byte_size(request_id) in 1..255 and is_list(commands) and commands != [] and
+             is_integer(absolute_deadline) do
+    with :ok <- validate_receive_pack_command_count(commands),
+         :ok <- receive_pack_deadline(absolute_deadline),
+         {:ok, operation_attrs} <-
+           receive_pack_operation_attrs(
+             repository,
+             actor_id,
+             request_id,
+             commands,
+             absolute_deadline
+           ) do
+      multi =
+        Multi.new()
+        |> Multi.run(:repository, fn repo, _changes ->
+          fetch_receive_pack_repository(repo, repository)
+        end)
+        |> Multi.run(:operations, fn repo, _changes ->
+          insert_receive_pack_operations(repo, operation_attrs, absolute_deadline)
+        end)
+
+      multi
+      |> transact_receive_pack(@receive_pack_busy_attempts, absolute_deadline)
+      |> case do
+        {:ok, %{operations: operations}} ->
+          case receive_pack_deadline(absolute_deadline) do
+            :ok -> {:ok, operations}
+            {:error, :unavailable} = error -> error
+          end
+
+        {:error, _step, reason, _changes} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  def prepare_receive_pack_operations(
+        _actor,
+        _repository,
+        _request_id,
+        _commands,
+        _absolute_deadline
+      ),
+      do: {:error, :invalid}
+
+  @spec receive_pack_operation_statuses([GitWriteOperation.t()]) ::
+          {:ok, [{String.t(), String.t(), nil | String.t()}]} | {:error, :unavailable}
+  def receive_pack_operation_statuses([%GitWriteOperation{} | _] = operations) do
+    ids = Enum.map(operations, & &1.id)
+
+    if Enum.all?(ids, &(is_integer(&1) and &1 > 0)) and length(Enum.uniq(ids)) == length(ids) do
+      persisted_by_id =
+        GitWriteOperation
+        |> where([operation], operation.id in ^ids)
+        |> Repo.all()
+        |> Map.new(&{&1.id, &1})
+
+      operations
+      |> Enum.reduce_while({:ok, []}, fn expected, {:ok, statuses} ->
+        case Map.fetch(persisted_by_id, expected.id) do
+          {:ok, persisted} ->
+            case receive_pack_terminal_status(expected, persisted) do
+              {:ok, status} -> {:cont, {:ok, [status | statuses]}}
+              {:error, :unavailable} = error -> {:halt, error}
+            end
+
+          :error ->
+            {:halt, {:error, :unavailable}}
+        end
+      end)
+      |> case do
+        {:ok, statuses} -> {:ok, Enum.reverse(statuses)}
+        {:error, :unavailable} = error -> error
+      end
+    else
+      {:error, :unavailable}
+    end
+  end
+
+  def receive_pack_operation_statuses(_operations), do: {:error, :unavailable}
+
+  defp validate_receive_pack_command_count(commands) do
+    limit = GitCore.Limits.get(:receive_pack_commands)
+
+    commands
+    |> Enum.reduce_while(0, fn _command, count ->
+      if count < limit, do: {:cont, count + 1}, else: {:halt, :too_many}
+    end)
+    |> case do
+      count when is_integer(count) -> :ok
+      :too_many -> {:error, :unavailable}
+    end
+  end
+
+  if Mix.env() == :test do
+    @receive_pack_transaction_hook_key {__MODULE__, :receive_pack_transaction_hook}
+
+    @doc false
+    def with_test_receive_pack_transaction_hook(hook, fun)
+        when is_function(hook, 2) and is_function(fun, 0) do
+      previous = Process.get(@receive_pack_transaction_hook_key)
+      Process.put(@receive_pack_transaction_hook_key, hook)
+
+      try do
+        fun.()
+      after
+        if previous == nil,
+          do: Process.delete(@receive_pack_transaction_hook_key),
+          else: Process.put(@receive_pack_transaction_hook_key, previous)
+      end
+    end
+
+    defp execute_receive_pack_transaction(multi, timeout) do
+      case Process.get(@receive_pack_transaction_hook_key) do
+        hook when is_function(hook, 2) -> hook.(multi, timeout)
+        nil -> Repo.transaction(multi, timeout: timeout)
+      end
+    end
+  else
+    defp execute_receive_pack_transaction(multi, timeout),
+      do: Repo.transaction(multi, timeout: timeout)
+  end
+
+  defp receive_pack_operation_attrs(
+         repository,
+         actor_id,
+         request_id,
+         commands,
+         absolute_deadline
+       ) do
+    commands
+    |> Enum.reduce_while({:ok, [], MapSet.new()}, fn
+      {old_oid, new_oid, target_ref}, {:ok, attrs, refs}
+      when is_binary(old_oid) and is_binary(new_oid) and is_binary(target_ref) ->
+        case receive_pack_deadline(absolute_deadline) do
+          :ok ->
+            if MapSet.member?(refs, target_ref) do
+              {:halt, {:error, :invalid}}
+            else
+              operation_attrs = %{
+                repository_id: repository.id,
+                actor_user_id: actor_id,
+                request_id: request_id,
+                kind: :receive_pack,
+                state: :prepared,
+                target_ref: target_ref,
+                expected_oid: normalize_receive_pack_expected_oid(old_oid),
+                proposed_oid: String.downcase(new_oid),
+                result_blob_oid: nil,
+                failure_reason: nil,
+                lease_owner: nil,
+                lease_expires_at: nil,
+                lock_version: 0
+              }
+
+              changeset = GitWriteOperation.changeset(%GitWriteOperation{}, operation_attrs)
+
+              if changeset.valid? do
+                {:cont, {:ok, [operation_attrs | attrs], MapSet.put(refs, target_ref)}}
+              else
+                {:halt, {:error, :invalid}}
+              end
+            end
+
+          {:error, :unavailable} = error ->
+            {:halt, error}
+        end
+
+      _invalid, _acc ->
+        {:halt, {:error, :invalid}}
+    end)
+    |> case do
+      {:ok, attrs, _refs} -> {:ok, Enum.reverse(attrs)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp normalize_receive_pack_expected_oid(@zero_oid), do: nil
+  defp normalize_receive_pack_expected_oid(oid), do: String.downcase(oid)
+
+  defp fetch_receive_pack_repository(repo, repository) do
+    query =
+      from candidate in Repository,
+        where:
+          candidate.id == ^repository.id and candidate.generation == ^repository.generation and
+            candidate.lifecycle == :ready and is_nil(candidate.deleted_at)
+
+    case repo.one(query) do
+      %Repository{} = repository -> {:ok, repository}
+      nil -> {:error, :stale_repository}
+    end
+  end
+
+  defp insert_receive_pack_operations(repo, operation_attrs, absolute_deadline) do
+    operation_attrs
+    |> Enum.reduce_while({:ok, []}, fn attrs, {:ok, operations} ->
+      case receive_pack_deadline(absolute_deadline) do
+        :ok ->
+          changeset = GitWriteOperation.changeset(%GitWriteOperation{}, attrs)
+
+          case repo.insert(changeset) do
+            {:ok, operation} -> {:cont, {:ok, [operation | operations]}}
+            {:error, %Changeset{}} -> {:halt, {:error, :conflict}}
+          end
+
+        {:error, :unavailable} = error ->
+          {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, operations} -> {:ok, Enum.reverse(operations)}
+      {:error, _reason} = error -> error
+    end
+  rescue
+    error in Turso.Error -> reraise error, __STACKTRACE__
+  end
+
+  defp transact_receive_pack(multi, attempts_remaining, absolute_deadline) do
+    case receive_pack_timeout(absolute_deadline) do
+      {:ok, timeout} ->
+        case execute_receive_pack_transaction(multi, timeout) do
+          :busy -> retry_receive_pack_transaction(multi, attempts_remaining, absolute_deadline)
+          result -> result
+        end
+
+      {:error, :unavailable} ->
+        receive_pack_transaction_error()
+    end
+  rescue
+    error in Turso.Error ->
+      if error.code == :busy do
+        retry_receive_pack_transaction(multi, attempts_remaining, absolute_deadline)
+      else
+        receive_pack_transaction_error()
+      end
+  end
+
+  defp retry_receive_pack_transaction(multi, attempts_remaining, absolute_deadline) do
+    remaining = absolute_deadline - System.monotonic_time(:millisecond)
+
+    if turso_adapter?() and attempts_remaining > 1 and remaining > 1 do
+      attempt = @receive_pack_busy_attempts - attempts_remaining + 1
+      backoff = min(attempt * @receive_pack_busy_backoff_ms, remaining - 1)
+      Process.sleep(backoff)
+      transact_receive_pack(multi, attempts_remaining - 1, absolute_deadline)
+    else
+      receive_pack_transaction_error()
+    end
+  end
+
+  defp receive_pack_terminal_status(expected, persisted) do
+    if receive_pack_operation_identity?(expected, persisted) do
+      case persisted.state do
+        :bookkeeping_complete -> {:ok, {persisted.target_ref, "ok", nil}}
+        :failed -> {:ok, {persisted.target_ref, "ng", "Git receive-pack failed"}}
+        _nonterminal -> {:error, :unavailable}
+      end
+    else
+      {:error, :unavailable}
+    end
+  end
+
+  defp receive_pack_operation_identity?(expected, persisted) do
+    persisted.id == expected.id and persisted.repository_id == expected.repository_id and
+      persisted.actor_user_id == expected.actor_user_id and
+      persisted.request_id == expected.request_id and persisted.kind == :receive_pack and
+      persisted.target_ref == expected.target_ref and
+      persisted.expected_oid == expected.expected_oid and
+      persisted.proposed_oid == expected.proposed_oid
+  end
+
+  defp receive_pack_timeout(absolute_deadline) do
+    case absolute_deadline - System.monotonic_time(:millisecond) do
+      remaining when remaining > 0 -> {:ok, remaining}
+      _expired -> {:error, :unavailable}
+    end
+  end
+
+  defp receive_pack_deadline(absolute_deadline) do
+    case receive_pack_timeout(absolute_deadline) do
+      {:ok, _remaining} -> :ok
+      {:error, :unavailable} = error -> error
+    end
+  end
+
+  defp receive_pack_transaction_error,
+    do: {:error, :operations, :unavailable, %{}}
+
+  defp turso_adapter? do
+    Application.get_env(:fornacast, :database_adapter) in ["libsql", "turso"]
   end
 
   def ssh_clone_url(%Repository{} = repository, owner, actor \\ nil) do
@@ -445,9 +1556,8 @@ defmodule ForgeRepos do
 
   defp directly_owned_repository_counts(owner_id) do
     counts =
-      Repository
+      ready_repository()
       |> where([repository], repository.owner_user_id == ^owner_id)
-      |> where([repository], is_nil(repository.deleted_at))
       |> group_by([repository], repository.visibility)
       |> select([repository], {repository.visibility, count(repository.id)})
       |> Repo.all()
@@ -486,20 +1596,34 @@ defmodule ForgeRepos do
   end
 
   defp build_repository_view(actor, %{repository: repository, owner: owner} = context) do
-    with :ok <- mask_repository_read(actor, context),
-         {:ok, path} <- safe_absolute_storage_path(repository),
-         {:ok, bytes} <- GitCore.repository_disk_usage(path) do
+    result =
+      with :ok <- mask_repository_read(actor, context) do
+        with_repository_read(repository, repository_read_deadline(), fn handle ->
+          build_repository_view_with_handle(actor, context, owner, handle)
+        end)
+      end
+
+    normalize_repository_view_result(result)
+  end
+
+  defp build_repository_view_with_handle(actor, context, owner, handle) do
+    with {:ok, bytes} <- GitCore.repository_disk_usage(repository_read_path(handle)) do
       {:ok,
        %RepositoryView{
-         repository: repository,
+         repository: repository_read_repository(handle),
          owner: owner,
          permissions: repository_permissions(actor, context),
          size_kib: div(bytes + 1023, 1024)
        }}
-    else
+    end
+  end
+
+  defp normalize_repository_view_result(result) do
+    case result do
       {:error, %GitCore.Error{kind: kind}} -> {:error, {:unavailable, kind}}
       {:error, :not_found} -> {:error, :not_found}
       {:error, _reason} -> {:error, {:unavailable, :storage_unavailable}}
+      result -> result
     end
   end
 
@@ -794,7 +1918,7 @@ defmodule ForgeRepos do
   defp accessible_repository_query(actor, params) do
     ids = accessible_repository_ids(actor, params.affiliations)
 
-    Repository
+    ready_repository()
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
     |> where([repository, _owner], repository.id in subquery(ids))
     |> apply_visibility_ceiling(params.visibility_ceiling)
@@ -807,7 +1931,7 @@ defmodule ForgeRepos do
   defp accessible_repository_ids(%User{id: actor_id}, affiliations) do
     relationship = affiliation_dynamic(affiliations, actor_id)
 
-    Repository
+    ready_repository()
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
     |> join(:left, [repository, _owner], membership in OrganizationMember,
       on:
@@ -817,8 +1941,8 @@ defmodule ForgeRepos do
       on: collaborator.repository_id == repository.id and collaborator.user_id == ^actor_id
     )
     |> where(
-      [repository, owner, _membership, _collaborator],
-      is_nil(repository.deleted_at) and owner.state == :active
+      [_repository, owner, _membership, _collaborator],
+      owner.state == :active
     )
     |> where(^relationship)
     |> select([repository, _owner, _membership, _collaborator], repository.id)
@@ -877,7 +2001,7 @@ defmodule ForgeRepos do
 
   defp apply_accessible_type_filter(query, %User{id: actor_id}, :member) do
     member_ids =
-      Repository
+      ready_repository()
       |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
       |> join(:inner, [repository, _owner], membership in OrganizationMember,
         on:
@@ -907,13 +2031,13 @@ defmodule ForgeRepos do
     candidate_ids = account_repository_ids(account, params.type)
     visible_ids = visible_repository_ids(candidate_ids, actor, params.visibility_ceiling)
 
-    Repository
+    ready_repository()
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
     |> where([repository, _owner], repository.id in subquery(visible_ids))
   end
 
   defp account_repository_ids(%User{id: account_id}, type) do
-    Repository
+    ready_repository()
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
     |> join(:left, [repository, _owner], membership in OrganizationMember,
       on:
@@ -921,8 +2045,8 @@ defmodule ForgeRepos do
           membership.user_id == ^account_id
     )
     |> where(
-      [repository, owner, _membership],
-      is_nil(repository.deleted_at) and owner.state == :active
+      [_repository, owner, _membership],
+      owner.state == :active
     )
     |> where(^user_account_type_dynamic(type, account_id))
     |> select([repository, _owner, _membership], repository.id)
@@ -930,12 +2054,12 @@ defmodule ForgeRepos do
   end
 
   defp account_repository_ids(%Organization{id: organization_id}, type) do
-    Repository
+    ready_repository()
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
     |> where(
       [repository, owner],
-      repository.owner_user_id == ^organization_id and is_nil(repository.deleted_at) and
-        owner.kind == :organization and owner.state == :active
+      repository.owner_user_id == ^organization_id and owner.kind == :organization and
+        owner.state == :active
     )
     |> apply_organization_account_type(type)
     |> select([repository, _owner], repository.id)
@@ -977,7 +2101,7 @@ defmodule ForgeRepos do
   end
 
   defp visible_repository_ids(candidate_ids, _actor, :public) do
-    Repository
+    ready_repository()
     |> where([repository], repository.id in subquery(candidate_ids))
     |> where([repository], repository.visibility == :public)
     |> select([repository], repository.id)
@@ -988,13 +2112,13 @@ defmodule ForgeRepos do
   end
 
   defp visible_repository_ids(candidate_ids, %User{role: :admin}, :all) do
-    Repository
+    ready_repository()
     |> where([repository], repository.id in subquery(candidate_ids))
     |> select([repository], repository.id)
   end
 
   defp visible_repository_ids(candidate_ids, %User{id: actor_id}, :all) do
-    Repository
+    ready_repository()
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
     |> join(:left, [repository, _owner], membership in OrganizationMember,
       on:
@@ -1055,22 +2179,26 @@ defmodule ForgeRepos do
       |> Enum.map(& &1.id)
       |> load_repository_contexts(actor)
 
-    Enum.reduce_while(repositories, {:ok, []}, fn repository, {:ok, views} ->
-      case Map.fetch(contexts, repository.id) do
-        {:ok, context} ->
-          case build_repository_view(actor, context) do
-            {:ok, view} -> {:cont, {:ok, [view | views]}}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
+    with_repository_reads(repositories, repository_read_deadline(), fn handles ->
+      handles = Map.new(handles, &{repository_read_repository(&1).id, &1})
 
-        :error ->
-          {:halt, {:error, :not_found}}
+      Enum.reduce_while(repositories, {:ok, []}, fn repository, {:ok, views} ->
+        with {:ok, context} <- Map.fetch(contexts, repository.id),
+             {:ok, handle} <- Map.fetch(handles, repository.id),
+             :ok <- mask_repository_read(actor, context),
+             {:ok, view} <-
+               build_repository_view_with_handle(actor, context, context.owner, handle) do
+          {:cont, {:ok, [view | views]}}
+        else
+          :error -> {:halt, {:error, :not_found}}
+          {:error, reason} -> {:halt, normalize_repository_view_result({:error, reason})}
+        end
+      end)
+      |> case do
+        {:ok, views} -> {:ok, Enum.reverse(views)}
+        error -> error
       end
     end)
-    |> case do
-      {:ok, views} -> {:ok, Enum.reverse(views)}
-      error -> error
-    end
   end
 
   defp load_repository_contexts([], _actor), do: %{}
@@ -1137,7 +2265,7 @@ defmodule ForgeRepos do
   end
 
   defp repository_context_query(repository_ids) do
-    Repository
+    ready_repository()
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
     |> join(:left, [_repository, owner], organization in Organization,
       on:
@@ -1146,8 +2274,8 @@ defmodule ForgeRepos do
     )
     |> where(
       [repository, owner, _organization],
-      repository.id in ^repository_ids and is_nil(repository.deleted_at) and
-        owner.state == :active and owner.kind in [:user, :organization]
+      repository.id in ^repository_ids and owner.state == :active and
+        owner.kind in [:user, :organization]
     )
   end
 
@@ -1287,11 +2415,10 @@ defmodule ForgeRepos do
   defp guard_repository_visibility(repo, repository_id, expected_visibility)
        when expected_visibility in [:public, :private] do
     guarded_query =
-      Repository
+      ready_repository()
       |> where(
         [repository],
-        repository.id == ^repository_id and is_nil(repository.deleted_at) and
-          repository.visibility == ^expected_visibility
+        repository.id == ^repository_id and repository.visibility == ^expected_visibility
       )
 
     case repo.update_all(guarded_query, set: [visibility: expected_visibility]) do
@@ -1301,15 +2428,23 @@ defmodule ForgeRepos do
   end
 
   defp active_repository_for_update(repo, repository_id) do
-    Repository
+    ready_repository()
     |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
     |> where(
       [repository, owner],
-      repository.id == ^repository_id and is_nil(repository.deleted_at) and
-        owner.state == :active and owner.kind in [:user, :organization]
+      repository.id == ^repository_id and owner.state == :active and
+        owner.kind in [:user, :organization]
     )
     |> select([repository, _owner], repository)
     |> repo.one()
+  end
+
+  defp ready_repository(query \\ Repository) do
+    where(
+      query,
+      [repository],
+      repository.lifecycle == :ready and is_nil(repository.deleted_at)
+    )
   end
 
   defp map_update_authorization(actor, permission, repository) do
@@ -1541,8 +2676,8 @@ defmodule ForgeRepos do
   defp validate_changed_default_branch(repository, branch, changeset) do
     selector = %GitCore.RefSelector{kind: :branch, full_name: "refs/heads/#{branch}"}
 
-    with {:ok, path} <- safe_absolute_storage_path(repository) do
-      case GitCore.resolve_snapshot(path, selector) do
+    with_repository_read(repository, repository_read_deadline(), fn handle ->
+      case GitCore.resolve_snapshot(repository_read_path(handle), selector) do
         {:ok, %GitCore.Snapshot{}} ->
           {:ok, changeset}
 
@@ -1552,10 +2687,21 @@ defmodule ForgeRepos do
         {:error, %GitCore.Error{kind: kind}} ->
           {:error, {:unavailable, kind}}
       end
-    else
-      {:error, :storage_unavailable} ->
+    end)
+    |> case do
+      {:error, reason} when reason in [:storage_unavailable, :unavailable] ->
         {:error, {:unavailable, :storage_unavailable}}
+
+      {:error, :deadline_exceeded} ->
+        {:error, {:unavailable, :read_timeout}}
+
+      result ->
+        result
     end
+  end
+
+  defp repository_read_deadline do
+    System.monotonic_time(:millisecond) + GitCore.Limits.get(:content_deadline_ms)
   end
 
   defp map_create_api_result({:ok, %{repository: repository}}, _storage_path),
@@ -1723,6 +2869,18 @@ defmodule ForgeRepos do
       digest <> ".git"
     ])
   end
+
+  defp import_shadow_slug(item_id) do
+    suffix =
+      12
+      |> :crypto.strong_rand_bytes()
+      |> Base.encode16(case: :lower)
+
+    "import-#{item_id}-#{suffix}"
+  end
+
+  defp positive_integer(value) when is_integer(value) and value > 0, do: {:ok, value}
+  defp positive_integer(_value), do: :error
 
   defp init_repository_storage(%Repository{} = repository) do
     path = absolute_storage_path(repository)

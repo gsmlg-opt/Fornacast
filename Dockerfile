@@ -4,7 +4,7 @@ ARG RUST_VERSION=1.96.0
 
 FROM ${ELIXIR_IMAGE} AS build
 
-ARG FORNACAST_DATABASE_ADAPTER=turso
+ARG FORNACAST_DATABASE_ADAPTER=postgres
 ARG RUST_VERSION
 ENV MIX_ENV=prod \
     FORNACAST_DATABASE_ADAPTER=${FORNACAST_DATABASE_ADAPTER} \
@@ -25,6 +25,10 @@ RUN apt-get update && \
       sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION} && \
     rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends cmake && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 RUN mix local.hex --force && mix local.rebar --force
@@ -34,6 +38,9 @@ COPY package.json package-lock.json ./
 COPY config config
 COPY apps/fornacast_web/package.json apps/fornacast_web/package.json
 COPY apps apps
+
+ENV HEX_HTTP_CONCURRENCY=1 \
+    HEX_HTTP_TIMEOUT=300
 
 RUN mix deps.get --only prod && \
     mix deps.compile && \
@@ -48,6 +55,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
       coreutils \
+      curl \
+      git \
       libstdc++6 \
       libsctp1 \
       ncurses-base \
@@ -65,13 +74,14 @@ COPY --chown=fornacast:fornacast \
   /app/bin/release_asset_storage_smoke
 
 ENV LANG=C.UTF-8 \
+    SHELL=/bin/sh \
     HOME=/app \
     PORT=4890 \
     FORNACAST_API_BIND_IP=0.0.0.0 \
     FORNACAST_API_PORT=4891 \
-    FORNACAST_DATABASE_ADAPTER=turso \
-    FORNACAST_DATABASE_PATH=/data/fornacast.db \
+    FORNACAST_DATABASE_ADAPTER=postgres \
     FORNACAST_CONFIG_DATABASE_PATH=/data/fornacast_config.db \
+    FORNACAST_LEGACY_TURSO_DATABASE_PATH=/data/fornacast.db \
     FORNACAST_REPO_STORAGE_ROOT=/data/repos \
     FORNACAST_RELEASE_ASSET_STORAGE_ROOT=/data/release-assets \
     FORNACAST_RELEASE_ASSET_MAX_BYTES=2147483648 \

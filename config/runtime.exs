@@ -14,38 +14,144 @@ if config_env() == :prod do
       end
   end
 
-  database_adapter =
-    System.get_env("FORNACAST_DATABASE_ADAPTER", "turso")
-    |> String.downcase()
+  fixed_postgres_build_config = [
+    hostname: "127.0.0.1",
+    socket_dir: nil,
+    port: 5432,
+    database: "fornacast_build"
+  ]
 
-  turso_auth_token =
-    case System.get_env("TURSO_AUTH_TOKEN") do
-      value when value in [nil, ""] ->
-        nil
-
-      _value ->
-        fn -> System.fetch_env!("TURSO_AUTH_TOKEN") end
+  compiled_database_adapter =
+    if require_runtime_env? do
+      case Fornacast.Repo.__adapter__() do
+        Ecto.Adapters.Postgres -> "postgres"
+        Ecto.Adapters.Turso -> "turso"
+        _other -> raise "compiled database adapter is unsupported"
+      end
     end
 
-  repo_config =
-    case database_adapter do
-      value when value in ["libsql", "turso"] ->
-        [
-          database: System.get_env("FORNACAST_DATABASE_PATH", "/data/fornacast.db"),
-          remote_url: System.get_env("TURSO_DATABASE_URL"),
-          auth_token: turso_auth_token
-        ]
-        |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
+  canonical_runtime_adapter = fn
+    value when is_binary(value) ->
+      case String.downcase(value) do
+        value when value in ["postgres", "postgresql"] -> "postgres"
+        value when value in ["turso", "libsql"] -> "turso"
+        _other -> :unsupported
+      end
+  end
 
-      value when value in ["postgres", "postgresql"] ->
-        database_url =
-          System.get_env("DATABASE_URL") ||
-            raise "environment variable DATABASE_URL is missing for PostgreSQL"
+  database_adapter =
+    if require_runtime_env? do
+      runtime_database_adapter =
+        case System.get_env("FORNACAST_DATABASE_ADAPTER") do
+          nil -> compiled_database_adapter
+          value -> canonical_runtime_adapter.(value)
+        end
+
+      if runtime_database_adapter != compiled_database_adapter do
+        raise "runtime database adapter does not match compiled adapter"
+      end
+
+      compiled_database_adapter
+    end
+
+  config :fornacast,
+    legacy_turso_preflight:
+      require_runtime_env? and database_adapter in ["postgres", "postgresql"]
+
+  postgres_runtime_config = fn ->
+    database_url = System.get_env("DATABASE_URL")
+
+    components = [
+      hostname: System.get_env("POSTGRES_HOST"),
+      port: System.get_env("POSTGRES_PORT"),
+      database: System.get_env("POSTGRES_DB"),
+      username: System.get_env("POSTGRES_USER"),
+      password: System.get_env("POSTGRES_PASSWORD")
+    ]
+
+    url_mode? = not is_nil(database_url)
+    component_mode? = Enum.any?(components, fn {_key, value} -> not is_nil(value) end)
+
+    case {url_mode?, component_mode?} do
+      {true, false} ->
+        if database_url == "" do
+          raise "DATABASE_URL is invalid"
+        end
+
+        parsed_url =
+          try do
+            Ecto.Repo.Supervisor.parse_url(database_url)
+          rescue
+            _error -> raise "DATABASE_URL is invalid"
+          end
+
+        if Keyword.has_key?(parsed_url, :show_sensitive_data_on_connection_error) do
+          raise "DATABASE_URL is invalid"
+        end
 
         [url: database_url]
 
-      value ->
-        raise "unsupported FORNACAST_DATABASE_ADAPTER=#{inspect(value)}"
+      {false, true} ->
+        required = Keyword.take(components, [:hostname, :database, :username, :password])
+
+        unless Enum.all?(required, fn {_key, value} -> is_binary(value) and value != "" end) do
+          raise "PostgreSQL component mode requires host, database, user, and password"
+        end
+
+        port =
+          case components[:port] do
+            nil ->
+              5432
+
+            raw_port ->
+              case Integer.parse(raw_port) do
+                {parsed_port, ""} when parsed_port in 1..65_535 ->
+                  parsed_port
+
+                _invalid ->
+                  raise "POSTGRES_PORT must be a decimal integer from 1 through 65535"
+              end
+          end
+
+        [
+          hostname: components[:hostname],
+          port: port,
+          database: components[:database],
+          username: components[:username],
+          password: components[:password]
+        ]
+
+      _neither_or_both ->
+        raise "configure exactly one PostgreSQL connection mode"
+    end
+  end
+
+  turso_runtime_config = fn ->
+    turso_auth_token =
+      case System.get_env("TURSO_AUTH_TOKEN") do
+        value when value in [nil, ""] ->
+          nil
+
+        _value ->
+          fn -> System.fetch_env!("TURSO_AUTH_TOKEN") end
+      end
+
+    [
+      database: System.get_env("FORNACAST_DATABASE_PATH", "/data/fornacast.db"),
+      remote_url: System.get_env("TURSO_DATABASE_URL"),
+      auth_token: turso_auth_token
+    ]
+    |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
+  end
+
+  repo_config =
+    if require_runtime_env? do
+      case compiled_database_adapter do
+        "postgres" -> postgres_runtime_config.()
+        "turso" -> turso_runtime_config.()
+      end
+    else
+      fixed_postgres_build_config
     end
 
   secret_key_base =
@@ -54,6 +160,37 @@ if config_env() == :prod do
   if byte_size(secret_key_base) < 64 do
     raise "environment variable SECRET_KEY_BASE must be at least 64 bytes"
   end
+
+  github_credential_keyring =
+    with keys_json when is_binary(keys_json) and keys_json != "" <-
+           System.get_env("FORNACAST_GITHUB_CREDENTIAL_KEYS"),
+         active when is_binary(active) and byte_size(active) in 1..255 <-
+           System.get_env("FORNACAST_GITHUB_CREDENTIAL_ACTIVE_KEY_ID"),
+         {:ok, encoded_keys} when is_map(encoded_keys) and map_size(encoded_keys) > 0 <-
+           JSON.decode(keys_json),
+         {:ok, keys} <-
+           Enum.reduce_while(encoded_keys, {:ok, %{}}, fn
+             {key_id, encoded_key}, {:ok, decoded}
+             when is_binary(key_id) and byte_size(key_id) in 1..255 and
+                    is_binary(encoded_key) ->
+               case Base.decode64(encoded_key) do
+                 {:ok, key} when byte_size(key) == 32 ->
+                   {:cont, {:ok, Map.put(decoded, key_id, key)}}
+
+                 _ ->
+                   {:halt, :error}
+               end
+
+             _, _decoded ->
+               {:halt, :error}
+           end),
+         {:ok, _active_key} <- Map.fetch(keys, active) do
+      %{active: active, keys: keys}
+    else
+      _ -> :unavailable
+    end
+
+  config :fornacast, :github_credential_keyring, github_credential_keyring
 
   api_bind = System.get_env("FORNACAST_API_BIND_IP", "127.0.0.1")
 
@@ -101,11 +238,16 @@ if config_env() == :prod do
       2_147_483_647
     )
 
-  config :fornacast, :database_adapter, database_adapter
+  if require_runtime_env? do
+    config :fornacast, :database_adapter, database_adapter
+  end
 
   config :fornacast,
          Fornacast.Repo,
-         [pool_size: String.to_integer(System.get_env("POOL_SIZE") || "10")] ++ repo_config
+         [
+           pool_size: String.to_integer(System.get_env("POOL_SIZE") || "10"),
+           show_sensitive_data_on_connection_error: false
+         ] ++ repo_config
 
   config_store_enabled =
     System.get_env("FORNACAST_CONFIG_STORE_ENABLED", "true")

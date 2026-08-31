@@ -27,6 +27,16 @@ defmodule FornacastWebTest do
     assert FornacastWeb.HTML.badge("Default") == ~s(<span class="badge">Default</span>)
   end
 
+  test "serves the logo and favicon" do
+    for path <- ["/images/logo.png", "/favicon.ico"] do
+      conn = get(build_conn(), path)
+
+      assert byte_size(response(conn, 200)) > 0
+      assert [content_type] = Plug.Conn.get_resp_header(conn, "content-type")
+      assert String.starts_with?(content_type, "image/")
+    end
+  end
+
   test "repository collaboration CSS keeps responsive flow and long diffs local" do
     css = File.read!(Path.expand("../assets/css/app.css", __DIR__))
 
@@ -104,8 +114,10 @@ defmodule FornacastWebTest do
 
     html = html_response(conn, 200)
 
+    assert html =~ ~s(<link rel="icon" href="/favicon.ico" sizes="any">)
+
     assert html =~
-             ~s(<a class="brand-mark" href="/" aria-label="Fornacast dashboard">Fornacast</a>)
+             ~s(<a class="brand-mark" href="/" aria-label="Fornacast dashboard"><img class="brand-logo" src="/images/logo.png" alt="" aria-hidden="true"><span>Fornacast</span></a>)
 
     assert html =~ ~s(<nav class="appbar-nav" aria-label="Workspace">)
     refute html =~ ~s(<a class="nav-link" href="/issues">Issues</a>)
@@ -123,13 +135,14 @@ defmodule FornacastWebTest do
     assert html =~ ~s(<a class="create-menu-item" href="/repos/new">)
     assert html =~ ~s(<a class="create-menu-item" href="/repos/import">)
     assert html =~ ~s(<a class="create-menu-item" href="/organizations/new">)
+    assert html =~ ~s(<a class="create-menu-item" href="/organizations/import">)
     assert html =~ ~s(<details class="theme-menu">)
     assert html =~ ~s(<button type="button" class="theme-menu-item" data-theme-choice="auto")
     assert html =~ ~s(<button type="button" class="theme-menu-item" data-theme-choice="sunshine")
     assert html =~ ~s(<button type="button" class="theme-menu-item" data-theme-choice="moonlight")
     assert html =~ ~s(<details class="account-menu">)
     assert html =~ ~s(<a class="account-menu-item" href="/alice">Profile</a>)
-    assert html =~ ~s(<a class="account-menu-item" href="/settings/ssh-keys">Settings</a>)
+    assert html =~ ~s(<a class="account-menu-item" href="/settings">Settings</a>)
     assert html =~ ~s(<form action="/logout" method="post" class="account-menu-logout">)
     refute html =~ ~s(<a class="nav-link" href="/">Dashboard</a>)
     refute html =~ ~s(<a class="nav-link" href="/repos/new">New repository</a>)
@@ -142,6 +155,76 @@ defmodule FornacastWebTest do
     refute html =~ ~s(class="account-pill")
     refute html =~ ~s(class="appbar-logout")
     refute html =~ ~s(<aside class="app-rail)
+  end
+
+  test "settings landing page shows the user's profile and settings navigation" do
+    reset_database!()
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "alice",
+               email: "alice-settings@example.com",
+               password: "correct horse battery staple"
+             })
+
+    conn =
+      build_conn()
+      |> Plug.Test.init_test_session(user_id: user.id)
+      |> get("/settings")
+
+    html = html_response(conn, 200)
+
+    assert html =~ "<h1>Settings</h1>"
+    assert html =~ ~s(<div class="settings-layout" data-settings-page>)
+
+    assert html =~
+             ~s(<nav class="nested-menu nested-menu-bordered settings-menu" aria-label="User settings">)
+
+    assert html =~ ~s(<a href="/settings" class="active" aria-current="page">Profile</a>)
+    assert html =~ ~s(<a href="/settings/api-keys">Applications</a>)
+    assert html =~ ~s(<a href="/settings/ssh-keys">SSH Keys</a>)
+    assert html =~ ~s(<a href="/settings/github">GitHub</a>)
+    assert html =~ "@alice"
+    assert html =~ "alice-settings@example.com"
+  end
+
+  @tag :tmp_dir
+  test "dashboard and namespace pages omit non-ready repositories", %{tmp_dir: tmp_dir} do
+    reset_database!()
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "lifecycle-pages",
+               email: "lifecycle-pages@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, _ready} =
+             ForgeRepos.create_repository(user, %{name: "Visible ready", slug: "visible-ready"})
+
+    for {slug, lifecycle} <- [
+          {"hidden-importing", :importing},
+          {"hidden-tombstoned", :tombstoned}
+        ] do
+      assert {:ok, repository} =
+               ForgeRepos.create_repository(user, %{name: slug, slug: slug})
+
+      repository
+      |> Ecto.Changeset.change(lifecycle: lifecycle)
+      |> Fornacast.Repo.update!()
+    end
+
+    conn = build_conn() |> Plug.Test.init_test_session(user_id: user.id)
+
+    for path <- ["/", "/lifecycle-pages"] do
+      body = conn |> get(path) |> html_response(200)
+      assert body =~ "visible-ready"
+      refute body =~ "hidden-importing"
+      refute body =~ "hidden-tombstoned"
+    end
   end
 
   test "SSH keys are available from settings" do
@@ -162,7 +245,11 @@ defmodule FornacastWebTest do
     html = html_response(conn, 200)
     assert html =~ "<h1>SSH keys</h1>"
     assert html =~ ~s(<form action="/settings/ssh-keys" method="post">)
-    assert html =~ ~s(<a href="/settings/api-keys">API keys</a>)
+
+    assert html =~
+             ~s(<a href="/settings/ssh-keys" class="active" aria-current="page">SSH Keys</a>)
+
+    assert html =~ ~s(<a href="/settings/api-keys">Applications</a>)
   end
 
   test "API key settings create named scoped keys and reveal the secret once" do
@@ -188,6 +275,9 @@ defmodule FornacastWebTest do
 
     html = html_response(conn, 201)
     [secret] = Regex.run(~r/fc_pat_[A-Za-z0-9_-]+/, html)
+
+    assert html =~
+             ~s(<a href="/settings/api-keys" class="active" aria-current="page">Applications</a>)
 
     assert Enum.count(Regex.scan(~r/#{Regex.escape(secret)}/, html)) == 1
     assert html =~ "deploy &amp; release"
@@ -508,7 +598,7 @@ defmodule FornacastWebTest do
     assert html_response(get(conn, "/pulls"), 200) =~ "<h1>Pull Requests</h1>"
   end
 
-  test "authenticated import repository page is reachable from the create menu" do
+  test "authenticated GitHub import pages are reachable from the create menu" do
     reset_database!()
 
     assert {:ok, user} =
@@ -521,9 +611,14 @@ defmodule FornacastWebTest do
     conn =
       build_conn()
       |> Plug.Test.init_test_session(user_id: user.id)
-      |> get("/repos/import")
 
-    assert html_response(conn, 200) =~ "<h1>Import repository</h1>"
+    repository = get(conn, "/repos/import")
+
+    assert html_response(repository, 200) =~
+             "<h1>Import repository from GitHub</h1>"
+
+    assert html_response(repository |> recycle() |> get("/organizations/import"), 200) =~
+             "<h1>Import organization from GitHub</h1>"
   end
 
   @tag :tmp_dir
@@ -1096,6 +1191,49 @@ defmodule FornacastWebTest do
 
     assert ["application/x-git-upload-pack-advertisement"] =
              Plug.Conn.get_resp_header(authorized, "content-type")
+  end
+
+  @tag :tmp_dir
+  test "smart HTTP masks non-ready repositories for upload and receive", %{tmp_dir: tmp_dir} do
+    reset_database!()
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
+
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "hidden-http",
+               email: "hidden-http@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, repository} =
+             ForgeRepos.create_repository(user, %{
+               name: "Hidden",
+               slug: "hidden",
+               visibility: :public
+             })
+
+    repository
+    |> Ecto.Changeset.change(lifecycle: :importing, storage_path: "../hidden.git")
+    |> Fornacast.Repo.update!()
+
+    assert {:ok, _api_key, secret} =
+             ForgeAccounts.create_api_key(user, %{name: "Hidden Git", scopes: ["repo"]})
+
+    authenticated =
+      build_conn()
+      |> Plug.Conn.put_req_header(
+        "authorization",
+        "Basic " <> Base.encode64("hidden-http:#{secret}")
+      )
+
+    for service <- ["git-upload-pack", "git-receive-pack"] do
+      path = "/hidden-http/hidden.git/info/refs?service=#{service}"
+      assert response(get(build_conn(), path), 401) == "Authentication required.\n"
+      assert response(get(authenticated, path), 404) == "Repository not found.\n"
+    end
   end
 
   defp git!(args), do: git!(args, [])

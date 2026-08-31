@@ -37,7 +37,7 @@ release_asset_gc_grace_seconds =
   )
 
 database_adapter =
-  System.get_env("FORNACAST_DATABASE_ADAPTER", "turso")
+  System.get_env("FORNACAST_DATABASE_ADAPTER", "postgres")
   |> String.downcase()
 
 repo_adapter =
@@ -47,10 +47,45 @@ repo_adapter =
     value -> raise "unsupported FORNACAST_DATABASE_ADAPTER=#{inspect(value)}"
   end
 
+github_credential_keyring =
+  if config_env() == :prod do
+    :unavailable
+  else
+    with keys_json when is_binary(keys_json) and keys_json != "" <-
+           System.get_env("FORNACAST_GITHUB_CREDENTIAL_KEYS"),
+         active when is_binary(active) and byte_size(active) in 1..255 <-
+           System.get_env("FORNACAST_GITHUB_CREDENTIAL_ACTIVE_KEY_ID"),
+         {:ok, encoded_keys} when is_map(encoded_keys) and map_size(encoded_keys) > 0 <-
+           JSON.decode(keys_json),
+         {:ok, keys} <-
+           Enum.reduce_while(encoded_keys, {:ok, %{}}, fn
+             {key_id, encoded_key}, {:ok, decoded}
+             when is_binary(key_id) and byte_size(key_id) in 1..255 and
+                    is_binary(encoded_key) ->
+               case Base.decode64(encoded_key) do
+                 {:ok, key} when byte_size(key) == 32 ->
+                   {:cont, {:ok, Map.put(decoded, key_id, key)}}
+
+                 _ ->
+                   {:halt, :error}
+               end
+
+             _, _decoded ->
+               {:halt, :error}
+           end),
+         {:ok, _active_key} <- Map.fetch(keys, active) do
+      %{active: active, keys: keys}
+    else
+      _ -> :unavailable
+    end
+  end
+
 config :fornacast, ecto_repos: [Fornacast.Repo]
 config :fornacast, :database_adapter, database_adapter
 config :fornacast, :repo_adapter, repo_adapter
 config :fornacast, :auto_migrate, true
+config :fornacast, :legacy_turso_preflight, false
+config :fornacast, :github_credential_keyring, github_credential_keyring
 
 config :fornacast,
   release_asset_storage_root: release_asset_root,
@@ -79,40 +114,98 @@ config :git_core, :limits,
   contents_json_bytes: 146_800_640,
   ref_deadline_ms: 10_000,
   content_deadline_ms: 60_000,
+  receive_pack_commands: 1_024,
   # Future bounded API ingestion; GitTransport retains its independent 4 GiB/nil policy.
   receive_pack_bytes: 104_857_600,
   body_total_timeout_ms: 120_000,
   body_idle_timeout_ms: 15_000,
-  reconcile_interval_ms: 30_000
+  reconcile_interval_ms: 30_000,
+  remote_concurrency: 2,
+  remote_wall_time_ms: 1_800_000,
+  remote_output_bytes: 1_048_576,
+  remote_repository_bytes: 21_474_836_480,
+  remote_refs: 200_000,
+  remote_poll_interval_ms: 100,
+  remote_credential_startup_ms: 10_000,
+  remote_kill_escalation_ms: 5_000,
+  remote_cleanup_wait_ms: 10_000
+
+parse_postgres_port! = fn raw ->
+  case Integer.parse(raw) do
+    {port, ""} when port in 1..65_535 -> port
+    _ -> raise "PGPORT/POSTGRES_PORT must be a decimal integer from 1 through 65535"
+  end
+end
+
+postgres_connection = fn default_database ->
+  host = System.get_env("PGHOST") || System.get_env("POSTGRES_HOST", "localhost")
+  port = System.get_env("PGPORT") || System.get_env("POSTGRES_PORT", "5432")
+
+  unless is_binary(host) and byte_size(host) in 1..4096 and String.valid?(host) and
+           String.printable?(host) and not Regex.match?(~r/[\p{Cc}\p{Cf}]/u, host) and
+           :binary.match(host, <<0>>) == :nomatch do
+    raise "PGHOST/POSTGRES_HOST must be a printable nonempty host or socket path"
+  end
+
+  connection =
+    if Path.type(host) == :absolute do
+      [hostname: nil, socket_dir: host]
+    else
+      [hostname: host, socket_dir: nil]
+    end
+
+  [
+    username:
+      System.get_env("PGUSER") || System.get_env("POSTGRES_USER") ||
+        System.get_env("USER", "postgres"),
+    password: System.get_env("PGPASSWORD") || System.get_env("POSTGRES_PASSWORD"),
+    database: System.get_env("PGDATABASE") || System.get_env("POSTGRES_DB", default_database),
+    port: parse_postgres_port!.(port)
+  ] ++ connection
+end
 
 repo_config =
   case database_adapter do
     value when value in ["libsql", "turso"] ->
-      [
-        database: System.get_env("FORNACAST_DATABASE_PATH", "fornacast_dev.db"),
-        remote_url: System.get_env("TURSO_DATABASE_URL"),
-        auth_token: System.get_env("TURSO_AUTH_TOKEN"),
-        # TODO(upstream): gsmlg-dev/concord#67
-        # WORKAROUND(upstream): gsmlg-dev/concord#67
-        after_connect:
-          {Ecto.Adapters.Turso.Connection, :query, ["PRAGMA foreign_keys = ON", [], []]}
-      ]
-      |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
+      if config_env() == :prod do
+        [
+          database: "fornacast_build.db",
+          # TODO(upstream): gsmlg-dev/concord#67
+          # WORKAROUND(upstream): gsmlg-dev/concord#67
+          after_connect:
+            {Ecto.Adapters.Turso.Connection, :query, ["PRAGMA foreign_keys = ON", [], []]}
+        ]
+      else
+        [
+          database: System.get_env("FORNACAST_DATABASE_PATH", "fornacast_dev.db"),
+          remote_url: System.get_env("TURSO_DATABASE_URL"),
+          auth_token: System.get_env("TURSO_AUTH_TOKEN"),
+          # TODO(upstream): gsmlg-dev/concord#67
+          # WORKAROUND(upstream): gsmlg-dev/concord#67
+          after_connect:
+            {Ecto.Adapters.Turso.Connection, :query, ["PRAGMA foreign_keys = ON", [], []]}
+        ]
+        |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
+      end
 
     value when value in ["postgres", "postgresql"] ->
-      [
-        username: System.get_env("POSTGRES_USER", "postgres"),
-        password: System.get_env("POSTGRES_PASSWORD", "postgres"),
-        hostname: System.get_env("POSTGRES_HOST", "localhost"),
-        database: System.get_env("POSTGRES_DB", "fornacast_dev")
-      ]
+      if config_env() == :prod do
+        [
+          hostname: "127.0.0.1",
+          socket_dir: nil,
+          port: 5432,
+          database: "fornacast_build"
+        ]
+      else
+        postgres_connection.("fornacast_dev")
+      end
   end
 
 config :fornacast,
        Fornacast.Repo,
        [
          stacktrace: true,
-         show_sensitive_data_on_connection_error: true,
+         show_sensitive_data_on_connection_error: config_env() != :prod,
          pool_size: String.to_integer(System.get_env("POOL_SIZE", "10"))
        ] ++ repo_config
 
@@ -207,6 +300,8 @@ config :logger, :console,
   metadata: [:request_id, :repo, :user_id]
 
 config :phoenix, :json_library, JSON
+
+config :phoenix, :filter_parameters, {:keep, []}
 
 fornacast_web_path = Path.expand("../apps/fornacast_web", __DIR__)
 

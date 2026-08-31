@@ -1,4 +1,5 @@
 name: E2E
+run-name: E2E ${{ github.event_name == 'workflow_dispatch' && format('release {0}', inputs.version) || format('pull request {0}', github.event.pull_request.number) }}
 
 on:
   pull_request:
@@ -13,6 +14,7 @@ on:
 
 permissions:
   contents: read
+  packages: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,7 +25,7 @@ env:
   OTP_VERSION: "29.0"
   RUST_VERSION: 1.96.0
   MIX_ENV: prod
-  FORNACAST_DATABASE_ADAPTER: turso
+  FORNACAST_DATABASE_ADAPTER: postgres
   FORNACAST_API_BIND_IP: "127.0.0.1"
   FORNACAST_API_PORT: "4101"
   FORNACAST_SSH_PORT: "22222"
@@ -33,10 +35,39 @@ jobs:
   release-smoke:
     name: Release Smoke
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: fornacast_e2e
+          POSTGRES_USER: fornacast
+          POSTGRES_PASSWORD: fornacast_e2e_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fornacast -d fornacast_e2e"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: fornacast_e2e
+      POSTGRES_USER: fornacast
+      POSTGRES_PASSWORD: fornacast_e2e_password
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Resolve published release version
+        if: github.event_name == 'workflow_dispatch'
+        id: dispatch_version
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          version="$(scripts/resolve_release_version.sh "$VERSION_INPUT")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install system dependencies
         run: |
@@ -65,9 +96,9 @@ jobs:
             ~/.cache/rebar3
             ~/.cargo/git
             ~/.cargo/registry
-          key: ${{ runner.os }}-e2e-release-${{ env.MIX_ENV }}-${{ hashFiles('mix.lock', 'apps/git_core/native/fornacast_git_core/Cargo.lock', 'package-lock.json') }}
+          key: ${{ runner.os }}-e2e-release-postgres-${{ env.MIX_ENV }}-${{ hashFiles('mix.lock', 'apps/git_core/native/fornacast_git_core/Cargo.lock', 'package-lock.json') }}
           restore-keys: |
-            ${{ runner.os }}-e2e-release-${{ env.MIX_ENV }}-
+            ${{ runner.os }}-e2e-release-postgres-${{ env.MIX_ENV }}-
 
       - name: Install Hex and Rebar
         if: github.event_name == 'pull_request'
@@ -78,6 +109,10 @@ jobs:
       - name: Fetch dependencies
         if: github.event_name == 'pull_request'
         run: mix deps.get --only prod
+
+      - name: Clean cached project artifacts
+        if: github.event_name == 'pull_request'
+        run: mix clean
 
       - name: Compile dependencies
         if: github.event_name == 'pull_request'
@@ -107,7 +142,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.dispatch_version.outputs.version }}
         run: |
           mkdir -p artifacts
           gh release download "v${VERSION}" \
@@ -118,7 +153,7 @@ jobs:
       - name: Extract release artifact
         if: github.event_name == 'workflow_dispatch'
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.dispatch_version.outputs.version }}
         run: |
           mkdir -p release
           tar -xzf "artifacts/fornacast-${VERSION}-linux-x86_64.tar.gz" -C release
@@ -126,11 +161,13 @@ jobs:
       - name: Prepare e2e environment
         run: |
           mkdir -p e2e-data/repos e2e-data/ssh e2e-data/release-assets e2e-work
+          legacy_turso_path="${GITHUB_WORKSPACE}/e2e-data/missing-legacy.db"
+          test ! -e "$legacy_turso_path"
           ssh-keygen -t ed25519 -f e2e-data/id_ed25519 -N "" -C e2e@example.com
           {
             echo "SECRET_KEY_BASE=$(openssl rand -base64 48)"
             echo "FORNACAST_BASE_URL=http://127.0.0.1:${PORT}"
-            echo "FORNACAST_DATABASE_PATH=${GITHUB_WORKSPACE}/e2e-data/fornacast.db"
+            echo "FORNACAST_LEGACY_TURSO_DATABASE_PATH=$legacy_turso_path"
             echo "FORNACAST_CONFIG_DATABASE_PATH=${GITHUB_WORKSPACE}/e2e-data/fornacast_config.db"
             echo "FORNACAST_REPO_STORAGE_ROOT=${GITHUB_WORKSPACE}/e2e-data/repos"
             echo "FORNACAST_RELEASE_ASSET_STORAGE_ROOT=${GITHUB_WORKSPACE}/e2e-data/release-assets"
@@ -289,94 +326,141 @@ jobs:
           GIT_SSH_COMMAND="ssh -F /dev/null -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=${GITHUB_WORKSPACE}/e2e-data/known_hosts -i ${GITHUB_WORKSPACE}/e2e-data/id_ed25519" \
             git -C e2e-work/demo ls-remote origin refs/heads/main
 
-      - name: Docker LocalCAS boot and recreate smoke
-        if: github.event_name == 'pull_request'
+      - name: Log in to GHCR for published image
+        if: github.event_name == 'workflow_dispatch'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Verify default Compose distribution
+        env:
+          VERSION: ${{ steps.dispatch_version.outputs.version }}
+        shell: bash
         run: |
-          owner="$(openssl rand -hex 16)"
-          container="fornacast-localcas-smoke-${owner:0:12}"
-          volume="fornacast-localcas-smoke-data-${owner:0:12}"
-          image="fornacast-localcas-smoke-${owner:0:12}"
-          secret_key_base="$(openssl rand -hex 32)"
+          set -euo pipefail
+
+          compose_project="fornacast-e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if ! printf '%s\n' "$compose_project" | grep -Eq '^fornacast-e2e-[0-9]+-[0-9]+$'; then
+            echo "refusing unsafe Compose project name" >&2
+            exit 64
+          fi
+
+          export COMPOSE_PROJECT_NAME=$compose_project
+          export SECRET_KEY_BASE="$(openssl rand -hex 32)"
+          export FORNACAST_BASE_URL=http://127.0.0.1:4000
+          export FORNACAST_CONFIG_DATABASE_PATH=/data/fornacast_config.db
+          export FORNACAST_SSH_HOST=localhost
+          export FORNACAST_SSH_PORT=2222
+          export POSTGRES_DB=fornacast_compose_e2e
+          export POSTGRES_USER=fornacast
+          export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+
           cleanup() {
             status=$?
             trap - EXIT
-            if [ "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container" 2>/dev/null || true)" = "$owner" ]; then
-              if [ "$status" -ne 0 ]; then
-                docker logs "$container" > fornacast-docker.log 2>&1 || true
-              fi
-              docker rm -f "$container" >/dev/null 2>&1 || true
+            if [ "$status" -ne 0 ]; then
+              docker compose logs > compose-e2e/compose.log 2>&1 || true
             fi
-            if [ "$(docker volume inspect -f '{{ index .Labels "fornacast.localcas.owner" }}' "$volume" 2>/dev/null || true)" = "$owner" ]; then
-              docker volume rm "$volume" >/dev/null 2>&1 || true
-            fi
-            if [ "$(docker image inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$image" 2>/dev/null || true)" = "$owner" ]; then
-              docker image rm "$image" >/dev/null 2>&1 || true
-            fi
+            docker compose down -v --remove-orphans >/dev/null 2>&1 || true
             exit "$status"
           }
-          run_container() {
-            docker run -d --name "$container" \
-              --label "fornacast.localcas.owner=$owner" \
-              -e SECRET_KEY_BASE="$secret_key_base" \
-              -e FORNACAST_BASE_URL=http://127.0.0.1:4890 \
-              -e FORNACAST_SSH_HOST=localhost \
-              -e FORNACAST_SSH_PORT=2222 \
-              -v "$volume:/data" \
-              "$image"
-          }
           trap cleanup EXIT
-          ! docker container inspect "$container" >/dev/null 2>&1
-          ! docker volume inspect "$volume" >/dev/null 2>&1
-          ! docker image inspect "$image" >/dev/null 2>&1
-          docker build --label "fornacast.localcas.owner=$owner" -t "$image" .
-          test "$(docker image inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$image")" = "$owner"
-          docker volume create --label "fornacast.localcas.owner=$owner" "$volume"
-          test "$(docker volume inspect -f '{{ index .Labels "fornacast.localcas.owner" }}' "$volume")" = "$owner"
-          run_container
-          test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"
 
-          for attempt in $(seq 1 60); do
-            if docker exec "$container" \
-                 /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); true = ForgeReleases.AssetStorage.Manager.ready?()'; then
-              break
-            fi
-            if [ "$attempt" = 60 ]; then
-              docker logs "$container"
-              exit 1
-            fi
-            sleep 2
-          done
+          mkdir -p compose-e2e
+          ssh-keygen -t ed25519 -f compose-e2e/id_ed25519 -N "" -C compose-e2e@example.com
 
-          docker exec "$container" \
-            /app/bin/release_asset_storage_smoke /app write
-          docker stop --time 45 "$container"
-          test "$(docker container inspect -f '{{.State.Running}}' "$container")" = false
-          test "$(docker container inspect -f '{{.State.ExitCode}}' "$container")" = 0
-          test "$(docker container inspect -f '{{.State.OOMKilled}}' "$container")" = false
-          test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"
-          docker rm "$container"
-          ! docker container inspect "$container" >/dev/null 2>&1
-          run_container
-          test "$(docker container inspect -f '{{ index .Config.Labels "fornacast.localcas.owner" }}' "$container")" = "$owner"
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              docker build \
+                --build-arg FORNACAST_DATABASE_ADAPTER=postgres \
+                --tag "fornacast-e2e:${GITHUB_SHA}" \
+                .
+              export FORNACAST_IMAGE="fornacast-e2e:${GITHUB_SHA}"
+              ;;
+            workflow_dispatch)
+              export FORNACAST_IMAGE="ghcr.io/gsmlg-dev/fornacast:${VERSION}"
+              ;;
+            *)
+              echo "unsupported E2E event: $GITHUB_EVENT_NAME" >&2
+              exit 64
+              ;;
+          esac
 
-          for attempt in $(seq 1 60); do
-            if docker exec "$container" \
-                 /app/bin/fornacast rpc 'true = Node.self() == :"fornacast@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); true = ForgeReleases.AssetStorage.Manager.ready?()'; then
-              break
-            fi
-            if [ "$attempt" = 60 ]; then
-              docker logs "$container"
-              exit 1
-            fi
-            sleep 2
-          done
+          docker compose up -d --no-build --wait --wait-timeout 180
+          scripts/api_proxy_smoke.sh http://127.0.0.1:4000
+          docker compose cp compose-e2e/id_ed25519.pub app:/tmp/compose_e2e.pub
 
-          docker exec "$container" \
-            /app/bin/release_asset_storage_smoke /app verify
-          published_ports="$(docker port "$container")"
-          test -z "$published_ports"
-          docker exec "$container" \
-            /app/bin/fornacast rpc 'nil = Application.spec(:ex_storage_service_s3)'
+          docker compose exec -T app /app/bin/fornacast rpc '
+          public_key = File.read!("/tmp/compose_e2e.pub")
+
+          {:ok, user} =
+            ForgeAccounts.create_first_admin(%{
+              username: "compose",
+              email: "compose@example.com",
+              password: "correct horse battery staple"
+            })
+
+          Fornacast.Setup.mark_initialized!(user)
+
+          {:ok, _api_key, _secret} =
+            ForgeAccounts.create_api_key(user, %{
+              name: "compose-e2e",
+              scopes: ["repo"]
+            })
+
+          {:ok, _ssh_key} =
+            ForgeAccounts.create_ssh_key(user, %{
+              title: "compose-e2e",
+              public_key: public_key
+            })
+
+          {:ok, _repo} =
+            ForgeRepos.create_repository(user, %{
+              name: "Compose Demo",
+              slug: "compose-demo",
+              description: "default Compose distribution e2e"
+            })
+          '
+
+          git init compose-e2e/compose-demo
+          git -C compose-e2e/compose-demo config user.name "Fornacast Compose E2E"
+          git -C compose-e2e/compose-demo config user.email "compose-e2e@example.com"
+          printf '# Compose Demo\n\nDefault Compose distribution.\n' > compose-e2e/compose-demo/README.md
+          git -C compose-e2e/compose-demo add README.md
+          git -C compose-e2e/compose-demo commit -m "Initial Compose e2e commit"
+          git -C compose-e2e/compose-demo branch -M main
+          git -C compose-e2e/compose-demo remote add origin "ssh://compose@127.0.0.1:2222/compose/compose-demo.git"
+          GIT_SSH_COMMAND="ssh -F /dev/null -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=${GITHUB_WORKSPACE}/compose-e2e/known_hosts -i ${GITHUB_WORKSPACE}/compose-e2e/id_ed25519" \
+            git -C compose-e2e/compose-demo push -u origin main
+
+          docker compose exec -T app /app/bin/release_asset_storage_smoke /app write
+
+          mapfile -t old_app_ids < <(docker compose ps -q app)
+          test "${#old_app_ids[@]}" -eq 1
+          old_app_id="${old_app_ids[0]}"
+          test -n "$old_app_id"
+
+          docker compose stop --timeout 45 app
+          test "$(docker container inspect -f '{{.State.Running}}' "$old_app_id")" = false
+          test "$(docker container inspect -f '{{.State.ExitCode}}' "$old_app_id")" = 0
+          test "$(docker container inspect -f '{{.State.OOMKilled}}' "$old_app_id")" = false
+          docker compose rm -f app
+          ! docker container inspect "$old_app_id" >/dev/null 2>&1
+
+          docker compose up -d --no-build --wait --wait-timeout 180 app
+          mapfile -t new_app_ids < <(docker compose ps -q app)
+          test "${#new_app_ids[@]}" -eq 1
+          new_app_id="${new_app_ids[0]}"
+          test -n "$new_app_id"
+          test "$new_app_id" != "$old_app_id"
+
+          docker compose restart nginx
+          scripts/api_proxy_smoke.sh http://127.0.0.1:4000
+          docker compose exec -T app /app/bin/release_asset_storage_smoke /app verify
+          GIT_SSH_COMMAND="ssh -F /dev/null -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${GITHUB_WORKSPACE}/compose-e2e/known_hosts -i ${GITHUB_WORKSPACE}/compose-e2e/id_ed25519" \
+            git -C compose-e2e/compose-demo ls-remote origin refs/heads/main
 
       - name: Stop release
         if: always()
@@ -393,4 +477,4 @@ jobs:
           path: |
             fornacast.log
             fornacast-restart.log
-            fornacast-docker.log
+            compose-e2e/compose.log

@@ -5,14 +5,34 @@ defmodule GitTransport.Channel do
 
   require Logger
 
+  if Mix.env() == :test do
+    @connection_value_hook_key {__MODULE__, :connection_value_hook}
+
+    @doc false
+    def with_test_connection_value(value, fun) when is_function(fun, 0) do
+      previous = Process.get(@connection_value_hook_key)
+      Process.put(@connection_value_hook_key, value)
+
+      try do
+        fun.()
+      after
+        if previous,
+          do: Process.put(@connection_value_hook_key, previous),
+          else: Process.delete(@connection_value_hook_key)
+      end
+    end
+  end
+
   defstruct cm: nil,
             channel_id: nil,
             operation: nil,
             actor: nil,
             repository: nil,
+            repository_read_handle: nil,
             buffer: "",
             request: nil,
-            receive_pack_bytes: 0
+            receive_pack_bytes: 0,
+            receive_pack_request_id: nil
 
   @impl :ssh_server_channel
   def init(_args) do
@@ -27,6 +47,22 @@ defmodule GitTransport.Channel do
   def handle_msg(_message, state), do: {:ok, state}
 
   @impl :ssh_server_channel
+  def handle_ssh_msg(
+        {:ssh_cm, cm, {:exec, channel_id, want_reply, _command}},
+        %{operation: operation} = state
+      )
+      when not is_nil(operation) do
+    reject_duplicate_exec(cm, channel_id, want_reply, state)
+  end
+
+  def handle_ssh_msg(
+        {:ssh_cm, cm, {:exec, channel_id, want_reply, _command}},
+        %{repository_read_handle: handle} = state
+      )
+      when not is_nil(handle) do
+    reject_duplicate_exec(cm, channel_id, want_reply, state)
+  end
+
   def handle_ssh_msg({:ssh_cm, cm, {:exec, channel_id, want_reply, command}}, state) do
     username = connection_value(cm, :user) |> to_string()
     command = to_string(command)
@@ -87,7 +123,7 @@ defmodule GitTransport.Channel do
   def handle_ssh_msg({:ssh_cm, _cm, {:signal, _channel_id, _signal}}, state), do: {:ok, state}
 
   def handle_ssh_msg({:ssh_cm, _cm, {:closed, channel_id}}, state) do
-    {:stop, channel_id, state}
+    {:stop, channel_id, close_repository_read(state)}
   end
 
   def handle_ssh_msg(message, state) do
@@ -96,26 +132,42 @@ defmodule GitTransport.Channel do
   end
 
   @impl :ssh_server_channel
-  def terminate(_reason, _state), do: :ok
+  def terminate(_reason, state) do
+    close_repository_read(state)
+    :ok
+  end
 
   defp start_upload_pack(cm, channel_id, want_reply, repository, state) do
-    case GitTransport.UploadPack.advertise_refs(repository) do
-      {:ok, advertisement} ->
-        :ssh_connection.reply_request(cm, want_reply, :success, channel_id)
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:content_deadline_ms)
 
-        with :ok <- send_data(cm, channel_id, advertisement) do
-          {:ok,
-           %{
-             state
-             | cm: cm,
-               channel_id: channel_id,
-               operation: :upload_pack,
-               repository: repository,
-               buffer: "",
-               request: GitTransport.UploadPack.new_request()
-           }}
-        else
-          {:error, _reason} -> fail_started(cm, channel_id, state)
+    case ForgeRepos.open_repository_read(repository, deadline) do
+      {:ok, handle} ->
+        case GitTransport.UploadPack.advertise_refs_handle(handle) do
+          {:ok, advertisement} ->
+            :ssh_connection.reply_request(cm, want_reply, :success, channel_id)
+
+            with :ok <- send_data(cm, channel_id, advertisement) do
+              {:ok,
+               %{
+                 state
+                 | cm: cm,
+                   channel_id: channel_id,
+                   operation: :upload_pack,
+                   repository: ForgeRepos.repository_read_repository(handle),
+                   repository_read_handle: handle,
+                   buffer: "",
+                   request: GitTransport.UploadPack.new_request()
+               }}
+            else
+              {:error, _reason} ->
+                ForgeRepos.close_repository_read(handle)
+                fail_started(cm, channel_id, state)
+            end
+
+          {:error, reason} ->
+            ForgeRepos.close_repository_read(handle)
+            Logger.error("Git upload-pack advertisement failed: #{inspect(reason)}")
+            reject(cm, channel_id, want_reply, "ERROR: Git upload-pack failed.\n", state)
         end
 
       {:error, reason} ->
@@ -140,14 +192,15 @@ defmodule GitTransport.Channel do
                repository: repository,
                buffer: "",
                request: GitTransport.ReceivePack.new_request(),
-               receive_pack_bytes: 0
+               receive_pack_bytes: 0,
+               receive_pack_request_id: ssh_request_id()
            }}
         else
           {:error, _reason} -> fail_started(cm, channel_id, state)
         end
 
-      {:error, reason} ->
-        Logger.error("Git receive-pack advertisement failed: #{inspect(reason)}")
+      {:error, _reason} ->
+        Logger.error("Git receive-pack advertisement failed")
         reject(cm, channel_id, want_reply, "ERROR: Git receive-pack failed.\n", state)
     end
   end
@@ -179,7 +232,7 @@ defmodule GitTransport.Channel do
   end
 
   defp handle_upload_pack_flush(cm, channel_id, buffer, request, state) do
-    case GitTransport.UploadPack.response(state.repository, request) do
+    case GitTransport.UploadPack.response_handle(state.repository_read_handle, request) do
       {:ok, response} ->
         with :ok <- send_data(cm, channel_id, response) do
           resume_upload_pack(cm, channel_id, buffer, request, state)
@@ -245,7 +298,7 @@ defmodule GitTransport.Channel do
   end
 
   defp finish_upload_pack(cm, channel_id, request, state) do
-    case GitTransport.UploadPack.response(state.repository, request) do
+    case GitTransport.UploadPack.response_handle(state.repository_read_handle, request) do
       {:ok, ""} ->
         exit_success(cm, channel_id, state)
 
@@ -262,10 +315,15 @@ defmodule GitTransport.Channel do
   end
 
   defp finish_receive_pack(cm, channel_id, %{phase: :pack} = request, pack, state) do
-    with {:ok, response, statuses} <-
-           GitTransport.ReceivePack.response(state.repository, request, pack),
-         :ok <- send_data(cm, channel_id, response),
-         :ok <- GitTransport.ReceivePack.record_push(state.actor, state.repository, statuses) do
+    with {:ok, response, _statuses} <-
+           GitTransport.ReceivePack.response(
+             state.actor,
+             state.repository,
+             request,
+             pack,
+             state.receive_pack_request_id
+           ),
+         :ok <- send_data(cm, channel_id, response) do
       exit_success(cm, channel_id, state)
     else
       {:error, _reason} -> fail_started(cm, channel_id, state)
@@ -276,12 +334,16 @@ defmodule GitTransport.Channel do
     fail_started(cm, channel_id, "ERROR: Incomplete Git receive-pack request.\n", state)
   end
 
+  defp ssh_request_id do
+    "ssh-" <> Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+  end
+
   defp reject(cm, channel_id, want_reply, message, state) do
-    :ssh_connection.reply_request(cm, want_reply, :success, channel_id)
-    send_error(cm, channel_id, message)
-    :ssh_connection.exit_status(cm, channel_id, 255)
-    :ssh_connection.send_eof(cm, channel_id)
-    {:stop, channel_id, %{state | cm: cm, channel_id: channel_id}}
+    best_effort(fn -> :ssh_connection.reply_request(cm, want_reply, :success, channel_id) end)
+    best_effort(fn -> send_error(cm, channel_id, message) end)
+    best_effort(fn -> :ssh_connection.exit_status(cm, channel_id, 255) end)
+    best_effort(fn -> :ssh_connection.send_eof(cm, channel_id) end)
+    {:stop, channel_id, close_repository_read(%{state | cm: cm, channel_id: channel_id})}
   end
 
   defp fail_started(cm, channel_id, state) do
@@ -292,13 +354,13 @@ defmodule GitTransport.Channel do
     send_error(cm, channel_id, message)
     :ssh_connection.exit_status(cm, channel_id, 255)
     :ssh_connection.send_eof(cm, channel_id)
-    {:stop, channel_id, %{state | cm: cm, channel_id: channel_id}}
+    {:stop, channel_id, close_repository_read(%{state | cm: cm, channel_id: channel_id})}
   end
 
   defp exit_success(cm, channel_id, state) do
     :ssh_connection.exit_status(cm, channel_id, 0)
     :ssh_connection.send_eof(cm, channel_id)
-    {:stop, channel_id, %{state | cm: cm, channel_id: channel_id}}
+    {:stop, channel_id, close_repository_read(%{state | cm: cm, channel_id: channel_id})}
   end
 
   defp send_data(cm, channel_id, data) do
@@ -315,11 +377,46 @@ defmodule GitTransport.Channel do
     :ssh_connection.send(cm, channel_id, 1, message)
   end
 
-  defp connection_value(cm, key) do
+  defp reject_duplicate_exec(cm, channel_id, want_reply, state) do
+    best_effort(fn -> :ssh_connection.reply_request(cm, want_reply, :failure, channel_id) end)
+    best_effort(fn -> send_error(cm, channel_id, "ERROR: Duplicate SSH exec request.\n") end)
+    best_effort(fn -> :ssh_connection.exit_status(cm, channel_id, 255) end)
+    best_effort(fn -> :ssh_connection.send_eof(cm, channel_id) end)
+    {:stop, channel_id, close_repository_read(%{state | cm: cm, channel_id: channel_id})}
+  end
+
+  defp best_effort(fun) do
+    try do
+      fun.()
+    catch
+      _kind, _reason -> :ok
+    end
+  end
+
+  if Mix.env() == :test do
+    defp connection_value(cm, key) do
+      if Process.get(@connection_value_hook_key) do
+        Process.get(@connection_value_hook_key)
+      else
+        connection_info_value(cm, key)
+      end
+    end
+  else
+    defp connection_value(cm, key), do: connection_info_value(cm, key)
+  end
+
+  defp connection_info_value(cm, key) do
     case :ssh.connection_info(cm, [key]) do
       [{^key, value}] -> value
       {^key, value} -> value
       _ -> nil
     end
+  end
+
+  defp close_repository_read(%{repository_read_handle: nil} = state), do: state
+
+  defp close_repository_read(%{repository_read_handle: handle} = state) do
+    ForgeRepos.close_repository_read(handle)
+    %{state | repository_read_handle: nil}
   end
 end

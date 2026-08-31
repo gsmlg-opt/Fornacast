@@ -29,6 +29,7 @@ defmodule ForgeAccounts.Organization do
     |> put_generated_credentials()
     |> validate_required([:username, :display_name, :kind, :state, :email, :password_hash])
     |> validate_format(:username, ~r/^[a-z0-9][a-z0-9_-]{1,38}[a-z0-9]$/)
+    |> validate_namespace()
     |> validate_length(:display_name, min: 1, max: 120)
     |> validate_length(:description, max: 500)
     |> validate_no_nul([:display_name, :description])
@@ -110,6 +111,15 @@ defmodule ForgeAccounts.Organization do
       end
 
     put_change(changeset, :display_name, display_name)
+  end
+
+  defp validate_namespace(changeset) do
+    validate_change(changeset, :username, fn :username, username ->
+      case ForgeAccounts.Namespace.validate(username) do
+        {:error, :reserved} -> [username: "is reserved"]
+        _ -> []
+      end
+    end)
   end
 
   defp put_generated_credentials(changeset) do

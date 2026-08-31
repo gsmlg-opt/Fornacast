@@ -3456,19 +3456,47 @@ defmodule GitCore.CacheIntegrationTest do
   @moduletag :tmp_dir
   @moduletag capture_log: true
 
+  test "strict repository invalidation succeeds and reports absent or crashed cache" do
+    assert :ok = GitCore.invalidate_repository_cache_strict("/repos/strict.git")
+
+    assert :ok = Supervisor.terminate_child(GitCore.Supervisor, GitCore.Cache)
+    assert Process.whereis(GitCore.Cache) == nil
+
+    assert {:error, :cache_unavailable} =
+             GitCore.invalidate_repository_cache_strict("/repos/strict.git")
+
+    assert :ok = GitCore.invalidate_repository_cache("/repos/strict.git")
+    assert {:ok, cache} = Supervisor.restart_child(GitCore.Supervisor, GitCore.Cache)
+
+    :sys.replace_state(cache, &Map.put(&1, :table, make_ref()))
+
+    assert {:error, :cache_unavailable} =
+             GitCore.invalidate_repository_cache_strict("/repos/strict.git")
+
+    assert is_pid(wait_for_cache_restart(cache))
+  end
+
   test "supervises the production cache after merge keepers and all limiters" do
     assert [
              {GitCore.Cache, cache_pid, :worker, [GitCore.Cache]},
+             {GitCore.RemoteLimiter, remote_pid, :worker, [GitCore.RemoteLimiter]},
+             {GitCore.RepositoryReadLimiter, reader_pid, :worker,
+              [GitCore.RepositoryReadLimiter]},
              {GitCore.RepositoryWriteLimiter, writer_pid, :worker,
               [GitCore.RepositoryWriteLimiter]},
              {GitCore.BlobLimiter, blob_pid, :worker, [GitCore.BlobLimiter]},
              {GitCore.ScanLimiter, scan_pid, :worker, [GitCore.ScanLimiter]},
+             {GitCore.RemoteTaskSupervisor, remote_supervisor_pid, :supervisor,
+              [Task.Supervisor]},
              {GitCore.MergeTaskSupervisor, merge_supervisor_pid, :supervisor, [Task.Supervisor]}
            ] = Supervisor.which_children(GitCore.Supervisor)
 
     assert is_pid(cache_pid)
     assert is_pid(blob_pid)
     assert is_pid(merge_supervisor_pid)
+    assert is_pid(reader_pid)
+    assert is_pid(remote_pid)
+    assert is_pid(remote_supervisor_pid)
     assert is_pid(scan_pid)
     assert is_pid(writer_pid)
   end

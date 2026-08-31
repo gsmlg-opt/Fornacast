@@ -367,6 +367,57 @@ defmodule Fornacast.AccessTest do
              )
   end
 
+  test "non-ready and deleted repository structs are rejected before every authorization role" do
+    owner = active_user_fixture("hidden-owner")
+    collaborator = active_user_fixture("hidden-collaborator")
+    site_admin = active_user_fixture("hidden-site-admin", role: :admin)
+
+    organization = organization_fixture("hidden-organization")
+    organization_owner_fixture(organization, owner)
+    organization_member = active_user_fixture("hidden-organization-member")
+    organization_member_fixture(organization, organization_member)
+
+    hidden_personal = [
+      personal_repository_fixture(owner, slug: "importing", visibility: :public)
+      |> hide_repository(:importing),
+      personal_repository_fixture(owner, slug: "tombstoned", visibility: :public)
+      |> hide_repository(:tombstoned),
+      personal_repository_fixture(owner, slug: "ready-deleted", visibility: :public)
+      |> hide_repository(:ready, ~U[2026-08-26 00:00:00Z])
+    ]
+
+    Enum.each(hidden_personal, &collaborator_fixture(&1, collaborator, :admin))
+
+    for repository <- hidden_personal,
+        actor <- [nil, owner, collaborator, site_admin],
+        permission <- @permissions do
+      refute Fornacast.Access.allowed?(actor, permission, repository)
+      assert {:error, :unauthorized} = Fornacast.Access.authorize(actor, permission, repository)
+
+      assert {:error, :not_found} =
+               ForgeRepos.fetch_authorized_repository(
+                 actor,
+                 owner.username,
+                 repository.slug,
+                 permission
+               )
+
+      assert {:error, :not_found} =
+               ForgeRepos.fetch_authorized_repository_by_id(actor, repository.id, permission)
+    end
+
+    hidden_organization =
+      organization_repository_fixture(organization, slug: "organization-importing")
+      |> hide_repository(:importing)
+
+    for actor <- [owner, organization_member, site_admin], permission <- @permissions do
+      refute Fornacast.Access.allowed?(actor, permission, hidden_organization)
+
+      assert {:error, :unauthorized} =
+               Fornacast.Access.authorize(actor, permission, hidden_organization)
+    end
+  end
+
   defp active_user_fixture(username, attrs \\ []) do
     user_fixture(username, Keyword.put_new(attrs, :state, :active))
   end
@@ -421,6 +472,12 @@ defmodule Fornacast.AccessTest do
       default_branch: "main"
     })
     |> Repo.insert!()
+  end
+
+  defp hide_repository(repository, lifecycle, deleted_at \\ nil) do
+    repository
+    |> Ecto.Changeset.change(lifecycle: lifecycle, deleted_at: deleted_at)
+    |> Repo.update!()
   end
 
   defp organization_owner_fixture(%Organization{} = organization, %User{} = user) do

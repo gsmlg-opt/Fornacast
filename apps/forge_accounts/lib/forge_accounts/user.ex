@@ -33,6 +33,7 @@ defmodule ForgeAccounts.User do
     |> put_change(:kind, :user)
     |> validate_required([:username, :email, :password, :kind, :role, :state])
     |> validate_format(:username, ~r/^[a-z0-9][a-z0-9_-]{1,38}[a-z0-9]$/)
+    |> validate_namespace()
     |> validate_format(:email, ~r/^[^\s]+@[^\s]+$/)
     |> validate_length(:password, min: password_min_length, max: 256)
     |> validate_inclusion(:kind, @kinds)
@@ -63,6 +64,15 @@ defmodule ForgeAccounts.User do
       email
       |> String.trim()
       |> String.downcase()
+    end)
+  end
+
+  defp validate_namespace(changeset) do
+    validate_change(changeset, :username, fn :username, username ->
+      case ForgeAccounts.Namespace.validate(username) do
+        {:error, :reserved} -> [username: "is reserved"]
+        _ -> []
+      end
     end)
   end
 

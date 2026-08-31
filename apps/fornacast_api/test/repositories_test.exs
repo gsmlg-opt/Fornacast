@@ -163,6 +163,66 @@ defmodule FornacastAPI.RepositoriesTest do
     end
   end
 
+  test "REST repository lists, detail, and mutation hide every non-ready shape", %{alice: alice} do
+    ready = repository(alice, "ready", visibility: :public)
+    organization = organization(alice, "hidden-list-org")
+    organization_ready = repository(organization, "ready", visibility: :public)
+
+    organization_hidden =
+      repository(organization, "importing", visibility: :public)
+      |> Ecto.Changeset.change(lifecycle: :importing)
+      |> Repo.update!()
+
+    importing =
+      repository(alice, "importing", visibility: :public)
+      |> Ecto.Changeset.change(lifecycle: :importing)
+      |> Repo.update!()
+
+    tombstoned =
+      repository(alice, "tombstoned", visibility: :private)
+      |> Ecto.Changeset.change(lifecycle: :tombstoned)
+      |> Repo.update!()
+
+    ready_deleted =
+      repository(alice, "ready-deleted", visibility: :public)
+      |> Ecto.Changeset.change(deleted_at: ~U[2026-08-26 00:00:00Z])
+      |> Repo.update!()
+
+    {_key, secret} = pat(alice, ["repo"])
+
+    authenticated = api_conn(secret: secret) |> get("/api/v3/user/repos") |> json_response(200)
+
+    assert MapSet.new(repository_ids(authenticated)) ==
+             MapSet.new([ready.id, organization_ready.id])
+
+    assert [body] = api_conn() |> get("/api/v3/users/alice/repos") |> json_response(200)
+    assert body["id"] == ready.id
+
+    assert [body] =
+             api_conn()
+             |> get("/api/v3/orgs/hidden-list-org/repos")
+             |> json_response(200)
+
+    assert body["id"] == organization_ready.id
+    refute body["id"] == organization_hidden.id
+
+    for hidden <- [importing, tombstoned, ready_deleted] do
+      assert_not_found(api_conn() |> get("/api/v3/repos/alice/#{hidden.slug}"))
+
+      assert_not_found(
+        api_conn(secret: secret)
+        |> get("/api/v3/repos/alice/#{hidden.slug}")
+      )
+
+      assert_not_found(
+        api_conn(secret: secret)
+        |> patch_json("/api/v3/repos/alice/#{hidden.slug}", %{"description" => "leak"})
+      )
+
+      refute Repo.get!(Repository, hidden.id).description == "leak"
+    end
+  end
+
   test "authenticated listing includes owned, organization, and collaborator repositories with pinned scope ceilings",
        %{alice: alice} do
     bob = user("bob")
@@ -1094,6 +1154,11 @@ defmodule FornacastAPI.RepositoriesTest do
     assert Enum.any?(body["errors"], fn error ->
              error["field"] == field and (is_nil(code) or error["code"] == code)
            end)
+  end
+
+  defp assert_not_found(conn) do
+    body = json_response(conn, 404)
+    assert body["message"] == "Not Found"
   end
 
   defp assert_error(conn, status, message, documentation_url, accepted_scopes) do

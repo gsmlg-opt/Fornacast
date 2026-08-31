@@ -29,6 +29,7 @@ defmodule FornacastWeb.HTML do
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="csrf-token" content="#{Plug.CSRFProtection.get_csrf_token()}">
         <title>#{escaped_title} - Fornacast</title>
+        <link rel="icon" href="/favicon.ico" sizes="any">
         #{preload_tags}
         <link rel="stylesheet" href="#{escape(css_path)}">
         <script type="module" src="#{escape(js_path)}"></script>
@@ -67,6 +68,7 @@ defmodule FornacastWeb.HTML do
       "<title>",
       escape(title),
       " - Fornacast</title>",
+      "<link rel=\"icon\" href=\"/favicon.ico\" sizes=\"any\">",
       preload_tags(),
       "<link rel=\"stylesheet\" href=\"",
       escape(css_path),
@@ -101,7 +103,7 @@ defmodule FornacastWeb.HTML do
       <div class="app-shell">
         <header class="appbar appbar-primary appbar-sticky">
           <div class="appbar-left">
-            <a class="brand-mark" href="/" aria-label="Fornacast dashboard">Fornacast</a>
+            #{brand_mark("Fornacast dashboard")}
             <nav class="appbar-nav" aria-label="Workspace">
               #{repository_menu(current_user)}
             </nav>
@@ -125,7 +127,7 @@ defmodule FornacastWeb.HTML do
       """
       <div class="auth-shell">
         <header class="appbar auth-appbar">
-          <a class="brand-mark" href="/" aria-label="Fornacast home">Fornacast</a>
+          #{brand_mark("Fornacast home")}
           <nav class="app-nav" aria-label="Primary">
             <a class="nav-link" href="/login">Login</a>
             #{theme_menu()}
@@ -151,7 +153,7 @@ defmodule FornacastWeb.HTML do
         "<div class=\"app-shell repository-shell\" data-repository-shell=\"authenticated\">",
         "<header class=\"appbar appbar-primary appbar-sticky\">",
         "<div class=\"appbar-left\">",
-        "<a class=\"brand-mark\" href=\"/\" aria-label=\"Fornacast dashboard\">Fornacast</a>",
+        brand_mark("Fornacast dashboard"),
         "<nav class=\"appbar-nav\" aria-label=\"Workspace\">",
         repository_menu(current_user),
         "</nav></div>",
@@ -168,7 +170,7 @@ defmodule FornacastWeb.HTML do
       [
         "<div class=\"repository-shell\" data-repository-shell=\"anonymous\">",
         "<header class=\"appbar appbar-primary appbar-sticky\">",
-        "<a class=\"brand-mark\" href=\"/\" aria-label=\"Fornacast home\">Fornacast</a>",
+        brand_mark("Fornacast home"),
         "<nav class=\"app-nav\" aria-label=\"Repository actions\">",
         "<a class=\"nav-link\" href=\"/login\">Login</a>",
         theme_menu(),
@@ -190,6 +192,10 @@ defmodule FornacastWeb.HTML do
   defp repository_safe_iodata(item) when is_binary(item), do: item
   defp repository_safe_iodata(item) when is_integer(item), do: <<item>>
 
+  def brand_mark(label) do
+    ~s(<a class="brand-mark" href="/" aria-label="#{escape(label)}"><img class="brand-logo" src="/images/logo.png" alt="" aria-hidden="true"><span>Fornacast</span></a>)
+  end
+
   defp create_menu do
     """
     <details class="appbar-create-menu">
@@ -209,6 +215,10 @@ defmodule FornacastWeb.HTML do
         <a class="create-menu-item" href="/organizations/new">
           <span class="create-menu-icon create-menu-icon-org" aria-hidden="true"></span>
           <span>New organization</span>
+        </a>
+        <a class="create-menu-item" href="/organizations/import">
+          <span class="create-menu-icon create-menu-icon-import" aria-hidden="true"></span>
+          <span>Import organization</span>
         </a>
       </div>
     </details>
@@ -264,7 +274,7 @@ defmodule FornacastWeb.HTML do
       </summary>
       <div class="account-menu-list" role="menu">
         <a class="account-menu-item" href="#{escape(account_profile_path(current_user))}">Profile</a>
-        <a class="account-menu-item" href="/settings/ssh-keys">Settings</a>
+        <a class="account-menu-item" href="/settings">Settings</a>
         <form action="/logout" method="post" class="account-menu-logout">
           #{csrf_input()}
           <input type="hidden" name="_method" value="delete">
@@ -319,6 +329,39 @@ defmodule FornacastWeb.HTML do
       </div>
       <div class="section-actions">#{action_html}</div>
     </section>
+    """
+  end
+
+  def settings_layout(active, body) do
+    items = [
+      {:profile, "Profile", "/settings"},
+      {:api_keys, "Applications", "/settings/api-keys"},
+      {:ssh_keys, "SSH Keys", "/settings/ssh-keys"},
+      {:github, "GitHub", "/settings/github"}
+    ]
+
+    navigation =
+      Enum.map_join(items, "\n", fn {key, label, href} ->
+        active_attributes =
+          if key == active,
+            do: ~s( class="active" aria-current="page"),
+            else: ""
+
+        ~s(<li><a href="#{href}"#{active_attributes}>#{label}</a></li>)
+      end)
+
+    """
+    <div class="settings-layout" data-settings-page>
+      <aside class="settings-sidebar">
+        <nav class="nested-menu nested-menu-bordered settings-menu" aria-label="User settings">
+          <ul role="list">
+            <li class="nested-menu-title">User Settings</li>
+            #{navigation}
+          </ul>
+        </nav>
+      </aside>
+      <div class="settings-content">#{body}</div>
+    </div>
     """
   end
 

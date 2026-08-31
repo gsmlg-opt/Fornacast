@@ -15,6 +15,7 @@ defmodule ForgePulls.MergeRecovery do
   @lease_seconds 30
   @terminal_states [:completed, :failed]
   @iteration_clock_key {__MODULE__, :iteration_clock}
+  @completion_clock_key {__MODULE__, :completion_clock}
   @lease_owner_key {__MODULE__, :lease_owner}
   @claim_observer_key {__MODULE__, :claim_observer}
 
@@ -34,6 +35,19 @@ defmodule ForgePulls.MergeRecovery do
         if previous == nil,
           do: Process.delete(@complete_multi_hook_key),
           else: Process.put(@complete_multi_hook_key, previous)
+      end
+    end
+
+    @doc false
+    def with_test_completion_clock(clock, fun)
+        when is_function(clock, 0) and is_function(fun, 0) do
+      previous = Process.get(@completion_clock_key)
+      Process.put(@completion_clock_key, clock)
+
+      try do
+        fun.()
+      after
+        restore_process_value(@completion_clock_key, previous)
       end
     end
 
@@ -114,6 +128,23 @@ defmodule ForgePulls.MergeRecovery do
     _kind, _reason -> {:error, :unavailable}
   end
 
+  @impl true
+  def cleanup_safety_locked(%Repository{id: repository_id}, %DateTime{} = now)
+      when is_integer(repository_id) and repository_id > 0 do
+    MergeOperation
+    |> where([operation], operation.repository_id == ^repository_id)
+    |> order_by([operation], asc: operation.id)
+    |> maybe_lock()
+    |> Repo.all()
+    |> classify_cleanup_safety(now, MergeOperation.terminal_states())
+  rescue
+    _error -> {:error, :unavailable}
+  catch
+    _kind, _reason -> {:error, :unavailable}
+  end
+
+  def cleanup_safety_locked(_repository, _now), do: {:error, :unavailable}
+
   defp reconcile_next(repository, repository_path, absolute_deadline, owner, after_id) do
     with :ok <- check_deadline(absolute_deadline) do
       now = iteration_now()
@@ -155,6 +186,49 @@ defmodule ForgePulls.MergeRecovery do
     |> order_by([operation], asc: operation.id)
     |> limit(1)
     |> Repo.one()
+  end
+
+  defp classify_cleanup_safety(operations, now, terminal_states) do
+    flags =
+      Enum.reduce(operations, MapSet.new(), fn operation, flags ->
+        terminal? = operation.state in terminal_states
+        owner = operation.lease_owner
+        expires_at = operation.lease_expires_at
+
+        cond do
+          terminal? and (not is_nil(owner) or not is_nil(expires_at)) ->
+            MapSet.put(flags, :inconsistent_lease)
+
+          (is_nil(owner) and not is_nil(expires_at)) or
+            (not is_nil(owner) and is_nil(expires_at)) or owner == "" ->
+            MapSet.put(flags, :inconsistent_lease)
+
+          terminal? ->
+            flags
+
+          is_nil(owner) ->
+            MapSet.put(flags, :claimable_operation)
+
+          DateTime.compare(expires_at, now) == :gt ->
+            MapSet.put(flags, :live_lease)
+
+          true ->
+            MapSet.put(flags, :claimable_operation)
+        end
+      end)
+
+    cond do
+      MapSet.member?(flags, :inconsistent_lease) -> {:blocked, :inconsistent_lease}
+      MapSet.member?(flags, :live_lease) -> {:blocked, :live_lease}
+      MapSet.member?(flags, :claimable_operation) -> {:blocked, :claimable_operation}
+      true -> :safe
+    end
+  end
+
+  defp maybe_lock(query) do
+    if Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"],
+      do: lock(query, "FOR UPDATE"),
+      else: query
   end
 
   defp reconcile_operation(
@@ -385,7 +459,7 @@ defmodule ForgePulls.MergeRecovery do
   end
 
   defp complete_transaction(repository, operation) do
-    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    now = completion_now()
     actor = load_actor(operation.actor_user_id)
     pull = Repo.get!(PullRequest, operation.pull_request_id)
 
@@ -407,7 +481,12 @@ defmodule ForgePulls.MergeRecovery do
               candidate.base_ref == ^operation.base_ref and
               is_nil(candidate.merge_commit_sha)
 
-      repository_query = from candidate in Repository, where: candidate.id == ^repository.id
+      repository_query =
+        from candidate in Repository,
+          where:
+            candidate.id == ^repository.id and
+              candidate.generation == ^repository.generation and
+              candidate.lifecycle == :ready and is_nil(candidate.deleted_at)
 
       multi =
         Multi.new()
@@ -438,8 +517,10 @@ defmodule ForgePulls.MergeRecovery do
           "state_reason" => "completed"
         })
         |> Multi.update_all(:repository, repository_query,
-          set: [last_pushed_at: now, updated_at: now]
+          set: [last_pushed_at: now, updated_at: now],
+          inc: [write_version: 1]
         )
+        |> require_one(:repository)
         |> Audit.record_multi(
           :audit,
           actor,
@@ -493,6 +574,14 @@ defmodule ForgePulls.MergeRecovery do
       owner when is_binary(owner) and owner != "" -> owner
       nil -> "pull-merge-recovery:#{node()}:#{inspect(self())}:#{repository_id}"
     end
+  end
+
+  defp completion_now do
+    case Process.get(@completion_clock_key) do
+      clock when is_function(clock, 0) -> clock.()
+      nil -> DateTime.utc_now()
+    end
+    |> DateTime.truncate(:second)
   end
 
   defp iteration_now do

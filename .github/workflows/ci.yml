@@ -19,7 +19,6 @@ env:
   ELIXIR_VERSION: 1.20.1
   OTP_VERSION: "29.0"
   RUST_VERSION: 1.96.0
-  FORNACAST_DATABASE_ADAPTER: turso
 
 jobs:
   format:
@@ -27,6 +26,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       MIX_ENV: dev
+      FORNACAST_DATABASE_ADAPTER: postgres
 
     steps:
       - name: Checkout
@@ -46,9 +46,9 @@ jobs:
             _build
             ~/.hex
             ~/.cache/rebar3
-          key: ${{ runner.os }}-mix-${{ env.MIX_ENV }}-${{ hashFiles('mix.lock') }}
+          key: ${{ runner.os }}-mix-postgres-${{ env.MIX_ENV }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-mix-${{ env.MIX_ENV }}-
+            ${{ runner.os }}-mix-postgres-${{ env.MIX_ENV }}-
 
       - name: Install Hex and Rebar
         run: |
@@ -66,6 +66,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       MIX_ENV: prod
+      FORNACAST_DATABASE_ADAPTER: postgres
 
     steps:
       - name: Checkout
@@ -95,9 +96,9 @@ jobs:
             ~/.cache/rebar3
             ~/.cargo/git
             ~/.cargo/registry
-          key: ${{ runner.os }}-build-${{ env.MIX_ENV }}-${{ hashFiles('mix.lock', 'apps/git_core/native/fornacast_git_core/Cargo.lock', 'package-lock.json') }}
+          key: ${{ runner.os }}-build-postgres-${{ env.MIX_ENV }}-${{ hashFiles('mix.lock', 'apps/git_core/native/fornacast_git_core/Cargo.lock', 'package-lock.json') }}
           restore-keys: |
-            ${{ runner.os }}-build-${{ env.MIX_ENV }}-
+            ${{ runner.os }}-build-postgres-${{ env.MIX_ENV }}-
 
       - name: Install Hex and Rebar
         run: |

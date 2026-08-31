@@ -733,6 +733,77 @@ defmodule GitCore do
     invalidate_repository_cache(repository_path, [])
   end
 
+  @type contained_tree_identity :: %{
+          mode: non_neg_integer(),
+          major_device: non_neg_integer(),
+          minor_device: non_neg_integer(),
+          inode: pos_integer()
+        }
+
+  @type contained_tree_proof :: %{
+          root: contained_tree_identity(),
+          target: contained_tree_identity()
+        }
+
+  @spec contained_tree_identity(Path.t(), [String.t()], non_neg_integer()) ::
+          {:ok, {:present, contained_tree_proof()}}
+          | {:ok, {:missing, contained_tree_identity()}}
+          | {:error, atom()}
+  def contained_tree_identity(storage_root, relative_segments, deadline_ms) do
+    cond do
+      not valid_contained_tree_request?(storage_root, relative_segments, deadline_ms) ->
+        {:error, :invalid_argument}
+
+      not anchored_remove_platform?() ->
+        {:error, :unsupported_platform}
+
+      true ->
+        GitCore.Native.contained_tree_identity(storage_root, relative_segments, deadline_ms)
+    end
+  end
+
+  @spec remove_contained_tree(
+          Path.t(),
+          [String.t()],
+          contained_tree_proof(),
+          non_neg_integer()
+        ) ::
+          {:ok, {:removed, contained_tree_proof()}}
+          | {:ok, {:missing, contained_tree_identity()}}
+          | {:error, atom()}
+  @doc false
+  # Safety precondition: the caller holds both the repository read-cleanup exclusive permit and
+  # the repository writer permit. RepositoryCleanup introduced by R8D is the sole intended caller.
+  def remove_contained_tree(storage_root, relative_segments, expected_proof, deadline_ms) do
+    cond do
+      not valid_contained_tree_request?(storage_root, relative_segments, deadline_ms) or
+          not valid_contained_tree_proof?(expected_proof) ->
+        {:error, :invalid_argument}
+
+      not anchored_remove_platform?() ->
+        {:error, :unsupported_platform}
+
+      true ->
+        GitCore.Native.remove_contained_tree(
+          storage_root,
+          relative_segments,
+          expected_proof,
+          deadline_ms
+        )
+    end
+  end
+
+  @spec invalidate_repository_cache_strict(Path.t()) ::
+          :ok | {:error, :cache_unavailable}
+  def invalidate_repository_cache_strict(repository_path) when is_binary(repository_path) do
+    case GitCore.Cache.invalidate_repository(repository_path) do
+      :ok -> :ok
+      _other -> {:error, :cache_unavailable}
+    end
+  catch
+    _kind, _reason -> {:error, :cache_unavailable}
+  end
+
   @doc false
   def invalidate_repository_cache(repository_path, opts)
       when is_binary(repository_path) and is_list(opts) do
@@ -741,6 +812,44 @@ defmodule GitCore do
     catch
       _kind, _reason -> :ok
     end
+  end
+
+  defp valid_contained_tree_request?(storage_root, relative_segments, deadline_ms) do
+    is_binary(storage_root) and String.valid?(storage_root) and storage_root != "/" and
+      Path.type(storage_root) == :absolute and byte_size(storage_root) <= 4_096 and
+      not String.contains?(storage_root, [<<0>>, "\\"]) and
+      Path.expand(storage_root) == storage_root and
+      is_list(relative_segments) and relative_segments != [] and
+      length(relative_segments) <= 128 and
+      Enum.all?(relative_segments, &valid_contained_tree_segment?/1) and is_integer(deadline_ms) and
+      deadline_ms >= 0 and deadline_ms <= 18_446_744_073_709_551_615
+  end
+
+  defp valid_contained_tree_segment?(segment) do
+    is_binary(segment) and String.valid?(segment) and segment not in ["", ".", ".."] and
+      byte_size(segment) <= 255 and not String.contains?(segment, ["/", "\\", <<0>>])
+  end
+
+  defp valid_contained_tree_proof?(%{root: root, target: target} = proof)
+       when map_size(proof) == 2 do
+    valid_contained_tree_identity?(root) and valid_contained_tree_identity?(target)
+  end
+
+  defp valid_contained_tree_proof?(_proof), do: false
+
+  defp valid_contained_tree_identity?(
+         %{mode: mode, major_device: major, minor_device: minor, inode: inode} = identity
+       )
+       when map_size(identity) == 4 do
+    Enum.all?([mode, major, minor, inode], &is_integer/1) and mode in 0..4_294_967_295 and
+      major in 0..4_294_967_295 and minor in 0..4_294_967_295 and
+      inode in 1..18_446_744_073_709_551_615
+  end
+
+  defp valid_contained_tree_identity?(_identity), do: false
+
+  defp anchored_remove_platform? do
+    match?({:unix, platform} when platform in [:linux, :darwin], :os.type())
   end
 
   def pack_objects(path, wants) when is_binary(path) and is_list(wants) do

@@ -12,13 +12,18 @@ defmodule GitTransport.ReceivePack do
   returns or raises, even if the caller exits or the deadline passes.
   """
 
+  alias ForgeAccounts.User
   alias ForgeRepos.Repository
   require Logger
 
   @zero_oid String.duplicate("0", 40)
   @object_id_pattern ~r/\A[0-9a-fA-F]{40}\z/
+  @max_target_ref_bytes 255
   @sideband_payload_size 65_515
   @default_max_request_bytes 4 * 1024 * 1024 * 1024
+  @http_operation_batch_domain "fornacast:git-http-receive-pack:v1"
+  @http_operation_batch_prefix "git-http-rp-"
+  @max_external_request_id_bytes 255
   @capabilities [
     "report-status",
     "side-band-64k",
@@ -28,20 +33,23 @@ defmodule GitTransport.ReceivePack do
   ]
 
   def advertise_refs(%Repository{} = repository) do
-    path = ForgeRepos.absolute_storage_path(repository)
+    result =
+      ForgeRepos.with_write_fence(repository, :receive_pack, fn path, _remaining ->
+        with {:ok, refs} <- GitCore.list_refs(path) do
+          refs =
+            refs
+            |> Enum.filter(&advertisable_ref?/1)
+            |> Enum.sort_by(& &1.name)
 
-    with {:ok, refs} <- GitCore.list_refs(path) do
-      refs =
-        refs
-        |> Enum.filter(&advertisable_ref?/1)
-        |> Enum.sort_by(& &1.name)
+          {:ok, render_advertisement(refs)}
+        end
+      end)
 
-      {:ok, render_advertisement(refs)}
-    end
+    result
   end
 
   def new_request do
-    %{commands: [], capabilities: MapSet.new(), phase: :commands}
+    %{commands: [], command_count: 0, capabilities: MapSet.new(), phase: :commands}
   end
 
   def max_request_bytes do
@@ -52,6 +60,28 @@ defmodule GitTransport.ReceivePack do
     end
   end
 
+  @spec http_operation_batch_id(User.t(), Repository.t(), String.t() | nil) :: String.t()
+  def http_operation_batch_id(
+        %User{id: actor_id},
+        %Repository{id: repository_id},
+        external_request_id
+      )
+      when is_integer(actor_id) and actor_id > 0 and is_integer(repository_id) and
+             repository_id > 0 do
+    digest =
+      if usable_external_request_id?(external_request_id) do
+        :crypto.hash(:sha256, [
+          @http_operation_batch_domain,
+          <<0, repository_id::unsigned-64, actor_id::unsigned-64, 0>>,
+          external_request_id
+        ])
+      else
+        :crypto.strong_rand_bytes(32)
+      end
+
+    @http_operation_batch_prefix <> Base.url_encode64(digest, padding: false)
+  end
+
   def parse_request_data(buffer, request \\ new_request())
       when is_binary(buffer) and is_map(request) do
     case request.phase do
@@ -60,26 +90,35 @@ defmodule GitTransport.ReceivePack do
     end
   end
 
-  def response(%Repository{} = repository, request, pack)
-      when is_map(request) and is_binary(pack) do
-    request = normalize_request(request)
-    commands = Enum.map(request.commands, &command_to_native/1)
+  def response(
+        %User{} = actor,
+        %Repository{} = repository,
+        request,
+        pack,
+        request_id
+      )
+      when is_map(request) and is_binary(pack) and is_binary(request_id) and
+             byte_size(request_id) in 1..255 do
+    command_limit = GitCore.Limits.get(:receive_pack_commands)
 
-    case supervised_receive_pack(repository, pack, commands) do
-      {:native, {:ok, statuses}} ->
-        {:ok, render_status_report(request, "ok", statuses), statuses}
-
-      {:native, {:error, reason}} ->
-        statuses =
-          Enum.map(request.commands, fn command ->
-            {command.ref, "ng", "Git receive-pack failed"}
-          end)
-
-        {:ok, render_status_report(request, sanitize_status(reason), statuses), statuses}
-
-      {:error, {:unavailable, _reason}} ->
-        Logger.warning("Git receive-pack write fence unavailable")
+    case bounded_normalize_request(request, command_limit) do
+      {:too_many, request} ->
         unavailable_response(request)
+
+      {:ok, request} ->
+        commands = Enum.map(request.commands, &command_to_native/1)
+
+        case supervised_receive_pack(actor, repository, request_id, pack, commands) do
+          {:durable, durable_statuses, native_result} ->
+            statuses = merge_native_diagnostics(durable_statuses, native_result)
+
+            {:ok, render_status_report(request, durable_unpack_status(native_result), statuses),
+             statuses}
+
+          {:error, {:unavailable, _reason}} ->
+            Logger.warning("Git receive-pack write fence unavailable")
+            unavailable_response(request)
+        end
     end
   end
 
@@ -105,39 +144,7 @@ defmodule GitTransport.ReceivePack do
     defp native_adapter, do: &GitCore.receive_pack/3
   end
 
-  def record_push(actor, %Repository{} = repository, statuses) when is_list(statuses) do
-    if accepted_push?(statuses) do
-      refs = Enum.map(statuses, fn {ref, "ok", _message} -> ref end)
-
-      Fornacast.Repo.transaction(fn ->
-        with {:ok, _repository} <- ForgeRepos.mark_pushed(repository),
-             {:ok, _event} <-
-               Fornacast.Audit.record(
-                 actor,
-                 "repository.pushed",
-                 "repository",
-                 repository.id,
-                 %{"refs" => refs}
-               ) do
-          :ok
-        else
-          {:error, reason} -> Fornacast.Repo.rollback(reason)
-        end
-      end)
-      |> case do
-        {:ok, :ok} ->
-          :ok
-
-        {:error, reason} ->
-          Logger.error("Git receive-pack audit update failed: #{inspect(reason)}")
-          :ok
-      end
-    else
-      :ok
-    end
-  end
-
-  defp supervised_receive_pack(repository, pack, commands) do
+  defp supervised_receive_pack(actor, repository, request_id, pack, commands) do
     caller = self()
     reply = make_ref()
     native = native_adapter()
@@ -146,7 +153,9 @@ defmodule GitTransport.ReceivePack do
            GitTransport.ReceivePackWorker.run(
              caller,
              reply,
+             actor,
              repository,
+             request_id,
              pack,
              commands,
              native
@@ -184,6 +193,33 @@ defmodule GitTransport.ReceivePack do
 
     {:ok, render_status_report(request, message, statuses), statuses}
   end
+
+  defp merge_native_diagnostics(durable_statuses, {:ok, native_statuses})
+       when is_list(native_statuses) do
+    diagnostics =
+      native_statuses
+      |> Enum.reduce(%{}, fn
+        {target_ref, "ng", message}, diagnostics
+        when is_binary(target_ref) and is_binary(message) ->
+          Map.put_new(diagnostics, target_ref, sanitize_status(message))
+
+        _status, diagnostics ->
+          diagnostics
+      end)
+
+    Enum.map(durable_statuses, fn
+      {target_ref, "ng", _message} ->
+        {target_ref, "ng", Map.get(diagnostics, target_ref, "Git receive-pack failed")}
+
+      status ->
+        status
+    end)
+  end
+
+  defp merge_native_diagnostics(durable_statuses, _native_result), do: durable_statuses
+
+  defp durable_unpack_status({:ok, _statuses}), do: "ok"
+  defp durable_unpack_status(_native_result), do: "Git receive-pack failed"
 
   defp render_advertisement([]) do
     [
@@ -249,13 +285,18 @@ defmodule GitTransport.ReceivePack do
   defp parse_command_line(line, request) do
     {command_line, capabilities} = split_capabilities(line)
 
-    with {:ok, command} <- parse_ref_command(command_line) do
+    with true <- request.command_count < GitCore.Limits.get(:receive_pack_commands),
+         {:ok, command} <- parse_ref_command(command_line) do
       request =
         request
         |> Map.update!(:commands, &[command | &1])
+        |> Map.update!(:command_count, &(&1 + 1))
         |> Map.update!(:capabilities, &MapSet.union(&1, MapSet.new(capabilities)))
 
       {:cont, request}
+    else
+      false -> {:error, "ERROR: Too many Git receive-pack commands.\n"}
+      {:error, _message} = error -> error
     end
   end
 
@@ -276,7 +317,7 @@ defmodule GitTransport.ReceivePack do
           not Regex.match?(@object_id_pattern, new) ->
             {:error, "ERROR: Invalid Git object id.\n"}
 
-          ref == "" ->
+          ref == "" or byte_size(ref) > @max_target_ref_bytes ->
             {:error, "ERROR: Invalid Git reference.\n"}
 
           true ->
@@ -288,12 +329,23 @@ defmodule GitTransport.ReceivePack do
     end
   end
 
-  defp normalize_request(request) do
-    %{request | commands: Enum.reverse(request.commands)}
+  defp bounded_normalize_request(%{commands: commands} = request, command_limit)
+       when is_list(commands) do
+    bounded_commands = Enum.take(commands, command_limit + 1)
+    request = %{request | commands: Enum.reverse(bounded_commands)}
+
+    if length(bounded_commands) > command_limit,
+      do: {:too_many, request},
+      else: {:ok, request}
   end
 
   defp command_to_native(command) do
     {command.old, command.new, command.ref}
+  end
+
+  defp usable_external_request_id?(request_id) do
+    is_binary(request_id) and request_id != "" and request_id != "unassigned" and
+      byte_size(request_id) <= @max_external_request_id_bytes
   end
 
   defp render_status_report(request, unpack_status, statuses) do
@@ -344,16 +396,8 @@ defmodule GitTransport.ReceivePack do
       "" -> "failed"
       sanitized -> sanitized
     end
+    |> String.slice(0, 240)
   end
 
   defp sanitize_status(reason), do: reason |> inspect() |> sanitize_status()
-
-  defp accepted_push?([]), do: false
-
-  defp accepted_push?(statuses) do
-    Enum.all?(statuses, fn
-      {_ref, "ok", _message} -> true
-      _status -> false
-    end)
-  end
 end

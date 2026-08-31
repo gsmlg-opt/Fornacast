@@ -619,12 +619,46 @@ defmodule FornacastWeb.RepositoryControllerTest do
 
     assert inaccessible.status == 404
     assert missing.status == 404
+    assert inaccessible.resp_body =~ ~s(<link rel="icon" href="/favicon.ico" sizes="any">)
+    assert inaccessible.resp_body =~ ~s(<img class="brand-logo" src="/images/logo.png")
     assert inaccessible.resp_body == missing.resp_body
     assert normalized_headers(inaccessible) == normalized_headers(missing)
     assert_private_no_store(inaccessible)
     assert_private_no_store(missing)
     assert inaccessible.resp_body =~ "Repository not found"
     refute inaccessible.resp_body =~ "private-repo"
+    assert TestPage.calls() == []
+  end
+
+  test "every repository route masks non-ready rows before page or storage access", %{
+    alice: alice
+  } do
+    hidden = [
+      insert_repository!(alice, "importing-repo", :public)
+      |> hide_repository(:importing, "../importing.git"),
+      insert_repository!(alice, "tombstoned-repo", :private)
+      |> hide_repository(:tombstoned, "../tombstoned.git"),
+      insert_repository!(alice, "ready-deleted-repo", :public)
+      |> hide_repository(:ready, "../ready-deleted.git", ~U[2026-08-26 00:00:00Z])
+    ]
+
+    for repository <- hidden,
+        suffix <- [
+          "",
+          "/branches",
+          "/tags",
+          "/commits/main",
+          "/commit/deadbeef",
+          "/src/main",
+          "/raw/main/README.md",
+          "/search"
+        ] do
+      conn = request_conn(alice) |> get("/alice/#{repository.slug}#{suffix}")
+      assert html_response(conn, 404) =~ "Repository not found"
+      refute conn.resp_body =~ repository.slug
+      assert_private_no_store(conn)
+    end
+
     assert TestPage.calls() == []
   end
 
@@ -1057,6 +1091,20 @@ defmodule FornacastWeb.RepositoryControllerTest do
     assert oid == String.duplicate("a", 40)
   end
 
+  test "repository read-handle atoms map to masked HTTP responses" do
+    TestPage.respond(:code, {:error, :not_found})
+    assert request_conn() |> get("/alice/public-repo") |> html_response(404) =~ "not found"
+
+    for reason <- [:unavailable, :deadline_exceeded] do
+      TestPage.reset()
+      TestPage.respond(:code, {:error, reason})
+
+      assert request_conn()
+             |> get("/alice/public-repo")
+             |> html_response(503) =~ "temporarily unavailable"
+    end
+  end
+
   test "a push after resolution cannot mix OIDs and the next HTTP request uses the new cache key" do
     old_oid = String.duplicate("a", 40)
     new_oid = String.duplicate("b", 40)
@@ -1344,6 +1392,16 @@ defmodule FornacastWeb.RepositoryControllerTest do
       storage_path: "@test/#{slug}.git",
       default_branch: "main"
     })
+  end
+
+  defp hide_repository(repository, lifecycle, storage_path, deleted_at \\ nil) do
+    repository
+    |> Ecto.Changeset.change(
+      lifecycle: lifecycle,
+      storage_path: storage_path,
+      deleted_at: deleted_at
+    )
+    |> Fornacast.Repo.update!()
   end
 
   defp reset_database! do

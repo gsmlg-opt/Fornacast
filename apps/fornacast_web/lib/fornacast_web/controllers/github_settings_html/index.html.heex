@@ -1,0 +1,222 @@
+<section
+  class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6"
+  data-github-settings
+>
+  <header class="grid gap-2">
+    <p class="text-xs text-on-surface-variant">Identity and credential security</p>
+    <h2 class="text-2xl font-semibold">Linked accounts</h2>
+    <p class="text-sm text-on-surface-variant max-w-3xl">
+      Link verified GitHub identities for attribution and save a personal access token for imports.
+      Linking never grants local repository or organization access.
+    </p>
+  </header>
+
+  <.dm_alert :if={@error} id="github-settings-error" variant="error" outlined role="alert">
+    {@error}
+  </.dm_alert>
+
+  <.dm_card id="github-link-account" variant="bordered" shadow="md" padding="lg">
+    <:title><span class="text-lg font-semibold">Link GitHub account</span></:title>
+    <p class="text-sm text-on-surface-variant">
+      The PAT is verified with GitHub, encrypted, and never shown again.
+    </p>
+    <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#157 --%>
+    <form id="link-github-account" action="/settings/github" method="post" class="mt-4 grid gap-4">
+      <input type="hidden" name="_csrf_token" value={csrf_token()} />
+      <.dm_input
+        id="github-account-pat"
+        class="w-full"
+        name="github_account[pat]"
+        type="password"
+        label="GitHub personal access token"
+        helper="Use a token that can read every repository you intend to import."
+        required
+        maxlength="4096"
+        autocomplete="new-password"
+        spellcheck="false"
+        autocapitalize="none"
+      />
+      <div>
+        <button class="btn btn-primary" type="submit">Link GitHub account</button>
+      </div>
+    </form>
+  </.dm_card>
+
+  <section
+    :if={@accounts == []}
+    class="grid gap-2 bg-surface-container text-on-surface rounded-lg border border-outline-variant p-6"
+    data-github-empty
+  >
+    <h3 class="text-lg font-semibold">No linked GitHub accounts</h3>
+    <p class="text-sm text-on-surface-variant">
+      Link an account above to use a saved PAT for repository or organization imports.
+    </p>
+  </section>
+
+  <ul :if={@accounts != []} class="grid gap-4" data-github-account-list role="list">
+    <li :for={account <- @accounts}>
+      <article aria-labelledby={"github-account-#{account.identity_id}-heading"}>
+        <.dm_card
+          id={"github-account-#{account.identity_id}"}
+          variant="bordered"
+          shadow="sm"
+          padding="lg"
+          data-github-account={account.identity_id}
+        >
+          <div class="grid gap-4">
+            <header class="flex flex-wrap items-center gap-2">
+              <h3
+                id={"github-account-#{account.identity_id}-heading"}
+                class="text-lg font-semibold"
+              >
+                {account.display_name}
+              </h3>
+              <.dm_badge variant={credential_variant(account)} soft size="sm">
+                {credential_label(account)}
+              </.dm_badge>
+            </header>
+
+            <div class="flex flex-wrap items-center gap-4">
+              <.dm_avatar name={account.display_name} size="lg" ring />
+              <div class="grid gap-2 min-w-0">
+                <p class="font-semibold">@{account.login}</p>
+                <.dm_link
+                  :if={account.profile_url}
+                  href={account.profile_url}
+                  class="text-sm text-primary"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  View verified GitHub profile
+                </.dm_link>
+                <p class="text-xs text-on-surface-variant">
+                  Identity verified
+                  <time
+                    :if={account.identity_last_verified_at}
+                    datetime={datetime_value(account.identity_last_verified_at)}
+                  >
+                    {verification_time(account.identity_last_verified_at)}
+                  </time>
+                  <span :if={!account.identity_last_verified_at}>Never</span>
+                </p>
+                <p :if={account.credential_present} class="text-xs text-on-surface-variant">
+                  Saved PAT verified
+                  <time
+                    :if={account.credential_last_verified_at}
+                    datetime={datetime_value(account.credential_last_verified_at)}
+                  >
+                    {verification_time(account.credential_last_verified_at)}
+                  </time>
+                  <span :if={!account.credential_last_verified_at}>Never</span>
+                </p>
+              </div>
+            </div>
+
+            <div :if={account.credential_present} class="grid gap-4">
+              <form
+                id={"reverify-github-account-#{account.identity_id}"}
+                action={"/settings/github/#{account.identity_id}/reverify"}
+                method="post"
+              >
+                <input type="hidden" name="_csrf_token" value={csrf_token()} />
+                <button
+                  class="btn btn-secondary btn-sm"
+                  type="submit"
+                  aria-label={"Reverify saved PAT for #{account.display_name}"}
+                >
+                  Reverify saved PAT
+                </button>
+              </form>
+
+              <form
+                id={"replace-github-credential-#{account.identity_id}"}
+                action={"/settings/github/#{account.identity_id}/credential"}
+                method="post"
+                class="grid gap-4 bg-surface-container-high text-on-surface rounded-lg p-4"
+              >
+                <input type="hidden" name="_csrf_token" value={csrf_token()} />
+                <input type="hidden" name="_method" value="put" />
+                <.dm_input
+                  id={"github-account-#{account.identity_id}-replacement-pat"}
+                  class="w-full"
+                  name="github_account[pat]"
+                  type="password"
+                  label={"Replacement PAT for #{account.display_name}"}
+                  required
+                  maxlength="4096"
+                  autocomplete="new-password"
+                  spellcheck="false"
+                  autocapitalize="none"
+                />
+                <div>
+                  <button
+                    class="btn btn-secondary btn-sm"
+                    type="submit"
+                    aria-label={"Replace saved PAT for #{account.display_name}"}
+                  >
+                    Replace saved PAT
+                  </button>
+                </div>
+              </form>
+            </div>
+
+            <p :if={!account.credential_present} class="text-sm text-on-surface-variant">
+              This identity remains linked. Link the account again above to save a new PAT.
+            </p>
+
+            <div class="flex flex-wrap items-start gap-4 border-t border-outline-variant pt-4">
+              <form
+                :if={account.credential_present}
+                id={"delete-github-credential-#{account.identity_id}"}
+                action={"/settings/github/#{account.identity_id}/credential"}
+                method="post"
+              >
+                <input type="hidden" name="_csrf_token" value={csrf_token()} />
+                <input type="hidden" name="_method" value="delete" />
+                <details class="grid gap-2">
+                  <summary class="btn btn-error btn-sm">Delete saved PAT</summary>
+                  <div class="grid gap-2 bg-error-container text-on-error-container rounded-lg p-3">
+                    <p id={"delete-github-credential-#{account.identity_id}-confirmation"}>
+                      Delete this saved GitHub PAT? The verified identity link will remain.
+                    </p>
+                    <button
+                      class="btn btn-error btn-sm"
+                      type="submit"
+                      aria-describedby={"delete-github-credential-#{account.identity_id}-confirmation"}
+                    >
+                      Confirm delete saved PAT
+                    </button>
+                  </div>
+                </details>
+              </form>
+
+              <form
+                id={"unlink-github-account-#{account.identity_id}"}
+                action={"/settings/github/#{account.identity_id}"}
+                method="post"
+              >
+                <input type="hidden" name="_csrf_token" value={csrf_token()} />
+                <input type="hidden" name="_method" value="delete" />
+                <details class="grid gap-2">
+                  <summary class="btn btn-error btn-sm">Unlink account</summary>
+                  <div class="grid gap-2 bg-error-container text-on-error-container rounded-lg p-3">
+                    <p id={"unlink-github-account-#{account.identity_id}-confirmation"}>
+                      Unlink this GitHub account? Historical attribution will remain {account.display_name}.
+                    </p>
+                    <button
+                      class="btn btn-error btn-sm"
+                      type="submit"
+                      aria-describedby={"unlink-github-account-#{account.identity_id}-confirmation"}
+                    >
+                      Confirm unlink account
+                    </button>
+                  </div>
+                </details>
+              </form>
+            </div>
+          </div>
+        </.dm_card>
+      </article>
+    </li>
+  </ul>
+</section>

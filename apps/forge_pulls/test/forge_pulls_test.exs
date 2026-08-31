@@ -173,6 +173,42 @@ defmodule ForgePullsTest do
 
     assert {:ok, pull} = create_pull(repository, reader, "Comparison", "feature", "main")
 
+    for {name, operation} <- [
+          branches: fn -> ForgePulls.branch_options(repository, reader) end,
+          compare: fn -> ForgePulls.compare(repository, reader, "feature", "main", []) end,
+          commits: fn -> ForgePulls.list_commits(repository, pull, reader, []) end,
+          files: fn -> ForgePulls.changed_files(repository, pull, reader, []) end,
+          list_refresh: fn -> ForgePulls.list_pull_requests(repository, reader, []) end,
+          detail_refresh: fn ->
+            ForgePulls.get_pull_request(repository, pull.issue.number, reader)
+          end
+        ] do
+      deadline = System.monotonic_time(:millisecond) + 2_000
+
+      assert {:ok, cleanup} =
+               GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
+
+      path = ForgeRepos.absolute_storage_path(repository)
+      assert :ok = GitCore.invalidate_repository_cache_strict(path)
+      parent = self()
+
+      task =
+        Task.async(fn ->
+          ForgePulls.with_test_read_phase_hook(
+            fn -> send(parent, {:git_read_entered, name}) end,
+            operation
+          )
+        end)
+
+      assert Task.yield(task, 30) == nil, "#{name} bypassed cleanup"
+      refute_received {:git_read_entered, ^name}
+      assert cache_keys_for(path) == MapSet.new(), "#{name} repopulated cache during cleanup"
+      assert :ok = GitCore.RepositoryReadLimiter.release(cleanup)
+      assert_receive {:git_read_entered, ^name}
+      assert {:ok, _result} = Task.await(task)
+      refute_receive {:git_read_entered, ^name}, 10
+    end
+
     assert {:ok, %Fornacast.Page{entries: commits, total: 3, page: 1, per_page: 2}} =
              ForgePulls.list_commits(repository, pull, reader, page: 1, per_page: 2)
 
@@ -224,6 +260,36 @@ defmodule ForgePullsTest do
 
     assert moved.oid == moved_head
     assert {:error, :not_found} = ForgePulls.changed_files(repository, pull, outsider, [])
+  end
+
+  test "comparison holds one repository read handle across every Git phase" do
+    owner = user_fixture(unique("pull-single-read-owner"))
+    repository = repository_fixture(owner)
+    create_comparison_branches!(repository)
+
+    {result, query_count} =
+      count_repo_queries(fn ->
+        ForgePulls.with_test_read_phase_hook(
+          fn ->
+            cleanup =
+              Task.async(fn ->
+                deadline = System.monotonic_time(:millisecond) + 2_000
+                GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
+              end)
+
+            Process.put({__MODULE__, :queued_cleanup}, cleanup)
+            assert Task.yield(cleanup, 30) == nil
+          end,
+          fn -> ForgePulls.compare(repository, owner, "feature", "main", []) end
+        )
+      end)
+
+    assert {:ok, %ForgePulls.Comparison{}} = result
+    # Authorization/context plus one exact repository-generation reload.
+    assert query_count <= 4
+    cleanup = Process.delete({__MODULE__, :queued_cleanup})
+    assert {:ok, cleanup_lease} = Task.await(cleanup)
+    assert :ok = GitCore.RepositoryReadLimiter.release(cleanup_lease)
   end
 
   test "fully loaded pulls expose canonical issues analysis and reader-specific capabilities" do
@@ -1126,7 +1192,8 @@ defmodule ForgePullsTest do
       end)
 
     assert {:ok, %{entries: [_, _], total: 2}} = result
-    assert query_count <= 11
+    # One exact repository-generation reload is part of opening the read lease.
+    assert query_count <= 12
 
     for {field, filters} <- [
           {"state", [state: :merged]},
@@ -2957,6 +3024,23 @@ defmodule ForgePullsTest do
     after
       0 -> count
     end
+  end
+
+  defp cache_keys_for(path) do
+    parent = self()
+    ref = make_ref()
+
+    :sys.replace_state(GitCore.Cache, fn state ->
+      send(parent, {ref, :ets.tab2list(state.table)})
+      state
+    end)
+
+    assert_receive {^ref, entries}
+
+    entries
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.filter(&(is_tuple(&1) and tuple_size(&1) > 0 and elem(&1, 0) == path))
+    |> MapSet.new()
   end
 
   defp database_contract do

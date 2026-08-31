@@ -27,13 +27,21 @@ defmodule Fornacast.Storage do
     end
   end
 
-  defp validate_relative_storage_path(storage_path) do
+  @doc "Validates an opaque repository storage path without resolving it."
+  def validate_relative_storage_path(storage_path) when is_binary(storage_path) do
     cond do
-      Path.type(storage_path) != :relative ->
+      not String.valid?(storage_path) or :binary.match(storage_path, <<0>>) != :nomatch ->
+        {:error, "contains invalid characters"}
+
+      Path.type(storage_path) != :relative or
+          Regex.match?(~r/\A(?:[A-Za-z]:|\\\\)/u, storage_path) ->
         {:error, "must be relative"}
 
       storage_path == "" ->
         {:error, "must not be empty"}
+
+      String.contains?(storage_path, "\\") ->
+        {:error, "must use forward slashes"}
 
       String.split(storage_path, "/") |> Enum.any?(&(&1 in ["", ".", ".."])) ->
         {:error, "contains unsafe path segment"}
@@ -45,6 +53,8 @@ defmodule Fornacast.Storage do
         :ok
     end
   end
+
+  def validate_relative_storage_path(_storage_path), do: {:error, "must be a string"}
 
   defp inside_root?(root, path) do
     root = Path.expand(root)

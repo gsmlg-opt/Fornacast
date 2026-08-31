@@ -17,14 +17,20 @@ defmodule FornacastWeb.GitHTTPController do
       }) do
     with {:ok, repo_slug} <- git_repo_slug(repo_dot_git),
          {:ok, _actor, %Repository{} = repository} <-
-           load_readable_repository(conn, owner_slug, repo_slug),
-         {:ok, advertisement} <- GitTransport.UploadPack.advertise_refs(repository) do
-      conn
-      |> send_git_response(@upload_pack_advertisement_type, [
-        GitTransport.PktLine.encode("# service=git-upload-pack\n"),
-        GitTransport.PktLine.flush(),
-        advertisement
-      ])
+           load_readable_repository(conn, owner_slug, repo_slug) do
+      with_http_repository_read(conn, repository, fn handle ->
+        case GitTransport.UploadPack.advertise_refs_handle(handle) do
+          {:ok, advertisement} ->
+            send_git_response(conn, @upload_pack_advertisement_type, [
+              GitTransport.PktLine.encode("# service=git-upload-pack\n"),
+              GitTransport.PktLine.flush(),
+              advertisement
+            ])
+
+          {:error, reason} ->
+            send_git_error(conn, reason)
+        end
+      end)
     else
       {:error, reason} -> send_git_error(conn, reason)
     end
@@ -55,12 +61,17 @@ defmodule FornacastWeb.GitHTTPController do
   def upload_pack(conn, %{"owner" => owner_slug, "repo_dot_git" => repo_dot_git}) do
     with {:ok, repo_slug} <- git_repo_slug(repo_dot_git),
          {:ok, _actor, %Repository{} = repository} <-
-           load_readable_repository(conn, owner_slug, repo_slug),
-         {:ok, body, conn} <- read_full_body(conn, upload_pack_max_bytes()),
-         {:ok, body} <- decode_upload_pack_body(conn, body),
-         {:ok, request} <- parse_upload_pack_request(body),
-         {:ok, response} <- GitTransport.UploadPack.response(repository, request) do
-      send_git_response(conn, @upload_pack_result_type, response)
+           load_readable_repository(conn, owner_slug, repo_slug) do
+      with_http_repository_read(conn, repository, fn handle ->
+        with {:ok, body, conn} <- read_full_body(conn, upload_pack_max_bytes()),
+             {:ok, body} <- decode_upload_pack_body(conn, body),
+             {:ok, request} <- parse_upload_pack_request(body),
+             {:ok, response} <- GitTransport.UploadPack.response_handle(handle, request) do
+          send_git_response(conn, @upload_pack_result_type, response)
+        else
+          {:error, reason} -> send_git_error(conn, reason)
+        end
+      end)
     else
       {:error, reason} -> send_git_error(conn, reason)
     end
@@ -74,9 +85,20 @@ defmodule FornacastWeb.GitHTTPController do
          {:ok, body, conn} <-
            read_full_body(conn, GitTransport.ReceivePack.max_request_bytes()),
          {:ok, request, pack} <- parse_receive_pack_request(body),
-         {:ok, response, statuses} <-
-           GitTransport.ReceivePack.response(repository, request, pack),
-         :ok <- GitTransport.ReceivePack.record_push(actor, repository, statuses) do
+         operation_batch_id =
+           GitTransport.ReceivePack.http_operation_batch_id(
+             actor,
+             repository,
+             FornacastWeb.RequestMetadata.external_request_id(conn)
+           ),
+         {:ok, response, _statuses} <-
+           GitTransport.ReceivePack.response(
+             actor,
+             repository,
+             request,
+             pack,
+             operation_batch_id
+           ) do
       send_git_response(conn, @receive_pack_result_type, response)
     else
       {:error, reason} -> send_git_error(conn, reason)
@@ -86,6 +108,22 @@ defmodule FornacastWeb.GitHTTPController do
   defp load_readable_repository(conn, owner_slug, repo_slug) do
     with {:ok, actor, api_key} <- authenticate_actor(conn, :read) do
       load_readable_repository_for_actor(actor, api_key, owner_slug, repo_slug)
+    end
+  end
+
+  defp with_http_repository_read(conn, repository, fun) do
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:content_deadline_ms)
+
+    case ForgeRepos.open_repository_read(repository, deadline) do
+      {:ok, handle} ->
+        try do
+          fun.(handle)
+        after
+          ForgeRepos.close_repository_read(handle)
+        end
+
+      {:error, reason} ->
+        send_git_error(conn, reason)
     end
   end
 
@@ -295,6 +333,12 @@ defmodule FornacastWeb.GitHTTPController do
 
   defp send_git_error(conn, :unsupported_media_type),
     do: send_resp(conn, 415, "Unsupported Git content type.\n")
+
+  defp send_git_error(conn, reason) when reason in [:unavailable, :deadline_exceeded],
+    do: send_resp(conn, 503, "Git service temporarily unavailable.\n")
+
+  defp send_git_error(conn, {:unavailable, _reason}),
+    do: send_resp(conn, 503, "Git service temporarily unavailable.\n")
 
   defp send_git_error(conn, reason) when is_binary(reason), do: send_resp(conn, 400, reason)
   defp send_git_error(conn, _reason), do: send_resp(conn, 500, "Git HTTP request failed.\n")

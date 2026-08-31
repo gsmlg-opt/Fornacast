@@ -8,10 +8,12 @@ defmodule FornacastAPI.PullControllerTest do
   @versions [nil, "2022-11-28", "2026-03-10"]
 
   setup do
-    on_exit(fn ->
-      Repo.delete_all(MergeOperation)
-      Repo.delete_all(PullRequest)
-    end)
+    unless postgres?() do
+      on_exit(fn ->
+        Repo.delete_all(MergeOperation)
+        Repo.delete_all(PullRequest)
+      end)
+    end
 
     :ok
   end
@@ -499,6 +501,9 @@ defmodule FornacastAPI.PullControllerTest do
 
   defp put_optional_authorization(conn, secret),
     do: put_req_header(conn, "authorization", "Bearer #{secret}")
+
+  defp postgres?,
+    do: Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"]
 
   defp grant_reader!(repository, user) do
     %ForgeRepos.Collaborator{}

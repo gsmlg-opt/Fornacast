@@ -17,7 +17,11 @@ defmodule ForgeRepos.Collaborator do
     collaborator
     |> cast(attrs, [:repository_id, :user_id, :role])
     |> validate_required([:repository_id, :user_id, :role])
+    |> validate_number(:repository_id, greater_than: 0)
+    |> validate_number(:user_id, greater_than: 0)
     |> validate_inclusion(:role, @roles)
+    |> foreign_key_constraint(:repository_id)
+    |> foreign_key_constraint(:user_id)
     |> unique_constraint([:repository_id, :user_id])
   end
 end

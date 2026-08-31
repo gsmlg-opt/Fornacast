@@ -1,0 +1,234 @@
+<section
+  class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6"
+  data-import-run={@run.id}
+>
+  <header class="grid gap-2">
+    <p class="text-xs text-on-surface-variant">GitHub migration plan</p>
+    <div class="flex flex-wrap items-center gap-2">
+      <h2 class="text-2xl font-semibold">Import plan</h2>
+      <.dm_badge variant={state_variant(@run.state)} soft pill>
+        {humanize(@run.state)}
+      </.dm_badge>
+    </div>
+    <p class="text-sm text-on-surface-variant">
+      {run_guidance(@run)}
+    </p>
+    <div class="flex flex-wrap items-center gap-2">
+      <.dm_link href={"/imports/#{@run.id}"} class="text-sm text-primary">Refresh status</.dm_link>
+      <.dm_link
+        :if={workflow_available?(@run)}
+        href={workflow_path(@run)}
+        class="btn btn-primary"
+      >
+        {workflow_label(@run)}
+      </.dm_link>
+    </div>
+  </header>
+
+  <.dm_alert :if={@error} id="import-run-error" variant="error" outlined role="alert">
+    {@error}
+  </.dm_alert>
+
+  <.dm_alert
+    :if={discovering?(@run)}
+    id="import-discovering-status"
+    variant="info"
+    outlined
+    role="status"
+    data-import-state-info="discovering"
+  >
+    GitHub repository discovery is in progress. Refresh this page to see durable progress.
+  </.dm_alert>
+
+  <.dm_alert
+    :if={destination_warning?(@run.destination)}
+    id="import-destination-warning"
+    variant={destination_warning_variant(@run.destination)}
+    outlined
+    role="alert"
+    data-destination-warning={@run.destination.organization_status}
+  >
+    <span class="font-semibold">
+      {humanize(destination_warning_classification(@run.destination))}
+    </span>
+    <span>Choose a valid new slug or an existing organization you own.</span>
+  </.dm_alert>
+
+  <.dm_card id="import-run-overview" variant="bordered" shadow="sm" padding="lg">
+    <:title><span class="text-lg font-semibold">Overview</span></:title>
+    <dl class="grid gap-2">
+      <div class="flex flex-wrap items-center gap-2">
+        <dt class="font-semibold">Source</dt>
+        <dd>{source_label(@run.source)}</dd>
+      </div>
+      <div class="flex flex-wrap items-center gap-2">
+        <dt class="font-semibold">Destination</dt>
+        <dd>{destination_label(@run.destination)}</dd>
+      </div>
+      <div class="flex flex-wrap items-center gap-2">
+        <dt class="font-semibold">Created</dt>
+        <dd>
+          <time datetime={datetime_value(@run.inserted_at)}>{datetime_label(@run.inserted_at)}</time>
+        </dd>
+      </div>
+      <div class="flex flex-wrap items-center gap-2">
+        <dt class="font-semibold">Updated</dt>
+        <dd>
+          <time datetime={datetime_value(@run.updated_at)}>{datetime_label(@run.updated_at)}</time>
+        </dd>
+      </div>
+    </dl>
+    <ul class="flex flex-wrap gap-2" aria-label="Import counts">
+      <li>
+        <.dm_badge variant="primary" soft>Selected {@run.counts.selected}</.dm_badge>
+      </li>
+      <li>
+        <.dm_badge variant="success" soft>Published {@run.counts.published}</.dm_badge>
+      </li>
+      <li>
+        <.dm_badge variant="secondary" soft>Skipped {@run.counts.skipped}</.dm_badge>
+      </li>
+      <li>
+        <.dm_badge variant="warning" soft>Warnings {@run.counts.warnings}</.dm_badge>
+      </li>
+      <li>
+        <.dm_badge variant="error" soft>Failures {@run.counts.failures}</.dm_badge>
+      </li>
+    </ul>
+  </.dm_card>
+
+  <.dm_card
+    :if={organization_run?(@run) && resolution_editable?(@run)}
+    id="import-destination-card"
+    variant="bordered"
+    shadow="sm"
+    padding="lg"
+  >
+    <:title><span class="text-lg font-semibold">Organization destination</span></:title>
+    <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#157 --%>
+    <form action={"/imports/#{@run.id}/destination"} method="post" class="grid gap-4">
+      <input type="hidden" name="_csrf_token" value={csrf_token()} />
+      <input type="hidden" name="_method" value="patch" />
+      <fieldset class="grid gap-2">
+        <legend class="font-semibold">Destination choice</legend>
+        <div class="flex flex-wrap gap-2">
+          <label class="inline-flex items-center gap-2">
+            <input
+              class="radio radio-primary"
+              type="radio"
+              name="destination[action]"
+              value="new"
+              checked={!existing_destination?(@run)}
+            /> Create a new local organization
+          </label>
+          <label class="inline-flex items-center gap-2">
+            <input
+              class="radio radio-primary"
+              type="radio"
+              name="destination[action]"
+              value="existing"
+              checked={existing_destination?(@run)}
+            /> Use an existing organization I own
+          </label>
+        </div>
+      </fieldset>
+      <.dm_input
+        id="import-destination-slug"
+        class="w-full"
+        name="destination[slug]"
+        type="text"
+        label="New local organization slug"
+        value={editable_new_destination_slug(@run)}
+        maxlength="255"
+        autocomplete="off"
+        spellcheck="false"
+        autocapitalize="none"
+      />
+      <.dm_input
+        id="import-existing-destination"
+        class="w-full"
+        name="destination[organization_id]"
+        type="select"
+        label="Existing organization I own"
+        prompt="Choose an owned organization"
+        value={destination_organization_id(@run)}
+        options={organization_options(@organizations)}
+      />
+      <p :if={@organizations == []} class="text-sm text-on-surface-variant">
+        No owned organizations are available.
+      </p>
+      <div>
+        <button class="btn btn-secondary" type="submit">Update destination</button>
+      </div>
+    </form>
+  </.dm_card>
+
+  <.dm_card
+    id="import-repositories-card"
+    variant="bordered"
+    shadow="sm"
+    padding="lg"
+    data-import-read-only={read_only_state(@run)}
+  >
+    <:title>
+      <h3 class="text-lg font-semibold">Repositories</h3>
+    </:title>
+    <.dm_alert
+      :if={@run.state == :awaiting_resolution && @run.repositories == []}
+      variant="info"
+      outlined
+      role="status"
+      data-import-empty="awaiting_resolution"
+    >
+      No GitHub repositories are available for selection. Resolve the organization destination
+      before continuing.
+    </.dm_alert>
+    <p
+      :if={
+        @run.state != :discovering && @run.state != :awaiting_resolution &&
+          @run.repositories == []
+      }
+      class="text-sm text-on-surface-variant"
+      data-import-empty={@run.state}
+    >
+      This import has no repository rows.
+    </p>
+    <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#157 --%>
+    <form
+      :if={resolution_editable?(@run) && @run.repositories != []}
+      action={"/imports/#{@run.id}/selection"}
+      method="post"
+      class="grid gap-4"
+    >
+      <input type="hidden" name="_csrf_token" value={csrf_token()} />
+      <input type="hidden" name="_method" value="patch" />
+      <input type="hidden" name="selection[present]" value="true" />
+      <.repository_table repositories={@run.repositories} editable={true} />
+      <div>
+        <button class="btn btn-primary" type="submit">Update repository selection</button>
+      </div>
+    </form>
+    <.repository_table
+      :if={!resolution_editable?(@run) && @run.repositories != []}
+      repositories={@run.repositories}
+      editable={false}
+    />
+  </.dm_card>
+
+  <.dm_card id="import-reports-card" variant="bordered" shadow="sm" padding="lg">
+    <:title>
+      <h3 class="text-lg font-semibold">Discovery report</h3>
+    </:title>
+    <p :if={@run.reports == []} class="text-sm text-on-surface-variant">
+      No discovery warnings were reported.
+    </p>
+    <ul :if={@run.reports != []} class="grid gap-2" role="list">
+      <li :for={report <- @run.reports}>
+        <.dm_alert variant={outcome_variant(report.outcome)} outlined>
+          <span class="font-semibold">{humanize(report.classification)}</span>
+          <span>{report.summary}</span>
+        </.dm_alert>
+      </li>
+    </ul>
+  </.dm_card>
+</section>

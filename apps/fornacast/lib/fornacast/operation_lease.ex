@@ -23,20 +23,31 @@ defmodule Fornacast.OperationLease do
 
   @spec claim(module(), pos_integer(), String.t(), DateTime.t(), pos_integer()) ::
           {:ok, struct()} | :busy | {:error, :not_found | :invalid_argument}
-  def claim(module, id, owner, %DateTime{} = now, lease_seconds)
+  def claim(module, id, owner, %DateTime{} = now, lease_seconds),
+    do: claim(module, id, owner, now, lease_seconds, [])
+
+  def claim(_module, _id, _owner, _now, _lease_seconds), do: {:error, :invalid_argument}
+
+  @spec claim(module(), pos_integer(), String.t(), DateTime.t(), pos_integer(), keyword()) ::
+          {:ok, struct()} | :busy | {:error, :not_found | :invalid_argument}
+  def claim(module, id, owner, %DateTime{} = now, lease_seconds, options)
       when is_atom(module) and is_integer(id) and id > 0 and is_binary(owner) and owner != "" and
-             is_integer(lease_seconds) and lease_seconds > 0 do
+             is_integer(lease_seconds) and lease_seconds > 0 and is_list(options) do
     with :ok <- validate_utc(now),
+         {:ok, allowed_states} <- claim_allowed_states(module, options),
          %{} = row <- Repo.get(module, id) do
       now = DateTime.truncate(now, :second)
       expires_at = DateTime.add(now, lease_seconds, :second)
       expected_version = row.lock_version + 1
 
       query =
-        from item in module,
+        from(item in module,
           where:
             item.id == ^id and item.lock_version == ^row.lock_version and
               (is_nil(item.lease_expires_at) or item.lease_expires_at <= ^now)
+        )
+        |> exclude_terminal_states(module)
+        |> include_allowed_states(allowed_states)
 
       case Repo.update_all(query,
              set: [lease_owner: owner, lease_expires_at: expires_at],
@@ -59,7 +70,8 @@ defmodule Fornacast.OperationLease do
     end
   end
 
-  def claim(_module, _id, _owner, _now, _lease_seconds), do: {:error, :invalid_argument}
+  def claim(_module, _id, _owner, _now, _lease_seconds, _options),
+    do: {:error, :invalid_argument}
 
   @spec release(module(), struct()) :: :ok | {:error, :lost_lease}
   def release(module, %{id: id, lease_owner: owner, lock_version: version})
@@ -91,6 +103,7 @@ defmodule Fornacast.OperationLease do
       when is_atom(module) and is_list(updates) and is_list(options) do
     with {:ok, now, expires_at} <- lease_window(options),
          {:ok, validated} <- owned_updates(module, operation, updates),
+         :ok <- reject_retained_terminal_transition(module, validated),
          {:ok, updated} <-
            renew_owned_row(
              module,
@@ -182,10 +195,12 @@ defmodule Fornacast.OperationLease do
        )
        when is_integer(id) and is_binary(owner) and owner != "" and is_integer(version) do
     query =
-      from item in module,
+      from(item in module,
         where:
           item.id == ^id and item.lease_owner == ^owner and item.lock_version == ^version and
             item.lease_expires_at > ^now
+      )
+      |> exclude_terminal_states(module)
 
     case Repo.update_all(query,
            set: updates ++ [lease_expires_at: expires_at],
@@ -209,12 +224,19 @@ defmodule Fornacast.OperationLease do
     do: {:error, :lost_lease}
 
   defp guarded_update(module, id, owner, version, updates) do
+    updates =
+      updates
+      |> Keyword.drop([:lease_owner, :lease_expires_at])
+      |> Keyword.merge(lease_owner: nil, lease_expires_at: nil)
+
     query =
-      from item in module,
+      from(item in module,
         where: item.id == ^id and item.lease_owner == ^owner and item.lock_version == ^version
+      )
+      |> exclude_terminal_states(module)
 
     Repo.update_all(query,
-      set: updates ++ [lease_owner: nil, lease_expires_at: nil],
+      set: updates,
       inc: [lock_version: 1]
     )
   end
@@ -233,6 +255,51 @@ defmodule Fornacast.OperationLease do
           item.id == ^id and item.lock_version == ^version and is_nil(item.lease_owner) and
             is_nil(item.lease_expires_at)
     )
+  end
+
+  defp reject_retained_terminal_transition(module, updates) do
+    case Keyword.fetch(updates, :state) do
+      {:ok, state} ->
+        if state in terminal_states(module), do: {:error, :invalid_update}, else: :ok
+
+      :error ->
+        :ok
+    end
+  end
+
+  defp exclude_terminal_states(query, module) do
+    case terminal_states(module) do
+      [] -> query
+      states -> from item in query, where: item.state not in ^states
+    end
+  end
+
+  defp claim_allowed_states(_module, []), do: {:ok, nil}
+
+  defp claim_allowed_states(module, allowed_states: states)
+       when is_list(states) and states != [] do
+    valid_states =
+      if Code.ensure_loaded?(module) and function_exported?(module, :states, 0),
+        do: module.states(),
+        else: []
+
+    if Enum.all?(states, &is_atom/1) and length(states) == length(Enum.uniq(states)) and
+         states -- valid_states == [],
+       do: {:ok, states},
+       else: {:error, :invalid_argument}
+  end
+
+  defp claim_allowed_states(_module, _options), do: {:error, :invalid_argument}
+
+  defp include_allowed_states(query, nil), do: query
+
+  defp include_allowed_states(query, states),
+    do: from(item in query, where: item.state in ^states)
+
+  defp terminal_states(module) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :terminal_states, 0),
+      do: module.terminal_states(),
+      else: []
   end
 
   defp run_after_write_hook(kind, module, id, version) do

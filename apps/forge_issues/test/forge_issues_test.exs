@@ -746,6 +746,24 @@ defmodule ForgeIssuesTest do
 
     assert {:error, :authorization, :not_found, %{}} = ForgeIssues.transaction(deleted_multi)
 
+    for lifecycle <- [:importing, :tombstoned] do
+      hidden_repository = repository_fixture(writer)
+
+      hidden_multi =
+        ForgeIssues.create_multi(
+          writer,
+          hidden_repository,
+          %{title: "Repository hidden"},
+          request_metadata()
+        )
+
+      hidden_repository
+      |> Ecto.Changeset.change(lifecycle: lifecycle)
+      |> Repo.update!()
+
+      assert {:error, :authorization, :not_found, %{}} = ForgeIssues.transaction(hidden_multi)
+    end
+
     assert Repo.aggregate(Issue, :count, :id) == 0
     assert Repo.aggregate(AuditEvent, :count, :id) == 0
   end
@@ -1494,6 +1512,28 @@ defmodule ForgeIssuesTest do
              ForgeIssues.list(writer, writer.username, repository.slug, %{per_page: 101})
   end
 
+  test "slug APIs mask non-ready repositories", %{writer: writer} do
+    for lifecycle <- [:importing, :tombstoned] do
+      repository =
+        writer
+        |> repository_fixture(%{visibility: :public})
+        |> Ecto.Changeset.change(lifecycle: lifecycle)
+        |> Repo.update!()
+
+      assert {:error, :not_found} =
+               ForgeIssues.list(writer, writer.username, repository.slug, %{})
+
+      assert {:error, :not_found} =
+               ForgeIssues.create(
+                 writer,
+                 writer.username,
+                 repository.slug,
+                 %{"title" => "Hidden"},
+                 request_metadata()
+               )
+    end
+  end
+
   test "public repositories expose issue comments anonymously in creation order", %{
     writer: writer,
     repository: repository
@@ -2171,6 +2211,24 @@ defmodule ForgeIssuesTest do
     )
 
     assert {:error, :authorization, :not_found, %{}} = ForgeIssues.transaction(repository_multi)
+
+    hidden_repository = repository_fixture(writer)
+    hidden_issue = issue_fixture(hidden_repository, writer)
+
+    hidden_multi =
+      ForgeIssues.create_comment_multi(
+        writer,
+        hidden_repository,
+        hidden_issue.number,
+        %{"body" => "Nope"},
+        request_metadata()
+      )
+
+    hidden_repository
+    |> Ecto.Changeset.change(lifecycle: :importing)
+    |> Repo.update!()
+
+    assert {:error, :authorization, :not_found, %{}} = ForgeIssues.transaction(hidden_multi)
     assert 0 == Repo.aggregate(AuditEvent, :count, :id)
   end
 

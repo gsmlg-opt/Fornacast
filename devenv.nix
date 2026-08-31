@@ -43,6 +43,7 @@ in {
     port = 55432;
     listen_addresses = "";
     initialDatabases = [
+      {name = "fornacast_dev";}
       {name = "fornacast_test";}
     ];
   };

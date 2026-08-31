@@ -21,6 +21,10 @@ defmodule FornacastWeb.Router do
     plug FornacastWeb.Plugs.RequireUser
   end
 
+  pipeline :private_no_store do
+    plug :put_private_no_store
+  end
+
   scope "/", FornacastWeb do
     get "/health", HealthController, :show
 
@@ -45,6 +49,32 @@ defmodule FornacastWeb.Router do
   end
 
   scope "/", FornacastWeb do
+    pipe_through [:private_no_store, :browser, :authenticated]
+
+    get "/settings/github", GitHubSettingsController, :index
+    post "/settings/github", GitHubSettingsController, :create
+    post "/settings/github/:identity_id/reverify", GitHubSettingsController, :reverify
+    put "/settings/github/:identity_id/credential", GitHubSettingsController, :replace
+
+    delete "/settings/github/:identity_id/credential",
+           GitHubSettingsController,
+           :delete_credential
+
+    delete "/settings/github/:identity_id", GitHubSettingsController, :unlink
+
+    get "/repos/import", ImportController, :repository_new
+    post "/repos/import/discover", ImportController, :repository_discover
+    get "/organizations/import", ImportController, :organization_new
+    post "/organizations/import/discover", ImportController, :organization_discover
+    get "/imports/:id", ImportController, :show
+    get "/imports/:id/conflicts", ImportController, :conflicts
+    patch "/imports/:id/conflicts", ImportController, :resolve_conflicts
+    get "/imports/:id/review", ImportController, :review
+    patch "/imports/:id/destination", ImportController, :destination
+    patch "/imports/:id/selection", ImportController, :selection
+  end
+
+  scope "/", FornacastWeb do
     pipe_through [:browser, :authenticated]
 
     get "/", DashboardController, :index
@@ -53,18 +83,17 @@ defmodule FornacastWeb.Router do
     get "/ssh-keys", SSHKeyController, :index
     post "/ssh-keys", SSHKeyController, :create
     delete "/ssh-keys/:id", SSHKeyController, :delete
+    get "/settings", SettingsController, :index
     get "/settings/ssh-keys", SSHKeyController, :index
     post "/settings/ssh-keys", SSHKeyController, :create
     delete "/settings/ssh-keys/:id", SSHKeyController, :delete
     get "/settings/api-keys", APIKeyController, :index
     post "/settings/api-keys", APIKeyController, :create
     delete "/settings/api-keys/:id", APIKeyController, :delete
-
     get "/organizations/new", OrganizationController, :new
     post "/organizations", OrganizationController, :create
 
     get "/repos/new", RepositoryController, :new
-    get "/repos/import", RepositoryController, :import_new
     post "/repos", RepositoryController, :create
 
     get "/:owner", OrganizationController, :show
@@ -100,5 +129,11 @@ defmodule FornacastWeb.Router do
     get "/:owner/:repo/search", RepositoryController, :search
     get "/:owner/:repo/src/*segments", RepositoryController, :src
     get "/:owner/:repo/raw/*segments", RepositoryController, :raw
+  end
+
+  defp put_private_no_store(conn, _opts) do
+    conn
+    |> put_resp_header("cache-control", "private, no-store")
+    |> put_resp_header("pragma", "no-cache")
   end
 end

@@ -13,6 +13,7 @@ defmodule ForgeRepos.GitWriteRecovery do
   @lease_seconds 30
   @terminal_states [:bookkeeping_complete, :failed]
   @complete_multi_hook_key {__MODULE__, :complete_multi_hook}
+  @completion_clock_key {__MODULE__, :completion_clock}
   @iteration_clock_key {__MODULE__, :iteration_clock}
   @claim_observer_key {__MODULE__, :claim_observer}
 
@@ -28,6 +29,19 @@ defmodule ForgeRepos.GitWriteRecovery do
       if previous == nil,
         do: Process.delete(@complete_multi_hook_key),
         else: Process.put(@complete_multi_hook_key, previous)
+    end
+  end
+
+  @doc false
+  def with_test_completion_clock(clock, fun)
+      when is_function(clock, 0) and is_function(fun, 0) do
+    previous = Process.get(@completion_clock_key)
+    Process.put(@completion_clock_key, clock)
+
+    try do
+      fun.()
+    after
+      restore_process_value(@completion_clock_key, previous)
     end
   end
 
@@ -56,7 +70,8 @@ defmodule ForgeRepos.GitWriteRecovery do
     case GitCore.RepositoryWriteLimiter.acquire(repository_id, absolute_deadline) do
       {:ok, lease} ->
         try do
-          with {:ok, repository_path} <- safe_repository_path(repository),
+          with {:ok, repository} <- reload_repository(repository),
+               {:ok, repository_path} <- safe_repository_path(repository),
                :ok <-
                  reconcile_repository_locked(repository, repository_path, absolute_deadline) do
             :ok
@@ -72,6 +87,23 @@ defmodule ForgeRepos.GitWriteRecovery do
     end
   end
 
+  defp reload_repository(%Repository{id: repository_id, generation: generation})
+       when is_integer(repository_id) and repository_id > 0 and is_integer(generation) and
+              generation > 0 do
+    repository =
+      Repository
+      |> where(
+        [repository],
+        repository.id == ^repository_id and repository.generation == ^generation and
+          repository.lifecycle == :ready and is_nil(repository.deleted_at)
+      )
+      |> Repo.one()
+
+    if repository, do: {:ok, repository}, else: {:error, :stale_repository}
+  end
+
+  defp reload_repository(%Repository{}), do: {:error, :stale_repository}
+
   @impl true
   def reconcile_repository_locked(
         %Repository{id: repository_id} = repository,
@@ -84,11 +116,28 @@ defmodule ForgeRepos.GitWriteRecovery do
     reconcile_next(repository, repository_path, absolute_deadline, owner, 0)
   end
 
+  @impl true
+  def cleanup_safety_locked(%Repository{id: repository_id}, %DateTime{} = now)
+      when is_integer(repository_id) and repository_id > 0 do
+    GitWriteOperation
+    |> where([operation], operation.repository_id == ^repository_id)
+    |> order_by([operation], asc: operation.id)
+    |> maybe_lock()
+    |> Repo.all()
+    |> classify_cleanup_safety(now, GitWriteOperation.terminal_states())
+  rescue
+    _error -> {:error, :unavailable}
+  catch
+    _kind, _reason -> {:error, :unavailable}
+  end
+
+  def cleanup_safety_locked(_repository, _now), do: {:error, :unavailable}
+
   defp reconcile_next(repository, repository_path, absolute_deadline, owner, after_id) do
     with :ok <- check_deadline(absolute_deadline) do
       now = iteration_now()
 
-      case next_claimable_operation(repository.id, after_id, now) do
+      case next_operation(repository.id, after_id) do
         nil ->
           :ok
 
@@ -102,7 +151,7 @@ defmodule ForgeRepos.GitWriteRecovery do
             now
           )
           |> case do
-            result when result in [:ok, :busy] ->
+            :ok ->
               reconcile_next(
                 repository,
                 repository_path,
@@ -110,6 +159,9 @@ defmodule ForgeRepos.GitWriteRecovery do
                 owner,
                 operation.id
               )
+
+            :busy ->
+              {:error, :unavailable}
 
             {:error, :unavailable} = error ->
               error
@@ -122,18 +174,57 @@ defmodule ForgeRepos.GitWriteRecovery do
     _kind, _reason -> {:error, :unavailable}
   end
 
-  defp next_claimable_operation(repository_id, after_id, now) do
+  defp next_operation(repository_id, after_id) do
     GitWriteOperation
     |> where([operation], operation.repository_id == ^repository_id)
     |> where([operation], operation.state not in ^@terminal_states)
     |> where([operation], operation.id > ^after_id)
-    |> where(
-      [operation],
-      is_nil(operation.lease_expires_at) or operation.lease_expires_at <= ^now
-    )
     |> order_by([operation], asc: operation.id)
     |> limit(1)
     |> Repo.one()
+  end
+
+  defp classify_cleanup_safety(operations, now, terminal_states) do
+    flags =
+      Enum.reduce(operations, MapSet.new(), fn operation, flags ->
+        terminal? = operation.state in terminal_states
+        owner = operation.lease_owner
+        expires_at = operation.lease_expires_at
+
+        cond do
+          terminal? and (not is_nil(owner) or not is_nil(expires_at)) ->
+            MapSet.put(flags, :inconsistent_lease)
+
+          (is_nil(owner) and not is_nil(expires_at)) or
+            (not is_nil(owner) and is_nil(expires_at)) or owner == "" ->
+            MapSet.put(flags, :inconsistent_lease)
+
+          terminal? ->
+            flags
+
+          is_nil(owner) ->
+            MapSet.put(flags, :claimable_operation)
+
+          DateTime.compare(expires_at, now) == :gt ->
+            MapSet.put(flags, :live_lease)
+
+          true ->
+            MapSet.put(flags, :claimable_operation)
+        end
+      end)
+
+    cond do
+      MapSet.member?(flags, :inconsistent_lease) -> {:blocked, :inconsistent_lease}
+      MapSet.member?(flags, :live_lease) -> {:blocked, :live_lease}
+      MapSet.member?(flags, :claimable_operation) -> {:blocked, :claimable_operation}
+      true -> :safe
+    end
+  end
+
+  defp maybe_lock(query) do
+    if Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"],
+      do: lock(query, "FOR UPDATE"),
+      else: query
   end
 
   defp reconcile_operation(
@@ -273,7 +364,7 @@ defmodule ForgeRepos.GitWriteRecovery do
   end
 
   defp complete_transaction(repository, operation) do
-    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    now = completion_now()
     actor = load_actor(operation.actor_user_id)
 
     operation_query =
@@ -282,7 +373,11 @@ defmodule ForgeRepos.GitWriteRecovery do
           candidate.id == ^operation.id and candidate.lease_owner == ^operation.lease_owner and
             candidate.lock_version == ^operation.lock_version
 
-    repository_query = from candidate in Repository, where: candidate.id == ^repository.id
+    repository_query =
+      from candidate in Repository,
+        where:
+          candidate.id == ^repository.id and candidate.generation == ^repository.generation and
+            candidate.lifecycle == :ready and is_nil(candidate.deleted_at)
 
     multi =
       Multi.new()
@@ -298,12 +393,12 @@ defmodule ForgeRepos.GitWriteRecovery do
         ],
         inc: [lock_version: 1]
       )
-      |> Multi.run(:ownership, fn _repo, %{operation: {count, _rows}} ->
-        if count == 1, do: {:ok, :owned}, else: {:error, :lost_lease}
-      end)
+      |> require_one(:operation)
       |> Multi.update_all(:repository, repository_query,
-        set: [last_pushed_at: now, updated_at: now]
+        set: [last_pushed_at: now, updated_at: now],
+        inc: [write_version: 1]
       )
+      |> require_one(:repository)
       |> Audit.record_multi(
         :audit,
         actor,
@@ -328,17 +423,34 @@ defmodule ForgeRepos.GitWriteRecovery do
     Repo.transaction(multi)
   end
 
+  defp require_one(multi, key) do
+    Multi.run(multi, {key, :ownership}, fn _repo, changes ->
+      case Map.fetch!(changes, key) do
+        {1, _rows} -> {:ok, :owned}
+        _other -> {:error, :lost_lease}
+      end
+    end)
+  end
+
   defp audit_action(:ref_create), do: "git.ref.created"
   defp audit_action(:ref_update), do: "git.ref.updated"
   defp audit_action(:content_create), do: "git.content.created"
   defp audit_action(:content_update), do: "git.content.updated"
   defp audit_action(:content_delete), do: "git.content.deleted"
-  defp audit_action(:receive_pack), do: "git.receive_pack.completed"
+  defp audit_action(:receive_pack), do: "repository.pushed"
 
   defp load_actor(nil), do: nil
   defp load_actor(actor_user_id), do: Repo.get(User, actor_user_id)
 
   defp operation_id(operation), do: "git_write:" <> Integer.to_string(operation.id)
+
+  defp completion_now do
+    case Process.get(@completion_clock_key) do
+      clock when is_function(clock, 0) -> clock.()
+      nil -> DateTime.utc_now()
+    end
+    |> DateTime.truncate(:second)
+  end
 
   defp check_deadline(absolute_deadline) do
     if System.monotonic_time(:millisecond) < absolute_deadline,

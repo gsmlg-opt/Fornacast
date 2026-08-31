@@ -715,8 +715,9 @@ defmodule ForgeIssues do
       )
       |> where(
         [repository, owner],
-        repository.id == ^repository_id and is_nil(repository.deleted_at) and
-          owner.state == :active and owner.kind in [:user, :organization]
+        repository.id == ^repository_id and repository.lifecycle == :ready and
+          is_nil(repository.deleted_at) and owner.state == :active and
+          owner.kind in [:user, :organization]
       )
       |> select([repository, _owner], repository)
       |> repo.one()
@@ -1283,7 +1284,7 @@ defmodule ForgeIssues do
   @spec transaction(Multi.t()) ::
           {:ok, map()} | {:error, Multi.name(), term(), map()}
   def transaction(%Multi{} = multi) do
-    attempts = if Repo.__adapter__() == Ecto.Adapters.Turso, do: @turso_busy_attempts, else: 1
+    attempts = if turso_adapter?(), do: @turso_busy_attempts, else: 1
     transact(multi, attempts)
   end
 
@@ -1806,8 +1807,7 @@ defmodule ForgeIssues do
     Repo.transaction(multi)
   rescue
     error in Turso.Error ->
-      if Repo.__adapter__() == Ecto.Adapters.Turso and error.code == :busy and
-           attempts_remaining > 1 do
+      if turso_adapter?() and error.code == :busy and attempts_remaining > 1 do
         attempt = @turso_busy_attempts - attempts_remaining + 1
         Process.sleep(attempt * @turso_busy_backoff_ms)
         transact(multi, attempts_remaining - 1)
@@ -1815,4 +1815,7 @@ defmodule ForgeIssues do
         reraise error, __STACKTRACE__
       end
   end
+
+  # Keep this dynamic so dual-adapter builds do not specialize the comparison.
+  defp turso_adapter?, do: apply(Repo, :__adapter__, []) == Ecto.Adapters.Turso
 end

@@ -10,7 +10,32 @@ use std::time::{Duration, Instant};
 
 use gix_object::bstr::ByteSlice;
 
+mod anchored_remove;
 mod bounded_blob;
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn contained_tree_identity(
+    storage_root: String,
+    relative_segments: Vec<String>,
+    deadline_ms: u64,
+) -> Result<anchored_remove::IdentityResult, anchored_remove::AnchoredRemoveError> {
+    anchored_remove::contained_tree_identity(storage_root, relative_segments, deadline_ms)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn remove_contained_tree(
+    storage_root: String,
+    relative_segments: Vec<String>,
+    expected_proof: anchored_remove::ContainedTreeProof,
+    deadline_ms: u64,
+) -> Result<anchored_remove::RemoveResult, anchored_remove::AnchoredRemoveError> {
+    anchored_remove::remove_contained_tree(
+        storage_root,
+        relative_segments,
+        expected_proof,
+        deadline_ms,
+    )
+}
 
 type NativeCommit = (
     String,

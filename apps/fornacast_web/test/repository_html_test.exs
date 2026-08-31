@@ -609,6 +609,8 @@ defmodule FornacastWeb.RepositoryHTMLTest do
 
     assert anonymous =~ "repository-shell"
     assert anonymous =~ "Fornacast"
+    assert anonymous =~ ~s(<link rel="icon" href="/favicon.ico" sizes="any">)
+    assert anonymous =~ ~s(<img class="brand-logo" src="/images/logo.png")
     assert anonymous =~ "href=\"/login\""
     assert anonymous =~ "Theme"
     assert anonymous =~ "<strong>safe</strong>"

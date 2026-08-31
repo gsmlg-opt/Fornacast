@@ -1,6 +1,8 @@
 defmodule FornacastWeb.SSHKeyController do
   use FornacastWeb, :controller
 
+  plug :put_private_no_store
+
   def index(%Plug.Conn{assigns: %{current_user: user}} = conn, _params) do
     keys = ForgeAccounts.list_user_ssh_keys(user)
     path = ssh_keys_path(conn)
@@ -38,14 +40,15 @@ defmodule FornacastWeb.SSHKeyController do
         """
       end
 
-    page(conn, "SSH keys", """
-    #{settings_navigation()}
+    content = """
     #{section_header("SSH keys", "Manage SSH keys for Git transport.", "")}
     <div class="settings-grid">
       #{ssh_key_form(path)}
       #{key_table}
     </div>
-    """)
+    """
+
+    page(conn, "SSH keys", settings_layout(:ssh_keys, content))
   end
 
   def create(%Plug.Conn{assigns: %{current_user: user}} = conn, %{"ssh_key" => attrs}) do
@@ -58,8 +61,10 @@ defmodule FornacastWeb.SSHKeyController do
         |> put_status(:unprocessable_entity)
         |> page(
           "SSH keys",
-          settings_navigation() <>
+          settings_layout(
+            :ssh_keys,
             error_panel(validation_errors(changeset)) <> ssh_key_form(ssh_keys_path(conn))
+          )
         )
     end
   end
@@ -101,7 +106,9 @@ defmodule FornacastWeb.SSHKeyController do
     )
   end
 
-  defp settings_navigation do
-    ~s(<nav aria-label="Settings"><a href="/settings/ssh-keys">SSH keys</a> <a href="/settings/api-keys">API keys</a></nav>)
+  defp put_private_no_store(conn, _opts) do
+    conn
+    |> put_resp_header("cache-control", "private, no-store")
+    |> put_resp_header("pragma", "no-cache")
   end
 end

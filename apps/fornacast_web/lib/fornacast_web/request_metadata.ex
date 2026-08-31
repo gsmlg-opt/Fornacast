@@ -6,6 +6,7 @@ defmodule FornacastWeb.RequestMetadata do
   import Plug.Conn, only: [get_req_header: 2, get_resp_header: 2]
 
   @max_request_id_bytes 255
+  @external_request_id_bytes 20..200
   @max_user_agent_bytes 512
 
   def from_conn(%Plug.Conn{} = conn) do
@@ -14,6 +15,17 @@ defmodule FornacastWeb.RequestMetadata do
       ip_address: normalize_ip(conn.remote_ip),
       user_agent: conn |> get_req_header("user-agent") |> List.first() |> bound_user_agent()
     }
+  end
+
+  @spec external_request_id(Plug.Conn.t()) :: String.t() | nil
+  def external_request_id(%Plug.Conn{} = conn) do
+    case get_req_header(conn, "x-request-id") do
+      [value | _rest] when byte_size(value) in @external_request_id_bytes ->
+        if String.valid?(value), do: value, else: nil
+
+      _missing_or_invalid ->
+        nil
+    end
   end
 
   defp request_id(conn) do

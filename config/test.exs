@@ -16,15 +16,25 @@ config :git_core, :limits,
   contents_json_bytes: 146_800_640,
   ref_deadline_ms: 10_000,
   content_deadline_ms: 60_000,
+  receive_pack_commands: 1_024,
   receive_pack_bytes: 104_857_600,
   body_total_timeout_ms: 120_000,
   body_idle_timeout_ms: 15_000,
-  reconcile_interval_ms: 30_000
+  reconcile_interval_ms: 30_000,
+  remote_concurrency: 2,
+  remote_wall_time_ms: 1_800_000,
+  remote_output_bytes: 1_048_576,
+  remote_repository_bytes: 21_474_836_480,
+  remote_refs: 200_000,
+  remote_poll_interval_ms: 100,
+  remote_credential_startup_ms: 10_000,
+  remote_kill_escalation_ms: 5_000,
+  remote_cleanup_wait_ms: 10_000
 
 test_root = Path.expand("..", __DIR__)
 
 database_adapter =
-  System.get_env("FORNACAST_DATABASE_ADAPTER", "turso")
+  System.get_env("FORNACAST_DATABASE_ADAPTER", "postgres")
   |> String.downcase()
 
 repo_config =
@@ -77,6 +87,10 @@ config :fornacast, Fornacast.Repo, [pool: Ecto.Adapters.SQL.Sandbox, pool_size: 
 
 config :fornacast,
   auto_migrate: false,
+  github_credential_keyring: %{
+    active: "test-2026-08-25",
+    keys: %{"test-2026-08-25" => :binary.copy(<<42>>, 32)}
+  },
   repo_storage_root: "tmp/test/repos",
   ssh_bind_ip: "127.0.0.1",
   ssh_port: 0,

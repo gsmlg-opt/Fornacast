@@ -4,7 +4,7 @@ defmodule FornacastWeb.MixProject do
   def project do
     [
       app: :fornacast_web,
-      version: "0.2.0",
+      version: "0.1.0",
       build_path: "../../_build",
       config_path: "../../config/config.exs",
       deps_path: "../../deps",
@@ -28,6 +28,7 @@ defmodule FornacastWeb.MixProject do
     [
       {:fornacast, in_umbrella: true},
       {:forge_accounts, in_umbrella: true},
+      {:forge_imports, in_umbrella: true},
       {:forge_issues, in_umbrella: true},
       {:forge_pulls, in_umbrella: true},
       {:forge_repos, in_umbrella: true},

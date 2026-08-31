@@ -28,6 +28,332 @@ defmodule GitTransportTest do
     assert GitTransport.ReceivePack.max_request_bytes() == nil
   end
 
+  test "receive-pack parser rejects commands beyond the hard configured ceiling" do
+    original_limits = Application.get_env(:git_core, :limits)
+
+    limits =
+      Application.get_env(:git_core, :limits, [])
+      |> Keyword.put(:receive_pack_commands, 1)
+
+    Application.put_env(:git_core, :limits, limits)
+
+    on_exit(fn ->
+      if is_nil(original_limits),
+        do: Application.delete_env(:git_core, :limits),
+        else: Application.put_env(:git_core, :limits, original_limits)
+    end)
+
+    zero_oid = String.duplicate("0", 40)
+    first_oid = String.duplicate("1", 40)
+    second_oid = String.duplicate("2", 40)
+
+    data =
+      GitTransport.PktLine.encode("#{zero_oid} #{first_oid} refs/heads/main\0report-status\n") <>
+        GitTransport.PktLine.encode("#{zero_oid} #{second_oid} refs/heads/feature\n")
+
+    assert {:error, "ERROR: Too many Git receive-pack commands.\n"} =
+             GitTransport.ReceivePack.parse_request_data(data)
+  end
+
+  test "receive-pack parser accepts 255-byte refs and rejects longer refs" do
+    zero_oid = String.duplicate("0", 40)
+    proposed_oid = String.duplicate("1", 40)
+    max_ref = "refs/heads/" <> String.duplicate("a", 244)
+    overlong_ref = "refs/heads/" <> String.duplicate("a", 245)
+
+    assert byte_size(max_ref) == 255
+    assert byte_size(overlong_ref) == 256
+
+    data =
+      GitTransport.PktLine.encode("#{zero_oid} #{proposed_oid} #{max_ref}\0report-status\n") <>
+        GitTransport.PktLine.flush()
+
+    assert {:pack, "", %{commands: [%{ref: ^max_ref}]}} =
+             GitTransport.ReceivePack.parse_request_data(data)
+
+    assert {:error, "ERROR: Invalid Git reference.\n"} =
+             GitTransport.ReceivePack.parse_request_data(
+               GitTransport.PktLine.encode(
+                 "#{zero_oid} #{proposed_oid} #{overlong_ref}\0report-status\n"
+               )
+             )
+  end
+
+  test "upload-pack serve-handle test adapter is process local and restored" do
+    refute GitTransport.UploadPack.test_serve_handle_hook?()
+    refute GitTransport.UploadPack.test_global_pack_objects_hook?()
+
+    assert :served =
+             GitTransport.UploadPack.with_test_serve_handle(
+               fn :opaque_handle -> :served end,
+               fn ->
+                 assert GitTransport.UploadPack.test_serve_handle_hook?()
+
+                 child = Task.async(fn -> GitTransport.UploadPack.test_serve_handle_hook?() end)
+                 refute Task.await(child)
+                 GitTransport.UploadPack.serve_handle(:opaque_handle)
+               end
+             )
+
+    refute GitTransport.UploadPack.test_serve_handle_hook?()
+    refute GitTransport.UploadPack.test_global_pack_objects_hook?()
+  end
+
+  test "HTTP operation batches are stable per actor and repository and random when unassigned" do
+    actor = %ForgeAccounts.User{id: 10}
+    other_actor = %ForgeAccounts.User{id: 11}
+    repository = %ForgeRepos.Repository{id: 20}
+    other_repository = %ForgeRepos.Repository{id: 21}
+    external_request_id = "shared-client-request-id-12345"
+
+    batch_id =
+      GitTransport.ReceivePack.http_operation_batch_id(
+        actor,
+        repository,
+        external_request_id
+      )
+
+    assert batch_id ==
+             GitTransport.ReceivePack.http_operation_batch_id(
+               actor,
+               repository,
+               external_request_id
+             )
+
+    refute batch_id ==
+             GitTransport.ReceivePack.http_operation_batch_id(
+               actor,
+               other_repository,
+               external_request_id
+             )
+
+    refute batch_id ==
+             GitTransport.ReceivePack.http_operation_batch_id(
+               other_actor,
+               repository,
+               external_request_id
+             )
+
+    random_ids = [
+      GitTransport.ReceivePack.http_operation_batch_id(actor, repository, nil),
+      GitTransport.ReceivePack.http_operation_batch_id(actor, repository, "unassigned")
+    ]
+
+    assert [first_random, second_random] = random_ids
+    refute first_random == second_random
+
+    for request_id <- [batch_id | random_ids] do
+      assert byte_size(request_id) <= 255
+      refute request_id =~ external_request_id
+    end
+  end
+
+  @tag :tmp_dir
+  test "upload-pack advertisement waits behind repository cleanup", %{tmp_dir: tmp_dir} do
+    share_database!()
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, Path.join(tmp_dir, "repos"))
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "reader-fence",
+               email: "reader-fence@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, repository} =
+             ForgeRepos.create_repository(user, %{name: "Reader fence", slug: "reader-fence"})
+
+    deadline = System.monotonic_time(:millisecond) + 2_000
+
+    assert {:ok, cleanup} =
+             GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
+
+    task = Task.async(fn -> GitTransport.UploadPack.advertise_refs(repository) end)
+    assert Task.yield(task, 30) == nil
+    assert :ok = GitCore.RepositoryReadLimiter.release(cleanup)
+    assert {:ok, advertisement} = Task.await(task)
+    assert is_binary(advertisement)
+  end
+
+  @tag :tmp_dir
+  test "cleanup waits for a dirty-I/O upload-pack response", %{tmp_dir: tmp_dir} do
+    share_database!()
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, Path.join(tmp_dir, "repos"))
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "dirty-reader",
+               email: "dirty-reader@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, repository} =
+             ForgeRepos.create_repository(user, %{name: "Dirty reader", slug: "dirty-reader"})
+
+    entered_path = Path.join(tmp_dir, "upload-pack-entered")
+    release_path = Path.join(tmp_dir, "upload-pack-release")
+
+    request = %{
+      GitTransport.UploadPack.new_request()
+      | wants: [String.duplicate("1", 40)],
+        done?: true
+    }
+
+    response =
+      Task.async(fn ->
+        GitTransport.UploadPack.with_test_pack_objects(
+          fn _path, _wants ->
+            {:ok, {}} =
+              GitTransport.TestDirtyIoNative.test_dirty_io_wait(entered_path, release_path)
+
+            {:ok, "PACK"}
+          end,
+          fn -> GitTransport.UploadPack.response(repository, request) end
+        )
+      end)
+
+    wait_for_file!(entered_path)
+
+    cleanup =
+      Task.async(fn ->
+        deadline = System.monotonic_time(:millisecond) + 2_000
+        GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
+      end)
+
+    assert Task.yield(cleanup, 30) == nil
+    File.touch!(release_path)
+    assert {:ok, response_body} = Task.await(response)
+    assert is_binary(response_body)
+    assert {:ok, cleanup_lease} = Task.await(cleanup)
+    assert :ok = GitCore.RepositoryReadLimiter.release(cleanup_lease)
+  end
+
+  @tag :tmp_dir
+  test "channel closed terminate and owner death release repository reads", %{tmp_dir: tmp_dir} do
+    share_database!()
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, Path.join(tmp_dir, "repos"))
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "channel-release",
+               email: "channel-release@example.com",
+               password: "correct horse battery staple"
+             })
+
+    for path <- [:closed, :terminate, :owner_death] do
+      assert {:ok, repository} =
+               ForgeRepos.create_repository(user, %{
+                 name: "Channel #{path}",
+                 slug: "channel-#{path}"
+               })
+
+      deadline = System.monotonic_time(:millisecond) + 2_000
+
+      case path do
+        :owner_death ->
+          parent = self()
+
+          owner =
+            spawn(fn ->
+              {:ok, _handle} = ForgeRepos.open_repository_read(repository, deadline)
+              send(parent, {:channel_owner_acquired, self()})
+              Process.sleep(:infinity)
+            end)
+
+          assert_receive {:channel_owner_acquired, ^owner}
+          Process.exit(owner, :kill)
+
+        path ->
+          assert {:ok, handle} = ForgeRepos.open_repository_read(repository, deadline)
+          state = %GitTransport.Channel{repository_read_handle: handle}
+
+          case path do
+            :closed ->
+              assert {:stop, 7, %{repository_read_handle: nil}} =
+                       GitTransport.Channel.handle_ssh_msg(
+                         {:ssh_cm, self(), {:closed, 7}},
+                         state
+                       )
+
+            :terminate ->
+              assert :ok = GitTransport.Channel.terminate(:normal, state)
+          end
+      end
+
+      assert {:ok, cleanup} =
+               GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
+
+      assert :ok = GitCore.RepositoryReadLimiter.release(cleanup)
+    end
+  end
+
+  @tag :tmp_dir
+  test "duplicate SSH exec never overwrites an existing repository read", %{tmp_dir: tmp_dir} do
+    share_database!()
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, Path.join(tmp_dir, "repos"))
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "duplicate-exec",
+               email: "duplicate-exec@example.com",
+               password: "correct horse battery staple"
+             })
+
+    for {index, operation, command} <- [
+          {1, :upload_pack, "git-upload-pack '/duplicate-exec/new-1.git'"},
+          {2, :upload_pack, "git-receive-pack '/duplicate-exec/new-2.git'"},
+          {3, nil, "git-upload-pack '/duplicate-exec/new-3.git'"}
+        ] do
+      assert {:ok, old_repository} =
+               ForgeRepos.create_repository(user, %{
+                 name: "Old #{index}",
+                 slug: "old-#{index}"
+               })
+
+      assert {:ok, new_repository} =
+               ForgeRepos.create_repository(user, %{
+                 name: "New #{index}",
+                 slug: "new-#{index}"
+               })
+
+      deadline = System.monotonic_time(:millisecond) + 2_000
+      assert {:ok, handle} = ForgeRepos.open_repository_read(old_repository, deadline)
+
+      state = %GitTransport.Channel{
+        operation: operation,
+        repository: if(operation, do: old_repository),
+        repository_read_handle: handle
+      }
+
+      result =
+        GitTransport.Channel.with_test_connection_value("duplicate-exec", fn ->
+          GitTransport.Channel.handle_ssh_msg(
+            {:ssh_cm, self(), {:exec, 7, true, command}},
+            state
+          )
+        end)
+
+      assert {:stop, 7, %{repository_read_handle: nil}} = result
+
+      for repository <- [old_repository, new_repository] do
+        assert {:ok, cleanup} =
+                 GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
+
+        assert :ok = GitCore.RepositoryReadLimiter.release(cleanup)
+      end
+    end
+
+    assert :sys.get_state(GitCore.RepositoryReadLimiter).grants == %{}
+  end
+
   test "GitCore's future API receive-pack ceiling does not configure Git transport" do
     original_git_core_limits = Application.get_env(:git_core, :limits)
     original_transport_limit = Application.fetch_env(:git_transport, :receive_pack_max_bytes)
@@ -185,6 +511,119 @@ defmodule GitTransportTest do
   end
 
   @tag :tmp_dir
+  test "receive-pack fence failures stay bounded in Exec and Channel", %{tmp_dir: tmp_dir} do
+    share_database!()
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    original_limits = Application.get_env(:git_core, :limits)
+    Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
+
+    on_exit(fn ->
+      Application.put_env(:fornacast, :repo_storage_root, original_root)
+
+      if original_limits,
+        do: Application.put_env(:git_core, :limits, original_limits),
+        else: Application.delete_env(:git_core, :limits)
+
+      restart_git_core_if_needed()
+    end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "receive-fence-error",
+               email: "receive-fence-error@example.com",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, repository} =
+             ForgeRepos.create_repository(user, %{name: "Demo", slug: "demo"})
+
+    writer = Process.whereis(GitCore.RepositoryWriteLimiter)
+    monitor = Process.monitor(writer)
+    Process.exit(writer, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^writer, :killed}
+
+    assert {:error, {:unavailable, :write_limiter}} =
+             GitTransport.ReceivePack.advertise_refs(repository)
+
+    assert {:error, "ERROR: Git receive-pack failed.\n"} =
+             GitTransport.handle_exec(
+               "receive-fence-error",
+               "git-receive-pack 'receive-fence-error/demo.git'"
+             )
+
+    restart_git_core_if_needed()
+    limits = Keyword.put(original_limits || [], :content_deadline_ms, 20)
+    Application.put_env(:git_core, :limits, limits)
+    deadline = System.monotonic_time(:millisecond) + 2_000
+    assert {:ok, holder} = GitCore.RepositoryWriteLimiter.acquire(repository.id, deadline)
+
+    assert {:error, {:unavailable, :write_timeout}} =
+             GitTransport.ReceivePack.advertise_refs(repository)
+
+    assert {:error, "ERROR: Git receive-pack failed.\n"} =
+             GitTransport.handle_exec(
+               "receive-fence-error",
+               "git-receive-pack 'receive-fence-error/demo.git'"
+             )
+
+    assert {:stop, 9, _state} =
+             GitTransport.Channel.with_test_connection_value("receive-fence-error", fn ->
+               GitTransport.Channel.handle_ssh_msg(
+                 {:ssh_cm, self(),
+                  {:exec, 9, true, "git-receive-pack 'receive-fence-error/demo.git'"}},
+                 %GitTransport.Channel{}
+               )
+             end)
+
+    assert :ok = GitCore.RepositoryWriteLimiter.release(holder)
+
+    assert GitTransport.Exec.error_message(%GitCore.Error{
+             kind: :storage_unavailable,
+             operation: :list_refs,
+             detail: "/secret/path"
+           }) == "ERROR: Git receive-pack failed.\n"
+  end
+
+  @tag :tmp_dir
+  test "SSH upload-pack and receive-pack mask non-ready repositories", %{tmp_dir: tmp_dir} do
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "hidden-ssh",
+               email: "hidden-ssh@example.com",
+               password: "correct horse battery staple"
+             })
+
+    for {slug, lifecycle, deleted_at} <- [
+          {"importing", :importing, nil},
+          {"tombstoned", :tombstoned, nil},
+          {"ready-deleted", :ready, ~U[2026-08-26 00:00:00Z]}
+        ] do
+      assert {:ok, repository} =
+               ForgeRepos.create_repository(user, %{name: slug, slug: slug})
+
+      repository
+      |> Ecto.Changeset.change(
+        lifecycle: lifecycle,
+        deleted_at: deleted_at,
+        storage_path: "../#{slug}.git"
+      )
+      |> Repo.update!()
+
+      for command <- [
+            "git-upload-pack 'hidden-ssh/#{slug}.git'",
+            "git-receive-pack 'hidden-ssh/#{slug}.git'"
+          ] do
+        assert {:error, "ERROR: Repository not found.\n"} =
+                 GitTransport.handle_exec("hidden-ssh", command)
+      end
+    end
+  end
+
+  @tag :tmp_dir
   test "starts supervised OTP SSH daemon with explicit Git-only policy", %{tmp_dir: tmp_dir} do
     system_dir = Path.join(tmp_dir, "ssh")
 
@@ -213,6 +652,15 @@ defmodule GitTransportTest do
     assert Keyword.fetch!(options, :subsystems) == []
     refute Keyword.fetch!(options, :tcpip_tunnel_in)
     refute Keyword.fetch!(options, :tcpip_tunnel_out)
+  end
+
+  test "Git transport runtime modules do not depend on Mix" do
+    for module <- [GitTransport.UploadPack, GitTransport.Channel] do
+      assert {:ok, {^module, [imports: imports]}} =
+               :beam_lib.chunks(:code.which(module), [:imports])
+
+      refute {Mix, :env, 0} in imports
+    end
   end
 
   @tag :tmp_dir
@@ -457,6 +905,89 @@ defmodule GitTransportTest do
     assert clone_status == 0, clone_output
     assert File.read!(Path.join(clone_path, "README.md")) == "# Demo\n"
 
+    dirty_clone_path = Path.join(tmp_dir, "dirty-clone")
+    dirty_entered = Path.join(tmp_dir, "ssh-dirty-entered")
+    dirty_release = Path.join(tmp_dir, "ssh-dirty-release")
+
+    GitTransport.UploadPack.with_test_global_pack_objects(
+      fn path, wants ->
+        {:ok, {}} =
+          GitTransport.TestDirtyIoNative.test_dirty_io_wait(dirty_entered, dirty_release)
+
+        GitCore.pack_objects(path, wants)
+      end,
+      fn ->
+        clone =
+          Task.async(fn ->
+            System.cmd(
+              "git",
+              ["clone", "ssh://alice@127.0.0.1:#{port}/alice/demo.git", dirty_clone_path],
+              env: [
+                {"GIT_SSH_COMMAND",
+                 Enum.join(
+                   [
+                     "ssh",
+                     "-F /dev/null",
+                     "-o IdentitiesOnly=yes",
+                     "-o KbdInteractiveAuthentication=no",
+                     "-o LogLevel=ERROR",
+                     "-o PasswordAuthentication=no",
+                     "-o PreferredAuthentications=publickey",
+                     "-o StrictHostKeyChecking=no",
+                     "-o UserKnownHostsFile=#{Path.join(tmp_dir, "dirty-known-hosts")}",
+                     "-i #{key_path}"
+                   ],
+                   " "
+                 )}
+              ],
+              stderr_to_stdout: true
+            )
+          end)
+
+        wait_for_file!(dirty_entered)
+
+        cleanup =
+          Task.async(fn ->
+            deadline = System.monotonic_time(:millisecond) + 2_000
+            GitCore.RepositoryReadLimiter.acquire_cleanup(repo.id, deadline)
+          end)
+
+        assert Task.yield(cleanup, 30) == nil
+        File.touch!(dirty_release)
+        assert {_output, 0} = Task.await(clone)
+        assert {:ok, cleanup_lease} = Task.await(cleanup)
+        assert :ok = GitCore.RepositoryReadLimiter.release(cleanup_lease)
+      end
+    )
+
+    failed_clone_path = Path.join(tmp_dir, "failed-clone")
+
+    GitTransport.UploadPack.with_test_global_pack_objects(
+      fn _path, _wants -> {:error, :simulated_pack_failure} end,
+      fn ->
+        {_output, status} =
+          System.cmd(
+            "git",
+            ["clone", "ssh://alice@127.0.0.1:#{port}/alice/demo.git", failed_clone_path],
+            env: [
+              {"GIT_SSH_COMMAND",
+               "ssh -F /dev/null -o IdentitiesOnly=yes -o LogLevel=ERROR " <>
+                 "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i #{key_path}"}
+            ],
+            stderr_to_stdout: true
+          )
+
+        refute status == 0
+      end
+    )
+
+    cleanup_deadline = System.monotonic_time(:millisecond) + 2_000
+
+    assert {:ok, cleanup_after_error} =
+             GitCore.RepositoryReadLimiter.acquire_cleanup(repo.id, cleanup_deadline)
+
+    assert :ok = GitCore.RepositoryReadLimiter.release(cleanup_after_error)
+
     {fetch_output, fetch_status} =
       System.cmd(
         "git",
@@ -668,8 +1199,9 @@ defmodule GitTransportTest do
     assert length(push_events) == 4
     assert Enum.all?(push_events, &(&1.actor_user_id == user.id))
     assert Enum.all?(push_events, &(&1.target_id == Integer.to_string(repo.id)))
-    assert Enum.any?(push_events, &("refs/heads/feature/demo" in &1.metadata["refs"]))
-    assert Enum.any?(push_events, &("refs/tags/v0.1" in &1.metadata["refs"]))
+    assert Enum.all?(push_events, &String.starts_with?(&1.request_id, "ssh-"))
+    assert Enum.any?(push_events, &(&1.metadata["ref"] == "refs/heads/feature/demo"))
+    assert Enum.any?(push_events, &(&1.metadata["ref"] == "refs/tags/v0.1"))
   end
 
   defp rsa_sha2_public_key do
@@ -695,6 +1227,7 @@ defmodule GitTransportTest do
 
   defp reset_tables do
     [
+      "git_write_operations",
       "audit_events",
       "repository_collaborators",
       "repositories",
@@ -703,6 +1236,26 @@ defmodule GitTransportTest do
       "ssh_keys",
       "users"
     ]
+  end
+
+  defp wait_for_file!(path, attempts \\ 200)
+
+  defp wait_for_file!(path, attempts) when attempts > 0 do
+    if File.exists?(path) do
+      :ok
+    else
+      Process.sleep(5)
+      wait_for_file!(path, attempts - 1)
+    end
+  end
+
+  defp wait_for_file!(path, 0), do: flunk("expected #{path} to exist")
+
+  defp restart_git_core_if_needed do
+    if Process.whereis(GitCore.RepositoryWriteLimiter) == nil do
+      Application.stop(:git_core)
+      {:ok, _started} = Application.ensure_all_started(:git_core)
+    end
   end
 
   defp populate_bare_repository!(tmp_dir, repo_path) do

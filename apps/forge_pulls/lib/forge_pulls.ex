@@ -131,6 +131,32 @@ defmodule ForgePulls do
   @oid_regex ~r/\A[0-9a-f]{40}(?:[0-9a-f]{24})?\z/
   @pull_list_analysis_deadline_ms 5_000
 
+  if Mix.env() == :test do
+    @read_phase_hook_key {__MODULE__, :read_phase_hook}
+
+    @doc false
+    def with_test_read_phase_hook(hook, fun)
+        when is_function(hook, 0) and is_function(fun, 0) do
+      previous = Process.get(@read_phase_hook_key)
+      Process.put(@read_phase_hook_key, hook)
+
+      try do
+        fun.()
+      after
+        if previous,
+          do: Process.put(@read_phase_hook_key, previous),
+          else: Process.delete(@read_phase_hook_key)
+      end
+    end
+
+    defp run_read_phase_hook do
+      Process.get(@read_phase_hook_key, fn -> :ok end).()
+      :ok
+    end
+  else
+    defp run_read_phase_hook, do: :ok
+  end
+
   @type error_reason ::
           :not_found
           | :forbidden
@@ -158,7 +184,7 @@ defmodule ForgePulls do
   def branch_options(%ForgeRepos.Repository{} = repository, actor) do
     with {:ok, repository} <- canonical_read_repository(repository, actor),
          {:ok, branches} <-
-           branch_option_pages(ForgeRepos.absolute_storage_path(repository), 1, []) do
+           with_read_path(repository, fn path -> branch_option_pages(path, 1, []) end) do
       {:ok, branches}
     else
       {:error, %GitCore.Error{kind: kind}} -> {:error, {:unavailable, kind}}
@@ -186,25 +212,28 @@ defmodule ForgePulls do
 
   def compare(%ForgeRepos.Repository{} = repository, actor, head, base, opts)
       when is_binary(head) and is_binary(base) and is_list(opts) do
-    with {:ok, repository} <- canonical_read_repository(repository, actor),
-         {:ok, head_ref} <- head_ref(repository, head),
-         {:ok, base_ref} <- branch_ref(base, :invalid_base),
-         :ok <- distinct_refs(head_ref, base_ref),
-         {:ok, head_snapshot} <- resolve_ref(repository, head_ref, :invalid_head),
-         {:ok, base_snapshot} <- resolve_ref(repository, base_ref, :invalid_base),
-         {:ok, analysis} <- pull_analysis(repository, base_snapshot, head_snapshot, opts) do
-      {:ok,
-       %ForgePulls.Comparison{
-         head_ref: head_snapshot.ref,
-         base_ref: base_snapshot.ref,
-         head_oid: head_snapshot.oid,
-         base_oid: base_snapshot.oid,
-         analysis: analysis
-       }}
-    else
-      {:error, %GitCore.Error{kind: kind}} -> {:error, {:unavailable, kind}}
-      {:error, _} = error -> error
-    end
+    result =
+      with {:ok, repository} <- canonical_read_repository(repository, actor) do
+        with_read_path(repository, fn path ->
+          with {:ok, head_ref} <- head_ref(repository, head),
+               {:ok, base_ref} <- branch_ref(base, :invalid_base),
+               :ok <- distinct_refs(head_ref, base_ref),
+               {:ok, head_snapshot} <- resolve_ref_path(path, head_ref, :invalid_head),
+               {:ok, base_snapshot} <- resolve_ref_path(path, base_ref, :invalid_base),
+               {:ok, analysis} <- pull_analysis_path(path, base_snapshot, head_snapshot, opts) do
+            {:ok,
+             %ForgePulls.Comparison{
+               head_ref: head_snapshot.ref,
+               base_ref: base_snapshot.ref,
+               head_oid: head_snapshot.oid,
+               base_oid: base_snapshot.oid,
+               analysis: analysis
+             }}
+          end
+        end)
+      end
+
+    normalize_public_read_result(result)
   end
 
   def compare(_repository, _actor, _head, _base, _opts), do: {:error, :not_found}
@@ -223,26 +252,24 @@ defmodule ForgePulls do
     page = positive_option(opts, :page, 1)
     per_page = positive_option(opts, :per_page, 50)
 
-    with {:ok, repository, head, base} <- resolve_pull_pair(repository, pull, actor),
-         {:ok, commit_page} <-
-           GitCore.commit_range_page(
-             ForgeRepos.absolute_storage_path(repository),
-             base.oid,
-             head.oid,
-             page,
-             per_page: per_page
-           ) do
-      {:ok,
-       %Page{
-         entries: commit_page.commits,
-         total: commit_page.total,
-         page: commit_page.page,
-         per_page: commit_page.per_page
-       }}
-    else
-      {:error, %GitCore.Error{kind: kind}} -> {:error, {:unavailable, kind}}
-      {:error, _} = error -> error
-    end
+    result =
+      with {:ok, repository} <- canonical_read_repository(repository, actor) do
+        with_read_path(repository, fn path ->
+          with {:ok, head, base} <- resolve_pull_pair_path(repository, pull, path),
+               {:ok, commit_page} <-
+                 GitCore.commit_range_page(path, base.oid, head.oid, page, per_page: per_page) do
+            {:ok,
+             %Page{
+               entries: commit_page.commits,
+               total: commit_page.total,
+               page: commit_page.page,
+               per_page: commit_page.per_page
+             }}
+          end
+        end)
+      end
+
+    normalize_public_read_result(result)
   end
 
   def list_commits(_repository, _pull, _actor, _opts), do: {:error, :not_found}
@@ -261,29 +288,30 @@ defmodule ForgePulls do
     page = positive_option(opts, :page, 1)
     per_page = opts |> positive_option(:per_page, 100) |> min(100)
 
-    with {:ok, repository, head, base} <- resolve_pull_pair(repository, pull, actor),
-         {:ok, diff} <-
-           GitCore.diff_between(
-             ForgeRepos.absolute_storage_path(repository),
-             base.oid,
-             head.oid,
-             page: page,
-             per_page: per_page
-           ) do
-      {:ok,
-       %ForgePulls.ChangedFilePage{
-         entries: diff.files,
-         total: diff.changed_files,
-         additions: diff.additions,
-         deletions: diff.deletions,
-         page: page,
-         per_page: per_page,
-         truncated: diff.truncated
-       }}
-    else
-      {:error, %GitCore.Error{kind: kind}} -> {:error, {:unavailable, kind}}
-      {:error, _} = error -> error
-    end
+    result =
+      with {:ok, repository} <- canonical_read_repository(repository, actor) do
+        with_read_path(repository, fn path ->
+          with {:ok, head, base} <- resolve_pull_pair_path(repository, pull, path),
+               {:ok, diff} <-
+                 GitCore.diff_between(path, base.oid, head.oid,
+                   page: page,
+                   per_page: per_page
+                 ) do
+            {:ok,
+             %ForgePulls.ChangedFilePage{
+               entries: diff.files,
+               total: diff.changed_files,
+               additions: diff.additions,
+               deletions: diff.deletions,
+               page: page,
+               per_page: per_page,
+               truncated: diff.truncated
+             }}
+          end
+        end)
+      end
+
+    normalize_public_read_result(result)
   end
 
   def changed_files(_repository, _pull, _actor, _opts), do: {:error, :not_found}
@@ -830,34 +858,38 @@ defmodule ForgePulls do
   end
 
   defp resolve_creation_refs(repository, attrs) do
-    with {:ok, head_ref} <- head_ref(repository, attr(attrs, "head")),
-         {:ok, base_ref} <- branch_ref(attr(attrs, "base"), :invalid_base),
-         :ok <- distinct_refs(head_ref, base_ref),
-         {:ok, head} <- resolve_ref(repository, head_ref, :invalid_head),
-         {:ok, base} <- resolve_ref(repository, base_ref, :invalid_base) do
-      {:ok, %{head_ref: head.ref, base_ref: base.ref, head_sha: head.oid, base_sha: base.oid}}
-    end
+    with_read_path(repository, fn path ->
+      with {:ok, head_ref} <- head_ref(repository, attr(attrs, "head")),
+           {:ok, base_ref} <- branch_ref(attr(attrs, "base"), :invalid_base),
+           :ok <- distinct_refs(head_ref, base_ref),
+           {:ok, head} <- resolve_ref_path(path, head_ref, :invalid_head),
+           {:ok, base} <- resolve_ref_path(path, base_ref, :invalid_base) do
+        {:ok, %{head_ref: head.ref, base_ref: base.ref, head_sha: head.oid, base_sha: base.oid}}
+      end
+    end)
   end
 
   defp resolve_updated_base(repository, pull, attrs) do
-    with {:ok, base_ref} <-
-           if(attr(attrs, "base"),
-             do: branch_ref(attr(attrs, "base"), :invalid_base),
-             else: {:ok, pull.base_ref}
-           ),
-         :ok <- distinct_refs(pull.head_ref, base_ref),
-         {:ok, head} <- resolve_ref(repository, pull.head_ref, :invalid_head),
-         {:ok, base} <- resolve_ref(repository, base_ref, :invalid_base) do
-      {:ok,
-       %{
-         head_ref: head.ref,
-         base_ref: base.ref,
-         head_sha: head.oid,
-         base_sha: base.oid,
-         mergeable: nil,
-         mergeable_state: :unknown
-       }}
-    end
+    with_read_path(repository, fn path ->
+      with {:ok, base_ref} <-
+             if(attr(attrs, "base"),
+               do: branch_ref(attr(attrs, "base"), :invalid_base),
+               else: {:ok, pull.base_ref}
+             ),
+           :ok <- distinct_refs(pull.head_ref, base_ref),
+           {:ok, head} <- resolve_ref_path(path, pull.head_ref, :invalid_head),
+           {:ok, base} <- resolve_ref_path(path, base_ref, :invalid_base) do
+        {:ok,
+         %{
+           head_ref: head.ref,
+           base_ref: base.ref,
+           head_sha: head.oid,
+           base_sha: base.oid,
+           mergeable: nil,
+           mergeable_state: :unknown
+         }}
+      end
+    end)
   end
 
   defp head_ref(repository, value) when is_binary(value) do
@@ -896,11 +928,10 @@ defmodule ForgePulls do
 
   defp branch_ref(_value, error), do: {:error, error}
 
-  defp resolve_ref(repository, ref, error) do
-    case GitCore.resolve_snapshot(
-           ForgeRepos.absolute_storage_path(repository),
-           %GitCore.RefSelector{kind: :branch, full_name: ref}
-         ) do
+  defp resolve_ref_path(path, ref, error) do
+    result = GitCore.resolve_snapshot(path, %GitCore.RefSelector{kind: :branch, full_name: ref})
+
+    case result do
       {:ok, snapshot} ->
         {:ok, snapshot}
 
@@ -912,16 +943,15 @@ defmodule ForgePulls do
     end
   end
 
-  defp resolve_pull_pair(repository, expected_pull, actor) do
-    with {:ok, repository} <- canonical_read_repository(repository, actor),
-         %PullRequest{} = pull <-
+  defp resolve_pull_pair_path(repository, expected_pull, path) do
+    with %PullRequest{} = pull <-
            Repo.get_by(PullRequest,
              id: expected_pull.id,
              repository_id: repository.id
            ),
-         {:ok, head} <- resolve_ref(repository, pull.head_ref, :invalid_head),
-         {:ok, base} <- resolve_ref(repository, pull.base_ref, :invalid_base) do
-      {:ok, repository, head, base}
+         {:ok, head} <- resolve_ref_path(path, pull.head_ref, :invalid_head),
+         {:ok, base} <- resolve_ref_path(path, pull.base_ref, :invalid_base) do
+      {:ok, head, base}
     else
       nil -> {:error, :not_found}
       {:error, _} = error -> error
@@ -1222,19 +1252,33 @@ defmodule ForgePulls do
       |> ForgeIssues.load_issue_metadata_by_ids(repository, actor)
       |> Map.new(&{&1.id, &1})
 
+    load_issues_with_analysis(pulls, issues_by_id, repository, absolute_deadline)
+    |> case do
+      {:ok, loaded} -> {:ok, Enum.reverse(loaded)}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp load_issues_with_analysis(pulls, issues_by_id, repository, absolute_deadline) do
+    if Enum.any?(pulls, &is_nil(&1.analysis)) do
+      with_read_path(repository, fn path ->
+        reduce_loaded_issues(pulls, issues_by_id, repository, absolute_deadline, path)
+      end)
+    else
+      reduce_loaded_issues(pulls, issues_by_id, repository, absolute_deadline, nil)
+    end
+  end
+
+  defp reduce_loaded_issues(pulls, issues_by_id, repository, absolute_deadline, path) do
     Enum.reduce_while(pulls, {:ok, []}, fn pull, {:ok, loaded} ->
       with {:ok, issue} <- Map.fetch(issues_by_id, pull.issue_id),
-           {:ok, analyzed} <- ensure_analysis(pull, repository, absolute_deadline) do
+           {:ok, analyzed} <- ensure_analysis(pull, repository, absolute_deadline, path) do
         pull = attach_issue_and_capabilities(analyzed, issue, repository)
         {:cont, {:ok, [pull | loaded]}}
       else
         :error -> {:halt, {:error, :not_found}}
       end
     end)
-    |> case do
-      {:ok, loaded} -> {:ok, Enum.reverse(loaded)}
-      {:error, _} = error -> error
-    end
   end
 
   defp load_issue_result(pull, repository, actor) do
@@ -1246,39 +1290,51 @@ defmodule ForgePulls do
   end
 
   defp refresh_analysis(pull, repository) do
-    with {:ok, head} <- resolve_ref(repository, pull.head_ref, :invalid_head),
-         {:ok, base} <- resolve_ref(repository, pull.base_ref, :invalid_base),
-         {:ok, analysis} <- pull_analysis(repository, base, head, []),
-         {:ok, refreshed} <-
-           ForgePulls.SnapshotRefresh.persist(pull, %{
-             head_ref: head.ref,
-             base_ref: base.ref,
-             head_sha: head.oid,
-             base_sha: base.oid,
-             mergeable: nil,
-             mergeable_state: :unknown
-           }) do
-      {:ok, %{refreshed | analysis: analysis}}
-    else
+    with_read_path(repository, fn path ->
+      with {:ok, head} <- resolve_ref_path(path, pull.head_ref, :invalid_head),
+           {:ok, base} <- resolve_ref_path(path, pull.base_ref, :invalid_base),
+           {:ok, analysis} <- pull_analysis_path(path, base, head, []),
+           {:ok, refreshed} <-
+             ForgePulls.SnapshotRefresh.persist(pull, %{
+               head_ref: head.ref,
+               base_ref: base.ref,
+               head_sha: head.oid,
+               base_sha: base.oid,
+               mergeable: nil,
+               mergeable_state: :unknown
+             }) do
+        {:ok, %{refreshed | analysis: analysis}}
+      end
+    end)
+    |> case do
       {:error, %GitCore.Error{kind: kind}} -> {:error, {:unavailable, kind}}
-      {:error, _} = error -> error
+      result -> result
     end
   end
+
+  defp ensure_analysis(pull, repository, absolute_deadline, path)
 
   defp ensure_analysis(
          %PullRequest{analysis: %GitCore.MergeAnalysis{}} = pull,
          _repository,
-         _absolute_deadline
+         _absolute_deadline,
+         _path
        ),
        do: {:ok, pull}
 
-  defp ensure_analysis(pull, repository, absolute_deadline) do
+  defp ensure_analysis(pull, repository, absolute_deadline, nil) do
+    with_read_path(repository, fn path ->
+      ensure_analysis(pull, repository, absolute_deadline, path)
+    end)
+  end
+
+  defp ensure_analysis(pull, _repository, absolute_deadline, path) when is_binary(path) do
     with true <- absolute_deadline > System.monotonic_time(:millisecond),
-         {:ok, head} <- resolve_ref(repository, pull.head_ref, :invalid_head),
-         {:ok, base} <- resolve_ref(repository, pull.base_ref, :invalid_base),
+         {:ok, head} <- resolve_ref_path(path, pull.head_ref, :invalid_head),
+         {:ok, base} <- resolve_ref_path(path, pull.base_ref, :invalid_base),
          remaining when remaining > 0 <-
            absolute_deadline - System.monotonic_time(:millisecond),
-         {:ok, analysis} <- pull_analysis(repository, base, head, deadline_ms: remaining) do
+         {:ok, analysis} <- pull_analysis_path(path, base, head, deadline_ms: remaining) do
       {:ok, %{pull | analysis: analysis}}
     else
       _ -> {:ok, %{pull | analysis: unknown_analysis(pull)}}
@@ -1297,13 +1353,13 @@ defmodule ForgePulls do
     }
   end
 
-  defp pull_analysis(repository, base, head, opts) do
-    case GitCore.merge_analysis(
-           ForgeRepos.absolute_storage_path(repository),
-           base.oid,
-           head.oid,
-           opts
-         ) do
+  defp pull_analysis_path(path, base, head, opts) do
+    GitCore.merge_analysis(path, base.oid, head.oid, opts)
+    |> normalize_pull_analysis(base, head)
+  end
+
+  defp normalize_pull_analysis(result, base, head) do
+    case result do
       {:ok, analysis} ->
         {:ok, analysis}
 
@@ -1323,6 +1379,25 @@ defmodule ForgePulls do
         error
     end
   end
+
+  defp with_read_path(repository, fun) do
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:content_deadline_ms)
+
+    ForgeRepos.with_repository_read(repository, deadline, fn handle ->
+      :ok = run_read_phase_hook()
+      fun.(ForgeRepos.repository_read_path(handle))
+    end)
+    |> case do
+      {:error, :unavailable} -> {:error, {:unavailable, :read_limiter}}
+      {:error, :deadline_exceeded} -> {:error, {:unavailable, :read_timeout}}
+      result -> result
+    end
+  end
+
+  defp normalize_public_read_result({:error, %GitCore.Error{kind: kind}}),
+    do: {:error, {:unavailable, kind}}
+
+  defp normalize_public_read_result(result), do: result
 
   defp attach_issue_and_capabilities(pull, issue, repository) do
     issue_capabilities = issue.capabilities || %{}

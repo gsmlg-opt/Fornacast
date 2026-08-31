@@ -14,6 +14,10 @@ defmodule Fornacast.Access do
 
   def authorize(_actor, _permission, _resource), do: {:error, :unauthorized}
 
+  def allowed?(_actor, _permission, %Repository{lifecycle: lifecycle, deleted_at: deleted_at})
+      when lifecycle != :ready or not is_nil(deleted_at),
+      do: false
+
   def allowed?(%User{role: :admin, state: :active}, _permission, %Repository{}), do: true
 
   def allowed?(%User{id: user_id, kind: :user, state: :active}, _permission, %Repository{

@@ -6,6 +6,15 @@ defmodule FornacastWeb.GitHTTPAuthTest do
   @endpoint FornacastWeb.Endpoint
   @challenge ~s(Basic realm="Fornacast Git")
 
+  unless Code.ensure_loaded?(GitTransport.TestDirtyIoNative) do
+    Code.require_file(
+      "../../git_transport/test/support/test_dirty_io_native.exs",
+      __DIR__
+    )
+
+    GitTransport.TestDirtyIoNative.load!()
+  end
+
   setup do
     Fornacast.Setup.force_initialized!()
     reset_database!()
@@ -106,6 +115,289 @@ esac
 
     assert status == 0, output
     assert File.read!(Path.join(clone_path, "README.md")) == "# Demo\n"
+  end
+
+  @tag :tmp_dir
+  test "read-handle lookup and infrastructure failures stay masked", %{tmp_dir: tmp_dir} do
+    with_storage_root(tmp_dir)
+    {_user, repository} = create_user_and_repository(:public)
+
+    tombstoned =
+      repository
+      |> Ecto.Changeset.change(
+        lifecycle: :tombstoned,
+        deleted_at: DateTime.utc_now() |> DateTime.truncate(:second)
+      )
+      |> Fornacast.Repo.update!()
+
+    assert request_info_refs(
+             "alice",
+             "correct horse battery staple",
+             "/alice/#{tombstoned.slug}.git"
+           )
+           |> response(404) =~ "Repository not found"
+
+    readable =
+      tombstoned
+      |> Ecto.Changeset.change(lifecycle: :ready, deleted_at: nil)
+      |> Fornacast.Repo.update!()
+
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, nil)
+
+    try do
+      assert request_info_refs(
+               "alice",
+               "correct horse battery staple",
+               "/alice/#{readable.slug}.git"
+             )
+             |> response(503) =~ "temporarily unavailable"
+    after
+      Application.put_env(:fornacast, :repo_storage_root, original_root)
+    end
+  end
+
+  @tag :tmp_dir
+  test "receive-pack discovery maps writer fence failures to safe HTTP responses", %{
+    tmp_dir: tmp_dir
+  } do
+    with_storage_root(tmp_dir)
+    share_database!()
+    {_user, repository} = create_user_and_repository(:public)
+    original_limits = Application.get_env(:git_core, :limits)
+
+    on_exit(fn ->
+      if original_limits,
+        do: Application.put_env(:git_core, :limits, original_limits),
+        else: Application.delete_env(:git_core, :limits)
+
+      restart_git_core_if_needed()
+    end)
+
+    writer = Process.whereis(GitCore.RepositoryWriteLimiter)
+    monitor = Process.monitor(writer)
+    Process.exit(writer, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^writer, :killed}
+
+    assert request_info_refs(
+             "alice",
+             "correct horse battery staple",
+             "/alice/demo.git",
+             "git-receive-pack"
+           )
+           |> response(503) =~ "temporarily unavailable"
+
+    restart_git_core_if_needed()
+
+    Application.put_env(
+      :git_core,
+      :limits,
+      Keyword.put(original_limits || [], :content_deadline_ms, 20)
+    )
+
+    deadline = System.monotonic_time(:millisecond) + 2_000
+    assert {:ok, holder} = GitCore.RepositoryWriteLimiter.acquire(repository.id, deadline)
+
+    assert request_info_refs(
+             "alice",
+             "correct horse battery staple",
+             "/alice/demo.git",
+             "git-receive-pack"
+           )
+           |> response(503) =~ "temporarily unavailable"
+
+    assert :ok = GitCore.RepositoryWriteLimiter.release(holder)
+
+    assert build_conn()
+           |> get("/alice/demo.git/info/refs?service=malformed")
+           |> response(400) =~ "Unsupported Git service"
+  end
+
+  @tag :tmp_dir
+  test "cleanup blocks repository views pages HTTP and Exec read entrypoints", %{tmp_dir: tmp_dir} do
+    with_storage_root(tmp_dir)
+    share_database!()
+    {owner, repository} = create_user_and_repository(:public)
+    path = ForgeRepos.absolute_storage_path(repository)
+    work_path = Path.join(tmp_dir, "matrix-work")
+    seed_repository(repository, work_path)
+    oid = git!(["-C", work_path, "rev-parse", "HEAD"])
+    selector = %GitCore.RefSelector{kind: :branch, full_name: "refs/heads/main"}
+
+    on_exit(fn ->
+      refute GitTransport.UploadPack.test_serve_handle_hook?()
+      refute GitTransport.UploadPack.test_global_pack_objects_hook?()
+      assert :sys.get_state(GitCore.RepositoryReadLimiter).grants == %{}
+    end)
+
+    operations = [
+      {:view, fn -> ForgeRepos.repository_view(nil, repository) end, :forge_repos},
+      {:list_views, fn -> ForgeRepos.list_accessible_repository_views(owner, per_page: 10) end,
+       :forge_repos},
+      {:browse,
+       fn ->
+         release_page_result(FornacastWeb.RepositoryPage.code(repository, owner, nil, selector))
+       end, :page},
+      {:search,
+       fn ->
+         FornacastWeb.RepositoryPage.search(
+           repository,
+           owner,
+           nil,
+           selector,
+           "needle",
+           :path
+         )
+       end, :page},
+      {:blob,
+       fn ->
+         release_page_result(
+           FornacastWeb.RepositoryPage.blob(
+             repository,
+             owner,
+             nil,
+             {selector, "README.md"}
+           )
+         )
+       end, :page},
+      {:history,
+       fn -> FornacastWeb.RepositoryPage.commits(repository, owner, nil, selector, 1) end, :page},
+      {:raw,
+       fn ->
+         release_page_result(
+           FornacastWeb.RepositoryPage.raw(
+             repository,
+             owner,
+             nil,
+             {selector, "README.md"}
+           )
+         )
+       end, :page},
+      {:refs, fn -> FornacastWeb.RepositoryPage.refs(repository, owner, nil, :branch, 1) end,
+       :page},
+      {:tree, fn -> FornacastWeb.RepositoryPage.tree(repository, owner, nil, selector, 1) end,
+       :page},
+      {:commit,
+       fn -> FornacastWeb.RepositoryPage.commit(repository, owner, nil, oid, selector) end,
+       :page},
+      {:http, fn -> build_conn() |> get("/alice/demo.git/info/refs?service=git-upload-pack") end,
+       :none},
+      {:exec, fn -> GitTransport.Exec.upload_pack(owner, repository) end, :none},
+      {:exec_stream,
+       fn ->
+         GitTransport.UploadPack.with_test_serve_handle(
+           fn handle ->
+             assert ForgeRepos.repository_read_repository(handle).id == repository.id
+             assert ForgeRepos.repository_read_path(handle) == path
+             :ok
+           end,
+           fn -> GitTransport.Exec.upload_pack_stream(owner, repository) end
+         )
+       end, :none}
+    ]
+
+    for {name, operation, hook} <- operations do
+      deadline = System.monotonic_time(:millisecond) + 2_000
+
+      assert {:ok, cleanup} =
+               GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
+
+      assert :ok = GitCore.invalidate_repository_cache_strict(path)
+      parent = self()
+
+      task =
+        Task.async(fn ->
+          case hook do
+            :page ->
+              FornacastWeb.RepositoryPage.with_test_read_phase_hook(
+                fn -> send(parent, {:git_read_entered, name}) end,
+                operation
+              )
+
+            :forge_repos ->
+              ForgeRepos.with_test_read_phase_hook(
+                fn -> send(parent, {:git_read_entered, name}) end,
+                operation
+              )
+
+            :none ->
+              operation.()
+          end
+        end)
+
+      assert Task.yield(task, 30) == nil, "#{name} bypassed repository cleanup"
+
+      if hook != :none, do: refute_received({:git_read_entered, ^name})
+
+      assert cache_keys_for(path) == MapSet.new(), "#{name} repopulated cache during cleanup"
+      assert :ok = GitCore.RepositoryReadLimiter.release(cleanup)
+
+      if hook != :none, do: assert_receive({:git_read_entered, ^name})
+
+      refute match?({:error, :deadline_exceeded}, Task.await(task, 2_000)), inspect(name)
+      refute Process.alive?(task.pid), "#{name} task leaked"
+
+      if hook != :none, do: refute_receive({:git_read_entered, ^name}, 10)
+    end
+
+    assert :ok = GitCore.invalidate_repository_cache_strict(path)
+    deadline = System.monotonic_time(:millisecond) + 2_000
+    assert {:ok, cleanup} = GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
+    browse = Task.async(fn -> FornacastWeb.RepositoryPage.code(repository, owner, nil, nil) end)
+    assert Task.yield(browse, 30) == nil
+    assert cache_keys_for(path) == MapSet.new()
+    assert :ok = GitCore.RepositoryReadLimiter.release(cleanup)
+    assert {:ok, _result} = Task.await(browse)
+    refute Process.alive?(browse.pid)
+
+    assert upload_pack_request(build_conn(), "/alice/demo.git", "bad") |> response(400) != ""
+
+    assert {:ok, cleanup_after_error} =
+             GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
+
+    assert :ok = GitCore.RepositoryReadLimiter.release(cleanup_after_error)
+  end
+
+  @tag :tmp_dir
+  test "HTTP upload-pack dirty I/O holds cleanup until pack completion", %{tmp_dir: tmp_dir} do
+    with_storage_root(tmp_dir)
+    share_database!()
+    {_owner, repository} = create_user_and_repository(:public)
+    work_path = Path.join(tmp_dir, "http-dirty-work")
+    seed_repository(repository, work_path)
+    oid = git!(["-C", work_path, "rev-parse", "HEAD"])
+    entered = Path.join(tmp_dir, "http-dirty-entered")
+    release = Path.join(tmp_dir, "http-dirty-release")
+
+    body =
+      GitTransport.PktLine.encode("want #{oid}\n") <>
+        GitTransport.PktLine.encode("done\n")
+
+    GitTransport.UploadPack.with_test_global_pack_objects(
+      fn path, wants ->
+        {:ok, {}} = GitTransport.TestDirtyIoNative.test_dirty_io_wait(entered, release)
+        GitCore.pack_objects(path, wants)
+      end,
+      fn ->
+        response =
+          Task.async(fn -> upload_pack_request(build_conn(), "/alice/demo.git", body) end)
+
+        wait_for_file!(entered)
+
+        cleanup =
+          Task.async(fn ->
+            deadline = System.monotonic_time(:millisecond) + 2_000
+            GitCore.RepositoryReadLimiter.acquire_cleanup(repository.id, deadline)
+          end)
+
+        assert Task.yield(cleanup, 30) == nil
+        File.touch!(release)
+        http_response = Task.await(response)
+        assert response(http_response, 200) != ""
+        assert {:ok, cleanup_lease} = Task.await(cleanup)
+        assert :ok = GitCore.RepositoryReadLimiter.release(cleanup_lease)
+      end
+    )
   end
 
   @tag :tmp_dir
@@ -556,6 +848,50 @@ esac
   defp share_database! do
     if Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"] do
       Ecto.Adapters.SQL.Sandbox.mode(Fornacast.Repo, {:shared, self()})
+    end
+  end
+
+  defp cache_keys_for(path) do
+    parent = self()
+    ref = make_ref()
+
+    :sys.replace_state(GitCore.Cache, fn state ->
+      send(parent, {ref, :ets.tab2list(state.table)})
+      state
+    end)
+
+    assert_receive {^ref, entries}
+
+    entries
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.filter(&(is_tuple(&1) and tuple_size(&1) > 0 and elem(&1, 0) == path))
+    |> MapSet.new()
+  end
+
+  defp release_page_result({:ok, %FornacastWeb.RepositoryPage.Result{} = result} = response) do
+    :ok = FornacastWeb.RepositoryPage.release(result)
+    response
+  end
+
+  defp release_page_result(response), do: response
+
+  defp wait_for_file!(path, attempts \\ 200)
+
+  defp wait_for_file!(path, attempts) when attempts > 0 do
+    if File.exists?(path) do
+      :ok
+    else
+      Process.sleep(5)
+      wait_for_file!(path, attempts - 1)
+    end
+  end
+
+  defp wait_for_file!(path, 0), do: flunk("expected #{path} to exist")
+
+  defp restart_git_core_if_needed do
+    if Process.whereis(GitCore.RepositoryWriteLimiter) == nil do
+      Application.stop(:git_core)
+      {:ok, _started} = Application.ensure_all_started(:git_core)
     end
   end
 
