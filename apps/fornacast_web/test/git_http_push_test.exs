@@ -7,6 +7,7 @@ defmodule FornacastWeb.GitHTTPPushTest do
 
   @endpoint FornacastWeb.Endpoint
   @challenge ~s(Basic realm="Fornacast Git")
+  @git_http_post_buffer 1024 * 1024
 
   setup do
     Fornacast.Setup.force_initialized!()
@@ -77,6 +78,55 @@ defmodule FornacastWeb.GitHTTPPushTest do
     assert metadata["ref"] == "refs/heads/main"
     assert metadata["result"] == "success"
     refute git!(["-C", work_path, "remote", "get-url", "origin"]) =~ secret
+  end
+
+  @tag :tmp_dir
+  test "a large smart HTTP push continues after the receive-pack probe", %{tmp_dir: tmp_dir} do
+    with_storage_root(tmp_dir)
+    share_database!()
+    {user, repository} = create_user_and_repository("alice")
+    {_api_key, secret} = insert_legacy_api_key!(user, "repo:write", "large git push")
+
+    work_path = Path.join(tmp_dir, "large-work")
+    git!(["init", work_path])
+
+    File.write!(
+      Path.join(work_path, "large.bin"),
+      :crypto.strong_rand_bytes(@git_http_post_buffer * 2)
+    )
+
+    git!(["-C", work_path, "add", "large.bin"])
+    git!(["-C", work_path, "commit", "-m", "Large initial commit"])
+    git!(["-C", work_path, "branch", "-M", "main"])
+
+    port = start_http_server()
+    remote_url = "http://127.0.0.1:#{port}/alice/demo.git"
+    git!(["-C", work_path, "remote", "add", "origin", remote_url])
+    askpass_path = write_askpass!(tmp_dir)
+
+    # Pin Git's documented default so host configuration cannot skip the
+    # large-request probe and chunked upload path exercised by this test.
+    git!(
+      [
+        "-c",
+        "http.postBuffer=#{@git_http_post_buffer}",
+        "-C",
+        work_path,
+        "push",
+        "-u",
+        "origin",
+        "main"
+      ],
+      [
+        {"GIT_ASKPASS", askpass_path},
+        {"GIT_ASKPASS_REQUIRE", "force"},
+        {"FORNACAST_GIT_USERNAME", "alice"},
+        {"FORNACAST_GIT_API_KEY", secret}
+      ]
+    )
+
+    assert {:ok, [%GitCore.Ref{name: "refs/heads/main"}]} =
+             repository |> ForgeRepos.absolute_storage_path() |> GitCore.branches()
   end
 
   @tag :tmp_dir
@@ -313,7 +363,10 @@ defmodule FornacastWeb.GitHTTPPushTest do
       |> Plug.Conn.put_req_header("content-type", "application/x-git-receive-pack-request")
       |> post("/alice/demo.git/git-receive-pack", "0000")
 
-    assert response(authenticated, 400) == "Incomplete Git request.\n"
+    assert response(authenticated, 200) == ""
+
+    assert Plug.Conn.get_resp_header(authenticated, "content-type") ==
+             ["application/x-git-receive-pack-result"]
   end
 
   test "unauthenticated receive-pack does not reveal whether a repository exists" do
@@ -407,7 +460,7 @@ defmodule FornacastWeb.GitHTTPPushTest do
       |> Plug.Conn.put_req_header("content-type", "application/x-git-receive-pack-request")
       |> post("/alice/demo.git/git-receive-pack", "0000")
 
-    assert response(response, 400) == "Incomplete Git request.\n"
+    assert response(response, 200) == ""
   end
 
   defp create_user_and_repository(username, repo_slug \\ "demo") do
