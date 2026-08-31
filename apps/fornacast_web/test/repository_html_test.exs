@@ -667,7 +667,7 @@ defmodule FornacastWeb.RepositoryHTMLTest do
 
     lock = File.read!(Path.expand("../../../mix.lock", __DIR__))
 
-    assert lock =~ ~r/"phoenix_duskmoon".*"9\.12\.1"/
+    assert lock =~ ~r/"phoenix_duskmoon".*"9\.12\.2"/
     assert source =~ "<.dm_breadcrumb"
     assert source =~ "<.dm_pagination"
     refute source =~ "WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#82"
