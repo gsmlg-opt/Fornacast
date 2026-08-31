@@ -371,6 +371,12 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert compose_step =~ "^fornacast-e2e-[0-9]+-[0-9]+$"
     assert compose_step =~ "export COMPOSE_PROJECT_NAME=$compose_project"
     assert compose_step =~ ~S|export SECRET_KEY_BASE="$(openssl rand -hex 32)"|
+    assert compose_step =~ "export FORNACAST_BASE_URL=http://127.0.0.1:4000"
+
+    assert compose_step =~
+             "export FORNACAST_CONFIG_DATABASE_PATH=/data/fornacast_config.db"
+
+    assert compose_step =~ "export FORNACAST_SSH_PORT=2222"
     assert compose_step =~ "export POSTGRES_DB=fornacast_compose_e2e"
     assert compose_step =~ "export POSTGRES_USER=fornacast"
     assert compose_step =~ ~S|export POSTGRES_PASSWORD="$(openssl rand -hex 24)"|

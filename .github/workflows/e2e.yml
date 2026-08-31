@@ -345,6 +345,9 @@ jobs:
 
           export COMPOSE_PROJECT_NAME=$compose_project
           export SECRET_KEY_BASE="$(openssl rand -hex 32)"
+          export FORNACAST_BASE_URL=http://127.0.0.1:4000
+          export FORNACAST_CONFIG_DATABASE_PATH=/data/fornacast_config.db
+          export FORNACAST_SSH_PORT=2222
           export POSTGRES_DB=fornacast_compose_e2e
           export POSTGRES_USER=fornacast
           export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
