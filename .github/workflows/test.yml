@@ -88,5 +88,8 @@ jobs:
       - name: Fetch dependencies
         run: mix deps.get
 
+      - name: Clean cached project artifacts
+        run: mix clean
+
       - name: Run unit tests
         run: mix test

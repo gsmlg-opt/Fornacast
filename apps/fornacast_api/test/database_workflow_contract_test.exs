@@ -50,7 +50,9 @@ defmodule FornacastAPI.DatabaseWorkflowContractTest do
     assert unit_job =~ ~r/restore-keys:\s*\|\s*\n\s*.*-postgres-/
     assert unit_job =~ "~/.cargo/git"
     assert unit_job =~ "~/.cargo/registry"
-    assert unit_job =~ "run: mix test"
+
+    assert unit_job =~
+             ~r/- name: Fetch dependencies\s+run: mix deps\.get\s+- name: Clean cached project artifacts\s+run: mix clean\s+- name: Run unit tests\s+run: mix test/s
   end
 
   defp workflow_job!(workflow, job, next_job \\ nil) do
