@@ -39,7 +39,9 @@ defmodule ForgeImports.CleanupReconciler do
     monotonic_ms =
       Keyword.get(opts, :monotonic_ms, fn -> System.monotonic_time(:millisecond) end)
 
-    absolute_deadline = monotonic_ms.() + deadline_ms
+    absolute_deadline =
+      Keyword.get_lazy(opts, :absolute_deadline, fn -> monotonic_ms.() + deadline_ms end)
+
     repository_cleanup = Keyword.get(opts, :repository_cleanup, RepositoryCleanup)
     raw_cursors = Keyword.get(opts, :raw_cursors, %{})
 
@@ -94,11 +96,23 @@ defmodule ForgeImports.CleanupReconciler do
   def handle_info(:scan, %{enabled: true, task: nil} = state) do
     parent = self()
 
+    monotonic_ms =
+      Keyword.get(state.cleanup_options, :monotonic_ms, fn ->
+        System.monotonic_time(:millisecond)
+      end)
+
+    scan_started_at = monotonic_ms.()
+    operation_deadline = scan_started_at + state.operation_deadline_ms
+    watchdog_deadline = scan_started_at + state.runtime_ms
+
     task =
       Task.Supervisor.async_nolink(state.task_supervisor, fn ->
+        run_before_reconcile_hook(state.cleanup_options)
+
         cleanup_options =
           state.cleanup_options
           |> Keyword.merge(deadline_ms: state.operation_deadline_ms)
+          |> Keyword.put(:absolute_deadline, operation_deadline)
           |> Keyword.put(:repository_cleanup, state.repository_cleanup)
           |> Keyword.put(:raw_cursors, state.raw_cursors)
           |> Keyword.put(:selection_observer, fn kind ->
@@ -119,7 +133,8 @@ defmodule ForgeImports.CleanupReconciler do
         {:cleanup_scan, cursor, collect_task_raw_cursors(state.raw_cursors)}
       end)
 
-    task_timeout = Process.send_after(self(), {:task_timeout, task.ref}, state.runtime_ms)
+    watchdog_delay = max(watchdog_deadline - monotonic_ms.(), 0)
+    task_timeout = Process.send_after(self(), {:task_timeout, task.ref}, watchdog_delay)
 
     {:noreply, %{state | task: task, task_timeout: task_timeout, timer: nil}}
   rescue
@@ -165,6 +180,17 @@ defmodule ForgeImports.CleanupReconciler do
     do: handle_info(:scan, %{state | timer: nil})
 
   def handle_info(_message, state), do: {:noreply, state}
+
+  if Mix.env() == :test do
+    defp run_before_reconcile_hook(opts) do
+      case Keyword.get(opts, :before_reconcile_hook) do
+        hook when is_function(hook, 0) -> hook.()
+        _none -> :ok
+      end
+    end
+  else
+    defp run_before_reconcile_hook(_opts), do: :ok
+  end
 
   defp queue_scan(state) do
     send(self(), :scan)

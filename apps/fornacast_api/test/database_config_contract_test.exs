@@ -451,15 +451,22 @@ defmodule FornacastAPI.DatabaseConfigContractTest do
   defp read_build_config_term(path, env, overrides) do
     elixir = System.find_executable("elixir") || flunk("elixir executable not found")
 
+    git_core_assertion =
+      if path == @runtime_config,
+        do: ":non_existing = :code.which(GitCore.Limits)",
+        else: ""
+
     empty_environment_variables =
       for {key, ""} <- overrides, do: to_string(key)
 
     script = """
     Enum.each(#{inspect(empty_environment_variables)}, &System.put_env(&1, ""))
     :non_existing = :code.which(Fornacast.Repo)
+    #{git_core_assertion}
 
     config = Config.Reader.read!(#{inspect(path)}, env: #{inspect(env)}, target: :host)
     :non_existing = :code.which(Fornacast.Repo)
+    #{git_core_assertion}
     IO.write(#{inspect(@config_marker)} <> Base.encode64(:erlang.term_to_binary(config, [:deterministic])))
     """
 
@@ -484,7 +491,9 @@ defmodule FornacastAPI.DatabaseConfigContractTest do
       def __adapter__, do: #{inspect(compiled_adapter)}
     end
 
+    :non_existing = :code.which(GitCore.Limits)
     config = Config.Reader.read!(#{inspect(@runtime_config)}, env: :prod, target: :host)
+    :non_existing = :code.which(GitCore.Limits)
     IO.write(#{inspect(@config_marker)} <> Base.encode64(:erlang.term_to_binary(config, [:deterministic])))
     """
 

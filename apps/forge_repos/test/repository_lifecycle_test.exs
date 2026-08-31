@@ -500,6 +500,7 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
   @write_version 20_260_825_000_410
   @staged_path_version 20_260_825_000_420
   @cleanup_recovery_version 20_260_825_000_430
+  @cleanup_selector_version 20_260_831_000_100
   @pre_version 20_260_825_000_370
   @migrations_path Path.expand("../../fornacast/priv/repo/migrations", __DIR__)
   @migration_path Path.join(
@@ -577,6 +578,11 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
     with_complete_restore(
       migration_repo,
       fn ->
+        if postgres?() and migration_applied?(migration_repo, @cleanup_selector_version) do
+          assert [@cleanup_selector_version] =
+                   migrate_down(migration_repo, @cleanup_selector_version)
+        end
+
         if postgres?() and migration_applied?(migration_repo, @cleanup_recovery_version) do
           assert [@cleanup_recovery_version] =
                    migrate_down(migration_repo, @cleanup_recovery_version)
@@ -610,6 +616,11 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
     migration_repo = start_migration_repo!(context)
 
     with_complete_restore(migration_repo, fn ->
+      if postgres?() and migration_applied?(migration_repo, @cleanup_selector_version) do
+        assert [@cleanup_selector_version] =
+                 migrate_down(migration_repo, @cleanup_selector_version)
+      end
+
       if postgres?() and migration_applied?(migration_repo, @cleanup_recovery_version) do
         assert [@cleanup_recovery_version] =
                  migrate_down(migration_repo, @cleanup_recovery_version)
@@ -657,6 +668,11 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
     with_complete_restore(
       migration_repo,
       fn ->
+        if postgres?() and migration_applied?(migration_repo, @cleanup_selector_version) do
+          assert [@cleanup_selector_version] =
+                   migrate_down(migration_repo, @cleanup_selector_version)
+        end
+
         if postgres?() and migration_applied?(migration_repo, @cleanup_recovery_version) do
           assert [@cleanup_recovery_version] =
                    migrate_down(migration_repo, @cleanup_recovery_version)
@@ -696,6 +712,11 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
     with_complete_restore(migration_repo, fn ->
       ensure_up!(migration_repo, @version)
       ensure_up!(migration_repo, @write_version)
+
+      if postgres?() and migration_applied?(migration_repo, @cleanup_selector_version) do
+        assert [@cleanup_selector_version] =
+                 migrate_down(migration_repo, @cleanup_selector_version)
+      end
 
       if postgres?() and migration_applied?(migration_repo, @cleanup_recovery_version) do
         assert [@cleanup_recovery_version] =
@@ -745,6 +766,11 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
     with_complete_restore(migration_repo, fn ->
       ensure_up!(migration_repo, @version)
       ensure_up!(migration_repo, @write_version)
+
+      if postgres?() and migration_applied?(migration_repo, @cleanup_selector_version) do
+        assert [@cleanup_selector_version] =
+                 migrate_down(migration_repo, @cleanup_selector_version)
+      end
 
       if postgres?() and migration_applied?(migration_repo, @cleanup_recovery_version) do
         assert [@cleanup_recovery_version] =
@@ -1284,6 +1310,7 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
         ensure_up!(repo, @write_version)
         ensure_up!(repo, @staged_path_version)
         ensure_up!(repo, @cleanup_recovery_version)
+        ensure_up!(repo, @cleanup_selector_version)
         cleanup.()
       end)
     else

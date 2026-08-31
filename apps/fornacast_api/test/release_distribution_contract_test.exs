@@ -1134,6 +1134,8 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert below_output =~
              "FORNACAST_IMPORT_REPOSITORY_CLEANUP_GRACE_SECONDS must be a decimal integer between #{minimum} and 2147483647"
 
+    minimum_output = "grace=#{minimum}\n"
+    assert {^minimum_output, 0} = read_runtime_cleanup_config(Integer.to_string(minimum))
     assert {"grace=2147483647\n", 0} = read_runtime_cleanup_config("2147483647")
   end
 
@@ -1261,6 +1263,8 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
           def __adapter__, do: Ecto.Adapters.Postgres
         end
 
+        true = Code.ensure_loaded?(GitCore.Limits)
+        true = function_exported?(GitCore.Limits, :minimum_repository_cleanup_grace_seconds, 0)
         config = Config.Reader.read!(#{inspect(@runtime_config)}, env: :prod)
 
         port =
@@ -1306,6 +1310,8 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
           def __adapter__, do: Ecto.Adapters.Postgres
         end
 
+        true = Code.ensure_loaded?(GitCore.Limits)
+        true = function_exported?(GitCore.Limits, :minimum_repository_cleanup_grace_seconds, 0)
         config = Config.Reader.read!(#{inspect(@runtime_config)}, env: :prod)
         values = Keyword.fetch!(config, :fornacast)
         IO.puts("max=\#{values[:release_asset_max_bytes]} grace=\#{values[:release_asset_gc_grace_seconds]}")
@@ -1346,6 +1352,8 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
           def __adapter__, do: Ecto.Adapters.Postgres
         end
 
+        true = Code.ensure_loaded?(GitCore.Limits)
+        true = function_exported?(GitCore.Limits, :minimum_repository_cleanup_grace_seconds, 0)
         config = Config.Reader.read!(#{inspect(@runtime_config)}, env: :prod)
         values = Keyword.fetch!(config, :forge_imports)
         IO.puts("grace=\#{values[:repository_cleanup_grace_seconds]}")

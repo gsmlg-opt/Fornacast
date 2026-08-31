@@ -42,6 +42,12 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
       :import_lease,
     {"apps/forge_imports/lib/forge_imports/repository_worker.ex", :choose_staging_action,
      :is_bare_repository?} => :import_lease,
+    # Repository cleanup holds both the exclusive read-cleanup permit and the
+    # repository writer fence across observation, removal, and final proof.
+    {"apps/forge_imports/lib/forge_imports/repository_cleanup.ex", :observe_owned,
+     :contained_tree_identity} => :writer_fence,
+    {"apps/forge_imports/lib/forge_imports/repository_cleanup.ex", :validate_final_outcome,
+     :contained_tree_identity} => :writer_fence,
     {"apps/git_transport/lib/git_transport/receive_pack.ex", :advertise_refs, :list_refs} =>
       :writer_fence,
     {"apps/git_transport/lib/git_transport/receive_pack_worker.ex", :validate_expected_refs,

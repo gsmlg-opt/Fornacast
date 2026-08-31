@@ -23,6 +23,7 @@ defmodule ForgeAccounts.GitHubCredentialVerificationMigrationTest do
   @repository_write_version 20_260_825_000_410
   @staged_path_version 20_260_825_000_420
   @cleanup_recovery_version 20_260_825_000_430
+  @cleanup_selector_version 20_260_831_000_100
   @migrations_path Path.expand("../../fornacast/priv/repo/migrations", __DIR__)
   @credential_migration Path.join(
                           @migrations_path,
@@ -61,6 +62,7 @@ defmodule ForgeAccounts.GitHubCredentialVerificationMigrationTest do
       ensure_provisional_indexes!(repo)
 
       try do
+        assert [@cleanup_selector_version] = migrate_down(repo, @cleanup_selector_version)
         assert [@cleanup_recovery_version] = migrate_down(repo, @cleanup_recovery_version)
         assert [@staged_path_version] = migrate_down(repo, @staged_path_version)
         assert [@repository_write_version] = migrate_down(repo, @repository_write_version)
@@ -88,6 +90,7 @@ defmodule ForgeAccounts.GitHubCredentialVerificationMigrationTest do
         assert [@repository_write_version] = migrate_up(repo, @repository_write_version)
         assert [@staged_path_version] = migrate_up(repo, @staged_path_version)
         assert [@cleanup_recovery_version] = migrate_up(repo, @cleanup_recovery_version)
+        assert [@cleanup_selector_version] = migrate_up(repo, @cleanup_selector_version)
       after
         ensure_up!(repo, @verification_version)
         ensure_up!(repo, @provisional_source_version)
@@ -96,6 +99,7 @@ defmodule ForgeAccounts.GitHubCredentialVerificationMigrationTest do
         ensure_up!(repo, @repository_write_version)
         ensure_up!(repo, @staged_path_version)
         ensure_up!(repo, @cleanup_recovery_version)
+        ensure_up!(repo, @cleanup_selector_version)
       end
     else
       assert_raise RuntimeError,
@@ -130,11 +134,14 @@ defmodule ForgeAccounts.GitHubCredentialVerificationMigrationTest do
     assert @import_version < @verification_version
     assert @verification_version < @provisional_source_version
     assert @provisional_source_version < @destination_status_version
+    assert @cleanup_recovery_version < @cleanup_selector_version
     assert migration_applied?(repo, @credential_version)
     assert migration_applied?(repo, @import_version)
     assert migration_applied?(repo, @verification_version)
     assert migration_applied?(repo, @provisional_source_version)
     assert migration_applied?(repo, @destination_status_version)
+    assert migration_applied?(repo, @cleanup_recovery_version)
+    assert migration_applied?(repo, @cleanup_selector_version)
     assert column_exists?(repo, "github_credentials", "verification_version")
   end
 

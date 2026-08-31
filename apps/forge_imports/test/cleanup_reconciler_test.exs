@@ -196,6 +196,51 @@ defmodule ForgeImports.CleanupReconcilerTest do
     assert state.timer != nil
   end
 
+  test "child scheduling delay cannot move the operation deadline past the parent epoch" do
+    task_supervisor =
+      start_supervised!(Supervisor.child_spec({Task.Supervisor, max_children: 1}, id: make_ref()))
+
+    clock = :atomics.new(1, [])
+    frozen = System.monotonic_time(:millisecond)
+    :atomics.put(clock, 1, frozen)
+    test_pid = self()
+
+    reconciler =
+      start_supervised!(
+        Supervisor.child_spec(
+          {CleanupReconciler,
+           name: __MODULE__.ParentEpochReconciler,
+           task_supervisor: task_supervisor,
+           repository_cleanup: __MODULE__.DeadlineProbeCleanup,
+           interval_ms: 60_000,
+           operation_deadline_ms: 40,
+           runtime_ms: 5_000,
+           cleanup_options: [
+             test_pid: test_pid,
+             monotonic_ms: fn -> :atomics.get(clock, 1) end,
+             before_reconcile_hook: fn ->
+               send(test_pid, {:before_reconcile, self()})
+
+               receive do
+                 :continue_reconcile -> :ok
+               end
+             end
+           ]},
+          id: make_ref()
+        )
+      )
+
+    assert_receive {:before_reconcile, worker}
+    :atomics.put(clock, 1, frozen + 80)
+    send(worker, :continue_reconcile)
+
+    assert_receive {:deadline_probe_waiting, ^worker, deadline, nil}
+    assert deadline == frozen + 40
+    send(worker, :return_at_internal_deadline)
+    assert_receive {:deadline_probe_settled, ^deadline}
+    wait_until_idle!(reconciler)
+  end
+
   defmodule ProbeCleanup do
     def reconcile_kind(kind, _now, _deadline, opts) do
       opts[:selection_observer].(kind)

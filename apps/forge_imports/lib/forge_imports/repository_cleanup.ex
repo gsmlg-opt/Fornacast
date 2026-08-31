@@ -322,7 +322,8 @@ defmodule ForgeImports.RepositoryCleanup do
       |> from(as: :item)
       |> where(
         [item],
-        item.state in ^@terminal_item_states and item.publication_evidence == ^%{} and
+        item.state in @terminal_item_states and
+          fragment("? = '{}'::jsonb", item.publication_evidence) and
           is_nil(item.lease_owner) and is_nil(item.lease_expires_at) and
           (is_nil(item.cleanup_eligible_at) or item.cleanup_eligible_at <= ^now)
       )

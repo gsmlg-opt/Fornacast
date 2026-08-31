@@ -247,11 +247,21 @@ if config_env() == :prod do
       2_147_483_647
     )
 
+  # App-isolated config readers may not ship GitCore. This fallback only
+  # validates positive-integer syntax; cleanup startup revalidates live limits.
+  repository_cleanup_parse_minimum_grace_seconds =
+    if Code.ensure_loaded?(GitCore.Limits) and
+         function_exported?(GitCore.Limits, :minimum_repository_cleanup_grace_seconds, 0) do
+      apply(GitCore.Limits, :minimum_repository_cleanup_grace_seconds, [])
+    else
+      1
+    end
+
   repository_cleanup_grace_seconds =
     parse_bounded_positive_integer!.(
       "FORNACAST_IMPORT_REPOSITORY_CLEANUP_GRACE_SECONDS",
       86_400,
-      GitCore.Limits.minimum_repository_cleanup_grace_seconds(),
+      repository_cleanup_parse_minimum_grace_seconds,
       2_147_483_647
     )
 

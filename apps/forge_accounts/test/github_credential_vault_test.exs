@@ -716,7 +716,7 @@ defmodule ForgeAccounts.GitHubCredentialVaultTest do
             def __adapter__, do: Ecto.Adapters.Postgres
           end
           """,
-          ""
+          ":non_existing = :code.which(GitCore.Limits)"
         }
       else
         {["-e"], ":non_existing = :code.which(Fornacast.Repo)",
@@ -725,6 +725,7 @@ defmodule ForgeAccounts.GitHubCredentialVaultTest do
 
     script = """
     #{repo_setup}
+    #{repo_assertion}
 
     config = Config.Reader.read!(#{inspect(config_path)}, env: #{inspect(env)}, target: :host)
     #{repo_assertion}

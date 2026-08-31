@@ -3,7 +3,15 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
 
   import Ecto.Query
 
-  alias ForgeImports.{CleanupOperation, ImportAttempt, ImportRun, Persistence, RepositoryItem}
+  alias ForgeImports.{
+    CleanupOperation,
+    ImportAttempt,
+    ImportRun,
+    Persistence,
+    RepositoryCleanup,
+    RepositoryItem
+  }
+
   alias ForgeRepos.Repository
   alias Fornacast.Repo
 
@@ -72,58 +80,29 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
     assert unpublished_definition =~ "lease_expires_at IS NULL"
   end
 
-  test "PostgreSQL unpublished cleanup query uses expression index order without a sort" do
+  test "PostgreSQL production unpublished selector uses its expression index under a generic plan" do
     if postgres?() do
+      now = DateTime.utc_now(:second)
+      {selector_sql, selector_params} = capture_unpublished_selector_sql(now)
+
+      refute selector_sql =~ ~r/\(g0\."state" = ANY\(\$\d+\)/
+
+      assert selector_sql =~
+               ~r/g0\."state" IN \('completed','skipped','canceled','failed','published'\)/
+
+      assert selector_sql =~ ~s(g0."publication_evidence" = '{}'::jsonb)
+
+      assert [^now, run_states, attempt_states] = selector_params
+      assert run_states == ["completed", "completed_with_warnings", "canceled", "failed"]
+      assert attempt_states == ["completed", "failed", "canceled", "destination_changed"]
+
       context = unpublished_selector_context!()
       insert_unpublished_selector_candidates!(context, 10_000)
       Ecto.Adapters.SQL.query!(Repo, "analyze github_import_repository_items", [])
+      Ecto.Adapters.SQL.query!(Repo, "set local plan_cache_mode = force_generic_plan", [])
       Ecto.Adapters.SQL.query!(Repo, "set local enable_sort = off", [])
 
-      plan =
-        explain_sql("""
-        select item.id, item.hidden_repository_id
-        from github_import_repository_items as item
-        where item.state in ('completed', 'skipped', 'canceled', 'failed', 'published')
-          and item.publication_evidence = '{}'::jsonb
-          and item.lease_owner is null and item.lease_expires_at is null
-          and (item.cleanup_eligible_at is null or item.cleanup_eligible_at <= now())
-          and exists (
-            select 1 from repositories as repository
-            where repository.id = item.hidden_repository_id
-              and repository.lifecycle = 'importing'
-              and repository.visibility = 'private'
-              and repository.write_version = 0
-              and repository.deleted_at is null
-              and repository.last_pushed_at is null
-              and repository.storage_reclaimed_at is null
-          )
-          and exists (
-            select 1 from github_import_runs as run
-            where run.id = item.import_run_id
-              and run.state in ('completed', 'completed_with_warnings', 'canceled', 'failed')
-              and run.lease_owner is null and run.lease_expires_at is null
-          )
-          and exists (
-            select 1 from github_import_attempts as attempt
-            where attempt.repository_item_id = item.id
-              and attempt.attempt_number = item.attempt_count
-              and attempt.state in ('completed', 'failed', 'canceled', 'destination_changed')
-          )
-          and not exists (
-            select 1 from github_import_repository_items as successor
-            where successor.predecessor_item_id = item.id
-               or (successor.id <> item.id
-                   and successor.hidden_repository_id = item.hidden_repository_id)
-          )
-          and not exists (
-            select 1 from github_import_repository_cleanups as operation
-            where operation.repository_item_id = item.id
-              and operation.kind = 'unpublished_shadow'
-              and operation.source_lock_version = item.lock_version
-          )
-        order by coalesce(item.cleanup_eligible_at, item.updated_at), item.id
-        limit 100
-        """)
+      plan = explain_prepared_sql(selector_sql, selector_params)
 
       assert plan =~ "github_import_items_unpublished_cleanup_index"
       refute plan =~ "Sort"
@@ -983,6 +962,76 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
     |> List.flatten()
     |> Enum.join("\n")
   end
+
+  defp capture_unpublished_selector_sql(now) do
+    handler_id = {__MODULE__, make_ref()}
+    owner = self()
+    prefix = Keyword.get(Repo.config(), :telemetry_prefix, [:fornacast, :repo])
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        prefix ++ [:query],
+        fn _event, _measurements, metadata, _config ->
+          query = metadata[:query]
+
+          if metadata[:source] == "github_import_repository_items" and is_binary(query) and
+               String.contains?(query, ~s("publication_evidence")) and
+               String.contains?(query, "coalesce") do
+            send(owner, {:unpublished_selector_sql, query, metadata[:params]})
+          end
+        end,
+        nil
+      )
+
+    try do
+      assert :none =
+               RepositoryCleanup.reconcile_kind(:unpublished_shadow, now, 1,
+                 monotonic_ms: fn -> 0 end
+               )
+
+      assert_receive {:unpublished_selector_sql, sql, params}
+      {sql, params}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp explain_prepared_sql(sql, params) do
+    statement = "fornacast_unpublished_cleanup_selector"
+
+    Ecto.Adapters.SQL.query!(Repo, "prepare #{statement} as #{sql}", [])
+
+    try do
+      params = Enum.map_join(params, ", ", &prepared_argument/1)
+
+      Ecto.Adapters.SQL.query!(
+        Repo,
+        "explain (costs off) execute #{statement}(#{params})",
+        []
+      ).rows
+      |> List.flatten()
+      |> Enum.join("\n")
+    after
+      Ecto.Adapters.SQL.query!(Repo, "deallocate #{statement}", [])
+    end
+  end
+
+  defp prepared_argument(%DateTime{} = value), do: sql_string(DateTime.to_iso8601(value))
+
+  defp prepared_argument(%NaiveDateTime{} = value),
+    do: sql_string(NaiveDateTime.to_iso8601(value))
+
+  defp prepared_argument(%{} = value), do: sql_string(JSON.encode!(value)) <> "::jsonb"
+
+  defp prepared_argument(value) when is_list(value) do
+    "ARRAY[" <> Enum.map_join(value, ", ", &prepared_argument/1) <> "]"
+  end
+
+  defp prepared_argument(value) when is_binary(value), do: sql_string(value)
+  defp prepared_argument(value) when is_integer(value), do: Integer.to_string(value)
+
+  defp sql_string(value), do: "'" <> String.replace(value, "'", "''") <> "'"
 
   defp reset_database! do
     for table <- [
