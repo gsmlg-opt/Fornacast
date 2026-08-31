@@ -83,8 +83,19 @@ defmodule FornacastWeb.GitHTTPController do
            load_writable_repository(conn, owner_slug, repo_slug),
          :ok <- validate_receive_pack_content_type(conn),
          {:ok, body, conn} <-
-           read_full_body(conn, GitTransport.ReceivePack.max_request_bytes()),
-         {:ok, request, pack} <- parse_receive_pack_request(body),
+           read_full_body(conn, GitTransport.ReceivePack.max_request_bytes()) do
+      receive_pack_response(conn, actor, repository, body)
+    else
+      {:error, reason} -> send_git_error(conn, reason)
+    end
+  end
+
+  defp receive_pack_response(conn, _actor, _repository, "0000") do
+    send_git_response(conn, @receive_pack_result_type, "")
+  end
+
+  defp receive_pack_response(conn, actor, repository, body) do
+    with {:ok, request, pack} <- parse_receive_pack_request(body),
          operation_batch_id =
            GitTransport.ReceivePack.http_operation_batch_id(
              actor,
