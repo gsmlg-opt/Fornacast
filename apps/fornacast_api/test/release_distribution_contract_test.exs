@@ -376,6 +376,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert compose_step =~
              "export FORNACAST_CONFIG_DATABASE_PATH=/data/fornacast_config.db"
 
+    assert compose_step =~ "export FORNACAST_SSH_HOST=localhost"
     assert compose_step =~ "export FORNACAST_SSH_PORT=2222"
     assert compose_step =~ "export POSTGRES_DB=fornacast_compose_e2e"
     assert compose_step =~ "export POSTGRES_USER=fornacast"
