@@ -918,6 +918,7 @@ defmodule GitCore.Remote do
     [
       {"HOME", credential_root},
       {"XDG_CONFIG_HOME", credential_root},
+      {"PATH", "/no-such-path"},
       {"LANG", "C.UTF-8"},
       {"LC_ALL", "C.UTF-8"},
       {"GIT_CONFIG_NOSYSTEM", "1"},
