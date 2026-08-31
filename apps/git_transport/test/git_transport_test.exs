@@ -654,6 +654,15 @@ defmodule GitTransportTest do
     refute Keyword.fetch!(options, :tcpip_tunnel_out)
   end
 
+  test "Git transport runtime modules do not depend on Mix" do
+    for module <- [GitTransport.UploadPack, GitTransport.Channel] do
+      assert {:ok, {^module, [imports: imports]}} =
+               :beam_lib.chunks(:code.which(module), [:imports])
+
+      refute {Mix, :env, 0} in imports
+    end
+  end
+
   @tag :tmp_dir
   test "real SSH client authenticates with account key and rejects arbitrary exec", %{
     tmp_dir: tmp_dir

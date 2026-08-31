@@ -8,7 +8,6 @@ defmodule GitTransport.UploadPack do
 
   alias ForgeRepos.Repository
   require Logger
-  @serve_handle_hook_key {__MODULE__, :serve_handle_hook}
 
   @zero_oid String.duplicate("0", 40)
   @object_id_pattern ~r/\A[0-9a-fA-F]{40}\z/
@@ -22,6 +21,7 @@ defmodule GitTransport.UploadPack do
   ]
 
   if Mix.env() == :test do
+    @serve_handle_hook_key {__MODULE__, :serve_handle_hook}
     @pack_objects_hook_key {__MODULE__, :pack_objects_hook}
     @global_pack_objects_hook_key {__MODULE__, :global_pack_objects_hook}
 
@@ -120,12 +120,16 @@ defmodule GitTransport.UploadPack do
   end
 
   @spec serve_handle(ForgeRepos.RepositoryReadHandle.t()) :: :ok | {:error, term()}
-  def serve_handle(handle) do
-    if Mix.env() == :test and Process.get(@serve_handle_hook_key) do
-      Process.get(@serve_handle_hook_key).(handle)
-    else
-      serve_handle_stdio(handle)
+  if Mix.env() == :test do
+    def serve_handle(handle) do
+      if Process.get(@serve_handle_hook_key) do
+        Process.get(@serve_handle_hook_key).(handle)
+      else
+        serve_handle_stdio(handle)
+      end
     end
+  else
+    def serve_handle(handle), do: serve_handle_stdio(handle)
   end
 
   defp serve_handle_stdio(handle) do

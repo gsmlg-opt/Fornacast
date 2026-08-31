@@ -4,9 +4,10 @@ defmodule GitTransport.Channel do
   @behaviour :ssh_server_channel
 
   require Logger
-  @connection_value_hook_key {__MODULE__, :connection_value_hook}
 
   if Mix.env() == :test do
+    @connection_value_hook_key {__MODULE__, :connection_value_hook}
+
     @doc false
     def with_test_connection_value(value, fun) when is_function(fun, 0) do
       previous = Process.get(@connection_value_hook_key)
@@ -392,15 +393,23 @@ defmodule GitTransport.Channel do
     end
   end
 
-  defp connection_value(cm, key) do
-    if Mix.env() == :test and Process.get(@connection_value_hook_key) do
-      Process.get(@connection_value_hook_key)
-    else
-      case :ssh.connection_info(cm, [key]) do
-        [{^key, value}] -> value
-        {^key, value} -> value
-        _ -> nil
+  if Mix.env() == :test do
+    defp connection_value(cm, key) do
+      if Process.get(@connection_value_hook_key) do
+        Process.get(@connection_value_hook_key)
+      else
+        connection_info_value(cm, key)
       end
+    end
+  else
+    defp connection_value(cm, key), do: connection_info_value(cm, key)
+  end
+
+  defp connection_info_value(cm, key) do
+    case :ssh.connection_info(cm, [key]) do
+      [{^key, value}] -> value
+      {^key, value} -> value
+      _ -> nil
     end
   end
 
