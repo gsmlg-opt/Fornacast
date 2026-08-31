@@ -222,6 +222,15 @@ if config_env() == :prod do
     end
   end
 
+  parse_bounded_positive_integer! = fn name, default, minimum, maximum ->
+    raw = System.get_env(name, Integer.to_string(default))
+
+    case Integer.parse(raw) do
+      {value, ""} when value >= minimum and value <= maximum -> value
+      _ -> raise "#{name} must be a decimal integer between #{minimum} and #{maximum}"
+    end
+  end
+
   release_asset_max_bytes =
     parse_positive_integer!.(
       "FORNACAST_RELEASE_ASSET_MAX_BYTES",
@@ -238,9 +247,20 @@ if config_env() == :prod do
       2_147_483_647
     )
 
+  repository_cleanup_grace_seconds =
+    parse_bounded_positive_integer!.(
+      "FORNACAST_IMPORT_REPOSITORY_CLEANUP_GRACE_SECONDS",
+      86_400,
+      GitCore.Limits.minimum_repository_cleanup_grace_seconds(),
+      2_147_483_647
+    )
+
   if require_runtime_env? do
     config :fornacast, :database_adapter, database_adapter
   end
+
+  config :forge_imports,
+    repository_cleanup_grace_seconds: repository_cleanup_grace_seconds
 
   config :fornacast,
          Fornacast.Repo,

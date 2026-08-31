@@ -14,6 +14,11 @@ defmodule ForgeRepos.RepositoryWriteReconcilers do
               | {:blocked, :inconsistent_lease}
               | {:error, :unavailable}
 
+  @callback cleanup_live_lease_expiry_locked(ForgeRepos.Repository.t(), DateTime.t()) ::
+              {:ok, DateTime.t() | nil} | {:error, :unavailable}
+
+  @optional_callbacks cleanup_live_lease_expiry_locked: 2
+
   @spec entries() :: [{integer(), atom(), module()}]
   def entries do
     configured = Application.get_env(:forge_repos, :repository_write_reconcilers, [])
@@ -71,6 +76,36 @@ defmodule ForgeRepos.RepositoryWriteReconcilers do
   end
 
   def cleanup_safety_locked(_repository, _now), do: {:error, :unavailable}
+
+  @spec cleanup_live_lease_expiry_locked(ForgeRepos.Repository.t(), DateTime.t()) ::
+          {:ok, DateTime.t() | nil} | {:error, :unavailable}
+  def cleanup_live_lease_expiry_locked(repository, %DateTime{} = now) do
+    results =
+      Enum.map(entries(), fn {_priority, _name, module} ->
+        if function_exported?(module, :cleanup_live_lease_expiry_locked, 2),
+          do: module.cleanup_live_lease_expiry_locked(repository, now),
+          else: {:error, :unavailable}
+      end)
+
+    with false <- results == [],
+         true <- Enum.all?(results, &(match?({:ok, nil}, &1) or match?({:ok, %DateTime{}}, &1))) do
+      latest =
+        results
+        |> Enum.map(&elem(&1, 1))
+        |> Enum.reject(&is_nil/1)
+        |> Enum.max_by(&DateTime.to_unix(&1, :second), fn -> nil end)
+
+      {:ok, latest}
+    else
+      _unavailable -> {:error, :unavailable}
+    end
+  rescue
+    _error -> {:error, :unavailable}
+  catch
+    _kind, _reason -> {:error, :unavailable}
+  end
+
+  def cleanup_live_lease_expiry_locked(_repository, _now), do: {:error, :unavailable}
 
   defp valid_entry?({priority, name, module}) do
     is_integer(priority) and is_atom(name) and is_atom(module) and

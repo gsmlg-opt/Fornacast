@@ -182,6 +182,14 @@ defmodule ForgePulls.MergeRecoveryTest do
     assert {:blocked, :live_lease} =
              MergeRecovery.cleanup_safety_locked(context.repository, now)
 
+    expiry = DateTime.add(now, 30, :second)
+
+    assert {:ok, ^expiry} =
+             RepositoryWriteReconcilers.cleanup_live_lease_expiry_locked(
+               context.repository,
+               now
+             )
+
     Repo.update_all(
       from(candidate in MergeOperation, where: candidate.id == ^context.operation.id),
       set: [state: :completed, lease_owner: nil, lease_expires_at: nil]

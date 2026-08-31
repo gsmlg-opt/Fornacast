@@ -1119,6 +1119,24 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
              "FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS must be a decimal integer >= 3600"
   end
 
+  test "production rejects repository cleanup grace outside its runtime bounds" do
+    minimum = GitCore.Limits.minimum_repository_cleanup_grace_seconds()
+
+    {above_output, above_status} = read_runtime_cleanup_config("2147483648")
+    assert above_status != 0
+
+    assert above_output =~
+             "FORNACAST_IMPORT_REPOSITORY_CLEANUP_GRACE_SECONDS must be a decimal integer between #{minimum} and 2147483647"
+
+    {below_output, below_status} = read_runtime_cleanup_config(Integer.to_string(minimum - 1))
+    assert below_status != 0
+
+    assert below_output =~
+             "FORNACAST_IMPORT_REPOSITORY_CLEANUP_GRACE_SECONDS must be a decimal integer between #{minimum} and 2147483647"
+
+    assert {"grace=2147483647\n", 0} = read_runtime_cleanup_config("2147483647")
+  end
+
   defp assert_order(source, first, second) do
     assert position!(source, first) < position!(source, second),
            "expected #{inspect(first)} to appear before #{inspect(second)}"
@@ -1228,12 +1246,15 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
   defp read_runtime_config(secret_key_base, api_port \\ "4891") do
     elixir = System.find_executable("elixir") || flunk("elixir executable not found")
     ecto_ebin = Ecto.Repo.Supervisor |> :code.which() |> to_string() |> Path.dirname()
+    git_core_ebin = GitCore.Limits |> :code.which() |> to_string() |> Path.dirname()
 
     System.cmd(
       elixir,
       [
         "-pa",
         ecto_ebin,
+        "-pa",
+        git_core_ebin,
         "-e",
         """
         defmodule Fornacast.Repo do
@@ -1270,12 +1291,15 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
   defp read_runtime_storage_config(max_bytes, grace_seconds) do
     elixir = System.find_executable("elixir") || flunk("elixir executable not found")
     ecto_ebin = Ecto.Repo.Supervisor |> :code.which() |> to_string() |> Path.dirname()
+    git_core_ebin = GitCore.Limits |> :code.which() |> to_string() |> Path.dirname()
 
     System.cmd(
       elixir,
       [
         "-pa",
         ecto_ebin,
+        "-pa",
+        git_core_ebin,
         "-e",
         """
         defmodule Fornacast.Repo do
@@ -1299,6 +1323,44 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
           FORNACAST_RELEASE_ASSET_STORAGE_ROOT: "/tmp/fornacast-runtime-assets",
           FORNACAST_RELEASE_ASSET_MAX_BYTES: max_bytes,
           FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS: grace_seconds
+        ),
+      stderr_to_stdout: true
+    )
+  end
+
+  defp read_runtime_cleanup_config(grace_seconds) do
+    elixir = System.find_executable("elixir") || flunk("elixir executable not found")
+    ecto_ebin = Ecto.Repo.Supervisor |> :code.which() |> to_string() |> Path.dirname()
+    git_core_ebin = GitCore.Limits |> :code.which() |> to_string() |> Path.dirname()
+
+    System.cmd(
+      elixir,
+      [
+        "-pa",
+        ecto_ebin,
+        "-pa",
+        git_core_ebin,
+        "-e",
+        """
+        defmodule Fornacast.Repo do
+          def __adapter__, do: Ecto.Adapters.Postgres
+        end
+
+        config = Config.Reader.read!(#{inspect(@runtime_config)}, env: :prod)
+        values = Keyword.fetch!(config, :forge_imports)
+        IO.puts("grace=\#{values[:repository_cleanup_grace_seconds]}")
+        """
+      ],
+      cd: @root,
+      env:
+        runtime_config_env(
+          SECRET_KEY_BASE: String.duplicate("s", 64),
+          FORNACAST_BASE_URL: "http://localhost:4890",
+          FORNACAST_REPO_STORAGE_ROOT: "/tmp/fornacast-runtime-config-repos",
+          FORNACAST_SSH_HOST: "localhost",
+          FORNACAST_SSH_PORT: "2222",
+          FORNACAST_SSH_SYSTEM_DIR: "/tmp/fornacast-runtime-config-ssh",
+          FORNACAST_IMPORT_REPOSITORY_CLEANUP_GRACE_SECONDS: grace_seconds
         ),
       stderr_to_stdout: true
     )

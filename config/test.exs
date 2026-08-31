@@ -1,5 +1,9 @@
 import Config
 
+config :forge_imports,
+  recovery_enabled: false,
+  repository_cleanup_enabled: false
+
 config :git_core, :limits,
   scan_concurrency: 4,
   scan_deadline_ms: 30_000,

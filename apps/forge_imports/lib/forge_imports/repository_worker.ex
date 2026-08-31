@@ -12,6 +12,7 @@ defmodule ForgeImports.RepositoryWorker do
   }
 
   alias ForgeImports.{
+    CleanupOperation,
     ImportAttempt,
     ImportRun,
     OneTimeCredential,
@@ -153,6 +154,9 @@ defmodule ForgeImports.RepositoryWorker do
     case staging_action(shadow, options) do
       {:ok, :no_cleanup} when mode == :normal ->
         cond do
+          completed_remote_cleanup?(capability.id) ->
+            settle_post_cleanup_terminal(capability)
+
           git_work_allowed?(capability.id, capability.lease_owner) ->
             case choose_staging_action(shadow, ForgeRepos.absolute_storage_path(shadow)) do
               {:ok, action} ->
@@ -1354,6 +1358,106 @@ defmodule ForgeImports.RepositoryWorker do
 
   defp git_work_allowed?(item_id, owner),
     do: match?({:ok, _context}, current_context(item_id, owner))
+
+  defp completed_remote_cleanup?(item_id) do
+    with %RepositoryItem{} = item <- Repo.get(RepositoryItem, item_id),
+         true <- item.state == :staging_git and is_nil(item.cleanup_state),
+         operation_id when is_binary(operation_id) and operation_id != "" <-
+           item.checkpoint["remote_cleanup_operation_id"] do
+      Repo.exists?(
+        from operation in CleanupOperation,
+          join: run in ImportRun,
+          on: run.id == ^item.import_run_id,
+          where:
+            operation.operation_id == ^operation_id and
+              operation.repository_item_id == ^item_id and
+              operation.kind == :remote_quarantine and
+              operation.state == :cleanup_complete and
+              operation.repository_id == ^item.hidden_repository_id and
+              run.state in [:completed, :completed_with_warnings, :canceled, :failed]
+      )
+    else
+      _missing -> false
+    end
+  rescue
+    _error in [Turso.Error, DBConnection.ConnectionError] -> false
+  end
+
+  defp settle_post_cleanup_terminal(capability) do
+    Repo.transaction(fn ->
+      with %ImportRun{state: run_state} <- locked_run(capability.import_run_id),
+           true <- run_state in [:completed, :completed_with_warnings, :canceled, :failed],
+           %RepositoryItem{} = item <- locked_item(capability.id),
+           true <-
+             item.lease_owner == capability.lease_owner and
+               item.lock_version == capability.lock_version and item.state == :staging_git and
+               is_nil(item.cleanup_state),
+           true <- completed_remote_cleanup?(item.id),
+           %ImportAttempt{state: :running} = attempt <- current_attempt(item),
+           target <- if(run_state == :canceled, do: :canceled, else: :failed),
+           now <- DateTime.utc_now(:second),
+           {:ok, _attempt} <-
+             attempt
+             |> ImportAttempt.transition_changeset(target, %{
+               terminal_at: now,
+               failure_kind: if(target == :failed, do: "remote_cleanup_failed", else: nil)
+             })
+             |> Repo.update(),
+           {:ok, settled} <- settle_post_cleanup_item(item, target, now) do
+        settled
+      else
+        _not_terminal -> Repo.rollback(:not_runnable)
+      end
+    end)
+    |> case do
+      {:ok, %RepositoryItem{} = item} -> {:ok, item}
+      {:error, reason} -> release_with_error(capability, reason)
+    end
+  rescue
+    _error in [Turso.Error, DBConnection.ConnectionError] ->
+      release_with_error(capability, :persistence_unavailable)
+  end
+
+  defp settle_post_cleanup_item(item, :canceled, now) do
+    lease_seconds = max(DateTime.diff(item.lease_expires_at, now, :second), 1)
+    checkpoint = Map.delete(item.checkpoint || %{}, "remote_cleanup_operation_id")
+
+    with {:ok, cancel_requested} <-
+           OperationLease.update_owned(
+             RepositoryItem,
+             item,
+             [
+               state: :cancel_requested,
+               wait_reason: "cancellation_requested",
+               next_attempt_at: nil,
+               failure_kind: nil,
+               failure_detail: nil
+             ],
+             now: now,
+             lease_seconds: lease_seconds
+           ) do
+      OperationLease.update_owned(RepositoryItem, cancel_requested,
+        state: :canceled,
+        wait_reason: nil,
+        next_attempt_at: nil,
+        failure_kind: nil,
+        failure_detail: nil,
+        checkpoint: checkpoint
+      )
+    end
+  end
+
+  defp settle_post_cleanup_item(item, :failed, _now) do
+    checkpoint = Map.delete(item.checkpoint || %{}, "remote_cleanup_operation_id")
+
+    OperationLease.update_owned(RepositoryItem, item,
+      state: :failed,
+      next_attempt_at: nil,
+      failure_kind: "remote_cleanup_failed",
+      failure_detail: nil,
+      checkpoint: checkpoint
+    )
+  end
 
   defp cancel_requested?(run_id) do
     Repo.exists?(

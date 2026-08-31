@@ -53,4 +53,14 @@ defmodule GitCore.Limits do
             "git_core limit #{inspect(key)} must be a positive integer, got: #{inspect(configured)}"
     end
   end
+
+  @spec minimum_repository_cleanup_grace_seconds() :: pos_integer()
+  def minimum_repository_cleanup_grace_seconds do
+    div(
+      get(:remote_wall_time_ms) +
+        get(:remote_kill_escalation_ms) +
+        get(:remote_cleanup_wait_ms) + 999,
+      1_000
+    ) + 1
+  end
 end

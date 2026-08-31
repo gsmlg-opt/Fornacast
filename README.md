@@ -308,6 +308,7 @@ Production environment variables:
 - `FORNACAST_API_PORT`, default `4891` in the release image
 - `FORNACAST_API_TRUSTED_PROXIES`, comma-separated trusted proxy CIDRs
 - `FORNACAST_REPO_STORAGE_ROOT`
+- `FORNACAST_IMPORT_REPOSITORY_CLEANUP_GRACE_SECONDS`, default `86400`; must stay above the bounded Git remote shutdown envelope
 - `FORNACAST_RELEASE_ASSET_STORAGE_ROOT`, default `/data/release-assets` in the release image
 - `FORNACAST_RELEASE_ASSET_MAX_BYTES`, default `2147483648` (2 GiB)
 - `FORNACAST_RELEASE_ASSET_GC_GRACE_SECONDS`, default `86400`
@@ -428,6 +429,13 @@ Fornacast stores authoritative domain state in PostgreSQL. The `postgres-data`
 volume stores the PostgreSQL domain database. The separate `fornacast-data`
 volume stores Git repositories, SSH material, LocalCAS release assets,
 staging data, and Concord's separate embedded Turso/VSR configuration store.
+
+Repository reclamation is deliberately delayed and descriptor-relative. The
+repository storage root and all of its cleanup targets must be owned by the
+same effective UID as the Fornacast BEAM, and parent directories must remain
+private (not group- or world-writable). Exactly one BEAM node may own the
+repository volume at a time; cleanup recovery assumes a single-node,
+exclusively mounted volume and does not support rolling or concurrent owners.
 
 Release-asset bytes use embedded LocalCAS under
 `FORNACAST_RELEASE_ASSET_STORAGE_ROOT` (default `/data/release-assets` in the

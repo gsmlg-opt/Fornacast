@@ -6,12 +6,14 @@ defmodule ForgeImports.RepositoryWorkerTest do
   alias ForgeAccounts.{GitHubCredential, Organization, OrganizationMember}
 
   alias ForgeImports.{
+    CleanupOperation,
     ImportAttempt,
     ImportRun,
     Persistence,
     Reconciler,
     RecoverySupervisor,
     ReportEntry,
+    RepositoryCleanup,
     RepositoryItem,
     RepositoryStager,
     RepositoryWorker
@@ -1804,6 +1806,425 @@ defmodule ForgeImports.RepositoryWorkerTest do
     assert Repo.get!(RepositoryItem, context.item.id).staged_storage_path == quarantine
   end
 
+  @tag :tmp_dir
+  test "Remote quarantine reclamation settles the terminal worker and hands off a distinct shadow journal",
+       %{tmp_dir: tmp_dir} = context do
+    original_root = Application.fetch_env!(:fornacast, :repo_storage_root)
+    root = Path.join(Path.expand(tmp_dir), "remote-cleanup-storage")
+    File.mkdir_p!(root)
+    File.chmod!(root, 0o700)
+    Application.put_env(:fornacast, :repo_storage_root, root)
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:error, :cleanup_pending} =
+             RepositoryWorker.stage(context.item.id,
+               owner: "remote-cleanup-worker",
+               lease_seconds: 60,
+               keyring: @keyring,
+               remote: __MODULE__.CleanupPendingRemote,
+               remote_options: [test_pid: self()]
+             )
+
+    assert_receive {:mirror_cleanup_pending, destination}, 1_000
+
+    item = Repo.get!(RepositoryItem, context.item.id)
+    quarantine = item.staged_storage_path
+    assert item.cleanup_state == "cleanup_pending"
+    assert quarantine == GitCore.Remote.cleanup_slot_path(destination)
+    assert File.dir?(quarantine)
+
+    now = DateTime.utc_now(:second)
+
+    context.run
+    |> ImportRun.transition_changeset(:failed, %{
+      terminal_at: now,
+      failure_kind: "remote_cleanup_terminal"
+    })
+    |> Repo.update!()
+
+    assert :attempted =
+             RepositoryCleanup.reconcile_kind(
+               :remote_quarantine,
+               now,
+               System.monotonic_time(:millisecond) + 5_000
+             )
+
+    refute File.exists?(quarantine)
+
+    assert %CleanupOperation{kind: :remote_quarantine, state: :cleanup_complete} =
+             remote_cleanup =
+             Repo.get_by!(CleanupOperation,
+               repository_item_id: item.id,
+               kind: :remote_quarantine
+             )
+
+    assert Repo.get!(Repository, item.hidden_repository_id).storage_reclaimed_at == nil
+
+    assert %RepositoryItem{
+             state: :staging_git,
+             cleanup_state: nil,
+             staged_storage_path: ^destination
+           } = Repo.get!(RepositoryItem, item.id)
+
+    assert {:ok, crashed_claim} =
+             Fornacast.OperationLease.claim(
+               RepositoryItem,
+               item.id,
+               "crashed-post-cleanup-worker",
+               DateTime.utc_now(:second),
+               60
+             )
+
+    assert :ok = Fornacast.OperationLease.release(RepositoryItem, crashed_claim)
+
+    assert {:ok, %RepositoryItem{state: :failed}} =
+             RepositoryWorker.stage(item.id,
+               owner: "post-remote-cleanup-worker",
+               lease_seconds: 60,
+               keyring: :unavailable,
+               remote: __MODULE__.UnexpectedRemote,
+               remote_options: [test_pid: self()]
+             )
+
+    refute_receive {:unexpected_remote, _operation}
+
+    assert %ImportAttempt{state: :failed} =
+             Repo.get_by!(ImportAttempt,
+               repository_item_id: item.id,
+               attempt_number: item.attempt_count
+             )
+
+    handoff_now = DateTime.add(now, 1, :second)
+
+    assert :attempted =
+             RepositoryCleanup.reconcile_kind(
+               :unpublished_shadow,
+               handoff_now,
+               System.monotonic_time(:millisecond) + 5_000
+             )
+
+    assert %CleanupOperation{kind: :unpublished_shadow, state: :cleanup_pending} =
+             shadow_cleanup =
+             Repo.get_by!(CleanupOperation,
+               repository_item_id: item.id,
+               kind: :unpublished_shadow
+             )
+
+    assert shadow_cleanup.id != remote_cleanup.id
+    assert shadow_cleanup.operation_id != remote_cleanup.operation_id
+  end
+
+  @tag :tmp_dir
+  test "Remote cleanup exception rejects a second nonterminal attempt",
+       %{
+         tmp_dir: tmp_dir
+       } = context do
+    original_root = Application.fetch_env!(:fornacast, :repo_storage_root)
+    root = Path.join(Path.expand(tmp_dir), "remote-second-attempt-storage")
+    File.mkdir_p!(root)
+    File.chmod!(root, 0o700)
+    Application.put_env(:fornacast, :repo_storage_root, root)
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:error, :cleanup_pending} =
+             RepositoryWorker.stage(context.item.id,
+               owner: "remote-second-attempt-worker",
+               lease_seconds: 60,
+               keyring: @keyring,
+               remote: __MODULE__.CleanupPendingRemote,
+               remote_options: [test_pid: self()]
+             )
+
+    assert_receive {:mirror_cleanup_pending, _destination}, 1_000
+    item = Repo.get!(RepositoryItem, context.item.id)
+
+    %ImportAttempt{}
+    |> ImportAttempt.create_changeset(%{
+      repository_item_id: item.id,
+      attempt_number: 2,
+      state: :running,
+      decision: %{"action" => "create", "slug" => item.destination_slug},
+      started_at: DateTime.utc_now(:second)
+    })
+    |> Repo.insert!()
+
+    now = DateTime.utc_now(:second)
+
+    assert :attempted =
+             RepositoryCleanup.reconcile_kind(
+               :remote_quarantine,
+               now,
+               System.monotonic_time(:millisecond) + 5_000
+             )
+
+    assert File.dir?(item.staged_storage_path)
+
+    assert %CleanupOperation{state: :cleanup_blocked, last_error: "concurrent_import_work"} =
+             Repo.get_by!(CleanupOperation,
+               repository_item_id: item.id,
+               kind: :remote_quarantine
+             )
+  end
+
+  @tag :tmp_dir
+  test "Remote cleanup settlement covers completed warning and canceled terminal runs",
+       %{
+         tmp_dir: tmp_dir
+       } = context do
+    original_root = Application.fetch_env!(:fornacast, :repo_storage_root)
+    root = Path.join(Path.expand(tmp_dir), "remote-terminal-matrix-storage")
+    File.mkdir_p!(root)
+    File.chmod!(root, 0o700)
+    Application.put_env(:fornacast, :repo_storage_root, root)
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    for run_state <- [:completed, :completed_with_warnings, :canceled] do
+      run = running_one_time_run_fixture(context.actor, context.identity)
+      item = queued_item_fixture(run, context.actor, github_repository_id: next_github_id())
+      attempt_fixture(item)
+
+      assert {:error, :cleanup_pending} =
+               RepositoryWorker.stage(item.id,
+                 owner: "remote-terminal-#{run_state}",
+                 lease_seconds: 60,
+                 keyring: @keyring,
+                 remote: __MODULE__.CleanupPendingRemote,
+                 remote_options: [test_pid: self()]
+               )
+
+      assert_receive {:mirror_cleanup_pending, _destination}, 1_000
+      now = DateTime.utc_now(:second)
+      terminalize_run!(run, run_state, now)
+
+      assert :attempted =
+               RepositoryCleanup.reconcile_kind(
+                 :remote_quarantine,
+                 now,
+                 System.monotonic_time(:millisecond) + 5_000
+               )
+
+      expected_item_state = if run_state == :canceled, do: :canceled, else: :failed
+
+      assert {:ok, %RepositoryItem{state: ^expected_item_state}} =
+               RepositoryWorker.stage(item.id,
+                 owner: "remote-terminal-settlement-#{run_state}",
+                 lease_seconds: 60,
+                 keyring: :unavailable,
+                 remote: __MODULE__.UnexpectedRemote,
+                 remote_options: [test_pid: self()]
+               )
+
+      assert %ImportAttempt{state: ^expected_item_state} =
+               Repo.get_by!(ImportAttempt,
+                 repository_item_id: item.id,
+                 attempt_number: item.attempt_count
+               )
+    end
+
+    refute_receive {:unexpected_remote, _operation}
+  end
+
+  @tag :tmp_dir
+  test "Remote cleanup exception accepts exact expired item and run leases",
+       %{
+         tmp_dir: tmp_dir
+       } = context do
+    original_root = Application.fetch_env!(:fornacast, :repo_storage_root)
+    root = Path.join(Path.expand(tmp_dir), "remote-expired-lease-storage")
+    File.mkdir_p!(root)
+    File.chmod!(root, 0o700)
+    Application.put_env(:fornacast, :repo_storage_root, root)
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:error, :cleanup_pending} =
+             RepositoryWorker.stage(context.item.id,
+               owner: "remote-expired-lease-worker",
+               lease_seconds: 60,
+               keyring: @keyring,
+               remote: __MODULE__.CleanupPendingRemote,
+               remote_options: [test_pid: self()]
+             )
+
+    assert_receive {:mirror_cleanup_pending, _destination}, 1_000
+    item = Repo.get!(RepositoryItem, context.item.id)
+    now = DateTime.utc_now(:second)
+    expired_at = DateTime.add(now, -1, :second)
+
+    Repo.update_all(
+      from(candidate in RepositoryItem, where: candidate.id == ^item.id),
+      set: [lease_owner: "expired-item", lease_expires_at: expired_at]
+    )
+
+    Repo.update_all(
+      from(candidate in ImportRun, where: candidate.id == ^context.run.id),
+      set: [lease_owner: "expired-run", lease_expires_at: expired_at]
+    )
+
+    assert :attempted =
+             RepositoryCleanup.reconcile_kind(
+               :remote_quarantine,
+               now,
+               System.monotonic_time(:millisecond) + 5_000
+             )
+
+    refute File.exists?(item.staged_storage_path)
+
+    assert %CleanupOperation{state: :cleanup_complete} =
+             Repo.get_by!(CleanupOperation,
+               repository_item_id: item.id,
+               kind: :remote_quarantine
+             )
+  end
+
+  @tag :tmp_dir
+  test "journal-less Remote cleanup defers future leases without intent and blocks malformed leases",
+       %{tmp_dir: tmp_dir} = context do
+    original_root = Application.fetch_env!(:fornacast, :repo_storage_root)
+    root = Path.join(Path.expand(tmp_dir), "remote-lease-shape-storage")
+    File.mkdir_p!(root)
+    File.chmod!(root, 0o700)
+    Application.put_env(:fornacast, :repo_storage_root, root)
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    for shape <- [:future_item, :future_run, :future_both, :one_sided] do
+      run = running_one_time_run_fixture(context.actor, context.identity)
+      item = queued_item_fixture(run, context.actor, github_repository_id: next_github_id())
+      attempt_fixture(item)
+
+      assert {:error, :cleanup_pending} =
+               RepositoryWorker.stage(item.id,
+                 owner: "remote-lease-shape-#{shape}",
+                 lease_seconds: 60,
+                 keyring: @keyring,
+                 remote: __MODULE__.CleanupPendingRemote,
+                 remote_options: [test_pid: self()]
+               )
+
+      assert_receive {:mirror_cleanup_pending, _destination}, 1_000
+      item = Repo.get!(RepositoryItem, item.id)
+      now = DateTime.utc_now(:second)
+      audit_count = Repo.aggregate(AuditEvent, :count)
+      source_lock_version = item.lock_version
+
+      expected_expiry =
+        case shape do
+          :future_item ->
+            item_expiry = DateTime.add(now, 60, :second)
+
+            Repo.update_all(
+              from(candidate in RepositoryItem, where: candidate.id == ^item.id),
+              set: [lease_owner: "future-item", lease_expires_at: item_expiry]
+            )
+
+            item_expiry
+
+          :future_run ->
+            run_expiry = DateTime.add(now, 90, :second)
+
+            Repo.update_all(
+              from(candidate in ImportRun, where: candidate.id == ^run.id),
+              set: [lease_owner: "future-run", lease_expires_at: run_expiry]
+            )
+
+            run_expiry
+
+          :future_both ->
+            item_expiry = DateTime.add(now, 60, :second)
+            run_expiry = DateTime.add(now, 90, :second)
+
+            Repo.update_all(
+              from(candidate in RepositoryItem, where: candidate.id == ^item.id),
+              set: [lease_owner: "future-item", lease_expires_at: item_expiry]
+            )
+
+            Repo.update_all(
+              from(candidate in ImportRun, where: candidate.id == ^run.id),
+              set: [lease_owner: "future-run", lease_expires_at: run_expiry]
+            )
+
+            run_expiry
+
+          :one_sided ->
+            Repo.update_all(
+              from(candidate in RepositoryItem, where: candidate.id == ^item.id),
+              set: [lease_owner: "malformed-item", lease_expires_at: nil]
+            )
+
+            nil
+        end
+
+      assert :attempted =
+               RepositoryCleanup.reconcile_kind(
+                 :remote_quarantine,
+                 now,
+                 System.monotonic_time(:millisecond) + 5_000
+               )
+
+      assert File.dir?(item.staged_storage_path)
+
+      case shape do
+        future when future in [:future_item, :future_run, :future_both] ->
+          source_operation_id =
+            CleanupOperation.deterministic_operation_id(
+              :remote_quarantine,
+              item.hidden_repository_id,
+              item.id,
+              source_lock_version
+            )
+
+          jitter_seconds = :erlang.phash2(source_operation_id, 30) + 1
+          expected_retry_at = DateTime.add(expected_expiry, jitter_seconds, :second)
+
+          assert Repo.aggregate(
+                   from(operation in CleanupOperation,
+                     where:
+                       operation.repository_item_id == ^item.id and
+                         operation.kind == :remote_quarantine
+                   ),
+                   :count
+                 ) == 0
+
+          assert %RepositoryItem{
+                   cleanup_eligible_at: ^expected_retry_at,
+                   cleanup_attempt_count: 0
+                 } = Repo.get!(RepositoryItem, item.id)
+
+          assert Repo.aggregate(AuditEvent, :count) == audit_count
+
+          assert :attempted =
+                   RepositoryCleanup.reconcile_kind(
+                     :remote_quarantine,
+                     expected_retry_at,
+                     System.monotonic_time(:millisecond) + 5_000
+                   )
+
+          refute File.exists?(item.staged_storage_path)
+
+          assert %CleanupOperation{
+                   state: :cleanup_complete,
+                   attempt_count: 0
+                 } =
+                   Repo.get_by!(CleanupOperation,
+                     repository_item_id: item.id,
+                     kind: :remote_quarantine
+                   )
+
+        :one_sided ->
+          operation =
+            Repo.get_by!(CleanupOperation,
+              repository_item_id: item.id,
+              kind: :remote_quarantine
+            )
+
+          assert operation.state == :cleanup_blocked
+          assert operation.last_error == "inconsistent_lease"
+          assert operation.attempt_count == 0
+          assert operation.effect_started_at == nil
+          assert operation.effect_finished_at == nil
+      end
+    end
+  end
+
   test "caller-loss recovery persists deterministic cleanup evidence without PAT checkout",
        context do
     assert {:error, :staging_unavailable} =
@@ -2779,6 +3200,28 @@ defmodule ForgeImports.RepositoryWorkerTest do
     |> Repo.insert!()
   end
 
+  defp terminalize_run!(run, :canceled, now) do
+    run =
+      run
+      |> ImportRun.transition_changeset(:cancel_requested, %{cancellation_requested_at: now})
+      |> Repo.update!()
+
+    run
+    |> ImportRun.transition_changeset(:canceled, %{terminal_at: now})
+    |> Repo.update!()
+  end
+
+  defp terminalize_run!(run, state, now) when state in [:completed, :completed_with_warnings] do
+    attrs =
+      if state == :completed_with_warnings,
+        do: %{terminal_at: now, warning_count: 1},
+        else: %{terminal_at: now}
+
+    run
+    |> ImportRun.transition_changeset(state, attrs)
+    |> Repo.update!()
+  end
+
   defp replace_attempt_fixture(item, target) do
     %ImportAttempt{}
     |> ImportAttempt.create_changeset(%{
@@ -2959,6 +3402,7 @@ defmodule ForgeImports.RepositoryWorkerTest do
 
   defp reset_database! do
     for table <- [
+          "github_import_repository_cleanups",
           "github_import_report_entries",
           "github_import_page_checkpoints",
           "github_import_object_mappings",

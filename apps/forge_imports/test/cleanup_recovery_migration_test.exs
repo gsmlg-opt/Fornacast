@@ -3,7 +3,8 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
 
   import Ecto.Query
 
-  alias ForgeImports.{CleanupOperation, Persistence}
+  alias ForgeImports.{CleanupOperation, ImportAttempt, ImportRun, Persistence, RepositoryItem}
+  alias ForgeRepos.Repository
   alias Fornacast.Repo
 
   @moduletag :persistence
@@ -34,6 +35,14 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
     assert "github_import_repository_cleanups_operation_id_index" in index_names
     assert "github_import_cleanups_item_kind_version_index" in index_names
     assert "github_import_repository_cleanups_recovery_index" in index_names
+
+    item_indexes =
+      Ecto.Adapters.SQL.query!(Repo, index_lookup_sql(), ["github_import_repository_items"]).rows
+      |> List.flatten()
+
+    assert "github_import_items_cleanup_due_index" in item_indexes
+    assert "github_import_items_replacement_cleanup_index" in item_indexes
+    assert "github_import_items_unpublished_cleanup_index" in item_indexes
   end
 
   test "cleanup indexes retain exact uniqueness and recovery order" do
@@ -43,7 +52,121 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
     assert unique_index?(indexes, "github_import_cleanups_item_kind_version_index")
 
     assert index_columns(indexes, "github_import_repository_cleanups_recovery_index") ==
-             ~w(state next_attempt_at eligible_at id)
+             ~w(kind state next_attempt_at eligible_at id)
+
+    item_indexes = index_definitions("github_import_repository_items")
+
+    assert index_columns(item_indexes, "github_import_items_cleanup_due_index") ==
+             ~w(cleanup_state cleanup_eligible_at id)
+
+    assert index_columns(item_indexes, "github_import_items_replacement_cleanup_index") ==
+             ~w(replacement_repository_id id)
+
+    unpublished_definition =
+      index_definition(item_indexes, "github_import_items_unpublished_cleanup_index")
+
+    assert unpublished_definition =~ "COALESCE(cleanup_eligible_at, updated_at)"
+    assert unpublished_definition =~ "(state)::text = ANY"
+    assert unpublished_definition =~ "publication_evidence = '{}'::jsonb"
+    assert unpublished_definition =~ "lease_owner IS NULL"
+    assert unpublished_definition =~ "lease_expires_at IS NULL"
+  end
+
+  test "PostgreSQL unpublished cleanup query uses expression index order without a sort" do
+    if postgres?() do
+      context = unpublished_selector_context!()
+      insert_unpublished_selector_candidates!(context, 10_000)
+      Ecto.Adapters.SQL.query!(Repo, "analyze github_import_repository_items", [])
+      Ecto.Adapters.SQL.query!(Repo, "set local enable_sort = off", [])
+
+      plan =
+        explain_sql("""
+        select item.id, item.hidden_repository_id
+        from github_import_repository_items as item
+        where item.state in ('completed', 'skipped', 'canceled', 'failed', 'published')
+          and item.publication_evidence = '{}'::jsonb
+          and item.lease_owner is null and item.lease_expires_at is null
+          and (item.cleanup_eligible_at is null or item.cleanup_eligible_at <= now())
+          and exists (
+            select 1 from repositories as repository
+            where repository.id = item.hidden_repository_id
+              and repository.lifecycle = 'importing'
+              and repository.visibility = 'private'
+              and repository.write_version = 0
+              and repository.deleted_at is null
+              and repository.last_pushed_at is null
+              and repository.storage_reclaimed_at is null
+          )
+          and exists (
+            select 1 from github_import_runs as run
+            where run.id = item.import_run_id
+              and run.state in ('completed', 'completed_with_warnings', 'canceled', 'failed')
+              and run.lease_owner is null and run.lease_expires_at is null
+          )
+          and exists (
+            select 1 from github_import_attempts as attempt
+            where attempt.repository_item_id = item.id
+              and attempt.attempt_number = item.attempt_count
+              and attempt.state in ('completed', 'failed', 'canceled', 'destination_changed')
+          )
+          and not exists (
+            select 1 from github_import_repository_items as successor
+            where successor.predecessor_item_id = item.id
+               or (successor.id <> item.id
+                   and successor.hidden_repository_id = item.hidden_repository_id)
+          )
+          and not exists (
+            select 1 from github_import_repository_cleanups as operation
+            where operation.repository_item_id = item.id
+              and operation.kind = 'unpublished_shadow'
+              and operation.source_lock_version = item.lock_version
+          )
+        order by coalesce(item.cleanup_eligible_at, item.updated_at), item.id
+        limit 100
+        """)
+
+      assert plan =~ "github_import_items_unpublished_cleanup_index"
+      refute plan =~ "Sort"
+    end
+  end
+
+  test "PostgreSQL cleanup selectors use their ordered indexes" do
+    if postgres?() do
+      Repo.transaction(fn ->
+        Ecto.Adapters.SQL.query!(Repo, "set local enable_seqscan = off", [])
+
+        assert explain_sql("""
+               select id, repository_id
+               from github_import_repository_cleanups
+               where kind = 'remote_quarantine'
+                 and state = 'cleanup_pending'
+                 and eligible_at <= now()
+                 and next_attempt_at <= now()
+                 and (lease_expires_at is null or lease_expires_at <= now())
+               order by next_attempt_at, eligible_at, id
+               limit 1
+               """) =~ "github_import_repository_cleanups_recovery_index"
+
+        assert explain_sql("""
+               select id, hidden_repository_id
+               from github_import_repository_items
+               where state = 'staging_git'
+                 and cleanup_state = 'cleanup_pending'
+                 and cleanup_eligible_at <= now()
+                 and hidden_repository_id is not null
+               order by cleanup_eligible_at, id
+               limit 100
+               """) =~ "github_import_items_cleanup_due_index"
+
+        assert explain_sql("""
+               select id
+               from github_import_repository_items
+               where replacement_repository_id = 1
+               order by id
+               limit 100
+               """) =~ "github_import_items_replacement_cleanup_index"
+      end)
+    end
   end
 
   test "database rejects incoherent lifecycle leases timestamps and anchor evidence" do
@@ -396,6 +519,167 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
     %{actor: actor, run: run, item: item, repository: repository, suffix: suffix}
   end
 
+  defp unpublished_selector_context! do
+    context = cleanup_context("unpublished-selector")
+    now = DateTime.utc_now(:second)
+
+    Repo.update_all(
+      from(repository in Repository, where: repository.id == ^context.repository.id),
+      set: [
+        lifecycle: :importing,
+        visibility: :private,
+        write_version: 0,
+        deleted_at: nil,
+        last_pushed_at: nil,
+        storage_reclaimed_at: nil
+      ]
+    )
+
+    Repo.update_all(
+      from(run in ImportRun, where: run.id == ^context.run.id),
+      set: [
+        state: :failed,
+        terminal_at: now,
+        failure_kind: "selector_fixture",
+        lease_owner: nil,
+        lease_expires_at: nil
+      ]
+    )
+
+    Repo.update_all(
+      from(item in RepositoryItem, where: item.id == ^context.item.id),
+      set: [
+        state: :failed,
+        hidden_repository_id: context.repository.id,
+        attempt_count: 1,
+        failure_kind: "selector_fixture",
+        publication_evidence: %{},
+        cleanup_eligible_at: nil,
+        lease_owner: nil,
+        lease_expires_at: nil
+      ]
+    )
+
+    %ImportAttempt{}
+    |> ImportAttempt.create_changeset(%{
+      repository_item_id: context.item.id,
+      attempt_number: 1,
+      state: :failed,
+      decision: %{"action" => "create", "slug" => context.repository.slug},
+      started_at: now,
+      terminal_at: now,
+      failure_kind: "selector_fixture"
+    })
+    |> Repo.insert!()
+
+    %{
+      context
+      | item: Repo.get!(RepositoryItem, context.item.id),
+        run: Repo.get!(ImportRun, context.run.id)
+    }
+  end
+
+  defp insert_unpublished_selector_candidates!(context, count) do
+    now = DateTime.utc_now(:second)
+    base = 9_930_000_000 + context.suffix * 10_000
+
+    repository_rows =
+      for index <- 1..count do
+        %{
+          owner_user_id: context.actor.id,
+          slug: "selector-#{context.suffix}-#{index}",
+          name: "Selector #{index}",
+          visibility: :private,
+          storage_path: "selector/#{context.suffix}-#{index}.git",
+          default_branch: "main",
+          has_issues: true,
+          allow_merge_commit: true,
+          lifecycle: :importing,
+          generation: 1,
+          write_version: 0,
+          inserted_at: now,
+          updated_at: now
+        }
+      end
+
+    repositories = insert_all_returning_ids!(Repository, repository_rows)
+    assert length(repositories) == count
+
+    item_rows =
+      repositories
+      |> Enum.with_index(1)
+      |> Enum.map(fn {%{id: repository_id}, index} ->
+        %{
+          import_run_id: context.run.id,
+          github_repository_id: base + index,
+          source_full_name: "noise/selector-#{context.suffix}-#{index}",
+          source_name: "selector-#{index}",
+          source_metadata: %{},
+          source_observed_at: now,
+          selected: true,
+          hidden_repository_id: repository_id,
+          state: :failed,
+          lock_version: 1,
+          attempt_count: 1,
+          failure_kind: "selector_fixture",
+          checkpoint: %{},
+          source_git: %{},
+          publication_evidence: %{},
+          imported_count: 0,
+          skipped_count: 0,
+          warning_count: 0,
+          failure_count: 0,
+          cleanup_attempt_count: 0,
+          inserted_at: now,
+          updated_at: now
+        }
+      end)
+
+    items = insert_all_returning_ids!(RepositoryItem, item_rows)
+    assert length(items) == count
+
+    attempt_rows =
+      items
+      |> Enum.with_index(1)
+      |> Enum.map(fn {%{id: item_id}, index} ->
+        %{
+          repository_item_id: item_id,
+          attempt_number: 1,
+          state: :failed,
+          decision: %{
+            "action" => "create",
+            "slug" => "selector-#{context.suffix}-#{index}"
+          },
+          started_at: now,
+          terminal_at: now,
+          failure_kind: "selector_fixture",
+          inserted_at: now,
+          updated_at: now
+        }
+      end)
+
+    inserted =
+      attempt_rows
+      |> Enum.chunk_every(1_000)
+      |> Enum.reduce(0, fn rows, total ->
+        {inserted, nil} = Repo.insert_all(ImportAttempt, rows)
+        total + inserted
+      end)
+
+    assert inserted == count
+    :ok
+  end
+
+  defp insert_all_returning_ids!(schema, rows) do
+    rows
+    |> Enum.chunk_every(1_000)
+    |> Enum.flat_map(fn chunk ->
+      {inserted, returned} = Repo.insert_all(schema, chunk, returning: [:id])
+      assert inserted == length(chunk)
+      returned
+    end)
+  end
+
   defp remote_attrs(repository, item) do
     now = ~U[2026-08-28 12:00:00Z]
     storage_root = Fornacast.Config.repo_storage_root()
@@ -685,6 +969,19 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
       ]).rows
       |> List.flatten()
     end
+  end
+
+  defp index_definition(indexes, name) do
+    case Enum.find(indexes, fn [index_name, _definition] -> index_name == name end) do
+      [_name, definition] -> definition
+      nil -> ""
+    end
+  end
+
+  defp explain_sql(sql) do
+    Ecto.Adapters.SQL.query!(Repo, "explain (costs off) " <> sql, []).rows
+    |> List.flatten()
+    |> Enum.join("\n")
   end
 
   defp reset_database! do

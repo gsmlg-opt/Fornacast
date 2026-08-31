@@ -98,6 +98,16 @@ config :forge_repos,
     {200, :pull_merges, ForgePulls.MergeRecovery}
   ]
 
+config :forge_imports,
+  recovery_enabled: true,
+  repository_cleanup_enabled: true,
+  repository_cleanup_grace_seconds: 86_400,
+  repository_cleanup_interval_ms: 30_000,
+  repository_cleanup_deadline_ms: 60_000,
+  repository_cleanup_lease_seconds: 120,
+  repository_cleanup_backoff_min_seconds: 30,
+  repository_cleanup_backoff_max_seconds: 21_600
+
 config :git_core, :limits,
   scan_concurrency: 4,
   scan_deadline_ms: 30_000,

@@ -83,4 +83,16 @@ defmodule GitCore.LimitsTest do
     assert GitCore.Limits.hard(:receive_pack_bytes) == 100 * 1024 * 1024
     assert GitCore.Limits.get(:receive_pack_bytes) == 100 * 1024 * 1024
   end
+
+  test "repository cleanup grace floor follows the configured remote shutdown envelope" do
+    assert GitCore.Limits.minimum_repository_cleanup_grace_seconds() == 1_816
+
+    Application.put_env(:git_core, :limits,
+      remote_wall_time_ms: 1_000,
+      remote_kill_escalation_ms: 1_000,
+      remote_cleanup_wait_ms: 1_000
+    )
+
+    assert GitCore.Limits.minimum_repository_cleanup_grace_seconds() == 4
+  end
 end

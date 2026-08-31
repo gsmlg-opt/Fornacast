@@ -133,6 +133,27 @@ defmodule ForgeRepos.GitWriteRecovery do
 
   def cleanup_safety_locked(_repository, _now), do: {:error, :unavailable}
 
+  @impl true
+  def cleanup_live_lease_expiry_locked(%Repository{id: repository_id}, %DateTime{} = now)
+      when is_integer(repository_id) and repository_id > 0 do
+    expiry =
+      Repo.one(
+        from operation in GitWriteOperation,
+          where:
+            operation.repository_id == ^repository_id and operation.state not in ^@terminal_states and
+              not is_nil(operation.lease_owner) and operation.lease_expires_at > ^now,
+          select: max(operation.lease_expires_at)
+      )
+
+    {:ok, expiry}
+  rescue
+    _error -> {:error, :unavailable}
+  catch
+    _kind, _reason -> {:error, :unavailable}
+  end
+
+  def cleanup_live_lease_expiry_locked(_repository, _now), do: {:error, :unavailable}
+
   defp reconcile_next(repository, repository_path, absolute_deadline, owner, after_id) do
     with :ok <- check_deadline(absolute_deadline) do
       now = iteration_now()
