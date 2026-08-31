@@ -112,38 +112,54 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
   test "PostgreSQL cleanup selectors use their ordered indexes" do
     if postgres?() do
       Repo.transaction(fn ->
+        # Prove each ordered index is a usable plan independently of cost
+        # estimates for the otherwise empty migration-test tables.
+        Ecto.Adapters.SQL.query!(Repo, "set local enable_bitmapscan = off", [])
         Ecto.Adapters.SQL.query!(Repo, "set local enable_seqscan = off", [])
+        Ecto.Adapters.SQL.query!(Repo, "set local enable_sort = off", [])
 
-        assert explain_sql("""
-               select id, repository_id
-               from github_import_repository_cleanups
-               where kind = 'remote_quarantine'
-                 and state = 'cleanup_pending'
-                 and eligible_at <= now()
-                 and next_attempt_at <= now()
-                 and (lease_expires_at is null or lease_expires_at <= now())
-               order by next_attempt_at, eligible_at, id
-               limit 1
-               """) =~ "github_import_repository_cleanups_recovery_index"
+        recovery_plan =
+          explain_sql("""
+          select id, repository_id
+          from github_import_repository_cleanups
+          where kind = 'remote_quarantine'
+            and state = 'cleanup_pending'
+            and eligible_at <= now()
+            and next_attempt_at <= now()
+            and (lease_expires_at is null or lease_expires_at <= now())
+          order by next_attempt_at, eligible_at, id
+          limit 1
+          """)
 
-        assert explain_sql("""
-               select id, hidden_repository_id
-               from github_import_repository_items
-               where state = 'staging_git'
-                 and cleanup_state = 'cleanup_pending'
-                 and cleanup_eligible_at <= now()
-                 and hidden_repository_id is not null
-               order by cleanup_eligible_at, id
-               limit 100
-               """) =~ "github_import_items_cleanup_due_index"
+        assert recovery_plan =~ "github_import_repository_cleanups_recovery_index"
+        refute recovery_plan =~ "Sort"
 
-        assert explain_sql("""
-               select id
-               from github_import_repository_items
-               where replacement_repository_id = 1
-               order by id
-               limit 100
-               """) =~ "github_import_items_replacement_cleanup_index"
+        due_plan =
+          explain_sql("""
+          select id, hidden_repository_id
+          from github_import_repository_items
+          where state = 'staging_git'
+            and cleanup_state = 'cleanup_pending'
+            and cleanup_eligible_at <= now()
+            and hidden_repository_id is not null
+          order by cleanup_eligible_at, id
+          limit 100
+          """)
+
+        assert due_plan =~ "github_import_items_cleanup_due_index"
+        refute due_plan =~ "Sort"
+
+        replacement_plan =
+          explain_sql("""
+          select id
+          from github_import_repository_items
+          where replacement_repository_id = 1
+          order by id
+          limit 100
+          """)
+
+        assert replacement_plan =~ "github_import_items_replacement_cleanup_index"
+        refute replacement_plan =~ "Sort"
       end)
     end
   end
