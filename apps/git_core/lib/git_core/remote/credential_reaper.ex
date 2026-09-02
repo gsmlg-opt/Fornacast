@@ -213,8 +213,35 @@ defmodule GitCore.Remote.CredentialReaper do
   end
 
   defp directory_not_symlink?(path) do
-    match?({:ok, %File.Stat{type: :directory}}, File.lstat(path))
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :directory}} ->
+        true
+
+      {:ok, %File.Stat{type: :symlink}} ->
+        system_symlink?(path)
+
+      _other ->
+        false
+    end
   end
+
+  defp system_symlink?(path) when path in ["/var", "/tmp", "/etc", "/run"] do
+    case :os.type() do
+      {:unix, :darwin} ->
+        case File.read_link(path) do
+          {:ok, target} when target in ["private" <> path, "private/var/run"] ->
+            match?({:ok, %File.Stat{type: :directory}}, File.lstat("/" <> target))
+
+          _other ->
+            false
+        end
+
+      _other ->
+        false
+    end
+  end
+
+  defp system_symlink?(_path), do: false
 
   defp before_deadline(deadline) do
     if System.monotonic_time(:millisecond) < deadline,
