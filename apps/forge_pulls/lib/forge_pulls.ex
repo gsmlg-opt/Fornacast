@@ -1412,8 +1412,20 @@ defmodule ForgePulls do
           issue.state == :open and is_nil(pull.merged_at) and pull.analysis.mergeable
     }
 
-    %{pull | issue: issue, capabilities: capabilities}
+    %{pull | issue: issue, capabilities: capabilities, merged_by: resolve_merged_by(pull)}
   end
+
+  defp resolve_merged_by(%PullRequest{merged_by_user_id: user_id}) when not is_nil(user_id) do
+    ForgeAccounts.get_user(user_id)
+  end
+
+  defp resolve_merged_by(%PullRequest{merged_by_github_identity_id: identity_id})
+       when not is_nil(identity_id) do
+    ForgeAccounts.resolve_attributions([{:github, identity_id}])
+    |> Map.get({:github, identity_id})
+  end
+
+  defp resolve_merged_by(_pull), do: nil
 
   defp create_result(
          {:ok, %{pull_request: pull, authorization: %{repository: repository, actor: actor}}}

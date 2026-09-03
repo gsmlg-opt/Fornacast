@@ -22,4 +22,20 @@ defmodule ForgeIssues.Label do
     |> validate_format(:color, ~r/^[0-9a-f]{6}$/)
     |> unique_constraint([:repository_id, :normalized_name])
   end
+
+  def import_changeset(label, attrs) do
+    label
+    |> cast(attrs, [:repository_id, :name, :normalized_name, :color, :description, :default])
+    |> update_change(:normalized_name, &(String.trim(&1) |> String.downcase()))
+    |> validate_required([:repository_id, :name, :normalized_name, :color])
+    |> validate_format(:color, ~r/^[0-9a-f]{6}$/)
+    |> put_default(:default, false)
+    |> unique_constraint([:repository_id, :normalized_name])
+  end
+
+  defp put_default(changeset, field, default) do
+    if get_field(changeset, field) in [nil, ""],
+      do: put_change(changeset, field, default),
+      else: changeset
+  end
 end

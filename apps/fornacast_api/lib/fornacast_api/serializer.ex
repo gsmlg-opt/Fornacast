@@ -17,6 +17,32 @@ defmodule FornacastAPI.Serializer.Fields do
 
   @maximum_repository_size 2_147_483_647
 
+  def simple_user(%ForgeAccounts.ExternalAttribution{} = value) do
+    login = value.username
+    id = value.github_identity_id
+
+    %{
+      avatar_url: value.avatar_url,
+      events_url: nil,
+      followers_url: nil,
+      following_url: nil,
+      gists_url: nil,
+      gravatar_id: nil,
+      html_url: value.profile_url,
+      id: id,
+      login: login,
+      node_id: node_id("GitHubIdentity", id),
+      organizations_url: nil,
+      received_events_url: nil,
+      repos_url: nil,
+      site_admin: false,
+      starred_url: nil,
+      subscriptions_url: nil,
+      type: "User",
+      url: value.profile_url
+    }
+  end
+
   def simple_user(value) do
     login = fetch!(value, :username)
     id = fetch!(value, :id)

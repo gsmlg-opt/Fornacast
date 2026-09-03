@@ -62,6 +62,8 @@ defmodule ForgeIssues.Fixtures do
         "organization_members",
         "api_keys",
         "ssh_keys",
+        "github_credentials",
+        "github_identities",
         "users"
       ],
       &Ecto.Adapters.SQL.query!(Repo, "delete from #{&1}", [])

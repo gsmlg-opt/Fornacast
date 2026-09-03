@@ -55,7 +55,11 @@ defmodule FornacastAPI.Serializers.V2022_11_28.Pull do
       mergeable_state: Atom.to_string(pull.mergeable_state || :unknown),
       merged: merged,
       merged_at: timestamp(pull.merged_at),
-      merged_by: nil,
+      merged_by:
+        if(pull.merged_by,
+          do: Serializer.render(@version, :simple_user, pull.merged_by, opts),
+          else: nil
+        ),
       milestone: nil,
       node_id: node_id("PullRequest", pull.id),
       number: issue.number,

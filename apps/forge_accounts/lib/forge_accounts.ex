@@ -11,6 +11,7 @@ defmodule ForgeAccounts do
   alias ForgeAccounts.{
     APIKey,
     APIScope,
+    ExternalAttribution,
     GitHubAccounts,
     GitHubIdentity,
     GitHubIdentityWrite,
@@ -169,6 +170,78 @@ defmodule ForgeAccounts do
     User
     |> where([user], user.id in ^Enum.uniq(ids) and user.kind == :user)
     |> Repo.all()
+  end
+
+  @type attribution_ref :: {:user, pos_integer()} | {:github, pos_integer()}
+  @type attribution_subject :: User.t() | ExternalAttribution.t()
+
+  @spec resolve_attributions([attribution_ref()]) :: %{attribution_ref() => attribution_subject()}
+  def resolve_attributions(refs) when is_list(refs) do
+    refs = Enum.uniq(refs)
+
+    user_ids = for {:user, id} <- refs, do: id
+
+    users_by_id =
+      user_ids
+      |> Enum.uniq()
+      |> get_users()
+      |> Map.new(&{&1.id, &1})
+
+    user_refs =
+      refs
+      |> Enum.filter(&match?({:user, _}, &1))
+      |> Map.new(fn {:user, id} = ref ->
+        case Map.fetch(users_by_id, id) do
+          {:ok, user} -> {ref, user}
+          :error -> {ref, nil}
+        end
+      end)
+      |> Enum.reject(fn {_ref, value} -> is_nil(value) end)
+      |> Map.new()
+
+    github_ids = for {:github, id} <- refs, do: id
+
+    github_refs =
+      if github_ids == [] do
+        %{}
+      else
+        linked_user_ids =
+          GitHubIdentity
+          |> where([identity], identity.id in ^github_ids and not is_nil(identity.local_user_id))
+          |> select([identity], {identity.id, identity.local_user_id})
+          |> Repo.all()
+          |> Map.new()
+
+        linked_users =
+          linked_user_ids
+          |> Map.values()
+          |> Enum.uniq()
+          |> get_users()
+          |> Map.new(&{&1.id, &1})
+
+        GitHubIdentity
+        |> where([identity], identity.id in ^github_ids)
+        |> Repo.all()
+        |> Map.new(fn identity ->
+          value =
+            case Map.get(linked_user_ids, identity.id) do
+              nil -> ExternalAttribution.from_identity(identity)
+              linked_id -> Map.fetch!(linked_users, linked_id)
+            end
+
+          {{:github, identity.id}, value}
+        end)
+      end
+
+    Map.merge(user_refs, github_refs)
+  end
+
+  @spec linked_user_id_for_github_identity(pos_integer()) :: pos_integer() | nil
+  def linked_user_id_for_github_identity(github_identity_id) when is_integer(github_identity_id) do
+    case Repo.get(GitHubIdentity, github_identity_id) do
+      %GitHubIdentity{local_user_id: local_user_id} -> local_user_id
+      nil -> nil
+    end
   end
 
   def get_user!(id), do: Repo.get_by!(User, id: id, kind: :user)

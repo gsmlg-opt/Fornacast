@@ -18,7 +18,9 @@ defmodule ForgePulls.PullRequest do
     field :mergeable_state, Ecto.Enum, values: @mergeable_states
     field :merged_at, :utc_datetime
     field :merged_by_user_id, :integer
+    field :merged_by_github_identity_id, :integer
     field :merge_commit_sha, :string
+    field :merged_by, :map, virtual: true
     field :issue, :map, virtual: true
     field :analysis, :map, virtual: true
     field :capabilities, :map, virtual: true

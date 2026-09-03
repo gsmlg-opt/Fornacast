@@ -17,4 +17,11 @@ defmodule ForgeIssues.NumberSequence do
     |> validate_required([:repository_id])
     |> unique_constraint(:repository_id)
   end
+
+  def finalize_changeset(sequence, attrs) do
+    sequence
+    |> cast(attrs, [:next_number, :updated_at])
+    |> validate_required([:next_number])
+    |> validate_number(:next_number, greater_than: 0)
+  end
 end

@@ -8,6 +8,7 @@ defmodule ForgeIssues.Comment do
   schema "issue_comments" do
     field :issue_id, :integer
     field :author_user_id, :integer
+    field :author_github_identity_id, :integer
     field :body, :string
 
     field :author, :map, virtual: true
@@ -36,6 +37,14 @@ defmodule ForgeIssues.Comment do
 
     changeset
     |> validate_required([:body])
+    |> validate_length(:body, min: 1)
+    |> validate_no_nul(:body)
+  end
+
+  def import_changeset(comment, attrs) do
+    comment
+    |> cast(attrs, [:body, :author_github_identity_id, :inserted_at, :updated_at])
+    |> validate_required([:issue_id, :body, :author_github_identity_id, :inserted_at, :updated_at])
     |> validate_length(:body, min: 1)
     |> validate_no_nul(:body)
   end

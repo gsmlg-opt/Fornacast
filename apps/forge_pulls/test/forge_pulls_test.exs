@@ -25,6 +25,7 @@ defmodule ForgePullsTest do
         "mergeable_state" => %{type: :text, nullable: true, default: nil},
         "merged_at" => %{type: :timestamp, nullable: true, default: nil, utc: true},
         "merged_by_user_id" => %{type: :bigint, nullable: true, default: nil},
+        "merged_by_github_identity_id" => %{type: :bigint, nullable: true, default: nil},
         "merge_commit_sha" => %{type: :text, nullable: true, default: nil},
         "inserted_at" => %{type: :timestamp, nullable: false, default: nil, utc: true},
         "updated_at" => %{type: :timestamp, nullable: false, default: nil, utc: true}
@@ -33,12 +34,14 @@ defmodule ForgePullsTest do
         MapSet.new([
           {"issue_id", "issues", "id", :cascade},
           {"repository_id", "repositories", "id", :cascade},
-          {"merged_by_user_id", "users", "id", :nilify}
+          {"merged_by_user_id", "users", "id", :nilify},
+          {"merged_by_github_identity_id", "github_identities", "id", :restrict}
         ]),
       indexes:
         MapSet.new([
           {false, ["repository_id"]},
           {false, ["repository_id", "base_ref"]},
+          {false, ["merged_by_github_identity_id"]},
           {true, ["issue_id"]}
         ]),
       checks: %{}
@@ -3086,6 +3089,7 @@ defmodule ForgePullsTest do
               "issue_id",
               "repository_id",
               "merged_by_user_id",
+              "merged_by_github_identity_id",
               "pull_request_id",
               "actor_user_id"
             ],

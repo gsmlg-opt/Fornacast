@@ -776,10 +776,14 @@ defmodule ForgeIssues do
     )
   end
 
-  defp mutation_capability(%ForgeAccounts.User{} = actor, repository, %Issue{
-         author_user_id: author_id
-       }) do
-    mutation_capability(actor, repository, author_id, repository_capability(actor, repository))
+  defp mutation_capability(%ForgeAccounts.User{} = actor, repository, %Issue{} = issue) do
+    case local_author_user_id(issue) do
+      nil ->
+        {:error, :forbidden}
+
+      author_id ->
+        mutation_capability(actor, repository, author_id, repository_capability(actor, repository))
+    end
   end
 
   defp mutation_capability(_actor, _repository, _issue), do: {:error, :forbidden}
@@ -792,15 +796,21 @@ defmodule ForgeIssues do
   defp mutation_capability(_actor, _repository, _author_id, _repository_capability),
     do: {:error, :forbidden}
 
-  defp authorize_comment_mutation(actor, repository, %Comment{author_user_id: author_id}) do
-    case comment_mutation_capability(
-           actor,
-           repository,
-           author_id,
-           repository_capability(actor, repository)
-         ) do
-      true -> :ok
-      false -> {:error, :forbidden}
+  defp authorize_comment_mutation(actor, repository, %Comment{} = comment) do
+    case local_author_user_id(comment) do
+      nil ->
+        {:error, :forbidden}
+
+      author_id ->
+        case comment_mutation_capability(
+               actor,
+               repository,
+               author_id,
+               repository_capability(actor, repository)
+             ) do
+          true -> :ok
+          false -> {:error, :forbidden}
+        end
     end
   end
 
@@ -1331,6 +1341,21 @@ defmodule ForgeIssues do
     end)
   end
 
+  defdelegate import_label_multi(multi, key, repository, attrs), to: ForgeIssues.Import
+  defdelegate import_identity_multi(multi, key, repository, github_identity, kind, attrs),
+    to: ForgeIssues.Import
+
+  defdelegate import_comment_multi(multi, key, issue, github_identity, attrs),
+    to: ForgeIssues.Import
+
+  def import_issue_label_multi(multi, key, issue, label, attrs \\ %{}),
+    do: ForgeIssues.Import.import_issue_label_multi(multi, key, issue, label, attrs)
+
+  def import_assignee_multi(multi, key, issue, github_identity, attrs \\ %{}),
+    do: ForgeIssues.Import.import_assignee_multi(multi, key, issue, github_identity, attrs)
+
+  defdelegate finalize_import_sequence_multi(multi, key, repository), to: ForgeIssues.Import
+
   @spec update_identity(Multi.t(), Multi.name(), Issue.t(), ForgeAccounts.User.t(), map()) ::
           Multi.t()
   def update_identity(multi, key, %Issue{} = issue, _actor, attrs) do
@@ -1396,8 +1421,8 @@ defmodule ForgeIssues do
         {false, _issue} ->
           {:error, :forbidden}
 
-        {true, %Issue{author_user_id: author_id}} ->
-          mutation_capability(actor, repository, author_id, repository_capability)
+        {true, %Issue{} = issue} ->
+          mutation_capability(actor, repository, issue)
 
         {true, nil} ->
           {:error, :forbidden}
@@ -1416,12 +1441,18 @@ defmodule ForgeIssues do
 
   defp comment_capabilities(actor, repository, comment, repository_capability) do
     allowed =
-      comment_mutation_capability(
-        actor,
-        repository,
-        comment.author_user_id,
-        repository_capability
-      )
+      case local_author_user_id(comment) do
+        nil ->
+          false
+
+        author_id ->
+          comment_mutation_capability(
+            actor,
+            repository,
+            author_id,
+            repository_capability
+          )
+      end
 
     %{can_edit: allowed, can_delete: allowed}
   end
@@ -1529,34 +1560,58 @@ defmodule ForgeIssues do
   defp do_load_issue_metadata(issues, repository, actor) do
     issue_ids = Enum.map(issues, & &1.id)
     labels = labels_by_issue(issue_ids)
-    assignee_ids = assignee_ids_by_issue(issue_ids)
+    assignee_refs_by_issue = assignee_refs_by_issue(issue_ids)
+
+    attribution_refs =
+      issues
+      |> Enum.map(&author_ref/1)
+      |> Kernel.++(assignee_refs_by_issue |> Map.values() |> List.flatten())
+      |> Kernel.++(Enum.map(capability_actor_ids(actor), &{:user, &1}))
+      |> Enum.uniq()
+
+    resolved = ForgeAccounts.resolve_attributions(attribution_refs)
 
     users =
-      issues
-      |> Enum.map(& &1.author_user_id)
-      |> Kernel.++(assignee_ids |> Map.values() |> List.flatten())
-      |> Kernel.++(capability_actor_ids(actor))
-      |> ForgeAccounts.get_users()
+      resolved
+      |> Map.values()
+      |> Enum.filter(&match?(%ForgeAccounts.User{}, &1))
+      |> Enum.uniq_by(& &1.id)
       |> Map.new(&{&1.id, &1})
 
-    associations = author_associations(issues, repository, users)
+    local_author_ids =
+      Enum.map(issues, fn issue ->
+        issue
+        |> author_ref()
+        |> then(&Map.get(resolved, &1))
+        |> attribution_local_user_id()
+      end)
+
+    associations = author_associations(local_author_ids, repository, users)
     counts = comment_counts(issues)
     actor = canonical_capability_actor(actor, users)
     repository_capability = repository_capability(actor, repository)
 
     Enum.map(issues, fn issue ->
+      author = Map.fetch!(resolved, author_ref(issue))
+
+      author_association =
+        case attribution_local_user_id(author) do
+          nil -> "NONE"
+          author_id -> Map.get(associations, author_id, "NONE")
+        end
+
       assignees =
-        assignee_ids
+        assignee_refs_by_issue
         |> Map.get(issue.id, [])
-        |> Enum.map(&Map.fetch!(users, &1))
-        |> Enum.sort_by(& &1.username)
+        |> Enum.map(&Map.fetch!(resolved, &1))
+        |> Enum.sort_by(&attribution_username/1)
 
       %{
         issue
         | labels: Map.get(labels, issue.id, []),
           assignees: assignees,
-          author: Map.get(users, issue.author_user_id),
-          author_association: Map.get(associations, issue.author_user_id, "NONE"),
+          author: author,
+          author_association: author_association,
           comment_count: Map.get(counts, issue.id, 0),
           capabilities: issue_capabilities(actor, repository, issue, repository_capability)
       }
@@ -1564,22 +1619,46 @@ defmodule ForgeIssues do
   end
 
   defp load_comment_metadata(comments, repository, issue_number, actor) when is_list(comments) do
-    users =
+    attribution_refs =
       comments
-      |> Enum.map(& &1.author_user_id)
-      |> Kernel.++(capability_actor_ids(actor))
-      |> ForgeAccounts.get_users()
+      |> Enum.map(&author_ref/1)
+      |> Kernel.++(Enum.map(capability_actor_ids(actor), &{:user, &1}))
+      |> Enum.uniq()
+
+    resolved = ForgeAccounts.resolve_attributions(attribution_refs)
+
+    users =
+      resolved
+      |> Map.values()
+      |> Enum.filter(&match?(%ForgeAccounts.User{}, &1))
+      |> Enum.uniq_by(& &1.id)
       |> Map.new(&{&1.id, &1})
 
-    associations = author_associations(comments, repository, users)
+    local_author_ids =
+      Enum.map(comments, fn comment ->
+        comment
+        |> author_ref()
+        |> then(&Map.get(resolved, &1))
+        |> attribution_local_user_id()
+      end)
+
+    associations = author_associations(local_author_ids, repository, users)
     actor = canonical_capability_actor(actor, users)
     repository_capability = repository_capability(actor, repository)
 
     Enum.map(comments, fn comment ->
+      author = Map.fetch!(resolved, author_ref(comment))
+
+      author_association =
+        case attribution_local_user_id(author) do
+          nil -> "NONE"
+          author_id -> Map.get(associations, author_id, "NONE")
+        end
+
       %{
         comment
-        | author: Map.get(users, comment.author_user_id),
-          author_association: Map.get(associations, comment.author_user_id, "NONE"),
+        | author: author,
+          author_association: author_association,
           issue_number: issue_number,
           capabilities: comment_capabilities(actor, repository, comment, repository_capability)
       }
@@ -1606,16 +1685,53 @@ defmodule ForgeIssues do
     |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
   end
 
-  defp assignee_ids_by_issue([]), do: %{}
+  defp assignee_refs_by_issue([]), do: %{}
 
-  defp assignee_ids_by_issue(issue_ids) do
+  defp assignee_refs_by_issue(issue_ids) do
     IssueAssignee
     |> where([join], join.issue_id in ^issue_ids)
-    |> order_by([join], asc: join.user_id)
-    |> select([join], {join.issue_id, join.user_id})
+    |> order_by([join], asc: join.user_id, asc: join.github_identity_id)
+    |> select([join], {join.issue_id, join.user_id, join.github_identity_id})
     |> Repo.all()
-    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    |> Enum.group_by(&elem(&1, 0), fn {_issue_id, user_id, github_identity_id} ->
+      cond do
+        not is_nil(user_id) -> {:user, user_id}
+        not is_nil(github_identity_id) -> {:github, github_identity_id}
+      end
+    end)
   end
+
+  defp author_ref(%Issue{author_user_id: user_id}) when not is_nil(user_id), do: {:user, user_id}
+
+  defp author_ref(%Issue{author_github_identity_id: identity_id}) when not is_nil(identity_id),
+    do: {:github, identity_id}
+
+  defp author_ref(%Comment{author_user_id: user_id}) when not is_nil(user_id), do: {:user, user_id}
+
+  defp author_ref(%Comment{author_github_identity_id: identity_id}) when not is_nil(identity_id),
+    do: {:github, identity_id}
+
+  defp local_author_user_id(%Issue{author_user_id: user_id}) when not is_nil(user_id), do: user_id
+
+  defp local_author_user_id(%Issue{author_github_identity_id: identity_id})
+       when not is_nil(identity_id),
+       do: ForgeAccounts.linked_user_id_for_github_identity(identity_id)
+
+  defp local_author_user_id(%Comment{author_user_id: user_id}) when not is_nil(user_id), do: user_id
+
+  defp local_author_user_id(%Comment{author_github_identity_id: identity_id})
+       when not is_nil(identity_id),
+       do: ForgeAccounts.linked_user_id_for_github_identity(identity_id)
+
+  defp local_author_user_id(_), do: nil
+
+  defp attribution_local_user_id(%ForgeAccounts.User{id: id}), do: id
+  defp attribution_local_user_id(%ForgeAccounts.ExternalAttribution{}), do: nil
+  defp attribution_local_user_id(nil), do: nil
+
+  defp attribution_username(%ForgeAccounts.User{username: username}), do: username
+
+  defp attribution_username(%ForgeAccounts.ExternalAttribution{username: username}), do: username
 
   defp resolve_relationships(repository, attrs) do
     _labels = DefaultLabels.ensure(repository)
@@ -1768,8 +1884,8 @@ defmodule ForgeIssues do
     |> Map.new()
   end
 
-  defp author_associations(issues, repository, users) do
-    author_ids = issues |> Enum.map(& &1.author_user_id) |> Enum.uniq()
+  defp author_associations(local_author_ids, repository, users) when is_list(local_author_ids) do
+    author_ids = local_author_ids |> Enum.reject(&is_nil/1) |> Enum.uniq()
     owner = ForgeRepos.repository_owner(repository)
     collaborator_roles = ForgeRepos.collaborator_roles(author_ids, repository)
 

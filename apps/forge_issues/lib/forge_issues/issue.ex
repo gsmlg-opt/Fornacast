@@ -23,6 +23,7 @@ defmodule ForgeIssues.Issue do
     field :state, Ecto.Enum, values: @states, default: :open
     field :state_reason, Ecto.Enum, values: @state_reasons
     field :author_user_id, :integer
+    field :author_github_identity_id, :integer
     field :closed_at, :utc_datetime
 
     field :labels, {:array, :map}, virtual: true, default: []
@@ -59,6 +60,39 @@ defmodule ForgeIssues.Issue do
     |> normalize_closed_fields()
   end
 
+  def import_changeset(issue, attrs) do
+    issue
+    |> cast(attrs, [
+      :number,
+      :kind,
+      :title,
+      :body,
+      :state,
+      :state_reason,
+      :author_github_identity_id,
+      :closed_at,
+      :inserted_at,
+      :updated_at
+    ])
+    |> validate_required([
+      :repository_id,
+      :number,
+      :kind,
+      :title,
+      :state,
+      :author_github_identity_id,
+      :inserted_at,
+      :updated_at
+    ])
+    |> validate_inclusion(:kind, @kinds)
+    |> validate_inclusion(:state, @states)
+    |> validate_inclusion(:state_reason, @state_reasons)
+    |> validate_length(:title, min: 1, max: 256)
+    |> reject_null_bytes([:title, :body])
+    |> validate_import_closed_fields()
+    |> unique_constraint([:repository_id, :number])
+  end
+
   defp normalize_closed_fields(changeset) do
     state = get_field(changeset, :state)
     previous_state = changeset.data.state
@@ -90,6 +124,26 @@ defmodule ForgeIssues.Issue do
   end
 
   defp validate_state_reason(changeset, _state), do: changeset
+
+  defp validate_import_closed_fields(changeset) do
+    state = get_field(changeset, :state)
+
+    changeset
+    |> validate_state_reason(state)
+    |> validate_closed_at_presence(state)
+  end
+
+  defp validate_closed_at_presence(changeset, :closed) do
+    if is_nil(get_field(changeset, :closed_at)),
+      do: add_error(changeset, :closed_at, "can't be blank"),
+      else: changeset
+  end
+
+  defp validate_closed_at_presence(changeset, :open) do
+    if is_nil(get_field(changeset, :closed_at)),
+      do: changeset,
+      else: add_error(changeset, :closed_at, "must be blank when open")
+  end
 
   defp reject_null_bytes(changeset, fields) do
     Enum.reduce(fields, changeset, fn field, changeset ->
