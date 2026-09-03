@@ -14,6 +14,7 @@ defmodule ForgeImports do
     OrganizationOrchestrator,
     Persistence,
     ReportEntry,
+    ReportView,
     RepositoryItem,
     RepositoryPublisher,
     RunView,
@@ -86,6 +87,14 @@ defmodule ForgeImports do
   def get_run_view(%User{} = actor, id), do: get_run(actor, id)
 
   def get_run_view(_actor, _id), do: {:error, :not_found}
+
+  def get_status(%User{} = actor, id), do: get_run(actor, id)
+
+  def get_status(_actor, _id), do: {:error, :not_found}
+
+  def get_report(%User{} = actor, id), do: ReportView.load(actor, id)
+
+  def get_report(_actor, _id), do: {:error, :not_found}
 
   def resolve_repository_conflicts(actor, run_id, decisions, request_metadata),
     do: Conflicts.resolve(actor, run_id, decisions, request_metadata)

@@ -7,6 +7,7 @@ defmodule FornacastWeb.ImportHTML do
 
   attr :repositories, :list, required: true
   attr :editable, :boolean, required: true
+  attr :run, :map, default: nil
 
   def repository_table(assigns) do
     ~H"""
@@ -20,6 +21,7 @@ defmodule FornacastWeb.ImportHTML do
             <th scope="col">Destination</th>
             <th scope="col">State</th>
             <th scope="col">Warnings</th>
+            <th :if={!@editable} scope="col">Published</th>
           </tr>
         </thead>
         <tbody>
@@ -53,12 +55,43 @@ defmodule FornacastWeb.ImportHTML do
             <td>{repository.destination_slug || "Needs a slug"}</td>
             <td>
               <.dm_badge variant={state_variant(repository.state)} soft size="sm">
-                {humanize(repository.state)}
+                <span data-repository-state>{humanize(repository.state)}</span>
               </.dm_badge>
             </td>
             <td>
-              <span :if={repository.wait_reason}>{humanize(repository.wait_reason)}</span>
-              <span :if={!repository.wait_reason} class="text-on-surface-variant">None</span>
+              <span :if={repository.wait_reason} data-repository-wait>{humanize(
+                repository.wait_reason
+              )}</span>
+              <span
+                :if={!repository.wait_reason && repository.next_attempt_at}
+                data-repository-wait
+              >
+                Resume after {datetime_label(repository.next_attempt_at)}
+              </span>
+              <span
+                :if={!repository.wait_reason && !repository.next_attempt_at}
+                data-repository-wait
+                class="text-on-surface-variant"
+              >
+                None
+              </span>
+            </td>
+            <td :if={!@editable}>
+              <.dm_link
+                :if={published_href(@run, repository)}
+                href={published_href(@run, repository)}
+                data-repository-published-link
+              >
+                View repository
+              </.dm_link>
+              <span
+                :if={!published_href(@run, repository)}
+                class="text-on-surface-variant"
+                data-repository-published-link
+                hidden
+              >
+                Not published
+              </span>
             </td>
           </tr>
         </tbody>
@@ -228,4 +261,53 @@ defmodule FornacastWeb.ImportHTML do
       do: id
 
   def destination_organization_id(_run), do: nil
+
+  @terminal_states [:completed, :completed_with_warnings, :canceled, :failed]
+  @cancellable_states [:discovering, :awaiting_resolution, :ready, :running, :awaiting_credential]
+  @retryable_states [:failed, :canceled, :completed_with_warnings]
+
+  def pollable?(%{state: state}), do: state not in @terminal_states
+  def pollable?(_run), do: false
+
+  def cancellable?(%{state: state}), do: state in @cancellable_states
+  def cancellable?(_run), do: false
+
+  def retryable?(%{state: state}), do: state in @retryable_states
+  def retryable?(_run), do: false
+
+  def awaiting_credential?(%{state: :awaiting_credential}), do: true
+  def awaiting_credential?(_run), do: false
+
+  def report_available?(%{report_finalized_at: %DateTime{}}), do: true
+  def report_available?(_run), do: false
+
+  def control_accounts?(%{state: state})
+      when state in [:awaiting_credential | @retryable_states],
+      do: true
+
+  def control_accounts?(_run), do: false
+
+  def destination_owner_username(%{destination_organization: %{username: username}})
+      when is_binary(username) and username != "",
+      do: username
+
+  def destination_owner_username(%{destination: %{organization_slug: slug}})
+      when is_binary(slug) and slug != "",
+      do: slug
+
+  def destination_owner_username(_run), do: nil
+
+  def published_href(nil, _repository), do: nil
+
+  def published_href(run, repository) do
+    owner = destination_owner_username(run)
+    slug = repository.destination_slug
+
+    if repository.state in [:published, :completed] and is_binary(owner) and is_binary(slug) and
+         slug != "" do
+      "/#{owner}/#{slug}"
+    else
+      nil
+    end
+  end
 end

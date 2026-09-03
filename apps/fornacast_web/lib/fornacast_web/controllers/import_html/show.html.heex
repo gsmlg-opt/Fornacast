@@ -1,20 +1,38 @@
 <section
   class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6"
   data-import-run={@run.id}
+  data-import-status-url={if(pollable?(@run), do: "/imports/#{@run.id}/status", else: nil)}
 >
   <header class="grid gap-2">
     <p class="text-xs text-on-surface-variant">GitHub migration plan</p>
     <div class="flex flex-wrap items-center gap-2">
       <h2 class="text-2xl font-semibold">Import plan</h2>
       <.dm_badge variant={state_variant(@run.state)} soft pill>
-        {humanize(@run.state)}
+        <span data-import-state-label>{humanize(@run.state)}</span>
       </.dm_badge>
     </div>
     <p class="text-sm text-on-surface-variant">
       {run_guidance(@run)}
     </p>
+    <p
+      :if={pollable?(@run)}
+      class="text-sm text-on-surface-variant"
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+      data-import-progress-live
+    >
+      Progress updates automatically when JavaScript is enabled. Use Refresh status any time.
+    </p>
     <div class="flex flex-wrap items-center gap-2">
       <.dm_link href={"/imports/#{@run.id}"} class="text-sm text-primary">Refresh status</.dm_link>
+      <.dm_link
+        :if={report_available?(@run)}
+        href={"/imports/#{@run.id}/report"}
+        class="text-sm text-primary"
+      >
+        View final report
+      </.dm_link>
       <.dm_link
         :if={workflow_available?(@run)}
         href={workflow_path(@run)}
@@ -24,6 +42,125 @@
       </.dm_link>
     </div>
   </header>
+
+  <.dm_alert
+    :if={awaiting_credential?(@run)}
+    id="import-awaiting-credential"
+    variant="warning"
+    outlined
+    role="alert"
+    data-import-awaiting-credential
+  >
+    <span class="font-semibold">GitHub credential required</span>
+    <span :if={@run.wait_reason} data-import-wait-reason>{humanize(@run.wait_reason)}</span>
+    <span :if={!@run.wait_reason}>Replace the saved credential or enter a one-time PAT to resume.</span>
+  </.dm_alert>
+
+  <.dm_card
+    :if={cancellable?(@run) || retryable?(@run) || awaiting_credential?(@run)}
+    id="import-controls-card"
+    variant="bordered"
+    shadow="sm"
+    padding="lg"
+  >
+    <:title><span class="text-lg font-semibold">Import controls</span></:title>
+    <div class="grid gap-4">
+      <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#157 --%>
+      <form
+        :if={cancellable?(@run)}
+        action={"/imports/#{@run.id}/cancel"}
+        method="post"
+        data-import-cancel-form
+      >
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <button class="btn btn-warning" type="submit">Cancel import</button>
+      </form>
+
+      <form
+        :if={awaiting_credential?(@run)}
+        action={"/imports/#{@run.id}/credential"}
+        method="post"
+        class="grid gap-4"
+        data-import-credential-form
+      >
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <fieldset class="grid gap-2">
+          <legend class="font-semibold">Replacement credential</legend>
+          <div class="flex flex-wrap gap-2">
+            <label class="inline-flex items-center gap-2">
+              <input
+                class="radio radio-primary"
+                type="radio"
+                name="import[credential_source]"
+                value="saved"
+                checked={@accounts != []}
+              /> Saved GitHub account
+            </label>
+            <label class="inline-flex items-center gap-2">
+              <input
+                class="radio radio-primary"
+                type="radio"
+                name="import[credential_source]"
+                value="one_time"
+                checked={@accounts == []}
+              /> One-time personal access token
+            </label>
+          </div>
+        </fieldset>
+        <.dm_input
+          id="import-credential-github-account"
+          class="w-full"
+          name="import[github_identity_id]"
+          type="select"
+          label="Saved GitHub account"
+          prompt="Choose a linked account"
+          options={account_options(@accounts)}
+          value={nil}
+        />
+        <.dm_input
+          id="import-credential-pat"
+          class="w-full"
+          name="import[pat]"
+          type="password"
+          label="One-time GitHub personal access token"
+          maxlength="4096"
+          autocomplete="new-password"
+          spellcheck="false"
+          autocapitalize="none"
+        />
+        <div>
+          <button class="btn btn-primary" type="submit">Resume with credential</button>
+        </div>
+      </form>
+
+      <form
+        :if={retryable?(@run)}
+        action={"/imports/#{@run.id}/retry"}
+        method="post"
+        class="grid gap-4"
+        data-import-retry-form
+      >
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <p class="text-sm text-on-surface-variant">
+          Create a successor import with only unpublished retryable repositories.
+        </p>
+        <.dm_input
+          id="import-retry-github-account"
+          class="w-full"
+          name="import[github_identity_id]"
+          type="select"
+          label="Saved GitHub account"
+          prompt="Choose a linked account"
+          options={account_options(@accounts)}
+          value={nil}
+          required
+        />
+        <div>
+          <button class="btn btn-primary" type="submit">Retry import</button>
+        </div>
+      </form>
+    </div>
+  </.dm_card>
 
   <.dm_alert :if={@error} id="import-run-error" variant="error" outlined role="alert">
     {@error}
@@ -80,19 +217,29 @@
     </dl>
     <ul class="flex flex-wrap gap-2" aria-label="Import counts">
       <li>
-        <.dm_badge variant="primary" soft>Selected {@run.counts.selected}</.dm_badge>
+        <.dm_badge variant="primary" soft>
+          Selected <span data-import-count-selected>{@run.counts.selected}</span>
+        </.dm_badge>
       </li>
       <li>
-        <.dm_badge variant="success" soft>Published {@run.counts.published}</.dm_badge>
+        <.dm_badge variant="success" soft>
+          Published <span data-import-count-published>{@run.counts.published}</span>
+        </.dm_badge>
       </li>
       <li>
-        <.dm_badge variant="secondary" soft>Skipped {@run.counts.skipped}</.dm_badge>
+        <.dm_badge variant="secondary" soft>
+          Skipped <span data-import-count-skipped>{@run.counts.skipped}</span>
+        </.dm_badge>
       </li>
       <li>
-        <.dm_badge variant="warning" soft>Warnings {@run.counts.warnings}</.dm_badge>
+        <.dm_badge variant="warning" soft>
+          Warnings <span data-import-count-warnings>{@run.counts.warnings}</span>
+        </.dm_badge>
       </li>
       <li>
-        <.dm_badge variant="error" soft>Failures {@run.counts.failures}</.dm_badge>
+        <.dm_badge variant="error" soft>
+          Failures <span data-import-count-failures>{@run.counts.failures}</span>
+        </.dm_badge>
       </li>
     </ul>
   </.dm_card>
@@ -203,7 +350,7 @@
       <input type="hidden" name="_csrf_token" value={csrf_token()} />
       <input type="hidden" name="_method" value="patch" />
       <input type="hidden" name="selection[present]" value="true" />
-      <.repository_table repositories={@run.repositories} editable={true} />
+      <.repository_table repositories={@run.repositories} editable={true} run={@run} />
       <div>
         <button class="btn btn-primary" type="submit">Update repository selection</button>
       </div>
@@ -212,6 +359,7 @@
       :if={!resolution_editable?(@run) && @run.repositories != []}
       repositories={@run.repositories}
       editable={false}
+      run={@run}
     />
   </.dm_card>
 

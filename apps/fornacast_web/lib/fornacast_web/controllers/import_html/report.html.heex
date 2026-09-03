@@ -1,0 +1,92 @@
+<section
+  class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6"
+  data-import-report={@report.id}
+>
+  <header class="grid gap-2">
+    <p class="text-xs text-on-surface-variant">GitHub migration report</p>
+    <div class="flex flex-wrap items-center gap-2">
+      <h2 class="text-2xl font-semibold">Import report</h2>
+      <.dm_badge variant={state_variant(@report.state)} soft pill>
+        {humanize(@report.state)}
+      </.dm_badge>
+    </div>
+    <p class="text-sm text-on-surface-variant">
+      Final outcomes for every selected repository and fetched supported object.
+    </p>
+    <div class="flex flex-wrap items-center gap-2">
+      <.dm_link href={"/imports/#{@report.id}"} class="text-sm text-primary">Back to import plan</.dm_link>
+    </div>
+  </header>
+
+  <.dm_card id="import-report-summary" variant="bordered" shadow="sm" padding="lg">
+    <:title><span class="text-lg font-semibold">Summary</span></:title>
+    <p :if={is_nil(@report.summary)} class="text-sm text-on-surface-variant">
+      No run-level summary was recorded.
+    </p>
+    <.dm_alert
+      :if={@report.summary}
+      variant={outcome_variant(@report.summary.outcome)}
+      outlined
+      role="status"
+    >
+      <span class="font-semibold">{humanize(@report.summary.classification)}</span>
+      <span>{@report.summary.summary}</span>
+    </.dm_alert>
+    <ul class="flex flex-wrap gap-2" aria-label="Import counts">
+      <li>
+        <.dm_badge variant="primary" soft>Selected {@report.counts.selected}</.dm_badge>
+      </li>
+      <li>
+        <.dm_badge variant="success" soft>Published {@report.counts.published}</.dm_badge>
+      </li>
+      <li>
+        <.dm_badge variant="secondary" soft>Skipped {@report.counts.skipped}</.dm_badge>
+      </li>
+      <li>
+        <.dm_badge variant="warning" soft>Warnings {@report.counts.warnings}</.dm_badge>
+      </li>
+      <li>
+        <.dm_badge variant="error" soft>Failures {@report.counts.failures}</.dm_badge>
+      </li>
+    </ul>
+  </.dm_card>
+
+  <.dm_card id="import-report-repositories" variant="bordered" shadow="sm" padding="lg">
+    <:title><span class="text-lg font-semibold">Repositories</span></:title>
+    <div class="overflow-x-auto">
+      <table class="table" aria-label="Import repository outcomes">
+        <caption class="sr-only">Import repository outcomes</caption>
+        <thead>
+          <tr>
+            <th scope="col">GitHub repository</th>
+            <th scope="col">Selection</th>
+            <th scope="col">Outcome</th>
+            <th scope="col">Summary</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr :for={repository <- @report.repositories} data-report-item={repository.id}>
+            <th scope="row">{repository.source_full_name}</th>
+            <td>
+              <.dm_badge variant="secondary" soft size="sm">
+                {if(repository.selected, do: "Selected", else: "Not selected")}
+              </.dm_badge>
+            </td>
+            <td>
+              <.dm_badge
+                :if={repository.outcome}
+                variant={outcome_variant(repository.outcome)}
+                soft
+                size="sm"
+              >
+                {humanize(repository.outcome)}
+              </.dm_badge>
+              <span :if={is_nil(repository.outcome)} class="text-on-surface-variant">Pending</span>
+            </td>
+            <td>{repository.summary || "No summary recorded."}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </.dm_card>
+</section>

@@ -2,6 +2,7 @@ import "phoenix_duskmoon";
 // TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#104
 import { registerAll } from "@duskmoon-dev/elements";
 import { registerAllArts } from "@duskmoon-dev/art-elements";
+import { initImportStatusPolling } from "./import_status.js";
 
 registerAll();
 registerAllArts();
@@ -138,6 +139,7 @@ if (document.readyState === "loading") {
       initThemeMenu();
       initAppbarMenus();
       initRepositoryClonePopoverFocus();
+      initImportStatusPolling();
     },
     { once: true },
   );
@@ -145,4 +147,5 @@ if (document.readyState === "loading") {
   initThemeMenu();
   initAppbarMenus();
   initRepositoryClonePopoverFocus();
+  initImportStatusPolling();
 }

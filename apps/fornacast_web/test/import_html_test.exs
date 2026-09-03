@@ -95,7 +95,7 @@ defmodule FornacastWeb.ImportHTMLTest do
     assert html =~ ~s(action="/imports/91/selection" method="post")
     assert html =~ ~s(action="/imports/91/destination" method="post")
     assert length(Regex.scan(~r/name="_method" value="patch"/, html)) == 2
-    assert length(Regex.scan(~r/name="_csrf_token"/, html)) == 2
+    assert length(Regex.scan(~r/name="_csrf_token"/, html)) == 3
     assert length(Regex.scan(~r/<time\b[^>]*datetime="2026-08-26T07:0[01]:00Z"/, html)) == 2
     assert html =~ ~r/<h2\b[^>]*>Import plan<\/h2>/
     assert html =~ ~r/<h3\b[^>]*>Repositories<\/h3>/
@@ -111,7 +111,9 @@ defmodule FornacastWeb.ImportHTMLTest do
     refute html =~ "opaque-internal-evidence"
     refute html =~ "credential_envelope"
     refute html =~ ~r/<img\b/
-    refute html =~ ~r/>\s*(?:Start|Cancel|Retry)(?: import)?\s*</i
+    refute html =~ ~r/>\s*Start import\s*</i
+    refute html =~ ~r/>\s*Retry import\s*</i
+    assert html =~ ~s(action="/imports/91/cancel")
     refute html =~ ~r/<el-dm-button\b/
     refute html =~ ~r/\bgap-(?:1|3|5|6|7|8|9|10|11|12)\b/
     refute html =~ ~r/(?:bg|text|border)-(?:red|blue|green|gray|slate|zinc)-\d+/
@@ -193,11 +195,33 @@ defmodule FornacastWeb.ImportHTMLTest do
         render_component(&ImportHTML.show/1,
           run: run,
           organizations: [%{id: 51, username: "acme"}],
+          accounts: [],
           error: nil
         )
 
       assert html =~ ~s(href="/imports/91")
-      refute html =~ ~r/>\s*(?:Start|Cancel|Retry)(?: import)?\s*</i
+      refute html =~ ~r/>\s*Start import\s*</i
+
+      if state in [:discovering, :awaiting_resolution, :ready, :running, :awaiting_credential] do
+        assert html =~ ~s(action="/imports/91/cancel")
+        assert html =~ "Cancel import"
+      else
+        refute html =~ ~s(action="/imports/91/cancel")
+      end
+
+      if state in [:failed, :canceled, :completed_with_warnings] do
+        assert html =~ ~s(action="/imports/91/retry")
+        assert html =~ "Retry import"
+      else
+        refute html =~ ~s(action="/imports/91/retry")
+      end
+
+      if state == :awaiting_credential do
+        assert html =~ ~s(action="/imports/91/credential")
+        assert html =~ "Resume with credential"
+      else
+        refute html =~ ~s(action="/imports/91/credential")
+      end
 
       if state in [:awaiting_resolution, :running] do
         assert html =~ ~s(href="/imports/91/conflicts")
@@ -217,6 +241,25 @@ defmodule FornacastWeb.ImportHTMLTest do
         assert html =~ ~s(data-import-read-only="#{state}")
       end
     end
+  end
+
+  test "running imports expose progressive polling hooks without replacing forms" do
+    view = %{run_view() | state: :running}
+
+    html =
+      render_component(&ImportHTML.show/1,
+        run: view,
+        organizations: [],
+        accounts: [],
+        error: nil
+      )
+
+    assert html =~ ~s(data-import-status-url="/imports/91/status")
+    assert html =~ ~s(data-import-count-selected)
+    assert html =~ ~s(data-import-state-label)
+    assert html =~ "Refresh status"
+    assert html =~ ~s(data-import-read-only="running")
+    refute html =~ ~s(action="/imports/91/selection")
   end
 
   test "discovering and zero-result resolution have distinct semantic empty states" do
@@ -307,7 +350,7 @@ defmodule FornacastWeb.ImportHTMLTest do
       assert warning_alert =~ ~s(type="#{variant}")
       refute html =~ "github_pat_destination_secret"
       refute html =~ "credential_envelope"
-      refute html =~ ~r/>\s*(?:Start|Cancel|Retry)(?: import)?\s*</i
+      refute html =~ ~r/>\s*Start import\s*</i
     end
 
     clean = render_component(&ImportHTML.show/1, run: base, organizations: [], error: nil)

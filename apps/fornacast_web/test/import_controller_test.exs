@@ -8,7 +8,7 @@ defmodule FornacastWeb.ImportControllerTest do
     only: [get_resp_header: 2, get_session: 1, get_session: 2, put_req_header: 3]
 
   alias ForgeAccounts.{GitHubAccountView, User}
-  alias ForgeImports.RunView
+  alias ForgeImports.{ReportView, RunView}
   alias Fornacast.Repo
 
   @endpoint FornacastWeb.Endpoint
@@ -50,6 +50,31 @@ defmodule FornacastWeb.ImportControllerTest do
     def get_run_view(actor, id) do
       record(:show, [actor, id])
       operation_result(:show)
+    end
+
+    def get_status(actor, id) do
+      record(:status, [actor, id])
+      operation_result(:status)
+    end
+
+    def get_report(actor, id) do
+      record(:report, [actor, id])
+      operation_result(:report)
+    end
+
+    def request_cancel(actor, run_id, metadata, opts \\ []) do
+      record(:cancel, [actor, run_id, metadata, opts])
+      operation_result(:cancel)
+    end
+
+    def retry_import(actor, run_id, credential, metadata, opts \\ []) do
+      record(:retry, [actor, run_id, credential, metadata, opts])
+      operation_result(:retry)
+    end
+
+    def replace_run_credential(actor, run_id, credential, metadata, opts \\ []) do
+      record(:credential, [actor, run_id, credential, metadata, opts])
+      operation_result(:credential)
     end
 
     def update_repository_selection(actor, id, repository_ids) do
@@ -631,7 +656,92 @@ defmodule FornacastWeb.ImportControllerTest do
     assert html =~ "Reserved namespace"
     refute html =~ @pat
     refute html =~ "credential_envelope"
-    refute html =~ ~r/>\s*(?:Start|Cancel|Retry)(?: import)?\s*</i
+    assert html =~ ~s(action="/imports/91/cancel")
+    refute html =~ ~r/>\s*Start import\s*</i
+  end
+
+  test "cancel posts a CSRF-protected owner-scoped request", %{actor: actor} do
+    view = %{run_view(actor, 91) | state: :running}
+    TestImports.result(:show, {:ok, view})
+    TestImports.result(:cancel, {:ok, view})
+
+    form = request_conn(actor) |> get("/imports/91")
+    html = html_response(form, 200)
+    token = extract_form_csrf_token(html, "/imports/91/cancel")
+
+    canceled =
+      request_conn(actor)
+      |> post("/imports/91/cancel", %{"_csrf_token" => token})
+
+    assert redirected_to(canceled, 303) == "/imports/91"
+    assert_private_no_store(canceled)
+
+    assert [
+             {:cancel,
+              [
+                %User{id: actor_id},
+                91,
+                metadata,
+                []
+              ]}
+           ] = Enum.filter(TestImports.calls(), &match?({:cancel, _}, &1))
+
+    assert actor_id == actor.id
+    assert is_map(metadata)
+    refute inspect(metadata) =~ @pat
+  end
+
+  test "retry posts a saved credential and redirects to the successor run", %{actor: actor} do
+    TestImports.accounts({:ok, [account(41, "octocat", :valid)]})
+
+    predecessor = %{run_view(actor, 91) | state: :failed}
+    successor = %{run_view(actor, 92) | state: :ready, predecessor_run_id: 91}
+
+    TestImports.result(:show, {:ok, predecessor})
+    TestImports.result(:retry, {:ok, successor})
+
+    form = request_conn(actor) |> get("/imports/91")
+    html = html_response(form, 200)
+    token = extract_form_csrf_token(html, "/imports/91/retry")
+
+    retried =
+      request_conn(actor)
+      |> post("/imports/91/retry", %{
+        "_csrf_token" => token,
+        "import" => %{"github_identity_id" => "41"}
+      })
+
+    assert redirected_to(retried, 303) == "/imports/92"
+    assert_private_no_store(retried)
+
+    assert [
+             {:retry,
+              [
+                %User{id: actor_id},
+                91,
+                {:saved, 41},
+                _metadata,
+                []
+              ]}
+           ] = Enum.filter(TestImports.calls(), &match?({:retry, _}, &1))
+
+    assert actor_id == actor.id
+  end
+
+  test "report renders a safe finalized report view", %{actor: actor} do
+    report = report_view()
+
+    TestImports.result(:report, {:ok, report})
+
+    conn = request_conn(actor) |> get("/imports/91/report")
+    html = html_response(conn, 200)
+
+    assert html =~ "Import report"
+    assert html =~ "octo/alpha"
+    assert html =~ "Imported"
+    refute html =~ @pat
+    refute html =~ "credential_envelope"
+    assert_private_no_store(conn)
   end
 
   test "known service failures are fixed, masked, non-cacheable, and secret-free", %{actor: actor} do
@@ -938,6 +1048,42 @@ defmodule FornacastWeb.ImportControllerTest do
   end
 
   defp invalid_message, do: "Check the GitHub source, credential, and destination."
+
+  defp report_view do
+    %ReportView{
+      id: 91,
+      state: :completed,
+      terminal_at: ~U[2026-08-26 08:00:00Z],
+      report_finalized_at: ~U[2026-08-26 08:00:00Z],
+      counts: %{selected: 1, published: 1, skipped: 0, warnings: 0, failures: 0},
+      repositories: [
+        %{
+          id: 301,
+          source_full_name: "octo/alpha",
+          source_name: "alpha",
+          selected: true,
+          state: :completed,
+          outcome: :imported,
+          classification: "imported",
+          summary: "Repository imported",
+          metadata: %{},
+          source_count: 0
+        }
+      ],
+      entries: [],
+      summary: %{
+        scope: :run,
+        outcome: :imported,
+        classification: "imported",
+        summary: "Import completed",
+        metadata: %{},
+        source_count: 1,
+        repository_item_id: nil
+      },
+      inserted_at: ~U[2026-08-26 07:00:00Z],
+      updated_at: ~U[2026-08-26 08:00:00Z]
+    }
+  end
 
   defp run_view(actor, id, kind \\ :repository) do
     %RunView{

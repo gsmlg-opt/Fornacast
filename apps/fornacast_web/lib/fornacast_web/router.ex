@@ -67,10 +67,15 @@ defmodule FornacastWeb.Router do
     get "/organizations/import", ImportController, :organization_new
     post "/organizations/import/discover", ImportController, :organization_discover
     get "/imports/:id", ImportController, :show
+    get "/imports/:id/status", ImportStatusController, :show
     get "/imports/:id/conflicts", ImportController, :conflicts
     patch "/imports/:id/conflicts", ImportController, :resolve_conflicts
     get "/imports/:id/review", ImportController, :review
     post "/imports/:id/start", ImportController, :start
+    post "/imports/:id/cancel", ImportController, :cancel
+    post "/imports/:id/retry", ImportController, :retry
+    post "/imports/:id/credential", ImportController, :credential
+    get "/imports/:id/report", ImportController, :report
     patch "/imports/:id/destination", ImportController, :destination
     patch "/imports/:id/selection", ImportController, :selection
   end

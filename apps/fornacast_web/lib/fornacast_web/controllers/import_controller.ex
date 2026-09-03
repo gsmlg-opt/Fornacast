@@ -5,7 +5,7 @@ defmodule FornacastWeb.ImportController do
   alias ForgeAccounts.GitHubAccounts.CredentialCallbackError
   alias ForgeImports.Discovery.CredentialBootstrapError
   alias ForgeImports.GitHubAccounts.CredentialVerificationError
-  alias ForgeImports.{ImportRun, RepositoryItem, RunView, SafeValue}
+  alias ForgeImports.{ImportRun, ReportView, RepositoryItem, RunView, SafeValue}
   alias FornacastWeb.{ImportHTML, RequestMetadata}
 
   plug :require_active_user
@@ -66,8 +66,12 @@ defmodule FornacastWeb.ImportController do
           case validate_run_view(run, actor, run_id) do
             :ok ->
               case owned_organizations(conn, actor) do
-                {:ok, organizations} -> render_run(conn, run, organizations)
-                {:error, _reason} -> render_fixed_error(conn, :unavailable)
+                {:ok, organizations} ->
+                  accounts = control_accounts(conn, run, actor)
+                  render_run(conn, run, organizations, accounts)
+
+                {:error, _reason} ->
+                  render_fixed_error(conn, :unavailable)
               end
 
             {:error, :not_found} ->
@@ -219,6 +223,67 @@ defmodule FornacastWeb.ImportController do
     end
   end
 
+  def cancel(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
+    with {:ok, run_id} <- canonical_id(Map.get(params, "id")),
+         result <-
+           service_call(fn ->
+             imports(conn).request_cancel(actor, run_id, RequestMetadata.from_conn(conn))
+           end) do
+      handle_control_result(conn, actor, run_id, result)
+    else
+      {:error, :not_found} -> render_fixed_error(conn, :not_found)
+    end
+  end
+
+  def retry(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
+    with {:ok, run_id} <- canonical_id(Map.get(params, "id")),
+         {:ok, credential} <- retry_credential_params(params),
+         result <-
+           service_call(fn ->
+             imports(conn).retry_import(
+               actor,
+               run_id,
+               credential,
+               RequestMetadata.from_conn(conn)
+             )
+           end) do
+      handle_retry_result(conn, actor, run_id, result)
+    else
+      {:error, :not_found} -> render_fixed_error(conn, :not_found)
+      {:error, _reason} -> render_fixed_error(conn, :invalid_choices)
+    end
+  end
+
+  def credential(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
+    with {:ok, run_id} <- canonical_id(Map.get(params, "id")),
+         {:ok, credential} <- resume_credential_params(conn, actor, params),
+         result <-
+           service_call(fn ->
+             imports(conn).replace_run_credential(
+               actor,
+               run_id,
+               credential,
+               RequestMetadata.from_conn(conn)
+             )
+           end) do
+      handle_control_result(conn, actor, run_id, result)
+    else
+      {:error, :not_found} -> render_fixed_error(conn, :not_found)
+      {:error, _reason} -> render_fixed_error(conn, :invalid_choices)
+    end
+  end
+
+  def report(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
+    with {:ok, run_id} <- canonical_id(Map.get(params, "id")),
+         {:ok, %ReportView{} = report} <-
+           service_call(fn -> imports(conn).get_report(actor, run_id) end) do
+      render_report(conn, report)
+    else
+      {:error, :not_found} -> render_fixed_error(conn, :not_found)
+      _unexpected -> render_fixed_error(conn, :unavailable)
+    end
+  end
+
   defp handle_discovery_result(conn, actor, _kind, {:ok, %RunView{} = run}) do
     case validate_run_view(run, actor, run.id) do
       :ok -> redirect_to_run(conn, run.id)
@@ -256,6 +321,44 @@ defmodule FornacastWeb.ImportController do
     do: render_update_error(conn, reason)
 
   defp handle_start_result(conn, _actor, _run_id, _unexpected),
+    do: render_fixed_error(conn, :unavailable)
+
+  defp handle_control_result(conn, _actor, run_id, {:ok, _result}) do
+    redirect_to_run(conn, run_id)
+  end
+
+  defp handle_control_result(conn, _actor, _run_id, {:error, :not_found}),
+    do: render_fixed_error(conn, :not_found)
+
+  defp handle_control_result(conn, _actor, _run_id, {:error, :invalid_transition}),
+    do: render_fixed_error(conn, :conflict)
+
+  defp handle_control_result(conn, _actor, _run_id, {:error, _reason}),
+    do: render_fixed_error(conn, :unavailable)
+
+  defp handle_control_result(conn, _actor, _run_id, _unexpected),
+    do: render_fixed_error(conn, :unavailable)
+
+  defp handle_retry_result(conn, actor, _run_id, {:ok, %RunView{id: successor_id} = run}) do
+    case validate_run_view(run, actor, successor_id) do
+      :ok -> redirect_to_run(conn, successor_id)
+      {:error, _reason} -> render_fixed_error(conn, :unavailable)
+    end
+  end
+
+  defp handle_retry_result(conn, _actor, _run_id, {:error, :not_found}),
+    do: render_fixed_error(conn, :not_found)
+
+  defp handle_retry_result(conn, _actor, _run_id, {:error, :forbidden}),
+    do: render_fixed_error(conn, :invalid_choices)
+
+  defp handle_retry_result(conn, _actor, _run_id, {:error, :invalid_predecessor}),
+    do: render_fixed_error(conn, :conflict)
+
+  defp handle_retry_result(conn, _actor, _run_id, {:error, _reason}),
+    do: render_fixed_error(conn, :unavailable)
+
+  defp handle_retry_result(conn, _actor, _run_id, _unexpected),
     do: render_fixed_error(conn, :unavailable)
 
   defp handle_conflict_resolution(conn, actor, _run, run_id, {:ok, %RunView{} = resolved}) do
@@ -343,16 +446,22 @@ defmodule FornacastWeb.ImportController do
     )
   end
 
-  defp render_run(conn, %RunView{} = run, organizations, error \\ nil) do
+  defp render_run(conn, %RunView{} = run, organizations, accounts \\ [], error \\ nil) do
     rendered =
       ImportHTML.show(%{
         run: run,
         organizations: organizations,
+        accounts: accounts,
         error: error,
         __changed__: nil
       })
 
     render_component_page(conn, "GitHub import", rendered)
+  end
+
+  defp render_report(conn, %ReportView{} = report) do
+    rendered = ImportHTML.report(%{report: report, __changed__: nil})
+    render_component_page(conn, "GitHub import report", rendered)
   end
 
   defp render_conflicts(conn, %RunView{} = run, error \\ nil) do
@@ -1003,6 +1112,86 @@ defmodule FornacastWeb.ImportController do
       else
         reraise error, __STACKTRACE__
       end
+  end
+
+  defp control_accounts(conn, %RunView{} = run, actor) do
+    if ImportHTML.control_accounts?(run) do
+      case safe_accounts(conn, actor) do
+        {:ok, accounts} -> accounts
+        _ -> []
+      end
+    else
+      []
+    end
+  end
+
+  defp retry_credential_params(%{"import" => %{"github_identity_id" => identity_id}})
+       when is_binary(identity_id) do
+    with {:ok, parsed_id} <- canonical_form_id(identity_id, :invalid_credential) do
+      {:ok, {:saved, parsed_id}}
+    end
+  end
+
+  defp retry_credential_params(_params), do: {:error, :invalid_credential}
+
+  defp resume_credential_params(conn, actor, %{"import" => attrs}) when is_map(attrs) do
+    with {:ok, credential} <- credential_params(attrs),
+         {:ok, source} <- resume_credential_source(conn, actor, credential) do
+      {:ok, source}
+    end
+  end
+
+  defp resume_credential_params(_conn, _actor, _params), do: {:error, :invalid_request}
+
+  defp resume_credential_source(conn, actor, %{
+         credential_source: "saved",
+         github_identity_id: identity_id
+       }) do
+    saved_credential_source(conn, actor, identity_id)
+  end
+
+  defp resume_credential_source(_conn, _actor, %{credential_source: "one_time", pat: pat}) do
+    {:ok, %{credential_source: :one_time, pat: pat}}
+  end
+
+  defp resume_credential_source(_conn, _actor, _credential), do: {:error, :invalid_credential}
+
+  defp saved_credential_source(conn, actor, identity_id) do
+    with {:ok, accounts} <- safe_accounts(conn, actor),
+         true <-
+           Enum.any?(accounts, fn account ->
+             account.identity_id == identity_id and account.credential_present and
+               account.credential_status == :valid
+           end),
+         {:ok, credential_id} <- saved_credential_id(actor, identity_id) do
+      {:ok,
+       %{
+         credential_source: :saved,
+         github_identity_id: identity_id,
+         github_credential_id: credential_id
+       }}
+    else
+      _ -> {:error, :invalid_credential}
+    end
+  end
+
+  defp saved_credential_id(%User{id: actor_id}, identity_id) do
+    import Ecto.Query
+
+    alias ForgeAccounts.GitHubCredential
+    alias Fornacast.Repo
+
+    case Repo.one(
+           from credential in GitHubCredential,
+             where:
+               credential.local_user_id == ^actor_id and
+                 credential.github_identity_id == ^identity_id and credential.status == :valid,
+             select: credential.id,
+             limit: 1
+         ) do
+      id when is_integer(id) and id > 0 -> {:ok, id}
+      _ -> {:error, :invalid_credential}
+    end
   end
 
   defp imports(conn), do: conn.private[:forge_imports] || ForgeImports
