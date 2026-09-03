@@ -1,0 +1,15 @@
+[
+  {
+    "id": 601,
+    "node_id": "MDU6SXNzdWVPbWVudDE=",
+    "body": "Comment body",
+    "user": {
+      "id": 583231,
+      "login": "octocat",
+      "avatar_url": "https://avatars.githubusercontent.com/u/583231?v=4",
+      "html_url": "https://github.com/octocat"
+    },
+    "created_at": "2025-01-01T00:00:00Z",
+    "updated_at": "2025-01-01T00:00:00Z"
+  }
+]

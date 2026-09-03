@@ -1,0 +1,37 @@
+{
+  "id": 701,
+  "number": 7,
+  "state": "closed",
+  "draft": false,
+  "merged": true,
+  "merged_at": "2025-02-03T00:00:00Z",
+  "merge_commit_sha": "cccccccccccccccccccccccccccccccccccccccc",
+  "title": "Same repo pull",
+  "body": "Pull body",
+  "user": {
+    "id": 583231,
+    "login": "octocat"
+  },
+  "merged_by": {
+    "id": 9001,
+    "login": "hubot"
+  },
+  "head": {
+    "ref": "feature",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "repo": {
+      "id": 1296269,
+      "name": "Hello-World"
+    }
+  },
+  "base": {
+    "ref": "main",
+    "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "repo": {
+      "id": 1296269,
+      "name": "Hello-World"
+    }
+  },
+  "created_at": "2025-02-01T00:00:00Z",
+  "updated_at": "2025-02-03T00:00:00Z"
+}

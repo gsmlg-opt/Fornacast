@@ -1,0 +1,23 @@
+[
+  {
+    "id": 301,
+    "node_id": "MDU6SXNzdWUx",
+    "number": 7,
+    "title": "Issue title",
+    "body": "Issue body",
+    "state": "open",
+    "locked": false,
+    "user": {
+      "id": 583231,
+      "login": "octocat",
+      "avatar_url": "https://avatars.githubusercontent.com/u/583231?v=4",
+      "html_url": "https://github.com/octocat"
+    },
+    "labels": [],
+    "assignees": [],
+    "milestone": null,
+    "created_at": "2025-01-01T00:00:00Z",
+    "updated_at": "2025-01-02T00:00:00Z",
+    "closed_at": null
+  }
+]
