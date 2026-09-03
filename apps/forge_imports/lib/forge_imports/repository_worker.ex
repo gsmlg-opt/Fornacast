@@ -19,7 +19,8 @@ defmodule ForgeImports.RepositoryWorker do
     Persistence,
     Recovery,
     ReportEntry,
-    RepositoryItem
+    RepositoryItem,
+    Waits
   }
 
   alias ForgeImports.RepositoryStager
@@ -1433,34 +1434,23 @@ defmodule ForgeImports.RepositoryWorker do
 
   defp pause_for_credential(capability, reason) do
     wait_reason = credential_wait_reason(reason)
+    now = DateTime.utc_now(:second)
 
-    transaction = fn ->
-      Repo.transaction(fn ->
-        with %ImportRun{} = run <- locked_run(capability.import_run_id),
-             %RepositoryItem{} = item <- locked_owned_item(capability),
-             :ok <- after_settlement_locks(:credential_pause),
-             now <- DateTime.utc_now(:second),
-             true <- live_lease?(item, now),
-             {:ok, _run} <- pause_run_for_credential(run, wait_reason, now),
-             {:ok, _item} <-
-               OperationLease.update_owned(RepositoryItem, item,
-                 state: :awaiting_credential,
-                 wait_reason: wait_reason,
-                 next_attempt_at: nil
-               ) do
-          :awaiting_credential
-        else
-          nil -> Repo.rollback(:lost_lease)
-          false -> Repo.rollback(:lost_lease)
-          {:error, reason} -> Repo.rollback(reason)
-        end
-      end)
-    end
-
-    case Persistence.with_retry(transaction) do
-      {:ok, :awaiting_credential} -> {:error, :awaiting_credential}
-      {:error, :lost_lease} -> {:error, :lost_lease}
-      {:error, _reason} -> {:error, :persistence_unavailable}
+    with %ImportRun{} = run <- Repo.get(ImportRun, capability.import_run_id),
+         %RepositoryItem{} = item <- Repo.get(RepositoryItem, capability.id),
+         true <- item.lease_owner == capability.lease_owner,
+         true <- live_lease?(item, now) do
+      case Waits.awaiting_credential(run, item, item.state,
+             wait_reason: wait_reason,
+             now: now
+           ) do
+        {:ok, _} -> {:error, :awaiting_credential}
+        {:error, :stale} -> {:error, :lost_lease}
+        {:error, :lost_lease} -> {:error, :lost_lease}
+        {:error, _reason} -> {:error, :persistence_unavailable}
+      end
+    else
+      _ -> {:error, :lost_lease}
     end
   rescue
     _error in Turso.Error -> {:error, :persistence_unavailable}
@@ -1477,21 +1467,6 @@ defmodule ForgeImports.RepositoryWorker do
     |> maybe_lock()
     |> Repo.one()
   end
-
-  defp pause_run_for_credential(%ImportRun{state: :running} = run, wait_reason, now) do
-    changeset =
-      ImportRun.transition_changeset(run, :awaiting_credential, %{
-        wait_reason: wait_reason,
-        next_attempt_at: nil
-      })
-
-    Persistence.update_without_lease(run, [:running], changeset, now)
-  end
-
-  defp pause_run_for_credential(%ImportRun{state: :awaiting_credential} = run, _reason, _now),
-    do: {:ok, run}
-
-  defp pause_run_for_credential(_run, _reason, _now), do: {:error, :lost_lease}
 
   defp credential_wait_reason(:invalid_credential), do: "credential_invalid"
   defp credential_wait_reason(:credential_changed), do: "credential_changed"

@@ -3,7 +3,7 @@ defmodule ForgeImports.Recovery do
 
   import Ecto.Query
 
-  alias ForgeImports.{ImportRun, Persistence, RepositoryItem, RepositoryPublisher}
+  alias ForgeImports.{ImportRun, Persistence, RepositoryItem, RepositoryPublisher, Waits}
   alias Fornacast.{OperationLease, Repo}
 
   @recoverable_states [
@@ -55,6 +55,16 @@ defmodule ForgeImports.Recovery do
     facts = Keyword.get(opts, :durable_facts, gather_durable_facts(item))
     now = Keyword.get(opts, :now, DateTime.utc_now(:second))
 
+    with {:ok, item} <- maybe_pause_missing_credential(item, now) do
+      if item.state == :awaiting_credential do
+        {:ok, item}
+      else
+        reconcile_recoverable(item, facts, now)
+      end
+    end
+  end
+
+  defp reconcile_recoverable(%RepositoryItem{} = item, facts, now) do
     with true <- item.state in @recoverable_states,
          {:ok, _phase} <- classify(item, facts),
          {:ok, released} <- release_expired_lease(item, now) do
@@ -73,6 +83,29 @@ defmodule ForgeImports.Recovery do
       terminal_report?: terminal_report?(item),
       credential_cleared?: credential_cleared?(item)
     }
+  end
+
+  defp maybe_pause_missing_credential(%RepositoryItem{} = item, now) do
+    case Repo.get(ImportRun, item.import_run_id) do
+      %ImportRun{} = run ->
+        if Waits.missing_saved_credential?(run) and item.state in @recoverable_states do
+          case Waits.pause_for_missing_saved_credential(run, item, now: now) do
+            {:ok, {_paused_run, paused_item}} when not is_nil(paused_item) ->
+              {:ok, paused_item}
+
+            {:ok, {_paused_run, nil}} ->
+              {:ok, item}
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+        else
+          {:ok, item}
+        end
+
+      nil ->
+        {:ok, item}
+    end
   end
 
   defp align_state(%RepositoryItem{state: state} = item, facts, now)

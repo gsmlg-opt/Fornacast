@@ -16,7 +16,8 @@ defmodule ForgeImports do
     ReportEntry,
     RepositoryItem,
     RepositoryPublisher,
-    RunView
+    RunView,
+    Waits
   }
 
   alias ForgeRepos.Repository
@@ -337,6 +338,28 @@ defmodule ForgeImports do
   end
 
   def attach_one_time_credential(_actor, _run, _envelope, _keyring), do: {:error, :not_found}
+
+  def replace_run_credential(actor, run_id, credential_source, request_metadata, opts \\ [])
+
+  def replace_run_credential(%User{} = actor, run_id, credential_source, request_metadata, opts)
+      when is_integer(run_id) and run_id > 0 and is_map(credential_source) and
+             is_map(request_metadata) and is_list(opts) do
+    with {:ok, active_actor} <- active_actor(actor),
+         %ImportRun{} = run <- actor_run(active_actor.id, run_id) do
+      Waits.resume_with_credential(
+        active_actor,
+        run,
+        credential_source,
+        request_metadata,
+        opts
+      )
+    else
+      _ -> {:error, :not_found}
+    end
+  end
+
+  def replace_run_credential(_actor, _run_id, _credential_source, _request_metadata, _opts),
+    do: {:error, :not_found}
 
   defp mutate_item(actor, expected_run, expected_item, callback) do
     transact(fn ->
