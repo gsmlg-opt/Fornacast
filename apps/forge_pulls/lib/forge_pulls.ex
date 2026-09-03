@@ -435,6 +435,9 @@ defmodule ForgePulls do
   def create_pull_request(_repository, _actor, _attrs, _request_metadata),
     do: {:error, :forbidden}
 
+  defdelegate import_pull_request_multi(multi, key, repository, canonical_issue, merger_identity, attrs),
+    to: ForgePulls.Import
+
   @spec update_pull_request(ForgeRepos.Repository.t(), PullRequest.t(), map(), map(), map()) ::
           {:ok, PullRequest.t()} | {:error, error_reason()}
   def update_pull_request(

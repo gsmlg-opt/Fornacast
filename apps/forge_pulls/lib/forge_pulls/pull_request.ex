@@ -3,6 +3,8 @@ defmodule ForgePulls.PullRequest do
 
   import Ecto.Changeset
 
+  alias ForgeIssues.Issue
+
   @mergeable_states [:unknown, :mergeable, :conflicting]
 
   @type t :: %__MODULE__{}
@@ -49,6 +51,79 @@ defmodule ForgePulls.PullRequest do
     |> cast(attrs, [:base_ref, :head_sha, :base_sha, :mergeable, :mergeable_state])
     |> validate_branch_refs()
     |> validate_distinct_refs()
+  end
+
+  def import_changeset(%__MODULE__{} = pull_request, attrs, %Issue{} = issue, %ForgeRepos.Repository{} = repository) do
+    pull_request
+    |> cast(attrs, [
+      :head_ref,
+      :base_ref,
+      :head_sha,
+      :base_sha,
+      :mergeable,
+      :mergeable_state,
+      :merged_at,
+      :merged_by_user_id,
+      :merged_by_github_identity_id,
+      :merge_commit_sha,
+      :inserted_at,
+      :updated_at
+    ])
+    |> validate_required([
+      :issue_id,
+      :repository_id,
+      :head_ref,
+      :base_ref,
+      :head_sha,
+      :base_sha,
+      :inserted_at,
+      :updated_at
+    ])
+    |> validate_canonical_issue(issue, repository)
+    |> validate_branch_refs()
+    |> validate_distinct_refs()
+    |> validate_merged_coherence()
+    |> unique_constraint(:issue_id)
+  end
+
+  defp validate_canonical_issue(changeset, %Issue{} = issue, %ForgeRepos.Repository{} = repository) do
+    cond do
+      issue.kind != :pull_request ->
+        add_error(changeset, :issue_id, "must reference a pull request identity")
+
+      issue.repository_id != repository.id ->
+        add_error(changeset, :repository_id, "must match the canonical issue repository")
+
+      get_field(changeset, :issue_id) != issue.id ->
+        add_error(changeset, :issue_id, "must match the canonical issue")
+
+      true ->
+        changeset
+    end
+  end
+
+  defp validate_merged_coherence(changeset) do
+    merged_at = get_field(changeset, :merged_at)
+    merge_commit_sha = get_field(changeset, :merge_commit_sha)
+    merged_by_user_id = get_field(changeset, :merged_by_user_id)
+    merged_by_github_identity_id = get_field(changeset, :merged_by_github_identity_id)
+
+    cond do
+      not is_nil(merged_at) and is_nil(merge_commit_sha) ->
+        add_error(changeset, :merge_commit_sha, "must be present when merged")
+
+      is_nil(merged_at) and not is_nil(merge_commit_sha) ->
+        add_error(changeset, :merged_at, "must be present when merge commit is set")
+
+      not is_nil(merged_by_user_id) and not is_nil(merged_by_github_identity_id) ->
+        add_error(changeset, :merged_by_github_identity_id, "must not be set with a local merger")
+
+      is_nil(merged_at) and (not is_nil(merged_by_user_id) or not is_nil(merged_by_github_identity_id)) ->
+        add_error(changeset, :merged_at, "must be present when a merger is recorded")
+
+      true ->
+        changeset
+    end
   end
 
   defp validate_repository_identity(changeset, nil), do: changeset
