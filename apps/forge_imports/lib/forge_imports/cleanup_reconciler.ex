@@ -3,10 +3,24 @@ defmodule ForgeImports.CleanupReconciler do
 
   use GenServer
 
-  alias ForgeImports.RepositoryCleanup
+  import Ecto.Query
+
+  alias ForgeImports.{ImportAttempt, ImportRun, Persistence, RepositoryCleanup, RepositoryItem}
+  alias Fornacast.Repo
 
   @kinds [:remote_quarantine, :unpublished_shadow, :replacement_tombstone]
   @settlement_margin_ms 1_000
+  @active_item_states [
+    :queued,
+    :awaiting_resolution,
+    :staging_git,
+    :git_staged,
+    :staging_metadata,
+    :ready_to_publish,
+    :publishing,
+    :awaiting_credential,
+    :cancel_requested
+  ]
 
   def start_link(opts \\ []) when is_list(opts) do
     {name, opts} = Keyword.pop(opts, :name, __MODULE__)
@@ -14,6 +28,43 @@ defmodule ForgeImports.CleanupReconciler do
   end
 
   def kick(server \\ __MODULE__), do: GenServer.cast(server, :kick)
+
+  @spec reconcile(DateTime.t(), pos_integer()) :: non_neg_integer()
+  def reconcile(%DateTime{} = now, limit) when is_integer(limit) and limit > 0 do
+    now = DateTime.truncate(now, :second)
+
+    ImportRun
+    |> where([run], run.state == :cancel_requested)
+    |> order_by([run], asc: run.id)
+    |> limit(^limit)
+    |> Repo.all()
+    |> Enum.count(&(reconcile_cancel_run(&1, now) == :reconciled))
+  end
+
+  @doc false
+  def reconcile_cancel_run(%ImportRun{} = run, %DateTime{} = now) do
+    transaction = fn ->
+      Repo.transaction(fn ->
+        with %ImportRun{state: :cancel_requested} = locked <- locked_run(run.id),
+             :ok <- settle_cancel_requested_items(locked, now),
+             true <- cancel_run_ready?(locked.id),
+             target <- cancel_terminal_target(locked),
+             {:ok, _terminal} <- finalize_cancel_run(locked, target, now) do
+          :reconciled
+        else
+          false -> :pending
+          %ImportRun{state: :cancel_requested} -> :pending
+          nil -> Repo.rollback(:not_found)
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+    end
+
+    case Persistence.with_retry(transaction) do
+      {:ok, result} -> result
+      {:error, _reason} -> :pending
+    end
+  end
 
   def interval_ms do
     Fornacast.Config.repository_cleanup().interval_ms
@@ -108,6 +159,7 @@ defmodule ForgeImports.CleanupReconciler do
     task =
       Task.Supervisor.async_nolink(state.task_supervisor, fn ->
         run_before_reconcile_hook(state.cleanup_options)
+        reconcile(DateTime.utc_now(:second), 10)
 
         cleanup_options =
           state.cleanup_options
@@ -262,5 +314,89 @@ defmodule ForgeImports.CleanupReconciler do
       margin = min(@settlement_margin_ms, max(div(runtime_ms, 10), 1))
       runtime_ms - margin
     end
+  end
+
+  defp locked_run(run_id) do
+    ImportRun
+    |> where([run], run.id == ^run_id)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+  end
+
+  defp settle_cancel_requested_items(%ImportRun{id: run_id}, now) do
+    items =
+      Repo.all(
+        from item in RepositoryItem,
+          where:
+            item.import_run_id == ^run_id and item.selected == true and
+              item.state == :cancel_requested and is_nil(item.hidden_repository_id)
+      )
+
+    Enum.reduce_while(items, :ok, fn item, :ok ->
+      case settle_cancel_requested_item(item, now) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp settle_cancel_requested_item(item, now) do
+    with {:ok, canceled} <-
+           Persistence.update_without_lease(
+             item,
+             [:cancel_requested],
+             RepositoryItem.transition_changeset(item, :canceled, %{
+               wait_reason: nil,
+               next_attempt_at: nil
+             }),
+             now
+           ),
+         :ok <- terminalize_attempt(canceled, now) do
+      :ok
+    end
+  end
+
+  defp terminalize_attempt(%RepositoryItem{id: item_id, attempt_count: attempt_count}, now) do
+    case Repo.one(
+           from attempt in ImportAttempt,
+             where:
+               attempt.repository_item_id == ^item_id and
+                 attempt.attempt_number == ^attempt_count and attempt.state == :running
+         ) do
+      %ImportAttempt{} = attempt ->
+        attempt
+        |> ImportAttempt.transition_changeset(:canceled, %{terminal_at: now})
+        |> Repo.update()
+        |> case do
+          {:ok, _attempt} -> :ok
+          {:error, _changeset} -> {:error, :persistence_unavailable}
+        end
+
+      nil ->
+        :ok
+    end
+  end
+
+  defp cancel_run_ready?(run_id) do
+    not Repo.exists?(
+      from item in RepositoryItem,
+        where:
+          item.import_run_id == ^run_id and item.selected == true and
+            item.state in @active_item_states
+    )
+  end
+
+  defp cancel_terminal_target(%ImportRun{published_count: published}) when published > 0,
+    do: :completed_with_warnings
+
+  defp cancel_terminal_target(_run), do: :canceled
+
+  defp finalize_cancel_run(run, target, now) do
+    Persistence.update_without_lease(
+      run,
+      [:cancel_requested],
+      ImportRun.transition_changeset(run, target, %{terminal_at: now}),
+      now
+    )
   end
 end

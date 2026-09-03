@@ -2,7 +2,16 @@ defmodule ForgeImports.Worker do
   @moduledoc false
 
   alias ForgeAccounts.User
-  alias ForgeImports.{ImportRun, Recovery, RepositoryItem, RepositoryPublisher, RepositoryWorker}
+
+  alias ForgeImports.{
+    Cancellation,
+    ImportRun,
+    Recovery,
+    RepositoryItem,
+    RepositoryPublisher,
+    RepositoryWorker
+  }
+
   alias Fornacast.Repo
 
   @spec run(pos_integer(), String.t(), keyword()) ::
@@ -13,10 +22,12 @@ defmodule ForgeImports.Worker do
     worker_opts = worker_options(lease_owner, opts)
 
     with %RepositoryItem{} = item <- Repo.get(RepositoryItem, item_id),
-         {:ok, item} <- Recovery.reconcile(item, opts) do
+         {:ok, item} <- Recovery.reconcile(item, opts),
+         false <- skip_dispatch?(item) do
       dispatch(item, repository_worker, worker_opts)
     else
       nil -> {:error, :not_found}
+      true -> {:error, :cancelled}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -24,19 +35,35 @@ defmodule ForgeImports.Worker do
   @spec run_discovery(pos_integer(), String.t(), keyword()) :: term()
   def run_discovery(run_id, lease_owner, opts \\ [])
       when is_integer(run_id) and run_id > 0 and is_binary(lease_owner) do
-    discovery_opts =
-      opts
-      |> Keyword.drop([:repository_worker, :repository_worker_options])
-      |> Keyword.put(:owner, lease_owner)
+    case Repo.get(ImportRun, run_id) do
+      %ImportRun{state: state} when state in [:cancel_requested, :canceled] ->
+        {:ok, :ignored}
 
-    ForgeImports.DiscoveryWorker.perform(run_id, discovery_opts)
+      _other ->
+        discovery_opts =
+          opts
+          |> Keyword.drop([:repository_worker, :repository_worker_options])
+          |> Keyword.put(:owner, lease_owner)
+
+        ForgeImports.DiscoveryWorker.perform(run_id, discovery_opts)
+    end
+  end
+
+  defp skip_dispatch?(%RepositoryItem{state: :publishing}), do: false
+
+  defp skip_dispatch?(%RepositoryItem{} = item) do
+    Cancellation.check(item) and item.state not in [:cancel_requested, :staging_git]
   end
 
   defp dispatch(%RepositoryItem{state: :publishing, id: item_id}, _worker, _opts) do
     RepositoryPublisher.recover(item_id)
   end
 
-  defp dispatch(%RepositoryItem{state: :ready_to_publish, import_run_id: run_id} = item, _worker, _opts) do
+  defp dispatch(
+         %RepositoryItem{state: :ready_to_publish, import_run_id: run_id} = item,
+         _worker,
+         _opts
+       ) do
     with %ImportRun{} = run <- Repo.get(ImportRun, run_id),
          %User{} = actor <- Repo.get(User, run.actor_user_id) do
       RepositoryPublisher.publish(actor, item.id, run.request_metadata)

@@ -985,6 +985,7 @@ defmodule ForgeImports.RepositoryPublicationTest do
   test "lease theft blocks the original worker and expired recovery commits exactly once",
        context do
     fixture = ready_publication_fixture(context, slug: "lease-theft")
+    audit_before = Repo.aggregate(AuditEvent, :count, :id)
     stolen_until = DateTime.add(DateTime.utc_now(:second), 60, :second)
 
     assert {:error, :persistence_unavailable} =
@@ -1012,7 +1013,7 @@ defmodule ForgeImports.RepositoryPublicationTest do
 
     assert repository.id == fixture.shadow.id
     assert Repo.get!(ImportRun, fixture.run.id).published_count == 1
-    assert Repo.aggregate(AuditEvent, :count, :id) == 1
+    assert Repo.aggregate(AuditEvent, :count, :id) == audit_before + 1
   end
 
   test "cancellation before intent wins without admitting publication", context do

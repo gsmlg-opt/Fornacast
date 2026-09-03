@@ -14,6 +14,7 @@ defmodule ForgeImports.RepositoryWorker do
   alias ForgeImports.{
     CleanupOperation,
     ImportAttempt,
+    Cancellation,
     ImportRun,
     OneTimeCredential,
     Persistence,
@@ -180,7 +181,7 @@ defmodule ForgeImports.RepositoryWorker do
   defp stage_metadata_claimed(capability, options) do
     with {:ok, %{actor: actor, run: run, item: item}} <-
            current_context(capability.id, capability.lease_owner),
-         false <- cancelled?(capability.id, capability.lease_owner),
+         false <- Cancellation.check(capability.id, capability.lease_owner),
          {:ok, item} <- ensure_staging_metadata(item, capability),
          :ok <-
            MetadataImporter.stage(
@@ -1021,7 +1022,7 @@ defmodule ForgeImports.RepositoryWorker do
     remote_options =
       options.remote_options ++
         [
-          cancel?: fn -> cancelled?(item.id, item.lease_owner) end,
+          cancel?: fn -> Cancellation.check(item.id, item.lease_owner) end,
           heartbeat: fn -> heartbeat(item.id, item.lease_owner, options.lease_seconds) end
         ]
 
@@ -1050,7 +1051,7 @@ defmodule ForgeImports.RepositoryWorker do
   defp persist_success(capability, %Remote.Result{} = result, options) do
     with {:ok, %{item: current}} <- current_context(capability.id, capability.lease_owner),
          :ok <- validate_result(current, result),
-         false <- cancelled?(current.id, current.lease_owner),
+         false <- Cancellation.check(current.id, current.lease_owner),
          {:ok, renewed} <- renew_for_post_remote(current, options.lease_seconds),
          {:ok, scan} <- scan_unsupported(renewed, result, options.scan_options),
          {:ok, post_scan} <- renew_for_post_remote(renewed, options.lease_seconds),
@@ -1456,18 +1457,6 @@ defmodule ForgeImports.RepositoryWorker do
     _error in Turso.Error -> {:error, :persistence_unavailable}
   end
 
-  defp locked_owned_item(capability) do
-    RepositoryItem
-    |> where(
-      [item],
-      item.id == ^capability.id and item.import_run_id == ^capability.import_run_id and
-        item.lock_version == ^capability.lock_version and
-        item.lease_owner == ^capability.lease_owner and item.state == :staging_git
-    )
-    |> maybe_lock()
-    |> Repo.one()
-  end
-
   defp credential_wait_reason(:invalid_credential), do: "credential_invalid"
   defp credential_wait_reason(:credential_changed), do: "credential_changed"
   defp credential_wait_reason(_reason), do: "credential_unavailable"
@@ -1644,21 +1633,6 @@ defmodule ForgeImports.RepositoryWorker do
     else
       {:error, _reason} -> :error
     end
-  end
-
-  defp cancelled?(item_id, owner) do
-    case Repo.one(
-           from item in RepositoryItem,
-             join: run in ImportRun,
-             on: run.id == item.import_run_id,
-             where: item.id == ^item_id and item.lease_owner == ^owner,
-             select: {item.state, run.state}
-         ) do
-      {:staging_git, :running} -> false
-      _missing_or_cancelled -> true
-    end
-  rescue
-    _error -> true
   end
 
   defp request(item, shadow, identity) do

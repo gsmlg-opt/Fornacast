@@ -17,6 +17,7 @@ defmodule ForgeImports do
     RepositoryItem,
     RepositoryPublisher,
     RunView,
+    Cancellation,
     Waits
   }
 
@@ -360,6 +361,25 @@ defmodule ForgeImports do
 
   def replace_run_credential(_actor, _run_id, _credential_source, _request_metadata, _opts),
     do: {:error, :not_found}
+
+  def request_cancel(actor, run_id, request_metadata, opts \\ [])
+
+  def request_cancel(%User{} = actor, run_id, request_metadata, opts)
+      when is_integer(run_id) and run_id > 0 and is_map(request_metadata) and is_list(opts) do
+    with {:ok, active_actor} <- active_actor(actor),
+         %ImportRun{} = run <- actor_run(active_actor.id, run_id),
+         {:ok, canceled} <- Cancellation.request(active_actor, run, request_metadata, opts) do
+      {:ok, canceled}
+    else
+      {:error, :forbidden} -> {:error, :not_found}
+      {:error, :invalid_transition} -> {:error, :invalid_transition}
+      {:error, :invalid_request_metadata} -> {:error, :invalid_request_metadata}
+      {:error, :persistence_unavailable} -> {:error, :persistence_unavailable}
+      _ -> {:error, :not_found}
+    end
+  end
+
+  def request_cancel(_actor, _run_id, _request_metadata, _opts), do: {:error, :not_found}
 
   defp mutate_item(actor, expected_run, expected_item, callback) do
     transact(fn ->

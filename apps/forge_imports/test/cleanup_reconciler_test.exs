@@ -2,6 +2,16 @@ defmodule ForgeImports.CleanupReconcilerTest do
   use ExUnit.Case, async: true
 
   alias ForgeImports.CleanupReconciler
+  alias Fornacast.Repo
+
+  setup tags do
+    if Map.get(tags, :postgres) && postgres?() do
+      :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+      :ok = Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+    end
+
+    :ok
+  end
 
   test "kind cursor advances round-robin after every attempted kind" do
     assert CleanupReconciler.kinds_after(nil) ==
@@ -277,6 +287,15 @@ defmodule ForgeImports.CleanupReconcilerTest do
       send(test_pid, {:deadline_probe_settled, deadline})
       :attempted
     end
+  end
+
+  @tag :postgres
+  test "reconcile returns zero when no cancel-requested runs are terminal-ready" do
+    assert CleanupReconciler.reconcile(~U[2026-08-25 12:00:00Z], 10) == 0
+  end
+
+  defp postgres? do
+    Application.get_env(:fornacast, Fornacast.Repo)[:adapter] == Ecto.Adapters.Postgres
   end
 
   defp wait_until_idle!(reconciler, attempts \\ 100)
