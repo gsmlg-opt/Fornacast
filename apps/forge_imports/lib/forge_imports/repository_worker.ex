@@ -21,10 +21,11 @@ defmodule ForgeImports.RepositoryWorker do
     Recovery,
     ReportEntry,
     RepositoryItem,
+    RepositoryStager,
+    Telemetry,
     Waits
   }
 
-  alias ForgeImports.RepositoryStager
   alias ForgeImports.GitHub.{Client, MetadataImporter}
   alias ForgeRepos.Repository
   alias Fornacast.{Audit, AuditEvent, OperationLease, Repo}
@@ -1223,8 +1224,19 @@ defmodule ForgeImports.RepositoryWorker do
               candidate.state == :staging_git and is_nil(candidate.cleanup_state)
 
       case Repo.update_all(query, set: updates, inc: [lock_version: 1]) do
-        {1, _rows} -> {:ok, Repo.get!(RepositoryItem, item.id)}
-        {0, _rows} -> {:error, :lost_lease}
+        {1, _rows} ->
+          updated = Repo.get!(RepositoryItem, item.id)
+
+          Telemetry.execute([:git, :staged], %{bytes: result.bytes}, %{
+            run_id: updated.import_run_id,
+            item_id: updated.id,
+            bytes: result.bytes
+          })
+
+          {:ok, updated}
+
+        {0, _rows} ->
+          {:error, :lost_lease}
       end
     else
       {:error, :persistence_unavailable}

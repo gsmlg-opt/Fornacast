@@ -3,7 +3,7 @@ defmodule FornacastWeb.OrganizationControllerTest do
 
   import Phoenix.ConnTest
 
-  alias ForgeAccounts.User
+  alias ForgeAccounts.{OrganizationMember, User}
   alias Fornacast.Repo
 
   @endpoint FornacastWeb.Endpoint
@@ -67,6 +67,71 @@ defmodule FornacastWeb.OrganizationControllerTest do
     assert owner_html =~ public.slug
     assert owner_html =~ private.slug
     assert_private_no_store(owner_conn)
+  end
+
+  test "an organization namespace hides importing private repositories from members", %{
+    owner: owner,
+    viewer: viewer,
+    public: public,
+    private: private
+  } do
+    suffix = :crypto.strong_rand_bytes(5) |> Base.encode16(case: :lower)
+
+    {:ok, organization} =
+      ForgeAccounts.create_organization(owner, %{
+        username: "org-#{suffix}",
+        display_name: "Org #{suffix}",
+        description: "Organization namespace"
+      })
+
+    Repo.insert!(%OrganizationMember{
+      organization_id: organization.id,
+      user_id: viewer.id,
+      role: :member
+    })
+
+    {:ok, org_public} =
+      ForgeRepos.create_repository(organization, %{
+        slug: "org-public-#{suffix}",
+        name: "org-public-#{suffix}",
+        visibility: :public
+      })
+
+    {:ok, org_private} =
+      ForgeRepos.create_repository(organization, %{
+        slug: "org-private-#{suffix}",
+        name: "org-private-#{suffix}",
+        visibility: :private
+      })
+
+    {:ok, importing_shadow} =
+      ForgeRepos.create_repository(organization, %{
+        slug: "org-importing-#{suffix}",
+        name: "org-importing-#{suffix}",
+        visibility: :private
+      })
+
+    importing_shadow =
+      importing_shadow
+      |> Ecto.Changeset.change(
+        lifecycle: :importing,
+        storage_path: "../org-importing-#{suffix}.git"
+      )
+      |> Repo.update!()
+
+    viewer_conn =
+      viewer
+      |> request_conn()
+      |> get("/#{organization.username}")
+
+    viewer_html = html_response(viewer_conn, 200)
+
+    assert viewer_html =~ org_public.slug
+    assert viewer_html =~ org_private.slug
+    refute viewer_html =~ importing_shadow.slug
+    refute viewer_html =~ public.slug
+    refute viewer_html =~ private.slug
+    assert_private_no_store(viewer_conn)
   end
 
   defp request_conn(user) do

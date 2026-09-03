@@ -6,7 +6,7 @@ defmodule ForgeImports.Waits do
   alias ForgeAccounts.{GitHubCredential, GitHubIdentity, User}
   alias ForgeImports.GitHub.{Client, Error}
   alias ForgeImports.GitHub.User, as: GitHubUser
-  alias ForgeImports.{ImportRun, OneTimeCredential, Persistence, RepositoryItem}
+  alias ForgeImports.{ImportRun, OneTimeCredential, Persistence, RepositoryItem, Telemetry}
   alias Fornacast.Repo
 
   @terminal_run_states [:completed, :completed_with_warnings, :canceled, :failed]
@@ -34,7 +34,20 @@ defmodule ForgeImports.Waits do
         next_attempt_at: retry_at
       )
 
-    Persistence.update_without_lease(item, [item.state], changeset, now)
+    case Persistence.update_without_lease(item, [item.state], changeset, now) do
+      {:ok, waiting} = result ->
+        Telemetry.execute([:rate_limit, :pause], %{count: 1}, %{
+          run_id: waiting.import_run_id,
+          item_id: waiting.id,
+          phase: waiting.state,
+          classification: classification
+        })
+
+        result
+
+      other ->
+        other
+    end
   end
 
   @spec awaiting_credential(ImportRun.t(), RepositoryItem.t() | nil, atom(), keyword()) ::

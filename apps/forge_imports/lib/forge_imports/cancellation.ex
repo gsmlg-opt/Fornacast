@@ -4,7 +4,7 @@ defmodule ForgeImports.Cancellation do
   import Ecto.Query
 
   alias ForgeAccounts.User
-  alias ForgeImports.{ImportAttempt, ImportRun, Persistence, RepositoryItem}
+  alias ForgeImports.{ImportAttempt, ImportRun, Persistence, RepositoryItem, Telemetry}
   alias Fornacast.{Audit, OperationLease, Repo}
 
   @cancellable_run_states [
@@ -64,8 +64,12 @@ defmodule ForgeImports.Cancellation do
     end
 
     case Persistence.with_retry(transaction) do
-      {:ok, run} -> {:ok, run}
-      {:error, reason} -> {:error, reason}
+      {:ok, %ImportRun{id: run_id} = run} ->
+        Telemetry.execute([:cancel, :requested], %{count: 1}, %{run_id: run_id, canceled: true})
+        {:ok, run}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

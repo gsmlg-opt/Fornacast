@@ -12,7 +12,8 @@ defmodule ForgeImports.RepositoryPublisher do
     ImportRun,
     PageCheckpoint,
     Persistence,
-    RepositoryItem
+    RepositoryItem,
+    Telemetry
   }
 
   alias ForgeRepos.Repository
@@ -306,19 +307,53 @@ defmodule ForgeImports.RepositoryPublisher do
   end
 
   defp finish(capability) do
-    with {:ok, context} <- publication_context(capability) do
-      result =
-        case context.expected_replacement do
-          nil -> commit_publication(context)
-          expected -> fenced_replacement(context, expected)
-        end
+    started = System.monotonic_time()
 
-      settle_finish_result(result, context.capability)
-    else
-      {:error, :destination_changed} -> reopen_drift(capability)
-      {:error, reason} -> settle_finish_result({:error, reason}, capability)
-    end
+    result =
+      with {:ok, context} <- publication_context(capability) do
+        result =
+          case context.expected_replacement do
+            nil -> commit_publication(context)
+            expected -> fenced_replacement(context, expected)
+          end
+
+        settle_finish_result(result, context.capability)
+      else
+        {:error, :destination_changed} -> reopen_drift(capability)
+        {:error, reason} -> settle_finish_result({:error, reason}, capability)
+      end
+
+    emit_publication(capability, result, System.monotonic_time() - started)
+    result
   end
+
+  defp emit_publication(capability, result, duration) do
+    metadata =
+      %{
+        item_id: capability.item_id,
+        run_id: capability.run_id,
+        success: match?({:ok, _}, result)
+      }
+      |> Map.merge(publication_repository_metadata(result))
+      |> maybe_put_publication_error(result)
+
+    Telemetry.execute([:publication, :stop], %{duration: duration}, metadata)
+  end
+
+  defp publication_repository_metadata({:ok, %{repository: repository, replaced: replaced}}) do
+    %{
+      repository_id: repository.id,
+      replaced: not is_nil(replaced)
+    }
+  end
+
+  defp publication_repository_metadata(_result), do: %{}
+
+  defp maybe_put_publication_error(metadata, {:error, reason}) when is_atom(reason) do
+    Map.put(metadata, :error, reason)
+  end
+
+  defp maybe_put_publication_error(metadata, _result), do: metadata
 
   defp fenced_replacement(context, expected) do
     target = %Repository{id: expected.repository_id, generation: expected.generation}

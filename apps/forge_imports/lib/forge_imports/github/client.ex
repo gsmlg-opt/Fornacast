@@ -13,6 +13,8 @@ defmodule ForgeImports.GitHub.Client do
     User
   }
 
+  alias ForgeImports.Telemetry
+
   @api_base "https://api.github.com"
   @accept "application/vnd.github+json"
   @api_version "2026-03-10"
@@ -363,55 +365,101 @@ defmodule ForgeImports.GitHub.Client do
   defp json_object(_value), do: {:error, :invalid_response}
 
   defp request(url, pat, opts) do
+    started = System.monotonic_time()
     deadline = monotonic_ms() + Keyword.get(opts, :request_timeout, @request_timeout)
 
-    with :ok <- validate_request_url(url),
-         {:ok, addresses} <- resolve_addresses(opts, deadline) do
-      request =
-        Req.new(
-          method: :get,
-          base_url: @api_base,
-          adapter: Transport,
-          headers: [
-            {"accept", @accept},
-            {"accept-encoding", "identity"},
-            {"authorization", "Bearer " <> pat},
-            {"user-agent", @user_agent},
-            {"x-github-api-version", @api_version}
-          ],
-          redirect: false,
-          retry: false,
-          compressed: false,
-          raw: true,
-          decode_body: false
-        )
-        |> Req.Request.put_private(:forge_imports_github_addresses, addresses)
-        |> maybe_put_transport_api(opts)
+    result =
+      with :ok <- validate_request_url(url),
+           {:ok, addresses} <- resolve_addresses(opts, deadline) do
+        request =
+          Req.new(
+            method: :get,
+            base_url: @api_base,
+            adapter: Transport,
+            headers: [
+              {"accept", @accept},
+              {"accept-encoding", "identity"},
+              {"authorization", "Bearer " <> pat},
+              {"user-agent", @user_agent},
+              {"x-github-api-version", @api_version}
+            ],
+            redirect: false,
+            retry: false,
+            compressed: false,
+            raw: true,
+            decode_body: false
+          )
+          |> Req.Request.put_private(:forge_imports_github_addresses, addresses)
+          |> maybe_put_transport_api(opts)
 
-      request_options = [url: url]
+        request_options = [url: url]
 
-      request_options =
-        case Keyword.fetch(opts, :plug) do
-          {:ok, plug} -> Keyword.put(request_options, :plug, plug)
-          :error -> request_options
+        request_options =
+          case Keyword.fetch(opts, :plug) do
+            {:ok, plug} -> Keyword.put(request_options, :plug, plug)
+            :error -> request_options
+          end
+
+        case remaining_timeout(deadline) do
+          {:ok, transport_timeout} ->
+            request
+            |> Req.Request.put_private(:forge_imports_transport_timeout, transport_timeout)
+            |> safe_req_request(request_options)
+
+          {:error, :timeout} ->
+            error(:timeout)
         end
-
-      case remaining_timeout(deadline) do
-        {:ok, transport_timeout} ->
-          request
-          |> Req.Request.put_private(:forge_imports_transport_timeout, transport_timeout)
-          |> safe_req_request(request_options)
-
-        {:error, :timeout} ->
-          error(:timeout)
+      else
+        {:error, :unsafe_host} -> error(:unsafe_host)
+        {:error, :host_unavailable} -> error(:host_unavailable)
+        {:error, :timeout} -> error(:timeout)
+        _invalid -> error(:invalid_request)
       end
-    else
-      {:error, :unsafe_host} -> error(:unsafe_host)
-      {:error, :host_unavailable} -> error(:host_unavailable)
-      {:error, :timeout} -> error(:timeout)
-      _invalid -> error(:invalid_request)
-    end
+
+    emit_request_telemetry(result, System.monotonic_time() - started, opts)
+    result
   end
+
+  defp emit_request_telemetry({:ok, %Req.Response{status: status}}, duration, _opts)
+       when status in 200..299 do
+    Telemetry.execute([:github, :request, :stop], %{duration: duration}, %{outcome: :ok})
+  end
+
+  defp emit_request_telemetry({:ok, %Req.Response{} = response}, duration, opts) do
+    metadata =
+      case classify_response(response, opts) do
+        {:error, %Error{kind: kind}} -> %{outcome: :error, error: kind}
+        _ -> %{outcome: :error}
+      end
+
+    Telemetry.execute([:github, :request, :stop], %{duration: duration}, metadata)
+    maybe_emit_rate_limit_pause(metadata)
+  end
+
+  defp emit_request_telemetry({:error, %Error{kind: kind}}, duration, _opts) do
+    Telemetry.execute([:github, :request, :stop], %{duration: duration}, %{
+      outcome: :error,
+      error: kind
+    })
+
+    maybe_emit_rate_limit_pause(%{error: kind})
+  end
+
+  defp emit_request_telemetry(_result, duration, _opts) do
+    Telemetry.execute([:github, :request, :stop], %{duration: duration}, %{outcome: :error})
+  end
+
+  defp maybe_emit_rate_limit_pause(%{error: kind})
+       when kind in [:primary_rate_limit, :secondary_rate_limit] do
+    classification = if kind == :primary_rate_limit, do: :primary, else: :secondary
+
+    Telemetry.execute([:rate_limit, :pause], %{count: 1}, %{
+      classification: classification,
+      error: kind
+    })
+  end
+
+  defp maybe_emit_rate_limit_pause(_metadata), do: :ok
 
   defp maybe_put_transport_api(request, opts) do
     case Keyword.fetch(opts, :transport_api) do

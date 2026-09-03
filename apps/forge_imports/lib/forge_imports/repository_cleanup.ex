@@ -4,7 +4,7 @@ defmodule ForgeImports.RepositoryCleanup do
   import Ecto.Query
 
   alias ForgeAccounts.User
-  alias ForgeImports.{CleanupOperation, ImportAttempt, ImportRun, RepositoryItem}
+  alias ForgeImports.{CleanupOperation, ImportAttempt, ImportRun, RepositoryItem, Telemetry}
   alias ForgeRepos.{Repository, RepositoryWriteReconcilers}
   alias Fornacast.{Audit, AuditEvent, Config, OperationLease, Repo}
 
@@ -66,34 +66,59 @@ defmodule ForgeImports.RepositoryCleanup do
   def reconcile_kind(kind, %DateTime{} = now, absolute_deadline, opts \\ [])
       when kind in [:remote_quarantine, :unpublished_shadow, :replacement_tombstone] and
              is_integer(absolute_deadline) and is_list(opts) do
+    started = System.monotonic_time()
     now = DateTime.truncate(now, :second)
 
-    case candidate(kind, now, absolute_deadline, opts) do
-      nil ->
-        :none
+    result =
+      case candidate(kind, now, absolute_deadline, opts) do
+        nil ->
+          :none
 
-      candidate ->
-        notify_selection(opts, kind)
+        candidate ->
+          notify_selection(opts, kind)
 
-        case with_permits(
-               candidate.repository_id,
-               absolute_deadline,
-               fn ->
-                 clear_admitted_raw_cursor(candidate, opts)
-                 reconcile_candidate(candidate, now, absolute_deadline, opts)
-               end,
-               opts
-             ) do
-          {:error, :limiter_unavailable} ->
-            checkpoint_unadmitted_raw_candidate(candidate, opts)
-            retry_unclaimed_candidate(candidate, now)
+          case with_permits(
+                 candidate.repository_id,
+                 absolute_deadline,
+                 fn ->
+                   clear_admitted_raw_cursor(candidate, opts)
+                   reconcile_candidate(candidate, now, absolute_deadline, opts)
+                 end,
+                 opts
+               ) do
+            {:error, :limiter_unavailable} ->
+              checkpoint_unadmitted_raw_candidate(candidate, opts)
+              retry_unclaimed_candidate(candidate, now)
 
-          result ->
-            result
-        end
-    end
+            inner ->
+              inner
+          end
+      end
+
+    emit_cleanup(kind, result, System.monotonic_time() - started)
+    result
   rescue
     _error in [Turso.Error, DBConnection.ConnectionError] -> {:error, :persistence_unavailable}
+  end
+
+  defp emit_cleanup(kind, result, duration) do
+    outcome =
+      case result do
+        :none -> :none
+        :attempted -> :attempted
+        {:error, _} -> :error
+        _ -> :attempted
+      end
+
+    metadata = %{cleanup_kind: kind, outcome: outcome}
+
+    metadata =
+      case result do
+        {:error, reason} when is_atom(reason) -> Map.put(metadata, :error, reason)
+        _ -> metadata
+      end
+
+    Telemetry.execute([:cleanup, :stop], %{duration: duration}, metadata)
   end
 
   @doc false

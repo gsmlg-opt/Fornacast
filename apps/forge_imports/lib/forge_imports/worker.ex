@@ -10,7 +10,8 @@ defmodule ForgeImports.Worker do
     RepositoryItem,
     RepositoryPublisher,
     RepositoryWorker,
-    RunAggregator
+    RunAggregator,
+    Telemetry
   }
 
   alias Fornacast.Repo
@@ -57,9 +58,15 @@ defmodule ForgeImports.Worker do
   end
 
   defp dispatch(%RepositoryItem{state: :publishing, id: item_id} = item, _worker, _opts) do
-    item_id
-    |> RepositoryPublisher.recover()
-    |> tap(fn _result -> RunAggregator.finish_if_terminal(item.import_run_id) end)
+    started = System.monotonic_time()
+
+    result =
+      item_id
+      |> RepositoryPublisher.recover()
+      |> tap(fn _result -> finish_if_terminal(item.import_run_id) end)
+
+    emit_phase(item, :publishing, result, System.monotonic_time() - started)
+    result
   end
 
   defp dispatch(
@@ -67,6 +74,8 @@ defmodule ForgeImports.Worker do
          _worker,
          _opts
        ) do
+    started = System.monotonic_time()
+
     result =
       with %ImportRun{} = run <- Repo.get(ImportRun, run_id),
            %User{} = actor <- Repo.get(User, run.actor_user_id) do
@@ -75,15 +84,61 @@ defmodule ForgeImports.Worker do
         _missing -> {:error, :not_found}
       end
 
-    RunAggregator.finish_if_terminal(run_id)
+    finish_if_terminal(run_id)
+    emit_phase(item, :ready_to_publish, result, System.monotonic_time() - started)
     result
   end
 
   defp dispatch(%RepositoryItem{} = item, repository_worker, opts) do
-    item.id
-    |> then(&apply(repository_worker, :stage, [&1, opts]))
-    |> tap(fn _result -> RunAggregator.finish_if_terminal(item.import_run_id) end)
+    started = System.monotonic_time()
+    phase = item.state
+
+    result =
+      item.id
+      |> then(&apply(repository_worker, :stage, [&1, opts]))
+      |> tap(fn _result -> finish_if_terminal(item.import_run_id) end)
+
+    emit_phase(item, phase, result, System.monotonic_time() - started)
+    result
   end
+
+  defp finish_if_terminal(run_id) do
+    case RunAggregator.finish_if_terminal(run_id) do
+      {:ok, %ImportRun{id: id, state: state}} ->
+        Telemetry.execute([:run, :completed], %{count: 1}, %{
+          run_id: id,
+          completion_state: state
+        })
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp emit_phase(%RepositoryItem{id: item_id, import_run_id: run_id}, phase, result, duration) do
+    metadata =
+      %{
+        run_id: run_id,
+        item_id: item_id,
+        phase: phase,
+        outcome: phase_outcome(result)
+      }
+      |> maybe_put_error(result)
+
+    Telemetry.execute([:phase, :stop], %{duration: duration}, metadata)
+  end
+
+  defp phase_outcome({:ok, :busy}), do: :busy
+  defp phase_outcome({:ok, :ignored}), do: :ignored
+  defp phase_outcome({:ok, _}), do: :ok
+  defp phase_outcome({:error, _}), do: :error
+  defp phase_outcome(_), do: :ok
+
+  defp maybe_put_error(metadata, {:error, reason}) when is_atom(reason) do
+    Map.put(metadata, :error, reason)
+  end
+
+  defp maybe_put_error(metadata, _result), do: metadata
 
   defp worker_options(lease_owner, opts) do
     opts

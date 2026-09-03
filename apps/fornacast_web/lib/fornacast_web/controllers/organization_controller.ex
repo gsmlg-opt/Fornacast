@@ -1,6 +1,7 @@
 defmodule FornacastWeb.OrganizationController do
   use FornacastWeb, :controller
 
+  alias ForgeAccounts.Organization
   alias FornacastWeb.OrganizationHTML
 
   plug :put_private_no_store
@@ -37,17 +38,31 @@ defmodule FornacastWeb.OrganizationController do
       nil ->
         render_namespace_not_found(conn)
 
-      owner ->
-        case ForgeRepos.list_account_repository_views(current_user, owner,
-               page: 1,
-               per_page: 100
-             ) do
-          {:ok, %Fornacast.Page{entries: repository_views}} ->
-            render_namespace(conn, owner, repository_views)
+      %ForgeAccounts.User{kind: :organization, id: organization_id} = owner ->
+        case ForgeAccounts.get_organization(organization_id) do
+          %Organization{} = organization ->
+            render_namespace_for_account(conn, current_user, organization, owner)
 
-          {:error, _masked} ->
+          nil ->
             render_namespace_not_found(conn)
         end
+
+      owner ->
+        render_namespace_for_account(conn, current_user, owner, owner)
+    end
+  end
+
+  defp render_namespace_for_account(conn, current_user, account, owner) do
+    case ForgeRepos.list_account_repository_views(current_user, account,
+           visibility_ceiling: :all,
+           page: 1,
+           per_page: 100
+         ) do
+      {:ok, %Fornacast.Page{entries: repository_views}} ->
+        render_namespace(conn, owner, repository_views)
+
+      {:error, _masked} ->
+        render_namespace_not_found(conn)
     end
   end
 

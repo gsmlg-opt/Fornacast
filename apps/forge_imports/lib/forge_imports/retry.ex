@@ -11,7 +11,8 @@ defmodule ForgeImports.Retry do
     PageCheckpoint,
     Persistence,
     RepositoryItem,
-    RepositoryPublisher
+    RepositoryPublisher,
+    Telemetry
   }
 
   alias ForgeRepos.Repository
@@ -66,8 +67,17 @@ defmodule ForgeImports.Retry do
     end
 
     case Persistence.with_retry(transaction) do
-      {:ok, run} -> {:ok, run}
-      {:error, reason} -> {:error, reason}
+      {:ok, %ImportRun{id: run_id, predecessor_run_id: predecessor_run_id} = run} ->
+        Telemetry.execute([:retry, :created], %{count: 1}, %{
+          run_id: run_id,
+          predecessor_run_id: predecessor_run_id,
+          retry: true
+        })
+
+        {:ok, run}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
