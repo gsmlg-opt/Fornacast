@@ -1,0 +1,47 @@
+<section class="form-panel">
+  <div class="panel-heading">
+    <h2>New organization</h2>
+    <p class="muted">Create a shared organization workspace.</p>
+  </div>
+  <.dm_alert :if={@error} variant="error" outlined role="alert" class="mb-4">
+    {@error}
+  </.dm_alert>
+  <form action="/organizations" method="post" class="grid gap-4">
+    <input type="hidden" name="_csrf_token" value={csrf_token()} />
+    <.dm_input
+      id="organization-username"
+      class="w-full"
+      name="organization[username]"
+      type="text"
+      label="Slug"
+      value={@organization["username"]}
+      required
+      autocomplete="off"
+      spellcheck="false"
+      autocapitalize="none"
+    />
+    <.dm_input
+      id="organization-display-name"
+      class="w-full"
+      name="organization[display_name]"
+      type="text"
+      label="Name"
+      value={@organization["display_name"]}
+      autocomplete="off"
+      spellcheck="false"
+    />
+    <.dm_input
+      id="organization-description"
+      class="w-full"
+      name="organization[description]"
+      type="textarea"
+      label="Description"
+      value={@organization["description"]}
+      rows="3"
+      spellcheck="false"
+    />
+    <div>
+      <button class="btn btn-primary" type="submit">Create organization</button>
+    </div>
+  </form>
+</section>

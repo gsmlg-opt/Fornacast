@@ -1,0 +1,36 @@
+<section class="form-panel">
+  <div class="panel-heading">
+    <h2>Sign in</h2>
+    <p class="muted">Use your local Fornacast account to access repositories.</p>
+  </div>
+  <.dm_alert :if={@error} variant="error" outlined role="alert" class="mb-4">
+    {@error}
+  </.dm_alert>
+  <form action="/login" method="post" class="grid gap-4">
+    <input type="hidden" name="_csrf_token" value={csrf_token()} />
+    <.dm_input
+      id="session-username"
+      class="w-full"
+      name="session[username]"
+      type="text"
+      label="Username"
+      value={@username}
+      required
+      autocomplete="username"
+      spellcheck="false"
+      autocapitalize="none"
+    />
+    <.dm_input
+      id="session-password"
+      class="w-full"
+      name="session[password]"
+      type="password"
+      label="Password"
+      required
+      autocomplete="current-password"
+    />
+    <div>
+      <button class="btn btn-primary" type="submit">Sign in</button>
+    </div>
+  </form>
+</section>

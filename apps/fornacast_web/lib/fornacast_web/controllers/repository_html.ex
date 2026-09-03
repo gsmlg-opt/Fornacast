@@ -7,6 +7,8 @@ defmodule FornacastWeb.RepositoryHTML do
 
   embed_templates "repository_html/*"
 
+  def csrf_token, do: Plug.CSRFProtection.get_csrf_token()
+
   attr :result, :any, required: true
 
   def repository(%{result: %RepositoryPage.Result{kind: kind}} = assigns) do

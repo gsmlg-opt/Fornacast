@@ -1,0 +1,41 @@
+{raw(
+  section_header(
+    "Repositories",
+    "Browse repositories available to #{@user.username}.",
+    primary_link("/repos/new", "New repository") <>
+      ghost_link("/organizations/new", "New organization")
+  )
+)}
+
+<div :if={@repos == []}>
+  {raw(
+    empty_state(
+      "No repositories yet",
+      "Create the first repository for this Fornacast instance.",
+      primary_link("/repos/new", "Create repository")
+    )
+  )}
+</div>
+
+<section :if={@repos != []} class="content-panel">
+  <table class="data-table repo-table">
+    <thead>
+      <tr>
+        <th>Repository</th>
+        <th>Visibility</th>
+        <th>Default branch</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr :for={repo <- @repos}>
+        <td>
+          <a href={"/#{owner_username(repo)}/#{repo.slug}"}>
+            {owner_username(repo)}/{repo.name}
+          </a>
+        </td>
+        <td>{raw(badge(repo.visibility, to_string(repo.visibility)))}</td>
+        <td><code>{repo.default_branch}</code></td>
+      </tr>
+    </tbody>
+  </table>
+</section>

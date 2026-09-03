@@ -1,16 +1,10 @@
 defmodule FornacastWeb.SessionController do
   use FornacastWeb, :controller
 
+  alias FornacastWeb.SessionHTML
+
   def new(conn, _params) do
-    page(
-      conn,
-      "Login",
-      form_panel(
-        "Sign in",
-        "Use your local Fornacast account to access repositories.",
-        login_form()
-      )
-    )
+    render_login(conn, nil, "")
   end
 
   def create(conn, %{"session" => %{"username" => username, "password" => password}}) do
@@ -24,15 +18,7 @@ defmodule FornacastWeb.SessionController do
       {:error, :invalid_credentials} ->
         conn
         |> put_status(:unauthorized)
-        |> page(
-          "Login",
-          error_panel("Invalid username or password.") <>
-            form_panel(
-              "Sign in",
-              "Use your local Fornacast account to access repositories.",
-              login_form()
-            )
-        )
+        |> render_login("Invalid username or password.", username)
     end
   end
 
@@ -44,14 +30,14 @@ defmodule FornacastWeb.SessionController do
     |> redirect(to: "/login")
   end
 
-  defp login_form do
-    """
-    <form action="/login" method="post">
-      #{csrf_input()}
-      <label>Username <input name="session[username]" autocomplete="username"></label>
-      <label>Password <input name="session[password]" type="password" autocomplete="current-password"></label>
-      <button class="btn btn-primary" type="submit">Sign in</button>
-    </form>
-    """
+  defp render_login(conn, error, username) do
+    rendered =
+      SessionHTML.new(%{
+        error: error,
+        username: username,
+        __changed__: nil
+      })
+
+    page(conn, "Login", rendered |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary())
   end
 end

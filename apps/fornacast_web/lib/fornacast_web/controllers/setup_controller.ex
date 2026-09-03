@@ -1,11 +1,13 @@
 defmodule FornacastWeb.SetupController do
   use FornacastWeb, :controller
 
+  alias FornacastWeb.SetupHTML
+
   def new(conn, _params) do
     if Fornacast.Setup.initialized?() do
       already_initialized(conn)
     else
-      page(conn, "Set up Fornacast", form_body())
+      render_setup(conn, %{}, nil)
     end
   end
 
@@ -25,7 +27,7 @@ defmodule FornacastWeb.SetupController do
         {:error, %Ecto.Changeset{} = changeset} ->
           conn
           |> put_status(:unprocessable_entity)
-          |> page("Set up Fornacast", error_body(changeset))
+          |> render_setup(attrs, inspect(changeset.errors))
       end
     end
   end
@@ -46,23 +48,18 @@ defmodule FornacastWeb.SetupController do
     |> page("Not found", error_panel("Fornacast is already set up."))
   end
 
-  defp form_body do
-    form_panel(
-      "First administrator",
-      "Create the first administrator account to finish setting up this Fornacast instance.",
-      """
-      <form action="/setup" method="post">
-        #{csrf_input()}
-        <label>Username <input name="admin[username]" autocomplete="username"></label>
-        <label>Email <input name="admin[email]" type="email" autocomplete="email"></label>
-        <label>Password <input name="admin[password]" type="password" autocomplete="new-password"></label>
-        <button class="btn btn-primary" type="submit">Create admin</button>
-      </form>
-      """
-    )
-  end
+  defp render_setup(conn, admin, error) do
+    rendered =
+      SetupHTML.new(%{
+        admin: admin,
+        error: error,
+        __changed__: nil
+      })
 
-  defp error_body(changeset) do
-    error_panel(inspect(changeset.errors)) <> form_body()
+    page(
+      conn,
+      "Set up Fornacast",
+      rendered |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary()
+    )
   end
 end

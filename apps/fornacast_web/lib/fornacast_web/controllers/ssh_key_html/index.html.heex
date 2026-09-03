@@ -1,0 +1,70 @@
+{raw(section_header("SSH keys", "Manage SSH keys for Git transport.", ""))}
+
+<.dm_alert :if={@error} variant="error" outlined role="alert" class="mb-4">
+  {@error}
+</.dm_alert>
+
+<div class="settings-grid">
+  <section class="form-panel">
+    <div class="panel-heading">
+      <h2>Add SSH key</h2>
+      <p class="muted">Paste an OpenSSH public key from your workstation.</p>
+    </div>
+    <form action={@path} method="post">
+      <input type="hidden" name="_csrf_token" value={csrf_token()} />
+      <.dm_input
+        id="ssh-key-title"
+        class="w-full"
+        name="ssh_key[title]"
+        type="text"
+        label="Title"
+        value={@form["title"]}
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <.dm_input
+        id="ssh-key-public-key"
+        class="w-full"
+        name="ssh_key[public_key]"
+        type="textarea"
+        label="Public key"
+        value={@form["public_key"]}
+        rows="5"
+        required
+        spellcheck="false"
+      />
+      <div>
+        <button class="btn btn-primary" type="submit">Add key</button>
+      </div>
+    </form>
+  </section>
+
+  <div :if={@keys == []}>
+    {raw(empty_state("No SSH keys", "Add a public key to push repositories over SSH."))}
+  </div>
+
+  <section :if={@keys != []} class="content-panel">
+    <table class="data-table key-table">
+      <thead>
+        <tr>
+          <th>Title</th>
+          <th>Fingerprint</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr :for={key <- @keys}>
+          <td>{key.title}</td>
+          <td><code>{key.fingerprint_sha256}</code></td>
+          <td>
+            <form action={"#{@path}/#{key.id}"} method="post">
+              <input type="hidden" name="_csrf_token" value={csrf_token()} />
+              <input type="hidden" name="_method" value="delete" />
+              <button class="btn btn-error btn-sm" type="submit">Delete</button>
+            </form>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+</div>

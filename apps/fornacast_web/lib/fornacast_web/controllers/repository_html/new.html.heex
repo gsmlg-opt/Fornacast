@@ -1,0 +1,65 @@
+<section class="form-panel">
+  <div class="panel-heading">
+    <h2>Repository details</h2>
+    <p class="muted">Choose a short slug and default visibility for the repository.</p>
+  </div>
+  <.dm_alert :if={@error} variant="error" outlined role="alert" class="mb-4">
+    {@error}
+  </.dm_alert>
+  <form action="/repos" method="post" class="grid gap-4">
+    <input type="hidden" name="_csrf_token" value={csrf_token()} />
+    <.dm_input
+      id="repository-owner"
+      class="w-full"
+      name="repository[owner]"
+      type="select"
+      label="Owner"
+      options={@owner_options}
+      value={@selected_owner}
+    />
+    <.dm_input
+      id="repository-name"
+      class="w-full"
+      name="repository[name]"
+      type="text"
+      label="Name"
+      value={@attrs["name"]}
+      required
+      autocomplete="off"
+      spellcheck="false"
+    />
+    <.dm_input
+      id="repository-slug"
+      class="w-full"
+      name="repository[slug]"
+      type="text"
+      label="Slug"
+      value={@attrs["slug"]}
+      autocomplete="off"
+      spellcheck="false"
+      autocapitalize="none"
+    />
+    <.dm_input
+      id="repository-description"
+      class="w-full"
+      name="repository[description]"
+      type="textarea"
+      label="Description"
+      value={@attrs["description"]}
+      rows="3"
+      spellcheck="false"
+    />
+    <.dm_input
+      id="repository-visibility"
+      class="w-full"
+      name="repository[visibility]"
+      type="select"
+      label="Visibility"
+      options={[{"Private", "private"}, {"Public", "public"}]}
+      value={@selected_visibility}
+    />
+    <div>
+      <button class="btn btn-primary" type="submit">Create repository</button>
+    </div>
+  </form>
+</section>

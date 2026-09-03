@@ -92,70 +92,6 @@
     padding-left: 1.35rem;
   }
 
-  input,
-  textarea,
-  select {
-    display: block;
-    width: 100%;
-    max-width: 40rem;
-    min-height: 2.5rem;
-    margin: 0.3rem 0 0.9rem;
-    padding: 0.6rem 0.7rem;
-    border: 1px solid var(--color-outline-variant);
-    border-radius: 6px;
-    background-color: var(--color-surface-container-lowest);
-    color: var(--color-on-surface);
-    font: inherit;
-  }
-
-  textarea {
-    min-height: 9rem;
-    resize: vertical;
-  }
-
-  input:focus,
-  textarea:focus,
-  select:focus,
-  button:focus-visible,
-  a:focus-visible {
-    outline: 2px solid var(--color-primary);
-    outline-offset: 2px;
-  }
-
-  label {
-    display: block;
-    color: var(--color-on-surface);
-    font-size: 0.92rem;
-    font-weight: 700;
-  }
-
-  button,
-  input[type="submit"] {
-    min-height: 2.35rem;
-    border: 0;
-    border-radius: 6px;
-    background-color: var(--color-primary);
-    color: var(--color-primary-content);
-    cursor: pointer;
-    font: inherit;
-    font-weight: 750;
-    padding: 0.54rem 0.86rem;
-  }
-
-  button:hover,
-  input[type="submit"]:hover {
-    background-color: color-mix(in oklab, var(--color-primary) 82%, var(--color-tertiary));
-  }
-
-  button:disabled {
-    opacity: 0.58;
-    cursor: not-allowed;
-  }
-
-  button:disabled:hover {
-    background-color: var(--color-primary);
-  }
-
   pre,
   code {
     font-family: var(--fornacast-font-mono);
@@ -168,35 +104,6 @@
     background-color: var(--color-surface-container-highest);
     color: var(--color-on-surface);
     padding: 0.9rem;
-  }
-
-  table {
-    width: 100%;
-    max-width: 100%;
-    border-collapse: collapse;
-    border: 1px solid var(--color-outline-variant);
-    border-radius: 8px;
-    background-color: var(--color-surface-container-lowest);
-  }
-
-  th,
-  td {
-    border-bottom: 1px solid var(--color-outline-variant);
-    padding: 0.72rem 0.8rem;
-    overflow-wrap: anywhere;
-    text-align: left;
-    vertical-align: top;
-  }
-
-  th {
-    background-color: var(--color-surface-container);
-    color: var(--color-on-surface);
-    font-size: 0.82rem;
-    font-weight: 800;
-  }
-
-  tr:last-child td {
-    border-bottom: 0;
   }
 }
 
@@ -691,11 +598,33 @@
   }
 
   .data-table {
-    @apply bg-surface-container border-outline-variant;
-    border-width: 1px;
+    width: 100%;
+    border-collapse: collapse;
+    border: 1px solid var(--color-outline-variant);
     border-radius: 8px;
-    display: block;
+    background-color: var(--color-surface-container-lowest);
+    display: table;
     overflow-x: auto;
+  }
+
+  .data-table th,
+  .data-table td {
+    border-bottom: 1px solid var(--color-outline-variant);
+    padding: 0.72rem 0.8rem;
+    overflow-wrap: anywhere;
+    text-align: left;
+    vertical-align: top;
+  }
+
+  .data-table th {
+    background-color: var(--color-surface-container);
+    color: var(--color-on-surface);
+    font-size: 0.82rem;
+    font-weight: 800;
+  }
+
+  .data-table tr:last-child td {
+    border-bottom: 0;
   }
 
   .path-bar,

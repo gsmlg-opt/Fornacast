@@ -1,0 +1,19 @@
+<p class="muted">{@description}</p>
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>Repository</th>
+      <th>Visibility</th>
+      <th>Default branch</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr :for={view <- @repository_views}>
+      <td>
+        <a href={"/#{@owner.username}/#{view.repository.slug}"}>{view.repository.name}</a>
+      </td>
+      <td>{view.repository.visibility}</td>
+      <td>{view.repository.default_branch}</td>
+    </tr>
+  </tbody>
+</table>

@@ -1,0 +1,50 @@
+<section class="form-panel">
+  <div class="panel-heading">
+    <h2>First administrator</h2>
+    <p class="muted">
+      Create the first administrator account to finish setting up this Fornacast instance.
+    </p>
+  </div>
+  <.dm_alert :if={@error} variant="error" outlined role="alert" class="mb-4">
+    {@error}
+  </.dm_alert>
+  <form action="/setup" method="post" class="grid gap-4">
+    <input type="hidden" name="_csrf_token" value={csrf_token()} />
+    <.dm_input
+      id="admin-username"
+      class="w-full"
+      name="admin[username]"
+      type="text"
+      label="Username"
+      value={@admin["username"]}
+      required
+      autocomplete="username"
+      spellcheck="false"
+      autocapitalize="none"
+    />
+    <.dm_input
+      id="admin-email"
+      class="w-full"
+      name="admin[email]"
+      type="email"
+      label="Email"
+      value={@admin["email"]}
+      required
+      autocomplete="email"
+      spellcheck="false"
+      autocapitalize="none"
+    />
+    <.dm_input
+      id="admin-password"
+      class="w-full"
+      name="admin[password]"
+      type="password"
+      label="Password"
+      required
+      autocomplete="new-password"
+    />
+    <div>
+      <button class="btn btn-primary" type="submit">Create admin</button>
+    </div>
+  </form>
+</section>

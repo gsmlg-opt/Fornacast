@@ -1,0 +1,102 @@
+{raw(section_header("API keys", "Create personal API keys for Git and API access.", ""))}
+
+<section :if={@secret} class="content-panel mb-4" role="status">
+  <h2>API key created</h2>
+  <p>Copy this secret now. It will not be shown again.</p>
+  <code>{@secret}</code>
+</section>
+
+<.dm_alert :if={@errors} variant="error" outlined role="alert" class="mb-4">
+  {@errors}
+</.dm_alert>
+
+<div class="settings-grid">
+  <section class="form-panel">
+    <div class="panel-heading">
+      <h2>Create API key</h2>
+      <p class="muted">The secret is shown once. Store it somewhere safe.</p>
+    </div>
+    <form action="/settings/api-keys" method="post" class="grid gap-4">
+      <input type="hidden" name="_csrf_token" value={csrf_token()} />
+      <.dm_input
+        id="api-key-name"
+        class="w-full"
+        name="api_key[name]"
+        type="text"
+        label="Name"
+        value={@form["name"]}
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <fieldset class="grid gap-2">
+        <legend class="font-semibold text-sm">Scopes</legend>
+        <div class="grid gap-1">
+          <label :for={scope <- classic_scopes()} class="inline-flex items-center gap-2">
+            <input
+              type="checkbox"
+              class="checkbox checkbox-primary"
+              name={"api_key[scopes][#{scope}]"}
+              value="true"
+              checked={scope_checked?(@form["scopes"], scope)}
+            />
+            <span>{scope}</span>
+          </label>
+        </div>
+      </fieldset>
+      <.dm_input
+        id="api-key-expires-at"
+        class="w-full"
+        name="api_key[expires_at]"
+        type="datetime-local"
+        label="Expires at (optional, UTC)"
+        value={@form["expires_at"]}
+      />
+      <div>
+        <button class="btn btn-primary" type="submit">Create key</button>
+      </div>
+    </form>
+  </section>
+
+  <div :if={@keys == []}>
+    {raw(empty_state("No API keys", "Create a personal API key for repository access."))}
+  </div>
+
+  <section :if={@keys != []} class="content-panel">
+    <table class="data-table key-table">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Prefix</th>
+          <th>Scopes</th>
+          <th>Created</th>
+          <th>Expires</th>
+          <th>Last used</th>
+          <th>Status</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr :for={key <- @keys}>
+          <td>{key.name}</td>
+          <td><code>{key.token_prefix}</code></td>
+          <td>{format_scopes(key.scopes)}</td>
+          <td>{format_datetime(key.inserted_at, "Unknown")}</td>
+          <td>{format_datetime(key.expires_at, "Never")}</td>
+          <td>{format_datetime(key.last_used_at, "Never")}</td>
+          <td>{key_status(key)}</td>
+          <td>
+            <form
+              :if={is_nil(key.revoked_at)}
+              action={"/settings/api-keys/#{key.id}"}
+              method="post"
+            >
+              <input type="hidden" name="_csrf_token" value={csrf_token()} />
+              <input type="hidden" name="_method" value="delete" />
+              <button class="btn btn-error btn-sm" type="submit">Revoke</button>
+            </form>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+</div>

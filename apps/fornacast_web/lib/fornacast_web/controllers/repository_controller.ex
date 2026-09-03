@@ -6,12 +6,7 @@ defmodule FornacastWeb.RepositoryController do
   alias FornacastWeb.{RepositoryHTML, RepositoryPage, RepositoryRaw, RepositoryWeb}
 
   def new(%Plug.Conn{assigns: %{current_user: user}} = conn, _params) do
-    page(
-      conn,
-      "New repository",
-      section_header("New repository", "Create a local Git repository.", "") <>
-        repository_form(user)
-    )
+    render_new(conn, user, %{}, nil)
   end
 
   def create(%Plug.Conn{assigns: %{current_user: user}} = conn, %{"repository" => attrs}) do
@@ -24,27 +19,24 @@ defmodule FornacastWeb.RepositoryController do
       {:error, %Ecto.Changeset{} = changeset} ->
         conn
         |> put_status(:unprocessable_entity)
-        |> page(
-          "New repository",
-          error_panel(inspect(changeset.errors)) <> repository_form(user, attrs)
-        )
+        |> render_new(user, attrs, inspect(changeset.errors))
 
       {:error, :unauthorized} ->
         conn
         |> put_status(:forbidden)
-        |> page("New repository", ~s(<p class="error">You cannot create repositories there.</p>))
+        |> render_new(user, attrs, "You cannot create repositories there.")
 
       {:error, reason} ->
         conn
         |> put_status(:unprocessable_entity)
-        |> page("New repository", error_panel(reason) <> repository_form(user, attrs))
+        |> render_new(user, attrs, to_string(reason))
     end
   end
 
-  def create(conn, _params) do
+  def create(%Plug.Conn{assigns: %{current_user: user}} = conn, _params) do
     conn
     |> put_status(:unprocessable_entity)
-    |> page("New repository", ~s(<p class="error">Repository parameters are required.</p>))
+    |> render_new(user, %{}, "Repository parameters are required.")
   end
 
   def show(conn, %{"owner" => owner_slug, "repo" => repo_slug} = params) do
@@ -526,49 +518,33 @@ defmodule FornacastWeb.RepositoryController do
   defp repository_html_module(conn),
     do: conn.private[:repository_html] || RepositoryHTML
 
-  defp repository_form(user, attrs \\ %{}) do
+  defp render_new(conn, user, attrs, error) do
     selected_owner = Map.get(attrs, "owner") || user.username
     selected_visibility = Map.get(attrs, "visibility") || "private"
 
-    form_panel(
-      "Repository details",
-      "Choose a short slug and default visibility for the repository.",
-      """
-      <form action="/repos" method="post">
-        #{csrf_input()}
-        <label>Owner
-          <select name="repository[owner]">
-            #{owner_options(user, selected_owner)}
-          </select>
-        </label>
-        <label>Name <input name="repository[name]" value="#{escape(Map.get(attrs, "name"))}"></label>
-        <label>Slug <input name="repository[slug]" value="#{escape(Map.get(attrs, "slug"))}"></label>
-        <label>Description <textarea name="repository[description]" rows="3">#{escape(Map.get(attrs, "description"))}</textarea></label>
-        <label>Visibility
-          <select name="repository[visibility]">
-            <option value="private"#{selected_attr(selected_visibility, "private")}>Private</option>
-            <option value="public"#{selected_attr(selected_visibility, "public")}>Public</option>
-          </select>
-        </label>
-        <button class="btn btn-primary" type="submit">Create repository</button>
-      </form>
-      """
-    )
-  end
+    owner_options =
+      user
+      |> ForgeAccounts.list_repository_owners()
+      |> Enum.map(fn owner ->
+        {"#{owner_label(owner)} (#{owner.username})", owner.username}
+      end)
 
-  defp owner_options(user, selected_owner) do
-    user
-    |> ForgeAccounts.list_repository_owners()
-    |> Enum.map(fn owner ->
-      label = "#{owner_label(owner)} (#{owner.username})"
-      selected = selected_attr(owner.username, selected_owner)
-      ~s(<option value="#{escape(owner.username)}"#{selected}>#{escape(label)}</option>)
-    end)
-    |> Enum.join("\n")
-  end
+    rendered =
+      RepositoryHTML.new(%{
+        attrs: attrs,
+        selected_owner: selected_owner,
+        selected_visibility: selected_visibility,
+        owner_options: owner_options,
+        error: error,
+        __changed__: nil
+      })
 
-  defp selected_attr(value, value), do: " selected"
-  defp selected_attr(_value, _selected), do: ""
+    body =
+      section_header("New repository", "Create a local Git repository.", "") <>
+        (rendered |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary())
+
+    page(conn, "New repository", body)
+  end
 
   defp owner_label(%{kind: :organization, display_name: display_name, username: username}) do
     display_name || username

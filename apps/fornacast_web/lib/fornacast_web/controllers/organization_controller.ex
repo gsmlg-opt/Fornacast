@@ -1,18 +1,12 @@
 defmodule FornacastWeb.OrganizationController do
   use FornacastWeb, :controller
 
+  alias FornacastWeb.OrganizationHTML
+
   plug :put_private_no_store
 
   def new(conn, _params) do
-    page(conn, "New organization", """
-    <form action="/organizations" method="post">
-      #{csrf_input()}
-      <label>Slug <input name="organization[username]"></label>
-      <label>Name <input name="organization[display_name]"></label>
-      <label>Description <textarea name="organization[description]" rows="3"></textarea></label>
-      <button type="submit">Create organization</button>
-    </form>
-    """)
+    render_new(conn, %{}, nil)
   end
 
   def create(%Plug.Conn{assigns: %{current_user: user}} = conn, %{"organization" => attrs}) do
@@ -23,19 +17,19 @@ defmodule FornacastWeb.OrganizationController do
       {:error, %Ecto.Changeset{} = changeset} ->
         conn
         |> put_status(:unprocessable_entity)
-        |> page("New organization", ~s(<p class="error">#{escape(inspect(changeset.errors))}</p>))
+        |> render_new(attrs, inspect(changeset.errors))
 
       {:error, reason} ->
         conn
         |> put_status(:forbidden)
-        |> page("New organization", ~s(<p class="error">#{escape(reason)}</p>))
+        |> render_new(attrs, to_string(reason))
     end
   end
 
   def create(conn, _params) do
     conn
     |> put_status(:unprocessable_entity)
-    |> page("New organization", ~s(<p class="error">Organization parameters are required.</p>))
+    |> render_new(%{}, "Organization parameters are required.")
   end
 
   def show(%Plug.Conn{assigns: %{current_user: current_user}} = conn, %{"owner" => owner_slug}) do
@@ -57,31 +51,41 @@ defmodule FornacastWeb.OrganizationController do
     end
   end
 
+  defp render_new(conn, organization, error) do
+    rendered =
+      OrganizationHTML.new(%{
+        organization: organization,
+        error: error,
+        __changed__: nil
+      })
+
+    page(
+      conn,
+      "New organization",
+      rendered |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary()
+    )
+  end
+
   defp render_namespace(conn, owner, repository_views) do
-    rows =
-      repository_views
-      |> Enum.map(fn view ->
-        repo = view.repository
+    rendered =
+      OrganizationHTML.show(%{
+        owner: owner,
+        description: namespace_description(owner),
+        repository_views: repository_views,
+        __changed__: nil
+      })
 
-        ~s(<tr><td><a href="/#{escape(owner.username)}/#{escape(repo.slug)}">#{escape(repo.name)}</a></td><td>#{escape(repo.visibility)}</td><td>#{escape(repo.default_branch)}</td></tr>)
-      end)
-      |> Enum.join("\n")
-
-    body = """
-    <p class="muted">#{escape(namespace_description(owner))}</p>
-    <table>
-      <thead><tr><th>Repository</th><th>Visibility</th><th>Default branch</th></tr></thead>
-      <tbody>#{rows}</tbody>
-    </table>
-    """
-
-    page(conn, namespace_title(owner), body)
+    page(
+      conn,
+      namespace_title(owner),
+      rendered |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary()
+    )
   end
 
   defp render_namespace_not_found(conn) do
     conn
     |> put_status(:not_found)
-    |> page("Not found", ~s(<p class="error">Namespace not found.</p>))
+    |> page("Not found", error_panel("Namespace not found."))
   end
 
   defp namespace_title(%{kind: :organization, display_name: display_name, username: username}) do

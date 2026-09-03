@@ -1,54 +1,12 @@
 defmodule FornacastWeb.SSHKeyController do
   use FornacastWeb, :controller
 
+  alias FornacastWeb.SSHKeyHTML
+
   plug :put_private_no_store
 
   def index(%Plug.Conn{assigns: %{current_user: user}} = conn, _params) do
-    keys = ForgeAccounts.list_user_ssh_keys(user)
-    path = ssh_keys_path(conn)
-
-    rows =
-      keys
-      |> Enum.map(fn key ->
-        """
-        <tr>
-          <td>#{escape(key.title)}</td>
-          <td><code>#{escape(key.fingerprint_sha256)}</code></td>
-          <td>
-            <form action="#{path}/#{key.id}" method="post">
-              #{csrf_input()}
-              <input type="hidden" name="_method" value="delete">
-              <button class="btn btn-error btn-sm" type="submit">Delete</button>
-            </form>
-          </td>
-        </tr>
-        """
-      end)
-      |> Enum.join("\n")
-
-    key_table =
-      if rows == "" do
-        empty_state("No SSH keys", "Add a public key to push repositories over SSH.")
-      else
-        """
-        <section class="content-panel">
-          <table class="data-table key-table">
-            <thead><tr><th>Title</th><th>Fingerprint</th><th>Action</th></tr></thead>
-            <tbody>#{rows}</tbody>
-          </table>
-        </section>
-        """
-      end
-
-    content = """
-    #{section_header("SSH keys", "Manage SSH keys for Git transport.", "")}
-    <div class="settings-grid">
-      #{ssh_key_form(path)}
-      #{key_table}
-    </div>
-    """
-
-    page(conn, "SSH keys", settings_layout(:ssh_keys, content))
+    render_index(conn, user, %{})
   end
 
   def create(%Plug.Conn{assigns: %{current_user: user}} = conn, %{"ssh_key" => attrs}) do
@@ -59,19 +17,30 @@ defmodule FornacastWeb.SSHKeyController do
       {:error, changeset} ->
         conn
         |> put_status(:unprocessable_entity)
-        |> page(
-          "SSH keys",
-          settings_layout(
-            :ssh_keys,
-            error_panel(validation_errors(changeset)) <> ssh_key_form(ssh_keys_path(conn))
-          )
-        )
+        |> render_index(user, attrs, validation_errors(changeset))
     end
   end
 
   def delete(%Plug.Conn{assigns: %{current_user: user}} = conn, %{"id" => id}) do
     _ = ForgeAccounts.delete_ssh_key(user, id)
     redirect(conn, to: ssh_keys_path(conn))
+  end
+
+  defp render_index(conn, user, form, error \\ nil) do
+    keys = ForgeAccounts.list_user_ssh_keys(user)
+    path = ssh_keys_path(conn)
+
+    rendered =
+      SSHKeyHTML.index(%{
+        keys: keys,
+        path: path,
+        form: form,
+        error: error,
+        __changed__: nil
+      })
+
+    content = rendered |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary()
+    page(conn, "SSH keys", settings_layout(:ssh_keys, content))
   end
 
   defp ssh_keys_path(%Plug.Conn{request_path: "/settings" <> _}), do: "/settings/ssh-keys"
@@ -89,21 +58,6 @@ defmodule FornacastWeb.SSHKeyController do
       Enum.map(messages, &"#{label} #{&1}")
     end)
     |> Enum.join("; ")
-  end
-
-  defp ssh_key_form(path) do
-    form_panel(
-      "Add SSH key",
-      "Paste an OpenSSH public key from your workstation.",
-      """
-      <form action="#{path}" method="post">
-        #{csrf_input()}
-        <label>Title <input name="ssh_key[title]"></label>
-        <label>Public key <textarea name="ssh_key[public_key]" rows="5"></textarea></label>
-        <button class="btn btn-primary" type="submit">Add key</button>
-      </form>
-      """
-    )
   end
 
   defp put_private_no_store(conn, _opts) do
