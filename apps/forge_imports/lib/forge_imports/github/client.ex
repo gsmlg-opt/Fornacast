@@ -94,6 +94,107 @@ defmodule ForgeImports.GitHub.Client do
     end
   end
 
+  @spec repository_labels(String.t(), String.t(), String.t(), keyword()) ::
+          {:ok, [map()]} | {:error, Error.t()}
+  def repository_labels(pat, owner, repository, opts \\ []) do
+    with {:ok, paths} <- repository_paths(owner, repository) do
+      with_request_gate(pat, opts, fn ->
+        paginate_json_list(
+          "#{@api_base}#{paths.labels}?per_page=100",
+          pat,
+          opts,
+          [paths.labels],
+          1,
+          []
+        )
+      end)
+    else
+      _invalid -> error(:invalid_request)
+    end
+  end
+
+  @spec repository_issues(String.t(), String.t(), String.t(), keyword()) ::
+          {:ok, [map()]} | {:error, Error.t()}
+  def repository_issues(pat, owner, repository, opts \\ []) do
+    with {:ok, paths} <- repository_paths(owner, repository) do
+      with_request_gate(pat, opts, fn ->
+        paginate_json_list(
+          "#{@api_base}#{paths.issues}?state=all&per_page=100",
+          pat,
+          opts,
+          [paths.issues],
+          1,
+          []
+        )
+      end)
+    else
+      _invalid -> error(:invalid_request)
+    end
+  end
+
+  @spec issue_comments(String.t(), String.t(), String.t(), pos_integer(), keyword()) ::
+          {:ok, [map()]} | {:error, Error.t()}
+  def issue_comments(pat, owner, repository, issue_number, opts \\ [])
+      when is_integer(issue_number) and issue_number > 0 do
+    with {:ok, paths} <- repository_paths(owner, repository),
+         true <- issue_number <= 999_999 do
+      with_request_gate(pat, opts, fn ->
+        paginate_json_list(
+          "#{@api_base}#{paths.comments}/#{issue_number}/comments?per_page=100",
+          pat,
+          opts,
+          ["#{paths.comments}/#{issue_number}/comments"],
+          1,
+          []
+        )
+      end)
+    else
+      _invalid -> error(:invalid_request)
+    end
+  end
+
+  @spec pull_request(String.t(), String.t(), String.t(), pos_integer(), keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def pull_request(pat, owner, repository, pull_number, opts \\ [])
+      when is_integer(pull_number) and pull_number > 0 do
+    with {:ok, paths} <- repository_paths(owner, repository),
+         true <- pull_number <= 999_999 do
+      with_request_gate(pat, opts, fn ->
+        fetch_one(
+          "#{@api_base}#{paths.pulls}/#{pull_number}",
+          pat,
+          opts,
+          &json_object/1
+        )
+      end)
+    else
+      _invalid -> error(:invalid_request)
+    end
+  end
+
+  def issue_comments(_pat, _owner, _repository, _issue_number, _opts),
+    do: error(:invalid_request)
+
+  def pull_request(_pat, _owner, _repository, _pull_number, _opts),
+    do: error(:invalid_request)
+
+  defp repository_paths(owner, repository) do
+    with true <- RepositoryReference.valid_owner?(owner),
+         true <- RepositoryReference.valid_repository?(repository) do
+      base = "/repos/#{owner}/#{repository}"
+
+      {:ok,
+       %{
+         labels: "#{base}/labels",
+         issues: "#{base}/issues",
+         comments: "#{base}/issues",
+         pulls: "#{base}/pulls"
+       }}
+    else
+      _invalid -> :error
+    end
+  end
+
   defp with_request_gate(pat, opts, fun) do
     with :ok <- validate_pat(pat),
          :ok <- validate_options(opts),
@@ -207,6 +308,32 @@ defmodule ForgeImports.GitHub.Client do
     end
   end
 
+  defp paginate_json_list(_url, _pat, _opts, _allowed_paths, page, _pages)
+       when page > @max_pages,
+       do: error(:pagination_limit)
+
+  defp paginate_json_list(url, pat, opts, allowed_paths, page, pages) do
+    with {:ok, response} <- request(url, pat, opts),
+         {:ok, json} <- successful_json(response, opts),
+         {:ok, items} <- json_list(json),
+         {:ok, next_url} <- Pagination.next_url(response, allowed_paths) do
+      case next_url do
+        nil ->
+          {:ok, [items | pages] |> Enum.reverse() |> List.flatten()}
+
+        _url when page == @max_pages ->
+          error(:pagination_limit)
+
+        next_url ->
+          paginate_json_list(next_url, pat, opts, allowed_paths, page + 1, [items | pages])
+      end
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, :invalid_response} -> error(:invalid_response)
+      {:error, :invalid_pagination} -> error(:invalid_pagination)
+    end
+  end
+
   defp repositories_from_json(values) when is_list(values) and length(values) <= 100 do
     Enum.reduce_while(values, {:ok, []}, fn value, {:ok, repositories} ->
       case Repository.from_json(value) do
@@ -221,6 +348,15 @@ defmodule ForgeImports.GitHub.Client do
   end
 
   defp repositories_from_json(_values), do: {:error, :invalid_response}
+
+  defp json_list(values) when is_list(values) and length(values) <= 100 do
+    if Enum.all?(values, &is_map/1), do: {:ok, values}, else: {:error, :invalid_response}
+  end
+
+  defp json_list(_values), do: {:error, :invalid_response}
+
+  defp json_object(value) when is_map(value), do: {:ok, value}
+  defp json_object(_value), do: {:error, :invalid_response}
 
   defp request(url, pat, opts) do
     deadline = monotonic_ms() + Keyword.get(opts, :request_timeout, @request_timeout)

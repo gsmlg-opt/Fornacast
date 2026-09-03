@@ -835,6 +835,149 @@ defmodule ForgeImports.GitHub.ClientTest do
     assert :counters.get(counter, 1) == 100
   end
 
+  test "repository_labels fetches paginated label payloads" do
+    stub = stub_name()
+    parent = self()
+    labels = fixture_json!("labels_page.json")
+    key = System.unique_integer([:positive])
+
+    Req.Test.stub(stub, fn conn ->
+      send(parent, {:request, conn.request_path, conn.query_string})
+
+      case {conn.request_path, conn.query_string} do
+        {"/repos/octocat/Hello-World/labels", "per_page=100"} ->
+          conn
+          |> Plug.Conn.put_resp_header(
+            "link",
+            ~s(<https://api.github.com/repos/octocat/Hello-World/labels?per_page=100&page=2>; rel="next")
+          )
+          |> Req.Test.json(labels)
+
+        {"/repos/octocat/Hello-World/labels", query} ->
+          assert URI.decode_query(query) == %{"page" => "2", "per_page" => "100"}
+          Req.Test.json(conn, [])
+      end
+    end)
+
+    assert {:ok, fetched} =
+             Client.repository_labels(
+               "github_pat_test",
+               "octocat",
+               "Hello-World",
+               client_opts(stub, key)
+             )
+
+    assert [%{"name" => "bug"} | _] = fetched
+    assert_received {:request, "/repos/octocat/Hello-World/labels", "per_page=100"}
+    assert_received {:request, "/repos/octocat/Hello-World/labels", query}
+    assert URI.decode_query(query) == %{"page" => "2", "per_page" => "100"}
+  end
+
+  test "repository_issues requests all states and preserves assignee payloads" do
+    stub = stub_name()
+    parent = self()
+    issues = fixture_json!("issues_page.json")
+
+    issues =
+      issues
+      |> hd()
+      |> Map.put("assignees", [
+        %{
+          "id" => 9001,
+          "login" => "hubot",
+          "avatar_url" => "https://avatars.githubusercontent.com/u/9001",
+          "html_url" => "https://github.com/hubot"
+        }
+      ])
+      |> List.wrap()
+
+    Req.Test.expect(stub, fn conn ->
+      send(parent, {:request, conn.request_path, conn.query_string})
+      Req.Test.json(conn, issues)
+    end)
+
+    assert {:ok, [issue]} =
+             Client.repository_issues("github_pat_test", "octocat", "Hello-World", client_opts(stub))
+
+    assert issue["number"] == 7
+    assert [%{"login" => "hubot"}] = issue["assignees"]
+
+    assert_received {:request, "/repos/octocat/Hello-World/issues", query}
+    assert URI.decode_query(query) == %{"per_page" => "100", "state" => "all"}
+  end
+
+  test "issue_comments fetches paginated comment payloads" do
+    stub = stub_name()
+    parent = self()
+    comments = fixture_json!("comments_page.json")
+
+    Req.Test.expect(stub, fn conn ->
+      send(parent, {:request, conn.request_path, conn.query_string})
+      Req.Test.json(conn, comments)
+    end)
+
+    assert {:ok, [comment]} =
+             Client.issue_comments(
+               "github_pat_test",
+               "octocat",
+               "Hello-World",
+               7,
+               client_opts(stub)
+             )
+
+    assert comment["id"] == 601
+    assert_received {:request, "/repos/octocat/Hello-World/issues/7/comments", "per_page=100"}
+  end
+
+  test "pull_request fetches a single pull payload" do
+    stub = stub_name()
+    parent = self()
+    pull = fixture_json!("pull_same_repo.json")
+
+    Req.Test.expect(stub, fn conn ->
+      send(parent, {:request, conn.request_path, conn.query_string})
+      Req.Test.json(conn, pull)
+    end)
+
+    assert {:ok, fetched} =
+             Client.pull_request("github_pat_test", "octocat", "Hello-World", 7, client_opts(stub))
+
+    assert fetched["number"] == 7
+    assert fetched["merge_commit_sha"] == pull["merge_commit_sha"]
+    assert_received {:request, "/repos/octocat/Hello-World/pulls/7", ""}
+  end
+
+  test "metadata endpoints reject invalid repository components and numbers" do
+    assert {:error, %Error{kind: :invalid_request}} =
+             Client.repository_labels("github_pat_test", "", "Hello-World",
+               client_opts(stub_name())
+             )
+
+    assert {:error, %Error{kind: :invalid_request}} =
+             Client.issue_comments("github_pat_test", "octocat", "Hello-World", 0,
+               client_opts(stub_name())
+             )
+
+    assert {:error, %Error{kind: :invalid_request}} =
+             Client.pull_request("github_pat_test", "octocat", "Hello-World", -1,
+               client_opts(stub_name())
+             )
+  end
+
+  test "metadata client surface excludes unsupported-only endpoints" do
+    unsupported = ~w(
+      repository_releases
+      pull_reviews
+      repository_projects
+      issue_reactions
+      milestone
+    )
+
+    exports = Client.__info__(:functions) |> Enum.map(&elem(&1, 0)) |> MapSet.new()
+
+    refute Enum.any?(unsupported, &MapSet.member?(exports, &1))
+  end
+
   defp client_opts(stub, key_id \\ 1, extra \\ []) do
     Keyword.merge(
       [
@@ -847,6 +990,14 @@ defmodule ForgeImports.GitHub.ClientTest do
   end
 
   defp stub_name, do: {__MODULE__, System.unique_integer([:positive])}
+
+  defp fixture_json!(name) do
+    __DIR__
+    |> Path.join("../fixtures/github/#{name}")
+    |> Path.expand()
+    |> File.read!()
+    |> Jason.decode!()
+  end
 
   defp http_date(datetime), do: Calendar.strftime(datetime, "%a, %d %b %Y %H:%M:%S GMT")
 
