@@ -3,7 +3,7 @@ defmodule ForgeImports.Conflicts do
 
   import Ecto.Query
 
-  alias ForgeAccounts.{Namespace, User}
+  alias ForgeAccounts.{Namespace, Organization, User}
 
   alias ForgeImports.{
     ImportAttempt,
@@ -1139,7 +1139,8 @@ defmodule ForgeImports.Conflicts do
            owner.id == organization_id and owner.kind == :organization and owner.state == :active and
              owner.username == slug
          end) do
-      %User{} -> {:ok, organization_id}
+      %Organization{id: ^organization_id} -> {:ok, organization_id}
+      %{id: ^organization_id, kind: :organization} -> {:ok, organization_id}
       nil -> {:error, :stale}
     end
   end

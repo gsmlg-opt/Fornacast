@@ -11,6 +11,7 @@ defmodule ForgeImports do
     GitHubAccounts,
     ImportRun,
     OneTimeCredential,
+    OrganizationOrchestrator,
     Persistence,
     ReportEntry,
     RepositoryItem,
@@ -86,8 +87,31 @@ defmodule ForgeImports do
   def resolve_repository_conflicts(actor, run_id, decisions, request_metadata),
     do: Conflicts.resolve(actor, run_id, decisions, request_metadata)
 
-  def start_import(actor, run_id, request_metadata, opts \\ []),
-    do: Conflicts.start(actor, run_id, request_metadata, opts)
+  def start_import(actor, run_id, request_metadata, opts \\ [])
+
+  def start_import(%User{} = actor, run_id, request_metadata, opts)
+      when is_integer(run_id) and run_id > 0 and is_map(request_metadata) and is_list(opts) do
+    case organization_import_run?(actor, run_id) do
+      true -> OrganizationOrchestrator.start(actor, run_id, request_metadata, opts)
+      false -> Conflicts.start(actor, run_id, request_metadata, opts)
+    end
+  end
+
+  def start_import(_actor, _run_id, _request_metadata, _opts), do: {:error, :invalid_selection}
+
+  defp organization_import_run?(%User{id: actor_id}, run_id)
+       when is_integer(actor_id) and is_integer(run_id) do
+    case Repo.one(
+           from run in ImportRun,
+             where: run.id == ^run_id and run.actor_user_id == ^actor_id,
+             select: run.source_kind
+         ) do
+      :organization -> true
+      _other -> false
+    end
+  end
+
+  defp organization_import_run?(_actor, _run_id), do: false
 
   def mark_destination_changed(actor, run_id, item_reference, request_metadata),
     do: Conflicts.destination_changed(actor, run_id, item_reference, request_metadata)

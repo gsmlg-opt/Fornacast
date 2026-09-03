@@ -831,7 +831,7 @@ defmodule ForgeImports.ConflictsTest do
     end
   end
 
-  test "a clean new-organization plan freezes without creating the organization", %{
+  test "a clean new-organization plan freezes and activates the destination organization", %{
     actor: actor,
     identity: identity
   } do
@@ -846,7 +846,11 @@ defmodule ForgeImports.ConflictsTest do
         source_repository_full_name: nil,
         destination_organization_action: :new,
         destination_organization_slug: organization_slug,
-        destination_organization_id: nil
+        destination_organization_id: nil,
+        source_metadata: %{
+          "name" => "Future Import Org",
+          "observed_at" => DateTime.to_iso8601(@now)
+        }
       )
 
     item =
@@ -861,7 +865,12 @@ defmodule ForgeImports.ConflictsTest do
     assert {:ok,
             %RunView{
               state: :running,
-              repositories: [%{id: item_id, destination_owner_id: nil, state: :queued}]
+              destination_organization: %ForgeAccounts.Organization{
+                username: ^organization_slug
+              },
+              repositories: [
+                %{id: item_id, destination_owner_id: organization_id, state: :queued}
+              ]
             }} =
              ForgeImports.start_import(
                actor,
@@ -871,7 +880,12 @@ defmodule ForgeImports.ConflictsTest do
              )
 
     assert item_id == item.id
-    refute Repo.get_by(ForgeAccounts.User, username: organization_slug)
+    assert is_integer(organization_id)
+
+    assert Repo.get_by(ForgeAccounts.Organization, username: organization_slug).id ==
+             organization_id
+
+    assert Repo.get!(ImportRun, run.id).destination_organization_id == organization_id
   end
 
   test "replace confirmation is case-sensitive and never retained on rejection", %{

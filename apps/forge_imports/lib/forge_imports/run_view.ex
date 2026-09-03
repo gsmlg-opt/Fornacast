@@ -19,6 +19,7 @@ defmodule ForgeImports.RunView do
              :counts,
              :repositories,
              :reports,
+             :destination_organization,
              :inserted_at,
              :updated_at
            ]}
@@ -37,6 +38,7 @@ defmodule ForgeImports.RunView do
     :counts,
     :repositories,
     :reports,
+    :destination_organization,
     :inserted_at,
     :updated_at
   ]
@@ -81,6 +83,7 @@ defmodule ForgeImports.RunView do
       },
       repositories: Enum.map(items, &repository_summary/1),
       reports: Enum.map(reports, &report_summary/1),
+      destination_organization: nil,
       inserted_at: run.inserted_at,
       updated_at: run.updated_at
     }

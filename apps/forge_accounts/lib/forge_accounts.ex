@@ -410,6 +410,44 @@ defmodule ForgeAccounts do
 
   def create_organization(_owner, _attrs), do: {:error, :unauthorized}
 
+  @spec create_import_organization(User.t(), map(), map()) ::
+          {:ok, Organization.t()} | {:error, term()}
+  def create_import_organization(
+        %User{kind: :user, state: :active} = actor,
+        attrs,
+        request_metadata
+      )
+      when is_map(attrs) and is_map(request_metadata) do
+    with {:ok, safe_metadata} <- validate_github_request_metadata(request_metadata),
+         {:ok, operation_id} <- import_organization_operation_id(safe_metadata) do
+      Multi.new()
+      |> github_import_organization_multi(
+        :organization,
+        actor,
+        attrs,
+        safe_metadata,
+        operation_id
+      )
+      |> Repo.transaction()
+      |> case do
+        {:ok, %{organization: organization}} -> {:ok, organization}
+        {:error, _step, reason, _changes} -> {:error, reason}
+      end
+    end
+  end
+
+  def create_import_organization(_actor, _attrs, _request_metadata), do: {:error, :forbidden}
+
+  defp import_organization_operation_id(metadata) when is_map(metadata) do
+    case Map.get(metadata, "operation_id") || Map.get(metadata, :operation_id) do
+      operation_id when is_binary(operation_id) and operation_id != "" ->
+        {:ok, operation_id}
+
+      _missing ->
+        {:error, :invalid_request_metadata}
+    end
+  end
+
   @doc false
   @spec github_import_organization_multi(
           Multi.t(),
