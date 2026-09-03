@@ -414,6 +414,9 @@ To rotate keys, first keep both the old and new entries in the key map, then
 switch the active key ID so new writes use the new key. A later credential
 lifecycle task must re-encrypt existing rows before the old key is removed.
 
+Operator documentation for GitHub import workflows, recovery controls, supported
+content, and acceptance lives in [`docs/github-imports.md`](docs/github-imports.md).
+
 The Ecto adapter is selected at compile time. PostgreSQL is the default and the
 only supported release build. Changing an explicit source build's adapter
 requires `mix clean` followed by a complete recompile. Concord is used

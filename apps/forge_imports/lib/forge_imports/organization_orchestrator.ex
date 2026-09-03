@@ -423,13 +423,38 @@ defmodule ForgeImports.OrganizationOrchestrator do
   end
 
   defp validate_frozen_destination(actor, run, item, :replace) do
-    with :ok <- validate_destination_owner(actor, run, item.destination_owner_id),
-         {:ok, target} <- exact_replacement_target(item.replacement_repository_id),
-         true <- replacement_fingerprint_matches?(item, target) do
+    with {:ok, target} <- exact_replacement_target(item.replacement_repository_id),
+         true <- replacement_fingerprint_matches?(item, target),
+         :ok <- validate_replace_scope(actor, run, item, target) do
       :ok
     else
       false -> {:error, :stale}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp validate_replace_scope(
+         actor,
+         %ImportRun{destination_organization_action: :new},
+         item,
+         target
+       ) do
+    if item.destination_owner_id == target.owner_user_id and
+         replacement_authorized?(actor, target) do
+      :ok
+    else
+      {:error, :stale}
+    end
+  end
+
+  defp validate_replace_scope(actor, run, item, _target) do
+    validate_destination_owner(actor, run, item.destination_owner_id)
+  end
+
+  defp replacement_authorized?(actor, repository) do
+    case Fornacast.Access.authorize(actor, :repository_admin, repository) do
+      :ok -> :ok
+      {:error, :unauthorized} -> {:error, :stale}
     end
   end
 
