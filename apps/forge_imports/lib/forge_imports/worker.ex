@@ -9,7 +9,8 @@ defmodule ForgeImports.Worker do
     Recovery,
     RepositoryItem,
     RepositoryPublisher,
-    RepositoryWorker
+    RepositoryWorker,
+    RunAggregator
   }
 
   alias Fornacast.Repo
@@ -55,8 +56,10 @@ defmodule ForgeImports.Worker do
     Cancellation.check(item) and item.state not in [:cancel_requested, :staging_git]
   end
 
-  defp dispatch(%RepositoryItem{state: :publishing, id: item_id}, _worker, _opts) do
-    RepositoryPublisher.recover(item_id)
+  defp dispatch(%RepositoryItem{state: :publishing, id: item_id} = item, _worker, _opts) do
+    item_id
+    |> RepositoryPublisher.recover()
+    |> tap(fn _result -> RunAggregator.finish_if_terminal(item.import_run_id) end)
   end
 
   defp dispatch(
@@ -64,16 +67,22 @@ defmodule ForgeImports.Worker do
          _worker,
          _opts
        ) do
-    with %ImportRun{} = run <- Repo.get(ImportRun, run_id),
-         %User{} = actor <- Repo.get(User, run.actor_user_id) do
-      RepositoryPublisher.publish(actor, item.id, run.request_metadata)
-    else
-      _missing -> {:error, :not_found}
-    end
+    result =
+      with %ImportRun{} = run <- Repo.get(ImportRun, run_id),
+           %User{} = actor <- Repo.get(User, run.actor_user_id) do
+        RepositoryPublisher.publish(actor, item.id, run.request_metadata)
+      else
+        _missing -> {:error, :not_found}
+      end
+
+    RunAggregator.finish_if_terminal(run_id)
+    result
   end
 
   defp dispatch(%RepositoryItem{} = item, repository_worker, opts) do
-    apply(repository_worker, :stage, [item.id, opts])
+    item.id
+    |> then(&apply(repository_worker, :stage, [&1, opts]))
+    |> tap(fn _result -> RunAggregator.finish_if_terminal(item.import_run_id) end)
   end
 
   defp worker_options(lease_owner, opts) do

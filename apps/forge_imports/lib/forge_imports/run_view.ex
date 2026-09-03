@@ -19,6 +19,7 @@ defmodule ForgeImports.RunView do
              :counts,
              :repositories,
              :reports,
+             :report_summary,
              :destination_organization,
              :inserted_at,
              :updated_at
@@ -38,6 +39,7 @@ defmodule ForgeImports.RunView do
     :counts,
     :repositories,
     :reports,
+    :report_summary,
     :destination_organization,
     :inserted_at,
     :updated_at
@@ -83,6 +85,7 @@ defmodule ForgeImports.RunView do
       },
       repositories: Enum.map(items, &repository_summary/1),
       reports: Enum.map(reports, &report_summary/1),
+      report_summary: run_level_summary(reports),
       destination_organization: nil,
       inserted_at: run.inserted_at,
       updated_at: run.updated_at
@@ -99,6 +102,13 @@ defmodule ForgeImports.RunView do
       metadata: report.metadata,
       source_count: report.source_count
     }
+  end
+
+  defp run_level_summary(reports) when is_list(reports) do
+    case Enum.find(reports, &(&1.idempotency_key == ForgeImports.Report.run_summary_key())) do
+      %ReportEntry{} = entry -> report_summary(entry)
+      nil -> nil
+    end
   end
 
   defp safe_provenance(metadata) when is_map(metadata) do
