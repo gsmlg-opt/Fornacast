@@ -115,6 +115,14 @@ defmodule FornacastWeb.ImportHTML do
 
   def workflow_available?(_run), do: false
 
+  def startable?(
+        %{state: :awaiting_resolution, destination: %{organization_status: :clean}} = run
+      ) do
+    not Enum.any?(run.repositories, &(&1.selected and &1.state == :awaiting_resolution))
+  end
+
+  def startable?(_run), do: false
+
   def workflow_path(run) do
     if run.state in [:awaiting_resolution, :running] and conflict_repositories(run) != [],
       do: "/imports/#{run.id}/conflicts",

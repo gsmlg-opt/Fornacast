@@ -351,7 +351,7 @@ defmodule FornacastWeb.ImportHTMLTest do
     refute html =~ "daisy"
   end
 
-  test "review summarizes the persisted plan without exposing a start action or unsafe metadata" do
+  test "review offers start for a fully resolved plan without unsafe metadata" do
     view = run_view()
     [created, conflicted] = view.repositories
 
@@ -377,14 +377,29 @@ defmodule FornacastWeb.ImportHTMLTest do
     assert html =~ "octo/beta"
     assert html =~ "Rename"
     assert html =~ "renamed-beta"
-    assert html =~ "Import start is unavailable until metadata import support is installed."
-    assert html =~ "GitHub releases are not imported"
-    assert html =~ "data-import-start-unavailable"
+    assert html =~ ~s(action="/imports/91/start")
+    assert html =~ "Start import"
+    assert html =~ "data-import-start-form"
+    refute html =~ "data-import-start-unavailable"
     assert html =~ ~s(href="/imports/91")
-    refute html =~ ~s(action="/imports/91/start")
-    refute html =~ ~r/>\s*Start(?: import)?\s*</i
     refute html =~ "github_pat_projection_secret"
     refute html =~ "opaque-internal-evidence"
+  end
+
+  test "review hides start while conflicts remain unresolved" do
+    html = render_component(&ImportHTML.review/1, run: run_view())
+
+    assert html =~ "Import start is unavailable until the migration plan is fully resolved."
+    assert html =~ "data-import-start-unavailable"
+    refute html =~ ~s(action="/imports/91/start")
+  end
+
+  test "review hides start when the run is already executing" do
+    view = %{run_view() | state: :running}
+    html = render_component(&ImportHTML.review/1, run: view)
+
+    refute html =~ ~s(action="/imports/91/start")
+    refute html =~ "data-import-start-form"
   end
 
   test "show with a dirty organization destination does not offer repository conflict workflow" do

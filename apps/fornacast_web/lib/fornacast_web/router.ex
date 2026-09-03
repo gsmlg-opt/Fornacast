@@ -70,6 +70,7 @@ defmodule FornacastWeb.Router do
     get "/imports/:id/conflicts", ImportController, :conflicts
     patch "/imports/:id/conflicts", ImportController, :resolve_conflicts
     get "/imports/:id/review", ImportController, :review
+    post "/imports/:id/start", ImportController, :start
     patch "/imports/:id/destination", ImportController, :destination
     patch "/imports/:id/selection", ImportController, :selection
   end

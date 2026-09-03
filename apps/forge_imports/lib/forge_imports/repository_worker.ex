@@ -22,6 +22,7 @@ defmodule ForgeImports.RepositoryWorker do
   }
 
   alias ForgeImports.RepositoryStager
+  alias ForgeImports.GitHub.{Client, MetadataImporter}
   alias ForgeRepos.Repository
   alias Fornacast.{Audit, AuditEvent, OperationLease, Repo}
   alias GitCore.Remote
@@ -143,10 +144,135 @@ defmodule ForgeImports.RepositoryWorker do
     end
   end
 
+  defp stage_in_mode(repository_item_id, options, :metadata) do
+    case claim_item(repository_item_id, options, :normal) do
+      {:ok, capability} -> stage_metadata_claimed(capability, options)
+      :busy -> {:ok, :busy}
+      :ignored -> {:ok, :ignored}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp stage_claimed(%RepositoryItem{state: state} = capability, options, mode)
+       when state in [:git_staged, :staging_metadata] do
+    stage_metadata_claimed(capability, options)
+  end
+
   defp stage_claimed(capability, options, mode) do
     case RepositoryStager.ensure_shadow(capability) do
       {:ok, {current, shadow}} -> stage_shadow(current, shadow, options, mode)
       {:error, reason} -> release_with_error(capability, reason)
+    end
+  end
+
+  defp stage_metadata_claimed(capability, options) do
+    with {:ok, %{actor: actor, run: run, item: item}} <-
+           current_context(capability.id, capability.lease_owner),
+         false <- cancelled?(capability.id, capability.lease_owner),
+         {:ok, item} <- ensure_staging_metadata(item, capability),
+         :ok <-
+           MetadataImporter.stage(
+             item,
+             &metadata_checkout(actor, run, item, &1, options),
+             metadata_importer_options(item, options)
+           ),
+         {:ok, updated} <- persist_ready_to_publish(capability) do
+      {:ok, updated}
+    else
+      true -> persist_cancellation(capability)
+      {:error, :cancelled} -> persist_cancellation(capability)
+      {:error, reason} -> release_with_error(capability, reason)
+    end
+  rescue
+    _error in [Turso.Error, DBConnection.ConnectionError] ->
+      release_with_error(capability, :persistence_unavailable)
+  end
+
+  defp metadata_checkout(actor, run, item, callback, options) do
+    reference = make_ref()
+    parent = self()
+
+    checkout =
+      case run.credential_source do
+        :one_time ->
+          OneTimeCredential.with_item_credential(actor, item, fn pat ->
+            send(parent, {reference, callback.(pat)})
+            :ok
+          end, options.keyring)
+
+        :saved ->
+          ForgeAccounts.with_github_import_credential(
+            actor,
+            run.github_identity_id,
+            run.github_credential_id,
+            fn pat, verification ->
+              result =
+                if saved_reference_matches?(run, verification),
+                  do: callback.(pat),
+                  else: {:error, :credential_changed}
+
+              send(parent, {reference, result})
+              :ok
+            end
+          )
+      end
+
+    receive_checkout_result(checkout, reference)
+  end
+
+  defp metadata_importer_options(item, options) do
+    [
+      gate_key: {:one_time_run, item.import_run_id},
+      client: Keyword.get(options, :client, Client),
+      client_options: Keyword.get(options, :client_options, [])
+    ]
+  end
+
+  defp ensure_staging_metadata(%RepositoryItem{state: :staging_metadata} = item, _capability),
+    do: {:ok, item}
+
+  defp ensure_staging_metadata(item, capability) do
+    now = DateTime.utc_now(:second)
+
+    query =
+      from candidate in RepositoryItem,
+        where:
+          candidate.id == ^item.id and candidate.lock_version == ^item.lock_version and
+            candidate.lease_owner == ^capability.lease_owner and candidate.lease_expires_at > ^now and
+            candidate.state == :git_staged and is_nil(candidate.cleanup_state)
+
+    case Repo.update_all(query,
+           set: [state: :staging_metadata, updated_at: now],
+           inc: [lock_version: 1]
+         ) do
+      {1, _rows} -> {:ok, Repo.get!(RepositoryItem, item.id)}
+      {0, _rows} -> {:error, :lost_lease}
+    end
+  end
+
+  defp persist_ready_to_publish(capability) do
+    now = DateTime.utc_now(:second)
+
+    query =
+      from candidate in RepositoryItem,
+        where:
+          candidate.id == ^capability.id and candidate.lock_version == ^capability.lock_version and
+            candidate.lease_owner == ^capability.lease_owner and candidate.lease_expires_at > ^now and
+            candidate.state == :staging_metadata and is_nil(candidate.cleanup_state)
+
+    case Repo.update_all(query,
+           set: [
+             state: :ready_to_publish,
+             lease_owner: nil,
+             lease_expires_at: nil,
+             next_attempt_at: nil,
+             wait_reason: nil,
+             updated_at: now
+           ],
+           inc: [lock_version: 1]
+         ) do
+      {1, _rows} -> {:ok, Repo.get!(RepositoryItem, capability.id)}
+      {0, _rows} -> {:error, :lost_lease}
     end
   end
 
@@ -249,6 +375,14 @@ defmodule ForgeImports.RepositoryWorker do
     end
   rescue
     _error in [File.Error, ArgumentError] -> {:ok, :recovery}
+  end
+
+  defp preflight_item_mode(%RepositoryItem{state: :git_staged} = item, _options) do
+    if metadata_ready_item?(item), do: {:ok, :metadata}, else: {:ok, :recovery}
+  end
+
+  defp preflight_item_mode(%RepositoryItem{state: :staging_metadata} = item, _options) do
+    if metadata_ready_item?(item), do: {:ok, :metadata}, else: {:ok, :recovery}
   end
 
   defp preflight_item_mode(%RepositoryItem{}, _options), do: {:ok, :recovery}
@@ -651,13 +785,16 @@ defmodule ForgeImports.RepositoryWorker do
       not cleanup_recovery? and attempt.state != :running -> {:error, :not_runnable}
       item.import_run_id != run.id -> {:error, :not_runnable}
       not item.selected -> {:error, :not_runnable}
-      item.state not in [:queued, :staging_git] -> {:error, :not_runnable}
+      item.state not in [:queued, :staging_git, :git_staged, :staging_metadata] ->
+        {:error, :not_runnable}
       item.attempt_count < 1 -> {:error, :not_runnable}
       mode != :cleanup_only and not due?(item, now) -> {:error, :not_runnable}
       not is_nil(item.cleanup_state) -> {:error, :not_runnable}
       live_lease?(item, now) -> :busy
       item.state == :queued and not fresh_item?(item) -> {:error, :not_runnable}
       item.state == :staging_git and not staged_item?(item) -> {:error, :not_runnable}
+      item.state in [:git_staged, :staging_metadata] and not metadata_ready_item?(item) ->
+        {:error, :not_runnable}
       true -> :ok
     end
   end
@@ -1603,7 +1740,8 @@ defmodule ForgeImports.RepositoryWorker do
     |> where(
       [item],
       item.id == ^capability.id and item.import_run_id == ^capability.import_run_id and
-        item.lease_owner == ^capability.lease_owner and item.state in [:queued, :staging_git] and
+        item.lease_owner == ^capability.lease_owner and
+        item.state in [:queued, :staging_git, :git_staged, :staging_metadata] and
         is_nil(item.cleanup_state)
     )
     |> maybe_lock()
@@ -1615,6 +1753,10 @@ defmodule ForgeImports.RepositoryWorker do
 
   defp staged_item?(item),
     do: is_integer(item.hidden_repository_id) and is_binary(item.staged_storage_path)
+
+  defp metadata_ready_item?(item) do
+    staged_item?(item) and get_in(item.checkpoint, ["git_staged"]) == true
+  end
 
   defp due?(%RepositoryItem{next_attempt_at: nil}, _now), do: true
   defp due?(%RepositoryItem{next_attempt_at: next}, now), do: DateTime.compare(next, now) != :gt
@@ -1635,7 +1777,7 @@ defmodule ForgeImports.RepositoryWorker do
   defp options(opts) do
     allowed =
       if @allow_test_options,
-        do: ~w(owner lease_seconds keyring remote remote_options scan_options persistence_hook)a,
+        do: ~w(owner lease_seconds keyring remote remote_options scan_options persistence_hook client client_options)a,
         else: ~w(owner lease_seconds)a
 
     cond do

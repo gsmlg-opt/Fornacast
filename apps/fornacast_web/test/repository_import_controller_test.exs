@@ -15,6 +15,7 @@ defmodule FornacastWeb.RepositoryImportControllerTest do
     def reset do
       Process.put({__MODULE__, :run_result}, {:error, :not_found})
       Process.put({__MODULE__, :resolve_result}, {:error, :not_found})
+      Process.delete({__MODULE__, :start_result})
       Process.put({__MODULE__, :calls}, [])
     end
 
@@ -31,6 +32,13 @@ defmodule FornacastWeb.RepositoryImportControllerTest do
       record(:resolve_repository_conflicts, [actor, run_id, decisions, request_metadata])
       Process.get({__MODULE__, :resolve_result})
     end
+
+    def start_import(actor, run_id, request_metadata, opts \\ []) do
+      record(:start_import, [actor, run_id, request_metadata, opts])
+      Process.get({__MODULE__, :start_result}, {:error, :not_found})
+    end
+
+    def start_result(result), do: Process.put({__MODULE__, :start_result}, result)
 
     defp record(operation, args) do
       Process.put(
@@ -123,6 +131,42 @@ defmodule FornacastWeb.RepositoryImportControllerTest do
     refute inspect(TestImports.calls()) =~ @secret
   end
 
+  test "review shows start for a resolved awaiting plan and running hides it", %{actor: actor} do
+    view = actor |> run_view() |> resolved_view()
+    TestImports.run_result({:ok, view})
+
+    conn = request_conn(actor) |> get("/imports/91/review")
+    html = html_response(conn, 200)
+
+    assert html =~ ~s(action="/imports/91/start")
+    assert html =~ "Start import"
+    refute html =~ "Import start is unavailable until metadata import support is installed."
+
+    TestImports.run_result({:ok, %{view | state: :running}})
+    running = request_conn(actor) |> get("/imports/91/review")
+    running_html = html_response(running, 200)
+
+    refute running_html =~ ~s(action="/imports/91/start")
+  end
+
+  test "start posts to the import service and redirects to progress", %{actor: actor} do
+    view = actor |> run_view() |> resolved_view()
+    TestImports.run_result({:ok, view})
+    TestImports.start_result({:ok, %{view | state: :running}})
+
+    conn = request_conn(actor) |> post("/imports/91/start", %{})
+
+    assert redirected_to(conn, 303) == "/imports/91"
+
+    assert Enum.any?(TestImports.calls(), fn
+             {:start_import, [^actor, 91, request_metadata, []]} ->
+               request_metadata.user_agent == "repository-import-controller-test"
+
+             _ ->
+               false
+           end)
+  end
+
   test "review is read-only, summarizes decisions and never assigns a PAT", %{actor: actor} do
     view = actor |> run_view() |> resolved_view()
     TestImports.run_result({:ok, %{view | state: :running}})
@@ -136,12 +180,7 @@ defmodule FornacastWeb.RepositoryImportControllerTest do
     assert html =~ "Rename"
     assert html =~ "Replace"
     assert html =~ "renamed-repository"
-    assert html =~ "Import start is unavailable until metadata import support is installed."
     refute html =~ ~s(action="/imports/91/start")
-    refute html =~ ~r/>\s*Start(?: import)?\s*</i
-
-    assert :error =
-             Phoenix.Router.route_info(FornacastWeb.Router, "POST", "/imports/91/start", "")
 
     refute secret_surfaces(conn) =~ @secret
     assert_private_no_store(conn)

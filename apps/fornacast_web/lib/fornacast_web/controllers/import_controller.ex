@@ -141,6 +141,32 @@ defmodule FornacastWeb.ImportController do
     end
   end
 
+  def start(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
+    with {:ok, run_id} <- canonical_id(Map.get(params, "id")),
+         {:ok, run} <- fetch_run_view(conn, actor, run_id) do
+      cond do
+        not clean_destination?(run) ->
+          redirect_to_run(conn, run_id)
+
+        not startable_review?(run) ->
+          redirect_to_run(conn, run_id)
+
+        unresolved_conflicts?(run) ->
+          redirect_to_conflicts(conn, run_id)
+
+        true ->
+          result =
+            service_call(fn ->
+              imports(conn).start_import(actor, run_id, RequestMetadata.from_conn(conn))
+            end)
+
+          handle_start_result(conn, actor, run_id, result)
+      end
+    else
+      {:error, reason} -> render_run_lookup_error(conn, reason)
+    end
+  end
+
   def review(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
     with {:ok, run_id} <- canonical_id(Map.get(params, "id")),
          {:ok, run} <- fetch_run_view(conn, actor, run_id) do
@@ -217,6 +243,19 @@ defmodule FornacastWeb.ImportController do
     do: render_update_error(conn, reason)
 
   defp handle_update_result(conn, _actor, _run_id, _unexpected),
+    do: render_fixed_error(conn, :unavailable)
+
+  defp handle_start_result(conn, actor, run_id, {:ok, %RunView{} = run}) do
+    case validate_run_view(run, actor, run_id) do
+      :ok -> redirect_to_run(conn, run_id)
+      {:error, _reason} -> render_fixed_error(conn, :unavailable)
+    end
+  end
+
+  defp handle_start_result(conn, _actor, _run_id, {:error, reason}),
+    do: render_update_error(conn, reason)
+
+  defp handle_start_result(conn, _actor, _run_id, _unexpected),
     do: render_fixed_error(conn, :unavailable)
 
   defp handle_conflict_resolution(conn, actor, _run, run_id, {:ok, %RunView{} = resolved}) do
@@ -516,6 +555,9 @@ defmodule FornacastWeb.ImportController do
        do: true
 
   defp conflict_resolution_state?(_run), do: false
+
+  defp startable_review?(%RunView{state: :awaiting_resolution}), do: true
+  defp startable_review?(_run), do: false
 
   defp reviewable_state?(%RunView{state: state})
        when state in [

@@ -16,14 +16,28 @@
   </header>
 
   <.dm_alert
+    :if={not startable?(@run)}
     id="import-start-unavailable"
     variant="info"
     outlined
     role="status"
     data-import-start-unavailable
   >
-    Import start is unavailable until metadata import support is installed.
+    Import start is unavailable until the migration plan is fully resolved.
   </.dm_alert>
+
+  <form
+    :if={startable?(@run)}
+    id="import-start-form"
+    action={"/imports/#{@run.id}/start"}
+    method="post"
+    data-import-start-form
+  >
+    <input type="hidden" name="_csrf_token" value={csrf_token()} />
+    <.dm_btn type="submit" variant="primary">
+      Start import
+    </.dm_btn>
+  </form>
 
   <.dm_card id="import-review-overview" variant="bordered" shadow="sm" padding="lg">
     <:title><span class="text-lg font-semibold">Overview</span></:title>
