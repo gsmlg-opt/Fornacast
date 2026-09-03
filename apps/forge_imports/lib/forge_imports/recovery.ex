@@ -163,7 +163,6 @@ defmodule ForgeImports.Recovery do
     else
       case OperationLease.release(RepositoryItem, item) do
         :ok -> {:ok, Repo.get!(RepositoryItem, item.id)}
-        {:ok, released} -> {:ok, released}
         {:error, reason} -> {:error, reason}
       end
     end

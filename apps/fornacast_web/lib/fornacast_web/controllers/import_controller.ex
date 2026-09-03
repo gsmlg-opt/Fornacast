@@ -446,13 +446,13 @@ defmodule FornacastWeb.ImportController do
     )
   end
 
-  defp render_run(conn, %RunView{} = run, organizations, accounts \\ [], error \\ nil) do
+  defp render_run(conn, %RunView{} = run, organizations, accounts) do
     rendered =
       ImportHTML.show(%{
         run: run,
         organizations: organizations,
         accounts: accounts,
-        error: error,
+        error: nil,
         __changed__: nil
       })
 

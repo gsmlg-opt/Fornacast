@@ -10,7 +10,6 @@ defmodule ForgeImports.Waits do
   alias Fornacast.Repo
 
   @terminal_run_states [:completed, :completed_with_warnings, :canceled, :failed]
-  @terminal_item_states [:completed, :skipped, :canceled, :failed]
   @pausable_item_states [
     :queued,
     :awaiting_resolution,
@@ -89,12 +88,14 @@ defmodule ForgeImports.Waits do
 
   @spec resume_with_credential(User.t(), ImportRun.t(), map(), map(), keyword()) ::
           {:ok, ImportRun.t()} | {:error, atom()}
+  def resume_with_credential(actor, run, credential_source, request_metadata, opts \\ [])
+
   def resume_with_credential(
         %User{} = actor,
         %ImportRun{} = expected_run,
         credential_source,
         request_metadata,
-        opts \\ []
+        opts
       )
       when is_map(credential_source) and is_map(request_metadata) and is_list(opts) do
     transaction = fn ->

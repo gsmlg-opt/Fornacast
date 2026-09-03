@@ -102,9 +102,6 @@ defmodule ForgeImports.Retry do
 
         phase when phase in [:git_staged, :ready_to_publish] ->
           adopt_proven_staging(repo, predecessor_item, successor_item, phase)
-
-        _other ->
-          {:error, :invalid_predecessor}
       end
     else
       {:error, :inconsistent} -> {:error, :invalid_predecessor}

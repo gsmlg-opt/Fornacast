@@ -426,14 +426,14 @@ defmodule ForgeImports.GitHub.Client do
   end
 
   defp emit_request_telemetry({:ok, %Req.Response{} = response}, duration, opts) do
-    metadata =
-      case classify_response(response, opts) do
-        {:error, %Error{kind: kind}} -> %{outcome: :error, error: kind}
-        _ -> %{outcome: :error}
-      end
+    {:error, %Error{kind: kind}} = classify_response(response, opts)
 
-    Telemetry.execute([:github, :request, :stop], %{duration: duration}, metadata)
-    maybe_emit_rate_limit_pause(metadata)
+    Telemetry.execute([:github, :request, :stop], %{duration: duration}, %{
+      outcome: :error,
+      error: kind
+    })
+
+    maybe_emit_rate_limit_pause(%{error: kind})
   end
 
   defp emit_request_telemetry({:error, %Error{kind: kind}}, duration, _opts) do
@@ -443,10 +443,6 @@ defmodule ForgeImports.GitHub.Client do
     })
 
     maybe_emit_rate_limit_pause(%{error: kind})
-  end
-
-  defp emit_request_telemetry(_result, duration, _opts) do
-    Telemetry.execute([:github, :request, :stop], %{duration: duration}, %{outcome: :error})
   end
 
   defp maybe_emit_rate_limit_pause(%{error: kind})
