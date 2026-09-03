@@ -14,6 +14,7 @@ defmodule ForgeImports.DiscoveryDispatchTest do
     if postgres?() do
       :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
       Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+      ForgeImports.RecoveryTestHelper.mark_sandbox_owner!()
     else
       reset_database!()
       on_exit(&reset_database!/0)

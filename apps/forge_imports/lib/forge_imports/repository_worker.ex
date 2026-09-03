@@ -17,6 +17,7 @@ defmodule ForgeImports.RepositoryWorker do
     ImportRun,
     OneTimeCredential,
     Persistence,
+    Recovery,
     ReportEntry,
     RepositoryItem
   }
@@ -92,7 +93,8 @@ defmodule ForgeImports.RepositoryWorker do
   def stage(repository_item_id, opts)
       when is_integer(repository_item_id) and repository_item_id > 0 and is_list(opts) do
     with {:ok, options} <- options(opts),
-         {:ok, mode} <- preflight_mode(repository_item_id, options) do
+         {:ok, mode} <- preflight_mode(repository_item_id, options),
+         {:ok, _} <- maybe_recover_item(repository_item_id, options) do
       stage_in_mode(repository_item_id, options, mode)
     else
       {:error, reason} -> {:error, reason}
@@ -100,6 +102,15 @@ defmodule ForgeImports.RepositoryWorker do
   end
 
   def stage(_repository_item_id, _opts), do: {:error, :invalid_request}
+
+  defp maybe_recover_item(repository_item_id, opts) do
+    case Repo.get(RepositoryItem, repository_item_id) do
+      %RepositoryItem{} = item -> Recovery.reconcile(item, opts)
+      nil -> {:error, :not_found}
+    end
+  rescue
+    _error in [Turso.Error, DBConnection.ConnectionError] -> {:error, :persistence_unavailable}
+  end
 
   defp stage_in_mode(repository_item_id, options, :normal) do
     case activate_destination(repository_item_id) do

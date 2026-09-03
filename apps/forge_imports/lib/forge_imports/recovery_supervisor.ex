@@ -19,6 +19,13 @@ defmodule ForgeImports.RecoverySupervisor do
     cleanup_reconciler_name =
       Keyword.get(opts, :cleanup_reconciler_name, ForgeImports.CleanupReconciler)
 
+    max_concurrency =
+      Keyword.get(
+        opts,
+        :max_concurrency,
+        Application.get_env(:forge_imports, :recovery_max_concurrency, 1)
+      )
+
     reconciler_opts =
       opts
       |> Keyword.drop([
@@ -27,9 +34,13 @@ defmodule ForgeImports.RecoverySupervisor do
         :cleanup_task_supervisor,
         :cleanup_reconciler_name,
         :cleanup_enabled,
-        :cleanup_options
+        :cleanup_options,
+        :max_concurrency,
+        :sandbox_owner
       ])
       |> Keyword.put(:task_supervisor, task_supervisor)
+      |> Keyword.put(:max_concurrency, max_concurrency)
+      |> Keyword.put(:sandbox_owner, Keyword.get(opts, :sandbox_owner))
       |> Keyword.put(:name, reconciler_name)
 
     cleanup_enabled = Keyword.get(opts, :cleanup_enabled, false)
@@ -45,6 +56,7 @@ defmodule ForgeImports.RecoverySupervisor do
       Supervisor.child_spec(
         {ForgeImports.RecoverySupervisor.Pair,
          task_supervisor: task_supervisor,
+         max_concurrency: max_concurrency,
          reconciler: ForgeImports.Reconciler,
          reconciler_opts: reconciler_opts,
          reconciler_id: reconciler_name},
@@ -91,9 +103,16 @@ defmodule ForgeImports.RecoverySupervisor.Pair do
     reconciler_opts = Keyword.fetch!(opts, :reconciler_opts)
     reconciler_id = Keyword.fetch!(opts, :reconciler_id)
 
+    max_concurrency =
+      Keyword.get(
+        opts,
+        :max_concurrency,
+        Keyword.get(reconciler_opts, :max_concurrency, 1)
+      )
+
     children = [
       Supervisor.child_spec(
-        {Task.Supervisor, name: task_supervisor, max_children: 1},
+        {Task.Supervisor, name: task_supervisor, max_children: max_concurrency},
         id: task_supervisor
       ),
       Supervisor.child_spec({reconciler, reconciler_opts}, id: reconciler_id)

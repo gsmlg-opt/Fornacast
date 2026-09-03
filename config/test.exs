@@ -2,6 +2,7 @@ import Config
 
 config :forge_imports,
   recovery_enabled: false,
+  recovery_max_concurrency: 1,
   repository_cleanup_enabled: false
 
 config :git_core, :limits,

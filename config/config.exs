@@ -100,6 +100,7 @@ config :forge_repos,
 
 config :forge_imports,
   recovery_enabled: true,
+  recovery_max_concurrency: 2,
   repository_cleanup_enabled: true,
   repository_cleanup_grace_seconds: 86_400,
   repository_cleanup_interval_ms: 30_000,
