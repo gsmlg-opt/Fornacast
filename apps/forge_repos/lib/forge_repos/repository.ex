@@ -98,6 +98,44 @@ defmodule ForgeRepos.Repository do
   end
 
   @doc false
+  def import_adoption_changeset(
+        %__MODULE__{
+          lifecycle: :importing,
+          deleted_at: nil,
+          write_version: 0,
+          visibility: :private
+        } = repository,
+        item_id
+      )
+      when is_integer(item_id) and item_id > 0 do
+    with {:ok, suffix} <- import_shadow_suffix(repository.slug) do
+      repository
+      |> change(%{
+        slug: "import-#{item_id}-#{suffix}",
+        name: "GitHub import #{item_id}"
+      })
+      |> validate_import_lifecycle()
+      |> validate_private_import()
+      |> unique_constraint([:owner_user_id, :slug], name: owner_slug_constraint())
+    else
+      :error ->
+        repository |> change() |> add_error(:slug, "is not an import shadow")
+    end
+  end
+
+  def import_adoption_changeset(%__MODULE__{} = repository, _item_id),
+    do: repository |> change() |> add_error(:lifecycle, "is not an importing shadow")
+
+  defp import_shadow_suffix(slug) when is_binary(slug) do
+    case Regex.run(~r/\Aimport-[0-9]+-([0-9a-f]{24})\z/, slug) do
+      [_, suffix] -> {:ok, suffix}
+      _ -> :error
+    end
+  end
+
+  defp import_shadow_suffix(_slug), do: :error
+
+  @doc false
   def import_publication_changeset(
         %__MODULE__{lifecycle: :importing, deleted_at: nil, write_version: 0} = repository,
         attrs
