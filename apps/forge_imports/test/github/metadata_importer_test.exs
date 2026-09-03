@@ -56,7 +56,9 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
       fixture!("issues_page.json")
       |> hd()
       |> Map.put("number", 7)
-      |> Map.put("pull_request", %{"url" => "https://api.github.com/repos/octocat/Hello-World/pulls/7"})
+      |> Map.put("pull_request", %{
+        "url" => "https://api.github.com/repos/octocat/Hello-World/pulls/7"
+      })
 
     ghost_comment =
       fixture!("comments_page.json")
@@ -71,14 +73,15 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
       |> Map.put("id", 602)
       |> Map.put("body", "Issue 3 comment")
 
-    stub = stub_client!(
-      labels: fixture!("labels_page.json"),
-      issues: [issue_payload, pull_issue],
-      comments: %{
-        3 => [comment_issue_3, ghost_comment]
-      },
-      pull: align_pull_payload(fixture!("pull_same_repo.json"), head_sha, base_sha)
-    )
+    stub =
+      stub_client!(
+        labels: fixture!("labels_page.json"),
+        issues: [issue_payload, pull_issue],
+        comments: %{
+          3 => [comment_issue_3, ghost_comment]
+        },
+        pull: align_pull_payload(fixture!("pull_same_repo.json"), head_sha, base_sha)
+      )
 
     assert :ok = stage(item, stub)
 
@@ -120,10 +123,13 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
 
     assert Repo.exists?(
              from mapping in ObjectMapping,
-               where: mapping.repository_item_id == ^item.id and mapping.object_kind == "pull_request"
+               where:
+                 mapping.repository_item_id == ^item.id and mapping.object_kind == "pull_request"
            )
 
-    assert Repo.exists?(from sequence in NumberSequence, where: sequence.repository_id == ^repository.id)
+    assert Repo.exists?(
+             from sequence in NumberSequence, where: sequence.repository_id == ^repository.id
+           )
 
     refute ForgeRepos.get_repository(user_slug(run), item.destination_slug)
   end
@@ -170,7 +176,9 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
 
     assert Repo.aggregate(
              from(report in ReportEntry,
-               where: report.repository_item_id == ^item.id and report.classification != "pull_candidate"
+               where:
+                 report.repository_item_id == ^item.id and
+                   report.classification != "pull_candidate"
              ),
              :count
            ) >= 2
@@ -195,8 +203,11 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
 
     assert :ok = stage(item, stub)
 
-    label_count = Repo.aggregate(from(l in Label, where: l.repository_id == ^repository.id), :count)
-    issue_count = Repo.aggregate(from(i in Issue, where: i.repository_id == ^repository.id), :count)
+    label_count =
+      Repo.aggregate(from(l in Label, where: l.repository_id == ^repository.id), :count)
+
+    issue_count =
+      Repo.aggregate(from(i in Issue, where: i.repository_id == ^repository.id), :count)
 
     checkpoint_count =
       Repo.aggregate(from(c in PageCheckpoint, where: c.repository_item_id == ^item.id), :count)
@@ -210,7 +221,10 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
              Repo.aggregate(from(i in Issue, where: i.repository_id == ^repository.id), :count)
 
     assert checkpoint_count ==
-             Repo.aggregate(from(c in PageCheckpoint, where: c.repository_item_id == ^item.id), :count)
+             Repo.aggregate(
+               from(c in PageCheckpoint, where: c.repository_item_id == ^item.id),
+               :count
+             )
   end
 
   test "client failures do not commit resource checkpoints", %{run: run} do
@@ -251,10 +265,16 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
       assert terminal?(item.id, Atom.to_string(phase))
     end
 
-    refute Repo.exists?(from sequence in NumberSequence, where: sequence.repository_id == ^repository.id)
+    refute Repo.exists?(
+             from sequence in NumberSequence, where: sequence.repository_id == ^repository.id
+           )
+
     assert :ok = MetadataImporter.stage_phase(item, :number_sequence, importer_opts(stub, item))
     assert terminal?(item.id, "number_sequence")
-    assert Repo.exists?(from sequence in NumberSequence, where: sequence.repository_id == ^repository.id)
+
+    assert Repo.exists?(
+             from sequence in NumberSequence, where: sequence.repository_id == ^repository.id
+           )
   end
 
   defp stage(item, stub, opts \\ []) do
@@ -264,9 +284,14 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
     Enum.reduce_while(phases, :ok, fn phase, :ok ->
       result =
         case phase do
-          "number_sequence" -> MetadataImporter.stage_phase(item, :number_sequence, importer_opts)
-          phase when is_binary(phase) -> MetadataImporter.stage_phase(item, String.to_atom(phase), importer_opts)
-          phase when is_atom(phase) -> MetadataImporter.stage_phase(item, phase, importer_opts)
+          "number_sequence" ->
+            MetadataImporter.stage_phase(item, :number_sequence, importer_opts)
+
+          phase when is_binary(phase) ->
+            MetadataImporter.stage_phase(item, String.to_atom(phase), importer_opts)
+
+          phase when is_atom(phase) ->
+            MetadataImporter.stage_phase(item, phase, importer_opts)
         end
 
       case result do
@@ -310,7 +335,10 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
 
     {:ok, %{shadow: shadow}} =
       Multi.new()
-      |> ForgeRepos.create_import_shadow(:shadow, run.actor_user_id, %{item_id: item.id, generation: 1})
+      |> ForgeRepos.create_import_shadow(:shadow, run.actor_user_id, %{
+        item_id: item.id,
+        generation: 1
+      })
       |> Repo.transaction()
 
     staged_path = staged_repo_path!(shadow)
@@ -355,10 +383,12 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
         String.ends_with?(conn.request_path, "/labels") ->
           Req.Test.json(conn, labels)
 
-        String.ends_with?(conn.request_path, "/issues") and not String.contains?(conn.request_path, "/issues/") ->
+        String.ends_with?(conn.request_path, "/issues") and
+            not String.contains?(conn.request_path, "/issues/") ->
           Req.Test.json(conn, issues)
 
-        String.contains?(conn.request_path, "/issues/") and String.ends_with?(conn.request_path, "/comments") ->
+        String.contains?(conn.request_path, "/issues/") and
+            String.ends_with?(conn.request_path, "/comments") ->
           number = conn.request_path |> String.split("/") |> Enum.at(5) |> String.to_integer()
           Req.Test.json(conn, Map.get(comments, number, []))
 
@@ -414,7 +444,8 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
   end
 
   defp update_ref!(path, oid, ref) do
-    {_, 0} = System.cmd("git", ["--git-dir=#{path}", "update-ref", ref, oid], stderr_to_stdout: true)
+    {_, 0} =
+      System.cmd("git", ["--git-dir=#{path}", "update-ref", ref, oid], stderr_to_stdout: true)
   end
 
   defp terminal?(item_id, resource) do

@@ -107,7 +107,14 @@ defmodule ForgeImports.Reconciler do
     |> where(
       [item, run, attempt, actor],
       item.selected == true and
-        item.state in [:queued, :staging_git, :git_staged, :staging_metadata, :ready_to_publish, :publishing] and
+        item.state in [
+          :queued,
+          :staging_git,
+          :git_staged,
+          :staging_metadata,
+          :ready_to_publish,
+          :publishing
+        ] and
         item.attempt_count > 0 and
         (is_nil(item.next_attempt_at) or item.next_attempt_at <= ^now) and
         (is_nil(item.lease_expires_at) or item.lease_expires_at <= ^now) and

@@ -237,7 +237,8 @@ defmodule ForgeAccounts do
   end
 
   @spec linked_user_id_for_github_identity(pos_integer()) :: pos_integer() | nil
-  def linked_user_id_for_github_identity(github_identity_id) when is_integer(github_identity_id) do
+  def linked_user_id_for_github_identity(github_identity_id)
+      when is_integer(github_identity_id) do
     case Repo.get(GitHubIdentity, github_identity_id) do
       %GitHubIdentity{local_user_id: local_user_id} -> local_user_id
       nil -> nil

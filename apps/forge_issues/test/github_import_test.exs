@@ -60,7 +60,9 @@ defmodule ForgeIssues.GitHubImportTest do
     assert issue_41.inserted_at == @inserted_at
     assert issue_41.updated_at == @updated_at
 
-    refute Repo.exists?(from(sequence in NumberSequence, where: sequence.repository_id == ^repository.id))
+    refute Repo.exists?(
+             from(sequence in NumberSequence, where: sequence.repository_id == ^repository.id)
+           )
   end
 
   test "imports comments, labels, and github assignees", %{

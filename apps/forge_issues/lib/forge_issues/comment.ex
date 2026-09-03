@@ -44,7 +44,13 @@ defmodule ForgeIssues.Comment do
   def import_changeset(comment, attrs) do
     comment
     |> cast(attrs, [:body, :author_github_identity_id, :inserted_at, :updated_at])
-    |> validate_required([:issue_id, :body, :author_github_identity_id, :inserted_at, :updated_at])
+    |> validate_required([
+      :issue_id,
+      :body,
+      :author_github_identity_id,
+      :inserted_at,
+      :updated_at
+    ])
     |> validate_length(:body, min: 1)
     |> validate_no_nul(:body)
   end

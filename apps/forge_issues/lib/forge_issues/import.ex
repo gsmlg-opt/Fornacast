@@ -5,6 +5,7 @@ defmodule ForgeIssues.Import do
 
   alias Ecto.Multi
   alias ForgeAccounts.GitHubIdentity
+
   alias ForgeIssues.{
     Comment,
     DefaultLabels,
@@ -14,6 +15,7 @@ defmodule ForgeIssues.Import do
     Label,
     NumberSequence
   }
+
   alias ForgeRepos.Repository
 
   @spec import_label_multi(Multi.t(), Multi.name(), Repository.t(), map()) :: Multi.t()
@@ -54,7 +56,14 @@ defmodule ForgeIssues.Import do
           :issue | :pull_request,
           map()
         ) :: Multi.t()
-  def import_identity_multi(multi, key, %Repository{} = repository, %GitHubIdentity{} = identity, kind, attrs)
+  def import_identity_multi(
+        multi,
+        key,
+        %Repository{} = repository,
+        %GitHubIdentity{} = identity,
+        kind,
+        attrs
+      )
       when kind in [:issue, :pull_request] and is_map(attrs) do
     Multi.insert(multi, key, fn _changes ->
       %Issue{
@@ -84,7 +93,8 @@ defmodule ForgeIssues.Import do
     end)
   end
 
-  @spec import_issue_label_multi(Multi.t(), Multi.name(), Issue.t(), Label.t(), map()) :: Multi.t()
+  @spec import_issue_label_multi(Multi.t(), Multi.name(), Issue.t(), Label.t(), map()) ::
+          Multi.t()
   def import_issue_label_multi(multi, key, %Issue{} = issue, %Label{} = label, attrs \\ %{}) do
     Multi.insert(multi, key, fn _changes ->
       attrs =
@@ -104,7 +114,13 @@ defmodule ForgeIssues.Import do
           GitHubIdentity.t(),
           map()
         ) :: Multi.t()
-  def import_assignee_multi(multi, key, %Issue{} = issue, %GitHubIdentity{} = identity, attrs \\ %{}) do
+  def import_assignee_multi(
+        multi,
+        key,
+        %Issue{} = issue,
+        %GitHubIdentity{} = identity,
+        attrs \\ %{}
+      ) do
     Multi.insert(multi, key, fn _changes ->
       attrs =
         attrs

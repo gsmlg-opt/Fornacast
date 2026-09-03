@@ -135,6 +135,8 @@ defmodule ForgeImports.GitHub.Client do
   @spec issue_comments(String.t(), String.t(), String.t(), pos_integer(), keyword()) ::
           {:ok, [map()]} | {:error, Error.t()}
   def issue_comments(pat, owner, repository, issue_number, opts \\ [])
+
+  def issue_comments(pat, owner, repository, issue_number, opts)
       when is_integer(issue_number) and issue_number > 0 do
     with {:ok, paths} <- repository_paths(owner, repository),
          true <- issue_number <= 999_999 do
@@ -153,9 +155,14 @@ defmodule ForgeImports.GitHub.Client do
     end
   end
 
+  def issue_comments(_pat, _owner, _repository, _issue_number, _opts),
+    do: error(:invalid_request)
+
   @spec pull_request(String.t(), String.t(), String.t(), pos_integer(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def pull_request(pat, owner, repository, pull_number, opts \\ [])
+
+  def pull_request(pat, owner, repository, pull_number, opts)
       when is_integer(pull_number) and pull_number > 0 do
     with {:ok, paths} <- repository_paths(owner, repository),
          true <- pull_number <= 999_999 do
@@ -171,9 +178,6 @@ defmodule ForgeImports.GitHub.Client do
       _invalid -> error(:invalid_request)
     end
   end
-
-  def issue_comments(_pat, _owner, _repository, _issue_number, _opts),
-    do: error(:invalid_request)
 
   def pull_request(_pat, _owner, _repository, _pull_number, _opts),
     do: error(:invalid_request)

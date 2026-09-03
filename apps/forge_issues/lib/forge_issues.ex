@@ -782,7 +782,12 @@ defmodule ForgeIssues do
         {:error, :forbidden}
 
       author_id ->
-        mutation_capability(actor, repository, author_id, repository_capability(actor, repository))
+        mutation_capability(
+          actor,
+          repository,
+          author_id,
+          repository_capability(actor, repository)
+        )
     end
   end
 
@@ -1342,6 +1347,7 @@ defmodule ForgeIssues do
   end
 
   defdelegate import_label_multi(multi, key, repository, attrs), to: ForgeIssues.Import
+
   defdelegate import_identity_multi(multi, key, repository, github_identity, kind, attrs),
     to: ForgeIssues.Import
 
@@ -1706,7 +1712,8 @@ defmodule ForgeIssues do
   defp author_ref(%Issue{author_github_identity_id: identity_id}) when not is_nil(identity_id),
     do: {:github, identity_id}
 
-  defp author_ref(%Comment{author_user_id: user_id}) when not is_nil(user_id), do: {:user, user_id}
+  defp author_ref(%Comment{author_user_id: user_id}) when not is_nil(user_id),
+    do: {:user, user_id}
 
   defp author_ref(%Comment{author_github_identity_id: identity_id}) when not is_nil(identity_id),
     do: {:github, identity_id}
@@ -1717,7 +1724,8 @@ defmodule ForgeIssues do
        when not is_nil(identity_id),
        do: ForgeAccounts.linked_user_id_for_github_identity(identity_id)
 
-  defp local_author_user_id(%Comment{author_user_id: user_id}) when not is_nil(user_id), do: user_id
+  defp local_author_user_id(%Comment{author_user_id: user_id}) when not is_nil(user_id),
+    do: user_id
 
   defp local_author_user_id(%Comment{author_github_identity_id: identity_id})
        when not is_nil(identity_id),

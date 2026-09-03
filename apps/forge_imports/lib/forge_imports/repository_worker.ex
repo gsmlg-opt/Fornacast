@@ -153,7 +153,7 @@ defmodule ForgeImports.RepositoryWorker do
     end
   end
 
-  defp stage_claimed(%RepositoryItem{state: state} = capability, options, mode)
+  defp stage_claimed(%RepositoryItem{state: state} = capability, options, _mode)
        when state in [:git_staged, :staging_metadata] do
     stage_metadata_claimed(capability, options)
   end
@@ -195,10 +195,15 @@ defmodule ForgeImports.RepositoryWorker do
     checkout =
       case run.credential_source do
         :one_time ->
-          OneTimeCredential.with_item_credential(actor, item, fn pat ->
-            send(parent, {reference, callback.(pat)})
-            :ok
-          end, options.keyring)
+          OneTimeCredential.with_item_credential(
+            actor,
+            item,
+            fn pat ->
+              send(parent, {reference, callback.(pat)})
+              :ok
+            end,
+            options.keyring
+          )
 
         :saved ->
           ForgeAccounts.with_github_import_credential(
@@ -778,24 +783,53 @@ defmodule ForgeImports.RepositoryWorker do
         ] and (run.state != :running or actor.state != :active)
 
     cond do
-      actor.kind != :user -> {:error, :not_runnable}
-      not cleanup_recovery? and actor.state != :active -> {:error, :not_runnable}
-      run.state != :running and not cleanup_recovery? -> {:error, :not_runnable}
-      not cleanup_recovery? and live_lease?(run, now) -> {:error, :not_runnable}
-      not cleanup_recovery? and attempt.state != :running -> {:error, :not_runnable}
-      item.import_run_id != run.id -> {:error, :not_runnable}
-      not item.selected -> {:error, :not_runnable}
+      actor.kind != :user ->
+        {:error, :not_runnable}
+
+      not cleanup_recovery? and actor.state != :active ->
+        {:error, :not_runnable}
+
+      run.state != :running and not cleanup_recovery? ->
+        {:error, :not_runnable}
+
+      not cleanup_recovery? and live_lease?(run, now) ->
+        {:error, :not_runnable}
+
+      not cleanup_recovery? and attempt.state != :running ->
+        {:error, :not_runnable}
+
+      item.import_run_id != run.id ->
+        {:error, :not_runnable}
+
+      not item.selected ->
+        {:error, :not_runnable}
+
       item.state not in [:queued, :staging_git, :git_staged, :staging_metadata] ->
         {:error, :not_runnable}
-      item.attempt_count < 1 -> {:error, :not_runnable}
-      mode != :cleanup_only and not due?(item, now) -> {:error, :not_runnable}
-      not is_nil(item.cleanup_state) -> {:error, :not_runnable}
-      live_lease?(item, now) -> :busy
-      item.state == :queued and not fresh_item?(item) -> {:error, :not_runnable}
-      item.state == :staging_git and not staged_item?(item) -> {:error, :not_runnable}
+
+      item.attempt_count < 1 ->
+        {:error, :not_runnable}
+
+      mode != :cleanup_only and not due?(item, now) ->
+        {:error, :not_runnable}
+
+      not is_nil(item.cleanup_state) ->
+        {:error, :not_runnable}
+
+      live_lease?(item, now) ->
+        :busy
+
+      item.state == :queued and not fresh_item?(item) ->
+        {:error, :not_runnable}
+
+      item.state == :staging_git and not staged_item?(item) ->
+        {:error, :not_runnable}
+
       item.state in [:git_staged, :staging_metadata] and not metadata_ready_item?(item) ->
         {:error, :not_runnable}
-      true -> :ok
+
+      true ->
+        :ok
     end
   end
 
@@ -1777,7 +1811,8 @@ defmodule ForgeImports.RepositoryWorker do
   defp options(opts) do
     allowed =
       if @allow_test_options,
-        do: ~w(owner lease_seconds keyring remote remote_options scan_options persistence_hook client client_options)a,
+        do:
+          ~w(owner lease_seconds keyring remote remote_options scan_options persistence_hook client client_options)a,
         else: ~w(owner lease_seconds)a
 
     cond do

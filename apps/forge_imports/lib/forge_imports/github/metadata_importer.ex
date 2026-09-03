@@ -11,7 +11,6 @@ defmodule ForgeImports.GitHub.MetadataImporter do
   alias ForgeIssues
   alias ForgeIssues.{Issue, Label}
   alias ForgePulls
-  alias ForgePulls.PullRequest
   alias ForgeRepos.Repository
   alias Fornacast.Repo
   alias GitCore
@@ -100,9 +99,6 @@ defmodule ForgeImports.GitHub.MetadataImporter do
 
               {:skip, :pull_request_issue, details} ->
                 record_pull_candidate(multi, item, details[:number])
-
-              {:skip, code, details} ->
-                skip_object(multi, item, "issue", payload["id"], code, details)
 
               {:error, _} ->
                 multi
@@ -194,6 +190,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
          {:ok, {owner, repo}} <- source_parts(item),
          {:ok, payloads} <- fetch_comments(item, owner, repo, issue_number, opts) do
       now = observed_at(item)
+
       commit_page(item, "comments", page_key, length(payloads), fn multi ->
         Enum.reduce(payloads, multi, fn payload, multi ->
           case MetadataMapper.comment(payload) do
@@ -215,6 +212,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
     with {:ok, {owner, repo}} <- source_parts(item),
          {:ok, payload} <- fetch_pull(item, owner, repo, number, opts) do
       now = observed_at(item)
+
       case MetadataMapper.pull(payload, item.github_repository_id, staged_refs: staged_refs) do
         {:ok, mapped} ->
           commit_page(item, "pull_requests", page_key, 1, fn multi ->
@@ -233,10 +231,16 @@ defmodule ForgeImports.GitHub.MetadataImporter do
   end
 
   defp fetch(:labels, item, owner, repo, opts),
-    do: checkout_fetch(opts, fn pat -> Client.repository_labels(pat, owner, repo, client_opts(item, opts)) end)
+    do:
+      checkout_fetch(opts, fn pat ->
+        Client.repository_labels(pat, owner, repo, client_opts(item, opts))
+      end)
 
   defp fetch(:issues, item, owner, repo, opts),
-    do: checkout_fetch(opts, fn pat -> Client.repository_issues(pat, owner, repo, client_opts(item, opts)) end)
+    do:
+      checkout_fetch(opts, fn pat ->
+        Client.repository_issues(pat, owner, repo, client_opts(item, opts))
+      end)
 
   defp fetch_comments(item, owner, repo, issue_number, opts),
     do:
@@ -390,9 +394,15 @@ defmodule ForgeImports.GitHub.MetadataImporter do
     end
   end
 
-  defp insert_imported_issue(repo, repository, identity, mapped) do
+  defp insert_imported_issue(_repo, repository, identity, mapped) do
     Multi.new()
-    |> ForgeIssues.import_identity_multi(:issue, repository, identity, :issue, issue_attrs(mapped))
+    |> ForgeIssues.import_identity_multi(
+      :issue,
+      repository,
+      identity,
+      :issue,
+      issue_attrs(mapped)
+    )
     |> Repo.transaction()
     |> case do
       {:ok, %{issue: issue}} -> {:ok, issue}
@@ -442,7 +452,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
     end
   end
 
-  defp import_assignees(repo, issue, payload, now) do
+  defp import_assignees(_repo, issue, payload, now) do
     Enum.reduce_while(Map.get(payload, "assignees", []), :ok, fn assignee_payload, :ok ->
       with {:ok, github_user_id} <- ForgeImports.GitHub.User.id(assignee_payload["id"]),
            {:ok, identity} <- observe_user(github_user_id, now),
@@ -457,7 +467,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
     end)
   end
 
-  defp import_labels(repo, issue, payload, repository) do
+  defp import_labels(_repo, issue, payload, repository) do
     Enum.reduce_while(Map.get(payload, "labels", []), :ok, fn label_payload, :ok ->
       case MetadataMapper.label(label_payload) do
         {:ok, mapped} ->
@@ -482,7 +492,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
     end)
   end
 
-  defp report_issue_warnings(repo, item, %{unsupported: []}), do: :ok
+  defp report_issue_warnings(_repo, _item, %{unsupported: []}), do: :ok
 
   defp report_issue_warnings(repo, item, mapped) do
     Enum.each(mapped.unsupported, fn category ->
@@ -587,7 +597,9 @@ defmodule ForgeImports.GitHub.MetadataImporter do
     client_options = Keyword.get(opts, :client_options, [])
 
     gate_key =
-      Keyword.get(opts, :gate_key,
+      Keyword.get(
+        opts,
+        :gate_key,
         Keyword.get(client_options, :gate_key, {:one_time_run, item.import_run_id})
       )
 
@@ -606,7 +618,9 @@ defmodule ForgeImports.GitHub.MetadataImporter do
   defp observed_at(%RepositoryItem{source_observed_at: %DateTime{} = at}), do: at
   defp observed_at(_item), do: DateTime.utc_now(:second)
 
-  defp resolve_author(%{author_deleted: true}, _now), do: {:ok, ForgeAccounts.github_deleted_identity()}
+  defp resolve_author(%{author_deleted: true}, _now),
+    do: {:ok, ForgeAccounts.github_deleted_identity()}
+
   defp resolve_author(%{author_github_user_id: id}, now), do: observe_user(id, now)
 
   defp resolve_comment_author(%{author_deleted: true}, _now),
@@ -615,13 +629,27 @@ defmodule ForgeImports.GitHub.MetadataImporter do
   defp resolve_comment_author(%{author_github_user_id: id}, now), do: observe_user(id, now)
 
   defp resolve_merger(%{merger_github_user_id: nil}, _now), do: {:ok, nil}
-  defp resolve_merger(%{merger_deleted: true}, _now), do: {:ok, ForgeAccounts.github_deleted_identity()}
+
+  defp resolve_merger(%{merger_deleted: true}, _now),
+    do: {:ok, ForgeAccounts.github_deleted_identity()}
+
   defp resolve_merger(%{merger_github_user_id: id}, now), do: observe_user(id, now)
 
   defp observe_user(github_user_id, now) do
     case Repo.get_by(GitHubIdentity, github_user_id: github_user_id) do
-      %GitHubIdentity{} = identity -> {:ok, identity}
-      nil -> ForgeAccounts.observe_github_identity(%{github_user_id: github_user_id, login: "gh-#{github_user_id}", avatar_url: nil, profile_url: nil}, now)
+      %GitHubIdentity{} = identity ->
+        {:ok, identity}
+
+      nil ->
+        ForgeAccounts.observe_github_identity(
+          %{
+            github_user_id: github_user_id,
+            login: "gh-#{github_user_id}",
+            avatar_url: nil,
+            profile_url: nil
+          },
+          now
+        )
     end
   end
 
@@ -658,7 +686,8 @@ defmodule ForgeImports.GitHub.MetadataImporter do
   defp pending_pull_numbers(item_id) do
     Repo.all(
       from report in ReportEntry,
-        where: report.repository_item_id == ^item_id and report.classification == "pull_candidate",
+        where:
+          report.repository_item_id == ^item_id and report.classification == "pull_candidate",
         select: report.source_object_id
     )
   end
@@ -735,6 +764,4 @@ defmodule ForgeImports.GitHub.MetadataImporter do
 
   defp source_url(item, segment, number),
     do: "https://github.com/#{item.source_full_name}/#{segment}/#{number}"
-
-  defp stringify_metadata(details) when is_map(details), do: sanitize_report_metadata(details)
 end

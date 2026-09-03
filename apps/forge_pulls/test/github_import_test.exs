@@ -157,7 +157,13 @@ defmodule ForgePulls.GitHubImportTest do
 
     assert {:error, :pull, changeset, _} =
              Multi.new()
-             |> ForgePulls.import_pull_request_multi(:pull, repository, plain_issue, nil, base_attrs)
+             |> ForgePulls.import_pull_request_multi(
+               :pull,
+               repository,
+               plain_issue,
+               nil,
+               base_attrs
+             )
              |> ForgeIssues.transaction()
 
     assert {"must reference a pull request identity", _} =
@@ -281,10 +287,33 @@ defmodule ForgePulls.GitHubImportTest do
 
   defp create_mergeable_branches!(repository) do
     path = ForgeRepos.absolute_storage_path(repository)
-    {tree, 0} = System.cmd("git", ["--git-dir=#{path}", "hash-object", "-t", "tree", "-w", "/dev/null"])
-    {base, 0} = System.cmd("git", ["--git-dir=#{path}", "commit-tree", String.trim(tree), "-m", "base"])
-    {head, 0} = System.cmd("git", ["--git-dir=#{path}", "commit-tree", String.trim(tree), "-p", String.trim(base), "-m", "head"])
-    {_, 0} = System.cmd("git", ["--git-dir=#{path}", "update-ref", "refs/heads/main", String.trim(base)])
-    {_, 0} = System.cmd("git", ["--git-dir=#{path}", "update-ref", "refs/heads/feature", String.trim(head)])
+
+    {tree, 0} =
+      System.cmd("git", ["--git-dir=#{path}", "hash-object", "-t", "tree", "-w", "/dev/null"])
+
+    {base, 0} =
+      System.cmd("git", ["--git-dir=#{path}", "commit-tree", String.trim(tree), "-m", "base"])
+
+    {head, 0} =
+      System.cmd("git", [
+        "--git-dir=#{path}",
+        "commit-tree",
+        String.trim(tree),
+        "-p",
+        String.trim(base),
+        "-m",
+        "head"
+      ])
+
+    {_, 0} =
+      System.cmd("git", ["--git-dir=#{path}", "update-ref", "refs/heads/main", String.trim(base)])
+
+    {_, 0} =
+      System.cmd("git", [
+        "--git-dir=#{path}",
+        "update-ref",
+        "refs/heads/feature",
+        String.trim(head)
+      ])
   end
 end

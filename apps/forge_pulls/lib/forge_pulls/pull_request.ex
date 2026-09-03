@@ -53,7 +53,12 @@ defmodule ForgePulls.PullRequest do
     |> validate_distinct_refs()
   end
 
-  def import_changeset(%__MODULE__{} = pull_request, attrs, %Issue{} = issue, %ForgeRepos.Repository{} = repository) do
+  def import_changeset(
+        %__MODULE__{} = pull_request,
+        attrs,
+        %Issue{} = issue,
+        %ForgeRepos.Repository{} = repository
+      ) do
     pull_request
     |> cast(attrs, [
       :head_ref,
@@ -86,7 +91,11 @@ defmodule ForgePulls.PullRequest do
     |> unique_constraint(:issue_id)
   end
 
-  defp validate_canonical_issue(changeset, %Issue{} = issue, %ForgeRepos.Repository{} = repository) do
+  defp validate_canonical_issue(
+         changeset,
+         %Issue{} = issue,
+         %ForgeRepos.Repository{} = repository
+       ) do
     cond do
       issue.kind != :pull_request ->
         add_error(changeset, :issue_id, "must reference a pull request identity")
@@ -118,7 +127,8 @@ defmodule ForgePulls.PullRequest do
       not is_nil(merged_by_user_id) and not is_nil(merged_by_github_identity_id) ->
         add_error(changeset, :merged_by_github_identity_id, "must not be set with a local merger")
 
-      is_nil(merged_at) and (not is_nil(merged_by_user_id) or not is_nil(merged_by_github_identity_id)) ->
+      is_nil(merged_at) and
+          (not is_nil(merged_by_user_id) or not is_nil(merged_by_github_identity_id)) ->
         add_error(changeset, :merged_at, "must be present when a merger is recorded")
 
       true ->

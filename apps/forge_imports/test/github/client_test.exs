@@ -897,7 +897,12 @@ defmodule ForgeImports.GitHub.ClientTest do
     end)
 
     assert {:ok, [issue]} =
-             Client.repository_issues("github_pat_test", "octocat", "Hello-World", client_opts(stub))
+             Client.repository_issues(
+               "github_pat_test",
+               "octocat",
+               "Hello-World",
+               client_opts(stub)
+             )
 
     assert issue["number"] == 7
     assert [%{"login" => "hubot"}] = issue["assignees"]
@@ -940,7 +945,13 @@ defmodule ForgeImports.GitHub.ClientTest do
     end)
 
     assert {:ok, fetched} =
-             Client.pull_request("github_pat_test", "octocat", "Hello-World", 7, client_opts(stub))
+             Client.pull_request(
+               "github_pat_test",
+               "octocat",
+               "Hello-World",
+               7,
+               client_opts(stub)
+             )
 
     assert fetched["number"] == 7
     assert fetched["merge_commit_sha"] == pull["merge_commit_sha"]
@@ -949,17 +960,28 @@ defmodule ForgeImports.GitHub.ClientTest do
 
   test "metadata endpoints reject invalid repository components and numbers" do
     assert {:error, %Error{kind: :invalid_request}} =
-             Client.repository_labels("github_pat_test", "", "Hello-World",
+             Client.repository_labels(
+               "github_pat_test",
+               "",
+               "Hello-World",
                client_opts(stub_name())
              )
 
     assert {:error, %Error{kind: :invalid_request}} =
-             Client.issue_comments("github_pat_test", "octocat", "Hello-World", 0,
+             Client.issue_comments(
+               "github_pat_test",
+               "octocat",
+               "Hello-World",
+               0,
                client_opts(stub_name())
              )
 
     assert {:error, %Error{kind: :invalid_request}} =
-             Client.pull_request("github_pat_test", "octocat", "Hello-World", -1,
+             Client.pull_request(
+               "github_pat_test",
+               "octocat",
+               "Hello-World",
+               -1,
                client_opts(stub_name())
              )
   end

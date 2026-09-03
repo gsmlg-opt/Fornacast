@@ -59,7 +59,9 @@ defmodule ForgeImports.GitHub.MetadataMapper do
 
   @spec pull(term(), pos_integer(), keyword()) ::
           {:ok, map()} | {:skip, atom(), map()} | {:error, atom()}
-  def pull(%{} = payload, source_repository_id, opts \\ []) when is_integer(source_repository_id) do
+  def pull(payload, source_repository_id, opts \\ [])
+
+  def pull(%{} = payload, source_repository_id, opts) when is_integer(source_repository_id) do
     staged_refs = Keyword.get(opts, :staged_refs, %{})
 
     with :ok <- classify_pull_shape(payload, source_repository_id),
@@ -169,10 +171,12 @@ defmodule ForgeImports.GitHub.MetadataMapper do
         {:skip, :deleted_branch, %{head_ref: head_ref, base_ref: base_ref}}
 
       Map.fetch!(staged_refs, head_ref) != head_sha ->
-        {:skip, :source_drift, %{ref: head_ref, expected: head_sha, observed: Map.fetch!(staged_refs, head_ref)}}
+        {:skip, :source_drift,
+         %{ref: head_ref, expected: head_sha, observed: Map.fetch!(staged_refs, head_ref)}}
 
       Map.fetch!(staged_refs, base_ref) != base_sha ->
-        {:skip, :source_drift, %{ref: base_ref, expected: base_sha, observed: Map.fetch!(staged_refs, base_ref)}}
+        {:skip, :source_drift,
+         %{ref: base_ref, expected: base_sha, observed: Map.fetch!(staged_refs, base_ref)}}
 
       true ->
         :ok
