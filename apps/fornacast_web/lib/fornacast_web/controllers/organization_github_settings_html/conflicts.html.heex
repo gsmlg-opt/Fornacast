@@ -1,0 +1,45 @@
+<section
+  class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6"
+  data-organization-github-conflicts={@organization.id}
+>
+  <header class="grid gap-2">
+    <p class="text-xs text-on-surface-variant">Organization integration</p>
+    <h2 class="text-2xl font-semibold">GitHub synchronization conflicts</h2>
+    <p class="text-sm text-on-surface-variant">
+      Conflicting changes are retained for owner review and never overwrite either side automatically.
+    </p>
+    <div>
+      <.dm_link
+        href={"/organizations/#{@organization.username}/settings/github"}
+        class="text-primary"
+      >
+        Back to GitHub settings
+      </.dm_link>
+    </div>
+  </header>
+
+  <.dm_card id="github-organization-conflicts" variant="bordered" shadow="sm" padding="lg">
+    <:title><span class="text-lg font-semibold">Outstanding conflicts</span></:title>
+    <p :if={@view.conflicts == []} class="text-sm text-on-surface-variant">
+      No outstanding synchronization conflicts.
+    </p>
+    <div :if={@view.conflicts != []} class="overflow-x-auto">
+      <table class="table" aria-label="GitHub synchronization conflicts">
+        <thead>
+          <tr>
+            <th scope="col">Resource</th>
+            <th scope="col">Conflict</th>
+            <th scope="col">State</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr :for={conflict <- @view.conflicts}>
+            <th scope="row">{item_label(conflict, [:resource, :resource_identity])}</th>
+            <td>{humanize(item_label(conflict, [:kind, :conflict_kind]))}</td>
+            <td>{item_label(conflict, [:state])}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </.dm_card>
+</section>

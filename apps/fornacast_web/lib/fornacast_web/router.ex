@@ -51,6 +51,48 @@ defmodule FornacastWeb.Router do
   scope "/", FornacastWeb do
     pipe_through [:private_no_store, :browser, :authenticated]
 
+    get "/organizations/:organization/settings", OrganizationSettingsController, :index
+
+    get "/organizations/:organization/settings/github",
+        OrganizationGitHubSettingsController,
+        :index
+
+    post "/organizations/:organization/settings/github/install",
+         OrganizationGitHubSettingsController,
+         :install
+
+    get "/organizations/:organization/settings/github/callback",
+        OrganizationGitHubSettingsController,
+        :callback
+
+    patch "/organizations/:organization/settings/github",
+          OrganizationGitHubSettingsController,
+          :update
+
+    post "/organizations/:organization/settings/github/bootstrap",
+         OrganizationGitHubSettingsController,
+         :bootstrap
+
+    post "/organizations/:organization/settings/github/reconcile",
+         OrganizationGitHubSettingsController,
+         :reconcile
+
+    post "/organizations/:organization/settings/github/pause",
+         OrganizationGitHubSettingsController,
+         :pause
+
+    post "/organizations/:organization/settings/github/resume",
+         OrganizationGitHubSettingsController,
+         :resume
+
+    delete "/organizations/:organization/settings/github",
+           OrganizationGitHubSettingsController,
+           :delete
+
+    get "/organizations/:organization/settings/github/conflicts",
+        OrganizationGitHubSettingsController,
+        :conflicts
+
     get "/settings/github", GitHubSettingsController, :index
     post "/settings/github", GitHubSettingsController, :create
     post "/settings/github/:identity_id/reverify", GitHubSettingsController, :reverify

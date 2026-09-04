@@ -1,0 +1,429 @@
+<section
+  class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6"
+  data-organization-github-settings={@organization.id}
+>
+  <header class="grid gap-2">
+    <p class="text-xs text-on-surface-variant">Organization integration</p>
+    <div class="flex flex-wrap items-center gap-2">
+      <h2 class="text-2xl font-semibold">GitHub settings</h2>
+      <.dm_badge variant={status_variant(@view)} soft>{status_label(@view)}</.dm_badge>
+    </div>
+    <p class="text-sm text-on-surface-variant max-w-3xl">
+      Connect {@organization.display_name || @organization.username} to one GitHub App installation,
+      review repository coverage, and operate synchronization without exposing installation credentials.
+    </p>
+    <div>
+      <.dm_link href={"/organizations/#{@organization.username}/settings"} class="text-primary">
+        Back to organization settings
+      </.dm_link>
+    </div>
+  </header>
+
+  <.dm_alert
+    :if={@view.missing_permissions != []}
+    id="github-organization-missing-permissions"
+    variant="error"
+    outlined
+    role="alert"
+  >
+    <div class="grid gap-2">
+      <span class="font-semibold">Missing GitHub App permissions</span>
+      <ul class="list-disc ps-5">
+        <li :for={permission <- @view.missing_permissions}>{humanize(permission)}</li>
+      </ul>
+    </div>
+  </.dm_alert>
+
+  <.dm_alert :if={partial?(@view)} id="github-organization-partial" variant="warning" outlined>
+    Partial repository coverage: only repositories selected for this installation can synchronize.
+  </.dm_alert>
+
+  <.dm_alert :if={degraded?(@view)} id="github-organization-degraded" variant="error" outlined>
+    Synchronization is degraded. Review operations and conflicts before resuming normal changes.
+  </.dm_alert>
+
+  <div class="grid gap-4 lg:grid-cols-2">
+    <.dm_card id="github-organization-connection" variant="bordered" shadow="sm" padding="lg">
+      <:title><span class="text-lg font-semibold">Connection</span></:title>
+      <div :if={!connected?(@view)} class="grid gap-4">
+        <p class="text-sm text-on-surface-variant">
+          No GitHub App installation is connected to this organization.
+        </p>
+        <form
+          :if={action_enabled?(@view, :install)}
+          action={"/organizations/#{@organization.username}/settings/github/install"}
+          method="post"
+        >
+          <input type="hidden" name="_csrf_token" value={csrf_token()} />
+          <button class={"btn #{action_class(@view, :install)}"} type="submit">
+            Install GitHub App
+          </button>
+        </form>
+      </div>
+      <dl :if={connected?(@view)} class="grid gap-3 text-sm">
+        <div class="grid gap-1">
+          <dt class="text-on-surface-variant">GitHub account</dt>
+          <dd class="font-semibold">{value(@view.installation, :account_login, "Unknown")}</dd>
+        </div>
+        <div class="grid gap-1">
+          <dt class="text-on-surface-variant">Immutable account ID</dt>
+          <dd>{humanize(value(@view.installation, :account_id))}</dd>
+        </div>
+        <div class="grid gap-1">
+          <dt class="text-on-surface-variant">Installation ID</dt>
+          <dd>{humanize(value(@view.installation, :installation_id))}</dd>
+        </div>
+        <div class="grid gap-1">
+          <dt class="text-on-surface-variant">Repository selection</dt>
+          <dd>{humanize(value(@view.installation, :repository_selection, @view.coverage))}</dd>
+        </div>
+      </dl>
+    </.dm_card>
+
+    <.dm_card id="github-organization-health" variant="bordered" shadow="sm" padding="lg">
+      <:title><span class="text-lg font-semibold">Sync health</span></:title>
+      <dl class="grid gap-3 text-sm">
+        <div class="grid gap-1">
+          <dt class="text-on-surface-variant">Mirror state</dt>
+          <dd class="font-semibold">{humanize(mirror_state(@view))}</dd>
+        </div>
+        <div class="grid gap-1">
+          <dt class="text-on-surface-variant">Last webhook</dt>
+          <dd>
+            <time datetime={datetime_value(value(@view.mirror, :last_webhook_at))}>
+              {datetime_label(value(@view.mirror, :last_webhook_at))}
+            </time>
+          </dd>
+        </div>
+        <div class="grid gap-1">
+          <dt class="text-on-surface-variant">Last reconciliation</dt>
+          <dd>
+            <time datetime={datetime_value(value(@view.mirror, :last_reconciled_at))}>
+              {datetime_label(value(@view.mirror, :last_reconciled_at))}
+            </time>
+          </dd>
+        </div>
+      </dl>
+      <ul class="mt-4 flex flex-wrap gap-2" aria-label="Repository counts">
+        <li :for={{state, count} <- map_entries(@view.repository_counts)}>
+          <.dm_badge variant="neutral" soft>{humanize(state)} {humanize(count)}</.dm_badge>
+        </li>
+      </ul>
+    </.dm_card>
+  </div>
+
+  <div :if={connected?(@view)} class="grid gap-4 lg:grid-cols-2">
+    <.dm_card id="github-organization-permissions" variant="bordered" shadow="sm" padding="lg">
+      <:title><span class="text-lg font-semibold">Granted permissions</span></:title>
+      <ul class="grid gap-2" role="list">
+        <li
+          :for={{permission, access} <- map_entries(value(@view.installation, :permissions, %{}))}
+          class="flex items-center justify-between gap-4"
+        >
+          <span>{humanize(permission)}</span>
+          <.dm_badge variant="info" soft size="sm">{humanize(access)}</.dm_badge>
+        </li>
+      </ul>
+    </.dm_card>
+
+    <.dm_card id="github-organization-capabilities" variant="bordered" shadow="sm" padding="lg">
+      <:title><span class="text-lg font-semibold">Capabilities</span></:title>
+      <ul class="grid gap-2" role="list">
+        <li
+          :for={{capability, state} <- map_entries(@view.capabilities)}
+          class="flex items-center justify-between gap-4"
+        >
+          <span>{humanize(capability)}</span>
+          <.dm_badge
+            variant={if(state in [:active, true], do: "success", else: "neutral")}
+            soft
+            size="sm"
+          >
+            {humanize(state)}
+          </.dm_badge>
+        </li>
+      </ul>
+    </.dm_card>
+  </div>
+
+  <.dm_card
+    :if={connected?(@view)}
+    id="github-organization-policy"
+    variant="bordered"
+    shadow="sm"
+    padding="lg"
+  >
+    <:title><span class="text-lg font-semibold">Repository policy</span></:title>
+    <form
+      :if={action_enabled?(@view, :update)}
+      id="github-organization-policy-form"
+      action={"/organizations/#{@organization.username}/settings/github"}
+      method="post"
+      class="grid gap-4"
+    >
+      <input type="hidden" name="_csrf_token" value={csrf_token()} />
+      <input type="hidden" name="_method" value="patch" />
+      <input type="hidden" name="github[selected_repository_ids][]" value="" />
+      <label class="grid gap-1" for="github-repository-selection">
+        <span class="font-semibold">Repository selection</span>
+        <select
+          id="github-repository-selection"
+          class="select"
+          name="github[repository_selection]"
+        >
+          <option
+            value="all"
+            selected={policy_value(@view, :repository_selection, :all) in [:all, "all"]}
+          >
+            All installation-visible repositories
+          </option>
+          <option
+            value="selected"
+            selected={policy_value(@view, :repository_selection) in [:selected, "selected"]}
+          >
+            Selected repositories only
+          </option>
+        </select>
+      </label>
+      <label class="flex items-start gap-2">
+        <input type="hidden" name="github[auto_import_new]" value="false" />
+        <input
+          class="checkbox"
+          type="checkbox"
+          name="github[auto_import_new]"
+          value="true"
+          checked={policy_value(@view, :auto_import_new, false) == true}
+        />
+        <span>Automatically import newly visible GitHub repositories</span>
+      </label>
+      <label class="flex items-start gap-2">
+        <input type="hidden" name="github[auto_create_remote]" value="false" />
+        <input
+          class="checkbox"
+          type="checkbox"
+          name="github[auto_create_remote]"
+          value="true"
+          checked={policy_value(@view, :auto_create_remote, false) == true}
+        />
+        <span>Automatically create GitHub repositories for new local repositories</span>
+      </label>
+      <label class="grid gap-1" for="github-repository-deletion-policy">
+        <span class="font-semibold">Repository deletion policy</span>
+        <select
+          id="github-repository-deletion-policy"
+          class="select"
+          name="github[repository_deletion_policy]"
+        >
+          <option
+            value="retain"
+            selected={
+              policy_value(@view, :repository_deletion_policy, :retain) in [:retain, "retain"]
+            }
+          >
+            Retain the opposite copy
+          </option>
+          <option
+            value="tombstone"
+            selected={
+              policy_value(@view, :repository_deletion_policy) in [:tombstone, "tombstone"]
+            }
+          >
+            Record a tombstone and require owner action
+          </option>
+        </select>
+      </label>
+      <label class="grid gap-1" for="github-conflict-notification-policy">
+        <span class="font-semibold">Conflict notification policy</span>
+        <select
+          id="github-conflict-notification-policy"
+          class="select"
+          name="github[conflict_notification_policy]"
+        >
+          <option
+            value="notify"
+            selected={
+              policy_value(@view, :conflict_notification_policy, :notify) in [:notify, "notify"]
+            }
+          >
+            Notify organization owners
+          </option>
+          <option
+            value="dashboard_only"
+            selected={
+              policy_value(@view, :conflict_notification_policy) in [
+                :dashboard_only,
+                "dashboard_only"
+              ]
+            }
+          >
+            Show in this dashboard only
+          </option>
+        </select>
+      </label>
+      <fieldset class="grid gap-2">
+        <legend class="font-semibold">Enabled capabilities</legend>
+        <label
+          :for={{capability, state} <- map_entries(@view.capabilities)}
+          class="flex items-center gap-2"
+        >
+          <input
+            class="checkbox"
+            type="checkbox"
+            name="github[capabilities][]"
+            value={capability}
+            checked={state in [:active, :enabled, true]}
+            disabled={state in [:unavailable, "unavailable"]}
+          />
+          <span>{humanize(capability)} — {humanize(state)}</span>
+        </label>
+      </fieldset>
+      <div>
+        <button class="btn btn-secondary" type="submit">Save repository policy</button>
+      </div>
+    </form>
+  </.dm_card>
+
+  <.dm_card id="github-organization-repositories" variant="bordered" shadow="sm" padding="lg">
+    <:title><span class="text-lg font-semibold">Repositories</span></:title>
+    <p :if={@view.repositories == []} class="text-sm text-on-surface-variant">
+      No installation-visible repositories have been inventoried.
+    </p>
+    <div :if={@view.repositories != []} class="overflow-x-auto">
+      <table class="table" aria-label="GitHub organization repositories">
+        <thead>
+          <tr>
+            <th scope="col">Synchronize</th>
+            <th scope="col">Repository</th>
+            <th scope="col">GitHub ID</th>
+            <th scope="col">State</th>
+            <th scope="col">Visibility</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr :for={repository <- @view.repositories}>
+            <td>
+              <input
+                :if={action_enabled?(@view, :update)}
+                class="checkbox"
+                type="checkbox"
+                form="github-organization-policy-form"
+                name="github[selected_repository_ids][]"
+                value={value(repository, :github_repository_id, value(repository, :github_id))}
+                checked={value(repository, :selected, false) == true}
+                aria-label={"Synchronize #{item_label(repository, [:full_name, :name])}"}
+              />
+              <span :if={!action_enabled?(@view, :update)}>
+                {if(value(repository, :selected, false), do: "Selected", else: "Not selected")}
+              </span>
+            </td>
+            <th scope="row">{item_label(repository, [:full_name, :name])}</th>
+            <td>{item_label(repository, [:github_repository_id, :github_id])}</td>
+            <td>{item_label(repository, [:state])}</td>
+            <td>{item_label(repository, [:visibility])}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </.dm_card>
+
+  <div class="grid gap-4 lg:grid-cols-2">
+    <.dm_card id="github-organization-operations" variant="bordered" shadow="sm" padding="lg">
+      <:title><span class="text-lg font-semibold">Recent operations</span></:title>
+      <p :if={@view.operations == []} class="text-sm text-on-surface-variant">
+        No recent synchronization operations.
+      </p>
+      <ul :if={@view.operations != []} class="grid gap-2" role="list">
+        <li :for={operation <- @view.operations} class="rounded-lg bg-surface-container p-3">
+          <span class="font-semibold">{humanize(item_label(operation, [:kind, :operation]))}</span>
+          <span class="text-sm text-on-surface-variant">{item_label(operation, [:state])}</span>
+        </li>
+      </ul>
+    </.dm_card>
+
+    <.dm_card
+      id="github-organization-conflicts-summary"
+      variant="bordered"
+      shadow="sm"
+      padding="lg"
+    >
+      <:title><span class="text-lg font-semibold">Conflicts</span></:title>
+      <p class="text-sm text-on-surface-variant">
+        {length(@view.conflicts)} conflict{if(length(@view.conflicts) == 1, do: "", else: "s")} require review.
+      </p>
+      <.dm_link
+        href={"/organizations/#{@organization.username}/settings/github/conflicts"}
+        class="text-primary"
+      >
+        Review conflicts
+      </.dm_link>
+    </.dm_card>
+  </div>
+
+  <.dm_card
+    :if={connected?(@view)}
+    id="github-organization-actions"
+    variant="bordered"
+    shadow="sm"
+    padding="lg"
+  >
+    <:title><span class="text-lg font-semibold">Operations</span></:title>
+    <div class="flex flex-wrap items-start gap-4">
+      <form
+        :if={action_enabled?(@view, :bootstrap)}
+        action={"/organizations/#{@organization.username}/settings/github/bootstrap"}
+        method="post"
+      >
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <input type="hidden" name="bootstrap[repository_selection]" value="current_policy" />
+        <button class={"btn #{action_class(@view, :bootstrap)}"} type="submit">Start bootstrap</button>
+      </form>
+      <form
+        :if={action_enabled?(@view, :reconcile)}
+        action={"/organizations/#{@organization.username}/settings/github/reconcile"}
+        method="post"
+      >
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <button class={"btn #{action_class(@view, :reconcile)}"} type="submit">Reconcile now</button>
+      </form>
+      <form
+        :if={action_enabled?(@view, :pause)}
+        action={"/organizations/#{@organization.username}/settings/github/pause"}
+        method="post"
+      >
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <button class="btn btn-warning" type="submit">Pause synchronization</button>
+      </form>
+      <form
+        :if={action_enabled?(@view, :resume)}
+        action={"/organizations/#{@organization.username}/settings/github/resume"}
+        method="post"
+      >
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <button class={"btn #{action_class(@view, :resume)}"} type="submit">Resume synchronization</button>
+      </form>
+      <form
+        :if={action_enabled?(@view, :disconnect)}
+        action={"/organizations/#{@organization.username}/settings/github"}
+        method="post"
+      >
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <input type="hidden" name="_method" value="delete" />
+        <details class="grid gap-2">
+          <summary class="btn btn-error">Disconnect GitHub</summary>
+          <div class="grid gap-2 bg-error-container text-on-error-container rounded-lg p-3">
+            <p id="disconnect-github-organization-confirmation">
+              Disconnect this GitHub installation? Existing repositories remain and the mirror becomes disconnected.
+            </p>
+            <button
+              class="btn btn-error"
+              type="submit"
+              aria-describedby="disconnect-github-organization-confirmation"
+            >
+              Confirm disconnect GitHub
+            </button>
+          </div>
+        </details>
+      </form>
+    </div>
+  </.dm_card>
+</section>

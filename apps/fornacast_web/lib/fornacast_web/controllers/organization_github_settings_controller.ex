@@ -1,0 +1,305 @@
+defmodule FornacastWeb.OrganizationGitHubSettingsController do
+  use FornacastWeb, :controller
+
+  alias FornacastWeb.{OrganizationGitHubSettingsHTML, RequestMetadata}
+
+  @callback_session_key :github_organization_installation
+  @canonical_id ~r/\A[1-9][0-9]*\z/
+  @callback_state ~r/\A[A-Za-z0-9_-]{43}\z/
+  @max_id 9_223_372_036_854_775_807
+  @max_install_url_bytes 2_048
+
+  def index(conn, params), do: render_settings(conn, params, :index)
+  def conflicts(conn, params), do: render_settings(conn, params, :conflicts)
+
+  def install(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
+    with {:ok, organization} <- manageable_organization(actor, params),
+         state = installation_state(),
+         {:ok, result} <-
+           organization_sync(conn).begin_installation(
+             actor,
+             organization,
+             state,
+             RequestMetadata.from_conn(conn)
+           ),
+         {:ok, url} <- github_install_url(result) do
+      correlation = %{
+        "actor_id" => actor.id,
+        "organization_id" => organization.id,
+        "state" => state
+      }
+
+      conn
+      |> put_session(@callback_session_key, correlation)
+      |> put_status(:see_other)
+      |> redirect(external: url)
+    else
+      {:error, reason} -> render_error(conn, reason)
+      _unexpected -> render_error(conn, :unavailable)
+    end
+  end
+
+  def callback(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
+    correlation = get_session(conn, @callback_session_key)
+    conn = delete_session(conn, @callback_session_key)
+
+    with {:ok, organization} <- manageable_organization(actor, params),
+         {:ok, callback_attrs} <- callback_params(params),
+         :ok <- validate_correlation(correlation, actor, organization, callback_attrs.state),
+         result <-
+           organization_sync(conn).complete_installation(
+             actor,
+             organization,
+             callback_attrs,
+             RequestMetadata.from_conn(conn)
+           ) do
+      handle_action_result(conn, organization, result)
+    else
+      {:error, :invalid_callback} -> render_error(conn, :invalid_callback)
+      {:error, reason} -> render_error(conn, reason)
+    end
+  end
+
+  def update(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
+    with {:ok, organization} <- manageable_organization(actor, params),
+         {:ok, attrs} <- nested_params(params, "github"),
+         result <-
+           organization_sync(conn).update_settings(
+             actor,
+             organization,
+             attrs,
+             RequestMetadata.from_conn(conn)
+           ) do
+      handle_action_result(conn, organization, result)
+    else
+      {:error, reason} -> render_error(conn, reason)
+    end
+  end
+
+  def bootstrap(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
+    with {:ok, organization} <- manageable_organization(actor, params),
+         {:ok, attrs} <- nested_params(params, "bootstrap"),
+         result <-
+           organization_sync(conn).bootstrap(
+             actor,
+             organization,
+             attrs,
+             RequestMetadata.from_conn(conn)
+           ) do
+      handle_action_result(conn, organization, result)
+    else
+      {:error, reason} -> render_error(conn, reason)
+    end
+  end
+
+  def reconcile(conn, params), do: simple_action(conn, params, :reconcile)
+  def pause(conn, params), do: simple_action(conn, params, :pause)
+  def resume(conn, params), do: simple_action(conn, params, :resume)
+  def delete(conn, params), do: simple_action(conn, params, :disconnect)
+
+  defp render_settings(
+         %Plug.Conn{assigns: %{current_user: actor}} = conn,
+         params,
+         template
+       ) do
+    with {:ok, organization} <- manageable_organization(actor, params),
+         {:ok, %{} = view} <- organization_sync(conn).get_settings(actor, organization),
+         {:ok, view} <- OrganizationGitHubSettingsHTML.normalize_view(organization, view) do
+      rendered =
+        apply(OrganizationGitHubSettingsHTML, template, [
+          %{organization: organization, view: view, __changed__: nil}
+        ])
+
+      page(
+        conn,
+        "#{organization.display_name || organization.username} GitHub settings",
+        rendered |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary()
+      )
+    else
+      {:error, reason} -> render_error(conn, reason)
+      _unexpected -> render_error(conn, :unavailable)
+    end
+  end
+
+  defp simple_action(
+         %Plug.Conn{assigns: %{current_user: actor}} = conn,
+         params,
+         action
+       ) do
+    with {:ok, organization} <- manageable_organization(actor, params),
+         result <-
+           apply(organization_sync(conn), action, [
+             actor,
+             organization,
+             RequestMetadata.from_conn(conn)
+           ]) do
+      handle_action_result(conn, organization, result)
+    else
+      {:error, reason} -> render_error(conn, reason)
+    end
+  end
+
+  defp handle_action_result(conn, organization, {:ok, _result}) do
+    conn
+    |> put_status(:see_other)
+    |> redirect(to: settings_path(organization))
+  end
+
+  defp handle_action_result(conn, _organization, {:error, reason}),
+    do: render_error(conn, reason)
+
+  defp handle_action_result(conn, _organization, _unexpected),
+    do: render_error(conn, :unavailable)
+
+  defp manageable_organization(actor, %{"organization" => slug}) when is_binary(slug),
+    do: ForgeAccounts.fetch_manageable_organization_by_slug(actor, slug)
+
+  defp manageable_organization(_actor, _params), do: {:error, :not_found}
+
+  defp nested_params(params, key) do
+    case Map.get(params, key, %{}) do
+      attrs when is_map(attrs) -> {:ok, attrs}
+      _invalid -> {:error, :invalid_request}
+    end
+  end
+
+  defp callback_params(%{
+         "installation_id" => installation_id,
+         "setup_action" => setup_action,
+         "state" => state
+       }) do
+    with {:ok, installation_id} <- canonical_id(installation_id),
+         {:ok, setup_action} <- setup_action(setup_action),
+         true <- valid_callback_state?(state) do
+      {:ok, %{installation_id: installation_id, setup_action: setup_action, state: state}}
+    else
+      _invalid -> {:error, :invalid_callback}
+    end
+  end
+
+  defp callback_params(_params), do: {:error, :invalid_callback}
+
+  defp canonical_id(value) when is_binary(value) and byte_size(value) <= 19 do
+    with true <- Regex.match?(@canonical_id, value),
+         {id, ""} when id <= @max_id <- Integer.parse(value) do
+      {:ok, id}
+    else
+      _invalid -> {:error, :invalid_callback}
+    end
+  end
+
+  defp canonical_id(_value), do: {:error, :invalid_callback}
+
+  defp setup_action("install"), do: {:ok, :install}
+  defp setup_action("update"), do: {:ok, :update}
+  defp setup_action(_action), do: {:error, :invalid_callback}
+
+  defp valid_callback_state?(state) when is_binary(state),
+    do: Regex.match?(@callback_state, state)
+
+  defp valid_callback_state?(_state), do: false
+
+  defp validate_correlation(
+         %{
+           "actor_id" => actor_id,
+           "organization_id" => organization_id,
+           "state" => expected_state
+         },
+         %{id: actor_id},
+         %{id: organization_id},
+         state
+       )
+       when is_binary(expected_state) and byte_size(expected_state) == 43 do
+    if Plug.Crypto.secure_compare(expected_state, state),
+      do: :ok,
+      else: {:error, :invalid_callback}
+  end
+
+  defp validate_correlation(_correlation, _actor, _organization, _state),
+    do: {:error, :invalid_callback}
+
+  defp github_install_url(%{url: url})
+       when is_binary(url) and byte_size(url) <= @max_install_url_bytes do
+    with true <- String.valid?(url),
+         false <- String.contains?(url, ["\\", "\r", "\n"]),
+         %URI{
+           scheme: "https",
+           host: "github.com",
+           port: port,
+           userinfo: nil,
+           fragment: nil,
+           path: path
+         } <- URI.parse(url),
+         true <- port in [nil, 443],
+         true <- is_binary(path) and String.starts_with?(path, "/") do
+      {:ok, url}
+    else
+      _unsafe -> {:error, :unsafe_install_url}
+    end
+  end
+
+  defp github_install_url(_result), do: {:error, :unsafe_install_url}
+
+  defp installation_state do
+    32
+    |> :crypto.strong_rand_bytes()
+    |> Base.url_encode64(padding: false)
+  end
+
+  defp settings_path(organization),
+    do: "/organizations/#{organization.username}/settings/github"
+
+  defp render_error(conn, :invalid_callback) do
+    conn
+    |> put_status(:bad_request)
+    |> page(
+      "GitHub organization settings",
+      error_panel("The GitHub installation callback is invalid or expired.")
+    )
+  end
+
+  defp render_error(conn, reason) when reason in [:not_found, :forbidden] do
+    conn
+    |> put_status(:not_found)
+    |> page("GitHub organization settings", error_panel("Organization settings not found."))
+  end
+
+  defp render_error(conn, :invalid_request) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> page(
+      "GitHub organization settings",
+      error_panel("GitHub organization settings parameters are invalid.")
+    )
+  end
+
+  defp render_error(conn, reason) when reason in [:busy, :stale, :conflict] do
+    conn
+    |> put_status(:conflict)
+    |> page(
+      "GitHub organization settings",
+      error_panel("GitHub organization sync changed or is busy. Refresh and try again.")
+    )
+  end
+
+  defp render_error(conn, :missing_permissions) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> page(
+      "GitHub organization settings",
+      error_panel("GitHub App permissions are insufficient for the requested capabilities.")
+    )
+  end
+
+  defp render_error(conn, _reason) do
+    conn
+    |> put_status(:service_unavailable)
+    |> page(
+      "GitHub organization settings",
+      error_panel("GitHub organization sync is temporarily unavailable.")
+    )
+  end
+
+  defp organization_sync(conn),
+    do: conn.private[:github_organization_sync] || ForgeImports.OrganizationSync
+end

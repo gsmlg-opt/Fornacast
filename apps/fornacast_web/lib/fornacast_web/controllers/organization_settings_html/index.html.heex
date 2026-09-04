@@ -1,0 +1,30 @@
+<section
+  class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6"
+  data-organization-settings={@organization.id}
+>
+  <header class="grid gap-2">
+    <p class="text-xs text-on-surface-variant">Organization administration</p>
+    <h2 class="text-2xl font-semibold">Organization settings</h2>
+    <p class="text-sm text-on-surface-variant">
+      Manage integrations and synchronization for {@organization.display_name ||
+        @organization.username}.
+    </p>
+  </header>
+
+  <.dm_card id="organization-github-settings" variant="bordered" shadow="sm" padding="lg">
+    <:title><span class="text-lg font-semibold">GitHub organization sync</span></:title>
+    <div class="grid gap-4">
+      <p class="text-sm text-on-surface-variant">
+        Status: <span class="font-semibold">{sync_status(@view)}</span>
+      </p>
+      <div>
+        <.dm_link
+          href={"/organizations/#{@organization.username}/settings/github"}
+          class="btn btn-primary"
+        >
+          Open GitHub settings
+        </.dm_link>
+      </div>
+    </div>
+  </.dm_card>
+</section>
