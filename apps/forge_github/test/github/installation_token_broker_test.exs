@@ -76,24 +76,36 @@ defmodule ForgeGitHub.InstallationTokenBrokerTest do
     assert_receive {:scope, %{}}
   end
 
-  test "invalidation rejects stale in-flight results and revocation is terminal" do
+  test "invalidation retires the stale task and the next fetch starts a new generation" do
     parent = self()
     now = ~U[2026-09-04 10:00:00Z]
+    counter = :counters.new(1, [])
 
     broker =
       start_broker!(
         now: fn -> now end,
         fetcher: fn _installation_id, _scope ->
-          send(parent, {:fetch_started, self()})
-          receive do: (:release -> token("stale", DateTime.add(now, 3_600)))
+          :counters.add(counter, 1, 1)
+          generation = :counters.get(counter, 1)
+          send(parent, {:fetch_started, generation, self()})
+
+          receive do
+            :release -> token("generation-#{generation}", DateTime.add(now, 3_600))
+          end
         end
       )
 
     caller = Task.async(fn -> InstallationTokenBroker.fetch(broker, 44) end)
-    assert_receive {:fetch_started, fetch_task}
+    assert_receive {:fetch_started, 1, stale_fetch_task}
+    stale_monitor = Process.monitor(stale_fetch_task)
     assert :ok = InstallationTokenBroker.invalidate(broker, 44)
-    send(fetch_task, :release)
     assert {:error, :invalidated} = Task.await(caller)
+    assert_receive {:DOWN, ^stale_monitor, :process, ^stale_fetch_task, _reason}
+
+    fresh = Task.async(fn -> InstallationTokenBroker.fetch(broker, 44) end)
+    assert_receive {:fetch_started, 2, fresh_fetch_task}
+    send(fresh_fetch_task, :release)
+    assert %InstallationToken{token: "generation-2"} = Task.await(fresh)
 
     assert :ok = InstallationTokenBroker.revoke(broker, 44)
     assert {:error, :revoked} = InstallationTokenBroker.fetch(broker, 44)
@@ -146,6 +158,124 @@ defmodule ForgeGitHub.InstallationTokenBrokerTest do
 
     assert {:error, :invalid_scope} =
              InstallationTokenBroker.fetch(broker, 44, %{permissions: %{"contents" => "owner"}})
+  end
+
+  test "bounds an adversarial two hundred and first waiter on one key" do
+    parent = self()
+    now = ~U[2026-09-04 10:00:00Z]
+
+    broker =
+      start_broker!(
+        max_waiters_per_key: 200,
+        max_waiters: 200,
+        now: fn -> now end,
+        fetcher: fn _, _ ->
+          send(parent, {:bounded_fetch, self()})
+          receive do: (:release -> token("bounded-secret", DateTime.add(now, 3_600)))
+        end
+      )
+
+    callers =
+      for _ <- 1..201 do
+        Task.async(fn ->
+          result = InstallationTokenBroker.fetch(broker, 44)
+          send(parent, {:bounded_result, result})
+          result
+        end)
+      end
+
+    assert_receive {:bounded_fetch, fetch_task}
+    assert_receive {:bounded_result, {:error, :busy}}, 2_000
+    refute_receive {:bounded_result, _other}, 100
+
+    status = :sys.get_status(broker) |> inspect()
+    assert status =~ "waiter_count: 200"
+    refute status =~ "bounded-secret"
+
+    send(fetch_task, :release)
+    results = Enum.map(callers, &Task.await(&1, 2_000))
+    assert Enum.count(results, &match?(%InstallationToken{}, &1)) == 200
+    assert Enum.count(results, &(&1 == {:error, :busy})) == 1
+  end
+
+  test "caller death removes its waiter and retires an unobserved fetch" do
+    parent = self()
+
+    broker =
+      start_broker!(
+        fetcher: fn _, _ ->
+          send(parent, {:dead_caller_fetch, self()})
+          receive do: (:never -> :unexpected)
+        end
+      )
+
+    caller = spawn(fn -> InstallationTokenBroker.fetch(broker, 44) end)
+    assert_receive {:dead_caller_fetch, fetch_task}
+    fetch_monitor = Process.monitor(fetch_task)
+    Process.exit(caller, :kill)
+    assert_receive {:DOWN, ^fetch_monitor, :process, ^fetch_task, _reason}, 1_000
+
+    replacement = Task.async(fn -> InstallationTokenBroker.fetch(broker, 44) end)
+    assert_receive {:dead_caller_fetch, replacement_fetch}
+    assert :ok = InstallationTokenBroker.invalidate(broker, 44)
+    assert {:error, :invalidated} = Task.await(replacement)
+    refute Process.alive?(replacement_fetch)
+  end
+
+  test "waiters expire before the public call timeout and release the task" do
+    parent = self()
+
+    broker =
+      start_broker!(
+        waiter_timeout_ms: 50,
+        fetcher: fn _, _ ->
+          send(parent, {:expiring_fetch, self()})
+          receive do: (:never -> :unexpected)
+        end
+      )
+
+    started_at = System.monotonic_time(:millisecond)
+    caller = Task.async(fn -> InstallationTokenBroker.fetch(broker, 44) end)
+    assert_receive {:expiring_fetch, fetch_task}
+    fetch_monitor = Process.monitor(fetch_task)
+    assert {:error, :timeout} = Task.await(caller, 1_000)
+    assert System.monotonic_time(:millisecond) - started_at < 1_000
+    assert_receive {:DOWN, ^fetch_monitor, :process, ^fetch_task, _reason}, 1_000
+
+    status = :sys.get_status(broker) |> inspect()
+    assert status =~ "waiter_count: 0"
+    assert status =~ "inflight_entries: 0"
+  end
+
+  test "the total waiter cap applies across different cache keys" do
+    parent = self()
+
+    broker =
+      start_broker!(
+        max_inflight: 3,
+        max_waiters_per_key: 2,
+        max_waiters: 2,
+        fetcher: fn installation_id, _ ->
+          send(parent, {:total_cap_fetch, installation_id, self()})
+          receive do: (:never -> :unexpected)
+        end
+      )
+
+    first = Task.async(fn -> InstallationTokenBroker.fetch(broker, 1) end)
+    second = Task.async(fn -> InstallationTokenBroker.fetch(broker, 2) end)
+
+    started =
+      for _ <- 1..2 do
+        assert_receive {:total_cap_fetch, installation_id, _}
+        installation_id
+      end
+
+    assert Enum.sort(started) == [1, 2]
+    assert {:error, :busy} = InstallationTokenBroker.fetch(broker, 3)
+    assert :ok = InstallationTokenBroker.invalidate(broker, 1)
+    assert :ok = InstallationTokenBroker.invalidate(broker, 2)
+    assert {:error, :invalidated} = Task.await(first)
+    assert {:error, :invalidated} = Task.await(second)
   end
 
   defp start_broker!(opts) do

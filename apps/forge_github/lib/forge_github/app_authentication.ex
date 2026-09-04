@@ -11,6 +11,8 @@ defmodule ForgeGitHub.AppAuthentication do
     InstallationTokenScope
   }
 
+  @max_installation_pages 100
+
   @spec create_app_jwt(AppConfig.t(), keyword()) ::
           {:ok, AppJWT.t()} | {:error, :invalid_configuration | :invalid_clock}
   def create_app_jwt(config, opts \\ [])
@@ -55,18 +57,17 @@ defmodule ForgeGitHub.AppAuthentication do
           {:ok, [AppInstallation.t()]} | {:error, Error.t()}
   def list_installations(%AppConfig{} = config, opts \\ []) do
     with {:ok, jwt} <- create_app_jwt(config, opts),
-         {:ok, values} when is_list(values) and length(values) <= 100 <-
-           Client.request(
-             jwt.token,
-             :get,
-             "/app/installations?per_page=100",
-             app_opts(config, opts)
-           ),
-         {:ok, installations} <- normalize_installations(values) do
+         {:ok, installations} <- list_installation_pages(jwt, config, opts, 1, []) do
       {:ok, installations}
     else
-      {:error, %Error{} = error} -> {:error, error}
-      _invalid -> {:error, Error.new(:invalid_response)}
+      {:error, %Error{} = error} ->
+        {:error, error}
+
+      {:error, reason} when reason in [:invalid_configuration, :invalid_clock] ->
+        {:error, Error.new(:invalid_request)}
+
+      _invalid ->
+        {:error, Error.new(:invalid_response)}
     end
   end
 
@@ -87,8 +88,14 @@ defmodule ForgeGitHub.AppAuthentication do
          {:ok, installation} <- AppInstallation.from_json(value) do
       {:ok, installation}
     else
-      {:error, %Error{} = error} -> {:error, error}
-      _invalid -> {:error, Error.new(:invalid_response)}
+      {:error, %Error{} = error} ->
+        {:error, error}
+
+      {:error, reason} when reason in [:invalid_configuration, :invalid_clock] ->
+        {:error, Error.new(:invalid_request)}
+
+      _invalid ->
+        {:error, Error.new(:invalid_response)}
     end
   end
 
@@ -113,9 +120,17 @@ defmodule ForgeGitHub.AppAuthentication do
          {:ok, token} <- InstallationToken.from_json(value) do
       {:ok, token}
     else
-      {:error, %Error{} = error} -> {:error, error}
-      {:error, :invalid_scope} -> {:error, Error.new(:invalid_request)}
-      _invalid -> {:error, Error.new(:invalid_response)}
+      {:error, %Error{} = error} ->
+        {:error, error}
+
+      {:error, :invalid_scope} ->
+        {:error, Error.new(:invalid_request)}
+
+      {:error, reason} when reason in [:invalid_configuration, :invalid_clock] ->
+        {:error, Error.new(:invalid_request)}
+
+      _invalid ->
+        {:error, Error.new(:invalid_response)}
     end
   end
 
@@ -132,6 +147,29 @@ defmodule ForgeGitHub.AppAuthentication do
     |> case do
       {:ok, installations} -> {:ok, Enum.reverse(installations)}
       error -> error
+    end
+  end
+
+  defp list_installation_pages(jwt, config, opts, page, pages)
+       when page <= @max_installation_pages do
+    path = "/app/installations?per_page=100&page=#{page}"
+
+    with {:ok, values} when is_list(values) and length(values) <= 100 <-
+           Client.request(jwt.token, :get, path, app_opts(config, opts)),
+         {:ok, installations} <- normalize_installations(values) do
+      cond do
+        length(values) < 100 ->
+          {:ok, [installations | pages] |> Enum.reverse() |> List.flatten()}
+
+        page == @max_installation_pages ->
+          {:error, Error.new(:pagination_limit)}
+
+        true ->
+          list_installation_pages(jwt, config, opts, page + 1, [installations | pages])
+      end
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      _invalid -> {:error, Error.new(:invalid_response)}
     end
   end
 

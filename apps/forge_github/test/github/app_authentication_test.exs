@@ -191,6 +191,84 @@ defmodule ForgeGitHub.AppAuthenticationTest do
     assert_received {:request, "POST", "/app/installations/44/access_tokens"}
   end
 
+  test "installation listing follows bounded pages beyond the first hundred", %{config: config} do
+    stub = {__MODULE__, System.unique_integer([:positive])}
+    parent = self()
+
+    Req.Test.expect(stub, 2, fn conn ->
+      query = URI.decode_query(conn.query_string)
+      send(parent, {:page, query["page"]})
+
+      case query["page"] do
+        "1" ->
+          installations =
+            for id <- 1..100 do
+              installation_json(%{
+                "id" => id,
+                "account" => %{
+                  "id" => id + 1_000,
+                  "login" => "org-#{id}",
+                  "type" => "Organization"
+                }
+              })
+            end
+
+          Req.Test.json(conn, installations)
+
+        "2" ->
+          Req.Test.json(conn, [
+            installation_json(%{
+              "id" => 101,
+              "account" => %{
+                "id" => 1_101,
+                "login" => "org-101",
+                "type" => "Organization"
+              }
+            })
+          ])
+      end
+    end)
+
+    assert {:ok, installations} =
+             AppAuthentication.list_installations(
+               config,
+               client_opts(stub, ~U[2026-09-04 10:00:00Z])
+             )
+
+    assert length(installations) == 101
+    assert Enum.map(installations, & &1.id) == Enum.to_list(1..101)
+    assert_received {:page, "1"}
+    assert_received {:page, "2"}
+  end
+
+  test "installation listing stops at the fixed page bound", %{config: config} do
+    stub = {__MODULE__, System.unique_integer([:positive])}
+    requests = :counters.new(1, [])
+    full_page = List.duplicate(installation_json(), 100)
+
+    Req.Test.expect(stub, 100, fn conn ->
+      :counters.add(requests, 1, 1)
+      Req.Test.json(conn, full_page)
+    end)
+
+    assert {:error, %ForgeGitHub.Error{kind: :pagination_limit}} =
+             AppAuthentication.list_installations(
+               config,
+               client_opts(stub, ~U[2026-09-04 10:00:00Z])
+             )
+
+    assert :counters.get(requests, 1) == 100
+  end
+
+  test "installation APIs map private-key failures to presentation-safe request errors", %{
+    config: config
+  } do
+    invalid = %{config | private_key_file: config.private_key_file <> ".missing"}
+
+    assert {:error, %ForgeGitHub.Error{kind: :invalid_request}} =
+             AppAuthentication.list_installations(invalid)
+  end
+
   test "normalizers reject malformed installation identities and token metadata" do
     assert {:error, :invalid_response} =
              AppInstallation.from_json(installation_json(%{"account" => %{"id" => 1}}))

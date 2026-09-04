@@ -22,9 +22,10 @@ defmodule ForgeMirrors.GitHubAppInstallationTest do
     assert installation.repository_selection == :all
     assert installation.permissions == %{"contents" => "write", "metadata" => "read"}
     assert installation.state == :active
-    assert installation.last_verified_at == observed_at
+    assert DateTime.compare(installation.last_verified_at, observed_at) == :eq
 
     fields = GitHubAppInstallation.__schema__(:fields)
+    assert GitHubAppInstallation.__schema__(:type, :last_verified_at) == :utc_datetime_usec
     refute Enum.any?(fields, &(&1 in [:token, :access_token, :private_key, :webhook_secret]))
   end
 
@@ -56,6 +57,24 @@ defmodule ForgeMirrors.GitHubAppInstallationTest do
              })
 
     assert active.state == :active
+  end
+
+  test "a microsecond-newer observation within the same second is not lost" do
+    first_at = ~U[2026-09-04 10:00:00.000001Z]
+    newer_at = ~U[2026-09-04 10:00:00.000002Z]
+
+    assert {:ok, first} = ForgeMirrors.observe_github_app_installation(attrs(first_at))
+    assert first.last_verified_at == first_at
+
+    assert {:ok, updated} =
+             ForgeMirrors.observe_github_app_installation(
+               attrs(newer_at)
+               |> Map.put(:github_account_login, "microsecond-newer")
+             )
+
+    assert updated.id == first.id
+    assert updated.github_account_login == "microsecond-newer"
+    assert updated.last_verified_at == newer_at
   end
 
   test "older and equal observations cannot overwrite newer provider state" do
@@ -115,7 +134,7 @@ defmodule ForgeMirrors.GitHubAppInstallationTest do
 
     assert {:ok, installation} = ForgeMirrors.get_github_app_installation(44)
     assert installation.github_account_login == "new-login"
-    assert installation.last_verified_at == DateTime.add(first_at, 60)
+    assert DateTime.compare(installation.last_verified_at, DateTime.add(first_at, 60)) == :eq
   end
 
   test "installation, account identity and account type are immutable" do

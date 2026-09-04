@@ -10,7 +10,7 @@ defmodule Fornacast.Repo.Migrations.CreateGitHubAppInstallations do
       add(:repository_selection, :string, null: false)
       add(:permissions, :map, null: false, default: %{})
       add(:state, :string, null: false)
-      add(:last_verified_at, :utc_datetime, null: false)
+      add(:last_verified_at, :utc_datetime_usec, null: false)
       timestamps(type: :utc_datetime)
     end
 

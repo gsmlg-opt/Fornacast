@@ -32,6 +32,7 @@ defmodule ForgeMirrors do
 
     if changeset.valid? do
       installation_id = Ecto.Changeset.get_field(changeset, :github_installation_id)
+      observation = normalized_installation_observation(changeset)
 
       Repo.transaction(fn ->
         lock_github_installation_identity!(installation_id)
@@ -45,7 +46,7 @@ defmodule ForgeMirrors do
         result =
           case existing do
             nil -> Repo.insert(changeset)
-            %GitHubAppInstallation{} = installation -> observe_existing(installation, attrs)
+            %GitHubAppInstallation{} = installation -> observe_existing(installation, observation)
           end
 
         case result do
@@ -109,8 +110,6 @@ defmodule ForgeMirrors do
             {:error, :not_found}
 
           %GitHubAppInstallation{} = installation ->
-            observed_at = DateTime.truncate(observed_at, :second)
-
             cond do
               not DateTime.after?(observed_at, installation.last_verified_at) ->
                 {:ok, installation}
@@ -138,9 +137,9 @@ defmodule ForgeMirrors do
 
   defp observe_existing(installation, attrs) do
     account_id = fetch_attr(attrs, :github_account_id)
-    account_type = normalize_account_type(fetch_attr(attrs, :account_type))
+    account_type = fetch_attr(attrs, :account_type)
     observed_at = fetch_attr(attrs, :last_verified_at)
-    target_state = normalize_installation_state(fetch_attr(attrs, :state))
+    target_state = fetch_attr(attrs, :state)
 
     cond do
       installation.github_account_id != account_id or installation.account_type != account_type ->
@@ -149,7 +148,7 @@ defmodule ForgeMirrors do
       not match?(%DateTime{}, observed_at) ->
         {:error, :invalid_transition}
 
-      not DateTime.after?(DateTime.truncate(observed_at, :second), installation.last_verified_at) ->
+      not DateTime.after?(observed_at, installation.last_verified_at) ->
         {:ok, installation}
 
       installation.state == :revoked ->
@@ -167,17 +166,20 @@ defmodule ForgeMirrors do
 
   defp fetch_attr(attrs, key), do: Map.get(attrs, key, Map.get(attrs, Atom.to_string(key)))
 
-  defp normalize_account_type(value) when value in [:organization, "organization"],
-    do: :organization
-
-  defp normalize_account_type(value) when value in [:user, "user"], do: :user
-  defp normalize_account_type(value) when value in [:enterprise, "enterprise"], do: :enterprise
-  defp normalize_account_type(_value), do: nil
-
-  defp normalize_installation_state(value) when value in [:active, "active"], do: :active
-  defp normalize_installation_state(value) when value in [:suspended, "suspended"], do: :suspended
-  defp normalize_installation_state(value) when value in [:revoked, "revoked"], do: :revoked
-  defp normalize_installation_state(_value), do: nil
+  defp normalized_installation_observation(changeset) do
+    changeset
+    |> Ecto.Changeset.apply_changes()
+    |> Map.take([
+      :github_installation_id,
+      :github_account_id,
+      :github_account_login,
+      :account_type,
+      :repository_selection,
+      :permissions,
+      :state,
+      :last_verified_at
+    ])
+  end
 
   defp normalize_transaction_result({:ok, value}), do: {:ok, value}
   defp normalize_transaction_result({:error, reason}), do: {:error, reason}

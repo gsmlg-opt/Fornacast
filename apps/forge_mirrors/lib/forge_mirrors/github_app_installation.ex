@@ -17,7 +17,7 @@ defmodule ForgeMirrors.GitHubAppInstallation do
     field :repository_selection, Ecto.Enum, values: @repository_selections
     field :permissions, :map, default: %{}
     field :state, Ecto.Enum, values: @states
-    field :last_verified_at, :utc_datetime
+    field :last_verified_at, :utc_datetime_usec
     timestamps(type: :utc_datetime)
   end
 
