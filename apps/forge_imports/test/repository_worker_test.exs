@@ -598,16 +598,18 @@ defmodule ForgeImports.RepositoryWorkerTest do
 
     assert %ImportRun{warning_count: 2} = Repo.get!(ImportRun, context.run.id)
 
-    assert {:ok, :ignored} =
+    assert {:ok, %RepositoryItem{state: :ready_to_publish}} =
              RepositoryWorker.stage(context.item.id,
                owner: "unsupported-scan-replay",
                lease_seconds: 60,
                keyring: @keyring,
                remote: __MODULE__.UnexpectedRemote,
-               remote_options: [test_pid: self()]
+               remote_options: [test_pid: self()],
+               client_options: empty_metadata_client_options()
              )
 
     assert Repo.aggregate(ReportEntry, :count) == 2
+    refute_receive {:unexpected_remote, _operation}
   end
 
   @tag :tmp_dir
@@ -887,7 +889,7 @@ defmodule ForgeImports.RepositoryWorkerTest do
     end
   end
 
-  test "startup reconciler stages exact runnable items in its existing serial scan", context do
+  test "startup reconciler completes exact runnable items in its existing serial scan", context do
     assert [context.item.id] ==
              Reconciler.runnable_repository_item_ids(10, DateTime.utc_now(:second))
 
@@ -904,19 +906,15 @@ defmodule ForgeImports.RepositoryWorkerTest do
            lease_seconds: 60,
            keyring: @keyring,
            remote: __MODULE__.SuccessfulRemote,
-           remote_options: [test_pid: self()]
+           remote_options: [test_pid: self()],
+           client_options: empty_metadata_client_options()
          ]}
       )
 
     assert is_pid(supervisor)
     assert_receive {:mirror, _request}, 2_000
 
-    assert eventually(fn ->
-             match?(
-               %RepositoryItem{state: :git_staged, lease_owner: nil},
-               Repo.get(RepositoryItem, context.item.id)
-             )
-           end)
+    assert eventually(fn -> terminal_item?(context.item.id) end)
 
     assert :ok = stop_supervised(RecoverySupervisor)
   end
@@ -940,7 +938,7 @@ defmodule ForgeImports.RepositoryWorkerTest do
     assert :ok = stop_supervised(RecoverySupervisor)
   end
 
-  test "one bounded reconciler scan processes repository workers serially", context do
+  test "one bounded reconciler scan completes repository workers serially", context do
     second =
       queued_item_fixture(context.run, context.actor,
         github_repository_id: 9_800_000_099,
@@ -968,7 +966,8 @@ defmodule ForgeImports.RepositoryWorkerTest do
          lease_seconds: 60,
          keyring: @keyring,
          remote: __MODULE__.SerialRemote,
-         remote_options: [test_pid: self(), state: state]
+         remote_options: [test_pid: self(), state: state],
+         client_options: empty_metadata_client_options()
        ]}
     )
 
@@ -985,7 +984,7 @@ defmodule ForgeImports.RepositoryWorkerTest do
 
     assert eventually(fn ->
              Enum.all?([context.item.id, second.id], fn id ->
-               match?(%RepositoryItem{state: :git_staged}, Repo.get(RepositoryItem, id))
+               terminal_item?(id)
              end)
            end)
 
@@ -1016,7 +1015,8 @@ defmodule ForgeImports.RepositoryWorkerTest do
          lease_seconds: 60,
          keyring: @keyring,
          remote: __MODULE__.FirstFailsRemote,
-         remote_options: [test_pid: self()]
+         remote_options: [test_pid: self()],
+         client_options: empty_metadata_client_options()
        ]}
     )
 
@@ -1030,12 +1030,7 @@ defmodule ForgeImports.RepositoryWorkerTest do
              lease_owner: nil
            } = Repo.get!(RepositoryItem, context.item.id)
 
-    assert eventually(fn ->
-             match?(
-               %RepositoryItem{state: :git_staged, lease_owner: nil},
-               Repo.get(RepositoryItem, second.id)
-             )
-           end)
+    assert eventually(fn -> terminal_item?(second.id) end)
 
     assert :ok = stop_supervised(RecoverySupervisor)
   end
@@ -1124,16 +1119,15 @@ defmodule ForgeImports.RepositoryWorkerTest do
          lease_seconds: 60,
          keyring: @keyring,
          remote: __MODULE__.FirstFailsRemote,
-         remote_options: [test_pid: self()]
+         remote_options: [test_pid: self()],
+         client_options: empty_metadata_client_options()
        ]}
     )
 
     assert_receive {:later_success, "later"}, 2_000
     refute_receive {:persistent_failure, "demo"}, 100
 
-    assert eventually(fn ->
-             match?(%RepositoryItem{state: :git_staged}, Repo.get(RepositoryItem, later.id))
-           end)
+    assert eventually(fn -> terminal_item?(later.id) end)
 
     assert Repo.get!(ImportRun, terminal_run.id).lock_version == terminal_run.lock_version
 
@@ -3374,6 +3368,34 @@ defmodule ForgeImports.RepositoryWorkerTest do
              )
 
     :ok
+  end
+
+  defp empty_metadata_client_options do
+    stub = {__MODULE__, :empty_metadata, System.unique_integer([:positive])}
+
+    Req.Test.stub(stub, fn conn ->
+      if String.ends_with?(conn.request_path, "/labels") or
+           String.ends_with?(conn.request_path, "/issues") do
+        Req.Test.json(conn, [])
+      else
+        Plug.Conn.send_resp(conn, 404, "{}")
+      end
+    end)
+
+    [
+      plug: {Req.Test, stub},
+      resolver: fn "api.github.com" -> {:ok, [{140, 82, 114, 5}]} end
+    ]
+  end
+
+  defp terminal_item?(item_id) do
+    case Repo.get(RepositoryItem, item_id) do
+      %RepositoryItem{state: state, lease_owner: nil} when state in [:published, :completed] ->
+        true
+
+      _other ->
+        false
+    end
   end
 
   defp eventually(fun, attempts \\ 100)

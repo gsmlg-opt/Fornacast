@@ -217,7 +217,8 @@ defmodule ForgeImports.OneTimeCredential do
           item.id == ^capability.id and item.import_run_id == ^capability.import_run_id and
             item.lock_version == ^capability.lock_version and
             item.lease_owner == ^capability.lease_owner and not is_nil(item.lease_expires_at) and
-            item.lease_expires_at > ^now and item.selected == true and item.state == :staging_git and
+            item.lease_expires_at > ^now and item.selected == true and
+            item.state in [:staging_git, :git_staged, :staging_metadata] and
             is_nil(item.cleanup_state) and run.actor_user_id == ^actor_id and
             run.state == :running and
             actor.kind == :user and actor.state == :active and attempt.state == :running,
