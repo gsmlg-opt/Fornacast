@@ -4,7 +4,16 @@ defmodule ForgeImports.ReconcilerTest do
   import Ecto.Query
 
   alias ForgeAccounts.User
-  alias ForgeImports.{ImportAttempt, ImportRun, Persistence, Reconciler, RepositoryItem, Scheduler}
+
+  alias ForgeImports.{
+    ImportAttempt,
+    ImportRun,
+    Persistence,
+    Reconciler,
+    RepositoryItem,
+    Scheduler
+  }
+
   alias ForgeRepos.Repository
   alias Fornacast.Repo
 
@@ -64,6 +73,8 @@ defmodule ForgeImports.ReconcilerTest do
 
     send(first_pid, :release)
     assert_receive {:worker_started, _third_id, _third_pid}, 2_000
+
+    assert :ok = stop_supervised(Reconciler)
   end
 
   test "expired item leases are claimable and live leases are skipped", context do
@@ -97,7 +108,9 @@ defmodule ForgeImports.ReconcilerTest do
     mark_staging_metadata!(context.item, context.actor)
     before = Repo.get!(RepositoryItem, context.item.id)
 
-    start_supervised!({Task.Supervisor, name: __MODULE__.ReturnValueTaskSupervisor, max_children: 1})
+    start_supervised!(
+      {Task.Supervisor, name: __MODULE__.ReturnValueTaskSupervisor, max_children: 1}
+    )
 
     start_supervised!(
       {Reconciler,
@@ -119,6 +132,8 @@ defmodule ForgeImports.ReconcilerTest do
              item = Repo.get!(RepositoryItem, context.item.id)
              item.state == before.state and item.lease_owner == before.lease_owner
            end)
+
+    assert :ok = stop_supervised(Reconciler)
   end
 
   test "a crashed worker task leaves durable SQL state for recovery", context do
@@ -151,6 +166,8 @@ defmodule ForgeImports.ReconcilerTest do
 
     send(Process.whereis(__MODULE__.CrashReconciler), :tick)
     assert_receive {:worker_started, _restarted_pid}, 2_000
+
+    assert :ok = stop_supervised(Reconciler)
   end
 
   defmodule CountingWorker do

@@ -1,11 +1,11 @@
 defmodule ForgeImports.CleanupReconcilerTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias ForgeImports.CleanupReconciler
   alias Fornacast.Repo
 
-  setup tags do
-    if Map.get(tags, :postgres) && postgres?() do
+  setup do
+    if postgres?() do
       :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
       :ok = Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
     end
@@ -295,7 +295,7 @@ defmodule ForgeImports.CleanupReconcilerTest do
   end
 
   defp postgres? do
-    Application.get_env(:fornacast, Fornacast.Repo)[:adapter] == Ecto.Adapters.Postgres
+    Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"]
   end
 
   defp wait_until_idle!(reconciler, attempts \\ 100)

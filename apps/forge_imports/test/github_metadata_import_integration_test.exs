@@ -275,8 +275,8 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
 
   defp seed_refs!(path) do
     tree = git!(path, ["hash-object", "-t", "tree", "-w", "/dev/null"])
-    base = git!(path, ["commit-tree", tree, "-m", "base"])
-    head = git!(path, ["commit-tree", tree, "-p", base, "-m", "head"])
+    base = git!(path, git_identity_args() ++ ["commit-tree", tree, "-m", "base"])
+    head = git!(path, git_identity_args() ++ ["commit-tree", tree, "-p", base, "-m", "head"])
     update_ref!(path, head, "refs/heads/feature")
     update_ref!(path, base, "refs/heads/main")
     {head, base}
@@ -286,6 +286,9 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
     {output, 0} = System.cmd("git", ["--git-dir=#{path}" | args], stderr_to_stdout: true)
     String.trim(output)
   end
+
+  defp git_identity_args,
+    do: ["-c", "user.name=Fornacast Import", "-c", "user.email=import@example.test"]
 
   defp update_ref!(path, oid, ref) do
     {_, 0} =

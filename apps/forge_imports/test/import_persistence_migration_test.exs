@@ -658,6 +658,8 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
   @repository_write_version 20_260_825_000_410
   @staged_path_version 20_260_825_000_420
   @cleanup_recovery_version 20_260_825_000_430
+  @external_attribution_version 20_260_825_000_500
+  @recovery_constraints_version 20_260_825_000_600
   @cleanup_selector_version 20_260_831_000_100
   @run_scoped_indexes [
     {"github_import_items_run_id_index", "github_import_repository_items"},
@@ -703,9 +705,13 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
         ensure_up!(repo, @repository_write_version)
         ensure_up!(repo, @staged_path_version)
         ensure_up!(repo, @cleanup_recovery_version)
+        ensure_up!(repo, @external_attribution_version)
+        ensure_up!(repo, @recovery_constraints_version)
         ensure_up!(repo, @cleanup_selector_version)
 
         assert [@cleanup_selector_version] = migrate_down(repo, @cleanup_selector_version)
+        assert [@recovery_constraints_version] = migrate_down(repo, @recovery_constraints_version)
+        assert [@external_attribution_version] = migrate_down(repo, @external_attribution_version)
         assert [@cleanup_recovery_version] = migrate_down(repo, @cleanup_recovery_version)
         assert [@staged_path_version] = migrate_down(repo, @staged_path_version)
         assert [@repository_write_version] = migrate_down(repo, @repository_write_version)
@@ -731,6 +737,8 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
         assert [@repository_write_version] = migrate_up(repo, @repository_write_version)
         assert [@staged_path_version] = migrate_up(repo, @staged_path_version)
         assert [@cleanup_recovery_version] = migrate_up(repo, @cleanup_recovery_version)
+        assert [@external_attribution_version] = migrate_up(repo, @external_attribution_version)
+        assert [@recovery_constraints_version] = migrate_up(repo, @recovery_constraints_version)
         assert [@cleanup_selector_version] = migrate_up(repo, @cleanup_selector_version)
       end)
     else
@@ -974,6 +982,8 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
       ensure_up!(repo, @repository_write_version)
       ensure_up!(repo, @staged_path_version)
       ensure_up!(repo, @cleanup_recovery_version)
+      ensure_up!(repo, @external_attribution_version)
+      ensure_up!(repo, @recovery_constraints_version)
       ensure_up!(repo, @cleanup_selector_version)
     end)
   end
@@ -1105,6 +1115,8 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
   @repository_write_version 20_260_825_000_410
   @staged_path_version 20_260_825_000_420
   @cleanup_recovery_version 20_260_825_000_430
+  @external_attribution_version 20_260_825_000_500
+  @recovery_constraints_version 20_260_825_000_600
   @cleanup_selector_version 20_260_831_000_100
   @migration_file Path.expand(
                     "../../fornacast/priv/repo/migrations/20260825000370_add_github_import_destination_status.exs",
@@ -1134,6 +1146,8 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
         assert Enum.all?(import_tables(), &table_exists?(repo, &1))
         ensure_latest_migrations_up!(repo)
         assert [@cleanup_selector_version] = migrate_down(repo, @cleanup_selector_version)
+        assert [@recovery_constraints_version] = migrate_down(repo, @recovery_constraints_version)
+        assert [@external_attribution_version] = migrate_down(repo, @external_attribution_version)
         assert [@cleanup_recovery_version] = migrate_down(repo, @cleanup_recovery_version)
         assert [@staged_path_version] = migrate_down(repo, @staged_path_version)
         assert [@repository_write_version] = migrate_down(repo, @repository_write_version)
@@ -1159,6 +1173,8 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
         assert [@repository_write_version] = migrate_up(repo, @repository_write_version)
         assert [@staged_path_version] = migrate_up(repo, @staged_path_version)
         assert [@cleanup_recovery_version] = migrate_up(repo, @cleanup_recovery_version)
+        assert [@external_attribution_version] = migrate_up(repo, @external_attribution_version)
+        assert [@recovery_constraints_version] = migrate_up(repo, @recovery_constraints_version)
         assert [@cleanup_selector_version] = migrate_up(repo, @cleanup_selector_version)
 
         assert migration_applied?(repo)
@@ -1196,6 +1212,8 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
         clear_import_rows!(repo)
         ensure_latest_migrations_up!(repo)
         assert [@cleanup_selector_version] = migrate_down(repo, @cleanup_selector_version)
+        assert [@recovery_constraints_version] = migrate_down(repo, @recovery_constraints_version)
+        assert [@external_attribution_version] = migrate_down(repo, @external_attribution_version)
         assert [@cleanup_recovery_version] = migrate_down(repo, @cleanup_recovery_version)
         assert [@staged_path_version] = migrate_down(repo, @staged_path_version)
         assert [@repository_write_version] = migrate_down(repo, @repository_write_version)
@@ -1209,6 +1227,8 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
         assert [@repository_write_version] = migrate_up(repo, @repository_write_version)
         assert [@staged_path_version] = migrate_up(repo, @staged_path_version)
         assert [@cleanup_recovery_version] = migrate_up(repo, @cleanup_recovery_version)
+        assert [@external_attribution_version] = migrate_up(repo, @external_attribution_version)
+        assert [@recovery_constraints_version] = migrate_up(repo, @recovery_constraints_version)
         assert [@cleanup_selector_version] = migrate_up(repo, @cleanup_selector_version)
       end)
     else
@@ -1563,6 +1583,8 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
     ensure_up!(repo, @repository_write_version)
     ensure_up!(repo, @staged_path_version)
     ensure_up!(repo, @cleanup_recovery_version)
+    ensure_up!(repo, @external_attribution_version)
+    ensure_up!(repo, @recovery_constraints_version)
     ensure_up!(repo, @cleanup_selector_version)
   end
 

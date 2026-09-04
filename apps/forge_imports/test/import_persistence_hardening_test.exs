@@ -601,25 +601,32 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
     actor: actor,
     identity: identity
   } do
-    assert {:ok, predecessor} = ForgeImports.create_run(actor, run_attrs(identity))
-    assert {:ok, item} = ForgeImports.create_repository_item(actor, predecessor, item_attrs())
-    hidden = repository_fixture(actor)
-
-    assert {1, _rows} =
-             Repo.update_all(
-               from(candidate in RepositoryItem, where: candidate.id == ^item.id),
-               set: [state: :failed, hidden_repository_id: hidden.id]
-             )
-
-    item = Repo.get!(RepositoryItem, item.id)
-    assert {:ok, predecessor} = ForgeImports.transition_run(actor, predecessor, :failed)
-
     for {suffix, failure} <- [
           {"dbconnection",
            fn -> raise DBConnection.ConnectionError, "injected adoption query failure" end},
           {"turso",
            fn -> raise Turso.Error, code: :io, message: "injected adoption query failure" end}
         ] do
+      assert {:ok, predecessor} = ForgeImports.create_run(actor, run_attrs(identity))
+
+      assert {:ok, item} =
+               ForgeImports.create_repository_item(
+                 actor,
+                 predecessor,
+                 item_attrs(github_repository_id: System.unique_integer([:positive]))
+               )
+
+      hidden = repository_fixture(actor)
+
+      assert {1, _rows} =
+               Repo.update_all(
+                 from(candidate in RepositoryItem, where: candidate.id == ^item.id),
+                 set: [state: :failed, hidden_repository_id: hidden.id]
+               )
+
+      item = Repo.get!(RepositoryItem, item.id)
+      assert {:ok, predecessor} = ForgeImports.transition_run(actor, predecessor, :failed)
+
       assert {:ok, successor} =
                ForgeImports.create_run(
                  actor,

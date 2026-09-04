@@ -154,7 +154,11 @@ defmodule ForgeImports.RecoverySupervisorTest do
 
   defmodule ClaimProbeWorker do
     def stage(item_id, opts) do
-      send(Keyword.fetch!(opts, :test_pid), {:worker_claimed, item_id, Keyword.fetch!(opts, :owner)})
+      send(
+        Keyword.fetch!(opts, :test_pid),
+        {:worker_claimed, item_id, Keyword.fetch!(opts, :owner)}
+      )
+
       {:ok, :busy}
     end
   end

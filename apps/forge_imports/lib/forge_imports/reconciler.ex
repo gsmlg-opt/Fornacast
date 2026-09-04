@@ -37,7 +37,11 @@ defmodule ForgeImports.Reconciler do
           Keyword.get(
             opts,
             :max_concurrency,
-            Application.get_env(:forge_imports, :recovery_max_concurrency, @default_max_concurrency)
+            Application.get_env(
+              :forge_imports,
+              :recovery_max_concurrency,
+              @default_max_concurrency
+            )
           ),
           1,
           100

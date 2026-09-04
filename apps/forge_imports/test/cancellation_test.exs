@@ -508,7 +508,7 @@ defmodule ForgeImports.CancellationTest do
   end
 
   defp postgres? do
-    Application.get_env(:fornacast, Fornacast.Repo)[:adapter] == Ecto.Adapters.Postgres
+    Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"]
   end
 
   defp reset_database! do
