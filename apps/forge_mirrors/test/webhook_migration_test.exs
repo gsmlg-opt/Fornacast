@@ -25,7 +25,8 @@ defmodule ForgeMirrors.WebhookMigrationTest do
       insert_delivery!(repo, deferred_guid, "pending_unsupported", nil)
 
       try do
-        assert [@version] = Ecto.Migrator.run(repo, path, :down, to: @version, log: false)
+        rolled_versions = Ecto.Migrator.run(repo, path, :down, to: @version, log: false)
+        assert @version in rolled_versions
 
         assert %{rows: [["failed", nil]]} =
                  Ecto.Adapters.SQL.query!(

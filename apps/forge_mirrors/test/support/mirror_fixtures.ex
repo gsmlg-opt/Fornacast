@@ -112,6 +112,19 @@ defmodule ForgeMirrors.TestSupport.MirrorFixtures do
       ForgeMirrors.transition_organization_mirror(actor, bootstrapping, :catching_up)
 
     {:ok, active} = ForgeMirrors.transition_organization_mirror(actor, catching_up, :active)
+
+    {:ok, _installation} =
+      ForgeMirrors.observe_github_app_installation(%{
+        github_installation_id: active.github_installation_id,
+        github_account_id: active.github_account_id,
+        github_account_login: active.github_account_login,
+        account_type: :organization,
+        repository_selection: :all,
+        permissions: %{"metadata" => "read"},
+        state: :active,
+        last_verified_at: DateTime.utc_now()
+      })
+
     active
   end
 

@@ -120,6 +120,43 @@ defmodule ForgeGitHub.Client do
     end
   end
 
+  @doc """
+  Fetches one bounded page of repositories visible to a GitHub App installation.
+
+  The cursor is a provider-owned page number rather than an arbitrary URL. This
+  keeps durable resume data small and prevents a persisted cursor from changing
+  the fixed GitHub origin or endpoint.
+  """
+  @spec installation_repositories_page(String.t(), nil | pos_integer(), keyword()) ::
+          {:ok, %{repositories: [Repository.t()], next_cursor: pos_integer() | nil}}
+          | {:error, Error.t()}
+  def installation_repositories_page(token, cursor \\ nil, opts \\ [])
+
+  def installation_repositories_page(token, cursor, opts)
+      when (is_nil(cursor) or (is_integer(cursor) and cursor in 1..@max_pages)) and
+             is_list(opts) do
+    page = cursor || 1
+
+    with_request_gate(token, opts, fn ->
+      url = "#{@api_base}/installation/repositories?per_page=100&page=#{page}"
+
+      with {:ok, response} <- perform_request(url, token, opts, :get, nil),
+           {:ok, json} <- successful_json(response, opts),
+           {:ok, repositories} <- installation_repositories_from_json(json),
+           {:ok, next_url} <- Pagination.next_url(response, ["/installation/repositories"]),
+           {:ok, next_cursor} <- installation_next_cursor(next_url, page) do
+        {:ok, %{repositories: repositories, next_cursor: next_cursor}}
+      else
+        {:error, %Error{} = error} -> {:error, error}
+        {:error, :invalid_response} -> error(:invalid_response)
+        {:error, :invalid_pagination} -> error(:invalid_pagination)
+        {:error, :pagination_limit} -> error(:pagination_limit)
+      end
+    end)
+  end
+
+  def installation_repositories_page(_token, _cursor, _opts), do: error(:invalid_request)
+
   @spec repository_labels(String.t(), String.t(), String.t(), keyword()) ::
           {:ok, [map()]} | {:error, Error.t()}
   def repository_labels(pat, owner, repository, opts \\ []) do
@@ -390,6 +427,41 @@ defmodule ForgeGitHub.Client do
   end
 
   defp repositories_from_json(_values), do: {:error, :invalid_response}
+
+  defp installation_repositories_from_json(%{
+         "total_count" => total_count,
+         "repositories" => repositories
+       })
+       when is_integer(total_count) and total_count in 0..10_000 do
+    with {:ok, repositories} <- repositories_from_json(repositories),
+         true <- Enum.all?(repositories, &(is_binary(&1.node_id) and &1.node_id != "")) do
+      {:ok, repositories}
+    else
+      _invalid -> {:error, :invalid_response}
+    end
+  end
+
+  defp installation_repositories_from_json(_json), do: {:error, :invalid_response}
+
+  defp installation_next_cursor(nil, _page), do: {:ok, nil}
+
+  defp installation_next_cursor(_next_url, @max_pages), do: {:error, :pagination_limit}
+
+  defp installation_next_cursor(next_url, page) when is_binary(next_url) do
+    with {:ok, %URI{path: "/installation/repositories", query: query}} <- URI.new(next_url),
+         true <- is_binary(query),
+         pairs <- Enum.to_list(URI.query_decoder(query)),
+         true <- length(pairs) == 2 and length(pairs) == length(Enum.uniq_by(pairs, &elem(&1, 0))),
+         %{"page" => encoded_page, "per_page" => "100"} <- Map.new(pairs),
+         {next_page, ""} <- Integer.parse(encoded_page),
+         true <- next_page == page + 1 and next_page in 2..@max_pages do
+      {:ok, next_page}
+    else
+      _invalid -> {:error, :invalid_pagination}
+    end
+  rescue
+    _exception -> {:error, :invalid_pagination}
+  end
 
   defp json_list(values) when is_list(values) and length(values) <= 100 do
     if Enum.all?(values, &is_map/1), do: {:ok, values}, else: {:error, :invalid_response}

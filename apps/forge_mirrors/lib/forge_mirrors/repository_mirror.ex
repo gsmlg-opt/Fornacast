@@ -20,12 +20,53 @@ defmodule ForgeMirrors.RepositoryMirror do
     field :github_repository_id, :integer
     field :github_node_id, :string
     field :github_full_name, :string
+    field :github_archived, :boolean
+    field :inventory_included, :boolean, default: true
+    field :inventory_selection, Ecto.Enum, values: [:all, :selected], default: :all
+    field :last_inventory_sweep, :string
     field :state, Ecto.Enum, values: @states, default: :discovered
     field :bootstrap_repository_item_id, :integer
     field :last_inventory_at, :utc_datetime
     field :last_synced_at, :utc_datetime
     field :lock_version, :integer, default: 1
     timestamps(type: :utc_datetime)
+  end
+
+  def inventory_create_changeset(mirror, attrs) do
+    mirror
+    |> cast(attrs, [
+      :organization_mirror_id,
+      :github_repository_id,
+      :github_node_id,
+      :github_full_name,
+      :github_archived,
+      :inventory_included,
+      :inventory_selection,
+      :last_inventory_sweep,
+      :last_inventory_at
+    ])
+    |> put_change(:state, :discovered)
+    |> put_change(:lock_version, 1)
+    |> validate_inventory()
+    |> validate_persistence()
+  end
+
+  def inventory_update_changeset(mirror, attrs) do
+    mirror
+    |> cast(attrs, [
+      :github_repository_id,
+      :github_node_id,
+      :github_full_name,
+      :github_archived,
+      :inventory_included,
+      :inventory_selection,
+      :last_inventory_sweep,
+      :last_inventory_at
+    ])
+    |> validate_immutable_fields([:github_repository_id, :github_node_id])
+    |> maybe_restore_remote_only()
+    |> validate_inventory()
+    |> validate_persistence()
   end
 
   def states, do: @states
@@ -84,6 +125,7 @@ defmodule ForgeMirrors.RepositoryMirror do
     |> validate_number(:lock_version, greater_than: 0)
     |> validate_length(:github_node_id, min: 1, max: 255, count: :bytes)
     |> validate_length(:github_full_name, min: 1, max: 255, count: :bytes)
+    |> validate_length(:last_inventory_sweep, min: 1, max: 255, count: :bytes)
     |> validate_trimmed([:github_node_id, :github_full_name])
     |> validate_identity()
     |> unique_constraint(:repository_id,
@@ -92,6 +134,29 @@ defmodule ForgeMirrors.RepositoryMirror do
     |> unique_constraint(:github_repository_id,
       name: :repository_mirrors_active_github_repository_index
     )
+  end
+
+  defp validate_inventory(changeset) do
+    changeset
+    |> validate_required([
+      :github_repository_id,
+      :github_node_id,
+      :github_full_name,
+      :github_archived,
+      :inventory_included,
+      :inventory_selection,
+      :last_inventory_sweep,
+      :last_inventory_at
+    ])
+    |> validate_trimmed([:last_inventory_sweep])
+  end
+
+  defp maybe_restore_remote_only(changeset) do
+    if changeset.data.state == :revoked and is_nil(changeset.data.repository_id) do
+      put_change(changeset, :state, :discovered)
+    else
+      changeset
+    end
   end
 
   defp validate_identity(changeset) do

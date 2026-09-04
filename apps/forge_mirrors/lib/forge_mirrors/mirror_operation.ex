@@ -29,6 +29,7 @@ defmodule ForgeMirrors.MirrorOperation do
     field :dedupe_key, :string
     field :state, Ecto.Enum, values: @states, default: :pending
     field :cursor, :map, default: %{}
+    field :checkpoint, :map, default: %{}
     field :attempt_count, :integer, default: 0
     field :next_attempt_at, :utc_datetime
     field :lease_owner, :string

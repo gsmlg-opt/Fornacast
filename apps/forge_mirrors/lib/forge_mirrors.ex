@@ -12,6 +12,7 @@ defmodule ForgeMirrors do
 
   alias ForgeMirrors.{
     GitHubAppInstallation,
+    InventoryPolicy,
     MirrorConflict,
     MirrorOperation,
     MirrorWebhookDelivery,
@@ -20,6 +21,7 @@ defmodule ForgeMirrors do
   }
 
   @max_claim_batch 100
+  @inventory_operation_kind "reconcile.organization_inventory"
 
   @type provider :: :github
   @type direction :: :inbound | :outbound
@@ -896,20 +898,127 @@ defmodule ForgeMirrors do
   def claim_operations(owner, %DateTime{} = now, lease_seconds, limit)
       when is_binary(owner) and is_integer(lease_seconds) and lease_seconds > 0 and
              is_integer(limit) and limit in 1..@max_claim_batch do
-    with :ok <- validate_owner(owner), :ok <- validate_utc(now) do
-      now = DateTime.truncate(now, :second)
-      expires_at = DateTime.add(now, lease_seconds, :second)
-
-      case Repo.transaction(fn -> claim_due_operations(owner, now, expires_at, limit) end) do
-        {:ok, operations} -> {:ok, operations}
-        {:error, _reason} -> {:error, :unavailable}
-      end
-    end
-  rescue
-    _ -> {:error, :unavailable}
+    do_claim_operations(owner, now, lease_seconds, limit, nil)
   end
 
   def claim_operations(_owner, _now, _lease_seconds, _limit), do: {:error, :invalid_argument}
+
+  @doc "Claims only operations whose kind is in the bounded allowlist."
+  @spec claim_operations(String.t(), DateTime.t(), pos_integer(), pos_integer(), [String.t()]) ::
+          {:ok, [MirrorOperation.t()]} | {:error, :invalid_argument | :unavailable}
+  def claim_operations(owner, %DateTime{} = now, lease_seconds, limit, kinds)
+      when is_binary(owner) and is_integer(lease_seconds) and lease_seconds > 0 and
+             is_integer(limit) and limit in 1..@max_claim_batch and is_list(kinds) do
+    with :ok <- validate_operation_kinds(kinds) do
+      do_claim_operations(owner, now, lease_seconds, limit, kinds)
+    end
+  end
+
+  def claim_operations(_owner, _now, _lease_seconds, _limit, _kinds),
+    do: {:error, :invalid_argument}
+
+  @doc false
+  @spec inventory_operation_context(MirrorOperation.t()) ::
+          {:ok,
+           %{
+             cursor: pos_integer(),
+             github_account_id: pos_integer(),
+             github_installation_id: pos_integer(),
+             installation_selection: :all | :selected,
+             sweep_marker: String.t()
+           }}
+          | {:error, :lost_lease | :invalid_transition | :invalid_policy}
+  def inventory_operation_context(%MirrorOperation{} = operation) do
+    Repo.transaction(fn ->
+      with :ok <- lock_inventory_organization(operation),
+           {:ok, persisted} <- load_owned_inventory_operation(operation),
+           {:ok, organization, installation, _policy} <-
+             load_inventory_scope(persisted.organization_mirror_id),
+           {:ok, cursor} <- inventory_checkpoint_cursor(persisted.checkpoint) do
+        %{
+          cursor: cursor,
+          github_account_id: organization.github_account_id,
+          github_installation_id: organization.github_installation_id,
+          installation_selection: installation.repository_selection,
+          sweep_marker: inventory_sweep_marker(persisted.id)
+        }
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> normalize_transaction_result()
+  rescue
+    _exception -> {:error, :lost_lease}
+  end
+
+  def inventory_operation_context(_operation), do: {:error, :invalid_transition}
+
+  @doc false
+  @spec record_inventory_page(
+          MirrorOperation.t(),
+          [map()],
+          pos_integer() | nil,
+          DateTime.t()
+        ) ::
+          {:ok, %{operation: MirrorOperation.t(), classifications: map()}}
+          | {:error,
+             Ecto.Changeset.t()
+             | :identity_conflict
+             | :invalid_argument
+             | :invalid_policy
+             | :invalid_transition
+             | :lost_lease}
+  def record_inventory_page(
+        %MirrorOperation{} = operation,
+        repositories,
+        next_cursor,
+        %DateTime{} = observed_at
+      )
+      when is_list(repositories) and length(repositories) <= 100 and
+             (is_nil(next_cursor) or
+                (is_integer(next_cursor) and next_cursor in 2..100)) do
+    with :ok <- validate_utc(observed_at),
+         {:ok, observations} <- normalize_inventory_repositories(repositories) do
+      Repo.transaction(fn ->
+        with :ok <- lock_inventory_organization(operation),
+             {:ok, persisted} <- load_owned_inventory_operation(operation),
+             {:ok, organization, installation, policy} <-
+               load_inventory_scope(persisted.organization_mirror_id),
+             {:ok, cursor} <- inventory_checkpoint_cursor(persisted.checkpoint),
+             :ok <- validate_inventory_next_cursor(cursor, next_cursor),
+             sweep_marker = inventory_sweep_marker(persisted.id),
+             {:ok, classifications} <-
+               persist_inventory_repositories(
+                 organization,
+                 installation,
+                 policy,
+                 observations,
+                 sweep_marker,
+                 observed_at
+               ),
+             {:ok, classifications} <-
+               maybe_finish_inventory_sweep(
+                 organization,
+                 next_cursor,
+                 sweep_marker,
+                 observed_at,
+                 classifications
+               ),
+             {:ok, updated_operation} <-
+               persist_inventory_checkpoint(persisted, next_cursor, sweep_marker, observed_at) do
+          %{operation: updated_operation, classifications: classifications}
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+      |> normalize_transaction_result()
+    end
+  rescue
+    _exception -> {:error, :lost_lease}
+  end
+
+  def record_inventory_page(_operation, _repositories, _next_cursor, _observed_at),
+    do: {:error, :invalid_argument}
 
   @spec mark_external_effect(MirrorOperation.t(), DateTime.t(), map()) ::
           {:ok, MirrorOperation.t()}
@@ -1945,7 +2054,21 @@ defmodule ForgeMirrors do
     |> DateTime.truncate(:second)
   end
 
-  defp claim_due_operations(owner, now, expires_at, limit) do
+  defp do_claim_operations(owner, now, lease_seconds, limit, kinds) do
+    with :ok <- validate_owner(owner), :ok <- validate_utc(now) do
+      now = DateTime.truncate(now, :second)
+      expires_at = DateTime.add(now, lease_seconds, :second)
+
+      case Repo.transaction(fn -> claim_due_operations(owner, now, expires_at, limit, kinds) end) do
+        {:ok, operations} -> {:ok, operations}
+        {:error, _reason} -> {:error, :unavailable}
+      end
+    end
+  rescue
+    _exception -> {:error, :unavailable}
+  end
+
+  defp claim_due_operations(owner, now, expires_at, limit, kinds) do
     sql = """
     select operation.id
     from mirror_operations operation
@@ -1953,8 +2076,19 @@ defmodule ForgeMirrors do
       on organization.id = operation.organization_mirror_id
     left join repository_mirrors repository
       on repository.id = operation.repository_mirror_id
+    left join github_app_installations installation
+      on installation.github_installation_id = organization.github_installation_id
     where organization.state not in ('paused', 'revoked')
       and (operation.repository_mirror_id is null or repository.state in ('discovered', 'active'))
+      and ($3::text[] is null or operation.kind = any($3))
+      and (
+        operation.kind <> 'reconcile.organization_inventory'
+        or (
+          organization.provider = 'github'
+          and installation.state = 'active'
+          and installation.github_account_id = organization.github_account_id
+        )
+      )
       and (
         (operation.state = 'pending' and operation.next_attempt_at <= $1)
         or (operation.state = 'processing' and operation.lease_expires_at <= $1)
@@ -1991,8 +2125,402 @@ defmodule ForgeMirrors do
     limit $2
     """
 
-    %{rows: rows} = Ecto.Adapters.SQL.query!(Repo, sql, [now, limit])
+    %{rows: rows} = Ecto.Adapters.SQL.query!(Repo, sql, [now, limit, kinds])
     Enum.map(rows, fn [id] -> claim_operation!(id, owner, now, expires_at) end)
+  end
+
+  defp load_owned_inventory_operation(%MirrorOperation{} = operation) do
+    if owned_capability?(operation) do
+      query =
+        from candidate in MirrorOperation,
+          where:
+            candidate.id == ^operation.id and candidate.kind == @inventory_operation_kind and
+              is_nil(candidate.repository_mirror_id) and candidate.state == :processing and
+              candidate.lease_owner == ^operation.lease_owner and
+              candidate.lease_expires_at == ^operation.lease_expires_at and
+              candidate.lease_expires_at > fragment("timezone('UTC', clock_timestamp())") and
+              candidate.lock_version == ^operation.lock_version,
+          lock: "FOR UPDATE"
+
+      case Repo.one(query) do
+        %MirrorOperation{} = persisted -> {:ok, persisted}
+        nil -> {:error, :lost_lease}
+      end
+    else
+      {:error, :lost_lease}
+    end
+  end
+
+  defp lock_inventory_organization(%MirrorOperation{id: id}) when is_integer(id) and id > 0 do
+    case Repo.get(MirrorOperation, id) do
+      %MirrorOperation{organization_mirror_id: organization_mirror_id} ->
+        case OrganizationMirror
+             |> where([mirror], mirror.id == ^organization_mirror_id)
+             |> lock("FOR UPDATE")
+             |> Repo.one() do
+          %OrganizationMirror{} -> :ok
+          nil -> {:error, :lost_lease}
+        end
+
+      nil ->
+        {:error, :lost_lease}
+    end
+  end
+
+  defp lock_inventory_organization(_operation), do: {:error, :lost_lease}
+
+  defp load_inventory_scope(organization_mirror_id) do
+    organization =
+      OrganizationMirror
+      |> where([mirror], mirror.id == ^organization_mirror_id)
+      |> lock("FOR UPDATE")
+      |> Repo.one()
+
+    with %OrganizationMirror{
+           provider: "github",
+           state: state,
+           github_installation_id: installation_id,
+           github_account_id: account_id,
+           policy: policy
+         } = organization
+         when state not in [:paused, :revoked] and is_integer(installation_id) and
+                is_integer(account_id) <- organization,
+         %GitHubAppInstallation{
+           state: :active,
+           github_account_id: ^account_id
+         } = installation <-
+           GitHubAppInstallation
+           |> where([record], record.github_installation_id == ^installation_id)
+           |> lock("FOR UPDATE")
+           |> Repo.one(),
+         {:ok, inventory_policy} <- InventoryPolicy.parse(policy) do
+      {:ok, organization, installation, inventory_policy}
+    else
+      {:error, :invalid_policy} = error -> error
+      _invalid -> {:error, :invalid_transition}
+    end
+  end
+
+  defp inventory_checkpoint_cursor(checkpoint) when checkpoint == %{}, do: {:ok, 1}
+
+  defp inventory_checkpoint_cursor(%{"next_cursor" => cursor})
+       when is_integer(cursor) and cursor in 2..100,
+       do: {:ok, cursor}
+
+  defp inventory_checkpoint_cursor(_checkpoint), do: {:error, :invalid_transition}
+
+  defp validate_inventory_next_cursor(100, nil), do: :ok
+  defp validate_inventory_next_cursor(cursor, nil) when cursor in 1..100, do: :ok
+
+  defp validate_inventory_next_cursor(cursor, next_cursor)
+       when cursor in 1..99 and next_cursor == cursor + 1,
+       do: :ok
+
+  defp validate_inventory_next_cursor(_cursor, _next_cursor),
+    do: {:error, :invalid_argument}
+
+  defp inventory_sweep_marker(operation_id), do: "inventory-operation:#{operation_id}"
+
+  defp normalize_inventory_repositories(repositories) do
+    repositories
+    |> Enum.reduce_while({:ok, [], MapSet.new(), MapSet.new()}, fn repository,
+                                                                   {:ok, normalized, ids, nodes} ->
+      with {:ok, observation} <- normalize_inventory_repository(repository),
+           false <- MapSet.member?(ids, observation.github_repository_id),
+           false <- MapSet.member?(nodes, observation.github_node_id) do
+        {:cont,
+         {:ok, [observation | normalized], MapSet.put(ids, observation.github_repository_id),
+          MapSet.put(nodes, observation.github_node_id)}}
+      else
+        _invalid -> {:halt, {:error, :invalid_argument}}
+      end
+    end)
+    |> case do
+      {:ok, normalized, _ids, _nodes} -> {:ok, Enum.reverse(normalized)}
+      error -> error
+    end
+  end
+
+  defp normalize_inventory_repository(repository) when is_map(repository) do
+    github_repository_id = fetch_attr(repository, :github_repository_id)
+    github_node_id = fetch_attr(repository, :github_node_id)
+    github_full_name = fetch_attr(repository, :github_full_name)
+    github_archived = fetch_attr(repository, :github_archived)
+
+    if is_integer(github_repository_id) and github_repository_id > 0 and
+         bounded_trimmed_string?(github_node_id, 255) and
+         bounded_trimmed_string?(github_full_name, 255) and is_boolean(github_archived) do
+      {:ok,
+       %{
+         github_repository_id: github_repository_id,
+         github_node_id: github_node_id,
+         github_full_name: github_full_name,
+         github_archived: github_archived
+       }}
+    else
+      {:error, :invalid_argument}
+    end
+  end
+
+  defp normalize_inventory_repository(_repository), do: {:error, :invalid_argument}
+
+  defp bounded_trimmed_string?(value, max_bytes) do
+    is_binary(value) and byte_size(value) in 1..max_bytes and String.valid?(value) and
+      value == String.trim(value) and :binary.match(value, <<0>>) == :nomatch
+  end
+
+  defp persist_inventory_repositories(
+         organization,
+         installation,
+         policy,
+         repositories,
+         sweep_marker,
+         observed_at
+       ) do
+    initial = %{added: [], renamed: [], archive_changed: [], access_revoked: []}
+
+    repositories
+    |> Enum.reduce_while({:ok, initial}, fn repository, {:ok, classifications} ->
+      case upsert_inventory_repository(
+             organization,
+             installation,
+             policy,
+             repository,
+             sweep_marker,
+             observed_at,
+             classifications
+           ) do
+        {:ok, classifications} -> {:cont, {:ok, classifications}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, classifications} -> {:ok, reverse_classifications(classifications)}
+      error -> error
+    end
+  end
+
+  defp upsert_inventory_repository(
+         organization,
+         installation,
+         policy,
+         repository,
+         sweep_marker,
+         observed_at,
+         classifications
+       ) do
+    existing =
+      RepositoryMirror
+      |> where(
+        [mirror],
+        mirror.github_repository_id == ^repository.github_repository_id and
+          mirror.state != :tombstoned
+      )
+      |> order_by([mirror], desc: mirror.id)
+      |> limit(1)
+      |> lock("FOR UPDATE")
+      |> Repo.one()
+
+    included = InventoryPolicy.included?(policy, repository.github_repository_id)
+
+    attrs =
+      repository
+      |> Map.merge(%{
+        organization_mirror_id: organization.id,
+        inventory_included: included,
+        inventory_selection: installation.repository_selection,
+        last_inventory_sweep: sweep_marker,
+        last_inventory_at: observed_at
+      })
+
+    with {:ok, mirror, newly_visible?, renamed?, archive_changed?} <-
+           persist_inventory_repository(existing, organization.id, attrs),
+         {:ok, _bootstrap} <-
+           maybe_enqueue_inventory_bootstrap(
+             organization,
+             mirror,
+             policy,
+             included,
+             newly_visible?,
+             repository.github_archived,
+             observed_at
+           ) do
+      {:ok,
+       classifications
+       |> maybe_classify(:added, newly_visible?, mirror.id)
+       |> maybe_classify(:renamed, renamed?, mirror.id)
+       |> maybe_classify(:archive_changed, archive_changed?, mirror.id)}
+    end
+  end
+
+  defp persist_inventory_repository(nil, _organization_mirror_id, attrs) do
+    case %RepositoryMirror{}
+         |> RepositoryMirror.inventory_create_changeset(attrs)
+         |> Repo.insert() do
+      {:ok, mirror} ->
+        {:ok, mirror, true, false, false}
+
+      {:error, changeset} ->
+        if constraint_error?(changeset, "repository_mirrors_active_github_repository_index"),
+          do: {:error, :identity_conflict},
+          else: {:error, changeset}
+    end
+  end
+
+  defp persist_inventory_repository(
+         %RepositoryMirror{organization_mirror_id: organization_mirror_id},
+         expected_organization_mirror_id,
+         _attrs
+       )
+       when organization_mirror_id != expected_organization_mirror_id,
+       do: {:error, :identity_conflict}
+
+  defp persist_inventory_repository(%RepositoryMirror{} = existing, _organization_id, attrs) do
+    newly_visible? = existing.state == :revoked and is_nil(existing.repository_id)
+
+    renamed? =
+      not is_nil(existing.github_full_name) and
+        existing.github_full_name != attrs.github_full_name
+
+    archive_changed? = existing.github_archived != attrs.github_archived
+
+    case existing
+         |> RepositoryMirror.inventory_update_changeset(attrs)
+         |> cas_update() do
+      {:ok, mirror} ->
+        {:ok, mirror, newly_visible?, renamed?, archive_changed?}
+
+      {:error, :stale} ->
+        {:error, :lost_lease}
+
+      {:error, changeset} ->
+        if Keyword.has_key?(changeset.errors, :github_node_id),
+          do: {:error, :identity_conflict},
+          else: {:error, changeset}
+    end
+  end
+
+  defp maybe_enqueue_inventory_bootstrap(
+         organization,
+         mirror,
+         policy,
+         included?,
+         newly_visible?,
+         archived?,
+         observed_at
+       ) do
+    if included? and InventoryPolicy.auto_import?(policy, newly_visible?, archived?) do
+      enqueue_operation(%{
+        organization_mirror_id: organization.id,
+        repository_mirror_id: mirror.id,
+        kind: "bootstrap.repository_import",
+        dedupe_key: "inventory-bootstrap:#{mirror.id}",
+        cursor: %{
+          "github_repository_id" => mirror.github_repository_id,
+          "source" => "inventory"
+        },
+        next_attempt_at: observed_at
+      })
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp maybe_classify(classifications, _kind, false, _id), do: classifications
+
+  defp maybe_classify(classifications, kind, true, id),
+    do: Map.update!(classifications, kind, &[id | &1])
+
+  defp reverse_classifications(classifications) do
+    Map.new(classifications, fn {kind, ids} -> {kind, Enum.reverse(ids)} end)
+  end
+
+  defp maybe_finish_inventory_sweep(
+         _organization,
+         next_cursor,
+         _sweep_marker,
+         _observed_at,
+         classifications
+       )
+       when not is_nil(next_cursor),
+       do: {:ok, classifications}
+
+  defp maybe_finish_inventory_sweep(
+         organization,
+         nil,
+         sweep_marker,
+         observed_at,
+         classifications
+       ) do
+    unseen_query =
+      from mirror in RepositoryMirror,
+        where:
+          mirror.organization_mirror_id == ^organization.id and
+            not is_nil(mirror.github_repository_id) and
+            mirror.state not in [:revoked, :tombstoned] and
+            fragment("? is distinct from ?", mirror.last_inventory_sweep, ^sweep_marker)
+
+    unseen_ids = unseen_query |> select([mirror], mirror.id) |> Repo.all()
+
+    Repo.update_all(unseen_query,
+      set: [state: :revoked, updated_at: observed_at],
+      inc: [lock_version: 1]
+    )
+
+    case organization
+         |> OrganizationMirror.update_changeset(%{last_reconciled_at: observed_at})
+         |> cas_update() do
+      {:ok, _organization} ->
+        {:ok, Map.put(classifications, :access_revoked, unseen_ids)}
+
+      {:error, :stale} ->
+        {:error, :lost_lease}
+
+      {:error, changeset} ->
+        {:error, changeset}
+    end
+  end
+
+  defp persist_inventory_checkpoint(operation, next_cursor, sweep_marker, observed_at) do
+    updates =
+      if is_nil(next_cursor) do
+        [
+          state: :completed,
+          checkpoint: %{"completed_sweep" => sweep_marker},
+          lease_owner: nil,
+          lease_expires_at: nil,
+          completed_at: observed_at,
+          failure_class: nil,
+          failure_disposition: nil,
+          failure_detail: nil
+        ]
+      else
+        [
+          state: :pending,
+          checkpoint: %{"next_cursor" => next_cursor},
+          next_attempt_at: observed_at,
+          lease_owner: nil,
+          lease_expires_at: nil,
+          failure_class: nil,
+          failure_disposition: nil,
+          failure_detail: nil
+        ]
+      end
+
+    owned_transition(operation, observed_at, [:processing], updates)
+  end
+
+  defp validate_operation_kinds(kinds) do
+    if kinds != [] and length(kinds) <= 16 and length(kinds) == length(Enum.uniq(kinds)) and
+         Enum.all?(kinds, &bounded_trimmed_string?(&1, 255)),
+       do: :ok,
+       else: {:error, :invalid_argument}
+  end
+
+  defp constraint_error?(changeset, constraint_name) do
+    Enum.any?(changeset.errors, fn {_field, {_message, options}} ->
+      options[:constraint_name] == constraint_name
+    end)
   end
 
   defp claim_operation!(id, owner, now, expires_at) do

@@ -6,6 +6,7 @@ defmodule ForgeGitHub.Repository do
   @derive {Inspect,
            only: [
              :id,
+             :node_id,
              :owner_id,
              :name,
              :full_name,
@@ -36,6 +37,7 @@ defmodule ForgeGitHub.Repository do
   ]
   defstruct [
     :id,
+    :node_id,
     :owner_id,
     :name,
     :full_name,
@@ -55,6 +57,7 @@ defmodule ForgeGitHub.Repository do
   @type visibility :: :public | :private | :internal
   @type t :: %__MODULE__{
           id: pos_integer(),
+          node_id: String.t() | nil,
           owner_id: pos_integer(),
           name: String.t(),
           full_name: String.t(),
@@ -74,6 +77,7 @@ defmodule ForgeGitHub.Repository do
   @spec from_json(term()) :: {:ok, t()} | {:error, :invalid_response}
   def from_json(%{"owner" => %{} = owner} = value) do
     with {:ok, id} <- User.id(value["id"]),
+         {:ok, node_id} <- User.string(value["node_id"], 255),
          {:ok, owner_id} <- User.id(owner["id"]),
          {:ok, name} <- User.string(value["name"], 100, required?: true),
          {:ok, full_name} <- User.string(value["full_name"], 255, required?: true),
@@ -91,6 +95,7 @@ defmodule ForgeGitHub.Repository do
       {:ok,
        %__MODULE__{
          id: id,
+         node_id: node_id,
          owner_id: owner_id,
          name: name,
          full_name: full_name,
