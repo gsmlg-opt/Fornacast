@@ -661,6 +661,7 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
   @external_attribution_version 20_260_825_000_500
   @recovery_constraints_version 20_260_825_000_600
   @cleanup_selector_version 20_260_831_000_100
+  @domain_outbox_version 20_260_904_000_100
   @run_scoped_indexes [
     {"github_import_items_run_id_index", "github_import_repository_items"},
     {"github_import_reports_run_id_index", "github_import_report_entries"}
@@ -708,7 +709,9 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
         ensure_up!(repo, @external_attribution_version)
         ensure_up!(repo, @recovery_constraints_version)
         ensure_up!(repo, @cleanup_selector_version)
+        ensure_up!(repo, @domain_outbox_version)
 
+        assert [@domain_outbox_version] = migrate_down(repo, @domain_outbox_version)
         assert [@cleanup_selector_version] = migrate_down(repo, @cleanup_selector_version)
         assert [@recovery_constraints_version] = migrate_down(repo, @recovery_constraints_version)
         assert [@external_attribution_version] = migrate_down(repo, @external_attribution_version)
@@ -740,6 +743,7 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
         assert [@external_attribution_version] = migrate_up(repo, @external_attribution_version)
         assert [@recovery_constraints_version] = migrate_up(repo, @recovery_constraints_version)
         assert [@cleanup_selector_version] = migrate_up(repo, @cleanup_selector_version)
+        assert [@domain_outbox_version] = migrate_up(repo, @domain_outbox_version)
       end)
     else
       repo = start_scratch_repo!(context.tmp_dir, "provisional")
@@ -985,6 +989,7 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
       ensure_up!(repo, @external_attribution_version)
       ensure_up!(repo, @recovery_constraints_version)
       ensure_up!(repo, @cleanup_selector_version)
+      ensure_up!(repo, @domain_outbox_version)
     end)
   end
 
@@ -1118,6 +1123,7 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
   @external_attribution_version 20_260_825_000_500
   @recovery_constraints_version 20_260_825_000_600
   @cleanup_selector_version 20_260_831_000_100
+  @domain_outbox_version 20_260_904_000_100
   @migration_file Path.expand(
                     "../../fornacast/priv/repo/migrations/20260825000370_add_github_import_destination_status.exs",
                     __DIR__
@@ -1145,6 +1151,7 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
         assert migration_applied?(repo)
         assert Enum.all?(import_tables(), &table_exists?(repo, &1))
         ensure_latest_migrations_up!(repo)
+        assert [@domain_outbox_version] = migrate_down(repo, @domain_outbox_version)
         assert [@cleanup_selector_version] = migrate_down(repo, @cleanup_selector_version)
         assert [@recovery_constraints_version] = migrate_down(repo, @recovery_constraints_version)
         assert [@external_attribution_version] = migrate_down(repo, @external_attribution_version)
@@ -1176,6 +1183,7 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
         assert [@external_attribution_version] = migrate_up(repo, @external_attribution_version)
         assert [@recovery_constraints_version] = migrate_up(repo, @recovery_constraints_version)
         assert [@cleanup_selector_version] = migrate_up(repo, @cleanup_selector_version)
+        assert [@domain_outbox_version] = migrate_up(repo, @domain_outbox_version)
 
         assert migration_applied?(repo)
         assert Enum.all?(import_tables(), &table_exists?(repo, &1))
@@ -1211,6 +1219,7 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
       with_complete_restore(repo, fn ->
         clear_import_rows!(repo)
         ensure_latest_migrations_up!(repo)
+        assert [@domain_outbox_version] = migrate_down(repo, @domain_outbox_version)
         assert [@cleanup_selector_version] = migrate_down(repo, @cleanup_selector_version)
         assert [@recovery_constraints_version] = migrate_down(repo, @recovery_constraints_version)
         assert [@external_attribution_version] = migrate_down(repo, @external_attribution_version)
@@ -1230,6 +1239,7 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
         assert [@external_attribution_version] = migrate_up(repo, @external_attribution_version)
         assert [@recovery_constraints_version] = migrate_up(repo, @recovery_constraints_version)
         assert [@cleanup_selector_version] = migrate_up(repo, @cleanup_selector_version)
+        assert [@domain_outbox_version] = migrate_up(repo, @domain_outbox_version)
       end)
     else
       repo = start_scratch_repo!(context.tmp_dir, "destination-upgrade")
@@ -1586,6 +1596,7 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
     ensure_up!(repo, @external_attribution_version)
     ensure_up!(repo, @recovery_constraints_version)
     ensure_up!(repo, @cleanup_selector_version)
+    ensure_up!(repo, @domain_outbox_version)
   end
 
   defp with_complete_restore(repo, body) do
