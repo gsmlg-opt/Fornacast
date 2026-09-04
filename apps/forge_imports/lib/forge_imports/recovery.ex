@@ -49,11 +49,11 @@ defmodule ForgeImports.Recovery do
     end
   end
 
-  @spec reconcile(RepositoryItem.t(), keyword()) ::
+  @spec reconcile(RepositoryItem.t(), keyword() | map()) ::
           {:ok, RepositoryItem.t()} | {:error, atom()}
   def reconcile(%RepositoryItem{} = item, opts \\ []) do
-    facts = Keyword.get(opts, :durable_facts, gather_durable_facts(item))
-    now = Keyword.get(opts, :now, DateTime.utc_now(:second))
+    facts = get_opt(opts, :durable_facts, fn -> gather_durable_facts(item) end)
+    now = get_opt(opts, :now, fn -> DateTime.utc_now(:second) end)
 
     with {:ok, item} <- maybe_pause_missing_credential(item, now) do
       if item.state == :awaiting_credential do
@@ -109,12 +109,12 @@ defmodule ForgeImports.Recovery do
   end
 
   defp align_state(%RepositoryItem{state: state} = item, facts, now)
-       when state in [:git_staged, :staging_metadata, :ready_to_publish] do
+       when state in [:staging_git, :git_staged, :staging_metadata, :ready_to_publish] do
     case classify(item, facts) do
       {:ok, ^state} ->
         {:ok, item}
 
-      {:ok, target} when target in [:git_staged, :staging_metadata, :ready_to_publish] ->
+      {:ok, target} when target in [:queued, :git_staged, :staging_metadata, :ready_to_publish] ->
         transition_to_recovered_state(item, target, now)
 
       {:ok, _other} ->
@@ -128,26 +128,31 @@ defmodule ForgeImports.Recovery do
   defp align_state(item, _facts, _now), do: {:ok, item}
 
   defp transition_to_recovered_state(item, target, now) do
-    source_state =
-      case item.state do
-        :staging_metadata -> :staging_metadata
-        :ready_to_publish -> :ready_to_publish
-        _ -> :git_staged
-      end
+    source_state = item.state
 
     allowed =
       case target do
-        :git_staged -> source_state in [:git_staged, :staging_metadata, :ready_to_publish]
-        :staging_metadata -> source_state in [:staging_metadata, :ready_to_publish]
-        :ready_to_publish -> source_state == :ready_to_publish
-        _ -> false
+        :queued ->
+          source_state in [:staging_git, :git_staged, :staging_metadata, :ready_to_publish]
+
+        :git_staged ->
+          source_state in [:git_staged, :staging_metadata, :ready_to_publish]
+
+        :staging_metadata ->
+          source_state in [:staging_metadata, :ready_to_publish]
+
+        :ready_to_publish ->
+          source_state == :ready_to_publish
+
+        _ ->
+          false
       end
 
     if allowed do
       Persistence.update_without_lease(
         item,
         [source_state],
-        RepositoryItem.transition_changeset(item, target, %{}),
+        RepositoryItem.recovery_changeset(item, target, %{}),
         now
       )
     else
@@ -201,4 +206,18 @@ defmodule ForgeImports.Recovery do
     do: DateTime.compare(expires_at, now) == :gt
 
   defp live_lease?(_row, _now), do: false
+
+  defp get_opt(opts, key, default_fun) when is_list(opts) do
+    case Keyword.fetch(opts, key) do
+      {:ok, val} -> val
+      :error -> default_fun.()
+    end
+  end
+
+  defp get_opt(opts, key, default_fun) when is_map(opts) do
+    case Map.fetch(opts, key) do
+      {:ok, val} -> val
+      :error -> default_fun.()
+    end
+  end
 end

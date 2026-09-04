@@ -772,19 +772,24 @@ defmodule ForgeImports.RepositoryPublisher do
   defp expected_replacement(_attempt), do: {:error, :destination_changed}
 
   defp final_settings(item) do
-    source = item.source_metadata
+    source = item.source_metadata || %{}
     default_branch = item.source_git["default_branch"]
 
     if (is_nil(source["description"]) or is_binary(source["description"])) and
          is_binary(default_branch) and default_branch != "" and
-         is_boolean(source["has_issues"]) and is_boolean(source["allow_merge_commit"]) and
+         (is_nil(source["has_issues"]) or is_boolean(source["has_issues"])) and
+         (is_nil(source["allow_merge_commit"]) or is_boolean(source["allow_merge_commit"])) and
          item.destination_visibility in [:private, :public] do
       {:ok,
        %{
          description: source["description"],
          default_branch: default_branch,
-         has_issues: source["has_issues"],
-         allow_merge_commit: source["allow_merge_commit"]
+         has_issues: if(is_boolean(source["has_issues"]), do: source["has_issues"], else: true),
+         allow_merge_commit:
+           if(is_boolean(source["allow_merge_commit"]),
+             do: source["allow_merge_commit"],
+             else: true
+           )
        }}
     else
       {:error, :destination_changed}

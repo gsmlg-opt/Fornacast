@@ -18,12 +18,10 @@ defmodule ForgeImports.RepositoryWorker do
     ImportRun,
     OneTimeCredential,
     Persistence,
-    Recovery,
     ReportEntry,
     RepositoryItem,
     RepositoryStager,
-    Telemetry,
-    Waits
+    Telemetry
   }
 
   alias ForgeImports.GitHub.{Client, MetadataImporter}
@@ -96,8 +94,7 @@ defmodule ForgeImports.RepositoryWorker do
   def stage(repository_item_id, opts)
       when is_integer(repository_item_id) and repository_item_id > 0 and is_list(opts) do
     with {:ok, options} <- options(opts),
-         {:ok, mode} <- preflight_mode(repository_item_id, options),
-         {:ok, _} <- maybe_recover_item(repository_item_id, options) do
+         {:ok, mode} <- preflight_mode(repository_item_id, options) do
       stage_in_mode(repository_item_id, options, mode)
     else
       {:error, reason} -> {:error, reason}
@@ -105,15 +102,6 @@ defmodule ForgeImports.RepositoryWorker do
   end
 
   def stage(_repository_item_id, _opts), do: {:error, :invalid_request}
-
-  defp maybe_recover_item(repository_item_id, opts) do
-    case Repo.get(RepositoryItem, repository_item_id) do
-      %RepositoryItem{} = item -> Recovery.reconcile(item, opts)
-      nil -> {:error, :not_found}
-    end
-  rescue
-    _error in [Turso.Error, DBConnection.ConnectionError] -> {:error, :persistence_unavailable}
-  end
 
   defp stage_in_mode(repository_item_id, options, :normal) do
     case activate_destination(repository_item_id) do
@@ -190,7 +178,7 @@ defmodule ForgeImports.RepositoryWorker do
              &metadata_checkout(actor, run, item, &1, options),
              metadata_importer_options(item, options)
            ),
-         {:ok, updated} <- persist_ready_to_publish(capability) do
+         {:ok, updated} <- persist_ready_to_publish(item) do
       {:ok, updated}
     else
       true -> persist_cancellation(capability)
@@ -236,14 +224,14 @@ defmodule ForgeImports.RepositoryWorker do
           )
       end
 
-    receive_checkout_result(checkout, reference)
+    receive_metadata_result(checkout, reference)
   end
 
   defp metadata_importer_options(item, options) do
     [
       gate_key: {:one_time_run, item.import_run_id},
-      client: Keyword.get(options, :client, Client),
-      client_options: Keyword.get(options, :client_options, [])
+      client: Map.get(options, :client, Client),
+      client_options: Map.get(options, :client_options, [])
     ]
   end
 
@@ -269,14 +257,14 @@ defmodule ForgeImports.RepositoryWorker do
     end
   end
 
-  defp persist_ready_to_publish(capability) do
+  defp persist_ready_to_publish(item) do
     now = DateTime.utc_now(:second)
 
     query =
       from candidate in RepositoryItem,
         where:
-          candidate.id == ^capability.id and candidate.lock_version == ^capability.lock_version and
-            candidate.lease_owner == ^capability.lease_owner and candidate.lease_expires_at > ^now and
+          candidate.id == ^item.id and candidate.lock_version == ^item.lock_version and
+            candidate.lease_owner == ^item.lease_owner and candidate.lease_expires_at > ^now and
             candidate.state == :staging_metadata and is_nil(candidate.cleanup_state)
 
     case Repo.update_all(query,
@@ -290,7 +278,7 @@ defmodule ForgeImports.RepositoryWorker do
            ],
            inc: [lock_version: 1]
          ) do
-      {1, _rows} -> {:ok, Repo.get!(RepositoryItem, capability.id)}
+      {1, _rows} -> {:ok, Repo.get!(RepositoryItem, item.id)}
       {0, _rows} -> {:error, :lost_lease}
     end
   end
@@ -1019,6 +1007,20 @@ defmodule ForgeImports.RepositoryWorker do
   defp receive_checkout_result({:error, reason}, _reference),
     do: {:error, normalize_credential_error(reason)}
 
+  defp receive_metadata_result({:ok, :acknowledged}, reference) do
+    receive do
+      {^reference, result} -> result
+    after
+      0 -> {:error, :credential_service_unavailable}
+    end
+  end
+
+  defp receive_metadata_result({:ok, :ok}, reference),
+    do: receive_metadata_result({:ok, :acknowledged}, reference)
+
+  defp receive_metadata_result({:error, reason}, _reference),
+    do: {:error, normalize_credential_error(reason)}
+
   defp invoke_remote(item, request, action, pat, options) do
     remote_options =
       options.remote_options ++
@@ -1447,27 +1449,66 @@ defmodule ForgeImports.RepositoryWorker do
 
   defp pause_for_credential(capability, reason) do
     wait_reason = credential_wait_reason(reason)
-    now = DateTime.utc_now(:second)
 
-    with %ImportRun{} = run <- Repo.get(ImportRun, capability.import_run_id),
-         %RepositoryItem{} = item <- Repo.get(RepositoryItem, capability.id),
-         true <- item.lease_owner == capability.lease_owner,
-         true <- live_lease?(item, now) do
-      case Waits.awaiting_credential(run, item, item.state,
-             wait_reason: wait_reason,
-             now: now
-           ) do
-        {:ok, _} -> {:error, :awaiting_credential}
-        {:error, :stale} -> {:error, :lost_lease}
-        {:error, :lost_lease} -> {:error, :lost_lease}
-        {:error, _reason} -> {:error, :persistence_unavailable}
-      end
-    else
-      _ -> {:error, :lost_lease}
+    transaction = fn ->
+      Repo.transaction(fn ->
+        with %ImportRun{} = run <- locked_run(capability.import_run_id),
+             %RepositoryItem{} = item <- locked_owned_item(capability),
+             :ok <- after_settlement_locks(:credential_pause),
+             now <- DateTime.utc_now(:second),
+             true <- live_lease?(item, now),
+             {:ok, _run} <- pause_run_for_credential(run, wait_reason, now),
+             {:ok, _item} <-
+               OperationLease.update_owned(RepositoryItem, item,
+                 state: :awaiting_credential,
+                 wait_reason: wait_reason,
+                 next_attempt_at: nil
+               ) do
+          :awaiting_credential
+        else
+          nil -> Repo.rollback(:lost_lease)
+          false -> Repo.rollback(:lost_lease)
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+    end
+
+    case Persistence.with_retry(transaction) do
+      {:ok, :awaiting_credential} -> {:error, :awaiting_credential}
+      {:error, :lost_lease} -> {:error, :lost_lease}
+      {:error, _reason} -> {:error, :persistence_unavailable}
     end
   rescue
     _error in Turso.Error -> {:error, :persistence_unavailable}
   end
+
+  defp locked_owned_item(capability) do
+    RepositoryItem
+    |> where(
+      [item],
+      item.id == ^capability.id and item.import_run_id == ^capability.import_run_id and
+        item.lock_version == ^capability.lock_version and
+        item.lease_owner == ^capability.lease_owner and
+        item.state in [:staging_git, :git_staged, :staging_metadata]
+    )
+    |> maybe_lock()
+    |> Repo.one()
+  end
+
+  defp pause_run_for_credential(%ImportRun{state: :running} = run, wait_reason, now) do
+    changeset =
+      ImportRun.transition_changeset(run, :awaiting_credential, %{
+        wait_reason: wait_reason,
+        next_attempt_at: nil
+      })
+
+    Persistence.update_without_lease(run, [:running], changeset, now)
+  end
+
+  defp pause_run_for_credential(%ImportRun{state: :awaiting_credential} = run, _reason, _now),
+    do: {:ok, run}
+
+  defp pause_run_for_credential(_run, _reason, _now), do: {:error, :lost_lease}
 
   defp credential_wait_reason(:invalid_credential), do: "credential_invalid"
   defp credential_wait_reason(:credential_changed), do: "credential_changed"
@@ -1501,7 +1542,8 @@ defmodule ForgeImports.RepositoryWorker do
              where:
                item.id == ^item_id and item.lease_owner == ^owner and
                  item.lease_expires_at > ^now and item.selected == true and
-                 item.state == :staging_git and is_nil(item.cleanup_state) and
+                 item.state in [:staging_git, :git_staged, :staging_metadata] and
+                 is_nil(item.cleanup_state) and
                  run.state in [:running, :cancel_requested] and actor.kind == :user and
                  actor.state == :active and
                  identity.kind == :user and not is_nil(identity.last_verified_at) and
@@ -1810,6 +1852,8 @@ defmodule ForgeImports.RepositoryWorker do
     scan_options = Keyword.get(opts, :scan_options, [])
     persistence_hook = Keyword.get(opts, :persistence_hook)
     keyring = Keyword.get(opts, :keyring, Fornacast.Config.github_credential_keyring())
+    client = Keyword.get(opts, :client, Client)
+    client_options = Keyword.get(opts, :client_options, [])
 
     if is_binary(owner) and byte_size(owner) in 1..255 and String.valid?(owner) and
          is_integer(lease_seconds) and lease_seconds in 2..@max_lease_seconds and is_atom(remote) and
@@ -1819,7 +1863,8 @@ defmodule ForgeImports.RepositoryWorker do
          Keyword.keyword?(scan_options) and
          (is_nil(persistence_hook) or is_function(persistence_hook, 0)) and
          not Keyword.has_key?(remote_options, :cancel?) and
-         not Keyword.has_key?(remote_options, :heartbeat) do
+         not Keyword.has_key?(remote_options, :heartbeat) and
+         is_atom(client) and Code.ensure_loaded?(client) and Keyword.keyword?(client_options) do
       {:ok,
        %{
          owner: owner,
@@ -1828,7 +1873,9 @@ defmodule ForgeImports.RepositoryWorker do
          remote_options: remote_options,
          scan_options: scan_options,
          persistence_hook: persistence_hook,
-         keyring: keyring
+         keyring: keyring,
+         client: client,
+         client_options: client_options
        }}
     else
       {:error, :invalid_request}

@@ -96,7 +96,7 @@ defmodule ForgeImports.Cancellation do
              select: {item.state, run.state}
          ) do
       {:publishing, _} -> false
-      {:staging_git, :running} -> false
+      {state, :running} when state in [:staging_git, :git_staged, :staging_metadata] -> false
       _ -> true
     end
   rescue

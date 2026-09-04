@@ -129,6 +129,12 @@ defmodule ForgeImports.RepositoryItem do
     ],
     cancel_requested: [:canceled, :published, :completed]
   }
+  @recovery_transitions %{
+    staging_git: [:queued],
+    git_staged: [:queued],
+    staging_metadata: [:queued, :git_staged],
+    ready_to_publish: [:queued, :git_staged, :staging_metadata]
+  }
 
   @derive {Inspect,
            except: [
@@ -640,12 +646,32 @@ defmodule ForgeImports.RepositoryItem do
 
   def transition_changeset(item, _target, _attrs), do: invalid_transition(item, "is invalid")
 
+  def recovery_changeset(item, target, attrs \\ %{})
+
+  def recovery_changeset(item, target, attrs) when is_atom(target) and is_map(attrs) do
+    allowed_targets =
+      Map.get(@recovery_transitions, item.state, []) ++
+        Map.get(@transitions, item.state, [])
+
+    build_transition_changeset(item, target, attrs,
+      clear_lease?: true,
+      allowed_targets: allowed_targets
+    )
+  end
+
+  def recovery_changeset(item, _target, _attrs), do: invalid_transition(item, "is invalid")
+
   defp build_transition_changeset(item, target, attrs, options) do
+    allowed_targets =
+      Keyword.get_lazy(options, :allowed_targets, fn ->
+        Map.get(@transitions, item.state, [])
+      end)
+
     cond do
       item.state in @terminal_states ->
         invalid_transition(item, "terminal items are immutable")
 
-      target not in Map.get(@transitions, item.state, []) ->
+      target not in allowed_targets ->
         invalid_transition(item, "is not an allowed transition")
 
       not coherent_resume_target?(item, target) ->
