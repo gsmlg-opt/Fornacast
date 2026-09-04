@@ -32,7 +32,14 @@ Implemented first-release paths:
 - A separate GitHub-compatible REST listener (`/api/v3`), started with the web application.
 - Read-only GraphQL (`/api/graphql`) and public discovery (`/.well-known/fornacast`) on the API listener.
 
-Out of scope for this release: CI, packages, LFS, mirrors, and forks.
+Out of scope for this release: CI, packages, LFS, permanent mirrors, and forks.
+The GitHub importer remains a one-time bootstrap path.
+
+## Roadmap
+
+Two-way GitHub organization mirroring is planned after v0.2.2. The permanent
+mirror domain will be separate from the bootstrap importer. GitHub wiki
+repositories and release asset binaries remain excluded from synchronization.
 
 ## Architecture
 
@@ -43,6 +50,9 @@ Fornacast is an Elixir **umbrella** released as a single OTP release named `forn
 | `fornacast` | Shared infra: Ecto repo/migrations, Concord config store, setup, audit, storage paths |
 | `forge_accounts` | Users, organizations, passwords, SSH keys, API keys/scopes |
 | `forge_repos` | Repositories, collaborators, authorization (`Fornacast.Access`) |
+| `forge_github` | GitHub provider authentication, transport, and webhook primitives |
+| `forge_imports` | One-time GitHub repository and organization bootstrap |
+| `forge_mirrors` | Provider-neutral organization/repository mirror policy and durable state |
 | `git_core` | Git read/write API via Rustler NIF (gitoxide) |
 | `git_transport` | OTP SSH daemon (`upload-pack` / `receive-pack`) |
 | `fornacast_web` | Phoenix HTML UI, Git-over-HTTP, DuskMoon assets |

@@ -11,6 +11,10 @@ Fornacast is a small self-hosted Git forge. First-release scope is intentionally
 - Elixir **umbrella** monorepo under `apps/`, released as a single OTP release named `fornacast`.
 - Domain contexts (`forge_accounts`, `forge_repos`) own Ecto schemas and business rules.
 - Shared infra (`fornacast`) owns `Fornacast.Repo`, migrations, Concord-backed config (`Fornacast.ConfigStore`), storage paths, setup, and audit.
+- `forge_imports` is a one-time bootstrap subsystem; its tables are not permanent mirror state.
+- `forge_github` owns GitHub provider authentication, transport, and webhook primitives.
+- `forge_mirrors` owns provider-neutral organization/repository mirror policy and durable state.
+- Domain apps will emit through `Fornacast.DomainOutbox`; they must never call `ForgeMirrors` directly.
 - Presentation is split: Phoenix web (`fornacast_web`) and a separate Bandit REST listener (`fornacast_api`).
 - Git I/O: Rust NIF over gitoxide (`git_core`) + Erlang/OTP SSH daemon (`git_transport`).
 - **PostgreSQL 17 is the supported/default domain database** for development,
@@ -18,7 +22,11 @@ Fornacast is a small self-hosted Git forge. First-release scope is intentionally
 - App-level key/value config uses **Concord's separate embedded Turso/VSR
   configuration store**. It is not the Ecto domain database.
 
-Out of scope for v0.1: CI, packages, LFS, mirrors, forks. Force-push and branch/tag deletion are rejected by write-side policy.
+Permanent GitHub organization mirroring is post-v0.2.2. The bootstrap importer
+remains one-time only, and GitHub wiki repositories and release asset binaries
+remain excluded from synchronization. CI, packages, LFS, mirrors, and forks
+remain outside the current release scope. Force-push and branch/tag deletion
+are rejected by write-side policy.
 
 ## 2. Quick Start / Local Environment
 
