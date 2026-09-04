@@ -90,6 +90,53 @@ defmodule ForgeGitHub.WebhookProcessorTest do
     assert persisted.github_account_login == "canonical"
   end
 
+  test "installation creation confirms the durable actor-bound intent from signed sender evidence" do
+    parent = self()
+    now = ~U[2026-09-05 01:02:03Z]
+
+    payload = %{
+      "action" => "created",
+      "installation" => %{"id" => 44},
+      "sender" => %{"id" => 777}
+    }
+
+    assert :defer =
+             delivery("installation", "created", payload)
+             |> ForgeGitHub.WebhookProcessor.process(
+               config_fetch: fn -> {:ok, :config} end,
+               installation_fetch: fn :config, 44 -> {:ok, installation()} end,
+               now: fn -> now end,
+               installation_confirm: fn 44, 777, ^now ->
+                 send(parent, :installation_intent_confirmed)
+                 {:ok, :unclaimed}
+               end,
+               inventory_schedule: fn 44, _delivery_guid -> {:ok, :deferred} end,
+               token_invalidate: fn 44 -> :ok end
+             )
+
+    assert_receive :installation_intent_confirmed
+  end
+
+  test "installation creation requires a signed sender identity" do
+    payload = %{"action" => "created", "installation" => %{"id" => 44}}
+
+    assert {:fail, "invalid_webhook_payload"} =
+             delivery("installation", "created", payload)
+             |> ForgeGitHub.WebhookProcessor.process(
+               config_fetch: fn -> {:ok, :config} end,
+               installation_fetch: fn :config, 44 -> {:ok, installation()} end,
+               installation_confirm: fn _installation_id, _sender_id, _now ->
+                 flunk("missing sender evidence must not confirm an intent")
+               end,
+               inventory_schedule: fn _installation_id, _delivery_guid ->
+                 flunk("invalid installation creation must not schedule inventory")
+               end,
+               token_invalidate: fn _installation_id ->
+                 flunk("invalid installation creation must not invalidate tokens")
+               end
+             )
+  end
+
   test "processable inventory delivery remains deferred until an installation is bound" do
     canonical = installation()
 

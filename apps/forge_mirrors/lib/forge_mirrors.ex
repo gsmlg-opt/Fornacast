@@ -78,6 +78,45 @@ defmodule ForgeMirrors do
 
   def get_github_app_installation(_installation_id), do: {:error, :invalid_argument}
 
+  @doc false
+  def begin_github_installation(actor, organization_id, state_digest, now, expires_at),
+    do:
+      ForgeMirrors.InstallationIntents.begin(
+        actor,
+        organization_id,
+        state_digest,
+        now,
+        expires_at
+      )
+
+  @doc false
+  def record_github_installation_callback(
+        actor,
+        organization_id,
+        state_digest,
+        installation_id,
+        setup_action,
+        now
+      ),
+      do:
+        ForgeMirrors.InstallationIntents.record_callback(
+          actor,
+          organization_id,
+          state_digest,
+          installation_id,
+          setup_action,
+          now
+        )
+
+  @doc false
+  def confirm_github_installation_webhook(installation_id, sender_github_user_id, now),
+    do:
+      ForgeMirrors.InstallationIntents.confirm_webhook(
+        installation_id,
+        sender_github_user_id,
+        now
+      )
+
   @spec suspend_github_app_installation(pos_integer(), DateTime.t()) ::
           {:ok, GitHubAppInstallation.t()}
           | {:error, :not_found | :invalid_argument | :invalid_transition}
@@ -712,6 +751,16 @@ defmodule ForgeMirrors do
 
   def get_organization_mirror_for_organization(_organization_id, _provider),
     do: {:error, :invalid_argument}
+
+  @spec organization_settings(ForgeAccounts.User.t(), pos_integer()) ::
+          {:ok, map()} | {:error, term()}
+  def organization_settings(actor, organization_id),
+    do: ForgeMirrors.Settings.view(actor, organization_id)
+
+  @spec update_organization_settings(ForgeAccounts.User.t(), pos_integer(), map()) ::
+          {:ok, OrganizationMirror.t()} | {:error, term()}
+  def update_organization_settings(actor, organization_id, attrs),
+    do: ForgeMirrors.Settings.update(actor, organization_id, attrs)
 
   @spec update_organization_mirror(ForgeAccounts.User.t(), OrganizationMirror.t(), map()) ::
           {:ok, OrganizationMirror.t()}

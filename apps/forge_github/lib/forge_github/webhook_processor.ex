@@ -54,9 +54,9 @@ defmodule ForgeGitHub.WebhookProcessor do
   defp dispatch(%{event: "installation", action: "deleted"} = delivery, payload, options),
     do: process_installation_deletion(delivery, payload, options)
 
-  defp dispatch(%{event: event} = delivery, _payload, options)
+  defp dispatch(%{event: event} = delivery, payload, options)
        when event in ["installation", "installation_repositories"],
-       do: refetch_installation(delivery, options)
+       do: refetch_installation(delivery, payload, options)
 
   defp dispatch(%{event: "repository"} = delivery, _payload, options) do
     case retain_inventory_trigger(delivery, options) do
@@ -69,7 +69,7 @@ defmodule ForgeGitHub.WebhookProcessor do
 
   defp dispatch(_delivery, _payload, _options), do: :ignore
 
-  defp refetch_installation(delivery, options) do
+  defp refetch_installation(delivery, payload, options) do
     config_fetch = Keyword.get(options, :config_fetch, &AppConfig.fetch/0)
 
     installation_fetch =
@@ -81,6 +81,7 @@ defmodule ForgeGitHub.WebhookProcessor do
          {:ok, %AppInstallation{} = installation} <-
            safe_call(installation_fetch, [config, delivery.installation_id]),
          {:ok, _persisted} <- observe(installation_attrs(installation, now), options),
+         :ok <- confirm_installation_intent(delivery, payload, now, options),
          {:ok, inventory_retention} <- retain_inventory_trigger(delivery, options),
          :ok <- invalidate_token(delivery.installation_id, options) do
       case inventory_retention do
@@ -110,10 +111,47 @@ defmodule ForgeGitHub.WebhookProcessor do
       {:error, :inventory_unavailable} ->
         {:retry, "inventory_trigger_unavailable", 30}
 
+      {:error, :invalid_webhook_sender} ->
+        {:fail, "invalid_webhook_payload"}
+
+      {:error, :installation_intent_unavailable} ->
+        {:retry, "installation_intent_unavailable", 30}
+
       _invalid ->
         {:retry, "processor_dependency_unavailable", 30}
     end
   end
+
+  defp confirm_installation_intent(
+         %{event: "installation", action: "created", installation_id: installation_id},
+         payload,
+         now,
+         options
+       ) do
+    confirmer =
+      Keyword.get(
+        options,
+        :installation_confirm,
+        &ForgeMirrors.confirm_github_installation_webhook/3
+      )
+
+    with sender_id when is_integer(sender_id) and sender_id > 0 <-
+           get_in(payload, ["sender", "id"]),
+         {:ok, _result} <- safe_call(confirmer, [installation_id, sender_id, now]) do
+      :ok
+    else
+      nil ->
+        {:error, :invalid_webhook_sender}
+
+      sender_id when not is_integer(sender_id) or sender_id <= 0 ->
+        {:error, :invalid_webhook_sender}
+
+      _unavailable ->
+        {:error, :installation_intent_unavailable}
+    end
+  end
+
+  defp confirm_installation_intent(_delivery, _payload, _now, _options), do: :ok
 
   defp process_installation_deletion(delivery, payload, options) do
     with %{"installation" => installation_payload} <- payload,
