@@ -549,6 +549,8 @@ end
 defmodule ForgeImports.ImportPersistenceMigrationTestSupport do
   @moduledoc false
 
+  import ExUnit.Assertions, only: [assert: 1]
+
   @import_tables [
     "github_import_report_entries",
     "github_import_page_checkpoints",
@@ -589,6 +591,50 @@ defmodule ForgeImports.ImportPersistenceMigrationTestSupport do
 
   def dual_failure_diagnostic, do: @dual_failure_diagnostic
 
+  def with_migration_cycle(repo, migration_sources, boundary_version, body)
+      when is_integer(boundary_version) and is_function(body, 1) do
+    migrations = Ecto.Migrator.migrations(repo, migration_sources)
+
+    assert {:up, ^boundary_version, _name} =
+             Enum.find(migrations, &(elem(&1, 1) == boundary_version))
+
+    newer_versions =
+      for {:up, version, _name} <- migrations,
+          version > boundary_version,
+          do: version
+
+    with_restore(
+      fn -> body.(newer_versions) end,
+      fn ->
+        restore_migrations_exact!(repo, migration_sources, [boundary_version | newer_versions])
+      end
+    )
+  end
+
+  def migrate_down_exact!(repo, migration_sources, versions) do
+    versions
+    |> Enum.sort(:desc)
+    |> Enum.each(fn version ->
+      assert [^version] =
+               Ecto.Migrator.run(repo, migration_sources, :down,
+                 to: version,
+                 log: false
+               )
+    end)
+  end
+
+  def migrate_up_exact!(repo, migration_sources, versions) do
+    versions
+    |> Enum.sort()
+    |> Enum.each(fn version ->
+      assert [^version] =
+               Ecto.Migrator.run(repo, migration_sources, :up,
+                 to: version,
+                 log: false
+               )
+    end)
+  end
+
   def foreign_key_states(repo, count) do
     parent = self()
 
@@ -625,6 +671,16 @@ defmodule ForgeImports.ImportPersistenceMigrationTestSupport do
     Task.await_many(tasks, 5_000)
   end
 
+  defp restore_migrations_exact!(repo, migration_sources, versions) do
+    applied_versions =
+      for {:up, version, _name} <- Ecto.Migrator.migrations(repo, migration_sources),
+          into: MapSet.new(),
+          do: version
+
+    missing_versions = Enum.reject(versions, &MapSet.member?(applied_versions, &1))
+    migrate_up_exact!(repo, migration_sources, missing_versions)
+  end
+
   defp capture_outcome(fun) do
     try do
       {:ok, fun.()}
@@ -654,14 +710,7 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
   @pre_provisional_version 20_260_825_000_350
   @provisional_version 20_260_825_000_360
   @destination_version 20_260_825_000_370
-  @repository_lifecycle_version 20_260_825_000_400
-  @repository_write_version 20_260_825_000_410
-  @staged_path_version 20_260_825_000_420
-  @cleanup_recovery_version 20_260_825_000_430
-  @external_attribution_version 20_260_825_000_500
-  @recovery_constraints_version 20_260_825_000_600
   @cleanup_selector_version 20_260_831_000_100
-  @domain_outbox_version 20_260_904_000_100
   @run_scoped_indexes [
     {"github_import_items_run_id_index", "github_import_repository_items"},
     {"github_import_reports_run_id_index", "github_import_report_entries"}
@@ -694,35 +743,85 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
   end
 
   @tag :tmp_dir
+  test "migration cycles discover and restore a future applied migration", context do
+    if postgres?() do
+      repo = start_migration_repo!()
+      future_version = 20_991_231_235_959
+      future_migrations_path = Path.join(context.tmp_dir, "future-migrations")
+      File.mkdir_p!(future_migrations_path)
+
+      File.write!(
+        Path.join(future_migrations_path, "#{future_version}_future_import_cycle.exs"),
+        """
+        defmodule ForgeImports.ImportPersistenceFutureMigration do
+          use Ecto.Migration
+
+          def change, do: :ok
+        end
+        """
+      )
+
+      migration_paths = [migrations_path(), future_migrations_path]
+
+      existing_versions =
+        for {:up, version, _name} <- Ecto.Migrator.migrations(repo, migration_paths),
+            version > @cleanup_selector_version,
+            do: version
+
+      assert [^future_version] =
+               Ecto.Migrator.run(repo, migration_paths, :up,
+                 to: future_version,
+                 log: false
+               )
+
+      assert_raise RuntimeError, "injected future migration failure", fn ->
+        ForgeImports.ImportPersistenceMigrationTestSupport.with_migration_cycle(
+          repo,
+          migration_paths,
+          @cleanup_selector_version,
+          fn versions ->
+            assert versions == existing_versions ++ [future_version]
+
+            ForgeImports.ImportPersistenceMigrationTestSupport.migrate_down_exact!(
+              repo,
+              migration_paths,
+              versions
+            )
+
+            raise "injected future migration failure"
+          end
+        )
+      end
+
+      assert {:up, ^future_version, _name} =
+               Enum.find(
+                 Ecto.Migrator.migrations(repo, migration_paths),
+                 &(elem(&1, 1) == future_version)
+               )
+
+      assert [^future_version] =
+               Ecto.Migrator.run(repo, migration_paths, :down,
+                 to: future_version,
+                 log: false
+               )
+    end
+  end
+
+  @tag :tmp_dir
   test "00360 independently preserves index shape and has an exact lifecycle", context do
     if postgres?() do
       repo = start_migration_repo!()
 
-      with_complete_restore(repo, fn ->
+      with_complete_restore(repo, fn newer_versions ->
         clear_import_rows!(repo)
-        ensure_up!(repo, @provisional_version)
-        ensure_up!(repo, @destination_version)
-        ensure_up!(repo, @repository_lifecycle_version)
-        ensure_up!(repo, @repository_write_version)
-        ensure_up!(repo, @staged_path_version)
-        ensure_up!(repo, @cleanup_recovery_version)
-        ensure_up!(repo, @external_attribution_version)
-        ensure_up!(repo, @recovery_constraints_version)
-        ensure_up!(repo, @cleanup_selector_version)
-        ensure_up!(repo, @domain_outbox_version)
+        assert [@destination_version | remaining_versions] = newer_versions
 
-        assert [@domain_outbox_version] = migrate_down(repo, @domain_outbox_version)
-        assert [@cleanup_selector_version] = migrate_down(repo, @cleanup_selector_version)
-        assert [@recovery_constraints_version] = migrate_down(repo, @recovery_constraints_version)
-        assert [@external_attribution_version] = migrate_down(repo, @external_attribution_version)
-        assert [@cleanup_recovery_version] = migrate_down(repo, @cleanup_recovery_version)
-        assert [@staged_path_version] = migrate_down(repo, @staged_path_version)
-        assert [@repository_write_version] = migrate_down(repo, @repository_write_version)
+        ForgeImports.ImportPersistenceMigrationTestSupport.migrate_down_exact!(
+          repo,
+          migrations_path(),
+          newer_versions
+        )
 
-        assert [@repository_lifecycle_version] =
-                 migrate_down(repo, @repository_lifecycle_version)
-
-        assert [@destination_version] = migrate_down(repo, @destination_version)
         assert_provisional_schema!(repo)
         assert [@provisional_version] = migrate_down(repo, @provisional_version)
         refute column_exists?(repo, "github_import_runs", "source_metadata")
@@ -736,14 +835,11 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
         clear_import_rows!(repo)
         delete_seed_accounts!(repo, seeded)
 
-        assert [@repository_lifecycle_version] = migrate_up(repo, @repository_lifecycle_version)
-        assert [@repository_write_version] = migrate_up(repo, @repository_write_version)
-        assert [@staged_path_version] = migrate_up(repo, @staged_path_version)
-        assert [@cleanup_recovery_version] = migrate_up(repo, @cleanup_recovery_version)
-        assert [@external_attribution_version] = migrate_up(repo, @external_attribution_version)
-        assert [@recovery_constraints_version] = migrate_up(repo, @recovery_constraints_version)
-        assert [@cleanup_selector_version] = migrate_up(repo, @cleanup_selector_version)
-        assert [@domain_outbox_version] = migrate_up(repo, @domain_outbox_version)
+        ForgeImports.ImportPersistenceMigrationTestSupport.migrate_up_exact!(
+          repo,
+          migrations_path(),
+          remaining_versions
+        )
       end)
     else
       repo = start_scratch_repo!(context.tmp_dir, "provisional")
@@ -974,23 +1070,13 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
     if postgres?(), do: naive, else: NaiveDateTime.to_iso8601(naive)
   end
 
-  defp ensure_up!(repo, version) do
-    if migration_applied?(repo, version), do: [], else: migrate_up(repo, version)
-  end
-
   defp with_complete_restore(repo, body) do
-    ForgeImports.ImportPersistenceMigrationTestSupport.with_restore(body, fn ->
-      ensure_up!(repo, @provisional_version)
-      ensure_up!(repo, @destination_version)
-      ensure_up!(repo, @repository_lifecycle_version)
-      ensure_up!(repo, @repository_write_version)
-      ensure_up!(repo, @staged_path_version)
-      ensure_up!(repo, @cleanup_recovery_version)
-      ensure_up!(repo, @external_attribution_version)
-      ensure_up!(repo, @recovery_constraints_version)
-      ensure_up!(repo, @cleanup_selector_version)
-      ensure_up!(repo, @domain_outbox_version)
-    end)
+    ForgeImports.ImportPersistenceMigrationTestSupport.with_migration_cycle(
+      repo,
+      migrations_path(),
+      @provisional_version,
+      body
+    )
   end
 
   defp migrate_down(repo, version),
@@ -1116,14 +1202,6 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
 
   @moduletag :persistence
   @version 20_260_825_000_370
-  @repository_lifecycle_version 20_260_825_000_400
-  @repository_write_version 20_260_825_000_410
-  @staged_path_version 20_260_825_000_420
-  @cleanup_recovery_version 20_260_825_000_430
-  @external_attribution_version 20_260_825_000_500
-  @recovery_constraints_version 20_260_825_000_600
-  @cleanup_selector_version 20_260_831_000_100
-  @domain_outbox_version 20_260_904_000_100
   @migration_file Path.expand(
                     "../../fornacast/priv/repo/migrations/20260825000370_add_github_import_destination_status.exs",
                     __DIR__
@@ -1146,21 +1224,16 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
     repo = start_migration_repo!()
 
     if postgres?() do
-      with_complete_restore(repo, fn ->
+      with_complete_restore(repo, fn newer_versions ->
         clear_import_rows!(repo)
         assert migration_applied?(repo)
         assert Enum.all?(import_tables(), &table_exists?(repo, &1))
-        ensure_latest_migrations_up!(repo)
-        assert [@domain_outbox_version] = migrate_down(repo, @domain_outbox_version)
-        assert [@cleanup_selector_version] = migrate_down(repo, @cleanup_selector_version)
-        assert [@recovery_constraints_version] = migrate_down(repo, @recovery_constraints_version)
-        assert [@external_attribution_version] = migrate_down(repo, @external_attribution_version)
-        assert [@cleanup_recovery_version] = migrate_down(repo, @cleanup_recovery_version)
-        assert [@staged_path_version] = migrate_down(repo, @staged_path_version)
-        assert [@repository_write_version] = migrate_down(repo, @repository_write_version)
 
-        assert [@repository_lifecycle_version] =
-                 migrate_down(repo, @repository_lifecycle_version)
+        ForgeImports.ImportPersistenceMigrationTestSupport.migrate_down_exact!(
+          repo,
+          migrations_path(),
+          newer_versions
+        )
 
         assert [@version] = migrate_down(repo, @version)
 
@@ -1176,14 +1249,12 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
                )
 
         assert [@version] = migrate_up(repo, @version)
-        assert [@repository_lifecycle_version] = migrate_up(repo, @repository_lifecycle_version)
-        assert [@repository_write_version] = migrate_up(repo, @repository_write_version)
-        assert [@staged_path_version] = migrate_up(repo, @staged_path_version)
-        assert [@cleanup_recovery_version] = migrate_up(repo, @cleanup_recovery_version)
-        assert [@external_attribution_version] = migrate_up(repo, @external_attribution_version)
-        assert [@recovery_constraints_version] = migrate_up(repo, @recovery_constraints_version)
-        assert [@cleanup_selector_version] = migrate_up(repo, @cleanup_selector_version)
-        assert [@domain_outbox_version] = migrate_up(repo, @domain_outbox_version)
+
+        ForgeImports.ImportPersistenceMigrationTestSupport.migrate_up_exact!(
+          repo,
+          migrations_path(),
+          newer_versions
+        )
 
         assert migration_applied?(repo)
         assert Enum.all?(import_tables(), &table_exists?(repo, &1))
@@ -1216,30 +1287,23 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
     if postgres?() do
       repo = start_migration_repo!()
 
-      with_complete_restore(repo, fn ->
+      with_complete_restore(repo, fn newer_versions ->
         clear_import_rows!(repo)
-        ensure_latest_migrations_up!(repo)
-        assert [@domain_outbox_version] = migrate_down(repo, @domain_outbox_version)
-        assert [@cleanup_selector_version] = migrate_down(repo, @cleanup_selector_version)
-        assert [@recovery_constraints_version] = migrate_down(repo, @recovery_constraints_version)
-        assert [@external_attribution_version] = migrate_down(repo, @external_attribution_version)
-        assert [@cleanup_recovery_version] = migrate_down(repo, @cleanup_recovery_version)
-        assert [@staged_path_version] = migrate_down(repo, @staged_path_version)
-        assert [@repository_write_version] = migrate_down(repo, @repository_write_version)
 
-        assert [@repository_lifecycle_version] =
-                 migrate_down(repo, @repository_lifecycle_version)
+        ForgeImports.ImportPersistenceMigrationTestSupport.migrate_down_exact!(
+          repo,
+          migrations_path(),
+          newer_versions
+        )
 
         assert [@version] = migrate_down(repo, @version)
         assert_destination_backfill!(repo)
-        assert [@repository_lifecycle_version] = migrate_up(repo, @repository_lifecycle_version)
-        assert [@repository_write_version] = migrate_up(repo, @repository_write_version)
-        assert [@staged_path_version] = migrate_up(repo, @staged_path_version)
-        assert [@cleanup_recovery_version] = migrate_up(repo, @cleanup_recovery_version)
-        assert [@external_attribution_version] = migrate_up(repo, @external_attribution_version)
-        assert [@recovery_constraints_version] = migrate_up(repo, @recovery_constraints_version)
-        assert [@cleanup_selector_version] = migrate_up(repo, @cleanup_selector_version)
-        assert [@domain_outbox_version] = migrate_up(repo, @domain_outbox_version)
+
+        ForgeImports.ImportPersistenceMigrationTestSupport.migrate_up_exact!(
+          repo,
+          migrations_path(),
+          newer_versions
+        )
       end)
     else
       repo = start_scratch_repo!(context.tmp_dir, "destination-upgrade")
@@ -1581,28 +1645,13 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
     rows == [[version]]
   end
 
-  defp ensure_up!(repo, version) do
-    unless migration_applied?(repo, version) do
-      Ecto.Migrator.run(repo, migrations_path(), :up, to: version, log: false)
-    end
-  end
-
-  defp ensure_latest_migrations_up!(repo) do
-    ensure_up!(repo, @version)
-    ensure_up!(repo, @repository_lifecycle_version)
-    ensure_up!(repo, @repository_write_version)
-    ensure_up!(repo, @staged_path_version)
-    ensure_up!(repo, @cleanup_recovery_version)
-    ensure_up!(repo, @external_attribution_version)
-    ensure_up!(repo, @recovery_constraints_version)
-    ensure_up!(repo, @cleanup_selector_version)
-    ensure_up!(repo, @domain_outbox_version)
-  end
-
   defp with_complete_restore(repo, body) do
-    ForgeImports.ImportPersistenceMigrationTestSupport.with_restore(body, fn ->
-      ensure_latest_migrations_up!(repo)
-    end)
+    ForgeImports.ImportPersistenceMigrationTestSupport.with_migration_cycle(
+      repo,
+      migrations_path(),
+      @version,
+      body
+    )
   end
 
   defp column_exists?(repo, table, column) do
