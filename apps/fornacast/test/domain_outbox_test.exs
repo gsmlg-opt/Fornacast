@@ -98,6 +98,21 @@ defmodule Fornacast.DomainOutboxTest do
             }} = record_event(attrs)
   end
 
+  test "record_multi evaluates functional attributes once" do
+    parent = self()
+
+    assert {:ok, %{event: %DomainOutboxEvent{event_id: "functional-attrs"}}} =
+             Multi.new()
+             |> DomainOutbox.record_multi(:event, fn changes ->
+               send(parent, {:attributes_evaluated, changes})
+               event_attrs("functional-attrs")
+             end)
+             |> Repo.transaction()
+
+    assert_receive {:attributes_evaluated, %{}}
+    refute_receive {:attributes_evaluated, _changes}
+  end
+
   test "the PostgreSQL payload bound is mapped back to the payload field" do
     oversized_payload = %{
       "data" => :crypto.strong_rand_bytes(70_000) |> Base.encode64()
@@ -232,6 +247,96 @@ defmodule Fornacast.DomainOutboxTest do
   end
 
   @tag independent_connections: true
+  test "a later same-aggregate transaction cannot become claimable first" do
+    now = DateTime.utc_now(:second)
+    parent = self()
+
+    on_exit(fn ->
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn -> Repo.delete_all(DomainOutboxEvent) end)
+    end)
+
+    Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn -> Repo.delete_all(DomainOutboxEvent) end)
+
+    first_task =
+      start_paused_event(
+        parent,
+        event_attrs("same-aggregate-first") |> Map.put(:available_at, now)
+      )
+
+    assert_receive {:first_inserted, first_writer, first_event}, 2_000
+
+    second_task =
+      start_observed_event(
+        parent,
+        event_attrs("same-aggregate-second") |> Map.put(:available_at, now)
+      )
+
+    assert_receive {:second_started, second_backend_pid}, 2_000
+
+    second_state = await_blocked_or_finished(second_task, second_backend_pid)
+
+    early_claim =
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+        DomainOutbox.claim_batch("worker-a", now, 30, 1)
+      end)
+
+    send(first_writer, :commit_first)
+
+    assert {:ok, %{event: ^first_event, pause_before_commit: :released}} =
+             Task.await(first_task, 5_000)
+
+    second_result =
+      case second_state do
+        {:finished, result} -> result
+        :blocked -> Task.await(second_task, 5_000)
+        :not_observed -> Task.await(second_task, 5_000)
+      end
+
+    assert :blocked = second_state
+    assert {:ok, []} = early_claim
+    assert {:ok, %{event: second_event}} = second_result
+    assert first_event.id < second_event.id
+
+    assert {:ok, [%DomainOutboxEvent{id: first_id}]} =
+             Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+               DomainOutbox.claim_batch("worker-b", now, 30, 1)
+             end)
+
+    assert first_id == first_event.id
+  end
+
+  @tag independent_connections: true
+  test "different aggregates can record while one aggregate transaction is open" do
+    parent = self()
+
+    on_exit(fn ->
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn -> Repo.delete_all(DomainOutboxEvent) end)
+    end)
+
+    Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn -> Repo.delete_all(DomainOutboxEvent) end)
+
+    first_task = start_paused_event(parent, event_attrs("different-aggregate-first"))
+    assert_receive {:first_inserted, first_writer, first_event}, 2_000
+
+    second_task =
+      start_observed_event(
+        parent,
+        event_attrs("different-aggregate-second") |> Map.put(:aggregate_id, "43")
+      )
+
+    assert_receive {:second_started, second_backend_pid}, 2_000
+    second_state = await_blocked_or_finished(second_task, second_backend_pid)
+
+    send(first_writer, :commit_first)
+
+    assert {:ok, %{event: ^first_event, pause_before_commit: :released}} =
+             Task.await(first_task, 5_000)
+
+    assert {:finished, {:ok, %{event: second_event}}} = second_state
+    assert second_event.aggregate_id == "43"
+  end
+
+  @tag independent_connections: true
   test "concurrent claimers preserve ordering within one aggregate" do
     now = DateTime.utc_now(:second)
 
@@ -275,6 +380,69 @@ defmodule Fornacast.DomainOutboxTest do
     Multi.new()
     |> DomainOutbox.record_multi(:event, attrs)
     |> Repo.transaction()
+  end
+
+  defp start_paused_event(parent, attrs) do
+    Task.async(fn ->
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+        Multi.new()
+        |> DomainOutbox.record_multi(:event, attrs)
+        |> Multi.run(:pause_before_commit, fn _repo, %{event: event} ->
+          send(parent, {:first_inserted, self(), event})
+
+          receive do
+            :commit_first -> {:ok, :released}
+          after
+            10_000 -> {:error, :release_timeout}
+          end
+        end)
+        |> Repo.transaction()
+      end)
+    end)
+  end
+
+  defp start_observed_event(parent, attrs) do
+    Task.async(fn ->
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+        Multi.new()
+        |> Multi.run(:started, fn repo, _changes ->
+          %{rows: [[backend_pid]]} =
+            Ecto.Adapters.SQL.query!(repo, "select pg_backend_pid()", [])
+
+          send(parent, {:second_started, backend_pid})
+          {:ok, backend_pid}
+        end)
+        |> DomainOutbox.record_multi(:event, attrs)
+        |> Repo.transaction()
+      end)
+    end)
+  end
+
+  defp await_blocked_or_finished(task, backend_pid, attempts \\ 200)
+
+  defp await_blocked_or_finished(_task, _backend_pid, 0), do: :not_observed
+
+  defp await_blocked_or_finished(task, backend_pid, attempts) do
+    case Task.yield(task, 0) do
+      {:ok, result} ->
+        {:finished, result}
+
+      nil ->
+        blocked? =
+          Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+            %{rows: [[blocking_pids]]} =
+              Ecto.Adapters.SQL.query!(Repo, "select pg_blocking_pids($1)", [backend_pid])
+
+            blocking_pids != []
+          end)
+
+        if blocked? do
+          :blocked
+        else
+          Process.sleep(5)
+          await_blocked_or_finished(task, backend_pid, attempts - 1)
+        end
+    end
   end
 
   defp event_attrs(event_id) do

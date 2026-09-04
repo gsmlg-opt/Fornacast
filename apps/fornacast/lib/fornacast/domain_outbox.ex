@@ -12,9 +12,18 @@ defmodule Fornacast.DomainOutbox do
 
   @spec record_multi(Multi.t(), Multi.name(), map() | (map() -> map())) :: Multi.t()
   def record_multi(%Multi{} = multi, key, attrs) when is_map(attrs) or is_function(attrs, 1) do
-    Multi.insert(multi, key, fn changes ->
+    Multi.run(multi, key, fn repo, changes ->
       attrs = if is_function(attrs, 1), do: attrs.(changes), else: attrs
-      DomainOutboxEvent.record_changeset(%DomainOutboxEvent{}, attrs)
+      changeset = DomainOutboxEvent.record_changeset(%DomainOutboxEvent{}, attrs)
+
+      if changeset.valid? do
+        aggregate_type = Ecto.Changeset.get_field(changeset, :aggregate_type)
+        aggregate_id = Ecto.Changeset.get_field(changeset, :aggregate_id)
+        lock_aggregate(repo, aggregate_type, aggregate_id)
+        repo.insert(changeset)
+      else
+        {:error, changeset}
+      end
     end)
   end
 
@@ -199,6 +208,29 @@ defmodule Fornacast.DomainOutbox do
 
   defp transition_owned(_event, _now, _target_state, _updates),
     do: {:error, :invalid_argument}
+
+  defp lock_aggregate(repo, aggregate_type, aggregate_id) do
+    canonical_key =
+      IO.iodata_to_binary([
+        Integer.to_string(byte_size(aggregate_type)),
+        ":",
+        aggregate_type,
+        Integer.to_string(byte_size(aggregate_id)),
+        ":",
+        aggregate_id
+      ])
+
+    # PostgreSQL hashes the collision-free canonical key to a signed 64-bit advisory-lock key.
+    # A hash collision can only serialize unrelated aggregates; it cannot weaken ordering.
+    Ecto.Adapters.SQL.query!(
+      repo,
+      "select pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+      [canonical_key],
+      log: false
+    )
+
+    :ok
+  end
 
   defp validate_owner(owner) do
     if byte_size(owner) in 1..255 and owner == String.trim(owner),
