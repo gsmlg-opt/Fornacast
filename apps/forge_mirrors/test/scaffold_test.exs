@@ -1,14 +1,20 @@
 defmodule ForgeMirrors.ScaffoldTest do
   use ExUnit.Case, async: true
 
-  test "application starts without synchronization workers" do
+  test "application starts the bounded coordinator tree" do
     supervisor = Process.whereis(ForgeMirrors.Supervisor)
 
     assert is_pid(supervisor)
-    assert [] = Supervisor.which_children(supervisor)
+
+    children = Supervisor.which_children(supervisor)
+    assert length(children) == 4
+    assert is_pid(Process.whereis(ForgeMirrors.TaskSupervisor))
+    assert is_pid(Process.whereis(ForgeMirrors.OperationReconciler))
+    assert is_pid(Process.whereis(ForgeMirrors.OutboxDispatcher))
+    assert is_pid(Process.whereis(ForgeMirrors.PeriodicReconciler))
   end
 
-  test "context exposes only compile-time mirror boundary types" do
+  test "context keeps provider-neutral mirror boundary types" do
     assert {:ok, types} = Code.Typespec.fetch_types(ForgeMirrors)
 
     assert types

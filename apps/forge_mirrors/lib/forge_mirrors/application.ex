@@ -5,6 +5,13 @@ defmodule ForgeMirrors.Application do
 
   @impl true
   def start(_type, _args) do
-    Supervisor.start_link([], strategy: :one_for_one, name: ForgeMirrors.Supervisor)
+    children = [
+      {Task.Supervisor, name: ForgeMirrors.TaskSupervisor},
+      ForgeMirrors.OperationReconciler,
+      ForgeMirrors.OutboxDispatcher,
+      ForgeMirrors.PeriodicReconciler
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: ForgeMirrors.Supervisor)
   end
 end

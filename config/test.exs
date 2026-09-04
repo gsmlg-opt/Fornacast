@@ -5,6 +5,11 @@ config :forge_imports,
   recovery_max_concurrency: 1,
   repository_cleanup_enabled: false
 
+config :forge_mirrors,
+  operation_reconciler_enabled: false,
+  outbox_dispatcher_enabled: false,
+  periodic_reconciler_enabled: false
+
 config :git_core, :limits,
   scan_concurrency: 4,
   scan_deadline_ms: 30_000,
