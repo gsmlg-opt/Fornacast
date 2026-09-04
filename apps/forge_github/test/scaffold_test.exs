@@ -1,11 +1,19 @@
 defmodule ForgeGitHub.ScaffoldTest do
   use ExUnit.Case, async: true
 
-  test "application starts without provider workers" do
+  test "application starts only bounded provider authentication infrastructure" do
     supervisor = Process.whereis(ForgeGitHub.Supervisor)
 
     assert is_pid(supervisor)
-    assert [] = Supervisor.which_children(supervisor)
+
+    assert [
+             {ForgeGitHub.InstallationTokenBroker, broker, :worker,
+              [ForgeGitHub.InstallationTokenBroker]},
+             {ForgeGitHub.TokenTaskSupervisor, task_supervisor, :supervisor, [Task.Supervisor]}
+           ] = Enum.sort(Supervisor.which_children(supervisor))
+
+    assert is_pid(broker)
+    assert is_pid(task_supervisor)
   end
 
   test "context exposes stable provider boundary types" do

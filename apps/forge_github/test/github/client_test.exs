@@ -717,6 +717,8 @@ defmodule ForgeGitHub.ClientTest do
     assert :ok = RequestGate.run({:saved_credential, 1}, fn -> :ok end)
     assert :ok = RequestGate.run({:one_time_run, 1}, fn -> :ok end)
     assert :ok = RequestGate.run({:account_setup, 1}, fn -> :ok end)
+    assert :ok = RequestGate.run({:github_app, 1}, fn -> :ok end)
+    assert :ok = RequestGate.run({:github_installation, 1}, fn -> :ok end)
   end
 
   test "the gate keeps the bounded operation in its calling process" do

@@ -8,11 +8,20 @@ defmodule ForgeGitHub.RequestGate do
           | {:one_time_run, pos_integer()}
           | {:import_setup, pos_integer()}
           | {:account_setup, pos_integer()}
+          | {:github_app, pos_integer()}
+          | {:github_installation, pos_integer()}
 
   @spec run(gate_key(), (-> result)) :: result | {:error, :invalid_gate_key | :busy}
         when result: term()
   def run({kind, id} = gate_key, fun)
-      when kind in [:saved_credential, :one_time_run, :import_setup, :account_setup] and
+      when kind in [
+             :saved_credential,
+             :one_time_run,
+             :import_setup,
+             :account_setup,
+             :github_app,
+             :github_installation
+           ] and
              is_integer(id) and
              id > 0 and
              id <= 9_223_372_036_854_775_807 and

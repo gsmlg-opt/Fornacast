@@ -11,6 +11,7 @@ defmodule ForgeMirrors do
   alias Fornacast.{DomainOutboxEvent, Repo}
 
   alias ForgeMirrors.{
+    GitHubAppInstallation,
     MirrorConflict,
     MirrorOperation,
     OrganizationMirror,
@@ -22,6 +23,172 @@ defmodule ForgeMirrors do
   @type provider :: :github
   @type direction :: :inbound | :outbound
   @type resource_kind :: :organization | :repository | :git | :lfs | :issue | :pull | :release
+
+  @spec observe_github_app_installation(map()) ::
+          {:ok, GitHubAppInstallation.t()}
+          | {:error, Ecto.Changeset.t() | :identity_mismatch | :invalid_transition}
+  def observe_github_app_installation(attrs) when is_map(attrs) do
+    changeset = GitHubAppInstallation.observation_changeset(%GitHubAppInstallation{}, attrs)
+
+    if changeset.valid? do
+      installation_id = Ecto.Changeset.get_field(changeset, :github_installation_id)
+
+      Repo.transaction(fn ->
+        lock_github_installation_identity!(installation_id)
+
+        existing =
+          GitHubAppInstallation
+          |> where([installation], installation.github_installation_id == ^installation_id)
+          |> lock("FOR UPDATE")
+          |> Repo.one()
+
+        result =
+          case existing do
+            nil -> Repo.insert(changeset)
+            %GitHubAppInstallation{} = installation -> observe_existing(installation, attrs)
+          end
+
+        case result do
+          {:ok, installation} -> installation
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+      |> normalize_transaction_result()
+    else
+      {:error, changeset}
+    end
+  end
+
+  def observe_github_app_installation(_attrs),
+    do: {:error, GitHubAppInstallation.observation_changeset(%GitHubAppInstallation{}, %{})}
+
+  @spec get_github_app_installation(pos_integer()) ::
+          {:ok, GitHubAppInstallation.t()} | {:error, :not_found | :invalid_argument}
+  def get_github_app_installation(installation_id)
+      when is_integer(installation_id) and installation_id > 0 do
+    case Repo.get_by(GitHubAppInstallation, github_installation_id: installation_id) do
+      nil -> {:error, :not_found}
+      installation -> {:ok, installation}
+    end
+  end
+
+  def get_github_app_installation(_installation_id), do: {:error, :invalid_argument}
+
+  @spec suspend_github_app_installation(pos_integer(), DateTime.t()) ::
+          {:ok, GitHubAppInstallation.t()}
+          | {:error, :not_found | :invalid_argument | :invalid_transition}
+  def suspend_github_app_installation(installation_id, %DateTime{} = observed_at),
+    do: transition_github_app_installation(installation_id, :suspended, observed_at)
+
+  def suspend_github_app_installation(_installation_id, _observed_at),
+    do: {:error, :invalid_argument}
+
+  @spec revoke_github_app_installation(pos_integer(), DateTime.t()) ::
+          {:ok, GitHubAppInstallation.t()}
+          | {:error, :not_found | :invalid_argument | :invalid_transition}
+  def revoke_github_app_installation(installation_id, %DateTime{} = observed_at),
+    do: transition_github_app_installation(installation_id, :revoked, observed_at)
+
+  def revoke_github_app_installation(_installation_id, _observed_at),
+    do: {:error, :invalid_argument}
+
+  defp transition_github_app_installation(installation_id, target, observed_at)
+       when is_integer(installation_id) and installation_id > 0 do
+    Repo.transaction(fn ->
+      lock_github_installation_identity!(installation_id)
+
+      installation =
+        GitHubAppInstallation
+        |> where([record], record.github_installation_id == ^installation_id)
+        |> lock("FOR UPDATE")
+        |> Repo.one()
+
+      result =
+        case installation do
+          nil ->
+            {:error, :not_found}
+
+          %GitHubAppInstallation{} = installation ->
+            observed_at = DateTime.truncate(observed_at, :second)
+
+            cond do
+              not DateTime.after?(observed_at, installation.last_verified_at) ->
+                {:ok, installation}
+
+              GitHubAppInstallation.legal_transition?(installation.state, target) ->
+                installation
+                |> GitHubAppInstallation.update_observation_changeset(%{
+                  state: target,
+                  last_verified_at: observed_at
+                })
+                |> Repo.update()
+
+              true ->
+                {:error, :invalid_transition}
+            end
+        end
+
+      case result do
+        {:ok, updated} -> updated
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> normalize_transaction_result()
+  end
+
+  defp observe_existing(installation, attrs) do
+    account_id = fetch_attr(attrs, :github_account_id)
+    account_type = normalize_account_type(fetch_attr(attrs, :account_type))
+    observed_at = fetch_attr(attrs, :last_verified_at)
+    target_state = normalize_installation_state(fetch_attr(attrs, :state))
+
+    cond do
+      installation.github_account_id != account_id or installation.account_type != account_type ->
+        {:error, :identity_mismatch}
+
+      not match?(%DateTime{}, observed_at) ->
+        {:error, :invalid_transition}
+
+      not DateTime.after?(DateTime.truncate(observed_at, :second), installation.last_verified_at) ->
+        {:ok, installation}
+
+      installation.state == :revoked ->
+        {:error, :invalid_transition}
+
+      not GitHubAppInstallation.legal_transition?(installation.state, target_state) ->
+        {:error, :invalid_transition}
+
+      true ->
+        installation
+        |> GitHubAppInstallation.update_observation_changeset(attrs)
+        |> Repo.update()
+    end
+  end
+
+  defp fetch_attr(attrs, key), do: Map.get(attrs, key, Map.get(attrs, Atom.to_string(key)))
+
+  defp normalize_account_type(value) when value in [:organization, "organization"],
+    do: :organization
+
+  defp normalize_account_type(value) when value in [:user, "user"], do: :user
+  defp normalize_account_type(value) when value in [:enterprise, "enterprise"], do: :enterprise
+  defp normalize_account_type(_value), do: nil
+
+  defp normalize_installation_state(value) when value in [:active, "active"], do: :active
+  defp normalize_installation_state(value) when value in [:suspended, "suspended"], do: :suspended
+  defp normalize_installation_state(value) when value in [:revoked, "revoked"], do: :revoked
+  defp normalize_installation_state(_value), do: nil
+
+  defp normalize_transaction_result({:ok, value}), do: {:ok, value}
+  defp normalize_transaction_result({:error, reason}), do: {:error, reason}
+
+  defp lock_github_installation_identity!(installation_id) do
+    if Repo.__adapter__() == Ecto.Adapters.Postgres do
+      Ecto.Adapters.SQL.query!(Repo, "select pg_advisory_xact_lock($1)", [installation_id])
+    end
+
+    :ok
+  end
 
   @spec create_organization_mirror(ForgeAccounts.User.t(), map()) ::
           {:ok, OrganizationMirror.t()}

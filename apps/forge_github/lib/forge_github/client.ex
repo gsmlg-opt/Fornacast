@@ -251,7 +251,7 @@ defmodule ForgeGitHub.Client do
   end
 
   defp validate_pat(pat) when is_binary(pat) do
-    if byte_size(pat) in 1..1_024 and String.valid?(pat) and
+    if byte_size(pat) in 1..16_384 and String.valid?(pat) and
          :binary.match(pat, <<0>>) == :nomatch,
        do: :ok,
        else: :error

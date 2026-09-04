@@ -86,6 +86,7 @@ config :fornacast, :repo_adapter, repo_adapter
 config :fornacast, :auto_migrate, true
 config :fornacast, :legacy_turso_preflight, false
 config :fornacast, :github_credential_keyring, github_credential_keyring
+config :forge_github, :app_configuration, :disabled
 
 config :fornacast,
   release_asset_storage_root: release_asset_root,

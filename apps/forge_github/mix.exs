@@ -18,7 +18,7 @@ defmodule ForgeGitHub.MixProject do
   def application do
     [
       mod: {ForgeGitHub.Application, []},
-      extra_applications: [:inets, :logger]
+      extra_applications: [:inets, :logger, :public_key]
     ]
   end
 
