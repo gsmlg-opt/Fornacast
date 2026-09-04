@@ -47,9 +47,38 @@ defmodule ForgeImports.Worker do
           |> Keyword.drop([:repository_worker, :repository_worker_options])
           |> Keyword.put(:owner, lease_owner)
 
-        ForgeImports.DiscoveryWorker.perform(run_id, discovery_opts)
+        run_id
+        |> ForgeImports.DiscoveryWorker.perform(discovery_opts)
+        |> maybe_start_app_bootstrap(run_id)
     end
   end
+
+  defp maybe_start_app_bootstrap({:ok, :awaiting_resolution} = discovery, run_id) do
+    case Repo.get(ImportRun, run_id) do
+      %ImportRun{
+        actor_user_id: actor_id,
+        credential_source: :github_app,
+        state: :awaiting_resolution,
+        request_metadata: request_metadata
+      } ->
+        case Repo.get(User, actor_id) do
+          %User{} = actor ->
+            case ForgeImports.start_import(actor, run_id, request_metadata) do
+              {:ok, _view} -> {:ok, :running}
+              {:error, reason} when reason in [:invalid_selection, :stale] -> discovery
+              {:error, reason} -> {:error, reason}
+            end
+
+          nil ->
+            {:error, :forbidden}
+        end
+
+      _other ->
+        discovery
+    end
+  end
+
+  defp maybe_start_app_bootstrap(result, _run_id), do: result
 
   defp skip_dispatch?(%RepositoryItem{state: :publishing}), do: false
 

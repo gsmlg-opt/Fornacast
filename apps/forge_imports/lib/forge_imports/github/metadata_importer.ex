@@ -19,7 +19,11 @@ defmodule ForgeImports.GitHub.MetadataImporter do
   @phases [:labels, :issues, :comments, :pull_requests, :number_sequence]
   @terminal_page_key "__terminal_v1__"
 
-  @type credential_checkout :: ((String.t() -> term()) -> term())
+  @type credential_metadata :: %{
+          required(:git_login) => String.t(),
+          required(:gate_key) => term()
+        }
+  @type credential_checkout :: ((String.t(), credential_metadata() -> term()) -> term())
 
   @spec stage(RepositoryItem.t(), credential_checkout(), keyword()) ::
           :ok | {:error, atom()}
@@ -231,28 +235,28 @@ defmodule ForgeImports.GitHub.MetadataImporter do
     end
   end
 
-  defp fetch(:labels, item, owner, repo, opts),
+  defp fetch(:labels, _item, owner, repo, opts),
     do:
-      checkout_fetch(opts, fn pat ->
-        Client.repository_labels(pat, owner, repo, client_opts(item, opts))
+      checkout_fetch(opts, fn credential, metadata ->
+        Client.repository_labels(credential, owner, repo, client_opts(opts, metadata))
       end)
 
-  defp fetch(:issues, item, owner, repo, opts),
+  defp fetch(:issues, _item, owner, repo, opts),
     do:
-      checkout_fetch(opts, fn pat ->
-        Client.repository_issues(pat, owner, repo, client_opts(item, opts))
+      checkout_fetch(opts, fn credential, metadata ->
+        Client.repository_issues(credential, owner, repo, client_opts(opts, metadata))
       end)
 
-  defp fetch_comments(item, owner, repo, issue_number, opts),
+  defp fetch_comments(_item, owner, repo, issue_number, opts),
     do:
-      checkout_fetch(opts, fn pat ->
-        Client.issue_comments(pat, owner, repo, issue_number, client_opts(item, opts))
+      checkout_fetch(opts, fn credential, metadata ->
+        Client.issue_comments(credential, owner, repo, issue_number, client_opts(opts, metadata))
       end)
 
-  defp fetch_pull(item, owner, repo, number, opts),
+  defp fetch_pull(_item, owner, repo, number, opts),
     do:
-      checkout_fetch(opts, fn pat ->
-        Client.pull_request(pat, owner, repo, number, client_opts(item, opts))
+      checkout_fetch(opts, fn credential, metadata ->
+        Client.pull_request(credential, owner, repo, number, client_opts(opts, metadata))
       end)
 
   defp checkout_fetch(opts, callback) do
@@ -347,7 +351,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
       |> Multi.run(key, fn repo, _changes ->
         with {:ok, author} <- resolve_author(mapped, now),
              {:ok, merger} <- resolve_merger(mapped, now),
-             {:ok, %{issue: issue, pull: _pull}} <-
+             {:ok, %{issue: issue, pull: pull}} <-
                Multi.new()
                |> ForgeIssues.import_identity_multi(
                  :issue,
@@ -384,7 +388,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
                  "pull_request",
                  mapped.github_id,
                  "ForgePulls.PullRequest",
-                 issue.id,
+                 pull.id,
                  source_url(item, "pulls", mapped.number)
                ) do
           {:ok, issue}
@@ -594,16 +598,8 @@ defmodule ForgeImports.GitHub.MetadataImporter do
     end
   end
 
-  defp client_opts(item, opts) do
+  defp client_opts(opts, %{gate_key: gate_key}) do
     client_options = Keyword.get(opts, :client_options, [])
-
-    gate_key =
-      Keyword.get(
-        opts,
-        :gate_key,
-        Keyword.get(client_options, :gate_key, {:one_time_run, item.import_run_id})
-      )
-
     Keyword.merge(client_options, gate_key: gate_key)
   end
 

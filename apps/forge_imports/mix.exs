@@ -26,6 +26,7 @@ defmodule ForgeImports.MixProject do
       {:forge_accounts, in_umbrella: true},
       {:forge_github, in_umbrella: true},
       {:forge_issues, in_umbrella: true},
+      {:forge_mirrors, in_umbrella: true},
       {:forge_pulls, in_umbrella: true},
       {:forge_repos, in_umbrella: true},
       {:git_core, in_umbrella: true},

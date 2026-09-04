@@ -119,13 +119,13 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
     assert %Issue{number: 7, kind: :pull_request} =
              Repo.get_by!(Issue, repository_id: repository.id, number: 7)
 
-    assert Repo.get_by!(PullRequest, repository_id: repository.id)
+    assert %PullRequest{id: pull_id} = Repo.get_by!(PullRequest, repository_id: repository.id)
 
-    assert Repo.exists?(
-             from mapping in ObjectMapping,
-               where:
-                 mapping.repository_item_id == ^item.id and mapping.object_kind == "pull_request"
-           )
+    assert %ObjectMapping{local_resource_id: ^pull_id} =
+             Repo.get_by!(ObjectMapping,
+               repository_item_id: item.id,
+               object_kind: "pull_request"
+             )
 
     assert Repo.exists?(
              from sequence in NumberSequence, where: sequence.repository_id == ^repository.id
@@ -409,8 +409,12 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
 
   defp importer_opts(stub, item) do
     [
-      credential_checkout: fn callback -> callback.(@pat) end,
-      gate_key: {:one_time_run, item.import_run_id},
+      credential_checkout: fn callback ->
+        callback.(@pat, %{
+          git_login: "metadata-test",
+          gate_key: {:one_time_run, item.import_run_id}
+        })
+      end,
       client_options: client_opts(stub)
     ]
   end

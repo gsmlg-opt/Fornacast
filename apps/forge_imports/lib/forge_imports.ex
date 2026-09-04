@@ -793,6 +793,13 @@ defmodule ForgeImports do
   defp validate_one_time_destination(_actor, %ImportRun{credential_source: :saved}, _profiles),
     do: :ok
 
+  defp validate_one_time_destination(
+         _actor,
+         %ImportRun{credential_source: :github_app},
+         _profiles
+       ),
+       do: :ok
+
   defp destination_item_attrs(item, %{status: :invalid} = destination, _duplicates) do
     destination_item_attrs(
       item,

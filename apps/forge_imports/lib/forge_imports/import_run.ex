@@ -17,7 +17,7 @@ defmodule ForgeImports.ImportRun do
   ]
   @terminal_states [:completed, :completed_with_warnings, :canceled, :failed]
   @source_kinds [:repository, :organization]
-  @credential_sources [:saved, :one_time]
+  @credential_sources [:saved, :one_time, :github_app]
   @destination_actions [:new, :existing]
   @destination_statuses [:clean, :conflict, :invalid]
   @max_id 9_223_372_036_854_775_807
@@ -253,7 +253,6 @@ defmodule ForgeImports.ImportRun do
     |> validate_required([
       :actor_user_id,
       :source_kind,
-      :github_identity_id,
       :credential_source,
       :source_owner_login,
       :source_metadata,
@@ -282,6 +281,7 @@ defmodule ForgeImports.ImportRun do
     |> validate_source_metadata()
     |> validate_source_shape()
     |> validate_destination_status()
+    |> validate_credential_identity()
     |> validate_credential_consistency()
     |> validate_envelope()
     |> validate_lifecycle()
@@ -529,6 +529,32 @@ defmodule ForgeImports.ImportRun do
 
       source == :one_time and not (all_absent? or all_present?) ->
         add_error(changeset, :credential_source, "one-time envelope is incomplete")
+
+      source == :github_app and not is_nil(saved_id) ->
+        add_error(changeset, :github_credential_id, "must be absent for GitHub App credentials")
+
+      source == :github_app and not all_absent? ->
+        add_error(
+          changeset,
+          :credential_source,
+          "GitHub App credentials cannot carry an envelope"
+        )
+
+      true ->
+        changeset
+    end
+  end
+
+  defp validate_credential_identity(changeset) do
+    source = get_field(changeset, :credential_source)
+    identity_id = get_field(changeset, :github_identity_id)
+
+    cond do
+      source in [:saved, :one_time] and is_nil(identity_id) ->
+        add_error(changeset, :github_identity_id, "is required for PAT credentials")
+
+      source == :github_app and not is_nil(identity_id) ->
+        add_error(changeset, :github_identity_id, "must be absent for GitHub App credentials")
 
       true ->
         changeset
@@ -803,6 +829,9 @@ defmodule ForgeImports.ImportRun do
       name: :github_import_runs_verified_source_check
     )
     |> check_constraint(:credential_source, name: :github_import_runs_credential_source_check)
+    |> check_constraint(:credential_source,
+      name: :github_import_runs_credential_identity_check
+    )
     |> check_constraint(:credential_source,
       name: :github_import_runs_credential_consistency_check
     )

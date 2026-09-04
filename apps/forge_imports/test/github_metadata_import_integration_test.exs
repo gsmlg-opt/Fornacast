@@ -60,7 +60,8 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
         pulls: [align_pull_payload(fixture!("pull_same_repo.json"), head_sha, base_sha), cross]
       )
 
-    assert :ok = MetadataImporter.stage(item, credential_checkout(), importer_opts(stub, item))
+    assert :ok =
+             MetadataImporter.stage(item, credential_checkout(item), importer_opts(stub, item))
 
     assert Repo.exists?(
              from report in ReportEntry,
@@ -135,14 +136,18 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
     |> Repo.insert!()
   end
 
-  defp credential_checkout do
-    fn callback -> callback.(@pat) end
+  defp credential_checkout(item) do
+    fn callback ->
+      callback.(@pat, %{
+        git_login: "metadata-integration-test",
+        gate_key: {:one_time_run, item.import_run_id}
+      })
+    end
   end
 
   defp importer_opts(stub, item) do
     [
-      credential_checkout: credential_checkout(),
-      gate_key: {:one_time_run, item.import_run_id},
+      credential_checkout: credential_checkout(item),
       client_options: client_opts(stub)
     ]
   end

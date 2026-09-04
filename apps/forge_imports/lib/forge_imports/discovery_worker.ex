@@ -1,14 +1,33 @@
 defmodule ForgeImports.DiscoveryWorker do
   @moduledoc false
 
+  import Ecto.Query
+
   alias ForgeAccounts.{GitHubCredentialVerification, GitHubProfileSafety, User}
-  alias ForgeGitHub.{Error, Organization, Repository}
-  alias ForgeImports.{Destination, ImportRun, OneTimeCredential, ReportEntry, RepositoryItem}
+
+  alias ForgeGitHub.{
+    Error,
+    InstallationTokenBroker,
+    InstallationTokenScope,
+    Organization,
+    Repository
+  }
+
+  alias ForgeImports.{
+    CredentialProvider,
+    Destination,
+    ImportRun,
+    ReportEntry,
+    RepositoryItem
+  }
+
+  alias ForgeMirrors.{InventoryPolicy, OrganizationMirror}
   alias Fornacast.{Audit, OperationLease, Repo}
 
   # F7 bounds one organization lookup, its list bootstrap, and 100 pages at 20s each.
   # This milestone has no heartbeat yet, so 2,400s covers that 2,040s hard bound plus cleanup.
   @default_lease_seconds 2_400
+  @credential_retry_seconds 30
   @max_repositories 10_000
 
   @spec perform(pos_integer(), keyword()) ::
@@ -51,37 +70,46 @@ defmodule ForgeImports.DiscoveryWorker do
           options
         )
 
-      capability.credential_source == :one_time ->
-        discover_with_one_time(actor, capability, options)
+      capability.credential_source in [:saved, :one_time, :github_app] ->
+        discover_with_credential(actor, capability, options)
 
-      capability.credential_source == :saved ->
-        discover_with_saved(actor, capability, options)
+      true ->
+        handle_discovery_result(actor, capability, {:error, :invalid_credential}, options)
     end
   end
 
   defp discover(_capability, _options), do: {:ok, :ignored}
 
-  defp discover_with_one_time(actor, capability, options) do
+  defp discover_with_credential(actor, capability, options) do
     reference = make_ref()
     parent = self()
 
     checkout =
-      OneTimeCredential.with_credential(
-        actor,
-        capability,
-        fn pat ->
-          result = discover_source(actor, capability, pat, options)
+      CredentialProvider.checkout(
+        %{actor: actor, run: capability, capability: capability},
+        fn credential, metadata ->
+          result = discover_source(actor, capability, credential, metadata, options)
           send(parent, {reference, result})
-          :ok
+          callback_result(result)
         end,
-        options.keyring
+        credential_options(options)
       )
 
     case checkout do
       {:ok, :acknowledged} ->
         handle_discovery_result(actor, capability, receive_result(reference), options)
 
-      {:error, reason} ->
+      {:error, {:invalid_credential, %GitHubCredentialVerification{} = verification}} ->
+        _result = receive_result(reference)
+        handle_saved_invalid_credential(actor, capability, verification, options)
+
+      {:error, {:retryable, _reason}} ->
+        defer_credential_retry(capability)
+
+      {:error, {:terminal, reason}} ->
+        handle_discovery_result(actor, capability, {:error, reason}, options)
+
+      {:error, reason} when is_atom(reason) ->
         handle_discovery_result(
           actor,
           capability,
@@ -91,55 +119,15 @@ defmodule ForgeImports.DiscoveryWorker do
     end
   end
 
-  defp discover_with_saved(actor, capability, options) do
-    reference = make_ref()
-    parent = self()
-
-    with {:ok, callback_result} <-
-           ForgeAccounts.with_github_import_credential(
-             actor,
-             capability.github_identity_id,
-             capability.github_credential_id,
-             fn pat, %GitHubCredentialVerification{} = current ->
-               result =
-                 if saved_reference_matches?(capability, current) do
-                   discover_source(actor, capability, pat, options)
-                 else
-                   {:error, :credential_changed}
-                 end
-
-               send(parent, {reference, {result, current}})
-               :ok
-             end
-           ),
-         :ok <- callback_result do
-      handle_saved_discovery_result(actor, capability, receive_result(reference), options)
-    else
-      {:error, reason} ->
-        handle_discovery_result(
-          actor,
-          capability,
-          {:error, normalize_checkout_error(reason)},
-          options
-        )
-    end
-  end
-
-  defp saved_reference_matches?(capability, reference) do
-    reference.credential_id == capability.github_credential_id and
-      reference.identity_id == capability.github_identity_id and
-      reference.local_user_id == capability.actor_user_id
-  end
-
-  defp discover_source(actor, capability, pat, options) do
-    client_options = put_gate(options.client_options, gate_key(capability))
+  defp discover_source(actor, capability, credential, metadata, options) do
+    client_options = put_gate(options.client_options, metadata.gate_key)
 
     case capability.source_kind do
       :repository ->
-        discover_repository(actor, capability, pat, options.client, client_options)
+        discover_repository(actor, capability, credential, options.client, client_options)
 
       :organization ->
-        discover_organization(actor, capability, pat, options.client, client_options)
+        discover_organization(actor, capability, credential, options.client, client_options)
     end
   end
 
@@ -176,6 +164,7 @@ defmodule ForgeImports.DiscoveryWorker do
            client.organization_repositories(pat, capability.source_owner_login, client_options),
          {:ok, repositories} <-
            validate_organization_repositories(actor, source, repositories, pat),
+         {:ok, repository_plans} <- repositories_for_policy(capability, repositories),
          {:ok, destination} <- destination_for_run(actor, capability, source.login) do
       {:ok,
        %{
@@ -185,7 +174,8 @@ defmodule ForgeImports.DiscoveryWorker do
          source_repository_full_name: nil,
          source_metadata: organization_metadata(source, observed_at),
          safety_profiles: [source | repositories],
-         repository_plans: Destination.repository_plans(repositories, destination, observed_at)
+         repository_plans:
+           Destination.repository_plans(repository_plans, destination, observed_at)
        }}
     else
       {:error, %Error{kind: kind}} -> {:error, kind}
@@ -271,6 +261,37 @@ defmodule ForgeImports.DiscoveryWorker do
   defp validate_organization_repositories(_actor, _source, _repositories, _pat),
     do: {:error, :invalid_response}
 
+  defp repositories_for_policy(
+         %ImportRun{
+           id: run_id,
+           credential_source: :github_app,
+           source_owner_github_id: github_account_id,
+           destination_organization_id: organization_id
+         },
+         repositories
+       ) do
+    mirrors =
+      Repo.all(
+        from mirror in OrganizationMirror,
+          where:
+            mirror.bootstrap_import_run_id == ^run_id and mirror.provider == "github" and
+              mirror.github_account_id == ^github_account_id and
+              mirror.organization_id == ^organization_id and mirror.state != :revoked,
+          order_by: [desc: mirror.id],
+          limit: 2
+      )
+
+    with [%OrganizationMirror{policy: policy}] <- mirrors,
+         {:ok, policy} <- InventoryPolicy.parse(policy) do
+      {:ok, Enum.filter(repositories, &InventoryPolicy.included?(policy, &1.id))}
+    else
+      {:error, :invalid_policy} -> {:error, :invalid_policy}
+      _invalid_binding -> {:error, :binding_mismatch}
+    end
+  end
+
+  defp repositories_for_policy(%ImportRun{}, repositories), do: {:ok, repositories}
+
   defp exact_repository(source, owner, repository) do
     if String.downcase(source.owner_login) == String.downcase(owner) and
          String.downcase(source.name) == String.downcase(repository) and
@@ -303,10 +324,10 @@ defmodule ForgeImports.DiscoveryWorker do
 
   defp destination_for_run(_actor, _run, _login), do: {:error, :invalid_destination}
 
-  defp handle_saved_discovery_result(
+  defp handle_saved_invalid_credential(
          actor,
          capability,
-         {{:error, :invalid_credential}, %GitHubCredentialVerification{} = reference},
+         %GitHubCredentialVerification{} = reference,
          options
        ) do
     with {:ok, fresh} <- fresh_capability(capability, options.lease_seconds) do
@@ -328,11 +349,15 @@ defmodule ForgeImports.DiscoveryWorker do
     end
   end
 
-  defp handle_saved_discovery_result(actor, capability, {result, _reference}, options),
-    do: handle_discovery_result(actor, capability, result, options)
+  defp defer_credential_retry(capability) do
+    retry_at = DateTime.add(DateTime.utc_now(:second), @credential_retry_seconds, :second)
 
-  defp handle_saved_discovery_result(actor, capability, _invalid, options),
-    do: handle_discovery_result(actor, capability, {:error, :invalid_response}, options)
+    case OperationLease.update_owned(ImportRun, capability, next_attempt_at: retry_at) do
+      {:ok, _run} -> {:error, :credential_service_unavailable}
+      {:error, :lost_lease} -> {:error, :lost_lease}
+      {:error, _reason} -> {:error, :persistence_unavailable}
+    end
+  end
 
   defp handle_discovery_result(actor, capability, result, options) do
     with {:ok, fresh} <- fresh_capability(capability, options.lease_seconds) do
@@ -554,13 +579,19 @@ defmodule ForgeImports.DiscoveryWorker do
   defp maybe_put_boolean(map, key, value) when is_boolean(value), do: Map.put(map, key, value)
   defp maybe_put_boolean(map, _key, _value), do: map
 
-  defp gate_key(%ImportRun{credential_source: :one_time, id: id}), do: {:one_time_run, id}
-
-  defp gate_key(%ImportRun{credential_source: :saved, github_credential_id: id}),
-    do: {:saved_credential, id}
-
   defp put_gate(options, gate_key),
     do: options |> Keyword.delete(:gate_key) |> Keyword.put(:gate_key, gate_key)
+
+  defp callback_result({:error, :invalid_credential}), do: {:error, :invalid_credential}
+  defp callback_result(_result), do: :ok
+
+  defp credential_options(options) do
+    [
+      keyring: options.keyring,
+      token_broker: options.token_broker,
+      scope: options.token_scope
+    ]
+  end
 
   defp receive_result(reference) do
     receive do
@@ -610,7 +641,7 @@ defmodule ForgeImports.DiscoveryWorker do
   defp normalize_source_error(_reason), do: :invalid_response
 
   defp options(opts) do
-    allowed = ~w(owner lease_seconds client client_options keyring)a
+    allowed = ~w(owner lease_seconds client client_options keyring token_broker token_scope)a
 
     if Keyword.keyword?(opts) and Keyword.keys(opts) -- allowed == [] and
          length(Keyword.keys(opts)) == length(Enum.uniq(Keyword.keys(opts))) do
@@ -619,18 +650,23 @@ defmodule ForgeImports.DiscoveryWorker do
       lease_seconds = Keyword.get(opts, :lease_seconds, @default_lease_seconds)
       owner = Keyword.get(opts, :owner, generated_owner())
       keyring = Keyword.get(opts, :keyring, Fornacast.Config.github_credential_keyring())
+      token_broker = Keyword.get(opts, :token_broker, InstallationTokenBroker)
+      token_scope = Keyword.get(opts, :token_scope, %{})
 
       if is_atom(client) and Code.ensure_loaded?(client) and Keyword.keyword?(client_options) and
            not Keyword.has_key?(client_options, :gate_key) and is_integer(lease_seconds) and
            lease_seconds in 1..@default_lease_seconds and is_binary(owner) and
-           byte_size(owner) in 1..255 do
+           byte_size(owner) in 1..255 and (is_atom(token_broker) or is_pid(token_broker)) and
+           match?({:ok, _scope, _key}, InstallationTokenScope.canonical(token_scope)) do
         {:ok,
          %{
            client: client,
            client_options: client_options,
            lease_seconds: lease_seconds,
            owner: owner,
-           keyring: keyring
+           keyring: keyring,
+           token_broker: token_broker,
+           token_scope: token_scope
          }}
       else
         {:error, :invalid_request}

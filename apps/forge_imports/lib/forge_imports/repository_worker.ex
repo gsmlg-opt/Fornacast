@@ -3,20 +3,14 @@ defmodule ForgeImports.RepositoryWorker do
 
   import Ecto.Query
 
-  alias ForgeAccounts.{
-    GitHubCredentialVerification,
-    GitHubIdentity,
-    Organization,
-    OrganizationMember,
-    User
-  }
+  alias ForgeAccounts.{Organization, OrganizationMember, User}
 
   alias ForgeImports.{
     CleanupOperation,
     ImportAttempt,
     Cancellation,
+    CredentialProvider,
     ImportRun,
-    OneTimeCredential,
     Persistence,
     ReportEntry,
     RepositoryItem,
@@ -24,7 +18,7 @@ defmodule ForgeImports.RepositoryWorker do
     Telemetry
   }
 
-  alias ForgeGitHub.Client
+  alias ForgeGitHub.{Client, InstallationTokenBroker, InstallationTokenScope}
   alias ForgeImports.GitHub.MetadataImporter
   alias ForgeRepos.Repository
   alias Fornacast.{Audit, AuditEvent, OperationLease, Repo}
@@ -34,6 +28,13 @@ defmodule ForgeImports.RepositoryWorker do
   @max_lease_seconds 2_400
   @post_remote_lease_seconds 10
   @retry_backoff_seconds 30
+  @github_app_scope %{
+    permissions: %{
+      "contents" => "read",
+      "issues" => "read",
+      "pull_requests" => "read"
+    }
+  }
   @allow_test_options Mix.env() == :test
 
   if Mix.env() == :test do
@@ -196,41 +197,20 @@ defmodule ForgeImports.RepositoryWorker do
     parent = self()
 
     checkout =
-      case run.credential_source do
-        :one_time ->
-          OneTimeCredential.with_item_credential(
-            actor,
-            item,
-            fn pat ->
-              send(parent, {reference, callback.(pat)})
-              :ok
-            end,
-            options.keyring
-          )
-
-        :saved ->
-          ForgeAccounts.with_github_import_credential(
-            actor,
-            run.github_identity_id,
-            run.github_credential_id,
-            fn pat, verification ->
-              result =
-                if saved_reference_matches?(run, verification),
-                  do: callback.(pat),
-                  else: {:error, :credential_changed}
-
-              send(parent, {reference, result})
-              :ok
-            end
-          )
-      end
+      CredentialProvider.checkout(
+        %{actor: actor, run: run, capability: item},
+        fn credential, metadata ->
+          send(parent, {reference, callback.(credential, metadata)})
+          :ok
+        end,
+        credential_options(options)
+      )
 
     receive_metadata_result(checkout, reference)
   end
 
-  defp metadata_importer_options(item, options) do
+  defp metadata_importer_options(_item, options) do
     [
-      gate_key: {:one_time_run, item.import_run_id},
       client: Map.get(options, :client, Client),
       client_options: Map.get(options, :client_options, [])
     ]
@@ -335,6 +315,12 @@ defmodule ForgeImports.RepositoryWorker do
 
   defp handle_remote_result(capability, _shadow, {:error, :cancelled}, _options),
     do: persist_cancellation(capability)
+
+  defp handle_remote_result(capability, _shadow, {:error, {:retryable, _reason}}, _options),
+    do: release_with_error(capability, :credential_service_unavailable)
+
+  defp handle_remote_result(capability, _shadow, {:error, {:terminal, _reason}}, _options),
+    do: release_with_error(capability, :credential_configuration_invalid)
 
   defp handle_remote_result(capability, _shadow, {:error, reason}, _options)
        when reason in [
@@ -924,69 +910,38 @@ defmodule ForgeImports.RepositoryWorker do
     end
   end
 
-  defp credential_result(
-         actor,
-         %ImportRun{credential_source: :one_time},
-         item,
-         shadow,
-         action,
-         options
-       ) do
+  defp credential_result(actor, %ImportRun{} = run, item, shadow, action, options) do
     reference = make_ref()
     parent = self()
 
     checkout =
-      OneTimeCredential.with_item_credential(
-        actor,
-        item,
-        fn pat ->
-          result = invoke_remote_fresh(item, shadow, action, pat, options)
-          send(parent, {reference, result})
-          :ok
+      CredentialProvider.checkout(
+        %{actor: actor, run: run, capability: item},
+        fn credential, metadata ->
+          result = invoke_remote_fresh(item, shadow, action, credential, metadata, options)
+          send(parent, {reference, result, metadata})
+          credential_callback_result(result)
         end,
-        options.keyring
+        credential_options(options)
       )
 
-    receive_checkout_result(checkout, reference)
+    case receive_checkout_result(checkout, reference) do
+      {:error, _reason} = error -> error
+      {result, metadata} -> normalize_app_credential_result(result, run, metadata, options)
+    end
   end
 
-  defp credential_result(
-         actor,
-         %ImportRun{credential_source: :saved} = run,
-         item,
-         shadow,
-         action,
-         options
-       ) do
-    reference = make_ref()
-    parent = self()
-
-    checkout =
-      ForgeAccounts.with_github_import_credential(
-        actor,
-        run.github_identity_id,
-        run.github_credential_id,
-        fn pat, %GitHubCredentialVerification{} = verification ->
-          result =
-            if saved_reference_matches?(run, verification) do
-              invoke_remote_fresh(item, shadow, action, pat, options)
-            else
-              {:error, :credential_changed}
-            end
-
-          send(parent, {reference, result})
-          :ok
-        end
-      )
-
-    receive_checkout_result(checkout, reference)
-  end
-
-  defp invoke_remote_fresh(item, shadow, action, pat, options) do
-    with {:ok, %{item: current, identity: identity}} <-
+  defp invoke_remote_fresh(item, shadow, action, credential, metadata, options) do
+    with {:ok, %{item: current}} <-
            current_context(item.id, item.lease_owner),
          true <- current.hidden_repository_id == shadow.id do
-      invoke_remote(current, request(current, shadow, identity), action, pat, options)
+      invoke_remote(
+        current,
+        request(current, shadow, metadata.git_login),
+        action,
+        credential,
+        options
+      )
     else
       false -> {:error, :lost_lease}
       {:error, :cancelled} -> {:error, :cancelled}
@@ -996,7 +951,7 @@ defmodule ForgeImports.RepositoryWorker do
 
   defp receive_checkout_result({:ok, :acknowledged}, reference) do
     receive do
-      {^reference, result} -> normalize_remote_result(result)
+      {^reference, result, metadata} -> {normalize_remote_result(result), metadata}
     after
       0 -> {:error, :credential_service_unavailable}
     end
@@ -1005,8 +960,33 @@ defmodule ForgeImports.RepositoryWorker do
   defp receive_checkout_result({:ok, :ok}, reference),
     do: receive_checkout_result({:ok, :acknowledged}, reference)
 
+  defp receive_checkout_result({:error, {:invalid_credential, _verification}}, reference) do
+    _result_and_metadata = receive_checkout_result({:ok, :acknowledged}, reference)
+    {:error, :invalid_credential}
+  end
+
   defp receive_checkout_result({:error, reason}, _reference),
     do: {:error, normalize_credential_error(reason)}
+
+  defp credential_callback_result({:error, %Remote.Error{kind: :invalid_credential}}),
+    do: {:error, :invalid_credential}
+
+  defp credential_callback_result({:error, :invalid_credential}),
+    do: {:error, :invalid_credential}
+
+  defp credential_callback_result(_result), do: :ok
+
+  defp normalize_app_credential_result(
+         {:error, :invalid_credential},
+         %ImportRun{credential_source: :github_app},
+         %{gate_key: {:github_installation, installation_id}},
+         options
+       ) do
+    _ = InstallationTokenBroker.invalidate(options.token_broker, installation_id)
+    {:error, {:retryable, :invalidated}}
+  end
+
+  defp normalize_app_credential_result(result, _run, _metadata, _options), do: result
 
   defp receive_metadata_result({:ok, :acknowledged}, reference) do
     receive do
@@ -1534,8 +1514,6 @@ defmodule ForgeImports.RepositoryWorker do
              on: run.id == item.import_run_id,
              join: actor in User,
              on: actor.id == run.actor_user_id,
-             join: identity in GitHubIdentity,
-             on: identity.id == run.github_identity_id,
              join: attempt in ImportAttempt,
              on:
                attempt.repository_item_id == item.id and
@@ -1546,10 +1524,8 @@ defmodule ForgeImports.RepositoryWorker do
                  item.state in [:staging_git, :git_staged, :staging_metadata] and
                  is_nil(item.cleanup_state) and
                  run.state in [:running, :cancel_requested] and actor.kind == :user and
-                 actor.state == :active and
-                 identity.kind == :user and not is_nil(identity.last_verified_at) and
-                 attempt.state == :running,
-             select: %{actor: actor, run: run, item: item, identity: identity}
+                 actor.state == :active and attempt.state == :running,
+             select: %{actor: actor, run: run, item: item}
          ) do
       %{run: %ImportRun{state: :running}, item: %RepositoryItem{}} = context -> {:ok, context}
       %{run: %ImportRun{state: :cancel_requested}} -> {:error, :cancelled}
@@ -1690,23 +1666,17 @@ defmodule ForgeImports.RepositoryWorker do
     end
   end
 
-  defp request(item, shadow, identity) do
+  defp request(item, shadow, credential_login) do
     [owner, repository] = String.split(item.source_full_name, "/", parts: 2)
 
     %Remote.Request{
       provider: :github,
       owner: owner,
       repository: repository,
-      credential_login: identity.login,
+      credential_login: credential_login,
       destination: ForgeRepos.absolute_storage_path(shadow),
       default_branch: Map.fetch!(item.source_metadata, "default_branch")
     }
-  end
-
-  defp saved_reference_matches?(run, reference) do
-    reference.credential_id == run.github_credential_id and
-      reference.identity_id == run.github_identity_id and
-      reference.local_user_id == run.actor_user_id
   end
 
   defp release_with_error(%RepositoryItem{} = capability, reason) do
@@ -1827,7 +1797,7 @@ defmodule ForgeImports.RepositoryWorker do
     allowed =
       if @allow_test_options,
         do:
-          ~w(owner lease_seconds keyring remote remote_options scan_options persistence_hook client client_options)a,
+          ~w(owner lease_seconds keyring remote remote_options scan_options persistence_hook client client_options token_broker token_scope)a,
         else: ~w(owner lease_seconds)a
 
     cond do
@@ -1855,6 +1825,8 @@ defmodule ForgeImports.RepositoryWorker do
     keyring = Keyword.get(opts, :keyring, Fornacast.Config.github_credential_keyring())
     client = Keyword.get(opts, :client, Client)
     client_options = Keyword.get(opts, :client_options, [])
+    token_broker = Keyword.get(opts, :token_broker, InstallationTokenBroker)
+    token_scope = Keyword.get(opts, :token_scope, @github_app_scope)
 
     if is_binary(owner) and byte_size(owner) in 1..255 and String.valid?(owner) and
          is_integer(lease_seconds) and lease_seconds in 2..@max_lease_seconds and is_atom(remote) and
@@ -1865,7 +1837,9 @@ defmodule ForgeImports.RepositoryWorker do
          (is_nil(persistence_hook) or is_function(persistence_hook, 0)) and
          not Keyword.has_key?(remote_options, :cancel?) and
          not Keyword.has_key?(remote_options, :heartbeat) and
-         is_atom(client) and Code.ensure_loaded?(client) and Keyword.keyword?(client_options) do
+         is_atom(client) and Code.ensure_loaded?(client) and Keyword.keyword?(client_options) and
+         (is_atom(token_broker) or is_pid(token_broker)) and
+         match?({:ok, _scope, _key}, InstallationTokenScope.canonical(token_scope)) do
       {:ok,
        %{
          owner: owner,
@@ -1876,7 +1850,9 @@ defmodule ForgeImports.RepositoryWorker do
          persistence_hook: persistence_hook,
          keyring: keyring,
          client: client,
-         client_options: client_options
+         client_options: client_options,
+         token_broker: token_broker,
+         token_scope: token_scope
        }}
     else
       {:error, :invalid_request}
@@ -1896,7 +1872,23 @@ defmodule ForgeImports.RepositoryWorker do
             ],
        do: if(reason == :credential_invalid, do: :invalid_credential, else: reason)
 
+  defp normalize_credential_error({:retryable, reason})
+       when reason in [:busy, :invalidated, :timeout, :unavailable],
+       do: {:retryable, reason}
+
+  defp normalize_credential_error({:terminal, reason})
+       when reason in [:binding_mismatch, :invalid_scope, :not_configured, :revoked, :suspended],
+       do: {:terminal, reason}
+
   defp normalize_credential_error(_reason), do: :credential_service_unavailable
+
+  defp credential_options(options) do
+    [
+      keyring: options.keyring,
+      token_broker: options.token_broker,
+      scope: options.token_scope
+    ]
+  end
 
   defp remote_error(kind)
        when kind in [
