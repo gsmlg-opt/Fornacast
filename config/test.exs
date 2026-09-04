@@ -8,7 +8,8 @@ config :forge_imports,
 config :forge_mirrors,
   operation_reconciler_enabled: false,
   outbox_dispatcher_enabled: false,
-  periodic_reconciler_enabled: false
+  periodic_reconciler_enabled: false,
+  webhook_worker_enabled: false
 
 config :git_core, :limits,
   scan_concurrency: 4,

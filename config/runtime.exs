@@ -251,6 +251,57 @@ if config_env() == :prod do
 
   config :forge_github, :app_configuration, github_app_configuration
 
+  webhook_worker_max_concurrency =
+    case Integer.parse(System.get_env("FORNACAST_GITHUB_WEBHOOK_MAX_CONCURRENCY", "8")) do
+      {value, ""} when value in 1..64 -> value
+      _invalid -> raise "FORNACAST_GITHUB_WEBHOOK_MAX_CONCURRENCY must be between 1 and 64"
+    end
+
+  webhook_worker_max_concurrency_per_installation =
+    case Integer.parse(
+           System.get_env("FORNACAST_GITHUB_WEBHOOK_MAX_CONCURRENCY_PER_INSTALLATION", "1")
+         ) do
+      {value, ""} when value in 1..webhook_worker_max_concurrency//1 ->
+        value
+
+      _invalid ->
+        raise "FORNACAST_GITHUB_WEBHOOK_MAX_CONCURRENCY_PER_INSTALLATION must be between 1 and FORNACAST_GITHUB_WEBHOOK_MAX_CONCURRENCY"
+    end
+
+  webhook_worker_processor_timeout_ms =
+    case Integer.parse(System.get_env("FORNACAST_GITHUB_WEBHOOK_PROCESSOR_TIMEOUT_MS", "25000")) do
+      {value, ""} when value in 1..25_000 ->
+        value
+
+      _invalid ->
+        raise "FORNACAST_GITHUB_WEBHOOK_PROCESSOR_TIMEOUT_MS must be between 1 and 25000"
+    end
+
+  webhook_worker_max_internal_attempts =
+    case Integer.parse(System.get_env("FORNACAST_GITHUB_WEBHOOK_MAX_INTERNAL_ATTEMPTS", "10")) do
+      {value, ""} when value in 1..1_000 ->
+        value
+
+      _invalid ->
+        raise "FORNACAST_GITHUB_WEBHOOK_MAX_INTERNAL_ATTEMPTS must be between 1 and 1000"
+    end
+
+  webhook_body_total_timeout_ms =
+    case Integer.parse(System.get_env("FORNACAST_GITHUB_WEBHOOK_BODY_TIMEOUT_MS", "5000")) do
+      {value, ""} when value in 1..30_000 -> value
+      _invalid -> raise "FORNACAST_GITHUB_WEBHOOK_BODY_TIMEOUT_MS must be between 1 and 30000"
+    end
+
+  config :forge_mirrors,
+    webhook_worker_max_concurrency: webhook_worker_max_concurrency,
+    webhook_worker_max_concurrency_per_installation:
+      webhook_worker_max_concurrency_per_installation,
+    webhook_worker_max_internal_attempts: webhook_worker_max_internal_attempts,
+    webhook_worker_processor_timeout_ms: webhook_worker_processor_timeout_ms
+
+  config :fornacast_api,
+    github_webhook_body_total_timeout_ms: webhook_body_total_timeout_ms
+
   api_bind = System.get_env("FORNACAST_API_BIND_IP", "127.0.0.1")
 
   api_ip =

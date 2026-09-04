@@ -14,6 +14,7 @@ defmodule ForgeMirrors do
     GitHubAppInstallation,
     MirrorConflict,
     MirrorOperation,
+    MirrorWebhookDelivery,
     OrganizationMirror,
     RepositoryMirror
   }
@@ -191,6 +192,470 @@ defmodule ForgeMirrors do
 
     :ok
   end
+
+  @spec enqueue_webhook_delivery(map(), atom()) ::
+          {:ok, MirrorWebhookDelivery.t(), :enqueued | :duplicate}
+          | {:error, Ecto.Changeset.t() | :delivery_collision | :invalid_argument | :unavailable}
+  def enqueue_webhook_delivery(attrs, state)
+      when is_map(attrs) and state in [:pending, :pending_unsupported, :ignored] do
+    Repo.transaction(fn ->
+      now = database_now!()
+
+      persisted_attrs =
+        attrs
+        |> Map.put(:state, state)
+        |> Map.put(:attempt_count, 0)
+        |> Map.put(:internal_failure_count, 0)
+        |> Map.put(:next_attempt_at, now)
+        |> Map.put(:received_at, now)
+        |> Map.put(:processed_at, if(state == :ignored, do: now, else: nil))
+        |> Map.put(:lease_owner, nil)
+        |> Map.put(:lease_expires_at, nil)
+        |> Map.put(:failure_class, nil)
+        |> Map.put(:lock_version, 1)
+
+      changeset =
+        MirrorWebhookDelivery.persistence_changeset(%MirrorWebhookDelivery{}, persisted_attrs)
+
+      result =
+        if changeset.valid? do
+          delivery_guid = Ecto.Changeset.get_field(changeset, :delivery_guid)
+          lock_webhook_delivery_guid!(delivery_guid)
+
+          case Repo.get_by(MirrorWebhookDelivery, delivery_guid: delivery_guid) do
+            nil ->
+              case Repo.insert(changeset) do
+                {:ok, delivery} -> {:ok, delivery, :enqueued}
+                {:error, %Ecto.Changeset{} = invalid} -> {:error, invalid}
+              end
+
+            existing ->
+              compare_webhook_redelivery(existing, persisted_attrs)
+          end
+        else
+          {:error, changeset}
+        end
+
+      case result do
+        {:ok, delivery, status} -> {delivery, status}
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> case do
+      {:ok, {delivery, status}} -> {:ok, delivery, status}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    _exception -> {:error, :unavailable}
+  end
+
+  def enqueue_webhook_delivery(_attrs, _state), do: {:error, :invalid_argument}
+
+  @spec get_webhook_delivery(String.t()) ::
+          {:ok, MirrorWebhookDelivery.t()} | {:error, :not_found | :invalid_argument}
+  def get_webhook_delivery(delivery_guid)
+      when is_binary(delivery_guid) and byte_size(delivery_guid) in 1..255 do
+    case Repo.get_by(MirrorWebhookDelivery, delivery_guid: delivery_guid) do
+      nil -> {:error, :not_found}
+      delivery -> {:ok, delivery}
+    end
+  end
+
+  def get_webhook_delivery(_delivery_guid), do: {:error, :invalid_argument}
+
+  @spec claim_webhook_deliveries(String.t(), pos_integer(), pos_integer()) ::
+          {:ok, [MirrorWebhookDelivery.t()]} | {:error, :invalid_argument | :unavailable}
+  def claim_webhook_deliveries(owner, lease_seconds, limit)
+      when is_binary(owner) and is_integer(lease_seconds) and is_integer(limit),
+      do:
+        claim_webhook_deliveries(
+          owner,
+          lease_seconds,
+          limit,
+          1,
+          webhook_max_internal_attempts()
+        )
+
+  def claim_webhook_deliveries(_owner, _lease_seconds, _limit),
+    do: {:error, :invalid_argument}
+
+  @spec claim_webhook_deliveries(String.t(), pos_integer(), pos_integer(), pos_integer()) ::
+          {:ok, [MirrorWebhookDelivery.t()]} | {:error, :invalid_argument | :unavailable}
+  def claim_webhook_deliveries(owner, lease_seconds, limit, max_per_installation)
+      when is_binary(owner) and is_integer(lease_seconds) and is_integer(limit) and
+             is_integer(max_per_installation),
+      do:
+        claim_webhook_deliveries(
+          owner,
+          lease_seconds,
+          limit,
+          max_per_installation,
+          webhook_max_internal_attempts()
+        )
+
+  def claim_webhook_deliveries(_owner, _lease_seconds, _limit, _max_per_installation),
+    do: {:error, :invalid_argument}
+
+  @doc false
+  @spec claim_webhook_deliveries(
+          String.t(),
+          pos_integer(),
+          pos_integer(),
+          pos_integer(),
+          pos_integer()
+        ) :: {:ok, [MirrorWebhookDelivery.t()]} | {:error, :invalid_argument | :unavailable}
+  def claim_webhook_deliveries(
+        owner,
+        lease_seconds,
+        limit,
+        max_per_installation,
+        max_internal_attempts
+      )
+      when is_binary(owner) and is_integer(lease_seconds) and lease_seconds in 1..3_600 and
+             is_integer(limit) and limit in 1..@max_claim_batch and
+             is_integer(max_per_installation) and max_per_installation in 1..@max_claim_batch and
+             is_integer(max_internal_attempts) and max_internal_attempts in 1..1_000 do
+    with :ok <- validate_owner(owner) do
+      Repo.transaction(fn ->
+        now = database_now!()
+        recover_expired_webhook_deliveries!(now, max_internal_attempts)
+        # `:utc_datetime` truncates fractional seconds. One extra stored second
+        # keeps the requested lease duration from being shortened by that truncation.
+        expires_at = DateTime.add(now, lease_seconds + 1, :second)
+
+        claim_due_webhook_deliveries(
+          owner,
+          now,
+          expires_at,
+          limit,
+          max_per_installation
+        )
+      end)
+      |> case do
+        {:ok, deliveries} -> {:ok, deliveries}
+        {:error, _reason} -> {:error, :unavailable}
+      end
+    end
+  rescue
+    _exception -> {:error, :unavailable}
+  end
+
+  def claim_webhook_deliveries(
+        _owner,
+        _lease_seconds,
+        _limit,
+        _max_per_installation,
+        _max_internal_attempts
+      ),
+      do: {:error, :invalid_argument}
+
+  @spec complete_webhook_delivery(MirrorWebhookDelivery.t(), String.t()) ::
+          {:ok, MirrorWebhookDelivery.t()}
+          | {:error, :invalid_argument | :invalid_transition | :lost_lease}
+  def complete_webhook_delivery(%MirrorWebhookDelivery{state: :processing} = delivery, owner) do
+    owned_webhook_transition(delivery, owner,
+      state: :completed,
+      processed_at: :server_now,
+      lease_owner: nil,
+      lease_expires_at: nil,
+      failure_class: nil,
+      internal_failure_count: 0
+    )
+  end
+
+  def complete_webhook_delivery(%MirrorWebhookDelivery{}, _owner),
+    do: {:error, :invalid_transition}
+
+  def complete_webhook_delivery(_delivery, _owner), do: {:error, :invalid_argument}
+
+  @spec ignore_webhook_delivery(MirrorWebhookDelivery.t(), String.t()) ::
+          {:ok, MirrorWebhookDelivery.t()}
+          | {:error, :invalid_argument | :invalid_transition | :lost_lease}
+  def ignore_webhook_delivery(%MirrorWebhookDelivery{state: :processing} = delivery, owner) do
+    owned_webhook_transition(delivery, owner,
+      state: :ignored,
+      processed_at: :server_now,
+      lease_owner: nil,
+      lease_expires_at: nil,
+      failure_class: nil,
+      internal_failure_count: 0
+    )
+  end
+
+  def ignore_webhook_delivery(%MirrorWebhookDelivery{}, _owner),
+    do: {:error, :invalid_transition}
+
+  def ignore_webhook_delivery(_delivery, _owner), do: {:error, :invalid_argument}
+
+  @spec defer_webhook_delivery(MirrorWebhookDelivery.t(), String.t()) ::
+          {:ok, MirrorWebhookDelivery.t()}
+          | {:error, :invalid_argument | :invalid_transition | :lost_lease}
+  def defer_webhook_delivery(%MirrorWebhookDelivery{state: :processing} = delivery, owner) do
+    owned_webhook_transition(delivery, owner,
+      state: :pending_unsupported,
+      processed_at: nil,
+      lease_owner: nil,
+      lease_expires_at: nil,
+      failure_class: nil,
+      internal_failure_count: 0
+    )
+  end
+
+  def defer_webhook_delivery(%MirrorWebhookDelivery{}, _owner),
+    do: {:error, :invalid_transition}
+
+  def defer_webhook_delivery(_delivery, _owner), do: {:error, :invalid_argument}
+
+  @spec retry_webhook_delivery(
+          MirrorWebhookDelivery.t(),
+          String.t(),
+          String.t(),
+          non_neg_integer()
+        ) ::
+          {:ok, MirrorWebhookDelivery.t()}
+          | {:error, :invalid_argument | :invalid_transition | :lost_lease}
+  def retry_webhook_delivery(
+        %MirrorWebhookDelivery{state: :processing} = delivery,
+        owner,
+        failure_class,
+        delay_seconds
+      )
+      when is_integer(delay_seconds),
+      do: retry_webhook_delivery(delivery, owner, failure_class, delay_seconds, 0)
+
+  def retry_webhook_delivery(%MirrorWebhookDelivery{}, _owner, _failure_class, _delay_seconds),
+    do: {:error, :invalid_transition}
+
+  def retry_webhook_delivery(_delivery, _owner, _failure_class, _delay_seconds),
+    do: {:error, :invalid_argument}
+
+  @doc false
+  @spec retry_webhook_delivery(
+          MirrorWebhookDelivery.t(),
+          String.t(),
+          String.t(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) ::
+          {:ok, MirrorWebhookDelivery.t()}
+          | {:error, :invalid_argument | :invalid_transition | :lost_lease}
+  def retry_webhook_delivery(
+        %MirrorWebhookDelivery{state: :processing} = delivery,
+        owner,
+        failure_class,
+        delay_seconds,
+        internal_failure_count
+      )
+      when is_integer(delay_seconds) and delay_seconds in 0..86_400 and
+             is_integer(internal_failure_count) and internal_failure_count in 0..1_000 do
+    with :ok <- validate_webhook_failure_class(failure_class) do
+      owned_webhook_transition(delivery, owner,
+        state: :pending,
+        next_attempt_at: {:server_after, delay_seconds},
+        processed_at: nil,
+        lease_owner: nil,
+        lease_expires_at: nil,
+        failure_class: failure_class,
+        internal_failure_count: internal_failure_count
+      )
+    end
+  end
+
+  def retry_webhook_delivery(
+        %MirrorWebhookDelivery{},
+        _owner,
+        _failure_class,
+        _delay_seconds,
+        _internal_failure_count
+      ),
+      do: {:error, :invalid_transition}
+
+  def retry_webhook_delivery(
+        _delivery,
+        _owner,
+        _failure_class,
+        _delay_seconds,
+        _internal_failure_count
+      ),
+      do: {:error, :invalid_argument}
+
+  @spec fail_webhook_delivery(MirrorWebhookDelivery.t(), String.t(), String.t()) ::
+          {:ok, MirrorWebhookDelivery.t()}
+          | {:error, :invalid_argument | :invalid_transition | :lost_lease}
+  def fail_webhook_delivery(
+        %MirrorWebhookDelivery{state: :processing} = delivery,
+        owner,
+        failure_class
+      ),
+      do: fail_webhook_delivery(delivery, owner, failure_class, 0)
+
+  def fail_webhook_delivery(%MirrorWebhookDelivery{}, _owner, _failure_class),
+    do: {:error, :invalid_transition}
+
+  def fail_webhook_delivery(_delivery, _owner, _failure_class),
+    do: {:error, :invalid_argument}
+
+  @doc false
+  @spec fail_webhook_delivery(
+          MirrorWebhookDelivery.t(),
+          String.t(),
+          String.t(),
+          non_neg_integer()
+        ) ::
+          {:ok, MirrorWebhookDelivery.t()}
+          | {:error, :invalid_argument | :invalid_transition | :lost_lease}
+  def fail_webhook_delivery(
+        %MirrorWebhookDelivery{state: :processing} = delivery,
+        owner,
+        failure_class,
+        internal_failure_count
+      )
+      when is_integer(internal_failure_count) and internal_failure_count in 0..1_000 do
+    with :ok <- validate_webhook_failure_class(failure_class) do
+      owned_webhook_transition(delivery, owner,
+        state: :failed,
+        processed_at: :server_now,
+        lease_owner: nil,
+        lease_expires_at: nil,
+        failure_class: failure_class,
+        internal_failure_count: internal_failure_count
+      )
+    end
+  end
+
+  def fail_webhook_delivery(
+        %MirrorWebhookDelivery{},
+        _owner,
+        _failure_class,
+        _internal_failure_count
+      ),
+      do: {:error, :invalid_transition}
+
+  def fail_webhook_delivery(_delivery, _owner, _failure_class, _internal_failure_count),
+    do: {:error, :invalid_argument}
+
+  @spec recover_expired_webhook_deliveries() ::
+          {:ok, non_neg_integer()} | {:error, :unavailable}
+  def recover_expired_webhook_deliveries do
+    Repo.transaction(fn ->
+      now = database_now!()
+      recover_expired_webhook_deliveries!(now, webhook_max_internal_attempts())
+    end)
+    |> case do
+      {:ok, count} -> {:ok, count}
+      {:error, _reason} -> {:error, :unavailable}
+    end
+  rescue
+    _exception -> {:error, :unavailable}
+  end
+
+  @doc false
+  @spec retain_webhook_inventory_trigger(pos_integer(), String.t()) ::
+          {:ok, :deferred | {:scheduled, MirrorOperation.t()}}
+          | {:error, :invalid_argument | :unavailable | term()}
+  def retain_webhook_inventory_trigger(installation_id, delivery_guid)
+      when is_integer(installation_id) and installation_id > 0 and is_binary(delivery_guid) and
+             byte_size(delivery_guid) in 1..255 do
+    Repo.transaction(fn ->
+      mirror =
+        OrganizationMirror
+        |> where(
+          [candidate],
+          candidate.provider == "github" and
+            candidate.github_installation_id == ^installation_id and
+            candidate.state != :revoked
+        )
+        |> lock("FOR UPDATE")
+        |> Repo.one()
+
+      case mirror do
+        nil ->
+          :deferred
+
+        %OrganizationMirror{} = mirror ->
+          now = database_now!()
+
+          with {:ok, operation} <-
+                 enqueue_operation(%{
+                   organization_mirror_id: mirror.id,
+                   kind: "reconcile.organization_inventory",
+                   dedupe_key: "webhook:#{delivery_guid}:organization_inventory",
+                   cursor: %{"delivery_guid" => delivery_guid},
+                   next_attempt_at: now
+                 }),
+               {:ok, _updated} <-
+                 mirror
+                 |> OrganizationMirror.update_changeset(%{last_webhook_at: now})
+                 |> cas_update() do
+            {:scheduled, operation}
+          else
+            {:error, reason} -> Repo.rollback(reason)
+          end
+      end
+    end)
+    |> case do
+      {:ok, result} -> {:ok, result}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    _exception -> {:error, :unavailable}
+  end
+
+  def retain_webhook_inventory_trigger(_installation_id, _delivery_guid),
+    do: {:error, :invalid_argument}
+
+  @doc false
+  @spec revoke_bound_organization_from_webhook(pos_integer()) ::
+          {:ok, :unbound | OrganizationMirror.t()}
+          | {:error, :invalid_argument | :unavailable | :invalid_transition}
+  def revoke_bound_organization_from_webhook(installation_id)
+      when is_integer(installation_id) and installation_id > 0 do
+    Repo.transaction(fn ->
+      mirror =
+        OrganizationMirror
+        |> where(
+          [candidate],
+          candidate.provider == "github" and
+            candidate.github_installation_id == ^installation_id
+        )
+        |> lock("FOR UPDATE")
+        |> Repo.one()
+
+      case mirror do
+        nil ->
+          :unbound
+
+        %OrganizationMirror{state: :revoked} = mirror ->
+          mirror
+
+        %OrganizationMirror{} = mirror ->
+          if OrganizationMirror.legal_transition?(mirror.state, :revoked) do
+            now = database_now!()
+
+            mirror
+            |> OrganizationMirror.transition_changeset(:revoked)
+            |> Ecto.Changeset.put_change(:last_webhook_at, now)
+            |> cas_update()
+            |> case do
+              {:ok, revoked} -> revoked
+              {:error, reason} -> Repo.rollback(reason)
+            end
+          else
+            Repo.rollback(:invalid_transition)
+          end
+      end
+    end)
+    |> case do
+      {:ok, result} -> {:ok, result}
+      {:error, :invalid_transition} -> {:error, :invalid_transition}
+      {:error, _reason} -> {:error, :unavailable}
+    end
+  rescue
+    _exception -> {:error, :unavailable}
+  end
+
+  def revoke_bound_organization_from_webhook(_installation_id),
+    do: {:error, :invalid_argument}
 
   @spec create_organization_mirror(ForgeAccounts.User.t(), map()) ::
           {:ok, OrganizationMirror.t()}
@@ -1237,6 +1702,248 @@ defmodule ForgeMirrors do
        do: :ok
 
   defp validate_effect_repository(%RepositoryMirror{}), do: {:error, :invalid_transition}
+
+  defp lock_webhook_delivery_guid!(delivery_guid) do
+    if Repo.__adapter__() == Ecto.Adapters.Postgres do
+      Ecto.Adapters.SQL.query!(
+        Repo,
+        "select pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [delivery_guid]
+      )
+    end
+
+    :ok
+  end
+
+  defp compare_webhook_redelivery(existing, attrs) do
+    fields = [
+      :delivery_guid,
+      :hook_id,
+      :event,
+      :action,
+      :installation_id,
+      :github_repository_id,
+      :signature_version,
+      :raw_payload
+    ]
+
+    expected = Map.new(fields, &{&1, attr(attrs, &1)})
+    actual = Map.take(existing, fields)
+
+    if expected == actual,
+      do: {:ok, existing, :duplicate},
+      else: {:error, :delivery_collision}
+  end
+
+  defp claim_due_webhook_deliveries(
+         owner,
+         now,
+         expires_at,
+         limit,
+         max_per_installation
+       ) do
+    sql = """
+    with pending_ranked as (
+      select candidate.id,
+             row_number() over (
+               partition by candidate.installation_id
+               order by candidate.id
+             ) as installation_position
+      from mirror_webhook_deliveries candidate
+      where candidate.state = 'pending'
+    ),
+    active_counts as (
+      select active.installation_id, count(*) as active_count
+      from mirror_webhook_deliveries active
+      where active.state = 'processing'
+        and active.lease_expires_at > $1
+      group by active.installation_id
+    )
+    select delivery.id
+    from mirror_webhook_deliveries delivery
+    join pending_ranked ranked on ranked.id = delivery.id
+    left join active_counts active on active.installation_id = delivery.installation_id
+    where delivery.state = 'pending'
+      and delivery.next_attempt_at <= $1
+      and (
+        (
+          delivery.event in ('installation', 'installation_repositories', 'repository')
+          and coalesce(active.active_count, 0) = 0
+          and not exists (
+            select 1
+            from mirror_webhook_deliveries earlier
+            where earlier.installation_id = delivery.installation_id
+              and earlier.id < delivery.id
+              and earlier.state in ('pending', 'processing')
+          )
+        )
+        or
+        (
+          delivery.event not in ('installation', 'installation_repositories', 'repository')
+          and ranked.installation_position + coalesce(active.active_count, 0) <= $2
+          and not exists (
+            select 1
+            from mirror_webhook_deliveries serialized
+            where serialized.installation_id = delivery.installation_id
+              and serialized.event in ('installation', 'installation_repositories', 'repository')
+              and (
+                serialized.state = 'processing'
+                or (serialized.state = 'pending' and serialized.id < delivery.id)
+              )
+          )
+        )
+      )
+    order by delivery.next_attempt_at, delivery.id
+    for update of delivery skip locked
+    limit $3
+    """
+
+    %{rows: rows} =
+      Ecto.Adapters.SQL.query!(Repo, sql, [now, max_per_installation, limit])
+
+    Enum.map(rows, fn [id] -> claim_webhook_delivery!(id, owner, now, expires_at) end)
+  end
+
+  defp claim_webhook_delivery!(id, owner, now, expires_at) do
+    delivery = Repo.get!(MirrorWebhookDelivery, id)
+
+    {1, _} =
+      MirrorWebhookDelivery
+      |> where(
+        [candidate],
+        candidate.id == ^id and candidate.state == :pending and
+          candidate.lock_version == ^delivery.lock_version
+      )
+      |> Repo.update_all(
+        set: [
+          state: :processing,
+          lease_owner: owner,
+          lease_expires_at: expires_at,
+          failure_class: nil,
+          updated_at: now
+        ],
+        inc: [attempt_count: 1, lock_version: 1]
+      )
+
+    Repo.get!(MirrorWebhookDelivery, id)
+  end
+
+  defp recover_expired_webhook_deliveries!(now, max_internal_attempts) do
+    sql = """
+    update mirror_webhook_deliveries
+    set state = case
+          when internal_failure_count + 1 >= $2 then 'failed'
+          else 'pending'
+        end,
+        next_attempt_at = $1,
+        lease_owner = null,
+        lease_expires_at = null,
+        processed_at = case
+          when internal_failure_count + 1 >= $2 then $1
+          else null
+        end,
+        failure_class = 'worker_crash',
+        internal_failure_count = internal_failure_count + 1,
+        lock_version = lock_version + 1,
+        updated_at = $1
+    where state = 'processing'
+      and lease_expires_at <= $1
+    """
+
+    %{num_rows: count} =
+      Ecto.Adapters.SQL.query!(Repo, sql, [now, max_internal_attempts])
+
+    count
+  end
+
+  defp webhook_max_internal_attempts do
+    case Application.get_env(:forge_mirrors, :webhook_worker_max_internal_attempts, 10) do
+      value when is_integer(value) and value in 1..1_000 -> value
+      _invalid -> raise ArgumentError, "invalid webhook worker internal attempt limit"
+    end
+  end
+
+  defp owned_webhook_transition(delivery, owner, updates) when is_list(updates) do
+    with :ok <- validate_owner(owner),
+         true <- webhook_capability?(delivery) do
+      Repo.transaction(fn ->
+        now = database_now!()
+
+        updates =
+          Enum.map(updates, fn
+            {:processed_at, :server_now} ->
+              {:processed_at, now}
+
+            {:next_attempt_at, {:server_after, seconds}} ->
+              {:next_attempt_at, DateTime.add(now, seconds, :second)}
+
+            update ->
+              update
+          end)
+
+        query =
+          from candidate in MirrorWebhookDelivery,
+            where:
+              candidate.id == ^delivery.id and candidate.state == :processing and
+                candidate.lease_owner == ^owner and
+                candidate.lease_owner == ^delivery.lease_owner and
+                candidate.lease_expires_at == ^delivery.lease_expires_at and
+                candidate.lease_expires_at > fragment("timezone('UTC', clock_timestamp())") and
+                candidate.lock_version == ^delivery.lock_version
+
+        case Repo.update_all(query,
+               set: Keyword.put(updates, :updated_at, now),
+               inc: [lock_version: 1]
+             ) do
+          {1, _} -> Repo.get!(MirrorWebhookDelivery, delivery.id)
+          {0, _} -> Repo.rollback(:lost_lease)
+        end
+      end)
+      |> case do
+        {:ok, updated} -> {:ok, updated}
+        {:error, :lost_lease} -> {:error, :lost_lease}
+        {:error, _reason} -> {:error, :lost_lease}
+      end
+    else
+      false -> {:error, :lost_lease}
+      {:error, _reason} -> {:error, :invalid_argument}
+    end
+  rescue
+    _exception -> {:error, :lost_lease}
+  end
+
+  defp webhook_capability?(%MirrorWebhookDelivery{
+         id: id,
+         state: :processing,
+         lease_owner: owner,
+         lease_expires_at: %DateTime{},
+         lock_version: lock_version
+       }) do
+    is_integer(id) and is_binary(owner) and is_integer(lock_version) and lock_version > 0
+  end
+
+  defp webhook_capability?(_delivery), do: false
+
+  defp validate_webhook_failure_class(failure_class) do
+    if is_binary(failure_class) and byte_size(failure_class) in 1..255 and
+         String.valid?(failure_class) and failure_class == String.trim(failure_class) and
+         :binary.match(failure_class, <<0>>) == :nomatch,
+       do: :ok,
+       else: {:error, :invalid_argument}
+  end
+
+  defp database_now! do
+    %{rows: [[naive]]} =
+      Ecto.Adapters.SQL.query!(
+        Repo,
+        "select date_trunc('second', timezone('UTC', clock_timestamp()))",
+        []
+      )
+
+    naive
+    |> DateTime.from_naive!("Etc/UTC")
+    |> DateTime.truncate(:second)
+  end
 
   defp claim_due_operations(owner, now, expires_at, limit) do
     sql = """

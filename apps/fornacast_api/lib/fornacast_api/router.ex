@@ -21,6 +21,10 @@ defmodule FornacastAPI.Router do
       json_decoder: Jason
   end
 
+  pipeline :github_webhook do
+    plug FornacastAPI.Plugs.GitHubWebhookRequest
+  end
+
   scope "/", FornacastAPI do
     get "/health", HealthController, :show
     get "/.well-known/fornacast", WellKnownController, :fornacast
@@ -30,6 +34,12 @@ defmodule FornacastAPI.Router do
     pipe_through :graphql
 
     forward "/graphql", Absinthe.Plug, schema: FornacastAPI.GraphQL.Schema
+  end
+
+  scope "/api/webhooks", FornacastAPI do
+    pipe_through :github_webhook
+
+    post "/github", GitHubWebhookController, :create
   end
 
   scope "/api/v3", FornacastAPI do

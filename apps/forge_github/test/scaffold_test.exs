@@ -1,19 +1,27 @@
 defmodule ForgeGitHub.ScaffoldTest do
   use ExUnit.Case, async: true
 
-  test "application starts only bounded provider authentication infrastructure" do
+  test "application starts bounded provider authentication and webhook infrastructure" do
     supervisor = Process.whereis(ForgeGitHub.Supervisor)
 
     assert is_pid(supervisor)
 
-    assert [
-             {ForgeGitHub.InstallationTokenBroker, broker, :worker,
-              [ForgeGitHub.InstallationTokenBroker]},
-             {ForgeGitHub.TokenTaskSupervisor, task_supervisor, :supervisor, [Task.Supervisor]}
-           ] = Enum.sort(Supervisor.which_children(supervisor))
+    children = Supervisor.which_children(supervisor)
+
+    assert {ForgeGitHub.InstallationTokenBroker, broker, :worker,
+            [ForgeGitHub.InstallationTokenBroker]} =
+             List.keyfind(children, ForgeGitHub.InstallationTokenBroker, 0)
+
+    assert {ForgeGitHub.TokenTaskSupervisor, task_supervisor, :supervisor, [Task.Supervisor]} =
+             List.keyfind(children, ForgeGitHub.TokenTaskSupervisor, 0)
+
+    assert {ForgeMirrors.WebhookWorker, webhook_worker, :worker, [ForgeMirrors.WebhookWorker]} =
+             List.keyfind(children, ForgeMirrors.WebhookWorker, 0)
 
     assert is_pid(broker)
     assert is_pid(task_supervisor)
+    assert is_pid(webhook_worker)
+    assert %{enabled: false} = :sys.get_state(webhook_worker)
   end
 
   test "context exposes stable provider boundary types" do

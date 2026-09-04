@@ -9,6 +9,10 @@ defmodule ForgeMirrors.CoordinatorRecoveryTest do
     assert_coordinator_recovers(ForgeMirrors.PeriodicReconciler)
   end
 
+  test "webhook coordinator observes a crashed task and schedules the next bounded run" do
+    assert_coordinator_recovers(ForgeMirrors.WebhookWorker)
+  end
+
   defp assert_coordinator_recovers(module) do
     parent = self()
 

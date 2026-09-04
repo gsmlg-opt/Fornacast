@@ -9,6 +9,11 @@ defmodule ForgeGitHub.RuntimeConfigurationTest do
     FORNACAST_GITHUB_APP_PRIVATE_KEY_FILE
     FORNACAST_GITHUB_WEBHOOK_SECRET
     FORNACAST_GITHUB_WEBHOOK_MAX_BYTES
+    FORNACAST_GITHUB_WEBHOOK_MAX_CONCURRENCY
+    FORNACAST_GITHUB_WEBHOOK_MAX_CONCURRENCY_PER_INSTALLATION
+    FORNACAST_GITHUB_WEBHOOK_MAX_INTERNAL_ATTEMPTS
+    FORNACAST_GITHUB_WEBHOOK_PROCESSOR_TIMEOUT_MS
+    FORNACAST_GITHUB_WEBHOOK_BODY_TIMEOUT_MS
   )
   @runtime_config Path.expand("../../../../config/runtime.exs", __DIR__)
 
@@ -49,6 +54,14 @@ defmodule ForgeGitHub.RuntimeConfigurationTest do
   test "runtime configuration is disabled when all GitHub App secrets are absent" do
     config = Config.Reader.read!(@runtime_config, env: :prod, target: :host)
     assert get_in(config, [:forge_github, :app_configuration]) == :disabled
+    assert get_in(config, [:forge_mirrors, :webhook_worker_max_concurrency]) == 8
+
+    assert get_in(config, [:forge_mirrors, :webhook_worker_max_concurrency_per_installation]) ==
+             1
+
+    assert get_in(config, [:forge_mirrors, :webhook_worker_max_internal_attempts]) == 10
+    assert get_in(config, [:forge_mirrors, :webhook_worker_processor_timeout_ms]) == 25_000
+    assert get_in(config, [:fornacast_api, :github_webhook_body_total_timeout_ms]) == 5_000
   end
 
   test "runtime configuration requires all identity and secret inputs and defaults the byte bound" do
@@ -103,6 +116,33 @@ defmodule ForgeGitHub.RuntimeConfigurationTest do
 
     assert message =~ "FORNACAST_GITHUB_WEBHOOK_MAX_BYTES"
     refute message =~ "must-not-appear"
+  end
+
+  test "runtime configuration validates webhook worker and body bounds" do
+    for {name, value} <- [
+          {"FORNACAST_GITHUB_WEBHOOK_MAX_CONCURRENCY", "65"},
+          {"FORNACAST_GITHUB_WEBHOOK_MAX_CONCURRENCY_PER_INSTALLATION", "65"},
+          {"FORNACAST_GITHUB_WEBHOOK_MAX_INTERNAL_ATTEMPTS", "0"},
+          {"FORNACAST_GITHUB_WEBHOOK_PROCESSOR_TIMEOUT_MS", "25001"},
+          {"FORNACAST_GITHUB_WEBHOOK_BODY_TIMEOUT_MS", "0"}
+        ] do
+      System.put_env(name, value)
+
+      assert_raise RuntimeError, ~r/#{name}/, fn ->
+        Config.Reader.read!(@runtime_config, env: :prod, target: :host)
+      end
+
+      System.delete_env(name)
+    end
+
+    System.put_env("FORNACAST_GITHUB_WEBHOOK_MAX_CONCURRENCY", "2")
+    System.put_env("FORNACAST_GITHUB_WEBHOOK_MAX_CONCURRENCY_PER_INSTALLATION", "3")
+
+    assert_raise RuntimeError,
+                 ~r/FORNACAST_GITHUB_WEBHOOK_MAX_CONCURRENCY_PER_INSTALLATION/,
+                 fn ->
+                   Config.Reader.read!(@runtime_config, env: :prod, target: :host)
+                 end
   end
 
   defp write_private_key! do

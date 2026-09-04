@@ -13,7 +13,8 @@ defmodule ForgeGitHub.Application do
     children = [
       {Task.Supervisor, name: ForgeGitHub.TokenTaskSupervisor, max_children: 16},
       {ForgeGitHub.InstallationTokenBroker,
-       task_supervisor: ForgeGitHub.TokenTaskSupervisor, max_inflight: 16, max_entries: 256}
+       task_supervisor: ForgeGitHub.TokenTaskSupervisor, max_inflight: 16, max_entries: 256},
+      {ForgeMirrors.WebhookWorker, processor: ForgeGitHub.WebhookProcessor}
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: ForgeGitHub.Supervisor)

@@ -87,6 +87,11 @@ config :fornacast, :auto_migrate, true
 config :fornacast, :legacy_turso_preflight, false
 config :fornacast, :github_credential_keyring, github_credential_keyring
 config :forge_github, :app_configuration, :disabled
+config :forge_mirrors, :webhook_worker_max_concurrency, 8
+config :forge_mirrors, :webhook_worker_max_concurrency_per_installation, 1
+config :forge_mirrors, :webhook_worker_max_internal_attempts, 10
+config :forge_mirrors, :webhook_worker_processor_timeout_ms, 25_000
+config :fornacast_api, :github_webhook_body_total_timeout_ms, 5_000
 
 config :fornacast,
   release_asset_storage_root: release_asset_root,
