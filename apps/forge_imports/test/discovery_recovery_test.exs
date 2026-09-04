@@ -15,7 +15,7 @@ defmodule ForgeImports.DiscoveryRecoveryTest do
     RunView
   }
 
-  alias ForgeImports.GitHub.{Organization, Repository, User}
+  alias ForgeGitHub.{Organization, Repository, User}
   alias Fornacast.{OperationLease, Repo}
 
   @pat "github_pat_ZYXWVUTSRQPONMLK"
@@ -370,7 +370,7 @@ defmodule ForgeImports.DiscoveryRecoveryTest do
       case Keyword.fetch!(opts, :state) do
         pid when is_pid(pid) ->
           if Process.info(pid, :dictionary) == nil do
-            {:error, ForgeImports.GitHub.Error.new(:upstream_unavailable)}
+            {:error, ForgeGitHub.Error.new(:upstream_unavailable)}
           else
             call =
               Agent.get_and_update(pid, fn state ->
@@ -512,7 +512,7 @@ defmodule ForgeImports.DiscoveryRecoveryTest do
   defmodule CheckoutProbeClient do
     def repository(_pat, _owner, _repository, opts) do
       send(Keyword.fetch!(opts, :test_pid), :saved_provider_called)
-      {:error, ForgeImports.GitHub.Error.new(:forbidden)}
+      {:error, ForgeGitHub.Error.new(:forbidden)}
     end
   end
 

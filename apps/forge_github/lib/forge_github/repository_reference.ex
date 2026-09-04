@@ -1,4 +1,4 @@
-defmodule ForgeImports.GitHub.RepositoryReference do
+defmodule ForgeGitHub.RepositoryReference do
   @moduledoc "Strict parser for GitHub.com repository references."
 
   @owner ~r/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/

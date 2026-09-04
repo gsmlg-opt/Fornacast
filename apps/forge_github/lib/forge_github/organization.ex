@@ -1,7 +1,7 @@
-defmodule ForgeImports.GitHub.Organization do
+defmodule ForgeGitHub.Organization do
   @moduledoc "A bounded GitHub organization representation."
 
-  alias ForgeImports.GitHub.User
+  alias ForgeGitHub.User
 
   @derive {Inspect, only: [:id, :login, :name, :description, :avatar_url, :html_url]}
   @enforce_keys [:id, :login]

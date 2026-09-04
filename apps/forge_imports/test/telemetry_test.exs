@@ -4,7 +4,7 @@ defmodule ForgeImports.TelemetryTest do
   import Ecto.Query
 
   alias ForgeAccounts.{GitHubCredential, User}
-  alias ForgeImports.GitHub.Client
+  alias ForgeGitHub.Client
   alias ForgeImports.{Cancellation, Persistence, Waits}
   alias Fornacast.Repo
 
@@ -14,7 +14,8 @@ defmodule ForgeImports.TelemetryTest do
 
   @telemetry_events [
     [:fornacast, :github_import, :phase, :stop],
-    [:fornacast, :github_import, :github, :request, :stop],
+    [:fornacast, :github, :request, :stop],
+    [:fornacast, :github, :rate_limit, :pause],
     [:fornacast, :github_import, :rate_limit, :pause],
     [:fornacast, :github_import, :cancel, :requested],
     [:fornacast, :github_import, :cleanup, :stop],
@@ -89,8 +90,7 @@ defmodule ForgeImports.TelemetryTest do
 
       assert {:ok, _user} = Client.authenticated_user(@pat, client_opts(stub))
 
-      assert_receive {:telemetry, [:fornacast, :github_import, :github, :request, :stop],
-                      measurements, metadata}
+      assert_receive {:telemetry, [:fornacast, :github, :request, :stop], measurements, metadata}
 
       assert is_integer(measurements.duration) and measurements.duration >= 0
       assert metadata.outcome == :ok
@@ -108,13 +108,13 @@ defmodule ForgeImports.TelemetryTest do
         |> Plug.Conn.send_resp(403, ~s({"message":"rate limit"}))
       end)
 
-      assert {:error, %ForgeImports.GitHub.Error{kind: :primary_rate_limit}} =
+      assert {:error, %ForgeGitHub.Error{kind: :primary_rate_limit}} =
                Client.authenticated_user(@pat, client_opts(stub))
 
-      assert_receive {:telemetry, [:fornacast, :github_import, :github, :request, :stop], _req,
+      assert_receive {:telemetry, [:fornacast, :github, :request, :stop], _req,
                       %{outcome: :error, error: :primary_rate_limit}}
 
-      assert_receive {:telemetry, [:fornacast, :github_import, :rate_limit, :pause], %{count: 1},
+      assert_receive {:telemetry, [:fornacast, :github, :rate_limit, :pause], %{count: 1},
                       metadata}
 
       assert metadata.classification == :primary

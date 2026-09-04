@@ -26,7 +26,7 @@ defmodule ForgeImports.Telemetry do
     invalid_request invalid_credential forbidden not_found
     primary_rate_limit secondary_rate_limit upstream_unavailable
     unexpected_status transport timeout host_unavailable unsafe_host
-    response_too_large invalid_json invalid_response invalid_pagination
+    request_too_large response_too_large invalid_json invalid_response invalid_pagination
     pagination_limit request_gate_busy cancelled canceled not_found
     metadata_not_ready busy destination_changed publication_unavailable
     persistence_unavailable publication_inconsistent invalid_transition

@@ -6,7 +6,8 @@ defmodule ForgeImports.GitHub.MetadataImporter do
   alias Ecto.Multi
   alias ForgeAccounts
   alias ForgeAccounts.GitHubIdentity
-  alias ForgeImports.GitHub.{Client, MetadataMapper}
+  alias ForgeGitHub.Client
+  alias ForgeImports.GitHub.MetadataMapper
   alias ForgeImports.{ObjectMapping, PageCheckpoint, Persistence, ReportEntry, RepositoryItem}
   alias ForgeIssues
   alias ForgeIssues.{Issue, Label}
@@ -454,7 +455,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
 
   defp import_assignees(_repo, issue, payload, now) do
     Enum.reduce_while(Map.get(payload, "assignees", []), :ok, fn assignee_payload, :ok ->
-      with {:ok, github_user_id} <- ForgeImports.GitHub.User.id(assignee_payload["id"]),
+      with {:ok, github_user_id} <- ForgeGitHub.User.id(assignee_payload["id"]),
            {:ok, identity} <- observe_user(github_user_id, now),
            {:ok, _} <-
              Multi.new()

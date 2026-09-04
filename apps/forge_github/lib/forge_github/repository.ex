@@ -1,7 +1,7 @@
-defmodule ForgeImports.GitHub.Repository do
+defmodule ForgeGitHub.Repository do
   @moduledoc "A bounded GitHub repository representation used by discovery."
 
-  alias ForgeImports.GitHub.User
+  alias ForgeGitHub.User
 
   @derive {Inspect,
            only: [

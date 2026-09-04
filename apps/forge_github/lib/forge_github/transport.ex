@@ -1,7 +1,7 @@
-defmodule ForgeImports.GitHub.Transport do
+defmodule ForgeGitHub.Transport do
   @moduledoc false
 
-  alias ForgeImports.GitHub.HostPolicy
+  alias ForgeGitHub.HostPolicy
 
   @host "api.github.com"
   @port 443
@@ -9,6 +9,7 @@ defmodule ForgeImports.GitHub.Transport do
   @total_timeout 20_000
   @max_body_bytes 2_000_000
   @max_header_bytes 65_536
+  @allowed_methods [:get, :post, :patch, :put, :delete]
 
   defmodule Error do
     @moduledoc false
@@ -36,7 +37,7 @@ defmodule ForgeImports.GitHub.Transport do
     with :ok <- validate_request(request),
          {:ok, addresses} <- addresses(request),
          {:ok, timeout} <- timeout(request) do
-      api = Req.Request.get_private(request, :forge_imports_transport_api, Mint.HTTP)
+      api = Req.Request.get_private(request, :forge_github_transport_api, Mint.HTTP)
       deadline = monotonic_ms() + timeout
       run_with_deadline(request, api, addresses, deadline)
     else
@@ -227,7 +228,13 @@ defmodule ForgeImports.GitHub.Transport do
         %Error{kind: :timeout}
 
       _remaining ->
-        case api.request(connection, "GET", request_target(request.url), headers, nil) do
+        case api.request(
+               connection,
+               method_name(request.method),
+               request_target(request.url),
+               headers,
+               request.body
+             ) do
           {:ok, connection, reference} ->
             receive_response(api, connection, reference, deadline, empty_response())
 
@@ -317,8 +324,8 @@ defmodule ForgeImports.GitHub.Transport do
   defp empty_response, do: %{status: nil, headers: [], header_size: 0, chunks: [], size: 0}
 
   defp validate_request(%Req.Request{
-         method: :get,
-         body: nil,
+         method: method,
+         body: body,
          url:
            %URI{
              scheme: "https",
@@ -329,10 +336,11 @@ defmodule ForgeImports.GitHub.Transport do
              path: path
            } = uri
        })
-       when is_binary(path) and path != "" and byte_size(path) <= 2_048 do
+       when method in @allowed_methods and is_binary(path) and path != "" and
+              byte_size(path) <= 2_048 do
     target = request_target(uri)
 
-    if byte_size(target) <= 4_096 and String.valid?(target) and
+    if valid_body?(body) and byte_size(target) <= 4_096 and String.valid?(target) and
          Enum.all?([<<0>>, "\r", "\n"], &(:binary.match(target, &1) == :nomatch)),
        do: :ok,
        else: :error
@@ -340,8 +348,18 @@ defmodule ForgeImports.GitHub.Transport do
 
   defp validate_request(_request), do: :error
 
+  defp valid_body?(nil), do: true
+  defp valid_body?(body) when is_binary(body), do: byte_size(body) <= @max_body_bytes
+  defp valid_body?(_body), do: false
+
+  defp method_name(:get), do: "GET"
+  defp method_name(:post), do: "POST"
+  defp method_name(:patch), do: "PATCH"
+  defp method_name(:put), do: "PUT"
+  defp method_name(:delete), do: "DELETE"
+
   defp addresses(request) do
-    case Req.Request.get_private(request, :forge_imports_github_addresses) do
+    case Req.Request.get_private(request, :forge_github_addresses) do
       addresses when is_list(addresses) and addresses != [] ->
         if Enum.all?(addresses, &HostPolicy.public_address?/1),
           do: {:ok, addresses},
@@ -353,7 +371,7 @@ defmodule ForgeImports.GitHub.Transport do
   end
 
   defp timeout(request) do
-    case Req.Request.get_private(request, :forge_imports_transport_timeout, @total_timeout) do
+    case Req.Request.get_private(request, :forge_github_transport_timeout, @total_timeout) do
       timeout when is_integer(timeout) and timeout in 1..@total_timeout -> {:ok, timeout}
       _invalid -> :error
     end

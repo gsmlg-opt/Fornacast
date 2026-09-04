@@ -4,7 +4,7 @@ defmodule ForgeImports.DiscoveryDispatchTest do
   import Ecto.Query
 
   alias ForgeImports.{ImportRun, Reconciler, RecoverySupervisor, RunView}
-  alias ForgeImports.GitHub.{Repository, User}
+  alias ForgeGitHub.{Repository, User}
   alias Fornacast.Repo
 
   @saved_pat "opaque-saved-value-QWERTYUIOP"

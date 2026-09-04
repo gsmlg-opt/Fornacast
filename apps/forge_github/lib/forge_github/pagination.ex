@@ -1,4 +1,4 @@
-defmodule ForgeImports.GitHub.Pagination do
+defmodule ForgeGitHub.Pagination do
   @moduledoc false
 
   @max_link_bytes 8_192

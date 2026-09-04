@@ -6,8 +6,8 @@ defmodule ForgeImports.GitHubAccountsTest do
   require Logger
 
   alias ForgeAccounts.{GitHubCredential, GitHubIdentity, User}
-  alias ForgeImports.GitHub.Error
-  alias ForgeImports.GitHub.User, as: GitHubUser
+  alias ForgeGitHub.Error
+  alias ForgeGitHub.User, as: GitHubUser
   alias ForgeImports.{ImportRun, RepositoryItem}
   alias Fornacast.{AuditEvent, OperationLease, Repo}
 

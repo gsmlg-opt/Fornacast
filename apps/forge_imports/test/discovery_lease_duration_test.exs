@@ -2,7 +2,7 @@ defmodule ForgeImports.DiscoveryLeaseDurationTest do
   use ExUnit.Case, async: false
 
   alias ForgeImports.{DiscoveryWorker, ImportRun, Persistence, ReportEntry, RepositoryItem}
-  alias ForgeImports.GitHub.Repository
+  alias ForgeGitHub.Repository
   alias Fornacast.{AuditEvent, OperationLease, Repo}
 
   @lease_seconds 2

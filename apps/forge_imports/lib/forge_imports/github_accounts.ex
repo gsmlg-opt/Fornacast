@@ -11,8 +11,8 @@ defmodule ForgeImports.GitHubAccounts do
     User
   }
 
-  alias ForgeImports.GitHub.{Client, Error, RequestGate}
-  alias ForgeImports.GitHub.User, as: GitHubUser
+  alias ForgeGitHub.{Client, Error, RequestGate}
+  alias ForgeGitHub.User, as: GitHubUser
   alias ForgeImports.{ImportRun, RepositoryItem}
   alias Fornacast.Repo
 

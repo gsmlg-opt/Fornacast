@@ -5,7 +5,7 @@ defmodule ForgeImports.DiscoveryTest do
 
   alias ForgeAccounts.{GitHubCredential, GitHubIdentity}
   alias ForgeImports.{ImportRun, ReportEntry, RunView}
-  alias ForgeImports.GitHub.{Error, Organization, Repository, User}
+  alias ForgeGitHub.{Error, Organization, Repository, User}
   alias ForgeRepos.Repository, as: LocalRepository
   alias Fornacast.{AuditEvent, Repo}
 

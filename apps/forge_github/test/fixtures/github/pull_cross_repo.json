@@ -1,0 +1,30 @@
+{
+  "id": 702,
+  "number": 8,
+  "state": "open",
+  "draft": false,
+  "merged": false,
+  "title": "Cross repo pull",
+  "user": {
+    "id": 583231,
+    "login": "octocat"
+  },
+  "head": {
+    "ref": "feature",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "repo": {
+      "id": 9999999,
+      "name": "forked"
+    }
+  },
+  "base": {
+    "ref": "main",
+    "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "repo": {
+      "id": 1296269,
+      "name": "Hello-World"
+    }
+  },
+  "created_at": "2025-02-01T00:00:00Z",
+  "updated_at": "2025-02-01T00:00:00Z"
+}

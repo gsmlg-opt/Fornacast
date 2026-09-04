@@ -1,7 +1,7 @@
-defmodule ForgeImports.GitHub.RepositoryReferenceTest do
+defmodule ForgeGitHub.RepositoryReferenceTest do
   use ExUnit.Case, async: true
 
-  alias ForgeImports.GitHub.RepositoryReference
+  alias ForgeGitHub.RepositoryReference
 
   test "parses an owner/repository reference" do
     assert {:ok, %{owner: "octocat", repository: "hello-world"}} =

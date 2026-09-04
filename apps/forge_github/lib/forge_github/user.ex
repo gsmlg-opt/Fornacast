@@ -1,4 +1,4 @@
-defmodule ForgeImports.GitHub.User do
+defmodule ForgeGitHub.User do
   @moduledoc "A bounded GitHub user representation."
 
   @derive {Inspect, only: [:id, :login, :name, :avatar_url, :html_url]}

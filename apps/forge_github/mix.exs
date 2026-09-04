@@ -11,14 +11,22 @@ defmodule ForgeGitHub.MixProject do
       lockfile: "../../mix.lock",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
-      deps: []
+      deps: deps()
     ]
   end
 
   def application do
     [
       mod: {ForgeGitHub.Application, []},
-      extra_applications: [:logger]
+      extra_applications: [:inets, :logger]
+    ]
+  end
+
+  defp deps do
+    [
+      {:mint, "~> 1.9"},
+      {:req, "~> 0.7"},
+      {:telemetry, "~> 1.0"}
     ]
   end
 end

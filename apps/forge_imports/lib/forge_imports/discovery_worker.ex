@@ -2,7 +2,7 @@ defmodule ForgeImports.DiscoveryWorker do
   @moduledoc false
 
   alias ForgeAccounts.{GitHubCredentialVerification, GitHubProfileSafety, User}
-  alias ForgeImports.GitHub.{Error, Organization, Repository}
+  alias ForgeGitHub.{Error, Organization, Repository}
   alias ForgeImports.{Destination, ImportRun, OneTimeCredential, ReportEntry, RepositoryItem}
   alias Fornacast.{Audit, OperationLease, Repo}
 
@@ -614,7 +614,7 @@ defmodule ForgeImports.DiscoveryWorker do
 
     if Keyword.keyword?(opts) and Keyword.keys(opts) -- allowed == [] and
          length(Keyword.keys(opts)) == length(Enum.uniq(Keyword.keys(opts))) do
-      client = Keyword.get(opts, :client, ForgeImports.GitHub.Client)
+      client = Keyword.get(opts, :client, ForgeGitHub.Client)
       client_options = Keyword.get(opts, :client_options, [])
       lease_seconds = Keyword.get(opts, :lease_seconds, @default_lease_seconds)
       owner = Keyword.get(opts, :owner, generated_owner())

@@ -5,7 +5,7 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
 
   alias Ecto.Multi
   alias ForgeAccounts
-  alias ForgeImports.GitHub.{Client, MetadataImporter}
+  alias ForgeImports.GitHub.MetadataImporter
   alias ForgeImports.{ObjectMapping, PageCheckpoint, Persistence, ReportEntry, RepositoryItem}
   alias ForgeIssues.{Comment, Issue, IssueAssignee, Label, NumberSequence}
   alias ForgePulls.PullRequest

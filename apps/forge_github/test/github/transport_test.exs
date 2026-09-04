@@ -1,7 +1,7 @@
-defmodule ForgeImports.GitHub.TransportTest do
+defmodule ForgeGitHub.TransportTest do
   use ExUnit.Case, async: true
 
-  alias ForgeImports.GitHub.Transport
+  alias ForgeGitHub.Transport
 
   test "connects to the pinned address with GitHub hostname verification and closes the socket" do
     address = {140, 82, 114, 5}
@@ -27,6 +27,36 @@ defmodule ForgeImports.GitHub.TransportTest do
     assert {"host", "api.github.com"} in headers
     assert {"authorization", "Bearer github_pat_transport_secret"} in headers
     assert_receive :closed
+  end
+
+  test "forwards each supported mutation method with its bounded body" do
+    for {method, wire_method} <- [
+          post: "POST",
+          patch: "PATCH",
+          put: "PUT",
+          delete: "DELETE"
+        ] do
+      body = ~s({"operation":"#{method}"})
+
+      request =
+        request({140, 82, 114, 5}, __MODULE__.SuccessMint)
+        |> Map.put(:method, method)
+        |> Map.put(:body, body)
+
+      assert {^request, %Req.Response{status: 200}} = Transport.run(request)
+      assert_receive {:request, ^wire_method, "/user?mode=test", _headers, ^body}
+      assert_receive :closed
+    end
+  end
+
+  test "rejects an oversized request body before connecting" do
+    request =
+      request({140, 82, 114, 5}, __MODULE__.SuccessMint)
+      |> Map.put(:method, :post)
+      |> Map.put(:body, String.duplicate("x", 2_000_001))
+
+    assert {^request, %Transport.Error{kind: :invalid_request}} = Transport.run(request)
+    refute_receive {:connect, _, _, _, _}
   end
 
   test "enforces a total deadline and passes only the remaining time to each receive" do
@@ -66,7 +96,7 @@ defmodule ForgeImports.GitHub.TransportTest do
     assert_receive :closed
   end
 
-  test "rejects any request outside the fixed method and host before connecting" do
+  test "rejects a request outside the fixed host before connecting" do
     request =
       request({140, 82, 114, 5}, __MODULE__.SuccessMint)
       |> Map.put(:url, URI.new!("https://example.com/user"))
@@ -176,10 +206,10 @@ defmodule ForgeImports.GitHub.TransportTest do
       headers: [{"authorization", "Bearer github_pat_transport_secret"}],
       adapter: Transport
     )
-    |> Req.Request.put_private(:forge_imports_github_addresses, addresses)
-    |> Req.Request.put_private(:forge_imports_transport_api, mint)
+    |> Req.Request.put_private(:forge_github_addresses, addresses)
+    |> Req.Request.put_private(:forge_github_transport_api, mint)
     |> Req.Request.put_private(
-      :forge_imports_transport_timeout,
+      :forge_github_transport_timeout,
       Keyword.get(opts, :timeout, 20_000)
     )
   end
@@ -222,12 +252,12 @@ defmodule ForgeImports.GitHub.TransportTest do
 
   defmodule DeadlineMint do
     defdelegate connect(scheme, address, port, options),
-      to: ForgeImports.GitHub.TransportTest.SuccessMint
+      to: ForgeGitHub.TransportTest.SuccessMint
 
     defdelegate request(state, method, path, headers, body),
-      to: ForgeImports.GitHub.TransportTest.SuccessMint
+      to: ForgeGitHub.TransportTest.SuccessMint
 
-    defdelegate close(state), to: ForgeImports.GitHub.TransportTest.SuccessMint
+    defdelegate close(state), to: ForgeGitHub.TransportTest.SuccessMint
 
     def recv(%{stage: :second} = state, 0, timeout) do
       send(state.owner, {:second_recv_timeout, timeout})
@@ -243,12 +273,12 @@ defmodule ForgeImports.GitHub.TransportTest do
 
   defmodule OversizedMint do
     defdelegate connect(scheme, address, port, options),
-      to: ForgeImports.GitHub.TransportTest.SuccessMint
+      to: ForgeGitHub.TransportTest.SuccessMint
 
     defdelegate request(state, method, path, headers, body),
-      to: ForgeImports.GitHub.TransportTest.SuccessMint
+      to: ForgeGitHub.TransportTest.SuccessMint
 
-    defdelegate close(state), to: ForgeImports.GitHub.TransportTest.SuccessMint
+    defdelegate close(state), to: ForgeGitHub.TransportTest.SuccessMint
 
     def recv(state, 0, _timeout) do
       {:ok, state,
@@ -263,12 +293,12 @@ defmodule ForgeImports.GitHub.TransportTest do
 
   defmodule SecretFailureMint do
     defdelegate connect(scheme, address, port, options),
-      to: ForgeImports.GitHub.TransportTest.SuccessMint
+      to: ForgeGitHub.TransportTest.SuccessMint
 
     defdelegate request(state, method, path, headers, body),
-      to: ForgeImports.GitHub.TransportTest.SuccessMint
+      to: ForgeGitHub.TransportTest.SuccessMint
 
-    defdelegate close(state), to: ForgeImports.GitHub.TransportTest.SuccessMint
+    defdelegate close(state), to: ForgeGitHub.TransportTest.SuccessMint
 
     def recv(state, 0, _timeout) do
       {:error, state, {:wire_error, "github_pat_transport_secret"}, []}
@@ -282,13 +312,13 @@ defmodule ForgeImports.GitHub.TransportTest do
     end
 
     def connect(scheme, address, port, options),
-      do: ForgeImports.GitHub.TransportTest.SuccessMint.connect(scheme, address, port, options)
+      do: ForgeGitHub.TransportTest.SuccessMint.connect(scheme, address, port, options)
 
     defdelegate request(state, method, path, headers, body),
-      to: ForgeImports.GitHub.TransportTest.SuccessMint
+      to: ForgeGitHub.TransportTest.SuccessMint
 
-    defdelegate recv(state, bytes, timeout), to: ForgeImports.GitHub.TransportTest.SuccessMint
-    defdelegate close(state), to: ForgeImports.GitHub.TransportTest.SuccessMint
+    defdelegate recv(state, bytes, timeout), to: ForgeGitHub.TransportTest.SuccessMint
+    defdelegate close(state), to: ForgeGitHub.TransportTest.SuccessMint
 
     defp owner do
       case Process.get(:"$callers", []) do
@@ -329,32 +359,32 @@ defmodule ForgeImports.GitHub.TransportTest do
 
   defmodule SendFailureMint do
     defdelegate connect(scheme, address, port, options),
-      to: ForgeImports.GitHub.TransportTest.SuccessMint
+      to: ForgeGitHub.TransportTest.SuccessMint
 
     def request(state, _method, _path, _headers, _body) do
       {:error, state, %Mint.TransportError{reason: :closed}}
     end
 
-    defdelegate close(state), to: ForgeImports.GitHub.TransportTest.SuccessMint
+    defdelegate close(state), to: ForgeGitHub.TransportTest.SuccessMint
   end
 
   defmodule ReceiveFailureMint do
     defdelegate connect(scheme, address, port, options),
-      to: ForgeImports.GitHub.TransportTest.SuccessMint
+      to: ForgeGitHub.TransportTest.SuccessMint
 
     defdelegate request(state, method, path, headers, body),
-      to: ForgeImports.GitHub.TransportTest.SuccessMint
+      to: ForgeGitHub.TransportTest.SuccessMint
 
     def recv(state, 0, _timeout) do
       {:error, state, %Mint.TransportError{reason: :closed}, []}
     end
 
-    defdelegate close(state), to: ForgeImports.GitHub.TransportTest.SuccessMint
+    defdelegate close(state), to: ForgeGitHub.TransportTest.SuccessMint
   end
 
   defmodule BlockingSendMint do
     defdelegate connect(scheme, address, port, options),
-      to: ForgeImports.GitHub.TransportTest.SuccessMint
+      to: ForgeGitHub.TransportTest.SuccessMint
 
     def request(state, _method, _path, _headers, _body) do
       send(state.owner, {:blocking_send_started, self()})
@@ -363,17 +393,17 @@ defmodule ForgeImports.GitHub.TransportTest do
       {:error, state, %Mint.TransportError{reason: :closed}}
     end
 
-    defdelegate close(state), to: ForgeImports.GitHub.TransportTest.SuccessMint
+    defdelegate close(state), to: ForgeGitHub.TransportTest.SuccessMint
   end
 
   defmodule BlockingCloseMint do
     defdelegate connect(scheme, address, port, options),
-      to: ForgeImports.GitHub.TransportTest.SuccessMint
+      to: ForgeGitHub.TransportTest.SuccessMint
 
     defdelegate request(state, method, path, headers, body),
-      to: ForgeImports.GitHub.TransportTest.SuccessMint
+      to: ForgeGitHub.TransportTest.SuccessMint
 
-    defdelegate recv(state, bytes, timeout), to: ForgeImports.GitHub.TransportTest.SuccessMint
+    defdelegate recv(state, bytes, timeout), to: ForgeGitHub.TransportTest.SuccessMint
 
     def close(state) do
       send(state.owner, {:blocking_close_started, self()})

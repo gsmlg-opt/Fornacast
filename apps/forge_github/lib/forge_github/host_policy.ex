@@ -1,4 +1,4 @@
-defmodule ForgeImports.GitHub.HostPolicy do
+defmodule ForgeGitHub.HostPolicy do
   @moduledoc "DNS policy for the fixed public GitHub API host."
 
   import Bitwise

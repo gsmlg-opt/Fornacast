@@ -4,8 +4,8 @@ defmodule ForgeImports.Waits do
   import Ecto.Query
 
   alias ForgeAccounts.{GitHubCredential, GitHubIdentity, User}
-  alias ForgeImports.GitHub.{Client, Error}
-  alias ForgeImports.GitHub.User, as: GitHubUser
+  alias ForgeGitHub.{Client, Error}
+  alias ForgeGitHub.User, as: GitHubUser
   alias ForgeImports.{ImportRun, OneTimeCredential, Persistence, RepositoryItem, Telemetry}
   alias Fornacast.Repo
 

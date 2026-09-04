@@ -1,4 +1,4 @@
-defmodule ForgeImports.GitHub.RequestGate do
+defmodule ForgeGitHub.RequestGate do
   @moduledoc "Serializes a bounded GitHub request sequence for one credential identity."
 
   @acquire_timeout 2_000

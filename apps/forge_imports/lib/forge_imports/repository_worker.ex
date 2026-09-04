@@ -24,7 +24,8 @@ defmodule ForgeImports.RepositoryWorker do
     Telemetry
   }
 
-  alias ForgeImports.GitHub.{Client, MetadataImporter}
+  alias ForgeGitHub.Client
+  alias ForgeImports.GitHub.MetadataImporter
   alias ForgeRepos.Repository
   alias Fornacast.{Audit, AuditEvent, OperationLease, Repo}
   alias GitCore.Remote

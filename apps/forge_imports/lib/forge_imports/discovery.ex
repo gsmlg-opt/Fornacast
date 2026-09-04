@@ -4,8 +4,8 @@ defmodule ForgeImports.Discovery do
   import Ecto.Query
 
   alias ForgeAccounts.{GitHubCredentialCallback, GitHubProfileSafety, User}
-  alias ForgeImports.GitHub.{Client, Error, RepositoryReference}
-  alias ForgeImports.GitHub.User, as: GitHubUser
+  alias ForgeGitHub.{Client, Error, RepositoryReference}
+  alias ForgeGitHub.User, as: GitHubUser
   alias ForgeImports.{Destination, DiscoveryWorker, ImportRun, Reconciler}
   alias Fornacast.Repo
 

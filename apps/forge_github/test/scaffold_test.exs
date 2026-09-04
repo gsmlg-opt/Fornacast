@@ -8,7 +8,7 @@ defmodule ForgeGitHub.ScaffoldTest do
     assert [] = Supervisor.which_children(supervisor)
   end
 
-  test "context exposes only compile-time provider boundary types" do
+  test "context exposes stable provider boundary types" do
     assert {:ok, types} = Code.Typespec.fetch_types(ForgeGitHub)
 
     assert types

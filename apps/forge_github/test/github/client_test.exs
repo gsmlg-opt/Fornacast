@@ -1,9 +1,9 @@
-defmodule ForgeImports.GitHub.ClientTest do
+defmodule ForgeGitHub.ClientTest do
   use ExUnit.Case, async: true
 
   import ExUnit.CaptureLog
 
-  alias ForgeImports.GitHub.{
+  alias ForgeGitHub.{
     Client,
     Error,
     HostPolicy,
@@ -39,6 +39,86 @@ defmodule ForgeImports.GitHub.ClientTest do
               avatar_url: "https://avatars.githubusercontent.com/u/9",
               html_url: "https://github.com/octocat"
             }} = Client.authenticated_user("github_pat_test", client_opts(stub))
+  end
+
+  test "request sends bounded JSON with every supported mutation method" do
+    for method <- [:post, :patch, :put, :delete] do
+      stub = stub_name()
+      payload = %{"operation" => Atom.to_string(method)}
+
+      Req.Test.expect(stub, fn conn ->
+        assert conn.method == method |> Atom.to_string() |> String.upcase()
+        assert conn.request_path == "/repos/octocat/hello-world/sync"
+        assert Plug.Conn.get_req_header(conn, "content-type") == ["application/json"]
+        assert {:ok, body, conn} = Plug.Conn.read_body(conn)
+        assert JSON.decode!(body) == payload
+
+        Req.Test.json(conn, %{"accepted" => true})
+      end)
+
+      assert {:ok, %{"accepted" => true}} =
+               Client.request(
+                 "github_pat_test",
+                 method,
+                 "/repos/octocat/hello-world/sync",
+                 client_opts(stub, System.unique_integer([:positive]), json: payload)
+               )
+    end
+  end
+
+  test "request accepts GET and returns nil for a bodyless success" do
+    get_stub = stub_name()
+    Req.Test.expect(get_stub, &Req.Test.json(&1, %{"ok" => true}))
+
+    assert {:ok, %{"ok" => true}} =
+             Client.request(
+               "github_pat_test",
+               :get,
+               "/user",
+               client_opts(get_stub, System.unique_integer([:positive]))
+             )
+
+    delete_stub = stub_name()
+    Req.Test.expect(delete_stub, &Plug.Conn.send_resp(&1, 204, ""))
+
+    assert {:ok, nil} =
+             Client.request(
+               "github_pat_test",
+               :delete,
+               "/repos/octocat/hello-world/sync",
+               client_opts(delete_stub, System.unique_integer([:positive]))
+             )
+  end
+
+  test "request rejects unsupported methods, unsafe origins, and oversized JSON bodies" do
+    stub = stub_name()
+    Req.Test.stub(stub, fn _conn -> flunk("invalid request reached HTTP") end)
+
+    assert {:error, %Error{kind: :invalid_request}} =
+             Client.request("github_pat_test", :head, "/user", client_opts(stub))
+
+    assert {:error, %Error{kind: :invalid_request}} =
+             Client.request(
+               "github_pat_test",
+               :post,
+               "https://example.com/user",
+               client_opts(stub, 2, json: %{"ok" => true})
+             )
+
+    assert {:error, %Error{kind: :request_too_large}} =
+             Client.request(
+               "github_pat_test",
+               :post,
+               "/repos/octocat/hello-world/sync",
+               client_opts(stub, 3,
+                 json: %{"values" => List.duplicate(String.duplicate("x", 16_000), 130)}
+               )
+             )
+  end
+
+  test "request rejects malformed option lists without raising" do
+    assert {:error, %Error{kind: :invalid_request}} =
+             Client.request("github_pat_test", :get, "/user", [:not_a_keyword])
   end
 
   test "repository and organization return bounded typed values" do
@@ -1018,7 +1098,7 @@ defmodule ForgeImports.GitHub.ClientTest do
     |> Path.join("../fixtures/github/#{name}")
     |> Path.expand()
     |> File.read!()
-    |> Jason.decode!()
+    |> JSON.decode!()
   end
 
   defp http_date(datetime), do: Calendar.strftime(datetime, "%a, %d %b %Y %H:%M:%S GMT")
@@ -1099,12 +1179,12 @@ defmodule ForgeImports.GitHub.ClientTest do
 
   defmodule ClientOversizedMint do
     defdelegate connect(scheme, address, port, options),
-      to: ForgeImports.GitHub.ClientTest.ClientMint
+      to: ForgeGitHub.ClientTest.ClientMint
 
     defdelegate request(state, method, path, headers, body),
-      to: ForgeImports.GitHub.ClientTest.ClientMint
+      to: ForgeGitHub.ClientTest.ClientMint
 
-    defdelegate close(state), to: ForgeImports.GitHub.ClientTest.ClientMint
+    defdelegate close(state), to: ForgeGitHub.ClientTest.ClientMint
 
     def recv(state, 0, _timeout) do
       {:ok, state,
@@ -1119,12 +1199,12 @@ defmodule ForgeImports.GitHub.ClientTest do
 
   defmodule ClientTimeoutMint do
     defdelegate connect(scheme, address, port, options),
-      to: ForgeImports.GitHub.ClientTest.ClientMint
+      to: ForgeGitHub.ClientTest.ClientMint
 
     defdelegate request(state, method, path, headers, body),
-      to: ForgeImports.GitHub.ClientTest.ClientMint
+      to: ForgeGitHub.ClientTest.ClientMint
 
-    defdelegate close(state), to: ForgeImports.GitHub.ClientTest.ClientMint
+    defdelegate close(state), to: ForgeGitHub.ClientTest.ClientMint
 
     def recv(state, 0, _timeout) do
       {:error, state, %Mint.TransportError{reason: :timeout}, []}

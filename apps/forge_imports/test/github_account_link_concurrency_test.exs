@@ -3,7 +3,7 @@ defmodule ForgeImports.GitHubAccountLinkConcurrencyTest do
 
   alias Ecto.Adapters.SQL
   alias ForgeAccounts.{GitHubCredential, GitHubIdentity}
-  alias ForgeImports.GitHub.User, as: GitHubUser
+  alias ForgeGitHub.User, as: GitHubUser
   alias Fornacast.{AuditEvent, Repo}
 
   @seed_pat "link-seed-token"

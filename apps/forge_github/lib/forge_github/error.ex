@@ -1,4 +1,4 @@
-defmodule ForgeImports.GitHub.Error do
+defmodule ForgeGitHub.Error do
   @moduledoc "A classified, presentation-safe GitHub transport error."
 
   defexception [:kind, :retry_at, :detail]
@@ -16,6 +16,7 @@ defmodule ForgeImports.GitHub.Error do
           | :timeout
           | :host_unavailable
           | :unsafe_host
+          | :request_too_large
           | :response_too_large
           | :invalid_json
           | :invalid_response
@@ -44,6 +45,7 @@ defmodule ForgeImports.GitHub.Error do
   defp message_for(:timeout), do: "The GitHub request timed out"
   defp message_for(:host_unavailable), do: "The GitHub API host could not be resolved"
   defp message_for(:unsafe_host), do: "The GitHub API host resolved to a non-public address"
+  defp message_for(:request_too_large), do: "The GitHub request exceeded the size limit"
   defp message_for(:response_too_large), do: "The GitHub response exceeded the size limit"
   defp message_for(:invalid_json), do: "GitHub returned malformed JSON"
   defp message_for(:invalid_response), do: "GitHub returned an invalid resource"
@@ -53,12 +55,12 @@ defmodule ForgeImports.GitHub.Error do
   defp message_for(_kind), do: "The GitHub request failed"
 end
 
-defimpl Inspect, for: ForgeImports.GitHub.Error do
+defimpl Inspect, for: ForgeGitHub.Error do
   import Inspect.Algebra
 
   def inspect(error, opts) do
     concat([
-      "#ForgeImports.GitHub.Error<",
+      "#ForgeGitHub.Error<",
       to_doc([kind: error.kind, retry_at: error.retry_at, detail: "[REDACTED]"], opts),
       ">"
     ])

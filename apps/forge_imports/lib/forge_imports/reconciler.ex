@@ -46,7 +46,7 @@ defmodule ForgeImports.Reconciler do
           1,
           100
         ),
-      client: Keyword.get(opts, :client, ForgeImports.GitHub.Client),
+      client: Keyword.get(opts, :client, ForgeGitHub.Client),
       client_options: Keyword.get(opts, :client_options, []),
       keyring: Keyword.get(opts, :keyring, Fornacast.Config.github_credential_keyring()),
       repository_worker: Keyword.get(opts, :repository_worker, ForgeImports.RepositoryWorker),

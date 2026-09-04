@@ -15,7 +15,7 @@ defmodule ForgeImports.RunViewConsistencyTest do
     RunView
   }
 
-  alias ForgeImports.GitHub.Repository
+  alias ForgeGitHub.Repository
   alias ForgeRepos.Repository, as: LocalRepository
   alias Fornacast.Repo
 

@@ -4,7 +4,7 @@ defmodule ForgeImports.Destination do
   import Ecto.Query
 
   alias ForgeAccounts.{Namespace, Organization, OrganizationMember, User}
-  alias ForgeImports.GitHub.Repository, as: GitHubRepository
+  alias ForgeGitHub.Repository, as: GitHubRepository
   alias ForgeRepos.Repository
   alias Fornacast.Repo
 

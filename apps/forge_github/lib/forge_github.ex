@@ -1,9 +1,7 @@
 defmodule ForgeGitHub do
   @moduledoc """
-  GitHub provider boundary for authentication, transport, and webhook primitives.
-
-  This scaffold intentionally exposes types only. Provider behavior remains in
-  `forge_imports` until it is extracted in a later change.
+  GitHub provider boundary for authentication, bounded API transport, resource
+  decoding, and webhook primitives.
   """
 
   @type provider :: :github

@@ -1,7 +1,7 @@
-defmodule ForgeImports.GitHub.Client do
-  @moduledoc "A fixed-host, bounded client for the GitHub REST resources used by imports."
+defmodule ForgeGitHub.Client do
+  @moduledoc "A fixed-host, bounded client for GitHub REST resources."
 
-  alias ForgeImports.GitHub.{
+  alias ForgeGitHub.{
     Error,
     HostPolicy,
     Organization,
@@ -13,14 +13,13 @@ defmodule ForgeImports.GitHub.Client do
     User
   }
 
-  alias ForgeImports.Telemetry
-
   @api_base "https://api.github.com"
   @accept "application/vnd.github+json"
   @api_version "2026-03-10"
   @user_agent "Fornacast/0.2.0"
   @request_timeout 20_000
   @max_body_bytes 2_000_000
+  @allowed_methods [:get, :post, :patch, :put, :delete]
   @max_pages 100
   @max_json_depth 16
   @max_json_nodes 50_000
@@ -31,6 +30,31 @@ defmodule ForgeImports.GitHub.Client do
   @retry_fallback_seconds 60
   @max_retry_delay_seconds 24 * 60 * 60
   @allow_test_plug Mix.env() == :test
+
+  @type method :: :get | :post | :patch | :put | :delete
+
+  @doc """
+  Performs one bounded request against the fixed GitHub API origin.
+
+  The result contains decoded, complexity-bounded JSON, or `nil` for a successful
+  response with no body. A request body may be supplied as bounded JSON through
+  the `:json` option.
+  """
+  @spec request(String.t(), method(), String.t(), keyword()) ::
+          {:ok, term()} | {:error, Error.t()}
+  def request(pat, method, path, opts \\ []) do
+    with_request_gate(pat, opts, [:json], fn ->
+      with true <- method in @allowed_methods,
+           {:ok, body} <- encode_request_body(opts),
+           {:ok, response} <- perform_request(path, pat, opts, method, body),
+           {:ok, value} <- successful_response(response, opts) do
+        {:ok, value}
+      else
+        {:error, %Error{} = error} -> {:error, error}
+        _invalid -> error(:invalid_request)
+      end
+    end)
+  end
 
   @spec authenticated_user(String.t(), keyword()) :: {:ok, User.t()} | {:error, Error.t()}
   def authenticated_user(pat, opts \\ []) do
@@ -202,8 +226,12 @@ defmodule ForgeImports.GitHub.Client do
   end
 
   defp with_request_gate(pat, opts, fun) do
+    with_request_gate(pat, opts, [], fun)
+  end
+
+  defp with_request_gate(pat, opts, extra_allowed, fun) do
     with :ok <- validate_pat(pat),
-         :ok <- validate_options(opts),
+         :ok <- validate_options(opts, extra_allowed),
          {:ok, gate_key} <- fetch_gate_key(opts) do
       case RequestGate.run(gate_key, fun) do
         {:error, :invalid_gate_key} -> error(:invalid_request)
@@ -232,33 +260,41 @@ defmodule ForgeImports.GitHub.Client do
   defp validate_pat(_pat), do: :error
 
   if @allow_test_plug do
-    defp validate_options(opts) when is_list(opts) do
-      allowed = [:gate_key, :plug, :resolver, :now, :transport_api, :request_timeout]
-      test_adapter? = Keyword.has_key?(opts, :plug) or Keyword.has_key?(opts, :transport_api)
+    defp validate_options(opts, extra_allowed) when is_list(opts) and is_list(extra_allowed) do
+      if Keyword.keyword?(opts) do
+        allowed =
+          [:gate_key, :plug, :resolver, :now, :transport_api, :request_timeout] ++ extra_allowed
 
-      injected? =
-        Enum.any?(
-          [:resolver, :now, :transport_api, :request_timeout],
-          &Keyword.has_key?(opts, &1)
-        )
+        test_adapter? = Keyword.has_key?(opts, :plug) or Keyword.has_key?(opts, :transport_api)
 
-      keys = Keyword.keys(opts)
+        injected? =
+          Enum.any?(
+            [:resolver, :now, :transport_api, :request_timeout],
+            &Keyword.has_key?(opts, &1)
+          )
 
-      cond do
-        keys -- allowed != [] -> :error
-        length(keys) != length(Enum.uniq(keys)) -> :error
-        injected? and not test_adapter? -> :error
-        not valid_test_injections?(opts) -> :error
-        true -> :ok
+        keys = Keyword.keys(opts)
+
+        cond do
+          keys -- allowed != [] -> :error
+          length(keys) != length(Enum.uniq(keys)) -> :error
+          injected? and not test_adapter? -> :error
+          not valid_test_injections?(opts) -> :error
+          true -> :ok
+        end
+      else
+        :error
       end
     end
   else
-    defp validate_options(opts) when is_list(opts) do
-      if Keyword.keys(opts) -- [:gate_key] == [], do: :ok, else: :error
+    defp validate_options(opts, extra_allowed) when is_list(opts) and is_list(extra_allowed) do
+      if Keyword.keyword?(opts) and Keyword.keys(opts) -- [:gate_key | extra_allowed] == [],
+        do: :ok,
+        else: :error
     end
   end
 
-  defp validate_options(_opts), do: :error
+  defp validate_options(_opts, _extra_allowed), do: :error
 
   if @allow_test_plug do
     defp valid_test_injections?(opts) do
@@ -271,7 +307,7 @@ defmodule ForgeImports.GitHub.Client do
   end
 
   defp fetch_one(url, pat, opts, decoder) do
-    with {:ok, response} <- request(url, pat, opts),
+    with {:ok, response} <- perform_request(url, pat, opts, :get, nil),
          {:ok, json} <- successful_json(response, opts),
          {:ok, value} <- decoder.(json) do
       {:ok, value}
@@ -286,7 +322,7 @@ defmodule ForgeImports.GitHub.Client do
        do: error(:pagination_limit)
 
   defp paginate_repositories(url, pat, opts, allowed_paths, page, pages) do
-    with {:ok, response} <- request(url, pat, opts),
+    with {:ok, response} <- perform_request(url, pat, opts, :get, nil),
          {:ok, json} <- successful_json(response, opts),
          {:ok, repositories} <- repositories_from_json(json),
          {:ok, next_url} <- Pagination.next_url(response, allowed_paths) do
@@ -319,7 +355,7 @@ defmodule ForgeImports.GitHub.Client do
        do: error(:pagination_limit)
 
   defp paginate_json_list(url, pat, opts, allowed_paths, page, pages) do
-    with {:ok, response} <- request(url, pat, opts),
+    with {:ok, response} <- perform_request(url, pat, opts, :get, nil),
          {:ok, json} <- successful_json(response, opts),
          {:ok, items} <- json_list(json),
          {:ok, next_url} <- Pagination.next_url(response, allowed_paths) do
@@ -364,7 +400,7 @@ defmodule ForgeImports.GitHub.Client do
   defp json_object(value) when is_map(value), do: {:ok, value}
   defp json_object(_value), do: {:error, :invalid_response}
 
-  defp request(url, pat, opts) do
+  defp perform_request(url, pat, opts, method, body) do
     started = System.monotonic_time()
     deadline = monotonic_ms() + Keyword.get(opts, :request_timeout, @request_timeout)
 
@@ -373,7 +409,7 @@ defmodule ForgeImports.GitHub.Client do
            {:ok, addresses} <- resolve_addresses(opts, deadline) do
         request =
           Req.new(
-            method: :get,
+            method: method,
             base_url: @api_base,
             adapter: Transport,
             headers: [
@@ -387,9 +423,11 @@ defmodule ForgeImports.GitHub.Client do
             retry: false,
             compressed: false,
             raw: true,
-            decode_body: false
+            decode_body: false,
+            body: body
           )
-          |> Req.Request.put_private(:forge_imports_github_addresses, addresses)
+          |> maybe_put_content_type(body)
+          |> Req.Request.put_private(:forge_github_addresses, addresses)
           |> maybe_put_transport_api(opts)
 
         request_options = [url: url]
@@ -403,7 +441,7 @@ defmodule ForgeImports.GitHub.Client do
         case remaining_timeout(deadline) do
           {:ok, transport_timeout} ->
             request
-            |> Req.Request.put_private(:forge_imports_transport_timeout, transport_timeout)
+            |> Req.Request.put_private(:forge_github_transport_timeout, transport_timeout)
             |> safe_req_request(request_options)
 
           {:error, :timeout} ->
@@ -422,13 +460,13 @@ defmodule ForgeImports.GitHub.Client do
 
   defp emit_request_telemetry({:ok, %Req.Response{status: status}}, duration, _opts)
        when status in 200..299 do
-    Telemetry.execute([:github, :request, :stop], %{duration: duration}, %{outcome: :ok})
+    emit_telemetry([:request, :stop], %{duration: duration}, %{outcome: :ok})
   end
 
   defp emit_request_telemetry({:ok, %Req.Response{} = response}, duration, opts) do
     {:error, %Error{kind: kind}} = classify_response(response, opts)
 
-    Telemetry.execute([:github, :request, :stop], %{duration: duration}, %{
+    emit_telemetry([:request, :stop], %{duration: duration}, %{
       outcome: :error,
       error: kind
     })
@@ -437,7 +475,7 @@ defmodule ForgeImports.GitHub.Client do
   end
 
   defp emit_request_telemetry({:error, %Error{kind: kind}}, duration, _opts) do
-    Telemetry.execute([:github, :request, :stop], %{duration: duration}, %{
+    emit_telemetry([:request, :stop], %{duration: duration}, %{
       outcome: :error,
       error: kind
     })
@@ -449,7 +487,7 @@ defmodule ForgeImports.GitHub.Client do
        when kind in [:primary_rate_limit, :secondary_rate_limit] do
     classification = if kind == :primary_rate_limit, do: :primary, else: :secondary
 
-    Telemetry.execute([:rate_limit, :pause], %{count: 1}, %{
+    emit_telemetry([:rate_limit, :pause], %{count: 1}, %{
       classification: classification,
       error: kind
     })
@@ -457,10 +495,20 @@ defmodule ForgeImports.GitHub.Client do
 
   defp maybe_emit_rate_limit_pause(_metadata), do: :ok
 
+  defp emit_telemetry(event, measurements, metadata) do
+    :telemetry.execute([:fornacast, :github] ++ event, measurements, metadata)
+  end
+
+  defp maybe_put_content_type(request, nil), do: request
+
+  defp maybe_put_content_type(request, _body) do
+    Req.Request.put_header(request, "content-type", "application/json")
+  end
+
   defp maybe_put_transport_api(request, opts) do
     case Keyword.fetch(opts, :transport_api) do
       {:ok, api} when is_atom(api) ->
-        Req.Request.put_private(request, :forge_imports_transport_api, api)
+        Req.Request.put_private(request, :forge_github_transport_api, api)
 
       _missing_or_invalid ->
         request
@@ -559,6 +607,42 @@ defmodule ForgeImports.GitHub.Client do
       _multiple -> false
     end
   end
+
+  defp encode_request_body(opts) do
+    case Keyword.fetch(opts, :json) do
+      :error ->
+        {:ok, nil}
+
+      {:ok, value} ->
+        with {:ok, _nodes} <- validate_json(value, 0, 0),
+             {:ok, body} <- encode_json(value) do
+          if byte_size(body) <= @max_body_bytes,
+            do: {:ok, body},
+            else: error(:request_too_large)
+        else
+          _invalid -> error(:invalid_request)
+        end
+    end
+  end
+
+  defp encode_json(value) do
+    {:ok, JSON.encode!(value)}
+  rescue
+    _exception -> :error
+  catch
+    _kind, _reason -> :error
+  end
+
+  defp successful_response(%Req.Response{status: status, body: ""}, _opts)
+       when status in 200..299,
+       do: {:ok, nil}
+
+  defp successful_response(%Req.Response{status: status, body: body}, _opts)
+       when status in 200..299 and is_binary(body),
+       do: decode_json(body)
+
+  defp successful_response(%Req.Response{} = response, opts),
+    do: classify_response(response, opts)
 
   defp successful_json(%Req.Response{status: 200, body: body}, _opts), do: decode_json(body)
 

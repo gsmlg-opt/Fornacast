@@ -1,7 +1,7 @@
 defmodule ForgeImports.GitHub.MetadataMapper do
   @moduledoc "Pure GitHub metadata normalization and skip classification for imports."
 
-  alias ForgeImports.GitHub.User
+  alias ForgeGitHub.User
 
   @spec label(term()) :: {:ok, map()} | {:error, atom()}
   def label(%{} = payload) do
