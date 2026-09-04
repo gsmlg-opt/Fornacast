@@ -10,6 +10,7 @@ defmodule ForgeImports.RepositoryPublisher do
     Conflicts,
     ImportAttempt,
     ImportRun,
+    OrganizationSync.Handoff,
     PageCheckpoint,
     Persistence,
     RepositoryItem,
@@ -404,6 +405,12 @@ defmodule ForgeImports.RepositoryPublisher do
     )
     |> Multi.run(:run, fn repo, _changes -> update_run_count(repo, context) end)
     |> Multi.run(:item, fn repo, changes -> commit_item(repo, context, changes) end)
+    |> Handoff.append(
+      :bootstrap_handoff,
+      context.capability.run_id,
+      context.capability.item_id,
+      context.publication_spec.timestamp
+    )
     |> Audit.record_multi(
       :audit,
       context.capability.actor,

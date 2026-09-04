@@ -37,19 +37,21 @@ defmodule ForgeImports.Worker do
   @spec run_discovery(pos_integer(), String.t(), keyword()) :: term()
   def run_discovery(run_id, lease_owner, opts \\ [])
       when is_integer(run_id) and run_id > 0 and is_binary(lease_owner) do
-    case Repo.get(ImportRun, run_id) do
-      %ImportRun{state: state} when state in [:cancel_requested, :canceled] ->
-        {:ok, :ignored}
+    with :ok <- ForgeImports.OrganizationSync.Bootstrap.runnable?(run_id) do
+      case Repo.get(ImportRun, run_id) do
+        %ImportRun{state: state} when state in [:cancel_requested, :canceled] ->
+          {:ok, :ignored}
 
-      _other ->
-        discovery_opts =
-          opts
-          |> Keyword.drop([:repository_worker, :repository_worker_options])
-          |> Keyword.put(:owner, lease_owner)
+        _other ->
+          discovery_opts =
+            opts
+            |> Keyword.drop([:repository_worker, :repository_worker_options])
+            |> Keyword.put(:owner, lease_owner)
 
-        run_id
-        |> ForgeImports.DiscoveryWorker.perform(discovery_opts)
-        |> maybe_start_app_bootstrap(run_id)
+          run_id
+          |> ForgeImports.DiscoveryWorker.perform(discovery_opts)
+          |> maybe_start_app_bootstrap(run_id)
+      end
     end
   end
 

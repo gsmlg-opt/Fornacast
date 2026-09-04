@@ -88,6 +88,7 @@ defmodule ForgeImports.CredentialProvider.GitHubApp do
              (is_struct(capability, ImportRun) or is_struct(capability, RepositoryItem)) do
     with %ImportRun{} = run <- current_run(actor_id, expected, capability),
          {:ok, mirror} <- bound_mirror(run.id),
+         :ok <- runnable_mirror(mirror),
          :ok <- authorize_binding(actor, run, mirror),
          {:ok, installation} <- active_installation(mirror),
          {:ok, token} <- fetch_token(installation.github_installation_id, opts),
@@ -184,6 +185,19 @@ defmodule ForgeImports.CredentialProvider.GitHubApp do
     end
   end
 
+  defp runnable_mirror(%OrganizationMirror{state: state})
+       when state in [:bootstrapping, :catching_up],
+       do: :ok
+
+  defp runnable_mirror(%OrganizationMirror{state: :paused}),
+    do: {:error, {:retryable, :busy}}
+
+  defp runnable_mirror(%OrganizationMirror{state: :revoked}),
+    do: {:error, {:terminal, :revoked}}
+
+  defp runnable_mirror(%OrganizationMirror{}),
+    do: {:error, {:terminal, :binding_mismatch}}
+
   defp active_installation(mirror) do
     case Repo.get_by(GitHubAppInstallation,
            github_installation_id: mirror.github_installation_id
@@ -264,7 +278,7 @@ defmodule ForgeImports.CredentialProvider.OneTimePAT do
       )
       when is_integer(actor_id) and run_id == run.id and is_function(callback, 2) and
              is_list(opts) do
-    with %GitHubIdentity{kind: :user, login: login, local_user_id: ^actor_id} <-
+    with %GitHubIdentity{kind: :user, login: login} <-
            Repo.get(GitHubIdentity, run.github_identity_id) do
       metadata = %{git_login: login, gate_key: {:one_time_run, run.id}}
       keyring = Keyword.get(opts, :keyring, Fornacast.Config.github_credential_keyring())
@@ -276,7 +290,7 @@ defmodule ForgeImports.CredentialProvider.OneTimePAT do
         keyring
       )
     else
-      nil -> {:error, :not_found}
+      _missing_or_invalid -> {:error, :not_found}
     end
   end
 
@@ -291,7 +305,7 @@ defmodule ForgeImports.CredentialProvider.OneTimePAT do
       )
       when is_integer(actor_id) and run_id == run.id and is_function(callback, 2) and
              is_list(opts) do
-    with %GitHubIdentity{kind: :user, login: login, local_user_id: ^actor_id} <-
+    with %GitHubIdentity{kind: :user, login: login} <-
            Repo.get(GitHubIdentity, run.github_identity_id) do
       metadata = %{git_login: login, gate_key: {:one_time_run, run.id}}
       keyring = Keyword.get(opts, :keyring, Fornacast.Config.github_credential_keyring())
@@ -303,7 +317,7 @@ defmodule ForgeImports.CredentialProvider.OneTimePAT do
         keyring
       )
     else
-      nil -> {:error, :not_found}
+      _missing_or_invalid -> {:error, :not_found}
     end
   end
 

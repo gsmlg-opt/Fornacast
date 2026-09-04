@@ -304,6 +304,71 @@ defmodule ForgeImports.OrganizationOrchestrationTest do
     assert Repo.aggregate(ImportAttempt, :count, :id) == 0
   end
 
+  test "site admin can start an existing-organization App bootstrap only through its bound mirror" do
+    owner = user_fixture("app-org-owner")
+
+    assert {:ok, %Organization{} = organization} =
+             ForgeAccounts.create_organization(owner, %{
+               username: "admin-app-bootstrap",
+               display_name: "Admin App Bootstrap"
+             })
+
+    site_admin = user_fixture("app-site-admin", role: :admin)
+    github_account_id = 8_720_000_001
+
+    run =
+      organization_run_fixture(site_admin, identity_fixture(site_admin),
+        credential_source: :github_app,
+        github_identity_id: nil,
+        source_owner_github_id: github_account_id,
+        source_owner_login: "admin-app-bootstrap",
+        destination_organization_action: :existing,
+        destination_organization_slug: organization.username,
+        destination_organization_id: organization.id
+      )
+
+    _item =
+      repository_item_fixture(run,
+        github_repository_id: 9_720_000_001,
+        destination_owner_id: organization.id,
+        destination_slug: "admin-managed"
+      )
+
+    assert {:ok, pending} =
+             ForgeMirrors.create_organization_mirror(site_admin, %{
+               organization_id: organization.id,
+               provider: "github",
+               github_installation_id: 9_730_000_001,
+               github_account_id: github_account_id,
+               github_account_login: "admin-app-bootstrap",
+               bootstrap_import_run_id: run.id
+             })
+
+    assert {:ok, ready} =
+             ForgeMirrors.transition_organization_mirror(
+               site_admin,
+               pending,
+               :ready_to_bootstrap
+             )
+
+    assert {:ok, _bootstrapping} =
+             ForgeMirrors.transition_organization_mirror(
+               site_admin,
+               ready,
+               :bootstrapping
+             )
+
+    assert {:ok, %RunView{destination_organization: ^organization}} =
+             ForgeImports.start_import(
+               site_admin,
+               run.id,
+               request_metadata("start-admin-app-bootstrap"),
+               dispatch: :manual
+             )
+
+    assert %ImportRun{state: :running} = Repo.get!(ImportRun, run.id)
+  end
+
   test "requires at least one selected repository and leaves not-selected items untouched", %{
     actor: actor,
     identity: identity

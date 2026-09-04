@@ -156,6 +156,29 @@ defmodule ForgeImports.CredentialProviderTest do
              Repo.get!(ImportRun, run.id)
   end
 
+  test "paused App bootstrap retains work without minting another token", context do
+    %{run: run, organization_mirror: mirror} = github_app_run_fixture(context.actor)
+    parent = self()
+
+    broker =
+      start_broker(fn _installation_id, _scope ->
+        send(parent, :unexpected_token_fetch)
+        installation_token(@app_secret)
+      end)
+
+    assert {:ok, _paused} = ForgeMirrors.pause(context.actor, mirror)
+
+    assert {:error, {:retryable, :busy}} =
+             CredentialProvider.checkout(
+               %{actor: context.actor, run: run, capability: run},
+               fn _credential, _metadata -> flunk("paused bootstrap must not use a token") end,
+               token_broker: broker,
+               scope: @app_scope
+             )
+
+    refute_receive :unexpected_token_fetch
+  end
+
   test "GitHub App discovery broker failure releases for retry without human credentials",
        context do
     %{run: claimed} = github_app_run_fixture(context.actor)

@@ -9,10 +9,23 @@ defmodule ForgeImports.RepositoryPublicationTest do
   alias ForgeImports.{
     ImportAttempt,
     ImportRun,
+    ObjectMapping,
     PageCheckpoint,
     Persistence,
     Reconciler,
-    RepositoryItem
+    RepositoryItem,
+    RunAggregator
+  }
+
+  alias ForgeIssues.Label
+
+  alias ForgeMirrors.{
+    MirrorOperation,
+    MirrorRefState,
+    MirrorResourceState,
+    MirrorWebhookDelivery,
+    OrganizationMirror,
+    RepositoryMirror
   }
 
   alias ForgePulls.{MergeOperation, PullRequest}
@@ -159,6 +172,181 @@ defmodule ForgeImports.RepositoryPublicationTest do
 
     assert replayed.id == published.id
     assert snapshot_counts() == before_replay
+  end
+
+  test "atomically hands an organization bootstrap publication to permanent mirror state",
+       context do
+    organization =
+      ForgeAccounts.create_organization(context.actor, %{
+        username: "mirror-org-#{System.unique_integer([:positive])}",
+        display_name: "Mirror Organization"
+      })
+      |> unwrap!()
+
+    fixture =
+      ready_publication_fixture(context,
+        owner: organization,
+        slug: "mirrored-repository"
+      )
+
+    shadow_path = ForgeRepos.absolute_storage_path(fixture.shadow)
+    File.mkdir_p!(Path.dirname(shadow_path))
+    assert {:ok, ^shadow_path} = GitCore.init_bare(shadow_path)
+    %{base: base_oid} = create_merge_graph!(shadow_path)
+    update_ref!(shadow_path, base_oid, "refs/tags/v1.0.0")
+
+    label =
+      %Label{repository_id: fixture.shadow.id}
+      |> Label.import_changeset(%{
+        name: "bug",
+        normalized_name: "bug",
+        color: "d73a4a",
+        description: "Something is not working",
+        default: true
+      })
+      |> Repo.insert!()
+
+    mapping =
+      %ObjectMapping{}
+      |> ObjectMapping.create_changeset(%{
+        repository_item_id: fixture.item.id,
+        hidden_repository_id: fixture.shadow.id,
+        github_repository_id: fixture.item.github_repository_id,
+        object_kind: "label",
+        github_object_id: 8_300_000_000 + System.unique_integer([:positive]),
+        local_resource_type: "ForgeIssues.Label",
+        local_resource_id: label.id,
+        source_url: "https://github.com/acme/mirrored-repository/labels"
+      })
+      |> Repo.insert!()
+
+    installation_id = 8_400_000_000 + System.unique_integer([:positive])
+
+    pending_mirror =
+      ForgeMirrors.create_organization_mirror(context.actor, %{
+        organization_id: organization.id,
+        provider: "github",
+        github_installation_id: installation_id,
+        github_account_id: fixture.run.source_owner_github_id,
+        github_account_login: fixture.run.source_owner_login
+      })
+      |> unwrap!()
+
+    ready_mirror =
+      ForgeMirrors.transition_organization_mirror(
+        context.actor,
+        pending_mirror,
+        :ready_to_bootstrap
+      )
+      |> unwrap!()
+
+    bound_mirror =
+      ForgeMirrors.update_organization_mirror(context.actor, ready_mirror, %{
+        bootstrap_import_run_id: fixture.run.id
+      })
+      |> unwrap!()
+
+    organization_mirror =
+      ForgeMirrors.transition_organization_mirror(
+        context.actor,
+        bound_mirror,
+        :bootstrapping
+      )
+      |> unwrap!()
+
+    repository_mirror =
+      ForgeMirrors.bind_repository(context.actor, %{
+        organization_mirror_id: organization_mirror.id,
+        github_repository_id: fixture.item.github_repository_id,
+        github_node_id: "R_bootstrap_#{fixture.item.id}",
+        github_full_name: fixture.item.source_full_name
+      })
+      |> unwrap!()
+
+    {:ok, delivery, :enqueued} =
+      ForgeMirrors.enqueue_webhook_delivery(
+        %{
+          organization_mirror_id: organization_mirror.id,
+          delivery_guid: Ecto.UUID.generate(),
+          hook_id: 8_500_000_000 + System.unique_integer([:positive]),
+          event: "repository",
+          action: "renamed",
+          installation_id: installation_id,
+          github_repository_id: fixture.item.github_repository_id,
+          signature_version: "sha256",
+          raw_payload:
+            JSON.encode!(%{
+              "action" => "renamed",
+              "installation" => %{"id" => installation_id},
+              "repository" => %{"id" => fixture.item.github_repository_id}
+            })
+        },
+        :pending_unsupported
+      )
+
+    assert {:ok, %{repository: published, replaced: nil}} =
+             ForgeImports.publish_repository(
+               context.actor,
+               fixture.item.id,
+               request_metadata("bootstrap-handoff")
+             )
+
+    assert %RepositoryMirror{
+             repository_id: repository_id,
+             bootstrap_repository_item_id: bootstrap_item_id,
+             state: :discovered,
+             last_synced_at: nil
+           } = Repo.get!(RepositoryMirror, repository_mirror.id)
+
+    assert repository_id == published.id
+    assert bootstrap_item_id == fixture.item.id
+
+    assert [
+             %MirrorResourceState{
+               resource_kind: :label,
+               local_resource_id: local_resource_id,
+               github_object_id: github_object_id,
+               state: :confirmed,
+               confirmed_remote_updated_at: %DateTime{},
+               confirmed_fingerprint: fingerprint
+             }
+           ] = Repo.all(MirrorResourceState)
+
+    assert local_resource_id == label.id
+    assert github_object_id == mapping.github_object_id
+    assert byte_size(fingerprint) == 64
+
+    assert [
+             %MirrorRefState{ref_name: "refs/heads/feature", state: :confirmed},
+             %MirrorRefState{ref_name: "refs/heads/main", state: :confirmed},
+             %MirrorRefState{ref_name: "refs/tags/v1.0.0", state: :confirmed}
+           ] =
+             Repo.all(
+               from state in MirrorRefState,
+                 order_by: [asc: state.ref_name]
+             )
+
+    assert %MirrorOperation{
+             kind: "reconcile.repository.bootstrap",
+             state: :pending,
+             completed_at: nil,
+             cursor: %{"baseline" => "seeded"}
+           } = Repo.get_by!(MirrorOperation, repository_mirror_id: repository_mirror.id)
+
+    assert %MirrorWebhookDelivery{state: :pending} =
+             Repo.get!(MirrorWebhookDelivery, delivery.id)
+
+    assert Repo.get!(ObjectMapping, mapping.id).repository_item_id == fixture.item.id
+
+    assert {:ok, %ImportRun{state: :completed}} =
+             RunAggregator.finish_if_terminal(fixture.run.id, now: @now)
+
+    assert %OrganizationMirror{
+             state: :catching_up,
+             last_reconciled_at: nil,
+             next_reconcile_at: %DateTime{}
+           } =
+             Repo.get!(OrganizationMirror, organization_mirror.id)
   end
 
   test "replacement keeps the URL, copies collaborators, increments generation, and tombstones old",

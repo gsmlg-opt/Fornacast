@@ -29,7 +29,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
           :ok | {:error, atom()}
   def stage(%RepositoryItem{} = item, credential_checkout, opts \\ [])
       when is_function(credential_checkout, 1) and is_list(opts) do
-    opts = Keyword.put(opts, :credential_checkout, credential_checkout)
+    opts = Keyword.put(opts, :credential_checkout, normalize_checkout(credential_checkout, opts))
 
     Enum.reduce_while(@phases, :ok, fn phase, :ok ->
       case stage_phase(item, phase, opts) do
@@ -262,6 +262,20 @@ defmodule ForgeImports.GitHub.MetadataImporter do
   defp checkout_fetch(opts, callback) do
     checkout = Keyword.fetch!(opts, :credential_checkout)
     checkout.(callback)
+  end
+
+  defp normalize_checkout(credential_checkout, opts) do
+    case Keyword.fetch(opts, :gate_key) do
+      {:ok, gate_key} ->
+        fn callback ->
+          credential_checkout.(fn credential ->
+            callback.(credential, %{gate_key: gate_key})
+          end)
+        end
+
+      :error ->
+        credential_checkout
+    end
   end
 
   defp import_label_row(multi, item, repository, mapped, _payload) do

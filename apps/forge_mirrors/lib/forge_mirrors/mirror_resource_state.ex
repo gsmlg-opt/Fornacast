@@ -10,7 +10,7 @@ defmodule ForgeMirrors.MirrorResourceState do
     field :repository_mirror_id, :integer
 
     field :resource_kind, Ecto.Enum,
-      values: [:repository, :issue, :issue_comment, :pull, :release]
+      values: [:repository, :label, :issue, :issue_comment, :pull, :release]
 
     field :local_resource_type, :string
     field :local_resource_id, :integer

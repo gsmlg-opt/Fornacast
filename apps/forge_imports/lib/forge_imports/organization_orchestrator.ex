@@ -14,6 +14,8 @@ defmodule ForgeImports.OrganizationOrchestrator do
     RepositoryPublisher
   }
 
+  alias ForgeMirrors.OrganizationMirror
+
   alias Fornacast.{Audit, Repo}
 
   @allow_test_options Mix.env() == :test
@@ -211,6 +213,33 @@ defmodule ForgeImports.OrganizationOrchestrator do
     end
   end
 
+  defp locked_owned_organization(
+         actor,
+         %ImportRun{credential_source: :github_app} = run
+       ) do
+    organization_id = run.destination_organization_id
+    slug = run.destination_organization_slug
+
+    organization =
+      Organization
+      |> where(
+        [candidate],
+        candidate.id == ^organization_id and candidate.kind == :organization and
+          candidate.state == :active and candidate.username == ^slug
+      )
+      |> maybe_lock()
+      |> Repo.one()
+
+    with %Organization{} = organization <- organization,
+         {:ok, %Organization{id: ^organization_id}} <-
+           ForgeAccounts.fetch_manageable_organization(actor, organization_id),
+         true <- app_sync_binding?(run, organization_id) do
+      {:ok, organization}
+    else
+      _invalid -> {:error, :stale}
+    end
+  end
+
   defp locked_owned_organization(actor, run) do
     organization_id = run.destination_organization_id
     slug = run.destination_organization_slug
@@ -315,6 +344,26 @@ defmodule ForgeImports.OrganizationOrchestrator do
   defp validate_run_destination(
          actor,
          %ImportRun{
+           credential_source: :github_app,
+           destination_organization_action: :existing,
+           destination_organization_id: organization_id,
+           destination_organization_slug: slug
+         } = run
+       )
+       when is_integer(organization_id) do
+    with {:ok, %Organization{} = organization} <-
+           ForgeAccounts.fetch_manageable_organization(actor, organization_id),
+         true <- organization.username == slug,
+         true <- app_sync_binding?(run, organization_id) do
+      :ok
+    else
+      _invalid -> {:error, :stale}
+    end
+  end
+
+  defp validate_run_destination(
+         actor,
+         %ImportRun{
            destination_organization_action: :existing,
            destination_organization_id: organization_id,
            destination_organization_slug: slug
@@ -346,6 +395,16 @@ defmodule ForgeImports.OrganizationOrchestrator do
   end
 
   defp validate_run_destination(_actor, _run), do: {:error, :stale}
+
+  defp app_sync_binding?(%ImportRun{id: run_id}, organization_id) do
+    Repo.exists?(
+      from mirror in OrganizationMirror,
+        where:
+          mirror.bootstrap_import_run_id == ^run_id and
+            mirror.organization_id == ^organization_id and mirror.provider == "github" and
+            mirror.state == :bootstrapping
+    )
+  end
 
   defp exact_selected_items(run, items, now) do
     selected = Enum.filter(items, & &1.selected)
@@ -475,6 +534,25 @@ defmodule ForgeImports.OrganizationOrchestrator do
          }
        ),
        do: {:ok, nil}
+
+  defp expected_destination_owner(
+         actor,
+         %ImportRun{
+           credential_source: :github_app,
+           destination_organization_action: :existing,
+           destination_organization_id: organization_id,
+           destination_organization_slug: slug
+         } = run
+       )
+       when is_integer(organization_id) do
+    with {:ok, %Organization{username: ^slug}} <-
+           ForgeAccounts.fetch_manageable_organization(actor, organization_id),
+         true <- app_sync_binding?(run, organization_id) do
+      {:ok, organization_id}
+    else
+      _invalid -> {:error, :stale}
+    end
+  end
 
   defp expected_destination_owner(
          actor,

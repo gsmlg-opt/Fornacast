@@ -95,7 +95,8 @@ defmodule ForgeImports.RepositoryWorker do
 
   def stage(repository_item_id, opts)
       when is_integer(repository_item_id) and repository_item_id > 0 and is_list(opts) do
-    with {:ok, options} <- options(opts),
+    with :ok <- bootstrap_runnable(repository_item_id),
+         {:ok, options} <- options(opts),
          {:ok, mode} <- preflight_mode(repository_item_id, options) do
       stage_in_mode(repository_item_id, options, mode)
     else
@@ -104,6 +105,16 @@ defmodule ForgeImports.RepositoryWorker do
   end
 
   def stage(_repository_item_id, _opts), do: {:error, :invalid_request}
+
+  defp bootstrap_runnable(repository_item_id) do
+    case Repo.get(RepositoryItem, repository_item_id) do
+      %RepositoryItem{import_run_id: run_id} ->
+        ForgeImports.OrganizationSync.Bootstrap.runnable?(run_id)
+
+      nil ->
+        {:error, :not_found}
+    end
+  end
 
   defp stage_in_mode(repository_item_id, options, :normal) do
     case activate_destination(repository_item_id) do
@@ -1868,6 +1879,7 @@ defmodule ForgeImports.RepositoryWorker do
               :not_found,
               :forbidden,
               :credential_invalid,
+              :invalid_credential,
               :credential_service_unavailable
             ],
        do: if(reason == :credential_invalid, do: :invalid_credential, else: reason)

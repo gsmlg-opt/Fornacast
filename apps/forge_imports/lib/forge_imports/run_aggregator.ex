@@ -36,7 +36,10 @@ defmodule ForgeImports.RunAggregator do
             Repo.rollback(:not_found)
 
           %ImportRun{state: state} = run when state in @terminal_run_states ->
-            run
+            case ForgeImports.OrganizationSync.Bootstrap.finish_in_transaction(run, now) do
+              :ok -> run
+              {:error, reason} -> Repo.rollback(reason)
+            end
 
           %ImportRun{} = run when run.state not in @aggregatable_run_states ->
             Repo.rollback(:pending)
@@ -45,8 +48,11 @@ defmodule ForgeImports.RunAggregator do
             if blocking_item?(run.id) do
               Repo.rollback(:pending)
             else
-              case finalize_run(run, now) do
-                {:ok, terminal} -> terminal
+              with {:ok, terminal} <- finalize_run(run, now),
+                   :ok <-
+                     ForgeImports.OrganizationSync.Bootstrap.finish_in_transaction(terminal, now) do
+                terminal
+              else
                 {:error, reason} -> Repo.rollback(reason)
               end
             end
@@ -55,9 +61,14 @@ defmodule ForgeImports.RunAggregator do
     end
 
     case Persistence.with_retry(transaction) do
-      {:ok, %ImportRun{} = run} -> {:ok, run}
-      {:error, :pending} -> :pending
-      {:error, reason} -> {:error, reason}
+      {:ok, %ImportRun{} = run} ->
+        {:ok, run}
+
+      {:error, :pending} ->
+        :pending
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

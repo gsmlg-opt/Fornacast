@@ -606,6 +606,7 @@ defmodule ForgeImports.DiscoveryWorker do
               :credential_service_unavailable,
               :unsafe_credential_result,
               :credential_invalid,
+              :invalid_credential,
               :not_found,
               :forbidden
             ],
