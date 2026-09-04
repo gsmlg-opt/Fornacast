@@ -246,6 +246,50 @@ defmodule Fornacast.DomainOutboxTest do
     assert Repo.get!(DomainOutboxEvent, event.id).state == :failed
   end
 
+  test "ack release and fail reject a lease expired by server time despite stale caller time" do
+    expired_at = DateTime.add(DateTime.utc_now(:second), -1)
+    stale_caller_now = DateTime.add(expired_at, -60)
+
+    for action <- [:ack, :release, :fail] do
+      now = DateTime.utc_now(:second)
+
+      assert {:ok, %{event: event}} =
+               record_event(
+                 event_attrs("server-expiry-#{action}")
+                 |> Map.put(:aggregate_id, "server-expiry-#{action}")
+                 |> Map.put(:available_at, now)
+               )
+
+      assert {:ok, [claimed]} =
+               DomainOutbox.claim_batch("server-expiry-#{action}", now, 30, 1)
+
+      Repo.update_all(from(row in DomainOutboxEvent, where: row.id == ^event.id),
+        set: [lease_expires_at: expired_at]
+      )
+
+      expired_capability = %{claimed | lease_expires_at: expired_at}
+
+      result =
+        case action do
+          :ack ->
+            DomainOutbox.ack(expired_capability, stale_caller_now)
+
+          :release ->
+            DomainOutbox.release(
+              expired_capability,
+              stale_caller_now,
+              DateTime.add(now, 60)
+            )
+
+          :fail ->
+            DomainOutbox.fail(expired_capability, stale_caller_now)
+        end
+
+      assert {:error, :lost_lease} = result
+      assert Repo.get!(DomainOutboxEvent, event.id).state == :processing
+    end
+  end
+
   @tag independent_connections: true
   test "a later same-aggregate transaction cannot become claimable first" do
     now = DateTime.utc_now(:second)

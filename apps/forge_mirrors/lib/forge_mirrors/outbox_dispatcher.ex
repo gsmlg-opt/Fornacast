@@ -21,7 +21,8 @@ defmodule ForgeMirrors.OutboxDispatcher do
     lease_seconds = Keyword.get(options, :lease_seconds, @default_lease_seconds)
     batch_size = Keyword.get(options, :batch_size, @default_batch_size)
 
-    with {:ok, events} <- DomainOutbox.claim_batch(owner, now, lease_seconds, batch_size) do
+    with {:ok, _recovered_count} <- DomainOutbox.recover_stale_leases(now),
+         {:ok, events} <- DomainOutbox.claim_batch(owner, now, lease_seconds, batch_size) do
       results = Enum.map(events, &dispatch_event(&1, now))
       {:ok, results}
     end

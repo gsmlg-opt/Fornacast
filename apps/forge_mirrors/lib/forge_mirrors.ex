@@ -231,7 +231,7 @@ defmodule ForgeMirrors do
 
   @spec mark_external_effect(MirrorOperation.t(), DateTime.t(), map()) ::
           {:ok, MirrorOperation.t()}
-          | {:error, :lost_lease | :invalid_transition | :invalid_argument}
+          | {:error, :lost_lease | :invalid_transition | :invalid_argument | :paused}
   def mark_external_effect(
         %MirrorOperation{state: :processing} = operation,
         %DateTime{} = now,
@@ -241,12 +241,32 @@ defmodule ForgeMirrors do
     with :ok <- validate_utc(now), :ok <- validate_bounded_object(marker) do
       now = DateTime.truncate(now, :second)
 
-      owned_transition(operation, now, [:processing],
-        state: :effect_pending,
-        external_effect_marker: canonical_map(marker),
-        effect_marked_at: now
-      )
+      Repo.transaction(fn ->
+        with :ok <- lock_effect_scope(operation),
+             {:ok, marked} <-
+               owned_transition(operation, now, [:processing],
+                 state: :effect_pending,
+                 external_effect_marker: canonical_map(marker),
+                 effect_marked_at: now
+               ) do
+          marked
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+      |> case do
+        {:ok, marked} ->
+          {:ok, marked}
+
+        {:error, reason} when reason in [:lost_lease, :invalid_transition, :paused] ->
+          {:error, reason}
+
+        {:error, _reason} ->
+          {:error, :lost_lease}
+      end
     end
+  rescue
+    _ -> {:error, :lost_lease}
   end
 
   def mark_external_effect(%MirrorOperation{}, %DateTime{}, _marker),
@@ -346,7 +366,7 @@ defmodule ForgeMirrors do
       )
       when state in [:processing, :effect_pending] do
     with :ok <- validate_utc(now),
-         {:ok, failure_disposition} <- failure_disposition(failure_class),
+         {:ok, failure_disposition} <- nonretryable_failure_disposition(failure_class),
          :ok <- validate_failure_detail(failure_detail) do
       owned_transition(operation, DateTime.truncate(now, :second), [state],
         state: :failed,
@@ -697,6 +717,61 @@ defmodule ForgeMirrors do
     end
   end
 
+  defp lock_effect_scope(%MirrorOperation{id: id}) when is_integer(id) and id > 0 do
+    case Repo.get(MirrorOperation, id) do
+      %MirrorOperation{} = persisted ->
+        organization =
+          OrganizationMirror
+          |> where([mirror], mirror.id == ^persisted.organization_mirror_id)
+          |> lock("FOR UPDATE")
+          |> Repo.one()
+
+        repository = lock_effect_repository(persisted.repository_mirror_id)
+
+        with %OrganizationMirror{} = organization <- organization,
+             {:ok, repository} <- repository,
+             :ok <- validate_effect_organization(organization),
+             :ok <- validate_effect_repository(repository) do
+          :ok
+        else
+          {:error, reason} -> {:error, reason}
+          _ -> {:error, :lost_lease}
+        end
+
+      nil ->
+        {:error, :lost_lease}
+    end
+  end
+
+  defp lock_effect_scope(_operation), do: {:error, :lost_lease}
+
+  defp lock_effect_repository(nil), do: {:ok, nil}
+
+  defp lock_effect_repository(repository_mirror_id) do
+    case RepositoryMirror
+         |> where([mirror], mirror.id == ^repository_mirror_id)
+         |> lock("FOR UPDATE")
+         |> Repo.one() do
+      %RepositoryMirror{} = repository -> {:ok, repository}
+      nil -> {:error, :lost_lease}
+    end
+  end
+
+  defp validate_effect_organization(%OrganizationMirror{state: :paused}), do: {:error, :paused}
+
+  defp validate_effect_organization(%OrganizationMirror{state: :revoked}),
+    do: {:error, :invalid_transition}
+
+  defp validate_effect_organization(%OrganizationMirror{}), do: :ok
+
+  defp validate_effect_repository(nil), do: :ok
+
+  defp validate_effect_repository(%RepositoryMirror{state: state})
+       when state in [:discovered, :active],
+       do: :ok
+
+  defp validate_effect_repository(%RepositoryMirror{}), do: {:error, :invalid_transition}
+
   defp claim_due_operations(owner, now, expires_at, limit) do
     sql = """
     select operation.id
@@ -772,14 +847,14 @@ defmodule ForgeMirrors do
   end
 
   defp owned_transition(operation, now, states, updates) do
-    if owned_capability?(operation, now) do
+    if owned_capability?(operation) do
       query =
         from candidate in MirrorOperation,
           where:
             candidate.id == ^operation.id and candidate.state in ^states and
               candidate.lease_owner == ^operation.lease_owner and
               candidate.lease_expires_at == ^operation.lease_expires_at and
-              candidate.lease_expires_at > ^now and
+              candidate.lease_expires_at > fragment("clock_timestamp()") and
               candidate.lock_version == ^operation.lock_version
 
       case Repo.update_all(query,
@@ -796,20 +871,16 @@ defmodule ForgeMirrors do
     _ -> {:error, :lost_lease}
   end
 
-  defp owned_capability?(
-         %MirrorOperation{
-           id: id,
-           lease_owner: owner,
-           lease_expires_at: %DateTime{} = expires_at,
-           lock_version: version
-         },
-         now
-       ) do
-    is_integer(id) and is_binary(owner) and owner != "" and is_integer(version) and
-      DateTime.compare(expires_at, now) == :gt
+  defp owned_capability?(%MirrorOperation{
+         id: id,
+         lease_owner: owner,
+         lease_expires_at: %DateTime{},
+         lock_version: version
+       }) do
+    is_integer(id) and is_binary(owner) and owner != "" and is_integer(version)
   end
 
-  defp owned_capability?(_operation, _now), do: false
+  defp owned_capability?(_operation), do: false
 
   defp conflict_insert_error(changeset, attrs) do
     if Enum.any?(changeset.errors, fn {_field, {_message, opts}} ->
@@ -899,6 +970,14 @@ defmodule ForgeMirrors do
     end
   end
 
+  defp nonretryable_failure_disposition(failure_class) do
+    case failure_disposition(failure_class) do
+      {:ok, :retry} -> {:error, :invalid_argument}
+      {:ok, disposition} -> {:ok, disposition}
+      {:error, :invalid_argument} = error -> error
+    end
+  end
+
   defp validate_failure_detail(nil), do: :ok
 
   defp validate_failure_detail(detail) when is_binary(detail) do
@@ -933,11 +1012,14 @@ defmodule ForgeMirrors do
 
   defp canonicalize_cursor(attrs) do
     cond do
-      Map.has_key?(attrs, :cursor) -> Map.update!(attrs, :cursor, &canonical_map/1)
-      Map.has_key?(attrs, "cursor") -> Map.update!(attrs, "cursor", &canonical_map/1)
+      Map.has_key?(attrs, :cursor) -> Map.update!(attrs, :cursor, &canonicalize_cursor_value/1)
+      Map.has_key?(attrs, "cursor") -> Map.update!(attrs, "cursor", &canonicalize_cursor_value/1)
       true -> attrs
     end
   end
+
+  defp canonicalize_cursor_value(value) when is_map(value), do: canonical_map(value)
+  defp canonicalize_cursor_value(value), do: value
 
   defp canonical_map(value) when is_map(value) do
     value |> JSON.encode!() |> JSON.decode!()

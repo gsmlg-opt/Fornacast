@@ -184,7 +184,7 @@ defmodule Fornacast.Repo.Migrations.CreateMirrorDomain do
       check(
         :mirror_ref_states,
         String.to_atom("mirror_ref_states_#{field}_check"),
-        "#{field} is null or #{field} ~ '^[0-9a-f]{40,64}$'"
+        "#{field} is null or (octet_length(#{field}) in (40, 64) and #{field} !~ '[^0-9a-f]')"
       )
     end
 
@@ -319,6 +319,17 @@ defmodule Fornacast.Repo.Migrations.CreateMirrorDomain do
 
     create(index(:mirror_operations, [:repository_mirror_id, :state, :id]))
     create(index(:mirror_operations, [:organization_mirror_id, :state, :id]))
+
+    unless turso?() do
+      execute("""
+      alter table mirror_operations
+      add constraint mirror_operations_repository_scope_fkey
+      foreign key (repository_mirror_id, organization_mirror_id)
+      references repository_mirrors(id, organization_mirror_id)
+      on delete cascade
+      """)
+    end
+
     bounded_string(:mirror_operations, :kind, false)
     bounded_string(:mirror_operations, :dedupe_key, false, 512)
     bounded_string(:mirror_operations, :lease_owner, true)
@@ -368,7 +379,7 @@ defmodule Fornacast.Repo.Migrations.CreateMirrorDomain do
     check(
       :mirror_operations,
       :mirror_operations_failed_state_check,
-      "state <> 'failed' or failure_class is not null"
+      "state <> 'failed' or (failure_class is not null and failure_disposition in ('degraded', 'conflict', 'terminal'))"
     )
   end
 

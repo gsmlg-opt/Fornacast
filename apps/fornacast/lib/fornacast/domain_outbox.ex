@@ -180,7 +180,8 @@ defmodule Fornacast.DomainOutbox do
                    event.id == ^id and event.state == :processing and
                      event.lease_owner == ^owner and
                      event.lease_expires_at == ^lease_expires_at and
-                     event.lock_version == ^lock_version and event.lease_expires_at > ^now
+                     event.lock_version == ^lock_version and
+                     event.lease_expires_at > fragment("clock_timestamp()")
 
              case Repo.update_all(query,
                     set:

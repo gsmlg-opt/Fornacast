@@ -34,7 +34,16 @@ defmodule ForgeMirrors.MirrorRefState do
     ])
     |> validate_required([:repository_mirror_id, :ref_name, :ref_kind, :state, :lock_version])
     |> validate_length(:ref_name, min: 1, max: 1_024, count: :bytes)
+    |> validate_oids()
     |> validate_number(:lock_version, greater_than: 0)
     |> unique_constraint([:repository_mirror_id, :ref_name])
+  end
+
+  defp validate_oids(changeset) do
+    Enum.reduce([:confirmed_oid, :last_local_oid, :last_remote_oid], changeset, fn field, acc ->
+      validate_format(acc, field, ~r/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/,
+        message: "must be a 40 or 64 character lowercase hexadecimal object ID"
+      )
+    end)
   end
 end

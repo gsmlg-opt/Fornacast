@@ -86,6 +86,116 @@ defmodule ForgeMirrors.ConcurrentClaimTest do
     assert claimed_ids == Enum.sort(operation_ids)
   end
 
+  test "an external effect marker that wins the organization lock serializes a later pause" do
+    now = DateTime.utc_now(:second)
+    parent = self()
+
+    {organization_id, organization_mirror, claimed} =
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+        organization_mirror = active_organization_mirror_fixture()
+        repository_mirror = repository_mirror_fixture(organization_mirror)
+
+        operation_fixture(organization_mirror, %{
+          repository_mirror_id: repository_mirror.id,
+          next_attempt_at: now
+        })
+
+        {:ok, [claimed]} = ForgeMirrors.claim_operations("marker-wins", now, 60, 1)
+        {organization_mirror.organization_id, organization_mirror, claimed}
+      end)
+
+    on_exit(fn -> cleanup_organization(organization_id) end)
+
+    marker_task =
+      Task.async(fn ->
+        Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+          Repo.transaction(fn ->
+            result =
+              ForgeMirrors.mark_external_effect(claimed, now, %{"request_id" => "marker-wins"})
+
+            send(parent, {:marker_written, self(), result})
+
+            receive do
+              :commit_marker -> result
+            after
+              10_000 -> Repo.rollback(:release_timeout)
+            end
+          end)
+        end)
+      end)
+
+    assert_receive {:marker_written, marker_writer, {:ok, marked}}, 2_000
+
+    pause_task =
+      observed_task(parent, :pause_started, fn -> ForgeMirrors.pause(organization_mirror) end)
+
+    assert_receive {:pause_started, pause_backend_pid}, 2_000
+    assert :blocked = await_blocked_or_finished(pause_task, pause_backend_pid)
+
+    send(marker_writer, :commit_marker)
+    assert {:ok, {:ok, ^marked}} = Task.await(marker_task, 5_000)
+    assert {:ok, paused} = Task.await(pause_task, 5_000)
+    assert paused.state == :paused
+
+    assert {:ok, completed} =
+             Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+               ForgeMirrors.complete_operation(marked, DateTime.add(now, 1))
+             end)
+
+    assert completed.state == :completed
+  end
+
+  test "a pause that wins the organization lock blocks and rejects a later effect marker" do
+    now = DateTime.utc_now(:second)
+    parent = self()
+
+    {organization_id, organization_mirror, claimed} =
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+        organization_mirror = active_organization_mirror_fixture()
+        repository_mirror = repository_mirror_fixture(organization_mirror)
+
+        operation_fixture(organization_mirror, %{
+          repository_mirror_id: repository_mirror.id,
+          next_attempt_at: now
+        })
+
+        {:ok, [claimed]} = ForgeMirrors.claim_operations("pause-wins", now, 60, 1)
+        {organization_mirror.organization_id, organization_mirror, claimed}
+      end)
+
+    on_exit(fn -> cleanup_organization(organization_id) end)
+
+    pause_task =
+      Task.async(fn ->
+        Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+          Repo.transaction(fn ->
+            result = ForgeMirrors.pause(organization_mirror)
+            send(parent, {:pause_written, self(), result})
+
+            receive do
+              :commit_pause -> result
+            after
+              10_000 -> Repo.rollback(:release_timeout)
+            end
+          end)
+        end)
+      end)
+
+    assert_receive {:pause_written, pause_writer, {:ok, paused}}, 2_000
+
+    marker_task =
+      observed_task(parent, :marker_started, fn ->
+        ForgeMirrors.mark_external_effect(claimed, now, %{"request_id" => "pause-wins"})
+      end)
+
+    assert_receive {:marker_started, marker_backend_pid}, 2_000
+    assert :blocked = await_blocked_or_finished(marker_task, marker_backend_pid)
+
+    send(pause_writer, :commit_pause)
+    assert {:ok, {:ok, ^paused}} = Task.await(pause_task, 5_000)
+    assert {:error, :paused} = Task.await(marker_task, 5_000)
+  end
+
   defp concurrent_claims(now) do
     ["concurrent-worker-a", "concurrent-worker-b"]
     |> Task.async_stream(
@@ -100,6 +210,44 @@ defmodule ForgeMirrors.ConcurrentClaimTest do
       timeout: 5_000
     )
     |> Enum.map(fn {:ok, operations} -> operations end)
+  end
+
+  defp observed_task(parent, started_message, function) do
+    Task.async(fn ->
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+        %{rows: [[backend_pid]]} =
+          Ecto.Adapters.SQL.query!(Repo, "select pg_backend_pid()", [])
+
+        send(parent, {started_message, backend_pid})
+        function.()
+      end)
+    end)
+  end
+
+  defp await_blocked_or_finished(task, backend_pid, attempts \\ 200)
+  defp await_blocked_or_finished(_task, _backend_pid, 0), do: :not_observed
+
+  defp await_blocked_or_finished(task, backend_pid, attempts) do
+    case Task.yield(task, 0) do
+      {:ok, result} ->
+        {:finished, result}
+
+      nil ->
+        blocked? =
+          Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+            %{rows: [[blocking_pids]]} =
+              Ecto.Adapters.SQL.query!(Repo, "select pg_blocking_pids($1)", [backend_pid])
+
+            blocking_pids != []
+          end)
+
+        if blocked? do
+          :blocked
+        else
+          Process.sleep(5)
+          await_blocked_or_finished(task, backend_pid, attempts - 1)
+        end
+    end
   end
 
   defp cleanup_organization(organization_id) do
