@@ -182,11 +182,16 @@ defmodule ForgeMirrors.OperationSchedulerTest do
         next_attempt_at: context.now
       })
 
-    assert {:ok, paused} = ForgeMirrors.pause(context.organization_mirror)
+    assert {:ok, paused} =
+             ForgeMirrors.pause(
+               organization_owner_fixture(context.organization_mirror),
+               context.organization_mirror
+             )
+
     assert {:ok, []} = ForgeMirrors.claim_operations("worker", context.now, 30, 10)
     assert Repo.get!(MirrorOperation, operation.id).state == :pending
 
-    assert {:ok, _active} = ForgeMirrors.resume(paused)
+    assert {:ok, _active} = ForgeMirrors.resume(organization_owner_fixture(paused), paused)
 
     assert {:ok, [%MirrorOperation{id: operation_id}]} =
              ForgeMirrors.claim_operations("worker", context.now, 30, 10)
@@ -198,7 +203,11 @@ defmodule ForgeMirrors.OperationSchedulerTest do
     operation_fixture(context.organization_mirror, %{next_attempt_at: context.now})
 
     assert {:ok, revoked} =
-             ForgeMirrors.transition_organization_mirror(context.organization_mirror, :revoked)
+             ForgeMirrors.transition_organization_mirror(
+               organization_owner_fixture(context.organization_mirror),
+               context.organization_mirror,
+               :revoked
+             )
 
     assert revoked.state == :revoked
     assert {:ok, []} = ForgeMirrors.claim_operations("worker", context.now, 30, 10)
@@ -214,7 +223,11 @@ defmodule ForgeMirrors.OperationSchedulerTest do
       })
 
     assert {:ok, revoked} =
-             ForgeMirrors.transition_repository_mirror(repository_mirror, :revoked)
+             ForgeMirrors.transition_repository_mirror(
+               organization_owner_fixture(repository_mirror),
+               repository_mirror,
+               :revoked
+             )
 
     assert revoked.state == :revoked
     assert {:ok, []} = ForgeMirrors.claim_operations("worker", context.now, 30, 10)
@@ -223,10 +236,18 @@ defmodule ForgeMirrors.OperationSchedulerTest do
 
   test "reconciliation is durable, idempotent for one schedule, and reported", context do
     assert {:ok, first} =
-             ForgeMirrors.schedule_reconciliation(context.organization_mirror, context.now)
+             ForgeMirrors.schedule_reconciliation(
+               organization_owner_fixture(context.organization_mirror),
+               context.organization_mirror,
+               context.now
+             )
 
     assert {:ok, replay} =
-             ForgeMirrors.schedule_reconciliation(context.organization_mirror, context.now)
+             ForgeMirrors.schedule_reconciliation(
+               organization_owner_fixture(context.organization_mirror),
+               context.organization_mirror,
+               context.now
+             )
 
     assert replay.id == first.id
 

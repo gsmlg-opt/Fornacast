@@ -184,6 +184,27 @@ defmodule ForgeRepos do
   def fetch_organization_repository(_organization_id, _repository_id),
     do: {:error, :not_found}
 
+  @doc "Fetches a live repository by its immutable local identity."
+  @spec fetch_live_repository(pos_integer()) ::
+          {:ok, Repository.t()} | {:error, :not_found}
+  def fetch_live_repository(repository_id) when is_integer(repository_id) and repository_id > 0 do
+    repository =
+      Repository
+      |> where(
+        [repository],
+        repository.id == ^repository_id and repository.lifecycle in [:importing, :ready] and
+          is_nil(repository.deleted_at)
+      )
+      |> Repo.one()
+
+    case repository do
+      %Repository{} = repository -> {:ok, repository}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  def fetch_live_repository(_repository_id), do: {:error, :not_found}
+
   @spec repository_view(User.t() | nil, Repository.t()) ::
           {:ok, RepositoryView.t()} | {:error, :not_found | {:unavailable, atom()}}
   def repository_view(actor, %Repository{id: repository_id}) when is_integer(repository_id) do

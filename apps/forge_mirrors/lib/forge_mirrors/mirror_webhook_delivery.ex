@@ -6,6 +6,9 @@ defmodule ForgeMirrors.MirrorWebhookDelivery do
 
   import Ecto.Changeset
 
+  @max_raw_payload_bytes 1_048_576
+  @states [:pending, :processing, :completed, :failed, :ignored]
+
   schema "mirror_webhook_deliveries" do
     field :organization_mirror_id, :integer
     field :delivery_guid, :string
@@ -15,8 +18,8 @@ defmodule ForgeMirrors.MirrorWebhookDelivery do
     field :installation_id, :integer
     field :github_repository_id, :integer
     field :signature_version, :string
-    field :raw_payload, :map
-    field :state, Ecto.Enum, values: [:pending, :processing, :completed, :failed]
+    field :raw_payload, :binary
+    field :state, Ecto.Enum, values: @states
     field :attempt_count, :integer, default: 0
     field :next_attempt_at, :utc_datetime
     field :lease_owner, :string
@@ -51,7 +54,6 @@ defmodule ForgeMirrors.MirrorWebhookDelivery do
       :lock_version
     ])
     |> validate_required([
-      :organization_mirror_id,
       :delivery_guid,
       :event,
       :installation_id,
@@ -63,6 +65,7 @@ defmodule ForgeMirrors.MirrorWebhookDelivery do
       :received_at,
       :lock_version
     ])
+    |> validate_length(:raw_payload, max: @max_raw_payload_bytes, count: :bytes)
     |> unique_constraint(:delivery_guid)
   end
 end

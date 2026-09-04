@@ -1,9 +1,12 @@
 defmodule ForgeMirrors.TestSupport.MirrorFixtures do
+  import Ecto.Query
+
   alias Fornacast.Repo
 
   def organization_fixture do
-    suffix = System.unique_integer([:positive, :monotonic])
+    suffix = Ecto.UUID.generate()
     now = DateTime.utc_now(:second)
+    owner_id = user_fixture()
 
     %{rows: [[id]]} =
       Ecto.Adapters.SQL.query!(
@@ -12,11 +15,41 @@ defmodule ForgeMirrors.TestSupport.MirrorFixtures do
         ["mirror-org-#{suffix}", "mirror-#{suffix}@example.test", "hash", "Mirror #{suffix}", now]
       )
 
+    Ecto.Adapters.SQL.query!(
+      Repo,
+      "insert into organization_members (organization_id, user_id, role, inserted_at, updated_at) values ($1, $2, 'owner', $3, $3)",
+      [id, owner_id, now]
+    )
+
     id
   end
 
+  def organization_owner_fixture(%{organization_id: organization_id}),
+    do: organization_owner_fixture(organization_id)
+
+  def organization_owner_fixture(%{organization_mirror_id: organization_mirror_id}) do
+    organization_mirror_id
+    |> then(&Repo.get!(ForgeMirrors.OrganizationMirror, &1))
+    |> organization_owner_fixture()
+  end
+
+  def organization_owner_fixture(organization_id) when is_integer(organization_id) do
+    ForgeAccounts.User
+    |> join(:inner, [user], member in ForgeAccounts.OrganizationMember,
+      on: member.user_id == user.id
+    )
+    |> where(
+      [user, member],
+      member.organization_id == ^organization_id and member.role == :owner and
+        user.kind == :user and user.state == :active
+    )
+    |> order_by([user, _member], asc: user.id)
+    |> limit(1)
+    |> Repo.one!()
+  end
+
   def user_fixture do
-    suffix = System.unique_integer([:positive, :monotonic])
+    suffix = Ecto.UUID.generate()
     now = DateTime.utc_now(:second)
 
     %{rows: [[id]]} =
@@ -30,7 +63,7 @@ defmodule ForgeMirrors.TestSupport.MirrorFixtures do
   end
 
   def repository_fixture(organization_id) do
-    suffix = System.unique_integer([:positive, :monotonic])
+    suffix = Ecto.UUID.generate()
     now = DateTime.utc_now(:second)
 
     %{rows: [[id]]} =
@@ -52,21 +85,33 @@ defmodule ForgeMirrors.TestSupport.MirrorFixtures do
       github_account_login: "github-org-#{System.unique_integer([:positive, :monotonic])}"
     }
 
-    {:ok, mirror} = ForgeMirrors.create_organization_mirror(Map.merge(defaults, attrs))
+    attrs = Map.merge(defaults, attrs)
+    actor = organization_owner_fixture(attrs.organization_id)
+    {:ok, mirror} = ForgeMirrors.create_organization_mirror(actor, attrs)
     mirror
   end
 
   def ready_organization_mirror_fixture(attrs \\ %{}) do
     mirror = organization_mirror_fixture(attrs)
-    {:ok, ready} = ForgeMirrors.transition_organization_mirror(mirror, :ready_to_bootstrap)
+    actor = organization_owner_fixture(mirror)
+
+    {:ok, ready} =
+      ForgeMirrors.transition_organization_mirror(actor, mirror, :ready_to_bootstrap)
+
     ready
   end
 
   def active_organization_mirror_fixture(attrs \\ %{}) do
     mirror = ready_organization_mirror_fixture(attrs)
-    {:ok, bootstrapping} = ForgeMirrors.transition_organization_mirror(mirror, :bootstrapping)
-    {:ok, catching_up} = ForgeMirrors.transition_organization_mirror(bootstrapping, :catching_up)
-    {:ok, active} = ForgeMirrors.transition_organization_mirror(catching_up, :active)
+    actor = organization_owner_fixture(mirror)
+
+    {:ok, bootstrapping} =
+      ForgeMirrors.transition_organization_mirror(actor, mirror, :bootstrapping)
+
+    {:ok, catching_up} =
+      ForgeMirrors.transition_organization_mirror(actor, bootstrapping, :catching_up)
+
+    {:ok, active} = ForgeMirrors.transition_organization_mirror(actor, catching_up, :active)
     active
   end
 
@@ -79,8 +124,9 @@ defmodule ForgeMirrors.TestSupport.MirrorFixtures do
       github_full_name: "example/repo-#{System.unique_integer([:positive, :monotonic])}"
     }
 
-    {:ok, mirror} = ForgeMirrors.bind_repository(Map.merge(defaults, attrs))
-    {:ok, active} = ForgeMirrors.transition_repository_mirror(mirror, :active)
+    actor = organization_owner_fixture(organization_mirror)
+    {:ok, mirror} = ForgeMirrors.bind_repository(actor, Map.merge(defaults, attrs))
+    {:ok, active} = ForgeMirrors.transition_repository_mirror(actor, mirror, :active)
     active
   end
 

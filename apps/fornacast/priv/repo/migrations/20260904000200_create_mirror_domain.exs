@@ -387,8 +387,7 @@ defmodule Fornacast.Repo.Migrations.CreateMirrorDomain do
     create table(:mirror_webhook_deliveries) do
       add(
         :organization_mirror_id,
-        references(:organization_mirrors, on_delete: :delete_all),
-        null: false
+        references(:organization_mirrors, on_delete: :delete_all)
       )
 
       add(:delivery_guid, :string, null: false)
@@ -398,7 +397,7 @@ defmodule Fornacast.Repo.Migrations.CreateMirrorDomain do
       add(:installation_id, :bigint, null: false)
       add(:github_repository_id, :bigint)
       add(:signature_version, :string, null: false)
-      add(:raw_payload, :map, null: false)
+      add(:raw_payload, :binary, null: false)
       add(:state, :string, null: false, default: "pending")
       add(:attempt_count, :integer, null: false, default: 0)
       add(:next_attempt_at, :utc_datetime, null: false)
@@ -444,8 +443,17 @@ defmodule Fornacast.Repo.Migrations.CreateMirrorDomain do
       "installation_id > 0"
     )
 
-    enum_constraint(:mirror_webhook_deliveries, :state, ~w(pending processing completed failed))
-    json_object(:mirror_webhook_deliveries, :raw_payload)
+    enum_constraint(
+      :mirror_webhook_deliveries,
+      :state,
+      ~w(pending processing completed failed ignored)
+    )
+
+    check(
+      :mirror_webhook_deliveries,
+      :mirror_webhook_deliveries_raw_payload_bounds_check,
+      "octet_length(raw_payload) between 1 and 1048576"
+    )
 
     check(
       :mirror_webhook_deliveries,
@@ -469,7 +477,8 @@ defmodule Fornacast.Repo.Migrations.CreateMirrorDomain do
     check(
       :mirror_webhook_deliveries,
       :mirror_webhook_deliveries_processed_at_check,
-      "(state = 'completed' and processed_at is not null) or (state <> 'completed' and processed_at is null)"
+      "(state in ('completed', 'ignored') and processed_at is not null) or " <>
+        "(state not in ('completed', 'ignored') and processed_at is null)"
     )
   end
 

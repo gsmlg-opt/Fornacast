@@ -23,25 +23,25 @@ defmodule ForgeMirrors do
   @type direction :: :inbound | :outbound
   @type resource_kind :: :organization | :repository | :git | :lfs | :issue | :pull | :release
 
-  @spec create_organization_mirror(map()) ::
-          {:ok, OrganizationMirror.t()} | {:error, Ecto.Changeset.t() | :not_found}
-  def create_organization_mirror(attrs) when is_map(attrs) do
+  @spec create_organization_mirror(ForgeAccounts.User.t(), map()) ::
+          {:ok, OrganizationMirror.t()}
+          | {:error, Ecto.Changeset.t() | :forbidden | :not_found}
+  def create_organization_mirror(actor, attrs) when is_map(attrs) do
     changeset = OrganizationMirror.create_changeset(%OrganizationMirror{}, attrs)
 
     if changeset.valid? do
       organization_id = Ecto.Changeset.get_field(changeset, :organization_id)
 
-      case ForgeAccounts.get_organization(organization_id) do
-        %ForgeAccounts.Organization{} -> Repo.insert(changeset)
-        nil -> {:error, :not_found}
+      with {:ok, _organization} <-
+             ForgeAccounts.fetch_manageable_organization(actor, organization_id) do
+        Repo.insert(changeset)
       end
     else
       {:error, changeset}
     end
   end
 
-  def create_organization_mirror(_attrs),
-    do: invalid_changeset(%OrganizationMirror{})
+  def create_organization_mirror(_actor, _attrs), do: {:error, :forbidden}
 
   @spec get_organization_mirror(pos_integer()) ::
           {:ok, OrganizationMirror.t()} | {:error, :not_found | :invalid_argument}
@@ -77,68 +77,100 @@ defmodule ForgeMirrors do
   def get_organization_mirror_for_organization(_organization_id, _provider),
     do: {:error, :invalid_argument}
 
-  @spec update_organization_mirror(OrganizationMirror.t(), map()) ::
-          {:ok, OrganizationMirror.t()} | {:error, Ecto.Changeset.t() | :stale}
-  def update_organization_mirror(%OrganizationMirror{} = mirror, attrs) when is_map(attrs) do
-    mirror
-    |> OrganizationMirror.update_changeset(attrs)
-    |> cas_update()
-  end
-
-  def update_organization_mirror(_mirror, _attrs), do: {:error, :stale}
-
-  @spec transition_organization_mirror(OrganizationMirror.t(), atom()) ::
+  @spec update_organization_mirror(ForgeAccounts.User.t(), OrganizationMirror.t(), map()) ::
           {:ok, OrganizationMirror.t()}
-          | {:error, Ecto.Changeset.t() | :invalid_transition | :stale}
-  def transition_organization_mirror(%OrganizationMirror{} = mirror, target) do
-    if OrganizationMirror.legal_transition?(mirror.state, target) and
-         (mirror.state != :paused or target == :revoked) do
-      mirror
-      |> OrganizationMirror.transition_changeset(target)
+          | {:error, Ecto.Changeset.t() | :forbidden | :not_found | :stale}
+  def update_organization_mirror(actor, %OrganizationMirror{} = mirror, attrs)
+      when is_map(attrs) do
+    with {:ok, persisted} <- load_organization_mirror_capability(mirror),
+         {:ok, _organization} <- authorize_organization_mirror(actor, persisted),
+         :ok <- validate_capability_version(mirror, persisted) do
+      persisted
+      |> OrganizationMirror.update_changeset(attrs)
       |> cas_update()
-    else
-      {:error, :invalid_transition}
     end
   end
 
-  def transition_organization_mirror(_mirror, _target), do: {:error, :invalid_transition}
+  def update_organization_mirror(_actor, _mirror, _attrs), do: {:error, :forbidden}
 
-  @spec pause(OrganizationMirror.t()) ::
-          {:ok, OrganizationMirror.t()} | {:error, :invalid_transition | :stale}
-  def pause(%OrganizationMirror{state: state} = mirror) do
-    if OrganizationMirror.legal_transition?(state, :paused) do
-      mirror
-      |> OrganizationMirror.transition_changeset(:paused, state)
-      |> cas_update()
-    else
-      {:error, :invalid_transition}
+  @spec transition_organization_mirror(
+          ForgeAccounts.User.t(),
+          OrganizationMirror.t(),
+          atom()
+        ) ::
+          {:ok, OrganizationMirror.t()}
+          | {:error, Ecto.Changeset.t() | :forbidden | :invalid_transition | :not_found | :stale}
+  def transition_organization_mirror(actor, %OrganizationMirror{} = mirror, target) do
+    with {:ok, persisted} <- load_organization_mirror_capability(mirror),
+         {:ok, _organization} <- authorize_organization_mirror(actor, persisted),
+         :ok <- validate_capability_version(mirror, persisted) do
+      if OrganizationMirror.legal_transition?(persisted.state, target) and
+           (persisted.state != :paused or target == :revoked) do
+        persisted
+        |> OrganizationMirror.transition_changeset(target)
+        |> cas_update()
+      else
+        {:error, :invalid_transition}
+      end
     end
   end
 
-  def pause(_mirror), do: {:error, :invalid_transition}
+  def transition_organization_mirror(_actor, _mirror, _target), do: {:error, :forbidden}
 
-  @spec resume(OrganizationMirror.t()) ::
-          {:ok, OrganizationMirror.t()} | {:error, :invalid_transition | :stale}
-  def resume(%OrganizationMirror{state: :paused, resume_state: target} = mirror)
-      when not is_nil(target) do
-    if OrganizationMirror.legal_transition?(:paused, target) do
-      mirror
-      |> OrganizationMirror.transition_changeset(target)
-      |> cas_update()
-    else
-      {:error, :invalid_transition}
+  @spec pause(ForgeAccounts.User.t(), OrganizationMirror.t()) ::
+          {:ok, OrganizationMirror.t()}
+          | {:error, :forbidden | :invalid_transition | :not_found | :stale}
+  def pause(actor, %OrganizationMirror{} = mirror) do
+    with {:ok, persisted} <- load_organization_mirror_capability(mirror),
+         {:ok, _organization} <- authorize_organization_mirror(actor, persisted),
+         :ok <- validate_capability_version(mirror, persisted) do
+      if OrganizationMirror.legal_transition?(persisted.state, :paused) do
+        persisted
+        |> OrganizationMirror.transition_changeset(:paused, persisted.state)
+        |> cas_update()
+      else
+        {:error, :invalid_transition}
+      end
     end
   end
 
-  def resume(_mirror), do: {:error, :invalid_transition}
+  def pause(_actor, _mirror), do: {:error, :forbidden}
 
-  @spec bind_repository(map()) ::
-          {:ok, RepositoryMirror.t()} | {:error, Ecto.Changeset.t() | :not_found}
-  def bind_repository(attrs) when is_map(attrs) do
+  @spec resume(ForgeAccounts.User.t(), OrganizationMirror.t()) ::
+          {:ok, OrganizationMirror.t()}
+          | {:error, :forbidden | :invalid_transition | :not_found | :stale}
+  def resume(actor, %OrganizationMirror{} = mirror) do
+    with {:ok, persisted} <- load_organization_mirror_capability(mirror),
+         {:ok, _organization} <- authorize_organization_mirror(actor, persisted),
+         :ok <- validate_capability_version(mirror, persisted) do
+      case persisted do
+        %OrganizationMirror{state: :paused, resume_state: target} when not is_nil(target) ->
+          if OrganizationMirror.legal_transition?(:paused, target) do
+            persisted
+            |> OrganizationMirror.transition_changeset(target)
+            |> cas_update()
+          else
+            {:error, :invalid_transition}
+          end
+
+        _other ->
+          {:error, :invalid_transition}
+      end
+    end
+  end
+
+  def resume(_actor, _mirror), do: {:error, :forbidden}
+
+  @spec bind_repository(ForgeAccounts.User.t(), map()) ::
+          {:ok, RepositoryMirror.t()}
+          | {:error, Ecto.Changeset.t() | :forbidden | :not_found}
+  def bind_repository(actor, attrs) when is_map(attrs) do
     changeset = RepositoryMirror.create_changeset(%RepositoryMirror{}, attrs)
 
     if changeset.valid? do
-      with {:ok, _organization_mirror} <- validate_repository_binding_scope(changeset) do
+      with {:ok, organization_mirror} <- load_binding_organization_mirror(changeset),
+           {:ok, _organization} <- authorize_organization_mirror(actor, organization_mirror),
+           {:ok, _validated_mirror} <- validate_repository_binding_scope(changeset) do
         Repo.insert(changeset)
       end
     else
@@ -146,7 +178,7 @@ defmodule ForgeMirrors do
     end
   end
 
-  def bind_repository(_attrs), do: invalid_changeset(%RepositoryMirror{})
+  def bind_repository(_actor, _attrs), do: {:error, :forbidden}
 
   @spec get_repository_mirror(pos_integer()) ::
           {:ok, RepositoryMirror.t()} | {:error, :not_found | :invalid_argument}
@@ -159,36 +191,52 @@ defmodule ForgeMirrors do
 
   def get_repository_mirror(_id), do: {:error, :invalid_argument}
 
-  @spec update_repository_mirror(RepositoryMirror.t(), map()) ::
-          {:ok, RepositoryMirror.t()} | {:error, Ecto.Changeset.t() | :not_found | :stale}
-  def update_repository_mirror(%RepositoryMirror{} = mirror, attrs) when is_map(attrs) do
-    changeset = RepositoryMirror.update_changeset(mirror, attrs)
-
-    if changeset.valid? do
-      with {:ok, _organization_mirror} <- validate_repository_binding_scope(changeset) do
-        cas_update(changeset)
-      end
-    else
-      {:error, changeset}
-    end
-  end
-
-  def update_repository_mirror(_mirror, _attrs), do: {:error, :stale}
-
-  @spec transition_repository_mirror(RepositoryMirror.t(), atom()) ::
+  @spec update_repository_mirror(ForgeAccounts.User.t(), RepositoryMirror.t(), map()) ::
           {:ok, RepositoryMirror.t()}
-          | {:error, Ecto.Changeset.t() | :invalid_transition | :stale}
-  def transition_repository_mirror(%RepositoryMirror{} = mirror, target) do
-    if RepositoryMirror.legal_transition?(mirror.state, target) do
-      mirror
-      |> RepositoryMirror.transition_changeset(target)
-      |> cas_update()
-    else
-      {:error, :invalid_transition}
+          | {:error, Ecto.Changeset.t() | :forbidden | :not_found | :stale}
+  def update_repository_mirror(actor, %RepositoryMirror{} = mirror, attrs)
+      when is_map(attrs) do
+    with {:ok, persisted} <- load_repository_mirror_capability(mirror),
+         {:ok, organization_mirror} <- load_repository_organization_mirror(persisted),
+         {:ok, _organization} <- authorize_organization_mirror(actor, organization_mirror),
+         :ok <- validate_capability_version(mirror, persisted) do
+      changeset = RepositoryMirror.update_changeset(persisted, attrs)
+
+      if changeset.valid? do
+        with {:ok, _organization_mirror} <- validate_repository_binding_scope(changeset) do
+          cas_update(changeset)
+        end
+      else
+        {:error, changeset}
+      end
     end
   end
 
-  def transition_repository_mirror(_mirror, _target), do: {:error, :invalid_transition}
+  def update_repository_mirror(_actor, _mirror, _attrs), do: {:error, :forbidden}
+
+  @spec transition_repository_mirror(
+          ForgeAccounts.User.t(),
+          RepositoryMirror.t(),
+          atom()
+        ) ::
+          {:ok, RepositoryMirror.t()}
+          | {:error, Ecto.Changeset.t() | :forbidden | :invalid_transition | :not_found | :stale}
+  def transition_repository_mirror(actor, %RepositoryMirror{} = mirror, target) do
+    with {:ok, persisted} <- load_repository_mirror_capability(mirror),
+         {:ok, organization_mirror} <- load_repository_organization_mirror(persisted),
+         {:ok, _organization} <- authorize_organization_mirror(actor, organization_mirror),
+         :ok <- validate_capability_version(mirror, persisted) do
+      if RepositoryMirror.legal_transition?(persisted.state, target) do
+        persisted
+        |> RepositoryMirror.transition_changeset(target)
+        |> cas_update()
+      else
+        {:error, :invalid_transition}
+      end
+    end
+  end
+
+  def transition_repository_mirror(_actor, _mirror, _target), do: {:error, :forbidden}
 
   @spec enqueue_operation(map()) ::
           {:ok, MirrorOperation.t()}
@@ -456,39 +504,56 @@ defmodule ForgeMirrors do
 
   def record_conflict(_attrs), do: invalid_changeset(%MirrorConflict{})
 
-  @spec resolve_conflict(MirrorConflict.t(), map(), pos_integer() | nil, DateTime.t()) ::
+  @spec resolve_conflict(
+          ForgeAccounts.User.t(),
+          MirrorConflict.t(),
+          map(),
+          DateTime.t()
+        ) ::
           {:ok, MirrorConflict.t()}
-          | {:error, Ecto.Changeset.t() | :invalid_transition | :stale | :invalid_argument}
+          | {:error,
+             Ecto.Changeset.t()
+             | :forbidden
+             | :invalid_transition
+             | :not_found
+             | :stale
+             | :invalid_argument}
   def resolve_conflict(
-        %MirrorConflict{state: :open} = conflict,
+        %ForgeAccounts.User{id: actor_id} = actor,
+        %MirrorConflict{} = conflict,
         resolution,
-        user_id,
         %DateTime{} = now
       )
-      when is_map(resolution) and (is_nil(user_id) or (is_integer(user_id) and user_id > 0)) do
-    with :ok <- validate_utc(now) do
-      conflict
-      |> MirrorConflict.resolve_changeset(
-        canonical_map(resolution),
-        user_id,
-        DateTime.truncate(now, :second)
-      )
-      |> cas_update()
-      |> resolve_idempotently(conflict.id, canonical_map(resolution))
+      when is_integer(actor_id) and is_map(resolution) do
+    with {:ok, persisted} <- load_conflict_capability(conflict),
+         {:ok, organization_mirror} <- load_conflict_organization_mirror(persisted),
+         {:ok, _organization} <- authorize_organization_mirror(actor, organization_mirror),
+         :ok <- validate_utc(now) do
+      resolution = canonical_map(resolution)
+
+      case persisted do
+        %MirrorConflict{state: :open} ->
+          with :ok <- validate_capability_version(conflict, persisted) do
+            persisted
+            |> MirrorConflict.resolve_changeset(
+              resolution,
+              actor_id,
+              DateTime.truncate(now, :second)
+            )
+            |> cas_update()
+            |> resolve_idempotently(persisted.id, resolution)
+          end
+
+        %MirrorConflict{state: :resolved, resolution: ^resolution} ->
+          {:ok, persisted}
+
+        %MirrorConflict{} ->
+          {:error, :invalid_transition}
+      end
     end
   end
 
-  def resolve_conflict(%MirrorConflict{state: :resolved} = conflict, resolution, _user_id, _now)
-      when is_map(resolution) do
-    if conflict.resolution == canonical_map(resolution),
-      do: {:ok, conflict},
-      else: {:error, :invalid_transition}
-  end
-
-  def resolve_conflict(%MirrorConflict{}, _resolution, _user_id, %DateTime{}),
-    do: {:error, :invalid_transition}
-
-  def resolve_conflict(_conflict, _resolution, _user_id, _now), do: {:error, :invalid_argument}
+  def resolve_conflict(_actor, _conflict, _resolution, _now), do: {:error, :forbidden}
 
   @spec organization_status(pos_integer()) ::
           {:ok, map()} | {:error, :not_found | :invalid_argument}
@@ -524,23 +589,30 @@ defmodule ForgeMirrors do
           {:ok, map()} | {:error, :not_found | :invalid_argument}
   def list_organization_status(id), do: organization_status(id)
 
-  @spec schedule_reconciliation(OrganizationMirror.t(), DateTime.t()) ::
+  @spec schedule_reconciliation(
+          ForgeAccounts.User.t(),
+          OrganizationMirror.t(),
+          DateTime.t()
+        ) ::
           {:ok, MirrorOperation.t()} | {:error, term()}
-  def schedule_reconciliation(%OrganizationMirror{} = mirror, %DateTime{} = scheduled_at) do
-    with :ok <- validate_utc(scheduled_at) do
+  def schedule_reconciliation(actor, %OrganizationMirror{} = mirror, %DateTime{} = scheduled_at) do
+    with {:ok, persisted} <- load_organization_mirror_capability(mirror),
+         {:ok, _organization} <- authorize_organization_mirror(actor, persisted),
+         :ok <- validate_capability_version(mirror, persisted),
+         :ok <- validate_utc(scheduled_at) do
       scheduled_at = DateTime.truncate(scheduled_at, :second)
 
       enqueue_operation(%{
-        organization_mirror_id: mirror.id,
+        organization_mirror_id: persisted.id,
         kind: "reconcile.organization_inventory",
-        dedupe_key: "reconcile:organization:#{mirror.id}:#{DateTime.to_unix(scheduled_at)}",
+        dedupe_key: "reconcile:organization:#{persisted.id}:#{DateTime.to_unix(scheduled_at)}",
         cursor: %{},
         next_attempt_at: scheduled_at
       })
     end
   end
 
-  def schedule_reconciliation(_mirror, _scheduled_at), do: {:error, :invalid_argument}
+  def schedule_reconciliation(_actor, _mirror, _scheduled_at), do: {:error, :forbidden}
 
   @doc false
   def schedule_due_reconciliations(%DateTime{} = now, limit, interval_seconds)
@@ -564,24 +636,40 @@ defmodule ForgeMirrors do
   end
 
   @doc false
+  @spec materialize_outbox_event(DomainOutboxEvent.t()) ::
+          {:ok, {:materialized, [MirrorOperation.t()]}}
+          | {:ok,
+             {:ignored,
+              :non_repository_event
+              | :non_local_event
+              | :repository_missing
+              | :unbound_repository
+              | :unmirrored_owner}}
+          | {:error, :invalid_payload | :repository_binding_conflict | term()}
   def materialize_outbox_event(%DomainOutboxEvent{} = event) do
-    case repository_id_from_event(event) do
-      repository_id when is_integer(repository_id) ->
-        RepositoryMirror
-        |> join(:inner, [repository], organization in OrganizationMirror,
-          on: organization.id == repository.organization_mirror_id
-        )
-        |> where(
-          [repository, organization],
-          repository.repository_id == ^repository_id and
-            repository.state in [:discovered, :active] and
-            organization.state != :revoked
-        )
-        |> Repo.all()
-        |> Enum.reduce_while({:ok, []}, &materialize_for_repository(&1, event, &2))
+    case event do
+      %DomainOutboxEvent{aggregate_type: "repository", origin: origin}
+      when origin != :fornacast ->
+        ignore_repository_event(event, :non_local_event)
 
-      _ ->
-        {:ok, []}
+      %DomainOutboxEvent{aggregate_type: "repository", event_type: "repository.created"} ->
+        materialize_created_repository(event)
+
+      %DomainOutboxEvent{aggregate_type: "repository", event_type: "repository." <> _suffix} ->
+        materialize_existing_repository(event)
+
+      %DomainOutboxEvent{aggregate_type: "repository"} ->
+        ignore_repository_event(event, :non_repository_event)
+
+      %DomainOutboxEvent{} ->
+        {:ok, {:ignored, :non_repository_event}}
+    end
+  end
+
+  defp ignore_repository_event(event, reason) do
+    with {:ok, {repository_id, owner_id}} <- repository_identity_from_event(event),
+         :ok <- validate_local_repository_identity(owner_id, repository_id) do
+      {:ok, {:ignored, reason}}
     end
   end
 
@@ -607,22 +695,155 @@ defmodule ForgeMirrors do
     result
   end
 
-  defp materialize_for_repository(repository, event, {:ok, operations}) do
-    case enqueue_operation(%{
-           organization_mirror_id: repository.organization_mirror_id,
-           repository_mirror_id: repository.id,
-           kind: event.event_type,
-           dedupe_key: "outbox:#{event.event_id}:#{repository.id}",
-           cursor: %{"outbox_event_id" => event.event_id},
-           next_attempt_at: event.available_at
-         }) do
-      {:ok, operation} -> {:cont, {:ok, [operation | operations]}}
-      error -> {:halt, error}
+  defp materialize_created_repository(event) do
+    with {:ok, {repository_id, owner_id}} <- repository_identity_from_event(event) do
+      materialize_in_transaction(fn ->
+        with :ok <- validate_local_repository_identity(owner_id, repository_id),
+             {:ok, organization_mirror} <- lock_non_revoked_organization_mirror(owner_id),
+             {:ok, repository_mirror} <-
+               find_or_create_local_repository_mirror(organization_mirror, repository_id),
+             {:ok, operation} <- materialize_repository_operation(repository_mirror, event) do
+          {:materialized, [operation]}
+        else
+          {:error, :repository_missing} -> {:ignored, :repository_missing}
+          {:error, :unmirrored_owner} -> {:ignored, :unmirrored_owner}
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
     end
   end
 
+  defp materialize_existing_repository(event) do
+    with {:ok, {repository_id, owner_id}} <- repository_identity_from_event(event) do
+      materialize_in_transaction(fn ->
+        with :ok <- validate_local_repository_identity(owner_id, repository_id),
+             {:ok, organization_mirror} <- lock_non_revoked_organization_mirror(owner_id) do
+          case find_bound_repository_mirror(organization_mirror.id, repository_id) do
+            %RepositoryMirror{} = repository_mirror ->
+              case materialize_repository_operation(repository_mirror, event) do
+                {:ok, operation} -> {:materialized, [operation]}
+                {:error, reason} -> Repo.rollback(reason)
+              end
+
+            nil ->
+              {:ignored, :unbound_repository}
+          end
+        else
+          {:error, :repository_missing} -> {:ignored, :repository_missing}
+          {:error, :unmirrored_owner} -> {:ignored, :unmirrored_owner}
+          {:error, :invalid_payload} -> Repo.rollback(:invalid_payload)
+        end
+      end)
+    end
+  end
+
+  defp materialize_in_transaction(callback) when is_function(callback, 0) do
+    case Repo.transaction(callback) do
+      {:ok, decision} -> {:ok, decision}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    _error -> {:error, :unavailable}
+  end
+
+  defp lock_non_revoked_organization_mirror(owner_id) do
+    case OrganizationMirror
+         |> where(
+           [mirror],
+           mirror.organization_id == ^owner_id and mirror.provider == "github" and
+             mirror.state != :revoked
+         )
+         |> order_by([mirror], desc: mirror.id)
+         |> limit(1)
+         |> lock("FOR UPDATE")
+         |> Repo.one() do
+      %OrganizationMirror{} = mirror -> {:ok, mirror}
+      nil -> {:error, :unmirrored_owner}
+    end
+  end
+
+  defp find_or_create_local_repository_mirror(organization_mirror, repository_id) do
+    case non_tombstoned_repository_mirror(repository_id) do
+      %RepositoryMirror{organization_mirror_id: organization_mirror_id} = mirror
+      when organization_mirror_id == organization_mirror.id ->
+        {:ok, mirror}
+
+      %RepositoryMirror{} ->
+        {:error, :repository_binding_conflict}
+
+      nil ->
+        %RepositoryMirror{}
+        |> RepositoryMirror.create_changeset(%{
+          organization_mirror_id: organization_mirror.id,
+          repository_id: repository_id,
+          state: :discovered
+        })
+        |> Repo.insert()
+    end
+  end
+
+  defp non_tombstoned_repository_mirror(repository_id) do
+    RepositoryMirror
+    |> where(
+      [mirror],
+      mirror.repository_id == ^repository_id and mirror.state != :tombstoned
+    )
+    |> order_by([mirror], desc: mirror.id)
+    |> limit(1)
+    |> Repo.one()
+  end
+
+  defp find_bound_repository_mirror(organization_mirror_id, repository_id) do
+    RepositoryMirror
+    |> where(
+      [mirror],
+      mirror.organization_mirror_id == ^organization_mirror_id and
+        mirror.repository_id == ^repository_id and mirror.state != :tombstoned
+    )
+    |> order_by([mirror], desc: mirror.id)
+    |> limit(1)
+    |> Repo.one()
+  end
+
+  defp materialize_repository_operation(repository, event) do
+    enqueue_operation(%{
+      organization_mirror_id: repository.organization_mirror_id,
+      repository_mirror_id: repository.id,
+      kind: event.event_type,
+      dedupe_key: "outbox:#{event.event_id}:#{repository.id}",
+      cursor: %{"outbox_event_id" => event.event_id},
+      next_attempt_at: event.available_at
+    })
+  end
+
+  defp validate_local_repository_identity(owner_id, repository_id) do
+    case ForgeRepos.fetch_live_repository(repository_id) do
+      {:ok, %ForgeRepos.Repository{owner_user_id: ^owner_id}} -> :ok
+      {:ok, %ForgeRepos.Repository{}} -> {:error, :invalid_payload}
+      {:error, :not_found} -> {:error, :repository_missing}
+    end
+  end
+
+  defp repository_identity_from_event(%DomainOutboxEvent{
+         aggregate_id: aggregate_id,
+         payload: payload
+       })
+       when is_binary(aggregate_id) and is_map(payload) do
+    with {repository_id, ""} when repository_id > 0 <- Integer.parse(aggregate_id),
+         ^repository_id <- Map.get(payload, "repository_id"),
+         owner_id when is_integer(owner_id) and owner_id > 0 <- Map.get(payload, "owner_id") do
+      {:ok, {repository_id, owner_id}}
+    else
+      _invalid -> {:error, :invalid_payload}
+    end
+  end
+
+  defp repository_identity_from_event(_event), do: {:error, :invalid_payload}
+
   defp insert_idempotent_operation(changeset) do
-    case Repo.insert(changeset) do
+    options = if Repo.in_transaction?(), do: [mode: :savepoint], else: []
+
+    case Repo.insert(changeset, options) do
       {:ok, operation} ->
         {:ok, operation}
 
@@ -655,6 +876,72 @@ defmodule ForgeMirrors do
     }
   end
 
+  defp load_organization_mirror_capability(%OrganizationMirror{
+         id: id,
+         lock_version: lock_version
+       })
+       when is_integer(id) and id > 0 and is_integer(lock_version) do
+    case Repo.get(OrganizationMirror, id) do
+      nil -> {:error, :not_found}
+      %OrganizationMirror{} = persisted -> {:ok, persisted}
+    end
+  end
+
+  defp load_organization_mirror_capability(_mirror), do: {:error, :not_found}
+
+  defp load_repository_mirror_capability(%RepositoryMirror{
+         id: id,
+         lock_version: lock_version
+       })
+       when is_integer(id) and id > 0 and is_integer(lock_version) do
+    case Repo.get(RepositoryMirror, id) do
+      nil -> {:error, :not_found}
+      %RepositoryMirror{} = persisted -> {:ok, persisted}
+    end
+  end
+
+  defp load_repository_mirror_capability(_mirror), do: {:error, :not_found}
+
+  defp load_conflict_capability(%MirrorConflict{id: id, lock_version: lock_version})
+       when is_integer(id) and id > 0 and is_integer(lock_version) do
+    case Repo.get(MirrorConflict, id) do
+      nil -> {:error, :not_found}
+      %MirrorConflict{} = persisted -> {:ok, persisted}
+    end
+  end
+
+  defp load_conflict_capability(_conflict), do: {:error, :not_found}
+
+  defp validate_capability_version(
+         %{lock_version: lock_version},
+         %{lock_version: lock_version}
+       ),
+       do: :ok
+
+  defp validate_capability_version(_provided, _persisted), do: {:error, :stale}
+
+  defp authorize_organization_mirror(actor, %OrganizationMirror{organization_id: id}) do
+    ForgeAccounts.fetch_manageable_organization(actor, id)
+  end
+
+  defp load_repository_organization_mirror(%RepositoryMirror{
+         organization_mirror_id: organization_mirror_id
+       }) do
+    case Repo.get(OrganizationMirror, organization_mirror_id) do
+      %OrganizationMirror{} = mirror -> {:ok, mirror}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  defp load_conflict_organization_mirror(%MirrorConflict{
+         organization_mirror_id: organization_mirror_id
+       }) do
+    case Repo.get(OrganizationMirror, organization_mirror_id) do
+      %OrganizationMirror{} = mirror -> {:ok, mirror}
+      nil -> {:error, :not_found}
+    end
+  end
+
   defp validate_repository_binding_scope(changeset) do
     organization_mirror_id =
       Ecto.Changeset.get_field(changeset, :organization_mirror_id)
@@ -670,6 +957,16 @@ defmodule ForgeMirrors do
       {:ok, organization_mirror}
     else
       _ -> {:error, :not_found}
+    end
+  end
+
+  defp load_binding_organization_mirror(changeset) do
+    changeset
+    |> Ecto.Changeset.get_field(:organization_mirror_id)
+    |> then(&Repo.get(OrganizationMirror, &1))
+    |> case do
+      %OrganizationMirror{} = organization_mirror -> {:ok, organization_mirror}
+      nil -> {:error, :not_found}
     end
   end
 
@@ -1026,33 +1323,6 @@ defmodule ForgeMirrors do
     value |> JSON.encode!() |> JSON.decode!()
   rescue
     _ -> value
-  end
-
-  defp repository_id_from_event(%DomainOutboxEvent{
-         aggregate_type: "repository",
-         aggregate_id: id
-       }) do
-    case Integer.parse(id) do
-      {value, ""} when value > 0 -> value
-      _ -> nil
-    end
-  end
-
-  defp repository_id_from_event(%DomainOutboxEvent{payload: payload}) when is_map(payload) do
-    case Map.get(payload, "repository_id") || Map.get(payload, :repository_id) do
-      value when is_integer(value) and value > 0 -> value
-      value when is_binary(value) -> parse_positive_integer(value)
-      _ -> nil
-    end
-  end
-
-  defp repository_id_from_event(_event), do: nil
-
-  defp parse_positive_integer(value) do
-    case Integer.parse(value) do
-      {id, ""} when id > 0 -> id
-      _ -> nil
-    end
   end
 
   defp attr(attrs, field), do: Map.get(attrs, field) || Map.get(attrs, Atom.to_string(field))

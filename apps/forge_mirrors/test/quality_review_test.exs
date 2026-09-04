@@ -34,7 +34,7 @@ defmodule ForgeMirrors.QualityReviewTest do
 
     restarted_at = DateTime.utc_now(:second)
 
-    assert {:ok, [{:ok, "stale-head-first", [_operation_id]}]} =
+    assert {:ok, [{:ok, "stale-head-first", {:materialized, [_operation_id]}}]} =
              ForgeMirrors.OutboxDispatcher.dispatch_once("restarted-dispatcher", restarted_at,
                lease_seconds: 30,
                batch_size: 1
@@ -43,7 +43,7 @@ defmodule ForgeMirrors.QualityReviewTest do
     assert Repo.get!(DomainOutboxEvent, first.id).state == :completed
     assert Repo.get!(DomainOutboxEvent, second.id).state == :pending
 
-    assert {:ok, [{:ok, "stale-head-second", [_operation_id]}]} =
+    assert {:ok, [{:ok, "stale-head-second", {:materialized, [_operation_id]}}]} =
              ForgeMirrors.OutboxDispatcher.dispatch_once("restarted-dispatcher", restarted_at,
                lease_seconds: 30,
                batch_size: 1
@@ -57,8 +57,18 @@ defmodule ForgeMirrors.QualityReviewTest do
 
       result =
         case target do
-          :paused -> ForgeMirrors.pause(organization_mirror)
-          :revoked -> ForgeMirrors.transition_organization_mirror(organization_mirror, :revoked)
+          :paused ->
+            ForgeMirrors.pause(
+              organization_owner_fixture(organization_mirror),
+              organization_mirror
+            )
+
+          :revoked ->
+            ForgeMirrors.transition_organization_mirror(
+              organization_owner_fixture(organization_mirror),
+              organization_mirror,
+              :revoked
+            )
         end
 
       assert {:ok, transitioned} = result
@@ -95,7 +105,11 @@ defmodule ForgeMirrors.QualityReviewTest do
       assert claimed.id == operation.id
 
       assert {:ok, _transitioned} =
-               ForgeMirrors.transition_repository_mirror(repository_mirror, target)
+               ForgeMirrors.transition_repository_mirror(
+                 organization_owner_fixture(repository_mirror),
+                 repository_mirror,
+                 target
+               )
 
       assert {:error, :invalid_transition} =
                ForgeMirrors.mark_external_effect(claimed, DateTime.utc_now(:second), %{
@@ -291,6 +305,9 @@ defmodule ForgeMirrors.QualityReviewTest do
   end
 
   defp outbox_event!(repository_mirror, event_id, now) do
+    organization_mirror =
+      Repo.get!(ForgeMirrors.OrganizationMirror, repository_mirror.organization_mirror_id)
+
     assert {:ok, %{event: event}} =
              Multi.new()
              |> DomainOutbox.record_multi(:event, %{
@@ -299,7 +316,10 @@ defmodule ForgeMirrors.QualityReviewTest do
                aggregate_id: Integer.to_string(repository_mirror.repository_id),
                event_type: "repository.updated",
                origin: :fornacast,
-               payload: %{"repository_id" => repository_mirror.repository_id},
+               payload: %{
+                 "repository_id" => repository_mirror.repository_id,
+                 "owner_id" => organization_mirror.organization_id
+               },
                available_at: now
              })
              |> Repo.transaction()

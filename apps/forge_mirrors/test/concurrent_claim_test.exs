@@ -127,7 +127,9 @@ defmodule ForgeMirrors.ConcurrentClaimTest do
     assert_receive {:marker_written, marker_writer, {:ok, marked}}, 2_000
 
     pause_task =
-      observed_task(parent, :pause_started, fn -> ForgeMirrors.pause(organization_mirror) end)
+      observed_task(parent, :pause_started, fn ->
+        ForgeMirrors.pause(organization_owner_fixture(organization_mirror), organization_mirror)
+      end)
 
     assert_receive {:pause_started, pause_backend_pid}, 2_000
     assert :blocked = await_blocked_or_finished(pause_task, pause_backend_pid)
@@ -169,7 +171,12 @@ defmodule ForgeMirrors.ConcurrentClaimTest do
       Task.async(fn ->
         Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
           Repo.transaction(fn ->
-            result = ForgeMirrors.pause(organization_mirror)
+            result =
+              ForgeMirrors.pause(
+                organization_owner_fixture(organization_mirror),
+                organization_mirror
+              )
+
             send(parent, {:pause_written, self(), result})
 
             receive do

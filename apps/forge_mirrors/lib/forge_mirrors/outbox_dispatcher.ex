@@ -64,14 +64,26 @@ defmodule ForgeMirrors.OutboxDispatcher do
 
   defp dispatch_event(event, now) do
     case ForgeMirrors.materialize_outbox_event(event) do
-      {:ok, operations} ->
+      {:ok, {:materialized, operations}} ->
         case DomainOutbox.ack(event, now) do
-          {:ok, _acked} -> {:ok, event.event_id, Enum.map(operations, & &1.id)}
+          {:ok, _acked} ->
+            {:ok, event.event_id, {:materialized, Enum.map(operations, & &1.id)}}
+
+          error ->
+            error
+        end
+
+      {:ok, {:ignored, reason}} ->
+        case DomainOutbox.ack(event, now) do
+          {:ok, _acked} -> {:ok, event.event_id, {:ignored, reason}}
           error -> error
         end
 
-      _error ->
-        DomainOutbox.release(event, now, DateTime.add(now, 5, :second))
+      {:error, reason} ->
+        case DomainOutbox.release(event, now, DateTime.add(now, 5, :second)) do
+          {:ok, _released} -> {:error, event.event_id, reason}
+          error -> error
+        end
     end
   end
 

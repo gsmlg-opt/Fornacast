@@ -267,6 +267,38 @@ defmodule ForgeAccounts do
 
   def get_organization(id), do: Repo.get_by(Organization, id: id, kind: :organization)
 
+  @doc """
+  Fetches an active organization that the active actor may manage.
+
+  Site administrators and organization owners may manage an organization. The
+  actor and organization are always reloaded so caller-provided role or state
+  fields are not authorization inputs.
+  """
+  @spec fetch_manageable_organization(User.t(), pos_integer()) ::
+          {:ok, Organization.t()} | {:error, :forbidden | :not_found}
+  def fetch_manageable_organization(%User{} = actor, organization_id)
+      when is_integer(organization_id) and organization_id > 0 do
+    with {:ok, active_actor} <- active_actor(actor),
+         %Organization{} = organization <-
+           Repo.get_by(Organization,
+             id: organization_id,
+             kind: :organization,
+             state: :active
+           ) do
+      if active_actor.role == :admin or
+           organization_role(active_actor, organization) == :owner do
+        {:ok, organization}
+      else
+        {:error, :forbidden}
+      end
+    else
+      nil -> {:error, :not_found}
+      {:error, :forbidden} = error -> error
+    end
+  end
+
+  def fetch_manageable_organization(_actor, _organization_id), do: {:error, :forbidden}
+
   def get_organization_by_slug(slug) when is_binary(slug) do
     Repo.get_by(Organization, username: normalize_username(slug), kind: :organization)
   end

@@ -12,8 +12,10 @@ defmodule ForgeMirrors.ReviewGapsTest do
   end
 
   test "organization mirrors reject personal user IDs" do
+    actor = organization_fixture() |> organization_owner_fixture()
+
     assert {:error, :not_found} =
-             ForgeMirrors.create_organization_mirror(%{
+             ForgeMirrors.create_organization_mirror(actor, %{
                organization_id: user_fixture(),
                provider: "github"
              })
@@ -21,33 +23,42 @@ defmodule ForgeMirrors.ReviewGapsTest do
 
   test "repository binding validates ownership and revalidates a filled local identity" do
     organization_mirror = active_organization_mirror_fixture()
+    actor = organization_owner_fixture(organization_mirror)
     other_organization_id = organization_fixture()
     wrong_owner_repository_id = repository_fixture(other_organization_id)
 
     assert {:error, :not_found} =
-             ForgeMirrors.bind_repository(%{
+             ForgeMirrors.bind_repository(actor, %{
                organization_mirror_id: organization_mirror.id,
                repository_id: wrong_owner_repository_id,
                github_repository_id: 501_001
              })
 
     assert {:ok, remote_only} =
-             ForgeMirrors.bind_repository(%{
+             ForgeMirrors.bind_repository(actor, %{
                organization_mirror_id: organization_mirror.id,
                github_repository_id: 501_002
              })
 
     assert {:error, :not_found} =
-             ForgeMirrors.update_repository_mirror(remote_only, %{
-               repository_id: wrong_owner_repository_id
-             })
+             ForgeMirrors.update_repository_mirror(
+               organization_owner_fixture(remote_only),
+               remote_only,
+               %{
+                 repository_id: wrong_owner_repository_id
+               }
+             )
 
     owned_repository_id = repository_fixture(organization_mirror.organization_id)
 
     assert {:ok, bound} =
-             ForgeMirrors.update_repository_mirror(remote_only, %{
-               repository_id: owned_repository_id
-             })
+             ForgeMirrors.update_repository_mirror(
+               organization_owner_fixture(remote_only),
+               remote_only,
+               %{
+                 repository_id: owned_repository_id
+               }
+             )
 
     assert bound.repository_id == owned_repository_id
   end
@@ -214,8 +225,13 @@ defmodule ForgeMirrors.ReviewGapsTest do
 
       result =
         if target == :paused,
-          do: ForgeMirrors.pause(mirror),
-          else: ForgeMirrors.transition_organization_mirror(mirror, target)
+          do: ForgeMirrors.pause(organization_owner_fixture(mirror), mirror),
+          else:
+            ForgeMirrors.transition_organization_mirror(
+              organization_owner_fixture(mirror),
+              mirror,
+              target
+            )
 
       if target in Map.fetch!(transitions, source) do
         assert {:ok, transitioned} = result
@@ -242,15 +258,19 @@ defmodule ForgeMirrors.ReviewGapsTest do
           :conflicted
         ] do
       mirror = organization_mirror_in_state(resume_state)
-      assert {:ok, paused} = ForgeMirrors.pause(mirror)
+      assert {:ok, paused} = ForgeMirrors.pause(organization_owner_fixture(mirror), mirror)
       assert paused.resume_state == resume_state
 
       for target <- OrganizationMirror.states() -- [:paused, :revoked] do
         assert {:error, :invalid_transition} =
-                 ForgeMirrors.transition_organization_mirror(paused, target)
+                 ForgeMirrors.transition_organization_mirror(
+                   organization_owner_fixture(paused),
+                   paused,
+                   target
+                 )
       end
 
-      assert {:ok, resumed} = ForgeMirrors.resume(paused)
+      assert {:ok, resumed} = ForgeMirrors.resume(organization_owner_fixture(paused), paused)
       assert resumed.state == resume_state
       assert resumed.resume_state == nil
     end
@@ -258,14 +278,24 @@ defmodule ForgeMirrors.ReviewGapsTest do
 
   test "paused mirror may revoke atomically while all other direct paused transitions fail" do
     mirror = active_organization_mirror_fixture()
-    assert {:ok, paused} = ForgeMirrors.pause(mirror)
+    assert {:ok, paused} = ForgeMirrors.pause(organization_owner_fixture(mirror), mirror)
 
     for target <- OrganizationMirror.states() -- [:paused, :revoked] do
       assert {:error, :invalid_transition} =
-               ForgeMirrors.transition_organization_mirror(paused, target)
+               ForgeMirrors.transition_organization_mirror(
+                 organization_owner_fixture(paused),
+                 paused,
+                 target
+               )
     end
 
-    assert {:ok, revoked} = ForgeMirrors.transition_organization_mirror(paused, :revoked)
+    assert {:ok, revoked} =
+             ForgeMirrors.transition_organization_mirror(
+               organization_owner_fixture(paused),
+               paused,
+               :revoked
+             )
+
     assert revoked.state == :revoked
     assert revoked.resume_state == nil
   end
@@ -281,13 +311,27 @@ defmodule ForgeMirrors.ReviewGapsTest do
 
   defp organization_mirror_in_state(:bootstrapping) do
     mirror = ready_organization_mirror_fixture()
-    {:ok, mirror} = ForgeMirrors.transition_organization_mirror(mirror, :bootstrapping)
+
+    {:ok, mirror} =
+      ForgeMirrors.transition_organization_mirror(
+        organization_owner_fixture(mirror),
+        mirror,
+        :bootstrapping
+      )
+
     mirror
   end
 
   defp organization_mirror_in_state(:catching_up) do
     mirror = organization_mirror_in_state(:bootstrapping)
-    {:ok, mirror} = ForgeMirrors.transition_organization_mirror(mirror, :catching_up)
+
+    {:ok, mirror} =
+      ForgeMirrors.transition_organization_mirror(
+        organization_owner_fixture(mirror),
+        mirror,
+        :catching_up
+      )
+
     mirror
   end
 
@@ -295,19 +339,40 @@ defmodule ForgeMirrors.ReviewGapsTest do
 
   defp organization_mirror_in_state(:degraded) do
     mirror = organization_mirror_in_state(:bootstrapping)
-    {:ok, mirror} = ForgeMirrors.transition_organization_mirror(mirror, :degraded)
+
+    {:ok, mirror} =
+      ForgeMirrors.transition_organization_mirror(
+        organization_owner_fixture(mirror),
+        mirror,
+        :degraded
+      )
+
     mirror
   end
 
   defp organization_mirror_in_state(:conflicted) do
     mirror = organization_mirror_in_state(:bootstrapping)
-    {:ok, mirror} = ForgeMirrors.transition_organization_mirror(mirror, :conflicted)
+
+    {:ok, mirror} =
+      ForgeMirrors.transition_organization_mirror(
+        organization_owner_fixture(mirror),
+        mirror,
+        :conflicted
+      )
+
     mirror
   end
 
   defp organization_mirror_in_state(:revoked) do
     mirror = organization_mirror_fixture()
-    {:ok, mirror} = ForgeMirrors.transition_organization_mirror(mirror, :revoked)
+
+    {:ok, mirror} =
+      ForgeMirrors.transition_organization_mirror(
+        organization_owner_fixture(mirror),
+        mirror,
+        :revoked
+      )
+
     mirror
   end
 end

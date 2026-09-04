@@ -60,37 +60,37 @@ defmodule ForgeAccounts.GitHubCredentialVerificationMigrationTest do
 
     if postgres?() do
       ensure_provisional_indexes!(repo)
+      initially_applied_versions = applied_migration_versions(repo)
 
       try do
-        assert [@cleanup_selector_version] = migrate_down(repo, @cleanup_selector_version)
-        assert [@cleanup_recovery_version] = migrate_down(repo, @cleanup_recovery_version)
-        assert [@staged_path_version] = migrate_down(repo, @staged_path_version)
-        assert [@repository_write_version] = migrate_down(repo, @repository_write_version)
+        assert @cleanup_selector_version in migrate_down(repo, @cleanup_selector_version)
+        assert @cleanup_recovery_version in migrate_down(repo, @cleanup_recovery_version)
+        assert @staged_path_version in migrate_down(repo, @staged_path_version)
+        assert @repository_write_version in migrate_down(repo, @repository_write_version)
 
-        assert [@repository_lifecycle_version] =
-                 migrate_down(repo, @repository_lifecycle_version)
+        assert @repository_lifecycle_version in migrate_down(repo, @repository_lifecycle_version)
 
-        assert [@destination_status_version] = migrate_down(repo, @destination_status_version)
-        assert [@provisional_source_version] = migrate_down(repo, @provisional_source_version)
-        assert [@verification_version] = migrate_down(repo, @verification_version)
-
-        assert_upgrade_baseline(repo, credential_id)
-        migrate_verification_up!(repo)
-        assert_upgraded_credential(repo, credential_id)
-
-        assert [@verification_version] = migrate_down(repo, @verification_version)
+        assert @destination_status_version in migrate_down(repo, @destination_status_version)
+        assert @provisional_source_version in migrate_down(repo, @provisional_source_version)
+        assert @verification_version in migrate_down(repo, @verification_version)
 
         assert_upgrade_baseline(repo, credential_id)
         migrate_verification_up!(repo)
         assert_upgraded_credential(repo, credential_id)
 
-        assert [@provisional_source_version] = migrate_up(repo, @provisional_source_version)
-        assert [@destination_status_version] = migrate_up(repo, @destination_status_version)
-        assert [@repository_lifecycle_version] = migrate_up(repo, @repository_lifecycle_version)
-        assert [@repository_write_version] = migrate_up(repo, @repository_write_version)
-        assert [@staged_path_version] = migrate_up(repo, @staged_path_version)
-        assert [@cleanup_recovery_version] = migrate_up(repo, @cleanup_recovery_version)
-        assert [@cleanup_selector_version] = migrate_up(repo, @cleanup_selector_version)
+        assert @verification_version in migrate_down(repo, @verification_version)
+
+        assert_upgrade_baseline(repo, credential_id)
+        migrate_verification_up!(repo)
+        assert_upgraded_credential(repo, credential_id)
+
+        assert @provisional_source_version in migrate_up(repo, @provisional_source_version)
+        assert @destination_status_version in migrate_up(repo, @destination_status_version)
+        assert @repository_lifecycle_version in migrate_up(repo, @repository_lifecycle_version)
+        assert @repository_write_version in migrate_up(repo, @repository_write_version)
+        assert @staged_path_version in migrate_up(repo, @staged_path_version)
+        assert @cleanup_recovery_version in migrate_up(repo, @cleanup_recovery_version)
+        assert @cleanup_selector_version in migrate_up(repo, @cleanup_selector_version)
       after
         ensure_up!(repo, @verification_version)
         ensure_up!(repo, @provisional_source_version)
@@ -100,6 +100,7 @@ defmodule ForgeAccounts.GitHubCredentialVerificationMigrationTest do
         ensure_up!(repo, @staged_path_version)
         ensure_up!(repo, @cleanup_recovery_version)
         ensure_up!(repo, @cleanup_selector_version)
+        Enum.each(initially_applied_versions, &ensure_up!(repo, &1))
       end
     else
       assert_raise RuntimeError,
@@ -286,6 +287,17 @@ defmodule ForgeAccounts.GitHubCredentialVerificationMigrationTest do
       )
 
     rows == [[version]]
+  end
+
+  defp applied_migration_versions(repo) do
+    %{rows: rows} =
+      Ecto.Adapters.SQL.query!(
+        repo,
+        "select version from schema_migrations order by version",
+        []
+      )
+
+    Enum.map(rows, fn [applied_version] -> applied_version end)
   end
 
   defp column_exists?(repo, table, column) do
