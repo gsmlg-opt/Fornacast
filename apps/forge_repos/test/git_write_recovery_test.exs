@@ -5,7 +5,7 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
 
   alias ForgeAccounts.User
   alias ForgeRepos.{GitWriteOperation, GitWriteRecovery, Repository}
-  alias Fornacast.{AuditEvent, OperationLease, Repo}
+  alias Fornacast.{AuditEvent, DomainOutboxEvent, OperationLease, Repo}
 
   setup context do
     if Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"] do
@@ -90,7 +90,7 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
 
   test "proposed refs atomically complete bookkeeping and deduplicated audit", context do
     update_ref(context.path, context.proposed_oid)
-    operation = operation!(context, :ref_advanced)
+    operation = operation!(context, :ref_advanced, kind: :receive_pack)
 
     assert :ok = locked_reconcile(context)
 
@@ -99,10 +99,42 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
 
     assert %Repository{last_pushed_at: %DateTime{}} = Repo.get!(Repository, context.repository.id)
 
-    assert [%AuditEvent{action: "git.ref.updated"}] =
+    assert [%AuditEvent{action: "repository.pushed"}] =
              Repo.all(
                from audit in AuditEvent, where: audit.operation_id == ^"git_write:#{operation.id}"
              )
+
+    assert [
+             %DomainOutboxEvent{
+               event_type: "repository.pushed",
+               origin: :fornacast,
+               causation_id: causation_id,
+               correlation_id: correlation_id,
+               payload: %{
+                 "repository_id" => repository_id,
+                 "changed_refs" => [
+                   %{
+                     "ref" => "refs/heads/main",
+                     "old_oid" => old_oid,
+                     "new_oid" => new_oid
+                   }
+                 ]
+               }
+             }
+           ] =
+             Repo.all(
+               from event in DomainOutboxEvent,
+                 where:
+                   event.aggregate_type == "repository" and
+                     event.aggregate_id == ^Integer.to_string(context.repository.id) and
+                     event.event_type == "repository.pushed"
+             )
+
+    assert causation_id == "git_write:#{operation.id}"
+    assert correlation_id == operation.request_id
+    assert repository_id == context.repository.id
+    assert old_oid == context.expected_oid
+    assert new_oid == context.proposed_oid
   end
 
   test "terminal Git write operations cannot be claimed", context do
@@ -487,7 +519,7 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
   test "SQL failure after proposed evidence rolls back bookkeeping and remains recoverable",
        context do
     update_ref(context.path, context.proposed_oid)
-    operation = operation!(context, :ref_advanced)
+    operation = operation!(context, :ref_advanced, kind: :receive_pack)
     cache_key = {context.path, :recovery_sql_failure}
     assert {:ok, :cached} = GitCore.Cache.fetch(cache_key, fn -> {:ok, :cached} end)
 
@@ -514,6 +546,7 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
              Repo.get!(Repository, context.repository.id)
 
     assert Repo.aggregate(AuditEvent, :count, :id) == 0
+    assert Repo.aggregate(DomainOutboxEvent, :count, :id) == 0
 
     assert {:ok, :cached} =
              GitCore.Cache.fetch(cache_key, fn ->
@@ -522,6 +555,10 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
 
     assert :ok = locked_reconcile(context)
     assert Repo.get!(GitWriteOperation, operation.id).state == :bookkeeping_complete
+    assert Repo.aggregate(DomainOutboxEvent, :count, :id) == 1
+
+    assert :ok = locked_reconcile(context)
+    assert Repo.aggregate(DomainOutboxEvent, :count, :id) == 1
     assert {:ok, :refreshed} = GitCore.Cache.fetch(cache_key, fn -> {:ok, :refreshed} end)
   end
 

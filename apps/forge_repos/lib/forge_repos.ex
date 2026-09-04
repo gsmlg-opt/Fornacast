@@ -18,7 +18,7 @@ defmodule ForgeRepos do
     RepositoryWriteReconcilers
   }
 
-  alias Fornacast.{Audit, Page, Repo, Storage}
+  alias Fornacast.{Audit, DomainOutbox, Page, Repo, Storage}
 
   @repository_permissions [:repository_read, :repository_write, :repository_admin]
   @receive_pack_busy_attempts 12
@@ -221,6 +221,9 @@ defmodule ForgeRepos do
           %Repository{owner_user_id: authorized_owner.id, storage_path: storage_path}
           |> Repository.api_create_changeset(Map.delete(params, :auto_init))
         end)
+        |> DomainOutbox.record_multi(:outbox_event, fn %{repository: repository} ->
+          repository_event_attrs(repository, "repository.created", request_metadata)
+        end)
         |> Multi.run(:storage, fn _repo, %{repository: repository} ->
           init_repository_storage(repository)
         end)
@@ -284,6 +287,9 @@ defmodule ForgeRepos do
         validate_repository_update(repository, params)
       end)
       |> Multi.update(:repository, fn %{validation: changeset} -> changeset end)
+      |> DomainOutbox.record_multi(:outbox_event, fn %{repository: repository} ->
+        repository_event_attrs(repository, "repository.updated", request_metadata)
+      end)
       |> Audit.record_multi(
         :audit,
         actor,
@@ -336,6 +342,9 @@ defmodule ForgeRepos do
 
     Multi.new()
     |> Multi.insert(:repository, changeset)
+    |> DomainOutbox.record_multi(:outbox_event, fn %{repository: repository} ->
+      repository_event_attrs(repository, "repository.created")
+    end)
     |> Multi.run(:storage, fn _repo, %{repository: repository} ->
       init_repository_storage(repository)
     end)
@@ -345,6 +354,31 @@ defmodule ForgeRepos do
       {:error, :storage, reason, %{repository: repository}} -> cleanup_storage(repository, reason)
       {:error, _step, reason, _changes} -> {:error, reason}
     end
+  end
+
+  defp repository_event_attrs(%Repository{} = repository, event_type, metadata \\ %{}) do
+    %{
+      event_id: Ecto.UUID.generate(),
+      aggregate_type: "repository",
+      aggregate_id: Integer.to_string(repository.id),
+      event_type: event_type,
+      origin: :fornacast,
+      causation_id:
+        metadata_value(metadata, :causation_id) || metadata_value(metadata, :request_id),
+      correlation_id: metadata_value(metadata, :correlation_id),
+      payload: %{
+        "repository_id" => repository.id,
+        "owner_id" => repository.owner_user_id,
+        "slug" => repository.slug,
+        "visibility" => Atom.to_string(repository.visibility),
+        "default_branch" => repository.default_branch,
+        "generation" => repository.generation
+      }
+    }
+  end
+
+  defp metadata_value(metadata, key) when is_map(metadata) do
+    Map.get(metadata, key) || Map.get(metadata, Atom.to_string(key))
   end
 
   @doc false

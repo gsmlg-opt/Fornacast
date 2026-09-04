@@ -8,7 +8,7 @@ defmodule ForgeRepos.GitWriteRecovery do
   alias Ecto.Multi
   alias ForgeAccounts.User
   alias ForgeRepos.{GitWriteOperation, Repository}
-  alias Fornacast.{Audit, OperationLease, Repo}
+  alias Fornacast.{Audit, DomainOutbox, OperationLease, Repo}
 
   @lease_seconds 30
   @terminal_states [:bookkeeping_complete, :failed]
@@ -420,6 +420,7 @@ defmodule ForgeRepos.GitWriteRecovery do
         inc: [write_version: 1]
       )
       |> require_one(:repository)
+      |> record_receive_pack_event(repository, operation)
       |> Audit.record_multi(
         :audit,
         actor,
@@ -443,6 +444,37 @@ defmodule ForgeRepos.GitWriteRecovery do
 
     Repo.transaction(multi)
   end
+
+  defp record_receive_pack_event(
+         multi,
+         repository,
+         %GitWriteOperation{kind: :receive_pack} = operation
+       ) do
+    DomainOutbox.record_multi(multi, :outbox_event, %{
+      event_id: "git_write:#{operation.id}:bookkeeping_complete",
+      aggregate_type: "repository",
+      aggregate_id: Integer.to_string(repository.id),
+      event_type: "repository.pushed",
+      origin: :fornacast,
+      causation_id: operation_id(operation),
+      correlation_id: operation.request_id,
+      payload: %{
+        "repository_id" => repository.id,
+        "owner_id" => repository.owner_user_id,
+        "slug" => repository.slug,
+        "generation" => repository.generation,
+        "changed_refs" => [
+          %{
+            "ref" => operation.target_ref,
+            "old_oid" => operation.expected_oid,
+            "new_oid" => operation.proposed_oid
+          }
+        ]
+      }
+    })
+  end
+
+  defp record_receive_pack_event(multi, _repository, _operation), do: multi
 
   defp require_one(multi, key) do
     Multi.run(multi, {key, :ownership}, fn _repo, changes ->
