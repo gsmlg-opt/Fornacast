@@ -41,6 +41,72 @@ defmodule ForgeAccounts.OrganizationManagementAuthorizationTest do
     assert admin_organization.id == context.organization.id
   end
 
+  test "owner and site admin may fetch a manageable organization by normalized slug", context do
+    normalized_input = "  #{String.upcase(context.organization.username)}  "
+
+    assert {:ok, %Organization{} = owner_organization} =
+             ForgeAccounts.fetch_manageable_organization_by_slug(
+               context.owner,
+               normalized_input
+             )
+
+    assert owner_organization.id == context.organization.id
+
+    assert {:ok, %Organization{} = admin_organization} =
+             ForgeAccounts.fetch_manageable_organization_by_slug(
+               context.admin,
+               normalized_input
+             )
+
+    assert admin_organization.id == context.organization.id
+  end
+
+  test "slug lookup forbids members outsiders inactive and forged actors", context do
+    slug = context.organization.username
+
+    assert {:error, :forbidden} =
+             ForgeAccounts.fetch_manageable_organization_by_slug(context.member, slug)
+
+    assert {:error, :forbidden} =
+             ForgeAccounts.fetch_manageable_organization_by_slug(context.outsider, slug)
+
+    assert {:ok, disabled} =
+             context.owner
+             |> User.state_changeset(%{state: :disabled})
+             |> Repo.update()
+
+    assert {:error, :forbidden} =
+             ForgeAccounts.fetch_manageable_organization_by_slug(
+               %{disabled | state: :active, role: :admin},
+               slug
+             )
+
+    assert {:error, :forbidden} =
+             ForgeAccounts.fetch_manageable_organization_by_slug(
+               %{context.member | role: :admin},
+               slug
+             )
+  end
+
+  test "slug lookup masks missing and disabled organizations as not found", context do
+    assert {:error, :not_found} =
+             ForgeAccounts.fetch_manageable_organization_by_slug(
+               context.owner,
+               unique("missing-org")
+             )
+
+    assert {:ok, disabled} =
+             context.organization
+             |> Organization.changeset(%{state: :disabled})
+             |> Repo.update()
+
+    assert {:error, :not_found} =
+             ForgeAccounts.fetch_manageable_organization_by_slug(
+               context.admin,
+               disabled.username
+             )
+  end
+
   test "member outsider inactive and forged actors are forbidden", context do
     assert {:error, :forbidden} =
              ForgeAccounts.fetch_manageable_organization(

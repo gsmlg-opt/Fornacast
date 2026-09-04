@@ -278,26 +278,24 @@ defmodule ForgeAccounts do
           {:ok, Organization.t()} | {:error, :forbidden | :not_found}
   def fetch_manageable_organization(%User{} = actor, organization_id)
       when is_integer(organization_id) and organization_id > 0 do
-    with {:ok, active_actor} <- active_actor(actor),
-         %Organization{} = organization <-
-           Repo.get_by(Organization,
-             id: organization_id,
-             kind: :organization,
-             state: :active
-           ) do
-      if active_actor.role == :admin or
-           organization_role(active_actor, organization) == :owner do
-        {:ok, organization}
-      else
-        {:error, :forbidden}
-      end
-    else
-      nil -> {:error, :not_found}
-      {:error, :forbidden} = error -> error
-    end
+    fetch_manageable_organization_by(actor, id: organization_id)
   end
 
   def fetch_manageable_organization(_actor, _organization_id), do: {:error, :forbidden}
+
+  @doc """
+  Fetches an active organization by slug that the active actor may manage.
+
+  Slugs use the same whitespace and case normalization as other username and
+  organization lookups.
+  """
+  @spec fetch_manageable_organization_by_slug(User.t(), String.t()) ::
+          {:ok, Organization.t()} | {:error, :forbidden | :not_found}
+  def fetch_manageable_organization_by_slug(%User{} = actor, slug) when is_binary(slug) do
+    fetch_manageable_organization_by(actor, username: normalize_username(slug))
+  end
+
+  def fetch_manageable_organization_by_slug(_actor, _slug), do: {:error, :forbidden}
 
   def get_organization_by_slug(slug) when is_binary(slug) do
     Repo.get_by(Organization, username: normalize_username(slug), kind: :organization)
@@ -1346,6 +1344,22 @@ defmodule ForgeAccounts do
   end
 
   defp active_actor(_actor), do: {:error, :forbidden}
+
+  defp fetch_manageable_organization_by(%User{} = actor, lookup) do
+    with {:ok, active_actor} <- active_actor(actor),
+         %Organization{} = organization <-
+           Repo.get_by(Organization, [kind: :organization, state: :active] ++ lookup) do
+      if active_actor.role == :admin or
+           organization_role(active_actor, organization) == :owner do
+        {:ok, organization}
+      else
+        {:error, :forbidden}
+      end
+    else
+      nil -> {:error, :not_found}
+      {:error, :forbidden} = error -> error
+    end
+  end
 
   defp active_organization(organization_id) when is_integer(organization_id) do
     case Repo.get_by(Organization,
