@@ -213,6 +213,8 @@ defmodule FornacastWeb.RepositoryHTML do
       |> assign(:commands, clone_commands(assigns.result))
       |> assign(:clone, assigns.result.chrome.clone)
 
+    # TODO(upstream): duskmoon-dev/duskmoon-elements#79
+    # WORKAROUND(upstream): duskmoon-dev/duskmoon-elements#79
     ~H"""
     <.dm_popover
       id="repository-clone-popover"

@@ -1407,6 +1407,15 @@
     white-space: pre-wrap;
   }
 
+  /* TODO(upstream): duskmoon-dev/duskmoon-elements#79
+   * WORKAROUND(upstream): duskmoon-dev/duskmoon-elements#79
+   * el-dm-popover does not hide .popover-content when not open.
+   */
+  el-dm-popover:not([open])::part(popover),
+  el-dm-popover:not(:defined) > :not([slot="trigger"]) {
+    display: none !important;
+  }
+
   [data-repository-page] .repository-clone-popover {
     position: relative;
     z-index: 50;
