@@ -290,6 +290,40 @@ defmodule Fornacast.DomainOutboxTest do
     end
   end
 
+  test "owned transitions compare UTC-naive leases with UTC server time in a non-UTC session" do
+    Ecto.Adapters.SQL.query!(Repo, "set local time zone 'Asia/Shanghai'", [])
+    assert %{rows: [["Asia/Shanghai"]]} = Ecto.Adapters.SQL.query!(Repo, "show time zone", [])
+
+    now = DateTime.utc_now(:second)
+
+    assert {:ok, %{event: _event}} =
+             record_event(
+               event_attrs("non-utc-valid-lease")
+               |> Map.put(:aggregate_id, "non-utc-valid-lease")
+               |> Map.put(:available_at, now)
+             )
+
+    assert {:ok, [valid]} = DomainOutbox.claim_batch("non-utc-valid", now, 30, 1)
+    assert {:ok, %DomainOutboxEvent{state: :completed}} = DomainOutbox.ack(valid, now)
+
+    assert {:ok, %{event: expired_event}} =
+             record_event(
+               event_attrs("non-utc-expired-lease")
+               |> Map.put(:aggregate_id, "non-utc-expired-lease")
+               |> Map.put(:available_at, now)
+             )
+
+    assert {:ok, [expired]} = DomainOutbox.claim_batch("non-utc-expired", now, 30, 1)
+    expired_at = DateTime.add(now, -1)
+
+    Repo.update_all(from(row in DomainOutboxEvent, where: row.id == ^expired_event.id),
+      set: [lease_expires_at: expired_at]
+    )
+
+    assert {:error, :lost_lease} =
+             DomainOutbox.ack(%{expired | lease_expires_at: expired_at}, DateTime.add(now, -60))
+  end
+
   @tag independent_connections: true
   test "a later same-aggregate transaction cannot become claimable first" do
     now = DateTime.utc_now(:second)

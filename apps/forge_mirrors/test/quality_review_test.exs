@@ -154,6 +154,31 @@ defmodule ForgeMirrors.QualityReviewTest do
     assert Repo.get!(MirrorOperation, claimed.id).state == :processing
   end
 
+  test "owned mirror transitions compare UTC-naive leases with UTC server time in a non-UTC session" do
+    Ecto.Adapters.SQL.query!(Repo, "set local time zone 'Asia/Shanghai'", [])
+    assert %{rows: [["Asia/Shanghai"]]} = Ecto.Adapters.SQL.query!(Repo, "show time zone", [])
+
+    organization_mirror = active_organization_mirror_fixture()
+    valid = claimed_repository_operation!(organization_mirror)
+    now = DateTime.utc_now(:second)
+
+    assert {:ok, %MirrorOperation{state: :completed}} =
+             ForgeMirrors.complete_operation(valid, now)
+
+    expired = claimed_repository_operation!(organization_mirror)
+    expired_at = DateTime.add(now, -1)
+
+    Repo.update_all(from(operation in MirrorOperation, where: operation.id == ^expired.id),
+      set: [lease_expires_at: expired_at]
+    )
+
+    assert {:error, :lost_lease} =
+             ForgeMirrors.complete_operation(
+               %{expired | lease_expires_at: expired_at},
+               DateTime.add(now, -60)
+             )
+  end
+
   test "operation repository scope is enforced by a composite foreign key" do
     first_organization = active_organization_mirror_fixture()
     second_organization = active_organization_mirror_fixture()

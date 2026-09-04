@@ -181,7 +181,7 @@ defmodule Fornacast.DomainOutbox do
                      event.lease_owner == ^owner and
                      event.lease_expires_at == ^lease_expires_at and
                      event.lock_version == ^lock_version and
-                     event.lease_expires_at > fragment("clock_timestamp()")
+                     event.lease_expires_at > fragment("timezone('UTC', clock_timestamp())")
 
              case Repo.update_all(query,
                     set:

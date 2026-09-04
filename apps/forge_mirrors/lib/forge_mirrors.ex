@@ -854,7 +854,8 @@ defmodule ForgeMirrors do
             candidate.id == ^operation.id and candidate.state in ^states and
               candidate.lease_owner == ^operation.lease_owner and
               candidate.lease_expires_at == ^operation.lease_expires_at and
-              candidate.lease_expires_at > fragment("clock_timestamp()") and
+              candidate.lease_expires_at >
+                fragment("timezone('UTC', clock_timestamp())") and
               candidate.lock_version == ^operation.lock_version
 
       case Repo.update_all(query,
