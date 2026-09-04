@@ -26,6 +26,8 @@ defmodule ForgeMirrors.MixProject do
   defp deps do
     [
       {:fornacast, in_umbrella: true},
+      {:forge_accounts, in_umbrella: true},
+      {:forge_repos, in_umbrella: true},
       {:ecto, "~> 3.14"}
     ]
   end

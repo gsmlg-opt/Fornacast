@@ -4,21 +4,21 @@ defmodule ForgeMirrors.MirrorOperation do
   import Ecto.Changeset
 
   @states [:pending, :processing, :effect_pending, :completed, :failed]
-  @failure_classes [
-    "credential_revoked",
-    "permission_missing",
-    "primary_rate_limit",
-    "secondary_rate_limit",
-    "network",
-    "provider_validation",
-    "local_validation",
-    "stale_baseline",
-    "git_divergence",
-    "lfs_missing",
-    "lfs_integrity",
-    "namespace_collision",
-    "unsupported_resource"
-  ]
+  @failure_dispositions %{
+    "credential_revoked" => :terminal,
+    "permission_missing" => :degraded,
+    "primary_rate_limit" => :retry,
+    "secondary_rate_limit" => :retry,
+    "network" => :retry,
+    "provider_validation" => :terminal,
+    "local_validation" => :terminal,
+    "stale_baseline" => :conflict,
+    "git_divergence" => :conflict,
+    "lfs_missing" => :degraded,
+    "lfs_integrity" => :degraded,
+    "namespace_collision" => :conflict,
+    "unsupported_resource" => :terminal
+  }
 
   @type t :: %__MODULE__{}
 
@@ -34,6 +34,7 @@ defmodule ForgeMirrors.MirrorOperation do
     field :lease_owner, :string
     field :lease_expires_at, :utc_datetime
     field :failure_class, :string
+    field :failure_disposition, Ecto.Enum, values: [:retry, :degraded, :conflict, :terminal]
     field :failure_detail, :string
     field :external_effect_marker, :map
     field :effect_marked_at, :utc_datetime
@@ -45,7 +46,13 @@ defmodule ForgeMirrors.MirrorOperation do
 
   def states, do: @states
   def terminal_states, do: [:completed, :failed]
-  def failure_classes, do: @failure_classes
+  def failure_classes, do: Map.keys(@failure_dispositions)
+
+  def failure_disposition(failure_class) when is_binary(failure_class) do
+    Map.fetch(@failure_dispositions, failure_class)
+  end
+
+  def failure_disposition(_failure_class), do: :error
 
   def enqueue_changeset(operation, attrs) do
     operation

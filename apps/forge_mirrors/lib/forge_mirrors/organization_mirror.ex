@@ -180,9 +180,8 @@ defmodule ForgeMirrors.OrganizationMirror do
 
   defp validate_immutable_fields(changeset, fields) do
     Enum.reduce(fields, changeset, fn field, acc ->
-      case {Map.get(acc.data, field), get_change(acc, field)} do
-        {existing, replacement}
-        when not is_nil(existing) and not is_nil(replacement) and existing != replacement ->
+      case {Map.get(acc.data, field), Map.fetch(acc.changes, field)} do
+        {existing, {:ok, replacement}} when not is_nil(existing) and existing != replacement ->
           add_error(acc, field, "is immutable once bound")
 
         _ ->

@@ -24,11 +24,20 @@ defmodule ForgeMirrors do
   @type resource_kind :: :organization | :repository | :git | :lfs | :issue | :pull | :release
 
   @spec create_organization_mirror(map()) ::
-          {:ok, OrganizationMirror.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, OrganizationMirror.t()} | {:error, Ecto.Changeset.t() | :not_found}
   def create_organization_mirror(attrs) when is_map(attrs) do
-    %OrganizationMirror{}
-    |> OrganizationMirror.create_changeset(attrs)
-    |> Repo.insert()
+    changeset = OrganizationMirror.create_changeset(%OrganizationMirror{}, attrs)
+
+    if changeset.valid? do
+      organization_id = Ecto.Changeset.get_field(changeset, :organization_id)
+
+      case ForgeAccounts.get_organization(organization_id) do
+        %ForgeAccounts.Organization{} -> Repo.insert(changeset)
+        nil -> {:error, :not_found}
+      end
+    else
+      {:error, changeset}
+    end
   end
 
   def create_organization_mirror(_attrs),
@@ -82,7 +91,8 @@ defmodule ForgeMirrors do
           {:ok, OrganizationMirror.t()}
           | {:error, Ecto.Changeset.t() | :invalid_transition | :stale}
   def transition_organization_mirror(%OrganizationMirror{} = mirror, target) do
-    if OrganizationMirror.legal_transition?(mirror.state, target) and mirror.state != :paused do
+    if OrganizationMirror.legal_transition?(mirror.state, target) and
+         (mirror.state != :paused or target == :revoked) do
       mirror
       |> OrganizationMirror.transition_changeset(target)
       |> cas_update()
@@ -122,11 +132,18 @@ defmodule ForgeMirrors do
 
   def resume(_mirror), do: {:error, :invalid_transition}
 
-  @spec bind_repository(map()) :: {:ok, RepositoryMirror.t()} | {:error, Ecto.Changeset.t()}
+  @spec bind_repository(map()) ::
+          {:ok, RepositoryMirror.t()} | {:error, Ecto.Changeset.t() | :not_found}
   def bind_repository(attrs) when is_map(attrs) do
-    %RepositoryMirror{}
-    |> RepositoryMirror.create_changeset(attrs)
-    |> Repo.insert()
+    changeset = RepositoryMirror.create_changeset(%RepositoryMirror{}, attrs)
+
+    if changeset.valid? do
+      with {:ok, _organization_mirror} <- validate_repository_binding_scope(changeset) do
+        Repo.insert(changeset)
+      end
+    else
+      {:error, changeset}
+    end
   end
 
   def bind_repository(_attrs), do: invalid_changeset(%RepositoryMirror{})
@@ -143,11 +160,17 @@ defmodule ForgeMirrors do
   def get_repository_mirror(_id), do: {:error, :invalid_argument}
 
   @spec update_repository_mirror(RepositoryMirror.t(), map()) ::
-          {:ok, RepositoryMirror.t()} | {:error, Ecto.Changeset.t() | :stale}
+          {:ok, RepositoryMirror.t()} | {:error, Ecto.Changeset.t() | :not_found | :stale}
   def update_repository_mirror(%RepositoryMirror{} = mirror, attrs) when is_map(attrs) do
-    mirror
-    |> RepositoryMirror.update_changeset(attrs)
-    |> cas_update()
+    changeset = RepositoryMirror.update_changeset(mirror, attrs)
+
+    if changeset.valid? do
+      with {:ok, _organization_mirror} <- validate_repository_binding_scope(changeset) do
+        cas_update(changeset)
+      end
+    else
+      {:error, changeset}
+    end
   end
 
   def update_repository_mirror(_mirror, _attrs), do: {:error, :stale}
@@ -231,6 +254,15 @@ defmodule ForgeMirrors do
 
   def mark_external_effect(_operation, _now, _marker), do: {:error, :invalid_argument}
 
+  @spec failure_disposition(String.t()) ::
+          {:ok, :retry | :degraded | :conflict | :terminal} | {:error, :invalid_argument}
+  def failure_disposition(failure_class) do
+    case MirrorOperation.failure_disposition(failure_class) do
+      {:ok, disposition} -> {:ok, disposition}
+      :error -> {:error, :invalid_argument}
+    end
+  end
+
   @spec complete_operation(MirrorOperation.t(), DateTime.t()) ::
           {:ok, MirrorOperation.t()}
           | {:error, :lost_lease | :invalid_transition | :invalid_argument}
@@ -247,6 +279,7 @@ defmodule ForgeMirrors do
         effect_marked_at: nil,
         completed_at: now,
         failure_class: nil,
+        failure_disposition: nil,
         failure_detail: nil
       )
     end
@@ -276,7 +309,7 @@ defmodule ForgeMirrors do
       when state in [:processing, :effect_pending] and is_list(options) do
     with :ok <- validate_utc(now),
          :ok <- validate_utc(next_attempt_at),
-         :ok <- validate_failure_class(failure_class),
+         :ok <- validate_retryable_failure_class(failure_class),
          :ok <- validate_keyword(options),
          :ok <- validate_failure_detail(Keyword.get(options, :failure_detail)),
          :ok <- validate_effect_retry(state, options) do
@@ -288,6 +321,7 @@ defmodule ForgeMirrors do
         external_effect_marker: nil,
         effect_marked_at: nil,
         failure_class: failure_class,
+        failure_disposition: :retry,
         failure_detail: Keyword.get(options, :failure_detail)
       )
     end
@@ -312,7 +346,7 @@ defmodule ForgeMirrors do
       )
       when state in [:processing, :effect_pending] do
     with :ok <- validate_utc(now),
-         :ok <- validate_failure_class(failure_class),
+         {:ok, failure_disposition} <- failure_disposition(failure_class),
          :ok <- validate_failure_detail(failure_detail) do
       owned_transition(operation, DateTime.truncate(now, :second), [state],
         state: :failed,
@@ -321,6 +355,7 @@ defmodule ForgeMirrors do
         external_effect_marker: nil,
         effect_marked_at: nil,
         failure_class: failure_class,
+        failure_disposition: failure_disposition,
         failure_detail: failure_detail
       )
     end
@@ -382,13 +417,20 @@ defmodule ForgeMirrors do
   def recover_expired_operations(_now), do: {:error, :invalid_argument}
 
   @spec record_conflict(map()) ::
-          {:ok, MirrorConflict.t()} | {:error, Ecto.Changeset.t() | :dedupe_conflict}
+          {:ok, MirrorConflict.t()}
+          | {:error, Ecto.Changeset.t() | :dedupe_conflict | :not_found}
   def record_conflict(attrs) when is_map(attrs) do
     changeset = MirrorConflict.record_changeset(%MirrorConflict{}, attrs)
 
-    case Repo.insert(changeset) do
-      {:ok, conflict} -> {:ok, conflict}
-      {:error, %Ecto.Changeset{} = invalid} -> conflict_insert_error(invalid, attrs)
+    if changeset.valid? do
+      with :ok <- validate_conflict_scope(changeset) do
+        case Repo.insert(changeset) do
+          {:ok, conflict} -> {:ok, conflict}
+          {:error, %Ecto.Changeset{} = invalid} -> conflict_insert_error(invalid, attrs)
+        end
+      end
+    else
+      {:error, changeset}
     end
   end
 
@@ -591,6 +633,47 @@ defmodule ForgeMirrors do
       Ecto.Changeset.get_field(changeset, :kind),
       Ecto.Changeset.get_field(changeset, :cursor)
     }
+  end
+
+  defp validate_repository_binding_scope(changeset) do
+    organization_mirror_id =
+      Ecto.Changeset.get_field(changeset, :organization_mirror_id)
+
+    repository_id = Ecto.Changeset.get_field(changeset, :repository_id)
+
+    with %OrganizationMirror{} = organization_mirror <-
+           Repo.get(OrganizationMirror, organization_mirror_id),
+         %ForgeAccounts.Organization{} <-
+           ForgeAccounts.get_organization(organization_mirror.organization_id),
+         :ok <-
+           validate_local_repository_scope(organization_mirror.organization_id, repository_id) do
+      {:ok, organization_mirror}
+    else
+      _ -> {:error, :not_found}
+    end
+  end
+
+  defp validate_local_repository_scope(_organization_id, nil), do: :ok
+
+  defp validate_local_repository_scope(organization_id, repository_id) do
+    case ForgeRepos.fetch_organization_repository(organization_id, repository_id) do
+      {:ok, _repository} -> :ok
+      {:error, :not_found} -> {:error, :not_found}
+    end
+  end
+
+  defp validate_conflict_scope(changeset) do
+    organization_mirror_id =
+      Ecto.Changeset.get_field(changeset, :organization_mirror_id)
+
+    repository_mirror_id = Ecto.Changeset.get_field(changeset, :repository_mirror_id)
+
+    with %OrganizationMirror{} <- Repo.get(OrganizationMirror, organization_mirror_id),
+         :ok <- validate_repository_scope(repository_mirror_id, organization_mirror_id) do
+      :ok
+    else
+      _ -> {:error, :not_found}
+    end
   end
 
   defp validate_operation_scope(changeset) do
@@ -809,15 +892,12 @@ defmodule ForgeMirrors do
   defp validate_utc(%DateTime{time_zone: "Etc/UTC", utc_offset: 0, std_offset: 0}), do: :ok
   defp validate_utc(_now), do: {:error, :invalid_argument}
 
-  defp validate_failure_class(nil), do: :ok
-
-  defp validate_failure_class(failure_class) when is_binary(failure_class) do
-    if failure_class in MirrorOperation.failure_classes(),
-      do: :ok,
-      else: {:error, :invalid_argument}
+  defp validate_retryable_failure_class(failure_class) do
+    case failure_disposition(failure_class) do
+      {:ok, :retry} -> :ok
+      _ -> {:error, :invalid_argument}
+    end
   end
-
-  defp validate_failure_class(_failure_class), do: {:error, :invalid_argument}
 
   defp validate_failure_detail(nil), do: :ok
 

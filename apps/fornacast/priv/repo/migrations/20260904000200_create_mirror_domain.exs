@@ -128,6 +128,12 @@ defmodule Fornacast.Repo.Migrations.CreateMirrorDomain do
       )
     )
 
+    create(
+      unique_index(:repository_mirrors, [:id, :organization_mirror_id],
+        name: :repository_mirrors_id_organization_index
+      )
+    )
+
     create(index(:repository_mirrors, [:organization_mirror_id, :state, :id]))
     positive_optional(:repository_mirrors, :github_repository_id)
     bounded_string(:repository_mirrors, :github_node_id, true)
@@ -278,6 +284,7 @@ defmodule Fornacast.Repo.Migrations.CreateMirrorDomain do
       add(:lease_owner, :string)
       add(:lease_expires_at, :utc_datetime)
       add(:failure_class, :string)
+      add(:failure_disposition, :string)
       add(:failure_detail, :string)
       add(:external_effect_marker, :map)
       add(:effect_marked_at, :utc_datetime)
@@ -318,6 +325,14 @@ defmodule Fornacast.Repo.Migrations.CreateMirrorDomain do
     bounded_string(:mirror_operations, :failure_class, true)
     bounded_string(:mirror_operations, :failure_detail, true, 2_048)
     enum_constraint(:mirror_operations, :state, @operation_states)
+
+    enum_constraint(
+      :mirror_operations,
+      :failure_disposition,
+      ~w(retry degraded conflict terminal),
+      true
+    )
+
     json_object(:mirror_operations, :cursor)
     json_optional_object(:mirror_operations, :external_effect_marker)
     check(:mirror_operations, :mirror_operations_attempt_count_check, "attempt_count >= 0")
@@ -342,6 +357,18 @@ defmodule Fornacast.Repo.Migrations.CreateMirrorDomain do
       :mirror_operations,
       :mirror_operations_completed_at_check,
       "(state = 'completed' and completed_at is not null) or (state <> 'completed' and completed_at is null)"
+    )
+
+    check(
+      :mirror_operations,
+      :mirror_operations_failure_disposition_coherence_check,
+      failure_disposition_check()
+    )
+
+    check(
+      :mirror_operations,
+      :mirror_operations_failed_state_check,
+      "state <> 'failed' or failure_class is not null"
     )
   end
 
@@ -479,6 +506,16 @@ defmodule Fornacast.Repo.Migrations.CreateMirrorDomain do
     create(index(:mirror_conflicts, [:organization_mirror_id, :state, :id]))
     create(index(:mirror_conflicts, [:repository_mirror_id, :state, :id]))
 
+    unless turso?() do
+      execute("""
+      alter table mirror_conflicts
+      add constraint mirror_conflicts_repository_scope_fkey
+      foreign key (repository_mirror_id, organization_mirror_id)
+      references repository_mirrors(id, organization_mirror_id)
+      on delete cascade
+      """)
+    end
+
     for field <- [:resource_kind, :resource_identity, :conflict_kind] do
       bounded_string(:mirror_conflicts, field, false, 512)
     end
@@ -499,9 +536,23 @@ defmodule Fornacast.Repo.Migrations.CreateMirrorDomain do
     )
   end
 
-  defp enum_constraint(table, field, values) do
+  defp enum_constraint(table, field, values, optional \\ false) do
     quoted = Enum.map_join(values, ", ", &"'#{&1}'")
-    check(table, String.to_atom("#{table}_#{field}_check"), "#{field} in (#{quoted})")
+    prefix = if optional, do: "#{field} is null or ", else: ""
+
+    check(
+      table,
+      String.to_atom("#{table}_#{field}_check"),
+      "#{prefix}#{field} in (#{quoted})"
+    )
+  end
+
+  defp failure_disposition_check do
+    "(failure_class is null and failure_disposition is null) or " <>
+      "(failure_class in ('primary_rate_limit', 'secondary_rate_limit', 'network') and failure_disposition = 'retry') or " <>
+      "(failure_class in ('permission_missing', 'lfs_missing', 'lfs_integrity') and failure_disposition = 'degraded') or " <>
+      "(failure_class in ('stale_baseline', 'git_divergence', 'namespace_collision') and failure_disposition = 'conflict') or " <>
+      "(failure_class in ('credential_revoked', 'provider_validation', 'local_validation', 'unsupported_resource') and failure_disposition = 'terminal')"
   end
 
   defp bounded_string(table, field, optional, max \\ 255) do

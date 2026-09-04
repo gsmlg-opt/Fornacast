@@ -15,6 +15,20 @@ defmodule ForgeMirrors.TestSupport.MirrorFixtures do
     id
   end
 
+  def user_fixture do
+    suffix = System.unique_integer([:positive, :monotonic])
+    now = DateTime.utc_now(:second)
+
+    %{rows: [[id]]} =
+      Ecto.Adapters.SQL.query!(
+        Repo,
+        "insert into users (username, email, password_hash, role, state, kind, inserted_at, updated_at) values ($1, $2, $3, 'user', 'active', 'user', $4, $4) returning id",
+        ["mirror-user-#{suffix}", "mirror-user-#{suffix}@example.test", "hash", now]
+      )
+
+    id
+  end
+
   def repository_fixture(organization_id) do
     suffix = System.unique_integer([:positive, :monotonic])
     now = DateTime.utc_now(:second)
