@@ -270,8 +270,10 @@ name = "fornacast_git_core"
 version = "0.1.0"
 dependencies = [
  "gix",
+ "gix-config",
  "gix-features",
  "gix-hash",
+ "gix-lock",
  "gix-object",
  "gix-pack",
  "gix-quote",

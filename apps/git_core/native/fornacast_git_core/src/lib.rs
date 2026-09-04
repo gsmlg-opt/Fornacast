@@ -1334,6 +1334,72 @@ fn valid_full_ref_name(full_name: &[u8]) -> bool {
     <&gix_ref::FullNameRef>::try_from(full_name.as_bstr()).is_ok()
 }
 
+#[rustler::nif]
+fn tracking_ref_name(namespace: String, source_ref: String) -> Result<String, NativeError> {
+    validated_tracking_ref_name(&namespace, &source_ref).map(|(name, _kind)| name.to_string())
+}
+
+#[derive(Clone, Copy)]
+enum TrackingRefKind {
+    Branch,
+    Tag,
+}
+
+fn validated_tracking_ref_name(
+    namespace: &str,
+    source_ref: &str,
+) -> Result<(gix_ref::FullName, TrackingRefKind), NativeError> {
+    const NAMESPACE_LIMIT: usize = 64;
+    const SOURCE_REF_LIMIT: usize = 1_024;
+
+    let namespace_valid = !namespace.is_empty()
+        && namespace.len() <= NAMESPACE_LIMIT
+        && namespace
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+
+    if !namespace_valid {
+        return Err(native_error(
+            "invalid_ref",
+            "tracking namespace must be one bounded ASCII identifier",
+        ));
+    }
+
+    if source_ref.len() > SOURCE_REF_LIMIT {
+        return Err(native_error(
+            "invalid_ref",
+            "tracking source exceeds the reference-name byte limit",
+        ));
+    }
+
+    let (relative_ref, kind) = source_ref
+        .strip_prefix("refs/heads/")
+        .map(|suffix| (format!("heads/{suffix}"), TrackingRefKind::Branch))
+        .or_else(|| {
+            source_ref
+                .strip_prefix("refs/tags/")
+                .map(|suffix| (format!("tags/{suffix}"), TrackingRefKind::Tag))
+        })
+        .filter(|(relative, _kind)| !relative.ends_with('/'))
+        .ok_or_else(|| {
+            native_error(
+                "invalid_ref",
+                "tracking source must be a canonical full branch or tag ref",
+            )
+        })?;
+
+    gix_ref::FullName::try_from(source_ref).map_err(|error| native_error("invalid_ref", error))?;
+
+    let tracking_ref = format!("refs/fornacast/mirrors/{namespace}/{relative_ref}");
+    gix_ref::FullName::try_from(tracking_ref.as_str())
+        .map(|name| (name, kind))
+        .map_err(|error| native_error("invalid_ref", error))
+}
+
 fn prefixed_ref(prefix: &[u8], full_name: &[u8]) -> Vec<u8> {
     let mut reference = Vec::with_capacity(prefix.len().saturating_add(full_name.len()));
     reference.extend_from_slice(prefix);
@@ -5136,6 +5202,33 @@ fn disk_usage_scan_duration(deadline_ms: u64) -> Duration {
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
+fn is_ancestor(
+    path: String,
+    ancestor_oid: String,
+    descendant_oid: String,
+    commit_limit: usize,
+    deadline_ms: u64,
+) -> Result<bool, NativeError> {
+    let deadline = Instant::now() + cas_duration(deadline_ms);
+    check_cas_deadline(deadline)?;
+
+    let ancestor = parse_cas_oid(&ancestor_oid)?;
+    let descendant = parse_cas_oid(&descendant_oid)?;
+    let repo = open_physical_bare_repository(&path)?;
+
+    find_cas_commit(&repo, ancestor, "ancestor")?;
+    find_cas_commit(&repo, descendant, "descendant")?;
+
+    cas_is_ancestor(
+        &repo,
+        ancestor,
+        descendant,
+        cas_commit_limit(commit_limit),
+        deadline,
+    )
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
 fn compare_and_swap_ref(
     path: String,
     full_ref: String,
@@ -5315,6 +5408,248 @@ where
     Ok(proposed_id.to_string())
 }
 
+#[rustler::nif(schedule = "DirtyIo")]
+fn compare_and_delete_ref(
+    path: String,
+    full_ref: String,
+    expected_oid: String,
+    deadline_ms: u64,
+) -> Result<String, NativeError> {
+    let full_ref = validated_cas_ref_name(&full_ref)?;
+    compare_and_delete_validated_ref(path, full_ref, expected_oid, deadline_ms)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn compare_and_swap_tracking_ref(
+    path: String,
+    namespace: String,
+    source_ref: String,
+    expected_oid: Option<String>,
+    proposed_oid: String,
+    deadline_ms: u64,
+) -> Result<String, NativeError> {
+    let (full_ref, kind) = validated_tracking_ref_name(&namespace, &source_ref)?;
+    compare_and_swap_validated_tracking_ref(
+        path,
+        full_ref,
+        kind,
+        expected_oid,
+        proposed_oid,
+        deadline_ms,
+    )
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn compare_and_delete_tracking_ref(
+    path: String,
+    namespace: String,
+    source_ref: String,
+    expected_oid: String,
+    deadline_ms: u64,
+) -> Result<String, NativeError> {
+    let (full_ref, _kind) = validated_tracking_ref_name(&namespace, &source_ref)?;
+    compare_and_delete_validated_ref(path, full_ref, expected_oid, deadline_ms)
+}
+
+fn compare_and_swap_validated_tracking_ref(
+    path: String,
+    full_ref: gix_ref::FullName,
+    kind: TrackingRefKind,
+    expected_oid: Option<String>,
+    proposed_oid: String,
+    deadline_ms: u64,
+) -> Result<String, NativeError> {
+    let deadline = Instant::now() + cas_duration(deadline_ms);
+    check_cas_deadline(deadline)?;
+
+    let expected = expected_oid.as_deref().map(parse_cas_oid).transpose()?;
+    let proposed = parse_cas_oid(&proposed_oid)?;
+    let full_ref_for_error = full_ref.to_string();
+    let repo = open_physical_bare_repository(&path)?;
+    let _cas_lock = acquire_cas_file_lock(&repo, deadline)?;
+
+    match kind {
+        TrackingRefKind::Branch => {
+            find_cas_commit(&repo, proposed, "proposed")?;
+        }
+        TrackingRefKind::Tag => {
+            find_cas_object(&repo, proposed, "proposed")?;
+        }
+    }
+
+    let previous = match (expected, direct_ref_target(&repo, full_ref.as_bstr())?) {
+        (None, DirectRefTarget::Missing) => {
+            ensure_no_ref_namespace_conflict(&repo, &full_ref_for_error, deadline)?;
+            gix_ref::transaction::PreviousValue::MustNotExist
+        }
+        (None, DirectRefTarget::Object(_) | DirectRefTarget::Symbolic) => {
+            return Err(native_error(
+                "ref_exists",
+                "tracking reference already exists",
+            ));
+        }
+        (Some(expected), DirectRefTarget::Object(actual)) if actual == expected => {
+            gix_ref::transaction::PreviousValue::MustExistAndMatch(gix_ref::Target::Object(
+                expected,
+            ))
+        }
+        (
+            Some(_),
+            DirectRefTarget::Missing | DirectRefTarget::Symbolic | DirectRefTarget::Object(_),
+        ) => {
+            return Err(native_error(
+                "stale_ref",
+                "tracking reference no longer has the expected target",
+            ));
+        }
+    };
+
+    ensure_internal_refs_hidden(&repo, deadline)?;
+
+    let edit = gix_ref::transaction::RefEdit {
+        change: gix_ref::transaction::Change::Update {
+            log: gix_ref::transaction::LogChange {
+                mode: gix_ref::transaction::RefLog::AndReference,
+                force_create_reflog: false,
+                message: format!("fornacast: track {full_ref}").into(),
+            },
+            expected: previous,
+            new: gix_ref::Target::Object(proposed),
+        },
+        name: full_ref,
+        deref: false,
+    };
+
+    check_cas_deadline(deadline)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let lock_failure = gix::lock::acquire::Fail::from(remaining);
+    let transaction = repo
+        .refs
+        .transaction()
+        .prepare([edit], lock_failure, lock_failure)
+        .map_err(|error| {
+            classify_cas_prepare_error(&repo, &full_ref_for_error, expected, &error)
+        })?;
+
+    let committer = repo
+        .committer()
+        .transpose()
+        .map_err(|error| native_error("invalid_repository", error))?;
+    check_cas_deadline(deadline)?;
+    transaction.commit(committer).map_err(|error| {
+        classify_cas_transaction_error(&repo, &full_ref_for_error, expected, &error)
+    })?;
+
+    Ok(proposed.to_string())
+}
+
+fn ensure_internal_refs_hidden(
+    repo: &gix::Repository,
+    deadline: Instant,
+) -> Result<(), NativeError> {
+    const HIDE_REFS_KEY: &str = "transfer.hideRefs";
+    const HIDE_REFS_VALUE: &str = "refs/fornacast/";
+
+    check_cas_deadline(deadline)?;
+    let config_path = repo.path().join("config");
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let mut lock = gix_lock::File::acquire_to_update_resource(
+        &config_path,
+        gix_lock::acquire::Fail::from(remaining),
+        Some(repo.path().to_path_buf()),
+    )
+    .map_err(|error| match error {
+        gix_lock::acquire::Error::PermanentlyLocked { .. } => native_error(
+            "ref_timeout",
+            "tracking-ref configuration exceeded its deadline waiting for the config lock",
+        ),
+        gix_lock::acquire::Error::Io(error) => native_error("storage_unavailable", error),
+    })?;
+
+    let mut config =
+        gix_config::File::from_path_no_includes(config_path, gix_config::Source::Local)
+            .map_err(|error| native_error("storage_unavailable", error))?;
+
+    if config.raw_values(HIDE_REFS_KEY).is_ok_and(|values| {
+        values
+            .iter()
+            .any(|value| value.as_ref() == HIDE_REFS_VALUE.as_bytes())
+    }) {
+        return Ok(());
+    }
+
+    config
+        .set_raw_value(HIDE_REFS_KEY, HIDE_REFS_VALUE)
+        .map_err(|error| native_error("storage_unavailable", error))?;
+
+    check_cas_deadline(deadline)?;
+    config
+        .write_to(&mut lock)
+        .map_err(|error| native_error("storage_unavailable", error))?;
+    check_cas_deadline(deadline)?;
+    lock.commit()
+        .map_err(|error| native_error("storage_unavailable", error))?;
+    check_cas_deadline(deadline)
+}
+
+fn compare_and_delete_validated_ref(
+    path: String,
+    full_ref: gix_ref::FullName,
+    expected_oid: String,
+    deadline_ms: u64,
+) -> Result<String, NativeError> {
+    let deadline = Instant::now() + cas_duration(deadline_ms);
+    check_cas_deadline(deadline)?;
+
+    let expected = parse_cas_oid(&expected_oid)?;
+    let full_ref_for_error = full_ref.to_string();
+    let repo = open_physical_bare_repository(&path)?;
+    let _cas_lock = acquire_cas_file_lock(&repo, deadline)?;
+
+    match direct_ref_target(&repo, full_ref.as_bstr())? {
+        DirectRefTarget::Object(actual) if actual == expected => {}
+        DirectRefTarget::Missing | DirectRefTarget::Symbolic | DirectRefTarget::Object(_) => {
+            return Err(native_error(
+                "stale_ref",
+                "reference no longer has the expected target",
+            ));
+        }
+    }
+
+    let edit = gix_ref::transaction::RefEdit {
+        change: gix_ref::transaction::Change::Delete {
+            expected: gix_ref::transaction::PreviousValue::MustExistAndMatch(
+                gix_ref::Target::Object(expected),
+            ),
+            log: gix_ref::transaction::RefLog::AndReference,
+        },
+        name: full_ref,
+        deref: false,
+    };
+
+    check_cas_deadline(deadline)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let lock_failure = gix::lock::acquire::Fail::from(remaining);
+    let transaction = repo
+        .refs
+        .transaction()
+        .prepare([edit], lock_failure, lock_failure)
+        .map_err(|error| {
+            classify_cas_prepare_error(&repo, &full_ref_for_error, Some(expected), &error)
+        })?;
+
+    let committer = repo
+        .committer()
+        .transpose()
+        .map_err(|error| native_error("invalid_repository", error))?;
+    check_cas_deadline(deadline)?;
+    transaction.commit(committer).map_err(|error| {
+        classify_cas_transaction_error(&repo, &full_ref_for_error, Some(expected), &error)
+    })?;
+
+    Ok(expected.to_string())
+}
+
 fn ensure_no_ref_namespace_conflict(
     repo: &gix::Repository,
     full_ref: &str,
@@ -5459,6 +5794,28 @@ fn find_cas_commit<'repo>(
             format!("{position} target must be a commit"),
         )
     })
+}
+
+fn find_cas_object(
+    repo: &gix::Repository,
+    oid: gix_hash::ObjectId,
+    position: &str,
+) -> Result<(), NativeError> {
+    match repo.find_object(oid) {
+        Ok(_object) => Ok(()),
+        Err(gix_object::find::existing::Error::NotFound { .. }) => Err(native_error(
+            "target_not_commit",
+            format!("{position} target must be an existing object"),
+        )),
+        Err(gix_object::find::existing::Error::Find(error)) => {
+            let kind = if error_chain_contains_storage_io(error.as_ref()) {
+                "storage_unavailable"
+            } else {
+                "corrupt_repository"
+            };
+            Err(native_error(kind, error))
+        }
+    }
 }
 
 fn classify_cas_prepare_error(

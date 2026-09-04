@@ -64,6 +64,88 @@ defmodule GitCore do
     end
   end
 
+  @doc "Returns whether one existing commit is an ancestor of another within bounded work."
+  @spec is_ancestor(Path.t(), String.t(), String.t(), keyword()) ::
+          {:ok, boolean()} | {:error, GitCore.Error.t()}
+  def is_ancestor(path, ancestor_oid, descendant_oid, opts \\ [])
+
+  def is_ancestor(path, ancestor_oid, descendant_oid, opts)
+      when is_binary(path) and is_binary(ancestor_oid) and is_binary(descendant_oid) and
+             is_list(opts) do
+    deadline =
+      if Keyword.keyword?(opts),
+        do: Keyword.get(opts, :deadline_ms, GitCore.Limits.get(:ref_deadline_ms)),
+        else: :invalid
+
+    case deadline do
+      deadline_ms when is_integer(deadline_ms) ->
+        deadline_ms = deadline_ms |> max(0) |> min(GitCore.Limits.get(:ref_deadline_ms))
+
+        GitCore.ScanLimiter.with_permit(:is_ancestor, fn ->
+          GitCore.Native.is_ancestor(
+            path,
+            ancestor_oid,
+            descendant_oid,
+            GitCore.Limits.get(:commit_visits),
+            deadline_ms
+          )
+          |> wrap_read(:is_ancestor)
+        end)
+
+      _invalid_deadline ->
+        invalid_input(:is_ancestor, "deadline_ms must be an integer")
+    end
+  end
+
+  def is_ancestor(_path, _ancestor_oid, _descendant_oid, _opts) do
+    invalid_input(:is_ancestor, "invalid ancestry arguments")
+  end
+
+  @doc "Maps a standard branch or tag ref into a caller-owned private mirror namespace."
+  @spec tracking_ref_name(String.t(), String.t()) ::
+          {:ok, String.t()} | {:error, GitCore.Error.t()}
+  def tracking_ref_name(namespace, source_ref)
+      when is_binary(namespace) and is_binary(source_ref) do
+    GitCore.Native.tracking_ref_name(namespace, source_ref)
+    |> wrap_read(:tracking_ref_name)
+  end
+
+  def tracking_ref_name(_namespace, _source_ref) do
+    invalid_input(:tracking_ref_name, "tracking namespace and source ref must be strings")
+  end
+
+  @doc "Reads one exact branch or tag in a caller-owned private mirror namespace."
+  @spec exact_tracking_ref(Path.t(), String.t(), String.t(), keyword()) ::
+          {:ok, String.t() | nil} | {:error, GitCore.Error.t()}
+  def exact_tracking_ref(path, namespace, source_ref, opts \\ [])
+
+  def exact_tracking_ref(path, namespace, source_ref, opts)
+      when is_binary(path) and is_binary(namespace) and is_binary(source_ref) and is_list(opts) do
+    deadline =
+      if Keyword.keyword?(opts),
+        do: Keyword.get(opts, :deadline_ms, GitCore.Limits.get(:ref_deadline_ms)),
+        else: :invalid
+
+    case deadline do
+      deadline_ms when is_integer(deadline_ms) and deadline_ms > 0 ->
+        deadline_ms = min(deadline_ms, GitCore.Limits.get(:ref_deadline_ms))
+
+        with {:ok, full_ref} <-
+               GitCore.Native.tracking_ref_name(namespace, source_ref)
+               |> wrap_read(:exact_tracking_ref) do
+          GitCore.Native.exact_ref(path, :binary.bin_to_list(full_ref), deadline_ms)
+          |> wrap_read(:exact_tracking_ref)
+        end
+
+      _invalid_deadline ->
+        invalid_input(:exact_tracking_ref, "deadline_ms must be a positive integer")
+    end
+  end
+
+  def exact_tracking_ref(_path, _namespace, _source_ref, _opts) do
+    invalid_input(:exact_tracking_ref, "invalid tracking-ref read arguments")
+  end
+
   def ref_summary(path, opts \\ []) when is_binary(path) and is_list(opts) do
     selected_ref = opts |> Keyword.get(:selected_ref) |> ref_name_to_native()
 
@@ -728,6 +810,130 @@ defmodule GitCore do
     invalid_input(:compare_and_swap_ref, "invalid compare-and-swap arguments")
   end
 
+  @doc """
+  Atomically deletes a canonical full branch or tag ref at its exact observed target.
+
+  The caller must hold the repository writer fence when any non-CAS writer can target the same
+  repository. Objects are never removed by this operation.
+  """
+  @spec compare_and_delete_ref(Path.t(), String.t(), String.t(), keyword()) ::
+          {:ok, String.t()} | {:error, GitCore.Error.t()}
+  def compare_and_delete_ref(path, full_ref, expected_oid, opts \\ [])
+
+  def compare_and_delete_ref(path, full_ref, expected_oid, opts)
+      when is_binary(path) and is_binary(full_ref) and is_binary(expected_oid) and is_list(opts) do
+    deadline =
+      if Keyword.keyword?(opts),
+        do: Keyword.get(opts, :deadline_ms, GitCore.Limits.get(:ref_deadline_ms)),
+        else: :invalid
+
+    case deadline do
+      deadline_ms when is_integer(deadline_ms) ->
+        deadline_ms = deadline_ms |> max(0) |> min(GitCore.Limits.get(:ref_deadline_ms))
+
+        GitCore.Native.compare_and_delete_ref(path, full_ref, expected_oid, deadline_ms)
+        |> wrap_read(:compare_and_delete_ref)
+
+      _invalid_deadline ->
+        invalid_input(:compare_and_delete_ref, "deadline_ms must be an integer")
+    end
+  end
+
+  def compare_and_delete_ref(_path, _full_ref, _expected_oid, _opts) do
+    invalid_input(:compare_and_delete_ref, "invalid compare-and-delete arguments")
+  end
+
+  @doc """
+  Atomically records an observed branch or tag in a caller-owned private mirror namespace.
+
+  Unlike public ref updates, an exact tracking update may record a non-fast-forward remote state.
+  The caller must hold the repository writer fence when non-CAS writers can target the repository.
+  """
+  @spec compare_and_swap_tracking_ref(
+          Path.t(),
+          String.t(),
+          String.t(),
+          String.t() | nil,
+          String.t(),
+          keyword()
+        ) :: {:ok, String.t()} | {:error, GitCore.Error.t()}
+  def compare_and_swap_tracking_ref(
+        path,
+        namespace,
+        source_ref,
+        expected_oid,
+        proposed_oid,
+        opts \\ []
+      )
+
+  def compare_and_swap_tracking_ref(
+        path,
+        namespace,
+        source_ref,
+        expected_oid,
+        proposed_oid,
+        opts
+      )
+      when is_binary(path) and is_binary(namespace) and is_binary(source_ref) and
+             (is_nil(expected_oid) or is_binary(expected_oid)) and is_binary(proposed_oid) and
+             is_list(opts) do
+    with {:ok, deadline_ms} <- ref_update_deadline(opts, :compare_and_swap_tracking_ref) do
+      GitCore.Native.compare_and_swap_tracking_ref(
+        path,
+        namespace,
+        source_ref,
+        expected_oid,
+        proposed_oid,
+        deadline_ms
+      )
+      |> wrap_read(:compare_and_swap_tracking_ref)
+    end
+  end
+
+  def compare_and_swap_tracking_ref(
+        _path,
+        _namespace,
+        _source_ref,
+        _expected_oid,
+        _proposed_oid,
+        _opts
+      ) do
+    invalid_input(:compare_and_swap_tracking_ref, "invalid tracking-ref update arguments")
+  end
+
+  @doc """
+  Atomically deletes an observed private tracking ref at its exact target.
+
+  The caller must hold the repository writer fence when non-CAS writers can target the repository.
+  """
+  @spec compare_and_delete_tracking_ref(
+          Path.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          keyword()
+        ) :: {:ok, String.t()} | {:error, GitCore.Error.t()}
+  def compare_and_delete_tracking_ref(path, namespace, source_ref, expected_oid, opts \\ [])
+
+  def compare_and_delete_tracking_ref(path, namespace, source_ref, expected_oid, opts)
+      when is_binary(path) and is_binary(namespace) and is_binary(source_ref) and
+             is_binary(expected_oid) and is_list(opts) do
+    with {:ok, deadline_ms} <- ref_update_deadline(opts, :compare_and_delete_tracking_ref) do
+      GitCore.Native.compare_and_delete_tracking_ref(
+        path,
+        namespace,
+        source_ref,
+        expected_oid,
+        deadline_ms
+      )
+      |> wrap_read(:compare_and_delete_tracking_ref)
+    end
+  end
+
+  def compare_and_delete_tracking_ref(_path, _namespace, _source_ref, _expected_oid, _opts) do
+    invalid_input(:compare_and_delete_tracking_ref, "invalid tracking-ref delete arguments")
+  end
+
   @spec invalidate_repository_cache(Path.t()) :: :ok
   def invalidate_repository_cache(repository_path) when is_binary(repository_path) do
     invalidate_repository_cache(repository_path, [])
@@ -1231,6 +1437,21 @@ defmodule GitCore do
 
   defp invalid_input(operation, detail) do
     {:error, %GitCore.Error{kind: :invalid_input, operation: operation, detail: detail}}
+  end
+
+  defp ref_update_deadline(opts, operation) do
+    deadline =
+      if Keyword.keyword?(opts),
+        do: Keyword.get(opts, :deadline_ms, GitCore.Limits.get(:ref_deadline_ms)),
+        else: :invalid
+
+    case deadline do
+      deadline_ms when is_integer(deadline_ms) ->
+        {:ok, deadline_ms |> max(0) |> min(GitCore.Limits.get(:ref_deadline_ms))}
+
+      _invalid_deadline ->
+        invalid_input(operation, "deadline_ms must be an integer")
+    end
   end
 
   defp merge_analysis_result(native_result) do

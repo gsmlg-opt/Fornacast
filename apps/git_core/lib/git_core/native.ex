@@ -17,6 +17,12 @@ defmodule GitCore.Native do
   def empty(_path), do: :erlang.nif_error(:nif_not_loaded)
   def list_refs(_path), do: :erlang.nif_error(:nif_not_loaded)
   def exact_ref(_path, _full_name, _deadline_ms), do: :erlang.nif_error(:nif_not_loaded)
+
+  def is_ancestor(_path, _ancestor_oid, _descendant_oid, _commit_limit, _deadline_ms),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def tracking_ref_name(_namespace, _source_ref), do: :erlang.nif_error(:nif_not_loaded)
+
   def ref_summary(_path, _selected_ref), do: :erlang.nif_error(:nif_not_loaded)
 
   def ref_summary_for_route(_path, _route_segments),
@@ -143,6 +149,28 @@ defmodule GitCore.Native do
         _proposed_oid,
         _mode,
         _commit_limit,
+        _deadline_ms
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  def compare_and_delete_ref(_path, _full_ref, _expected_oid, _deadline_ms),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def compare_and_swap_tracking_ref(
+        _path,
+        _namespace,
+        _source_ref,
+        _expected_oid,
+        _proposed_oid,
+        _deadline_ms
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  def compare_and_delete_tracking_ref(
+        _path,
+        _namespace,
+        _source_ref,
+        _expected_oid,
         _deadline_ms
       ),
       do: :erlang.nif_error(:nif_not_loaded)
