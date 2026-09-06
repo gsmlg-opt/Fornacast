@@ -82,7 +82,63 @@ defmodule ForgeGitHub.WebhookProcessor do
     end
   end
 
+  defp dispatch(%{event: event} = delivery, payload, options)
+       when event in ["issues", "issue_comment", "pull_request"] do
+    with {:ok, hints} <- resource_hints(event, payload) do
+      scheduler =
+        Keyword.get(options, :resource_schedule, &ForgeMirrors.retain_webhook_resource_trigger/2)
+
+      case safe_call(scheduler, [delivery, hints]) do
+        {:ok, :deferred} -> :defer
+        {:ok, :scheduled} -> :ok
+        {:ok, {:scheduled, _operation}} -> :ok
+        _unavailable -> {:retry, "resource_trigger_unavailable", 30}
+      end
+    else
+      {:error, :invalid_identity} -> {:fail, "invalid_webhook_payload"}
+    end
+  end
+
   defp dispatch(_delivery, _payload, _options), do: :ignore
+
+  defp resource_hints(event, payload) when event in ["issues", "pull_request"] do
+    field = if event == "issues", do: "issue", else: "pull_request"
+
+    with %{"id" => id, "number" => number} = resource <- Map.get(payload, field),
+         true <- resource_id?(id) and resource_id?(number),
+         false <- event == "issues" and Map.has_key?(resource, "pull_request") do
+      {:ok,
+       %{
+         "resource_kind" => if(event == "issues", do: "issue", else: "pull"),
+         "github_object_id" => id,
+         "github_number" => number,
+         "issue_kind" => if(event == "issues", do: "issue", else: "pull_request")
+       }}
+    else
+      _invalid -> {:error, :invalid_identity}
+    end
+  end
+
+  defp resource_hints("issue_comment", payload) do
+    with %{"id" => issue_id, "number" => number} = issue <- Map.get(payload, "issue"),
+         %{"id" => comment_id} <- Map.get(payload, "comment"),
+         true <- Enum.all?([issue_id, number, comment_id], &resource_id?/1),
+         pull <- Map.get(issue, "pull_request"),
+         true <- is_nil(pull) or is_map(pull) do
+      {:ok,
+       %{
+         "resource_kind" => "issue_comment",
+         "github_object_id" => comment_id,
+         "github_number" => number,
+         "github_issue_id" => issue_id,
+         "issue_kind" => if(is_map(pull), do: "pull_request", else: "issue")
+       }}
+    else
+      _invalid -> {:error, :invalid_identity}
+    end
+  end
+
+  defp resource_id?(id), do: is_integer(id) and id in 1..9_223_372_036_854_775_807
 
   defp refetch_installation(delivery, payload, options) do
     config_fetch = Keyword.get(options, :config_fetch, &AppConfig.fetch/0)

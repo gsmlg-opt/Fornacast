@@ -738,6 +738,186 @@ defmodule ForgeMirrors do
     do: {:error, :invalid_argument}
 
   @doc false
+  def retain_webhook_resource_trigger(%MirrorWebhookDelivery{} = delivery, hints)
+      when is_map(hints) do
+    if valid_webhook_resource_hints?(hints) do
+      Repo.transaction(fn ->
+        stored = if is_integer(delivery.id), do: Repo.get(MirrorWebhookDelivery, delivery.id)
+
+        unless valid_resource_delivery?(stored, delivery, hints),
+          do: Repo.rollback(:invalid_delivery)
+
+        organization =
+          OrganizationMirror
+          |> where(
+            [m],
+            m.provider == "github" and m.github_installation_id == ^stored.installation_id
+          )
+          |> lock("FOR UPDATE")
+          |> Repo.one()
+
+        if organization && stored.organization_mirror_id &&
+             stored.organization_mirror_id != organization.id,
+           do: Repo.rollback(:invalid_delivery)
+
+        if resource_webhook_enabled?(organization, hints) do
+          binding =
+            RepositoryMirror
+            |> where(
+              [m],
+              m.organization_mirror_id == ^organization.id and
+                m.github_repository_id == ^stored.github_repository_id and
+                m.state in [:discovered, :active] and m.inventory_included == true
+            )
+            |> lock("FOR UPDATE")
+            |> Repo.one()
+
+          with %RepositoryMirror{repository_id: id} when is_integer(id) <- binding,
+               {:ok, repository} <- ForgeRepos.fetch_live_repository(id),
+               true <- repository.lifecycle in [:ready, :synchronizing],
+               true <- repository.owner_user_id == organization.organization_id do
+            now = database_now!()
+            digest = :crypto.hash(:sha256, stored.delivery_guid) |> Base.encode16(case: :lower)
+
+            with {:ok, operation} <-
+                   enqueue_operation(%{
+                     organization_mirror_id: organization.id,
+                     repository_mirror_id: binding.id,
+                     kind: "sync." <> hints["resource_kind"],
+                     dedupe_key: "webhook-resource:#{digest}:#{binding.id}",
+                     cursor:
+                       Map.merge(hints, %{
+                         "trigger" => "remote",
+                         "delivery_guid" => stored.delivery_guid
+                       }),
+                     next_attempt_at: now
+                   }),
+                 {:ok, _} <-
+                   organization
+                   |> OrganizationMirror.update_changeset(%{last_webhook_at: now})
+                   |> cas_update() do
+              {:scheduled, operation}
+            else
+              {:error, reason} -> Repo.rollback(reason)
+            end
+          else
+            _ -> :deferred
+          end
+        else
+          :deferred
+        end
+      end)
+    else
+      {:error, :invalid_argument}
+    end
+  rescue
+    _exception -> {:error, :unavailable}
+  end
+
+  def retain_webhook_resource_trigger(_, _), do: {:error, :invalid_argument}
+
+  defp valid_webhook_resource_hints?(hints) do
+    common = ~w(resource_kind github_object_id github_number issue_kind)
+    kind = hints["resource_kind"]
+    keys = if kind == "issue_comment", do: ["github_issue_id" | common], else: common
+
+    Enum.sort(Map.keys(hints)) == Enum.sort(keys) and
+      positive_resource_id?(hints["github_object_id"]) and
+      positive_resource_id?(hints["github_number"]) and
+      case {kind, hints["issue_kind"]} do
+        {"issue", "issue"} ->
+          true
+
+        {"pull", "pull_request"} ->
+          true
+
+        {"issue_comment", issue_kind} when issue_kind in ["issue", "pull_request"] ->
+          positive_resource_id?(hints["github_issue_id"])
+
+        _ ->
+          false
+      end
+  end
+
+  defp valid_resource_delivery?(%MirrorWebhookDelivery{} = stored, supplied, hints) do
+    immutable = [
+      :organization_mirror_id,
+      :delivery_guid,
+      :hook_id,
+      :event,
+      :action,
+      :installation_id,
+      :github_repository_id,
+      :signature_version,
+      :raw_payload
+    ]
+
+    Map.take(stored, immutable) == Map.take(supplied, immutable) and
+      stored.signature_version == "sha256" and
+      positive_resource_id?(stored.installation_id) and
+      positive_resource_id?(stored.github_repository_id) and
+      bounded_trimmed_string?(stored.delivery_guid, 255) and
+      case JSON.decode(stored.raw_payload) do
+        {:ok,
+         %{"installation" => %{"id" => installation}, "repository" => %{"id" => repository}} =
+             payload} ->
+          installation == stored.installation_id and repository == stored.github_repository_id and
+            payload["action"] == stored.action and
+            resource_payload_identity?(stored.event, payload, hints)
+
+        _ ->
+          false
+      end
+  end
+
+  defp valid_resource_delivery?(_, _, _), do: false
+
+  defp resource_payload_identity?(
+         "issues",
+         %{"issue" => issue},
+         %{"resource_kind" => "issue"} = hints
+       )
+       when is_map(issue) do
+    not Map.has_key?(issue, "pull_request") and issue["id"] == hints["github_object_id"] and
+      issue["number"] == hints["github_number"]
+  end
+
+  defp resource_payload_identity?(
+         "pull_request",
+         %{"pull_request" => pull},
+         %{"resource_kind" => "pull"} = hints
+       )
+       when is_map(pull) do
+    pull["id"] == hints["github_object_id"] and pull["number"] == hints["github_number"]
+  end
+
+  defp resource_payload_identity?(
+         "issue_comment",
+         %{"issue" => issue, "comment" => comment},
+         %{"resource_kind" => "issue_comment"} = hints
+       )
+       when is_map(issue) and is_map(comment) do
+    pull = issue["pull_request"]
+    issue_kind = if is_map(pull), do: "pull_request", else: "issue"
+
+    (is_nil(pull) or is_map(pull)) and
+      issue["id"] == hints["github_issue_id"] and issue["number"] == hints["github_number"] and
+      comment["id"] == hints["github_object_id"] and issue_kind == hints["issue_kind"]
+  end
+
+  defp resource_payload_identity?(_, _, _), do: false
+
+  defp resource_webhook_enabled?(%OrganizationMirror{} = organization, hints) do
+    state =
+      if organization.state == :paused, do: organization.resume_state, else: organization.state
+
+    state in [:catching_up, :active, :degraded, :conflicted] and
+      issue_capability_enabled?(organization, hints["issue_kind"])
+  end
+
+  defp resource_webhook_enabled?(_, _), do: false
+
+  @doc false
   @spec revoke_bound_organization_from_webhook(pos_integer()) ::
           {:ok, :unbound | OrganizationMirror.t()}
           | {:error, :invalid_argument | :unavailable | :invalid_transition}
@@ -2187,6 +2367,9 @@ defmodule ForgeMirrors do
           | {:error, :invalid_payload | :repository_binding_conflict | term()}
   def materialize_outbox_event(%DomainOutboxEvent{} = event) do
     case event do
+      %DomainOutboxEvent{aggregate_type: type} when type in ["issue", "issue_comment"] ->
+        materialize_issue_event(event)
+
       %DomainOutboxEvent{aggregate_type: "repository", origin: origin}
       when origin != :fornacast ->
         ignore_repository_event(event, :non_local_event)
@@ -2203,6 +2386,218 @@ defmodule ForgeMirrors do
       %DomainOutboxEvent{} ->
         {:ok, {:ignored, :non_repository_event}}
     end
+  end
+
+  defp materialize_issue_event(event) do
+    with {:ok, cursor} <- issue_event_cursor(event) do
+      materialize_in_transaction(fn ->
+        with {:ok, repository} <- ForgeRepos.fetch_live_repository(cursor["repository_id"]),
+             :ok <- validate_issue_event_scope(event, cursor),
+             :fornacast <- event.origin,
+             {:ok, organization} <- lock_non_revoked_organization_mirror(repository.owner_user_id),
+             true <- issue_capability_enabled?(organization, cursor["issue_kind"]),
+             %RepositoryMirror{state: state, inventory_included: true} = binding
+             when state in [:discovered, :active] <-
+               find_bound_repository_mirror(organization.id, repository.id),
+             {:ok, operation} <- enqueue_issue_event(binding, event, cursor) do
+          {:materialized, [operation]}
+        else
+          origin when origin in [:github, :system] -> {:ignored, :non_local_event}
+          false -> {:ignored, :capability_disabled}
+          nil -> Repo.rollback(:unbound_repository)
+          %RepositoryMirror{} -> {:ignored, :inactive_repository}
+          {:error, :not_found} -> {:ignored, :repository_missing}
+          {:error, :unmirrored_owner} -> {:ignored, :unmirrored_owner}
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+    end
+  end
+
+  defp issue_event_cursor(event) do
+    payload = event.payload
+    comment? = event.aggregate_type == "issue_comment"
+    identity_key = if comment?, do: "comment_id", else: "issue_id"
+
+    event_types =
+      if comment?,
+        do: ~w(issue_comment.created issue_comment.updated issue_comment.deleted),
+        else: ~w(issue.created issue.updated)
+
+    with true <- is_map(payload),
+         true <- event.event_type in event_types,
+         true <- event.origin in [:fornacast, :github, :system],
+         true <- bounded_trimmed_string?(event.event_id, 255),
+         true <-
+           Enum.all?(
+             [event.causation_id, event.correlation_id],
+             &(is_nil(&1) or bounded_trimmed_string?(&1, 255))
+           ),
+         :ok <- validate_utc(event.available_at),
+         true <-
+           Enum.all?(
+             ~w(repository_id issue_id issue_number sync_version),
+             &positive_resource_id?(payload[&1])
+           ),
+         true <- payload["issue_kind"] in ["issue", "pull_request"],
+         true <- positive_resource_id?(payload[identity_key]),
+         true <- event.aggregate_id == to_string(payload[identity_key]),
+         true <- valid_comment_event?(event, payload, comment?) do
+      keys = ~w(repository_id issue_id issue_number issue_kind sync_version)
+
+      keys =
+        if comment?,
+          do: keys ++ ~w(comment_id deleted author_user_id author_github_identity_id),
+          else: keys
+
+      {:ok,
+       Map.take(payload, keys)
+       |> Map.merge(%{
+         "event_type" => event.event_type,
+         "outbox_event_id" => event.event_id,
+         "trigger" => "local",
+         "origin" => Atom.to_string(event.origin),
+         "causation_id" => event.causation_id,
+         "correlation_id" => event.correlation_id
+       })}
+    else
+      _invalid -> {:error, :invalid_payload}
+    end
+  end
+
+  defp positive_resource_id?(id),
+    do: is_integer(id) and id > 0 and id <= 9_223_372_036_854_775_807
+
+  defp valid_comment_event?(_event, _payload, false), do: true
+
+  defp valid_comment_event?(event, payload, true) do
+    author = payload["author_user_id"]
+    external_author = payload["author_github_identity_id"]
+
+    payload["deleted"] == (event.event_type == "issue_comment.deleted") and
+      ((positive_resource_id?(author) and is_nil(external_author)) or
+         (is_nil(author) and positive_resource_id?(external_author)))
+  end
+
+  defp validate_issue_event_scope(event, cursor) do
+    repository_id = cursor["repository_id"]
+    number = cursor["issue_number"]
+    kind = cursor["issue_kind"]
+
+    issue =
+      Repo.one(
+        from issue in "issues",
+          where: issue.id == ^cursor["issue_id"],
+          select: %{
+            repository_id: issue.repository_id,
+            number: issue.number,
+            kind: issue.kind,
+            sync_version: issue.sync_version
+          }
+      )
+
+    case issue do
+      %{repository_id: ^repository_id, number: ^number, kind: ^kind, sync_version: version} ->
+        if event.aggregate_type == "issue" do
+          if version >= cursor["sync_version"], do: :ok, else: {:error, :invalid_payload}
+        else
+          validate_comment_event_scope(event, cursor)
+        end
+
+      _missing_or_mismatched ->
+        {:error, :invalid_payload}
+    end
+  end
+
+  defp validate_comment_event_scope(event, cursor) do
+    comment =
+      Repo.one(
+        from comment in "issue_comments",
+          where: comment.id == ^cursor["comment_id"],
+          select: %{
+            issue_id: comment.issue_id,
+            sync_version: comment.sync_version,
+            author_user_id: comment.author_user_id,
+            author_github_identity_id: comment.author_github_identity_id
+          }
+      )
+
+    case comment do
+      nil ->
+        if cursor["deleted"] or durable_comment_tombstone?(event, cursor),
+          do: :ok,
+          else: {:error, :invalid_payload}
+
+      %{
+        issue_id: issue_id,
+        sync_version: version,
+        author_user_id: author,
+        author_github_identity_id: external
+      } ->
+        if not cursor["deleted"] and issue_id == cursor["issue_id"] and
+             version >= cursor["sync_version"] and
+             author == cursor["author_user_id"] and
+             external == cursor["author_github_identity_id"],
+           do: :ok,
+           else: {:error, :invalid_payload}
+    end
+  end
+
+  defp durable_comment_tombstone?(event, cursor) do
+    tombstone =
+      Repo.one(
+        from tombstone in DomainOutboxEvent,
+          where:
+            tombstone.aggregate_type == "issue_comment" and
+              tombstone.aggregate_id == ^event.aggregate_id and
+              tombstone.event_type == "issue_comment.deleted" and
+              tombstone.origin == ^event.origin,
+          order_by: [desc: tombstone.id],
+          limit: 1
+      )
+
+    keys =
+      ~w(repository_id issue_id issue_number issue_kind comment_id author_user_id author_github_identity_id)
+
+    with %DomainOutboxEvent{} = tombstone <- tombstone,
+         {:ok, tombstone_cursor} <- issue_event_cursor(tombstone) do
+      Map.take(tombstone_cursor, keys) == Map.take(cursor, keys) and
+        tombstone_cursor["sync_version"] > cursor["sync_version"]
+    else
+      _invalid -> false
+    end
+  end
+
+  defp issue_capability_enabled?(organization, kind) do
+    capability = if kind == "pull_request", do: "pulls", else: "issues"
+
+    Map.get(organization.capabilities || %{}, capability) in [
+      true,
+      :enabled,
+      :active,
+      "enabled",
+      "active"
+    ]
+  end
+
+  defp enqueue_issue_event(binding, event, cursor) do
+    kind =
+      cond do
+        event.aggregate_type == "issue_comment" -> "sync.issue_comment"
+        cursor["issue_kind"] == "pull_request" -> "sync.pull"
+        true -> "sync.issue"
+      end
+
+    digest = :crypto.hash(:sha256, event.event_id) |> Base.encode16(case: :lower)
+
+    enqueue_operation(%{
+      organization_mirror_id: binding.organization_mirror_id,
+      repository_mirror_id: binding.id,
+      kind: kind,
+      cursor: cursor,
+      dedupe_key: "outbox-resource:#{digest}:#{binding.id}",
+      next_attempt_at: event.available_at
+    })
   end
 
   defp ignore_repository_event(event, reason) do
