@@ -539,6 +539,7 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
         context: fn ^operation -> {:ok, comment_context(baseline)} end,
         local_observe: fn _ -> {:ok, local_comment(baseline, 3)} end,
         get_comment: fn _, _, _, 601, _ -> {:error, Error.new(:not_found)} end,
+        get_repository: fn _, "acme", "project", _ -> {:ok, %{id: 900}} end,
         confirm: fn ^operation, @now, _expected, confirmation, domain_request ->
           assert confirmation.state == :deleted
           assert confirmation.confirmed_local_version == 4
@@ -605,6 +606,215 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
            ]
   end
 
+  test "an existing exact GitHub label is adopted before the parent issue is retried" do
+    parent = self()
+    operation = operation("sync.issue", :processing)
+    candidate = local_label_candidate()
+
+    options =
+      options(operation,
+        local_observe: fn _ -> {:label_required, candidate} end,
+        get_label: fn _, _, _, "bug", _ ->
+          send(parent, :label_refetched)
+          {:ok, github_label_resource()}
+        end,
+        confirm_label: fn ^operation, @now, expected, confirmation, domain_request ->
+          assert expected.local_label_id == 101
+          assert expected.effect_marker == nil
+          assert confirmation.github_object_id == 41
+          assert confirmation.confirmed_snapshot == candidate.snapshot
+          assert domain_request.action == :observe
+          send(parent, :label_adopted)
+          {:ok, %{operation: %{operation | state: :pending}}}
+        end,
+        create_label: fn _, _, _, _, _ -> flunk("existing label was recreated") end,
+        get_issue: fn _, _, _, _, _ -> flunk("parent issue ran before its label mapping") end
+      )
+
+    assert {:ok, %{operation: %MirrorOperation{state: :pending}}} =
+             IssueSyncWorker.process_operation(operation, @now, options)
+
+    assert collect_events(2) == [:label_refetched, :label_adopted]
+  end
+
+  test "a missing GitHub label is marked, created once, and mapped before the issue effect" do
+    parent = self()
+    operation = operation("sync.issue", :processing)
+    candidate = local_label_candidate()
+
+    options =
+      options(operation,
+        local_observe: fn _ -> {:label_required, candidate} end,
+        get_label: fn _, _, _, "bug", _ -> {:error, Error.new(:not_found)} end,
+        mark_label_effect: fn ^operation, @now, expected, marker, domain_request ->
+          assert expected.local_label_id == 101
+          assert expected.expected_local_version == 1
+          assert marker["action"] == "create_remote_label"
+          assert marker["expected_remote_absent"] == true
+          assert domain_request.action == :observe
+          send(parent, :label_effect_marked)
+
+          {:ok,
+           %{
+             operation: %{
+               operation
+               | state: :effect_pending,
+                 external_effect_marker: marker
+             }
+           }}
+        end,
+        create_label: fn _, _, _, attrs, _ ->
+          assert attrs == %{"name" => "bug", "color" => "aabbcc", "description" => "Fix"}
+          send(parent, :label_created)
+          {:ok, github_label_resource()}
+        end,
+        confirm_label: fn marked, @now, expected, confirmation, _domain_request ->
+          assert expected.effect_marker == marked.external_effect_marker
+          assert confirmation.github_object_id == 41
+          send(parent, :label_mapped)
+          {:ok, %{operation: %{marked | state: :pending, external_effect_marker: nil}}}
+        end
+      )
+
+    assert {:ok, %{operation: %MirrorOperation{state: :pending}}} =
+             IssueSyncWorker.process_operation(operation, @now, options)
+
+    assert collect_events(3) == [:label_effect_marked, :label_created, :label_mapped]
+  end
+
+  test "label create recovery adopts only the exact recorded postcondition and never posts again" do
+    parent = self()
+    marker = label_effect_marker()
+    operation = operation("sync.issue", :effect_pending, marker)
+
+    options =
+      options(operation,
+        context: fn ^operation -> {:ok, context(marker)} end,
+        label_observe: fn 10, 101 -> {:ok, label_projection()} end,
+        get_label: fn _, _, _, "bug", _ ->
+          send(parent, :label_recovered)
+          {:ok, github_label_resource()}
+        end,
+        confirm_label: fn ^operation, @now, expected, confirmation, domain_request ->
+          assert expected.effect_marker == marker
+          assert confirmation.confirmed_snapshot == marker["proposed_snapshot"]
+          assert domain_request.action == :observe
+          {:ok, %{operation: %{operation | state: :pending, external_effect_marker: nil}}}
+        end,
+        create_label: fn _, _, _, _, _ -> flunk("ambiguous label create was replayed") end,
+        local_observe: fn _ -> flunk("parent issue ran before label recovery") end
+      )
+
+    assert {:ok, %{operation: %MirrorOperation{state: :pending}}} =
+             IssueSyncWorker.process_operation(operation, @now, options)
+
+    assert_received :label_recovered
+  end
+
+  test "label create recovery conflicts when the recorded name is still absent" do
+    parent = self()
+    marker = label_effect_marker()
+    operation = operation("sync.issue", :effect_pending, marker)
+
+    options =
+      options(operation,
+        context: fn ^operation -> {:ok, context(marker)} end,
+        label_observe: fn 10, 101 -> {:ok, label_projection()} end,
+        get_label: fn _, _, _, "bug", _ -> {:error, Error.new(:not_found)} end,
+        conflict: fn ^operation, @now, "ambiguous_label_create", @base, local, %{} ->
+          assert local == marker["proposed_snapshot"]
+          send(parent, :label_conflicted)
+          {:ok, :conflicted}
+        end,
+        create_label: fn _, _, _, _, _ ->
+          flunk("missing recovery label was blindly recreated")
+        end
+      )
+
+    assert {:ok, :conflicted} = IssueSyncWorker.process_operation(operation, @now, options)
+    assert_received :label_conflicted
+  end
+
+  test "an unmapped remote label is imported and mapped one claim before issue apply" do
+    parent = self()
+    operation = operation("sync.issue", :processing)
+
+    options =
+      options(operation,
+        local_observe: fn _ -> {:ok, local_issue(@base, 3)} end,
+        get_issue: fn _, _, _, _, _ ->
+          {:ok,
+           github_issue(@base,
+             labels: [github_label(41, "bug")],
+             assignees: [github_user(21, "base")]
+           )}
+        end,
+        remote_relationships: fn _sync, _raw, _now ->
+          {:label_required,
+           %{
+             direction: :remote,
+             github_object_id: 41,
+             github_node_id: "L_41",
+             snapshot: %{"name" => "bug", "color" => "aabbcc", "description" => "Fix"}
+           }}
+        end,
+        confirm_label: fn ^operation, @now, expected, confirmation, domain_request ->
+          assert expected.github_object_id == 41
+          assert expected.local_label_id == nil
+          assert confirmation.github_node_id == "L_41"
+          assert domain_request.action == :import
+          assert domain_request.fields == confirmation.confirmed_snapshot
+          send(parent, :remote_label_imported)
+          {:ok, %{operation: %{operation | state: :pending}}}
+        end,
+        confirm: fn _, _, _, _, _ -> flunk("issue confirmed before label import") end
+      )
+
+    assert {:ok, %{operation: %MirrorOperation{state: :pending}}} =
+             IssueSyncWorker.process_operation(operation, @now, options)
+
+    assert_received :remote_label_imported
+  end
+
+  test "an incompatible local label namespace records a visible conflict for a remote label" do
+    parent = self()
+    operation = operation("sync.issue", :processing)
+    remote_snapshot = %{"name" => "bug", "color" => "aabbcc", "description" => "Fix"}
+
+    options =
+      options(operation,
+        local_observe: fn _ -> {:ok, local_issue(@base, 3)} end,
+        get_issue: fn _, _, _, _, _ -> {:ok, github_issue(@base)} end,
+        remote_relationships: fn _sync, _raw, _now ->
+          {:label_required,
+           %{
+             direction: :remote,
+             github_object_id: 41,
+             github_node_id: "L_41",
+             snapshot: remote_snapshot
+           }}
+        end,
+        confirm_label: fn ^operation, @now, expected, _confirmation, domain_request ->
+          assert expected.expected_local_fingerprint == nil
+          assert domain_request.action == :import
+          {:error, :namespace_collision}
+        end,
+        conflict: fn ^operation,
+                     @now,
+                     "label_namespace_collision",
+                     @base,
+                     %{},
+                     ^remote_snapshot ->
+          send(parent, :label_namespace_conflicted)
+          {:ok, :conflicted}
+        end,
+        confirm: fn _, _, _, _, _ -> flunk("issue confirmed through a label collision") end
+      )
+
+    assert {:ok, :conflicted} = IssueSyncWorker.process_operation(operation, @now, options)
+    assert_received :label_namespace_conflicted
+  end
+
   test "a reconciliation claim fetches and records exactly one provider page" do
     parent = self()
     operation = reconciliation_operation("reconcile.repository.issues")
@@ -651,6 +861,7 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
       local_observe: fn _ -> {:ok, local_issue(@base, 3)} end,
       get_issue: fn _, _, _, _, _ -> {:ok, github_issue(@base)} end,
       get_comment: fn _, _, _, _, _ -> {:error, Error.new(:not_found)} end,
+      get_repository: fn _, _, _, _ -> flunk("unexpected repository access proof") end,
       list_issues: fn _, _, _, _, _, _ -> {:ok, %{issues: [], next_cursor: nil}} end,
       list_comments: fn _, _, _, _, _, _ -> {:ok, %{comments: [], next_cursor: nil}} end,
       remote_relationships: fn _context, raw, _now ->
@@ -686,6 +897,11 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
       create_comment: fn _, _, _, _, _, _ -> flunk("unexpected comment create") end,
       update_comment: fn _, _, _, _, _, _ -> flunk("unexpected comment update") end,
       delete_comment: fn _, _, _, _, _ -> flunk("unexpected comment delete") end,
+      get_label: fn _, _, _, _, _ -> flunk("unexpected label lookup") end,
+      create_label: fn _, _, _, _, _ -> flunk("unexpected label create") end,
+      label_observe: fn _, _ -> flunk("unexpected label observation") end,
+      mark_label_effect: fn _, _, _, _, _ -> flunk("unexpected label effect") end,
+      confirm_label: fn _, _, _, _, _ -> flunk("unexpected label confirmation") end,
       confirm: fn _, _, _, _, _ -> {:ok, :confirmed} end,
       conflict: fn _, _, _, _, _, _ -> {:ok, :conflicted} end,
       record_page: fn _, _, _, _, _ -> flunk("unexpected reconciliation page") end,
@@ -727,6 +943,7 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
         repository_id: 10,
         repository_mirror_id: 3,
         github_installation_id: 44,
+        github_repository_id: 900,
         remote_owner: "acme",
         remote_repository: "project",
         local_resource_id: 100,
@@ -852,6 +1069,53 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
   end
 
   defp github_label(id, name), do: %{"id" => id, "node_id" => "L_#{id}", "name" => name}
+
+  defp local_label_candidate do
+    %{
+      direction: :local,
+      local_label_id: 101,
+      local_version: 1,
+      snapshot: %{"name" => "bug", "color" => "aabbcc", "description" => "Fix"}
+    }
+  end
+
+  defp label_projection do
+    %{
+      repository_id: 10,
+      resource_kind: :label,
+      local_resource_id: 101,
+      local_resource_type: "ForgeIssues.Label",
+      local_version: 1,
+      fields: local_label_candidate().snapshot
+    }
+  end
+
+  defp github_label_resource do
+    %{
+      "id" => 41,
+      "node_id" => "L_41",
+      "name" => "bug",
+      "color" => "aabbcc",
+      "description" => "Fix"
+    }
+  end
+
+  defp label_effect_marker do
+    snapshot = local_label_candidate().snapshot
+
+    %{
+      "v" => 1,
+      "action" => "create_remote_label",
+      "resource_kind" => "label",
+      "local_label_id" => 101,
+      "expected_local_version" => 1,
+      "expected_local_fingerprint" => fingerprint(snapshot),
+      "expected_remote_absent" => true,
+      "label_name" => "bug",
+      "proposed_fingerprint" => fingerprint(snapshot),
+      "proposed_snapshot" => snapshot
+    }
+  end
 
   defp github_user(id, login),
     do: %{"id" => id, "node_id" => "U_#{id}", "login" => login}

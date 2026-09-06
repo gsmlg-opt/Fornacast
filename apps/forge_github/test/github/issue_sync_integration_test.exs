@@ -153,6 +153,85 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
     assert [%{origin: :fornacast}] = issue_events(ctx)
   end
 
+  test "a local label is created under a durable marker before the issue relationship is sent",
+       ctx do
+    labels = ForgeIssues.list_labels(ctx.repository)
+    label = Enum.find(labels, &(&1.name == "bug"))
+    assert label
+
+    assert {:ok, _} =
+             ForgeIssues.update(
+               ctx.owner,
+               ctx.owner_slug,
+               ctx.repository.slug,
+               7,
+               %{labels: [label.name]},
+               %{}
+             )
+
+    now = DateTime.utc_now(:second)
+    id = dispatch_issue_event(ctx, "local-label", now)
+    operation = claim(id, now)
+
+    remote_label = %{
+      "id" => 444,
+      "node_id" => "LA_444",
+      "name" => label.name,
+      "color" => label.color,
+      "description" => label.description
+    }
+
+    Req.Test.expect(ctx.stub, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/repos/acme/project/labels/bug"
+      conn |> Plug.Conn.put_status(404) |> Req.Test.json(%{"message" => "Not Found"})
+    end)
+
+    Req.Test.expect(ctx.stub, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/repos/acme/project/labels"
+
+      assert %{
+               state: :effect_pending,
+               external_effect_marker: %{"action" => "create_remote_label"}
+             } =
+               Repo.get!(MirrorOperation, id)
+
+      conn |> Plug.Conn.put_status(201) |> Req.Test.json(remote_label)
+    end)
+
+    assert {:ok, _} = IssueSyncWorker.process_operation(operation, now, options(ctx))
+    assert %{state: :pending, external_effect_marker: nil} = Repo.get!(MirrorOperation, id)
+
+    assert %{local_resource_id: local_id, confirmed_local_version: 1} =
+             Repo.get_by!(MirrorResourceState,
+               repository_mirror_id: ctx.binding.id,
+               resource_kind: :label,
+               github_object_id: 444
+             )
+
+    assert local_id == label.id
+
+    operation = claim(id, now)
+
+    Req.Test.expect(ctx.stub, fn conn ->
+      assert conn.method == "GET"
+      Req.Test.json(conn, issue_json(@base, @source_time))
+    end)
+
+    target = Map.put(@base, "label_github_ids", [444])
+
+    Req.Test.expect(ctx.stub, fn conn ->
+      assert conn.method == "PATCH"
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert JSON.decode!(body)["labels"] == ["bug"]
+      Req.Test.json(conn, Map.put(issue_json(target, now), "labels", [remote_label]))
+    end)
+
+    assert {:ok, _} = IssueSyncWorker.process_operation(operation, now, options(ctx))
+    assert_confirmed(ctx, operation, target, 2)
+  end
+
   test "local edits during the provider write survive confirmation of the proven older common base",
        ctx do
     target = Map.put(@base, "body", "Sent local edit")
@@ -200,19 +279,48 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
   test "a previously unmapped GitHub issue creates a local identity and permanent mapping together",
        ctx do
     now = DateTime.utc_now(:second)
-    target = Map.put(@base, "title", "New GitHub issue")
+    target = @base |> Map.put("title", "New GitHub issue") |> Map.put("label_github_ids", [333])
     operation = remote_operation(ctx, now, 701, 8)
 
-    Req.Test.expect(ctx.stub, fn conn ->
+    Req.Test.expect(ctx.stub, 2, fn conn ->
       assert conn.method == "GET"
       assert conn.request_path == "/repos/acme/project/issues/8"
 
       Req.Test.json(
         conn,
-        Map.merge(issue_json(target, now), %{"id" => 701, "node_id" => "I_701", "number" => 8})
+        Map.merge(issue_json(target, now), %{
+          "id" => 701,
+          "node_id" => "I_701",
+          "number" => 8,
+          "labels" => [
+            %{
+              "id" => 333,
+              "node_id" => "LA_333",
+              "name" => "remote-new-label",
+              "color" => "aabbcc",
+              "description" => "Imported with issue"
+            }
+          ]
+        })
       )
     end)
 
+    assert {:ok, _} = IssueSyncWorker.process_operation(operation, now, options(ctx))
+
+    assert %{state: :pending} = Repo.get!(MirrorOperation, operation.id)
+
+    label_mapping =
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: ctx.binding.id,
+        resource_kind: :label,
+        github_object_id: 333
+      )
+
+    assert Repo.get!(ForgeIssues.Label, label_mapping.local_resource_id).name ==
+             "remote-new-label"
+
+    assert label_mapping.confirmed_local_version == 1
+    operation = claim(operation.id, now)
     assert {:ok, _} = IssueSyncWorker.process_operation(operation, now, options(ctx))
 
     mapping =
@@ -288,79 +396,122 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
              )
   end
 
-  test "a mapped remote comment deletion atomically retains its tombstone and emits no echo",
-       ctx do
-    identity = Repo.get!(ForgeAccounts.GitHubIdentity, ctx.issue.author_github_identity_id)
+  for access <- [:confirmed, :denied, :wrong_repository] do
+    @tag deletion_access: access
+    test "mapped comment deletion requires repository access proof: #{access}", ctx do
+      access = ctx.deletion_access
+      identity = Repo.get!(ForgeAccounts.GitHubIdentity, ctx.issue.author_github_identity_id)
 
-    {:ok, %{comment: comment}} =
-      Multi.new()
-      |> ForgeIssues.import_comment_multi(:comment, ctx.issue, identity, %{
-        "body" => "Original comment",
-        "inserted_at" => @source_time,
-        "updated_at" => @source_time
-      })
-      |> Repo.transaction()
+      {:ok, %{comment: comment}} =
+        Multi.new()
+        |> ForgeIssues.import_comment_multi(:comment, ctx.issue, identity, %{
+          "body" => "Original comment",
+          "inserted_at" => @source_time,
+          "updated_at" => @source_time
+        })
+        |> Repo.transaction()
 
-    snapshot = %{"body" => comment.body}
-    {:ok, fingerprint} = ForgeMirrors.resource_fingerprint(snapshot)
+      snapshot = %{"body" => comment.body}
+      {:ok, fingerprint} = ForgeMirrors.resource_fingerprint(snapshot)
 
-    mapping =
-      %MirrorResourceState{}
-      |> MirrorResourceState.persistence_changeset(%{
-        repository_mirror_id: ctx.binding.id,
-        resource_kind: :issue_comment,
-        local_resource_type: "ForgeIssues.Comment",
-        local_resource_id: comment.id,
-        github_object_id: 900,
-        github_node_id: "IC_900",
-        github_number: 7,
-        confirmed_snapshot: snapshot,
-        confirmed_fingerprint: fingerprint,
-        confirmed_local_version: 1,
-        confirmed_remote_updated_at: @source_time,
-        state: :confirmed
-      })
-      |> Repo.insert!()
+      mapping =
+        %MirrorResourceState{}
+        |> MirrorResourceState.persistence_changeset(%{
+          repository_mirror_id: ctx.binding.id,
+          resource_kind: :issue_comment,
+          local_resource_type: "ForgeIssues.Comment",
+          local_resource_id: comment.id,
+          github_object_id: 900,
+          github_node_id: "IC_900",
+          github_number: 7,
+          confirmed_snapshot: snapshot,
+          confirmed_fingerprint: fingerprint,
+          confirmed_local_version: 1,
+          confirmed_remote_updated_at: @source_time,
+          state: :confirmed
+        })
+        |> Repo.insert!()
 
-    now = DateTime.utc_now(:second)
+      now = DateTime.utc_now(:second)
 
-    operation =
-      operation_fixture(ctx.organization, %{
-        repository_mirror_id: ctx.binding.id,
-        kind: "sync.issue_comment",
-        cursor: %{
-          "trigger" => "remote",
-          "resource_kind" => "issue_comment",
-          "github_object_id" => 900,
-          "github_issue_id" => 700,
-          "github_number" => 7,
-          "delivery_guid" => "deleted-comment-delivery"
-        },
-        next_attempt_at: now
-      })
+      operation =
+        operation_fixture(ctx.organization, %{
+          repository_mirror_id: ctx.binding.id,
+          kind: "sync.issue_comment",
+          cursor: %{
+            "trigger" => "remote",
+            "resource_kind" => "issue_comment",
+            "github_object_id" => 900,
+            "github_issue_id" => 700,
+            "github_number" => 7,
+            "delivery_guid" => "deleted-comment-delivery"
+          },
+          next_attempt_at: now
+        })
 
-    operation = claim(operation.id, now, "sync.issue_comment")
+      operation = claim(operation.id, now, "sync.issue_comment")
 
-    Req.Test.expect(ctx.stub, fn conn ->
-      assert conn.method == "GET"
-      assert conn.request_path == "/repos/acme/project/issues/comments/900"
-      conn |> Plug.Conn.put_status(404) |> Req.Test.json(%{"message" => "Not Found"})
-    end)
+      Req.Test.expect(ctx.stub, fn conn ->
+        assert conn.method == "GET"
+        assert conn.request_path == "/repos/acme/project/issues/comments/900"
+        conn |> Plug.Conn.put_status(404) |> Req.Test.json(%{"message" => "Not Found"})
+      end)
 
-    assert {:ok, _} = IssueSyncWorker.process_operation(operation, now, options(ctx))
-    assert Repo.get(ForgeIssues.Comment, comment.id) == nil
+      Req.Test.expect(ctx.stub, fn conn ->
+        assert conn.method == "GET"
+        assert conn.request_path == "/repos/acme/project"
 
-    assert %{state: :completed, external_effect_marker: nil} =
-             Repo.get!(MirrorOperation, operation.id)
+        if access == :denied do
+          conn |> Plug.Conn.put_status(404) |> Req.Test.json(%{"message" => "Not Found"})
+        else
+          id = ctx.binding.github_repository_id + if(access == :wrong_repository, do: 1, else: 0)
 
-    assert %{state: :deleted, confirmed_local_version: 2} =
-             Repo.get!(MirrorResourceState, mapping.id)
+          Req.Test.json(conn, %{
+            "id" => id,
+            "node_id" => "R_#{id}",
+            "name" => "project",
+            "full_name" => "acme/project",
+            "owner" => %{"id" => 42, "login" => "acme"},
+            "visibility" => "private",
+            "default_branch" => "main",
+            "has_issues" => true,
+            "allow_merge_commit" => true,
+            "fork" => false,
+            "archived" => false
+          })
+        end
+      end)
 
-    assert %{origin: :github, event_type: "issue_comment.deleted"} =
-             Repo.get_by!(DomainOutboxEvent,
-               aggregate_type: "issue_comment",
-               aggregate_id: to_string(comment.id)
-             )
+      result = IssueSyncWorker.process_operation(operation, now, options(ctx))
+
+      if access == :confirmed do
+        assert {:ok, _} = result
+        assert Repo.get(ForgeIssues.Comment, comment.id) == nil
+
+        assert %{state: :completed, external_effect_marker: nil} =
+                 Repo.get!(MirrorOperation, operation.id)
+
+        assert %{state: :deleted, confirmed_local_version: 2} =
+                 Repo.get!(MirrorResourceState, mapping.id)
+
+        assert %{origin: :github, event_type: "issue_comment.deleted"} =
+                 Repo.get_by!(DomainOutboxEvent,
+                   aggregate_type: "issue_comment",
+                   aggregate_id: to_string(comment.id)
+                 )
+      else
+        assert {:ok, %{state: :failed}} = result
+        assert Repo.get!(ForgeIssues.Comment, comment.id).body == "Original comment"
+        assert Repo.get!(MirrorResourceState, mapping.id).state == :confirmed
+
+        refute Repo.exists?(
+                 from e in DomainOutboxEvent,
+                   where:
+                     e.aggregate_type == "issue_comment" and
+                       e.aggregate_id == ^to_string(comment.id)
+               )
+      end
+    end
   end
 
   defp remote_operation(ctx, now, github_id \\ 700, number \\ 7) do
@@ -435,6 +586,27 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
       end,
       get_comment: fn token, owner, repository, id, opts ->
         IssueClient.get_comment(token, owner, repository, id, transport_options(ctx, opts))
+      end,
+      get_repository: fn token, owner, repository, opts ->
+        ForgeGitHub.Client.repository(token, owner, repository, transport_options(ctx, opts))
+      end,
+      get_label: fn token, owner, repository, name, opts ->
+        ForgeGitHub.LabelClient.get_label(
+          token,
+          owner,
+          repository,
+          name,
+          transport_options(ctx, opts)
+        )
+      end,
+      create_label: fn token, owner, repository, attrs, opts ->
+        ForgeGitHub.LabelClient.create_label(
+          token,
+          owner,
+          repository,
+          attrs,
+          transport_options(ctx, opts)
+        )
       end,
       update_issue: fn token, owner, repository, number, attrs, opts ->
         IssueClient.update_issue(

@@ -9,7 +9,15 @@ defmodule ForgeGitHub.IssueSyncWorker do
 
   use GenServer
 
-  alias ForgeGitHub.{Error, InstallationToken, InstallationTokenBroker, IssueClient}
+  alias ForgeGitHub.{
+    Client,
+    Error,
+    InstallationToken,
+    InstallationTokenBroker,
+    IssueClient,
+    LabelClient
+  }
+
   alias ForgeGitHub.IssueSyncProjection
   alias ForgeMirrors.{CorrelationMarker, MirrorOperation, ResourceDecision}
 
@@ -41,6 +49,10 @@ defmodule ForgeGitHub.IssueSyncWorker do
     :remote_relationships,
     :get_issue,
     :get_comment,
+    :get_repository,
+    :get_label,
+    :create_label,
+    :label_observe,
     :list_issues,
     :list_comments,
     :create_issue,
@@ -49,9 +61,11 @@ defmodule ForgeGitHub.IssueSyncWorker do
     :update_comment,
     :delete_comment,
     :mark_effect,
+    :mark_label_effect,
     :replace_effect,
     :checkpoint,
     :confirm,
+    :confirm_label,
     :conflict,
     :record_page,
     :retry,
@@ -159,16 +173,11 @@ defmodule ForgeGitHub.IssueSyncWorker do
   def process_operation(%MirrorOperation{kind: kind} = operation, %DateTime{} = now, options)
       when kind in @resource_kinds do
     with {:ok, sync} <- context(operation, options),
-         {:ok, token} <- installation_token(sync, options),
-         {:ok, local} <- local_observation(sync, options) do
-      if create_effect?(operation, sync) do
-        recover_create(operation, now, sync, token, local, options)
+         {:ok, token} <- installation_token(sync, options) do
+      if label_effect?(operation, sync) do
+        recover_label_effect(operation, now, sync, token, options)
       else
-        with {:ok, remote} <- remote_observation(sync, token, now, options) do
-          continue_after_observation(operation, now, sync, token, local, remote, options)
-        else
-          {:error, reason} -> persist_failure(operation, now, reason, options)
-        end
+        continue_resource_operation(operation, now, sync, token, options)
       end
     else
       {:error, reason} -> persist_failure(operation, now, reason, options)
@@ -181,6 +190,36 @@ defmodule ForgeGitHub.IssueSyncWorker do
 
   def process_operation(%MirrorOperation{} = operation, %DateTime{} = now, options),
     do: persist_failure(operation, now, :unsupported_operation, options)
+
+  defp continue_resource_operation(operation, now, sync, token, options) do
+    case local_observation(sync, options) do
+      {:ok, local} ->
+        if create_effect?(operation, sync) do
+          recover_create(operation, now, sync, token, local, options)
+        else
+          continue_with_local(operation, now, sync, token, local, options)
+        end
+
+      {:label_required, candidate} ->
+        materialize_label(operation, now, sync, token, candidate, options)
+
+      {:error, reason} ->
+        persist_failure(operation, now, reason, options)
+    end
+  end
+
+  defp continue_with_local(operation, now, sync, token, local, options) do
+    case remote_observation(sync, token, now, options) do
+      {:ok, remote} ->
+        continue_after_observation(operation, now, sync, token, local, remote, options)
+
+      {:label_required, candidate} ->
+        materialize_label(operation, now, sync, token, candidate, options)
+
+      {:error, reason} ->
+        persist_failure(operation, now, reason, options)
+    end
+  end
 
   @impl true
   def init(options) do
@@ -253,20 +292,24 @@ defmodule ForgeGitHub.IssueSyncWorker do
              sync.repository_id,
              sync.resource_kind,
              sync.local_resource_id
-           ),
-         {:ok, relationships} <-
-           ForgeMirrors.resolve_issue_relationships(
+           ) do
+      case ForgeMirrors.resolve_issue_relationships(
              sync.repository_mirror_id,
              :local,
              projection.label_ids,
              projection.assignee_refs
            ) do
-      IssueSyncProjection.from_local(projection, relationships)
+        {:ok, relationships} ->
+          IssueSyncProjection.from_local(projection, relationships)
+
+        {:error, {:unmapped_label, candidate}} ->
+          {:label_required, candidate}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
-
-  defp remote_observation(%{remote_deleted: true}, _token, _now, _options),
-    do: {:ok, :deleted}
 
   defp remote_observation(%{resource_kind: :issue, github_number: nil}, _token, _now, _options),
     do: {:ok, :missing}
@@ -312,45 +355,62 @@ defmodule ForgeGitHub.IssueSyncWorker do
         request_options(sync)
       )
 
-    decode_remote(result, sync, now, nil, options)
-  end
-
-  defp decode_remote({:ok, raw}, sync, now, correlation_id, options) do
-    with :ok <- validate_remote_identity(raw, sync),
-         {:ok, relationships} <- remote_relationships(sync, raw, now, options) do
-      case sync.resource_kind do
-        :issue ->
-          IssueSyncProjection.from_remote_issue(raw, relationships, correlation_id)
-
-        :issue_comment ->
-          IssueSyncProjection.from_remote_comment(raw, relationships, correlation_id)
-      end
+    case result do
+      {:error, %Error{kind: :not_found}} -> verify_repository_access(sync, token, options)
+      _other -> decode_remote(result, sync, now, nil, options)
     end
   end
 
-  defp decode_remote(
-         {:error, %Error{kind: :not_found}},
-         %{remote_deleted: true},
-         _now,
-         _id,
-         _opts
-       ),
-       do: {:ok, :deleted}
+  defp decode_remote({:ok, raw}, sync, now, correlation_id, options) do
+    with :ok <- validate_remote_identity(raw, sync) do
+      case remote_relationships(sync, raw, now, options) do
+        {:ok, relationships} ->
+          case sync.resource_kind do
+            :issue ->
+              IssueSyncProjection.from_remote_issue(raw, relationships, correlation_id)
 
-  defp decode_remote(
-         {:error, %Error{kind: :not_found}},
-         %{resource_kind: :issue_comment, github_object_id: id},
-         _now,
-         _correlation_id,
-         _options
-       )
-       when is_integer(id) and id > 0,
-       do: {:ok, :deleted}
+            :issue_comment ->
+              IssueSyncProjection.from_remote_comment(raw, relationships, correlation_id)
+          end
+
+        {:label_required, candidate} ->
+          {:label_required, candidate}
+
+        {:error, {:unmapped_label, candidate}} ->
+          {:label_required, candidate}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
 
   defp decode_remote({:error, %Error{} = error}, _sync, _now, _id, _options),
     do: {:error, error}
 
   defp decode_remote(_result, _sync, _now, _id, _options),
+    do: {:error, :invalid_remote_resource}
+
+  defp verify_repository_access(
+         %{github_repository_id: expected_id} = sync,
+         token,
+         options
+       )
+       when is_integer(expected_id) and expected_id > 0 do
+    case callback(options, :get_repository, &Client.repository/4).(
+           token,
+           sync.remote_owner,
+           sync.remote_repository,
+           request_options(sync)
+         ) do
+      {:ok, %{id: ^expected_id}} -> {:ok, :deleted}
+      {:ok, _mismatched_repository} -> {:error, :invalid_remote_resource}
+      {:error, reason} -> {:error, reason}
+      _invalid -> {:error, :invalid_remote_resource}
+    end
+  end
+
+  defp verify_repository_access(_sync, _token, _options),
     do: {:error, :invalid_remote_resource}
 
   defp remote_relationships(sync, raw, now, options) do
@@ -362,15 +422,17 @@ defmodule ForgeGitHub.IssueSyncWorker do
     assignees = if sync.resource_kind == :issue, do: raw["assignees"], else: []
 
     with {:ok, author} <- observe_author(raw["user"], now),
-         {:ok, observed_assignees} <- observe_assignees(assignees, now),
-         {:ok, relationships} <-
-           ForgeMirrors.resolve_issue_relationships(
+         {:ok, observed_assignees} <- observe_assignees(assignees, now) do
+      case ForgeMirrors.resolve_issue_relationships(
              sync.repository_mirror_id,
              :remote,
              labels,
              observed_assignees
            ) do
-      {:ok, Map.put(relationships, :author, author)}
+        {:ok, relationships} -> {:ok, Map.put(relationships, :author, author)}
+        {:error, {:unmapped_label, candidate}} -> {:label_required, candidate}
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
 
@@ -401,6 +463,457 @@ defmodule ForgeGitHub.IssueSyncWorker do
   end
 
   defp observe_assignees(_assignees, _now), do: {:error, :invalid_remote_resource}
+
+  defp materialize_label(operation, now, sync, token, candidate, options) do
+    with {:ok, candidate} <- normalize_label_candidate(candidate),
+         {:ok, candidate} <- put_label_fingerprint(candidate, options) do
+      case candidate.direction do
+        :local -> materialize_local_label(operation, now, sync, token, candidate, options)
+        :remote -> confirm_label_mapping(operation, now, sync, candidate, nil, options)
+      end
+    else
+      {:error, reason} -> persist_failure(operation, now, reason, options)
+    end
+  end
+
+  defp materialize_local_label(operation, now, sync, token, candidate, options) do
+    case callback(options, :get_label, &LabelClient.get_label/5).(
+           token,
+           sync.remote_owner,
+           sync.remote_repository,
+           candidate.snapshot["name"],
+           request_options(sync)
+         ) do
+      {:ok, raw} ->
+        with {:ok, remote} <- provider_label(raw) do
+          if remote.snapshot == candidate.snapshot do
+            confirm_label_mapping(operation, now, sync, candidate, remote, options)
+          else
+            label_conflict(
+              operation,
+              now,
+              sync,
+              :label_namespace_collision,
+              candidate.snapshot,
+              remote.snapshot,
+              options
+            )
+          end
+        else
+          {:error, reason} -> persist_failure(operation, now, reason, options)
+        end
+
+      {:error, %Error{kind: :not_found}} ->
+        create_local_label(operation, now, sync, token, candidate, options)
+
+      {:error, reason} ->
+        persist_failure(operation, now, reason, options)
+
+      _invalid ->
+        persist_failure(operation, now, :invalid_remote_resource, options)
+    end
+  end
+
+  defp create_local_label(operation, now, sync, token, candidate, options) do
+    with {:ok, marker} <- label_effect_marker(candidate, options),
+         expected <- label_expected(candidate, nil),
+         domain_request <- label_domain_request(sync, operation, candidate),
+         {:ok, %{operation: marked}} <-
+           callback(
+             options,
+             :mark_label_effect,
+             &default_mark_label_effect/5
+           ).(operation, now, expected, marker, domain_request) do
+      case callback(options, :create_label, &LabelClient.create_label/5).(
+             token,
+             sync.remote_owner,
+             sync.remote_repository,
+             candidate.snapshot,
+             request_options(sync)
+           ) do
+        {:ok, raw} ->
+          with {:ok, remote} <- provider_label(raw) do
+            if remote.snapshot == candidate.snapshot do
+              confirm_label_mapping(marked, now, sync, candidate, remote, options)
+            else
+              label_conflict(
+                marked,
+                now,
+                sync,
+                :ambiguous_label_create,
+                candidate.snapshot,
+                remote.snapshot,
+                options
+              )
+            end
+          else
+            {:error, reason} -> schedule_effect_recovery(marked, now, reason, options)
+          end
+
+        {:error, reason} ->
+          schedule_effect_recovery(marked, now, reason, options)
+
+        _invalid ->
+          schedule_effect_recovery(marked, now, :invalid_remote_resource, options)
+      end
+    else
+      {:error, reason} -> persist_failure(operation, now, reason, options)
+    end
+  end
+
+  defp recover_label_effect(operation, now, sync, token, options) do
+    marker = operation.external_effect_marker
+
+    with {:ok, projection} <-
+           callback(options, :label_observe, &ForgeIssues.label_sync_projection/2).(
+             sync.repository_id,
+             marker["local_label_id"]
+           ),
+         {:ok, candidate} <- label_candidate_from_projection(projection),
+         {:ok, candidate} <- put_label_fingerprint(candidate, options),
+         :ok <- validate_label_effect_marker(marker, sync, candidate, options) do
+      case callback(options, :get_label, &LabelClient.get_label/5).(
+             token,
+             sync.remote_owner,
+             sync.remote_repository,
+             marker["label_name"],
+             request_options(sync)
+           ) do
+        {:ok, raw} ->
+          with {:ok, remote} <- provider_label(raw) do
+            if remote.snapshot == candidate.snapshot do
+              confirm_label_mapping(operation, now, sync, candidate, remote, options)
+            else
+              label_conflict(
+                operation,
+                now,
+                sync,
+                :ambiguous_label_create,
+                candidate.snapshot,
+                remote.snapshot,
+                options
+              )
+            end
+          else
+            {:error, reason} -> schedule_effect_recovery(operation, now, reason, options)
+          end
+
+        {:error, %Error{kind: :not_found}} ->
+          label_conflict(
+            operation,
+            now,
+            sync,
+            :ambiguous_label_create,
+            candidate.snapshot,
+            %{},
+            options
+          )
+
+        {:error, reason} ->
+          schedule_effect_recovery(operation, now, reason, options)
+
+        _invalid ->
+          schedule_effect_recovery(operation, now, :invalid_remote_resource, options)
+      end
+    else
+      {:error, reason} ->
+        label_conflict(operation, now, sync, reason, %{}, %{}, options)
+    end
+  end
+
+  defp confirm_label_mapping(operation, now, sync, candidate, remote, options) do
+    expected = label_expected(candidate, operation.external_effect_marker)
+    confirmation = label_confirmation(candidate, remote)
+    domain_request = label_domain_request(sync, operation, candidate)
+
+    case callback(options, :confirm_label, &default_confirm_label/5).(
+           operation,
+           now,
+           expected,
+           confirmation,
+           domain_request
+         ) do
+      {:error, reason} when reason in [:namespace_collision, :label_normalization_conflict] ->
+        {local, remote} = label_conflict_snapshots(candidate)
+
+        label_conflict(
+          operation,
+          now,
+          sync,
+          :label_namespace_collision,
+          local,
+          remote,
+          options
+        )
+
+      {:error, reason} ->
+        persist_failure(
+          operation,
+          now,
+          reason,
+          options,
+          preserve_effect?: operation.state == :effect_pending
+        )
+
+      result ->
+        result
+    end
+  end
+
+  defp default_mark_label_effect(operation, now, expected, marker, domain_request) do
+    ForgeMirrors.mark_label_effect_for_resource_operation(
+      operation,
+      now,
+      expected,
+      marker,
+      label_domain_multi(domain_request)
+    )
+  end
+
+  defp default_confirm_label(operation, now, expected, confirmation, domain_request) do
+    ForgeMirrors.confirm_label_for_resource_operation(
+      operation,
+      now,
+      expected,
+      confirmation,
+      label_domain_multi(domain_request)
+    )
+  end
+
+  defp label_domain_multi(%{action: :observe} = request),
+    do: &ForgeIssues.append_sync_label_observe(&1, :resource, Map.delete(request, :action))
+
+  defp label_domain_multi(%{action: :import} = request),
+    do: &ForgeIssues.append_sync_label_import(&1, :resource, Map.delete(request, :action))
+
+  defp label_domain_request(sync, _operation, %{direction: :local} = candidate) do
+    %{
+      action: :observe,
+      repository_id: sync.repository_id,
+      local_resource_id: candidate.local_label_id,
+      expected_local_version: candidate.local_version,
+      expected_fields: candidate.snapshot
+    }
+  end
+
+  defp label_domain_request(sync, operation, %{direction: :remote} = candidate) do
+    %{
+      action: :import,
+      repository_id: sync.repository_id,
+      fields: candidate.snapshot,
+      provenance: resource_provenance(sync, operation)
+    }
+  end
+
+  defp resource_provenance(sync, operation) do
+    %{
+      origin: :github,
+      causation_id:
+        sync.provenance.delivery_guid || sync.provenance.outbox_event_id ||
+          "mirror-operation:#{operation.id}",
+      correlation_id: sync.provenance.correlation_id || "mirror-operation:#{operation.id}"
+    }
+  end
+
+  defp label_expected(candidate, effect_marker) do
+    %{
+      resource_state_lock_version: :missing,
+      local_label_id: candidate[:local_label_id],
+      expected_local_version: candidate[:local_version],
+      expected_local_fingerprint:
+        if(candidate.direction == :local, do: candidate[:fingerprint], else: nil),
+      github_object_id: candidate[:github_object_id],
+      effect_marker: effect_marker
+    }
+  end
+
+  defp label_confirmation(%{direction: :local}, remote) do
+    %{
+      github_object_id: remote.github_object_id,
+      github_node_id: remote.github_node_id,
+      confirmed_snapshot: remote.snapshot
+    }
+  end
+
+  defp label_confirmation(%{direction: :remote} = candidate, nil) do
+    %{
+      github_object_id: candidate.github_object_id,
+      github_node_id: candidate.github_node_id,
+      confirmed_snapshot: candidate.snapshot
+    }
+  end
+
+  defp label_effect_marker(candidate, options) do
+    with {:ok, fingerprint} <- fingerprint(candidate.snapshot, options) do
+      {:ok,
+       %{
+         "v" => 1,
+         "action" => "create_remote_label",
+         "resource_kind" => "label",
+         "local_label_id" => candidate.local_label_id,
+         "expected_local_version" => candidate.local_version,
+         "expected_local_fingerprint" => fingerprint,
+         "expected_remote_absent" => true,
+         "label_name" => candidate.snapshot["name"],
+         "proposed_fingerprint" => fingerprint,
+         "proposed_snapshot" => candidate.snapshot
+       }}
+    end
+  end
+
+  defp validate_label_effect_marker(marker, sync, candidate, options) do
+    with true <- sync.effect_marker == marker,
+         true <- marker["v"] == 1 and marker["action"] == "create_remote_label",
+         true <- marker["resource_kind"] == "label",
+         true <- marker["local_label_id"] == candidate.local_label_id,
+         true <- marker["expected_local_version"] == candidate.local_version,
+         true <- marker["expected_remote_absent"] == true,
+         true <- marker["label_name"] == candidate.snapshot["name"],
+         true <- marker["proposed_snapshot"] == candidate.snapshot,
+         {:ok, fingerprint} <- fingerprint(candidate.snapshot, options),
+         true <- marker["expected_local_fingerprint"] == fingerprint,
+         true <- marker["proposed_fingerprint"] == fingerprint do
+      :ok
+    else
+      _invalid -> {:error, :ambiguous_label_create}
+    end
+  end
+
+  defp label_effect?(
+         %MirrorOperation{state: :effect_pending, external_effect_marker: marker},
+         %{effect_marker: marker}
+       )
+       when is_map(marker),
+       do: marker["action"] == "create_remote_label" and marker["resource_kind"] == "label"
+
+  defp label_effect?(_operation, _sync), do: false
+
+  defp normalize_label_candidate(%{direction: :local} = candidate) do
+    with id when is_integer(id) and id > 0 <- candidate[:local_label_id],
+         version when is_integer(version) and version > 0 <- candidate[:local_version],
+         {:ok, snapshot} <- canonical_label_snapshot(candidate_snapshot(candidate)) do
+      {:ok, Map.merge(candidate, %{snapshot: snapshot, fingerprint: nil})}
+    else
+      _invalid -> {:error, :invalid_projection}
+    end
+  end
+
+  defp normalize_label_candidate(%{direction: :remote} = candidate) do
+    with id when is_integer(id) and id > 0 <- candidate[:github_object_id],
+         node_id when is_binary(node_id) and node_id != "" <- candidate[:github_node_id],
+         {:ok, snapshot} <- canonical_label_snapshot(candidate_snapshot(candidate)) do
+      {:ok, Map.merge(candidate, %{snapshot: snapshot, fingerprint: nil})}
+    else
+      _invalid -> {:error, :invalid_remote_resource}
+    end
+  end
+
+  defp normalize_label_candidate(%{local_label_id: _id} = candidate),
+    do: normalize_label_candidate(Map.put(candidate, :direction, :local))
+
+  defp normalize_label_candidate(%{github_object_id: _id, node_id: node_id} = candidate),
+    do:
+      candidate
+      |> Map.put(:direction, :remote)
+      |> Map.put(:github_node_id, node_id)
+      |> normalize_label_candidate()
+
+  defp normalize_label_candidate(_candidate), do: {:error, :invalid_projection}
+
+  defp label_candidate_from_projection(%{
+         repository_id: repository_id,
+         resource_kind: :label,
+         local_resource_id: id,
+         local_resource_type: "ForgeIssues.Label",
+         local_version: version,
+         fields: fields
+       })
+       when is_integer(repository_id) and repository_id > 0 do
+    normalize_label_candidate(%{
+      direction: :local,
+      local_label_id: id,
+      local_version: version,
+      snapshot: fields
+    })
+  end
+
+  defp label_candidate_from_projection(_projection), do: {:error, :invalid_projection}
+
+  defp put_label_fingerprint(candidate, options) do
+    with {:ok, fingerprint} <- fingerprint(candidate.snapshot, options) do
+      {:ok, Map.put(candidate, :fingerprint, fingerprint)}
+    end
+  end
+
+  defp provider_label(raw) when is_map(raw) do
+    with false <- raw["archived"] == true,
+         id when is_integer(id) and id > 0 <- raw["id"],
+         node_id when is_binary(node_id) and node_id != "" <- raw["node_id"],
+         {:ok, snapshot} <- canonical_label_snapshot(raw) do
+      {:ok, %{github_object_id: id, github_node_id: node_id, snapshot: snapshot}}
+    else
+      true -> {:error, :unsupported_resource}
+      _invalid -> {:error, :invalid_remote_resource}
+    end
+  end
+
+  defp provider_label(_raw), do: {:error, :invalid_remote_resource}
+
+  defp candidate_snapshot(%{snapshot: snapshot}), do: snapshot
+
+  defp candidate_snapshot(candidate) do
+    %{
+      "name" => candidate[:name],
+      "color" => candidate[:color],
+      "description" => candidate[:description]
+    }
+  end
+
+  defp canonical_label_snapshot(
+         %{"name" => name, "color" => color, "description" => description} = snapshot
+       )
+       when map_size(snapshot) >= 3 and is_binary(name) and is_binary(color) do
+    description =
+      if is_binary(description) and String.trim(description) == "", do: nil, else: description
+
+    color = String.downcase(color)
+
+    if valid_label_text?(name, 255) and String.trim(name) != "" and
+         Regex.match?(~r/\A[0-9a-f]{6}\z/, color) and
+         (is_nil(description) or valid_label_text?(description, 100)) do
+      {:ok, %{"name" => name, "color" => color, "description" => description}}
+    else
+      {:error, :invalid_projection}
+    end
+  end
+
+  defp canonical_label_snapshot(_snapshot), do: {:error, :invalid_projection}
+
+  defp valid_label_text?(value, maximum)
+       when is_binary(value) and byte_size(value) <= maximum * 4 do
+    String.valid?(value) and :binary.match(value, <<0>>) == :nomatch and
+      length(String.codepoints(value)) <= maximum
+  end
+
+  defp valid_label_text?(_value, _maximum), do: false
+
+  defp label_conflict_snapshots(%{direction: :local, snapshot: snapshot}),
+    do: {snapshot, %{}}
+
+  defp label_conflict_snapshots(%{direction: :remote, snapshot: snapshot}),
+    do: {%{}, snapshot}
+
+  defp label_conflict(operation, now, sync, kind, local, remote, options) do
+    conflict(
+      operation,
+      now,
+      sync,
+      kind,
+      %{snapshot: local},
+      %{snapshot: remote},
+      options
+    )
+  end
 
   defp continue_after_observation(operation, now, sync, token, local, remote, options) do
     case recorded_effect_condition(operation, sync, local, remote, options) do
