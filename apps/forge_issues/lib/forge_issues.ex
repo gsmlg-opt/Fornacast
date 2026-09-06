@@ -793,18 +793,12 @@ defmodule ForgeIssues do
   end
 
   defp mutation_capability(%ForgeAccounts.User{} = actor, repository, %Issue{} = issue) do
-    case local_author_user_id(issue) do
-      nil ->
-        {:error, :forbidden}
-
-      author_id ->
-        mutation_capability(
-          actor,
-          repository,
-          author_id,
-          repository_capability(actor, repository)
-        )
-    end
+    mutation_capability(
+      actor,
+      repository,
+      local_author_user_id(issue),
+      repository_capability(actor, repository)
+    )
   end
 
   defp mutation_capability(_actor, _repository, _issue), do: {:error, :forbidden}
@@ -818,20 +812,14 @@ defmodule ForgeIssues do
     do: {:error, :forbidden}
 
   defp authorize_comment_mutation(actor, repository, %Comment{} = comment) do
-    case local_author_user_id(comment) do
-      nil ->
-        {:error, :forbidden}
-
-      author_id ->
-        case comment_mutation_capability(
-               actor,
-               repository,
-               author_id,
-               repository_capability(actor, repository)
-             ) do
-          true -> :ok
-          false -> {:error, :forbidden}
-        end
+    case comment_mutation_capability(
+           actor,
+           repository,
+           local_author_user_id(comment),
+           repository_capability(actor, repository)
+         ) do
+      true -> :ok
+      false -> {:error, :forbidden}
     end
   end
 
@@ -1481,18 +1469,12 @@ defmodule ForgeIssues do
 
   defp comment_capabilities(actor, repository, comment, repository_capability) do
     allowed =
-      case local_author_user_id(comment) do
-        nil ->
-          false
-
-        author_id ->
-          comment_mutation_capability(
-            actor,
-            repository,
-            author_id,
-            repository_capability
-          )
-      end
+      comment_mutation_capability(
+        actor,
+        repository,
+        local_author_user_id(comment),
+        repository_capability
+      )
 
     %{can_edit: allowed, can_delete: allowed}
   end
