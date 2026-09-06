@@ -23,7 +23,7 @@ PR13–16 remain to be implemented and verified.
 | 10 | Divergence is visible and neither side overwritten | Conflict persistence/worker tests exist. Finish and verify conflict UX in PR16. |
 | 11 | LFS clone and checkout succeed from either endpoint after sync | Actual Fornacast smart-HTTP clone with official git-lfs 3.7.1 checks out 128 KiB with matching SHA-256. Existing official SSH LFS transfer coverage is also present. Remote endpoint plus full synchronization-to-clone chain remain unproven. |
 | 12 | Missing/corrupt LFS blocks confirmation and degrades sync | Focused worker, storage, durable 101-pointer replay, and authoritative-scan tests pass. Finalizer queue/catch-up review fixes are committed in `acedead`; retain the full integrated gate in final acceptance. |
-| 13 | Issue/comment changes converge both ways | PR12 in progress: scalar/set comparison, persisted snapshots, correlation-marker codec, transactional version/outbox producers (`b8c9ea7`) and bounded provider APIs (`ae19146`) pass focused tests. Consumer/webhook wiring is underway. Worker effects, mappings, correlation recovery, and integrated convergence remain open. |
+| 13 | Issue/comment changes converge both ways | PR12 in progress: scalar/set comparison, persisted snapshots, correlation-marker codec, transactional version/outbox producers (`b8c9ea7`), bounded provider APIs (`ae19146`), and consumer/webhook trigger retention (`7128612`) pass focused tests. Worker effects, mappings, correlation recovery, and integrated convergence remain open. |
 | 14 | Same-repository PR metadata converges both ways | PR13 remains open. Bootstrap import is not two-way synchronization. |
 | 15 | Coordinated PR merge produces one confirmed Git result | PR13 remains open; verify effect-boundary recovery, exact expected SHAs, and both resulting endpoints. |
 | 16 | Release metadata converges and stays bound to a confirmed tag | PR14–15 remain open. Existing scaffold is not proof of implementation. |
@@ -61,6 +61,21 @@ PR13–16 remain to be implemented and verified.
   issue/comment bodies survive ingress without expanding other field budgets.
   Metadata notifications still remain `pending_unsupported` until the resource
   worker is ready; direct processor wiring alone is not an enabled sync path.
+- Final consumer/webhook routing matrix: 71 passed (mirror retention/materializer
+  33, provider webhook processor/body 38). Tests cover forged routes, immutable
+  IDs, pull-vs-issue identity separation, bootstrap buffering, capabilities,
+  paused/conflicted retention, tombstones, and transactional enqueue before ack.
+- Conflict/baseline snapshot matrix: eight passed (`a876382`). Supported long
+  bodies now persist in all three conflict snapshots, with independent bounded
+  PostgreSQL enforcement. Resolution metadata retains its smaller limit.
+
+## Active PR12 integration work
+
+One resource worker, lease-checked atomic mirror confirmation, and trusted domain
+apply/observe APIs are being implemented together. Bootstrap handoff must seed
+the same canonical snapshot (including labels and known-identity assignees) and
+the actual local `sync_version`; its older timestamp-derived version and missing
+snapshot are not sufficient proof of a usable three-way baseline.
 - Compilation with warnings-as-errors and staged formatting checks passed for
   committed PR11. Existing importer test-support warnings
   are distinct from production compilation.
