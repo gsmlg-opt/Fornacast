@@ -97,12 +97,20 @@ The real tests cover outbound label creation before issue assignment, inbound
 unknown-label materialization before issue creation, and denied/mismatched
 repository access preserving comments when GitHub returns 404.
 
-Ingress activation and broader recovery acceptance remain open. An activation
-audit found that metadata sweeps are not yet enqueued by production reconciliation,
-bootstrap replay excludes issue/comment events, Git finalization lacks metadata
-sweep completion proof, and remote listings alone cannot discover deleted comments.
-An effect-recovery/concurrent-new-label ordering case also needs verification.
-These results do not prove full issue convergence or PR12 completion.
+`b8256b9` verifies effect recovery before concurrent new-label materialization.
+`d08c70c` provides bounded mapped-resource inventory. `d1dce73` schedules partial
+bootstrap reconciliation and replays bound metadata; `f45097e` enables signed
+issue/comment ingress, schedules metadata sweeps from handoff/inventory, and gates
+activation on current successful Git and metadata completion without conflicts.
+Sweeps traverse remote listings then mapped identities, including omitted comment
+deletions. A real integration test proves empty remote listing -> mapped scan ->
+access-checked GET/404 -> local tombstone without a webhook.
+
+The combined activation matrix passed 150 tests (mirrors 61, worker/integration
+39, publication 41, API ingress nine), plus production warnings-as-errors.
+Pause/revoke finalizer races, superseded finalizer proof, and organization health
+restoration are covered. Full PRD acceptance, live GitHub validation, and the
+remaining PR13–16 work are not established by this local matrix.
 - Compilation with warnings-as-errors and staged formatting checks passed for
   committed PR11. Existing importer test-support warnings
   are distinct from production compilation.
