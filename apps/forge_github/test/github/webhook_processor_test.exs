@@ -176,6 +176,64 @@ defmodule ForgeGitHub.WebhookProcessorTest do
     assert_received {:repository_inventory_retained, _delivery_guid}
   end
 
+  test "Git ref notifications retain only a validated ref hint and refetch canonical state later" do
+    parent = self()
+
+    cases = [
+      {"push", %{"ref" => "refs/heads/main"}, "refs/heads/main", false},
+      {"push", %{"ref" => "refs/heads/new", "created" => true}, "refs/heads/new", true},
+      {"create", %{"ref_type" => "tag", "ref" => "v1.0.0"}, "refs/tags/v1.0.0", true},
+      {"delete", %{"ref_type" => "branch", "ref" => "old"}, "refs/heads/old", false}
+    ]
+
+    for {event, ref_payload, expected_ref, initial_absence} <- cases do
+      payload =
+        Map.merge(ref_payload, %{
+          "installation" => %{"id" => 44},
+          "repository" => %{"id" => 99}
+        })
+
+      delivery =
+        delivery(event, nil, payload)
+        |> Map.put(:github_repository_id, 99)
+
+      assert :ok =
+               ForgeGitHub.WebhookProcessor.process(delivery,
+                 git_ref_schedule: fn scheduled, ref, absent? ->
+                   send(parent, {:git_ref_retained, scheduled.delivery_guid, ref, absent?})
+                   {:ok, {:scheduled, :operation}}
+                 end
+               )
+
+      assert_receive {:git_ref_retained, _, ^expected_ref, ^initial_absence}
+    end
+  end
+
+  test "Git ref notifications reject nonstandard or malformed ref hints" do
+    for {event, ref_payload} <- [
+          {"push", %{"ref" => "refs/pull/1/head"}},
+          {"create", %{"ref_type" => "branch", "ref" => "bad..name"}},
+          {"delete", %{"ref_type" => "unknown", "ref" => "main"}}
+        ] do
+      payload =
+        Map.merge(ref_payload, %{
+          "installation" => %{"id" => 44},
+          "repository" => %{"id" => 99}
+        })
+
+      delivery =
+        delivery(event, nil, payload)
+        |> Map.put(:github_repository_id, 99)
+
+      assert {:fail, "invalid_webhook_payload"} =
+               ForgeGitHub.WebhookProcessor.process(delivery,
+                 git_ref_schedule: fn _delivery, _ref, _absent? ->
+                   flunk("invalid refs must not be scheduled")
+                 end
+               )
+    end
+  end
+
   test "immutable installation deletion persists full identity evidence before revoking tokens",
        %{
          test: test

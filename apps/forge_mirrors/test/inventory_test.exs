@@ -397,6 +397,35 @@ defmodule ForgeMirrors.InventoryTest do
     assert status.mirror.capabilities == capabilities
   end
 
+  test "a completed inventory sweep schedules canonical Git reconciliation for each bound repo",
+       context do
+    repository_mirror = repository_mirror_fixture(context.organization_mirror)
+    operation = inventory_operation(context.organization_mirror, context.now, "git-reconcile")
+    claimed = claim_inventory!(operation, context.now)
+
+    observation = %{
+      github_repository_id: repository_mirror.github_repository_id,
+      github_node_id: repository_mirror.github_node_id,
+      github_full_name: repository_mirror.github_full_name,
+      github_archived: false
+    }
+
+    assert {:ok, %{operation: %MirrorOperation{state: :completed}}} =
+             ForgeMirrors.record_inventory_page(claimed, [observation], nil, context.now)
+
+    assert %MirrorOperation{
+             kind: "reconcile.repository.git",
+             repository_mirror_id: repository_mirror_id,
+             state: :pending
+           } =
+             Repo.get_by!(MirrorOperation,
+               dedupe_key:
+                 "inventory-git:inventory-operation:#{operation.id}:#{repository_mirror.id}"
+             )
+
+    assert repository_mirror_id == repository_mirror.id
+  end
+
   defp active_inventory_mirror(now, options \\ []) do
     policy = Keyword.get(options, :policy, %{})
 

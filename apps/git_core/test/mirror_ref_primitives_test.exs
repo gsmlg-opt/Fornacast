@@ -174,6 +174,25 @@ defmodule GitCore.MirrorRefPrimitivesTest do
            end) == 1
   end
 
+  test "public exact creation retains an annotated tag object without peeling it", %{
+    fixture: fixture
+  } do
+    assert {:ok, tag_oid} =
+             GitCore.compare_and_swap_ref(
+               fixture.repo_path,
+               "refs/tags/copy",
+               nil,
+               fixture.tag_oid,
+               :fast_forward,
+               deadline_ms: 1_000
+             )
+
+    assert tag_oid == fixture.tag_oid
+    assert {:ok, ^tag_oid} = GitCore.exact_ref(fixture.repo_path, "refs/tags/copy")
+
+    assert git!(["--git-dir", fixture.repo_path, "cat-file", "-t", tag_oid]) == "tag"
+  end
+
   test "public exact deletion validates refs, expected OIDs, and deadlines without mutation", %{
     fixture: fixture
   } do

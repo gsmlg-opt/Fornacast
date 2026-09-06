@@ -128,7 +128,7 @@ defmodule ForgeGitHub.Webhook do
     do: :processable
 
   def classify(event, nil) when event in ["push", "create", "delete"],
-    do: :pending_unsupported
+    do: :processable
 
   def classify("issues", action) when action in @issue_actions,
     do: :pending_unsupported

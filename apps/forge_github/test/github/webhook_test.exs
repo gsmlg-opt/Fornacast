@@ -222,7 +222,11 @@ defmodule ForgeGitHub.WebhookTest do
     end
   end
 
-  test "marks known deferred repository and synchronization events pending" do
+  test "marks Git ref observations processable and later synchronization events pending" do
+    for event <- ~w(push create delete) do
+      assert :processable = Webhook.classify(event, nil)
+    end
+
     pending_actions = %{
       "issues" =>
         ~w(assigned closed deleted edited labeled opened reopened transferred unassigned unlabeled),
@@ -234,10 +238,6 @@ defmodule ForgeGitHub.WebhookTest do
 
     for {event, actions} <- pending_actions, action <- actions do
       assert :pending_unsupported = Webhook.classify(event, action)
-    end
-
-    for event <- ~w(push create delete) do
-      assert :pending_unsupported = Webhook.classify(event, nil)
     end
   end
 

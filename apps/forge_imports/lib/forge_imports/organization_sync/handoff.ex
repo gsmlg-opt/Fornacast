@@ -19,7 +19,7 @@ defmodule ForgeImports.OrganizationSync.Handoff do
   alias ForgePulls.PullRequest
   alias ForgeRepos.Repository
 
-  @supported_repository_events ["repository"]
+  @supported_repository_events ["repository", "push", "create", "delete"]
 
   def append(%Multi{} = multi, name, run_id, item_id, %DateTime{} = now)
       when is_atom(name) and is_integer(run_id) and run_id > 0 and is_integer(item_id) and

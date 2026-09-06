@@ -5324,7 +5324,11 @@ where
     // non-CAS writers such as receive-pack.
     let _cas_lock = acquire_cas_file_lock(&repo, deadline)?;
 
-    find_cas_commit(&repo, proposed_id, "proposed")?;
+    if full_ref_for_error.starts_with("refs/tags/") {
+        find_cas_object(&repo, proposed_id, "proposed")?;
+    } else {
+        find_cas_commit(&repo, proposed_id, "proposed")?;
+    }
 
     let actual = direct_ref_target(&repo, full_ref.as_bstr())?;
     let previous = match (expected_id, actual) {

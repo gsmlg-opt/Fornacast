@@ -67,6 +67,21 @@ defmodule ForgeGitHub.WebhookProcessor do
     end
   end
 
+  defp dispatch(%{event: event} = delivery, payload, options)
+       when event in ["push", "create", "delete"] do
+    with {:ok, ref, initial_absence} <- webhook_ref(event, payload),
+         {:ok, scheduling} <- retain_git_ref_trigger(delivery, ref, initial_absence, options) do
+      case scheduling do
+        :deferred -> :defer
+        :scheduled -> :ok
+        {:scheduled, _operation} -> :ok
+      end
+    else
+      {:error, :invalid_ref} -> {:fail, "invalid_webhook_payload"}
+      {:error, :git_ref_unavailable} -> {:retry, "git_ref_trigger_unavailable", 30}
+    end
+  end
+
   defp dispatch(_delivery, _payload, _options), do: :ignore
 
   defp refetch_installation(delivery, payload, options) do
@@ -291,6 +306,51 @@ defmodule ForgeGitHub.WebhookProcessor do
       {:ok, {:scheduled, _operation} = result} -> {:ok, result}
       _error -> {:error, :inventory_unavailable}
     end
+  end
+
+  defp retain_git_ref_trigger(delivery, ref, initial_absence, options) do
+    scheduler =
+      Keyword.get(
+        options,
+        :git_ref_schedule,
+        &ForgeMirrors.retain_webhook_git_ref_trigger/3
+      )
+
+    case safe_call(scheduler, [delivery, ref, initial_absence]) do
+      {:ok, result} when result in [:deferred, :scheduled] -> {:ok, result}
+      {:ok, {:scheduled, _operation} = result} -> {:ok, result}
+      _error -> {:error, :git_ref_unavailable}
+    end
+  end
+
+  defp webhook_ref("push", %{"ref" => ref} = payload) do
+    if standard_ref?(ref),
+      do: {:ok, ref, Map.get(payload, "created", false) == true},
+      else: {:error, :invalid_ref}
+  end
+
+  defp webhook_ref(event, %{"ref_type" => type, "ref" => tail})
+       when event in ["create", "delete"] and type in ["branch", "tag"] and is_binary(tail) do
+    prefix = if type == "branch", do: "refs/heads/", else: "refs/tags/"
+    ref = prefix <> tail
+
+    if standard_ref?(ref),
+      do: {:ok, ref, event == "create"},
+      else: {:error, :invalid_ref}
+  end
+
+  defp webhook_ref(_event, _payload), do: {:error, :invalid_ref}
+
+  defp standard_ref?("refs/heads/" <> tail), do: valid_ref_tail?(tail)
+  defp standard_ref?("refs/tags/" <> tail), do: valid_ref_tail?(tail)
+  defp standard_ref?(_ref), do: false
+
+  defp valid_ref_tail?(tail) do
+    byte_size(tail) in 1..1_000 and String.valid?(tail) and
+      not String.starts_with?(tail, ["/", "."]) and
+      not String.ends_with?(tail, ["/", ".", ".lock"]) and
+      not String.contains?(tail, [<<0>>, "//", "..", "@{", "\\", "~", "^", ":", "?", "*", "["]) and
+      not String.match?(tail, ~r/[\x00-\x20\x7f]/)
   end
 
   defp installation_attrs(installation, observed_at) do

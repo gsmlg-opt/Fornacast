@@ -6,6 +6,8 @@ defmodule ForgeMirrors.MirrorRefState do
 
   import Ecto.Changeset
 
+  @type t :: %__MODULE__{}
+
   schema "mirror_ref_states" do
     field :repository_mirror_id, :integer
     field :ref_name, :string

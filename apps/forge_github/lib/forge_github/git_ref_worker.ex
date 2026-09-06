@@ -1,0 +1,624 @@
+defmodule ForgeGitHub.GitRefWorker do
+  @moduledoc """
+  Bounded executor for exact-state Git ref reconciliation operations.
+
+  Every attempt re-observes both repositories. Durable operations retain only a ref hint;
+  webhook payload OIDs and prior in-memory observations are never applied directly.
+  """
+
+  use GenServer
+
+  alias ForgeGitHub.{InstallationToken, InstallationTokenBroker}
+  alias ForgeMirrors.{GitRefDecision, MirrorOperation}
+  alias GitCore.Remote.{ObservedRef, RefUpdate, SyncRequest}
+
+  @operation_kind "sync.git_ref"
+  @operation_kinds [
+    @operation_kind,
+    "reconcile.repository.bootstrap",
+    "reconcile.repository.git",
+    "finalize.repository.git"
+  ]
+  @default_interval_ms 1_000
+  @default_lease_seconds 1_860
+  @default_batch_size 4
+  @default_max_concurrency 2
+  @default_processor_timeout_ms 1_850_000
+  @lease_margin_ms 5_000
+  @run_option_keys [
+    :lease_seconds,
+    :batch_size,
+    :max_concurrency,
+    :processor_timeout_ms,
+    :task_supervisor,
+    :claim,
+    :context,
+    :repository_context,
+    :token_fetch,
+    :fetch_refs,
+    :exact_ref,
+    :list_refs,
+    :ancestor?,
+    :mark_effect,
+    :apply_local,
+    :delete_local,
+    :push_remote,
+    :delete_remote,
+    :confirm,
+    :conflict,
+    :fanout,
+    :finalize,
+    :retry,
+    :fail,
+    :now
+  ]
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(options) when is_list(options) do
+    case Keyword.get(options, :name, __MODULE__) do
+      nil -> GenServer.start_link(__MODULE__, options)
+      name -> GenServer.start_link(__MODULE__, options, name: name)
+    end
+  end
+
+  @doc false
+  @spec run_once(String.t(), keyword()) :: {:ok, list()} | {:error, atom()}
+  def run_once(owner, options \\ [])
+
+  def run_once(owner, options) when is_binary(owner) and is_list(options) do
+    now = callback(options, :now, fn -> DateTime.utc_now(:second) end).()
+    lease_seconds = bounded_option(options, :lease_seconds, @default_lease_seconds, 1, 3_600)
+    batch_size = bounded_option(options, :batch_size, @default_batch_size, 1, 100)
+
+    max_concurrency =
+      bounded_option(
+        options,
+        :max_concurrency,
+        config(:git_ref_worker_max_concurrency, @default_max_concurrency),
+        1,
+        8
+      )
+
+    processor_timeout_ms =
+      bounded_option(
+        options,
+        :processor_timeout_ms,
+        config(:git_ref_worker_processor_timeout_ms, @default_processor_timeout_ms),
+        1,
+        3_599_000
+      )
+
+    unless processor_timeout_ms <= lease_seconds * 1_000 - @lease_margin_ms do
+      raise ArgumentError, "Git ref processor timeout must finish inside its lease"
+    end
+
+    claim = callback(options, :claim, &ForgeMirrors.claim_operations/5)
+
+    with {:ok, operations} <-
+           claim.(owner, now, lease_seconds, min(batch_size, max_concurrency), @operation_kinds) do
+      supervisor = Keyword.get(options, :task_supervisor, ForgeGitHub.GitRefTaskSupervisor)
+
+      results =
+        supervisor
+        |> Task.Supervisor.async_stream_nolink(
+          operations,
+          &process_operation(&1, now, options),
+          max_concurrency: max_concurrency,
+          ordered: true,
+          on_timeout: :kill_task,
+          timeout: processor_timeout_ms
+        )
+        |> Stream.zip(operations)
+        |> Enum.map(fn
+          {{:ok, result}, operation} -> {operation.id, result}
+          {{:exit, _reason}, operation} -> {operation.id, {:error, :worker_crash}}
+        end)
+
+      {:ok, results}
+    end
+  rescue
+    _exception -> {:error, :unavailable}
+  catch
+    _kind, _reason -> {:error, :unavailable}
+  end
+
+  def run_once(_owner, _options), do: {:error, :invalid_argument}
+
+  @doc false
+  def process_operation(
+        %MirrorOperation{kind: kind} = operation,
+        %DateTime{} = now,
+        options
+      )
+      when kind in ["reconcile.repository.bootstrap", "reconcile.repository.git"] do
+    context =
+      callback(
+        options,
+        :repository_context,
+        &ForgeMirrors.git_repository_operation_context/1
+      )
+
+    token_fetch = callback(options, :token_fetch, &InstallationTokenBroker.fetch/2)
+
+    with {:ok, sync} <- context.(operation),
+         %InstallationToken{token: token} <-
+           token_fetch.(sync.github_installation_id, %{
+             permissions: %{"contents" => "write", "metadata" => "read"}
+           }),
+         request <- sync_request(sync),
+         {:ok, observations} <- fetch_remote_refs(request, token, sync, options),
+         {:ok, local_refs} <-
+           callback(options, :list_refs, &GitCore.list_refs/1).(sync.repository_path),
+         {:ok, ref_names} <- reconciliation_ref_names(sync, local_refs, observations) do
+      callback(options, :fanout, &ForgeMirrors.fanout_git_ref_reconciliation/3).(
+        operation,
+        ref_names,
+        now
+      )
+    else
+      {:error, reason} -> persist_failure(operation, now, reason, options)
+      _invalid -> persist_failure(operation, now, :credential_unavailable, options)
+    end
+  rescue
+    _exception -> persist_failure(operation, now, :worker_crash, options)
+  catch
+    _kind, _reason -> persist_failure(operation, now, :worker_crash, options)
+  end
+
+  def process_operation(
+        %MirrorOperation{kind: "finalize.repository.git"} = operation,
+        %DateTime{} = now,
+        options
+      ) do
+    callback(options, :finalize, &ForgeMirrors.finalize_git_ref_reconciliation/2).(
+      operation,
+      now
+    )
+  rescue
+    _exception -> persist_failure(operation, now, :worker_crash, options)
+  catch
+    _kind, _reason -> persist_failure(operation, now, :worker_crash, options)
+  end
+
+  def process_operation(
+        %MirrorOperation{kind: @operation_kind} = operation,
+        %DateTime{} = now,
+        options
+      ) do
+    context = callback(options, :context, &ForgeMirrors.git_ref_operation_context/1)
+    token_fetch = callback(options, :token_fetch, &InstallationTokenBroker.fetch/2)
+
+    with {:ok, sync} <- context.(operation),
+         %InstallationToken{token: token} <-
+           token_fetch.(sync.github_installation_id, %{
+             permissions: %{"contents" => "write", "metadata" => "read"}
+           }),
+         request <- sync_request(sync),
+         {:ok, observations} <- fetch_remote_refs(request, token, sync, options),
+         {:ok, local_oid} <- read_local_ref(sync, options),
+         remote_oid <- observed_oid(observations, sync.ref_name),
+         decision <- decide(sync, local_oid, remote_oid, options) do
+      apply_decision(
+        operation,
+        now,
+        sync,
+        request,
+        token,
+        local_oid,
+        remote_oid,
+        decision,
+        options
+      )
+    else
+      {:error, reason} -> persist_failure(operation, now, reason, options)
+      _invalid -> persist_failure(operation, now, :credential_unavailable, options)
+    end
+  rescue
+    _exception -> persist_failure(operation, now, :worker_crash, options)
+  catch
+    _kind, _reason -> persist_failure(operation, now, :worker_crash, options)
+  end
+
+  def process_operation(%MirrorOperation{} = operation, %DateTime{} = now, options),
+    do: persist_failure(operation, now, :unsupported_operation, options)
+
+  @impl true
+  def init(options) do
+    owner = "git-ref-#{node()}-#{System.unique_integer([:positive])}"
+    run_options = Keyword.take(options, @run_option_keys)
+
+    state = %{
+      enabled: Keyword.get(options, :enabled, config(:git_ref_worker_enabled, true)),
+      interval_ms:
+        bounded_option(
+          options,
+          :interval_ms,
+          config(:git_ref_worker_interval_ms, @default_interval_ms),
+          1,
+          3_600_000
+        ),
+      task_supervisor: Keyword.get(options, :task_supervisor, ForgeGitHub.GitRefTaskSupervisor),
+      runner: Keyword.get(options, :runner, fn -> run_once(owner, run_options) end),
+      task_ref: nil
+    }
+
+    if state.enabled, do: schedule(state.interval_ms)
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_info(:tick, %{task_ref: nil} = state) do
+    case Task.Supervisor.start_child(state.task_supervisor, state.runner) do
+      {:ok, pid} ->
+        {:noreply, %{state | task_ref: Process.monitor(pid)}}
+
+      {:error, _reason} ->
+        schedule(state.interval_ms)
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(:tick, state), do: {:noreply, state}
+
+  def handle_info({:DOWN, reference, :process, _pid, _reason}, %{task_ref: reference} = state) do
+    schedule(state.interval_ms)
+    {:noreply, %{state | task_ref: nil}}
+  end
+
+  def handle_info(_message, state), do: {:noreply, state}
+
+  defp fetch_remote_refs(request, token, sync, options) do
+    callback(options, :fetch_refs, fn request, token, namespace ->
+      GitCore.Remote.fetch_observed_refs(request, token, namespace)
+    end).(request, token, sync.tracking_namespace)
+  end
+
+  defp read_local_ref(sync, options) do
+    callback(options, :exact_ref, &GitCore.exact_ref/2).(sync.repository_path, sync.ref_name)
+  end
+
+  defp decide(sync, local_oid, remote_oid, options) do
+    ancestor = callback(options, :ancestor?, &GitCore.is_ancestor/3)
+
+    GitRefDecision.decide(sync.ref_kind, sync.baseline, local_oid, remote_oid, fn left, right ->
+      ancestor.(sync.repository_path, left, right)
+    end)
+  end
+
+  defp apply_decision(
+         operation,
+         now,
+         sync,
+         _request,
+         _token,
+         _local_oid,
+         _remote_oid,
+         {:confirm, oid},
+         options
+       ) do
+    callback(options, :confirm, &ForgeMirrors.confirm_git_ref/5).(
+      operation,
+      sync.ref_name,
+      oid,
+      oid,
+      now
+    )
+  end
+
+  defp apply_decision(
+         operation,
+         now,
+         sync,
+         request,
+         token,
+         local_oid,
+         remote_oid,
+         decision,
+         options
+       )
+       when elem(decision, 0) in [:apply_local, :apply_remote, :delete_local, :delete_remote] do
+    case mark_effect(operation, now, sync.ref_name, decision, options) do
+      {:ok, marked} ->
+        case execute_effect(decision, sync, request, token, options) do
+          :ok ->
+            expected_oid = resulting_oid(decision)
+
+            callback(options, :confirm, &ForgeMirrors.confirm_git_ref/5).(
+              marked,
+              sync.ref_name,
+              expected_oid,
+              expected_oid,
+              now
+            )
+
+          {:error, reason} ->
+            persist_effect_failure(
+              marked,
+              now,
+              sync,
+              local_oid,
+              remote_oid,
+              reason,
+              options
+            )
+        end
+
+      {:error, reason} ->
+        persist_failure(operation, now, reason, options)
+    end
+  end
+
+  defp apply_decision(
+         operation,
+         now,
+         sync,
+         _request,
+         _token,
+         local_oid,
+         remote_oid,
+         {:conflict, kind},
+         options
+       ) do
+    persist_conflict(operation, now, sync, local_oid, remote_oid, kind, options)
+  end
+
+  defp apply_decision(
+         operation,
+         now,
+         _sync,
+         _request,
+         _token,
+         _local_oid,
+         _remote_oid,
+         {:error, reason},
+         options
+       ),
+       do: persist_failure(operation, now, reason, options)
+
+  defp mark_effect(
+         %MirrorOperation{state: :effect_pending} = operation,
+         _now,
+         _ref,
+         _decision,
+         _opts
+       ),
+       do: {:ok, operation}
+
+  defp mark_effect(operation, now, ref, decision, options) do
+    marker = effect_marker(ref, decision)
+    callback(options, :mark_effect, &ForgeMirrors.mark_external_effect/3).(operation, now, marker)
+  end
+
+  defp execute_effect({:apply_local, expected, proposed}, sync, _request, _token, options) do
+    callback(options, :apply_local, &apply_local/4).(
+      sync.repository_path,
+      sync.ref_name,
+      expected,
+      proposed
+    )
+    |> normalize_git_effect()
+  end
+
+  defp execute_effect({:delete_local, expected}, sync, _request, _token, options) do
+    callback(options, :delete_local, &delete_local/3).(
+      sync.repository_path,
+      sync.ref_name,
+      expected
+    )
+    |> normalize_git_effect()
+  end
+
+  defp execute_effect({:apply_remote, expected, proposed}, sync, request, token, options) do
+    update = %RefUpdate{ref: sync.ref_name, expected_oid: expected, proposed_oid: proposed}
+
+    callback(options, :push_remote, fn request, token, update ->
+      GitCore.Remote.push_refs(request, token, [update])
+    end).(request, token, update)
+  end
+
+  defp execute_effect({:delete_remote, expected}, sync, request, token, options) do
+    callback(options, :delete_remote, &GitCore.Remote.delete_ref/4).(
+      request,
+      token,
+      sync.ref_name,
+      expected
+    )
+  end
+
+  defp apply_local(path, ref, expected, proposed) do
+    with_write_fence(path, fn ->
+      with {:ok, oid} <-
+             GitCore.compare_and_swap_ref(path, ref, expected, proposed, :fast_forward, []),
+           :ok <- GitCore.invalidate_repository_cache(path) do
+        {:ok, oid}
+      end
+    end)
+  end
+
+  defp delete_local(path, ref, expected) do
+    with_write_fence(path, fn ->
+      with {:ok, oid} <- GitCore.compare_and_delete_ref(path, ref, expected),
+           :ok <- GitCore.invalidate_repository_cache(path) do
+        {:ok, oid}
+      end
+    end)
+  end
+
+  defp with_write_fence(path, callback) do
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:ref_deadline_ms)
+
+    case GitCore.RepositoryWriteLimiter.acquire(path, deadline) do
+      {:ok, lease} ->
+        try do
+          callback.()
+        after
+          :ok = GitCore.RepositoryWriteLimiter.release(lease)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp normalize_git_effect({:ok, _oid}) do
+    :ok
+  end
+
+  defp normalize_git_effect(other), do: other
+
+  defp persist_effect_failure(operation, now, sync, local_oid, remote_oid, reason, options) do
+    case conflict_kind(reason) do
+      nil -> persist_failure(operation, now, reason, options, external_effect_reconciled: true)
+      kind -> persist_conflict(operation, now, sync, local_oid, remote_oid, kind, options)
+    end
+  end
+
+  defp persist_conflict(operation, now, sync, local_oid, remote_oid, kind, options) do
+    callback(options, :conflict, &ForgeMirrors.conflict_git_ref/7).(
+      operation,
+      sync.ref_name,
+      kind,
+      sync.baseline,
+      local_oid,
+      remote_oid,
+      now
+    )
+  end
+
+  defp persist_failure(operation, now, reason, options, retry_options \\ []) do
+    cond do
+      reason == :git_ref_conflicted ->
+        callback(options, :fail, &ForgeMirrors.fail_operation/4).(
+          operation,
+          now,
+          "git_divergence",
+          "Git ref has an unresolved conflict"
+        )
+
+      reason in [:revoked, :credential_unavailable] ->
+        callback(options, :fail, &ForgeMirrors.fail_operation/4).(
+          operation,
+          now,
+          "credential_revoked",
+          "GitHub installation credential unavailable"
+        )
+
+      reason in [:invalid_scope, :permission_missing] ->
+        callback(options, :fail, &ForgeMirrors.fail_operation/4).(
+          operation,
+          now,
+          "permission_missing",
+          "GitHub contents write permission unavailable"
+        )
+
+      true ->
+        retry_at = DateTime.add(now, 60, :second)
+
+        callback(options, :retry, &ForgeMirrors.retry_operation/5).(
+          operation,
+          now,
+          retry_at,
+          "network",
+          retry_options
+        )
+    end
+  end
+
+  defp conflict_kind(%GitCore.Error{kind: kind}) when kind in [:stale_ref, :ref_exists],
+    do: :git_divergence
+
+  defp conflict_kind(%GitCore.Remote.Error{kind: :stale_remote}), do: :git_divergence
+  defp conflict_kind(%GitCore.Remote.Error{kind: :non_fast_forward}), do: :git_divergence
+  defp conflict_kind(%GitCore.Remote.Error{kind: :tag_retarget}), do: :tag_retarget
+  defp conflict_kind(_reason), do: nil
+
+  defp effect_marker(ref, {:apply_local, expected, proposed}),
+    do: %{
+      "action" => "apply_local",
+      "expected_oid" => expected,
+      "proposed_oid" => proposed,
+      "ref" => ref
+    }
+
+  defp effect_marker(ref, {:apply_remote, expected, proposed}),
+    do: %{
+      "action" => "apply_remote",
+      "expected_oid" => expected,
+      "proposed_oid" => proposed,
+      "ref" => ref
+    }
+
+  defp effect_marker(ref, {:delete_local, expected}),
+    do: %{"action" => "delete_local", "expected_oid" => expected, "ref" => ref}
+
+  defp effect_marker(ref, {:delete_remote, expected}),
+    do: %{"action" => "delete_remote", "expected_oid" => expected, "ref" => ref}
+
+  defp resulting_oid({:apply_local, _expected, proposed}), do: proposed
+  defp resulting_oid({:apply_remote, _expected, proposed}), do: proposed
+  defp resulting_oid({:delete_local, _expected}), do: nil
+  defp resulting_oid({:delete_remote, _expected}), do: nil
+
+  defp observed_oid(observations, ref_name) do
+    Enum.find_value(observations, fn
+      %ObservedRef{ref: ^ref_name, oid: oid} -> oid
+      _other -> nil
+    end)
+  end
+
+  defp reconciliation_ref_names(sync, local_refs, observations)
+       when is_list(local_refs) and is_list(observations) and is_list(sync.baseline_ref_names) do
+    local_names =
+      Enum.flat_map(local_refs, fn
+        %{name: "refs/heads/" <> _ = name} -> [name]
+        %{name: "refs/tags/" <> _ = name} -> [name]
+        _other -> []
+      end)
+
+    remote_names = Enum.map(observations, & &1.ref)
+
+    names =
+      (sync.baseline_ref_names ++ local_names ++ remote_names)
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    if Enum.all?(names, &valid_standard_ref?/1),
+      do: {:ok, names},
+      else: {:error, :invalid_ref}
+  end
+
+  defp reconciliation_ref_names(_sync, _local_refs, _observations),
+    do: {:error, :invalid_ref}
+
+  defp valid_standard_ref?(ref) do
+    match?({:ok, _tracking}, GitCore.tracking_ref_name("reconcile-validation", ref))
+  end
+
+  defp sync_request(sync) do
+    %SyncRequest{
+      provider: :github,
+      owner: sync.remote_owner,
+      repository: sync.remote_repository,
+      credential_login: "x-access-token",
+      repository_path: sync.repository_path
+    }
+  end
+
+  defp callback(options, key, default) do
+    case Keyword.get(options, key, default) do
+      function when is_function(function) -> function
+      _invalid -> raise ArgumentError, "invalid Git ref worker callback"
+    end
+  end
+
+  defp bounded_option(options, key, default, minimum, maximum) do
+    value = Keyword.get(options, key, default)
+
+    if is_integer(value) and value in minimum..maximum,
+      do: value,
+      else: raise(ArgumentError, "invalid Git ref worker option")
+  end
+
+  defp schedule(interval_ms), do: Process.send_after(self(), :tick, interval_ms)
+  defp config(key, default), do: Application.get_env(:forge_github, key, default)
+end

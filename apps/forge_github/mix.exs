@@ -25,6 +25,7 @@ defmodule ForgeGitHub.MixProject do
   defp deps do
     [
       {:forge_mirrors, in_umbrella: true},
+      {:git_core, in_umbrella: true},
       {:mint, "~> 1.9"},
       {:plug, "~> 1.19"},
       {:req, "~> 0.7"},

@@ -69,16 +69,61 @@ defmodule ForgeMirrors.OutboxMaterializationTest do
       payload: %{
         "repository_id" => repository_mirror.repository_id,
         "owner_id" => organization_mirror.organization_id,
-        "changed_refs" => ["refs/heads/main"]
+        "changed_refs" => [
+          %{
+            "ref" => "refs/heads/main",
+            "old_oid" => nil,
+            "new_oid" => String.duplicate("a", 40)
+          },
+          %{
+            "ref" => "refs/tags/v1.0.0",
+            "old_oid" => String.duplicate("b", 40),
+            "new_oid" => nil
+          }
+        ]
       },
       available_at: DateTime.utc_now(:second)
     }
 
-    assert {:ok, {:materialized, [%MirrorOperation{} = operation]}} =
+    assert {:ok, {:materialized, [%MirrorOperation{} = branch, %MirrorOperation{} = tag]}} =
              ForgeMirrors.materialize_outbox_event(event)
 
-    assert operation.repository_mirror_id == repository_mirror.id
-    assert operation.kind == "repository.pushed"
+    assert branch.repository_mirror_id == repository_mirror.id
+    assert branch.kind == "sync.git_ref"
+
+    assert branch.cursor == %{
+             "initial_absence" => true,
+             "outbox_event_id" => event.event_id,
+             "ref_name" => "refs/heads/main",
+             "trigger" => "local"
+           }
+
+    assert tag.kind == "sync.git_ref"
+    assert tag.cursor["ref_name"] == "refs/tags/v1.0.0"
+    assert tag.cursor["initial_absence"] == false
+
+    assert {:ok, {:materialized, replayed}} = ForgeMirrors.materialize_outbox_event(event)
+    assert Enum.map(replayed, & &1.id) == [branch.id, tag.id]
+  end
+
+  test "repository.pushed rejects malformed or duplicate exact-ref evidence" do
+    organization_mirror = active_organization_mirror_fixture()
+    repository_mirror = repository_mirror_fixture(organization_mirror)
+
+    for changed_refs <- [
+          [%{"ref" => "refs/pull/1/head", "old_oid" => nil, "new_oid" => nil}],
+          [%{"ref" => "refs/heads/main", "old_oid" => "bad", "new_oid" => nil}],
+          [
+            %{"ref" => "refs/heads/main", "old_oid" => nil, "new_oid" => nil},
+            %{"ref" => "refs/heads/main", "old_oid" => nil, "new_oid" => nil}
+          ]
+        ] do
+      event =
+        repository_event(repository_mirror, organization_mirror, event_type: "repository.pushed")
+        |> put_in([Access.key!(:payload), "changed_refs"], changed_refs)
+
+      assert {:error, :invalid_payload} = ForgeMirrors.materialize_outbox_event(event)
+    end
   end
 
   test "non-local repository events are explicitly ignored without outbound intent" do
