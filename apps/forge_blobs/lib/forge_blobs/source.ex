@@ -1,6 +1,6 @@
-defmodule ForgeReleases.AssetStorage.Source do
+defmodule ForgeBlobs.Source do
   @moduledoc """
-  Opaque, single-owner cursor for an opened asset.
+  Opaque, single-owner cursor for an opened blob.
 
   Opacity and redacted inspection establish a caller convention; Elixir structs
   remain introspectable at runtime. One controlling process must thread every
@@ -19,6 +19,6 @@ defmodule ForgeReleases.AssetStorage.Source do
           }
 end
 
-defimpl Inspect, for: ForgeReleases.AssetStorage.Source do
-  def inspect(_source, _options), do: "#ForgeReleases.AssetStorage.Source<redacted>"
+defimpl Inspect, for: ForgeBlobs.Source do
+  def inspect(_source, _options), do: "#ForgeBlobs.Source<redacted>"
 end

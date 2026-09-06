@@ -1,4 +1,4 @@
-defmodule ForgeReleases.AssetStorage.FileSystem do
+defmodule ForgeBlobs.FileSystem do
   @moduledoc false
 
   def mkdir_p(path), do: File.mkdir_p(path)

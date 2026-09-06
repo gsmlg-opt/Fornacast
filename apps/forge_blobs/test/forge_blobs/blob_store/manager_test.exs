@@ -1,21 +1,10 @@
-defmodule ForgeReleases.AssetStorage.ManagerTest do
+defmodule ForgeBlobs.ManagerTest do
   use ExUnit.Case, async: false
 
   alias ExStorageService.Names
   alias ForgeBlobs.Manager
 
   @instance :fornacast_release_assets
-
-  test "forge_releases does not start a second blob-storage subtree" do
-    assert Process.whereis(ForgeBlobs.ApplicationSupervisor)
-    assert Process.whereis(ForgeBlobs.Supervisor)
-    assert Process.whereis(ForgeBlobs.InstanceSupervisor)
-    assert Process.whereis(ForgeBlobs.Manager)
-
-    refute Process.whereis(ForgeReleases.AssetStorage.Supervisor)
-    refute Process.whereis(ForgeReleases.AssetStorage.InstanceSupervisor)
-    refute Process.whereis(ForgeReleases.AssetStorage.Manager)
-  end
 
   test "the exact instance is ready, owned, and has only its Engine child" do
     assert Manager.status() == :ready

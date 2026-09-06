@@ -32,8 +32,10 @@ defmodule FornacastUmbrella.MixProject do
           forge_issues: :permanent,
           forge_pulls: :permanent,
           ex_storage_service: :temporary,
+          forge_blobs: :permanent,
           forge_releases: :permanent,
           git_core: :permanent,
+          git_lfs: :permanent,
           git_transport: :permanent,
           fornacast_web: :permanent,
           fornacast_api: :permanent

@@ -129,6 +129,14 @@ defmodule GitTransport.Exec do
     Fornacast.Access.authorize(actor, :repository_write, repository)
   end
 
+  defp authorize(actor, %{operation: :lfs_authenticate, lfs_operation: :download}, repository) do
+    Fornacast.Access.authorize(actor, :repository_read, repository)
+  end
+
+  defp authorize(actor, %{operation: :lfs_authenticate, lfs_operation: :upload}, repository) do
+    Fornacast.Access.authorize(actor, :repository_write, repository)
+  end
+
   defp dispatch(actor, %{operation: :upload_pack}, repository, peer) do
     upload_pack(actor, repository, peer)
   end
@@ -137,12 +145,20 @@ defmodule GitTransport.Exec do
     receive_pack(actor, repository, peer)
   end
 
+  defp dispatch(actor, %{operation: :lfs_authenticate} = command, repository, _peer) do
+    lfs_authenticate(actor, repository, command.lfs_operation)
+  end
+
   defp stream_dispatch(actor, %{operation: :upload_pack}, repository, peer) do
     upload_pack_stream(actor, repository, peer)
   end
 
   defp stream_dispatch(actor, %{operation: :receive_pack}, repository, peer) do
     receive_pack(actor, repository, peer)
+  end
+
+  defp stream_dispatch(actor, %{operation: :lfs_authenticate} = command, repository, _peer) do
+    lfs_authenticate(actor, repository, command.lfs_operation)
   end
 
   def upload_pack(_actor, repository, _peer \\ nil) do
@@ -155,6 +171,32 @@ defmodule GitTransport.Exec do
 
   def receive_pack(_actor, repository, _peer \\ nil) do
     GitTransport.ReceivePack.advertise_refs(repository)
+  end
+
+  def lfs_authenticate(actor, repository, operation) when operation in [:download, :upload] do
+    with {:ok, token, expires_in} <-
+           GitLFS.TransferToken.issue(
+             GitLFS.Principal.ssh(actor),
+             repository,
+             :batch,
+             operation,
+             nil
+           ),
+         %ForgeAccounts.User{username: owner} <-
+           ForgeAccounts.get_account(repository.owner_user_id) do
+      href =
+        Fornacast.Config.base_url() <>
+          "/#{owner}/#{repository.slug}.git/info/lfs"
+
+      {:ok,
+       JSON.encode!(%{
+         "expires_in" => expires_in,
+         "header" => %{"Authorization" => "Bearer " <> token},
+         "href" => href
+       })}
+    else
+      _invalid -> {:error, :unavailable}
+    end
   end
 
   defp with_repository_read(repository, fun) do

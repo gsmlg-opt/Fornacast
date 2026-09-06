@@ -235,7 +235,7 @@ jobs:
           release/fornacast/bin/fornacast rpc '
             true = Node.self() == :"fornacast_e2e@127.0.0.1"
             true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000)
-            true = ForgeReleases.AssetStorage.Manager.ready?()
+            true = ForgeBlobs.Manager.ready?()
             nil = Application.spec(:ex_storage_service_s3)
             instance = GenServer.whereis(ExStorageService.Names.instance_supervisor(:fornacast_release_assets))
             [{_, engine, :worker, [ExStorageService.Storage.Engine]}] = Supervisor.which_children(instance)
@@ -312,7 +312,7 @@ jobs:
 
           for attempt in $(seq 1 60); do
             if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null && \
-               release/fornacast/bin/fornacast rpc 'true = Node.self() == :"fornacast_e2e@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); true = ForgeReleases.AssetStorage.Manager.ready?()'; then
+               release/fornacast/bin/fornacast rpc 'true = Node.self() == :"fornacast_e2e@127.0.0.1"; true = ExStorageService.Cluster.Readiness.ready?(timeout: 1_000); true = ForgeBlobs.Manager.ready?()'; then
               break
             fi
             if [ "$attempt" = 60 ]; then

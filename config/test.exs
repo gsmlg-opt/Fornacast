@@ -112,7 +112,9 @@ config :fornacast,
 
 release_asset_root = Path.expand("tmp/test/release-assets", test_root)
 
-config :fornacast, release_asset_storage_root: release_asset_root
+config :fornacast,
+  blob_storage_root: release_asset_root,
+  release_asset_storage_root: release_asset_root
 
 config :concord,
   cluster_enabled: true,

@@ -28,7 +28,8 @@ defmodule GitTransport.MixProject do
     [
       {:fornacast, in_umbrella: true},
       {:forge_accounts, in_umbrella: true},
-      {:forge_repos, in_umbrella: true}
+      {:forge_repos, in_umbrella: true},
+      {:git_lfs, in_umbrella: true}
     ]
   end
 end

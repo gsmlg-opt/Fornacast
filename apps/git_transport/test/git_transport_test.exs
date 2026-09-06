@@ -391,6 +391,19 @@ defmodule GitTransportTest do
 
     assert {:ok, command} = GitTransport.parse_exec("git-receive-pack alice/demo.git")
     assert command.operation == :receive_pack
+
+    assert {:ok, command} =
+             GitTransport.parse_exec("git-lfs-authenticate 'alice/demo.git' download")
+
+    assert command.operation == :lfs_authenticate
+    assert command.lfs_operation == :download
+    assert command.path == "alice/demo.git"
+
+    assert {:ok, command} =
+             GitTransport.parse_exec("git-lfs-authenticate /alice/demo.git upload")
+
+    assert command.operation == :lfs_authenticate
+    assert command.lfs_operation == :upload
   end
 
   test "rejects arbitrary or unsafe SSH exec commands" do
@@ -402,6 +415,12 @@ defmodule GitTransportTest do
 
     assert {:error, :invalid_command} =
              GitTransport.parse_exec("git-upload-pack alice/demo.git extra")
+
+    assert {:error, :invalid_command} =
+             GitTransport.parse_exec("git-lfs-authenticate alice/demo.git delete")
+
+    assert {:error, :invalid_command} =
+             GitTransport.parse_exec("git-lfs-authenticate 'alice/demo.git' download extra")
   end
 
   test "upload-pack keeps a standalone negotiation flush distinct from done" do
@@ -508,6 +527,64 @@ defmodule GitTransportTest do
 
     assert {:error, "ERROR: You do not have access to this repository.\n"} =
              GitTransport.handle_exec("bob", "git-upload-pack 'alice/demo.git'")
+  end
+
+  @tag :tmp_dir
+  test "git-lfs-authenticate returns one short-lived repository-scoped HTTP authorization", %{
+    tmp_dir: tmp_dir
+  } do
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, user} =
+             ForgeAccounts.create_user(%{
+               username: "lfs-ssh",
+               email: "lfs-ssh@example.test",
+               password: "correct horse battery staple"
+             })
+
+    assert {:ok, repository} =
+             ForgeRepos.create_repository(user, %{name: "LFS SSH", slug: "objects"})
+
+    assert {:ok, encoded} =
+             GitTransport.handle_exec(
+               "lfs-ssh",
+               "git-lfs-authenticate 'lfs-ssh/objects.git' download"
+             )
+
+    assert %{
+             "href" => href,
+             "header" => %{"Authorization" => "Bearer " <> token},
+             "expires_in" => expires_in
+           } = JSON.decode!(encoded)
+
+    assert href == "http://localhost:4890/lfs-ssh/objects.git/info/lfs"
+    assert expires_in in 1..300
+
+    assert {:ok, principal, authorized_repository} =
+             GitLFS.TransferToken.verify(token, :batch, :download, nil)
+
+    assert principal.actor.id == user.id
+    assert authorized_repository.id == repository.id
+
+    assert {:error, :invalid_credentials} =
+             GitLFS.TransferToken.verify(token, :batch, :upload, nil)
+
+    assert {:ok, outsider} =
+             ForgeAccounts.create_user(%{
+               username: "lfs-outsider",
+               email: "lfs-outsider@example.test",
+               password: "correct horse battery staple"
+             })
+
+    assert outsider.id != user.id
+
+    assert {:error, "ERROR: You do not have access to this repository.\n"} =
+             GitTransport.handle_exec(
+               "lfs-outsider",
+               "git-lfs-authenticate 'lfs-ssh/objects.git' upload"
+             )
   end
 
   @tag :tmp_dir

@@ -1,8 +1,8 @@
-defmodule ForgeReleases.AssetStorage.ConfigTest do
+defmodule ForgeBlobs.ConfigTest do
   use ExUnit.Case, async: false
 
   alias ExStorageService.InstanceConfig
-  alias ForgeBlobs.Config, as: AssetStorageConfig
+  alias ForgeBlobs.Config, as: BlobConfig
   alias Fornacast.Config
 
   @workers [
@@ -17,12 +17,12 @@ defmodule ForgeReleases.AssetStorage.ConfigTest do
   ]
 
   test "test environment has one exact, listener-free LocalCAS instance" do
-    root = Config.release_asset_storage_root()
+    root = Config.blob_storage_root()
 
     assert Path.type(root) == :absolute
     assert root == Path.expand("../../../../../tmp/test/release-assets", __DIR__)
-    assert Config.release_asset_max_bytes() == 2_147_483_648
-    assert Config.release_asset_gc_grace_seconds() == 86_400
+    assert Config.blob_max_bytes() == 2_147_483_648
+    assert Config.blob_gc_grace_seconds() == 86_400
 
     assert {:ok, instance} = InstanceConfig.from_application_env()
     assert instance.instance == :fornacast_release_assets
@@ -47,7 +47,7 @@ defmodule ForgeReleases.AssetStorage.ConfigTest do
     assert Application.fetch_env!(:concord, :cluster_enabled)
 
     assert Application.fetch_env!(:concord, :data_dir) ==
-             Path.join(Config.release_asset_storage_root(), "concord")
+             Path.join(Config.blob_storage_root(), "concord")
 
     assert concord == [
              group_id: :ex_storage_service_metadata,
@@ -58,6 +58,40 @@ defmodule ForgeReleases.AssetStorage.ConfigTest do
            ]
 
     assert Application.fetch_env!(:concord, :turso)[:enabled]
+  end
+
+  test "neutral blob settings do not require legacy release-asset settings" do
+    keys = [
+      :blob_storage_root,
+      :blob_max_bytes,
+      :blob_gc_grace_seconds,
+      :release_asset_storage_root,
+      :release_asset_max_bytes,
+      :release_asset_gc_grace_seconds
+    ]
+
+    original = Map.new(keys, &{&1, Application.fetch_env(:fornacast, &1)})
+
+    on_exit(fn ->
+      Enum.each(original, fn
+        {key, {:ok, value}} -> Application.put_env(:fornacast, key, value)
+        {key, :error} -> Application.delete_env(:fornacast, key)
+      end)
+    end)
+
+    Application.put_env(:fornacast, :blob_storage_root, "/tmp/neutral-blobs")
+    Application.put_env(:fornacast, :blob_max_bytes, 123)
+    Application.put_env(:fornacast, :blob_gc_grace_seconds, 4_567)
+    Application.delete_env(:fornacast, :release_asset_storage_root)
+    Application.delete_env(:fornacast, :release_asset_max_bytes)
+    Application.delete_env(:fornacast, :release_asset_gc_grace_seconds)
+
+    assert Config.blob_storage_root() == "/tmp/neutral-blobs"
+    assert Config.blob_max_bytes() == 123
+    assert Config.blob_gc_grace_seconds() == 4_567
+    assert Config.release_asset_storage_root() == "/tmp/neutral-blobs"
+    assert Config.release_asset_max_bytes() == 123
+    assert Config.release_asset_gc_grace_seconds() == 4_567
   end
 
   test "storage configuration reports invalid ESS instance configuration" do
@@ -72,7 +106,7 @@ defmodule ForgeReleases.AssetStorage.ConfigTest do
 
     assert_raise ArgumentError,
                  ~r/invalid ex_storage_service instance configuration:.*mode must be/,
-                 fn -> AssetStorageConfig.load!() end
+                 fn -> BlobConfig.load!() end
   end
 
   test "storage configuration reports invalid ESS context configuration" do
@@ -87,6 +121,6 @@ defmodule ForgeReleases.AssetStorage.ConfigTest do
 
     assert_raise ArgumentError,
                  ~r/invalid ex_storage_service context:.*metadata_root is application infrastructure/,
-                 fn -> AssetStorageConfig.load!() end
+                 fn -> BlobConfig.load!() end
   end
 end

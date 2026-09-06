@@ -418,6 +418,9 @@ if config_env() == :prod do
   ]
 
   config :fornacast,
+    blob_storage_root: release_asset_root,
+    blob_max_bytes: release_asset_max_bytes,
+    blob_gc_grace_seconds: release_asset_gc_grace_seconds,
     release_asset_storage_root: release_asset_root,
     release_asset_max_bytes: release_asset_max_bytes,
     release_asset_gc_grace_seconds: release_asset_gc_grace_seconds

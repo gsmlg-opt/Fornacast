@@ -1,14 +1,14 @@
-defmodule ForgeReleases.AssetStorage.LocalCAS do
+defmodule ForgeBlobs.LocalCAS do
   @moduledoc false
 
-  @behaviour ForgeReleases.AssetStorage
+  @behaviour ForgeBlobs
 
   require Record
   Record.defrecordp(:file_info, Record.extract(:file_info, from_lib: "kernel/include/file.hrl"))
 
   alias ExStorageService.BlobStore.LocalCAS, as: ESSLocalCAS
   alias ExStorageService.BlobStore.StagedBlob
-  alias ForgeReleases.AssetStorage.{Config, FileSystem, Manager, Source, StagedRef}
+  alias ForgeBlobs.{Config, FileSystem, Manager, Source, StagedRef}
 
   @digest_regex ~r/\A[0-9a-f]{64}\z/
   @etag_regex ~r/\A[0-9a-f]{32}\z/

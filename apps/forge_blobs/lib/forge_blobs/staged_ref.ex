@@ -1,4 +1,4 @@
-defmodule ForgeReleases.AssetStorage.StagedRef do
+defmodule ForgeBlobs.StagedRef do
   @moduledoc """
   Opaque caller handle for staged bytes.
 
@@ -18,6 +18,6 @@ defmodule ForgeReleases.AssetStorage.StagedRef do
           }
 end
 
-defimpl Inspect, for: ForgeReleases.AssetStorage.StagedRef do
-  def inspect(_staged, _options), do: "#ForgeReleases.AssetStorage.StagedRef<redacted>"
+defimpl Inspect, for: ForgeBlobs.StagedRef do
+  def inspect(_staged, _options), do: "#ForgeBlobs.StagedRef<redacted>"
 end

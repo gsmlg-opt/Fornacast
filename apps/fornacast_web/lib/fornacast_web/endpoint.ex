@@ -25,7 +25,7 @@ defmodule FornacastWeb.Endpoint do
     gzip: false,
     only: ~w(assets fonts images favicon.ico robots.txt)
 
-  plug Plug.Parsers,
+  plug FornacastWeb.RequestParsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],
     json_decoder: JSON

@@ -11,12 +11,16 @@ defmodule ForgeReleases.ApplicationTest do
              fornacast: :permanent,
              forge_accounts: :permanent,
              forge_repos: :permanent,
+             forge_github: :permanent,
              forge_imports: :permanent,
+             forge_mirrors: :permanent,
              forge_issues: :permanent,
              forge_pulls: :permanent,
              ex_storage_service: :temporary,
+             forge_blobs: :permanent,
              forge_releases: :permanent,
              git_core: :permanent,
+             git_lfs: :permanent,
              git_transport: :permanent,
              fornacast_web: :permanent,
              fornacast_api: :permanent
@@ -27,10 +31,12 @@ defmodule ForgeReleases.ApplicationTest do
              :forge_accounts,
              :forge_repos,
              :git_core,
-             :git_transport,
              :forge_issues,
              :forge_pulls,
+             :forge_blobs,
              :forge_releases,
+             :git_lfs,
+             :git_transport,
              :fornacast_api,
              :fornacast_web
            ]
@@ -62,10 +68,10 @@ defmodule ForgeReleases.ApplicationTest do
     refute Application.spec(:ex_storage_service_s3)
   end
 
-  test "forge_releases owns the storage subtree" do
+  test "forge_blobs owns the storage subtree" do
     assert Process.whereis(ForgeReleases.Supervisor)
-    assert Process.whereis(ForgeReleases.AssetStorage.Supervisor)
-    assert Process.whereis(ForgeReleases.AssetStorage.InstanceSupervisor)
-    assert Process.whereis(ForgeReleases.AssetStorage.Manager)
+    assert Process.whereis(ForgeBlobs.ApplicationSupervisor)
+    assert Process.whereis(ForgeBlobs.InstanceSupervisor)
+    assert Process.whereis(ForgeBlobs.Manager)
   end
 end

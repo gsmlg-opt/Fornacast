@@ -28,6 +28,11 @@ defmodule FornacastWeb.Router do
   scope "/", FornacastWeb do
     get "/health", HealthController, :show
 
+    post "/:owner/:repo_dot_git/info/lfs/objects/batch", GitLFSController, :batch
+    get "/:owner/:repo_dot_git/info/lfs/objects/:oid", GitLFSController, :download
+    put "/:owner/:repo_dot_git/info/lfs/objects/:oid", GitLFSController, :upload
+    post "/:owner/:repo_dot_git/info/lfs/objects/:oid/verify", GitLFSController, :verify
+
     get "/:owner/:repo_dot_git/info/refs", GitHTTPController, :info_refs
     post "/:owner/:repo_dot_git/git-upload-pack", GitHTTPController, :upload_pack
     post "/:owner/:repo_dot_git/git-receive-pack", GitHTTPController, :receive_pack

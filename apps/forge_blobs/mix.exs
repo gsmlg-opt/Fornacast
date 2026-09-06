@@ -1,9 +1,9 @@
-defmodule ForgeReleases.MixProject do
+defmodule ForgeBlobs.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :forge_releases,
+      app: :forge_blobs,
       version: "0.2.2",
       build_path: "../../_build",
       config_path: "../../config/config.exs",
@@ -17,7 +17,7 @@ defmodule ForgeReleases.MixProject do
 
   def application do
     [
-      mod: {ForgeReleases.Application, []},
+      mod: {ForgeBlobs.Application, []},
       extra_applications: [:logger]
     ]
   end
@@ -25,7 +25,8 @@ defmodule ForgeReleases.MixProject do
   defp deps do
     [
       {:fornacast, in_umbrella: true},
-      {:forge_blobs, in_umbrella: true}
+      # TODO(upstream): gsmlg-opt/ex_storage_service#17
+      {:ex_storage_service, "== 0.6.4"}
     ]
   end
 end

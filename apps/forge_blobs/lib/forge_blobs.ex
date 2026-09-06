@@ -1,7 +1,7 @@
-defmodule ForgeReleases.AssetStorage do
+defmodule ForgeBlobs do
   @moduledoc false
 
-  alias ForgeBlobs.{Source, StagedRef}
+  alias ForgeBlobs.{LocalCAS, Manager, Source, StagedRef}
 
   @type storage_key :: String.t()
   @type storage_error ::
@@ -46,7 +46,7 @@ defmodule ForgeReleases.AssetStorage do
   @callback capacity() :: {:ok, capacity()} | {:error, storage_error()}
 
   @spec ready?() :: boolean()
-  def ready?, do: ForgeBlobs.ready?()
+  def ready?, do: Manager.ready?()
 
   @doc """
   Streams a caller-owned source into one staging directory.
@@ -55,26 +55,26 @@ defmodule ForgeReleases.AssetStorage do
   cooperative deadline budget; the callback remains responsible for enforcing
   it and returning its latest classified state.
   """
-  defdelegate stage_from_reader(staging_key, reader, state, options), to: ForgeBlobs
-  defdelegate commit(staged_ref), to: ForgeBlobs
-  defdelegate discard(staged_ref), to: ForgeBlobs
-  defdelegate stat(storage_key), to: ForgeBlobs
-  defdelegate open(storage_key, expected_size, range), to: ForgeBlobs
+  defdelegate stage_from_reader(staging_key, reader, state, options), to: LocalCAS
+  defdelegate commit(staged_ref), to: LocalCAS
+  defdelegate discard(staged_ref), to: LocalCAS
+  defdelegate stat(storage_key), to: LocalCAS
+  defdelegate open(storage_key, expected_size, range), to: LocalCAS
 
   @doc """
   Recovers the only direct regular survivor for an exclusively owned staging key.
   """
-  defdelegate recover_stage(staging_key, expected_digest, expected_size), to: ForgeBlobs
+  defdelegate recover_stage(staging_key, expected_digest, expected_size), to: LocalCAS
 
   @doc """
   Durably cleans the direct survivor directory for an exclusively owned staging key.
 
   Callers must linearize this operation with recovery and staging for the same key.
   """
-  defdelegate cleanup_staging(staging_key), to: ForgeBlobs
-  defdelegate read(source, requested_bytes), to: ForgeBlobs
-  defdelegate close(source), to: ForgeBlobs
-  defdelegate verify(storage_key), to: ForgeBlobs
-  defdelegate delete(storage_key), to: ForgeBlobs
-  defdelegate capacity(), to: ForgeBlobs
+  defdelegate cleanup_staging(staging_key), to: LocalCAS
+  defdelegate read(source, requested_bytes), to: LocalCAS
+  defdelegate close(source), to: LocalCAS
+  defdelegate verify(storage_key), to: LocalCAS
+  defdelegate delete(storage_key), to: LocalCAS
+  defdelegate capacity(), to: LocalCAS
 end

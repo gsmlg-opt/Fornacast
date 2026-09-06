@@ -1,4 +1,4 @@
-defmodule ForgeReleases.AssetStorage.Config do
+defmodule ForgeBlobs.Config do
   @moduledoc false
 
   alias ExStorageService.InstanceConfig
@@ -19,7 +19,7 @@ defmodule ForgeReleases.AssetStorage.Config do
 
   @spec load!() :: t()
   def load! do
-    root = Fornacast.Config.release_asset_storage_root()
+    root = Fornacast.Config.blob_storage_root()
     instance_config = load_instance_config!()
     context = load_context!(instance_config)
 
@@ -30,8 +30,8 @@ defmodule ForgeReleases.AssetStorage.Config do
       tmp_root: context.tmp_root,
       ra_root: context.ra_root,
       metadata_root: context.metadata_root,
-      max_bytes: Fornacast.Config.release_asset_max_bytes(),
-      gc_grace_seconds: Fornacast.Config.release_asset_gc_grace_seconds(),
+      max_bytes: Fornacast.Config.blob_max_bytes(),
+      gc_grace_seconds: Fornacast.Config.blob_gc_grace_seconds(),
       instance_config: instance_config,
       context: context
     })
@@ -62,16 +62,16 @@ defmodule ForgeReleases.AssetStorage.Config do
       validate_absolute_normalized!(name, path)
 
       unless contained?(config.root, path) do
-        raise ArgumentError, "#{name} must be contained by the release-asset root"
+        raise ArgumentError, "#{name} must be contained by the blob root"
       end
     end
 
     unless is_integer(config.max_bytes) and config.max_bytes in 1..2_147_483_648 do
-      raise ArgumentError, "release-asset maximum must be in 1..2147483648"
+      raise ArgumentError, "blob maximum must be in 1..2147483648"
     end
 
     unless is_integer(config.gc_grace_seconds) and config.gc_grace_seconds >= 3_600 do
-      raise ArgumentError, "release-asset GC grace must be at least 3600 seconds"
+      raise ArgumentError, "blob GC grace must be at least 3600 seconds"
     end
 
     config

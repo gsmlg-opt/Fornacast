@@ -33,6 +33,7 @@ defmodule FornacastWeb.MixProject do
       {:forge_pulls, in_umbrella: true},
       {:forge_repos, in_umbrella: true},
       {:git_core, in_umbrella: true},
+      {:git_lfs, in_umbrella: true},
       {:git_transport, in_umbrella: true},
       {:phoenix, "~> 1.8"},
       {:phoenix_duskmoon, "~> 9.8"},

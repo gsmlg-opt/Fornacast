@@ -1,4 +1,4 @@
-defmodule ForgeReleases.AssetStorage.LocalCASContractTest do
+defmodule ForgeBlobs.LocalCASContractTest do
   use ExUnit.Case, async: true
 
   alias ExStorageService.BlobStore.LocalCAS

@@ -96,6 +96,9 @@ config :forge_mirrors, :webhook_worker_processor_timeout_ms, 25_000
 config :fornacast_api, :github_webhook_body_total_timeout_ms, 5_000
 
 config :fornacast,
+  blob_storage_root: release_asset_root,
+  blob_max_bytes: release_asset_max_bytes,
+  blob_gc_grace_seconds: release_asset_gc_grace_seconds,
   release_asset_storage_root: release_asset_root,
   release_asset_max_bytes: release_asset_max_bytes,
   release_asset_gc_grace_seconds: release_asset_gc_grace_seconds

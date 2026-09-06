@@ -1,16 +1,18 @@
 defmodule Mix.Tasks.Fornacast.RunTest do
   use ExUnit.Case, async: true
 
-  test "service applications include the issue, pull, and release applications before the API and web endpoints" do
+  test "service applications are ordered before their consumers and endpoints" do
     assert Mix.Tasks.Fornacast.Run.service_applications() == [
              :fornacast,
              :forge_accounts,
              :forge_repos,
              :git_core,
-             :git_transport,
              :forge_issues,
              :forge_pulls,
+             :forge_blobs,
              :forge_releases,
+             :git_lfs,
+             :git_transport,
              :fornacast_api,
              :fornacast_web
            ]
@@ -30,10 +32,12 @@ defmodule Mix.Tasks.Fornacast.RunTest do
              :forge_accounts,
              :forge_repos,
              :git_core,
-             :git_transport,
              :forge_issues,
              :forge_pulls,
+             :forge_blobs,
              :forge_releases,
+             :git_lfs,
+             :git_transport,
              :fornacast_api
            ]
   end

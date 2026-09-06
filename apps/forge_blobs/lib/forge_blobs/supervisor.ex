@@ -1,9 +1,9 @@
-defmodule ForgeReleases.AssetStorage.Supervisor do
+defmodule ForgeBlobs.Supervisor do
   @moduledoc false
 
   use Supervisor
 
-  alias ForgeReleases.AssetStorage.{Config, LocalCAS, Manager}
+  alias ForgeBlobs.{Config, LocalCAS, Manager}
 
   def start_link(options) do
     Supervisor.start_link(__MODULE__, options, name: __MODULE__)
@@ -15,8 +15,7 @@ defmodule ForgeReleases.AssetStorage.Supervisor do
     :ok = LocalCAS.preflight(config)
 
     children = [
-      {DynamicSupervisor,
-       strategy: :one_for_one, name: ForgeReleases.AssetStorage.InstanceSupervisor},
+      {DynamicSupervisor, strategy: :one_for_one, name: ForgeBlobs.InstanceSupervisor},
       {Manager, config: config}
     ]
 

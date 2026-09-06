@@ -10,13 +10,15 @@ defmodule ForgeReleases.ReleaseModeRecoveryProbe do
       |> Keyword.fetch!(:applications)
 
     host_mode = Keyword.fetch!(release_applications, :forge_releases)
+    blob_mode = Keyword.fetch!(release_applications, :forge_blobs)
     storage_mode = Keyword.fetch!(release_applications, :ex_storage_service)
 
     assert!(host_mode == :permanent, {:unexpected_host_mode, host_mode})
     assert!(storage_mode == :temporary, {:unexpected_storage_mode, storage_mode})
 
-    :ok = load_database_independent_host!()
+    :ok = load_database_independent_storage_apps!()
     {:ok, _started} = Application.ensure_all_started(:ex_storage_service, storage_mode)
+    :ok = Application.start(:forge_blobs, blob_mode)
     :ok = Application.start(:forge_releases, host_mode)
 
     assert!(Process.whereis(Fornacast.Repo) == nil, :database_started)
@@ -24,13 +26,13 @@ defmodule ForgeReleases.ReleaseModeRecoveryProbe do
     assert_application_mode!(:ex_storage_service, :temporary)
 
     release_supervisor = required_process!(ForgeReleases.Supervisor)
-    manager = required_process!(ForgeReleases.AssetStorage.Manager)
+    manager = required_process!(ForgeBlobs.Manager)
     vsr_supervisor = required_process!(Concord.Engine.VSR.Supervisor)
     old_storage_supervisor = required_process!(ExStorageService.Supervisor)
     old_registry = required_process!(ExStorageService.Registry)
     old_instance = required_instance!()
 
-    assert!(ForgeReleases.AssetStorage.Manager.ready?(), :manager_not_ready_before_failure)
+    assert!(ForgeBlobs.Manager.ready?(), :manager_not_ready_before_failure)
 
     Process.exit(old_storage_supervisor, :kill)
 
@@ -41,11 +43,11 @@ defmodule ForgeReleases.ReleaseModeRecoveryProbe do
 
       is_pid(storage_supervisor) and storage_supervisor != old_storage_supervisor and
         is_pid(registry) and registry != old_registry and is_pid(instance) and
-        instance != old_instance and ForgeReleases.AssetStorage.Manager.ready?()
+        instance != old_instance and ForgeBlobs.Manager.ready?()
     end)
 
     assert!(Process.whereis(ForgeReleases.Supervisor) == release_supervisor, :host_restarted)
-    assert!(Process.whereis(ForgeReleases.AssetStorage.Manager) == manager, :manager_restarted)
+    assert!(Process.whereis(ForgeBlobs.Manager) == manager, :manager_restarted)
     assert!(Process.whereis(Concord.Engine.VSR.Supervisor) == vsr_supervisor, :vsr_restarted)
     assert!(Process.whereis(Fornacast.Repo) == nil, :database_started)
     assert_application_mode!(:forge_releases, :permanent)
@@ -60,6 +62,7 @@ defmodule ForgeReleases.ReleaseModeRecoveryProbe do
       |> Path.join("release-assets")
       |> Path.expand()
 
+    Application.put_env(:fornacast, :blob_storage_root, root)
     Application.put_env(:fornacast, :release_asset_storage_root, root)
 
     Application.put_env(:concord, :data_dir, Path.join(root, "concord"))
@@ -85,20 +88,22 @@ defmodule ForgeReleases.ReleaseModeRecoveryProbe do
     end
   end
 
-  defp load_database_independent_host! do
-    spec =
-      :forge_releases
-      |> Application.spec()
-      |> Keyword.update!(:applications, &List.delete(&1, :fornacast))
-      |> Keyword.reject(fn {_key, value} -> value == :undefined end)
+  defp load_database_independent_storage_apps! do
+    for application <- [:forge_blobs, :forge_releases] do
+      spec =
+        application
+        |> Application.spec()
+        |> Keyword.update!(:applications, &List.delete(&1, :fornacast))
+        |> Keyword.reject(fn {_key, value} -> value == :undefined end)
 
-    :ok = Application.unload(:forge_releases)
-    :ok = :application.load({:application, :forge_releases, spec})
+      :ok = Application.unload(application)
+      :ok = :application.load({:application, application, spec})
 
-    assert!(
-      :fornacast not in Application.spec(:forge_releases, :applications),
-      :database_dependency_retained
-    )
+      assert!(
+        :fornacast not in Application.spec(application, :applications),
+        {:database_dependency_retained, application}
+      )
+    end
 
     :ok
   end

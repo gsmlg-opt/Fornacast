@@ -1,4 +1,4 @@
-defmodule ForgeReleases.AssetStorage.LocalCASTest do
+defmodule ForgeBlobs.LocalCASTest do
   use ExUnit.Case, async: false
 
   alias ExStorageService.BlobStore.StagedBlob
@@ -18,7 +18,7 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
     end
 
     def notify_close(io) do
-      send(Process.get(:asset_storage_test_observer), {:fs_close, io})
+      send(Process.get(:blob_store_test_observer), {:fs_close, io})
     end
   end
 
@@ -200,7 +200,7 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
     directory = Path.join([config.tmp_root, "uploads", key])
 
     File.mkdir_p!(directory)
-    Process.put(:asset_storage_test_observer, self())
+    Process.put(:blob_store_test_observer, self())
     DurabilityFS.reset()
 
     on_exit(fn ->
@@ -214,11 +214,11 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
   test "loads the exact validated ESS context" do
     config = Config.load!()
 
-    assert config.root == Fornacast.Config.release_asset_storage_root()
+    assert config.root == Fornacast.Config.blob_storage_root()
     assert config.instance_config.instance == :fornacast_release_assets
     assert config.context.blob_root == config.blob_root
     assert config.context.tmp_root == config.tmp_root
-    assert config.max_bytes == Fornacast.Config.release_asset_max_bytes()
+    assert config.max_bytes == Fornacast.Config.blob_max_bytes()
   end
 
   test "preflight writes, syncs, closes, and removes contained probes", %{root: root} do
@@ -353,7 +353,7 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
 
   describe "opaque adapter contract" do
     test "capacity reports only bounded byte and inode counts" do
-      assert {:ok, capacity} = ForgeReleases.AssetStorage.capacity()
+      assert {:ok, capacity} = ForgeBlobs.capacity()
 
       for area <- [:cas, :staging] do
         assert %{bytes: bytes, inodes: inodes} = Map.fetch!(capacity, area)
@@ -366,7 +366,7 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
     end
 
     test "stage, commit, stat, ranged fd reads, verify, and delete", %{key: key} do
-      assert ForgeReleases.AssetStorage.ready?()
+      assert ForgeBlobs.ready?()
 
       reader = fn
         %{chunks: [chunk | rest]} = state, read_options ->
@@ -380,7 +380,7 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
       state = %{chunks: ["forna", "cast"]}
 
       assert {:ok, staged, metadata, final_state} =
-               ForgeReleases.AssetStorage.stage_from_reader(key, reader, state,
+               ForgeBlobs.stage_from_reader(key, reader, state,
                  read_options: [length: 262_144, read_length: 262_144, read_timeout: 1_000]
                )
 
@@ -389,41 +389,41 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
       assert final_state == %{chunks: []}
       assert inspect(staged) == "#ForgeBlobs.StagedRef<redacted>"
 
-      assert {:ok, ^metadata} = ForgeReleases.AssetStorage.commit(staged)
-      assert {:ok, %{storage_key: ^digest, size: 9}} = ForgeReleases.AssetStorage.stat(digest)
-      assert :ok = ForgeReleases.AssetStorage.verify(digest)
+      assert {:ok, ^metadata} = ForgeBlobs.commit(staged)
+      assert {:ok, %{storage_key: ^digest, size: 9}} = ForgeBlobs.stat(digest)
+      assert :ok = ForgeBlobs.verify(digest)
 
-      assert {:ok, source} = ForgeReleases.AssetStorage.open(digest, 9, {2, 5})
+      assert {:ok, source} = ForgeBlobs.open(digest, 9, {2, 5})
       assert inspect(source) == "#ForgeBlobs.Source<redacted>"
-      assert {:ok, "rn", source} = ForgeReleases.AssetStorage.read(source, 2)
-      assert {:ok, "aca", source} = ForgeReleases.AssetStorage.read(source, 10)
-      assert :eof = ForgeReleases.AssetStorage.read(source, 1)
-      assert :ok = ForgeReleases.AssetStorage.close(source)
-      assert :ok = ForgeReleases.AssetStorage.close(source)
+      assert {:ok, "rn", source} = ForgeBlobs.read(source, 2)
+      assert {:ok, "aca", source} = ForgeBlobs.read(source, 10)
+      assert :eof = ForgeBlobs.read(source, 1)
+      assert :ok = ForgeBlobs.close(source)
+      assert :ok = ForgeBlobs.close(source)
 
-      assert :ok = ForgeReleases.AssetStorage.delete(digest)
-      assert {:error, :not_found} = ForgeReleases.AssetStorage.stat(digest)
+      assert :ok = ForgeBlobs.delete(digest)
+      assert {:error, :not_found} = ForgeBlobs.stat(digest)
     end
 
     test "open owns an fd and validates the recorded size", %{key: key} do
       reader = fn state, _options -> {:ok, "descriptor", state} end
 
       assert {:ok, staged, %{storage_key: digest}, :state} =
-               ForgeReleases.AssetStorage.stage_from_reader(key, reader, :state,
+               ForgeBlobs.stage_from_reader(key, reader, :state,
                  read_options: [length: 32, read_length: 32, read_timeout: 1_000]
                )
 
-      assert {:ok, _metadata} = ForgeReleases.AssetStorage.commit(staged)
+      assert {:ok, _metadata} = ForgeBlobs.commit(staged)
 
       assert {:error, :integrity_mismatch} =
-               ForgeReleases.AssetStorage.open(digest, 99, :all)
+               ForgeBlobs.open(digest, 99, :all)
 
-      assert {:ok, source} = ForgeReleases.AssetStorage.open(digest, 10, :all)
+      assert {:ok, source} = ForgeBlobs.open(digest, 10, :all)
 
-      assert :ok = ForgeReleases.AssetStorage.delete(digest)
-      assert {:ok, "descriptor", source} = ForgeReleases.AssetStorage.read(source, 1_048_577)
-      assert :eof = ForgeReleases.AssetStorage.read(source, 1)
-      assert :ok = ForgeReleases.AssetStorage.close(source)
+      assert :ok = ForgeBlobs.delete(digest)
+      assert {:ok, "descriptor", source} = ForgeBlobs.read(source, 1_048_577)
+      assert :eof = ForgeBlobs.read(source, 1)
+      assert :ok = ForgeBlobs.close(source)
     end
 
     test "reads clamp each fd operation to one MiB", %{key: key} do
@@ -435,7 +435,7 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
       end
 
       assert {:ok, staged, %{storage_key: digest}, []} =
-               ForgeReleases.AssetStorage.stage_from_reader(
+               ForgeBlobs.stage_from_reader(
                  key,
                  reader,
                  [:binary.copy("x", 1_048_576), "y"],
@@ -446,33 +446,33 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
                  ]
                )
 
-      assert {:ok, _metadata} = ForgeReleases.AssetStorage.commit(staged)
-      assert {:ok, source} = ForgeReleases.AssetStorage.open(digest, byte_size(payload), :all)
-      assert {:ok, first, source} = ForgeReleases.AssetStorage.read(source, 2_097_152)
+      assert {:ok, _metadata} = ForgeBlobs.commit(staged)
+      assert {:ok, source} = ForgeBlobs.open(digest, byte_size(payload), :all)
+      assert {:ok, first, source} = ForgeBlobs.read(source, 2_097_152)
       assert byte_size(first) == 1_048_576
-      assert {:ok, "y", source} = ForgeReleases.AssetStorage.read(source, 2_097_152)
-      assert :eof = ForgeReleases.AssetStorage.read(source, 1)
-      assert :ok = ForgeReleases.AssetStorage.close(source)
-      assert :ok = ForgeReleases.AssetStorage.delete(digest)
+      assert {:ok, "y", source} = ForgeBlobs.read(source, 2_097_152)
+      assert :eof = ForgeBlobs.read(source, 1)
+      assert :ok = ForgeBlobs.close(source)
+      assert :ok = ForgeBlobs.delete(digest)
     end
 
     test "effective lower maximum and caller input are enforced", %{key: key} do
       reader = fn state, _options -> {:ok, "four", state + 1} end
 
       assert {:error, :entity_too_large, 1} =
-               ForgeReleases.AssetStorage.stage_from_reader(key, reader, 0,
+               ForgeBlobs.stage_from_reader(key, reader, 0,
                  max_size: 3,
                  read_options: [length: 3, read_length: 3, read_timeout: 1_000]
                )
 
       assert {:error, :invalid_source, 0} =
-               ForgeReleases.AssetStorage.stage_from_reader("../escape", reader, 0,
+               ForgeBlobs.stage_from_reader("../escape", reader, 0,
                  read_options: [length: 3, read_length: 3, read_timeout: 1_000]
                )
 
       uppercase = String.duplicate("A", 64)
-      assert {:error, :invalid_source} = ForgeReleases.AssetStorage.stat(uppercase)
-      assert {:error, :invalid_source} = ForgeReleases.AssetStorage.open(uppercase, 1, :all)
+      assert {:error, :invalid_source} = ForgeBlobs.stat(uppercase)
+      assert {:error, :invalid_source} = ForgeBlobs.open(uppercase, 1, :all)
     end
 
     test "reader ceilings are enforced and the latest classified state is retained", %{key: key} do
@@ -487,7 +487,7 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
       initial = %{calls: 0, reader_error: nil}
 
       assert {:error, :invalid_source, %{calls: 1, reader_error: :reader}} =
-               ForgeReleases.AssetStorage.stage_from_reader(key, oversized, initial,
+               ForgeBlobs.stage_from_reader(key, oversized, initial,
                  read_options: [length: 8, read_length: 4, read_timeout: 30_000]
                )
 
@@ -498,7 +498,7 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
         end
 
         assert {:error, _normalized, %{calls: 1, reader_error: ^classification}} =
-                 ForgeReleases.AssetStorage.stage_from_reader(
+                 ForgeBlobs.stage_from_reader(
                    "#{key}-#{classification}",
                    reader,
                    initial,
@@ -507,7 +507,7 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
       end
 
       assert {:error, :invalid_source, ^initial} =
-               ForgeReleases.AssetStorage.stage_from_reader(
+               ForgeBlobs.stage_from_reader(
                  "#{key}-timeout",
                  oversized,
                  initial,
@@ -567,8 +567,8 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
 
       for fields <- malformed do
         staged = struct!(StagedRef, fields)
-        assert {:error, :invalid_source} = ForgeReleases.AssetStorage.commit(staged)
-        assert {:error, :invalid_source} = ForgeReleases.AssetStorage.discard(staged)
+        assert {:error, :invalid_source} = ForgeBlobs.commit(staged)
+        assert {:error, :invalid_source} = ForgeBlobs.discard(staged)
       end
 
       injected =
@@ -577,8 +577,8 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
           | options: [fs_module: :bogus]
         })
 
-      assert {:error, :invalid_source} = ForgeReleases.AssetStorage.commit(injected)
-      assert {:error, :invalid_source} = ForgeReleases.AssetStorage.discard(injected)
+      assert {:error, :invalid_source} = ForgeBlobs.commit(injected)
+      assert {:error, :invalid_source} = ForgeBlobs.discard(injected)
     end
 
     test "forged source handles cannot crash read arithmetic" do
@@ -592,8 +592,8 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
 
       for fields <- malformed do
         source = struct!(Source, fields)
-        assert {:error, :invalid_source} = ForgeReleases.AssetStorage.read(source, 1)
-        assert :ok = ForgeReleases.AssetStorage.close(source)
+        assert {:error, :invalid_source} = ForgeBlobs.read(source, 1)
+        assert :ok = ForgeBlobs.close(source)
       end
 
       plausible =
@@ -604,8 +604,8 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
           remaining: 1
         )
 
-      assert {:error, :unavailable} = ForgeReleases.AssetStorage.read(plausible, 1)
-      assert :ok = ForgeReleases.AssetStorage.close(plausible)
+      assert {:error, :unavailable} = ForgeBlobs.read(plausible, 1)
+      assert :ok = ForgeBlobs.close(plausible)
     end
 
     test "failed finish-open paths close exactly once", context do
@@ -630,22 +630,22 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
       File.write!(path, "survivor")
       digest = :crypto.hash(:sha256, "survivor") |> Base.encode16(case: :lower)
 
-      assert {:ok, staged} = ForgeReleases.AssetStorage.recover_stage(context.key, digest, 8)
+      assert {:ok, staged} = ForgeBlobs.recover_stage(context.key, digest, 8)
       assert inspect(staged) == "#ForgeBlobs.StagedRef<redacted>"
 
       assert {:ok, %{sha256_digest: ^digest, storage_key: ^digest, size: 8}} =
-               ForgeReleases.AssetStorage.commit(staged)
+               ForgeBlobs.commit(staged)
 
-      assert :ok = ForgeReleases.AssetStorage.cleanup_staging(context.key)
+      assert :ok = ForgeBlobs.cleanup_staging(context.key)
       refute File.exists?(context.directory)
-      assert :ok = ForgeReleases.AssetStorage.cleanup_staging(context.key)
+      assert :ok = ForgeBlobs.cleanup_staging(context.key)
     end
 
     test "rejects missing, symlinked, nested, multiple, size, and digest mismatches", context do
-      assert :ok = ForgeReleases.AssetStorage.cleanup_staging(context.key)
+      assert :ok = ForgeBlobs.cleanup_staging(context.key)
 
       assert {:error, :not_found} =
-               ForgeReleases.AssetStorage.recover_stage(
+               ForgeBlobs.recover_stage(
                  context.key,
                  String.duplicate("a", 64),
                  1
@@ -656,7 +656,7 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
       File.write!(Path.join(context.directory, "two"), "b")
 
       assert {:error, :invalid_source} =
-               ForgeReleases.AssetStorage.recover_stage(
+               ForgeBlobs.recover_stage(
                  context.key,
                  String.duplicate("a", 64),
                  1
@@ -666,7 +666,7 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
       File.mkdir_p!(Path.join(context.directory, "nested"))
 
       assert {:error, :invalid_source} =
-               ForgeReleases.AssetStorage.recover_stage(
+               ForgeBlobs.recover_stage(
                  context.key,
                  String.duplicate("a", 64),
                  1
@@ -680,7 +680,7 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
       File.rm!(target)
 
       assert {:error, :invalid_source} =
-               ForgeReleases.AssetStorage.recover_stage(
+               ForgeBlobs.recover_stage(
                  context.key,
                  String.duplicate("a", 64),
                  1
@@ -691,14 +691,14 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
       File.write!(Path.join(context.directory, "one"), "short")
 
       assert {:error, :integrity_mismatch} =
-               ForgeReleases.AssetStorage.recover_stage(
+               ForgeBlobs.recover_stage(
                  context.key,
                  String.duplicate("a", 64),
                  99
                )
 
       assert {:error, :integrity_mismatch} =
-               ForgeReleases.AssetStorage.recover_stage(
+               ForgeBlobs.recover_stage(
                  context.key,
                  String.duplicate("a", 64),
                  5
@@ -716,7 +716,7 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
       File.write!(Path.join(context.directory, "upload-1"), "12345")
 
       assert {:error, :entity_too_large} =
-               ForgeReleases.AssetStorage.recover_stage(
+               ForgeBlobs.recover_stage(
                  context.key,
                  String.duplicate("a", 64),
                  5
@@ -735,7 +735,7 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
       on_exit(fn -> File.rm_rf!(target) end)
 
       assert {:error, :invalid_source} =
-               ForgeReleases.AssetStorage.cleanup_staging(context.key)
+               ForgeBlobs.cleanup_staging(context.key)
 
       assert File.read!(Path.join(target, "keep")) == "kept"
     end
@@ -776,11 +776,11 @@ defmodule ForgeReleases.AssetStorage.LocalCASTest do
     reader = fn state, _options -> {:ok, contents, state} end
 
     assert {:ok, staged, %{storage_key: digest}, :state} =
-             ForgeReleases.AssetStorage.stage_from_reader(context.key, reader, :state,
+             ForgeBlobs.stage_from_reader(context.key, reader, :state,
                read_options: [length: 32, read_length: 32, read_timeout: 1_000]
              )
 
-    assert {:ok, _metadata} = ForgeReleases.AssetStorage.commit(staged)
+    assert {:ok, _metadata} = ForgeBlobs.commit(staged)
     digest
   end
 

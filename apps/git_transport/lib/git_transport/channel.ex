@@ -74,6 +74,9 @@ defmodule GitTransport.Channel do
       {:ok, actor, %{operation: :receive_pack}, repository} ->
         start_receive_pack(cm, channel_id, want_reply, actor, repository, state)
 
+      {:ok, actor, %{operation: :lfs_authenticate} = command, repository} ->
+        start_lfs_authenticate(cm, channel_id, want_reply, actor, command, repository, state)
+
       {:error, reason} ->
         reject(cm, channel_id, want_reply, GitTransport.Exec.error_message(reason), state)
     end
@@ -202,6 +205,30 @@ defmodule GitTransport.Channel do
       {:error, _reason} ->
         Logger.error("Git receive-pack advertisement failed")
         reject(cm, channel_id, want_reply, "ERROR: Git receive-pack failed.\n", state)
+    end
+  end
+
+  defp start_lfs_authenticate(
+         cm,
+         channel_id,
+         want_reply,
+         actor,
+         command,
+         repository,
+         state
+       ) do
+    case GitTransport.Exec.lfs_authenticate(actor, repository, command.lfs_operation) do
+      {:ok, response} ->
+        :ssh_connection.reply_request(cm, want_reply, :success, channel_id)
+
+        with :ok <- send_data(cm, channel_id, response) do
+          exit_success(cm, channel_id, %{state | cm: cm, channel_id: channel_id})
+        else
+          {:error, _reason} -> fail_started(cm, channel_id, state)
+        end
+
+      {:error, reason} ->
+        reject(cm, channel_id, want_reply, GitTransport.Exec.error_message(reason), state)
     end
   end
 

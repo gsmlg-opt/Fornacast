@@ -16,17 +16,36 @@ defmodule Fornacast.Config do
   end
 
   def release_asset_storage_root do
-    :fornacast
-    |> Application.fetch_env!(:release_asset_storage_root)
-    |> Path.expand()
+    blob_storage_root()
   end
 
   def release_asset_max_bytes do
-    Application.fetch_env!(:fornacast, :release_asset_max_bytes)
+    blob_max_bytes()
   end
 
   def release_asset_gc_grace_seconds do
-    Application.fetch_env!(:fornacast, :release_asset_gc_grace_seconds)
+    blob_gc_grace_seconds()
+  end
+
+  def blob_storage_root do
+    :fornacast
+    |> blob_config(:blob_storage_root, :release_asset_storage_root)
+    |> Path.expand()
+  end
+
+  def blob_max_bytes do
+    blob_config(:fornacast, :blob_max_bytes, :release_asset_max_bytes)
+  end
+
+  def blob_gc_grace_seconds do
+    blob_config(:fornacast, :blob_gc_grace_seconds, :release_asset_gc_grace_seconds)
+  end
+
+  defp blob_config(application, key, legacy_key) do
+    case Application.fetch_env(application, key) do
+      {:ok, value} -> value
+      :error -> Application.fetch_env!(application, legacy_key)
+    end
   end
 
   @spec repository_cleanup() :: %{

@@ -31,7 +31,7 @@ case "$phase" in
       payload = "fornacast-release-asset-restart-smoke"
       digest = :crypto.hash(:sha256, payload) |> Base.encode16(case: :lower)
       size = byte_size(payload)
-      true = ForgeReleases.AssetStorage.Manager.ready?()
+      true = ForgeBlobs.Manager.ready?()
       {:ok, %{storage_key: ^digest, size: ^size}} = ForgeReleases.AssetStorage.stat(digest)
       :ok = ForgeReleases.AssetStorage.verify(digest)
       {:ok, source} = ForgeReleases.AssetStorage.open(digest, size, :all)

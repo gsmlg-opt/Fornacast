@@ -1,4 +1,4 @@
-defmodule ForgeReleases.AssetStorage.Manager do
+defmodule ForgeBlobs.Manager do
   @moduledoc false
 
   use GenServer
@@ -6,7 +6,7 @@ defmodule ForgeReleases.AssetStorage.Manager do
   alias ExStorageService.{InstanceConfig, Names}
   alias ExStorageService.Storage.Engine
 
-  @default_instance_supervisor ForgeReleases.AssetStorage.InstanceSupervisor
+  @default_instance_supervisor ForgeBlobs.InstanceSupervisor
   @initial_backoff_ms 100
   @maximum_backoff_ms 5_000
 
@@ -64,10 +64,10 @@ defmodule ForgeReleases.AssetStorage.Manager do
         :absent -> start_initial_instance(state)
         {:ok, instance} -> attach_existing_instance(state, instance)
         {:stale_owned, instance} -> replace_stale_initial_instance(state, instance)
-        {:error, reason} -> {:stop, {:asset_storage_start_failed, reason}}
+        {:error, reason} -> {:stop, {:blob_storage_start_failed, reason}}
       end
     else
-      {:error, reason} -> {:stop, {:asset_storage_start_failed, reason}}
+      {:error, reason} -> {:stop, {:blob_storage_start_failed, reason}}
     end
   end
 
@@ -127,11 +127,11 @@ defmodule ForgeReleases.AssetStorage.Manager do
           {:error, reason, failed} ->
             clear_monitors(failed)
             _ = terminate_instance(state.instance_supervisor, instance)
-            {:stop, {:asset_storage_start_failed, reason}}
+            {:stop, {:blob_storage_start_failed, reason}}
         end
 
       {:error, reason} ->
-        {:stop, {:asset_storage_start_failed, reason}}
+        {:stop, {:blob_storage_start_failed, reason}}
     end
   end
 
@@ -186,7 +186,7 @@ defmodule ForgeReleases.AssetStorage.Manager do
 
     case terminate_stale_instance(state.instance_supervisor, instance) do
       :ok -> start_initial_instance(state)
-      {:error, reason} -> {:stop, {:asset_storage_start_failed, reason}}
+      {:error, reason} -> {:stop, {:blob_storage_start_failed, reason}}
     end
   end
 
@@ -356,7 +356,7 @@ defmodule ForgeReleases.AssetStorage.Manager do
 
   defp set_status(state, status) do
     if is_pid(state.test_observer) do
-      send(state.test_observer, {:asset_storage_status, status})
+      send(state.test_observer, {:blob_storage_status, status})
     end
 
     %{state | status: status}
