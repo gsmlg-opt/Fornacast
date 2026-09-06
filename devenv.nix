@@ -11,6 +11,7 @@ in {
   packages = with pkgs-stable;
     [
       git
+      git-lfs
       pkg-config
       openssl
       cargo
