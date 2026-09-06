@@ -4,7 +4,7 @@ defmodule ForgeMirrors.IssueOutboxMaterializationTest do
   import Ecto.Query
   import ForgeMirrors.TestSupport.MirrorFixtures
   alias Fornacast.{DomainOutboxEvent, Repo}
-  alias ForgeMirrors.{MirrorOperation, OrganizationMirror}
+  alias ForgeMirrors.{MirrorOperation, MirrorResourceState, OrganizationMirror}
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
@@ -49,6 +49,15 @@ defmodule ForgeMirrors.IssueOutboxMaterializationTest do
 
     assert operation.cursor["author_user_id"] ==
              organization_owner_fixture(context.organization).id
+  end
+
+  test "unpublished repositories retry without acknowledging local intent", context do
+    Repo.get!(ForgeRepos.Repository, context.binding.repository_id)
+    |> Ecto.Changeset.change(lifecycle: :importing)
+    |> Repo.update!()
+
+    assert {:error, :unpublished_repository} =
+             ForgeMirrors.materialize_outbox_event(event(context))
   end
 
   test "malformed identity and cross-repository issue references are rejected", context do
@@ -148,6 +157,80 @@ defmodule ForgeMirrors.IssueOutboxMaterializationTest do
     assert operation.cursor["deleted"] == false
     assert operation.cursor["sync_version"] == 1
     assert operation.cursor["comment_id"] == tombstone.payload["comment_id"]
+
+    parent_mapping(context)
+
+    {:ok, [claimed]} =
+      ForgeMirrors.claim_operations("old-comment", DateTime.utc_now(:second), 60, 1, [
+        "sync.issue_comment"
+      ])
+
+    assert {:ok, sync} = ForgeMirrors.resource_operation_context(claimed)
+    assert sync.local_deleted == true
+    assert sync.local_version == 3
+    assert sync.parent_issue_id == context.issue.id
+    assert Repo.get!(MirrorOperation, claimed.id).cursor["sync_version"] == 1
+  end
+
+  test "context never borrows a malformed or differently scoped later comment tombstone",
+       context do
+    tombstone = comment_event(context, "issue_comment.deleted") |> Repo.insert!()
+
+    earlier =
+      comment_event(context, "issue_comment.updated")
+      |> put_in([Access.key!(:payload), "sync_version"], 1)
+
+    assert {:ok, {:materialized, [_]}} = ForgeMirrors.materialize_outbox_event(earlier)
+    parent_mapping(context)
+
+    {:ok, [claimed]} =
+      ForgeMirrors.claim_operations("invalid-tombstone", DateTime.utc_now(:second), 60, 1, [
+        "sync.issue_comment"
+      ])
+
+    for payload <- [
+          Map.put(tombstone.payload, "deleted", false),
+          Map.put(tombstone.payload, "repository_id", context.binding.repository_id + 1),
+          Map.put(tombstone.payload, "author_user_id", tombstone.payload["author_user_id"] + 1),
+          Map.put(tombstone.payload, "sync_version", 1)
+        ] do
+      tombstone |> Ecto.Changeset.change(payload: payload) |> Repo.update!()
+
+      assert {:ok, %{local_deleted: false, local_version: 1}} =
+               ForgeMirrors.resource_operation_context(claimed)
+    end
+
+    Repo.get!(DomainOutboxEvent, tombstone.id)
+    |> Ecto.Changeset.change(payload: tombstone.payload)
+    |> Repo.update!()
+
+    Repo.insert_all("issue_comments", [
+      %{
+        id: tombstone.payload["comment_id"],
+        issue_id: context.issue.id,
+        body: "still exists",
+        author_user_id: tombstone.payload["author_user_id"],
+        sync_version: 1,
+        inserted_at: DateTime.utc_now(:second),
+        updated_at: DateTime.utc_now(:second)
+      }
+    ])
+
+    assert {:ok, %{local_deleted: false}} = ForgeMirrors.resource_operation_context(claimed)
+  end
+
+  defp parent_mapping(context) do
+    %MirrorResourceState{}
+    |> MirrorResourceState.persistence_changeset(%{
+      repository_mirror_id: context.binding.id,
+      resource_kind: :issue,
+      local_resource_type: "ForgeIssues.Issue",
+      local_resource_id: context.issue.id,
+      github_object_id: 98765,
+      github_number: context.issue.number,
+      state: :confirmed
+    })
+    |> Repo.insert!()
   end
 
   test "malformed later deletion metadata does not authorize a vanished comment event", context do
@@ -217,7 +300,9 @@ defmodule ForgeMirrors.IssueOutboxMaterializationTest do
             inserted_at: now,
             updated_at: now
           }
-        ], returning: [:id])
+        ],
+        returning: [:id]
+      )
 
     %{id: id, kind: kind, number: number}
   end

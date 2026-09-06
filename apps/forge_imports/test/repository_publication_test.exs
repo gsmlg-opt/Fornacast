@@ -17,7 +17,7 @@ defmodule ForgeImports.RepositoryPublicationTest do
     RunAggregator
   }
 
-  alias ForgeIssues.Label
+  alias ForgeIssues.{Comment, Issue, IssueAssignee, IssueLabel, Label}
 
   alias ForgeMirrors.{
     MirrorOperation,
@@ -222,6 +222,57 @@ defmodule ForgeImports.RepositoryPublicationTest do
 
     installation_id = 8_400_000_000 + System.unique_integer([:positive])
 
+    {:ok, identity} =
+      ForgeAccounts.observe_github_identity(%{"id" => 812_345, "login" => "assignee"}, @now)
+
+    issue =
+      %Issue{repository_id: fixture.shadow.id, kind: :issue}
+      |> Issue.import_changeset(%{
+        number: 7,
+        title: "Imported",
+        body: "Baseline",
+        state: :open,
+        author_github_identity_id: identity.id,
+        inserted_at: @now,
+        updated_at: @now
+      })
+      |> Repo.insert!()
+
+    comment =
+      %Comment{issue_id: issue.id}
+      |> Comment.import_changeset(%{
+        body: "Imported comment",
+        author_github_identity_id: identity.id,
+        inserted_at: @now,
+        updated_at: @now
+      })
+      |> Repo.insert!()
+
+    %IssueLabel{}
+    |> IssueLabel.changeset(%{issue_id: issue.id, label_id: label.id})
+    |> Repo.insert!()
+
+    %IssueAssignee{}
+    |> IssueAssignee.import_changeset(%{issue_id: issue.id, github_identity_id: identity.id})
+    |> Repo.insert!()
+
+    for {kind, type, resource, remote_id} <- [
+          {"issue", "ForgeIssues.Issue", issue, 812_346},
+          {"comment", "ForgeIssues.Comment", comment, 812_347}
+        ] do
+      %ObjectMapping{}
+      |> ObjectMapping.create_changeset(%{
+        repository_item_id: fixture.item.id,
+        hidden_repository_id: fixture.shadow.id,
+        github_repository_id: fixture.item.github_repository_id,
+        object_kind: kind,
+        github_object_id: remote_id,
+        local_resource_type: type,
+        local_resource_id: resource.id
+      })
+      |> Repo.insert!()
+    end
+
     pending_mirror =
       ForgeMirrors.create_organization_mirror(context.actor, %{
         organization_id: organization.id,
@@ -337,11 +388,37 @@ defmodule ForgeImports.RepositoryPublicationTest do
                confirmed_remote_updated_at: %DateTime{},
                confirmed_fingerprint: fingerprint
              }
-           ] = Repo.all(MirrorResourceState)
+           ] = Repo.all(from state in MirrorResourceState, where: state.resource_kind == :label)
 
     assert local_resource_id == label.id
     assert github_object_id == mapping.github_object_id
     assert byte_size(fingerprint) == 64
+
+    issue_state =
+      Repo.get_by!(MirrorResourceState, resource_kind: :issue, local_resource_id: issue.id)
+
+    assert issue_state.confirmed_local_version == issue.sync_version
+
+    assert issue_state.confirmed_snapshot == %{
+             "title" => "Imported",
+             "body" => "Baseline",
+             "state" => "open",
+             "state_reason" => nil,
+             "label_github_ids" => [mapping.github_object_id],
+             "assignee_github_ids" => [identity.github_user_id]
+           }
+
+    assert {:ok, issue_state.confirmed_fingerprint} ==
+             ForgeMirrors.resource_fingerprint(issue_state.confirmed_snapshot)
+
+    comment_state =
+      Repo.get_by!(MirrorResourceState,
+        resource_kind: :issue_comment,
+        local_resource_id: comment.id
+      )
+
+    assert comment_state.confirmed_local_version == comment.sync_version
+    assert comment_state.confirmed_snapshot == %{"body" => "Imported comment"}
 
     assert [
              %MirrorRefState{

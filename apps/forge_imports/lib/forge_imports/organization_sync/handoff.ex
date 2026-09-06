@@ -145,6 +145,7 @@ defmodule ForgeImports.OrganizationSync.Handoff do
           where: mapping.repository_item_id == ^item.id,
           order_by: [asc: mapping.id]
       )
+      |> Enum.sort_by(fn mapping -> if mapping.object_kind == "label", do: 0, else: 1 end)
 
     Enum.reduce_while(mappings, {:ok, 0}, fn mapping, {:ok, count} ->
       with {:ok, attrs} <- resource_attrs(repo, repository_mirror, mapping, now),
@@ -160,7 +161,8 @@ defmodule ForgeImports.OrganizationSync.Handoff do
     with {:ok, kind} <- resource_kind(mapping.object_kind),
          {:ok, resource} <- local_resource(repo, mapping),
          :ok <- validate_local_resource(repo, resource, repository_mirror.repository_id),
-         {:ok, snapshot} <- resource_snapshot(kind, resource, repo),
+         {:ok, snapshot} <- resource_snapshot(kind, resource, repo, repository_mirror.id),
+         {:ok, fingerprint} <- ForgeMirrors.resource_fingerprint(snapshot),
          %DateTime{} = remote_updated_at <- Map.get(resource, :updated_at) do
       {:ok,
        %{
@@ -170,9 +172,10 @@ defmodule ForgeImports.OrganizationSync.Handoff do
          local_resource_id: resource.id,
          github_object_id: mapping.github_object_id,
          github_number: resource_number(kind, resource, repo),
-         confirmed_local_version: local_version(remote_updated_at, resource.id),
+         confirmed_local_version: resource_local_version(resource, remote_updated_at),
          confirmed_remote_updated_at: remote_updated_at,
-         confirmed_fingerprint: fingerprint(snapshot),
+         confirmed_fingerprint: fingerprint,
+         confirmed_snapshot: snapshot,
          state: :confirmed,
          lock_version: 1,
          inserted_at: now,
@@ -245,7 +248,7 @@ defmodule ForgeImports.OrganizationSync.Handoff do
   defp validate_local_resource(_repo, _resource, _repository_id),
     do: {:error, :bootstrap_mapping_mismatch}
 
-  defp resource_snapshot(:label, label, _repo),
+  defp resource_snapshot(:label, label, _repo, _mirror_id),
     do:
       {:ok,
        %{
@@ -255,35 +258,20 @@ defmodule ForgeImports.OrganizationSync.Handoff do
          "default" => label.default
        }}
 
-  defp resource_snapshot(:issue, issue, _repo),
-    do:
-      {:ok,
-       %{
-         "number" => issue.number,
-         "kind" => Atom.to_string(issue.kind),
-         "title" => issue.title,
-         "body" => issue.body,
-         "state" => Atom.to_string(issue.state),
-         "state_reason" => enum_value(issue.state_reason),
-         "closed_at" => datetime_value(issue.closed_at)
-       }}
+  defp resource_snapshot(:issue, issue, _repo, mirror_id),
+    do: canonical_issue_snapshot(issue.repository_id, :issue, issue.id, mirror_id)
 
-  defp resource_snapshot(:issue_comment, comment, repo) do
+  defp resource_snapshot(:issue_comment, comment, repo, mirror_id) do
     case repo.get(Issue, comment.issue_id) do
       %Issue{} = issue ->
-        {:ok,
-         %{
-           "issue_number" => issue.number,
-           "body" => comment.body,
-           "updated_at" => datetime_value(comment.updated_at)
-         }}
+        canonical_issue_snapshot(issue.repository_id, :issue_comment, comment.id, mirror_id)
 
       nil ->
         {:error, :bootstrap_mapping_missing}
     end
   end
 
-  defp resource_snapshot(:pull, pull, repo) do
+  defp resource_snapshot(:pull, pull, repo, _mirror_id) do
     case repo.get(Issue, pull.issue_id) do
       %Issue{} = issue ->
         {:ok,
@@ -299,6 +287,20 @@ defmodule ForgeImports.OrganizationSync.Handoff do
 
       nil ->
         {:error, :bootstrap_mapping_missing}
+    end
+  end
+
+  defp canonical_issue_snapshot(repository_id, kind, local_id, mirror_id) do
+    with {:ok, projection} <- ForgeIssues.sync_projection(repository_id, kind, local_id),
+         {:ok, relationships} <-
+           ForgeMirrors.resolve_issue_relationships(
+             mirror_id,
+             :local,
+             projection.label_ids,
+             projection.assignee_refs
+           ),
+         {:ok, canonical} <- ForgeGitHub.IssueSyncProjection.from_local(projection, relationships) do
+      {:ok, canonical.snapshot}
     end
   end
 
@@ -437,20 +439,10 @@ defmodule ForgeImports.OrganizationSync.Handoff do
     end
   end
 
-  defp local_version(updated_at, id) do
-    max(DateTime.to_unix(updated_at, :microsecond), id)
-  end
+  defp resource_local_version(%{sync_version: version}, _updated_at), do: version
 
-  defp fingerprint(snapshot) do
-    snapshot
-    |> JSON.encode_to_iodata!()
-    |> then(&:crypto.hash(:sha256, &1))
-    |> Base.encode16(case: :lower)
-  end
-
-  defp enum_value(nil), do: nil
-  defp enum_value(value) when is_atom(value), do: Atom.to_string(value)
-  defp enum_value(value), do: value
+  defp resource_local_version(%{id: id}, updated_at),
+    do: max(DateTime.to_unix(updated_at, :microsecond), id)
 
   defp datetime_value(nil), do: nil
   defp datetime_value(%DateTime{} = value), do: DateTime.to_iso8601(value)

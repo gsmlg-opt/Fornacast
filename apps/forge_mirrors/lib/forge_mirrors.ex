@@ -16,6 +16,7 @@ defmodule ForgeMirrors do
     MirrorConflict,
     MirrorOperation,
     MirrorRefState,
+    MirrorResourceState,
     MirrorWebhookDelivery,
     OrganizationMirror,
     RepositoryMirror
@@ -815,6 +816,694 @@ defmodule ForgeMirrors do
   end
 
   def retain_webhook_resource_trigger(_, _), do: {:error, :invalid_argument}
+
+  @resource_operation_kinds [
+    "sync.issue",
+    "sync.issue_comment",
+    "reconcile.repository.issues",
+    "reconcile.repository.issue_comments"
+  ]
+
+  @doc false
+  defdelegate resolve_issue_relationships(id, direction, labels, assignees),
+    to: ForgeMirrors.IssueRelationships,
+    as: :resolve
+
+  @doc false
+  def resource_operation_context(%MirrorOperation{} = operation) do
+    Repo.transaction(fn ->
+      with {:ok, persisted, scope} <- lock_resource_operation(operation),
+           {:ok, mapping} <- resource_mapping(persisted, scope.resource_kind),
+           false <- mapping_value(mapping, :state) == :conflicted,
+           {:ok, parent} <- resource_parent(persisted, mapping) do
+        cursor = persisted.cursor
+        local_state = resource_local_state(persisted, scope)
+
+        Map.merge(scope, %{
+          trigger: resource_trigger(cursor["trigger"]),
+          local_resource_id:
+            resource_local_id(cursor) || mapping_value(mapping, :local_resource_id),
+          github_object_id:
+            cursor["github_object_id"] || mapping_value(mapping, :github_object_id),
+          github_node_id: mapping_value(mapping, :github_node_id),
+          github_number:
+            cursor["github_number"] || mapping_value(mapping, :github_number) ||
+              parent[:github_number],
+          github_issue_id: cursor["github_issue_id"] || parent[:github_issue_id],
+          parent_issue_id: parent[:parent_issue_id],
+          local_version: local_state.local_version,
+          local_deleted: local_state.local_deleted,
+          remote_deleted: false,
+          baseline: mapping_value(mapping, :confirmed_snapshot) || :missing,
+          confirmed_local_version: mapping_value(mapping, :confirmed_local_version),
+          confirmed_remote_updated_at: mapping_value(mapping, :confirmed_remote_updated_at),
+          resource_state_lock_version: mapping_value(mapping, :lock_version),
+          effect_marker: persisted.external_effect_marker,
+          since:
+            if(String.starts_with?(persisted.kind, "reconcile.repository."),
+              do: ~U[1970-01-01 00:00:00Z]
+            ),
+          page: persisted.checkpoint["page"] || 1,
+          provenance: %{
+            delivery_guid: cursor["delivery_guid"],
+            outbox_event_id: cursor["outbox_event_id"],
+            causation_id: cursor["causation_id"],
+            correlation_id: cursor["correlation_id"]
+          }
+        })
+      else
+        true -> Repo.rollback(:resource_conflicted)
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+  end
+
+  def resource_operation_context(_), do: {:error, :invalid_transition}
+
+  defp resource_local_state(operation, scope) do
+    cursor = operation.cursor
+    initial = %{local_version: cursor["sync_version"], local_deleted: false}
+
+    if operation.kind == "sync.issue_comment" and cursor["trigger"] == "local" and
+         positive_resource_id?(cursor["comment_id"]) and
+         positive_resource_id?(cursor["sync_version"]) and
+         not Repo.exists?(
+           from comment in "issue_comments", where: comment.id == ^cursor["comment_id"]
+         ) do
+      explicit_delete =
+        cursor["deleted"] == true and cursor["event_type"] == "issue_comment.deleted"
+
+      initial = %{initial | local_deleted: explicit_delete}
+
+      with true <-
+             cursor["origin"] == "fornacast" and cursor["repository_id"] == scope.repository_id,
+           {:ok, tombstone} <-
+             latest_comment_tombstone(to_string(cursor["comment_id"]), :fornacast, cursor) do
+        %{local_deleted: true, local_version: tombstone["sync_version"]}
+      else
+        _ -> initial
+      end
+    else
+      initial
+    end
+  end
+
+  defp resource_parent(%{kind: "sync.issue_comment"} = operation, mapping) do
+    cursor = operation.cursor
+    local_id = if cursor["trigger"] == "local", do: cursor["issue_id"]
+    remote_id = cursor["github_issue_id"]
+    number = cursor["github_number"] || mapping_value(mapping, :github_number)
+
+    local_match =
+      if positive_resource_id?(local_id),
+        do: dynamic([s], s.local_resource_id == ^local_id),
+        else: dynamic(false)
+
+    remote_match =
+      if positive_resource_id?(remote_id),
+        do: dynamic([s], s.github_object_id == ^remote_id),
+        else: dynamic(false)
+
+    number_match =
+      if positive_resource_id?(number),
+        do: dynamic([s], s.github_number == ^number),
+        else: dynamic(false)
+
+    parents =
+      MirrorResourceState
+      |> where(
+        [s],
+        s.repository_mirror_id == ^operation.repository_mirror_id and
+          s.resource_kind in [:issue, :pull]
+      )
+      |> where(^dynamic([s], ^local_match or ^remote_match or ^number_match))
+      |> lock("FOR UPDATE")
+      |> Repo.all()
+
+    case parents do
+      [%MirrorResourceState{resource_kind: :pull}] ->
+        {:error, :unsupported_resource}
+
+      [%MirrorResourceState{state: :confirmed} = parent] ->
+        if positive_resource_id?(parent.local_resource_id) and
+             positive_resource_id?(parent.github_number) and
+             (is_nil(local_id) or parent.local_resource_id == local_id) and
+             (is_nil(remote_id) or parent.github_object_id == remote_id) and
+             (is_nil(number) or parent.github_number == number) do
+          {:ok,
+           %{
+             parent_issue_id: parent.local_resource_id,
+             github_number: parent.github_number,
+             github_issue_id: parent.github_object_id
+           }}
+        else
+          {:error, :identity_conflict}
+        end
+
+      [] ->
+        {:error, :parent_mapping_missing}
+
+      _ ->
+        {:error, :identity_conflict}
+    end
+  end
+
+  defp resource_parent(_, _), do: {:ok, %{}}
+
+  @doc false
+  def checkpoint_resource_operation(%MirrorOperation{} = operation, checkpoint, %DateTime{} = now)
+      when is_map(checkpoint) do
+    checkpoint_resource_operation(operation, checkpoint, now, nil, now)
+  end
+
+  def checkpoint_resource_operation(_, _, _), do: {:error, :invalid_argument}
+
+  @doc false
+  def checkpoint_resource_operation(
+        %MirrorOperation{} = operation,
+        checkpoint,
+        %DateTime{} = next_attempt_at,
+        failure_class,
+        %DateTime{} = now
+      )
+      when is_map(checkpoint) do
+    with :ok <- validate_utc(now),
+         :ok <- validate_utc(next_attempt_at),
+         true <-
+           is_nil(failure_class) or
+             MirrorOperation.failure_disposition(failure_class) == {:ok, :retry},
+         :ok <- validate_bounded_object(checkpoint) do
+      Repo.transaction(fn ->
+        with {:ok, persisted, _} <- lock_resource_operation(operation),
+             {:ok, updated} <-
+               owned_transition(persisted, DateTime.truncate(now, :second), [persisted.state],
+                 state:
+                   if(persisted.state == :effect_pending, do: :effect_pending, else: :pending),
+                 checkpoint: canonical_map(checkpoint),
+                 next_attempt_at: DateTime.truncate(next_attempt_at, :second),
+                 failure_class: failure_class,
+                 failure_disposition: if(failure_class, do: :retry, else: nil),
+                 lease_owner: nil,
+                 lease_expires_at: nil
+               ) do
+          updated
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+    else
+      false -> {:error, :invalid_argument}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def checkpoint_resource_operation(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  @doc false
+  def record_resource_reconciliation_page(
+        %MirrorOperation{} = operation,
+        kind,
+        observations,
+        next_page,
+        %DateTime{} = now
+      )
+      when kind in [:issue, :issue_comment] and is_list(observations) and
+             length(observations) <= 100 do
+    with :ok <- validate_utc(now),
+         true <- Enum.all?(observations, &valid_resource_observation?/1) do
+      Repo.transaction(fn ->
+        with {:ok, persisted, scope} <- lock_resource_operation(operation),
+             true <-
+               scope.resource_kind == kind and
+                 String.starts_with?(persisted.kind, "reconcile.repository."),
+             true <-
+               persisted.cursor["since"] == "1970-01-01T00:00:00Z" and
+                 persisted.cursor["page"] == 1,
+             sweep when is_binary(sweep) <- persisted.cursor["sweep_id"],
+             {:ok, _} <- Ecto.UUID.cast(sweep),
+             page when is_integer(page) and page > 0 <- persisted.checkpoint["page"] || 1,
+             true <-
+               is_nil(next_page) or
+                 (is_integer(next_page) and next_page > page and next_page <= 1_000_000) do
+          children =
+            Enum.map(observations, fn observation ->
+              cursor = %{
+                "trigger" => "reconcile",
+                "resource_kind" => Atom.to_string(kind),
+                "github_object_id" => observation.github_object_id,
+                "github_number" => observation.github_number,
+                "github_issue_id" => observation[:github_issue_id],
+                "remote_updated_at" => DateTime.to_iso8601(observation.remote_updated_at),
+                "sweep_id" => sweep
+              }
+
+              {:ok, digest} = resource_fingerprint(cursor)
+
+              case enqueue_operation(%{
+                     organization_mirror_id: persisted.organization_mirror_id,
+                     repository_mirror_id: persisted.repository_mirror_id,
+                     kind: "sync.#{kind}",
+                     dedupe_key: "resource-sweep:#{persisted.repository_mirror_id}:#{digest}",
+                     cursor: cursor,
+                     next_attempt_at: now
+                   }) do
+                {:ok, child} -> child
+                {:error, reason} -> Repo.rollback(reason)
+              end
+            end)
+
+          result =
+            if is_nil(next_page),
+              do: complete_operation(persisted, now),
+              else: checkpoint_resource_operation(persisted, %{"page" => next_page}, now)
+
+          case result do
+            {:ok, updated} -> %{operation: updated, operations: children}
+            {:error, reason} -> Repo.rollback(reason)
+          end
+        else
+          {:error, reason} -> Repo.rollback(reason)
+          _ -> Repo.rollback(:invalid_transition)
+        end
+      end)
+    else
+      false -> {:error, :invalid_argument}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def record_resource_reconciliation_page(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  defp valid_resource_observation?(value) when is_map(value) do
+    Enum.all?(
+      Map.keys(value),
+      &(&1 in [:github_object_id, :github_number, :github_issue_id, :remote_updated_at])
+    ) and
+      positive_resource_id?(value[:github_object_id]) and
+      positive_resource_id?(value[:github_number]) and
+      (is_nil(value[:github_issue_id]) or positive_resource_id?(value[:github_issue_id])) and
+      validate_utc(value[:remote_updated_at]) == :ok
+  end
+
+  defp valid_resource_observation?(_), do: false
+
+  @doc false
+  def resource_fingerprint(snapshot) when is_map(snapshot) and not is_struct(snapshot) do
+    encoded = snapshot |> resource_json(0) |> IO.iodata_to_binary()
+
+    if byte_size(encoded) <= 2_000_000,
+      do: {:ok, :crypto.hash(:sha256, encoded) |> Base.encode16(case: :lower)},
+      else: {:error, :invalid_snapshot}
+  rescue
+    _ -> {:error, :invalid_snapshot}
+  catch
+    :invalid_snapshot -> {:error, :invalid_snapshot}
+  end
+
+  def resource_fingerprint(_), do: {:error, :invalid_snapshot}
+
+  defp resource_json(_, depth) when depth > 100, do: throw(:invalid_snapshot)
+
+  defp resource_json(value, depth) when is_map(value) and not is_struct(value) do
+    if Enum.all?(Map.keys(value), &is_binary/1) do
+      [
+        "{",
+        value
+        |> Enum.sort_by(&elem(&1, 0))
+        |> Enum.map(fn {key, entry} ->
+          [JSON.encode!(key), ":", resource_json(entry, depth + 1)]
+        end)
+        |> Enum.intersperse(","),
+        "}"
+      ]
+    else
+      throw(:invalid_snapshot)
+    end
+  end
+
+  defp resource_json(value, depth) when is_list(value),
+    do: ["[", Enum.intersperse(Enum.map(value, &resource_json(&1, depth + 1)), ","), "]"]
+
+  defp resource_json(value, _)
+       when is_binary(value) or is_number(value) or is_boolean(value) or is_nil(value),
+       do: JSON.encode!(value)
+
+  defp resource_json(_, _), do: throw(:invalid_snapshot)
+
+  @doc false
+  def confirm_resource_operation(
+        %MirrorOperation{} = operation,
+        %DateTime{} = now,
+        expected,
+        confirmation,
+        domain_multi_fun
+      )
+      when is_map(expected) and is_map(confirmation) and is_function(domain_multi_fun, 1) do
+    with :ok <- validate_utc(now),
+         {:ok, fingerprint} <- resource_fingerprint(confirmation[:confirmed_snapshot]),
+         :ok <- validate_resource_confirmation(confirmation) do
+      Repo.transaction(fn ->
+        with {:ok, persisted, scope} <- lock_resource_operation(operation),
+             {:ok, mapping} <- resource_mapping(persisted, scope.resource_kind),
+             :ok <-
+               resource_confirmation_precondition(
+                 persisted,
+                 mapping,
+                 expected,
+                 confirmation,
+                 fingerprint
+               ),
+             {:ok, %{resource: projection}} <-
+               Repo.transaction(domain_multi_fun.(Ecto.Multi.new())),
+             :ok <- validate_resource_projection(projection, scope, expected, confirmation),
+             {:ok, resource_state} <-
+               persist_resource_confirmation(
+                 persisted,
+                 scope,
+                 mapping,
+                 projection,
+                 confirmation,
+                 fingerprint
+               ),
+             {:ok, completed} <- complete_operation(persisted, now) do
+          %{operation: completed, resource_state: resource_state, resource: projection}
+        else
+          {:error, _step, reason, _changes} -> Repo.rollback(reason)
+          {:error, reason} -> Repo.rollback(reason)
+          _ -> Repo.rollback(:invalid_projection)
+        end
+      end)
+    end
+  end
+
+  def confirm_resource_operation(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  defp validate_resource_confirmation(confirmation) do
+    if positive_resource_id?(confirmation[:github_object_id]) and
+         positive_resource_id?(confirmation[:github_number]) and
+         positive_resource_id?(confirmation[:confirmed_local_version]) and
+         bounded_trimmed_string?(confirmation[:github_node_id], 255) and
+         confirmation[:state] in [:confirmed, :deleted] and
+         validate_utc(confirmation[:remote_updated_at]) == :ok,
+       do: :ok,
+       else: {:error, :invalid_confirmation}
+  end
+
+  defp resource_confirmation_precondition(operation, mapping, expected, confirmation, fingerprint) do
+    cursor = operation.cursor
+
+    identities_match =
+      Enum.all?([:github_object_id, :github_node_id, :github_number], fn key ->
+        observed = mapping_value(mapping, key)
+        is_nil(observed) or observed == confirmation[key]
+      end)
+
+    marker = operation.external_effect_marker
+
+    marker_matches =
+      is_nil(marker) or
+        (marker["proposed_fingerprint"] == fingerprint and
+           (is_nil(marker["github_object_id"]) or
+              marker["github_object_id"] == confirmation.github_object_id))
+
+    if expected[:resource_state_lock_version] ==
+         (mapping_value(mapping, :lock_version) || :missing) and
+         expected[:effect_marker] == marker and marker_matches and identities_match and
+         (is_nil(expected[:local_resource_id]) or
+            is_nil(mapping_value(mapping, :local_resource_id)) or
+            expected.local_resource_id == mapping.local_resource_id) and
+         (is_nil(expected[:github_object_id]) or
+            expected.github_object_id == confirmation.github_object_id) and
+         (is_nil(cursor["github_object_id"]) or
+            cursor["github_object_id"] == confirmation.github_object_id) and
+         (is_nil(cursor["github_number"]) or cursor["github_number"] == confirmation.github_number),
+       do: :ok,
+       else: {:error, :stale_baseline}
+  end
+
+  defp validate_resource_projection(projection, scope, expected, confirmation)
+       when is_map(projection) do
+    type = if scope.resource_kind == :issue, do: "ForgeIssues.Issue", else: "ForgeIssues.Comment"
+
+    if projection[:repository_id] == scope.repository_id and
+         projection[:resource_kind] == scope.resource_kind and
+         projection[:local_resource_type] == type and
+         positive_resource_id?(projection[:local_resource_id]) and
+         positive_resource_id?(projection[:local_version]) and
+         projection.local_version >= confirmation.confirmed_local_version and
+         (is_nil(expected[:local_resource_id]) or
+            expected.local_resource_id == projection.local_resource_id) and
+         (confirmation.state != :deleted or projection[:deleted] == true),
+       do: :ok,
+       else: {:error, :invalid_projection}
+  end
+
+  defp validate_resource_projection(_, _, _, _), do: {:error, :invalid_projection}
+
+  defp persist_resource_confirmation(
+         operation,
+         scope,
+         mapping,
+         projection,
+         confirmation,
+         fingerprint
+       ) do
+    if mapping && mapping.local_resource_id &&
+         mapping.local_resource_id != projection.local_resource_id do
+      {:error, :identity_conflict}
+    else
+      (mapping || %MirrorResourceState{})
+      |> MirrorResourceState.persistence_changeset(%{
+        repository_mirror_id: operation.repository_mirror_id,
+        resource_kind: scope.resource_kind,
+        local_resource_type: projection.local_resource_type,
+        local_resource_id: projection.local_resource_id,
+        github_object_id: confirmation.github_object_id,
+        github_node_id: confirmation.github_node_id,
+        github_number: confirmation.github_number,
+        confirmed_local_version: confirmation.confirmed_local_version,
+        confirmed_remote_updated_at: confirmation.remote_updated_at,
+        confirmed_snapshot: confirmation.confirmed_snapshot,
+        confirmed_fingerprint: fingerprint,
+        state: confirmation.state,
+        lock_version: (mapping_value(mapping, :lock_version) || 0) + 1
+      })
+      |> Repo.insert_or_update()
+    end
+  end
+
+  @doc false
+  def conflict_resource_operation(
+        %MirrorOperation{} = operation,
+        %DateTime{} = now,
+        kind,
+        baseline,
+        local,
+        remote
+      )
+      when is_binary(kind) and is_map(baseline) and is_map(local) and is_map(remote) do
+    with :ok <- validate_utc(now) do
+      Repo.transaction(fn ->
+        with {:ok, persisted, scope} <- lock_resource_operation(operation),
+             {:ok, mapping} <- resource_mapping(persisted, scope.resource_kind) do
+          identity =
+            "#{persisted.repository_mirror_id}:#{scope.resource_kind}:" <>
+              if(
+                mapping_value(mapping, :github_object_id) || persisted.cursor["github_object_id"],
+                do:
+                  "github:#{mapping_value(mapping, :github_object_id) || persisted.cursor["github_object_id"]}",
+                else: "local:#{resource_local_id(persisted.cursor)}"
+              )
+
+          with {:ok, conflict} <-
+                 record_conflict(%{
+                   organization_mirror_id: persisted.organization_mirror_id,
+                   repository_mirror_id: persisted.repository_mirror_id,
+                   resource_kind: Atom.to_string(scope.resource_kind),
+                   resource_identity: identity,
+                   conflict_kind: kind,
+                   baseline_snapshot: baseline,
+                   local_snapshot: local,
+                   remote_snapshot: remote
+                 }),
+               {:ok, _mapping} <-
+                 (mapping || %MirrorResourceState{})
+                 |> MirrorResourceState.persistence_changeset(%{
+                   repository_mirror_id: persisted.repository_mirror_id,
+                   resource_kind: scope.resource_kind,
+                   local_resource_id:
+                     mapping_value(mapping, :local_resource_id) ||
+                       resource_local_id(persisted.cursor),
+                   local_resource_type:
+                     mapping_value(mapping, :local_resource_type) ||
+                       if(scope.resource_kind == :issue,
+                         do: "ForgeIssues.Issue",
+                         else: "ForgeIssues.Comment"
+                       ),
+                   github_object_id:
+                     mapping_value(mapping, :github_object_id) ||
+                       persisted.cursor["github_object_id"],
+                   state: :conflicted,
+                   lock_version: (mapping_value(mapping, :lock_version) || 0) + 1
+                 })
+                 |> Repo.insert_or_update(),
+               {:ok, failed} <-
+                 owned_transition(persisted, now, [persisted.state],
+                   state: :failed,
+                   failure_class: "stale_baseline",
+                   failure_disposition: :conflict,
+                   completed_at: nil,
+                   external_effect_marker: nil,
+                   effect_marked_at: nil,
+                   checkpoint:
+                     if(persisted.external_effect_marker,
+                       do: %{"conflicted_effect_marker" => persisted.external_effect_marker},
+                       else: persisted.checkpoint
+                     ),
+                   lease_owner: nil,
+                   lease_expires_at: nil
+                 ) do
+            %{operation: failed, conflict: conflict}
+          else
+            {:error, reason} -> Repo.rollback(reason)
+          end
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+    end
+  end
+
+  def conflict_resource_operation(_, _, _, _, _, _), do: {:error, :invalid_argument}
+
+  defp lock_resource_operation(operation) do
+    with :ok <- lock_effect_scope(operation),
+         {:ok, persisted} <- lock_owned_operation(operation, @resource_operation_kinds),
+         true <-
+           persisted.cursor == operation.cursor and
+             persisted.organization_mirror_id == operation.organization_mirror_id,
+         {:ok, scope} <- resource_scope(persisted) do
+      {:ok, persisted, scope}
+    else
+      false -> {:error, :invalid_transition}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp resource_scope(operation) do
+    binding = Repo.get(RepositoryMirror, operation.repository_mirror_id)
+    organization = Repo.get(OrganizationMirror, operation.organization_mirror_id)
+    cursor = operation.cursor
+
+    kind =
+      if operation.kind in ["sync.issue", "reconcile.repository.issues"],
+        do: :issue,
+        else: :issue_comment
+
+    with %RepositoryMirror{inventory_included: true, repository_id: id} when is_integer(id) <-
+           binding,
+         %OrganizationMirror{provider: "github", state: state}
+         when state in [:catching_up, :active, :degraded, :conflicted] <- organization,
+         true <- binding.organization_mirror_id == organization.id,
+         true <- issue_capability_enabled?(organization, cursor["issue_kind"] || "issue"),
+         true <- cursor["issue_kind"] != "pull_request",
+         true <- resource_trigger(cursor["trigger"]) != nil,
+         true <- valid_resource_sweep?(operation),
+         true <-
+           String.starts_with?(operation.kind, "reconcile.repository.") or
+             positive_resource_id?(resource_local_id(cursor)) or
+             positive_resource_id?(cursor["github_object_id"]),
+         true <-
+           is_nil(cursor["resource_kind"]) or cursor["resource_kind"] == Atom.to_string(kind),
+         {:ok, repository} <- ForgeRepos.fetch_live_repository(id),
+         true <-
+           repository.lifecycle in [:ready, :synchronizing] and
+             repository.owner_user_id == organization.organization_id,
+         [owner, name] <- String.split(binding.github_full_name || "", "/"),
+         true <- bounded_trimmed_string?(owner, 255) and bounded_trimmed_string?(name, 255),
+         %GitHubAppInstallation{state: :active} <-
+           Repo.get_by(GitHubAppInstallation,
+             github_installation_id: organization.github_installation_id
+           ) do
+      {:ok,
+       %{
+         resource_kind: kind,
+         repository_id: id,
+         repository_mirror_id: binding.id,
+         github_installation_id: organization.github_installation_id,
+         remote_owner: owner,
+         remote_repository: name
+       }}
+    else
+      _ -> {:error, :invalid_transition}
+    end
+  end
+
+  defp resource_mapping(operation, kind) do
+    local_id = resource_local_id(operation.cursor)
+    remote_id = operation.cursor["github_object_id"]
+    type = if kind == :issue, do: "ForgeIssues.Issue", else: "ForgeIssues.Comment"
+
+    if (is_nil(local_id) or positive_resource_id?(local_id)) and
+         (is_nil(remote_id) or positive_resource_id?(remote_id)) do
+      local_match =
+        if local_id,
+          do: dynamic([s], s.local_resource_id == ^local_id and s.local_resource_type == ^type),
+          else: dynamic(false)
+
+      remote_match =
+        if remote_id, do: dynamic([s], s.github_object_id == ^remote_id), else: dynamic(false)
+
+      mappings =
+        MirrorResourceState
+        |> where(
+          [s],
+          s.repository_mirror_id == ^operation.repository_mirror_id and s.resource_kind == ^kind
+        )
+        |> where(^dynamic([s], ^local_match or ^remote_match))
+        |> lock("FOR UPDATE")
+        |> Repo.all()
+
+      case mappings do
+        [] ->
+          {:ok, nil}
+
+        [mapping] ->
+          if (is_nil(local_id) or is_nil(mapping.local_resource_id) or
+                mapping.local_resource_id == local_id) and
+               (is_nil(remote_id) or is_nil(mapping.github_object_id) or
+                  mapping.github_object_id == remote_id) and
+               (is_nil(operation.cursor["github_number"]) or is_nil(mapping.github_number) or
+                  mapping.github_number == operation.cursor["github_number"]),
+             do: {:ok, mapping},
+             else: {:error, :invalid_transition}
+
+        _ ->
+          {:error, :invalid_transition}
+      end
+    else
+      {:error, :invalid_transition}
+    end
+  end
+
+  defp valid_resource_sweep?(%{kind: kind, cursor: cursor, checkpoint: checkpoint})
+       when kind in ["reconcile.repository.issues", "reconcile.repository.issue_comments"] do
+    cursor["trigger"] == "reconcile" and cursor["since"] == "1970-01-01T00:00:00Z" and
+      cursor["page"] == 1 and match?({:ok, _}, Ecto.UUID.cast(cursor["sweep_id"])) and
+      is_integer(checkpoint["page"] || 1) and (checkpoint["page"] || 1) in 1..1_000_000
+  end
+
+  defp valid_resource_sweep?(_), do: true
+
+  defp resource_local_id(cursor),
+    do: cursor["comment_id"] || cursor["issue_id"] || cursor["local_resource_id"]
+
+  defp resource_trigger("local"), do: :local
+  defp resource_trigger("remote"), do: :remote
+  defp resource_trigger("reconcile"), do: :reconcile
+  defp resource_trigger(_), do: nil
+  defp mapping_value(nil, _), do: nil
+  defp mapping_value(mapping, key), do: Map.get(mapping, key)
 
   defp valid_webhook_resource_hints?(hints) do
     common = ~w(resource_kind github_object_id github_number issue_kind)
@@ -2392,6 +3081,7 @@ defmodule ForgeMirrors do
     with {:ok, cursor} <- issue_event_cursor(event) do
       materialize_in_transaction(fn ->
         with {:ok, repository} <- ForgeRepos.fetch_live_repository(cursor["repository_id"]),
+             :ok <- resource_repository_published(repository),
              :ok <- validate_issue_event_scope(event, cursor),
              :fornacast <- event.origin,
              {:ok, organization} <- lock_non_revoked_organization_mirror(repository.owner_user_id),
@@ -2413,6 +3103,11 @@ defmodule ForgeMirrors do
       end)
     end
   end
+
+  defp resource_repository_published(%{lifecycle: lifecycle})
+       when lifecycle in [:ready, :synchronizing], do: :ok
+
+  defp resource_repository_published(_), do: {:error, :unpublished_repository}
 
   defp issue_event_cursor(event) do
     payload = event.payload
@@ -2544,14 +3239,18 @@ defmodule ForgeMirrors do
   end
 
   defp durable_comment_tombstone?(event, cursor) do
+    match?({:ok, _}, latest_comment_tombstone(event.aggregate_id, event.origin, cursor))
+  end
+
+  defp latest_comment_tombstone(aggregate_id, origin, cursor) do
     tombstone =
       Repo.one(
         from tombstone in DomainOutboxEvent,
           where:
             tombstone.aggregate_type == "issue_comment" and
-              tombstone.aggregate_id == ^event.aggregate_id and
+              tombstone.aggregate_id == ^aggregate_id and
               tombstone.event_type == "issue_comment.deleted" and
-              tombstone.origin == ^event.origin,
+              tombstone.origin == ^origin,
           order_by: [desc: tombstone.id],
           limit: 1
       )
@@ -2561,10 +3260,12 @@ defmodule ForgeMirrors do
 
     with %DomainOutboxEvent{} = tombstone <- tombstone,
          {:ok, tombstone_cursor} <- issue_event_cursor(tombstone) do
-      Map.take(tombstone_cursor, keys) == Map.take(cursor, keys) and
-        tombstone_cursor["sync_version"] > cursor["sync_version"]
+      if Map.take(tombstone_cursor, keys) == Map.take(cursor, keys) and
+           tombstone_cursor["sync_version"] > cursor["sync_version"],
+         do: {:ok, tombstone_cursor},
+         else: :error
     else
-      _invalid -> false
+      _invalid -> :error
     end
   end
 
@@ -3873,7 +4574,7 @@ defmodule ForgeMirrors do
       and (
         (operation.state = 'pending' and operation.next_attempt_at <= $1)
         or (operation.state = 'processing' and operation.lease_expires_at <= $1)
-        or (operation.state = 'effect_pending' and
+        or (operation.state = 'effect_pending' and operation.next_attempt_at <= $1 and
               (operation.lease_expires_at is null or operation.lease_expires_at <= $1))
       )
       and not exists (
