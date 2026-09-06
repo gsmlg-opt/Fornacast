@@ -45,6 +45,29 @@ defmodule GitCore.Remote do
     @type t :: %__MODULE__{}
   end
 
+  defmodule SyncRequest do
+    @enforce_keys [:provider, :owner, :repository, :credential_login, :repository_path]
+    defstruct @enforce_keys
+    @type t :: %__MODULE__{}
+  end
+
+  defmodule ObservedRef do
+    @enforce_keys [:ref, :oid]
+    defstruct @enforce_keys
+    @type t :: %__MODULE__{ref: String.t(), oid: String.t()}
+  end
+
+  defmodule RefUpdate do
+    @enforce_keys [:ref, :expected_oid, :proposed_oid]
+    defstruct @enforce_keys
+
+    @type t :: %__MODULE__{
+            ref: String.t(),
+            expected_oid: String.t() | nil,
+            proposed_oid: String.t()
+          }
+  end
+
   defmodule Result do
     @enforce_keys [:path, :empty?, :default_branch, :refs, :bytes]
     defstruct @enforce_keys
@@ -101,6 +124,86 @@ defmodule GitCore.Remote do
       run_owned(operation.task_supervisor, fn parent_monitor, supervisor_pid ->
         with_remote_permit(operation, fn ->
           do_refresh(operation, parent_monitor, supervisor_pid)
+        end)
+      end)
+    end
+  end
+
+  @doc """
+  Fetches the remote's standard branches and tags into a private tracking namespace.
+
+  The operation may force and prune only refs derived beneath the validated caller-owned
+  namespace. It never updates or prunes public local branches or tags.
+  """
+  @spec fetch_observed_refs(SyncRequest.t(), binary(), String.t(), keyword()) ::
+          {:ok, [ObservedRef.t()]} | {:error, Error.t()}
+  def fetch_observed_refs(request, pat, namespace, opts \\ []) do
+    with {:ok, operation} <- prepare_sync_operation(request, pat, opts),
+         {:ok, prefixes} <- tracking_prefixes(namespace) do
+      run_owned(operation.task_supervisor, fn parent_monitor, supervisor_pid ->
+        with_repository_write(operation, fn ->
+          with_remote_permit(operation, fn ->
+            do_fetch_observed_refs(
+              operation,
+              prefixes,
+              parent_monitor,
+              supervisor_pid
+            )
+          end)
+        end)
+      end)
+    end
+  end
+
+  @doc "Lists the validated remote observations stored in one private tracking namespace."
+  @spec list_observed_refs(Path.t(), String.t(), keyword()) ::
+          {:ok, [ObservedRef.t()]} | {:error, Error.t()}
+  def list_observed_refs(repository_path, namespace, opts \\ []) do
+    request = %SyncRequest{
+      provider: :github,
+      owner: "local",
+      repository: "observed-refs",
+      credential_login: "unused",
+      repository_path: repository_path
+    }
+
+    with {:ok, operation} <- prepare_sync_operation(request, "unused", opts),
+         {:ok, prefixes} <- tracking_prefixes(namespace) do
+      run_owned(operation.task_supervisor, fn parent_monitor, supervisor_pid ->
+        with_repository_write(operation, fn ->
+          do_list_observed_refs(operation, prefixes, parent_monitor, supervisor_pid)
+        end)
+      end)
+    end
+  end
+
+  @doc "Pushes validated branch and tag updates guarded by their exact remote OIDs."
+  @spec push_refs(SyncRequest.t(), binary(), [RefUpdate.t()], keyword()) ::
+          :ok | {:error, Error.t()}
+  def push_refs(request, pat, updates, opts \\ []) do
+    with :ok <- validate_ref_updates(updates),
+         {:ok, operation} <- prepare_sync_operation(request, pat, opts) do
+      run_owned(operation.task_supervisor, fn parent_monitor, supervisor_pid ->
+        with_repository_write(operation, fn ->
+          with_remote_permit(operation, fn ->
+            do_push_refs(operation, updates, parent_monitor, supervisor_pid)
+          end)
+        end)
+      end)
+    end
+  end
+
+  @doc "Deletes one validated remote branch or tag guarded by its exact current OID."
+  @spec delete_ref(SyncRequest.t(), binary(), String.t(), String.t(), keyword()) ::
+          :ok | {:error, Error.t()}
+  def delete_ref(request, pat, ref, expected_oid, opts \\ []) do
+    with :ok <- validate_remote_delete(ref, expected_oid),
+         {:ok, operation} <- prepare_sync_operation(request, pat, opts) do
+      run_owned(operation.task_supervisor, fn parent_monitor, supervisor_pid ->
+        with_repository_write(operation, fn ->
+          with_remote_permit(operation, fn ->
+            do_delete_ref(operation, ref, expected_oid, parent_monitor, supervisor_pid)
+          end)
         end)
       end)
     end
@@ -237,6 +340,447 @@ defmodule GitCore.Remote do
       result
     end
   end
+
+  defp do_fetch_observed_refs(operation, prefixes, parent_monitor, supervisor_pid) do
+    destination = operation.request.destination
+
+    with {:ok, destination_identity} <- validate_sync_destination(destination),
+         {:ok, host_policy} <-
+           resolve_host_policy(operation, parent_monitor, supervisor_pid),
+         result <-
+           with_credentials(
+             operation,
+             destination_identity,
+             parent_monitor,
+             supervisor_pid,
+             fn context ->
+               with {:ok, advertised} <- list_advertised_refs(context, host_policy),
+                    :ok <- validate_advertised_refs(advertised, prefixes.namespace),
+                    :ok <- ensure_internal_refs_hidden(context),
+                    :ok <- fetch_into_tracking_refs(context, host_policy, prefixes),
+                    {:ok, observed} <- list_observed_refs_in_context(context, prefixes) do
+                 {:ok, observed}
+               end
+             end
+           ),
+         :ok <- ensure_destination_identity(destination, destination_identity) do
+      result
+    end
+  end
+
+  defp do_list_observed_refs(operation, prefixes, parent_monitor, supervisor_pid) do
+    destination = operation.request.destination
+
+    with {:ok, destination_identity} <- validate_sync_destination(destination) do
+      context = %{
+        operation: operation,
+        destination_identity: destination_identity,
+        daemon: nil,
+        parent_monitor: parent_monitor,
+        owner_exit_pid: supervisor_pid
+      }
+
+      with {:ok, observed} <- list_observed_refs_in_context(context, prefixes),
+           :ok <- ensure_destination_identity(destination, destination_identity) do
+        {:ok, observed}
+      end
+    end
+  end
+
+  defp do_push_refs(operation, updates, parent_monitor, supervisor_pid) do
+    destination = operation.request.destination
+
+    with {:ok, destination_identity} <- validate_sync_destination(destination),
+         {:ok, host_policy} <-
+           resolve_host_policy(operation, parent_monitor, supervisor_pid),
+         result <-
+           with_credentials(
+             operation,
+             destination_identity,
+             parent_monitor,
+             supervisor_pid,
+             fn context -> push_refs_in_context(context, host_policy, updates) end
+           ),
+         :ok <- ensure_destination_identity(destination, destination_identity) do
+      result
+    end
+  end
+
+  defp do_delete_ref(operation, ref, expected_oid, parent_monitor, supervisor_pid) do
+    destination = operation.request.destination
+
+    with {:ok, destination_identity} <- validate_sync_destination(destination),
+         {:ok, host_policy} <-
+           resolve_host_policy(operation, parent_monitor, supervisor_pid),
+         result <-
+           with_credentials(
+             operation,
+             destination_identity,
+             parent_monitor,
+             supervisor_pid,
+             fn context -> delete_ref_in_context(context, host_policy, ref, expected_oid) end
+           ),
+         :ok <- ensure_destination_identity(destination, destination_identity) do
+      result
+    end
+  end
+
+  defp push_refs_in_context(context, host_policy, updates) do
+    refs = Enum.map(updates, & &1.ref)
+
+    with {:ok, observed} <- observe_exact_remote_refs(context, host_policy, refs),
+         :ok <- require_expected_remote_state(observed, updates),
+         :ok <- validate_proposed_objects(context, updates) do
+      argv =
+        git_prefix(context, host_policy) ++
+          [
+            "--git-dir=#{context.operation.request.destination}",
+            "push",
+            "--atomic",
+            "--no-verify"
+          ] ++
+          Enum.map(updates, &force_with_lease_argument/1) ++
+          [source_url(context.operation.request)] ++ Enum.map(updates, &push_refspec/1)
+
+      expected_after = Map.new(updates, &{&1.ref, &1.proposed_oid})
+
+      run_remote_effect(
+        context,
+        host_policy,
+        argv,
+        observed,
+        expected_after
+      )
+    end
+  end
+
+  defp delete_ref_in_context(context, host_policy, ref, expected_oid) do
+    with {:ok, observed} <- observe_exact_remote_refs(context, host_policy, [ref]),
+         :ok <- require_expected_remote_state(observed, %{ref: ref, expected_oid: expected_oid}) do
+      argv =
+        git_prefix(context, host_policy) ++
+          [
+            "--git-dir=#{context.operation.request.destination}",
+            "push",
+            "--atomic",
+            "--no-verify",
+            "--force-with-lease=#{ref}:#{expected_oid}",
+            source_url(context.operation.request),
+            ":#{ref}"
+          ]
+
+      run_remote_effect(context, host_policy, argv, observed, %{ref => nil})
+    end
+  end
+
+  defp observe_exact_remote_refs(context, host_policy, refs) do
+    request = context.operation.request
+
+    with {:ok, output} <-
+           run_git_output(
+             context,
+             git_prefix(context, host_policy) ++
+               ["ls-remote", "--refs", source_url(request) | refs]
+           ),
+         {:ok, observations} <- parse_remote_ref_lines(output),
+         true <- length(observations) <= length(refs),
+         true <- unique_ref_names?(observations),
+         true <-
+           Enum.all?(observations, fn observed ->
+             observed.ref in refs and valid_oid?(observed.oid)
+           end) do
+      {:ok, Map.new(observations, &{&1.ref, &1.oid})}
+    else
+      false -> remote_error(:source_validation)
+      {:error, %Error{}} = error -> error
+    end
+  end
+
+  defp require_expected_remote_state(observed, updates) when is_list(updates) do
+    if Enum.all?(updates, &(Map.get(observed, &1.ref) == &1.expected_oid)),
+      do: :ok,
+      else: remote_error(:stale_remote)
+  end
+
+  defp require_expected_remote_state(observed, update) do
+    if Map.get(observed, update.ref) == update.expected_oid,
+      do: :ok,
+      else: remote_error(:stale_remote)
+  end
+
+  defp validate_proposed_objects(context, updates) do
+    Enum.reduce_while(updates, :ok, fn update, :ok ->
+      case validate_proposed_object(context, update) do
+        :ok -> {:cont, :ok}
+        {:error, %Error{}} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp validate_proposed_object(
+         context,
+         %RefUpdate{ref: "refs/heads/" <> _, expected_oid: nil} = update
+       ) do
+    validate_branch_ancestry(context, update.proposed_oid, update.proposed_oid)
+  end
+
+  defp validate_proposed_object(context, %RefUpdate{ref: "refs/heads/" <> _} = update) do
+    validate_branch_ancestry(context, update.expected_oid, update.proposed_oid)
+  end
+
+  defp validate_proposed_object(context, %RefUpdate{ref: "refs/tags/" <> _} = update) do
+    cond do
+      is_binary(update.expected_oid) and update.expected_oid != update.proposed_oid ->
+        remote_error(:tag_retarget)
+
+      true ->
+        run_git(
+          context,
+          local_git(context, ["cat-file", "-e", "#{update.proposed_oid}^{object}"])
+        )
+        |> normalize_object_validation()
+    end
+  end
+
+  defp validate_branch_ancestry(context, ancestor_oid, descendant_oid) do
+    case GitCore.is_ancestor(
+           context.operation.request.destination,
+           ancestor_oid,
+           descendant_oid
+         ) do
+      {:ok, true} -> :ok
+      {:ok, false} -> remote_error(:non_fast_forward)
+      {:error, _reason} -> remote_error(:source_validation)
+    end
+  end
+
+  defp normalize_object_validation(:ok), do: :ok
+  defp normalize_object_validation({:error, %Error{}}), do: remote_error(:source_validation)
+
+  defp force_with_lease_argument(update) do
+    "--force-with-lease=#{update.ref}:#{update.expected_oid || ""}"
+  end
+
+  defp push_refspec(update), do: "#{update.proposed_oid}:#{update.ref}"
+
+  defp run_remote_effect(context, host_policy, argv, before, expected_after) do
+    case run_git(context, argv) do
+      :ok ->
+        confirm_remote_effect(context, host_policy, expected_after)
+
+      {:error, %Error{kind: :process_exit}} = error ->
+        classify_failed_remote_effect(context, host_policy, before, expected_after, error)
+
+      {:error, %Error{}} = error ->
+        error
+    end
+  end
+
+  defp confirm_remote_effect(context, host_policy, expected_after) do
+    with {:ok, observed} <-
+           observe_exact_remote_refs(context, host_policy, Map.keys(expected_after)) do
+      if remote_state_matches?(observed, expected_after),
+        do: :ok,
+        else: remote_error(:stale_remote)
+    end
+  end
+
+  defp classify_failed_remote_effect(context, host_policy, before, expected_after, error) do
+    case observe_exact_remote_refs(context, host_policy, Map.keys(expected_after)) do
+      {:ok, observed} ->
+        cond do
+          remote_state_matches?(observed, expected_after) -> remote_error(:effect_unknown)
+          remote_state_matches?(observed, before) -> error
+          true -> remote_error(:stale_remote)
+        end
+
+      {:error, %Error{}} ->
+        remote_error(:effect_unknown)
+    end
+  end
+
+  defp remote_state_matches?(observed, expected) do
+    Enum.all?(expected, fn {ref, oid} -> Map.get(observed, ref) == oid end)
+  end
+
+  defp list_advertised_refs(context, host_policy) do
+    request = context.operation.request
+
+    run_git_output(
+      context,
+      git_prefix(context, host_policy) ++
+        ["ls-remote", "--refs", "--heads", "--tags", source_url(request)]
+    )
+  end
+
+  defp validate_advertised_refs(output, namespace) do
+    with {:ok, refs} <- parse_remote_ref_lines(output),
+         true <- length(refs) <= GitCore.Limits.get(:remote_refs),
+         true <- unique_ref_names?(refs),
+         true <- Enum.all?(refs, &valid_observed_ref?(&1, namespace)) do
+      :ok
+    else
+      false -> remote_error(:source_validation)
+      {:error, %Error{}} = error -> error
+    end
+  end
+
+  defp ensure_internal_refs_hidden(context) do
+    run_git(
+      context,
+      local_git(context, [
+        "config",
+        "--local",
+        "--replace-all",
+        "transfer.hideRefs",
+        "refs/fornacast/",
+        "^refs/fornacast/$"
+      ])
+    )
+  end
+
+  defp fetch_into_tracking_refs(context, host_policy, prefixes) do
+    request = context.operation.request
+
+    run_git(
+      context,
+      git_prefix(context, host_policy) ++
+        [
+          "--git-dir=#{request.destination}",
+          "fetch",
+          "--force",
+          "--prune",
+          "--no-tags",
+          "--no-auto-maintenance",
+          "--no-write-fetch-head",
+          "--no-recurse-submodules",
+          source_url(request),
+          "+refs/heads/*:#{prefixes.heads}*",
+          "+refs/tags/*:#{prefixes.tags}*"
+        ],
+      disk_check: true
+    )
+  end
+
+  defp list_observed_refs_in_context(context, prefixes) do
+    with {:ok, output} <-
+           run_git_output(
+             context,
+             local_git(context, [
+               "for-each-ref",
+               "--format=%(refname)%00%(objectname)",
+               prefixes.root
+             ])
+           ),
+         {:ok, internal_refs} <- parse_internal_ref_lines(output),
+         true <- length(internal_refs) <= GitCore.Limits.get(:remote_refs),
+         {:ok, observed} <- decode_internal_refs(internal_refs, prefixes),
+         true <- unique_ref_names?(observed) do
+      {:ok, Enum.sort_by(observed, & &1.ref)}
+    else
+      false -> remote_error(:ref_limit)
+      {:error, %Error{}} = error -> error
+    end
+  end
+
+  defp parse_remote_ref_lines(output) when is_binary(output) do
+    parse_bounded_lines(output, fn line ->
+      case :binary.split(line, "\t") do
+        [oid, ref] -> {:ok, %ObservedRef{ref: ref, oid: oid}}
+        _invalid -> :error
+      end
+    end)
+  end
+
+  defp parse_internal_ref_lines(output) when is_binary(output) do
+    parse_bounded_lines(output, fn line ->
+      case :binary.split(line, <<0>>) do
+        [ref, oid] -> {:ok, {ref, oid}}
+        _invalid -> :error
+      end
+    end)
+  end
+
+  defp parse_bounded_lines(output, decoder) when is_function(decoder, 1) do
+    if String.valid?(output) and byte_size(output) <= GitCore.Limits.get(:remote_output_bytes) do
+      output
+      |> String.split("\n", trim: true)
+      |> Enum.reduce_while({:ok, []}, fn line, {:ok, parsed} ->
+        case decoder.(line) do
+          {:ok, value} -> {:cont, {:ok, [value | parsed]}}
+          :error -> {:halt, remote_error(:source_validation)}
+        end
+      end)
+      |> case do
+        {:ok, parsed} -> {:ok, Enum.reverse(parsed)}
+        {:error, %Error{}} = error -> error
+      end
+    else
+      remote_error(:source_validation)
+    end
+  end
+
+  defp decode_internal_refs(refs, prefixes) do
+    Enum.reduce_while(refs, {:ok, []}, fn {internal_ref, oid}, {:ok, observed} ->
+      case observed_ref_from_internal(internal_ref, oid, prefixes) do
+        {:ok, ref} -> {:cont, {:ok, [ref | observed]}}
+        :error -> {:halt, remote_error(:source_validation)}
+      end
+    end)
+    |> case do
+      {:ok, observed} -> {:ok, Enum.reverse(observed)}
+      {:error, %Error{}} = error -> error
+    end
+  end
+
+  defp observed_ref_from_internal(internal_ref, oid, prefixes) do
+    source_ref =
+      cond do
+        String.starts_with?(internal_ref, prefixes.heads) ->
+          "refs/heads/" <> String.replace_prefix(internal_ref, prefixes.heads, "")
+
+        String.starts_with?(internal_ref, prefixes.tags) ->
+          "refs/tags/" <> String.replace_prefix(internal_ref, prefixes.tags, "")
+
+        true ->
+          nil
+      end
+
+    observed = %ObservedRef{ref: source_ref, oid: oid}
+
+    if valid_observed_ref?(observed, prefixes.namespace) and
+         tracking_ref_matches?(prefixes.namespace, source_ref, internal_ref),
+       do: {:ok, observed},
+       else: :error
+  end
+
+  defp valid_observed_ref?(%ObservedRef{ref: ref, oid: oid}, namespace) do
+    valid_oid?(oid) and
+      match?({:ok, _tracking_ref}, GitCore.tracking_ref_name(namespace, ref))
+  end
+
+  defp tracking_ref_matches?(namespace, source_ref, internal_ref) do
+    case GitCore.tracking_ref_name(namespace, source_ref) do
+      {:ok, ^internal_ref} -> true
+      _invalid -> false
+    end
+  end
+
+  defp unique_ref_names?(refs) do
+    names =
+      Enum.map(refs, fn
+        %ObservedRef{ref: ref} -> ref
+        {_internal_ref, _oid} = pair -> elem(pair, 0)
+      end)
+
+    length(names) == length(Enum.uniq(names))
+  end
+
+  defp valid_oid?(oid) when is_binary(oid) do
+    byte_size(oid) in [40, 64] and String.match?(oid, ~r/\A[0-9a-f]+\z/)
+  end
+
+  defp valid_oid?(_oid), do: false
 
   defp with_credentials(
          operation,
@@ -797,6 +1341,91 @@ defmodule GitCore.Remote do
 
   defp prepare_operation(_request, _pat, _opts), do: remote_error(:invalid_request)
 
+  defp prepare_sync_operation(%SyncRequest{} = request, pat, opts) do
+    bootstrap_request = %Request{
+      provider: request.provider,
+      owner: request.owner,
+      repository: request.repository,
+      credential_login: request.credential_login,
+      destination: request.repository_path,
+      default_branch: "main"
+    }
+
+    with :ok <- validate_sync_request(request),
+         {:ok, operation} <- prepare_operation(bootstrap_request, pat, opts) do
+      {:ok, Map.put(operation, :sync_request, request)}
+    end
+  end
+
+  defp prepare_sync_operation(_request, _pat, _opts), do: remote_error(:invalid_request)
+
+  defp validate_sync_request(request) do
+    cond do
+      request.provider != :github -> remote_error(:unsupported_provider)
+      not Regex.match?(@owner_pattern, request.owner) -> remote_error(:invalid_request)
+      not Regex.match?(@repository_pattern, request.repository) -> remote_error(:invalid_request)
+      request.repository in [".", ".."] -> remote_error(:invalid_request)
+      not credential_field?(request.credential_login, 255) -> remote_error(:invalid_credential)
+      not destination?(request.repository_path) -> remote_error(:invalid_destination)
+      true -> :ok
+    end
+  rescue
+    _error -> remote_error(:invalid_request)
+  end
+
+  defp tracking_prefixes(namespace) do
+    with {:ok, head_ref} <- GitCore.tracking_ref_name(namespace, "refs/heads/__prefix__"),
+         {:ok, tag_ref} <- GitCore.tracking_ref_name(namespace, "refs/tags/__prefix__") do
+      {:ok,
+       %{
+         namespace: namespace,
+         root: "refs/fornacast/mirrors/#{namespace}/",
+         heads: String.replace_suffix(head_ref, "__prefix__", ""),
+         tags: String.replace_suffix(tag_ref, "__prefix__", "")
+       }}
+    else
+      _invalid -> remote_error(:invalid_ref)
+    end
+  end
+
+  defp validate_ref_updates(updates) when is_list(updates) do
+    refs =
+      Enum.map(updates, fn
+        %RefUpdate{ref: ref} -> ref
+        _invalid -> nil
+      end)
+
+    cond do
+      updates == [] -> remote_error(:invalid_request)
+      length(updates) > GitCore.Limits.get(:remote_refs) -> remote_error(:ref_limit)
+      length(refs) != length(Enum.uniq(refs)) -> remote_error(:invalid_ref)
+      not Enum.all?(updates, &valid_ref_update?/1) -> remote_error(:invalid_ref)
+      true -> :ok
+    end
+  end
+
+  defp validate_ref_updates(_updates), do: remote_error(:invalid_request)
+
+  defp valid_ref_update?(%RefUpdate{} = update) do
+    standard_ref?(update.ref) and
+      (is_nil(update.expected_oid) or valid_oid?(update.expected_oid)) and
+      valid_oid?(update.proposed_oid)
+  end
+
+  defp valid_ref_update?(_update), do: false
+
+  defp validate_remote_delete(ref, expected_oid) do
+    if standard_ref?(ref) and valid_oid?(expected_oid),
+      do: :ok,
+      else: remote_error(:invalid_ref)
+  end
+
+  defp standard_ref?(ref) when is_binary(ref) do
+    match?({:ok, _tracking_ref}, GitCore.tracking_ref_name("remote-validation", ref))
+  end
+
+  defp standard_ref?(_ref), do: false
+
   defp validate_options(opts) do
     keys = if Keyword.keyword?(opts), do: Keyword.keys(opts), else: []
 
@@ -940,6 +1569,26 @@ defmodule GitCore.Remote do
     end
   end
 
+  defp with_repository_write(operation, fun) do
+    case GitCore.RepositoryWriteLimiter.acquire(
+           operation.request.destination,
+           operation.absolute_deadline
+         ) do
+      {:ok, lease} ->
+        try do
+          fun.()
+        after
+          :ok = GitCore.RepositoryWriteLimiter.release(lease)
+        end
+
+      {:error, :timeout} ->
+        remote_error(:timeout)
+
+      {:error, :unavailable} ->
+        remote_error(:remote_unavailable)
+    end
+  end
+
   defp run_owned(task_supervisor, fun) do
     caller = self()
     reply = make_ref()
@@ -1021,6 +1670,17 @@ defmodule GitCore.Remote do
   defp validate_existing_destination(destination) do
     with :ok <- GitCore.Remote.CredentialReaper.safe_existing_directory_path(destination),
          {:ok, identity} <- private_directory_identity(destination) do
+      {:ok, identity}
+    else
+      _error -> remote_error(:invalid_destination)
+    end
+  end
+
+  defp validate_sync_destination(destination) do
+    with :ok <- GitCore.Remote.CredentialReaper.safe_existing_directory_path(destination),
+         {:ok, identity} <- directory_identity(destination),
+         {:ok, true} <- GitCore.is_bare_repository?(destination),
+         :ok <- ensure_destination_identity(destination, identity) do
       {:ok, identity}
     else
       _error -> remote_error(:invalid_destination)
@@ -1434,10 +2094,12 @@ defmodule GitCore.Remote do
               :default_branch,
               :destination_exists,
               :disk_unavailable,
+              :effect_unknown,
               :heartbeat_failed,
               :host_policy,
               :invalid_credential,
               :invalid_destination,
+              :invalid_ref,
               :invalid_options,
               :invalid_request,
               :output_limit,
@@ -1448,6 +2110,9 @@ defmodule GitCore.Remote do
               :remote_unavailable,
               :repository_limit,
               :source_validation,
+              :stale_remote,
+              :non_fast_forward,
+              :tag_retarget,
               :timeout,
               :unsafe_config,
               :unsupported_provider
