@@ -993,6 +993,72 @@ defmodule ForgeGitHub.ClientTest do
     assert URI.decode_query(query) == %{"per_page" => "100", "state" => "all"}
   end
 
+  test "pull metadata transport permits long bodies only on scoped App endpoints" do
+    stub = stub_name()
+    body = String.duplicate("界", 20_000)
+    opts = client_opts(stub, 1, gate_key: {:github_installation, 123})
+
+    Req.Test.expect(stub, fn conn ->
+      assert conn.request_path == "/repos/acme/project/pulls/7"
+      Req.Test.json(conn, %{"body" => body})
+    end)
+
+    assert {:ok, %{"body" => ^body}} =
+             Client.pull_metadata_request("token", :get, "/repos/acme/project/pulls/7", 200, opts)
+
+    assert {:error, %Error{kind: :invalid_request}} =
+             Client.pull_metadata_request(
+               "token",
+               :get,
+               "/repos/acme/project/pulls/7",
+               200,
+               client_opts(stub)
+             )
+
+    for path <- [
+          "/user",
+          "/repos/acme/project/pulls/7/merge",
+          "https://api.github.com/repos/acme/project/pulls/7"
+        ] do
+      assert {:error, %Error{kind: :invalid_request}} =
+               Client.pull_metadata_request("token", :get, path, 200, opts)
+    end
+  end
+
+  test "pull pagination and GraphQL keep fixed origins, installation gates and exact status" do
+    stub = stub_name()
+    opts = client_opts(stub, 1, gate_key: {:github_installation, 124})
+
+    Req.Test.expect(stub, fn conn ->
+      conn
+      |> Plug.Conn.put_resp_header(
+        "link",
+        ~s(<https://api.github.com/repos/acme/project/pulls?page=2>; rel="next")
+      )
+      |> Req.Test.json([])
+    end)
+
+    assert {:ok, %{json: [], next_url: "/repos/acme/project/pulls?page=2"}} =
+             Client.pull_metadata_page("token", "/repos/acme/project/pulls?page=1", opts)
+
+    Req.Test.expect(stub, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/graphql"
+      Req.Test.json(conn, %{"data" => %{}})
+    end)
+
+    assert {:ok, %{"data" => %{}}} =
+             Client.pull_graphql_request("token", %{"query" => "query { viewer { id } }"}, opts)
+
+    assert {:error, %Error{kind: :invalid_request}} =
+             Client.pull_graphql_request("token", %{}, client_opts(stub))
+
+    Req.Test.expect(stub, fn conn -> conn |> Plug.Conn.put_status(201) |> Req.Test.json(%{}) end)
+
+    assert {:error, %Error{kind: :unexpected_status}} =
+             Client.pull_graphql_request("token", %{}, opts)
+  end
+
   test "App bootstrap retains bounded long issue and comment bodies across pages" do
     body = String.duplicate("界", 20_000)
 

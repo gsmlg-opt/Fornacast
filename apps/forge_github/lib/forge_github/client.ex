@@ -61,7 +61,16 @@ defmodule ForgeGitHub.Client do
   @spec issue_metadata_request(String.t(), method(), String.t(), 200 | 201 | 204, keyword()) ::
           {:ok, term()} | {:error, Error.t()}
   def issue_metadata_request(token, method, path, expected_status, opts) do
-    with {:ok, request_kind} <- issue_metadata_request_kind(method, path),
+    metadata_request(token, method, path, expected_status, opts, &issue_metadata_request_kind/2)
+  end
+
+  @doc false
+  def pull_metadata_request(token, method, path, expected_status, opts) do
+    metadata_request(token, method, path, expected_status, opts, &pull_metadata_request_kind/2)
+  end
+
+  defp metadata_request(token, method, path, expected_status, opts, classify) do
+    with {:ok, request_kind} <- classify.(method, path),
          true <- valid_issue_metadata_status?(request_kind, expected_status),
          true <- installation_gate?(opts) do
       with_request_gate(token, opts, [:json], fn ->
@@ -88,7 +97,16 @@ defmodule ForgeGitHub.Client do
   @spec issue_metadata_page(String.t(), String.t(), keyword()) ::
           {:ok, %{json: term(), next_url: String.t() | nil}} | {:error, Error.t()}
   def issue_metadata_page(token, path, opts) do
-    with {:ok, :page} <- issue_metadata_request_kind(:get, path),
+    metadata_page(token, path, opts, &issue_metadata_request_kind/2)
+  end
+
+  @doc false
+  def pull_metadata_page(token, path, opts) do
+    metadata_page(token, path, opts, &pull_metadata_request_kind/2)
+  end
+
+  defp metadata_page(token, path, opts, classify) do
+    with {:ok, :page} <- classify.(:get, path),
          true <- installation_gate?(opts),
          {:ok, %URI{path: allowed_path}} <- URI.new(path) do
       with_request_gate(token, opts, fn ->
@@ -106,6 +124,24 @@ defmodule ForgeGitHub.Client do
       _invalid -> error(:invalid_request)
     end
   end
+
+  @doc false
+  def pull_graphql_request(token, json, opts) when is_map(json) do
+    if installation_gate?(opts) do
+      opts = Keyword.put(opts, :json, json)
+
+      with_request_gate(token, opts, [:json], fn ->
+        with {:ok, body} <- encode_request_body(opts),
+             {:ok, response} <- perform_request("/graphql", token, opts, :post, body) do
+          successful_response(response, opts, 200, :generic)
+        end
+      end)
+    else
+      error(:invalid_request)
+    end
+  end
+
+  def pull_graphql_request(_, _, _), do: error(:invalid_request)
 
   @spec authenticated_user(String.t(), keyword()) :: {:ok, User.t()} | {:error, Error.t()}
   def authenticated_user(pat, opts \\ []) do
@@ -314,6 +350,38 @@ defmodule ForgeGitHub.Client do
       _invalid -> :error
     end
   end
+
+  defp pull_metadata_request_kind(method, path)
+       when method in [:get, :post, :patch] and is_binary(path) do
+    with {:ok,
+          %URI{scheme: nil, host: nil, userinfo: nil, fragment: nil, path: parsed, query: query}} <-
+           URI.new(path),
+         ["repos", owner, repository, "pulls" | resource] <- String.split(parsed, "/", trim: true),
+         true <-
+           RepositoryReference.valid_owner?(owner) and
+             RepositoryReference.valid_repository?(repository) do
+      case {method, resource, query} do
+        {:get, [], query} when is_binary(query) ->
+          {:ok, :page}
+
+        {:post, [], nil} ->
+          {:ok, :create}
+
+        {method, [number], nil} when method in [:get, :patch] ->
+          with :ok <- validate_positive_id(number),
+               do: {:ok, if(method == :get, do: :read, else: :update)}
+
+        _ ->
+          :error
+      end
+    else
+      _ -> :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  defp pull_metadata_request_kind(_, _), do: :error
 
   defp issue_metadata_request_kind(method, path)
        when method in [:get, :post, :patch, :delete] and is_binary(path) do
