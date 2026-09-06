@@ -10,6 +10,7 @@ defmodule ForgeIssues.Comment do
     field :author_user_id, :integer
     field :author_github_identity_id, :integer
     field :body, :string
+    field :sync_version, :integer, default: 1
 
     field :author, :map, virtual: true
     field :author_association, :string, virtual: true, default: "NONE"
@@ -39,6 +40,7 @@ defmodule ForgeIssues.Comment do
     |> validate_required([:body])
     |> validate_length(:body, min: 1)
     |> validate_no_nul(:body)
+    |> optimistic_lock(:sync_version, &(&1 + 1))
   end
 
   def import_changeset(comment, attrs) do

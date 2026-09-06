@@ -49,6 +49,11 @@ defmodule ForgeIssues.GitHubImportTest do
 
     assert {:ok, %{issue_7: issue_7, issue_41: issue_41}} = ForgeIssues.transaction(multi)
 
+    refute Repo.exists?(
+             from event in Fornacast.DomainOutboxEvent,
+               where: event.aggregate_type in ["issue", "issue_comment"]
+           )
+
     assert issue_7.number == 7
     assert issue_7.author_github_identity_id == identity.id
     assert is_nil(issue_7.author_user_id)
@@ -101,6 +106,11 @@ defmodule ForgeIssues.GitHubImportTest do
                |> ForgeIssues.import_assignee_multi(:assignment, issue, assignee)
              end)
              |> ForgeIssues.transaction()
+
+    refute Repo.exists?(
+             from event in Fornacast.DomainOutboxEvent,
+               where: event.aggregate_type in ["issue", "issue_comment"]
+           )
 
     assert %Label{name: "bug"} = label
     assert Repo.get_by!(IssueLabel, issue_id: issue.id, label_id: label.id)

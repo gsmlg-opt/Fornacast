@@ -25,6 +25,7 @@ defmodule ForgeIssues.Issue do
     field :author_user_id, :integer
     field :author_github_identity_id, :integer
     field :closed_at, :utc_datetime
+    field :sync_version, :integer, default: 1
 
     field :labels, {:array, :map}, virtual: true, default: []
     field :assignees, {:array, :map}, virtual: true, default: []
@@ -58,6 +59,7 @@ defmodule ForgeIssues.Issue do
     |> validate_length(:title, min: 1, max: 256)
     |> reject_null_bytes([:title, :body])
     |> normalize_closed_fields()
+    |> optimistic_lock(:sync_version, &(&1 + 1))
   end
 
   def import_changeset(issue, attrs) do

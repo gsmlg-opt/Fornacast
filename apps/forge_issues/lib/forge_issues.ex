@@ -25,6 +25,7 @@ defmodule ForgeIssues do
   alias ForgeRepos.Collaborator
 
   alias Fornacast.{Audit, Page, Repo}
+  alias ForgeIssues.SyncEvents
 
   @turso_busy_attempts 12
   @turso_busy_backoff_ms 5
@@ -376,10 +377,11 @@ defmodule ForgeIssues do
         %ForgeRepos.Repository{id: repository_id} = repository,
         number,
         attrs,
-        request_metadata
+        request_metadata,
+        event_options \\ []
       )
       when is_integer(repository_id) and is_integer(number) and number > 0 and is_map(attrs) and
-             is_map(request_metadata) do
+             is_map(request_metadata) and is_list(event_options) do
     attrs = normalize_attrs(attrs)
     request_metadata = safe_request_metadata(request_metadata)
 
@@ -402,6 +404,7 @@ defmodule ForgeIssues do
           Map.merge(attrs, %{"issue_id" => issue.id, "author_user_id" => current_actor.id})
         )
       )
+      |> SyncEvents.comment("issue_comment.created", issue, current_repository, event_options)
       |> Audit.record_multi(
         :audit,
         current_actor,
@@ -427,13 +430,14 @@ defmodule ForgeIssues do
         %ForgeRepos.Repository{} = repository,
         comment_id,
         attrs,
-        request_metadata
+        request_metadata,
+        event_options \\ []
       )
       when is_integer(comment_id) and comment_id > 0 and is_map(attrs) and
-             is_map(request_metadata) do
+             is_map(request_metadata) and is_list(event_options) do
     actor
     |> comment_mutation_multi(repository, comment_id)
-    |> put_comment_update(attrs, request_metadata)
+    |> put_comment_update(attrs, request_metadata, event_options)
   end
 
   @doc false
@@ -447,12 +451,14 @@ defmodule ForgeIssues do
         %ForgeAccounts.User{} = actor,
         %ForgeRepos.Repository{} = repository,
         comment_id,
-        request_metadata
+        request_metadata,
+        event_options \\ []
       )
-      when is_integer(comment_id) and comment_id > 0 and is_map(request_metadata) do
+      when is_integer(comment_id) and comment_id > 0 and is_map(request_metadata) and
+             is_list(event_options) do
     actor
     |> comment_mutation_multi(repository, comment_id)
-    |> put_comment_delete(request_metadata)
+    |> put_comment_delete(request_metadata, event_options)
   end
 
   @doc false
@@ -475,8 +481,8 @@ defmodule ForgeIssues do
 
   @doc false
   @spec put_comment_update(Multi.t(), map(), map()) :: Multi.t()
-  def put_comment_update(%Multi{} = multi, attrs, request_metadata)
-      when is_map(attrs) and is_map(request_metadata) do
+  def put_comment_update(%Multi{} = multi, attrs, request_metadata, event_options \\ [])
+      when is_map(attrs) and is_map(request_metadata) and is_list(event_options) do
     attrs = normalize_attrs(attrs)
     request_metadata = safe_request_metadata(request_metadata)
 
@@ -484,7 +490,8 @@ defmodule ForgeIssues do
                             authorization: %{
                               actor: current_actor,
                               repository: current_repository,
-                              comment: comment
+                              comment: comment,
+                              issue: issue
                             }
                           } ->
       Multi.new()
@@ -493,6 +500,7 @@ defmodule ForgeIssues do
         |> Comment.update_changeset(Map.take(attrs, ["body"]))
         |> update_comment_row(repo)
       end)
+      |> SyncEvents.comment("issue_comment.updated", issue, current_repository, event_options)
       |> Audit.record_multi(
         :audit,
         current_actor,
@@ -507,18 +515,21 @@ defmodule ForgeIssues do
 
   @doc false
   @spec put_comment_delete(Multi.t(), map()) :: Multi.t()
-  def put_comment_delete(%Multi{} = multi, request_metadata) when is_map(request_metadata) do
+  def put_comment_delete(%Multi{} = multi, request_metadata, event_options \\ [])
+      when is_map(request_metadata) and is_list(event_options) do
     request_metadata = safe_request_metadata(request_metadata)
 
     Multi.merge(multi, fn %{
                             authorization: %{
                               actor: current_actor,
                               repository: current_repository,
-                              comment: comment
+                              comment: comment,
+                              issue: issue
                             }
                           } ->
       Multi.new()
       |> Multi.run(:comment, fn repo, _changes -> delete_comment_row(repo, comment) end)
+      |> SyncEvents.comment("issue_comment.deleted", issue, current_repository, event_options)
       |> Audit.record_multi(
         :audit,
         current_actor,
@@ -537,10 +548,11 @@ defmodule ForgeIssues do
         %ForgeAccounts.User{id: actor_id},
         %ForgeRepos.Repository{id: repository_id},
         attrs,
-        request_metadata
+        request_metadata,
+        event_options \\ []
       )
       when is_integer(actor_id) and is_integer(repository_id) and is_map(attrs) and
-             is_map(request_metadata) do
+             is_map(request_metadata) and is_list(event_options) do
     attrs = normalize_attrs(attrs)
     request_metadata = safe_request_metadata(request_metadata)
 
@@ -555,6 +567,7 @@ defmodule ForgeIssues do
       Multi.new()
       |> insert_numbered_identity(:issue, repository, actor, :issue, identity_attrs)
       |> put_relationship_operations(:issue, repository, actor, attrs, capability)
+      |> SyncEvents.issue("issue.created", event_options)
       |> Audit.record_multi(
         :audit,
         actor,
@@ -580,10 +593,11 @@ defmodule ForgeIssues do
         %ForgeRepos.Repository{id: repository_id},
         number,
         attrs,
-        request_metadata
+        request_metadata,
+        event_options \\ []
       )
       when is_integer(actor_id) and is_integer(repository_id) and is_integer(number) and
-             number > 0 and is_map(attrs) and is_map(request_metadata) do
+             number > 0 and is_map(attrs) and is_map(request_metadata) and is_list(event_options) do
     attrs = normalize_attrs(attrs)
     request_metadata = safe_request_metadata(request_metadata)
 
@@ -608,6 +622,7 @@ defmodule ForgeIssues do
         Map.take(authorized_attrs, ["title", "body", "state", "state_reason"])
       )
       |> put_relationship_operations(:issue, repository, actor, authorized_attrs, capability)
+      |> SyncEvents.issue("issue.updated", event_options)
       |> Audit.record_multi(
         :audit,
         actor,
@@ -734,7 +749,8 @@ defmodule ForgeIssues do
   defp current_issue(repo, repository, number) do
     case repo.one(
            from(issue in Issue,
-             where: issue.repository_id == ^repository.id and issue.number == ^number
+             where: issue.repository_id == ^repository.id and issue.number == ^number,
+             lock: "FOR UPDATE"
            )
          ) do
       %Issue{} = issue -> {:ok, issue}
@@ -754,7 +770,7 @@ defmodule ForgeIssues do
   end
 
   defp current_comment(repo, repository, comment_id) do
-    case comment_query(repository, comment_id) |> repo.one() do
+    case comment_query(repository, comment_id) |> lock("FOR UPDATE") |> repo.one() do
       {comment, issue} -> {:ok, {comment, issue}}
       nil -> {:error, :not_found}
     end
@@ -865,14 +881,19 @@ defmodule ForgeIssues do
   defp comment_mutation_capability(_actor, _repository, _author_id, _capability), do: false
 
   defp update_comment_row(changeset, repo) do
-    case repo.update(changeset, stale_error_field: :id) do
+    case repo.update(changeset, stale_error_field: :id, force: true) do
       {:ok, comment} -> {:ok, comment}
       {:error, changeset} -> stale_or_changeset_error(changeset)
     end
   end
 
   defp delete_comment_row(repo, comment) do
-    case repo.delete(comment, stale_error_field: :id) do
+    changeset =
+      comment
+      |> Ecto.Changeset.change()
+      |> Ecto.Changeset.optimistic_lock(:sync_version, &(&1 + 1))
+
+    case repo.delete(changeset, stale_error_field: :id) do
       {:ok, deleted} -> {:ok, deleted}
       {:error, changeset} -> stale_or_changeset_error(changeset)
     end
@@ -1365,7 +1386,10 @@ defmodule ForgeIssues do
   @spec update_identity(Multi.t(), Multi.name(), Issue.t(), ForgeAccounts.User.t(), map()) ::
           Multi.t()
   def update_identity(multi, key, %Issue{} = issue, _actor, attrs) do
-    Multi.update(multi, key, fn _changes -> Issue.update_changeset(issue, attrs) end)
+    Multi.update(multi, key, fn _changes -> Issue.update_changeset(issue, attrs) end,
+      stale_error_field: :id,
+      force: true
+    )
   end
 
   @spec list_labels(ForgeRepos.Repository.t()) :: [Label.t()]
