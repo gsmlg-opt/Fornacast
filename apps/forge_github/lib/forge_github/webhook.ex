@@ -218,36 +218,38 @@ defmodule ForgeGitHub.Webhook do
 
   defp valid_id?(id), do: id in 1..9_223_372_036_854_775_807
 
-  defp validate_json(_value, depth, _nodes) when depth > @max_json_depth,
+  defp validate_json(value, depth, nodes, path \\ [])
+
+  defp validate_json(_value, depth, _nodes, _path) when depth > @max_json_depth,
     do: {:error, :json_too_complex}
 
-  defp validate_json(_value, _depth, nodes) when nodes >= @max_json_nodes,
+  defp validate_json(_value, _depth, nodes, _path) when nodes >= @max_json_nodes,
     do: {:error, :json_too_complex}
 
-  defp validate_json(value, _depth, nodes) when is_binary(value) do
+  defp validate_json(value, _depth, nodes, path) when is_binary(value) do
     cond do
       not String.valid?(value) -> {:error, :invalid_utf8}
       :binary.match(value, <<0>>) != :nomatch -> {:error, :nul_byte}
-      byte_size(value) > @max_json_string_bytes -> {:error, :json_too_complex}
+      not bounded_string?(value, path) -> {:error, :json_too_complex}
       true -> {:ok, nodes + 1}
     end
   end
 
-  defp validate_json(value, _depth, nodes)
+  defp validate_json(value, _depth, nodes, _path)
        when is_integer(value) or is_float(value) or is_boolean(value) or is_nil(value),
        do: {:ok, nodes + 1}
 
-  defp validate_json(values, depth, nodes)
+  defp validate_json(values, depth, nodes, path)
        when is_list(values) and length(values) <= @max_json_collection do
     Enum.reduce_while(values, {:ok, nodes + 1}, fn value, {:ok, count} ->
-      case validate_json(value, depth + 1, count) do
+      case validate_json(value, depth + 1, count, [:item | path]) do
         {:ok, count} -> {:cont, {:ok, count}}
         error -> {:halt, error}
       end
     end)
   end
 
-  defp validate_json(values, depth, nodes)
+  defp validate_json(values, depth, nodes, path)
        when is_map(values) and map_size(values) <= @max_json_collection do
     Enum.reduce_while(values, {:ok, nodes + 1}, fn {key, value}, {:ok, count} ->
       cond do
@@ -261,7 +263,7 @@ defmodule ForgeGitHub.Webhook do
           {:halt, {:error, :json_too_complex}}
 
         true ->
-          case validate_json(value, depth + 1, count) do
+          case validate_json(value, depth + 1, count, [key | path]) do
             {:ok, count} -> {:cont, {:ok, count}}
             error -> {:halt, error}
           end
@@ -269,7 +271,21 @@ defmodule ForgeGitHub.Webhook do
     end)
   end
 
-  defp validate_json(_value, _depth, _nodes), do: {:error, :json_too_complex}
+  defp validate_json(_value, _depth, _nodes, _path), do: {:error, :json_too_complex}
+
+  # Metadata bodies can exceed generic JSON strings without expanding the
+  # budget of unrelated fields, nested objects, or array elements.
+  defp bounded_string?(value, ["body", resource]) when resource in ["issue", "comment"],
+    do: byte_size(value) <= 262_144 and bounded_codepoints?(value, 65_536)
+
+  defp bounded_string?(value, _path), do: byte_size(value) <= @max_json_string_bytes
+
+  defp bounded_codepoints?("", _remaining), do: true
+
+  defp bounded_codepoints?(<<_codepoint::utf8, rest::binary>>, remaining) when remaining > 0,
+    do: bounded_codepoints?(rest, remaining - 1)
+
+  defp bounded_codepoints?(_value, _remaining), do: false
 
   defp decode_signature("sha256=" <> digest) when byte_size(digest) == 64 do
     case Base.decode16(digest, case: :lower) do
