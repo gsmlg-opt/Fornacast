@@ -25,6 +25,7 @@ defmodule ForgeGitHub.Client do
   @max_json_nodes 50_000
   @max_json_collection 512
   @max_json_string_bytes 16_384
+  @max_issue_metadata_string_bytes 262_144
   # GitHub asks clients to pause on rate limits; cap a durable pause at 24 hours so a
   # malformed or hostile header cannot strand an import indefinitely.
   @retry_fallback_seconds 60
@@ -54,6 +55,56 @@ defmodule ForgeGitHub.Client do
         _invalid -> error(:invalid_request)
       end
     end)
+  end
+
+  @doc false
+  @spec issue_metadata_request(String.t(), method(), String.t(), 200 | 201 | 204, keyword()) ::
+          {:ok, term()} | {:error, Error.t()}
+  def issue_metadata_request(token, method, path, expected_status, opts) do
+    with {:ok, request_kind} <- issue_metadata_request_kind(method, path),
+         true <- valid_issue_metadata_status?(request_kind, expected_status),
+         true <- installation_gate?(opts) do
+      with_request_gate(token, opts, [:json], fn ->
+        with {:ok, body} <- encode_request_body(opts, :issue_metadata),
+             {:ok, response} <- perform_request(path, token, opts, method, body),
+             {:ok, value} <-
+               successful_response(
+                 response,
+                 opts,
+                 expected_status,
+                 :issue_metadata
+               ) do
+          {:ok, value}
+        else
+          {:error, %Error{} = error} -> {:error, error}
+        end
+      end)
+    else
+      _invalid -> error(:invalid_request)
+    end
+  end
+
+  @doc false
+  @spec issue_metadata_page(String.t(), String.t(), keyword()) ::
+          {:ok, %{json: term(), next_url: String.t() | nil}} | {:error, Error.t()}
+  def issue_metadata_page(token, path, opts) do
+    with {:ok, :page} <- issue_metadata_request_kind(:get, path),
+         true <- installation_gate?(opts),
+         {:ok, %URI{path: allowed_path}} <- URI.new(path) do
+      with_request_gate(token, opts, fn ->
+        with {:ok, response} <- perform_request(path, token, opts, :get, nil),
+             {:ok, json} <-
+               successful_response(response, opts, 200, :issue_metadata),
+             {:ok, next_url} <- Pagination.next_url(response, [allowed_path]) do
+          {:ok, %{json: json, next_url: next_url}}
+        else
+          {:error, %Error{} = error} -> {:error, error}
+          {:error, :invalid_pagination} -> error(:invalid_pagination)
+        end
+      end)
+    else
+      _invalid -> error(:invalid_request)
+    end
   end
 
   @spec authenticated_user(String.t(), keyword()) :: {:ok, User.t()} | {:error, Error.t()}
@@ -261,6 +312,87 @@ defmodule ForgeGitHub.Client do
       _invalid -> :error
     end
   end
+
+  defp issue_metadata_request_kind(method, path)
+       when method in [:get, :post, :patch, :delete] and is_binary(path) do
+    with {:ok,
+          %URI{
+            scheme: nil,
+            host: nil,
+            userinfo: nil,
+            fragment: nil,
+            path: path,
+            query: query
+          }} <- URI.new(path),
+         ["repos", owner, repository, "issues" | resource] <-
+           String.split(path, "/", trim: true),
+         true <- RepositoryReference.valid_owner?(owner),
+         true <- RepositoryReference.valid_repository?(repository) do
+      issue_metadata_resource_kind(method, resource, query)
+    else
+      _invalid -> :error
+    end
+  rescue
+    _exception -> :error
+  end
+
+  defp issue_metadata_request_kind(_method, _path), do: :error
+
+  defp issue_metadata_resource_kind(:get, [], query) when is_binary(query), do: {:ok, :page}
+  defp issue_metadata_resource_kind(:post, [], nil), do: {:ok, :create}
+
+  defp issue_metadata_resource_kind(:get, ["comments"], query) when is_binary(query),
+    do: {:ok, :page}
+
+  defp issue_metadata_resource_kind(method, ["comments", id], nil)
+       when method in [:get, :patch, :delete] do
+    with :ok <- validate_positive_id(id) do
+      {:ok,
+       case method do
+         :get -> :read
+         :patch -> :update
+         :delete -> :delete
+       end}
+    end
+  end
+
+  defp issue_metadata_resource_kind(:post, [issue_number, "comments"], nil) do
+    with :ok <- validate_positive_id(issue_number), do: {:ok, :create}
+  end
+
+  defp issue_metadata_resource_kind(method, [issue_number], nil)
+       when method in [:get, :patch] do
+    with :ok <- validate_positive_id(issue_number) do
+      {:ok, if(method == :get, do: :read, else: :update)}
+    end
+  end
+
+  defp issue_metadata_resource_kind(_method, _resource, _query), do: :error
+
+  defp validate_positive_id(value) when is_binary(value) and byte_size(value) in 1..19 do
+    case Integer.parse(value) do
+      {id, ""} when id in 1..9_223_372_036_854_775_807 -> :ok
+      _invalid -> :error
+    end
+  end
+
+  defp validate_positive_id(_value), do: :error
+
+  defp valid_issue_metadata_status?(:create, 201), do: true
+  defp valid_issue_metadata_status?(kind, 200) when kind in [:read, :update], do: true
+  defp valid_issue_metadata_status?(:delete, 204), do: true
+  defp valid_issue_metadata_status?(_kind, _status), do: false
+
+  defp installation_gate?(opts) when is_list(opts) do
+    Keyword.keyword?(opts) and
+      match?(
+        {:ok, {:github_installation, id}}
+        when is_integer(id) and id in 1..9_223_372_036_854_775_807,
+        Keyword.fetch(opts, :gate_key)
+      )
+  end
+
+  defp installation_gate?(_opts), do: false
 
   defp with_request_gate(pat, opts, fun) do
     with_request_gate(pat, opts, [], fun)
@@ -680,13 +812,15 @@ defmodule ForgeGitHub.Client do
     end
   end
 
-  defp encode_request_body(opts) do
+  defp encode_request_body(opts), do: encode_request_body(opts, :generic)
+
+  defp encode_request_body(opts, json_profile) do
     case Keyword.fetch(opts, :json) do
       :error ->
         {:ok, nil}
 
       {:ok, value} ->
-        with {:ok, _nodes} <- validate_json(value, 0, 0),
+        with {:ok, _nodes} <- validate_json(value, 0, 0, json_profile),
              {:ok, body} <- encode_json(value) do
           if byte_size(body) <= @max_body_bytes,
             do: {:ok, body},
@@ -716,14 +850,45 @@ defmodule ForgeGitHub.Client do
   defp successful_response(%Req.Response{} = response, opts),
     do: classify_response(response, opts)
 
+  defp successful_response(
+         %Req.Response{status: expected_status, body: ""},
+         _opts,
+         expected_status,
+         _json_profile
+       ),
+       do: {:ok, nil}
+
+  defp successful_response(
+         %Req.Response{status: expected_status, body: body},
+         _opts,
+         expected_status,
+         json_profile
+       )
+       when is_binary(body),
+       do: decode_json(body, json_profile)
+
+  defp successful_response(
+         %Req.Response{status: status},
+         _opts,
+         expected_status,
+         _json_profile
+       )
+       when status in 200..299 and status != expected_status,
+       do: error(:unexpected_status)
+
+  defp successful_response(%Req.Response{} = response, opts, _expected_status, _json_profile),
+    do: classify_response(response, opts)
+
   defp successful_json(%Req.Response{status: 200, body: body}, _opts), do: decode_json(body)
 
   defp successful_json(%Req.Response{} = response, opts),
     do: classify_response(response, opts)
 
-  defp decode_json(body) do
+  defp decode_json(body), do: decode_json(body, :generic)
+
+  defp decode_json(body, json_profile) do
     with {:ok, value} <- JSON.decode(body),
-         {:ok, _nodes} <- validate_json(value, 0, 0) do
+         {:ok, _nodes} <- validate_json(value, 0, 0, json_profile) do
       {:ok, value}
     else
       {:error, {_reason, _offset}} -> error(:invalid_json)
@@ -732,35 +897,40 @@ defmodule ForgeGitHub.Client do
     end
   end
 
-  defp validate_json(_value, depth, _nodes) when depth > @max_json_depth,
+  defp validate_json(_value, depth, _nodes, _json_profile) when depth > @max_json_depth,
     do: {:error, :invalid_json}
 
-  defp validate_json(_value, _depth, nodes) when nodes >= @max_json_nodes,
+  defp validate_json(_value, _depth, nodes, _json_profile) when nodes >= @max_json_nodes,
     do: {:error, :invalid_json}
 
-  defp validate_json(value, _depth, nodes)
-       when is_binary(value) and byte_size(value) <= @max_json_string_bytes,
-       do: {:ok, nodes + 1}
+  defp validate_json(value, _depth, nodes, json_profile) when is_binary(value) do
+    if byte_size(value) <= json_string_limit(json_profile),
+      do: {:ok, nodes + 1},
+      else: {:error, :invalid_json}
+  end
 
-  defp validate_json(value, _depth, nodes)
+  defp validate_json(value, _depth, nodes, _json_profile)
        when is_integer(value) or is_float(value) or is_boolean(value) or is_nil(value),
        do: {:ok, nodes + 1}
 
-  defp validate_json(values, depth, nodes)
+  defp validate_json(values, depth, nodes, json_profile)
        when is_list(values) and length(values) <= @max_json_collection do
+    item_profile = if json_profile == :issue_metadata, do: :issue_metadata, else: :generic
+
     Enum.reduce_while(values, {:ok, nodes + 1}, fn value, {:ok, count} ->
-      case validate_json(value, depth + 1, count) do
+      case validate_json(value, depth + 1, count, item_profile) do
         {:ok, count} -> {:cont, {:ok, count}}
         error -> {:halt, error}
       end
     end)
   end
 
-  defp validate_json(values, depth, nodes)
+  defp validate_json(values, depth, nodes, json_profile)
        when is_map(values) and map_size(values) <= @max_json_collection do
     Enum.reduce_while(values, {:ok, nodes + 1}, fn {key, value}, {:ok, count} ->
       with true <- is_binary(key) and byte_size(key) <= 128,
-           {:ok, count} <- validate_json(value, depth + 1, count) do
+           {:ok, count} <-
+             validate_json(value, depth + 1, count, json_value_profile(json_profile, key)) do
         {:cont, {:ok, count}}
       else
         _invalid -> {:halt, {:error, :invalid_json}}
@@ -768,7 +938,13 @@ defmodule ForgeGitHub.Client do
     end)
   end
 
-  defp validate_json(_value, _depth, _nodes), do: {:error, :invalid_json}
+  defp validate_json(_value, _depth, _nodes, _json_profile), do: {:error, :invalid_json}
+
+  defp json_value_profile(:issue_metadata, "body"), do: :issue_body
+  defp json_value_profile(_json_profile, _key), do: :generic
+
+  defp json_string_limit(:issue_body), do: @max_issue_metadata_string_bytes
+  defp json_string_limit(_json_profile), do: @max_json_string_bytes
 
   defp classify_response(%Req.Response{status: 401}, _opts), do: error(:invalid_credential)
 
