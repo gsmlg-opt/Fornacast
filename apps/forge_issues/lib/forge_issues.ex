@@ -1369,6 +1369,16 @@ defmodule ForgeIssues do
 
   defdelegate import_label_multi(multi, key, repository, attrs), to: ForgeIssues.Import
 
+  @doc false
+  defdelegate sync_projection(repository_id, resource_kind, local_resource_id),
+    to: ForgeIssues.Sync
+
+  @doc false
+  defdelegate append_sync_apply(multi, key, request), to: ForgeIssues.Sync
+
+  @doc false
+  defdelegate append_sync_observe(multi, key, expected), to: ForgeIssues.Sync
+
   defdelegate import_identity_multi(multi, key, repository, github_identity, kind, attrs),
     to: ForgeIssues.Import
 
