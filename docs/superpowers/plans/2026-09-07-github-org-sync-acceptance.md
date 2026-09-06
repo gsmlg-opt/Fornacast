@@ -72,10 +72,18 @@ PR13–16 remain to be implemented and verified.
 ## Active PR12 integration work
 
 One resource worker, lease-checked atomic mirror confirmation, and trusted domain
-apply/observe APIs are being implemented together. Bootstrap handoff must seed
-the same canonical snapshot (including labels and known-identity assignees) and
-the actual local `sync_version`; its older timestamp-derived version and missing
-snapshot are not sufficient proof of a usable three-way baseline.
+apply/observe APIs are being implemented together. Domain APIs are committed in
+`90843ae` (25 focused tests); `b696e4b` preserves repository writers' existing
+permissions on imported issues/comments (93 focused tests). Relationship identity
+resolution is committed in `ac2ce32` (six tests), including repository-scoped label
+IDs, verified assignee links, deduplication, and ambiguous-account rejection.
+
+The bootstrap handoff now locally seeds the shared canonical snapshot, including
+labels and known-identity assignees, and the actual local `sync_version`.
+The complete publication file (41 tests) plus six resolver tests pass. Handoff
+and shared worker/persistence code are still pending a coherent integration
+commit. Real inbound/outbound/racing-edit worker integration tests are underway;
+these foundation results do not prove issue convergence or PR12 completion.
 - Compilation with warnings-as-errors and staged formatting checks passed for
   committed PR11. Existing importer test-support warnings
   are distinct from production compilation.
