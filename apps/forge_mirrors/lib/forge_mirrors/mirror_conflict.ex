@@ -3,6 +3,8 @@ defmodule ForgeMirrors.MirrorConflict do
 
   import Ecto.Changeset
 
+  @max_snapshot_bytes 2_000_000
+
   @type t :: %__MODULE__{}
 
   schema "mirror_conflicts" do
@@ -85,10 +87,12 @@ defmodule ForgeMirrors.MirrorConflict do
   end
 
   defp validate_map(changeset, field) do
+    limit = if field == :resolution, do: 65_536, else: @max_snapshot_bytes
+
     validate_change(changeset, field, fn ^field, value ->
       cond do
         not is_map(value) -> [{field, "must be an object"}]
-        encoded_size(value) > 65_536 -> [{field, "is too large"}]
+        encoded_size(value) > limit -> [{field, "is too large"}]
         true -> []
       end
     end)
@@ -97,6 +101,6 @@ defmodule ForgeMirrors.MirrorConflict do
   defp encoded_size(value) do
     value |> JSON.encode_to_iodata!() |> IO.iodata_length()
   rescue
-    _ -> 65_537
+    _ -> @max_snapshot_bytes + 1
   end
 end
