@@ -94,11 +94,34 @@ defmodule ForgeImports.OrganizationSync.Bootstrap do
 
       %OrganizationMirror{} = mirror ->
         with :ok <- validate_handoffs(run, mirror),
-             {:ok, %OrganizationMirror{}} <- finalize_mirror(mirror, run.state, now) do
+             {:ok, %OrganizationMirror{} = finalized} <- finalize_mirror(mirror, run.state, now) do
+          replay_bound_metadata(finalized, run.state, now)
           :ok
         end
     end
   end
+
+  defp replay_bound_metadata(%OrganizationMirror{state: state} = mirror, run_state, now)
+       when state in [:catching_up, :degraded] and
+              run_state in [:completed, :completed_with_warnings] do
+    Repo.update_all(
+      from(delivery in ForgeMirrors.MirrorWebhookDelivery,
+        join: binding in RepositoryMirror,
+        on:
+          binding.organization_mirror_id == delivery.organization_mirror_id and
+            binding.github_repository_id == delivery.github_repository_id,
+        where:
+          delivery.organization_mirror_id == ^mirror.id and
+            delivery.state == :pending_unsupported and
+            delivery.event in ["issues", "issue_comment"] and not is_nil(binding.repository_id)
+      ),
+      set: [state: :pending, next_attempt_at: now, failure_class: nil, updated_at: now]
+    )
+
+    :ok
+  end
+
+  defp replay_bound_metadata(_mirror, _run_state, _now), do: :ok
 
   defp create_and_bind(actor, organization, mirror, request_metadata) do
     Repo.transaction(fn ->
@@ -183,8 +206,13 @@ defmodule ForgeImports.OrganizationSync.Bootstrap do
     end
   end
 
-  defp finalize_mirror(mirror, :completed_with_warnings, _now),
-    do: transition_if_needed(mirror, :degraded)
+  defp finalize_mirror(mirror, :completed_with_warnings, now) do
+    with {:ok, degraded} <- transition_if_needed(mirror, :degraded) do
+      degraded
+      |> OrganizationMirror.update_changeset(%{next_reconcile_at: now})
+      |> Repo.update()
+    end
+  end
 
   defp finalize_mirror(mirror, :failed, _now), do: transition_if_needed(mirror, :degraded)
 

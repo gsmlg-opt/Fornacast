@@ -30,7 +30,7 @@ defmodule ForgeImports.OrganizationSyncTest do
 
     assert disconnected.coverage == :none
     assert disconnected.actions.install
-    assert disconnected.capabilities["lfs"] == "unavailable"
+    assert disconnected.capabilities["lfs"] == "disabled"
     assert disconnected.capabilities["releases"] == "unavailable"
 
     outsider = user_fixture()
@@ -107,7 +107,7 @@ defmodule ForgeImports.OrganizationSyncTest do
     assert updated.policy["selected_repository_ids"] == [101, 202]
     assert updated.policy["auto_import_new_repositories"]
     assert updated.capabilities["git"] == "enabled"
-    assert updated.capabilities["lfs"] == "unavailable"
+    assert updated.capabilities["lfs"] == "disabled"
 
     assert {:ok, view} =
              ForgeImports.OrganizationSync.get_settings(context.actor, context.organization)
@@ -262,7 +262,7 @@ defmodule ForgeImports.OrganizationSyncTest do
                  "git" => "enabled",
                  "issues" => "enabled",
                  "pulls" => "enabled",
-                 "lfs" => "unavailable",
+                 "lfs" => "enabled",
                  "releases" => "unavailable"
                },
                policy: %{
@@ -347,6 +347,36 @@ defmodule ForgeImports.OrganizationSyncTest do
                    is_nil(run.credential_tag) and is_nil(run.credential_key_id),
                select: count(run.id)
            ) == 1
+
+    bound_mirror = Repo.get_by!(OrganizationMirror, bootstrap_import_run_id: run_id)
+    binding = ForgeMirrors.TestSupport.MirrorFixtures.repository_mirror_fixture(bound_mirror)
+
+    {:ok, deferred, :enqueued} =
+      ForgeMirrors.enqueue_webhook_delivery(
+        %{
+          organization_mirror_id: bound_mirror.id,
+          delivery_guid: Ecto.UUID.generate(),
+          hook_id: System.unique_integer([:positive]),
+          event: "issues",
+          action: "edited",
+          installation_id: installation_id,
+          github_repository_id: binding.github_repository_id,
+          signature_version: "sha256",
+          raw_payload: JSON.encode!(%{"action" => "edited"})
+        },
+        :pending_unsupported
+      )
+
+    completed =
+      Repo.get!(ImportRun, run_id)
+      |> Ecto.Changeset.change(state: :completed_with_warnings, terminal_at: now)
+      |> Repo.update!()
+
+    assert :ok = ForgeImports.OrganizationSync.Bootstrap.finish(completed, now)
+    mirror = Repo.get_by!(OrganizationMirror, bootstrap_import_run_id: run_id)
+    assert mirror.state == :degraded
+    assert mirror.next_reconcile_at == now
+    assert Repo.get!(ForgeMirrors.MirrorWebhookDelivery, deferred.id).state == :pending
   end
 
   defp user_fixture do
