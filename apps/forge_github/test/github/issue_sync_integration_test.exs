@@ -288,6 +288,81 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
              )
   end
 
+  test "a mapped remote comment deletion atomically retains its tombstone and emits no echo",
+       ctx do
+    identity = Repo.get!(ForgeAccounts.GitHubIdentity, ctx.issue.author_github_identity_id)
+
+    {:ok, %{comment: comment}} =
+      Multi.new()
+      |> ForgeIssues.import_comment_multi(:comment, ctx.issue, identity, %{
+        "body" => "Original comment",
+        "inserted_at" => @source_time,
+        "updated_at" => @source_time
+      })
+      |> Repo.transaction()
+
+    snapshot = %{"body" => comment.body}
+    {:ok, fingerprint} = ForgeMirrors.resource_fingerprint(snapshot)
+
+    mapping =
+      %MirrorResourceState{}
+      |> MirrorResourceState.persistence_changeset(%{
+        repository_mirror_id: ctx.binding.id,
+        resource_kind: :issue_comment,
+        local_resource_type: "ForgeIssues.Comment",
+        local_resource_id: comment.id,
+        github_object_id: 900,
+        github_node_id: "IC_900",
+        github_number: 7,
+        confirmed_snapshot: snapshot,
+        confirmed_fingerprint: fingerprint,
+        confirmed_local_version: 1,
+        confirmed_remote_updated_at: @source_time,
+        state: :confirmed
+      })
+      |> Repo.insert!()
+
+    now = DateTime.utc_now(:second)
+
+    operation =
+      operation_fixture(ctx.organization, %{
+        repository_mirror_id: ctx.binding.id,
+        kind: "sync.issue_comment",
+        cursor: %{
+          "trigger" => "remote",
+          "resource_kind" => "issue_comment",
+          "github_object_id" => 900,
+          "github_issue_id" => 700,
+          "github_number" => 7,
+          "delivery_guid" => "deleted-comment-delivery"
+        },
+        next_attempt_at: now
+      })
+
+    operation = claim(operation.id, now, "sync.issue_comment")
+
+    Req.Test.expect(ctx.stub, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/repos/acme/project/issues/comments/900"
+      conn |> Plug.Conn.put_status(404) |> Req.Test.json(%{"message" => "Not Found"})
+    end)
+
+    assert {:ok, _} = IssueSyncWorker.process_operation(operation, now, options(ctx))
+    assert Repo.get(ForgeIssues.Comment, comment.id) == nil
+
+    assert %{state: :completed, external_effect_marker: nil} =
+             Repo.get!(MirrorOperation, operation.id)
+
+    assert %{state: :deleted, confirmed_local_version: 2} =
+             Repo.get!(MirrorResourceState, mapping.id)
+
+    assert %{origin: :github, event_type: "issue_comment.deleted"} =
+             Repo.get_by!(DomainOutboxEvent,
+               aggregate_type: "issue_comment",
+               aggregate_id: to_string(comment.id)
+             )
+  end
+
   defp remote_operation(ctx, now, github_id \\ 700, number \\ 7) do
     operation =
       operation_fixture(ctx.organization, %{
