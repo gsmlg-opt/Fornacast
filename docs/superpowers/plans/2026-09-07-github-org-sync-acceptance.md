@@ -80,10 +80,16 @@ IDs, verified assignee links, deduplication, and ambiguous-account rejection.
 
 The bootstrap handoff now locally seeds the shared canonical snapshot, including
 labels and known-identity assignees, and the actual local `sync_version`.
-The complete publication file (41 tests) plus six resolver tests pass. Handoff
-and shared worker/persistence code are still pending a coherent integration
-commit. Real inbound/outbound/racing-edit worker integration tests are underway;
-these foundation results do not prove issue convergence or PR12 completion.
+The handoff and shared worker/persistence implementation are committed in
+`dace021`. A combined 93-test run passed: publication (41), mirror persistence
+and outbox (30), worker (17), and real integration (5). The integration tests use
+real domain transactions, leases, mappings, and confirmation with stubbed HTTP;
+they prove mapped inbound/outbound edits, newer-local-edit preservation, and
+remote issue/comment creation. Production warnings-as-errors compilation passed.
+App bootstrap now also retains bounded long issue/comment bodies across pages;
+all 44 Client tests pass, including unchanged PAT and unrelated-field limits.
+Live label materialization, ingress activation, and broader recovery acceptance
+remain open; these results do not prove full issue convergence or PR12 completion.
 - Compilation with warnings-as-errors and staged formatting checks passed for
   committed PR11. Existing importer test-support warnings
   are distinct from production compilation.
