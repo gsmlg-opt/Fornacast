@@ -146,6 +146,25 @@ defmodule ForgeMirrors.ResourceSyncPersistenceTest do
              ForgeMirrors.checkpoint_resource_operation(operation, checkpoint, c.now)
   end
 
+  test "a reconciled unapplied effect releases its parent without discarding intent", c do
+    operation = claimed(c)
+    marker = %{"action" => "update_remote_issue", "github_object_id" => 456}
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, c.now, marker)
+
+    marked =
+      marked
+      |> Ecto.Changeset.change(checkpoint: %{"recovery" => %{"complete" => true}})
+      |> Repo.update!()
+
+    assert {:ok, pending} = ForgeMirrors.requeue_reconciled_resource_effect(marked, c.now)
+    assert pending.state == :pending
+    assert pending.cursor == operation.cursor
+    assert pending.external_effect_marker == nil
+    assert pending.lease_owner == nil
+    assert pending.checkpoint == %{}
+    assert {:error, :lost_lease} = ForgeMirrors.requeue_reconciled_resource_effect(marked, c.now)
+  end
+
   test "effect recovery respects backoff while preserving its marker", c do
     operation = claimed(c)
     marker = %{"action" => "create_remote_issue", "correlation_id" => Ecto.UUID.generate()}

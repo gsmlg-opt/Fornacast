@@ -282,6 +282,182 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
     assert_received :conflicted
   end
 
+  test "effect-pending update confirms its older postcondition before a newer unmapped local label" do
+    parent = self()
+    proposed = Map.put(@base, "body", "sent")
+    marker = effect_marker("update_remote_issue", @base, proposed)
+    operation = operation("sync.issue", :effect_pending, marker)
+
+    options =
+      options(operation,
+        context: fn ^operation -> {:ok, context(marker)} end,
+        local_observe: fn _ ->
+          {:label_required, local_label_candidate(), %{local_resource_id: 100, local_version: 5}}
+        end,
+        get_issue: fn _, _, _, _, _ ->
+          {:ok, github_issue(proposed, updated_at: "2026-09-07T08:00:01Z")}
+        end,
+        confirm: fn ^operation, @now, expected, confirmation, domain_request ->
+          assert expected.effect_marker == marker
+          assert confirmation.confirmed_snapshot == proposed
+          assert confirmation.confirmed_local_version == 4
+          assert domain_request.action == :observe
+          assert domain_request.minimum_local_version == 4
+          send(parent, :older_effect_confirmed)
+          {:ok, :confirmed}
+        end,
+        get_label: fn _, _, _, _, _ ->
+          flunk("label effect replaced an unreconciled issue effect")
+        end,
+        update_issue: fn _, _, _, _, _, _ -> flunk("applied issue effect was replayed") end
+      )
+
+    assert {:ok, :confirmed} = IssueSyncWorker.process_operation(operation, @now, options)
+    assert_received :older_effect_confirmed
+  end
+
+  test "effect-pending update clears its proven precondition before a newer unmapped local label" do
+    parent = self()
+    proposed = Map.put(@base, "body", "sent")
+    marker = effect_marker("update_remote_issue", @base, proposed)
+    operation = operation("sync.issue", :effect_pending, marker)
+
+    options =
+      options(operation,
+        context: fn ^operation -> {:ok, context(marker)} end,
+        local_observe: fn _ ->
+          {:label_required, local_label_candidate(), %{local_resource_id: 100, local_version: 5}}
+        end,
+        get_issue: fn _, _, _, _, _ -> {:ok, github_issue(@base)} end,
+        requeue_effect: fn ^operation, @now ->
+          send(parent, :effect_reconciled_not_applied)
+          {:ok, %{operation | state: :pending, external_effect_marker: nil}}
+        end,
+        get_label: fn _, _, _, _, _ ->
+          flunk("label effect replaced an unreconciled issue effect")
+        end,
+        update_issue: fn _, _, _, _, _, _ -> flunk("old issue effect was replayed") end
+      )
+
+    assert {:ok, %MirrorOperation{state: :pending, external_effect_marker: nil}} =
+             IssueSyncWorker.process_operation(operation, @now, options)
+
+    assert_received :effect_reconciled_not_applied
+  end
+
+  test "effect-pending update conflicts before mapping a newly observed remote label" do
+    parent = self()
+    proposed = Map.put(@base, "body", "sent")
+    marker = effect_marker("update_remote_issue", @base, proposed)
+    operation = operation("sync.issue", :effect_pending, marker)
+
+    options =
+      options(operation,
+        context: fn ^operation -> {:ok, context(marker)} end,
+        local_observe: fn _ -> {:ok, local_issue(proposed, 4)} end,
+        get_issue: fn _, _, _, _, _ -> {:ok, github_issue(proposed)} end,
+        remote_relationships: fn _, _, _ -> {:label_required, local_label_candidate()} end,
+        conflict: fn ^operation, @now, "ambiguous_external_effect", @base, ^proposed, %{} ->
+          send(parent, :remote_label_blocked)
+          {:ok, :conflicted}
+        end,
+        get_label: fn _, _, _, _, _ ->
+          flunk("label effect replaced an unreconciled issue effect")
+        end,
+        confirm_label: fn _, _, _, _, _ ->
+          flunk("label mapping used an unreconciled issue marker")
+        end
+      )
+
+    assert {:ok, :conflicted} = IssueSyncWorker.process_operation(operation, @now, options)
+    assert_received :remote_label_blocked
+  end
+
+  test "effect-pending create adopts its correlated postcondition before a newer unmapped label" do
+    parent = self()
+    proposed = Map.put(@base, "title", "created")
+    correlation_id = "e7e9e395-b50f-4d28-bca9-9fa20e05e6af"
+    marker = create_marker("create_remote_issue", proposed, correlation_id)
+
+    checkpoint = %{
+      "recovery" => %{
+        "complete" => true,
+        "match" => %{
+          "github_object_id" => 501,
+          "github_number" => 9,
+          "remote_updated_at" => "2026-09-07T08:00:01Z"
+        }
+      }
+    }
+
+    operation = operation("sync.issue", :effect_pending, marker, checkpoint)
+
+    options =
+      options(operation,
+        context: fn ^operation ->
+          {:ok, context(marker, github_object_id: nil, github_number: nil)}
+        end,
+        local_observe: fn _ ->
+          {:label_required, local_label_candidate(), %{local_resource_id: 100, local_version: 2}}
+        end,
+        get_issue: fn _, _, _, 9, _ ->
+          {:ok,
+           github_issue(proposed,
+             id: 501,
+             number: 9,
+             body: proposed["body"] <> "\n\n<!-- fornacast:sync:v1:#{correlation_id} -->",
+             updated_at: "2026-09-07T08:00:01Z"
+           )}
+        end,
+        confirm: fn ^operation, @now, expected, confirmation, domain_request ->
+          assert expected.effect_marker == marker
+          assert confirmation.github_number == 9
+          assert confirmation.confirmed_snapshot == proposed
+          assert confirmation.confirmed_local_version == 1
+          assert domain_request.minimum_local_version == 1
+          send(parent, :older_create_confirmed)
+          {:ok, :confirmed}
+        end,
+        get_label: fn _, _, _, _, _ -> flunk("label effect replaced an unreconciled create") end,
+        create_issue: fn _, _, _, _, _ -> flunk("correlated issue was recreated") end
+      )
+
+    assert {:ok, :confirmed} = IssueSyncWorker.process_operation(operation, @now, options)
+    assert_received :older_create_confirmed
+  end
+
+  test "effect-pending create clears its completed no-match scan before a newer unmapped label" do
+    parent = self()
+    proposed = Map.put(@base, "title", "created")
+    correlation_id = "e7e9e395-b50f-4d28-bca9-9fa20e05e6af"
+    marker = create_marker("create_remote_issue", proposed, correlation_id)
+    checkpoint = %{"recovery" => %{"complete" => true, "match" => nil}}
+    operation = operation("sync.issue", :effect_pending, marker, checkpoint)
+
+    options =
+      options(operation,
+        context: fn ^operation ->
+          {:ok, context(marker, github_object_id: nil, github_number: nil)}
+        end,
+        local_observe: fn _ ->
+          {:label_required, local_label_candidate(), %{local_resource_id: 100, local_version: 2}}
+        end,
+        requeue_effect: fn ^operation, @now ->
+          send(parent, :create_reconciled_not_applied)
+          {:ok, %{operation | state: :pending, external_effect_marker: nil}}
+        end,
+        get_label: fn _, _, _, _, _ -> flunk("label effect replaced an unreconciled create") end,
+        create_issue: fn _, _, _, _, _ ->
+          flunk("old create was replayed before label mapping")
+        end
+      )
+
+    assert {:ok, %MirrorOperation{state: :pending, external_effect_marker: nil}} =
+             IssueSyncWorker.process_operation(operation, @now, options)
+
+    assert_received :create_reconciled_not_applied
+  end
+
   test "an ambiguous issue create scans one full-list page per claim and retains no body" do
     parent = self()
     proposed = Map.put(@base, "title", "created")
@@ -902,6 +1078,7 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
       label_observe: fn _, _ -> flunk("unexpected label observation") end,
       mark_label_effect: fn _, _, _, _, _ -> flunk("unexpected label effect") end,
       confirm_label: fn _, _, _, _, _ -> flunk("unexpected label confirmation") end,
+      requeue_effect: fn _, _ -> flunk("unexpected reconciled-effect requeue") end,
       confirm: fn _, _, _, _, _ -> {:ok, :confirmed} end,
       conflict: fn _, _, _, _, _, _ -> {:ok, :conflicted} end,
       record_page: fn _, _, _, _, _ -> flunk("unexpected reconciliation page") end,

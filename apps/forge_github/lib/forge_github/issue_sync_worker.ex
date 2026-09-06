@@ -63,6 +63,7 @@ defmodule ForgeGitHub.IssueSyncWorker do
     :mark_effect,
     :mark_label_effect,
     :replace_effect,
+    :requeue_effect,
     :checkpoint,
     :confirm,
     :confirm_label,
@@ -201,7 +202,25 @@ defmodule ForgeGitHub.IssueSyncWorker do
         end
 
       {:label_required, candidate} ->
-        materialize_label(operation, now, sync, token, candidate, options)
+        if resource_effect?(operation) do
+          conflict(operation, now, sync, :ambiguous_external_effect, :missing, :missing, options)
+        else
+          materialize_label(operation, now, sync, token, candidate, options)
+        end
+
+      {:label_required, candidate, local_identity} ->
+        if resource_effect?(operation) do
+          recover_resource_effect_before_label(
+            operation,
+            now,
+            sync,
+            token,
+            local_identity,
+            options
+          )
+        else
+          materialize_label(operation, now, sync, token, candidate, options)
+        end
 
       {:error, reason} ->
         persist_failure(operation, now, reason, options)
@@ -214,12 +233,221 @@ defmodule ForgeGitHub.IssueSyncWorker do
         continue_after_observation(operation, now, sync, token, local, remote, options)
 
       {:label_required, candidate} ->
-        materialize_label(operation, now, sync, token, candidate, options)
+        if resource_effect?(operation) do
+          conflict(operation, now, sync, :ambiguous_external_effect, local, :missing, options)
+        else
+          materialize_label(operation, now, sync, token, candidate, options)
+        end
 
       {:error, reason} ->
         persist_failure(operation, now, reason, options)
     end
   end
+
+  defp recover_resource_effect_before_label(
+         operation,
+         now,
+         sync,
+         token,
+         local_identity,
+         options
+       ) do
+    with {:ok, local} <- unresolved_effect_local(sync, operation, local_identity) do
+      if create_effect?(operation, sync) do
+        recover_create_before_label(operation, now, sync, token, local, options)
+      else
+        recover_update_before_label(operation, now, sync, token, local, options)
+      end
+    else
+      {:error, _reason} ->
+        conflict(operation, now, sync, :ambiguous_external_effect, :missing, :missing, options)
+    end
+  end
+
+  defp recover_update_before_label(operation, now, sync, token, local, options) do
+    case remote_observation(sync, token, now, options) do
+      {:ok, remote} ->
+        case recorded_effect_condition(operation, sync, local, remote, options) do
+          {:applied, postcondition} ->
+            confirm_reconciled_resource_effect(
+              operation,
+              now,
+              sync,
+              local,
+              postcondition,
+              options
+            )
+
+          :not_applied ->
+            requeue_reconciled_effect(operation, now, options)
+
+          _ambiguous ->
+            conflict(operation, now, sync, :ambiguous_external_effect, local, remote, options)
+        end
+
+      {:label_required, _candidate} ->
+        conflict(operation, now, sync, :ambiguous_external_effect, local, :missing, options)
+
+      {:error, reason} ->
+        persist_failure(operation, now, reason, options, preserve_effect?: true)
+    end
+  end
+
+  defp recover_create_before_label(operation, now, sync, token, local, options) do
+    with :ok <- validate_create_marker(sync.effect_marker, sync, local, options),
+         {:ok, recovery} <- recovery_checkpoint(operation.checkpoint) do
+      case recovery do
+        %{complete: true, match: nil} ->
+          requeue_reconciled_effect(operation, now, options)
+
+        %{complete: true, match: match} ->
+          adopt_created_match_before_label(operation, now, sync, token, local, match, options)
+
+        %{page: page, match: match} ->
+          scan_create_page(operation, now, sync, token, local, page, match, options)
+      end
+    else
+      _invalid ->
+        conflict(operation, now, sync, :ambiguous_external_effect, local, :missing, options)
+    end
+  end
+
+  defp adopt_created_match_before_label(
+         operation,
+         now,
+         sync,
+         token,
+         local,
+         match,
+         options
+       ) do
+    recovery_sync = %{
+      sync
+      | github_object_id: match["github_object_id"],
+        github_number: match["github_number"]
+    }
+
+    result =
+      case sync.resource_kind do
+        :issue ->
+          callback(options, :get_issue, &IssueClient.get_issue/5).(
+            token,
+            sync.remote_owner,
+            sync.remote_repository,
+            match["github_number"],
+            request_options(sync)
+          )
+
+        :issue_comment ->
+          callback(options, :get_comment, &IssueClient.get_comment/5).(
+            token,
+            sync.remote_owner,
+            sync.remote_repository,
+            match["github_object_id"],
+            request_options(sync)
+          )
+      end
+
+    with {:ok, remote} <-
+           decode_remote(
+             result,
+             recovery_sync,
+             now,
+             sync.effect_marker["correlation_id"],
+             options
+           ),
+         {:ok, fingerprint} <- observation_fingerprint(remote, options),
+         true <- fingerprint == sync.effect_marker["proposed_fingerprint"] do
+      confirm_reconciled_resource_effect(
+        operation,
+        now,
+        recovery_sync,
+        local,
+        remote,
+        options
+      )
+    else
+      _invalid ->
+        conflict(operation, now, sync, :ambiguous_external_effect, local, :missing, options)
+    end
+  end
+
+  defp confirm_reconciled_resource_effect(operation, now, sync, local, remote, options) do
+    marker = operation.external_effect_marker
+
+    domain_request = %{
+      action: :observe,
+      repository_id: sync.repository_id,
+      resource_kind: sync.resource_kind,
+      local_resource_id: local.local_resource_id,
+      minimum_local_version: marker["expected_local_version"]
+    }
+
+    confirmation = %{
+      github_object_id: remote.github_object_id,
+      github_node_id: remote.github_node_id,
+      github_number: remote.github_number,
+      remote_updated_at: remote.remote_updated_at,
+      confirmed_local_version: marker["expected_local_version"],
+      confirmed_snapshot: remote.snapshot,
+      state: :confirmed
+    }
+
+    expected = %{
+      resource_state_lock_version: sync.resource_state_lock_version || :missing,
+      local_resource_id: local.local_resource_id,
+      expected_local_version: local.local_version,
+      github_object_id: remote.github_object_id,
+      observed_remote_updated_at: remote.remote_updated_at,
+      effect_marker: marker
+    }
+
+    callback(options, :confirm, &default_confirm/5).(
+      operation,
+      now,
+      expected,
+      confirmation,
+      domain_request
+    )
+  end
+
+  defp requeue_reconciled_effect(operation, now, options) do
+    callback(
+      options,
+      :requeue_effect,
+      &ForgeMirrors.requeue_reconciled_resource_effect/2
+    ).(operation, now)
+  end
+
+  defp unresolved_effect_local(
+         sync,
+         %MirrorOperation{state: :effect_pending, external_effect_marker: marker},
+         %{local_resource_id: id, local_version: version}
+       )
+       when is_integer(id) and id > 0 and is_integer(version) and version > 0 and is_map(marker) do
+    if marker == sync.effect_marker and marker["local_resource_id"] == id and
+         is_integer(marker["expected_local_version"]) and
+         version > marker["expected_local_version"] do
+      {:ok,
+       %{
+         presence: :present,
+         resource_kind: sync.resource_kind,
+         local_resource_id: id,
+         local_version: version,
+         snapshot: %{},
+         label_catalog: %{},
+         assignee_catalog: %{}
+       }}
+    else
+      {:error, :ambiguous_external_effect}
+    end
+  end
+
+  defp unresolved_effect_local(_sync, _operation, _local_identity),
+    do: {:error, :ambiguous_external_effect}
+
+  defp resource_effect?(%MirrorOperation{state: :effect_pending}), do: true
+  defp resource_effect?(_operation), do: false
 
   @impl true
   def init(options) do
@@ -303,7 +531,11 @@ defmodule ForgeGitHub.IssueSyncWorker do
           IssueSyncProjection.from_local(projection, relationships)
 
         {:error, {:unmapped_label, candidate}} ->
-          {:label_required, candidate}
+          {:label_required, candidate,
+           %{
+             local_resource_id: projection.local_resource_id,
+             local_version: projection.local_version
+           }}
 
         {:error, reason} ->
           {:error, reason}

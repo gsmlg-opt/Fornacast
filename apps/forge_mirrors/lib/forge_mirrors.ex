@@ -1020,6 +1020,39 @@ defmodule ForgeMirrors do
   def checkpoint_resource_operation(_, _, _, _, _), do: {:error, :invalid_argument}
 
   @doc false
+  def requeue_reconciled_resource_effect(%MirrorOperation{} = operation, %DateTime{} = now) do
+    with :ok <- validate_utc(now) do
+      Repo.transaction(fn ->
+        with {:ok, persisted, _scope} <- lock_resource_operation(operation),
+             true <-
+               persisted.state == :effect_pending and
+                 persisted.external_effect_marker == operation.external_effect_marker and
+                 persisted.external_effect_marker["action"] in ~w(create_remote_issue update_remote_issue create_remote_comment update_remote_comment delete_remote_comment),
+             {:ok, pending} <-
+               owned_transition(persisted, now, [:effect_pending],
+                 state: :pending,
+                 next_attempt_at: now,
+                 external_effect_marker: nil,
+                 effect_marked_at: nil,
+                 checkpoint: %{},
+                 lease_owner: nil,
+                 lease_expires_at: nil,
+                 failure_class: nil,
+                 failure_disposition: nil,
+                 failure_detail: nil
+               ) do
+          pending
+        else
+          false -> Repo.rollback(:invalid_transition)
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+    end
+  end
+
+  def requeue_reconciled_resource_effect(_, _), do: {:error, :invalid_argument}
+
+  @doc false
   def record_resource_reconciliation_page(
         %MirrorOperation{} = operation,
         kind,
