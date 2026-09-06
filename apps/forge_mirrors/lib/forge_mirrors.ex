@@ -1206,6 +1206,60 @@ defmodule ForgeMirrors do
 
   def mark_external_effect(_operation, _now, _marker), do: {:error, :invalid_argument}
 
+  @spec replace_external_effect(MirrorOperation.t(), DateTime.t(), map(), map()) ::
+          {:ok, MirrorOperation.t()}
+          | {:error, :lost_lease | :invalid_transition | :invalid_argument | :paused}
+  def replace_external_effect(
+        %MirrorOperation{state: :effect_pending} = operation,
+        %DateTime{} = now,
+        expected_marker,
+        replacement_marker
+      )
+      when is_map(expected_marker) and map_size(expected_marker) > 0 and
+             is_map(replacement_marker) and map_size(replacement_marker) > 0 do
+    with :ok <- validate_utc(now),
+         :ok <- validate_bounded_object(expected_marker),
+         :ok <- validate_bounded_object(replacement_marker) do
+      now = DateTime.truncate(now, :second)
+      expected_marker = canonical_map(expected_marker)
+      replacement_marker = canonical_map(replacement_marker)
+
+      Repo.transaction(fn ->
+        with :ok <- lock_effect_scope(operation),
+             {:ok, persisted} <- lock_owned_operation(operation, [operation.kind]),
+             true <- persisted.external_effect_marker == expected_marker,
+             {:ok, replaced} <-
+               owned_transition(persisted, now, [:effect_pending],
+                 external_effect_marker: replacement_marker,
+                 effect_marked_at: now
+               ) do
+          replaced
+        else
+          false -> Repo.rollback(:invalid_transition)
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+      |> case do
+        {:ok, replaced} ->
+          {:ok, replaced}
+
+        {:error, reason} when reason in [:lost_lease, :invalid_transition, :paused] ->
+          {:error, reason}
+
+        {:error, _reason} ->
+          {:error, :lost_lease}
+      end
+    end
+  rescue
+    _ -> {:error, :lost_lease}
+  end
+
+  def replace_external_effect(%MirrorOperation{}, %DateTime{}, _expected, _replacement),
+    do: {:error, :invalid_transition}
+
+  def replace_external_effect(_operation, _now, _expected, _replacement),
+    do: {:error, :invalid_argument}
+
   @spec failure_disposition(String.t()) ::
           {:ok, :retry | :degraded | :conflict | :terminal} | {:error, :invalid_argument}
   def failure_disposition(failure_class) do
@@ -1395,10 +1449,13 @@ defmodule ForgeMirrors do
              baseline: String.t() | nil | :missing,
              effect_marker: map() | nil,
              github_installation_id: pos_integer(),
+             lfs_enabled: boolean(),
              ref_kind: :branch | :tag,
              ref_name: String.t(),
              remote_owner: String.t(),
              remote_repository: String.t(),
+             repository_generation: pos_integer(),
+             repository_id: pos_integer(),
              repository_path: Path.t(),
              tracking_namespace: String.t()
            }}
@@ -1433,12 +1490,65 @@ defmodule ForgeMirrors do
   def git_ref_operation_context(_operation), do: {:error, :invalid_transition}
 
   @doc false
+  @spec checkpoint_git_ref_operation(
+          MirrorOperation.t(),
+          String.t(),
+          map(),
+          DateTime.t()
+        ) :: {:ok, MirrorOperation.t()} | {:error, term()}
+  def checkpoint_git_ref_operation(
+        %MirrorOperation{state: state} = operation,
+        ref_name,
+        checkpoint,
+        %DateTime{} = now
+      )
+      when is_map(checkpoint) and state in [:processing, :effect_pending] do
+    with true <- standard_git_ref?(ref_name),
+         :ok <- validate_utc(now),
+         :ok <- validate_bounded_object(checkpoint) do
+      now = DateTime.truncate(now, :second)
+
+      Repo.transaction(fn ->
+        with {:ok, persisted} <- lock_owned_git_ref_operation(operation, ref_name),
+             {:ok, yielded} <-
+               owned_transition(persisted, now, [state],
+                 state: if(state == :effect_pending, do: :effect_pending, else: :pending),
+                 checkpoint: canonical_map(checkpoint),
+                 next_attempt_at: now,
+                 lease_owner: nil,
+                 lease_expires_at: nil,
+                 failure_class: nil,
+                 failure_disposition: nil,
+                 failure_detail: nil
+               ) do
+          yielded
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+      |> normalize_transaction_result()
+    else
+      false -> {:error, :invalid_argument}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    _exception -> {:error, :lost_lease}
+  end
+
+  def checkpoint_git_ref_operation(%MirrorOperation{}, _ref_name, _checkpoint, %DateTime{}),
+    do: {:error, :invalid_transition}
+
+  def checkpoint_git_ref_operation(_operation, _ref_name, _checkpoint, _now),
+    do: {:error, :invalid_argument}
+
+  @doc false
   def git_repository_operation_context(%MirrorOperation{} = operation) do
     Repo.transaction(fn ->
       with {:ok, persisted} <-
              lock_owned_operation(operation, [
                "reconcile.repository.bootstrap",
-               "reconcile.repository.git"
+               "reconcile.repository.git",
+               "finalize.repository.git"
              ]),
            {:ok, scope} <- load_git_ref_scope(persisted) do
         baseline_ref_names =
@@ -1449,6 +1559,7 @@ defmodule ForgeMirrors do
 
         Map.merge(scope, %{
           baseline_ref_names: baseline_ref_names,
+          confirmed_ref_oids: confirmed_ref_oids(persisted.repository_mirror_id),
           tracking_namespace: "repository-#{persisted.repository_mirror_id}"
         })
       else
@@ -1461,6 +1572,63 @@ defmodule ForgeMirrors do
   end
 
   def git_repository_operation_context(_operation), do: {:error, :invalid_transition}
+
+  defp confirmed_ref_oids(repository_mirror_id) do
+    MirrorRefState
+    |> where([ref], ref.repository_mirror_id == ^repository_mirror_id)
+    |> Repo.all()
+    |> Enum.flat_map(fn
+      %{state: :deleted, confirmed_oid: nil} -> []
+      %{state: :confirmed, confirmed_oid: nil} -> []
+      %{state: :confirmed, ref_name: name, confirmed_oid: oid} -> [{name, oid}]
+      %{ref_name: name} -> [{name, :unconfirmed}]
+    end)
+    |> Map.new()
+  end
+
+  @doc false
+  def checkpoint_git_reconciliation(operation, checkpoint, now) when is_map(checkpoint) do
+    with :ok <- validate_bounded_object(checkpoint),
+         :ok <- validate_utc(now) do
+      Repo.transaction(fn ->
+        with {:ok, persisted} <- lock_owned_operation(operation, ["finalize.repository.git"]),
+             {:ok, yielded} <-
+               owned_transition(persisted, DateTime.truncate(now, :second), [:processing],
+                 state: :pending,
+                 checkpoint: canonical_map(checkpoint),
+                 next_attempt_at: now,
+                 lease_owner: nil,
+                 lease_expires_at: nil
+               ) do
+          yielded
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+      |> normalize_transaction_result()
+    end
+  end
+
+  @doc false
+  def fail_git_lfs_reconciliation(operation, now, failure_class)
+      when failure_class in ["lfs_missing", "lfs_integrity"] do
+    Repo.transaction(fn ->
+      with {:ok, persisted} <- lock_owned_operation(operation, ["finalize.repository.git"]),
+           {:ok, _mirror} <- degrade_git_ref_organization(persisted),
+           {:ok, failed} <-
+             fail_operation(
+               persisted,
+               now,
+               failure_class,
+               "authoritative LFS reachability verification failed"
+             ) do
+        failed
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> normalize_transaction_result()
+  end
 
   @doc false
   def fanout_git_ref_reconciliation(
@@ -1502,35 +1670,58 @@ defmodule ForgeMirrors do
     do: {:error, :invalid_argument}
 
   @doc false
+  def preflight_git_ref_reconciliation(%MirrorOperation{} = operation, %DateTime{} = now) do
+    with :ok <- validate_utc(now) do
+      now = DateTime.truncate(now, :second)
+
+      Repo.transaction(fn ->
+        with {:ok, persisted} <- lock_owned_operation(operation, ["finalize.repository.git"]),
+             %RepositoryMirror{} = repository <- lock_finalizer_repository(persisted) do
+          case git_ref_reconciliation_blocker(repository, persisted) do
+            :clear ->
+              :continue
+
+            {:blocked, _failure_class, _failure_detail} = blocker ->
+              fail_git_ref_reconciliation(persisted, now, blocker)
+
+            {:superseded, later} ->
+              supersede_git_ref_reconciliation(persisted, later, now)
+          end
+        else
+          nil -> Repo.rollback(:invalid_transition)
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+      |> normalize_transaction_result()
+    end
+  rescue
+    _exception -> {:error, :lost_lease}
+  end
+
+  def preflight_git_ref_reconciliation(_operation, _now),
+    do: {:error, :invalid_argument}
+
+  @doc false
   def finalize_git_ref_reconciliation(%MirrorOperation{} = operation, %DateTime{} = now) do
     with :ok <- validate_utc(now) do
       now = DateTime.truncate(now, :second)
 
       Repo.transaction(fn ->
         with {:ok, persisted} <- lock_owned_operation(operation, ["finalize.repository.git"]),
-             %RepositoryMirror{} = repository <-
-               RepositoryMirror
-               |> where([mirror], mirror.id == ^persisted.repository_mirror_id)
-               |> lock("FOR UPDATE")
-               |> Repo.one(),
-             false <- repository_has_open_git_conflicts?(repository.id),
+             %RepositoryMirror{} = repository <- lock_finalizer_repository(persisted),
+             :clear <- git_ref_reconciliation_blocker(repository, persisted),
+             :ok <- release_bootstrap_publication(repository, persisted),
              {:ok, updated_repository} <-
-               repository
-               |> RepositoryMirror.update_changeset(%{last_synced_at: now})
-               |> Repo.update(),
+               persist_successful_git_reconciliation(repository, now),
+             {:ok, _organization_mirror} <- maybe_restore_git_mirror_health(persisted),
              {:ok, completed} <- complete_operation(persisted, now) do
           %{operation: completed, repository_mirror: updated_repository}
         else
-          true ->
-            case fail_operation(
-                   operation,
-                   now,
-                   "git_divergence",
-                   "repository has open Git ref conflicts"
-                 ) do
-              {:ok, failed} -> %{operation: failed, repository_mirror: nil}
-              {:error, reason} -> Repo.rollback(reason)
-            end
+          {:blocked, _failure_class, _failure_detail} = blocker ->
+            fail_git_ref_reconciliation(operation, now, blocker)
+
+          {:superseded, later} ->
+            supersede_git_ref_reconciliation(operation, later, now)
 
           nil ->
             Repo.rollback(:invalid_transition)
@@ -1547,6 +1738,106 @@ defmodule ForgeMirrors do
 
   def finalize_git_ref_reconciliation(_operation, _now),
     do: {:error, :invalid_argument}
+
+  defp lock_finalizer_repository(operation) do
+    RepositoryMirror
+    |> where([mirror], mirror.id == ^operation.repository_mirror_id)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+  end
+
+  defp git_ref_reconciliation_blocker(repository, operation) do
+    if repository_has_open_git_conflicts?(repository.id) do
+      {:blocked, "git_divergence", "repository has open Git ref conflicts"}
+    else
+      case reconciliation_child_failure(operation) do
+        failure_class when is_binary(failure_class) ->
+          {:blocked, failure_class, git_ref_child_failure_detail(failure_class)}
+
+        nil ->
+          case later_repository_reconciliation_work(operation) || later_repository_work(operation) do
+            nil -> :clear
+            later -> {:superseded, later}
+          end
+      end
+    end
+  end
+
+  defp fail_git_ref_reconciliation(
+         operation,
+         now,
+         {:blocked, failure_class, failure_detail}
+       ) do
+    case fail_operation(operation, now, failure_class, failure_detail) do
+      {:ok, failed} -> %{operation: failed, repository_mirror: nil}
+      {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+
+  defp git_ref_child_failure_detail(failure_class)
+       when failure_class in ["lfs_missing", "lfs_integrity"],
+       do: "repository has a degraded Git LFS ref"
+
+  defp git_ref_child_failure_detail(_failure_class),
+    do: "repository has a failed Git ref reconciliation"
+
+  defp supersede_git_ref_reconciliation(operation, later, now) do
+    with {:ok, replacement} <- replacement_git_reconciliation(operation, later, now),
+         {:ok, completed} <- complete_operation(operation, now) do
+      %{operation: completed, repository_mirror: nil, replacement: replacement}
+    else
+      {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+
+  defp replacement_git_reconciliation(_operation, %{kind: kind} = later, _now)
+       when kind in [
+              "reconcile.repository.bootstrap",
+              "reconcile.repository.git",
+              "finalize.repository.git"
+            ],
+       do: {:ok, later}
+
+  defp replacement_git_reconciliation(operation, _later, now) do
+    enqueue_operation(%{
+      organization_mirror_id: operation.organization_mirror_id,
+      repository_mirror_id: operation.repository_mirror_id,
+      kind: "reconcile.repository.git",
+      dedupe_key: "reconcile:finalizer:#{operation.id}:replacement",
+      cursor: %{"superseded_finalizer_operation_id" => operation.id},
+      next_attempt_at: now
+    })
+  end
+
+  defp later_repository_reconciliation_work(operation) do
+    operation
+    |> later_repository_work_query()
+    |> where(
+      [candidate],
+      candidate.kind in [
+        "reconcile.repository.bootstrap",
+        "reconcile.repository.git",
+        "finalize.repository.git"
+      ]
+    )
+    |> first(:id)
+    |> Repo.one()
+  end
+
+  defp later_repository_work(operation) do
+    operation
+    |> later_repository_work_query()
+    |> first(:id)
+    |> Repo.one()
+  end
+
+  defp later_repository_work_query(operation) do
+    from candidate in MirrorOperation,
+      where:
+        candidate.repository_mirror_id == ^operation.repository_mirror_id and
+          candidate.id > ^operation.id and
+          candidate.state in [:pending, :processing, :effect_pending]
+  end
 
   @doc false
   @spec confirm_git_ref(
@@ -1593,6 +1884,75 @@ defmodule ForgeMirrors do
 
   def confirm_git_ref(_operation, _ref_name, _local_oid, _remote_oid, _now),
     do: {:error, :invalid_argument}
+
+  @doc false
+  @spec degrade_git_ref(
+          MirrorOperation.t(),
+          String.t(),
+          String.t() | nil,
+          String.t() | nil,
+          DateTime.t(),
+          String.t(),
+          String.t() | nil
+        ) ::
+          {:ok,
+           %{
+             operation: MirrorOperation.t(),
+             ref_state: MirrorRefState.t(),
+             organization_mirror: OrganizationMirror.t()
+           }}
+          | {:error, term()}
+  def degrade_git_ref(
+        %MirrorOperation{} = operation,
+        ref_name,
+        local_oid,
+        remote_oid,
+        %DateTime{} = now,
+        failure_class,
+        failure_detail
+      )
+      when failure_class in ["lfs_missing", "lfs_integrity"] do
+    with true <- standard_git_ref?(ref_name),
+         true <- optional_oid?(local_oid) and optional_oid?(remote_oid),
+         :ok <- validate_utc(now),
+         :ok <- validate_failure_detail(failure_detail) do
+      now = DateTime.truncate(now, :second)
+
+      Repo.transaction(fn ->
+        with {:ok, persisted} <- lock_owned_git_ref_operation(operation, ref_name),
+             {:ok, ref_state} <-
+               persist_degraded_git_ref_state(persisted, ref_name, local_oid, remote_oid),
+             {:ok, organization_mirror} <- degrade_git_ref_organization(persisted),
+             {:ok, failed} <-
+               fail_operation(persisted, now, failure_class, failure_detail) do
+          %{
+            operation: failed,
+            ref_state: ref_state,
+            organization_mirror: organization_mirror
+          }
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+      |> normalize_transaction_result()
+    else
+      false -> {:error, :invalid_argument}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    _exception -> {:error, :lost_lease}
+  end
+
+  def degrade_git_ref(
+        _operation,
+        _ref_name,
+        _local_oid,
+        _remote_oid,
+        _now,
+        _failure_class,
+        _failure_detail
+      ),
+      do: {:error, :invalid_argument}
 
   @doc false
   @spec conflict_git_ref(
@@ -2144,7 +2504,8 @@ defmodule ForgeMirrors do
          %OrganizationMirror{
            provider: "github",
            state: organization_state,
-           github_installation_id: installation_id
+           github_installation_id: installation_id,
+           capabilities: capabilities
          }
          when organization_state not in [:paused, :revoked] and is_integer(installation_id) <-
            organization_mirror,
@@ -2156,7 +2517,12 @@ defmodule ForgeMirrors do
            )
            |> lock("FOR UPDATE")
            |> Repo.one(),
-         {:ok, %ForgeRepos.Repository{owner_user_id: owner_id} = repository} <-
+         {:ok,
+          %ForgeRepos.Repository{
+            id: repository_id,
+            owner_user_id: owner_id,
+            generation: repository_generation
+          } = repository} <-
            ForgeRepos.fetch_live_repository(repository_id),
          true <- owner_id == organization_mirror.organization_id,
          [remote_owner, remote_repository] <- String.split(github_full_name || "", "/"),
@@ -2166,8 +2532,18 @@ defmodule ForgeMirrors do
       {:ok,
        %{
          github_installation_id: installation_id,
+         lfs_enabled:
+           Map.get(capabilities || %{}, "lfs") in [
+             true,
+             :enabled,
+             :active,
+             "enabled",
+             "active"
+           ],
          remote_owner: remote_owner,
          remote_repository: remote_repository,
+         repository_id: repository_id,
+         repository_generation: repository_generation,
          repository_path: ForgeRepos.absolute_storage_path(repository)
        }}
     else
@@ -2178,7 +2554,7 @@ defmodule ForgeMirrors do
   defp git_ref_baseline(operation, ref_name) do
     case locked_git_ref_state(operation.repository_mirror_id, ref_name) do
       %MirrorRefState{confirmed_oid: oid, state: state}
-      when state in [:confirmed, :deleted, :pending] ->
+      when state in [:confirmed, :deleted, :pending, :degraded] ->
         oid
 
       %MirrorRefState{state: :conflicted} ->
@@ -2247,6 +2623,52 @@ defmodule ForgeMirrors do
     (existing || %MirrorRefState{})
     |> MirrorRefState.persistence_changeset(attrs)
     |> Repo.insert_or_update()
+  end
+
+  defp persist_degraded_git_ref_state(operation, ref_name, local_oid, remote_oid) do
+    existing = locked_git_ref_state(operation.repository_mirror_id, ref_name)
+
+    attrs = %{
+      repository_mirror_id: operation.repository_mirror_id,
+      ref_name: ref_name,
+      ref_kind: git_ref_kind(ref_name),
+      confirmed_oid: existing && existing.confirmed_oid,
+      last_local_oid: local_oid,
+      last_remote_oid: remote_oid,
+      state: :degraded,
+      last_confirmed_at: existing && existing.last_confirmed_at,
+      lock_version: if(existing, do: existing.lock_version + 1, else: 1)
+    }
+
+    (existing || %MirrorRefState{})
+    |> MirrorRefState.persistence_changeset(attrs)
+    |> Repo.insert_or_update()
+  end
+
+  defp degrade_git_ref_organization(operation) do
+    mirror =
+      OrganizationMirror
+      |> where([candidate], candidate.id == ^operation.organization_mirror_id)
+      |> lock("FOR UPDATE")
+      |> Repo.one()
+
+    case mirror do
+      %OrganizationMirror{state: :degraded} ->
+        {:ok, mirror}
+
+      %OrganizationMirror{state: state} = mirror ->
+        if OrganizationMirror.legal_transition?(state, :degraded) do
+          mirror
+          |> OrganizationMirror.transition_changeset(:degraded)
+          |> Ecto.Changeset.put_change(:lock_version, mirror.lock_version + 1)
+          |> Repo.update()
+        else
+          {:error, :invalid_transition}
+        end
+
+      nil ->
+        {:error, :invalid_transition}
+    end
   end
 
   defp locked_git_ref_state(repository_mirror_id, ref_name) do
@@ -2368,6 +2790,159 @@ defmodule ForgeMirrors do
           conflict.repository_mirror_id == ^repository_mirror_id and
             conflict.resource_kind == "git_ref" and conflict.state == :open
     )
+  end
+
+  defp reconciliation_child_failure(%MirrorOperation{cursor: cursor} = operation) do
+    case cursor["reconciliation_operation_id"] do
+      reconciliation_id when is_integer(reconciliation_id) and reconciliation_id > 0 ->
+        MirrorOperation
+        |> where(
+          [candidate],
+          candidate.repository_mirror_id == ^operation.repository_mirror_id and
+            candidate.kind == "sync.git_ref" and candidate.state == :failed and
+            fragment(
+              "?->>'reconciliation_operation_id' = ?",
+              candidate.cursor,
+              ^Integer.to_string(reconciliation_id)
+            )
+        )
+        |> order_by([candidate], asc: candidate.id)
+        |> select([candidate], candidate.failure_class)
+        |> limit(1)
+        |> Repo.one()
+
+      _invalid ->
+        nil
+    end
+  end
+
+  defp release_bootstrap_publication(repository_mirror, operation) do
+    repository =
+      ForgeRepos.Repository
+      |> where([repository], repository.id == ^repository_mirror.repository_id)
+      |> lock("FOR UPDATE")
+      |> Repo.one()
+
+    case repository do
+      %ForgeRepos.Repository{lifecycle: :synchronizing, deleted_at: nil} ->
+        incomplete_refs? =
+          Repo.exists?(
+            from ref in MirrorRefState,
+              where:
+                ref.repository_mirror_id == ^repository_mirror.id and
+                  ref.state not in [:confirmed, :deleted]
+          )
+
+        reconciliation_id = operation.cursor["reconciliation_operation_id"]
+
+        incomplete_children? =
+          Repo.exists?(
+            from child in MirrorOperation,
+              where:
+                child.repository_mirror_id == ^repository_mirror.id and
+                  child.kind == "sync.git_ref" and child.state != :completed and
+                  fragment(
+                    "?->>'reconciliation_operation_id' = ?",
+                    child.cursor,
+                    ^to_string(reconciliation_id)
+                  )
+          )
+
+        if incomplete_refs? or incomplete_children? or not is_integer(reconciliation_id) do
+          {:error, :bootstrap_refs_unconfirmed}
+        else
+          repository
+          |> Ecto.Changeset.change(lifecycle: :ready)
+          |> Repo.update()
+          |> case do
+            {:ok, _repository} -> :ok
+            {:error, reason} -> {:error, reason}
+          end
+        end
+
+      %ForgeRepos.Repository{lifecycle: :ready, deleted_at: nil} ->
+        :ok
+
+      _unavailable ->
+        {:error, :invalid_transition}
+    end
+  end
+
+  defp persist_successful_git_reconciliation(
+         %RepositoryMirror{state: :discovered} = repository,
+         now
+       ) do
+    repository
+    |> RepositoryMirror.transition_changeset(:active)
+    |> Ecto.Changeset.put_change(:last_synced_at, now)
+    |> Ecto.Changeset.put_change(:lock_version, repository.lock_version + 1)
+    |> Repo.update()
+  end
+
+  defp persist_successful_git_reconciliation(%RepositoryMirror{} = repository, now) do
+    repository
+    |> RepositoryMirror.update_changeset(%{last_synced_at: now})
+    |> Repo.update()
+  end
+
+  defp maybe_restore_git_mirror_health(operation) do
+    mirror =
+      OrganizationMirror
+      |> where([candidate], candidate.id == ^operation.organization_mirror_id)
+      |> lock("FOR UPDATE")
+      |> Repo.one()
+
+    case mirror do
+      %OrganizationMirror{state: state} = mirror when state in [:catching_up, :degraded] ->
+        if organization_git_catchup_complete?(mirror.id, operation.id) do
+          mirror
+          |> OrganizationMirror.transition_changeset(:active)
+          |> Ecto.Changeset.put_change(:lock_version, mirror.lock_version + 1)
+          |> Repo.update()
+        else
+          {:ok, mirror}
+        end
+
+      %OrganizationMirror{} = mirror ->
+        {:ok, mirror}
+
+      nil ->
+        {:error, :invalid_transition}
+    end
+  end
+
+  defp organization_has_degraded_git_refs?(organization_mirror_id) do
+    Repo.exists?(
+      from state in MirrorRefState,
+        join: repository in RepositoryMirror,
+        on: repository.id == state.repository_mirror_id,
+        where:
+          repository.organization_mirror_id == ^organization_mirror_id and
+            state.state == :degraded
+    )
+  end
+
+  defp organization_git_catchup_complete?(organization_mirror_id, current_operation_id) do
+    not organization_has_degraded_git_refs?(organization_mirror_id) and
+      not Repo.exists?(
+        from conflict in MirrorConflict,
+          where:
+            conflict.organization_mirror_id == ^organization_mirror_id and
+              conflict.state == :open
+      ) and
+      not Repo.exists?(
+        from repository in RepositoryMirror,
+          where:
+            repository.organization_mirror_id == ^organization_mirror_id and
+              repository.inventory_included == true and repository.state != :active
+      ) and
+      not Repo.exists?(
+        from candidate in MirrorOperation,
+          where:
+            candidate.organization_mirror_id == ^organization_mirror_id and
+              candidate.id != ^current_operation_id and
+              candidate.state in [:pending, :processing, :effect_pending]
+      )
   end
 
   defp validate_local_repository_identity(owner_id, repository_id) do

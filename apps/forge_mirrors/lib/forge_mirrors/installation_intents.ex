@@ -403,9 +403,9 @@ defmodule ForgeMirrors.InstallationIntents do
   defp default_capabilities do
     %{
       "git" => "enabled",
+      "lfs" => "enabled",
       "issues" => "enabled",
       "pulls" => "enabled",
-      "lfs" => "unavailable",
       "releases" => "unavailable"
     }
   end

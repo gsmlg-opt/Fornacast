@@ -206,6 +206,67 @@ defmodule GitLFS.StorageTest do
     assert {:error, :not_found} = GitLFS.object_metadata(repository, oid)
   end
 
+  test "provider synchronization can attach verified global bytes with ref provenance", %{
+    owner: owner,
+    repository: first_repository
+  } do
+    payload = "provider-proven shared object"
+    oid = digest(payload)
+    on_exit(fn -> ForgeBlobs.delete(oid) end)
+
+    assert {:ok, second_repository} =
+             ForgeRepos.create_repository(owner, %{name: "Provider proof", slug: "provider-proof"})
+
+    assert {:ok, reservation} =
+             GitLFS.reserve_upload(first_repository, oid, byte_size(payload))
+
+    assert {:ok, staged, _state} =
+             GitLFS.stage_upload(reservation, &chunk_reader/2, %{chunks: [payload]})
+
+    assert {:ok, _object} = GitLFS.commit_upload(staged)
+    assert {:error, :not_found} = GitLFS.object_metadata(second_repository, oid)
+
+    assert :ok =
+             GitLFS.ensure_synchronized_object(
+               second_repository,
+               oid,
+               byte_size(payload),
+               "refs/heads/main"
+             )
+
+    assert :ok = GitLFS.verify_object(second_repository, oid, byte_size(payload))
+
+    assert %RepositoryObject{first_seen_ref: "refs/heads/main", reachable: true} =
+             Repo.get_by!(RepositoryObject,
+               repository_id: second_repository.id,
+               oid_sha256: oid
+             )
+  end
+
+  test "synchronized uploads retain the first ref that made an object reachable", %{
+    repository: repository
+  } do
+    repository =
+      repository
+      |> Ecto.Changeset.change(lifecycle: :synchronizing)
+      |> Repo.update!()
+
+    payload = "downloaded from provider"
+    oid = digest(payload)
+    on_exit(fn -> ForgeBlobs.delete(oid) end)
+
+    assert {:ok, reservation} = GitLFS.reserve_upload(repository, oid, byte_size(payload))
+
+    assert {:ok, staged, _state} =
+             GitLFS.stage_upload(reservation, &chunk_reader/2, %{chunks: [payload]})
+
+    assert {:ok, %LFSObject{oid_sha256: ^oid}} =
+             GitLFS.commit_synchronized_upload(staged, "refs/tags/v1.0.0")
+
+    assert %RepositoryObject{first_seen_ref: "refs/tags/v1.0.0"} =
+             Repo.get_by!(RepositoryObject, repository_id: repository.id, oid_sha256: oid)
+  end
+
   test "deleting one repository never removes bytes shared by another repository", %{
     owner: owner,
     repository: first_repository

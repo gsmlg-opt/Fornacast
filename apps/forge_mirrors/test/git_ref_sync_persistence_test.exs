@@ -6,7 +6,7 @@ defmodule ForgeMirrors.GitRefSyncPersistenceTest do
 
   alias Fornacast.Repo
 
-  alias ForgeMirrors.{MirrorConflict, MirrorOperation, MirrorWebhookDelivery}
+  alias ForgeMirrors.{MirrorConflict, MirrorOperation, MirrorRefState, MirrorWebhookDelivery}
   alias ForgeRepos.Repository
 
   @oid String.duplicate("a", 40)
@@ -58,6 +58,129 @@ defmodule ForgeMirrors.GitRefSyncPersistenceTest do
     assert state.last_local_oid == @oid
     assert state.last_remote_oid == @oid
     assert state.last_confirmed_at == now
+  end
+
+  test "an LFS failure degrades the ref without replacing its confirmed baseline", context do
+    confirmed_at = DateTime.utc_now(:second)
+    failed_at = DateTime.add(confirmed_at, 60)
+
+    first =
+      operation(context, "refs/heads/main", Ecto.UUID.generate(), confirmed_at)
+      |> claim!(confirmed_at)
+
+    assert {:ok, %{ref_state: confirmed}} =
+             ForgeMirrors.confirm_git_ref(
+               first,
+               "refs/heads/main",
+               @oid,
+               @oid,
+               confirmed_at
+             )
+
+    second =
+      operation(context, "refs/heads/main", Ecto.UUID.generate(), failed_at) |> claim!(failed_at)
+
+    assert {:ok, %{operation: failed, ref_state: degraded}} =
+             ForgeMirrors.degrade_git_ref(
+               second,
+               "refs/heads/main",
+               @other_oid,
+               @other_oid,
+               failed_at,
+               "lfs_integrity",
+               "required LFS object failed verification"
+             )
+
+    assert failed.state == :failed
+    assert failed.failure_class == "lfs_integrity"
+    assert failed.failure_disposition == :degraded
+    assert degraded.state == :degraded
+    assert degraded.confirmed_oid == @oid
+    assert degraded.last_confirmed_at == confirmed_at
+    assert degraded.last_local_oid == @other_oid
+    assert degraded.last_remote_oid == @other_oid
+    assert Repo.get!(MirrorRefState, confirmed.id).confirmed_oid == @oid
+
+    assert Repo.get!(ForgeMirrors.OrganizationMirror, context.organization_mirror.id).state ==
+             :degraded
+  end
+
+  test "an incomplete LFS scan checkpoints and yields its lease without a fake failure",
+       context do
+    now = DateTime.utc_now(:second)
+    operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)
+    checkpoint = %{"lfs_scan_key" => "scan-1", "phase" => "scan"}
+
+    assert {:ok, yielded} =
+             ForgeMirrors.checkpoint_git_ref_operation(
+               operation,
+               "refs/heads/main",
+               checkpoint,
+               now
+             )
+
+    assert yielded.state == :pending
+    assert yielded.checkpoint == checkpoint
+    assert yielded.next_attempt_at == now
+    assert is_nil(yielded.lease_owner)
+    assert is_nil(yielded.lease_expires_at)
+    assert is_nil(yielded.failure_class)
+    assert is_nil(yielded.failure_disposition)
+  end
+
+  test "LFS recovery checkpoints preserve an ambiguous Git effect across lease release",
+       context do
+    now = DateTime.utc_now(:second)
+    operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)
+    marker = %{"action" => "apply_local", "ref" => "refs/heads/main", "proposed_oid" => @oid}
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, now, marker)
+    checkpoint = %{"scan_key" => "recovery", "phase" => "scan"}
+
+    assert {:ok, yielded} =
+             ForgeMirrors.checkpoint_git_ref_operation(marked, "refs/heads/main", checkpoint, now)
+
+    assert yielded.state == :effect_pending
+    assert yielded.external_effect_marker == marker
+    assert is_nil(yielded.lease_owner)
+    reclaimed = claim!(yielded, now)
+    assert reclaimed.state == :effect_pending
+    assert reclaimed.checkpoint == checkpoint
+    assert reclaimed.external_effect_marker == marker
+  end
+
+  test "effect marker replacement compares and swaps the recorded recovery intent", context do
+    now = DateTime.utc_now(:second)
+    operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)
+
+    marker = %{
+      "action" => "apply_remote",
+      "expected_oid" => @oid,
+      "proposed_oid" => @other_oid,
+      "ref" => "refs/heads/main"
+    }
+
+    replacement = %{
+      "action" => "apply_local",
+      "expected_oid" => @oid,
+      "proposed_oid" => @other_oid,
+      "ref" => "refs/heads/main"
+    }
+
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, now, marker)
+
+    assert {:ok, replaced} =
+             ForgeMirrors.replace_external_effect(marked, now, marker, replacement)
+
+    assert replaced.state == :effect_pending
+    assert replaced.external_effect_marker == replacement
+
+    assert {:error, :invalid_transition} =
+             ForgeMirrors.replace_external_effect(replaced, now, marker, %{
+               replacement
+               | "proposed_oid" => String.duplicate("c", 40)
+             })
+
+    assert Repo.get!(MirrorOperation, replaced.id).external_effect_marker == replacement
   end
 
   test "conflict persistence marks the ref and operation in one transaction and deduplicates",
@@ -143,6 +266,112 @@ defmodule ForgeMirrors.GitRefSyncPersistenceTest do
     assert finalizer.id > tag.id
   end
 
+  test "finalizer LFS checkpoints release the lease and survive reclaim", context do
+    now = DateTime.utc_now(:second)
+
+    finalizer =
+      finalizer_operation(context, %{"reconciliation_operation_id" => 31}, now)
+      |> claim!(now)
+
+    checkpoint = %{"scan_key" => "lfs-reconcile:31", "after_oid" => String.duplicate("a", 64)}
+
+    assert {:ok, yielded} = ForgeMirrors.checkpoint_git_reconciliation(finalizer, checkpoint, now)
+    assert yielded.state == :pending
+    assert yielded.lease_owner == nil
+    assert yielded.lease_expires_at == nil
+    reclaimed = claim!(yielded, now)
+    assert reclaimed.kind == "finalize.repository.git"
+    assert reclaimed.checkpoint == checkpoint
+    assert reclaimed.cursor == finalizer.cursor
+  end
+
+  test "a finalizer yields behind later repository work and queues a replacement sweep",
+       context do
+    now = DateTime.utc_now(:second)
+    repository_id = context.repository_mirror.repository_id
+
+    Repo.get!(Repository, repository_id)
+    |> Ecto.Changeset.change(lifecycle: :synchronizing)
+    |> Repo.update!()
+
+    finalizer =
+      finalizer_operation(context, %{"reconciliation_operation_id" => 37}, now)
+
+    {:ok, later} =
+      ForgeMirrors.enqueue_operation(%{
+        organization_mirror_id: context.organization_mirror.id,
+        repository_mirror_id: context.repository_mirror.id,
+        kind: "sync.git_ref",
+        dedupe_key: Ecto.UUID.generate(),
+        cursor: %{
+          "initial_absence" => false,
+          "ref_name" => "refs/heads/later",
+          "trigger" => "local"
+        },
+        next_attempt_at: now
+      })
+
+    finalizer = claim!(finalizer, now)
+
+    assert {:ok,
+            %{
+              operation: %{state: :completed},
+              replacement: %{kind: "reconcile.repository.git"},
+              repository_mirror: nil
+            }} = ForgeMirrors.preflight_git_ref_reconciliation(finalizer, now)
+
+    assert Repo.get!(Repository, repository_id).lifecycle == :synchronizing
+
+    assert {:ok, [claimed_later]} =
+             ForgeMirrors.claim_operations("git-ref-test", now, 30, 1)
+
+    assert claimed_later.id == later.id
+    assert {:ok, %{state: :completed}} = ForgeMirrors.complete_operation(claimed_later, now)
+
+    assert {:ok, [replacement]} =
+             ForgeMirrors.claim_operations("git-ref-test", now, 30, 1)
+
+    assert replacement.kind == "reconcile.repository.git"
+  end
+
+  test "finalization rechecks for repository work queued after preflight", context do
+    now = DateTime.utc_now(:second)
+    repository_id = context.repository_mirror.repository_id
+
+    Repo.get!(Repository, repository_id)
+    |> Ecto.Changeset.change(lifecycle: :synchronizing)
+    |> Repo.update!()
+
+    finalizer =
+      finalizer_operation(context, %{"reconciliation_operation_id" => 38}, now)
+      |> claim!(now)
+
+    assert {:ok, :continue} = ForgeMirrors.preflight_git_ref_reconciliation(finalizer, now)
+
+    {:ok, _later} =
+      ForgeMirrors.enqueue_operation(%{
+        organization_mirror_id: context.organization_mirror.id,
+        repository_mirror_id: context.repository_mirror.id,
+        kind: "sync.git_ref",
+        dedupe_key: Ecto.UUID.generate(),
+        cursor: %{
+          "initial_absence" => false,
+          "ref_name" => "refs/heads/raced",
+          "trigger" => "local"
+        },
+        next_attempt_at: now
+      })
+
+    assert {:ok,
+            %{
+              operation: %{state: :completed},
+              replacement: %{kind: "reconcile.repository.git"},
+              repository_mirror: nil
+            }} = ForgeMirrors.finalize_git_ref_reconciliation(finalizer, now)
+
+    assert Repo.get!(Repository, repository_id).lifecycle == :synchronizing
+  end
+
   test "repository reconciliation finalizer records a successful Git sweep", context do
     now = DateTime.utc_now(:second)
 
@@ -155,6 +384,55 @@ defmodule ForgeMirrors.GitRefSyncPersistenceTest do
 
     assert completed.state == :completed
     assert repository_mirror.last_synced_at == now
+  end
+
+  test "the last bootstrap Git finalizer activates permanent repository and organization bindings" do
+    now = DateTime.utc_now(:second)
+    organization_mirror = ready_organization_mirror_fixture()
+    actor = organization_owner_fixture(organization_mirror)
+
+    assert {:ok, bootstrapping} =
+             ForgeMirrors.transition_organization_mirror(
+               actor,
+               organization_mirror,
+               :bootstrapping
+             )
+
+    assert {:ok, catching_up} =
+             ForgeMirrors.transition_organization_mirror(actor, bootstrapping, :catching_up)
+
+    repository_id = repository_fixture(catching_up.organization_id)
+
+    Repo.get!(Repository, repository_id)
+    |> Ecto.Changeset.change(lifecycle: :synchronizing)
+    |> Repo.update!()
+
+    assert {:ok, discovered} =
+             ForgeMirrors.bind_repository(actor, %{
+               organization_mirror_id: catching_up.id,
+               repository_id: repository_id,
+               github_repository_id: System.unique_integer([:positive, :monotonic]),
+               github_node_id: "R_#{System.unique_integer([:positive, :monotonic])}",
+               github_full_name: "example/bootstrap-finalizer"
+             })
+
+    finalizer =
+      operation(
+        %{organization_mirror: catching_up, repository_mirror: discovered},
+        "finalize.repository.git",
+        %{"reconciliation_operation_id" => System.unique_integer([:positive])},
+        Ecto.UUID.generate(),
+        now
+      )
+      |> claim!(now)
+
+    assert {:ok, %{operation: completed, repository_mirror: active_repository}} =
+             ForgeMirrors.finalize_git_ref_reconciliation(finalizer, now)
+
+    assert completed.state == :completed
+    assert active_repository.state == :active
+    assert Repo.get!(Repository, repository_id).lifecycle == :ready
+    assert Repo.get!(ForgeMirrors.OrganizationMirror, catching_up.id).state == :active
   end
 
   test "repository reconciliation finalizer fails while a Git ref conflict is open", context do
@@ -182,6 +460,143 @@ defmodule ForgeMirrors.GitRefSyncPersistenceTest do
     assert failed.state == :failed
     assert failed.failure_class == "git_divergence"
     assert failed.failure_disposition == :conflict
+  end
+
+  test "bootstrap publication remains hidden until seeded refs are confirmed", context do
+    now = DateTime.utc_now(:second)
+    repository_id = context.repository_mirror.repository_id
+
+    Repo.get!(Repository, repository_id)
+    |> Ecto.Changeset.change(lifecycle: :synchronizing)
+    |> Repo.update!()
+
+    ref =
+      %MirrorRefState{}
+      |> MirrorRefState.persistence_changeset(%{
+        repository_mirror_id: context.repository_mirror.id,
+        ref_name: "refs/heads/main",
+        ref_kind: :branch,
+        state: :pending
+      })
+      |> Repo.insert!()
+
+    finalizer =
+      finalizer_operation(context, %{"reconciliation_operation_id" => 123_456}, now)
+      |> claim!(now)
+
+    assert {:error, :bootstrap_refs_unconfirmed} =
+             ForgeMirrors.finalize_git_ref_reconciliation(finalizer, now)
+
+    assert Repo.get!(Repository, repository_id).lifecycle == :synchronizing
+
+    ref
+    |> MirrorRefState.persistence_changeset(%{
+      state: :confirmed,
+      confirmed_oid: @oid,
+      last_confirmed_at: now
+    })
+    |> Repo.update!()
+
+    assert {:ok, %{operation: %{state: :completed}}} =
+             ForgeMirrors.finalize_git_ref_reconciliation(finalizer, now)
+
+    assert Repo.get!(Repository, repository_id).lifecycle == :ready
+  end
+
+  test "repository reconciliation finalizer preserves last sync after a degraded LFS child",
+       context do
+    now = DateTime.utc_now(:second)
+    reconciliation_id = System.unique_integer([:positive])
+
+    {:ok, child} =
+      ForgeMirrors.enqueue_operation(%{
+        organization_mirror_id: context.organization_mirror.id,
+        repository_mirror_id: context.repository_mirror.id,
+        kind: "sync.git_ref",
+        dedupe_key: Ecto.UUID.generate(),
+        cursor: %{
+          "initial_absence" => false,
+          "reconciliation_operation_id" => reconciliation_id,
+          "ref_name" => "refs/heads/main"
+        },
+        next_attempt_at: now
+      })
+
+    child = claim!(child, now)
+
+    assert {:ok, %{operation: _failed_child}} =
+             ForgeMirrors.degrade_git_ref(
+               child,
+               "refs/heads/main",
+               @oid,
+               @oid,
+               now,
+               "lfs_missing",
+               "required LFS object is missing"
+             )
+
+    finalizer =
+      finalizer_operation(context, %{"reconciliation_operation_id" => reconciliation_id}, now)
+      |> claim!(now)
+
+    assert {:ok, %{operation: failed, repository_mirror: nil}} =
+             ForgeMirrors.finalize_git_ref_reconciliation(finalizer, now)
+
+    assert failed.failure_class == "lfs_missing"
+    assert failed.failure_disposition == :degraded
+
+    assert Repo.get!(ForgeMirrors.RepositoryMirror, context.repository_mirror.id).last_synced_at ==
+             context.repository_mirror.last_synced_at
+  end
+
+  test "finalizer preserves a non-LFS terminal child failure", context do
+    now = DateTime.utc_now(:second)
+    reconciliation_id = System.unique_integer([:positive])
+
+    %MirrorRefState{}
+    |> MirrorRefState.persistence_changeset(%{
+      repository_mirror_id: context.repository_mirror.id,
+      ref_name: "refs/heads/main",
+      ref_kind: :branch,
+      state: :pending
+    })
+    |> Repo.insert!()
+
+    {:ok, child} =
+      ForgeMirrors.enqueue_operation(%{
+        organization_mirror_id: context.organization_mirror.id,
+        repository_mirror_id: context.repository_mirror.id,
+        kind: "sync.git_ref",
+        dedupe_key: Ecto.UUID.generate(),
+        cursor: %{
+          "initial_absence" => false,
+          "reconciliation_operation_id" => reconciliation_id,
+          "ref_name" => "refs/heads/main"
+        },
+        next_attempt_at: now
+      })
+
+    child = claim!(child, now)
+
+    assert {:ok, %{state: :failed, failure_class: "credential_revoked"}} =
+             ForgeMirrors.fail_operation(
+               child,
+               now,
+               "credential_revoked",
+               "installation credential was revoked"
+             )
+
+    finalizer =
+      finalizer_operation(context, %{"reconciliation_operation_id" => reconciliation_id}, now)
+      |> claim!(now)
+
+    assert {:ok, %{operation: failed, repository_mirror: nil}} =
+             ForgeMirrors.preflight_git_ref_reconciliation(finalizer, now)
+
+    assert failed.state == :failed
+    assert failed.failure_class == "credential_revoked"
+    assert failed.failure_disposition == :terminal
+    assert {:ok, []} = ForgeMirrors.claim_operations("git-ref-test", now, 30, 1)
   end
 
   test "claimed ref context resolves the immutable repository binding and confirmed absence",

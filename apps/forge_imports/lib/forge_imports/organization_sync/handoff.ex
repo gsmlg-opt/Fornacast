@@ -37,6 +37,7 @@ defmodule ForgeImports.OrganizationSync.Handoff do
       %OrganizationMirror{state: state} = organization_mirror
       when state in [:bootstrapping, :catching_up] ->
         with :ok <- validate_publication(organization_mirror, repository, item, item_id),
+             {:ok, repository} <- hold_lfs_publication(repo, organization_mirror, repository),
              {:ok, repository_mirror} <-
                bind_repository_mirror(repo, organization_mirror, repository, item, now),
              {:ok, resource_count} <- promote_resources(repo, repository_mirror, item, now),
@@ -46,6 +47,7 @@ defmodule ForgeImports.OrganizationSync.Handoff do
              {:ok, operation} <- record_reconciliation(repo, repository_mirror, item, now) do
           {:ok,
            %{
+             repository: repository,
              repository_mirror: repository_mirror,
              reconciliation_operation: operation,
              promoted_resources: resource_count,
@@ -56,6 +58,22 @@ defmodule ForgeImports.OrganizationSync.Handoff do
 
       %OrganizationMirror{} ->
         {:error, :bootstrap_handoff_unavailable}
+    end
+  end
+
+  defp hold_lfs_publication(repo, organization_mirror, repository) do
+    if Map.get(organization_mirror.capabilities || %{}, "lfs") in [
+         true,
+         :enabled,
+         :active,
+         "enabled",
+         "active"
+       ] do
+      repository
+      |> Ecto.Changeset.change(lifecycle: :synchronizing)
+      |> repo.update()
+    else
+      {:ok, repository}
     end
   end
 
@@ -331,7 +349,7 @@ defmodule ForgeImports.OrganizationSync.Handoff do
     end
   end
 
-  defp seed_refs(repo, repository_mirror, repository, now) do
+  defp seed_refs(repo, repository_mirror, repository, _now) do
     case GitCore.list_refs(ForgeRepos.absolute_storage_path(repository)) do
       {:ok, refs} ->
         refs
@@ -341,11 +359,11 @@ defmodule ForgeImports.OrganizationSync.Handoff do
             repository_mirror_id: repository_mirror.id,
             ref_name: ref.name,
             ref_kind: ref_kind(ref.name),
-            confirmed_oid: ref.target,
+            confirmed_oid: nil,
             last_local_oid: ref.target,
             last_remote_oid: ref.target,
-            state: :confirmed,
-            last_confirmed_at: now,
+            state: :pending,
+            last_confirmed_at: nil,
             lock_version: 1
           }
 

@@ -127,12 +127,36 @@ defmodule GitLFS do
 
   @spec commit_upload(StagedUpload.t()) :: {:ok, LFSObject.t()} | {:error, atom()}
   def commit_upload(%StagedUpload{reservation: reservation, staged_ref: staged_ref}) do
+    commit_staged_upload(reservation, staged_ref, nil)
+  end
+
+  def commit_upload(_staged), do: {:error, :invalid_request}
+
+  @doc "Commits a provider-verified upload and records its first synchronized ref."
+  @spec commit_synchronized_upload(StagedUpload.t(), String.t()) ::
+          {:ok, LFSObject.t()} | {:error, atom()}
+  def commit_synchronized_upload(
+        %StagedUpload{reservation: reservation, staged_ref: staged_ref},
+        first_seen_ref
+      ) do
+    with true <- standard_ref?(first_seen_ref) do
+      commit_staged_upload(reservation, staged_ref, first_seen_ref)
+    else
+      false -> {:error, :invalid_request}
+    end
+  end
+
+  def commit_synchronized_upload(_staged, _first_seen_ref),
+    do: {:error, :invalid_request}
+
+  defp commit_staged_upload(reservation, staged_ref, first_seen_ref) do
     with :ok <- validate_reservation(reservation),
          {:ok, repository} <- reservation_repository(reservation),
          {:ok, %{sha256_digest: oid, storage_key: storage_key, size: size}} <-
            ForgeBlobs.commit(staged_ref),
          true <- oid == reservation.oid and size == reservation.size,
-         {:ok, object} <- persist_ready_object(repository, oid, size, storage_key) do
+         {:ok, object} <-
+           persist_ready_object(repository, oid, size, storage_key, first_seen_ref) do
       {:ok, object}
     else
       false -> {:error, :integrity_mismatch}
@@ -140,7 +164,26 @@ defmodule GitLFS do
     end
   end
 
-  def commit_upload(_staged), do: {:error, :invalid_request}
+  @doc "Attaches verified global bytes after a trusted provider proves repository reachability."
+  @spec ensure_synchronized_object(Repository.t(), String.t(), non_neg_integer(), String.t()) ::
+          :ok | {:error, atom()}
+  def ensure_synchronized_object(%Repository{} = repository, oid, size, first_seen_ref) do
+    with :ok <- validate_object(oid, size),
+         true <- standard_ref?(first_seen_ref),
+         {:ok, repository} <- current_repository(repository),
+         {:ok, %{size: ^size}} <- ForgeBlobs.stat(oid),
+         :ok <- ForgeBlobs.verify(oid),
+         {:ok, _object} <- persist_ready_object(repository, oid, size, oid, first_seen_ref) do
+      :ok
+    else
+      false -> {:error, :invalid_request}
+      {:ok, _metadata} -> {:error, :integrity_mismatch}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def ensure_synchronized_object(_repository, _oid, _size, _first_seen_ref),
+    do: {:error, :invalid_request}
 
   @spec verify_object(Repository.t(), String.t(), non_neg_integer()) ::
           :ok | {:error, atom()}
@@ -282,12 +325,12 @@ defmodule GitLFS do
     |> where(
       [repository],
       repository.id == ^repository_id and repository.generation == ^generation and
-        repository.lifecycle == :ready and is_nil(repository.deleted_at)
+        repository.lifecycle in [:ready, :synchronizing] and is_nil(repository.deleted_at)
     )
     |> Repo.one()
   end
 
-  defp persist_ready_object(repository, oid, size, storage_key) do
+  defp persist_ready_object(repository, oid, size, storage_key, first_seen_ref) do
     now = DateTime.utc_now(:second)
 
     transaction =
@@ -308,7 +351,7 @@ defmodule GitLFS do
 
         case ready_object(oid) do
           %LFSObject{size: ^size, storage_key: ^storage_key} = object ->
-            case attach(repository.id, oid, now) do
+            case attach(repository.id, oid, first_seen_ref, now) do
               :ok -> object
               {:error, reason} -> Repo.rollback(reason)
             end
@@ -327,10 +370,11 @@ defmodule GitLFS do
     end
   end
 
-  defp attach(repository_id, oid, now) do
+  defp attach(repository_id, oid, first_seen_ref, now) do
     attrs = %{
       repository_id: repository_id,
       oid_sha256: oid,
+      first_seen_ref: first_seen_ref,
       reachable: true,
       last_reconciled_at: now
     }
@@ -572,4 +616,16 @@ defmodule GitLFS do
 
   defp valid_oid?(oid) when is_binary(oid), do: Regex.match?(@oid_regex, oid)
   defp valid_oid?(_oid), do: false
+
+  defp standard_ref?("refs/heads/" <> name), do: valid_ref_tail?(name)
+  defp standard_ref?("refs/tags/" <> name), do: valid_ref_tail?(name)
+  defp standard_ref?(_ref), do: false
+
+  defp valid_ref_tail?(name) when is_binary(name) do
+    byte_size(name) in 1..1_000 and String.valid?(name) and
+      not String.starts_with?(name, ["/", "."]) and
+      not String.ends_with?(name, ["/", ".", ".lock"]) and
+      not String.contains?(name, [<<0>>, "//", "..", "@{", "\\", "~", "^", ":", "?", "*", "["]) and
+      not String.match?(name, ~r/[\x00-\x20\x7f]/)
+  end
 end

@@ -79,6 +79,7 @@ defmodule ForgeMirrors.GitHubInstallationIntentTest do
     assert ready.github_account_id == context.organization_id
     assert ready.github_account_login == "github-org-#{context.organization_id}"
     assert ready.capabilities["git"] == "enabled"
+    assert ready.capabilities["lfs"] == "enabled"
     assert ready.capabilities["issues"] == "enabled"
     assert ready.capabilities["pulls"] == "enabled"
 

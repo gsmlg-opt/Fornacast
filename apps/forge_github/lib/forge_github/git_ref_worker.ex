@@ -8,7 +8,7 @@ defmodule ForgeGitHub.GitRefWorker do
 
   use GenServer
 
-  alias ForgeGitHub.{InstallationToken, InstallationTokenBroker}
+  alias ForgeGitHub.{Error, InstallationToken, InstallationTokenBroker}
   alias ForgeMirrors.{GitRefDecision, MirrorOperation}
   alias GitCore.Remote.{ObservedRef, RefUpdate, SyncRequest}
 
@@ -39,7 +39,11 @@ defmodule ForgeGitHub.GitRefWorker do
     :exact_ref,
     :list_refs,
     :ancestor?,
+    :lfs_gate,
+    :checkpoint_lfs,
+    :degrade_lfs,
     :mark_effect,
+    :replace_effect,
     :apply_local,
     :delete_local,
     :push_remote,
@@ -48,6 +52,9 @@ defmodule ForgeGitHub.GitRefWorker do
     :conflict,
     :fanout,
     :finalize,
+    :finalize_preflight,
+    :reconcile_lfs,
+    :checkpoint_reconciliation,
     :retry,
     :fail,
     :now
@@ -170,10 +177,76 @@ defmodule ForgeGitHub.GitRefWorker do
         %DateTime{} = now,
         options
       ) do
-    callback(options, :finalize, &ForgeMirrors.finalize_git_ref_reconciliation/2).(
-      operation,
-      now
-    )
+    finalize = fn ->
+      callback(options, :finalize, &ForgeMirrors.finalize_git_ref_reconciliation/2).(
+        operation,
+        now
+      )
+    end
+
+    preflight =
+      callback(
+        options,
+        :finalize_preflight,
+        &ForgeMirrors.preflight_git_ref_reconciliation/2
+      )
+
+    with {:ok, sync} <-
+           callback(
+             options,
+             :repository_context,
+             &ForgeMirrors.git_repository_operation_context/1
+           ).(operation) do
+      result =
+        case preflight.(operation, now) do
+          {:ok, :continue} ->
+            if sync.lfs_enabled do
+              callback(options, :reconcile_lfs, &ForgeGitHub.LFSReconciliation.run/3).(
+                operation,
+                sync,
+                finalize
+              )
+            else
+              finalize.()
+            end
+
+          terminal ->
+            terminal
+        end
+
+      case result do
+        {:incomplete, checkpoint} ->
+          callback(
+            options,
+            :checkpoint_reconciliation,
+            &ForgeMirrors.checkpoint_git_reconciliation/3
+          ).(
+            operation,
+            checkpoint,
+            now
+          )
+
+        {:error, reason} when reason in [:lfs_missing, :lfs_integrity] ->
+          ForgeMirrors.fail_git_lfs_reconciliation(operation, now, Atom.to_string(reason))
+
+        {:error, :bootstrap_refs_unconfirmed} ->
+          case preflight.(operation, now) do
+            {:ok, :continue} ->
+              persist_failure(operation, now, :bootstrap_refs_unconfirmed, options)
+
+            superseded ->
+              superseded
+          end
+
+        {:error, reason} ->
+          persist_failure(operation, now, reason, options)
+
+        completed ->
+          completed
+      end
+    else
+      {:error, reason} -> persist_failure(operation, now, reason, options)
+    end
   rescue
     _exception -> persist_failure(operation, now, :worker_crash, options)
   catch
@@ -198,7 +271,7 @@ defmodule ForgeGitHub.GitRefWorker do
          {:ok, local_oid} <- read_local_ref(sync, options),
          remote_oid <- observed_oid(observations, sync.ref_name),
          decision <- decide(sync, local_oid, remote_oid, options) do
-      apply_decision(
+      continue_after_observation(
         operation,
         now,
         sync,
@@ -285,6 +358,247 @@ defmodule ForgeGitHub.GitRefWorker do
     end)
   end
 
+  defp continue_after_observation(
+         operation,
+         now,
+         sync,
+         request,
+         token,
+         local_oid,
+         remote_oid,
+         decision,
+         options
+       ) do
+    case reconcile_recorded_effect(operation, sync, local_oid, remote_oid) do
+      :ok ->
+        continue_after_lfs(
+          operation,
+          now,
+          sync,
+          request,
+          token,
+          local_oid,
+          remote_oid,
+          decision,
+          options
+        )
+
+      {:error, :ambiguous_external_effect} ->
+        persist_conflict(
+          operation,
+          now,
+          sync,
+          local_oid,
+          remote_oid,
+          :git_divergence,
+          options
+        )
+    end
+  end
+
+  defp reconcile_recorded_effect(%MirrorOperation{state: :processing}, _sync, _local, _remote),
+    do: :ok
+
+  defp reconcile_recorded_effect(
+         %MirrorOperation{state: :effect_pending},
+         sync,
+         local_oid,
+         remote_oid
+       ) do
+    recorded_effect_condition(sync.effect_marker, sync.ref_name, local_oid, remote_oid)
+  end
+
+  defp recorded_effect_condition(
+         %{
+           "action" => "apply_local",
+           "expected_oid" => expected,
+           "proposed_oid" => proposed,
+           "ref" => marker_ref
+         },
+         ref,
+         local_oid,
+         _remote_oid
+       ) do
+    validate_recorded_condition(marker_ref, ref, local_oid, expected, proposed, false, true)
+  end
+
+  defp recorded_effect_condition(
+         %{
+           "action" => "apply_remote",
+           "expected_oid" => expected,
+           "proposed_oid" => proposed,
+           "ref" => marker_ref
+         },
+         ref,
+         _local_oid,
+         remote_oid
+       ) do
+    validate_recorded_condition(marker_ref, ref, remote_oid, expected, proposed, false, true)
+  end
+
+  defp recorded_effect_condition(
+         %{"action" => "delete_local", "expected_oid" => expected, "ref" => marker_ref},
+         ref,
+         local_oid,
+         _remote_oid
+       ) do
+    validate_recorded_condition(marker_ref, ref, local_oid, expected, nil, true, false)
+  end
+
+  defp recorded_effect_condition(
+         %{"action" => "delete_remote", "expected_oid" => expected, "ref" => marker_ref},
+         ref,
+         _local_oid,
+         remote_oid
+       ) do
+    validate_recorded_condition(marker_ref, ref, remote_oid, expected, nil, true, false)
+  end
+
+  defp recorded_effect_condition(_marker, _ref, _local_oid, _remote_oid),
+    do: {:error, :ambiguous_external_effect}
+
+  defp validate_recorded_condition(
+         marker_ref,
+         ref,
+         observed_oid,
+         expected_oid,
+         proposed_oid,
+         expected_required?,
+         proposed_required?
+       ) do
+    valid_expected =
+      if expected_required?,
+        do: valid_effect_oid?(expected_oid),
+        else: valid_optional_effect_oid?(expected_oid)
+
+    valid_proposed =
+      if proposed_required?, do: valid_effect_oid?(proposed_oid), else: is_nil(proposed_oid)
+
+    if marker_ref == ref and valid_expected and valid_proposed and
+         observed_oid in [expected_oid, proposed_oid] do
+      :ok
+    else
+      {:error, :ambiguous_external_effect}
+    end
+  end
+
+  defp valid_optional_effect_oid?(nil), do: true
+  defp valid_optional_effect_oid?(oid), do: valid_effect_oid?(oid)
+
+  defp valid_effect_oid?(oid) when is_binary(oid) and byte_size(oid) in [40, 64] do
+    oid == String.downcase(oid) and String.match?(oid, ~r/\A[0-9a-f]+\z/)
+  end
+
+  defp valid_effect_oid?(_oid), do: false
+
+  defp continue_after_lfs(
+         operation,
+         now,
+         sync,
+         request,
+         token,
+         local_oid,
+         remote_oid,
+         decision,
+         options
+       ) do
+    case lfs_gate(decision, operation, sync, request, token, options) do
+      :ok ->
+        apply_decision(
+          operation,
+          now,
+          sync,
+          request,
+          token,
+          local_oid,
+          remote_oid,
+          decision,
+          options
+        )
+
+      {:incomplete, checkpoint} when is_map(checkpoint) ->
+        callback(options, :checkpoint_lfs, &ForgeMirrors.checkpoint_git_ref_operation/4).(
+          operation,
+          sync.ref_name,
+          checkpoint,
+          now
+        )
+
+      {:error, reason} when reason in [:lfs_missing, :lfs_integrity] ->
+        failure_class = Atom.to_string(reason)
+
+        callback(options, :degrade_lfs, &ForgeMirrors.degrade_git_ref/7).(
+          operation,
+          sync.ref_name,
+          local_oid,
+          remote_oid,
+          now,
+          failure_class,
+          lfs_failure_detail(reason)
+        )
+
+      {:error, reason} ->
+        persist_failure(operation, now, reason, options, reconciled_effect_retry(operation))
+
+      _invalid ->
+        persist_failure(
+          operation,
+          now,
+          :invalid_lfs_state,
+          options,
+          reconciled_effect_retry(operation)
+        )
+    end
+  end
+
+  defp reconciled_effect_retry(%MirrorOperation{state: :effect_pending}),
+    do: [external_effect_reconciled: true]
+
+  defp reconciled_effect_retry(%MirrorOperation{}), do: []
+
+  defp lfs_gate({:conflict, _kind}, _operation, _sync, _request, _token, _options), do: :ok
+  defp lfs_gate({:error, _reason}, _operation, _sync, _request, _token, _options), do: :ok
+  defp lfs_gate(_decision, _operation, %{lfs_enabled: false}, _request, _token, _options), do: :ok
+
+  defp lfs_gate(decision, operation, sync, request, token, options) do
+    {direction, target_oid} = lfs_target(decision)
+
+    case callback(options, :lfs_gate, &ForgeGitHub.LFSSync.ensure/6).(
+           operation,
+           sync,
+           direction,
+           target_oid,
+           token,
+           request
+         ) do
+      {:error, %Error{kind: :object_missing}} ->
+        {:error, :lfs_missing}
+
+      {:error, %Error{kind: :integrity_mismatch}} ->
+        {:error, :lfs_integrity}
+
+      {:error, reason} when reason in [:not_found, :lfs_missing] ->
+        {:error, :lfs_missing}
+
+      {:error, reason} when reason in [:integrity_mismatch, :lfs_integrity] ->
+        {:error, :lfs_integrity}
+
+      result ->
+        result
+    end
+  end
+
+  defp lfs_target({:apply_local, _expected, proposed}), do: {:inbound, proposed}
+  defp lfs_target({:apply_remote, _expected, proposed}), do: {:outbound, proposed}
+  defp lfs_target({:confirm, oid}), do: {:converge, oid}
+  defp lfs_target({:delete_local, _expected}), do: {:inbound, nil}
+  defp lfs_target({:delete_remote, _expected}), do: {:outbound, nil}
+
+  defp lfs_failure_detail(:lfs_missing), do: "a required reachable Git LFS object is missing"
+
+  defp lfs_failure_detail(:lfs_integrity),
+    do: "a required reachable Git LFS object failed integrity verification"
+
   defp apply_decision(
          operation,
          now,
@@ -317,7 +631,7 @@ defmodule ForgeGitHub.GitRefWorker do
          options
        )
        when elem(decision, 0) in [:apply_local, :apply_remote, :delete_local, :delete_remote] do
-    case mark_effect(operation, now, sync.ref_name, decision, options) do
+    case mark_effect(operation, now, sync.effect_marker, sync.ref_name, decision, options) do
       {:ok, marked} ->
         case execute_effect(decision, sync, request, token, options) do
           :ok ->
@@ -377,34 +691,52 @@ defmodule ForgeGitHub.GitRefWorker do
 
   defp mark_effect(
          %MirrorOperation{state: :effect_pending} = operation,
-         _now,
-         _ref,
-         _decision,
-         _opts
-       ),
-       do: {:ok, operation}
+         now,
+         recorded_marker,
+         ref,
+         decision,
+         options
+       )
+       when is_map(recorded_marker) do
+    replacement_marker = effect_marker(ref, decision)
 
-  defp mark_effect(operation, now, ref, decision, options) do
+    if replacement_marker == recorded_marker do
+      {:ok, operation}
+    else
+      callback(options, :replace_effect, &ForgeMirrors.replace_external_effect/4).(
+        operation,
+        now,
+        recorded_marker,
+        replacement_marker
+      )
+    end
+  end
+
+  defp mark_effect(operation, now, _recorded_marker, ref, decision, options) do
     marker = effect_marker(ref, decision)
     callback(options, :mark_effect, &ForgeMirrors.mark_external_effect/3).(operation, now, marker)
   end
 
   defp execute_effect({:apply_local, expected, proposed}, sync, _request, _token, options) do
-    callback(options, :apply_local, &apply_local/4).(
-      sync.repository_path,
-      sync.ref_name,
-      expected,
-      proposed
-    )
+    with_write_fence(sync.repository_id, fn ->
+      callback(options, :apply_local, &apply_local/4).(
+        sync.repository_path,
+        sync.ref_name,
+        expected,
+        proposed
+      )
+    end)
     |> normalize_git_effect()
   end
 
   defp execute_effect({:delete_local, expected}, sync, _request, _token, options) do
-    callback(options, :delete_local, &delete_local/3).(
-      sync.repository_path,
-      sync.ref_name,
-      expected
-    )
+    with_write_fence(sync.repository_id, fn ->
+      callback(options, :delete_local, &delete_local/3).(
+        sync.repository_path,
+        sync.ref_name,
+        expected
+      )
+    end)
     |> normalize_git_effect()
   end
 
@@ -426,28 +758,24 @@ defmodule ForgeGitHub.GitRefWorker do
   end
 
   defp apply_local(path, ref, expected, proposed) do
-    with_write_fence(path, fn ->
-      with {:ok, oid} <-
-             GitCore.compare_and_swap_ref(path, ref, expected, proposed, :fast_forward, []),
-           :ok <- GitCore.invalidate_repository_cache(path) do
-        {:ok, oid}
-      end
-    end)
+    with {:ok, oid} <-
+           GitCore.compare_and_swap_ref(path, ref, expected, proposed, :fast_forward, []),
+         :ok <- GitCore.invalidate_repository_cache(path) do
+      {:ok, oid}
+    end
   end
 
   defp delete_local(path, ref, expected) do
-    with_write_fence(path, fn ->
-      with {:ok, oid} <- GitCore.compare_and_delete_ref(path, ref, expected),
-           :ok <- GitCore.invalidate_repository_cache(path) do
-        {:ok, oid}
-      end
-    end)
+    with {:ok, oid} <- GitCore.compare_and_delete_ref(path, ref, expected),
+         :ok <- GitCore.invalidate_repository_cache(path) do
+      {:ok, oid}
+    end
   end
 
-  defp with_write_fence(path, callback) do
+  defp with_write_fence(repository_id, callback) do
     deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:ref_deadline_ms)
 
-    case GitCore.RepositoryWriteLimiter.acquire(path, deadline) do
+    case GitCore.RepositoryWriteLimiter.acquire(repository_id, deadline) do
       {:ok, lease} ->
         try do
           callback.()
@@ -485,7 +813,94 @@ defmodule ForgeGitHub.GitRefWorker do
     )
   end
 
-  defp persist_failure(operation, now, reason, options, retry_options \\ []) do
+  defp persist_failure(operation, now, reason, options, retry_options \\ [])
+
+  defp persist_failure(
+         operation,
+         now,
+         %Error{kind: kind, retry_at: retry_at},
+         options,
+         retry_options
+       )
+       when kind in [:primary_rate_limit, :secondary_rate_limit] do
+    retry_at =
+      if is_struct(retry_at, DateTime) and DateTime.after?(retry_at, now),
+        do: retry_at,
+        else: DateTime.add(now, 60, :second)
+
+    callback(options, :retry, &ForgeMirrors.retry_operation/5).(
+      operation,
+      now,
+      retry_at,
+      Atom.to_string(kind),
+      retry_options
+    )
+  end
+
+  defp persist_failure(operation, now, %Error{kind: :invalid_credential}, options, _retry_options) do
+    callback(options, :fail, &ForgeMirrors.fail_operation/4).(
+      operation,
+      now,
+      "credential_revoked",
+      "GitHub rejected the installation token"
+    )
+  end
+
+  defp persist_failure(operation, now, %Error{kind: :forbidden}, options, _retry_options) do
+    callback(options, :fail, &ForgeMirrors.fail_operation/4).(
+      operation,
+      now,
+      "permission_missing",
+      "GitHub denied the Git LFS operation"
+    )
+  end
+
+  defp persist_failure(operation, now, %Error{kind: kind}, options, retry_options)
+       when kind in [
+              :transport,
+              :timeout,
+              :host_unavailable,
+              :upstream_unavailable,
+              :request_gate_busy,
+              :action_expired
+            ] do
+    retry_at = DateTime.add(now, 60, :second)
+
+    callback(options, :retry, &ForgeMirrors.retry_operation/5).(
+      operation,
+      now,
+      retry_at,
+      "network",
+      retry_options
+    )
+  end
+
+  defp persist_failure(
+         operation,
+         now,
+         %Error{kind: kind},
+         options,
+         _retry_options
+       )
+       when kind in [:source, :sink, :local_storage] do
+    callback(options, :fail, &ForgeMirrors.fail_operation/4).(
+      operation,
+      now,
+      "local_validation",
+      "The local Git LFS object could not be read or written"
+    )
+  end
+
+  defp persist_failure(operation, now, %Error{}, options, _retry_options) do
+    callback(options, :fail, &ForgeMirrors.fail_operation/4).(
+      operation,
+      now,
+      "provider_validation",
+      "GitHub returned an invalid Git LFS response"
+    )
+  end
+
+  defp persist_failure(operation, now, reason, options, retry_options) do
     cond do
       reason == :git_ref_conflicted ->
         callback(options, :fail, &ForgeMirrors.fail_operation/4).(

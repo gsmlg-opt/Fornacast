@@ -68,6 +68,9 @@ defmodule GitCore.Native do
   def read_blob_complete(_path, _oid, _expected_size),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  def expand_lfs_scan_object(_path, _oid, _kind_hint, _offset, _limit),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def diff_commit(_path, _oid, _limit, _deadline_ms), do: :erlang.nif_error(:nif_not_loaded)
 
   def diff_between(

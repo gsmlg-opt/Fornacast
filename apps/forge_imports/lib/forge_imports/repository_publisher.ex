@@ -378,7 +378,13 @@ defmodule ForgeImports.RepositoryPublisher do
       {:ok, changes} ->
         repository_result = changes.repository
 
-        {:ok, %{repository: repository_result.repository, replaced: repository_result.replaced}}
+        repository =
+          case changes.bootstrap_handoff do
+            %{repository: repository} -> repository
+            :not_applicable -> repository_result.repository
+          end
+
+        {:ok, %{repository: repository, replaced: repository_result.replaced}}
 
       {:error, step, :destination_changed, _changes}
       when step in [:cleanup_fence, :repository, {:repository, :authorization}] ->
@@ -1166,7 +1172,8 @@ defmodule ForgeImports.RepositoryPublisher do
          true <-
            repository.slug == evidence["slug"] and repository.slug == attempt.decision["slug"],
          true <- repository.generation == evidence["generation"],
-         true <- repository.lifecycle == :ready and is_nil(repository.deleted_at),
+         true <-
+           repository.lifecycle in [:ready, :synchronizing] and is_nil(repository.deleted_at),
          true <-
            repository.name == item.source_name and repository.description == settings.description,
          true <- repository.visibility == item.destination_visibility,

@@ -20,8 +20,8 @@ defmodule ForgeMirrors.Settings do
   @repository_limit 100
   @operation_limit 50
   @conflict_limit 50
-  @capabilities ~w(git issues pulls)
-  @all_capabilities @capabilities ++ ~w(lfs releases)
+  @capabilities ~w(git lfs issues pulls)
+  @all_capabilities @capabilities ++ ~w(releases)
   @update_states [:ready_to_bootstrap, :active, :paused, :degraded, :conflicted]
   @allowed_policy_keys ~w(
     repository_selection selected_repository_ids auto_import_new auto_create_remote
@@ -239,7 +239,7 @@ defmodule ForgeMirrors.Settings do
 
     []
     |> maybe_require("metadata", "read", true)
-    |> maybe_require("contents", "write", "git" in enabled)
+    |> maybe_require("contents", "write", "git" in enabled or "lfs" in enabled)
     |> maybe_require("issues", "write", "issues" in enabled)
     |> maybe_require("pull_requests", "write", "pulls" in enabled)
     |> maybe_require(
@@ -316,7 +316,7 @@ defmodule ForgeMirrors.Settings do
         Map.new(@all_capabilities, fn capability ->
           state =
             cond do
-              capability in ~w(lfs releases) -> "unavailable"
+              capability == "releases" -> "unavailable"
               capability in enabled -> "enabled"
               true -> "disabled"
             end
@@ -449,7 +449,7 @@ defmodule ForgeMirrors.Settings do
       "git" => "disabled",
       "issues" => "disabled",
       "pulls" => "disabled",
-      "lfs" => "unavailable",
+      "lfs" => "disabled",
       "releases" => "unavailable"
     }
 

@@ -8,6 +8,7 @@ defmodule GitCore do
   @tree_page_limit 200
   @inline_blob_limit 1_048_576
   @complete_blob_limit 100_000_000
+  @lfs_expansion_child_limit 200
   @diff_source_limit 200_000
   @diff_file_page_limit 100
   @diff_scan_deadline_ms 5_000
@@ -464,6 +465,63 @@ defmodule GitCore do
 
   def release_blob(%GitCore.Blob{lease: lease}) do
     GitCore.BlobLimiter.release(lease)
+  end
+
+  @doc """
+  Expands one Git object for a durable, caller-owned LFS reachability walk.
+
+  The caller persists and deduplicates the returned `{oid, kind}` children per scan and ref.
+  A non-nil offset is re-enqueued for the same object before that work item is acknowledged.
+  Tree offsets are raw object-body byte offsets, so resuming never skips or rescans repository-wide
+  history. Blob candidates contain the complete body only when it is at most 1024 bytes.
+  """
+  @spec expand_lfs_scan_object(
+          Path.t(),
+          String.t(),
+          :commit | :tree | :blob | :tag | :tag_or_commit,
+          non_neg_integer(),
+          pos_integer()
+        ) ::
+          {:ok,
+           %{
+             object_kind: :commit | :tree | :blob | :tag,
+             children: [%{oid: String.t(), kind: atom()}],
+             candidate: nil | %{data: binary(), blob_size: non_neg_integer()},
+             next_offset: non_neg_integer() | nil
+           }}
+          | {:error, GitCore.Error.t()}
+  def expand_lfs_scan_object(path, oid, kind_hint, offset, limit)
+
+  def expand_lfs_scan_object(path, oid, kind_hint, offset, limit)
+      when is_binary(path) and is_binary(oid) and is_atom(kind_hint) and
+             is_integer(offset) and offset >= 0 and is_integer(limit) and limit > 0 do
+    with {:ok, oid} <- lfs_scan_oid(oid),
+         {:ok, native_hint} <- lfs_scan_kind_hint(kind_hint) do
+      child_limit = min(limit, @lfs_expansion_child_limit)
+
+      GitCore.ScanLimiter.with_permit(:expand_lfs_scan_object, fn ->
+        with {:ok, expansion} <-
+               wrap_read(
+                 GitCore.Native.expand_lfs_scan_object(
+                   path,
+                   oid,
+                   native_hint,
+                   offset,
+                   child_limit
+                 ),
+                 :expand_lfs_scan_object
+               ) do
+          {:ok, lfs_expansion_from_native(expansion)}
+        end
+      end)
+    end
+  end
+
+  def expand_lfs_scan_object(_path, _oid, _kind_hint, _offset, _limit) do
+    invalid_input(
+      :expand_lfs_scan_object,
+      "path and oid must be strings; kind_hint, offset, and limit must be valid bounded values"
+    )
   end
 
   def diff_commit(path, oid, opts \\ [])
@@ -1408,6 +1466,60 @@ defmodule GitCore do
   defp search_reason("byte_limit"), do: :byte_limit
   defp search_reason("deadline"), do: :deadline
   defp search_reason("result_limit"), do: :result_limit
+
+  defp lfs_scan_oid(oid) when byte_size(oid) in [40, 64] do
+    if Enum.all?(:binary.bin_to_list(oid), fn byte ->
+         byte in ?0..?9 or byte in ?a..?f or byte in ?A..?F
+       end) do
+      {:ok, String.downcase(oid)}
+    else
+      invalid_input(:expand_lfs_scan_object, "oid must be a 40- or 64-character hex object id")
+    end
+  end
+
+  defp lfs_scan_oid(_oid) do
+    invalid_input(:expand_lfs_scan_object, "oid must be a 40- or 64-character hex object id")
+  end
+
+  defp lfs_scan_kind_hint(:commit), do: {:ok, "commit"}
+  defp lfs_scan_kind_hint(:tree), do: {:ok, "tree"}
+  defp lfs_scan_kind_hint(:blob), do: {:ok, "blob"}
+  defp lfs_scan_kind_hint(:tag), do: {:ok, "tag"}
+  defp lfs_scan_kind_hint(:tag_or_commit), do: {:ok, "tag_or_commit"}
+
+  defp lfs_scan_kind_hint(_kind_hint) do
+    invalid_input(
+      :expand_lfs_scan_object,
+      "kind_hint must be :commit, :tree, :blob, :tag, or :tag_or_commit"
+    )
+  end
+
+  defp lfs_expansion_from_native({kind, children, candidate, next_offset}) do
+    %{
+      object_kind: lfs_object_kind(kind),
+      children:
+        Enum.map(children, fn {oid, kind_hint} ->
+          %{oid: oid, kind: lfs_kind_hint_from_native(kind_hint)}
+        end),
+      candidate:
+        case candidate do
+          nil -> nil
+          {data, blob_size} -> %{data: IO.iodata_to_binary(data), blob_size: blob_size}
+        end,
+      next_offset: next_offset
+    }
+  end
+
+  defp lfs_object_kind("commit"), do: :commit
+  defp lfs_object_kind("tree"), do: :tree
+  defp lfs_object_kind("blob"), do: :blob
+  defp lfs_object_kind("tag"), do: :tag
+
+  defp lfs_kind_hint_from_native("commit"), do: :commit
+  defp lfs_kind_hint_from_native("tree"), do: :tree
+  defp lfs_kind_hint_from_native("blob"), do: :blob
+  defp lfs_kind_hint_from_native("tag"), do: :tag
+  defp lfs_kind_hint_from_native("tag_or_commit"), do: :tag_or_commit
 
   defp commit_from_native(
          {oid, title, message, {author_name, author_email, author_time},

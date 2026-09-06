@@ -18,13 +18,15 @@ defmodule ForgeGitHub.MixProject do
   def application do
     [
       mod: {ForgeGitHub.Application, []},
-      extra_applications: [:inets, :logger, :public_key]
+      extra_applications: [:crypto, :inets, :logger, :public_key]
     ]
   end
 
   defp deps do
     [
       {:forge_mirrors, in_umbrella: true},
+      {:forge_repos, in_umbrella: true},
+      {:git_lfs, in_umbrella: true},
       {:git_core, in_umbrella: true},
       {:mint, "~> 1.9"},
       {:plug, "~> 1.19"},

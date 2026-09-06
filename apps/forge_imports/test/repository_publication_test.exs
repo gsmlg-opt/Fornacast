@@ -242,7 +242,8 @@ defmodule ForgeImports.RepositoryPublicationTest do
 
     bound_mirror =
       ForgeMirrors.update_organization_mirror(context.actor, ready_mirror, %{
-        bootstrap_import_run_id: fixture.run.id
+        bootstrap_import_run_id: fixture.run.id,
+        capabilities: %{"git" => "enabled", "lfs" => "enabled"}
       })
       |> unwrap!()
 
@@ -301,6 +302,32 @@ defmodule ForgeImports.RepositoryPublicationTest do
     assert repository_id == published.id
     assert bootstrap_item_id == fixture.item.id
 
+    assert published.lifecycle == :synchronizing
+    assert %Repository{lifecycle: :synchronizing} = pending = Repo.get!(Repository, published.id)
+    assert {:ok, ^pending} = ForgeRepos.fetch_live_repository(published.id)
+
+    for actor <- [nil, context.actor], permission <- [:repository_read, :repository_write] do
+      refute Fornacast.Access.allowed?(actor, permission, pending)
+
+      assert {:error, :not_found} =
+               ForgeRepos.fetch_authorized_repository(
+                 actor,
+                 organization.username,
+                 pending.slug,
+                 permission
+               )
+
+      assert {:error, :not_found} =
+               ForgeRepos.fetch_authorized_repository_by_id(actor, pending.id, permission)
+    end
+
+    assert {:ok, %{repository: %Repository{lifecycle: :synchronizing}}} =
+             ForgeImports.publish_repository(
+               context.actor,
+               fixture.item.id,
+               request_metadata("bootstrap-handoff-replay")
+             )
+
     assert [
              %MirrorResourceState{
                resource_kind: :label,
@@ -317,9 +344,24 @@ defmodule ForgeImports.RepositoryPublicationTest do
     assert byte_size(fingerprint) == 64
 
     assert [
-             %MirrorRefState{ref_name: "refs/heads/feature", state: :confirmed},
-             %MirrorRefState{ref_name: "refs/heads/main", state: :confirmed},
-             %MirrorRefState{ref_name: "refs/tags/v1.0.0", state: :confirmed}
+             %MirrorRefState{
+               ref_name: "refs/heads/feature",
+               state: :pending,
+               confirmed_oid: nil,
+               last_confirmed_at: nil
+             },
+             %MirrorRefState{
+               ref_name: "refs/heads/main",
+               state: :pending,
+               confirmed_oid: nil,
+               last_confirmed_at: nil
+             },
+             %MirrorRefState{
+               ref_name: "refs/tags/v1.0.0",
+               state: :pending,
+               confirmed_oid: nil,
+               last_confirmed_at: nil
+             }
            ] =
              Repo.all(
                from state in MirrorRefState,

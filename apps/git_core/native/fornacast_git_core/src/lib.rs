@@ -12,6 +12,10 @@ use gix_object::bstr::ByteSlice;
 
 mod anchored_remove;
 mod bounded_blob;
+mod lfs_candidates;
+
+#[cfg(test)]
+use lfs_candidates::expand_lfs_scan_object_impl;
 
 #[rustler::nif(schedule = "DirtyIo")]
 fn contained_tree_identity(
@@ -49,6 +53,14 @@ type NativeCommit = (
 type NativeTreeEntry = (String, String, String, String);
 type NativeBlobMetadata = (Vec<u8>, String, u64);
 type NativeBlobBody<'env> = (u64, rustler::Binary<'env>, bool, bool);
+type NativeLfsChild = (String, String);
+type NativeLfsCandidate = (Vec<u8>, u64);
+type NativeLfsExpansion = (
+    String,
+    Vec<NativeLfsChild>,
+    Option<NativeLfsCandidate>,
+    Option<u64>,
+);
 type NativeDiffLine = (String, Option<u32>, Option<u32>, Vec<u8>);
 type NativeDiffStats = (u64, u64, bool, Vec<NativeDiffLine>);
 type NativeDiffFile = (
@@ -271,6 +283,9 @@ const COMMIT_PAGE_LIMIT: usize = 50;
 const TREE_PAGE_LIMIT: usize = 200;
 const INLINE_BLOB_LIMIT: usize = 1_048_576;
 const COMPLETE_BLOB_LIMIT: u64 = 100_000_000;
+const LFS_CANDIDATE_BLOB_LIMIT: u64 = 1024;
+const LFS_EXPANSION_CHILD_LIMIT: usize = 200;
+const LFS_CANDIDATE_STRUCTURAL_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
 const DIFF_SOURCE_LIMIT: usize = 200_000;
 const DIFF_FILE_LIMIT: usize = 1_000;
 const DIFF_FILE_PAGE_LIMIT: usize = 100;
@@ -8315,6 +8330,207 @@ mod tests {
             ordered_search_reasons(&stops),
             ["file_limit", "byte_limit", "deadline", "result_limit"]
         );
+    }
+
+    #[test]
+    fn lfs_object_expansion_is_replay_safe_and_pages_tree_children() {
+        let fixture = MergeBoundaryFixture::new("lfs-object-expansion");
+        let commit = fixture.commit_with_flat_tree(2, "two paths to one candidate");
+        let tree = tree_history_git(
+            &[
+                "--git-dir",
+                fixture.path(),
+                "rev-parse",
+                &format!("{commit}^{{tree}}"),
+            ],
+            None,
+        );
+
+        let first = expand_lfs_scan_object_impl(fixture.path(), &tree, "tree", 0, 1)
+            .expect("first bounded tree page");
+        let replay = expand_lfs_scan_object_impl(fixture.path(), &tree, "tree", 0, 1)
+            .expect("replayed first tree page");
+        assert_eq!(first, replay, "the same offset must replay exactly");
+        assert_eq!(first.0, "tree");
+        assert_eq!(first.1.len(), 1);
+        let next_offset = first.3.expect("a second tree page");
+
+        let second = expand_lfs_scan_object_impl(fixture.path(), &tree, "tree", next_offset, 1)
+            .expect("second bounded tree page");
+        assert_eq!(second.1.len(), 1);
+        assert_eq!(second.3, None);
+        assert_eq!(
+            first.1[0], second.1[0],
+            "the caller deduplicates queue OIDs"
+        );
+
+        let blob = expand_lfs_scan_object_impl(fixture.path(), &first.1[0].0, "blob", 0, 1)
+            .expect("small complete blob candidate");
+        assert_eq!(blob.0, "blob");
+        assert_eq!(blob.1, Vec::<NativeLfsChild>::new());
+        assert_eq!(blob.2, Some((b"merge boundary\n".to_vec(), 15)));
+        assert_eq!(blob.3, None);
+    }
+
+    #[test]
+    fn lfs_object_expansion_pages_commit_history_and_peels_annotated_tags() {
+        let fixture = MergeBoundaryFixture::new("lfs-history-expansion");
+        let root = fixture.commit_with_flat_tree(1, "root");
+        let head = fixture.commit_with_flat_tree_and_parent(1, "head", Some(&root));
+
+        let first = expand_lfs_scan_object_impl(fixture.path(), &head, "commit", 0, 1)
+            .expect("commit tree page");
+        assert_eq!(first.0, "commit");
+        assert_eq!(first.1.len(), 1);
+        assert_eq!(first.1[0].1, "tree");
+        let second = expand_lfs_scan_object_impl(
+            fixture.path(),
+            &head,
+            "commit",
+            first.3.expect("commit parent page"),
+            1,
+        )
+        .expect("commit parent page");
+        assert_eq!(second.1, vec![(root.clone(), "commit".to_string())]);
+        assert_eq!(second.3, None);
+
+        let tag_body = format!(
+            "object {head}\ntype commit\ntag v1\ntagger Test <test@example.com> 1 +0000\n\nrelease\n"
+        );
+        let tag = tree_history_git(
+            &[
+                "--git-dir",
+                fixture.path(),
+                "hash-object",
+                "-t",
+                "tag",
+                "-w",
+                "--stdin",
+            ],
+            Some(tag_body.as_bytes()),
+        );
+        let outer_tag_body = format!(
+            "object {tag}\ntype tag\ntag stable\ntagger Test <test@example.com> 2 +0000\n\nstable\n"
+        );
+        let outer_tag = tree_history_git(
+            &[
+                "--git-dir",
+                fixture.path(),
+                "hash-object",
+                "-t",
+                "tag",
+                "-w",
+                "--stdin",
+            ],
+            Some(outer_tag_body.as_bytes()),
+        );
+        let outer = expand_lfs_scan_object_impl(fixture.path(), &outer_tag, "tag_or_commit", 0, 1)
+            .expect("outer annotated tag expansion");
+        assert_eq!(outer.1, vec![(tag.clone(), "tag_or_commit".to_string())]);
+
+        let expanded = expand_lfs_scan_object_impl(fixture.path(), &tag, "tag_or_commit", 0, 1)
+            .expect("annotated tag expansion");
+        assert_eq!(expanded.0, "tag");
+        assert_eq!(expanded.1, vec![(head, "commit".to_string())]);
+        assert_eq!(expanded.3, None);
+    }
+
+    #[test]
+    fn lfs_object_expansion_never_materializes_large_blob_candidates() {
+        let fixture = MergeBoundaryFixture::new("lfs-large-blob-expansion");
+        let commit = fixture.commit_with_single_blob(1_025);
+        let tree = tree_history_git(
+            &[
+                "--git-dir",
+                fixture.path(),
+                "rev-parse",
+                &format!("{commit}^{{tree}}"),
+            ],
+            None,
+        );
+        let expanded_tree = expand_lfs_scan_object_impl(fixture.path(), &tree, "tree", 0, 1)
+            .expect("large blob tree expansion");
+        let blob_oid = &expanded_tree.1[0].0;
+        let expanded_blob = expand_lfs_scan_object_impl(fixture.path(), blob_oid, "blob", 0, 1)
+            .expect("large blob metadata expansion");
+        assert_eq!(expanded_blob.0, "blob");
+        assert_eq!(expanded_blob.2, None);
+    }
+
+    #[test]
+    fn lfs_tree_expansion_rejects_noncanonical_order_and_nonboundary_offsets() {
+        let fixture = MergeBoundaryFixture::new("lfs-invalid-tree-expansion");
+        let blob = gix_hash::ObjectId::from_hex(fixture.blob_oid.as_bytes()).expect("blob oid");
+        let mut invalid_tree = Vec::new();
+        for name in [b"z".as_slice(), b"a".as_slice()] {
+            invalid_tree.extend_from_slice(b"100644 ");
+            invalid_tree.extend_from_slice(name);
+            invalid_tree.push(0);
+            invalid_tree.extend_from_slice(blob.as_slice());
+        }
+        let invalid_tree_oid = tree_history_git(
+            &[
+                "--git-dir",
+                fixture.path(),
+                "hash-object",
+                "--literally",
+                "-t",
+                "tree",
+                "-w",
+                "--stdin",
+            ],
+            Some(&invalid_tree),
+        );
+
+        let result = expand_lfs_scan_object_impl(fixture.path(), &invalid_tree_oid, "tree", 0, 10);
+        assert!(matches!(result, Err((kind, _)) if kind == "corrupt_repository"));
+
+        let valid_commit = fixture.commit_with_flat_tree(1, "valid tree");
+        let valid_tree = tree_history_git(
+            &[
+                "--git-dir",
+                fixture.path(),
+                "rev-parse",
+                &format!("{valid_commit}^{{tree}}"),
+            ],
+            None,
+        );
+        let result = expand_lfs_scan_object_impl(fixture.path(), &valid_tree, "tree", 1, 1);
+        assert!(matches!(result, Err((kind, _)) if kind == "invalid_input"));
+    }
+
+    #[test]
+    fn lfs_object_expansion_supports_sha256_repositories() {
+        let sequence = TREE_HISTORY_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let temp_path = std::env::temp_dir().join(format!(
+            "fornacast-lfs-sha256-{}-{sequence}",
+            std::process::id()
+        ));
+        let repo_path = temp_path.join("repo.git");
+        let _ = std::fs::remove_dir_all(&temp_path);
+        std::fs::create_dir_all(&temp_path).expect("create SHA-256 LFS fixture");
+        let repo = tree_history_path(&repo_path);
+        tree_history_git(&["init", "--bare", "--object-format=sha256", repo], None);
+        let blob = tree_history_git(
+            &["--git-dir", repo, "hash-object", "-w", "--stdin"],
+            Some(b"sha256 pointer candidate\n"),
+        );
+        let tree = tree_history_git(
+            &["--git-dir", repo, "mktree"],
+            Some(format!("100644 blob {blob}\tasset.lfs\n").as_bytes()),
+        );
+
+        let expansion =
+            expand_lfs_scan_object_impl(repo, &tree, "tree", 0, 1).expect("SHA-256 tree expansion");
+        assert_eq!(expansion.1, vec![(blob.clone(), "blob".to_string())]);
+        let candidate =
+            expand_lfs_scan_object_impl(repo, &blob, "blob", 0, 1).expect("SHA-256 blob expansion");
+        assert_eq!(
+            candidate.2,
+            Some((b"sha256 pointer candidate\n".to_vec(), 25))
+        );
+
+        let _ = std::fs::remove_dir_all(temp_path);
     }
 
     #[test]

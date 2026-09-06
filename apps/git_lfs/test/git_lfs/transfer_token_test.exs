@@ -89,6 +89,25 @@ defmodule GitLFS.TransferTokenTest do
              TransferToken.verify(token, :object, :download, @oid, now: now)
   end
 
+  test "synchronizing repositories reject new and previously issued transfer tokens", %{
+    actor: actor,
+    repository: repository
+  } do
+    principal = Principal.password(actor)
+
+    assert {:ok, token, _ttl} =
+             TransferToken.issue(principal, repository, :object, :download, @oid, object_size: 42)
+
+    repository
+    |> Ecto.Changeset.change(lifecycle: :synchronizing)
+    |> Repo.update!()
+
+    assert {:error, :not_found} =
+             TransferToken.issue(principal, repository, :object, :download, @oid, object_size: 42)
+
+    assert {:error, :not_found} = TransferToken.verify(token, :object, :download, @oid)
+  end
+
   test "upload and verify tokens require their signed object size", %{
     actor: actor,
     repository: repository

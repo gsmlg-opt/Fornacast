@@ -171,7 +171,8 @@ defmodule ForgeRepos do
       |> where(
         [repository],
         repository.id == ^repository_id and repository.owner_user_id == ^organization_id and
-          repository.lifecycle in [:importing, :ready] and is_nil(repository.deleted_at)
+          repository.lifecycle in [:importing, :synchronizing, :ready] and
+          is_nil(repository.deleted_at)
       )
       |> Repo.one()
 
@@ -192,7 +193,8 @@ defmodule ForgeRepos do
       Repository
       |> where(
         [repository],
-        repository.id == ^repository_id and repository.lifecycle in [:importing, :ready] and
+        repository.id == ^repository_id and
+          repository.lifecycle in [:importing, :synchronizing, :ready] and
           is_nil(repository.deleted_at)
       )
       |> Repo.one()

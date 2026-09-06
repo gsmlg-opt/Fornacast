@@ -4,7 +4,7 @@ defmodule ForgeRepos.Repository do
   import Ecto.Changeset
 
   @visibilities [:private, :public]
-  @lifecycles [:importing, :ready, :tombstoned]
+  @lifecycles [:importing, :synchronizing, :ready, :tombstoned]
   @slug_regex ~r/^[a-z0-9][a-z0-9._-]{0,62}$/
   @api_fields [
     :slug,

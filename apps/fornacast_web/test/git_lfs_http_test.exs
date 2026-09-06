@@ -311,6 +311,108 @@ defmodule FornacastWeb.GitLFSHTTPTest do
     assert File.read!(object_path) == payload
   end
 
+  @tag :tmp_dir
+  test "official HTTP clone checks out LFS bytes and fails when required bytes are missing", %{
+    repository: repository,
+    actor: actor,
+    tmp_dir: tmp_dir
+  } do
+    Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+    repository = repository |> Ecto.Changeset.change(visibility: :public) |> Repo.update!()
+    port = start_http_server()
+    previous_base_url = Application.fetch_env!(:fornacast, :base_url)
+    Application.put_env(:fornacast, :base_url, "http://127.0.0.1:#{port}")
+    on_exit(fn -> Application.put_env(:fornacast, :base_url, previous_base_url) end)
+
+    payload = :crypto.strong_rand_bytes(128 * 1_024)
+    oid = digest(payload)
+    on_exit(fn -> ForgeBlobs.delete(oid) end)
+    assert {:ok, reservation} = GitLFS.reserve_upload(repository, oid, byte_size(payload))
+
+    reader = fn
+      [chunk], _maximum -> {:more, chunk, []}
+      [], _maximum -> {:done, []}
+    end
+
+    assert {:ok, staged, []} = GitLFS.stage_upload(reservation, reader, [payload])
+    assert {:ok, _object} = GitLFS.commit_upload(staged)
+
+    env = [
+      {"GIT_CONFIG_GLOBAL", "/dev/null"},
+      {"GIT_CONFIG_NOSYSTEM", "1"},
+      {"GIT_TERMINAL_PROMPT", "0"},
+      {"GIT_LFS_SKIP_SMUDGE", nil},
+      {"GIT_AUTHOR_NAME", "LFS Acceptance"},
+      {"GIT_AUTHOR_EMAIL", "lfs@example.test"},
+      {"GIT_COMMITTER_NAME", "LFS Acceptance"},
+      {"GIT_COMMITTER_EMAIL", "lfs@example.test"}
+    ]
+
+    source = Path.join(tmp_dir, "source")
+    git!(["init", source], env)
+
+    File.write!(
+      Path.join(source, ".gitattributes"),
+      "*.bin filter=lfs diff=lfs merge=lfs -text\n"
+    )
+
+    File.write!(
+      Path.join(source, "asset.bin"),
+      "version https://git-lfs.github.com/spec/v1\noid sha256:#{oid}\nsize #{byte_size(payload)}\n"
+    )
+
+    git!(["-C", source, "add", ".gitattributes", "asset.bin"], env)
+    git!(["-C", source, "commit", "-m", "Imported LFS pointer"], env)
+
+    git!(
+      [
+        "-C",
+        source,
+        "push",
+        ForgeRepos.absolute_storage_path(repository),
+        "HEAD:refs/heads/main"
+      ],
+      env
+    )
+
+    git!(
+      [
+        "--git-dir",
+        ForgeRepos.absolute_storage_path(repository),
+        "symbolic-ref",
+        "HEAD",
+        "refs/heads/main"
+      ],
+      env
+    )
+
+    url = "http://127.0.0.1:#{port}/#{actor.username}/#{repository.slug}.git"
+
+    filter_options = [
+      "-c",
+      "filter.lfs.process=git-lfs filter-process",
+      "-c",
+      "filter.lfs.required=true"
+    ]
+
+    checkout = Path.join(tmp_dir, "checkout")
+    git!(filter_options ++ ["clone", url, checkout], env)
+    assert File.read!(Path.join(checkout, "asset.bin")) == payload
+    assert digest(File.read!(Path.join(checkout, "asset.bin"))) == oid
+
+    assert :ok = ForgeBlobs.delete(oid)
+
+    {output, status} =
+      System.cmd("git", filter_options ++ ["clone", url, Path.join(tmp_dir, "missing")],
+        stderr_to_stdout: true,
+        env: env
+      )
+
+    assert status != 0
+    assert output =~ "smudge"
+    assert output =~ String.slice(oid, 0, 7)
+  end
+
   defp lfs_json_request(context, method, path, body) do
     context
     |> basic_conn()
