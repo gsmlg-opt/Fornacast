@@ -10,6 +10,7 @@ defmodule ForgeIssues.Label do
     field :color, :string
     field :description, :string
     field :default, :boolean, default: false
+    field :sync_version, :integer, default: 1
 
     timestamps(type: :utc_datetime)
   end
@@ -21,6 +22,7 @@ defmodule ForgeIssues.Label do
     |> validate_required([:repository_id, :name, :normalized_name, :color, :default])
     |> validate_format(:color, ~r/^[0-9a-f]{6}$/)
     |> unique_constraint([:repository_id, :normalized_name])
+    |> lock_existing()
   end
 
   def import_changeset(label, attrs) do
@@ -31,7 +33,13 @@ defmodule ForgeIssues.Label do
     |> validate_format(:color, ~r/^[0-9a-f]{6}$/)
     |> put_default(:default, false)
     |> unique_constraint([:repository_id, :normalized_name])
+    |> lock_existing()
   end
+
+  defp lock_existing(%{data: %{__meta__: %{state: :loaded}}} = changeset),
+    do: optimistic_lock(changeset, :sync_version, &(&1 + 1))
+
+  defp lock_existing(changeset), do: changeset
 
   defp put_default(changeset, field, default) do
     if get_field(changeset, field) in [nil, ""],
