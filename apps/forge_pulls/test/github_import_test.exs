@@ -1,6 +1,8 @@
 defmodule ForgePulls.GitHubImportTest do
   use ExUnit.Case, async: false
 
+  import Ecto.Query
+
   alias Ecto.Multi
   alias ForgePulls.PullRequest
   alias Fornacast.Repo
@@ -53,6 +55,8 @@ defmodule ForgePulls.GitHubImportTest do
 
     assert pull.issue_id == canonical_issue.id
     assert pull.repository_id == repository.id
+    assert Map.get(pull, :head_repository_id) == repository.id
+    assert Map.get(pull, :draft) == false
     assert pull.head_ref == "refs/heads/feature"
     assert pull.base_ref == "refs/heads/main"
     assert pull.head_sha == head
@@ -223,7 +227,36 @@ defmodule ForgePulls.GitHubImportTest do
              )
 
     assert pull.issue.kind == :pull_request
+    assert Map.get(pull, :head_repository_id) == repository.id
+    assert Map.get(pull, :draft) == false
     assert is_nil(pull.merged_at)
+  end
+
+  test "head identity foreign key permits same-repository cascade deletion", %{
+    repository: repository,
+    merger: merger
+  } do
+    issue = import_issue!(repository, merger, 31, :pull_request, "Draft pull")
+
+    attrs = %{
+      draft: true,
+      head_ref: "refs/heads/feature",
+      base_ref: "refs/heads/main",
+      head_sha: String.duplicate("a", 40),
+      base_sha: String.duplicate("b", 40),
+      inserted_at: @inserted_at,
+      updated_at: @updated_at
+    }
+
+    assert {:ok, pull} =
+             %PullRequest{issue_id: issue.id, repository_id: repository.id}
+             |> PullRequest.import_changeset(attrs, issue, repository)
+             |> Repo.insert()
+
+    assert Map.get(Repo.get!(PullRequest, pull.id), :draft) == true
+    assert Map.get(pull, :head_repository_id) == repository.id
+    assert {1, _} = Repo.delete_all(where(ForgeRepos.Repository, id: ^repository.id))
+    assert Repo.get(PullRequest, pull.id) == nil
   end
 
   defp import_issue!(repository, identity, number, kind, title) do

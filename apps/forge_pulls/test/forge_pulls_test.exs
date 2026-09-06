@@ -17,6 +17,8 @@ defmodule ForgePullsTest do
         "id" => %{type: :bigint, nullable: false, default: :generated},
         "issue_id" => %{type: :bigint, nullable: false, default: nil},
         "repository_id" => %{type: :bigint, nullable: false, default: nil},
+        "head_repository_id" => %{type: :bigint, nullable: true, default: nil},
+        "draft" => %{type: :boolean, nullable: false, default: false},
         "head_ref" => %{type: :text, nullable: false, default: nil},
         "base_ref" => %{type: :text, nullable: false, default: nil},
         "head_sha" => %{type: :text, nullable: false, default: nil},
@@ -34,12 +36,14 @@ defmodule ForgePullsTest do
         MapSet.new([
           {"issue_id", "issues", "id", :cascade},
           {"repository_id", "repositories", "id", :cascade},
+          {"head_repository_id", "repositories", "id", :restrict},
           {"merged_by_user_id", "users", "id", :nilify},
           {"merged_by_github_identity_id", "github_identities", "id", :restrict}
         ]),
       indexes:
         MapSet.new([
           {false, ["repository_id"]},
+          {false, ["head_repository_id"]},
           {false, ["repository_id", "base_ref"]},
           {false, ["merged_by_github_identity_id"]},
           {true, ["issue_id"]}
@@ -1659,6 +1663,28 @@ defmodule ForgePullsTest do
     assert audit_metadata["api_version"] == "2026-03-10"
     assert audit_metadata["token_id"] == "token-immediate"
     refute Map.has_key?(audit_metadata, "unsafe")
+  end
+
+  test "draft pull requests cannot merge even through a stale non-draft handle" do
+    owner = user_fixture(unique("draft-merge"))
+    repository = repository_fixture(owner)
+    {base_oid, _head_oid} = create_mergeable_branches!(repository)
+    assert {:ok, pull} = create_pull(repository, owner, "Draft", "feature", "main")
+    Repo.get!(PullRequest, pull.id) |> Ecto.Changeset.change(draft: true) |> Repo.update!()
+
+    assert {:ok, current} = ForgePulls.get_pull_request(repository, pull.issue.number, owner)
+    refute current.capabilities.can_merge
+
+    assert {:error, :conflict} =
+             ForgePulls.merge(repository, pull, owner, %{}, request_metadata("draft-merge"))
+
+    assert String.trim(
+             git!(ForgeRepos.absolute_storage_path(repository), ["rev-parse", "refs/heads/main"])
+           ) == base_oid
+
+    refute Repo.exists?(
+             from operation in MergeOperation, where: operation.pull_request_id == ^pull.id
+           )
   end
 
   test "merge validates method messages sha policy and closed or already-merged pulls" do
@@ -3289,6 +3315,10 @@ defmodule ForgePullsTest do
   end
 
   defp normalize_default(_name, _default, true), do: :generated
+
+  defp normalize_default("draft", default, false) when default in [false, "false", 0, "0"],
+    do: false
+
   defp normalize_default("lock_version", default, false) when default in [0, "0"], do: 0
   defp normalize_default(_name, nil, false), do: nil
 

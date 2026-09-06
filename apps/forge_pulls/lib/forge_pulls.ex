@@ -656,6 +656,8 @@ defmodule ForgePulls do
   defp merge_allowed(%{repository: %{allow_merge_commit: false}}),
     do: {:error, :merge_commits_disabled}
 
+  defp merge_allowed(%{pull: %{draft: true}}), do: {:error, :conflict}
+
   defp merge_allowed(%{pull: %{merge_commit_sha: merge_oid}}) when is_binary(merge_oid),
     do: {:error, :conflict}
 
@@ -1419,7 +1421,8 @@ defmodule ForgePulls do
       can_merge:
         repository.allow_merge_commit and
           Map.get(issue_capabilities, :can_manage_relationships, false) and
-          issue.state == :open and is_nil(pull.merged_at) and pull.analysis.mergeable
+          issue.state == :open and not pull.draft and is_nil(pull.merged_at) and
+          pull.analysis.mergeable
     }
 
     %{pull | issue: issue, capabilities: capabilities, merged_by: resolve_merged_by(pull)}

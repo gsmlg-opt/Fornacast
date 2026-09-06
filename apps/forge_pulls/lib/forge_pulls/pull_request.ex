@@ -12,6 +12,8 @@ defmodule ForgePulls.PullRequest do
   schema "pull_requests" do
     field :issue_id, :integer
     field :repository_id, :integer
+    field :head_repository_id, :integer
+    field :draft, :boolean, default: false
     field :head_ref, :string
     field :base_ref, :string
     field :head_sha, :string
@@ -34,10 +36,12 @@ defmodule ForgePulls.PullRequest do
     pull_request
     |> cast(attrs, [:issue_id, :repository_id, :head_ref, :base_ref, :head_sha, :base_sha])
     |> validate_repository_identity(pull_request.repository_id)
+    |> same_repository_head()
     |> validate_required([:issue_id, :repository_id, :head_ref, :base_ref, :head_sha, :base_sha])
     |> validate_branch_refs()
     |> validate_distinct_refs()
     |> unique_constraint(:issue_id)
+    |> foreign_key_constraint(:head_repository_id)
   end
 
   def create_changeset(%__MODULE__{} = pull_request, _attrs) do
@@ -48,7 +52,9 @@ defmodule ForgePulls.PullRequest do
 
   def update_changeset(%__MODULE__{} = pull_request, attrs) do
     pull_request
-    |> cast(attrs, [:base_ref, :head_sha, :base_sha, :mergeable, :mergeable_state])
+    |> cast(attrs, [:base_ref, :head_sha, :base_sha, :mergeable, :mergeable_state, :draft])
+    |> validate_required([:draft])
+    |> validate_submitted_head_identity(attrs)
     |> validate_branch_refs()
     |> validate_distinct_refs()
   end
@@ -59,8 +65,20 @@ defmodule ForgePulls.PullRequest do
         %Issue{} = issue,
         %ForgeRepos.Repository{} = repository
       ) do
+    import_changeset(pull_request, attrs, issue, repository, repository.id)
+  end
+
+  # Head identity is trusted context input, never provider or user attrs.
+  def import_changeset(
+        %__MODULE__{} = pull_request,
+        attrs,
+        %Issue{} = issue,
+        %ForgeRepos.Repository{} = repository,
+        head_repository_id
+      ) do
     pull_request
     |> cast(attrs, [
+      :draft,
       :head_ref,
       :base_ref,
       :head_sha,
@@ -74,7 +92,9 @@ defmodule ForgePulls.PullRequest do
       :inserted_at,
       :updated_at
     ])
+    |> put_import_head_identity(head_repository_id)
     |> validate_required([
+      :draft,
       :issue_id,
       :repository_id,
       :head_ref,
@@ -89,6 +109,38 @@ defmodule ForgePulls.PullRequest do
     |> validate_distinct_refs()
     |> validate_merged_coherence()
     |> unique_constraint(:issue_id)
+    |> foreign_key_constraint(:head_repository_id)
+  end
+
+  defp same_repository_head(changeset),
+    do: put_change(changeset, :head_repository_id, get_field(changeset, :repository_id))
+
+  defp put_import_head_identity(changeset, head_repository_id) do
+    cond do
+      not (is_nil(head_repository_id) or
+               (is_integer(head_repository_id) and head_repository_id > 0 and
+                  head_repository_id <= 9_223_372_036_854_775_807)) ->
+        add_error(changeset, :head_repository_id, "must be a positive repository ID or nil")
+
+      not is_nil(changeset.data.id) and
+          changeset.data.head_repository_id != head_repository_id ->
+        add_error(changeset, :head_repository_id, "is immutable")
+
+      true ->
+        put_change(changeset, :head_repository_id, head_repository_id)
+    end
+  end
+
+  defp validate_submitted_head_identity(changeset, attrs) do
+    Enum.reduce([:head_repository_id, "head_repository_id"], changeset, fn key, changeset ->
+      case Map.fetch(attrs, key) do
+        {:ok, head_id} when head_id != changeset.data.head_repository_id ->
+          add_error(changeset, :head_repository_id, "is immutable")
+
+        _ ->
+          changeset
+      end
+    end)
   end
 
   defp validate_canonical_issue(
