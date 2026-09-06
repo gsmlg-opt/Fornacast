@@ -37,7 +37,7 @@ defmodule FornacastAPI.Serializers.V2026_03_10.Pull do
       created_at: timestamp(issue.inserted_at),
       deletions: 0,
       diff_url: url,
-      draft: false,
+      draft: pull.draft,
       head: branch(owner, pull.head_ref, pull.head_sha, repository, owner_user),
       html_url: URL.pull_web(owner, repo, issue.number),
       id: pull.id,

@@ -104,6 +104,36 @@ defmodule FornacastAPI.PullControllerTest do
     assert pull.issue_id
   end
 
+  test "pull detail and list expose persisted draft state in every API version" do
+    alice = user("alice")
+    repository = repository(alice, "drafts")
+    create_branch!(repository, "main")
+    create_branch!(repository, "feature/api")
+    pull = pull(repository, alice, 8)
+
+    for draft <- [true, false] do
+      PullRequest
+      |> Repo.get!(pull.id)
+      |> Ecto.Changeset.change(draft: draft)
+      |> Repo.update!()
+
+      for version <- @versions do
+        detail =
+          api_conn(nil, version)
+          |> get("/api/v3/repos/alice/drafts/pulls/8")
+          |> json_response(200)
+
+        [listed] =
+          api_conn(nil, version)
+          |> get("/api/v3/repos/alice/drafts/pulls")
+          |> json_response(200)
+
+        assert detail["draft"] == draft
+        assert listed["draft"] == draft
+      end
+    end
+  end
+
   test "authentication scopes and private masking precede mutation body parsing" do
     alice = user("alice")
     bob = user("bob")
