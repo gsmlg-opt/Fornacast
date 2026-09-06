@@ -367,6 +367,30 @@ defmodule ForgeImports.OrganizationSyncTest do
         :pending_unsupported
       )
 
+    retained =
+      for {event, repository_id} <- [
+            {"issues", binding.github_repository_id + 1},
+            {"pull_request", binding.github_repository_id}
+          ] do
+        {:ok, delivery, :enqueued} =
+          ForgeMirrors.enqueue_webhook_delivery(
+            %{
+              organization_mirror_id: bound_mirror.id,
+              delivery_guid: Ecto.UUID.generate(),
+              hook_id: System.unique_integer([:positive]),
+              event: event,
+              action: "edited",
+              installation_id: installation_id,
+              github_repository_id: repository_id,
+              signature_version: "sha256",
+              raw_payload: JSON.encode!(%{"action" => "edited"})
+            },
+            :pending_unsupported
+          )
+
+        delivery
+      end
+
     completed =
       Repo.get!(ImportRun, run_id)
       |> Ecto.Changeset.change(state: :completed_with_warnings, terminal_at: now)
@@ -377,6 +401,11 @@ defmodule ForgeImports.OrganizationSyncTest do
     assert mirror.state == :degraded
     assert mirror.next_reconcile_at == now
     assert Repo.get!(ForgeMirrors.MirrorWebhookDelivery, deferred.id).state == :pending
+
+    for delivery <- retained do
+      assert Repo.get!(ForgeMirrors.MirrorWebhookDelivery, delivery.id).state ==
+               :pending_unsupported
+    end
   end
 
   defp user_fixture do
