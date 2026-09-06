@@ -88,8 +88,21 @@ they prove mapped inbound/outbound edits, newer-local-edit preservation, and
 remote issue/comment creation. Production warnings-as-errors compilation passed.
 App bootstrap now also retains bounded long issue/comment bodies across pages;
 all 44 Client tests pass, including unchanged PAT and unrelated-field limits.
-Live label materialization, ingress activation, and broader recovery acceptance
-remain open; these results do not prove full issue convergence or PR12 completion.
+Label domain/versioning (`02fb593`) and atomic leased identity mapping (`b56b616`)
+are committed. Exact domain tests: nine passed; mirror mapping/resolver tests:
+34 passed. Worker label materialization and authenticated comment-deletion proof
+are committed in `5ff311b`: 23 worker tests and nine real integration tests pass,
+with production warnings-as-errors and scoped formatting checks passing.
+The real tests cover outbound label creation before issue assignment, inbound
+unknown-label materialization before issue creation, and denied/mismatched
+repository access preserving comments when GitHub returns 404.
+
+Ingress activation and broader recovery acceptance remain open. An activation
+audit found that metadata sweeps are not yet enqueued by production reconciliation,
+bootstrap replay excludes issue/comment events, Git finalization lacks metadata
+sweep completion proof, and remote listings alone cannot discover deleted comments.
+An effect-recovery/concurrent-new-label ordering case also needs verification.
+These results do not prove full issue convergence or PR12 completion.
 - Compilation with warnings-as-errors and staged formatting checks passed for
   committed PR11. Existing importer test-support warnings
   are distinct from production compilation.
