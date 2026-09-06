@@ -6,6 +6,8 @@ defmodule ForgeMirrors.MirrorResourceState do
 
   import Ecto.Changeset
 
+  @max_snapshot_bytes 2_000_000
+
   schema "mirror_resource_states" do
     field :repository_mirror_id, :integer
 
@@ -20,6 +22,7 @@ defmodule ForgeMirrors.MirrorResourceState do
     field :confirmed_local_version, :integer
     field :confirmed_remote_updated_at, :utc_datetime
     field :confirmed_fingerprint, :string
+    field :confirmed_snapshot, :map
     field :state, Ecto.Enum, values: [:pending, :confirmed, :conflicted, :deleted, :unsupported]
     field :lock_version, :integer, default: 1
     timestamps(type: :utc_datetime)
@@ -38,12 +41,23 @@ defmodule ForgeMirrors.MirrorResourceState do
       :confirmed_local_version,
       :confirmed_remote_updated_at,
       :confirmed_fingerprint,
+      :confirmed_snapshot,
       :state,
       :lock_version
     ])
     |> validate_required([:repository_mirror_id, :resource_kind, :state, :lock_version])
     |> validate_number(:lock_version, greater_than: 0)
+    |> validate_change(:confirmed_snapshot, &validate_snapshot/2)
+    |> check_constraint(:confirmed_snapshot, name: :mirror_resource_states_snapshot_check)
     |> validate_identity()
+  end
+
+  defp validate_snapshot(field, snapshot) do
+    if byte_size(JSON.encode!(snapshot)) <= @max_snapshot_bytes,
+      do: [],
+      else: [{field, "must be at most #{@max_snapshot_bytes} encoded bytes"}]
+  rescue
+    _invalid -> [{field, "must be a JSON object"}]
   end
 
   defp validate_identity(changeset) do

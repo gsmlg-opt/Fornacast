@@ -23,7 +23,7 @@ PR13–16 remain to be implemented and verified.
 | 10 | Divergence is visible and neither side overwritten | Conflict persistence/worker tests exist. Finish and verify conflict UX in PR16. |
 | 11 | LFS clone and checkout succeed from either endpoint after sync | Actual Fornacast smart-HTTP clone with official git-lfs 3.7.1 checks out 128 KiB with matching SHA-256. Existing official SSH LFS transfer coverage is also present. Remote endpoint plus full synchronization-to-clone chain remain unproven. |
 | 12 | Missing/corrupt LFS blocks confirmation and degrades sync | Focused worker, storage, durable 101-pointer replay, and authoritative-scan tests pass. Finalizer queue/catch-up review fixes are committed in `acedead`; retain the full integrated gate in final acceptance. |
-| 13 | Issue/comment changes converge both ways | PR12 in progress: pure scalar/set comparison tests pass; transactional version/outbox work is underway. Provider effects, mappings, correlation recovery, and integrated convergence remain open. |
+| 13 | Issue/comment changes converge both ways | PR12 in progress: pure scalar/set comparison, bounded persisted snapshots, and correlation-marker codec tests pass. Transactional version/outbox and provider API work are underway. Provider effects, mappings, correlation recovery, and integrated convergence remain open. |
 | 14 | Same-repository PR metadata converges both ways | PR13 remains open. Bootstrap import is not two-way synchronization. |
 | 15 | Coordinated PR merge produces one confirmed Git result | PR13 remains open; verify effect-boundary recovery, exact expected SHAs, and both resulting endpoints. |
 | 16 | Release metadata converges and stays bound to a confirmed tag | PR14–15 remain open. Existing scaffold is not proof of implementation. |
@@ -49,6 +49,10 @@ PR13–16 remain to be implemented and verified.
   test-owned object bytes are removed. This is **local endpoint** evidence.
 - PR12 comparison policy: five standalone ExUnit tests passed, including all 512
   combinations of three-element baseline/local/remote sets.
+- PR12 baseline/marker/policy matrix: 15 passed. Snapshot tests include direct
+  PostgreSQL constraint rejection of oversized objects and arrays. Marker tests
+  preserve unrelated content and count the suffix and combining codepoints in
+  the bounded body budget. These helpers do not yet prove worker integration.
 - Compilation with warnings-as-errors and staged formatting checks passed for
   committed PR11. Existing importer test-support warnings
   are distinct from production compilation.
