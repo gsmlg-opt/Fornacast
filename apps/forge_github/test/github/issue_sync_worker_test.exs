@@ -1002,6 +1002,7 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
            context(nil,
              trigger: :reconcile,
              resource_kind: :issue,
+             phase: :remote,
              page: 2,
              since: ~U[1970-01-01 00:00:00Z]
            )}
@@ -1024,6 +1025,58 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
     assert collect_events(2) == [:page_fetched, :page_recorded]
   end
 
+  test "a mapped reconciliation claim enumerates exactly one pinned inventory page" do
+    parent = self()
+    operation = reconciliation_operation("reconcile.repository.issues")
+
+    mapping_cursor = %{
+      "repository_mirror_id" => 3,
+      "resource_kind" => "issue",
+      "after_id" => 40,
+      "through_id" => 90
+    }
+
+    next_cursor = %{mapping_cursor | "after_id" => 55}
+
+    observations = [
+      %{
+        github_object_id: 501,
+        github_number: 7,
+        github_issue_id: nil,
+        remote_updated_at: @now
+      }
+    ]
+
+    options =
+      options(operation,
+        context: fn ^operation ->
+          {:ok,
+           context(nil,
+             trigger: :reconcile,
+             resource_kind: :issue,
+             phase: :mapped,
+             mapping_cursor: mapping_cursor,
+             page: nil,
+             since: ~U[1970-01-01 00:00:00Z]
+           )}
+        end,
+        resource_inventory: fn 3, :issue, ^mapping_cursor, 100 ->
+          send(parent, :inventory_fetched)
+          {:ok, %{observations: observations, next_cursor: next_cursor}}
+        end,
+        list_issues: fn _, _, _, _, _, _ -> flunk("mapped phase fetched the provider list") end,
+        record_page: fn ^operation, :issue, ^observations, ^next_cursor, @now ->
+          send(parent, :inventory_recorded)
+          {:ok, %{operation | state: :pending}}
+        end
+      )
+
+    assert {:ok, %MirrorOperation{state: :pending}} =
+             IssueSyncWorker.process_operation(operation, @now, options)
+
+    assert collect_events(2) == [:inventory_fetched, :inventory_recorded]
+  end
+
   defp options(operation, overrides) do
     defaults = [
       context: fn ^operation -> {:ok, context(operation.external_effect_marker)} end,
@@ -1040,6 +1093,7 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
       get_repository: fn _, _, _, _ -> flunk("unexpected repository access proof") end,
       list_issues: fn _, _, _, _, _, _ -> {:ok, %{issues: [], next_cursor: nil}} end,
       list_comments: fn _, _, _, _, _, _ -> {:ok, %{comments: [], next_cursor: nil}} end,
+      resource_inventory: fn _, _, _, _ -> flunk("unexpected resource inventory page") end,
       remote_relationships: fn _context, raw, _now ->
         labels = raw["labels"] || []
         assignees = raw["assignees"] || []

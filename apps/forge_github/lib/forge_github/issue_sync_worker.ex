@@ -55,6 +55,7 @@ defmodule ForgeGitHub.IssueSyncWorker do
     :label_observe,
     :list_issues,
     :list_comments,
+    :resource_inventory,
     :create_issue,
     :update_issue,
     :create_comment,
@@ -154,7 +155,7 @@ defmodule ForgeGitHub.IssueSyncWorker do
     with {:ok, sync} <- context(operation, options),
          {:ok, token} <- installation_token(sync, options),
          {:ok, page} <- fetch_reconciliation_page(sync, token, options),
-         {:ok, observations} <- page_observations(sync.resource_kind, page) do
+         {:ok, observations} <- page_observations(sync.phase, sync.resource_kind, page) do
       callback(options, :record_page, &ForgeMirrors.record_resource_reconciliation_page/5).(
         operation,
         sync.resource_kind,
@@ -1970,7 +1971,16 @@ defmodule ForgeGitHub.IssueSyncWorker do
   defp effect_actions(:issue_comment),
     do: ["update_remote_comment", "delete_remote_comment"]
 
-  defp fetch_reconciliation_page(%{resource_kind: :issue} = sync, token, options) do
+  defp fetch_reconciliation_page(%{phase: :mapped} = sync, _token, options) do
+    callback(options, :resource_inventory, &ForgeMirrors.ResourceInventory.page/4).(
+      sync.repository_mirror_id,
+      sync.resource_kind,
+      sync.mapping_cursor,
+      100
+    )
+  end
+
+  defp fetch_reconciliation_page(%{phase: :remote, resource_kind: :issue} = sync, token, options) do
     callback(options, :list_issues, &IssueClient.list_updated_issues_page/6).(
       token,
       sync.remote_owner,
@@ -1981,7 +1991,11 @@ defmodule ForgeGitHub.IssueSyncWorker do
     )
   end
 
-  defp fetch_reconciliation_page(%{resource_kind: :issue_comment} = sync, token, options) do
+  defp fetch_reconciliation_page(
+         %{phase: :remote, resource_kind: :issue_comment} = sync,
+         token,
+         options
+       ) do
     callback(options, :list_comments, &IssueClient.list_updated_comments_page/6).(
       token,
       sync.remote_owner,
@@ -1992,7 +2006,7 @@ defmodule ForgeGitHub.IssueSyncWorker do
     )
   end
 
-  defp page_observations(:issue, %{issues: issues, next_cursor: next_cursor})
+  defp page_observations(:remote, :issue, %{issues: issues, next_cursor: next_cursor})
        when is_list(issues) and length(issues) <= 100 do
     observations =
       Enum.map(issues, fn issue ->
@@ -2009,7 +2023,11 @@ defmodule ForgeGitHub.IssueSyncWorker do
     _invalid -> {:error, :invalid_remote_resource}
   end
 
-  defp page_observations(:issue_comment, %{comments: comments, next_cursor: next_cursor})
+  defp page_observations(
+         :remote,
+         :issue_comment,
+         %{comments: comments, next_cursor: next_cursor}
+       )
        when is_list(comments) and length(comments) <= 100 do
     observations =
       Enum.map(comments, fn comment ->
@@ -2026,7 +2044,31 @@ defmodule ForgeGitHub.IssueSyncWorker do
     _invalid -> {:error, :invalid_remote_resource}
   end
 
-  defp page_observations(_kind, _page), do: {:error, :invalid_remote_resource}
+  defp page_observations(
+         :mapped,
+         kind,
+         %{observations: observations, next_cursor: next_cursor}
+       )
+       when kind in [:issue, :issue_comment] and is_list(observations) and
+              length(observations) <= 100 and (is_nil(next_cursor) or is_map(next_cursor)) do
+    if Enum.all?(observations, &valid_inventory_observation?/1),
+      do: {:ok, observations},
+      else: {:error, :invalid_remote_resource}
+  end
+
+  defp page_observations(_phase, _kind, _page), do: {:error, :invalid_remote_resource}
+
+  defp valid_inventory_observation?(observation) when is_map(observation) do
+    Enum.sort(Map.keys(observation)) ==
+      [:github_issue_id, :github_number, :github_object_id, :remote_updated_at] and
+      is_integer(observation.github_object_id) and observation.github_object_id > 0 and
+      is_integer(observation.github_number) and observation.github_number > 0 and
+      (is_nil(observation.github_issue_id) or
+         (is_integer(observation.github_issue_id) and observation.github_issue_id > 0)) and
+      match?(%DateTime{utc_offset: 0, std_offset: 0}, observation.remote_updated_at)
+  end
+
+  defp valid_inventory_observation?(_observation), do: false
 
   defp observations_with_cursor(observations, _next_cursor), do: observations
 

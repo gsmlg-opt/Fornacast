@@ -864,6 +864,8 @@ defmodule ForgeMirrors do
               do: ~U[1970-01-01 00:00:00Z]
             ),
           page: persisted.checkpoint["page"] || 1,
+          phase: if(persisted.checkpoint["phase"] == "mapped", do: :mapped, else: :remote),
+          mapping_cursor: persisted.checkpoint["mapping_cursor"],
           provenance: %{
             delivery_guid: cursor["delivery_guid"],
             outbox_event_id: cursor["outbox_event_id"],
@@ -1074,10 +1076,7 @@ defmodule ForgeMirrors do
                  persisted.cursor["page"] == 1,
              sweep when is_binary(sweep) <- persisted.cursor["sweep_id"],
              {:ok, _} <- Ecto.UUID.cast(sweep),
-             page when is_integer(page) and page > 0 <- persisted.checkpoint["page"] || 1,
-             true <-
-               is_nil(next_page) or
-                 (is_integer(next_page) and next_page > page and next_page <= 1_000_000) do
+             true <- valid_resource_next_cursor?(persisted, next_page) do
           children =
             Enum.map(observations, fn observation ->
               cursor = %{
@@ -1106,13 +1105,35 @@ defmodule ForgeMirrors do
             end)
 
           result =
-            if is_nil(next_page),
-              do: complete_operation(persisted, now),
-              else: checkpoint_resource_operation(persisted, %{"page" => next_page}, now)
+            case {persisted.checkpoint["phase"], next_page} do
+              {"mapped", nil} ->
+                complete_operation(persisted, now)
+
+              {"mapped", cursor} ->
+                checkpoint_resource_operation(
+                  persisted,
+                  %{"phase" => "mapped", "mapping_cursor" => cursor},
+                  now
+                )
+
+              {_, nil} ->
+                checkpoint_resource_operation(
+                  persisted,
+                  %{"phase" => "mapped", "mapping_cursor" => nil},
+                  now
+                )
+
+              {_, page} ->
+                checkpoint_resource_operation(persisted, %{"page" => page}, now)
+            end
 
           case result do
-            {:ok, updated} -> %{operation: updated, operations: children}
-            {:error, reason} -> Repo.rollback(reason)
+            {:ok, updated} ->
+              maybe_activate_resource_repository(updated, now)
+              %{operation: updated, operations: children}
+
+            {:error, reason} ->
+              Repo.rollback(reason)
           end
         else
           {:error, reason} -> Repo.rollback(reason)
@@ -1126,6 +1147,31 @@ defmodule ForgeMirrors do
   end
 
   def record_resource_reconciliation_page(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  defp valid_resource_next_cursor?(%{checkpoint: %{"phase" => "mapped"}} = operation, next) do
+    previous = operation.checkpoint["mapping_cursor"]
+
+    is_nil(next) or
+      (valid_mapping_cursor?(next, operation) and
+         (is_nil(previous) or
+            (next["through_id"] == previous["through_id"] and
+               next["after_id"] > previous["after_id"])))
+  end
+
+  defp valid_resource_next_cursor?(operation, next) do
+    is_nil(next) or
+      (is_integer(next) and next > (operation.checkpoint["page"] || 1) and next <= 1_000_000)
+  end
+
+  defp valid_mapping_cursor?(cursor, operation) when is_map(cursor) do
+    map_size(cursor) == 4 and cursor["repository_mirror_id"] == operation.repository_mirror_id and
+      cursor["resource_kind"] == operation.cursor["resource_kind"] and
+      is_integer(cursor["after_id"]) and is_integer(cursor["through_id"]) and
+      cursor["after_id"] > 0 and cursor["through_id"] >= cursor["after_id"] and
+      cursor["through_id"] <= 9_223_372_036_854_775_807
+  end
+
+  defp valid_mapping_cursor?(_, _), do: false
 
   defp valid_resource_observation?(value) when is_map(value) do
     Enum.all?(
@@ -1219,6 +1265,7 @@ defmodule ForgeMirrors do
                  fingerprint
                ),
              {:ok, completed} <- complete_operation(persisted, now) do
+          maybe_activate_resource_repository(completed, now)
           %{operation: completed, resource_state: resource_state, resource: projection}
         else
           {:error, _step, reason, _changes} -> Repo.rollback(reason)
@@ -1705,11 +1752,15 @@ defmodule ForgeMirrors do
     end
   end
 
-  defp valid_resource_sweep?(%{kind: kind, cursor: cursor, checkpoint: checkpoint})
+  defp valid_resource_sweep?(%{kind: kind, cursor: cursor, checkpoint: checkpoint} = operation)
        when kind in ["reconcile.repository.issues", "reconcile.repository.issue_comments"] do
     cursor["trigger"] == "reconcile" and cursor["since"] == "1970-01-01T00:00:00Z" and
       cursor["page"] == 1 and match?({:ok, _}, Ecto.UUID.cast(cursor["sweep_id"])) and
-      is_integer(checkpoint["page"] || 1) and (checkpoint["page"] || 1) in 1..1_000_000
+      is_integer(checkpoint["page"] || 1) and (checkpoint["page"] || 1) in 1..1_000_000 and
+      (is_nil(checkpoint["phase"]) or
+         (checkpoint["phase"] == "mapped" and
+            (is_nil(checkpoint["mapping_cursor"]) or
+               valid_mapping_cursor?(checkpoint["mapping_cursor"], operation))))
   end
 
   defp valid_resource_sweep?(_), do: true
@@ -2763,7 +2814,8 @@ defmodule ForgeMirrors do
       now = DateTime.truncate(now, :second)
 
       Repo.transaction(fn ->
-        with {:ok, persisted} <- lock_owned_operation(operation, ["finalize.repository.git"]),
+        with :ok <- lock_effect_scope(operation),
+             {:ok, persisted} <- lock_owned_operation(operation, ["finalize.repository.git"]),
              %RepositoryMirror{} = repository <- lock_finalizer_repository(persisted) do
           case git_ref_reconciliation_blocker(repository, persisted) do
             :clear ->
@@ -2795,14 +2847,24 @@ defmodule ForgeMirrors do
       now = DateTime.truncate(now, :second)
 
       Repo.transaction(fn ->
-        with {:ok, persisted} <- lock_owned_operation(operation, ["finalize.repository.git"]),
+        with :ok <- lock_effect_scope(operation),
+             {:ok, persisted} <- lock_owned_operation(operation, ["finalize.repository.git"]),
              %RepositoryMirror{} = repository <- lock_finalizer_repository(persisted),
              :clear <- git_ref_reconciliation_blocker(repository, persisted),
              :ok <- release_bootstrap_publication(repository, persisted),
              {:ok, updated_repository} <-
                persist_successful_git_reconciliation(repository, now),
              {:ok, _organization_mirror} <- maybe_restore_git_mirror_health(persisted),
-             {:ok, completed} <- complete_operation(persisted, now) do
+             {:ok, proved} <-
+               owned_transition(persisted, now, [:processing, :effect_pending],
+                 checkpoint:
+                   Map.put(
+                     persisted.checkpoint,
+                     "successful_bootstrap_item_id",
+                     repository.bootstrap_repository_item_id
+                   )
+               ),
+             {:ok, completed} <- complete_operation(proved, now) do
           %{operation: completed, repository_mirror: updated_repository}
         else
           {:blocked, _failure_class, _failure_detail} = blocker ->
@@ -4187,17 +4249,96 @@ defmodule ForgeMirrors do
          %RepositoryMirror{state: :discovered} = repository,
          now
        ) do
-    repository
-    |> RepositoryMirror.transition_changeset(:active)
-    |> Ecto.Changeset.put_change(:last_synced_at, now)
-    |> Ecto.Changeset.put_change(:lock_version, repository.lock_version + 1)
-    |> Repo.update()
+    if bootstrap_metadata_complete?(repository) do
+      repository
+      |> RepositoryMirror.transition_changeset(:active)
+      |> Ecto.Changeset.put_change(:last_synced_at, now)
+      |> Ecto.Changeset.put_change(:lock_version, repository.lock_version + 1)
+      |> Repo.update()
+    else
+      repository |> RepositoryMirror.update_changeset(%{last_synced_at: now}) |> Repo.update()
+    end
   end
 
   defp persist_successful_git_reconciliation(%RepositoryMirror{} = repository, now) do
     repository
     |> RepositoryMirror.update_changeset(%{last_synced_at: now})
     |> Repo.update()
+  end
+
+  defp maybe_activate_resource_repository(%{state: :completed} = operation, now) do
+    organization = Repo.get!(OrganizationMirror, operation.organization_mirror_id)
+    repository = Repo.get!(RepositoryMirror, operation.repository_mirror_id)
+
+    if organization.state in [:catching_up, :active, :degraded] and
+         bootstrap_metadata_complete?(repository) do
+      if repository.state == :discovered and completed_bootstrap_git?(repository) do
+        case persist_successful_git_reconciliation(repository, now) do
+          {:ok, _} -> :ok
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end
+
+      case maybe_restore_git_mirror_health(operation) do
+        {:ok, _} -> :ok
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end
+  end
+
+  defp maybe_activate_resource_repository(_, _), do: :ok
+
+  defp bootstrap_metadata_complete?(repository) do
+    organization = Repo.get!(OrganizationMirror, repository.organization_mirror_id)
+    item_id = repository.bootstrap_repository_item_id
+
+    if is_nil(item_id) or not issue_capability_enabled?(organization, "issue") do
+      true
+    else
+      sweep_key = "bootstrap:item:#{item_id}"
+
+      required =
+        Repo.all(
+          from op in MirrorOperation,
+            where:
+              op.repository_mirror_id == ^repository.id and
+                op.kind in ["reconcile.repository.issues", "reconcile.repository.issue_comments"] and
+                fragment(
+                  "?->>'bootstrap_repository_item_id' = ?",
+                  op.cursor,
+                  ^Integer.to_string(item_id)
+                ) and
+                fragment("?->>'sweep_key' = ?", op.cursor, ^sweep_key),
+            limit: 3
+        )
+
+      sweep_ids = Enum.map(required, & &1.cursor["sweep_id"])
+
+      length(required) == 2 and Enum.all?(required, &(&1.state == :completed)) and
+        not Repo.exists?(
+          from op in MirrorOperation,
+            where:
+              op.repository_mirror_id == ^repository.id and
+                op.kind in ["sync.issue", "sync.issue_comment"] and op.state != :completed and
+                fragment("?->>'sweep_id'", op.cursor) in ^sweep_ids
+        ) and
+        not Repo.exists?(
+          from conflict in MirrorConflict,
+            where: conflict.repository_mirror_id == ^repository.id and conflict.state == :open
+        )
+    end
+  end
+
+  defp completed_bootstrap_git?(repository) do
+    item = to_string(repository.bootstrap_repository_item_id)
+
+    Repo.exists?(
+      from finalizer in MirrorOperation,
+        where:
+          finalizer.repository_mirror_id == ^repository.id and
+            finalizer.kind == "finalize.repository.git" and finalizer.state == :completed and
+            fragment("?->>'successful_bootstrap_item_id' = ?", finalizer.checkpoint, ^item)
+    )
   end
 
   defp maybe_restore_git_mirror_health(operation) do
@@ -5185,6 +5326,82 @@ defmodule ForgeMirrors do
     end
   end
 
+  @doc false
+  def enqueue_repository_resource_reconciliations(
+        %RepositoryMirror{} = supplied,
+        sweep_key,
+        %DateTime{} = now
+      )
+      when is_binary(sweep_key) and byte_size(sweep_key) in 1..255 do
+    with :ok <- validate_utc(now) do
+      Repo.transaction(fn ->
+        organization =
+          Repo.one(
+            from m in OrganizationMirror,
+              where: m.id == ^supplied.organization_mirror_id,
+              lock: "FOR UPDATE"
+          )
+
+        binding =
+          Repo.one(from m in RepositoryMirror, where: m.id == ^supplied.id, lock: "FOR UPDATE")
+
+        with %OrganizationMirror{provider: "github", state: state} <- organization,
+             true <-
+               state in [:bootstrapping, :catching_up, :active, :degraded, :conflicted, :paused],
+             %RepositoryMirror{inventory_included: true, state: binding_state} <- binding,
+             true <- binding_state in [:discovered, :active],
+             true <-
+               binding.organization_mirror_id == organization.id and
+                 binding.repository_id == supplied.repository_id,
+             {:ok, repository} <- ForgeRepos.fetch_live_repository(binding.repository_id),
+             true <-
+               repository.lifecycle in [:ready, :synchronizing] and
+                 repository.owner_user_id == organization.organization_id do
+          if issue_capability_enabled?(organization, "issue") do
+            Enum.map([{"issue", "issues"}, {"issue_comment", "issue_comments"}], fn {kind,
+                                                                                     collection} ->
+              {:ok, digest} =
+                resource_fingerprint(%{
+                  "sweep_key" => sweep_key,
+                  "item_id" => binding.bootstrap_repository_item_id,
+                  "kind" => kind
+                })
+
+              key = "metadata-sweep:#{binding.id}:#{digest}"
+
+              Repo.get_by(MirrorOperation, dedupe_key: key) ||
+                case enqueue_operation(%{
+                       organization_mirror_id: organization.id,
+                       repository_mirror_id: binding.id,
+                       kind: "reconcile.repository.#{collection}",
+                       dedupe_key: key,
+                       cursor: %{
+                         "trigger" => "reconcile",
+                         "resource_kind" => kind,
+                         "since" => "1970-01-01T00:00:00Z",
+                         "page" => 1,
+                         "sweep_id" => Ecto.UUID.generate(),
+                         "sweep_key" => sweep_key,
+                         "bootstrap_repository_item_id" => binding.bootstrap_repository_item_id
+                       },
+                       next_attempt_at: now
+                     }) do
+                  {:ok, operation} -> operation
+                  {:error, reason} -> Repo.rollback(reason)
+                end
+            end)
+          else
+            []
+          end
+        else
+          _ -> Repo.rollback(:invalid_transition)
+        end
+      end)
+    end
+  end
+
+  def enqueue_repository_resource_reconciliations(_, _, _), do: {:error, :invalid_argument}
+
   defp enqueue_inventory_git_reconciliations(organization_mirror_id, sweep_marker, now) do
     repository_ids =
       RepositoryMirror
@@ -5210,8 +5427,20 @@ defmodule ForgeMirrors do
       }
 
       case enqueue_operation(attrs) do
-        {:ok, operation} -> {:cont, {:ok, [operation | operations]}}
-        {:error, reason} -> {:halt, {:error, reason}}
+        {:ok, operation} ->
+          binding = Repo.get!(RepositoryMirror, repository_mirror_id)
+
+          case enqueue_repository_resource_reconciliations(
+                 binding,
+                 "inventory:#{sweep_marker}",
+                 now
+               ) do
+            {:ok, metadata} -> {:cont, {:ok, Enum.reverse(metadata) ++ [operation | operations]}}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
       end
     end)
     |> case do

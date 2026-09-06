@@ -196,7 +196,7 @@ defmodule FornacastAPI.GitHubWebhookIngressTest do
     repository_guid = Ecto.UUID.generate()
 
     assert request(conn, payload("opened", 44, 99),
-             event: "issues",
+             event: "pull_request",
              delivery: repository_guid
            ).status == 202
 
@@ -211,6 +211,18 @@ defmodule FornacastAPI.GitHubWebhookIngressTest do
     ignored = Repo.get_by!(MirrorWebhookDelivery, delivery_guid: unknown_guid)
     assert ignored.state == :ignored
     assert ignored.processed_at
+  end
+
+  test "signed issue and comment events enter the durable processing queue", %{conn: conn} do
+    for {event, action} <- [{"issues", "edited"}, {"issue_comment", "created"}] do
+      guid = Ecto.UUID.generate()
+      raw = payload(action, 44, 99)
+      assert request(conn, raw, event: event, delivery: guid).status == 202
+      delivery = Repo.get_by!(MirrorWebhookDelivery, delivery_guid: guid)
+      assert delivery.state == :pending
+      assert delivery.raw_payload == raw
+      assert delivery.event == event
+    end
   end
 
   test "durable inbox failure returns non-2xx and request path performs no provider call", %{

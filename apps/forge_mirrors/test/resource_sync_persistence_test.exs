@@ -259,6 +259,15 @@ defmodule ForgeMirrors.ResourceSyncPersistenceTest do
                c.now
              )
 
+    assert completed.state == :pending
+    assert completed.checkpoint["phase"] == "mapped"
+
+    assert {:ok, [mapped]} =
+             ForgeMirrors.claim_operations("mapped-sweep", c.now, 60, 100, [operation.kind])
+
+    assert {:ok, %{operation: completed}} =
+             ForgeMirrors.record_resource_reconciliation_page(mapped, :issue, [], nil, c.now)
+
     assert completed.state == :completed
   end
 
@@ -290,6 +299,12 @@ defmodule ForgeMirrors.ResourceSyncPersistenceTest do
                    c.now
                  )
 
+        assert {:ok, [mapped]} =
+                 ForgeMirrors.claim_operations("mapped-sweep", c.now, 60, 100, [operation.kind])
+
+        assert {:ok, _} =
+                 ForgeMirrors.record_resource_reconciliation_page(mapped, :issue, [], nil, c.now)
+
         assert {:ok, [claimed_child]} =
                  ForgeMirrors.claim_operations("child", c.now, 60, 100, ["sync.issue"])
 
@@ -301,6 +316,7 @@ defmodule ForgeMirrors.ResourceSyncPersistenceTest do
   end
 
   test "confirmation commits domain projection and mapping baseline with operation", c do
+    c.organization |> Ecto.Changeset.change(state: :catching_up) |> Repo.update!()
     operation = claimed(c)
     projection = projection(c)
     callback = &Ecto.Multi.run(&1, :resource, fn _, _ -> {:ok, projection} end)
@@ -319,6 +335,7 @@ defmodule ForgeMirrors.ResourceSyncPersistenceTest do
     assert mapping.confirmed_snapshot == %{"title" => "confirmed"}
     assert mapping.confirmed_local_version == 1
     assert mapping.github_object_id == 456
+    assert Repo.get!(ForgeMirrors.OrganizationMirror, c.organization.id).state == :active
   end
 
   test "bad callback scope rolls back both its writes and confirmation", c do

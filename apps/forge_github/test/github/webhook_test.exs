@@ -222,15 +222,22 @@ defmodule ForgeGitHub.WebhookTest do
     end
   end
 
-  test "marks Git ref observations processable and later synchronization events pending" do
+  test "marks Git refs and supported issue metadata processable while later resources remain pending" do
     for event <- ~w(push create delete) do
       assert :processable = Webhook.classify(event, nil)
     end
 
-    pending_actions = %{
+    issue_actions = %{
       "issues" =>
         ~w(assigned closed deleted edited labeled opened reopened transferred unassigned unlabeled),
-      "issue_comment" => ~w(created edited deleted),
+      "issue_comment" => ~w(created edited deleted)
+    }
+
+    for {event, actions} <- issue_actions, action <- actions do
+      assert :processable = Webhook.classify(event, action)
+    end
+
+    pending_actions = %{
       "pull_request" =>
         ~w(assigned closed converted_to_draft edited labeled opened ready_for_review reopened synchronize unassigned unlabeled),
       "release" => ~w(created deleted edited prereleased published released unpublished)

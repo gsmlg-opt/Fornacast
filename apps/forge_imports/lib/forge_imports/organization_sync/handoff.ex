@@ -19,7 +19,14 @@ defmodule ForgeImports.OrganizationSync.Handoff do
   alias ForgePulls.PullRequest
   alias ForgeRepos.Repository
 
-  @supported_repository_events ["repository", "push", "create", "delete"]
+  @supported_repository_events [
+    "repository",
+    "push",
+    "create",
+    "delete",
+    "issues",
+    "issue_comment"
+  ]
 
   def append(%Multi{} = multi, name, run_id, item_id, %DateTime{} = now)
       when is_atom(name) and is_integer(run_id) and run_id > 0 and is_integer(item_id) and
@@ -44,12 +51,19 @@ defmodule ForgeImports.OrganizationSync.Handoff do
              {:ok, ref_count} <- seed_refs(repo, repository_mirror, repository, now),
              {:ok, replay_count} <-
                make_buffered_deliveries_eligible(repo, organization_mirror, item, now),
-             {:ok, operation} <- record_reconciliation(repo, repository_mirror, item, now) do
+             {:ok, operation} <- record_reconciliation(repo, repository_mirror, item, now),
+             {:ok, metadata_operations} <-
+               ForgeMirrors.enqueue_repository_resource_reconciliations(
+                 repository_mirror,
+                 "bootstrap:item:#{item.id}",
+                 now
+               ) do
           {:ok,
            %{
              repository: repository,
              repository_mirror: repository_mirror,
              reconciliation_operation: operation,
+             metadata_reconciliation_operations: metadata_operations,
              promoted_resources: resource_count,
              seeded_refs: ref_count,
              eligible_deliveries: replay_count

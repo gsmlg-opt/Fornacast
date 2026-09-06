@@ -294,7 +294,7 @@ defmodule ForgeImports.RepositoryPublicationTest do
     bound_mirror =
       ForgeMirrors.update_organization_mirror(context.actor, ready_mirror, %{
         bootstrap_import_run_id: fixture.run.id,
-        capabilities: %{"git" => "enabled", "lfs" => "enabled"}
+        capabilities: %{"git" => "enabled", "lfs" => "enabled", "issues" => "enabled"}
       })
       |> unwrap!()
 
@@ -336,12 +336,43 @@ defmodule ForgeImports.RepositoryPublicationTest do
         :pending_unsupported
       )
 
+    metadata_deliveries =
+      for {event, action} <- [{"issues", "edited"}, {"issue_comment", "created"}] do
+        {:ok, metadata, :enqueued} =
+          ForgeMirrors.enqueue_webhook_delivery(
+            %{
+              organization_mirror_id: organization_mirror.id,
+              delivery_guid: Ecto.UUID.generate(),
+              hook_id: 8_500_000_000 + System.unique_integer([:positive]),
+              event: event,
+              action: action,
+              installation_id: installation_id,
+              github_repository_id: fixture.item.github_repository_id,
+              signature_version: "sha256",
+              raw_payload:
+                JSON.encode!(%{
+                  "action" => action,
+                  "installation" => %{"id" => installation_id},
+                  "repository" => %{"id" => fixture.item.github_repository_id}
+                })
+            },
+            :pending_unsupported
+          )
+
+        metadata
+      end
+
     assert {:ok, %{repository: published, replaced: nil}} =
              ForgeImports.publish_repository(
                context.actor,
                fixture.item.id,
                request_metadata("bootstrap-handoff")
              )
+
+    for metadata <- metadata_deliveries do
+      assert %{state: :pending, failure_class: nil} =
+               Repo.get!(MirrorWebhookDelivery, metadata.id)
+    end
 
     assert %RepositoryMirror{
              repository_id: repository_id,
@@ -450,7 +481,22 @@ defmodule ForgeImports.RepositoryPublicationTest do
              state: :pending,
              completed_at: nil,
              cursor: %{"baseline" => "seeded"}
-           } = Repo.get_by!(MirrorOperation, repository_mirror_id: repository_mirror.id)
+           } =
+             Repo.get_by!(MirrorOperation,
+               repository_mirror_id: repository_mirror.id,
+               kind: "reconcile.repository.bootstrap"
+             )
+
+    for kind <- ["reconcile.repository.issues", "reconcile.repository.issue_comments"] do
+      assert %{state: :pending, cursor: cursor} =
+               Repo.get_by!(MirrorOperation,
+                 repository_mirror_id: repository_mirror.id,
+                 kind: kind
+               )
+
+      assert cursor["bootstrap_repository_item_id"] == fixture.item.id
+      assert cursor["sweep_key"] == "bootstrap:item:#{fixture.item.id}"
+    end
 
     assert %MirrorWebhookDelivery{state: :pending} =
              Repo.get!(MirrorWebhookDelivery, delivery.id)

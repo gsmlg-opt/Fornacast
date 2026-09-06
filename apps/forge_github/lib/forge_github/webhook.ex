@@ -131,10 +131,10 @@ defmodule ForgeGitHub.Webhook do
     do: :processable
 
   def classify("issues", action) when action in @issue_actions,
-    do: :pending_unsupported
+    do: :processable
 
   def classify("issue_comment", action) when action in @issue_comment_actions,
-    do: :pending_unsupported
+    do: :processable
 
   def classify("pull_request", action) when action in @pull_request_actions,
     do: :pending_unsupported

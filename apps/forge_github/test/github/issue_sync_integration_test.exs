@@ -396,7 +396,7 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
              )
   end
 
-  for access <- [:confirmed, :denied, :wrong_repository] do
+  for access <- [:confirmed, :denied, :wrong_repository, :missed_webhook] do
     @tag deletion_access: access
     test "mapped comment deletion requires repository access proof: #{access}", ctx do
       access = ctx.deletion_access
@@ -435,19 +435,57 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
       now = DateTime.utc_now(:second)
 
       operation =
-        operation_fixture(ctx.organization, %{
-          repository_mirror_id: ctx.binding.id,
-          kind: "sync.issue_comment",
-          cursor: %{
-            "trigger" => "remote",
-            "resource_kind" => "issue_comment",
-            "github_object_id" => 900,
-            "github_issue_id" => 700,
-            "github_number" => 7,
-            "delivery_guid" => "deleted-comment-delivery"
-          },
-          next_attempt_at: now
-        })
+        if access == :missed_webhook do
+          sweep =
+            operation_fixture(ctx.organization, %{
+              repository_mirror_id: ctx.binding.id,
+              kind: "reconcile.repository.issue_comments",
+              cursor: %{
+                "trigger" => "reconcile",
+                "since" => "1970-01-01T00:00:00Z",
+                "page" => 1,
+                "sweep_id" => Ecto.UUID.generate()
+              },
+              next_attempt_at: now
+            })
+
+          Req.Test.expect(ctx.stub, fn conn ->
+            assert conn.method == "GET"
+            assert conn.request_path == "/repos/acme/project/issues/comments"
+            Req.Test.json(conn, [])
+          end)
+
+          for phase <- [:remote, :mapped] do
+            leased = claim(sweep.id, now, sweep.kind)
+            assert {:ok, _} = IssueSyncWorker.process_operation(leased, now, options(ctx))
+
+            if phase == :remote do
+              assert %{state: :pending, checkpoint: %{"phase" => "mapped"}} =
+                       Repo.get!(MirrorOperation, sweep.id)
+            end
+          end
+
+          assert Repo.get!(MirrorOperation, sweep.id).state == :completed
+
+          Repo.get_by!(MirrorOperation,
+            repository_mirror_id: ctx.binding.id,
+            kind: "sync.issue_comment"
+          )
+        else
+          operation_fixture(ctx.organization, %{
+            repository_mirror_id: ctx.binding.id,
+            kind: "sync.issue_comment",
+            cursor: %{
+              "trigger" => "remote",
+              "resource_kind" => "issue_comment",
+              "github_object_id" => 900,
+              "github_issue_id" => 700,
+              "github_number" => 7,
+              "delivery_guid" => "deleted-comment-delivery"
+            },
+            next_attempt_at: now
+          })
+        end
 
       operation = claim(operation.id, now, "sync.issue_comment")
 
@@ -484,7 +522,7 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
 
       result = IssueSyncWorker.process_operation(operation, now, options(ctx))
 
-      if access == :confirmed do
+      if access in [:confirmed, :missed_webhook] do
         assert {:ok, _} = result
         assert Repo.get(ForgeIssues.Comment, comment.id) == nil
 
@@ -589,6 +627,16 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
       end,
       get_repository: fn token, owner, repository, opts ->
         ForgeGitHub.Client.repository(token, owner, repository, transport_options(ctx, opts))
+      end,
+      list_comments: fn token, owner, repository, since, page, opts ->
+        IssueClient.list_updated_comments_page(
+          token,
+          owner,
+          repository,
+          since,
+          page,
+          transport_options(ctx, opts)
+        )
       end,
       get_label: fn token, owner, repository, name, opts ->
         ForgeGitHub.LabelClient.get_label(
