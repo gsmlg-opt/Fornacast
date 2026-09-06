@@ -1198,6 +1198,185 @@ defmodule ForgeMirrors do
 
   def confirm_resource_operation(_, _, _, _, _), do: {:error, :invalid_argument}
 
+  @doc false
+  def confirm_label_for_resource_operation(
+        %MirrorOperation{} = operation,
+        %DateTime{} = now,
+        expected,
+        confirmation,
+        domain_multi_fun
+      )
+      when is_map(expected) and is_map(confirmation) and is_function(domain_multi_fun, 1) do
+    with :ok <- validate_utc(now),
+         {:ok, fingerprint} <- resource_fingerprint(confirmation[:confirmed_snapshot]),
+         true <-
+           positive_resource_id?(confirmation[:github_object_id]) and
+             bounded_trimmed_string?(confirmation[:github_node_id], 255) do
+      Repo.transaction(fn ->
+        with {:ok, persisted, scope} <- lock_resource_operation(operation),
+             {:ok, mapping} <-
+               label_operation_mapping(persisted, expected, confirmation.github_object_id),
+             :ok <- label_mapping_expected(persisted, mapping, expected),
+             :ok <- label_remote_expected(expected, confirmation),
+             true <- label_identity_compatible?(mapping, confirmation),
+             {:ok, %{resource: projection}} <-
+               Repo.transaction(domain_multi_fun.(Ecto.Multi.new())),
+             :ok <- validate_label_projection(projection, scope, expected),
+             true <-
+               is_nil(mapping_value(mapping, :local_resource_id)) or
+                 mapping.local_resource_id == projection.local_resource_id,
+             {:ok, ^fingerprint} <- resource_fingerprint(projection.fields),
+             true <-
+               is_nil(confirmation[:confirmed_local_version]) or
+                 confirmation.confirmed_local_version == projection.local_version,
+             {:ok, resource_state} <-
+               (mapping || %MirrorResourceState{})
+               |> MirrorResourceState.persistence_changeset(%{
+                 repository_mirror_id: persisted.repository_mirror_id,
+                 resource_kind: :label,
+                 local_resource_type: "ForgeIssues.Label",
+                 local_resource_id: projection.local_resource_id,
+                 github_object_id: confirmation.github_object_id,
+                 github_node_id: confirmation.github_node_id,
+                 confirmed_local_version: projection.local_version,
+                 confirmed_snapshot: confirmation.confirmed_snapshot,
+                 confirmed_fingerprint: fingerprint,
+                 state: :confirmed,
+                 lock_version: (mapping_value(mapping, :lock_version) || 0) + 1
+               })
+               |> Repo.insert_or_update(),
+             {:ok, parent} <-
+               owned_transition(persisted, now, [persisted.state],
+                 state: :pending,
+                 next_attempt_at: now,
+                 lease_owner: nil,
+                 lease_expires_at: nil,
+                 external_effect_marker: nil,
+                 effect_marked_at: nil,
+                 failure_class: nil,
+                 failure_disposition: nil,
+                 failure_detail: nil
+               ) do
+          %{operation: parent, resource_state: resource_state, resource: projection}
+        else
+          {:error, _step, reason, _changes} -> Repo.rollback(reason)
+          {:error, reason} -> Repo.rollback(reason)
+          _ -> Repo.rollback(:invalid_projection)
+        end
+      end)
+    else
+      false -> {:error, :invalid_confirmation}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def confirm_label_for_resource_operation(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  @doc false
+  def mark_label_effect_for_resource_operation(
+        %MirrorOperation{} = operation,
+        %DateTime{} = now,
+        expected,
+        marker,
+        domain_multi_fun
+      )
+      when is_map(expected) and is_map(marker) and is_function(domain_multi_fun, 1) do
+    with :ok <- validate_utc(now), :ok <- validate_bounded_object(marker) do
+      Repo.transaction(fn ->
+        with {:ok, persisted, scope} <- lock_resource_operation(operation),
+             true <- persisted.state == :processing and is_nil(persisted.external_effect_marker),
+             {:ok, nil} <-
+               label_operation_mapping(persisted, expected, expected[:github_object_id]),
+             :ok <- label_mapping_expected(persisted, nil, expected),
+             true <-
+               marker["action"] == "create_remote_label" and
+                 positive_resource_id?(expected[:local_label_id]) and
+                 marker["local_label_id"] == expected.local_label_id and
+                 marker["expected_local_version"] == expected[:expected_local_version] and
+                 marker["expected_local_fingerprint"] == expected[:expected_local_fingerprint],
+             {:ok, %{resource: projection}} <-
+               Repo.transaction(domain_multi_fun.(Ecto.Multi.new())),
+             :ok <- validate_label_projection(projection, scope, expected),
+             {:ok, marked} <- mark_external_effect(persisted, now, marker) do
+          %{operation: marked, resource: projection}
+        else
+          {:error, _step, reason, _changes} -> Repo.rollback(reason)
+          {:error, reason} -> Repo.rollback(reason)
+          _ -> Repo.rollback(:stale_baseline)
+        end
+      end)
+    end
+  end
+
+  def mark_label_effect_for_resource_operation(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  defp label_operation_mapping(operation, expected, remote_id) do
+    resource_mapping(
+      %{
+        operation
+        | cursor: %{
+            "local_resource_id" => expected[:local_label_id],
+            "github_object_id" => remote_id
+          }
+      },
+      :label
+    )
+  end
+
+  defp label_mapping_expected(operation, mapping, expected) do
+    if expected[:resource_state_lock_version] ==
+         (mapping_value(mapping, :lock_version) || :missing) and
+         expected[:effect_marker] == operation.external_effect_marker and
+         (is_nil(operation.external_effect_marker) or
+            operation.external_effect_marker["action"] == "create_remote_label") and
+         (is_nil(expected[:local_label_id]) or is_nil(mapping_value(mapping, :local_resource_id)) or
+            mapping.local_resource_id == expected.local_label_id) and
+         (is_nil(expected[:github_object_id]) or is_nil(mapping_value(mapping, :github_object_id)) or
+            mapping.github_object_id == expected.github_object_id),
+       do: :ok,
+       else: {:error, :stale_baseline}
+  end
+
+  defp label_identity_compatible?(mapping, confirmation) do
+    Enum.all?([:github_object_id, :github_node_id], fn key ->
+      is_nil(mapping_value(mapping, key)) or mapping_value(mapping, key) == confirmation[key]
+    end)
+  end
+
+  defp label_remote_expected(expected, confirmation) do
+    if is_nil(expected[:github_object_id]) or
+         expected.github_object_id == confirmation.github_object_id,
+       do: :ok,
+       else: {:error, :stale_baseline}
+  end
+
+  defp validate_label_projection(projection, scope, expected) when is_map(projection) do
+    fields = projection[:fields]
+
+    with true <-
+           projection[:repository_id] == scope.repository_id and
+             projection[:resource_kind] == :label and
+             projection[:local_resource_type] == "ForgeIssues.Label" and
+             positive_resource_id?(projection[:local_resource_id]) and
+             positive_resource_id?(projection[:local_version]),
+         true <- is_map(fields) and Enum.sort(Map.keys(fields)) == ~w(color description name),
+         true <-
+           is_binary(fields["name"]) and fields["name"] != "" and is_binary(fields["color"]) and
+             (is_nil(fields["description"]) or is_binary(fields["description"])),
+         {:ok, fingerprint} <- resource_fingerprint(fields),
+         true <-
+           is_nil(expected[:local_label_id]) or
+             (projection.local_resource_id == expected.local_label_id and
+                projection.local_version == expected[:expected_local_version] and
+                fingerprint == expected[:expected_local_fingerprint]) do
+      :ok
+    else
+      _ -> {:error, :invalid_projection}
+    end
+  end
+
+  defp validate_label_projection(_, _, _), do: {:error, :invalid_projection}
+
   defp validate_resource_confirmation(confirmation) do
     if positive_resource_id?(confirmation[:github_object_id]) and
          positive_resource_id?(confirmation[:github_number]) and
@@ -1430,6 +1609,7 @@ defmodule ForgeMirrors do
          resource_kind: kind,
          repository_id: id,
          repository_mirror_id: binding.id,
+         github_repository_id: binding.github_repository_id,
          github_installation_id: organization.github_installation_id,
          remote_owner: owner,
          remote_repository: name
@@ -1442,7 +1622,13 @@ defmodule ForgeMirrors do
   defp resource_mapping(operation, kind) do
     local_id = resource_local_id(operation.cursor)
     remote_id = operation.cursor["github_object_id"]
-    type = if kind == :issue, do: "ForgeIssues.Issue", else: "ForgeIssues.Comment"
+
+    type =
+      case kind do
+        :issue -> "ForgeIssues.Issue"
+        :issue_comment -> "ForgeIssues.Comment"
+        :label -> "ForgeIssues.Label"
+      end
 
     if (is_nil(local_id) or positive_resource_id?(local_id)) and
          (is_nil(remote_id) or positive_resource_id?(remote_id)) do

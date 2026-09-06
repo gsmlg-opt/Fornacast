@@ -63,13 +63,84 @@ defmodule ForgeMirrors.IssueRelationships do
           rows
         end
 
-      if length(rows) == length(ids),
-        do: {:ok, Enum.sort_by(rows, & &1.github_object_id)},
-        else: {:error, :unmapped_label}
+      if length(rows) == length(ids) do
+        {:ok, Enum.sort_by(rows, & &1.github_object_id)}
+      else
+        mapped_ids =
+          Enum.map(rows, fn row ->
+            if direction == :local, do: row.local_label_id, else: row.github_object_id
+          end)
+
+        first_missing = ids |> Enum.sort() |> Enum.find(&(&1 not in mapped_ids))
+        missing_label_candidate(repository_id, direction, first_missing, values)
+      end
     else
       {:error, :invalid_relationships}
     end
   end
+
+  defp missing_label_candidate(repository_id, :local, id, _values) do
+    label =
+      Repo.one(
+        from label in "repository_labels",
+          where: label.repository_id == ^repository_id and label.id == ^id,
+          select: %{
+            local_label_id: label.id,
+            name: label.name,
+            color: label.color,
+            description: label.description,
+            local_version: label.sync_version
+          }
+      )
+
+    case label do
+      %{local_version: version} when is_integer(version) and version > 0 ->
+        bounded_label_candidate(label)
+
+      _ ->
+        {:error, :unmapped_label}
+    end
+  end
+
+  defp missing_label_candidate(_repository_id, :remote, id, values) do
+    label = Enum.find(values, &(&1["id"] == id))
+
+    if text?(label["node_id"], 255) and label["node_id"] != "" do
+      bounded_label_candidate(%{
+        github_object_id: id,
+        node_id: label["node_id"],
+        name: label["name"],
+        color: label["color"],
+        description: label["description"]
+      })
+    else
+      {:error, :invalid_relationships}
+    end
+  end
+
+  defp bounded_label_candidate(candidate) do
+    if text?(candidate.name, 255) and String.trim(candidate.name) != "" and
+         is_binary(candidate.color) and Regex.match?(~r/^[0-9a-fA-F]{6}$/, candidate.color) and
+         (is_nil(candidate.description) or text?(candidate.description, 100)) do
+      candidate = %{
+        candidate
+        | color: String.downcase(candidate.color),
+          description: if(candidate.description == "", do: nil, else: candidate.description)
+      }
+
+      {:error, {:unmapped_label, candidate}}
+    else
+      {:error, :invalid_relationships}
+    end
+  end
+
+  defp text?(value, maximum) when is_binary(value),
+    do:
+      byte_size(value) <= maximum * 4 and
+        String.valid?(value) and :binary.match(value, <<0>>) == :nomatch and
+        length(String.codepoints(value)) <= maximum
+
+  defp text?(_, _), do: false
 
   defp assignees(:local, refs) do
     if Enum.all?(refs, &ref?/1) do

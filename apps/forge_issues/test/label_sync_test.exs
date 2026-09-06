@@ -170,7 +170,13 @@ defmodule ForgeIssues.LabelSyncTest do
     row = Repo.get!(Label, first.local_resource_id)
 
     for invalid <- [0, -1] do
-      changeset = row |> Changeset.change(sync_version: invalid) |> Changeset.check_constraint(:sync_version, name: :repository_labels_sync_version_positive)
+      changeset =
+        row
+        |> Changeset.change(sync_version: invalid)
+        |> Changeset.check_constraint(:sync_version,
+          name: :repository_labels_sync_version_positive
+        )
+
       assert {:error, failed} = Repo.update(changeset, mode: :savepoint)
       assert Keyword.has_key?(failed.errors, :sync_version)
     end

@@ -21,6 +21,7 @@ defmodule ForgeMirrors.ResourceSyncPersistenceTest do
     assert context.baseline == %{"title" => "base"}
     assert context.resource_state_lock_version == mapping.lock_version
     assert context.repository_id == c.binding.repository_id
+    assert context.github_repository_id == c.binding.github_repository_id
     assert context.provenance.delivery_guid == "delivery-1"
   end
 

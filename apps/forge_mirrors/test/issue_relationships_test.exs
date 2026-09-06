@@ -57,7 +57,7 @@ defmodule ForgeMirrors.IssueRelationshipsTest do
   end
 
   test "remote lookup never adopts unknown labels by name", ctx do
-    assert {:error, :unmapped_label} =
+    assert {:error, :invalid_relationships} =
              IssueRelationships.resolve(
                ctx.binding.id,
                :remote,
@@ -78,6 +78,46 @@ defmodule ForgeMirrors.IssueRelationshipsTest do
 
     assert {:error, :unmapped_label} =
              IssueRelationships.resolve(other.id, :local, [ctx.label_id], [])
+  end
+
+  test "missing local labels expose bounded exact metadata and monotonic version", ctx do
+    Repo.get_by!(MirrorResourceState, repository_mirror_id: ctx.binding.id, resource_kind: :label)
+    |> Repo.delete!()
+
+    assert {:error, {:unmapped_label, candidate}} =
+             IssueRelationships.resolve(ctx.binding.id, :local, [ctx.label_id], [])
+
+    assert candidate == %{
+             local_label_id: ctx.label_id,
+             name: "bug",
+             color: "aabbcc",
+             description: nil,
+             local_version: 1
+           }
+  end
+
+  test "remote missing candidates are deterministic and include only full label metadata", ctx do
+    labels =
+      for id <- [9999, 999],
+          do: %{
+            "id" => id,
+            "node_id" => "LA_#{id}",
+            "name" => "new",
+            "color" => "aabbcc",
+            "description" => "full description",
+            "url" => "ignored"
+          }
+
+    assert {:error, {:unmapped_label, candidate}} =
+             IssueRelationships.resolve(ctx.binding.id, :remote, labels, [])
+
+    assert candidate == %{
+             github_object_id: 999,
+             node_id: "LA_999",
+             name: "new",
+             color: "aabbcc",
+             description: "full description"
+           }
   end
 
   test "known links canonicalize remote assignees and local-only users remain unmanaged", ctx do
