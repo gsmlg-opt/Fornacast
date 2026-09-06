@@ -993,6 +993,66 @@ defmodule ForgeGitHub.ClientTest do
     assert URI.decode_query(query) == %{"per_page" => "100", "state" => "all"}
   end
 
+  test "App bootstrap retains bounded long issue and comment bodies across pages" do
+    body = String.duplicate("界", 20_000)
+
+    for kind <- [:issue, :comment] do
+      stub = stub_name()
+
+      Req.Test.expect(stub, 2, fn conn ->
+        conn =
+          if URI.decode_query(conn.query_string)["page"] == "2" do
+            conn
+          else
+            Plug.Conn.put_resp_header(
+              conn,
+              "link",
+              ~s(<https://api.github.com#{conn.request_path}?per_page=100&page=2>; rel="next")
+            )
+          end
+
+        Req.Test.json(conn, [%{"id" => 1, "body" => body}])
+      end)
+
+      opts =
+        Keyword.put(
+          client_opts(stub),
+          :gate_key,
+          {:github_installation, System.unique_integer([:positive])}
+        )
+
+      result =
+        case kind do
+          :issue -> Client.repository_issues("app_token", "octocat", "Hello-World", opts)
+          :comment -> Client.issue_comments("app_token", "octocat", "Hello-World", 7, opts)
+        end
+
+      assert {:ok, [%{"body" => ^body}, %{"body" => ^body}]} = result
+    end
+  end
+
+  test "App bootstrap keeps unrelated strings bounded and PAT body limits unchanged" do
+    for {key, gate} <- [{"title", :github_installation}, {"body", :one_time_run}] do
+      stub = stub_name()
+
+      Req.Test.expect(stub, fn conn ->
+        Req.Test.json(conn, [%{key => String.duplicate("a", 20_000)}])
+      end)
+
+      assert {:error, %Error{kind: :invalid_response}} =
+               Client.repository_issues(
+                 "token",
+                 "octocat",
+                 "Hello-World",
+                 Keyword.put(
+                   client_opts(stub),
+                   :gate_key,
+                   {gate, System.unique_integer([:positive])}
+                 )
+               )
+    end
+  end
+
   test "issue_comments fetches paginated comment payloads" do
     stub = stub_name()
     parent = self()

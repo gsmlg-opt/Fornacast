@@ -238,7 +238,8 @@ defmodule ForgeGitHub.Client do
           opts,
           [paths.issues],
           1,
-          []
+          [],
+          if(installation_gate?(opts), do: :issue_metadata, else: :generic)
         )
       end)
     else
@@ -261,7 +262,8 @@ defmodule ForgeGitHub.Client do
           opts,
           ["#{paths.comments}/#{issue_number}/comments"],
           1,
-          []
+          [],
+          if(installation_gate?(opts), do: :issue_metadata, else: :generic)
         )
       end)
     else
@@ -519,13 +521,15 @@ defmodule ForgeGitHub.Client do
     end
   end
 
-  defp paginate_json_list(_url, _pat, _opts, _allowed_paths, page, _pages)
+  defp paginate_json_list(url, pat, opts, allowed_paths, page, pages, json_profile \\ :generic)
+
+  defp paginate_json_list(_url, _pat, _opts, _allowed_paths, page, _pages, _json_profile)
        when page > @max_pages,
        do: error(:pagination_limit)
 
-  defp paginate_json_list(url, pat, opts, allowed_paths, page, pages) do
+  defp paginate_json_list(url, pat, opts, allowed_paths, page, pages, json_profile) do
     with {:ok, response} <- perform_request(url, pat, opts, :get, nil),
-         {:ok, json} <- successful_json(response, opts),
+         {:ok, json} <- successful_response(response, opts, 200, json_profile),
          {:ok, items} <- json_list(json),
          {:ok, next_url} <- Pagination.next_url(response, allowed_paths) do
       case next_url do
@@ -536,7 +540,15 @@ defmodule ForgeGitHub.Client do
           error(:pagination_limit)
 
         next_url ->
-          paginate_json_list(next_url, pat, opts, allowed_paths, page + 1, [items | pages])
+          paginate_json_list(
+            next_url,
+            pat,
+            opts,
+            allowed_paths,
+            page + 1,
+            [items | pages],
+            json_profile
+          )
       end
     else
       {:error, %Error{} = error} -> {:error, error}
