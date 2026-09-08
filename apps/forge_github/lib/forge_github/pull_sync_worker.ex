@@ -288,7 +288,7 @@ defmodule ForgeGitHub.PullSyncWorker do
            }
          },
          {:ok, result} <-
-           with_inbound_ref_fences(head.git_proof, fn ->
+           with_ref_fences(head.git_proof, fn ->
              ForgeMirrors.confirm_remote_pull_creation(
                operation,
                now,
@@ -373,7 +373,8 @@ defmodule ForgeGitHub.PullSyncWorker do
 
   # Hold every repository writer fence in stable order until both mappings commit.
   # A successful ref read followed by releasing its fence would leave a race.
-  defp with_inbound_ref_fences(%{base: base, head: head}, fun) do
+  @doc false
+  def with_ref_fences(%{base: base, head: head}, fun) when is_function(fun, 0) do
     refs = [base, head] |> Enum.reject(&is_nil/1) |> Enum.group_by(& &1.repository_id)
     deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:ref_deadline_ms)
 
