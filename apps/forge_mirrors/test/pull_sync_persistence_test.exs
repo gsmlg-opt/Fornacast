@@ -1363,6 +1363,197 @@ defmodule ForgeMirrors.PullSyncPersistenceTest do
     assert Repo.get!(MirrorResourceState, c.mapping.id).confirmed_remote_updated_at == c.now
   end
 
+  test "mapped label node inventory seeds one page and preserves paired effect evidence", c do
+    {expected, marker, payload, label} = metadata_effect(c)
+
+    mapping =
+      Repo.get_by!(MirrorResourceState, resource_kind: :label, local_resource_id: label.id)
+
+    Repo.update_all(from(m in MirrorResourceState, where: m.id == ^mapping.id),
+      set: [github_node_id: nil]
+    )
+
+    assert {:ok, effect} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               payload
+             )
+
+    assert {:ok, proof} = ForgeMirrors.mapped_pull_label_node_context(effect.operation)
+    assert proof.status == :scanning
+
+    page = %{
+      labels: [%{"id" => 77, "node_id" => "L_77"}],
+      next_cursor: nil,
+      repository: %{
+        github_object_id: c.binding.github_repository_id,
+        github_node_id: c.binding.github_node_id
+      }
+    }
+
+    assert {:ok, %{operation: yielded, status: :ready}} =
+             ForgeMirrors.seed_mapped_pull_label_nodes(
+               effect.operation,
+               c.now,
+               Map.take(proof, [:marker, :targets, :checkpoint]),
+               page
+             )
+
+    assert yielded.lease_owner == nil
+    assert yielded.external_effect_marker == effect.marker
+    updated = Repo.get!(MirrorResourceState, mapping.id)
+    assert updated.github_node_id == "L_77"
+    assert updated.lock_version == mapping.lock_version + 1
+    assert updated.confirmed_snapshot == mapping.confirmed_snapshot
+    assert Repo.get!(MirrorResourceState, c.mapping.id).lock_version == c.mapping.lock_version
+    assert Repo.get!(ForgeMirrors.PullMetadataIntent, effect.intent.id).payload == payload
+  end
+
+  test "mapped label exhausted inventory remains unavailable on reclaim", c do
+    {expected, marker, payload, label} = metadata_effect(c)
+
+    Repo.update_all(
+      from(m in MirrorResourceState,
+        where: m.resource_kind == :label and m.local_resource_id == ^label.id
+      ),
+      set: [github_node_id: nil]
+    )
+
+    {:ok, effect} =
+      ForgeMirrors.mark_mapped_pull_effect(c.operation, c.now, expected.pair, marker, payload)
+
+    assert {:ok, proof} = ForgeMirrors.mapped_pull_label_node_context(effect.operation)
+
+    page = %{
+      labels: [],
+      next_cursor: nil,
+      repository: %{
+        github_object_id: c.binding.github_repository_id,
+        github_node_id: c.binding.github_node_id
+      }
+    }
+
+    assert {:ok, %{operation: yielded, status: :unavailable}} =
+             ForgeMirrors.seed_mapped_pull_label_nodes(
+               effect.operation,
+               c.now,
+               Map.take(proof, [:marker, :targets, :checkpoint]),
+               page
+             )
+
+    {:ok, claims} =
+      ForgeMirrors.claim_operations("label-proof-reclaim", c.now, 60, 100, ["sync.pull"])
+
+    claimed = Enum.find(claims, &(&1.id == yielded.id))
+
+    assert {:ok, %{status: :unavailable, checkpoint: %{"complete" => true}}} =
+             ForgeMirrors.mapped_pull_label_node_context(claimed)
+
+    assert claimed.external_effect_marker == effect.marker
+  end
+
+  test "mapped label proof rejects substituted repository and skipped pages atomically", c do
+    {expected, marker, payload, label} = metadata_effect(c)
+
+    Repo.update_all(
+      from(m in MirrorResourceState,
+        where: m.resource_kind == :label and m.local_resource_id == ^label.id
+      ),
+      set: [github_node_id: nil]
+    )
+
+    {:ok, effect} =
+      ForgeMirrors.mark_mapped_pull_effect(c.operation, c.now, expected.pair, marker, payload)
+
+    assert {:ok, proof} = ForgeMirrors.mapped_pull_label_node_context(effect.operation)
+
+    page = %{
+      labels: [%{"id" => 77, "node_id" => "L_77"}],
+      next_cursor: nil,
+      repository: %{
+        github_object_id: c.binding.github_repository_id + 1,
+        github_node_id: c.binding.github_node_id
+      }
+    }
+
+    expected_proof = Map.take(proof, [:marker, :targets, :checkpoint])
+
+    assert {:error, :identity_conflict} =
+             ForgeMirrors.seed_mapped_pull_label_nodes(
+               effect.operation,
+               c.now,
+               expected_proof,
+               page
+             )
+
+    page = %{
+      page
+      | repository: %{
+          github_object_id: c.binding.github_repository_id,
+          github_node_id: c.binding.github_node_id
+        },
+        next_cursor: 3
+    }
+
+    assert {:error, :invalid_label_page} =
+             ForgeMirrors.seed_mapped_pull_label_nodes(
+               effect.operation,
+               c.now,
+               expected_proof,
+               page
+             )
+
+    assert Repo.get_by!(MirrorResourceState, resource_kind: :label, local_resource_id: label.id).github_node_id ==
+             nil
+
+    assert Repo.get!(ForgeMirrors.MirrorOperation, effect.operation.id).checkpoint ==
+             effect.operation.checkpoint
+  end
+
+  test "mapped label cursor never carries between intents and rejects a changed current hash",
+       c do
+    {expected, marker, payload, _label} = metadata_effect(c)
+
+    {:ok, effect} =
+      ForgeMirrors.mark_mapped_pull_effect(c.operation, c.now, expected.pair, marker, payload)
+
+    checkpoint = %{
+      "intent_id" => effect.intent.id,
+      "intent_fingerprint" => "wrong",
+      "page" => 8,
+      "complete" => false
+    }
+
+    Repo.update_all(from(o in ForgeMirrors.MirrorOperation, where: o.id == ^effect.operation.id),
+      set: [checkpoint: %{"pull_metadata_label_nodes" => checkpoint}]
+    )
+
+    assert {:error, :invalid_label_checkpoint} =
+             ForgeMirrors.mapped_pull_label_node_context(effect.operation)
+
+    other = %{checkpoint | "intent_id" => effect.intent.id + 1}
+
+    Repo.update_all(from(o in ForgeMirrors.MirrorOperation, where: o.id == ^effect.operation.id),
+      set: [checkpoint: %{"pull_metadata_label_nodes" => other}]
+    )
+
+    assert {:ok, proof} = ForgeMirrors.mapped_pull_label_node_context(effect.operation)
+
+    assert proof.checkpoint == %{
+             "intent_id" => effect.intent.id,
+             "intent_fingerprint" => effect.intent.payload_fingerprint,
+             "page" => 1,
+             "complete" => false
+           }
+
+    assert Repo.get!(ForgeMirrors.MirrorOperation, effect.operation.id).checkpoint[
+             "pull_metadata_label_nodes"
+           ] == other
+  end
+
   defp metadata_effect(c) do
     {_paired, label, expected, _, _} = paired_confirmation(c)
     Repo.insert!(%ForgeIssues.IssueLabel{issue_id: c.issue.id, label_id: label.id})

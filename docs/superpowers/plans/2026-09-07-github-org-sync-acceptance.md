@@ -10,6 +10,22 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 mapped relationship node proofs (2026-09-08)
+
+- Mapped metadata effects seed missing immutable user nodes one per claim and
+  label nodes one bounded inventory page per claim, preserving the exact intent
+  and effect marker. Repository, installation, lease, identity collision and
+  paired-state checks reject stale or substituted proofs atomically.
+- Label cursors are intent-bound; exhausted inventory becomes a visible conflict
+  instead of restarting. Draft-only effects do not perform relationship discovery.
+- Real HTTP-stub integration covers multi-claim discovery, lost PATCH responses,
+  draft continuation, exhaustion, wrong users and revocation during proof reads.
+- Combined scoped PostgreSQL verification passed 180 tests (mirrors 80, provider
+  100); all eight changed Elixir files passed formatting and diff checks.
+- This closes this missing-node slice only. Unknown relationship materialization,
+  remaining head/merge transport, activation and PR14–16/full acceptance remain
+  open. No push, deployment or live GitHub write validation occurred.
+
 ### PR13 remote-version replay guard (2026-09-08)
 
 - Paired markers retain independent canonical issue and pull observation times.

@@ -1,5 +1,5 @@
 defmodule ForgeMirrors.PullLabelProofBoundary do
-  @moduledoc "One leased label inventory page, preserving the creation intent and all resource baselines."
+  @moduledoc "One leased label inventory page, preserving its immutable intent and all resource baselines."
   import Ecto.Query
 
   alias ForgeMirrors.{
@@ -12,6 +12,7 @@ defmodule ForgeMirrors.PullLabelProofBoundary do
   alias Fornacast.Repo
 
   @key "pull_creation_label_nodes"
+  @mapped_key "pull_metadata_label_nodes"
   @max_page 2_147_483_647
 
   def context(%MirrorOperation{} = operation, lock_fun) do
@@ -19,7 +20,7 @@ defmodule ForgeMirrors.PullLabelProofBoundary do
       with {:ok, persisted, scope, intent, current} <- recover(operation, lock_fun),
            {:ok, mappings} <- mappings(scope, intent),
            {:ok, checkpoint} <- checkpoint(persisted, intent),
-           {:ok, _, _} <- lock_fun.(operation) do
+           {:ok, _, _} <- recheck(operation, lock_fun) do
         scope
         |> Map.merge(current)
         |> Map.merge(result(mappings, checkpoint))
@@ -56,16 +57,22 @@ defmodule ForgeMirrors.PullLabelProofBoundary do
              :ok <- require_equal(expected_targets, targets(mappings), :stale_label_proof),
              :ok <- require_equal(expected_checkpoint, checkpoint, :stale_label_proof),
              :ok <- incomplete(checkpoint),
-             {:ok, labels, next} <- validate_page(page, checkpoint, intent),
+             {:ok, labels, next} <-
+               validate_page(page, checkpoint, expected_repository(scope, intent)),
              {:ok, updated} <- seed_mappings(mappings, labels, scope),
              checkpoint = %{
                checkpoint
                | "page" => next || checkpoint["page"],
                  "complete" => is_nil(next)
              },
-             {:ok, persisted, _} <- lock_fun.(operation),
+             {:ok, persisted, _} <- recheck(operation, lock_fun),
              {:ok, saved} <-
-               yield_fun.(persisted, Map.put(persisted.checkpoint, @key, checkpoint), now, now) do
+               yield_fun.(
+                 persisted,
+                 Map.put(persisted.checkpoint, checkpoint_key(intent), checkpoint),
+                 now,
+                 now
+               ) do
           result(updated, checkpoint) |> Map.put(:operation, saved)
         else
           {:error, reason} -> Repo.rollback(reason)
@@ -78,6 +85,15 @@ defmodule ForgeMirrors.PullLabelProofBoundary do
 
   def seed(_, _, _, _, _, _), do: {:error, :invalid_argument}
 
+  defp recover(operation, :mapped) do
+    with {:ok, evidence} <- ForgeMirrors.mapped_pull_effect_context(operation) do
+      scope =
+        Map.put(evidence.sync, :organization_mirror_id, evidence.operation.organization_mirror_id)
+
+      {:ok, evidence.operation, scope, evidence.intent, %{}}
+    end
+  end
+
   defp recover(operation, lock_fun) do
     with {:ok, persisted, scope} <- lock_fun.(operation),
          :ok <- require_equal(persisted.state, :effect_pending, :invalid_transition),
@@ -89,8 +105,29 @@ defmodule ForgeMirrors.PullLabelProofBoundary do
     end
   end
 
+  defp recheck(operation, :mapped) do
+    with {:ok, evidence} <- ForgeMirrors.mapped_pull_effect_context(operation),
+         do: {:ok, evidence.operation, evidence.sync}
+  end
+
+  defp recheck(operation, lock_fun), do: lock_fun.(operation)
+
+  defp desired_snapshot(%ForgeMirrors.PullMetadataIntent{payload: payload}),
+    do: payload["target_issue"]
+
+  defp desired_snapshot(intent), do: intent.payload["issue_snapshot"]
+
+  defp checkpoint_key(%ForgeMirrors.PullMetadataIntent{}), do: @mapped_key
+  defp checkpoint_key(_), do: @key
+
+  defp expected_repository(scope, %ForgeMirrors.PullMetadataIntent{}),
+    do: scope.provider_identity["base_repository"]
+
+  defp expected_repository(_scope, intent),
+    do: intent.payload["provider_repositories"]["base_repository"]
+
   defp mappings(scope, intent) do
-    ids = intent.payload["issue_snapshot"]["label_github_ids"]
+    ids = desired_snapshot(intent)["label_github_ids"]
 
     if is_list(ids) and length(ids) <= 512 and Enum.all?(ids, &positive?/1) and
          length(ids) == length(Enum.uniq(ids)) do
@@ -161,7 +198,15 @@ defmodule ForgeMirrors.PullLabelProofBoundary do
       "complete" => false
     }
 
-    value = Map.get(operation.checkpoint, @key, initial)
+    value = Map.get(operation.checkpoint, checkpoint_key(intent), initial)
+
+    # A replacement metadata effect is a new inventory attempt. Never carry an
+    # earlier intent's cursor into it; seeded immutable mapping nodes survive.
+    value =
+      if match?(%ForgeMirrors.PullMetadataIntent{}, intent) and is_map(value) and
+           is_integer(value["intent_id"]) and value["intent_id"] != intent.id,
+         do: initial,
+         else: value
 
     if is_map(value) and map_size(value) == 4 and value["intent_id"] == intent.id and
          value["intent_fingerprint"] == intent.payload_fingerprint and
@@ -177,11 +222,9 @@ defmodule ForgeMirrors.PullLabelProofBoundary do
   defp validate_page(
          %{labels: labels, next_cursor: next, repository: repository} = page,
          checkpoint,
-         intent
+         expected_repo
        )
        when map_size(page) == 3 and is_list(labels) and length(labels) <= 100 do
-    expected_repo = intent.payload["provider_repositories"]["base_repository"]
-
     with :ok <-
            require_equal(
              repository,

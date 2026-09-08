@@ -1540,6 +1540,22 @@ defmodule ForgeMirrors do
     do: ForgeMirrors.PullLabelProofBoundary.context(operation, &lock_pull_creation_operation/1)
 
   @doc false
+  def mapped_pull_label_node_context(operation),
+    do: ForgeMirrors.PullLabelProofBoundary.context(operation, :mapped)
+
+  @doc false
+  def seed_mapped_pull_label_nodes(operation, now, expected, page),
+    do:
+      ForgeMirrors.PullLabelProofBoundary.seed(
+        operation,
+        now,
+        expected,
+        page,
+        :mapped,
+        &checkpoint_pull_creation_operation/4
+      )
+
+  @doc false
   def seed_outbound_pull_label_nodes(operation, now, expected, page),
     do:
       ForgeMirrors.PullLabelProofBoundary.seed(
@@ -1612,6 +1628,21 @@ defmodule ForgeMirrors do
       lease_expires_at: nil
     )
   end
+
+  @doc false
+  def mapped_pull_assignee_node_context(operation),
+    do: ForgeMirrors.PullMappedAssigneeProof.context(operation)
+
+  @doc false
+  def seed_mapped_pull_assignee_node(operation, now, expected, profile),
+    do:
+      ForgeMirrors.PullMappedAssigneeProof.seed(
+        operation,
+        now,
+        expected,
+        profile,
+        &yield_pull_relationship_proof_operation/2
+      )
 
   @doc false
   def outbound_pull_assignee_node_context(operation),

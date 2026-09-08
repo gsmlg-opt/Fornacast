@@ -13,11 +13,14 @@ defmodule ForgeGitHub.PullSyncWorker do
   import Ecto.Query
 
   alias ForgeGitHub.{
+    Client,
     Error,
+    IdentityClient,
     InstallationToken,
     InstallationTokenBroker,
     IssueClient,
     IssueSyncProjection,
+    LabelClient,
     PullClient,
     PullMetadataDecision,
     PullMetadataRecovery,
@@ -1002,7 +1005,8 @@ defmodule ForgeGitHub.PullSyncWorker do
     payload = sync.metadata_intent.payload
 
     result =
-      with {:ok, attrs} <- pair_effect_attrs(operation, sync, token, payload, options),
+      with :ok <- prepare_pair_nodes(operation, now, sync, token, local, options),
+           {:ok, attrs} <- pair_effect_attrs(operation, sync, token, payload, options),
            :ok <- fresh_pair_after_relationships(operation, now, sync, token, local, options),
            {:ok, fresh} <-
              callback(options, :pair_effect_context, &ForgeMirrors.mapped_pull_effect_context/1).(
@@ -1031,6 +1035,20 @@ defmodule ForgeGitHub.PullSyncWorker do
       end
 
     case result do
+      {:seeded, saved} ->
+        {:ok, saved}
+
+      :relationship_unavailable ->
+        conflict(
+          operation,
+          now,
+          sync,
+          :relationship_unavailable,
+          local[:issue_snapshot],
+          payload["target_issue"],
+          options
+        )
+
       {:already_applied, remote, identity, proof} ->
         recover_pair_effect(
           operation,
@@ -1088,13 +1106,166 @@ defmodule ForgeGitHub.PullSyncWorker do
     _, _ -> persist_failure(operation, now, :worker_crash, options)
   end
 
-  defp fresh_pair_after_relationships(operation, now, sync, token, local, options) do
+  defp prepare_pair_nodes(operation, now, sync, token, local, options) do
+    if operation.external_effect_marker["action"] == "set_remote_pull_draft" do
+      :ok
+    else
+      prepare_pair_issue_nodes(operation, now, sync, token, local, options)
+    end
+  end
+
+  defp prepare_pair_issue_nodes(operation, now, sync, token, local, options) do
+    target = sync.metadata_intent.payload["target_issue"]
+
+    if target["assignee_github_ids"] == [] do
+      prepare_pair_label_nodes(operation, now, sync, token, local, options)
+    else
+      with {:ok, context} <-
+             callback(
+               options,
+               :mapped_assignee_node_context,
+               &ForgeMirrors.mapped_pull_assignee_node_context/1
+             ).(operation) do
+        case context.target do
+          nil ->
+            prepare_pair_label_nodes(operation, now, sync, token, local, options)
+
+          target ->
+            with {:ok, user} <-
+                   IdentityClient.get_user(
+                     token,
+                     target.github_user_id,
+                     pair_client_options(sync, options)
+                   ),
+                 :ok <-
+                   fresh_pair_after_relationships(
+                     operation,
+                     now,
+                     sync,
+                     token,
+                     local,
+                     options,
+                     true
+                   ),
+                 {:ok, saved} <-
+                   callback(
+                     options,
+                     :seed_mapped_assignee_node,
+                     &ForgeMirrors.seed_mapped_pull_assignee_node/4
+                   ).(
+                     operation,
+                     now,
+                     Map.take(context, [:marker, :target]),
+                     Map.from_struct(user)
+                   ) do
+              {:seeded, saved}
+            end
+        end
+      end
+    end
+  end
+
+  defp prepare_pair_label_nodes(operation, now, sync, token, local, options) do
+    if sync.metadata_intent.payload["target_issue"]["label_github_ids"] == [] do
+      :ok
+    else
+      with {:ok, context} <-
+             callback(
+               options,
+               :mapped_label_node_context,
+               &ForgeMirrors.mapped_pull_label_node_context/1
+             ).(operation) do
+        case context.status do
+          :ready ->
+            :ok
+
+          :unavailable ->
+            :relationship_unavailable
+
+          :scanning ->
+            with {:ok, repository} <- pair_repository_identity(sync, token, options),
+                 {:ok, page} <-
+                   LabelClient.list_labels_page(
+                     token,
+                     sync.remote_owner,
+                     sync.remote_repository,
+                     context.checkpoint["page"],
+                     pair_client_options(sync, options)
+                   ),
+                 {:ok, ^repository} <- pair_repository_identity(sync, token, options),
+                 :ok <-
+                   fresh_pair_after_relationships(
+                     operation,
+                     now,
+                     sync,
+                     token,
+                     local,
+                     options,
+                     true
+                   ),
+                 {:ok, saved} <-
+                   callback(
+                     options,
+                     :seed_mapped_label_nodes,
+                     &ForgeMirrors.seed_mapped_pull_label_nodes/4
+                   ).(
+                     operation,
+                     now,
+                     Map.take(context, [:marker, :targets, :checkpoint]),
+                     Map.put(page, :repository, repository)
+                   ) do
+              {:seeded, saved}
+            end
+        end
+      end
+    end
+  end
+
+  defp pair_repository_identity(sync, token, options) do
+    expected = sync.provider_identity["base_repository"]
+
+    with {:ok, repo} <-
+           Client.repository(
+             token,
+             sync.remote_owner,
+             sync.remote_repository,
+             pair_client_options(sync, options)
+           ),
+         true <-
+           repo.id == expected["id"] and repo.node_id == expected["node_id"] and
+             repo.full_name == sync.remote_owner <> "/" <> sync.remote_repository do
+      {:ok, %{github_object_id: repo.id, github_node_id: repo.node_id}}
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :identity_conflict}
+    end
+  end
+
+  defp pair_client_options(sync, options) do
+    extra =
+      if @test_client_options,
+        do: Keyword.get(options, :relationship_client_options, []),
+        else: []
+
+    Keyword.merge(extra, request_options(sync))
+  end
+
+  defp fresh_pair_after_relationships(
+         operation,
+         now,
+         sync,
+         token,
+         local,
+         options,
+         force? \\ false
+       ) do
     marker = operation.external_effect_marker
     payload = sync.metadata_intent.payload
     target_issue = payload["target_issue"]
 
-    if marker["action"] == "update_remote_pull_issue" and
-         (target_issue["label_github_ids"] != [] or target_issue["assignee_github_ids"] != []) do
+    if force? or
+         (marker["action"] == "update_remote_pull_issue" and
+            (target_issue["label_github_ids"] != [] or target_issue["assignee_github_ids"] != [])) do
       with {:ok, remote, identity, proof} <- observe_authorized(sync, token, local, now, options),
            :ok <- normalize_precondition(precondition(sync, local, remote, identity, proof)) do
         before =

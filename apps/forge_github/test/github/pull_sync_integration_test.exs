@@ -763,6 +763,225 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_snapshot == ctx.baseline
   end
 
+  test "mapped missing nodes seed one user or label page per claim without metadata writes",
+       ctx do
+    now = DateTime.utc_now(:second)
+    {operation, labels, users} = relationship_fixture(ctx, now)
+    ctx.pull |> Ecto.Changeset.change(draft: true) |> Repo.update!()
+    clear_relationship_nodes(ctx, users)
+
+    remote =
+      start_supervised!(
+        {Agent,
+         fn ->
+           %{
+             labels: [331, 333],
+             users: [441, 443],
+             patches: 0,
+             queries: 0,
+             body: ctx.baseline["body"]
+           }
+         end}
+      )
+
+    relationship_provider(ctx, remote, now, :missing_nodes)
+    opts = relationship_options(ctx)
+    assert {:ok, _} = PullSyncWorker.process_operation(operation, now, opts)
+    marked = Repo.get!(MirrorOperation, operation.id)
+    assert marked.state == :effect_pending and is_nil(marked.lease_owner)
+    assert Agent.get(remote, &Map.get(&1, :user_gets)) == [442]
+    assert Repo.get!(ForgeAccounts.GitHubIdentity, users[442].id).github_node_id == "U_442"
+
+    for page <- [1, 2] do
+      assert {:ok, _} = PullSyncWorker.process_operation(claim(operation.id, now), now, opts)
+      current = Repo.get!(MirrorOperation, operation.id)
+      assert current.external_effect_marker == marked.external_effect_marker
+      assert current.state == :effect_pending and is_nil(current.lease_owner)
+      assert Agent.get(remote, &Map.get(&1, :label_pages)) == Enum.to_list(1..page)
+      assert Agent.get(remote, & &1.patches) == 0
+      assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id).confirmed_local_version == 1
+      assert Repo.get!(ForgeIssues.Label, labels[332].id).name == "label-332"
+    end
+
+    assert {:ok, _} = PullSyncWorker.process_operation(claim(operation.id, now), now, opts)
+    pending = Repo.get!(MirrorOperation, operation.id)
+    assert Agent.get(remote, & &1.patches) == 1
+
+    assert {:ok, %{operation: %{state: :completed}}} =
+             PullSyncWorker.process_operation(
+               claim(operation.id, pending.next_attempt_at),
+               pending.next_attempt_at,
+               opts
+             )
+
+    assert Agent.get(remote, & &1.patches) == 1
+    assert Agent.get(remote, & &1.queries) == 1
+    assert Agent.get(remote, &Map.get(&1, :draft_writes)) == 1
+    assert Agent.get(remote, &Map.get(&1, :label_pages)) == [1, 2]
+    assert Agent.get(remote, &Map.get(&1, :user_gets)) == [442]
+  end
+
+  test "draft-only effect does not require label node inventory or user lookup", ctx do
+    now = DateTime.utc_now(:second)
+    {operation, _, users} = relationship_fixture(ctx, now)
+    clear_relationship_nodes(ctx, users)
+    ctx.pull |> Ecto.Changeset.change(draft: true) |> Repo.update!()
+    mapping = Repo.get!(MirrorResourceState, ctx.issue_mapping.id)
+
+    snapshot =
+      Map.merge(mapping.confirmed_snapshot, %{
+        "label_github_ids" => [332],
+        "assignee_github_ids" => [442]
+      })
+
+    {:ok, fingerprint} = ForgeMirrors.resource_fingerprint(snapshot)
+
+    mapping
+    |> Ecto.Changeset.change(confirmed_snapshot: snapshot, confirmed_fingerprint: fingerprint)
+    |> Repo.update!()
+
+    remote =
+      start_supervised!(
+        {Agent,
+         fn ->
+           %{labels: [332], users: [442], patches: 0, queries: 0, body: ctx.baseline["body"]}
+         end}
+      )
+
+    relationship_provider(ctx, remote, now, :draft_only)
+
+    assert {:ok, %{operation: %{state: :completed}}} =
+             PullSyncWorker.process_operation(operation, now, relationship_options(ctx))
+
+    assert Agent.get(remote, & &1.queries) == 0
+    assert Agent.get(remote, & &1.patches) == 0
+    assert Agent.get(remote, &Map.get(&1, :draft_writes)) == 1
+    assert Agent.get(remote, &Map.get(&1, :label_pages)) == nil
+    assert Agent.get(remote, &Map.get(&1, :user_gets)) == nil
+
+    assert Repo.get_by!(MirrorResourceState,
+             repository_mirror_id: ctx.base.id,
+             resource_kind: :label,
+             github_object_id: 332
+           ).github_node_id == nil
+  end
+
+  test "exhausted mapped label inventory becomes a visible conflict without restarting", ctx do
+    now = DateTime.utc_now(:second)
+    {operation, _, users} = relationship_fixture(ctx, now)
+    clear_relationship_nodes(ctx, users)
+
+    remote =
+      start_supervised!(
+        {Agent,
+         fn ->
+           %{
+             labels: [331, 333],
+             users: [441, 443],
+             patches: 0,
+             queries: 0,
+             body: ctx.baseline["body"]
+           }
+         end}
+      )
+
+    relationship_provider(ctx, remote, now, :missing_inventory)
+    opts = relationship_options(ctx)
+    assert {:ok, _} = PullSyncWorker.process_operation(operation, now, opts)
+    assert {:ok, _} = PullSyncWorker.process_operation(claim(operation.id, now), now, opts)
+    current = Repo.get!(MirrorOperation, operation.id)
+
+    if current.state == :effect_pending,
+      do: PullSyncWorker.process_operation(claim(operation.id, now), now, opts)
+
+    assert Repo.get!(MirrorOperation, operation.id).state == :failed
+    assert Agent.get(remote, &Map.get(&1, :label_pages)) == [1]
+    assert Agent.get(remote, & &1.patches) == 0
+
+    assert Repo.get_by(ForgeMirrors.MirrorConflict,
+             repository_mirror_id: ctx.base.id,
+             state: :open
+           )
+  end
+
+  test "wrong numeric user response never seeds a mapped relationship or writes metadata", ctx do
+    now = DateTime.utc_now(:second)
+    {operation, _, users} = relationship_fixture(ctx, now)
+    clear_relationship_nodes(ctx, users)
+
+    remote =
+      start_supervised!(
+        {Agent,
+         fn ->
+           %{
+             labels: [331, 333],
+             users: [441, 443],
+             patches: 0,
+             queries: 0,
+             body: ctx.baseline["body"]
+           }
+         end}
+      )
+
+    relationship_provider(ctx, remote, now, :wrong_user)
+    _ = PullSyncWorker.process_operation(operation, now, relationship_options(ctx))
+    assert Agent.get(remote, &Map.get(&1, :user_gets)) == [442]
+    assert Repo.get!(ForgeAccounts.GitHubIdentity, users[442].id).github_node_id == nil
+    refute Repo.get_by(ForgeAccounts.GitHubIdentity, github_user_id: 999_442)
+    assert Agent.get(remote, & &1.patches) == 0
+    assert Repo.get!(MirrorOperation, operation.id).external_effect_marker["metadata_intent_id"]
+  end
+
+  defp relationship_options(ctx),
+    do:
+      options(ctx)
+      |> Keyword.delete(:remote_relationships)
+      |> Keyword.put(:relationship_client_options, transport_options(ctx, []))
+
+  for mode <- [:revoked_user, :drift_user] do
+    @mode mode
+    test "#{mode} during numeric identity GET prevents seed and metadata mutation", ctx do
+      now = DateTime.utc_now(:second)
+      {operation, _, users} = relationship_fixture(ctx, now)
+      clear_relationship_nodes(ctx, users)
+
+      remote =
+        start_supervised!(
+          {Agent,
+           fn ->
+             %{
+               labels: [331, 333],
+               users: [441, 443],
+               patches: 0,
+               queries: 0,
+               body: ctx.baseline["body"]
+             }
+           end}
+        )
+
+      relationship_provider(ctx, remote, now, @mode)
+      _ = PullSyncWorker.process_operation(operation, now, relationship_options(ctx))
+      assert Agent.get(remote, &Map.get(&1, :user_gets)) == [442]
+      assert Repo.get!(ForgeAccounts.GitHubIdentity, users[442].id).github_node_id == nil
+      assert Agent.get(remote, & &1.patches) == 0
+      assert Repo.get!(MirrorOperation, operation.id).state != :completed
+    end
+  end
+
+  defp clear_relationship_nodes(ctx, users) do
+    users[442] |> Ecto.Changeset.change(github_node_id: nil) |> Repo.update!()
+
+    for id <- [332, 333] do
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: ctx.base.id,
+        resource_kind: :label,
+        github_object_id: id
+      )
+      |> Ecto.Changeset.change(github_node_id: nil)
+      |> Repo.update!()
+    end
+  end
+
   test "restored issue values with a newer issue timestamp cannot replay a lost effect", ctx do
     now = DateTime.utc_now(:second)
     {operation, _, _} = relationship_fixture(ctx, now)
@@ -974,9 +1193,79 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
   defp relationship_provider(ctx, remote, now, mode) do
     Req.Test.stub(ctx.stub, fn conn ->
       current = Agent.get(remote, & &1)
-      snapshot = Map.put(ctx.baseline, "body", current.body)
+
+      snapshot =
+        ctx.baseline
+        |> Map.put("body", current.body)
+        |> Map.put("draft", Map.get(current, :draft, false))
 
       case {conn.method, conn.request_path} do
+        {"GET", "/user/442"} ->
+          Agent.update(remote, &Map.update(&1, :user_gets, [442], fn ids -> ids ++ [442] end))
+
+          if mode == :revoked_user,
+            do:
+              Repo.get!(ForgeMirrors.OrganizationMirror, ctx.organization.id)
+              |> Ecto.Changeset.change(state: :revoked)
+              |> Repo.update!()
+
+          if mode == :drift_user,
+            do: Agent.update(remote, &%{&1 | body: "Third party during identity GET"})
+
+          id = if mode == :wrong_user, do: 999_442, else: 442
+          Req.Test.json(conn, %{"id" => id, "node_id" => "U_#{id}", "login" => "current-#{id}"})
+
+        {"GET", "/repos/acme/project"} ->
+          Req.Test.json(conn, %{
+            "id" => 900,
+            "node_id" => "R_900",
+            "owner" => %{"id" => 12, "login" => "acme"},
+            "name" => "project",
+            "full_name" => "acme/project",
+            "visibility" => "private",
+            "default_branch" => "main",
+            "has_issues" => true,
+            "allow_merge_commit" => true,
+            "fork" => false,
+            "archived" => false
+          })
+
+        {"GET", "/repos/acme/project/labels"} ->
+          query = URI.decode_query(conn.query_string)
+          assert query["per_page"] == "100"
+          page = String.to_integer(query["page"])
+
+          Agent.update(
+            remote,
+            &Map.update(&1, :label_pages, [page], fn pages -> pages ++ [page] end)
+          )
+
+          ids = if page == 1, do: [331], else: [332, 333]
+
+          conn =
+            if page == 1 and mode != :missing_inventory,
+              do:
+                Plug.Conn.put_resp_header(
+                  conn,
+                  "link",
+                  "<https://api.github.com/repos/acme/project/labels?page=2&per_page=100>; rel=\"next\""
+                ),
+              else: conn
+
+          Req.Test.json(
+            conn,
+            Enum.map(
+              ids,
+              &%{
+                "id" => &1,
+                "node_id" => "L_#{&1}",
+                "name" => "inventory-#{&1}",
+                "color" => "abcdef",
+                "description" => nil
+              }
+            )
+          )
+
         {"GET", "/repos/acme/project/pulls/7"} ->
           Req.Test.json(conn, pull_json(snapshot, now))
 
@@ -1003,52 +1292,70 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
         {"POST", "/graphql"} ->
           {:ok, encoded, conn} = Plug.Conn.read_body(conn)
 
-          assert JSON.decode!(encoded)["variables"] == %{
-                   "labels" => ["L_332", "L_333"],
-                   "assignees" => ["U_442", "U_443"]
-                 }
+          if get_in(JSON.decode!(encoded), ["variables", "input"]) do
+            assert get_in(JSON.decode!(encoded), ["variables", "input", "pullRequestId"]) ==
+                     "PR_802"
 
-          Agent.update(remote, fn s ->
-            %{
-              s
-              | queries: s.queries + 1,
-                body: if(mode == :drift, do: "Third party body", else: s.body)
-            }
-          end)
+            Agent.update(
+              remote,
+              &(&1 |> Map.put(:draft, true) |> Map.update(:draft_writes, 1, fn n -> n + 1 end))
+            )
 
-          if mode == :applied,
-            do:
-              Agent.update(
-                remote,
-                &Map.merge(&1, %{
-                  labels: [332, 333],
-                  users: [442, 443],
-                  issue_time: DateTime.add(now, 1)
-                })
-              )
+            Req.Test.json(conn, %{
+              "data" => %{
+                "convertPullRequestToDraft" => %{
+                  "pullRequest" => %{"id" => "PR_802", "isDraft" => true}
+                }
+              }
+            })
+          else
+            assert JSON.decode!(encoded)["variables"] == %{
+                     "labels" => ["L_332", "L_333"],
+                     "assignees" => ["U_442", "U_443"]
+                   }
 
-          if mode == :aba,
-            do: Agent.update(remote, &Map.put(&1, :issue_time, DateTime.add(now, 1)))
+            Agent.update(remote, fn s ->
+              %{
+                s
+                | queries: s.queries + 1,
+                  body: if(mode == :drift, do: "Third party body", else: s.body)
+              }
+            end)
 
-          Req.Test.json(conn, %{
-            "data" => %{
-              "labels" =>
-                Enum.map(
-                  [332, 333],
-                  &%{
-                    "__typename" => "Label",
-                    "id" => "L_#{&1}",
-                    "name" => "current-label-#{&1}",
-                    "repository" => %{"id" => "R_900"}
-                  }
-                ),
-              "assignees" =>
-                Enum.map(
-                  [442, 443],
-                  &%{"__typename" => "User", "id" => "U_#{&1}", "login" => "current-#{&1}"}
+            if mode == :applied,
+              do:
+                Agent.update(
+                  remote,
+                  &Map.merge(&1, %{
+                    labels: [332, 333],
+                    users: [442, 443],
+                    issue_time: DateTime.add(now, 1)
+                  })
                 )
-            }
-          })
+
+            if mode == :aba,
+              do: Agent.update(remote, &Map.put(&1, :issue_time, DateTime.add(now, 1)))
+
+            Req.Test.json(conn, %{
+              "data" => %{
+                "labels" =>
+                  Enum.map(
+                    [332, 333],
+                    &%{
+                      "__typename" => "Label",
+                      "id" => "L_#{&1}",
+                      "name" => "current-label-#{&1}",
+                      "repository" => %{"id" => "R_900"}
+                    }
+                  ),
+                "assignees" =>
+                  Enum.map(
+                    [442, 443],
+                    &%{"__typename" => "User", "id" => "U_#{&1}", "login" => "current-#{&1}"}
+                  )
+              }
+            })
+          end
 
         {"PATCH", "/repos/acme/project/issues/7"} ->
           {:ok, encoded, conn} = Plug.Conn.read_body(conn)

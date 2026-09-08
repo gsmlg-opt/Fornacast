@@ -199,7 +199,8 @@ defmodule ForgeMirrors.PullLabelProofBoundaryTest do
   end
 
   test "replacement installation cannot provide proof for the original intent", c do
-    replacement_id = System.unique_integer([:positive, :monotonic])
+    replacement_id =
+      (Repo.aggregate(ForgeMirrors.GitHubAppInstallation, :max, :github_installation_id) || 0) + 1
 
     {:ok, _} =
       ForgeMirrors.observe_github_app_installation(%{
