@@ -442,15 +442,27 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
     end)
   end
 
-  test "skips cross-repository and draft pulls without creating issue rows", %{run: run} do
-    {item, repository, stub, _head_sha, _base_sha} =
+  test "imports external heads read-only and preserves same-repository drafts", %{run: run} do
+    {item, repository, stub, head_sha, base_sha} =
       git_staged_fixture(run,
         full_name: "octocat/Hello-World",
         github_repository_id: 1_296_269
       )
 
-    cross = fixture!("pull_cross_repo.json")
-    draft = cross |> Map.put("draft", true) |> Map.put("number", 9) |> Map.put("id", 703)
+    cross =
+      fixture!("pull_cross_repo.json")
+      |> align_pull_payload(head_sha, base_sha)
+      |> put_in(["head", "repo", "node_id"], "R_external_head")
+
+    draft =
+      fixture!("pull_same_repo.json")
+      |> align_pull_payload(head_sha, base_sha)
+      |> Map.put("draft", true)
+      |> Map.put("number", 9)
+      |> Map.put("id", 703)
+      |> Map.put("state", "open")
+      |> Map.put("merged", false)
+      |> Map.put("merged_by", nil)
 
     stub =
       stub_client!(stub,
@@ -472,24 +484,267 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
         outcome: :skipped,
         classification: "pull_candidate",
         summary: "Pull request deferred to pull phase",
-        metadata: %{"count" => number},
+        metadata: %{"count" => number, "github_id" => 300 + number},
         source_count: 0
       })
       |> Repo.insert!()
     end
 
+    conflicting =
+      %ReportEntry{}
+      |> ReportEntry.create_changeset(%{
+        import_run_id: run.id,
+        repository_item_id: item.id,
+        idempotency_key: "pull-head-identity-#{item.id}-#{cross["id"]}",
+        scope: :object,
+        object_kind: "pull_request",
+        source_object_id: cross["id"],
+        outcome: :imported,
+        classification: "pull_head_identity",
+        summary: "Prior head identity",
+        metadata: %{"github_id" => 777, "github_node_id" => "R_other"},
+        source_count: 0
+      })
+      |> Repo.insert!()
+
+    assert {:error, :pull_head_identity_mismatch} = stage(item, stub, phases: [:pull_requests])
+    refute Repo.exists?(from i in Issue, where: i.repository_id == ^repository.id)
+    Repo.delete!(conflicting)
     assert :ok = stage(item, stub, phases: [:pull_requests])
 
-    refute Repo.exists?(from issue in Issue, where: issue.repository_id == ^repository.id)
+    external_issue = Repo.get_by!(Issue, repository_id: repository.id, number: 8)
+    external = Repo.get_by!(PullRequest, issue_id: external_issue.id)
+    assert external.head_repository_id == nil
+    assert external.head_sha == head_sha
+    draft_issue = Repo.get_by!(Issue, repository_id: repository.id, number: 9)
+    draft_pull = Repo.get_by!(PullRequest, issue_id: draft_issue.id)
+    assert draft_pull.draft
+    assert draft_pull.head_repository_id == repository.id
 
-    assert Repo.aggregate(
-             from(report in ReportEntry,
+    evidence =
+      Repo.get_by!(ReportEntry,
+        repository_item_id: item.id,
+        classification: "pull_head_identity",
+        source_object_id: cross["id"]
+      )
+
+    assert evidence.metadata["github_id"] == cross["head"]["repo"]["id"]
+    assert evidence.metadata["github_node_id"] == "R_external_head"
+    assert :ok = stage(item, stub, phases: [:pull_requests])
+  end
+
+  test "represented bootstrap heads require active confirmed live refs and reject stale absence",
+       %{run: run, actor: actor} do
+    {item, shadow, _, _, base_sha} = git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    {:ok, organization} =
+      ForgeAccounts.create_organization(actor, %{
+        username: "head-binding-#{item.id}",
+        display_name: "Head Binding"
+      })
+
+    mirror =
+      ForgeMirrors.TestSupport.MirrorFixtures.active_organization_mirror_fixture(%{
+        organization_id: organization.id,
+        github_installation_id: System.system_time(:microsecond),
+        bootstrap_import_run_id: run.id,
+        capabilities: %{"git" => "enabled", "pulls" => "enabled"}
+      })
+
+    Repo.get!(ForgeImports.ImportRun, run.id)
+    |> Ecto.Changeset.change(source_owner_github_id: mirror.github_account_id)
+    |> Repo.update!()
+
+    item = item |> Ecto.Changeset.change(destination_owner_id: organization.id) |> Repo.update!()
+    shadow |> Ecto.Changeset.change(owner_user_id: organization.id) |> Repo.update!()
+
+    mapped = %{
+      github_id: 702,
+      head_github_repository_id: 9_999_999,
+      head_github_node_id: "R_head",
+      head_ref: "refs/heads/feature",
+      head_sha: String.duplicate("a", 40)
+    }
+
+    assert {:ok, absent} = ForgeImports.GitHub.PullHeadBinding.observe(item, mapped)
+
+    assert {:ok, nil} =
+             ForgeImports.GitHub.PullHeadBinding.with_observation(
+               item,
+               mapped,
+               absent,
+               &{:ok, &1}
+             )
+
+    binding =
+      ForgeMirrors.TestSupport.MirrorFixtures.repository_mirror_fixture(
+        mirror,
+        %{github_repository_id: 9_999_999, github_node_id: "R_head"}
+      )
+
+    assert {:error, :pull_head_not_ready} =
+             ForgeImports.GitHub.PullHeadBinding.with_observation(
+               item,
+               mapped,
+               absent,
+               &{:ok, &1}
+             )
+
+    assert {:error, :pull_head_not_ready} =
+             ForgeImports.GitHub.PullHeadBinding.observe(item, mapped)
+
+    issue =
+      hd(fixture!("issues_page.json"))
+      |> Map.put("number", 8)
+      |> Map.put("pull_request", %{
+        "url" => "https://api.github.com/repos/octocat/Hello-World/pulls/8"
+      })
+
+    payload =
+      fixture!("pull_cross_repo.json")
+      |> put_in(["base", "sha"], base_sha)
+      |> put_in(["head", "repo", "node_id"], "R_head")
+
+    stub = stub_client!(labels: [], issues: [issue], comments: %{}, pull: payload)
+    assert :ok = stage(item, stub, phases: [:issues])
+    assert {:error, :pull_head_not_ready} = stage(item, stub, phases: [:pull_requests])
+
+    assert Repo.exists?(
+             from r in ReportEntry,
                where:
-                 report.repository_item_id == ^item.id and
-                   report.classification != "pull_candidate"
-             ),
-             :count
-           ) >= 2
+                 r.repository_item_id == ^item.id and r.classification == "pull_head_not_ready"
+           )
+
+    refute Repo.exists?(from p in PullRequest, where: p.repository_id == ^shadow.id)
+
+    head_repository =
+      Repo.get!(Repository, binding.repository_id)
+      |> Ecto.Changeset.change(storage_path: "head-binding/#{binding.id}.git")
+      |> Repo.update!()
+
+    path = staged_repo_path!(head_repository)
+    {head_sha, _} = seed_refs!(path)
+    mapped = %{mapped | head_sha: head_sha}
+
+    %ForgeMirrors.MirrorRefState{}
+    |> ForgeMirrors.MirrorRefState.persistence_changeset(%{
+      repository_mirror_id: binding.id,
+      ref_name: mapped.head_ref,
+      ref_kind: :branch,
+      state: :confirmed,
+      confirmed_oid: head_sha,
+      last_local_oid: head_sha,
+      last_remote_oid: head_sha,
+      last_confirmed_at: DateTime.utc_now(:second)
+    })
+    |> Repo.insert!()
+
+    assert {:ok, proof} = ForgeImports.GitHub.PullHeadBinding.observe(item, mapped)
+
+    assert {:ok, local_id} =
+             ForgeImports.GitHub.PullHeadBinding.with_observation(item, mapped, proof, &{:ok, &1})
+
+    assert local_id == head_repository.id
+
+    invalid_payload =
+      payload
+      |> put_in(["head", "sha"], head_sha)
+      |> Map.put("merged_by", %{"id" => 9001, "login" => "hubot"})
+
+    stub_client!(stub, labels: [], issues: [issue], comments: %{}, pull: invalid_payload)
+    assert {:error, %Ecto.Changeset{}} = stage(item, stub, phases: [:pull_requests])
+
+    assert Repo.get_by!(ReportEntry,
+             repository_item_id: item.id,
+             classification: "pull_head_not_ready",
+             source_object_id: payload["id"]
+           ).outcome == :warning
+
+    refute Repo.exists?(
+             from r in ReportEntry,
+               where:
+                 r.repository_item_id == ^item.id and r.classification == "pull_head_identity"
+           )
+
+    stub_client!(stub,
+      labels: [],
+      issues: [issue],
+      comments: %{},
+      pull: put_in(payload, ["head", "sha"], head_sha)
+    )
+
+    assert :ok = stage(item, stub, phases: [:pull_requests])
+    imported_issue = Repo.get_by!(Issue, repository_id: shadow.id, number: 8)
+
+    resolved =
+      Repo.get_by!(ReportEntry,
+        repository_item_id: item.id,
+        classification: "pull_head_not_ready",
+        source_object_id: payload["id"]
+      )
+
+    assert resolved.outcome == :imported
+    assert resolved.metadata["code"] == "head_ref_proof_confirmed"
+
+    assert Repo.get_by!(PullRequest, issue_id: imported_issue.id).head_repository_id ==
+             head_repository.id
+
+    binding |> Ecto.Changeset.change(state: :orphaned) |> Repo.update!()
+
+    assert {:error, :pull_head_not_ready} =
+             ForgeImports.GitHub.PullHeadBinding.with_observation(item, mapped, proof, &{:ok, &1})
+
+    node_missing = %{mapped | head_github_node_id: nil}
+
+    Repo.get!(ForgeMirrors.RepositoryMirror, binding.id)
+    |> Ecto.Changeset.change(state: :active)
+    |> Repo.update!()
+
+    assert {:error, :pull_head_not_ready} =
+             ForgeImports.GitHub.PullHeadBinding.observe(item, node_missing)
+
+    dangling_lease =
+      item
+      |> Ecto.Changeset.change(lease_expires_at: DateTime.add(DateTime.utc_now(:second), 60))
+      |> Repo.update!()
+
+    assert {:error, :pull_head_not_ready} =
+             ForgeImports.GitHub.PullHeadBinding.with_observation(
+               dangling_lease,
+               mapped,
+               proof,
+               &{:ok, &1}
+             )
+
+    dangling_lease |> Ecto.Changeset.change(lease_expires_at: nil) |> Repo.update!()
+    update_ref!(path, git!(path, ["rev-parse", "refs/heads/main"]), mapped.head_ref)
+
+    assert {:error, :pull_head_not_ready} =
+             ForgeImports.GitHub.PullHeadBinding.with_observation(item, mapped, proof, &{:ok, &1})
+
+    tree = git!(path, ["hash-object", "-t", "tree", "-w", "/dev/null"])
+    File.write!(Path.join(path, mapped.head_ref), tree <> "\n")
+
+    ref =
+      Repo.get_by!(ForgeMirrors.MirrorRefState,
+        repository_mirror_id: binding.id,
+        ref_name: mapped.head_ref
+      )
+
+    ref
+    |> Ecto.Changeset.change(confirmed_oid: tree, last_local_oid: tree, last_remote_oid: tree)
+    |> Repo.update!()
+
+    mapped = %{mapped | head_sha: tree}
+    assert {:ok, tree_proof} = ForgeImports.GitHub.PullHeadBinding.observe(item, mapped)
+
+    assert {:error, :pull_head_not_ready} =
+             ForgeImports.GitHub.PullHeadBinding.with_observation(
+               item,
+               mapped,
+               tree_proof,
+               &{:ok, &1}
+             )
   end
 
   test "replaying committed pages is a no-op", %{run: run} do

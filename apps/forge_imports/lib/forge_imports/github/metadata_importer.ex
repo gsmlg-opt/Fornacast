@@ -480,15 +480,38 @@ defmodule ForgeImports.GitHub.MetadataImporter do
         {:ok, mapped} ->
           with true <- mapped.number == number,
                {:ok, issue_id} <- candidate_issue_id(item, number) do
-            commit_page(item, "pull_requests", page_key, 1, fn multi ->
-              import_pull_row(
-                multi,
-                item,
-                repository,
-                Map.put(mapped, :github_issue_id, issue_id),
-                now
-              )
-            end)
+            ForgeImports.GitHub.PullHeadBinding.with_binding(
+              item,
+              mapped,
+              fn head_repository_id ->
+                commit_page(item, "pull_requests", page_key, 1, fn multi ->
+                  multi
+                  |> Multi.run({:head_identity, mapped.github_id}, fn _repo, _ ->
+                    persist_pull_head_identity(item, mapped, head_repository_id)
+                  end)
+                  |> import_pull_row(
+                    item,
+                    repository,
+                    Map.merge(mapped, %{
+                      github_issue_id: issue_id,
+                      head_repository_id: head_repository_id
+                    }),
+                    now
+                  )
+                  |> Multi.run({:head_diagnostic, mapped.github_id}, fn _repo, _ ->
+                    resolve_pending_pull_head(item, mapped)
+                  end)
+                end)
+              end
+            )
+            |> case do
+              {:error, :pull_head_not_ready} = error ->
+                report_pending_pull_head(item, mapped)
+                error
+
+              result ->
+                result
+            end
           else
             false -> {:error, :invalid_pull}
             {:error, _} = error -> error
@@ -651,7 +674,8 @@ defmodule ForgeImports.GitHub.MetadataImporter do
                    repository,
                    issue,
                    merger,
-                   pull_attrs(mapped)
+                   pull_attrs(mapped),
+                   mapped.head_repository_id
                  )
                end)
                |> Repo.transaction(),
@@ -714,6 +738,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
 
   defp pull_attrs(mapped) do
     %{
+      draft: mapped.draft,
       head_ref: mapped.head_ref,
       base_ref: mapped.base_ref,
       head_sha: mapped.head_sha,
@@ -723,6 +748,87 @@ defmodule ForgeImports.GitHub.MetadataImporter do
       inserted_at: mapped.inserted_at,
       updated_at: mapped.updated_at
     }
+  end
+
+  defp persist_pull_head_identity(item, mapped, head_repository_id) do
+    key = "pull-head-identity-#{item.id}-#{mapped.github_id}"
+
+    case Repo.get_by(ReportEntry, import_run_id: item.import_run_id, idempotency_key: key) do
+      %ReportEntry{} = evidence ->
+        if evidence.source_object_id == mapped.github_id &&
+             evidence.metadata["github_id"] == mapped.head_github_repository_id &&
+             evidence.metadata["github_node_id"] == mapped.head_github_node_id,
+           do: {:ok, evidence},
+           else: {:error, :pull_head_identity_mismatch}
+
+      nil ->
+        %ReportEntry{}
+        |> ReportEntry.create_changeset(%{
+          import_run_id: item.import_run_id,
+          repository_item_id: item.id,
+          idempotency_key: key,
+          scope: :object,
+          object_kind: "pull_request",
+          source_object_id: mapped.github_id,
+          outcome: :imported,
+          classification: "pull_head_identity",
+          summary: "Retained immutable pull head repository identity",
+          metadata: %{
+            "github_id" => mapped.head_github_repository_id,
+            "github_node_id" => mapped.head_github_node_id,
+            "code" =>
+              if(is_nil(head_repository_id), do: "external_read_only", else: "represented")
+          },
+          source_count: 0
+        })
+        |> Repo.insert()
+    end
+  end
+
+  defp report_pending_pull_head(item, mapped) do
+    %ReportEntry{}
+    |> ReportEntry.create_changeset(%{
+      import_run_id: item.import_run_id,
+      repository_item_id: item.id,
+      idempotency_key: "pull-head-pending-#{item.id}-#{mapped.github_id}",
+      scope: :object,
+      object_kind: "pull_request",
+      source_object_id: mapped.github_id,
+      outcome: :warning,
+      classification: "pull_head_not_ready",
+      summary: "Represented pull head awaits confirmed available refs",
+      metadata: %{
+        "github_id" => mapped.head_github_repository_id,
+        "github_node_id" => mapped.head_github_node_id,
+        "code" => "head_ref_proof_required"
+      },
+      source_count: 0
+    })
+    |> Repo.insert(on_conflict: :nothing, conflict_target: [:import_run_id, :idempotency_key])
+  end
+
+  defp resolve_pending_pull_head(item, mapped) do
+    case Repo.get_by(ReportEntry,
+           import_run_id: item.import_run_id,
+           idempotency_key: "pull-head-pending-#{item.id}-#{mapped.github_id}"
+         ) do
+      nil ->
+        {:ok, :not_applicable}
+
+      %ReportEntry{} = report ->
+        if report.metadata["github_id"] == mapped.head_github_repository_id &&
+             report.metadata["github_node_id"] == mapped.head_github_node_id do
+          report
+          |> ReportEntry.create_changeset(%{
+            outcome: :imported,
+            summary: "Represented pull head refs verified and imported",
+            metadata: Map.put(report.metadata, "code", "head_ref_proof_confirmed")
+          })
+          |> Repo.update()
+        else
+          {:error, :pull_head_identity_mismatch}
+        end
+    end
   end
 
   defp insert_issue_mapping(repo, item, mapped, issue) do

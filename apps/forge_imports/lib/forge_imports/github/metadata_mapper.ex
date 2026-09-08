@@ -79,7 +79,16 @@ defmodule ForgeImports.GitHub.MetadataMapper do
          {:ok, base_ref} <- branch_ref(payload["base"]["ref"]),
          {:ok, head_sha} <- oid(payload["head"]["sha"]),
          {:ok, base_sha} <- oid(payload["base"]["sha"]),
-         :ok <- validate_staged_refs(staged_refs, head_ref, base_ref, head_sha, base_sha),
+         :ok <-
+           validate_pull_refs(
+             payload,
+             source_repository_id,
+             staged_refs,
+             head_ref,
+             base_ref,
+             head_sha,
+             base_sha
+           ),
          {:ok, normalized} <- map_pull(payload, head_ref, base_ref, head_sha, base_sha) do
       {:ok, normalized}
     else
@@ -125,6 +134,7 @@ defmodule ForgeImports.GitHub.MetadataMapper do
 
   defp map_pull(payload, head_ref, base_ref, head_sha, base_sha) do
     with {:ok, github_id} <- User.id(payload["id"]),
+         {:ok, head_node_id} <- User.string(get_in(payload, ["head", "repo", "node_id"]), 255),
          {:ok, number} <- User.id(payload["number"]),
          {:ok, title} <- User.string(payload["title"], 256, required?: true),
          {:ok, body} <- User.string(payload["body"], 65_536),
@@ -139,6 +149,9 @@ defmodule ForgeImports.GitHub.MetadataMapper do
          github_id: github_id,
          number: number,
          kind: :pull_request,
+         draft: payload["draft"],
+         head_github_repository_id: repo_id(payload["head"]),
+         head_github_node_id: head_node_id,
          title: title,
          body: body,
          state: state,
@@ -162,17 +175,19 @@ defmodule ForgeImports.GitHub.MetadataMapper do
   end
 
   defp classify_pull_shape(payload, source_repository_id) do
-    cond do
-      payload["draft"] == true ->
-        {:skip, :draft_pull, %{number: payload["number"]}}
-
-      repo_id(payload["head"]) != source_repository_id or
-          repo_id(payload["base"]) != source_repository_id ->
-        {:skip, :cross_repository_pull, %{number: payload["number"]}}
-
-      true ->
-        :ok
+    with {:ok, _} <- User.boolean(payload["draft"]),
+         {:ok, _} <- User.id(repo_id(payload["head"])),
+         {:ok, ^source_repository_id} <- User.id(repo_id(payload["base"])) do
+      :ok
+    else
+      _ -> {:error, :invalid_pull}
     end
+  end
+
+  defp validate_pull_refs(payload, source_id, refs, head, base, head_sha, base_sha) do
+    if repo_id(payload["head"]) == source_id,
+      do: validate_staged_refs(refs, head, base, head_sha, base_sha),
+      else: validate_staged_refs(refs, base, base, base_sha, base_sha)
   end
 
   defp validate_staged_refs(staged_refs, head_ref, base_ref, head_sha, base_sha) do

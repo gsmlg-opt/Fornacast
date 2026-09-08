@@ -60,16 +60,26 @@ defmodule ForgeImports.GitHub.MetadataMapperTest do
     assert pull.merger_github_user_id == 9001
   end
 
-  test "skips cross-repository and draft pulls" do
+  test "maps external heads by provider identity and preserves drafts" do
     cross = fixture!("pull_cross_repo.json")
+    staged = %{"refs/heads/main" => cross["base"]["sha"]}
 
-    assert {:skip, :cross_repository_pull, _details} =
-             MetadataMapper.pull(cross, 1_296_269, staged_refs: %{})
+    assert {:ok, %{head_github_repository_id: 9_999_999, draft: false}} =
+             MetadataMapper.pull(cross, 1_296_269, staged_refs: staged)
 
-    draft = Map.put(cross, "draft", true)
+    draft = fixture!("pull_same_repo.json") |> Map.put("draft", true)
+    refs = Map.put(staged, "refs/heads/feature", draft["head"]["sha"])
 
-    assert {:skip, :draft_pull, _details} =
-             MetadataMapper.pull(draft, 1_296_269, staged_refs: %{})
+    assert {:ok, %{draft: true, head_github_repository_id: 1_296_269}} =
+             MetadataMapper.pull(draft, 1_296_269, staged_refs: refs)
+
+    assert {:error, :invalid_pull} =
+             MetadataMapper.pull(put_in(cross, ["base", "repo", "id"], 77), 1_296_269,
+               staged_refs: staged
+             )
+
+    assert {:error, :invalid_pull} =
+             MetadataMapper.pull(Map.put(draft, "draft", "true"), 1_296_269, staged_refs: refs)
   end
 
   test "skips pulls when staged refs are missing or drift" do

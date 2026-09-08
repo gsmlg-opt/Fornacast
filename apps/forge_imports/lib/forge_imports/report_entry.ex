@@ -8,7 +8,7 @@ defmodule ForgeImports.ReportEntry do
 
   def outcomes, do: @outcomes
   @metadata_keys MapSet.new(~w(
-                   code field phase state count github_id category expected actual visibility
+                   code field phase state count github_id github_node_id category expected actual visibility
                    published skipped warnings failures selected
                  ))
   @max_id 9_223_372_036_854_775_807
