@@ -1,6 +1,6 @@
 defmodule ForgePulls.Sync do
   @moduledoc """
-  Trusted metadata synchronization for existing canonical pull identities.
+  Trusted metadata synchronization for canonical pull identities.
 
   The caller owns mirror authorization, ref availability and lease checks. No Git
   effects occur here. Full expected fields are mandatory alongside the canonical
@@ -31,6 +31,240 @@ defmodule ForgePulls.Sync do
   end
 
   def sync_projection(_, _, _), do: {:error, :not_found}
+
+  @doc """
+  Appends a trusted inbound creation. No provider or local number is accepted:
+  the canonical issue uses the repository's shared local number sequence.
+
+  `head_repository_id` is explicit (including nil for read-only metadata).
+  `local_label_ids` and `assignee_refs` are required observed relationships;
+  empty lists explicitly mean none. The caller must prove mirror eligibility
+  and provider identity before committing this Multi. Merge facts here describe
+  a newly discovered aggregate; this never merges an existing pull or writes Git.
+  """
+  def append_sync_create(%Multi{} = multi, key, request) do
+    multi
+    |> Multi.run(key, fn repo, _ ->
+      with :ok <- validate_creation(request),
+           {:ok, repository} <- creation_repository(repo, request),
+           %ForgeAccounts.GitHubIdentity{} = author <-
+             repo.get(ForgeAccounts.GitHubIdentity, request.author_github_identity_id),
+           {:ok, number} <- allocate_number(repo, repository.id),
+           {:ok, issue} <-
+             repo.insert(
+               Issue.import_changeset(
+                 %Issue{repository_id: repository.id, kind: :pull_request},
+                 Map.merge(Map.take(request.fields, ~w(title body state state_reason)), %{
+                   "number" => number,
+                   "author_github_identity_id" => author.id,
+                   "inserted_at" => request.inserted_at,
+                   "updated_at" => request.updated_at,
+                   "closed_at" => if(request.fields["state"] == "closed", do: request.updated_at)
+                 })
+               )
+             ),
+           {:ok, pull} <-
+             repo.insert(
+               PullRequest.import_changeset(
+                 %PullRequest{repository_id: repository.id, issue_id: issue.id},
+                 Map.merge(request.fields, %{
+                   "inserted_at" => request.inserted_at,
+                   "updated_at" => request.updated_at,
+                   "merged_at" => request.merge_state.merged_at,
+                   "merge_commit_sha" => request.merge_state.merge_commit_sha
+                 }),
+                 issue,
+                 repository,
+                 request.head_repository_id
+               )
+             ),
+           {:ok, relationships} <- create_relationships(repo, issue, request) do
+        {:ok, Map.merge(projection(pull, issue), relationships)}
+      else
+        nil -> {:error, :invalid_author}
+        {:error, reason} -> {:error, reason}
+      end
+    end)
+    |> DomainOutbox.record_multi({key, :outbox}, fn changes ->
+      result = Map.fetch!(changes, key)
+
+      %{
+        event_id: Ecto.UUID.generate(),
+        aggregate_type: "issue",
+        aggregate_id: to_string(result.issue_id),
+        event_type: "issue.created",
+        origin: :github,
+        causation_id: request.provenance[:causation_id],
+        correlation_id: request.provenance[:correlation_id],
+        payload: %{
+          "repository_id" => result.repository_id,
+          "issue_id" => result.issue_id,
+          "issue_number" => result.issue_number,
+          "issue_kind" => "pull_request",
+          "sync_version" => result.local_version
+        }
+      }
+    end)
+    |> Audit.record_multi(
+      {key, :audit},
+      nil,
+      "github_sync.applied",
+      "repository",
+      fn changes -> Map.fetch!(changes, key).repository_id end,
+      fn changes ->
+        result = Map.fetch!(changes, key)
+
+        %{
+          "repository_id" => result.repository_id,
+          "resource_id" => result.local_resource_id,
+          "resource_kind" => "pull",
+          "action" => "create"
+        }
+      end
+    )
+  end
+
+  defp validate_creation(
+         %{
+           resource_kind: :pull,
+           repository_id: repository_id,
+           head_repository_id: head_id,
+           author_github_identity_id: author_id,
+           fields: fields,
+           merge_state: merge,
+           local_label_ids: labels,
+           assignee_refs: refs,
+           inserted_at: inserted_at,
+           updated_at: updated_at,
+           provenance: %{origin: :github} = provenance
+         } = request
+       )
+       when valid_id(repository_id) and valid_id(author_id) and
+              (is_nil(head_id) or valid_id(head_id)) do
+    if map_size(request) == 11 and valid_fields?(fields) and valid_merge_state?(merge) and
+         valid_creation_time?(inserted_at) and valid_creation_time?(updated_at) and
+         DateTime.compare(inserted_at, updated_at) != :gt and
+         (is_nil(merge.merged_at) or
+            (valid_creation_time?(merge.merged_at) and fields["state"] == "closed" and
+               DateTime.compare(merge.merged_at, updated_at) != :gt)) and
+         is_list(labels) and length(labels) <= 100 and
+         Enum.all?(labels, fn id -> valid_id(id) end) and
+         is_list(refs) and length(refs) <= 100 and Enum.all?(refs, &valid_assignee?/1) and
+         Enum.all?(Map.keys(provenance), &(&1 in [:origin, :causation_id, :correlation_id])) and
+         Enum.all?([:causation_id, :correlation_id], &bounded_optional?(provenance[&1], 255)),
+       do: :ok,
+       else: {:error, :invalid_sync_request}
+  end
+
+  defp validate_creation(_), do: {:error, :invalid_sync_request}
+
+  defp valid_creation_time?(%DateTime{
+         time_zone: "Etc/UTC",
+         utc_offset: 0,
+         std_offset: 0,
+         microsecond: {0, _}
+       }),
+       do: true
+
+  defp valid_creation_time?(_), do: false
+
+  defp valid_assignee?(%{kind: kind, id: id} = ref)
+       when kind in [:local_user, :github_identity] and valid_id(id), do: map_size(ref) == 2
+
+  defp valid_assignee?(_), do: false
+
+  defp creation_repository(repo, request) do
+    ids =
+      [request.repository_id, request.head_repository_id]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    rows =
+      repo.all(
+        from r in ForgeRepos.Repository,
+          where:
+            r.id in ^ids and is_nil(r.deleted_at) and r.lifecycle in [:ready, :synchronizing],
+          order_by: r.id,
+          lock: "FOR UPDATE"
+      )
+
+    if length(rows) == length(ids),
+      do: {:ok, Enum.find(rows, &(&1.id == request.repository_id))},
+      else: {:error, :not_found}
+  end
+
+  defp allocate_number(repo, repository_id) do
+    alias ForgeIssues.NumberSequence
+
+    with {:ok, _} <-
+           repo.insert(
+             NumberSequence.changeset(%NumberSequence{}, %{repository_id: repository_id}),
+             on_conflict: :nothing,
+             conflict_target: [:repository_id]
+           ) do
+      sequence =
+        repo.one!(
+          from s in NumberSequence, where: s.repository_id == ^repository_id, lock: "FOR UPDATE"
+        )
+
+      if sequence.next_number < @max_id do
+        case repo.update(
+               NumberSequence.finalize_changeset(sequence, %{
+                 next_number: sequence.next_number + 1
+               })
+             ) do
+          {:ok, _} -> {:ok, sequence.next_number}
+          {:error, reason} -> {:error, reason}
+        end
+      else
+        {:error, :number_sequence_exhausted}
+      end
+    end
+  end
+
+  defp create_relationships(repo, issue, request) do
+    labels = Enum.sort(Enum.uniq(request.local_label_ids))
+    refs = Enum.sort(Enum.uniq(request.assignee_refs))
+
+    identities =
+      Enum.map(refs, fn
+        %{kind: :local_user, id: id} -> {:user, id}
+        %{kind: :github_identity, id: id} -> {:github, id}
+      end)
+
+    if repo.aggregate(
+         from(l in ForgeIssues.Label,
+           where: l.repository_id == ^issue.repository_id and l.id in ^labels
+         ),
+         :count
+       ) == length(labels) and
+         map_size(ForgeAccounts.resolve_attributions(identities)) == length(refs) do
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+      repo.insert_all(
+        ForgeIssues.IssueLabel,
+        Enum.map(labels, &%{issue_id: issue.id, label_id: &1, inserted_at: now, updated_at: now})
+      )
+
+      repo.insert_all(
+        ForgeIssues.IssueAssignee,
+        Enum.map(refs, fn ref ->
+          %{
+            issue_id: issue.id,
+            user_id: if(ref.kind == :local_user, do: ref.id),
+            github_identity_id: if(ref.kind == :github_identity, do: ref.id),
+            inserted_at: now,
+            updated_at: now
+          }
+        end)
+      )
+
+      {:ok, %{label_ids: labels, assignee_refs: refs}}
+    else
+      {:error, :invalid_relationship}
+    end
+  end
 
   def append_sync_observe(%Multi{} = multi, key, expected) do
     Multi.run(multi, key, fn repo, _ ->

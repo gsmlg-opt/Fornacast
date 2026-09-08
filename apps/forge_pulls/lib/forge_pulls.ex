@@ -157,6 +157,7 @@ defmodule ForgePulls do
   defdelegate sync_projection(repository_id, kind, id), to: ForgePulls.Sync
   defdelegate append_sync_observe(multi, key, expected), to: ForgePulls.Sync
   defdelegate append_sync_apply(multi, key, request), to: ForgePulls.Sync
+  defdelegate append_sync_create(multi, key, request), to: ForgePulls.Sync
 
   defdelegate append_prepare_coordinated_merge(multi, key, request),
     to: ForgePulls.CoordinatedMerge
