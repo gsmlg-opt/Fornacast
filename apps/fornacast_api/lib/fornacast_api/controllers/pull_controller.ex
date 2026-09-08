@@ -184,9 +184,35 @@ defmodule FornacastAPI.PullController do
       owner: owner,
       repo: repo,
       actor: actor,
-      repository_view: view
+      repository_view: view,
+      head_repository_view: head_repository_view(conn, pull, actor, view)
     )
   end
+
+  defp head_repository_view(
+         _conn,
+         %{head_repository_id: id},
+         _actor,
+         %{repository: %{id: id}} = view
+       ),
+       do: view
+
+  defp head_repository_view(conn, %{head_repository_id: id}, actor, _view)
+       when is_integer(id) do
+    with {:ok, head_view} <- ForgeRepos.repository_view(actor, %ForgeRepos.Repository{id: id}),
+         {:ok, _scopes} <-
+           authorize_scope(
+             conn.assigns[:api_auth],
+             :repository_read,
+             head_view.repository.visibility
+           ) do
+      head_view
+    else
+      _ -> nil
+    end
+  end
+
+  defp head_repository_view(_conn, _pull, _actor, _view), do: nil
 
   defp optional_actor(%Authentication{actor: actor}), do: actor
   defp optional_actor(_authentication), do: nil

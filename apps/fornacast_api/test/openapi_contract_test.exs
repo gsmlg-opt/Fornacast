@@ -201,6 +201,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
     "unsupported_issue_features" => ~w(milestone type locked active_lock_reason),
     "issues_disabled_410_operations" => @declared_issues_disabled_operations,
     "merge_method" => "merge",
+    "unavailable_pull_head" => "nullable_repo_and_user_with_ref_only_label",
     "release_assets_server" => "/api/uploads",
     "release_archives" => nil,
     "issue_pull_release_html_url" => "corresponding_public_api_url",
@@ -337,6 +338,39 @@ defmodule FornacastAPI.OpenAPIContractTest do
 
     assert overlay["delivery_slices"]["1"] == expected_foundation
     assert Enum.sort(Map.keys(overlay["delivery_slices"])) == ~w(1 2 3 4 5)
+  end
+
+  test "pull responses permit redacted head identity without weakening base or label schemas" do
+    for {_version, {filename, _blob}} <- @contracts,
+        {path, method, status, collection?} <- [
+          {"/repos/{owner}/{repo}/pulls", "get", "200", true},
+          {"/repos/{owner}/{repo}/pulls", "post", "201", false},
+          {"/repos/{owner}/{repo}/pulls/{pull_number}", "get", "200", false},
+          {"/repos/{owner}/{repo}/pulls/{pull_number}", "patch", "200", false}
+        ] do
+      document = filename |> contract_path() |> File.read!() |> JSON.decode!()
+
+      response =
+        get_in(document, [
+          "paths",
+          path,
+          method,
+          "responses",
+          status,
+          "content",
+          "application/json",
+          "schema"
+        ])
+
+      schema = if collection?, do: response["items"], else: response
+      head = schema["properties"]["head"]
+      assert head["properties"]["repo"]["nullable"] == true
+      assert head["properties"]["user"]["nullable"] == true
+      assert head["properties"]["label"]["type"] == "string"
+      refute head["properties"]["label"]["nullable"] == true
+      assert Enum.sort(head["required"]) == ~w(label ref repo sha user)
+      refute schema["properties"]["base"]["properties"]["repo"]["nullable"] == true
+    end
   end
 
   test "every disabled-issue controller operation declares the shared 410 response" do

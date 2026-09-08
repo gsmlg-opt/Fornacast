@@ -208,6 +208,26 @@ defmodule Fornacast.OpenAPIPruner do
     )
   end
 
+  defp prune_operation(operation, path, method)
+       when path in ["/repos/{owner}/{repo}/pulls", "/repos/{owner}/{repo}/pulls/{pull_number}"] and
+              method in ["get", "post", "patch"] do
+    status = if method == "post", do: "201", else: "200"
+    schema_path = ["responses", status, "content", "application/json", "schema"]
+
+    schema_path =
+      if method == "get" and path == "/repos/{owner}/{repo}/pulls",
+        do: schema_path ++ ["items"],
+        else: schema_path
+
+    # The authorized base remains required. An unavailable or inaccessible head
+    # must not be replaced by the base repository or disclose private identity.
+    update_in(operation, schema_path ++ ["properties", "head", "properties"], fn properties ->
+      Enum.reduce(["repo", "user"], properties, fn field, acc ->
+        Map.update!(acc, field, &Map.put(&1, "nullable", true))
+      end)
+    end)
+  end
+
   defp prune_operation(operation, _path, _method), do: operation
 
   defp put_issues_disabled_response(operation, path, method, response) do
@@ -266,6 +286,7 @@ defmodule Fornacast.OpenAPIPruner do
         "unsupported_issue_features" => ~w(milestone type locked active_lock_reason),
         "issues_disabled_410_operations" => declared_issues_disabled_operations(),
         "merge_method" => "merge",
+        "unavailable_pull_head" => "nullable_repo_and_user_with_ref_only_label",
         "release_assets_server" => "/api/uploads",
         "release_archives" => nil,
         "issue_pull_release_html_url" => "corresponding_public_api_url",

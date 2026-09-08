@@ -38,7 +38,7 @@ defmodule FornacastAPI.Serializers.V2026_03_10.Pull do
       deletions: 0,
       diff_url: url,
       draft: pull.draft,
-      head: branch(owner, pull.head_ref, pull.head_sha, repository, owner_user),
+      head: head_branch(pull, opts),
       html_url: URL.pull_web(owner, repo, issue.number),
       id: pull.id,
       issue_url: issue_url,
@@ -82,6 +82,23 @@ defmodule FornacastAPI.Serializers.V2026_03_10.Pull do
   defp branch(owner, ref, sha, repository, user) do
     short_ref = String.replace_prefix(ref, "refs/heads/", "")
     %{label: "#{owner}:#{short_ref}", ref: short_ref, sha: sha, repo: repository, user: user}
+  end
+
+  defp head_branch(pull, opts) do
+    default_view =
+      if pull.head_repository_id == pull.repository_id,
+        do: Keyword.fetch!(opts, :repository_view)
+
+    case Keyword.get(opts, :head_repository_view, default_view) do
+      nil ->
+        short_ref = String.replace_prefix(pull.head_ref, "refs/heads/", "")
+        %{label: short_ref, ref: short_ref, sha: pull.head_sha, repo: nil, user: nil}
+
+      view ->
+        repository = V2026_03_10.render(:repository, view, actor: Keyword.get(opts, :actor))
+        user = V2026_03_10.render(:simple_user, view.owner, [])
+        branch(user.login, pull.head_ref, pull.head_sha, repository, user)
+    end
   end
 
   defp links(owner, repo, number, head_sha) do

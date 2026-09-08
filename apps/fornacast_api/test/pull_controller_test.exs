@@ -134,6 +134,76 @@ defmodule FornacastAPI.PullControllerTest do
     end
   end
 
+  test "cross-repository heads require both actor access and token scope" do
+    alice = user("alice")
+    bob = user("bob")
+    base = repository(alice, "base")
+    head = repository(bob, "secret-head")
+    create_branch!(base, "main")
+    create_branch!(base, "feature/api")
+    pull = pull(base, alice, 8)
+    pull |> Ecto.Changeset.change(head_repository_id: head.id) |> Repo.update!()
+    head |> Ecto.Changeset.change(visibility: :private) |> Repo.update!()
+    {_key, narrow_secret} = pat(bob, ["public_repo"])
+    {_key, owner_secret} = pat(bob, ["repo"])
+    {_key, stranger_secret} = pat(alice, ["repo"])
+
+    for version <- @versions,
+        {secret, visible?} <- [
+          {nil, false},
+          {narrow_secret, false},
+          {stranger_secret, false},
+          {owner_secret, true}
+        ] do
+      detail =
+        api_conn(secret, version)
+        |> get("/api/v3/repos/alice/base/pulls/8")
+        |> json_response(200)
+
+      [listed] =
+        api_conn(secret, version)
+        |> get("/api/v3/repos/alice/base/pulls")
+        |> json_response(200)
+
+      for body <- [detail, listed] do
+        assert body["base"]["repo"]["full_name"] == "alice/base"
+        assert body["head"]["ref"] == "feature/api"
+
+        if visible? do
+          assert body["head"]["repo"]["full_name"] == "bob/secret-head"
+          assert body["head"]["user"]["login"] == "bob"
+          assert body["head"]["label"] == "bob:feature/api"
+        else
+          assert body["head"]["repo"] == nil
+          assert body["head"]["user"] == nil
+          assert body["head"]["label"] == "feature/api"
+        end
+      end
+    end
+  end
+
+  test "unrepresented heads retain refs without borrowing the base repository identity" do
+    alice = user("alice")
+    base = repository(alice, "external-head")
+    create_branch!(base, "main")
+    create_branch!(base, "feature/api")
+    pull = pull(base, alice, 8)
+    pull |> Ecto.Changeset.change(head_repository_id: nil) |> Repo.update!()
+
+    for version <- @versions do
+      body =
+        api_conn(nil, version)
+        |> get("/api/v3/repos/alice/external-head/pulls/8")
+        |> json_response(200)
+
+      assert body["head"]["repo"] == nil
+      assert body["head"]["user"] == nil
+      assert body["head"]["label"] == "feature/api"
+      assert body["head"]["sha"] == pull.head_sha
+      assert body["base"]["repo"]["full_name"] == "alice/external-head"
+    end
+  end
+
   test "authentication scopes and private masking precede mutation body parsing" do
     alice = user("alice")
     bob = user("bob")
@@ -455,6 +525,7 @@ defmodule FornacastAPI.PullControllerTest do
 
     Repo.insert!(%PullRequest{
       repository_id: repository.id,
+      head_repository_id: repository.id,
       issue_id: issue.id,
       head_ref: "refs/heads/feature/api",
       base_ref: "refs/heads/main",

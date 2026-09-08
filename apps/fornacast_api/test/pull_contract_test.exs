@@ -496,6 +496,7 @@ defmodule FornacastAPI.PullContractTest do
       id: 4001,
       issue_id: 3001,
       repository_id: 2001,
+      head_repository_id: 2001,
       head_ref: "refs/heads/feature/api",
       base_ref: "refs/heads/main",
       head_sha: String.duplicate("b", 40),
