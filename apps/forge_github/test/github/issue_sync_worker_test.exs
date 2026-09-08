@@ -633,13 +633,17 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
 
   test "a completed empty comment recovery scan cannot repeat a possibly successful POST" do
     snapshot = %{"body" => "local comment"}
-    marker = create_marker("create_remote_comment", snapshot, Ecto.UUID.generate())
+
+    marker =
+      create_marker("create_remote_comment", snapshot, Ecto.UUID.generate())
+      |> Map.merge(%{"resource_kind" => "issue_comment", "local_resource_id" => 200})
+
     checkpoint = %{"recovery" => %{"complete" => true, "match" => nil}}
     operation = operation("sync.issue_comment", :effect_pending, marker, checkpoint)
 
     options =
       options(operation,
-        context: fn ^operation ->
+        context: fn _operation ->
           {:ok,
            comment_context(:missing,
              github_object_id: nil,
@@ -648,6 +652,10 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
            )}
         end,
         local_observe: fn _ -> {:ok, local_comment(snapshot, 1)} end,
+        checkpoint: fn scanning, ^checkpoint, @now, nil, @now ->
+          assert scanning.checkpoint == %{}
+          {:ok, :scan_complete}
+        end,
         create_comment: fn _, _, _, _, _, _ ->
           flunk("possibly successful comment POST repeated")
         end,
@@ -655,6 +663,9 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
           {:ok, :conflicted}
         end
       )
+
+    assert {:ok, :scan_complete} =
+             IssueSyncWorker.process_operation(%{operation | checkpoint: %{}}, @now, options)
 
     assert {:ok, :conflicted} = IssueSyncWorker.process_operation(operation, @now, options)
   end
