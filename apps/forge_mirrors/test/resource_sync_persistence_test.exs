@@ -502,6 +502,8 @@ defmodule ForgeMirrors.ResourceSyncPersistenceTest do
     operation = claimed(c)
     marker = %{"action" => "create_remote_issue", "correlation_id" => Ecto.UUID.generate()}
     assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, c.now, marker)
+    checkpoint = %{"recovery" => %{"complete" => true, "match" => nil}}
+    marked = marked |> Ecto.Changeset.change(checkpoint: checkpoint) |> Repo.update!()
 
     assert {:ok, %{operation: failed}} =
              ForgeMirrors.conflict_resource_operation(
@@ -514,6 +516,7 @@ defmodule ForgeMirrors.ResourceSyncPersistenceTest do
              )
 
     assert failed.checkpoint["conflicted_effect_marker"] == marker
+    assert failed.checkpoint["recovery"] == checkpoint["recovery"]
     assert failed.external_effect_marker == nil
   end
 

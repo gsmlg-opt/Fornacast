@@ -1514,6 +1514,56 @@ defmodule ForgeMirrors do
 
   def confirm_pull_operation(_, _, _, _, _), do: {:error, :invalid_argument}
 
+  @doc false
+  def remote_pull_creation_context(operation),
+    do: ForgeMirrors.PullCreationBoundary.context(operation, &lock_pull_creation_operation/1)
+
+  @doc false
+  def resolve_remote_pull_head(operation, identity, snapshot),
+    do:
+      ForgeMirrors.PullHeadResolution.resolve(
+        operation,
+        identity,
+        snapshot,
+        &lock_pull_creation_operation/1
+      )
+
+  @doc false
+  def confirm_remote_pull_creation(operation, now, expected, observation, callback),
+    do:
+      ForgeMirrors.PullCreationBoundary.confirm(
+        operation,
+        now,
+        expected,
+        observation,
+        callback,
+        &lock_pull_creation_operation/1,
+        &complete_pull_creation_operation/2
+      )
+
+  defp complete_pull_creation_operation(operation, now) do
+    with {:ok, completed} <- complete_operation(operation, now) do
+      maybe_activate_resource_repository(completed, now)
+      {:ok, completed}
+    end
+  end
+
+  # Missing remote pull identities cannot use the mapped-only merge reservation
+  # lookup. The creation boundary instead proves both mapping namespaces absent.
+  defp lock_pull_creation_operation(operation) do
+    with :ok <- lock_effect_scope(operation),
+         {:ok, persisted} <- lock_owned_operation(operation, ["sync.pull"]),
+         true <-
+           persisted.cursor == operation.cursor and
+             persisted.organization_mirror_id == operation.organization_mirror_id,
+         {:ok, scope} <- resource_scope(persisted) do
+      {:ok, persisted, scope}
+    else
+      false -> {:error, :invalid_transition}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp pull_confirmation_precondition(
          %{resource_kind: :pull} = scope,
          mapping,
@@ -1867,7 +1917,12 @@ defmodule ForgeMirrors do
                    effect_marked_at: nil,
                    checkpoint:
                      if(persisted.external_effect_marker,
-                       do: %{"conflicted_effect_marker" => persisted.external_effect_marker},
+                       do:
+                         Map.put(
+                           persisted.checkpoint || %{},
+                           "conflicted_effect_marker",
+                           persisted.external_effect_marker
+                         ),
                        else: persisted.checkpoint
                      ),
                    lease_owner: nil,
