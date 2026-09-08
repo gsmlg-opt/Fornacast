@@ -426,6 +426,47 @@ defmodule ForgeMirrors.InventoryTest do
     assert repository_mirror_id == repository_mirror.id
   end
 
+  test "a completed inventory sweep schedules bounded pull head discovery when pulls are enabled",
+       context do
+    context.organization_mirror
+    |> Ecto.Changeset.change(capabilities: %{"pulls" => "enabled"})
+    |> Repo.update!()
+
+    repository_mirror = repository_mirror_fixture(context.organization_mirror)
+    operation = inventory_operation(context.organization_mirror, context.now, "pull-heads")
+    claimed = claim_inventory!(operation, context.now)
+
+    observation = %{
+      github_repository_id: repository_mirror.github_repository_id,
+      github_node_id: repository_mirror.github_node_id,
+      github_full_name: repository_mirror.github_full_name,
+      github_archived: false
+    }
+
+    assert {:ok, %{operation: %MirrorOperation{state: :completed}}} =
+             ForgeMirrors.record_inventory_page(claimed, [observation], nil, context.now)
+
+    assert %MirrorOperation{
+             kind: "reconcile.repository.pull_heads",
+             repository_mirror_id: repository_mirror_id,
+             state: :pending,
+             cursor: %{
+               "trigger" => "reconcile",
+               "resource_kind" => "pull",
+               "since" => "1970-01-01T00:00:00Z",
+               "page" => 1,
+               "sweep_key" => "inventory:inventory-operation:" <> _
+             },
+             checkpoint: %{"phase" => "mapped", "mapping_cursor" => nil}
+           } =
+             Repo.get_by!(MirrorOperation,
+               repository_mirror_id: repository_mirror.id,
+               kind: "reconcile.repository.pull_heads"
+             )
+
+    assert repository_mirror_id == repository_mirror.id
+  end
+
   defp active_inventory_mirror(now, options \\ []) do
     policy = Keyword.get(options, :policy, %{})
 

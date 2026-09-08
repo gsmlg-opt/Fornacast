@@ -699,6 +699,287 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     assert Repo.get!(MirrorOperation, operation.id).failure_class == "network"
   end
 
+  test "bounded pull-head discovery promotes an existing external head without a webhook", ctx do
+    unsupported_head_fixture(ctx, %{"id" => 901, "node_id" => "R_901"})
+    now = DateTime.utc_now(:second)
+
+    assert {:ok, sweep} =
+             ForgeMirrors.enqueue_repository_pull_head_reconciliation(
+               ctx.base,
+               "integration-head-discovery",
+               now
+             )
+
+    assert {:ok, claimed} =
+             ForgeMirrors.claim_operations("head-discovery-integration", now, 60, 100, [
+               sweep.kind
+             ])
+
+    page = Enum.find(claimed, &(&1.id == sweep.id)) || flunk("head sweep was not claimable")
+
+    assert {:ok, %{operation: %{state: :completed}, operations: [child]}} =
+             PullSyncWorker.process_operation(page, now,
+               token_fetch: fn _, _ -> flunk("discovery page must not request a token") end
+             )
+
+    assert child.kind == "sync.pull"
+    assert child.cursor["trigger"] == "reconcile"
+    expect_observation(ctx, ctx.baseline, now)
+
+    assert {:ok, _} =
+             PullSyncWorker.process_operation(
+               claim(child.id, now),
+               now,
+               Keyword.delete(options(ctx), :remote_relationships)
+             )
+
+    assert Repo.get!(MirrorOperation, child.id).state == :completed
+    assert Repo.get!(PullRequest, ctx.pull.id).head_repository_id == ctx.head.repository_id
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).state == :confirmed
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_local_version == 2
+    assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id).confirmed_local_version == 2
+  end
+
+  for original <- [nil, :known] do
+    test "unsupported #{inspect(original)} head becomes represented only through exact paired evidence",
+         ctx do
+      identity = if unquote(original) == :known, do: %{"id" => 901, "node_id" => "R_901"}
+      unsupported_head_fixture(ctx, identity)
+      now = DateTime.utc_now(:second)
+      operation = remote_operation(ctx, now)
+      expect_observation(ctx, ctx.baseline, now)
+
+      assert {:ok, _} =
+               PullSyncWorker.process_operation(
+                 operation,
+                 now,
+                 Keyword.delete(options(ctx), :remote_relationships)
+               )
+
+      if unquote(original) == nil do
+        assert Repo.get!(MirrorOperation, operation.id).state == :pending
+        assert Repo.get!(PullRequest, ctx.pull.id).head_repository_id == nil
+        expect_observation(ctx, ctx.baseline, now)
+
+        assert {:ok, _} =
+                 PullSyncWorker.process_operation(
+                   claim(operation.id, now),
+                   now,
+                   Keyword.delete(options(ctx), :remote_relationships)
+                 )
+      end
+
+      assert Repo.get!(MirrorOperation, operation.id).state == :completed
+      assert Repo.get!(PullRequest, ctx.pull.id).head_repository_id == ctx.head.repository_id
+      assert Repo.get!(ForgeIssues.Issue, ctx.issue.id).sync_version == 2
+      assert Repo.get!(MirrorResourceState, ctx.mapping.id).state == :confirmed
+      assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_snapshot == ctx.baseline
+      assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_local_version == 2
+      assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id).confirmed_local_version == 2
+    end
+  end
+
+  test "unsupported opaque head can pin one authenticated identity but cannot substitute it later",
+       ctx do
+    unsupported_head_fixture(ctx, nil)
+    now = DateTime.utc_now(:second)
+    initial = remote_operation(ctx, now)
+
+    for {id, node} <- [{9901, "R_9901"}, {9902, "R_9902"}] do
+      operation = if id == 9901, do: initial, else: claim(initial.id, now)
+
+      Req.Test.expect(
+        ctx.stub,
+        &Req.Test.json(
+          &1,
+          put_in(pull_json(ctx.baseline, now), ["head", "repo"], %{
+            "id" => id,
+            "node_id" => node,
+            "full_name" => "external/head"
+          })
+        )
+      )
+
+      Req.Test.expect(ctx.stub, &Req.Test.json(&1, issue_json(ctx.baseline, now)))
+
+      PullSyncWorker.process_operation(
+        operation,
+        now,
+        Keyword.delete(options(ctx), :remote_relationships)
+      )
+
+      mapping = Repo.get!(MirrorResourceState, ctx.mapping.id)
+
+      assert mapping.provider_identity["head_repository"] == %{
+               "id" => 9901,
+               "node_id" => "R_9901"
+             }
+
+      assert mapping.confirmed_snapshot == ctx.baseline
+      assert mapping.confirmed_local_version == 1
+      assert Repo.get!(PullRequest, ctx.pull.id).head_repository_id == nil
+    end
+  end
+
+  test "unsupported still-opaque head completes read-only reevaluation without fabricating identity",
+       ctx do
+    unsupported_head_fixture(ctx, nil)
+    now = DateTime.utc_now(:second)
+    operation = remote_operation(ctx, now)
+
+    Req.Test.expect(
+      ctx.stub,
+      &Req.Test.json(&1, put_in(pull_json(ctx.baseline, now), ["head", "repo"], nil))
+    )
+
+    Req.Test.expect(ctx.stub, &Req.Test.json(&1, issue_json(ctx.baseline, now)))
+
+    assert {:ok, _} =
+             PullSyncWorker.process_operation(
+               operation,
+               now,
+               Keyword.delete(options(ctx), :remote_relationships)
+             )
+
+    assert Repo.get!(MirrorOperation, operation.id).state == :completed
+
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).provider_identity["head_repository"] ==
+             nil
+
+    assert Repo.get!(ForgeIssues.Issue, ctx.issue.id).sync_version == 1
+    assert Repo.get!(PullRequest, ctx.pull.id).head_repository_id == nil
+  end
+
+  for drift <- [:remote, :local] do
+    test "still-opaque head #{drift} metadata drift fails visibly without rebasing", ctx do
+      unsupported_head_fixture(ctx, nil)
+      now = DateTime.utc_now(:second)
+      operation = remote_operation(ctx, now)
+
+      if unquote(drift) == :local,
+        do:
+          Repo.update!(
+            Ecto.Changeset.change(ctx.issue, title: "Newer local metadata", sync_version: 2)
+          )
+
+      snapshot =
+        if unquote(drift) == :remote,
+          do: Map.put(ctx.baseline, "title", "Unexpected remote metadata"),
+          else: ctx.baseline
+
+      Req.Test.expect(
+        ctx.stub,
+        &Req.Test.json(&1, put_in(pull_json(snapshot, now), ["head", "repo"], nil))
+      )
+
+      Req.Test.expect(ctx.stub, &Req.Test.json(&1, issue_json(snapshot, now)))
+
+      PullSyncWorker.process_operation(
+        operation,
+        now,
+        Keyword.delete(options(ctx), :remote_relationships)
+      )
+
+      assert %{
+               state: :failed,
+               failure_class: "local_validation",
+               failure_detail: "read-only pull metadata differs from confirmed baseline"
+             } = Repo.get!(MirrorOperation, operation.id)
+
+      assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_snapshot == ctx.baseline
+      assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_local_version == 1
+      assert Repo.get!(PullRequest, ctx.pull.id).head_repository_id == nil
+    end
+  end
+
+  for failure <- [
+        :head_inactive,
+        :head_ref_missing,
+        :remote_drift,
+        :local_drift,
+        :relationship_drift,
+        :revoked,
+        :expired
+      ] do
+    test "unsupported head #{failure} cannot promote or rebase confirmed metadata", ctx do
+      unsupported_head_fixture(ctx, %{"id" => 901, "node_id" => "R_901"})
+      now = DateTime.utc_now(:second)
+      operation = remote_operation(ctx, now)
+
+      if unquote(failure) == :head_inactive,
+        do: Repo.update!(Ecto.Changeset.change(ctx.head, state: :orphaned))
+
+      if unquote(failure) == :head_ref_missing,
+        do: git!(ctx.head_path, ["update-ref", "-d", ctx.baseline["head_ref"]])
+
+      if unquote(failure) == :local_drift,
+        do:
+          Repo.update!(
+            Ecto.Changeset.change(ctx.issue, title: "Newer local metadata", sync_version: 2)
+          )
+
+      snapshot =
+        if unquote(failure) == :remote_drift,
+          do: Map.put(ctx.baseline, "title", "Unexpected new metadata"),
+          else: ctx.baseline
+
+      Req.Test.expect(ctx.stub, &Req.Test.json(&1, pull_json(snapshot, now)))
+
+      Req.Test.expect(ctx.stub, fn conn ->
+        if unquote(failure) == :revoked,
+          do: Repo.update!(Ecto.Changeset.change(ctx.organization, state: :revoked))
+
+        if unquote(failure) == :expired,
+          do:
+            Repo.update!(
+              Ecto.Changeset.change(Repo.get!(MirrorOperation, operation.id),
+                lease_expires_at: DateTime.add(now, -1)
+              )
+            )
+
+        issue = issue_json(snapshot, now)
+
+        issue =
+          if unquote(failure) == :relationship_drift,
+            do:
+              Map.put(issue, "labels", [
+                %{
+                  "id" => 998,
+                  "node_id" => "LA_998",
+                  "name" => "unknown-external-label",
+                  "color" => "abcdef",
+                  "description" => nil
+                }
+              ]),
+            else: issue
+
+        Req.Test.json(conn, issue)
+      end)
+
+      PullSyncWorker.process_operation(
+        operation,
+        now,
+        Keyword.delete(options(ctx), :remote_relationships)
+      )
+
+      assert Repo.get!(PullRequest, ctx.pull.id).head_repository_id == nil
+
+      assert Repo.get!(ForgeIssues.Issue, ctx.issue.id).sync_version ==
+               if(unquote(failure) == :local_drift, do: 2, else: 1)
+
+      assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_snapshot == ctx.baseline
+      assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_local_version == 1
+
+      if unquote(failure) in [:remote_drift, :local_drift, :relationship_drift] do
+        assert %{
+                 state: :failed,
+                 failure_class: "local_validation",
+                 failure_detail: "read-only pull metadata differs from confirmed baseline"
+               } = Repo.get!(MirrorOperation, operation.id)
+      end
+    end
+  end
+
   test "authenticated opaque head imports read-only without guessing repository identity", ctx do
     Repo.delete!(ctx.mapping)
     Repo.delete!(ctx.issue_mapping)
@@ -2085,6 +2366,18 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
       ForgeMirrors.claim_operations("pull-integration", now, 60, 100, ["sync.pull"])
 
     Enum.find(operations, &(&1.id == id)) || flunk("operation was not claimable")
+  end
+
+  defp unsupported_head_fixture(ctx, head_identity) do
+    Repo.update!(Ecto.Changeset.change(ctx.pull, head_repository_id: nil))
+
+    Repo.update!(
+      Ecto.Changeset.change(ctx.mapping,
+        state: :unsupported,
+        provider_identity:
+          Map.put(ctx.mapping.provider_identity, "head_repository", head_identity)
+      )
+    )
   end
 
   defp local_label_provider(ctx, state, now, recovery) do

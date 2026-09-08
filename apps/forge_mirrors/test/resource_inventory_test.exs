@@ -55,6 +55,32 @@ defmodule ForgeMirrors.ResourceInventoryTest do
     assert observation.github_object_id == ordinary.github_object_id
   end
 
+  test "pull head discovery pages unsupported identities only and pins its high water mark",
+       ctx do
+    attrs = %{
+      resource_kind: :pull,
+      local_resource_type: "ForgePulls.PullRequest",
+      state: :unsupported
+    }
+
+    first = mapping(ctx, Map.put(attrs, :github_number, 1))
+    second = mapping(ctx, Map.put(attrs, :github_number, 2))
+    mapping(ctx, %{attrs | state: :confirmed})
+    mapping(ctx, %{attrs | state: :conflicted})
+    assert {:ok, page} = ResourceInventory.page(ctx.binding.id, :pull, nil, 1)
+    assert [observation] = page.observations
+    assert observation.github_object_id == first.github_object_id
+    mapping(ctx, Map.put(attrs, :github_number, 3))
+
+    assert {:ok, %{observations: [last], next_cursor: nil}} =
+             ResourceInventory.page(ctx.binding.id, :pull, page.next_cursor, 1)
+
+    assert last.github_object_id == second.github_object_id
+
+    assert {:error, :invalid_argument} =
+             ResourceInventory.page(ctx.binding.id, :issue, page.next_cursor)
+  end
+
   test "cursor scope and limits are validated before enumeration", ctx do
     mapping(ctx)
     mapping(ctx)

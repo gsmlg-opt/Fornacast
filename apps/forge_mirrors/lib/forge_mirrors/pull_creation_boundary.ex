@@ -188,11 +188,12 @@ defmodule ForgeMirrors.PullCreationBoundary do
 
   def confirm(_, _, _, _, _, _, _), do: {:error, :invalid_argument}
 
-  defp validate_pair(
-         %{head_repository_id: head, pull_eligibility_proof: proof} = expected,
-         %{pull: pull, issue: issue} = observation
-       )
-       when is_map(pull) and is_map(issue) do
+  @doc false
+  def validate_pair(
+        %{head_repository_id: head, pull_eligibility_proof: proof} = expected,
+        %{pull: pull, issue: issue} = observation
+      )
+      when is_map(pull) and is_map(issue) do
     identity = pull[:provider_identity]
 
     valid =
@@ -222,7 +223,7 @@ defmodule ForgeMirrors.PullCreationBoundary do
     if valid, do: :ok, else: {:error, :identity_conflict}
   end
 
-  defp validate_pair(_, _), do: {:error, :invalid_argument}
+  def validate_pair(_, _), do: {:error, :invalid_argument}
 
   defp valid_observation?(value),
     do:

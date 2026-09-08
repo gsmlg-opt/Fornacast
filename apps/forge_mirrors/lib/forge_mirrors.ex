@@ -821,6 +821,7 @@ defmodule ForgeMirrors do
     "sync.pull",
     "sync.issue",
     "sync.issue_comment",
+    "reconcile.repository.pull_heads",
     "reconcile.repository.issues",
     "reconcile.repository.issue_comments"
   ]
@@ -1250,6 +1251,41 @@ defmodule ForgeMirrors do
   def requeue_reconciled_resource_effect(_, _), do: {:error, :invalid_argument}
 
   @doc false
+  def reconcile_pull_head_page(
+        %MirrorOperation{kind: "reconcile.repository.pull_heads"} = operation,
+        %DateTime{} = now
+      ) do
+    with :ok <- validate_utc(now) do
+      Repo.transaction(fn ->
+        with {:ok, persisted, scope} <- lock_resource_operation(operation),
+             true <- persisted.state == :processing and is_nil(persisted.external_effect_marker),
+             true <- persisted.checkpoint["phase"] == "mapped",
+             {:ok, page} <-
+               ForgeMirrors.ResourceInventory.page(
+                 scope.repository_mirror_id,
+                 :pull,
+                 persisted.checkpoint["mapping_cursor"]
+               ),
+             {:ok, result} <-
+               record_resource_reconciliation_page(
+                 persisted,
+                 :pull,
+                 page.observations,
+                 page.next_cursor,
+                 now
+               ) do
+          result
+        else
+          {:error, reason} -> Repo.rollback(reason)
+          _ -> Repo.rollback(:invalid_transition)
+        end
+      end)
+    end
+  end
+
+  def reconcile_pull_head_page(_, _), do: {:error, :invalid_argument}
+
+  @doc false
   def record_resource_reconciliation_page(
         %MirrorOperation{} = operation,
         kind,
@@ -1257,7 +1293,7 @@ defmodule ForgeMirrors do
         next_page,
         %DateTime{} = now
       )
-      when kind in [:issue, :issue_comment] and is_list(observations) and
+      when kind in [:issue, :issue_comment, :pull] and is_list(observations) and
              length(observations) <= 100 do
     with :ok <- validate_utc(now),
          true <- Enum.all?(observations, &valid_resource_observation?/1) do
@@ -1698,6 +1734,66 @@ defmodule ForgeMirrors do
   @doc false
   def remote_pull_creation_context(operation),
     do: ForgeMirrors.PullCreationBoundary.context(operation, &lock_pull_creation_operation/1)
+
+  @doc false
+  def unsupported_pull_context(operation),
+    do: ForgeMirrors.PullHeadReevaluation.context(operation, &lock_pull_reevaluation_operation/1)
+
+  @doc false
+  def resolve_unsupported_pull_head(operation, pair, observation),
+    do:
+      ForgeMirrors.PullHeadReevaluation.resolve(
+        operation,
+        pair,
+        observation,
+        &lock_pull_reevaluation_operation/1
+      )
+
+  @doc false
+  def pin_unsupported_pull_head(operation, now, pair, observation),
+    do:
+      ForgeMirrors.PullHeadReevaluation.pin(
+        operation,
+        now,
+        pair,
+        observation,
+        &lock_pull_reevaluation_operation/1,
+        &finish_pull_reevaluation_operation/3
+      )
+
+  @doc false
+  def confirm_unsupported_pull_head(operation, now, expected, observation),
+    do:
+      ForgeMirrors.PullHeadReevaluation.confirm(
+        operation,
+        now,
+        expected,
+        observation,
+        &lock_pull_reevaluation_operation/1,
+        &finish_pull_reevaluation_operation/3
+      )
+
+  defp lock_pull_reevaluation_operation(operation) do
+    with {:ok, persisted, scope} <- lock_pull_creation_operation(operation),
+         {:ok, mapping} <- resource_mapping(persisted, :pull) do
+      {:ok, persisted, Map.put(scope, :reevaluation_mapping, mapping)}
+    else
+      {:error, :invalid_pull_mapping} -> {:error, :unsupported_pull_unavailable}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp finish_pull_reevaluation_operation(operation, now, :completed),
+    do: complete_pull_creation_operation(operation, now)
+
+  defp finish_pull_reevaluation_operation(operation, now, :pending),
+    do:
+      owned_transition(operation, DateTime.truncate(now, :second), [:processing],
+        state: :pending,
+        next_attempt_at: DateTime.truncate(now, :second),
+        lease_owner: nil,
+        lease_expires_at: nil
+      )
 
   @doc false
   def resolve_remote_pull_head(operation, identity, snapshot),
@@ -2482,7 +2578,7 @@ defmodule ForgeMirrors do
 
     kind =
       case operation.kind do
-        "sync.pull" -> :pull
+        kind when kind in ["sync.pull", "reconcile.repository.pull_heads"] -> :pull
         kind when kind in ["sync.issue", "reconcile.repository.issues"] -> :issue
         _ -> :issue_comment
       end
@@ -2638,7 +2734,11 @@ defmodule ForgeMirrors do
   defp resource_type(:pull), do: "ForgePulls.PullRequest"
 
   defp valid_resource_sweep?(%{kind: kind, cursor: cursor, checkpoint: checkpoint} = operation)
-       when kind in ["reconcile.repository.issues", "reconcile.repository.issue_comments"] do
+       when kind in [
+              "reconcile.repository.issues",
+              "reconcile.repository.issue_comments",
+              "reconcile.repository.pull_heads"
+            ] do
     cursor["trigger"] == "reconcile" and cursor["since"] == "1970-01-01T00:00:00Z" and
       cursor["page"] == 1 and match?({:ok, _}, Ecto.UUID.cast(cursor["sweep_id"])) and
       is_integer(checkpoint["page"] || 1) and (checkpoint["page"] || 1) in 1..1_000_000 and
@@ -6348,6 +6448,93 @@ defmodule ForgeMirrors do
 
   def enqueue_repository_resource_reconciliations(_, _, _), do: {:error, :invalid_argument}
 
+  @doc false
+  def enqueue_repository_pull_head_reconciliation(
+        %RepositoryMirror{} = supplied,
+        sweep_key,
+        %DateTime{} = now
+      )
+      when is_binary(sweep_key) and byte_size(sweep_key) in 1..255 do
+    with :ok <- validate_utc(now) do
+      Repo.transaction(fn ->
+        organization =
+          Repo.one(
+            from m in OrganizationMirror,
+              where: m.id == ^supplied.organization_mirror_id,
+              lock: "FOR UPDATE"
+          )
+
+        binding =
+          Repo.one(from m in RepositoryMirror, where: m.id == ^supplied.id, lock: "FOR UPDATE")
+
+        with %OrganizationMirror{provider: "github", state: state} <- organization,
+             true <-
+               state in [:bootstrapping, :catching_up, :active, :degraded, :conflicted, :paused],
+             %RepositoryMirror{inventory_included: true, state: binding_state} <- binding,
+             true <- binding_state in [:discovered, :active],
+             true <-
+               binding.organization_mirror_id == organization.id and
+                 binding.repository_id == supplied.repository_id,
+             {:ok, repository} <- ForgeRepos.fetch_live_repository(binding.repository_id),
+             true <-
+               repository.lifecycle in [:ready, :synchronizing] and
+                 repository.owner_user_id == organization.organization_id do
+          if issue_capability_enabled?(organization, "pull_request") do
+            {:ok, digest} =
+              resource_fingerprint(%{
+                "sweep_key" => sweep_key,
+                "item_id" => binding.bootstrap_repository_item_id,
+                "kind" => "pull_heads"
+              })
+
+            key = "pull-head-sweep:#{binding.id}:#{digest}"
+
+            case Repo.get_by(MirrorOperation, dedupe_key: key) do
+              %MirrorOperation{} = operation ->
+                operation
+
+              nil ->
+                case enqueue_operation(%{
+                       organization_mirror_id: organization.id,
+                       repository_mirror_id: binding.id,
+                       kind: "reconcile.repository.pull_heads",
+                       dedupe_key: key,
+                       cursor: %{
+                         "trigger" => "reconcile",
+                         "resource_kind" => "pull",
+                         "since" => "1970-01-01T00:00:00Z",
+                         "page" => 1,
+                         "sweep_id" => Ecto.UUID.generate(),
+                         "sweep_key" => sweep_key,
+                         "bootstrap_repository_item_id" => binding.bootstrap_repository_item_id
+                       },
+                       next_attempt_at: now
+                     }) do
+                  {:ok, operation} ->
+                    case operation
+                         |> Ecto.Changeset.change(
+                           checkpoint: %{"phase" => "mapped", "mapping_cursor" => nil}
+                         )
+                         |> Repo.update() do
+                      {:ok, operation} -> operation
+                      {:error, reason} -> Repo.rollback(reason)
+                    end
+
+                  {:error, reason} ->
+                    Repo.rollback(reason)
+                end
+            end
+          end
+        else
+          _ -> Repo.rollback(:invalid_transition)
+        end
+      end)
+    end
+  end
+
+  def enqueue_repository_pull_head_reconciliation(_, _, _),
+    do: {:error, :invalid_argument}
+
   defp resource_sweep_kinds(organization) do
     issues = issue_capability_enabled?(organization, "issue")
     pulls = issue_capability_enabled?(organization, "pull_request")
@@ -6389,8 +6576,22 @@ defmodule ForgeMirrors do
                  "inventory:#{sweep_marker}",
                  now
                ) do
-            {:ok, metadata} -> {:cont, {:ok, Enum.reverse(metadata) ++ [operation | operations]}}
-            {:error, reason} -> {:halt, {:error, reason}}
+            {:ok, metadata} ->
+              case enqueue_repository_pull_head_reconciliation(
+                     binding,
+                     "inventory:#{sweep_marker}",
+                     now
+                   ) do
+                {:ok, pull_heads} ->
+                  scheduled = metadata ++ if(pull_heads, do: [pull_heads], else: [])
+                  {:cont, {:ok, Enum.reverse(scheduled) ++ [operation | operations]}}
+
+                {:error, reason} ->
+                  {:halt, {:error, reason}}
+              end
+
+            {:error, reason} ->
+              {:halt, {:error, reason}}
           end
 
         {:error, reason} ->

@@ -30,7 +30,7 @@ defmodule ForgeGitHub.PullSyncWorker do
 
   alias ForgeMirrors.{MirrorOperation, PullEligibility, ResourceDecision}
 
-  @operation_kinds ["sync.pull"]
+  @operation_kinds ["sync.pull", "reconcile.repository.pull_heads"]
   @mutable_fields ~w(title body state state_reason draft)
   @issue_fields ~w(title body state state_reason)
   @ref_fields ~w(head_ref head_sha base_ref base_sha)
@@ -116,6 +116,18 @@ defmodule ForgeGitHub.PullSyncWorker do
   @doc false
   @spec process_operation(MirrorOperation.t(), DateTime.t(), keyword()) :: term()
   def process_operation(
+        %MirrorOperation{kind: "reconcile.repository.pull_heads", state: :processing} = operation,
+        %DateTime{} = now,
+        options
+      )
+      when is_list(options) do
+    callback(options, :reconcile_pull_heads, &ForgeMirrors.reconcile_pull_head_page/2).(
+      operation,
+      now
+    )
+  end
+
+  def process_operation(
         %MirrorOperation{kind: "sync.pull", state: state} = operation,
         %DateTime{} = now,
         options
@@ -123,6 +135,9 @@ defmodule ForgeGitHub.PullSyncWorker do
       when state in [:processing, :effect_pending] and is_list(options) do
     with {:ok, sync} <- context(operation, options) do
       case Map.get(sync, :mode) do
+        :unsupported_head ->
+          reevaluate_unsupported_head(operation, now, sync, options)
+
         :mapped_label_recovery ->
           recover_mapped_local_label(operation, now, sync, options)
 
@@ -340,15 +355,25 @@ defmodule ForgeGitHub.PullSyncWorker do
     end
   end
 
-  defp legacy_or_processing_context(operation) do
+  defp legacy_or_processing_context(%{state: :processing} = operation) do
+    case ForgeMirrors.unsupported_pull_context(operation) do
+      {:ok, context} ->
+        {:ok, Map.merge(context.sync, %{mode: :unsupported_head, unsupported_context: context})}
+
+      {:error, :unsupported_pull_unavailable} ->
+        legacy_resource_context(operation)
+
+      error ->
+        error
+    end
+  end
+
+  defp legacy_or_processing_context(operation), do: legacy_resource_context(operation)
+
+  defp legacy_resource_context(operation) do
     case ForgeMirrors.resource_operation_context(operation) do
       {:error, :invalid_pull_mapping} ->
-        if operation.cursor["trigger"] == "local" do
-          with {:ok, context} <- ForgeMirrors.outbound_pull_creation_context(operation),
-               do: {:ok, Map.put(context, :mode, :outbound_create)}
-        else
-          ForgeMirrors.remote_pull_creation_context(operation)
-        end
+        missing_pull_context(operation)
 
       {:ok, _sync} when operation.state == :processing ->
         ForgeMirrors.mapped_pull_pair_context(operation)
@@ -357,6 +382,116 @@ defmodule ForgeGitHub.PullSyncWorker do
         result
     end
   end
+
+  defp missing_pull_context(operation) do
+    if operation.cursor["trigger"] == "local" do
+      with {:ok, context} <- ForgeMirrors.outbound_pull_creation_context(operation),
+           do: {:ok, Map.put(context, :mode, :outbound_create)}
+    else
+      ForgeMirrors.remote_pull_creation_context(operation)
+    end
+  end
+
+  defp reevaluate_unsupported_head(operation, now, sync, options) do
+    context = sync.unsupported_context
+
+    with {:ok, token} <- installation_token(sync, options),
+         {:ok, observed} <- unsupported_head_observation(sync, token, options) do
+      if is_nil(context.provider_identity["head_repository"]) and
+           not is_nil(observed.pull.provider_identity["head_repository"]) do
+        ForgeMirrors.pin_unsupported_pull_head(operation, now, context.pair, observed)
+      else
+        with {:ok, head} <-
+               ForgeMirrors.resolve_unsupported_pull_head(operation, context.pair, observed) do
+          expected =
+            Map.merge(Map.take(head, [:head_repository_id, :pull_eligibility_proof]), %{
+              pair: context.pair
+            })
+
+          with_ref_fences(head.git_proof, fn ->
+            ForgeMirrors.confirm_unsupported_pull_head(operation, now, expected, observed)
+          end)
+        end
+      end
+      |> case do
+        {:error, reason} -> unsupported_head_failure(operation, now, reason, options)
+        result -> result
+      end
+    else
+      {:error, reason} -> unsupported_head_failure(operation, now, reason, options)
+    end
+  end
+
+  defp unsupported_head_failure(operation, now, reason, options)
+       when reason in [:identity_conflict, :invalid_observation, :inconsistent_observation],
+       do: persist_failure(operation, now, :invalid_remote_resource, options)
+
+  defp unsupported_head_failure(operation, now, reason, options),
+    do: persist_failure(operation, now, reason, options)
+
+  defp unsupported_head_observation(sync, token, options) do
+    with {:ok, pull} <-
+           callback(options, :get_pull, &PullClient.get_pull/5).(
+             token,
+             sync.remote_owner,
+             sync.remote_repository,
+             sync.github_number,
+             request_options(sync)
+           ),
+         {:ok, issue} <-
+           callback(options, :get_pull_issue, &IssueClient.get_pull_issue/5).(
+             token,
+             sync.remote_owner,
+             sync.remote_repository,
+             sync.github_number,
+             request_options(sync)
+           ),
+         {:ok, scalar} <- inbound_preflight(pull, issue),
+         {:ok, identity} <- provider_identity(scalar),
+         {:ok, labels} <- observed_relationship_ids(issue["labels"]),
+         {:ok, assignees} <- observed_relationship_ids(issue["assignees"]) do
+      # Re-evaluation compares canonical provider ID sets without importing labels
+      # or observing authors/assignees. The locked boundary proves continuity.
+      {:ok,
+       %{
+         pull: %{
+           github_object_id: scalar.github_object_id,
+           github_node_id: scalar.github_node_id,
+           github_number: scalar.github_number,
+           remote_updated_at: scalar.remote_updated_at,
+           confirmed_snapshot: scalar.snapshot,
+           confirmed_merge_state: persistent_merge_state(scalar.merge_state),
+           provider_identity: identity
+         },
+         issue: %{
+           github_object_id: scalar.github_issue_object_id,
+           github_node_id: scalar.github_issue_node_id,
+           github_number: scalar.github_number,
+           remote_updated_at: scalar.issue_remote_updated_at,
+           confirmed_snapshot:
+             Map.merge(
+               Map.take(scalar.snapshot, @issue_fields),
+               %{"label_github_ids" => labels, "assignee_github_ids" => assignees}
+             )
+         }
+       }}
+    end
+  end
+
+  defp observed_relationship_ids(values) when is_list(values) and length(values) <= 512 do
+    if Enum.all?(values, &is_map/1) do
+      ids = Enum.map(values, & &1["id"])
+
+      if Enum.all?(ids, &(is_integer(&1) and &1 in 1..9_223_372_036_854_775_807)) and
+           length(Enum.uniq(ids)) == length(ids),
+         do: {:ok, Enum.sort(ids)},
+         else: {:error, :invalid_remote_resource}
+    else
+      {:error, :invalid_remote_resource}
+    end
+  end
+
+  defp observed_relationship_ids(_), do: {:error, :invalid_remote_resource}
 
   defp create_inbound(operation, now, sync, options) do
     with {:ok, token} <- installation_token(sync, options),
@@ -3050,6 +3185,9 @@ defmodule ForgeGitHub.PullSyncWorker do
 
   defp failure(:unsupported_resource),
     do: {:fail, "unsupported_resource", "pull request cannot be represented locally"}
+
+  defp failure(:unsupported_metadata_conflict),
+    do: {:fail, "local_validation", "read-only pull metadata differs from confirmed baseline"}
 
   defp failure(:unsupported_operation),
     do: {:fail, "unsupported_resource", "unsupported operation"}

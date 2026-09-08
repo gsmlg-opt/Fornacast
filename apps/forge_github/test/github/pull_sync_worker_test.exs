@@ -19,6 +19,17 @@ defmodule ForgeGitHub.PullSyncWorkerTest do
     "base_sha" => @base_sha
   }
 
+  test "routes a pull-head reconciliation page without provider or mapped pull observation" do
+    operation = %MirrorOperation{kind: "reconcile.repository.pull_heads", state: :processing}
+
+    assert {:ok, :page_recorded} =
+             PullSyncWorker.process_operation(operation, @now,
+               reconcile_pull_heads: fn ^operation, @now -> {:ok, :page_recorded} end,
+               context: fn _ -> flunk("page must not load a pull context") end,
+               token_fetch: fn _, _ -> flunk("page must not request a token") end
+             )
+  end
+
   test "routes both first creation and recovery without observing a mapped pull" do
     for state <- [:processing, :effect_pending] do
       operation = operation(state)

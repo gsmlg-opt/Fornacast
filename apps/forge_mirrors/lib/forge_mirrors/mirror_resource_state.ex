@@ -63,6 +63,32 @@ defmodule ForgeMirrors.MirrorResourceState do
     |> validate_identity()
   end
 
+  @doc false
+  def reveal_head_changeset(state, head) do
+    changeset = persistence_changeset(state, %{lock_version: state.lock_version + 1})
+
+    case {state, head} do
+      {%{
+         resource_kind: :pull,
+         state: :unsupported,
+         provider_identity: %{"head_repository" => nil} = identity
+       }, %{"id" => id, "node_id" => node}}
+      when map_size(head) == 2 ->
+        if is_integer(id) and id in 1..9_223_372_036_854_775_807 and
+             is_binary(node) and byte_size(node) in 1..255 and String.valid?(node) and
+             String.trim(node) == node and not String.contains?(node, <<0>>) do
+          changeset
+          |> put_change(:provider_identity, Map.put(identity, "head_repository", head))
+          |> validate_change(:provider_identity, &validate_metadata/2)
+        else
+          add_error(changeset, :provider_identity, "invalid head identity")
+        end
+
+      _ ->
+        add_error(changeset, :provider_identity, "head identity is immutable")
+    end
+  end
+
   defp immutable_provider_identity(changeset, %{provider_identity: identity})
        when not is_nil(identity) do
     if get_field(changeset, :provider_identity) == identity,

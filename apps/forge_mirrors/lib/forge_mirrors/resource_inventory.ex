@@ -9,7 +9,8 @@ defmodule ForgeMirrors.ResourceInventory do
 
   Confirmed mappings and unfinished provider-bound mappings are eligible.
   Local-only pending rows, tombstones, conflicts and unsupported resources are
-  not remote discovery candidates. The coordinator owns authorization, leases
+  not remote discovery candidates for issues and comments. Pull head discovery
+  instead selects only unsupported pulls. The coordinator owns authorization, leases
   and durable checkpointing; this module performs no mutations or HTTP calls.
   """
   import Ecto.Query
@@ -21,13 +22,13 @@ defmodule ForgeMirrors.ResourceInventory do
   defguardp valid_id(id) when is_integer(id) and id > 0 and id <= @max_id
   defguardp valid_cursor_id(id) when is_integer(id) and id >= 0 and id <= @max_id
 
-  @spec page(pos_integer(), :issue | :issue_comment, map() | nil, 1..100) ::
+  @spec page(pos_integer(), :issue | :issue_comment | :pull, map() | nil, 1..100) ::
           {:ok, %{observations: [map()], next_cursor: map() | nil}}
           | {:error, :invalid_argument | :unbound_repository | :invalid_mapping}
   def page(repository_mirror_id, kind, cursor \\ nil, limit \\ 100)
 
   def page(repository_mirror_id, kind, cursor, limit)
-      when valid_id(repository_mirror_id) and kind in [:issue, :issue_comment] and
+      when valid_id(repository_mirror_id) and kind in [:issue, :issue_comment, :pull] and
              is_integer(limit) and limit in 1..100 do
     with {:ok, {after_id, through_id}} <- bounds(cursor, repository_mirror_id, kind),
          %RepositoryMirror{repository_id: repository_id} when valid_id(repository_id) <-
@@ -37,10 +38,17 @@ defmodule ForgeMirrors.ResourceInventory do
           as: :mapping,
           where:
             mapping.repository_mirror_id == ^repository_mirror_id and
-              mapping.resource_kind == ^kind,
-          where:
-            mapping.state == :confirmed or
-              (mapping.state == :pending and not is_nil(mapping.github_object_id))
+              mapping.resource_kind == ^kind
+
+      query =
+        if kind == :pull do
+          from mapping in query, where: mapping.state == :unsupported
+        else
+          from mapping in query,
+            where:
+              mapping.state == :confirmed or
+                (mapping.state == :pending and not is_nil(mapping.github_object_id))
+        end
 
       query =
         if kind == :issue do
@@ -137,6 +145,7 @@ defmodule ForgeMirrors.ResourceInventory do
 
   defp local_type(:issue), do: "ForgeIssues.Issue"
   defp local_type(:issue_comment), do: "ForgeIssues.Comment"
+  defp local_type(:pull), do: "ForgePulls.PullRequest"
   defp valid_timestamp?(nil), do: true
   defp valid_timestamp?(%DateTime{utc_offset: 0, std_offset: 0}), do: true
   defp valid_timestamp?(_), do: false

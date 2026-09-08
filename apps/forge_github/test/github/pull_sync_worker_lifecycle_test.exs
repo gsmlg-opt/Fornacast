@@ -34,7 +34,11 @@ defmodule ForgeGitHub.PullSyncWorkerLifecycleTest do
           owner: "pull-lifecycle-test",
           interval_ms: 10,
           task_supervisor: supervisor,
-          claim: fn "pull-lifecycle-test", %DateTime{}, 60, 2, ["sync.pull"] ->
+          claim: fn "pull-lifecycle-test",
+                    %DateTime{},
+                    60,
+                    2,
+                    ["sync.pull", "reconcile.repository.pull_heads"] ->
             send(parent, :pull_claimed)
             {:ok, []}
           end

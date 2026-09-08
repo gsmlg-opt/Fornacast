@@ -219,7 +219,8 @@ defmodule ForgeMirrors.PullPairBoundary do
        else: {:error, :paired_identity_mismatch}
   end
 
-  defp baselines(pull, issue) do
+  @doc false
+  def baselines(pull, issue) do
     p = pull.confirmed_snapshot
     i = issue.confirmed_snapshot
 
@@ -285,7 +286,8 @@ defmodule ForgeMirrors.PullPairBoundary do
             snapshot["state_reason"] in [nil, "completed", "not_planned"]))
   end
 
-  defp view(mapping) do
+  @doc false
+  def view(mapping) do
     with {:ok, fingerprint} <- ForgeMirrors.resource_fingerprint(mapping.confirmed_snapshot),
          true <-
            is_nil(mapping.confirmed_fingerprint) or mapping.confirmed_fingerprint == fingerprint do

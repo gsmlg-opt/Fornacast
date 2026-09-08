@@ -43,6 +43,12 @@ defmodule ForgeMirrors.PullHeadResolution do
 
   def resolve(_, _, _, _), do: {:error, :identity_conflict}
 
+  @doc false
+  def resolve_existing(scope, identity, snapshot) do
+    with :ok <- validate(identity, snapshot),
+         do: resolve_locked(scope, identity.provider_identity, snapshot)
+  end
+
   defp resolve_locked(scope, identity, snapshot) do
     base = Repo.get!(RepositoryMirror, scope.repository_mirror_id)
     head_identity = identity["head_repository"]

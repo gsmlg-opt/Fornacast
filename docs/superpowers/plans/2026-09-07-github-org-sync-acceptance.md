@@ -10,6 +10,35 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 read-only head reevaluation and discovery (2026-09-08)
+
+- Unsupported pulls now have a leased coordinator and worker path. An explicitly
+  unknown provider head may be revealed once from authenticated paired evidence;
+  that claim yields without changing domain state or confirmed baselines. A
+  separate claim may bind the immutable head to an active local mirror only
+  under fresh Git ref/OID fences and exact paired local/provider metadata proof.
+- Representation advances the canonical domain version and both mapping versions
+  atomically while retaining snapshots, provider identities, and remote timestamps.
+  Changed local or remote metadata, including still-opaque head observations, is
+  not silently acknowledged or rebased: the worker records a terminal validation
+  failure with an explicit read-only metadata mismatch detail.
+- Sorted, bounded, nonblocking merge-reservation guards cover base and head;
+  busy guards, revoked access, stale leases, substituted identities, unavailable
+  refs, and malformed unsupported mappings cannot promote the pull.
+- Completed organization inventory schedules idempotent pull-head discovery.
+  Its database-only pages enumerate at most 100 unsupported mappings with a
+  scoped high-water cursor, yielding ordinary pull reconciliation children.
+  This does not add a bootstrap activation requirement. A real local integration
+  test covers discovery through representation without a webhook.
+- Final combined scoped PostgreSQL verification: **401 passed** (issues 11,
+  mirrors 178, pull domain 9, provider 201, API 1, HTML 1). This includes existing
+  paired metadata, creation, relationship/label recovery, and read-only rendering
+  regressions. Provider HTTP is stubbed; Git repositories and database boundaries
+  are real. Existing unrelated importer fixture warnings remain unchanged.
+- This closes the locally verified reevaluation gap described below, not PR13
+  merge orchestration, overall activation, PR14–16, or full PRD acceptance.
+  No push, deployment, or live GitHub write validation occurred.
+
 ### PR13 explicit unknown-head import (2026-09-08)
 
 - Pull transport and projection accept explicit `head.repo: null` while rejecting
@@ -26,7 +55,8 @@ remain open.
   retains null head repository/user without borrowing the base identity; the UI
   identifies read-only external pulls and omits merge/comment controls. Ten-file
   formatting, diff checks and focused review passed.
-- Reevaluation remains open: the existing `ForgePulls.HeadRepresentation` domain
+- At this checkpoint reevaluation remained open (now addressed by the section
+  above): the existing `ForgePulls.HeadRepresentation` domain
   transition has no mirror coordinator/worker path. That path must validate the
   unsupported pull and canonical issue pair, prove fresh immutable head identity
   and active refs, and bind head identity atomically without silently confirming
