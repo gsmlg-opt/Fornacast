@@ -56,6 +56,16 @@ PR13 integration audit additionally identified these concrete remaining gates:
 
 ## Current local verification
 
+- `5a78ec6` persists immutable outbound pull-create intents and implements paired
+  identification/confirmation. A committed first marker alone grants creation;
+  recovery and different operations cannot obtain a second grant. PostgreSQL
+  constraints preserve bounded full bodies and unresolved intent reservations.
+  Confirmation stores the original intent version in both mappings while newer
+  local metadata survives. Review regressions reject generic evidence clearing
+  and callback relationship mutations. Fresh verification passed 47 scoped tests
+  (29 admission/finalization, 18 recovery/client), with all seven changed files
+  format-checked. Provider POST/scan/cleanup orchestration and live ref fencing
+  remain caller obligations and are not yet integrated into outbound creation.
 - `7534f74` adds bounded, observation-only outbound pull-create recovery. The
   scanner retains candidate identities across pages, requires a complete scan,
   and treats zero or multiple UUID matches as ambiguous; it never grants another
