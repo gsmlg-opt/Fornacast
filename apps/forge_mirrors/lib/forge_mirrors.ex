@@ -1576,20 +1576,157 @@ defmodule ForgeMirrors do
 
   @doc false
   def confirm_label_for_resource_operation(
-        %MirrorOperation{} = operation,
-        %DateTime{} = now,
+        operation,
+        now,
         expected,
         confirmation,
         domain_multi_fun
-      )
+      ),
+      do:
+        confirm_label_operation(
+          operation,
+          now,
+          expected,
+          confirmation,
+          domain_multi_fun,
+          &lock_resource_operation/1
+        )
+
+  @doc false
+  def confirm_remote_pull_label(operation, now, expected, confirmation, domain_multi_fun)
       when is_map(expected) and is_map(confirmation) and is_function(domain_multi_fun, 1) do
+    if expected[:resource_state_lock_version] == :missing and
+         is_nil(expected[:effect_marker]) and is_nil(expected[:local_label_id]) and
+         is_nil(expected[:expected_local_version]) and
+         is_nil(expected[:expected_local_fingerprint]) and
+         positive_resource_id?(expected[:github_object_id]) and
+         expected.github_object_id == confirmation[:github_object_id] do
+      guarded = fn multi ->
+        multi
+        |> Ecto.Multi.run(:remote_pull_label_admission, fn repo, _ ->
+          with {:ok, _persisted, scope} <- lock_remote_pull_label_operation(operation) do
+            {:ok, remote_pull_label_admission(repo, scope.repository_id)}
+          end
+        end)
+        |> Ecto.Multi.merge(fn _ -> domain_multi_fun.(Ecto.Multi.new()) end)
+        |> Ecto.Multi.run(:remote_pull_label_projection, fn repo, changes ->
+          with :ok <-
+                 verify_remote_pull_label(
+                   repo,
+                   changes[:resource],
+                   changes.remote_pull_label_admission
+                 ),
+               do: {:ok, :verified}
+        end)
+      end
+
+      confirm_label_operation(
+        operation,
+        now,
+        expected,
+        confirmation,
+        guarded,
+        &lock_remote_pull_label_operation/1
+      )
+    else
+      {:error, :invalid_argument}
+    end
+  end
+
+  def confirm_remote_pull_label(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  defp lock_remote_pull_label_operation(operation) do
+    with {:ok, _context} <- remote_pull_creation_context(operation),
+         {:ok, persisted, scope} <- lock_pull_creation_operation(operation),
+         do: {:ok, persisted, scope}
+  end
+
+  defp remote_pull_label_admission(repo, repository_id) do
+    %{
+      repository_id: repository_id,
+      label:
+        repo.one(
+          from l in "repository_labels",
+            where: l.repository_id == ^repository_id,
+            select: max(l.id)
+        ) || 0,
+      issue:
+        repo.one(from i in "issues", where: i.repository_id == ^repository_id, select: max(i.id)) ||
+          0,
+      pull:
+        repo.one(
+          from p in "pull_requests", where: p.repository_id == ^repository_id, select: max(p.id)
+        ) || 0
+    }
+  end
+
+  defp verify_remote_pull_label(repo, projection, before) when is_map(projection) do
+    id = projection[:local_resource_id]
+
+    with true <- positive_resource_id?(id),
+         %{id: ^id, repository_id: repository_id, sync_version: version} = label <-
+           repo.one(
+             from l in "repository_labels",
+               where: l.id == ^id and l.repository_id == ^before.repository_id,
+               select: %{
+                 id: l.id,
+                 repository_id: l.repository_id,
+                 sync_version: l.sync_version,
+                 name: l.name,
+                 color: l.color,
+                 description: l.description
+               },
+               lock: "FOR UPDATE"
+           ),
+         true <-
+           projection[:repository_id] == repository_id and projection[:local_version] == version and
+             projection[:fields] == %{
+               "name" => label.name,
+               "color" => label.color,
+               "description" => label.description
+             },
+         new_labels <-
+           repo.all(
+             from l in "repository_labels",
+               where: l.repository_id == ^repository_id and l.id > ^before.label,
+               order_by: l.id,
+               limit: 2,
+               select: l.id
+           ),
+         true <- new_labels == if(id > before.label, do: [id], else: []),
+         false <-
+           repo.exists?(
+             from i in "issues", where: i.repository_id == ^repository_id and i.id > ^before.issue
+           ),
+         false <-
+           repo.exists?(
+             from p in "pull_requests",
+               where: p.repository_id == ^repository_id and p.id > ^before.pull
+           ) do
+      :ok
+    else
+      _ -> {:error, :invalid_projection}
+    end
+  end
+
+  defp verify_remote_pull_label(_, _, _), do: {:error, :invalid_projection}
+
+  defp confirm_label_operation(
+         %MirrorOperation{} = operation,
+         %DateTime{} = now,
+         expected,
+         confirmation,
+         domain_multi_fun,
+         lock_fun
+       )
+       when is_map(expected) and is_map(confirmation) and is_function(domain_multi_fun, 1) do
     with :ok <- validate_utc(now),
          {:ok, fingerprint} <- resource_fingerprint(confirmation[:confirmed_snapshot]),
          true <-
            positive_resource_id?(confirmation[:github_object_id]) and
              bounded_trimmed_string?(confirmation[:github_node_id], 255) do
       Repo.transaction(fn ->
-        with {:ok, persisted, scope} <- lock_resource_operation(operation),
+        with {:ok, persisted, _scope} <- lock_fun.(operation),
              {:ok, mapping} <-
                label_operation_mapping(persisted, expected, confirmation.github_object_id),
              :ok <- label_mapping_expected(persisted, mapping, expected),
@@ -1597,6 +1734,10 @@ defmodule ForgeMirrors do
              true <- label_identity_compatible?(mapping, confirmation),
              {:ok, %{resource: projection}} <-
                Repo.transaction(domain_multi_fun.(Ecto.Multi.new())),
+             {:ok, persisted, scope} <- lock_fun.(operation),
+             {:ok, current_mapping} <-
+               label_operation_mapping(persisted, expected, confirmation.github_object_id),
+             true <- current_mapping == mapping,
              :ok <- validate_label_projection(projection, scope, expected),
              true <-
                is_nil(mapping_value(mapping, :local_resource_id)) or
@@ -1621,6 +1762,7 @@ defmodule ForgeMirrors do
                  lock_version: (mapping_value(mapping, :lock_version) || 0) + 1
                })
                |> Repo.insert_or_update(),
+             {:ok, persisted, _scope} <- lock_fun.(operation),
              {:ok, parent} <-
                owned_transition(persisted, now, [persisted.state],
                  state: :pending,
@@ -1646,7 +1788,7 @@ defmodule ForgeMirrors do
     end
   end
 
-  def confirm_label_for_resource_operation(_, _, _, _, _), do: {:error, :invalid_argument}
+  defp confirm_label_operation(_, _, _, _, _, _), do: {:error, :invalid_argument}
 
   @doc false
   def mark_label_effect_for_resource_operation(

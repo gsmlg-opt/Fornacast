@@ -333,6 +333,88 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     assert_confirmed(ctx, operation, target, 2)
   end
 
+  test "unknown remote labels yield one per claim on the same inbound parent", ctx do
+    Repo.delete!(ctx.mapping)
+    now = DateTime.utc_now(:second)
+    operation = remote_operation(ctx, now)
+
+    label = %{
+      "id" => 333,
+      "node_id" => "LA_333",
+      "name" => "remote-label",
+      "color" => "abcdef",
+      "description" => "Discovered with pull"
+    }
+
+    second_label = %{label | "id" => 334, "node_id" => "LA_334", "name" => "another-label"}
+
+    Req.Test.expect(ctx.stub, 6, fn conn ->
+      assert conn.method == "GET"
+
+      case conn.request_path do
+        "/repos/acme/project/pulls/7" ->
+          Req.Test.json(conn, pull_json(ctx.baseline, now))
+
+        "/repos/acme/project/issues/7" ->
+          Req.Test.json(
+            conn,
+            Map.put(issue_json(ctx.baseline, now), "labels", [label, second_label])
+          )
+      end
+    end)
+
+    worker_options = Keyword.delete(options(ctx), :remote_relationships)
+
+    assert {:ok, %{operation: %{state: :pending, id: id}}} =
+             PullSyncWorker.process_operation(operation, now, worker_options)
+
+    assert id == operation.id
+
+    refute Repo.get_by(MirrorResourceState,
+             repository_mirror_id: ctx.base.id,
+             resource_kind: :pull,
+             github_object_id: 802
+           )
+
+    label_mapping =
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: ctx.base.id,
+        resource_kind: :label,
+        github_object_id: 333
+      )
+
+    assert Repo.get!(ForgeIssues.Label, label_mapping.local_resource_id).name == "remote-label"
+
+    refute Repo.get_by(MirrorResourceState,
+             repository_mirror_id: ctx.base.id,
+             resource_kind: :label,
+             github_object_id: 334
+           )
+
+    assert {:ok, %{operation: %{state: :pending, id: ^id}}} =
+             PullSyncWorker.process_operation(claim(id, now), now, worker_options)
+
+    second_mapping =
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: ctx.base.id,
+        resource_kind: :label,
+        github_object_id: 334
+      )
+
+    assert {:ok, %{operation: %{state: :completed}, resource: created}} =
+             PullSyncWorker.process_operation(claim(id, now), now, worker_options)
+
+    assert Repo.get_by!(ForgeIssues.IssueLabel,
+             issue_id: created.issue_id,
+             label_id: label_mapping.local_resource_id
+           )
+
+    assert Repo.get_by!(ForgeIssues.IssueLabel,
+             issue_id: created.issue_id,
+             label_id: second_mapping.local_resource_id
+           )
+  end
+
   test "real outbound issue and draft effects use distinct durable markers before confirmation",
        ctx do
     now = DateTime.utc_now(:second)

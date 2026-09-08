@@ -299,8 +299,54 @@ defmodule ForgeGitHub.PullSyncWorker do
            end) do
       {:ok, result}
     else
-      false -> persist_failure(operation, now, :invalid_remote_resource, options)
+      false ->
+        persist_failure(operation, now, :invalid_remote_resource, options)
+
+      {:error, {:unmapped_label, candidate}} ->
+        import_inbound_label(operation, now, sync, candidate, options)
+
+      {:error, reason} ->
+        persist_failure(operation, now, reason, options)
+    end
+  end
+
+  defp import_inbound_label(operation, now, sync, candidate, options) do
+    fields = %{
+      "name" => candidate.name,
+      "color" => candidate.color,
+      "description" => candidate.description
+    }
+
+    expected = %{
+      resource_state_lock_version: :missing,
+      local_label_id: nil,
+      expected_local_version: nil,
+      expected_local_fingerprint: nil,
+      github_object_id: candidate.github_object_id,
+      effect_marker: nil
+    }
+
+    confirmation = %{
+      github_object_id: candidate.github_object_id,
+      github_node_id: candidate.node_id,
+      confirmed_snapshot: fields
+    }
+
+    request = %{
+      repository_id: sync.repository_id,
+      fields: fields,
+      provenance: provenance(sync, operation)
+    }
+
+    case ForgeMirrors.confirm_remote_pull_label(
+           operation,
+           now,
+           expected,
+           confirmation,
+           &ForgeIssues.append_sync_label_import(&1, :resource, request)
+         ) do
       {:error, reason} -> persist_failure(operation, now, reason, options)
+      result -> result
     end
   end
 
@@ -442,8 +488,13 @@ defmodule ForgeGitHub.PullSyncWorker do
            ) do
       {:ok, Map.put(relationships, :author, author)}
     else
-      {:error, {:unmapped_label, _candidate}} -> {:error, :unsupported_resource}
-      {:error, reason} -> {:error, reason}
+      {:error, {:unmapped_label, candidate}} ->
+        if Map.get(sync, :mode) == :inbound_create,
+          do: {:error, {:unmapped_label, candidate}},
+          else: {:error, :unsupported_resource}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
