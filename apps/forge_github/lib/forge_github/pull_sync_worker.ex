@@ -169,18 +169,21 @@ defmodule ForgeGitHub.PullSyncWorker do
   def init(options) do
     interval_ms = Keyword.get(options, :interval_ms, @default_interval_ms)
     owner = Keyword.get_lazy(options, :owner, &Ecto.UUID.generate/0)
-    run_options = Keyword.drop(options, [:interval_ms, :owner, :name])
+    enabled = Keyword.get(options, :enabled, config(:pull_sync_worker_enabled, false))
+    run_options = Keyword.drop(options, [:interval_ms, :owner, :name, :enabled])
 
-    if is_integer(interval_ms) and interval_ms > 0 and is_binary(owner) do
-      schedule(0)
-      {:ok, %{interval_ms: interval_ms, owner: owner, run_options: run_options}}
+    if is_integer(interval_ms) and interval_ms > 0 and is_binary(owner) and is_boolean(enabled) do
+      if enabled, do: schedule(0)
+      {:ok, %{interval_ms: interval_ms, owner: owner, run_options: run_options, enabled: enabled}}
     else
       {:stop, :invalid_options}
     end
   end
 
   @impl true
-  def handle_info(:tick, state) do
+  def handle_info(:tick, %{enabled: false} = state), do: {:noreply, state}
+
+  def handle_info(:tick, %{enabled: true} = state) do
     _ = run_once(state.owner, state.run_options)
     schedule(state.interval_ms)
     {:noreply, state}

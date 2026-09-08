@@ -11,7 +11,7 @@ config :forge_mirrors,
   periodic_reconciler_enabled: false,
   webhook_worker_enabled: false
 
-config :forge_github, inventory_worker_enabled: false
+config :forge_github, inventory_worker_enabled: false, pull_sync_worker_enabled: false
 
 config :git_core, :limits,
   scan_concurrency: 4,
