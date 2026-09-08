@@ -10,6 +10,23 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 remote-version replay guard (2026-09-08)
+
+- Paired markers retain independent canonical issue and pull observation times.
+  Admission/reload reject missing, malformed or older-than-baseline versions.
+  Replay requires both the full preimage and its versions to match; restored
+  values with changed timestamps become ambiguous instead of causing another
+  PATCH/draft conversion. An exact target still confirms with a newer timestamp.
+- Genuine HTTP-stub integration regressions reproduced duplicate issue writes,
+  duplicate draft conversions and a write after restored values during GraphQL
+  lookup; all three now reject replay. Paired confirmation additionally prevents
+  either stored remote observation time from moving backward.
+- Root final combined verification passed 141 tests (mirrors 47, provider 94),
+  plus five-file formatting. Timestamp precision remains that of the provider:
+  indistinguishable same-second changes are not claimed to be detectable.
+- This does not close missing-node seeding, activation, the other PR13 gates,
+  PR14–16 or full PRD acceptance. Nothing was pushed or deployed.
+
 ### PR13 paired effect admission and historical confirmation (2026-09-08)
 
 - `9bce29e` atomically persists immutable full metadata evidence and its compact
