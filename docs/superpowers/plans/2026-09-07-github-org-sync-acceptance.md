@@ -12,8 +12,9 @@ remain open.
 
 PR13 integration audit additionally identified these concrete remaining gates:
 
-- Bootstrap `MetadataMapper` still skips draft and cross-repository pulls;
-  remove those exclusions only with the new supported/read-only eligibility paths.
+- Bootstrap draft and cross-repository mapping exclusions were removed in
+  `667af80`, with supported/read-only eligibility paths. Runtime discovery and
+  two-way creation still require their separate worker and activation gates.
 - New bootstrap imports now preserve the issue-list's authoritative issue ID for
   the PR's canonical issue mapping (14 mapper/importer tests passed). Legacy rows
   previously recorded the PR ID as the issue ID; those are rejected with an
@@ -50,6 +51,18 @@ PR13 integration audit additionally identified these concrete remaining gates:
 | 22 | Disconnect/revocation stops token use and retains local repos | App credential/lifecycle foundation exists. Verify every new worker and in-flight recovery path in final acceptance. |
 
 ## Current local verification
+
+- `792fd97` adds trusted inbound pull aggregate creation with independent shared
+  local numbering, explicit head identity, relationships, and atomic event/audit
+  rollback. `60c207f` adds leased merge reservations, opposing base/head overlap
+  fencing, current requester authorization and post-wait database-clock checks.
+  A fresh combined PostgreSQL matrix passed 164 tests (mirrors 57, pulls 94,
+  provider worker/integration 13); all nine changed files passed formatting.
+  These are domain/pre-push boundaries, not remote merge or discovery completion.
+- Comment synchronization now verifies canonical issue/pull provider mappings
+  without requiring local issue numbers to equal GitHub numbers. The regression
+  failed before the fix; the fresh focused matrix passed 55 tests (mirrors 39,
+  provider integration 16). Remote routes still use the mapped GitHub number.
 
 - PR13 provider client and authorized head rendering are checkpointed locally
   in `47f1801` and `c29f656`. A fresh combined run passed provider 10 and API 25
