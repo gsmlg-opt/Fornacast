@@ -148,6 +148,174 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     }
   end
 
+  test "an unmapped inbound pull creates its canonical issue and both identities through the worker",
+       ctx do
+    Repo.delete!(ctx.mapping)
+    now = DateTime.utc_now(:second)
+    operation = remote_operation(ctx, now)
+    expect_observation(ctx, ctx.baseline, now)
+
+    assert {:ok, %{operation: %{state: :completed}, resource: created}} =
+             PullSyncWorker.process_operation(operation, now, options(ctx))
+
+    assert created.local_resource_id != ctx.pull.id
+    assert created.issue_number != 7
+    assert created.head_repository_id == ctx.head.repository_id
+    assert created.local_version == 1
+
+    assert %{github_object_id: 802, github_number: 7, state: :confirmed} =
+             Repo.get_by!(MirrorResourceState,
+               repository_mirror_id: ctx.base.id,
+               resource_kind: :pull,
+               local_resource_id: created.local_resource_id
+             )
+
+    assert %{github_object_id: 801, github_number: 7, state: :confirmed} =
+             Repo.get_by!(MirrorResourceState,
+               repository_mirror_id: ctx.base.id,
+               resource_kind: :issue,
+               local_resource_id: created.issue_id
+             )
+
+    issue = Repo.get!(ForgeIssues.Issue, created.issue_id)
+
+    assert Repo.get!(ForgeAccounts.GitHubIdentity, issue.author_github_identity_id).kind ==
+             :deleted
+  end
+
+  test "inbound creation checks live Git rather than trusting only mirrored ref rows", ctx do
+    Repo.delete!(ctx.mapping)
+    git!(ctx.head_path, ["update-ref", "-d", ctx.baseline["head_ref"]])
+    now = DateTime.utc_now(:second)
+    operation = remote_operation(ctx, now)
+    expect_observation(ctx, ctx.baseline, now)
+
+    assert {:ok, %{state: :pending}} =
+             PullSyncWorker.process_operation(operation, now, options(ctx))
+
+    refute Repo.get_by(MirrorResourceState,
+             repository_mirror_id: ctx.base.id,
+             resource_kind: :pull,
+             github_object_id: 802
+           )
+
+    assert Repo.all(PullRequest)
+           |> Enum.count(&(&1.repository_id == ctx.base.repository_id)) == 1
+  end
+
+  test "inbound creation rejects a substituted base identity before observing relationships",
+       ctx do
+    Repo.delete!(ctx.mapping)
+    now = DateTime.utc_now(:second)
+    operation = remote_operation(ctx, now)
+
+    Req.Test.expect(ctx.stub, fn conn ->
+      Req.Test.json(
+        conn,
+        put_in(pull_json(ctx.baseline, now), ["base", "repo", "node_id"], "R_wrong")
+      )
+    end)
+
+    assert {:ok, %{state: :failed}} =
+             PullSyncWorker.process_operation(
+               operation,
+               now,
+               options(ctx,
+                 remote_relationships: fn _, _, _ ->
+                   flunk("untrusted repository mutated identities")
+                 end
+               )
+             )
+
+    refute Repo.get_by(MirrorResourceState,
+             repository_mirror_id: ctx.base.id,
+             resource_kind: :pull,
+             github_object_id: 802
+           )
+  end
+
+  test "an authenticated unrepresented head creates explicitly read-only metadata", ctx do
+    Repo.delete!(ctx.mapping)
+    now = DateTime.utc_now(:second)
+    operation = remote_operation(ctx, now)
+
+    Req.Test.expect(ctx.stub, fn conn ->
+      pull =
+        put_in(pull_json(ctx.baseline, now), ["head", "repo"], %{
+          "id" => 9901,
+          "node_id" => "R_9901",
+          "full_name" => "external/head"
+        })
+
+      Req.Test.json(conn, pull)
+    end)
+
+    Req.Test.expect(ctx.stub, &Req.Test.json(&1, issue_json(ctx.baseline, now)))
+
+    assert {:ok, %{resource: %{head_repository_id: nil}, pull_state: %{state: :unsupported}}} =
+             PullSyncWorker.process_operation(operation, now, options(ctx))
+  end
+
+  test "substituted head and canonical issue identities cannot persist author observations",
+       ctx do
+    Repo.delete!(ctx.mapping)
+    now = DateTime.utc_now(:second)
+    original = remote_operation(ctx, now)
+
+    for substitution <- [:head, :issue] do
+      author_id = System.unique_integer([:positive]) + 1_000_000
+
+      cursor =
+        if substitution == :issue,
+          do: Map.put(original.cursor, "github_issue_id", 999_801),
+          else: original.cursor
+
+      operation = original |> Ecto.Changeset.change(cursor: cursor) |> Repo.update!()
+
+      Req.Test.expect(ctx.stub, fn conn ->
+        pull = pull_json(ctx.baseline, now)
+
+        pull =
+          if substitution == :head,
+            do: put_in(pull, ["head", "repo", "node_id"], "R_substituted"),
+            else: pull
+
+        Req.Test.json(conn, pull)
+      end)
+
+      Req.Test.expect(ctx.stub, fn conn ->
+        issue =
+          Map.put(issue_json(ctx.baseline, now), "user", %{
+            "id" => author_id,
+            "node_id" => "U_#{author_id}",
+            "login" => "untrusted-author",
+            "type" => "User"
+          })
+
+        Req.Test.json(conn, issue)
+      end)
+
+      assert {:ok, _} =
+               PullSyncWorker.process_operation(
+                 operation,
+                 now,
+                 Keyword.delete(options(ctx), :remote_relationships)
+               )
+
+      refute Repo.get_by(ForgeAccounts.GitHubIdentity, github_user_id: author_id)
+      # Restore the same owned fixture capability for the independent substitution.
+      Repo.get!(MirrorOperation, operation.id)
+      |> Ecto.Changeset.change(
+        state: :processing,
+        lease_owner: original.lease_owner,
+        lease_expires_at: original.lease_expires_at,
+        lock_version: original.lock_version,
+        cursor: original.cursor
+      )
+      |> Repo.update!()
+    end
+  end
+
   test "real inbound pull metadata and draft observation commits with its mirror baseline", ctx do
     now = DateTime.utc_now(:second)
     target = ctx.baseline |> Map.put("title", "GitHub title") |> Map.put("draft", true)

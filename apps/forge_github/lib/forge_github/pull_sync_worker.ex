@@ -1,8 +1,8 @@
 defmodule ForgeGitHub.PullSyncWorker do
   @moduledoc """
-  Bounded, crash-recoverable synchronization for existing mapped pull requests.
+  Bounded synchronization for mapped pulls and authenticated inbound creation.
 
-  This worker intentionally excludes pull creation, ref retargeting, merging,
+  This worker still excludes outbound pull creation, ref retargeting, merging,
   deletion, and reconciliation sweeps. GitHub issue metadata and draft
   conversion are separate durable effects. Every effect and confirmation is
   guarded by the same persisted pull/ref eligibility proof.
@@ -112,13 +112,32 @@ defmodule ForgeGitHub.PullSyncWorker do
         options
       )
       when state in [:processing, :effect_pending] and is_list(options) do
-    with {:ok, sync} <- context(operation, options),
-         {:ok, token} <- installation_token(sync, options),
+    with {:ok, sync} <- context(operation, options) do
+      if Map.get(sync, :mode) == :inbound_create do
+        create_inbound(operation, now, sync, options)
+      else
+        process_mapped(operation, now, sync, options)
+      end
+    else
+      {:error, reason} -> persist_failure(operation, now, reason, options)
+    end
+  rescue
+    _exception -> persist_failure(operation, now, :worker_crash, options)
+  catch
+    _kind, _reason -> persist_failure(operation, now, :worker_crash, options)
+  end
+
+  def process_operation(%MirrorOperation{} = operation, %DateTime{} = now, options)
+      when is_list(options),
+      do: persist_failure(operation, now, :unsupported_operation, options)
+
+  defp process_mapped(operation, now, sync, options) do
+    with {:ok, token} <- installation_token(sync, options),
          {:ok, local} <- local_observation(sync, options),
          {:ok, remote, provider_identity, proof} <-
            observe_authorized(sync, token, local, now, options) do
       case precondition(sync, local, remote, provider_identity, proof) do
-        :ok when state == :effect_pending ->
+        :ok when operation.state == :effect_pending ->
           recover_effect(
             operation,
             now,
@@ -155,15 +174,7 @@ defmodule ForgeGitHub.PullSyncWorker do
     else
       {:error, reason} -> persist_failure(operation, now, reason, options)
     end
-  rescue
-    _exception -> persist_failure(operation, now, :worker_crash, options)
-  catch
-    _kind, _reason -> persist_failure(operation, now, :worker_crash, options)
   end
-
-  def process_operation(%MirrorOperation{} = operation, %DateTime{} = now, options)
-      when is_list(options),
-      do: persist_failure(operation, now, :unsupported_operation, options)
 
   @impl true
   def init(options) do
@@ -190,7 +201,166 @@ defmodule ForgeGitHub.PullSyncWorker do
   end
 
   defp context(operation, options),
-    do: callback(options, :context, &ForgeMirrors.resource_operation_context/1).(operation)
+    do: callback(options, :context, &default_context/1).(operation)
+
+  defp default_context(operation) do
+    case ForgeMirrors.resource_operation_context(operation) do
+      {:error, :invalid_pull_mapping} -> ForgeMirrors.remote_pull_creation_context(operation)
+      result -> result
+    end
+  end
+
+  defp create_inbound(operation, now, sync, options) do
+    with {:ok, token} <- installation_token(sync, options),
+         {:ok, pull} <-
+           callback(options, :get_pull, &PullClient.get_pull/5).(
+             token,
+             sync.remote_owner,
+             sync.remote_repository,
+             sync.github_number,
+             request_options(sync)
+           ),
+         true <- pull["id"] == sync.github_object_id and pull["number"] == sync.github_number,
+         true <-
+           get_in(pull, ["base", "repo", "id"]) == sync.github_repository_id and
+             get_in(pull, ["base", "repo", "node_id"]) == sync.github_repository_node_id,
+         {:ok, raw_issue} <-
+           callback(options, :get_pull_issue, &IssueClient.get_pull_issue/5).(
+             token,
+             sync.remote_owner,
+             sync.remote_repository,
+             sync.github_number,
+             request_options(sync)
+           ),
+         {:ok, remote} <- inbound_preflight(pull, raw_issue),
+         {:ok, identity} <- provider_identity(remote),
+         {:ok, head} <-
+           ForgeMirrors.resolve_remote_pull_head(
+             operation,
+             %{
+               github_object_id: remote.github_object_id,
+               github_node_id: remote.github_node_id,
+               github_number: remote.github_number,
+               provider_identity: identity
+             },
+             remote.snapshot
+           ),
+         {:ok, relationships} <- remote_relationships(sync, raw_issue, now, options),
+         {:ok, issue} <- IssueSyncProjection.from_remote_issue(raw_issue, relationships),
+         {:ok, remote} <- PullSyncProjection.from_remote(pull, issue),
+         {:ok, author_id} <- inbound_author(issue),
+         {:ok, local_relationships} <-
+           IssueSyncProjection.local_relationships(
+             issue.snapshot,
+             issue.label_catalog,
+             issue.assignee_catalog
+           ),
+         request = %{
+           repository_id: sync.repository_id,
+           resource_kind: :pull,
+           head_repository_id: head.head_repository_id,
+           author_github_identity_id: author_id,
+           fields: remote.snapshot,
+           merge_state: Map.take(remote.merge_state, [:merged_at, :merge_commit_sha]),
+           inserted_at: remote.remote_created_at,
+           updated_at: remote.remote_updated_at,
+           local_label_ids: local_relationships.local_label_ids,
+           assignee_refs: local_relationships.assignee_refs,
+           provenance: provenance(sync, operation)
+         },
+         {:ok, merge_state} <- json_safe(request.merge_state),
+         observation = %{
+           pull: %{
+             github_object_id: remote.github_object_id,
+             github_node_id: remote.github_node_id,
+             github_number: remote.github_number,
+             remote_updated_at: remote.remote_updated_at,
+             confirmed_snapshot: remote.snapshot,
+             confirmed_merge_state: merge_state,
+             provider_identity: identity
+           },
+           issue: %{
+             github_object_id: issue.github_object_id,
+             github_node_id: issue.github_node_id,
+             github_number: issue.github_number,
+             remote_updated_at: issue.remote_updated_at,
+             confirmed_snapshot: issue.snapshot
+           }
+         },
+         {:ok, result} <-
+           with_inbound_ref_fences(head.git_proof, fn ->
+             ForgeMirrors.confirm_remote_pull_creation(
+               operation,
+               now,
+               Map.take(head, [:head_repository_id, :pull_eligibility_proof]),
+               observation,
+               &ForgePulls.append_sync_create(&1, :resource, request)
+             )
+           end) do
+      {:ok, result}
+    else
+      false -> persist_failure(operation, now, :invalid_remote_resource, options)
+      {:error, reason} -> persist_failure(operation, now, reason, options)
+    end
+  end
+
+  # Validate immutable identity, scalar coherence and refs without resolving any
+  # local relationship or writing attribution. This temporary scalar projection
+  # is never persisted: the complete relationship projection is rebuilt afterward.
+  defp inbound_preflight(pull, raw_issue) do
+    scalars = Map.merge(raw_issue, %{"labels" => [], "assignees" => []})
+
+    with {:ok, issue} <-
+           IssueSyncProjection.from_remote_issue(scalars, %{labels: [], assignees: []}),
+         do: PullSyncProjection.from_remote(pull, issue)
+  end
+
+  defp inbound_author(%{author: %{github_identity_id: id}}) when is_integer(id) and id > 0,
+    do: {:ok, id}
+
+  defp inbound_author(%{raw_author: nil}) do
+    %{id: id} = ForgeAccounts.github_deleted_identity()
+    {:ok, id}
+  end
+
+  defp inbound_author(_), do: {:error, :invalid_remote_resource}
+
+  # Hold every repository writer fence in stable order until both mappings commit.
+  # A successful ref read followed by releasing its fence would leave a race.
+  defp with_inbound_ref_fences(%{base: base, head: head}, fun) do
+    refs = [base, head] |> Enum.reject(&is_nil/1) |> Enum.group_by(& &1.repository_id)
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:ref_deadline_ms)
+
+    inbound_fences(Enum.sort(refs), %{}, deadline, fn paths ->
+      with :ok <-
+             Enum.reduce_while(refs, :ok, fn {id, required}, :ok ->
+               case Enum.reduce_while(required, :ok, fn ref, :ok ->
+                      case verify_required_ref(Map.fetch!(paths, id), ref, deadline) do
+                        :ok -> {:cont, :ok}
+                        error -> {:halt, error}
+                      end
+                    end) do
+                 :ok -> {:cont, :ok}
+                 error -> {:halt, error}
+               end
+             end),
+           do: fun.()
+    end)
+  end
+
+  defp inbound_fences([], paths, _deadline, fun), do: fun.(paths)
+
+  defp inbound_fences([{id, refs} | rest], paths, deadline, fun) do
+    with true <- System.monotonic_time(:millisecond) < deadline,
+         {:ok, repository} <- ForgeRepos.fetch_live_repository(id),
+         true <- Enum.all?(refs, &(&1.repository_generation == repository.generation)) do
+      ForgeRepos.with_write_fence(repository, :ref, fn path, _remaining ->
+        inbound_fences(rest, Map.put(paths, id, path), deadline, fun)
+      end)
+    else
+      _ -> {:error, :required_ref_unavailable}
+    end
+  end
 
   defp installation_token(sync, options) do
     case callback(options, :token_fetch, &InstallationTokenBroker.fetch/2).(
