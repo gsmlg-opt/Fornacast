@@ -24,6 +24,10 @@ PR13 integration audit additionally identified these concrete remaining gates:
   its event atomically for changed refs, with unchanged-read churn prevented.
   Confirmation retains exact expected fields and merge-state checks as well as
   the version; remaining worker and merge-coordinator paths must honor them.
+- A provider pull with `head.repo: null` is still rejected by the canonical
+  projection. Known but unrepresented immutable head identities are a different
+  case. Add an explicit opaque read-only identity path and authenticated later
+  representation; never invent provider IDs or bind by branch/repository names.
 
 | # | Required outcome | Current evidence / next gate |
 |---|---|---|
@@ -52,6 +56,35 @@ PR13 integration audit additionally identified these concrete remaining gates:
 
 ## Current local verification
 
+- `7a6c1fb` adds leased missing-pull routing, immutable head resolution and atomic
+  inbound canonical issue/pull mappings. Review regressions now reject a callback
+  that creates two aggregates and accept equal numeric IDs in separate provider
+  namespaces. Completion uses the normal finality hook, but current eligibility
+  requires active bindings; no new bootstrap activation claim follows.
+- Fresh combined verification passed 180 scoped PostgreSQL tests (mirrors 88,
+  pulls 25, provider 67). Worker integration covers paired inbound creation,
+  deleted author attribution, substituted base identity, missing live Git refs,
+  and known unrepresented read-only heads. Repository writer fences remain held
+  from final live-ref checks through the mapping transaction. Nine changed files
+  passed formatting. Worker changes are under final review; unknown-label
+  prerequisites, outbound creation/recovery and activation remain open.
+- `e4bfb7a` adds an explicit trusted nil-to-represented head transition. It checks
+  the full local preimage and both repository generations, preserves content and
+  merge facts, and emits one canonical version/event/audit transaction. The outer
+  mirror operation must still prove provider identity and active ref eligibility;
+  this domain API does not itself enable automatic head discovery.
+- Fresh combined verification passed 196 scoped PostgreSQL tests (mirrors 52,
+  pulls 81, provider workers/integration 63). It includes the new atomic inbound
+  paired-mapping boundary, real elapsed lease expiry, callback binding replacement,
+  independent local/provider numbering, and valid comment-create scan recovery
+  (`e1f655f`). Eight changed source/test paths passed formatting checks.
+- `bbc3e71` removes automatic repeated issue/comment POSTs after a complete
+  zero-match correlation scan, including the newer-label recovery branch.
+  A missing marker cannot prove a prior create failed. The operation instead
+  becomes a visible ambiguous-effect conflict; positive matches still use the
+  existing authenticated adoption path. Root verification passed 72 scoped
+  PostgreSQL tests (worker 34, integration 16, persistence 22), including retained
+  conflict scan evidence. Explicit owner resolution remains a PR16 gate.
 - `792fd97` adds trusted inbound pull aggregate creation with independent shared
   local numbering, explicit head identity, relationships, and atomic event/audit
   rollback. `60c207f` adds leased merge reservations, opposing base/head overlap
