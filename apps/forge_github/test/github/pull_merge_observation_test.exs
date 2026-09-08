@@ -211,6 +211,169 @@ defmodule ForgeGitHub.PullMergeObservationTest do
     end
   end
 
+  test "observes known provider memberships absent from the local issue without writes", c do
+    label =
+      Repo.insert!(
+        ForgeIssues.Label.changeset(%ForgeIssues.Label{repository_id: c.sync.repository_id}, %{
+          name: "remote-known",
+          normalized_name: "remote-known",
+          color: "223344"
+        })
+      )
+
+    Repo.insert!(
+      ForgeMirrors.MirrorResourceState.persistence_changeset(
+        %ForgeMirrors.MirrorResourceState{},
+        %{
+          repository_mirror_id: c.sync.repository_mirror_id,
+          resource_kind: :label,
+          local_resource_type: "ForgeIssues.Label",
+          local_resource_id: label.id,
+          github_object_id: 802,
+          github_node_id: "L_802",
+          confirmed_snapshot: %{},
+          state: :confirmed
+        }
+      )
+    )
+
+    Repo.insert!(
+      ForgeAccounts.GitHubIdentity.observed_changeset(%ForgeAccounts.GitHubIdentity{}, %{
+        github_user_id: 803,
+        github_node_id: "U_803",
+        login: "remote-known"
+      })
+    )
+
+    pair =
+      c.pair
+      |> put_in([:issue, "labels"], [
+        %{"id" => 802, "node_id" => "L_802", "name" => "remote-known"}
+      ])
+      |> put_in([:issue, "assignees"], [
+        %{"id" => 803, "node_id" => "U_803", "login" => "remote-known"}
+      ])
+
+    before =
+      {Repo.all(ForgeAccounts.GitHubIdentity), Repo.all(ForgeMirrors.MirrorResourceState),
+       Repo.all(ForgeIssues.IssueLabel), Repo.all(ForgeIssues.IssueAssignee)}
+
+    assert {:ok, result} = PullMergeObservation.build(c.sync, pair, c.m)
+    assert result.issue.confirmed_snapshot["label_github_ids"] == [802]
+    assert result.issue.confirmed_snapshot["assignee_github_ids"] == [803]
+
+    assert before ==
+             {Repo.all(ForgeAccounts.GitHubIdentity), Repo.all(ForgeMirrors.MirrorResourceState),
+              Repo.all(ForgeIssues.IssueLabel), Repo.all(ForgeIssues.IssueAssignee)}
+  end
+
+  test "observes provider removals without deleting local memberships", c do
+    pair = c.pair |> put_in([:issue, "labels"], []) |> put_in([:issue, "assignees"], [])
+    before = {Repo.all(ForgeIssues.IssueLabel), Repo.all(ForgeIssues.IssueAssignee)}
+    assert {:ok, result} = PullMergeObservation.build(c.sync, pair, c.m)
+    assert result.issue.confirmed_snapshot["label_github_ids"] == []
+    assert result.issue.confirmed_snapshot["assignee_github_ids"] == []
+    assert before == {Repo.all(ForgeIssues.IssueLabel), Repo.all(ForgeIssues.IssueAssignee)}
+  end
+
+  test "node validation takes ordered nonblocking share locks in the caller transaction", c do
+    owner = self()
+    handler = "merge-observation-node-locks-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fornacast, :repo, :query],
+      fn _, _, metadata, _ -> send(owner, {:node_query, metadata.query}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    assert {:ok, {:ok, _}} =
+             Repo.transaction(fn -> PullMergeObservation.build(c.sync, c.pair, c.m) end)
+
+    queries = node_queries([])
+
+    for table <- ["mirror_resource_states", "github_identities"] do
+      assert Enum.any?(
+               queries,
+               &(String.contains?(&1, "FROM \"#{table}\"") and String.contains?(&1, "ORDER BY") and
+                   String.contains?(&1, "FOR SHARE NOWAIT"))
+             )
+    end
+  end
+
+  test "a contended node identity returns a typed error and leaves the outer transaction usable",
+       c do
+    owner = self()
+    github_id = System.unique_integer([:positive]) + 8_000_000_000
+
+    task =
+      Task.async(fn ->
+        Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+          identity =
+            Repo.insert!(
+              ForgeAccounts.GitHubIdentity.observed_changeset(%ForgeAccounts.GitHubIdentity{}, %{
+                github_user_id: github_id,
+                github_node_id: "U_BUSY_#{github_id}",
+                login: "busy-#{github_id}"
+              })
+            )
+
+          try do
+            Repo.transaction(fn ->
+              Ecto.Adapters.SQL.query!(
+                Repo,
+                "SELECT id FROM github_identities WHERE id = $1 FOR UPDATE",
+                [identity.id]
+              )
+
+              send(owner, {:identity_locked, github_id})
+
+              receive do
+                :release -> :ok
+              after
+                10_000 -> raise "identity lock was not released"
+              end
+            end)
+          after
+            Repo.delete!(identity)
+          end
+        end)
+      end)
+
+    try do
+      assert_receive {:identity_locked, ^github_id}, 5_000
+
+      pair =
+        c.pair
+        |> put_in([:issue, "labels"], [])
+        |> put_in([:issue, "assignees"], [
+          %{"id" => github_id, "node_id" => "U_BUSY_#{github_id}", "login" => "busy-#{github_id}"}
+        ])
+
+      assert {:ok, :usable} =
+               Repo.transaction(fn ->
+                 assert {:error, :relationship_lock_busy} =
+                          PullMergeObservation.build(c.sync, pair, c.m)
+
+                 assert %{rows: [[1]]} = Ecto.Adapters.SQL.query!(Repo, "SELECT 1", [])
+                 :usable
+               end)
+    after
+      send(task.pid, :release)
+      Task.await(task, 5_000)
+    end
+  end
+
+  defp node_queries(acc) do
+    receive do
+      {:node_query, query} -> node_queries([query | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
   test "unknown or substituted relationship identities cause no database writes", %{
     sync: sync,
     pair: pair,

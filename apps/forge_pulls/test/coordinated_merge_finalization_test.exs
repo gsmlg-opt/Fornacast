@@ -424,6 +424,120 @@ defmodule ForgePulls.CoordinatedMergeFinalizationTest do
     assert {:error, :merge_intent_conflict} = finish(c)
   end
 
+  test "applies exact inbound metadata and relationships before closure once", c do
+    request = metadata_request(c)
+
+    label =
+      Repo.insert!(%ForgeIssues.Label{
+        repository_id: c.repository.id,
+        name: "Inbound",
+        normalized_name: "inbound",
+        color: "abcdef"
+      })
+
+    request =
+      Map.merge(request, %{
+        local_label_ids: [label.id],
+        assignee_refs: [%{kind: :local_user, id: c.actor.id}]
+      })
+
+    before = counts(c)
+    assert {:ok, %{resource: result}} = finish(c, metadata_request: request)
+    assert result.fields["title"] == "Inbound title"
+    assert result.fields["body"] == "Inbound body"
+    assert result.fields["state"] == "closed"
+    assert result.fields["base_sha"] == c.intent.merge_oid
+    assert result.local_version == request.expected_local_version + 2
+    assert result.label_ids == [label.id]
+    assert %{kind: :local_user, id: c.actor.id} in result.assignee_refs
+    assert counts(c) == {elem(before, 0) + 2, elem(before, 1) + 1}
+    after_counts = counts(c)
+    assert {:ok, %{resource: ^result}} = finish(c, metadata_request: request)
+    assert counts(c) == after_counts
+  end
+
+  test "rejects stale metadata preimages and forbidden or partial requests", c do
+    request = metadata_request(c)
+
+    invalid = [
+      %{request | expected_local_version: request.expected_local_version + 1},
+      %{request | expected_fields: Map.put(request.expected_fields, "title", "stale")},
+      %{request | expected_relationships: %{label_ids: [999], managed_assignee_identity_ids: []}},
+      Map.delete(request, :assignee_refs),
+      Map.delete(request, :expected_relationships),
+      Map.put(request, :minimum_local_version, 1),
+      %{request | repository_id: c.repository.id + 1},
+      %{request | local_resource_id: c.pull.id + 1},
+      %{request | fields: Map.put(request.fields, "state", "closed")},
+      %{request | fields: Map.put(request.fields, "state_reason", "reopened")},
+      %{request | fields: Map.put(request.fields, "base_sha", c.intent.merge_oid)},
+      %{request | fields: Map.put(request.fields, "head_ref", "refs/heads/other")},
+      %{request | fields: Map.put(request.fields, "draft", true)}
+    ]
+
+    before = counts(c)
+
+    for bad <- invalid do
+      assert {:error, _} = finish(c, metadata_request: bad)
+      assert Repo.get!(Issue, c.pull.issue_id).title == "Merge"
+      assert Repo.get!(Issue, c.pull.issue_id).sync_version == request.expected_local_version
+      assert counts(c) == before
+    end
+  end
+
+  test "confirmation failure rolls back inbound metadata and both events with ref M recoverable",
+       c do
+    request = metadata_request(c)
+    before = counts(c)
+
+    assert {:error, :no_confirmation} =
+             finish(c,
+               metadata_request: request,
+               confirm: fn _, _ -> {:error, :no_confirmation} end
+             )
+
+    assert Repo.get!(Issue, c.pull.issue_id).title == "Merge"
+    assert Repo.get!(Issue, c.pull.issue_id).sync_version == request.expected_local_version
+    assert Repo.get!(MergeOperation, c.intent.id).state == :merge_written
+    assert counts(c) == before
+    assert {:ok, oid} = GitCore.exact_ref(c.path, "refs/heads/main")
+    assert oid == c.intent.merge_oid
+    assert {:ok, %{resource: result}} = finish(c, metadata_request: request)
+    assert result.local_version == request.expected_local_version + 2
+  end
+
+  test "inbound metadata cannot erase an exactly observed newer draft", c do
+    c.pull |> Changeset.change(draft: true) |> Repo.update!()
+    request = metadata_request(c)
+    assert request.expected_fields["draft"] == true
+    request = %{request | fields: Map.put(request.fields, "draft", false)}
+    before = counts(c)
+    assert {:error, :invalid_metadata_request} = finish(c, metadata_request: request)
+    assert Repo.get!(PullRequest, c.pull.id).draft
+    assert Repo.get!(PullRequest, c.pull.id).merged_at == nil
+    assert Repo.get!(Issue, c.pull.issue_id).title == "Merge"
+    assert counts(c) == before
+  end
+
+  defp metadata_request(c) do
+    {:ok, local} = ForgePulls.sync_projection(c.repository.id, :pull, c.pull.id)
+
+    %{
+      repository_id: c.repository.id,
+      resource_kind: :pull,
+      local_resource_id: c.pull.id,
+      action: :update,
+      expected_local_version: local.local_version,
+      expected_fields: local.fields,
+      expected_merge_state: local.merge_state,
+      expected_relationships: local.relationship_preimage,
+      local_label_ids: local.label_ids,
+      assignee_refs: local.assignee_refs,
+      fields: Map.merge(local.fields, %{"title" => "Inbound title", "body" => "Inbound body"}),
+      provenance: %{origin: :github}
+    }
+  end
+
   defp counts(c) do
     {Repo.aggregate(
        from(e in Fornacast.DomainOutboxEvent,

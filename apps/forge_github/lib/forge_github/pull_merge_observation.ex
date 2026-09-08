@@ -6,9 +6,8 @@ defmodule ForgeGitHub.PullMergeObservation do
 
   def build(
         %{
-          repository_id: repository_id,
           repository_mirror_id: binding_id,
-          expected: %{pull_id: pull_id, provider_identity: identity},
+          expected: %{provider_identity: identity},
           provider_pull_identity: pinned,
           intent: %{
             merge_oid: merge_oid,
@@ -24,8 +23,7 @@ defmodule ForgeGitHub.PullMergeObservation do
       when is_map(identity) and is_map(pinned) and is_map(raw_pull) and is_map(raw_issue) and
              is_binary(merge_oid) do
     with true <- remote_base_oid == merge_oid,
-         {:ok, local} <- ForgePulls.sync_projection(repository_id, :pull, pull_id),
-         {:ok, relationships} <- relationships(binding_id, local, raw_issue),
+         {:ok, relationships} <- relationships(binding_id, raw_issue),
          {:ok, issue} <-
            IssueSyncProjection.from_remote_issue(raw_issue, relationships, sync[:correlation_id]),
          {:ok, pull} <- PullSyncProjection.from_remote(raw_pull, issue),
@@ -92,6 +90,7 @@ defmodule ForgeGitHub.PullMergeObservation do
        }}
     else
       {:error, :merge_metadata_unconfirmed} = error -> error
+      {:error, :relationship_lock_busy} = error -> error
       _ -> {:error, :invalid_merge_observation}
     end
   end
@@ -103,35 +102,30 @@ defmodule ForgeGitHub.PullMergeObservation do
 
   defp repository_identity(_), do: nil
 
-  defp relationships(binding_id, local, %{"labels" => labels, "assignees" => assignees})
+  defp relationships(binding_id, %{"labels" => labels, "assignees" => assignees})
        when is_list(labels) and is_list(assignees) and length(labels) <= 512 and
               length(assignees) <= 512 do
     with {:ok, relationships} <-
            ForgeMirrors.resolve_issue_relationships(
              binding_id,
-             :local,
-             local.label_ids,
-             local.assignee_refs
+             :remote,
+             labels,
+             assignees
            ),
-         true <- exact_ids?(labels, relationships.labels, :github_object_id),
-         true <- exact_ids?(assignees, relationships.assignees, :github_user_id),
          true <- label_nodes?(binding_id, labels),
          true <- assignee_nodes?(assignees) do
       {:ok, relationships}
     else
       _ -> {:error, :merge_metadata_unconfirmed}
     end
+  rescue
+    error in Postgrex.Error ->
+      if error.postgres[:code] == :lock_not_available,
+        do: {:error, :relationship_lock_busy},
+        else: reraise(error, __STACKTRACE__)
   end
 
-  defp relationships(_, _, _), do: {:error, :merge_metadata_unconfirmed}
-
-  defp exact_ids?(raw, catalog, key) do
-    ids = Enum.map(raw, fn value -> if is_map(value), do: value["id"] end)
-
-    Enum.all?(ids, &(is_integer(&1) and &1 > 0)) and
-      length(ids) == length(Enum.uniq(ids)) and
-      Enum.sort(ids) == Enum.sort(Enum.map(catalog, &Map.fetch!(&1, key)))
-  end
+  defp relationships(_, _), do: {:error, :merge_metadata_unconfirmed}
 
   # The projection normalizers compare numeric IDs. Preserve their immutable
   # node identity too, without creating or updating provider catalog entries.
@@ -140,11 +134,15 @@ defmodule ForgeGitHub.PullMergeObservation do
 
     rows =
       Repo.all(
-        from m in ForgeMirrors.MirrorResourceState,
+        from(m in ForgeMirrors.MirrorResourceState,
           where:
             m.repository_mirror_id == ^binding_id and m.resource_kind == :label and
               m.state == :confirmed and m.github_object_id in ^ids,
+          order_by: m.id,
+          lock: "FOR SHARE NOWAIT",
           select: {m.github_object_id, m.github_node_id}
+        ),
+        lock_options()
       )
 
     exact_nodes?(labels, rows)
@@ -155,9 +153,13 @@ defmodule ForgeGitHub.PullMergeObservation do
 
     rows =
       Repo.all(
-        from i in ForgeAccounts.GitHubIdentity,
+        from(i in ForgeAccounts.GitHubIdentity,
           where: i.kind == :user and i.github_user_id in ^ids,
+          order_by: i.id,
+          lock: "FOR SHARE NOWAIT",
           select: {i.github_user_id, i.github_node_id}
+        ),
+        lock_options()
       )
 
     exact_nodes?(assignees, rows)
@@ -172,4 +174,8 @@ defmodule ForgeGitHub.PullMergeObservation do
         is_binary(node) and node != "" and nodes[value["id"]] == node
       end)
   end
+
+  # Postgrex savepoints require an active caller transaction. The initial
+  # provider observation also runs in autocommit mode before finalization.
+  defp lock_options, do: if(Repo.in_transaction?(), do: [mode: :savepoint], else: [])
 end

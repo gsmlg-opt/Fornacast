@@ -664,6 +664,187 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     assert mapping.confirmed_snapshot["base_sha"] == c.base
   end
 
+  test "remote-only title and body apply atomically with merge and actual paired version", c do
+    issue_mapping = paired_issue_mapping(c)
+    marked = mark(c)
+    before = Repo.get!(ForgeIssues.Issue, c.issue.id).sync_version
+    opts = merged_options(c, "Updated remotely")
+
+    opts =
+      Enum.reduce([:get_pull, :get_pull_issue], opts, fn key, acc ->
+        fetch = Keyword.fetch!(acc, key)
+
+        Keyword.put(acc, key, fn a, b, d, e, f ->
+          {:ok, response} = fetch.(a, b, d, e, f)
+          {:ok, Map.put(response, "body", "Remote body")}
+        end)
+      end)
+
+    assert {:ok, completed} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert completed.state == :completed
+    issue = Repo.get!(ForgeIssues.Issue, c.issue.id)
+    assert {issue.title, issue.body, issue.state} == {"Updated remotely", "Remote body", :closed}
+    assert issue.sync_version == before + 2
+
+    pull_mapping =
+      Repo.get_by!(MirrorResourceState, resource_kind: :pull, local_resource_id: c.pull.id)
+
+    issue_mapping = Repo.get!(MirrorResourceState, issue_mapping.id)
+    assert pull_mapping.confirmed_local_version == issue.sync_version
+    assert issue_mapping.confirmed_local_version == issue.sync_version
+    assert pull_mapping.confirmed_snapshot["title"] == issue.title
+    assert issue_mapping.confirmed_snapshot["body"] == issue.body
+    assert pull_mapping.confirmed_snapshot["base_sha"] == c.intent.merge_oid
+    assert Repo.get!(ForgePulls.MergeOperation, c.intent.id).state == :completed
+  end
+
+  test "known remote relationship additions merge while retaining unmanaged local assignees", c do
+    paired_issue_mapping(c)
+    {label, identity} = known_relationships(c)
+
+    Repo.insert!(%ForgeIssues.IssueAssignee{
+      issue_id: c.issue.id,
+      user_id: c.issue.author_user_id
+    })
+
+    marked = mark(c)
+    opts = merged_options(c)
+    fetch = Keyword.fetch!(opts, :get_pull_issue)
+
+    opts =
+      Keyword.put(opts, :get_pull_issue, fn a, b, d, e, f ->
+        {:ok, raw} = fetch.(a, b, d, e, f)
+
+        {:ok,
+         Map.merge(raw, %{
+           "labels" => [%{"id" => 800, "node_id" => "L_800", "name" => "known"}],
+           "assignees" => [%{"id" => 801, "node_id" => "U_801", "login" => "known"}]
+         })}
+      end)
+
+    assert {:ok, completed} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert completed.state == :completed
+    assert {:ok, actual} = ForgePulls.sync_projection(c.repository.id, :pull, c.pull.id)
+    assert actual.label_ids == [label.id]
+    assert %{kind: :github_identity, id: identity.id} in actual.assignee_refs
+    assert %{kind: :local_user, id: c.issue.author_user_id} in actual.assignee_refs
+
+    mapping =
+      Repo.get_by!(MirrorResourceState, resource_kind: :issue, local_resource_id: c.issue.id)
+
+    assert mapping.confirmed_snapshot["label_github_ids"] == [800]
+    assert mapping.confirmed_snapshot["assignee_github_ids"] == [801]
+    assert mapping.confirmed_local_version == actual.local_version
+  end
+
+  test "relationship node drift after initial observation cannot be acknowledged by merge", c do
+    paired_issue_mapping(c)
+    {label, _identity} = known_relationships(c)
+    marked = mark(c)
+    opts = merged_options(c)
+    fetch = Keyword.fetch!(opts, :get_pull_issue)
+
+    opts =
+      Keyword.put(opts, :get_pull_issue, fn a, b, d, e, f ->
+        {:ok, raw} = fetch.(a, b, d, e, f)
+
+        {:ok,
+         Map.merge(raw, %{
+           "labels" => [%{"id" => 800, "node_id" => "L_800", "name" => "known"}],
+           "assignees" => [%{"id" => 801, "node_id" => "U_801", "login" => "known"}]
+         })}
+      end)
+
+    handler = "merge-relationship-drift-#{marked.id}"
+    owner = self()
+
+    :telemetry.attach(
+      handler,
+      [:fornacast, :repo, :query],
+      fn _, _, metadata, _ ->
+        if self() == owner and not Process.get(handler, false) and
+             String.starts_with?(
+               metadata.query,
+               "SELECT g0.\"github_user_id\", g0.\"github_node_id\" FROM"
+             ) and
+             String.contains?(metadata.query, "FROM \"github_identities\"") do
+          Process.put(handler, true)
+
+          Repo.get_by!(MirrorResourceState, resource_kind: :label, local_resource_id: label.id)
+          |> Changeset.change(github_node_id: "L_changed")
+          |> Repo.update!()
+        end
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert Process.get(handler)
+    assert pending.state == :effect_pending
+    assert pending.external_effect_marker == marked.external_effect_marker
+    assert Repo.get!(ForgeIssues.Issue, c.issue.id).state == :open
+    assert Repo.get!(ForgePulls.MergeOperation, c.intent.id).state == :merge_written
+  end
+
+  test "known remote relationship removals use the unchanged paired baseline", c do
+    mapping = paired_issue_mapping(c)
+    {label, identity} = known_relationships(c)
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: c.issue.id, label_id: label.id})
+
+    Repo.insert!(%ForgeIssues.IssueAssignee{
+      issue_id: c.issue.id,
+      github_identity_id: identity.id
+    })
+
+    mapping
+    |> Changeset.change(
+      confirmed_snapshot:
+        Map.merge(
+          mapping.confirmed_snapshot,
+          %{"label_github_ids" => [800], "assignee_github_ids" => [801]}
+        )
+    )
+    |> Repo.update!()
+
+    marked = mark(c)
+
+    assert {:ok, completed} = PullMergeWorker.process_operation(marked, c.now, merged_options(c))
+    assert completed.state == :completed
+    assert {:ok, actual} = ForgePulls.sync_projection(c.repository.id, :pull, c.pull.id)
+    assert actual.label_ids == []
+    assert actual.assignee_refs == []
+    assert Repo.get!(MirrorResourceState, mapping.id).confirmed_snapshot["label_github_ids"] == []
+  end
+
+  test "remote-only metadata also completes when local ref and snapshot already recovered to M",
+       c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    git!(c.path, ["update-ref", "refs/heads/main", c.intent.merge_oid])
+
+    assert {:ok, _} =
+             ForgePulls.SnapshotRefresh.persist(
+               c.pull,
+               Map.put(
+                 Map.take(c.pull, [:base_ref, :head_ref, :base_sha, :head_sha]),
+                 :base_sha,
+                 c.intent.merge_oid
+               )
+             )
+
+    assert {:ok, completed} =
+             PullMergeWorker.process_operation(
+               marked,
+               c.now,
+               merged_options(c, "Remote after recovery")
+             )
+
+    assert completed.state == :completed
+    assert Repo.get!(ForgeIssues.Issue, c.issue.id).title == "Remote after recovery"
+  end
+
   test "incompatible concurrent merge metadata records authentic conflict snapshots", c do
     paired_issue_mapping(c)
     marked = mark(c)
@@ -821,6 +1002,39 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
     assert pending.external_effect_marker == marked.external_effect_marker
     assert_unfinished(c)
+  end
+
+  defp known_relationships(c) do
+    label =
+      Repo.insert!(
+        ForgeIssues.Label.changeset(
+          %ForgeIssues.Label{repository_id: c.repository.id},
+          %{name: "known", normalized_name: "known", color: "112233"}
+        )
+      )
+
+    Repo.insert!(
+      MirrorResourceState.persistence_changeset(%MirrorResourceState{}, %{
+        repository_mirror_id: c.binding.id,
+        resource_kind: :label,
+        local_resource_type: "ForgeIssues.Label",
+        local_resource_id: label.id,
+        github_object_id: 800,
+        github_node_id: "L_800",
+        confirmed_snapshot: %{},
+        state: :confirmed
+      })
+    )
+
+    identity =
+      Repo.insert!(
+        ForgeAccounts.GitHubIdentity.observed_changeset(
+          %ForgeAccounts.GitHubIdentity{},
+          %{github_user_id: 801, github_node_id: "U_801", login: "known"}
+        )
+      )
+
+    {label, identity}
   end
 
   defp paired_issue_mapping(c) do

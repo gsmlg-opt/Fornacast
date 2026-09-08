@@ -12,6 +12,11 @@ defmodule ForgePulls.CoordinatedMergeFinalization do
   A SQL rollback after ref advancement deliberately leaves M recoverable. This
   boundary never constructs a commit. Completed replay requires replay-safe
   callbacks and does not repeat domain mutations or events.
+
+  Optional `metadata_request` is a trusted exact-preimage Sync update applied
+  before closure in this same transaction. It may change title, body and
+  relationships, never state or refs. Metadata and closure each advance the
+  canonical version once; confirmation receives the final actual projection.
   """
   import Ecto.Query
   alias Ecto.{Changeset, Multi}
@@ -63,6 +68,9 @@ defmodule ForgePulls.CoordinatedMergeFinalization do
            :ok <- validate_refs(intent, paths, deadline),
            :ok <- opts[:authorize].(intent),
            :ok <- advance_ref(intent, paths[intent.repository_id], deadline),
+           :ok <- apply_metadata(intent, Keyword.fetch(opts, :metadata_request)),
+           {:ok, issue, pull, ^intent} <- lock_resource(intent),
+           :ok <- validate_snapshot(issue, pull, intent, merged_at),
            :ok <- apply_domain(issue, pull, intent, merged_at),
            {:ok, projection} <- Sync.sync_projection(intent.repository_id, :pull, pull.id),
            :ok <- remaining(deadline),
@@ -196,6 +204,46 @@ defmodule ForgePulls.CoordinatedMergeFinalization do
       end
     end
   end
+
+  defp apply_metadata(%{state: :completed}, _), do: :ok
+  defp apply_metadata(_, :error), do: :ok
+
+  defp apply_metadata(intent, {:ok, request}) do
+    with :ok <- validate_metadata_request(intent, request) do
+      case Multi.new() |> Sync.append_sync_apply(:metadata, request) |> Repo.transaction() do
+        {:ok, _} -> :ok
+        {:error, _, reason, _} -> {:error, reason}
+      end
+    end
+  end
+
+  defp validate_metadata_request(
+         intent,
+         %{
+           repository_id: repository_id,
+           resource_kind: :pull,
+           local_resource_id: pull_id,
+           action: :update,
+           expected_local_version: version,
+           expected_fields: expected,
+           expected_merge_state: merge_state,
+           fields: fields
+         } = request
+       )
+       when is_map(expected) and is_map(fields) and is_map(merge_state) do
+    protected = ~w(state state_reason head_ref head_sha base_ref base_sha)
+    relationships = [:expected_relationships, :local_label_ids, :assignee_refs]
+    relationship_count = Enum.count(relationships, &Map.has_key?(request, &1))
+
+    if repository_id == intent.repository_id and pull_id == intent.pull_request_id and
+         positive?(version) and not Map.has_key?(request, :minimum_local_version) and
+         Map.take(fields, protected) == Map.take(expected, protected) and
+         expected["draft"] == false and fields["draft"] == false and relationship_count in [0, 3],
+       do: :ok,
+       else: {:error, :invalid_metadata_request}
+  end
+
+  defp validate_metadata_request(_, _), do: {:error, :invalid_metadata_request}
 
   defp apply_domain(_, _, %{state: :completed}, _), do: :ok
 

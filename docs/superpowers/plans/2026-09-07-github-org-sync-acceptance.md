@@ -10,6 +10,38 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 atomic inbound metadata convergence during merge (2026-09-08)
+
+- Compatible provider-only title/body and already-mapped label/assignee changes
+  now apply inside the existing merge finalization transaction. The exact local
+  version, fields, merge state and relationship preimage fence the update; state,
+  refs and draft cannot be rewritten through the metadata request. Metadata and
+  closure each advance the canonical version, and paired confirmation uses the
+  resulting actual version. Failed confirmation rolls back both updates/events;
+  an already advanced Git M remains recoverable without another merge commit.
+- The read-only provider observation accepts differing known memberships while
+  retaining immutable node checks. Final authorization revalidates the original
+  raw pair under ordered nonblocking identity locks held through confirmation.
+  Savepoints preserve transaction usability on contention and are used only in
+  active transactions. Unknown identities remain prerequisites, not implicit
+  catalog writes. Existing unmanaged local assignees remain preserved.
+- Connected PostgreSQL verification: **79 passed** (domain finalization and
+  metadata sync 34; provider worker and observation 45). Tests cover inbound
+  additions/removals, node drift, actual cross-connection contention, same-M
+  recovery, exact preimage rejection, rollback and completed replay.
+- Broader scoped run: **226 assertions passed** (Git 4, mirrors 63, pull domain
+  99, provider 57, API 3), with a verification caveat: the unchanged standalone
+  `MergeReconciler` 30-second background task logged a sandbox ownership error
+  after the test owner exited. No assertions failed; this is not an entirely
+  clean runtime run. The final focused 79-test rerun passed without that error.
+  Existing importer fixture warnings remain unchanged. The separate background
+  runtime/test ownership issue was not suppressed or modified in this slice.
+- Production warnings-as-errors compilation and scoped formatting/diff checks
+  passed. Spec and code-quality reviews approved the inbound implementation.
+- Outbound merge-owned metadata effects/recovery, unknown relationship
+  materialization, conflict resolution, admission/activation, PR14–16 and full
+  PRD acceptance remain unfinished. No push, deployment or live GitHub writes.
+
 ### PR13 merge-owned metadata decisions and durable conflicts (2026-09-08)
 
 - A separate pure merge-time decision uses authentic paired baselines for
