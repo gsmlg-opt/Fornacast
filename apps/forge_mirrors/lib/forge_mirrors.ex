@@ -1519,6 +1519,38 @@ defmodule ForgeMirrors do
     do: ForgeMirrors.PullOutboundCreation.context(operation, &lock_pull_creation_operation/1)
 
   @doc false
+  def conflict_outbound_pull_creation(operation, now, marker, kind, evidence),
+    do:
+      ForgeMirrors.PullCreationConflictBoundary.conflict(
+        operation,
+        now,
+        marker,
+        kind,
+        evidence,
+        &lock_pull_creation_operation/1,
+        &conflict_pull_creation_operation/2
+      )
+
+  defp conflict_pull_creation_operation(operation, now) do
+    owned_transition(operation, DateTime.truncate(now, :second), [:effect_pending],
+      state: :failed,
+      failure_class: "stale_baseline",
+      failure_disposition: :conflict,
+      completed_at: nil,
+      external_effect_marker: nil,
+      effect_marked_at: nil,
+      checkpoint:
+        Map.put(
+          operation.checkpoint,
+          "conflicted_effect_marker",
+          operation.external_effect_marker
+        ),
+      lease_owner: nil,
+      lease_expires_at: nil
+    )
+  end
+
+  @doc false
   def outbound_pull_creation_recovery_context(operation),
     do:
       ForgeMirrors.PullCreationRecoveryBoundary.context(

@@ -76,6 +76,8 @@ defmodule ForgeMirrors.PullOutboundCreationTest do
       |> Repo.insert!()
 
     {:ok, {:materialized, [op]}} = ForgeMirrors.materialize_outbox_event(event)
+    # The operation gets its due time during materialization, not at setup start.
+    now = DateTime.utc_now(:second)
 
     {:ok, claimed} =
       ForgeMirrors.claim_operations("outbound-create", now, 120, 100, ["sync.pull"])

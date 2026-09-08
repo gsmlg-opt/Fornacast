@@ -132,9 +132,26 @@ defmodule ForgeGitHub.PullCreateWorker do
                  sync.remote_repository,
                  page,
                  request_options(sync, options)
-               ),
-             {:ok, next} <- PullCreateRecovery.advance(scan, rows, sync.intent.creation_uuid) do
-          checkpoint(operation, scan, next, now, options)
+               ) do
+          case PullCreateRecovery.advance(scan, rows, sync.intent.creation_uuid) do
+            {:ok, next} ->
+              checkpoint(operation, scan, next, now, options)
+
+            {:error, :ambiguous_external_effect} ->
+              conflict(
+                operation,
+                now,
+                "ambiguous_external_effect",
+                %{
+                  "reason" => "multiple_uuid_matches",
+                  "candidates" => conflicting_candidates(scan, rows, sync.intent.creation_uuid)
+                },
+                options
+              )
+
+            {:error, reason} ->
+              failure(operation, now, reason, options)
+          end
         else
           {:error, reason} -> failure(operation, now, reason, options)
         end
@@ -149,6 +166,15 @@ defmodule ForgeGitHub.PullCreateWorker do
           false -> failure(operation, now, :identity_conflict, options)
           {:error, reason} -> failure(operation, now, reason, options)
         end
+
+      {:error, :ambiguous_external_effect} ->
+        conflict(
+          operation,
+          now,
+          "ambiguous_external_effect",
+          %{"reason" => "zero_complete_scan"},
+          options
+        )
 
       {:error, reason} ->
         failure(operation, now, reason, options)
@@ -179,9 +205,23 @@ defmodule ForgeGitHub.PullCreateWorker do
                ),
              true <- identified_pair?(fresh, pair) do
           case phase(fresh.intent, pair) do
-            :desired -> confirm(operation, now, fresh, pair, token, options)
-            :transport -> patch(operation, now, fresh, pair, token, options)
-            :conflict -> failure(operation, now, :identity_conflict, options)
+            :desired ->
+              confirm(operation, now, fresh, pair, token, options)
+
+            :transport ->
+              patch(operation, now, fresh, pair, token, options)
+
+            :conflict ->
+              conflict(
+                operation,
+                now,
+                "third_party_metadata",
+                %{
+                  "reason" => "third_party_metadata",
+                  "observation" => conflict_observation(pair)
+                },
+                options
+              )
           end
         else
           false -> failure(operation, now, :identity_conflict, options)
@@ -561,6 +601,40 @@ defmodule ForgeGitHub.PullCreateWorker do
 
   defp fenced(proof, options, fun),
     do: callback(options, :with_ref_fences, &PullSyncWorker.with_ref_fences/2).(proof, fun)
+
+  # A candidate is only diagnostic evidence. Never select one of two UUID
+  # matches as an authenticated provider identity or create a mapping for it.
+  defp conflicting_candidates(scan, %{pulls: pulls}, uuid) do
+    current =
+      pulls
+      |> Enum.filter(&CorrelationMarker.matches?(&1["body"], uuid))
+      |> Enum.map(&candidate/1)
+
+    [scan["candidate"] | current] |> Enum.reject(&is_nil/1) |> Enum.uniq() |> Enum.take(2)
+  end
+
+  defp conflict_observation(pair),
+    do: %{
+      "pull_snapshot" => pair.pull.confirmed_snapshot,
+      "issue_snapshot" => pair.issue.confirmed_snapshot,
+      "provider_identity" => pair.pull.provider_identity,
+      "github_object_id" => pair.pull.github_object_id,
+      "github_node_id" => pair.pull.github_node_id,
+      "github_number" => pair.pull.github_number
+    }
+
+  defp conflict(operation, now, kind, evidence, options),
+    do:
+      callback(options, :conflict, &ForgeMirrors.conflict_outbound_pull_creation/5).(
+        operation,
+        now,
+        operation.external_effect_marker,
+        kind,
+        evidence
+      )
+
+  defp failure(%{state: :effect_pending} = operation, now, :identity_conflict, options),
+    do: conflict(operation, now, "identity_conflict", %{"reason" => "pair_mismatch"}, options)
 
   defp failure(%{state: :effect_pending} = operation, now, reason, options) do
     {failure_class, retry_at} =

@@ -5,6 +5,7 @@ defmodule ForgeGitHub.PullCreateIntegrationTest do
   alias Fornacast.{DomainOutboxEvent, Repo}
   alias ForgeGitHub.{InstallationToken, PullSyncWorker}
   alias ForgeMirrors.{MirrorOperation, MirrorRefState, MirrorResourceState, PullCreationIntent}
+  alias ForgeMirrors.MirrorConflict
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
@@ -195,6 +196,27 @@ defmodule ForgeGitHub.PullCreateIntegrationTest do
     assert Repo.aggregate(MirrorResourceState, :count) == 2
   end
 
+  test "an empty completed recovery scan becomes a visible conflict and retains creation evidence",
+       c do
+    stub_provider(c, ambiguous_create: true, empty_scan: true)
+    assert {:ok, _} = process(c)
+    marker = Repo.get!(MirrorOperation, c.operation.id).external_effect_marker
+    assert {:ok, _} = process(c, 31)
+    assert {:ok, _} = process(c, 32)
+    failed = Repo.get!(MirrorOperation, c.operation.id)
+    assert failed.state == :failed
+    assert failed.failure_disposition == :conflict
+    assert failed.checkpoint["conflicted_effect_marker"] == marker
+    assert failed.checkpoint["pull_creation_recovery"]["complete"]
+    conflict = Repo.get_by!(MirrorConflict, repository_mirror_id: c.base.id)
+    assert conflict.state == :open
+    assert conflict.remote_snapshot["reason"] == "zero_complete_scan"
+    assert Process.get(:create_posts) == 1
+    assert is_nil(Process.get(:create_patches))
+    assert Repo.aggregate(PullCreationIntent, :count) == 1
+    assert Repo.aggregate(MirrorResourceState, :count) == 0
+  end
+
   defp process(c, offset \\ 0) do
     now = DateTime.add(DateTime.utc_now(:second), offset)
 
@@ -243,7 +265,10 @@ defmodule ForgeGitHub.PullCreateIntegrationTest do
           Req.Test.json(conn, pull(c))
 
         {"GET", "/repos/acme/base/pulls"} ->
-          Req.Test.json(conn, [pull(c)])
+          Req.Test.json(
+            conn,
+            if(Keyword.get(options, :empty_scan, false), do: [], else: [pull(c)])
+          )
 
         {"GET", "/repos/acme/base/issues/7"} ->
           Req.Test.json(conn, issue(c))

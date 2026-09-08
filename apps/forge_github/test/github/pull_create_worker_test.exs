@@ -158,6 +158,11 @@ defmodule ForgeGitHub.PullCreateWorkerTest do
              lease_owner: nil
          }}
       end,
+      conflict: fn op, _, marker, kind, evidence ->
+        assert marker == op.external_effect_marker
+        send(self(), {:conflicted, marker, kind, evidence})
+        {:ok, %{operation: %{op | state: :failed}}}
+      end,
       defer: fn op, _, _, _, code ->
         send(self(), {:deferred, op.external_effect_marker, code})
         {:ok, op}
@@ -250,14 +255,36 @@ defmodule ForgeGitHub.PullCreateWorkerTest do
     refute_received :marked
   end
 
-  test "a completed empty scan defers forever rather than granting another creator", c do
+  test "a completed empty scan becomes a visible conflict without another creator", c do
     recovery = %{
       c.recovery
       | recovery_checkpoint: %{"page" => 1, "candidate" => nil, "complete" => true}
     }
 
     assert {:ok, _} = PullCreateWorker.process_operation(c.marked, c.now, recovery, c.options)
-    assert_received {:deferred, _, _}
+
+    assert_received {:conflicted, _, "ambiguous_external_effect",
+                     %{"reason" => "zero_complete_scan"}}
+
+    refute_received {:deferred, _, _}
+    refute_received :marked
+  end
+
+  test "multiple UUID matches become evidence, never an arbitrary provider binding", c do
+    Req.Test.stub(c.stub, fn conn ->
+      assert conn.method == "GET"
+      first = pull(c, :transport)
+      second = Map.merge(first, %{"id" => 701, "node_id" => "PR_701", "number" => 8})
+      Req.Test.json(conn, [first, second])
+    end)
+
+    assert {:ok, _} = run_recovery(c)
+
+    assert_received {:conflicted, _, "ambiguous_external_effect",
+                     %{"reason" => "multiple_uuid_matches", "candidates" => candidates}}
+
+    assert Enum.map(candidates, & &1["github_object_id"]) == [700, 701]
+    refute_received {:identified, _}
     refute_received :marked
   end
 
@@ -318,7 +345,7 @@ defmodule ForgeGitHub.PullCreateWorkerTest do
     assert_received {:confirmed, _}
   end
 
-  test "third-party cleanup shape and substituted provider identity preserve recovery evidence",
+  test "third-party cleanup shape records a visible conflict with its remote snapshot",
        c do
     c = identified(c)
 
@@ -334,8 +361,33 @@ defmodule ForgeGitHub.PullCreateWorkerTest do
     end)
 
     assert {:ok, _} = run_recovery(c)
-    assert_received {:deferred, _, _}
+
+    assert_received {:conflicted, _, "third_party_metadata",
+                     %{"reason" => "third_party_metadata", "observation" => observation}}
+
+    assert observation["pull_snapshot"]["body"] == "third-party"
+    refute_received {:deferred, _, _}
     refute_received {:confirmed, _}
+  end
+
+  test "substituted identified provider IDs conflict without PATCH", c do
+    c = identified(c)
+
+    Req.Test.stub(c.stub, fn conn ->
+      assert conn.method == "GET"
+
+      raw =
+        if String.contains?(conn.request_path, "/pulls/"),
+          do: Map.put(pull(c, :transport), "id", 701),
+          else: issue(c, :transport)
+
+      Req.Test.json(conn, raw)
+    end)
+
+    assert {:ok, _} = run_recovery(c)
+    assert_received {:conflicted, _, "identity_conflict", %{"reason" => "pair_mismatch"}}
+    refute_received {:confirmed, _}
+    refute_received {:deferred, _, _}
   end
 
   test "inactive recovery context cannot PATCH or confirm and retains old marker", c do
