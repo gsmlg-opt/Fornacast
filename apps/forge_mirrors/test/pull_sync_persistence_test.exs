@@ -760,6 +760,46 @@ defmodule ForgeMirrors.PullSyncPersistenceTest do
     assert Repo.get!(ForgeMirrors.MirrorOperation, c.operation.id).state == :processing
   end
 
+  test "full metadata evidence persists independently of compact markers and cannot be overwritten",
+       c do
+    alias ForgeMirrors.PullMetadataIntent
+
+    attrs = %{
+      operation_id: c.operation.id,
+      repository_mirror_id: c.binding.id,
+      pull_id: c.pull.id,
+      issue_id: c.issue.id,
+      local_version: c.local.local_version,
+      sequence: 1,
+      payload: %{"body" => String.duplicate("x", 70_000)}
+    }
+
+    assert {:ok, intent} =
+             %PullMetadataIntent{} |> PullMetadataIntent.create_changeset(attrs) |> Repo.insert()
+
+    assert Repo.get!(PullMetadataIntent, intent.id).payload == attrs.payload
+
+    assert {:error, changeset} =
+             %PullMetadataIntent{}
+             |> PullMetadataIntent.create_changeset(attrs)
+             |> Repo.insert(mode: :savepoint)
+
+    assert Keyword.has_key?(changeset.errors, :operation_id)
+
+    assert {:error, _} =
+             intent |> PullMetadataIntent.create_changeset(%{payload: %{}}) |> Repo.update()
+
+    assert Repo.get!(PullMetadataIntent, intent.id).payload == attrs.payload
+
+    assert {:ok, second} =
+             %PullMetadataIntent{}
+             |> PullMetadataIntent.create_changeset(%{attrs | sequence: 2})
+             |> Repo.insert()
+
+    assert second.id != intent.id
+    assert Repo.get!(ForgeMirrors.MirrorOperation, c.operation.id).external_effect_marker == nil
+  end
+
   defp paired_confirmation(c) do
     snapshot =
       Map.take(c.local.fields, ~w(title body state state_reason))
