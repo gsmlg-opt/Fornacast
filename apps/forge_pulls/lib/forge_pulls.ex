@@ -166,6 +166,9 @@ defmodule ForgePulls do
   defdelegate write_coordinated_merge(intent_id, coordinator_operation_id, opts),
     to: ForgePulls.CoordinatedMerge
 
+  defdelegate finalize_coordinated_merge(intent_id, coordinator_operation_id, merged_at, opts),
+    to: ForgePulls.CoordinatedMergeFinalization
+
   if Mix.env() == :test do
     @read_phase_hook_key {__MODULE__, :read_phase_hook}
 

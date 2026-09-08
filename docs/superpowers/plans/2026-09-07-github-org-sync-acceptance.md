@@ -10,6 +10,36 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 local merge finalization boundary (2026-09-08)
+
+- A dedicated trusted domain finalizer can apply an already written merge commit
+  after coordinator authorization. Both authorization and caller confirmation
+  callbacks are mandatory and run inside the database transaction; numeric IDs
+  alone are not authorization. This API is not yet connected to the merge worker.
+- Sorted distinct base/head repository fences protect exact local ref checks.
+  The private result/tree pins and actual merge object's tree and ordered parents
+  must match the durable intent. Only the original base can advance to that merge
+  commit; an already advanced ref is recoverable, and a third OID is rejected.
+  No new merge commit is constructed during finalization.
+- Closure and merge facts preserve newer title/body/draft/relationship edits.
+  The canonical issue version, domain outbox, audit, repository write version,
+  caller confirmation SQL, and intent completion commit atomically. Callback
+  rejection or final SQL failure rolls them back while leaving the local Git
+  result recoverable. Completed replay does not repeat domain mutations/events.
+- Combined scoped PostgreSQL regression matrix: **147 passed** (Git transport 4,
+  mirror merge boundary 38, pull domain/recovery/snapshot/outbox 79, prepared
+  provider merge worker 23, API merge 3). Fourteen finalization tests use real
+  database transactions and Git objects, including caller SQL rollback after a
+  successful callback followed by failed intent completion. They prove trusted
+  transaction composition, not real GitHub final confirmation.
+  Production compilation with warnings-as-errors and scoped formatting checks
+  passed; existing unrelated importer test fixture warnings remain unchanged.
+- The coordinator still needs dedicated final authorization and authenticated
+  paired provider evidence, safe paired mapping/ref baseline confirmation, and
+  worker integration. It must not label newer local metadata remotely confirmed
+  without evidence. Existing ref-only readiness and generic completion guards
+  remain unchanged; this is not full FR-083 or PR13 acceptance.
+
 ### PR13 prepared merge execution and ambiguous-effect recovery (2026-09-08)
 
 - A bounded, deliberately unregistered merge worker executes an already written
