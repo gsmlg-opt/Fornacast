@@ -4,10 +4,25 @@ Source: `docs/fornacast-github-org-sync-prd.md`, section 13 (all 22 criteria).
 
 This is a working evidence ledger, not a completion declaration. A test entrypoint
 below identifies relevant coverage; its existence alone does not prove acceptance.
-The full goal remains open. PR11 is locally implemented in `acedead`, PR12 is in progress, and
-PR13–16 remain to be implemented and verified.
+The full goal remains open. PR11 and PR12 have local implementation and focused
+integration proof; PR13 is in progress. PR14–16 and the complete acceptance matrix
+remain open.
 
 ## Requirement-by-requirement gates
+
+PR13 integration audit additionally identified these concrete remaining gates:
+
+- Bootstrap `MetadataMapper` still skips draft and cross-repository pulls;
+  remove those exclusions only with the new supported/read-only eligibility paths.
+- New bootstrap imports now preserve the issue-list's authoritative issue ID for
+  the PR's canonical issue mapping (14 mapper/importer tests passed). Legacy rows
+  previously recorded the PR ID as the issue ID; those are rejected with an
+  actionable revalidation error. Authenticated legacy recovery and already-bound
+  mirror repair remain required; never infer issue identity from a PR ID or number.
+- Read-side `SnapshotRefresh` now advances the canonical issue version and emits
+  its event atomically for changed refs, with unchanged-read churn prevented.
+  Confirmation retains exact expected fields and merge-state checks as well as
+  the version; remaining worker and merge-coordinator paths must honor them.
 
 | # | Required outcome | Current evidence / next gate |
 |---|---|---|
@@ -23,8 +38,8 @@ PR13–16 remain to be implemented and verified.
 | 10 | Divergence is visible and neither side overwritten | Conflict persistence/worker tests exist. Finish and verify conflict UX in PR16. |
 | 11 | LFS clone and checkout succeed from either endpoint after sync | Actual Fornacast smart-HTTP clone with official git-lfs 3.7.1 checks out 128 KiB with matching SHA-256. Existing official SSH LFS transfer coverage is also present. Remote endpoint plus full synchronization-to-clone chain remain unproven. |
 | 12 | Missing/corrupt LFS blocks confirmation and degrades sync | Focused worker, storage, durable 101-pointer replay, and authoritative-scan tests pass. Finalizer queue/catch-up review fixes are committed in `acedead`; retain the full integrated gate in final acceptance. |
-| 13 | Issue/comment changes converge both ways | PR12 in progress: scalar/set comparison, persisted snapshots, correlation-marker codec, transactional version/outbox producers (`b8c9ea7`), bounded provider APIs (`ae19146`), and consumer/webhook trigger retention (`7128612`) pass focused tests. Worker effects, mappings, correlation recovery, and integrated convergence remain open. |
-| 14 | Same-repository PR metadata converges both ways | PR13 remains open. Bootstrap import is not two-way synchronization. FR-080 additionally requires cross-repository PR synchronization when both head and base repositories have active mirrors; FR-082 permits read-only metadata only when the head repository is not represented locally. |
+| 13 | Issue/comment changes converge both ways | PR12 local worker, mapping, effect recovery, label materialization, signed ingress and bootstrap activation are implemented through `f45097e`; combined activation matrix: 150 passed. Real domain/lease/HTTP-stub tests cover both directions and omitted comment deletion. Complete end-to-end acceptance and restart matrix remain open. |
+| 14 | Same-repository PR metadata converges both ways | PR13 remains open. Bootstrap import is not two-way synchronization. FR-080 additionally requires cross-repository PR synchronization when both head and base repositories have active mirrors; FR-082 permits read-only metadata only when the head repository is not represented locally. Include a trusted nil-to-represented head binding transition when its mirror later becomes available; current immutable import identity alone cannot perform that transition. |
 | 15 | Coordinated PR merge produces one confirmed Git result | PR13 remains open; verify effect-boundary recovery, exact expected SHAs, and both resulting endpoints. |
 | 16 | Release metadata converges and stays bound to a confirmed tag | PR14–15 remain open. Existing scaffold is not proof of implementation. |
 | 17 | Release assets and wiki never synchronize | Verify explicit negative fixtures across import, inbound events, outbound events, and reconciliation when release sync is implemented. |
@@ -35,6 +50,226 @@ PR13–16 remain to be implemented and verified.
 | 22 | Disconnect/revocation stops token use and retains local repos | App credential/lifecycle foundation exists. Verify every new worker and in-flight recovery path in final acceptance. |
 
 ## Current local verification
+
+- PR13 provider client and authorized head rendering are checkpointed locally
+  in `47f1801` and `c29f656`. A fresh combined run passed provider 10 and API 25
+  tests before those commits. Nothing was pushed. Transactional PR apply/observe,
+  canonical projection and active-mirror/ref eligibility are the next integration
+  prerequisites; the worker and coordinated merge remain open.
+- Existing-PR transactional domain foundation passed 68 scoped PostgreSQL tests
+  (seven new sync cases plus 61 existing pull cases). Exact issue version, all
+  nine metadata fields and merge state protect apply/observe. Full Unicode body
+  limits and rollback are covered. Persisted mirror/ref eligibility passed eight
+  cases. These helpers do not yet prove worker integration, fresh Git availability,
+  PR creation or coordinated merges.
+- Local REST draft creation is now accepted as a boolean in both API versions;
+  REST draft updates remain rejected. The focused creation and pinned contract
+  run passed 18 tests. Local domain create/update outbox and SnapshotRefresh
+  version/event producers are under regression verification; no worker enablement
+  is implied by this API result.
+- Local producers and snapshot refresh passed a combined 78-test PostgreSQL
+  run. A separate fresh API/client/projection run passed 40 tests; projection
+  (`7472732`) and draft creation API (`938b173`) are checkpointed locally.
+  The projection retains distinct PR and canonical issue identities and rejects
+  inconsistent paired observations. Worker integration is still pending.
+- PR13 persistence RED now covers missing pull context/confirmation and rejected
+  stale or revoked head eligibility at effect boundaries (five expected failures
+  before implementation). Authenticated legacy identity recovery has a separate
+  RED covering successful/idempotent repair and mismatched/denied evidence.
+  These are unfinished implementation gates, not passing acceptance evidence.
+- Initial persistence verification passed 27 PostgreSQL tests (eight pull cases
+  plus 19 existing resource cases), and authenticated bootstrap recovery passed
+  15 mapper/importer cases. Review follow-ups remain open: exact local marker
+  preimage/version checks, correlated nil-identity initialization, and cancellation,
+  expired-lease and App revocation fencing for recovery. No worker enablement or
+  completed acceptance claim follows from these initial results.
+- Follow-up scoped runs passed 29 persistence/resource tests and 16 bootstrap
+  mapper/importer/recovery authorization tests. Persistence now checks marker
+  preimages and permits correlated initial provider identity; recovery rechecks
+  cancellation, leases, owner access and App binding state under locks. Review
+  continues on confirmation fingerprint continuity and repository/destination
+  ownership consistency. Automatic legacy recovery scheduling, already-bound
+  repair and the real PR worker integration remain open.
+- Publication review found that legacy `ready_to_publish` dispatch calls the
+  publisher directly and its durable proof currently trusts terminal metadata
+  checkpoints. The identity guard in the importer alone is therefore insufficient:
+  publication must validate identities without HTTP, and the worker must route
+  invalid legacy evidence through bounded authenticated metadata recovery.
+  Worker unit-contract RED: all five tests fail because `PullSyncWorker` is absent;
+  these injected callbacks are not PostgreSQL integration evidence.
+- Persistence follow-up passed 42 scoped PostgreSQL tests (15 pull persistence,
+  19 generic resource, eight eligibility). Regressions proved rejection of a
+  substituted marker preimage and incorrect canonical issue projection; database
+  object constraints and version monotonicity also passed. Contradictory mixed
+  local/remote operation cursors remain under review before checkpointing.
+- Fresh combined verification passed 103 scoped PostgreSQL tests: persistence
+  45 and importer/mapper/publication 58. Persistence is checkpointed locally in
+  `47540f7`, including contradictory-cursor rejection and observed mapping-version
+  fencing before effects. Publication now rechecks identity in its final locked
+  transaction, including recovery of already-admitted legacy publication. Automatic
+  metadata recovery routing and worker integration are still being implemented;
+  this checkpoint does not enable PR synchronization or complete PR13.
+- The initial worker implementation is present but unverified. Review identified
+  two recovery requirements now under regression testing: failed reads must retain
+  unresolved effect markers, and an applied disjoint-field merge must recover even
+  after a newer local edit. Bootstrap automatic identity recovery is also under
+  test; the existing recovery state machine can demote invalid legacy publication
+  evidence without introducing a second publication dispatch path.
+- Root worker/provider verification passed 19 tests (seven worker contracts and
+  12 issue-client cases). The worker retains pending markers on observation
+  failure and reconstructs disjoint-merge preimages without storing large bodies
+  in effect markers. One test assertion was corrected to the domain's actual
+  two-field merge-state contract. Real leased PostgreSQL worker integration,
+  ingress enablement and full PR synchronization acceptance remain unproven.
+- Trusted head import API is checkpointed in `515c00c` (14 import + six model
+  tests freshly passed); canonical PR issue transport is in `dd9ef24` (12 client
+  cases in the prior 19-test root run, formatting checked). Bootstrap identity
+  recovery is checkpointed in `a6ee26d`, with 58 importer/mapper/publication tests
+  freshly passed. Recovery handles one identity per lease and retains durable
+  progress; already-admitted publication reopening and already-bound mapping
+  repair are still open. Bootstrap draft/external-head mapper wiring is next.
+- FR-083 audit found mirrored same-repository PRs can still enter the ordinary
+  local merge path through `ForgePulls.merge/5`. A no-local-fallback guard is a
+  prerequisite only; the actual single coordinator and identical two-endpoint
+  result confirmation must still be implemented and verified.
+- Worker checkpoint `b5f95a5` passed a fresh ten-test run: seven contracts and
+  three real leased PostgreSQL/domain/persistence integrations with stubbed
+  provider HTTP. Required Git refs are still represented by fixture baselines;
+  live Git availability is an explicit pending gate before worker enablement.
+  Merge guard `7da8f81` passed both mirrored/no-local-fallback and ordinary local
+  merge tests. It prevents independent merges but does not implement FR-083.
+  Scoped formatting passed for both checkpoints. Bootstrap mapper RED reproduced
+  the remaining draft/external import exclusions (13/15 passed before changes).
+- Fresh-Git behavioral RED passed the three existing scenarios with real bare
+  repositories, but reproduced two unsafe paths: a deleted external head ref
+  still allowed confirmation, and a changed base ref still allowed an outbound
+  effect. Availability checks are being implemented before enablement. Bootstrap
+  represented-head RED separately reproduced external-head binding to the base
+  repository and missing represented-head proof handling (six of eight passed).
+- Merge design retains a single deterministic local commit and exact expected-base
+  push, followed by fresh provider and local confirmation of the same result.
+  GitHub's [REST merge API](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
+  documents a head-SHA condition, not an expected-base condition. Direct pushes
+  can produce [indirect merges](https://docs.github.com/en/pull-requests/reference/pull-request-merges#indirect-merges),
+  but push success is not proof of exact PR merge state. Durable intent preparation
+  must precede object writing and exclude coordinator-owned operations from the
+  ordinary local merge reconciler. Implementation and two-endpoint proof are open.
+- Live availability checkpoint `3c2a069` passed 13 scoped tests (eight worker
+  contracts and five integrations with real bare Git refs/objects). Checks use
+  proof-selected repository generations, bounded exact refs and commit existence,
+  including post-effect rechecks. Retry diagnostics retain a Git-specific reason
+  without discarding unresolved markers. Worker activation is still disabled.
+- Root handoff audit found another activation gate: `organization_sync/handoff.ex`
+  still seeds the legacy pull snapshot and does not initialize the worker's
+  canonical issue version, PR node identity or separate merge state. Actual
+  bootstrap-to-worker compatibility must be implemented and tested; manually
+  seeded integration mappings are not proof that this production path works.
+- Bootstrap checkpoint `667af80` passed fresh root verification: 16 mapper/importer
+  tests alongside 13 worker tests (29 total), with scoped formatting clean. Draft
+  flags, external read-only heads, represented-head live/ref proof and atomic
+  warning resolution are implemented. Handoff compatibility is still open.
+- The handoff fix will retain bounded authenticated numeric/node identities,
+  original canonical snapshot fingerprint/version and merge state on the import
+  mapping, without duplicating large bodies or expanding report metadata limits.
+  Handoff must match this evidence to both mappings and the local projection;
+  missing legacy evidence requires authenticated recovery, never rebaselining.
+- Durable merge-intent tests reproduced the missing API, then exposed an SQL
+  NULL constraint gap. The implementation is under scoped regression verification;
+  an additive constraint correction preserves the retained database. This remains
+  intent preparation only, not Git object writing or two-endpoint merge completion.
+- Durable intent checkpoint `7d20c62` passed a fresh root run of 91 scoped
+  PostgreSQL tests and formatting. Fixed message/signatures and resource preimage
+  are replay-validated; ordinary recovery cannot process coordinator-owned rows,
+  and unfinished intents still block cleanup. Deterministic object writing and
+  all provider/public-ref/merged-state effects remain to be implemented.
+- FR-081 audit found the existing comment domain accepts PR parents but mirror
+  routing rejects them or confuses the canonical issue and pull mappings. Pulls-only
+  comment sweeps and bootstrap completion gates are also missing. The implementation
+  must use canonical issue identity, verify its PR companion, and derive actual
+  parent kind under locks before checking the appropriate capability.
+- FR-082 UI checkpoint `422161a` adds the external-head read-only notice using
+  the existing DuskMoon alert and avoids claiming merge conflicts when analysis
+  cannot resolve a non-local head. All 33 scoped pull HTML/controller tests and
+  scoped formatting passed. This does not establish the remaining head-binding
+  transition, provider integration, or full browser acceptance gates.
+- Merge writer RED reproduced missing APIs in nine domain tests and two native
+  tests (28 existing native tests passed). Native tree-only and fixed-tree commit
+  primitives now compile, but writer verification remains open. Review requires
+  recursive merge-base coverage and recovery between tree publication, pinning,
+  and the durable tree checkpoint; fixed signatures alone do not ensure replay
+  uses the same merge tree after repository configuration changes.
+  The expanded RED matrix reproduced one virtual commit published by a
+  crisscross merge during the tree-only phase (30/31 native tests passed), plus
+  two missing tree crash checkpoints (10/12 writer tests passed). The correction
+  filters tree-phase publication to trees/blobs and commits the tree ID before
+  pinning. The subsequent focused matrix passed all 43 tests (31 native, 12
+  writer), including cleanup blocking at the durable tree checkpoint. Fresh
+  root regression then passed 134 tests (103 pull domain/recovery, 31 native);
+  scoped Elixir and Rust formatting passed. This writer checkpoint is committed
+  locally in `ff98558`. A separate scoped Rust merge unit run passed 13 tests,
+  including hard limits, deadline cancellation and exact worker-capacity release.
+  Remote coordinator execution remains open.
+- Pull bootstrap evidence mapper tests pass (nine); integration reached the new
+  paired identity and handoff assertions but its final comment claim was blocked
+  by repository FIFO ordering. The pipeline is not yet verified. Handoff retains
+  both canonical issue and pull mirror identities; ordinary issue synchronization
+  must exclude the PR companion while comments verify both identities.
+- The comment-routing matrix passed 86 scoped tests (41 mirror, 45 GitHub),
+  including capability-specific token permissions, mixed issue/PR comment pages,
+  canonical companion exclusion, and pending-parent FIFO progression. Review
+  then identified an early-context failure path that could discard an existing
+  effect marker. Two unit regressions reproduced marker loss on context/token
+  failures, and two database regressions reproduced the missing recovery-only
+  deferral API. Recovery GET permission failures also cannot prove an old write
+  was rejected. The preservation fix subsequently passed 92 scoped tests
+  (43 mirror, 49 GitHub), including real worker-to-database evidence retention;
+  root independently reran all 92 successfully and checked scoped formatting.
+  The checkpoint is committed locally in `5a7ec30`; actual bootstrap handoff
+  integration remains a separate, still-open proof.
+- Bootstrap review also found authenticated PR companion labels/assignees were
+  not imported/proved before confirming their issue snapshot. The pending fix
+  must import those authenticated relationships and verify a compact canonical
+  issue fingerprint; current local relationship values alone are not evidence.
+- Paired App bootstrap PR/issue GETs now retain the existing bounded body
+  allowance while keeping PAT and unrelated JSON-field limits unchanged.
+  `f41f6d0` passed all 48 Client tests, including 65,536 four-byte codepoints
+  and rejection above 262,144 body bytes. Importer domain validation and the
+  complete authenticated baseline pipeline remain separate gates.
+- The evidence slice passed 11 focused tests, including real PAT import,
+  evidence replay, contradictory-node recovery, handoff and leased comment
+  context. Root's broader four-file run passed 57/62: five existing metadata
+  importer cases now receive provider 404 before their identity/head assertions.
+  Their authenticated companion fixtures and behavior need verification before
+  committing the slice. Genuine App-bootstrap long-body proof is still open;
+  a PAT fixture cannot establish that gate or bypass the intentional PAT limit.
+  These five fixtures were corrected without weakening their identity/head
+  assertions. A separate real App credential-provider/broker test now verifies
+  the full multibyte body through metadata staging and publication. Root reran
+  all 63 scoped import/publication tests successfully and checked formatting;
+  the evidence/handoff checkpoint is committed in `935ded0`. This does not prove
+  live GitHub inventory/bootstrap or background pull synchronization.
+- Runtime activation audit confirms PullSyncWorker is not supervised and its
+  current init ignores `enabled: false`. Local outbox already enqueues sync.pull;
+  unmapped pulls are rejected and can block repository FIFO. Signed pull webhook
+  admission, pull reconciliation sweeps, discovery/create, changing ref/SHA
+  handling and merge routing are still missing. Lifecycle gating alone must not
+  be called runtime synchronization completion or silently drop unmapped work.
+  Lifecycle gating is now committed as `a6324f6`: root reran 16 lifecycle,
+  mapped-worker and integration tests and checked formatting. Production worker
+  registration remains intentionally absent until creation/recovery is handled.
+
+- On 2026-09-08 the user approved leaving the dormant Turso migration test
+  unchanged and resuming PostgreSQL-only verification. The scoped domain run
+  passed 148 tests after fixture isolation and query-budget repairs. The first
+  combined API/provider run passed 33 of 34 tests: head redaction, nullable
+  contracts and provider cases passed, while the issue-composition route still
+  made two pull queries against its budget of one. The follow-up repaired that
+  regression without increasing the budget, preserved repository-level issue
+  creation, and rejected foreign-head commit/diff ref resolution in the base
+  repository. Final combined PostgreSQL run: **184 passed** (issues 88,
+  pulls 61, API/contracts 25, provider 10). The existing background
+  MergeReconciler SQL sandbox ownership error was still logged without a failed
+  test and is not claimed fixed. This is not PR13 completion.
 
 - Latest combined scoped matrix: **152 passed** (GitCore 2, GitLFS 24,
   ForgeMirrors 25 including the five PR12 comparison tests, ForgeGitHub 54,
