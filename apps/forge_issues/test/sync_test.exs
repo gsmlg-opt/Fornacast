@@ -179,7 +179,12 @@ defmodule ForgeIssues.SyncTest do
              |> Repo.transaction()
 
     assert Repo.aggregate(Issue, :count) == 0
-    refute Repo.exists?(from e in DomainOutboxEvent, where: e.aggregate_type == "issue")
+
+    refute Repo.exists?(
+             from e in DomainOutboxEvent,
+               where:
+                 e.aggregate_type == "issue" and e.payload["repository_id"] == ^ctx.repository.id
+           )
   end
 
   test "comment create edit delete retains immutable author and versioned tombstone", ctx do

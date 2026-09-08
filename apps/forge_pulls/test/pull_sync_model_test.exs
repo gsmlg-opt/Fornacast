@@ -97,4 +97,14 @@ defmodule ForgePulls.PullSyncModelTest do
       refute PullRequest.import_changeset(new_pull(), attrs(), issue(), repository(), head_id).valid?
     end
   end
+
+  test "same branch name is allowed across represented or external heads but not the same repository" do
+    same_name = %{attrs() | head_ref: "refs/heads/main"}
+
+    for head_id <- [3, nil] do
+      assert PullRequest.import_changeset(new_pull(), same_name, issue(), repository(), head_id).valid?
+    end
+
+    refute PullRequest.import_changeset(new_pull(), same_name, issue(), repository(), 2).valid?
+  end
 end

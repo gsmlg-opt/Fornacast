@@ -19,11 +19,16 @@ defmodule ForgePulls.Mutations do
     |> Multi.insert(:pull_request, fn %{issue: issue} ->
       %PullRequest{}
       |> PullRequest.create_changeset(
-        Map.merge(refs, %{issue_id: issue.id, repository_id: repository.id})
+        Map.merge(refs, %{
+          issue_id: issue.id,
+          repository_id: repository.id,
+          draft: Map.get(attrs, "draft", Map.get(attrs, :draft, false))
+        })
       )
       |> Ecto.Changeset.put_change(:mergeable, nil)
       |> Ecto.Changeset.put_change(:mergeable_state, :unknown)
     end)
+    |> ForgeIssues.SyncEvents.issue("issue.created", [])
     |> Audit.record_multi(
       :audit,
       actor,
@@ -62,59 +67,77 @@ defmodule ForgePulls.SnapshotRefresh do
   import Ecto.Query
 
   alias Ecto.Multi
+  alias ForgeIssues.Issue
   alias ForgePulls.PullRequest
   alias Fornacast.Repo
 
+  @ref_fields [:head_ref, :base_ref, :head_sha, :base_sha]
+
   def persist(%PullRequest{} = expected, attrs) when is_map(attrs) do
+    attrs = Map.take(attrs, @ref_fields)
+
     Multi.new()
+    |> Multi.run(:snapshot_issue, fn repo, _ ->
+      case repo.one(
+             from issue in Issue,
+               where:
+                 issue.id == ^expected.issue_id and issue.repository_id == ^expected.repository_id and
+                   issue.kind == :pull_request,
+               lock: "FOR UPDATE"
+           ) do
+        %Issue{} = issue -> {:ok, issue}
+        nil -> {:error, :ref_conflict}
+      end
+    end)
     |> Multi.run(:pull_request, fn repo, _changes ->
       persist_in_transaction(repo, expected, attrs)
+    end)
+    |> Multi.merge(fn %{snapshot_issue: issue} ->
+      if Map.take(expected, @ref_fields) == attrs do
+        Multi.new()
+      else
+        Multi.new()
+        |> ForgeIssues.update_identity(:issue, issue, nil, %{})
+        |> ForgeIssues.SyncEvents.issue("issue.updated", [])
+      end
     end)
     |> ForgeIssues.transaction()
     |> case do
       {:ok, %{pull_request: pull}} -> {:ok, pull}
-      {:error, :pull_request, reason, _changes} -> {:error, reason}
+      {:error, _step, reason, _changes} -> {:error, reason}
     end
   end
 
+  # The caller owns the canonical Issue version and outbox event in its existing
+  # transaction. Public pull updates use this path after update_identity/5.
   def persist_in_transaction(repo, %PullRequest{} = expected, attrs) when is_map(attrs) do
-    target_head_ref = Map.fetch!(attrs, :head_ref)
-    target_base_ref = Map.fetch!(attrs, :base_ref)
-    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    target = Map.new(@ref_fields, &{&1, Map.fetch!(attrs, &1)})
+    target = Map.put(target, :draft, Map.get(attrs, :draft, expected.draft))
 
     query =
       from(pull in PullRequest,
         where:
           pull.id == ^expected.id and pull.repository_id == ^expected.repository_id and
+            pull.issue_id == ^expected.issue_id and pull.draft == ^expected.draft and
             pull.head_ref == ^expected.head_ref and pull.base_ref == ^expected.base_ref and
-            pull.head_sha == ^expected.head_sha and pull.base_sha == ^expected.base_sha
+            pull.head_sha == ^expected.head_sha and pull.base_sha == ^expected.base_sha,
+        lock: "FOR UPDATE"
       )
 
-    updates = [
-      head_ref: target_head_ref,
-      base_ref: target_base_ref,
-      head_sha: Map.fetch!(attrs, :head_sha),
-      base_sha: Map.fetch!(attrs, :base_sha),
-      mergeable: nil,
-      mergeable_state: :unknown,
-      updated_at: now
-    ]
-
-    case repo.update_all(query, set: updates) do
-      {1, _rows} ->
-        {:ok,
-         repo.one!(
-           from(pull in PullRequest,
-             where:
-               pull.id == ^expected.id and pull.repository_id == ^expected.repository_id and
-                 pull.head_ref == ^target_head_ref and pull.base_ref == ^target_base_ref and
-                 pull.head_sha == ^Map.fetch!(attrs, :head_sha) and
-                 pull.base_sha == ^Map.fetch!(attrs, :base_sha)
-           )
-         )}
-
-      {0, _rows} ->
+    case repo.one(query) do
+      nil ->
         {:error, :ref_conflict}
+
+      %PullRequest{} = pull ->
+        if Map.take(pull, @ref_fields ++ [:draft]) == target do
+          {:ok, pull}
+        else
+          pull
+          |> Ecto.Changeset.change(
+            Map.merge(target, %{mergeable: nil, mergeable_state: :unknown})
+          )
+          |> repo.update()
+        end
     end
   end
 end
@@ -130,6 +153,10 @@ defmodule ForgePulls do
 
   @oid_regex ~r/\A[0-9a-f]{40}(?:[0-9a-f]{24})?\z/
   @pull_list_analysis_deadline_ms 5_000
+
+  defdelegate sync_projection(repository_id, kind, id), to: ForgePulls.Sync
+  defdelegate append_sync_observe(multi, key, expected), to: ForgePulls.Sync
+  defdelegate append_sync_apply(multi, key, request), to: ForgePulls.Sync
 
   if Mix.env() == :test do
     @read_phase_hook_key {__MODULE__, :read_phase_hook}
@@ -405,6 +432,7 @@ defmodule ForgePulls do
       when is_map(attrs) and is_map(request_metadata) do
     with %ForgeAccounts.User{} = actor <- actor,
          {:ok, repository} <- canonical_read_repository(repository, actor),
+         :ok <- validate_draft(attrs),
          {:ok, refs} <- resolve_creation_refs(repository, attrs) do
       Ecto.Multi.new()
       |> Ecto.Multi.run(:authorization, fn repo, _ ->
@@ -459,6 +487,7 @@ defmodule ForgePulls do
          {:ok, preflight} <- authorize_update_preflight(actor, repository, pull),
          :ok <- unchanged_snapshot(preflight.pull, pull),
          :ok <- immutable_source(attrs),
+         :ok <- validate_draft(attrs),
          {:ok, attrs} <- normalize_update_attrs(attrs) do
       ForgeRepos.with_write_fence(preflight.repository, :merge, fn _repository_path, _remaining ->
         execute_update(preflight.repository, pull, actor, attrs, request_metadata)
@@ -636,6 +665,7 @@ defmodule ForgePulls do
            ),
          :ok <- same_pull_refs(pull, expected_pull),
          %Issue{kind: :pull_request} = issue <- current_issue(pull.issue_id, repository),
+         true <- pull.head_repository_id == repository.id,
          true <- Fornacast.Access.allowed?(actor, :repository_write, repository) do
       {:ok, %{actor: actor, repository: repository, pull: pull, issue: issue}}
     else
@@ -881,6 +911,24 @@ defmodule ForgePulls do
     end)
   end
 
+  defp resolve_updated_base(repository, %{head_repository_id: head_id} = pull, attrs)
+       when head_id != repository.id do
+    snapshot = Map.take(pull, [:head_ref, :base_ref, :head_sha, :base_sha])
+
+    case fetch_attr(attrs, "base") do
+      :error ->
+        {:ok, snapshot}
+
+      {:ok, base} ->
+        with_read_path(repository, fn path ->
+          with {:ok, base_ref} <- branch_ref(base, :invalid_base),
+               {:ok, base} <- resolve_ref_path(path, base_ref, :invalid_base) do
+            {:ok, %{snapshot | base_ref: base.ref, base_sha: base.oid}}
+          end
+        end)
+    end
+  end
+
   defp resolve_updated_base(repository, pull, attrs) do
     with_read_path(repository, fn path ->
       with {:ok, base_ref} <-
@@ -961,10 +1009,12 @@ defmodule ForgePulls do
              id: expected_pull.id,
              repository_id: repository.id
            ),
+         true <- pull.head_repository_id == repository.id,
          {:ok, head} <- resolve_ref_path(path, pull.head_ref, :invalid_head),
          {:ok, base} <- resolve_ref_path(path, pull.base_ref, :invalid_base) do
       {:ok, head, base}
     else
+      false -> {:error, :cross_repository_head}
       nil -> {:error, :not_found}
       {:error, _} = error -> error
     end
@@ -1027,6 +1077,7 @@ defmodule ForgePulls do
              )
            ),
          %Issue{kind: :pull_request} = issue <- current_issue(pull.issue_id, repository),
+         :ok <- require_local_metadata_mutation(issue),
          {:ok, capability} <- mutation_capability(actor, repository, issue) do
       {:ok,
        %{actor: actor, repository: repository, issue: issue, pull: pull, capability: capability}}
@@ -1049,6 +1100,7 @@ defmodule ForgePulls do
          :ok <- unchanged_snapshot(pull, expected_pull),
          %Issue{kind: :pull_request} = issue <-
            current_issue(pull.issue_id, repository),
+         :ok <- require_local_metadata_mutation(issue),
          {:ok, capability} <- mutation_capability(actor, repository, issue) do
       {:ok,
        %{actor: actor, repository: repository, issue: issue, pull: pull, capability: capability}}
@@ -1063,6 +1115,12 @@ defmodule ForgePulls do
          :ok <- unchanged_snapshot(context.pull, expected_pull),
          :ok <- compatible_merged_update(context.pull, attrs),
          {:ok, pull_attrs} <- resolve_updated_base(context.repository, context.pull, attrs) do
+      pull_attrs =
+        case fetch_attr(attrs, "draft") do
+          {:ok, draft} -> Map.put(pull_attrs, :draft, draft)
+          :error -> pull_attrs
+        end
+
       Ecto.Multi.new()
       |> Ecto.Multi.run(:authorization, fn repo, _ ->
         authorize_update(repo, context.actor.id, context.repository.id, context.pull)
@@ -1083,6 +1141,7 @@ defmodule ForgePulls do
         |> Ecto.Multi.run(:pull_request, fn repo, _changes ->
           ForgePulls.SnapshotRefresh.persist_in_transaction(repo, current_pull, pull_attrs)
         end)
+        |> ForgeIssues.SyncEvents.issue("issue.updated", [])
         |> Audit.record_multi(
           :audit,
           current_actor,
@@ -1140,6 +1199,10 @@ defmodule ForgePulls do
     end
   end
 
+  defp require_local_metadata_mutation(issue) do
+    if ForgeIssues.local_mutation_allowed?(issue), do: :ok, else: {:error, :forbidden}
+  end
+
   defp mutation_capability(actor, repository, issue) do
     cond do
       Fornacast.Access.allowed?(actor, :repository_write, repository) ->
@@ -1161,6 +1224,14 @@ defmodule ForgePulls do
       {state, :closed} when state != :closed -> Map.put(attrs, "state_reason", :completed)
       {state, :open} when state != :open -> Map.put(attrs, "state_reason", :reopened)
       _ -> attrs
+    end
+  end
+
+  defp validate_draft(attrs) do
+    case fetch_attr(attrs, "draft") do
+      :error -> :ok
+      {:ok, draft} when is_boolean(draft) -> :ok
+      _ -> {:error, {:validation, [%{resource: "PullRequest", field: "draft", code: :invalid}]}}
     end
   end
 
@@ -1272,7 +1343,7 @@ defmodule ForgePulls do
   end
 
   defp load_issues_with_analysis(pulls, issues_by_id, repository, absolute_deadline) do
-    if Enum.any?(pulls, &is_nil(&1.analysis)) do
+    if Enum.any?(pulls, &(is_nil(&1.analysis) and &1.head_repository_id == repository.id)) do
       with_read_path(repository, fn path ->
         reduce_loaded_issues(pulls, issues_by_id, repository, absolute_deadline, path)
       end)
@@ -1301,6 +1372,10 @@ defmodule ForgePulls do
     end
   end
 
+  defp refresh_analysis(%{head_repository_id: head_id} = pull, repository)
+       when head_id != repository.id,
+       do: {:ok, %{pull | analysis: unknown_analysis(pull)}}
+
   defp refresh_analysis(pull, repository) do
     with_read_path(repository, fn path ->
       with {:ok, head} <- resolve_ref_path(path, pull.head_ref, :invalid_head),
@@ -1325,6 +1400,10 @@ defmodule ForgePulls do
   end
 
   defp ensure_analysis(pull, repository, absolute_deadline, path)
+
+  defp ensure_analysis(%{head_repository_id: head_id} = pull, repository, _deadline, _path)
+       when head_id != repository.id,
+       do: {:ok, %{pull | analysis: unknown_analysis(pull)}}
 
   defp ensure_analysis(
          %PullRequest{analysis: %GitCore.MergeAnalysis{}} = pull,
@@ -1419,7 +1498,7 @@ defmodule ForgePulls do
       can_close: Map.get(issue_capabilities, :can_close, false),
       can_comment: Map.get(issue_capabilities, :can_comment, false),
       can_merge:
-        repository.allow_merge_commit and
+        pull.head_repository_id == repository.id and repository.allow_merge_commit and
           Map.get(issue_capabilities, :can_manage_relationships, false) and
           issue.state == :open and not pull.draft and is_nil(pull.merged_at) and
           pull.analysis.mergeable

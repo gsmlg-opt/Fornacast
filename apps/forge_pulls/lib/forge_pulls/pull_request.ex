@@ -34,10 +34,18 @@ defmodule ForgePulls.PullRequest do
 
   def create_changeset(%__MODULE__{id: nil} = pull_request, attrs) do
     pull_request
-    |> cast(attrs, [:issue_id, :repository_id, :head_ref, :base_ref, :head_sha, :base_sha])
+    |> cast(attrs, [:issue_id, :repository_id, :head_ref, :base_ref, :head_sha, :base_sha, :draft])
     |> validate_repository_identity(pull_request.repository_id)
     |> same_repository_head()
-    |> validate_required([:issue_id, :repository_id, :head_ref, :base_ref, :head_sha, :base_sha])
+    |> validate_required([
+      :issue_id,
+      :repository_id,
+      :head_ref,
+      :base_ref,
+      :head_sha,
+      :base_sha,
+      :draft
+    ])
     |> validate_branch_refs()
     |> validate_distinct_refs()
     |> unique_constraint(:issue_id)
@@ -230,7 +238,8 @@ defmodule ForgePulls.PullRequest do
   defp canonical_branch_ref?(_ref), do: false
 
   defp validate_distinct_refs(changeset) do
-    if get_field(changeset, :head_ref) == get_field(changeset, :base_ref) do
+    if get_field(changeset, :head_ref) == get_field(changeset, :base_ref) and
+         get_field(changeset, :head_repository_id) == get_field(changeset, :repository_id) do
       add_error(changeset, :base_ref, "must differ from head ref")
     else
       changeset

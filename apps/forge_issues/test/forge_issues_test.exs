@@ -2273,7 +2273,7 @@ defmodule ForgeIssuesTest do
       })
       |> ForgeIssues.transaction()
 
-    pull
+    pull_extension_fixture(pull)
   end
 
   defp request_metadata do

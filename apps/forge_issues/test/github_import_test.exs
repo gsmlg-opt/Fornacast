@@ -51,7 +51,9 @@ defmodule ForgeIssues.GitHubImportTest do
 
     refute Repo.exists?(
              from event in Fornacast.DomainOutboxEvent,
-               where: event.aggregate_type in ["issue", "issue_comment"]
+               where:
+                 event.aggregate_type in ["issue", "issue_comment"] and
+                   event.payload["repository_id"] == ^repository.id
            )
 
     assert issue_7.number == 7
@@ -109,7 +111,9 @@ defmodule ForgeIssues.GitHubImportTest do
 
     refute Repo.exists?(
              from event in Fornacast.DomainOutboxEvent,
-               where: event.aggregate_type in ["issue", "issue_comment"]
+               where:
+                 event.aggregate_type in ["issue", "issue_comment"] and
+                   event.payload["repository_id"] == ^repository.id
            )
 
     assert %Label{name: "bug"} = label

@@ -3,6 +3,28 @@ defmodule ForgeIssues.Fixtures do
   alias ForgeRepos.Repository
   alias Fornacast.Repo
 
+  def pull_extension_fixture(%ForgeIssues.Issue{kind: :pull_request} = issue) do
+    now = DateTime.utc_now(:second)
+
+    {1, _} =
+      Repo.insert_all("pull_requests", [
+        %{
+          issue_id: issue.id,
+          repository_id: issue.repository_id,
+          head_repository_id: issue.repository_id,
+          draft: false,
+          head_ref: "refs/heads/feature",
+          base_ref: "refs/heads/main",
+          head_sha: String.duplicate("a", 40),
+          base_sha: String.duplicate("b", 40),
+          inserted_at: now,
+          updated_at: now
+        }
+      ])
+
+    issue
+  end
+
   def reset_database! do
     case Application.get_env(:fornacast, :database_adapter) do
       value when value in ["postgres", "postgresql"] ->

@@ -259,6 +259,202 @@ defmodule ForgePulls.GitHubImportTest do
     assert Repo.get(PullRequest, pull.id) == nil
   end
 
+  test "external-head pulls reject all shared issue and comment mutations", ctx do
+    {issue, pull} = import_head_pull!(ctx, nil)
+
+    {:ok, %{comment: comment}} =
+      Multi.new()
+      |> ForgeIssues.import_comment_multi(:comment, issue, ctx.merger, %{
+        body: "Remote comment",
+        inserted_at: @inserted_at,
+        updated_at: @updated_at
+      })
+      |> Repo.transaction()
+
+    for attrs <- [
+          %{title: "Changed"},
+          %{state: :closed},
+          %{labels: ["bug"]},
+          %{assignees: [ctx.owner.username]}
+        ] do
+      assert {:error, :forbidden} =
+               ForgeIssues.update(
+                 ctx.owner,
+                 ctx.owner.username,
+                 ctx.repository.slug,
+                 issue.number,
+                 attrs,
+                 %{}
+               )
+    end
+
+    assert {:error, :forbidden} =
+             ForgeIssues.create_comment(
+               ctx.owner,
+               ctx.owner.username,
+               ctx.repository.slug,
+               issue.number,
+               %{body: "Local"},
+               %{}
+             )
+
+    assert {:error, :forbidden} =
+             ForgeIssues.update_comment(
+               ctx.owner,
+               ctx.owner.username,
+               ctx.repository.slug,
+               comment.id,
+               %{body: "Local"},
+               %{}
+             )
+
+    assert {:error, :forbidden} =
+             ForgeIssues.delete_comment(
+               ctx.owner,
+               ctx.owner.username,
+               ctx.repository.slug,
+               comment.id,
+               %{}
+             )
+
+    assert {:error, :forbidden} =
+             ForgePulls.update_pull_request(
+               ctx.repository,
+               pull,
+               ctx.owner,
+               %{title: "Local"},
+               %{}
+             )
+
+    assert {:error, :forbidden} =
+             ForgePulls.merge(ctx.repository, pull, ctx.owner, %{}, %{
+               request_id: "external-merge"
+             })
+
+    assert {:ok, visible_comment} =
+             ForgeIssues.get_comment(
+               ctx.owner,
+               ctx.owner.username,
+               ctx.repository.slug,
+               comment.id
+             )
+
+    assert visible_comment.capabilities == %{can_edit: false, can_delete: false}
+    assert Repo.get!(ForgeIssues.Issue, issue.id).title == issue.title
+    assert Repo.get!(ForgeIssues.Comment, comment.id).body == "Remote comment"
+  end
+
+  test "external-head metadata remains readable with no mutation capabilities or local ref refresh",
+       ctx do
+    {issue, pull} = import_head_pull!(ctx, nil)
+
+    assert {:ok, visible_issue} =
+             ForgeIssues.get(ctx.owner, ctx.owner.username, ctx.repository.slug, issue.number)
+
+    assert visible_issue.capabilities.can_create
+
+    refute Enum.any?(Map.delete(visible_issue.capabilities, :can_create), fn {_key, allowed} ->
+             allowed
+           end)
+
+    assert {:ok, visible} = ForgePulls.get_pull_request(ctx.repository, issue.number, ctx.owner)
+    assert visible.head_sha == pull.head_sha
+    assert visible.base_sha == pull.base_sha
+    refute Enum.any?(visible.capabilities, fn {_key, allowed} -> allowed end)
+    assert Repo.get!(PullRequest, pull.id).head_sha == pull.head_sha
+  end
+
+  test "represented cross-repository metadata can change but cannot merge using base-repository head refs",
+       ctx do
+    head_repository = repository_fixture(ctx.owner)
+    {issue, pull} = import_head_pull!(ctx, head_repository.id)
+
+    assert {:ok, changed} =
+             ForgePulls.update_pull_request(
+               ctx.repository,
+               pull,
+               ctx.owner,
+               %{title: "Edited metadata"},
+               %{}
+             )
+
+    assert changed.issue.title == "Edited metadata"
+    assert changed.head_sha == pull.head_sha
+    assert {:ok, visible} = ForgePulls.get_pull_request(ctx.repository, issue.number, ctx.owner)
+    assert visible.capabilities.can_edit
+    refute visible.capabilities.can_merge
+
+    assert {:error, :forbidden} =
+             ForgePulls.merge(ctx.repository, visible, ctx.owner, %{}, %{
+               request_id: "cross-merge"
+             })
+  end
+
+  test "a canonical pull identity without its extension fails closed", ctx do
+    issue = import_issue!(ctx.repository, ctx.merger, 71, :pull_request, "Incomplete pull")
+
+    assert {:error, :forbidden} =
+             ForgeIssues.update(
+               ctx.owner,
+               ctx.owner.username,
+               ctx.repository.slug,
+               issue.number,
+               %{title: "Changed"},
+               %{}
+             )
+
+    assert {:error, :forbidden} =
+             ForgeIssues.create_comment(
+               ctx.owner,
+               ctx.owner.username,
+               ctx.repository.slug,
+               issue.number,
+               %{body: "Local"},
+               %{}
+             )
+  end
+
+  test "external and represented foreign heads cannot read commits or files from the base repository",
+       ctx do
+    head_repository = repository_fixture(ctx.owner)
+
+    for head_id <- [nil, head_repository.id] do
+      {issue, pull} = import_head_pull!(ctx, head_id)
+
+      assert {:error, :cross_repository_head} =
+               ForgePulls.list_commits(ctx.repository, pull, ctx.owner)
+
+      assert {:error, :cross_repository_head} =
+               ForgePulls.changed_files(ctx.repository, pull, ctx.owner)
+
+      Repo.delete!(pull)
+      Repo.delete!(issue)
+    end
+  end
+
+  defp import_head_pull!(ctx, head_repository_id) do
+    issue = import_issue!(ctx.repository, ctx.merger, 70, :pull_request, "Remote head")
+
+    {:ok, pull} =
+      %PullRequest{issue_id: issue.id, repository_id: ctx.repository.id}
+      |> PullRequest.import_changeset(
+        %{
+          head_ref: "refs/heads/remote-feature",
+          base_ref: "refs/heads/main",
+          head_sha: String.duplicate("a", 40),
+          base_sha: String.duplicate("b", 40),
+          inserted_at: @inserted_at,
+          updated_at: @updated_at
+        },
+        issue,
+        ctx.repository,
+        head_repository_id
+      )
+      |> Repo.insert()
+
+    {issue, pull}
+  end
+
   defp import_issue!(repository, identity, number, kind, title) do
     assert {:ok, %{issue: issue}} =
              Multi.new()

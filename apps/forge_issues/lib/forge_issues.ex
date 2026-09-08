@@ -71,8 +71,9 @@ defmodule ForgeIssues do
         query
         |> limit(^filters.per_page)
         |> offset(^filters.offset)
+        |> with_local_mutation_policy()
         |> Repo.all()
-        |> do_load_issue_metadata(repository, actor)
+        |> load_issue_policy_rows(repository, actor)
 
       {:ok, %Page{entries: entries, total: total, page: filters.page, per_page: filters.per_page}}
     end
@@ -144,14 +145,16 @@ defmodule ForgeIssues do
   def get(actor, owner_slug, repository_slug, number) when is_integer(number) and number > 0 do
     with {:ok, repository} <-
            fetch_repository(actor, owner_slug, repository_slug, :repository_read),
-         %Issue{} = issue <-
+         {%Issue{} = issue, writable} <-
            Repo.one(
              from(issue in Issue,
                where: issue.repository_id == ^repository.id and issue.number == ^number
              )
+             |> with_local_mutation_policy()
            ),
          :ok <- require_identity_enabled(repository, issue) do
-      {:ok, load_issue_metadata(issue, repository, actor)}
+      [loaded] = load_issue_policy_rows([{issue, writable}], repository, actor)
+      {:ok, loaded}
     else
       nil -> {:error, :not_found}
       {:error, _reason} = error -> error
@@ -213,7 +216,7 @@ defmodule ForgeIssues do
 
       {:ok,
        %Page{
-         entries: load_comment_metadata(entries, repository, issue.number, actor),
+         entries: load_comment_metadata(entries, repository, issue, actor),
          total: total,
          page: filters.page,
          per_page: filters.per_page
@@ -232,7 +235,7 @@ defmodule ForgeIssues do
            fetch_repository(actor, owner_slug, repository_slug, :repository_read),
          {:ok, {comment, issue}} <- fetch_comment(repository, comment_id),
          :ok <- require_identity_enabled(repository, issue) do
-      {:ok, load_comment_metadata(comment, repository, issue.number, actor)}
+      {:ok, load_comment_metadata(comment, repository, issue, actor)}
     end
   end
 
@@ -678,6 +681,7 @@ defmodule ForgeIssues do
          :ok <- authorize_repository_read(actor, repository),
          {:ok, issue} <- current_issue(repo, repository, number),
          :ok <- require_identity_enabled(repository, issue),
+         :ok <- require_local_mutation(issue),
          {:ok, capability} <- mutation_capability(actor, repository, issue),
          {:ok, attrs} <- mutation_attrs(attrs, capability, issue) do
       {:ok,
@@ -696,7 +700,8 @@ defmodule ForgeIssues do
          {:ok, repository} <- current_repository(repo, repository_id),
          :ok <- authorize_repository_read(actor, repository),
          {:ok, issue} <- current_issue(repo, repository, number),
-         :ok <- require_identity_enabled(repository, issue) do
+         :ok <- require_identity_enabled(repository, issue),
+         :ok <- require_local_mutation(issue) do
       {:ok, %{actor: actor, repository: repository, issue: issue}}
     end
   end
@@ -707,6 +712,7 @@ defmodule ForgeIssues do
          :ok <- authorize_repository_read(actor, repository),
          {:ok, {comment, issue}} <- current_comment(repo, repository, comment_id),
          :ok <- require_identity_enabled(repository, issue),
+         :ok <- require_local_mutation(issue),
          :ok <- authorize_comment_mutation(actor, repository, comment) do
       {:ok, %{actor: actor, repository: repository, comment: comment, issue: issue}}
     end
@@ -952,7 +958,7 @@ defmodule ForgeIssues do
             comment: comment
           }}
        ),
-       do: {:ok, load_comment_metadata(comment, repository, issue.number, actor)}
+       do: {:ok, load_comment_metadata(comment, repository, issue, actor)}
 
   defp map_comment_result({:error, :authorization, reason, _changes}), do: {:error, reason}
   defp map_comment_result({:error, :comment, :not_found, _changes}), do: {:error, :not_found}
@@ -1440,7 +1446,41 @@ defmodule ForgeIssues do
     |> Repo.all()
   end
 
-  defp issue_capabilities(actor, repository, issue, repository_capability) do
+  @doc "Whether the canonical identity permits local mutation; does not grant actor authorization."
+  def local_mutation_allowed?(%Issue{} = issue) do
+    MapSet.member?(locally_writable_identity_ids([issue], issue.repository_id), issue.id)
+  end
+
+  defp require_local_mutation(issue) do
+    if local_mutation_allowed?(issue), do: :ok, else: {:error, :forbidden}
+  end
+
+  defp locally_writable_identity_ids(issues, repository_id) do
+    ordinary_ids = for %Issue{kind: :issue, id: id} <- issues, do: id
+    pull_ids = for %Issue{kind: :pull_request, id: id} <- issues, do: id
+
+    # Read only the canonical pull head identity without depending on ForgePulls
+    # (which depends on this context). Missing extensions and external heads fail closed.
+    represented_pull_ids =
+      if pull_ids == [] do
+        []
+      else
+        from(pull in "pull_requests",
+          where:
+            pull.repository_id == ^repository_id and pull.issue_id in ^pull_ids and
+              not is_nil(pull.head_repository_id),
+          select: pull.issue_id
+        )
+        |> Repo.all()
+      end
+
+    MapSet.new(ordinary_ids ++ represented_pull_ids)
+  end
+
+  defp issue_capabilities(actor, repository, issue, repository_capability, writable \\ nil) do
+    writable =
+      if is_nil(writable), do: is_nil(issue) or local_mutation_allowed?(issue), else: writable
+
     resource_enabled =
       case issue do
         nil -> repository.has_issues
@@ -1448,7 +1488,10 @@ defmodule ForgeIssues do
         %Issue{} -> repository.has_issues
       end
 
-    can_create = repository.has_issues and repository_capability in [:reader, :writer]
+    resource_enabled = resource_enabled and writable
+
+    can_create =
+      repository.has_issues and repository_capability in [:reader, :writer]
 
     can_comment =
       resource_enabled and not is_nil(issue) and repository_capability in [:reader, :writer]
@@ -1476,14 +1519,15 @@ defmodule ForgeIssues do
     }
   end
 
-  defp comment_capabilities(actor, repository, comment, repository_capability) do
+  defp comment_capabilities(actor, repository, comment, repository_capability, writable) do
     allowed =
-      comment_mutation_capability(
-        actor,
-        repository,
-        local_author_user_id(comment),
-        repository_capability
-      )
+      writable and
+        comment_mutation_capability(
+          actor,
+          repository,
+          local_author_user_id(comment),
+          repository_capability
+        )
 
     %{can_edit: allowed, can_delete: allowed}
   end
@@ -1579,17 +1623,32 @@ defmodule ForgeIssues do
         ) :: [Issue.t()]
   def load_issue_metadata_by_ids(ids, %ForgeRepos.Repository{} = repository, actor)
       when is_list(ids) do
-    issues =
+    rows =
       from(issue in Issue,
         where: issue.repository_id == ^repository.id and issue.id in ^ids
       )
+      |> with_local_mutation_policy()
       |> Repo.all()
 
-    do_load_issue_metadata(issues, repository, actor)
+    load_issue_policy_rows(rows, repository, actor)
   end
 
-  defp do_load_issue_metadata(issues, repository, actor) do
+  defp with_local_mutation_policy(query) do
+    from(issue in query,
+      left_join: pull in "pull_requests",
+      on: pull.issue_id == issue.id and pull.repository_id == issue.repository_id,
+      select: {issue, issue.kind == :issue or not is_nil(pull.head_repository_id)}
+    )
+  end
+
+  defp load_issue_policy_rows(rows, repository, actor) do
+    writable_ids = for {issue, true} <- rows, into: MapSet.new(), do: issue.id
+    do_load_issue_metadata(Enum.map(rows, &elem(&1, 0)), repository, actor, writable_ids)
+  end
+
+  defp do_load_issue_metadata(issues, repository, actor, writable_ids \\ nil) do
     issue_ids = Enum.map(issues, & &1.id)
+    writable_ids = writable_ids || locally_writable_identity_ids(issues, repository.id)
     labels = labels_by_issue(issue_ids)
     assignee_refs_by_issue = assignee_refs_by_issue(issue_ids)
 
@@ -1644,12 +1703,22 @@ defmodule ForgeIssues do
           author: author,
           author_association: author_association,
           comment_count: Map.get(counts, issue.id, 0),
-          capabilities: issue_capabilities(actor, repository, issue, repository_capability)
+          capabilities:
+            issue_capabilities(
+              actor,
+              repository,
+              issue,
+              repository_capability,
+              MapSet.member?(writable_ids, issue.id)
+            )
       }
     end)
   end
 
-  defp load_comment_metadata(comments, repository, issue_number, actor) when is_list(comments) do
+  defp load_comment_metadata(comments, repository, %Issue{} = issue, actor)
+       when is_list(comments) do
+    writable_ids = locally_writable_identity_ids([issue], repository.id)
+
     attribution_refs =
       comments
       |> Enum.map(&author_ref/1)
@@ -1690,14 +1759,21 @@ defmodule ForgeIssues do
         comment
         | author: author,
           author_association: author_association,
-          issue_number: issue_number,
-          capabilities: comment_capabilities(actor, repository, comment, repository_capability)
+          issue_number: issue.number,
+          capabilities:
+            comment_capabilities(
+              actor,
+              repository,
+              comment,
+              repository_capability,
+              MapSet.member?(writable_ids, comment.issue_id)
+            )
       }
     end)
   end
 
-  defp load_comment_metadata(%Comment{} = comment, repository, issue_number, actor) do
-    [loaded] = load_comment_metadata([comment], repository, issue_number, actor)
+  defp load_comment_metadata(%Comment{} = comment, repository, %Issue{} = issue, actor) do
+    [loaded] = load_comment_metadata([comment], repository, issue, actor)
     loaded
   end
 

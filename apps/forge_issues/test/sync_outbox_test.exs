@@ -141,7 +141,13 @@ defmodule ForgeIssues.SyncOutboxTest do
              |> ForgeIssues.transaction()
 
     assert Repo.aggregate(Issue, :count) == 0
-    refute Repo.exists?(from event in DomainOutboxEvent, where: event.aggregate_type == "issue")
+
+    refute Repo.exists?(
+             from event in DomainOutboxEvent,
+               where:
+                 event.aggregate_type == "issue" and
+                   event.payload["repository_id"] == ^repository.id
+           )
   end
 
   test "shared pull identities keep one row and identify pull comments", %{
@@ -154,6 +160,8 @@ defmodule ForgeIssues.SyncOutboxTest do
                title: "Pull"
              })
              |> ForgeIssues.transaction()
+
+    pull_extension_fixture(pull_identity)
 
     assert {:ok, updated} =
              ForgeIssues.update(
