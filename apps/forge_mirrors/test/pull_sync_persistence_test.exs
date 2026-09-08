@@ -136,6 +136,166 @@ defmodule ForgeMirrors.PullSyncPersistenceTest do
     }
   end
 
+  test "paired context requires canonical issue mapping and retains both baselines", c do
+    assert {:error, :paired_mapping_unavailable} =
+             ForgeMirrors.mapped_pull_pair_context(c.operation)
+
+    snapshot =
+      Map.take(c.local.fields, ~w(title body state state_reason))
+      |> Map.merge(%{"label_github_ids" => [], "assignee_github_ids" => []})
+
+    paired =
+      Repo.insert!(%MirrorResourceState{
+        repository_mirror_id: c.binding.id,
+        resource_kind: :issue,
+        local_resource_type: "ForgeIssues.Issue",
+        local_resource_id: c.issue.id,
+        github_object_id: 901,
+        github_node_id: "I_901",
+        github_number: 7,
+        confirmed_local_version: c.issue.sync_version,
+        confirmed_snapshot: snapshot,
+        state: :confirmed
+      })
+
+    assert {:ok, context} = ForgeMirrors.mapped_pull_pair_context(c.operation)
+    assert context.pair.pull.mapping_id == c.mapping.id
+    assert context.pair.issue.mapping_id == paired.id
+    assert context.pair.pull.snapshot == c.local.fields
+    assert context.pair.issue.snapshot == snapshot
+    assert context.pair.issue.lock_version == paired.lock_version
+    assert context.pair.issue.fingerprint_source == :derived
+    assert Repo.get!(MirrorResourceState, paired.id).confirmed_fingerprint == nil
+
+    Repo.update_all(from(m in MirrorResourceState, where: m.id == ^paired.id),
+      set: [github_object_id: 999]
+    )
+
+    assert {:error, :paired_identity_mismatch} =
+             ForgeMirrors.mapped_pull_pair_context(c.operation)
+
+    Repo.update_all(from(m in MirrorResourceState, where: m.id == ^paired.id),
+      set: [github_object_id: 901, confirmed_fingerprint: String.duplicate("0", 64)]
+    )
+
+    assert {:error, :paired_baseline_mismatch} =
+             ForgeMirrors.mapped_pull_pair_context(c.operation)
+
+    Repo.update_all(from(m in MirrorResourceState, where: m.id == ^paired.id),
+      set: [
+        confirmed_fingerprint: nil,
+        confirmed_snapshot: Map.put(snapshot, "label_github_ids", [7, 7])
+      ]
+    )
+
+    assert {:error, :paired_baseline_mismatch} =
+             ForgeMirrors.mapped_pull_pair_context(c.operation)
+  end
+
+  test "paired context rejects stale scalar or version baselines without repairing them", c do
+    snapshot =
+      Map.take(c.local.fields, ~w(title body state state_reason))
+      |> Map.merge(%{"label_github_ids" => [], "assignee_github_ids" => [], "title" => "Old"})
+
+    paired =
+      Repo.insert!(%MirrorResourceState{
+        repository_mirror_id: c.binding.id,
+        resource_kind: :issue,
+        local_resource_type: "ForgeIssues.Issue",
+        local_resource_id: c.issue.id,
+        github_object_id: 901,
+        github_node_id: "I_901",
+        github_number: 7,
+        confirmed_local_version: c.issue.sync_version,
+        confirmed_snapshot: snapshot,
+        state: :confirmed
+      })
+
+    assert {:error, :paired_baseline_mismatch} =
+             ForgeMirrors.mapped_pull_pair_context(c.operation)
+
+    assert Repo.get!(MirrorResourceState, paired.id).confirmed_snapshot == snapshot
+
+    Repo.update_all(from(m in MirrorResourceState, where: m.id == ^paired.id),
+      set: [
+        confirmed_snapshot: Map.put(snapshot, "title", c.local.fields["title"]),
+        confirmed_local_version: c.issue.sync_version + 1
+      ]
+    )
+
+    assert {:error, :paired_baseline_mismatch} =
+             ForgeMirrors.mapped_pull_pair_context(c.operation)
+  end
+
+  test "paired context rejects malformed matched baselines and incomplete repository identity",
+       c do
+    snapshot =
+      Map.take(c.local.fields, ~w(title body state state_reason))
+      |> Map.merge(%{"label_github_ids" => [], "assignee_github_ids" => []})
+
+    paired =
+      Repo.insert!(%MirrorResourceState{
+        repository_mirror_id: c.binding.id,
+        resource_kind: :issue,
+        local_resource_type: "ForgeIssues.Issue",
+        local_resource_id: c.issue.id,
+        github_object_id: 901,
+        github_node_id: "I_901",
+        github_number: 7,
+        confirmed_local_version: c.issue.sync_version,
+        confirmed_snapshot: snapshot,
+        state: :confirmed
+      })
+
+    for identity <- [
+          Map.delete(c.identity, "head_repository"),
+          put_in(c.identity, ["base_repository", "id"], 999)
+        ] do
+      Repo.update_all(from(m in MirrorResourceState, where: m.id == ^c.mapping.id),
+        set: [provider_identity: identity]
+      )
+
+      assert {:error, :paired_identity_mismatch} =
+               ForgeMirrors.mapped_pull_pair_context(c.operation)
+    end
+
+    Repo.update_all(from(m in MirrorResourceState, where: m.id == ^c.mapping.id),
+      set: [provider_identity: c.identity]
+    )
+
+    for {key, value} <- [
+          {"title", nil},
+          {"state", "unknown"},
+          {"draft", "bad"},
+          {"head_ref", "not-a-ref"},
+          {"base_sha", "bad"}
+        ] do
+      pull_snapshot = Map.put(c.local.fields, key, value)
+
+      issue_snapshot =
+        Map.merge(snapshot, Map.take(pull_snapshot, ~w(title body state state_reason)))
+
+      Repo.update_all(from(m in MirrorResourceState, where: m.id == ^c.mapping.id),
+        set: [confirmed_snapshot: pull_snapshot]
+      )
+
+      Repo.update_all(from(m in MirrorResourceState, where: m.id == ^paired.id),
+        set: [confirmed_snapshot: issue_snapshot]
+      )
+
+      assert {:error, :paired_baseline_mismatch} =
+               ForgeMirrors.mapped_pull_pair_context(c.operation)
+    end
+  end
+
+  test "paired context rechecks the live database lease", c do
+    Repo.update_all(from(o in ForgeMirrors.MirrorOperation, where: o.id == ^c.operation.id),
+      set: [lease_expires_at: DateTime.add(c.now, -1)]
+    )
+
+    assert {:error, :lost_lease} = ForgeMirrors.mapped_pull_pair_context(c.operation)
+  end
+
   test "context resolves canonical issue cursor to pull mapping and separate baselines", c do
     assert {:ok, context} = ForgeMirrors.resource_operation_context(c.operation)
     assert context.resource_kind == :pull

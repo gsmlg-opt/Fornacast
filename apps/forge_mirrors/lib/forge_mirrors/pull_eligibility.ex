@@ -114,14 +114,15 @@ defmodule ForgeMirrors.PullEligibility do
   defp enabled?(capabilities, key),
     do: Map.get(capabilities || %{}, key) in [true, "enabled", "active"]
 
-  defp valid_refs?(
-         %{base_ref: base, head_ref: head, base_sha: base_sha, head_sha: head_sha} = refs
-       ),
-       do:
-         map_size(refs) == 4 and branch?(base) and branch?(head) and oid?(base_sha) and
-           oid?(head_sha)
+  @doc false
+  def valid_refs?(
+        %{base_ref: base, head_ref: head, base_sha: base_sha, head_sha: head_sha} = refs
+      ),
+      do:
+        map_size(refs) == 4 and branch?(base) and branch?(head) and oid?(base_sha) and
+          oid?(head_sha)
 
-  defp valid_refs?(_), do: false
+  def valid_refs?(_), do: false
 
   defp oid?(oid) when is_binary(oid), do: Regex.match?(~r/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/, oid)
   defp oid?(_), do: false

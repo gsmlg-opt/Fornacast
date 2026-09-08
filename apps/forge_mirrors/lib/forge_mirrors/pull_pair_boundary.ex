@@ -1,0 +1,164 @@
+defmodule ForgeMirrors.PullPairBoundary do
+  @moduledoc "Leased paired mapping observations; never silently repairs divergent baselines."
+  import Ecto.Query
+  alias ForgeMirrors.{MirrorOperation, MirrorResourceState, PullEligibility, RepositoryMirror}
+  alias Fornacast.Repo
+
+  @scalars ~w(title body state state_reason)
+  @pull_keys Enum.sort(@scalars ++ ~w(draft head_ref head_sha base_ref base_sha))
+  @issue_keys Enum.sort(@scalars ++ ~w(label_github_ids assignee_github_ids))
+
+  def context(%MirrorOperation{kind: "sync.pull"} = operation, context_fun) do
+    Repo.transaction(fn ->
+      with {:ok, sync} <- context_fun.(operation),
+           {:ok, pull, issue} <- pair(sync),
+           :ok <- identity(sync, pull, issue),
+           :ok <- baselines(pull, issue),
+           {:ok, pull_view} <- view(pull),
+           {:ok, issue_view} <- view(issue),
+           {:ok, _fresh} <- context_fun.(operation) do
+        Map.put(sync, :pair, %{pull: pull_view, issue: issue_view})
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+  end
+
+  def context(_, _), do: {:error, :invalid_argument}
+
+  defp pair(sync) do
+    # Existing context has acquired the organization operation lock. Acquire
+    # both mapping rows in deterministic order and retain them to transaction end.
+    rows =
+      Repo.all(
+        from m in MirrorResourceState,
+          where:
+            m.repository_mirror_id == ^sync.repository_mirror_id and
+              ((m.resource_kind == :pull and m.local_resource_type == "ForgePulls.PullRequest" and
+                  m.local_resource_id == ^sync.local_resource_id) or
+                 (m.resource_kind == :issue and m.local_resource_type == "ForgeIssues.Issue" and
+                    m.local_resource_id == ^sync.issue_id)),
+          order_by: m.id,
+          lock: "FOR UPDATE"
+      )
+
+    pull = Enum.find(rows, &(&1.resource_kind == :pull))
+    issue = Enum.find(rows, &(&1.resource_kind == :issue))
+
+    if length(rows) == 2 and match?(%{state: :confirmed}, pull) and
+         match?(%{state: :confirmed}, issue),
+       do: {:ok, pull, issue},
+       else: {:error, :paired_mapping_unavailable}
+  end
+
+  defp identity(sync, pull, issue) do
+    provider = pull.provider_identity
+    binding = Repo.get!(RepositoryMirror, sync.repository_mirror_id)
+
+    if valid_provider?(provider) and
+         provider["base_repository"] == %{
+           "id" => binding.github_repository_id,
+           "node_id" => binding.github_node_id
+         } and
+         pull.github_object_id == sync.github_object_id and
+         pull.github_node_id == sync.github_node_id and
+         issue.github_object_id == provider["github_issue_object_id"] and
+         issue.github_node_id == provider["github_issue_node_id"] and
+         is_integer(issue.github_object_id) and issue.github_object_id > 0 and
+         is_binary(issue.github_node_id) and byte_size(issue.github_node_id) > 0 and
+         pull.github_number == issue.github_number and
+         issue.github_number == provider["github_number"],
+       do: :ok,
+       else: {:error, :paired_identity_mismatch}
+  end
+
+  defp baselines(pull, issue) do
+    p = pull.confirmed_snapshot
+    i = issue.confirmed_snapshot
+
+    if is_map(p) and is_map(i) and Enum.sort(Map.keys(p)) == @pull_keys and
+         Enum.sort(Map.keys(i)) == @issue_keys and
+         scalar_values?(p) and is_boolean(p["draft"]) and
+         PullEligibility.valid_refs?(%{
+           base_ref: p["base_ref"],
+           head_ref: p["head_ref"],
+           base_sha: p["base_sha"],
+           head_sha: p["head_sha"]
+         }) and
+         Map.take(p, @scalars) == Map.take(i, @scalars) and
+         is_integer(pull.confirmed_local_version) and pull.confirmed_local_version > 0 and
+         pull.confirmed_local_version == issue.confirmed_local_version and
+         ids?(i["label_github_ids"]) and ids?(i["assignee_github_ids"]),
+       do: :ok,
+       else: {:error, :paired_baseline_mismatch}
+  end
+
+  defp ids?(ids) when is_list(ids) and length(ids) <= 512,
+    do:
+      ids == Enum.sort(Enum.uniq(ids)) and
+        Enum.all?(ids, &(is_integer(&1) and &1 in 1..9_223_372_036_854_775_807))
+
+  defp ids?(_), do: false
+
+  defp valid_provider?(
+         %{
+           "github_issue_object_id" => id,
+           "github_issue_node_id" => node,
+           "github_number" => number,
+           "base_repository" => base,
+           "head_repository" => head
+         } = value
+       ),
+       do:
+         map_size(value) == 5 and positive?(id) and positive?(number) and node?(node) and
+           repository?(base) and repository?(head)
+
+  defp valid_provider?(_), do: false
+
+  defp repository?(%{"id" => id, "node_id" => node} = value),
+    do: map_size(value) == 2 and positive?(id) and node?(node)
+
+  defp repository?(_), do: false
+  defp positive?(id), do: is_integer(id) and id in 1..9_223_372_036_854_775_807
+  defp node?(node), do: text?(node, 255) and node != "" and String.trim(node) == node
+
+  defp text?(text, max),
+    do:
+      is_binary(text) and byte_size(text) <= max and String.valid?(text) and
+        not String.contains?(text, <<0>>)
+
+  defp scalar_values?(snapshot) do
+    text?(snapshot["title"], 1024) and snapshot["title"] != "" and
+      length(String.codepoints(snapshot["title"])) <= 256 and
+      (is_nil(snapshot["body"]) or
+         (text?(snapshot["body"], 262_144) and
+            length(String.codepoints(snapshot["body"])) <= 65_536)) and
+      ((snapshot["state"] == "open" and snapshot["state_reason"] in [nil, "reopened"]) or
+         (snapshot["state"] == "closed" and
+            snapshot["state_reason"] in [nil, "completed", "not_planned"]))
+  end
+
+  defp view(mapping) do
+    with {:ok, fingerprint} <- ForgeMirrors.resource_fingerprint(mapping.confirmed_snapshot),
+         true <-
+           is_nil(mapping.confirmed_fingerprint) or mapping.confirmed_fingerprint == fingerprint do
+      # Legacy nil hashes are read-derived fingerprints, not evidence of an
+      # earlier stored confirmation. They are never written back by this gate.
+      {:ok,
+       %{
+         mapping_id: mapping.id,
+         lock_version: mapping.lock_version,
+         github_object_id: mapping.github_object_id,
+         github_node_id: mapping.github_node_id,
+         github_number: mapping.github_number,
+         local_version: mapping.confirmed_local_version,
+         snapshot: mapping.confirmed_snapshot,
+         fingerprint: fingerprint,
+         fingerprint_source:
+           if(is_nil(mapping.confirmed_fingerprint), do: :derived, else: :stored)
+       }}
+    else
+      _ -> {:error, :paired_baseline_mismatch}
+    end
+  end
+end

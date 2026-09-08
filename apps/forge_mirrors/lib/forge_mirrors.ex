@@ -886,6 +886,10 @@ defmodule ForgeMirrors do
 
   def resource_operation_context(_), do: {:error, :invalid_transition}
 
+  @doc false
+  def mapped_pull_pair_context(operation),
+    do: ForgeMirrors.PullPairBoundary.context(operation, &resource_operation_context/1)
+
   defp pull_resource_context(%{resource_kind: :pull} = scope, mapping),
     do: ForgeMirrors.PullResourceBoundary.context(scope, mapping)
 
