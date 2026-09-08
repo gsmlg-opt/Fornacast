@@ -56,6 +56,18 @@ PR13 integration audit additionally identified these concrete remaining gates:
 
 ## Current local verification
 
+- `3339b3a` commits the inbound pull worker path. Review caught attribution writes
+  preceding immutable head/canonical issue validation; the real regression failed
+  before the fix and the paired no-write preflight now runs first. Eighteen pull
+  worker/integration tests passed after that correction.
+- `70df2ec` imports/adopts one missing remote label per inbound-creation claim,
+  retaining the same pending parent/cursor/checkpoint rather than enqueueing a
+  blocked child. A real two-label test refetches paired observations on three
+  claims, then commits the pull and both label memberships. Fresh combined
+  PostgreSQL verification passed 111 tests (mirrors 42, provider 69), with four
+  changed files format-checked. This covers new inbound creation; mapped-pull
+  relationship reconciliation, label-conflict UX and outbound creation still
+  require their own gates. No production worker activation or push occurred.
 - `7a6c1fb` adds leased missing-pull routing, immutable head resolution and atomic
   inbound canonical issue/pull mappings. Review regressions now reject a callback
   that creates two aggregates and accept equal numeric IDs in separate provider
