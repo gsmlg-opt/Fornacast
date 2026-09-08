@@ -52,6 +52,9 @@ defmodule ForgePullsTest do
     },
     "pull_merge_operations" => %{
       columns: %{
+        "coordination_mode" => %{type: :text, nullable: false, default: "standalone"},
+        "coordinator_operation_id" => %{type: :bigint, nullable: true, default: nil},
+        "commit_intent" => %{type: :map, nullable: true, default: nil},
         "id" => %{type: :bigint, nullable: false, default: :generated},
         "pull_request_id" => %{type: :bigint, nullable: false, default: nil},
         "repository_id" => %{type: :bigint, nullable: false, default: nil},
@@ -89,7 +92,8 @@ defmodule ForgePullsTest do
         MapSet.new([
           {false, ["repository_id", "state"]},
           {false, ["pull_request_id", "state"]},
-          {false, ["lease_expires_at"]}
+          {false, ["lease_expires_at"]},
+          {true, ["coordinator_operation_id"]}
         ]),
       checks: %{"state" => MapSet.new(@states)}
     }
@@ -3296,6 +3300,7 @@ defmodule ForgePullsTest do
   defp postgres_semantic_type("bigint", "int8"), do: :bigint
   defp postgres_semantic_type("integer", "int4"), do: :integer
   defp postgres_semantic_type("boolean", "bool"), do: :boolean
+  defp postgres_semantic_type("jsonb", "jsonb"), do: :map
   defp postgres_semantic_type("character varying", "varchar"), do: :text
   defp postgres_semantic_type("text", "text"), do: :text
   defp postgres_semantic_type("timestamp without time zone", "timestamp"), do: :timestamp
@@ -3385,6 +3390,11 @@ defmodule ForgePullsTest do
     do: false
 
   defp normalize_default("lock_version", default, false) when default in [0, "0"], do: 0
+
+  defp normalize_default("coordination_mode", default, false)
+       when default in ["'standalone'::character varying", "'standalone'::text", "standalone"],
+       do: "standalone"
+
   defp normalize_default(_name, nil, false), do: nil
 
   defp maybe_mark_utc(%{type: :timestamp} = metadata), do: Map.put(metadata, :utc, true)

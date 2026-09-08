@@ -24,6 +24,9 @@ defmodule ForgePulls.MergeOperation do
     field :repository_id, :integer
     field :actor_user_id, :integer
     field :request_id, :string
+    field :coordination_mode, Ecto.Enum, values: [:standalone, :mirror], default: :standalone
+    field :coordinator_operation_id, :integer
+    field :commit_intent, :map
     field :api_version, :string
     field :ip_address, :string
     field :user_agent, :string
@@ -41,6 +44,9 @@ defmodule ForgePulls.MergeOperation do
 
     timestamps(type: :utc_datetime)
   end
+
+  def prepare_changeset(%{coordination_mode: :mirror} = operation, _attrs),
+    do: invalid_coordinator_transition(operation)
 
   def prepare_changeset(operation, attrs) do
     operation
@@ -75,6 +81,33 @@ defmodule ForgePulls.MergeOperation do
     |> validate_lease_coherence()
   end
 
+  @doc false
+  def prepare_coordinated_changeset(%__MODULE__{id: nil} = operation, attrs) do
+    operation
+    |> prepare_changeset(attrs)
+    |> put_change(:coordination_mode, :mirror)
+    |> put_change(:coordinator_operation_id, attrs[:coordinator_operation_id])
+    |> put_change(:commit_intent, attrs[:commit_intent])
+    |> validate_required([:coordinator_operation_id, :commit_intent])
+    |> validate_number(:coordinator_operation_id,
+      greater_than: 0,
+      less_than_or_equal_to: 9_223_372_036_854_775_807
+    )
+    |> validate_change(:commit_intent, fn field, intent ->
+      if is_map(intent) and byte_size(JSON.encode!(intent)) <= 2_000_000,
+        do: [],
+        else: [{field, "must be a JSON object of at most 2000000 encoded bytes"}]
+    end)
+    |> unique_constraint(:coordinator_operation_id)
+    |> check_constraint(:commit_intent, name: :pull_merge_operations_coordination_check)
+  end
+
+  def prepare_coordinated_changeset(operation, _attrs),
+    do: invalid_coordinator_transition(operation)
+
+  def lease_update_changeset(%{coordination_mode: :mirror} = operation, _updates),
+    do: invalid_coordinator_transition(operation)
+
   def lease_update_changeset(operation, updates) when is_list(updates) do
     if exact_fields?(updates, @lease_mutable_fields) do
       operation
@@ -95,6 +128,9 @@ defmodule ForgePulls.MergeOperation do
   def lease_update_changeset(operation, _updates),
     do: operation |> change() |> add_error(:base, "is invalid")
 
+  def transition_changeset(%{coordination_mode: :mirror} = operation, _state),
+    do: invalid_coordinator_transition(operation)
+
   def transition_changeset(operation, state) when is_atom(state) do
     if state in Map.get(@transitions, operation.state, []) do
       operation |> change(state: state) |> validate_lease_coherence()
@@ -106,6 +142,9 @@ defmodule ForgePulls.MergeOperation do
   def transition_changeset(operation, _state), do: invalid_transition_changeset(operation)
 
   def merge_written_changeset(operation), do: transition_changeset(operation, :merge_written)
+
+  def merge_written_changeset(%{coordination_mode: :mirror} = operation, _merge_oid),
+    do: invalid_coordinator_transition(operation)
 
   def merge_written_changeset(%__MODULE__{state: :prepared} = operation, merge_oid) do
     operation
@@ -120,6 +159,9 @@ defmodule ForgePulls.MergeOperation do
   def ref_advanced_changeset(operation), do: transition_changeset(operation, :ref_advanced)
 
   def completed_changeset(operation), do: transition_changeset(operation, :completed)
+
+  def failed_changeset(%{coordination_mode: :mirror} = operation, _reason),
+    do: invalid_coordinator_transition(operation)
 
   def failed_changeset(%__MODULE__{state: state} = operation, reason)
       when state in @failure_states do
@@ -287,4 +329,7 @@ defmodule ForgePulls.MergeOperation do
   defp invalid_transition_changeset(operation) do
     operation |> change() |> add_error(:state, "is not a valid transition")
   end
+
+  defp invalid_coordinator_transition(operation),
+    do: operation |> change() |> add_error(:coordination_mode, "requires its mirror coordinator")
 end

@@ -201,6 +201,7 @@ defmodule ForgePulls.MergeRecovery do
 
   defp next_operation(repository_id, after_id) do
     MergeOperation
+    |> where([operation], operation.coordination_mode == :standalone)
     |> where([operation], operation.repository_id == ^repository_id)
     |> where([operation], operation.state not in ^@terminal_states)
     |> where([operation], operation.id > ^after_id)
@@ -479,6 +480,9 @@ defmodule ForgePulls.MergeRecovery do
     end
   end
 
+  defp complete_transaction(_repository, %MergeOperation{coordination_mode: :mirror}),
+    do: {:error, :mirror_merge_coordinator_required}
+
   defp complete_transaction(repository, operation) do
     now = completion_now()
     actor = load_actor(operation.actor_user_id)
@@ -491,6 +495,7 @@ defmodule ForgePulls.MergeRecovery do
         from candidate in MergeOperation,
           where:
             candidate.id == ^operation.id and candidate.lease_owner == ^operation.lease_owner and
+              candidate.coordination_mode == :standalone and
               candidate.lock_version == ^operation.lock_version and
               candidate.state == :ref_advanced and candidate.merge_oid == ^operation.merge_oid
 

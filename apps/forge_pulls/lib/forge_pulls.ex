@@ -158,6 +158,9 @@ defmodule ForgePulls do
   defdelegate append_sync_observe(multi, key, expected), to: ForgePulls.Sync
   defdelegate append_sync_apply(multi, key, request), to: ForgePulls.Sync
 
+  defdelegate append_prepare_coordinated_merge(multi, key, request),
+    to: ForgePulls.CoordinatedMerge
+
   if Mix.env() == :test do
     @read_phase_hook_key {__MODULE__, :read_phase_hook}
 
@@ -1322,6 +1325,7 @@ defmodule ForgePulls do
         from operation in MergeOperation,
           where:
             operation.pull_request_id == ^pull.id and
+              operation.coordination_mode == :standalone and
               operation.state not in [:completed, :failed]
       )
 
@@ -1343,6 +1347,7 @@ defmodule ForgePulls do
         from operation in MergeOperation,
           where:
             operation.repository_id == ^repository.id and
+              operation.coordination_mode == :standalone and
               operation.state not in [:completed, :failed]
       )
 

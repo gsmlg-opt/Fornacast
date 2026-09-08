@@ -78,7 +78,8 @@ defmodule ForgePulls.MergeReconciler do
     )
     |> where(
       [operation, repository],
-      operation.state not in ^@terminal_states and repository.lifecycle == :ready and
+      operation.coordination_mode == :standalone and
+        operation.state not in ^@terminal_states and repository.lifecycle == :ready and
         is_nil(repository.deleted_at)
     )
     |> group_by([operation, _repository], operation.repository_id)
