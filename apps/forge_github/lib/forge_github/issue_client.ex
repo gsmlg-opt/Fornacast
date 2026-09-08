@@ -61,6 +61,27 @@ defmodule ForgeGitHub.IssueClient do
     end
   end
 
+  @doc """
+  Fetches the canonical issue record that backs a pull request.
+
+  GitHub gives issues and pull requests distinct object identities. This
+  endpoint therefore requires the issue response's pull-request signpost and
+  never treats a pull object ID as an issue object ID.
+  """
+  @spec get_pull_issue(String.t(), String.t(), String.t(), pos_integer(), keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def get_pull_issue(token, owner, repository, issue_number, opts) do
+    with {:ok, base} <- repository_base(owner, repository),
+         :ok <- validate_id(issue_number),
+         true <- valid_options?(opts) do
+      token
+      |> Client.issue_metadata_request(:get, "#{base}/issues/#{issue_number}", 200, opts)
+      |> decode_resource(&pull_issue_from_json(&1, owner, repository, issue_number))
+    else
+      _invalid -> error(:invalid_request)
+    end
+  end
+
   @spec update_issue(String.t(), String.t(), String.t(), pos_integer(), map(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def update_issue(token, owner, repository, issue_number, attrs, opts) do
@@ -76,6 +97,38 @@ defmodule ForgeGitHub.IssueClient do
         opts
       )
       |> decode_resource(&issue_from_json/1)
+    else
+      _invalid -> error(:invalid_request)
+    end
+  end
+
+  @doc """
+  Updates the canonical issue record backing an existing pull request.
+
+  The response must retain the exact pull-request signpost so the caller never
+  acknowledges an ordinary issue or a pull from another repository.
+  """
+  @spec update_pull_issue(
+          String.t(),
+          String.t(),
+          String.t(),
+          pos_integer(),
+          map(),
+          keyword()
+        ) :: {:ok, map()} | {:error, Error.t()}
+  def update_pull_issue(token, owner, repository, issue_number, attrs, opts) do
+    with {:ok, base} <- repository_base(owner, repository),
+         :ok <- validate_id(issue_number),
+         {:ok, payload} <- normalize_issue_update(attrs),
+         {:ok, opts} <- request_options(opts, payload) do
+      token
+      |> Client.issue_metadata_request(
+        :patch,
+        "#{base}/issues/#{issue_number}",
+        200,
+        opts
+      )
+      |> decode_resource(&pull_issue_from_json(&1, owner, repository, issue_number))
     else
       _invalid -> error(:invalid_request)
     end
@@ -568,6 +621,57 @@ defmodule ForgeGitHub.IssueClient do
   end
 
   defp issue_from_json(_issue), do: {:error, :invalid_response}
+
+  defp pull_issue_from_json(
+         %{
+           "number" => expected_number,
+           "pull_request" => %{"url" => pull_url}
+         } = issue,
+         owner,
+         repository,
+         expected_number
+       ) do
+    if pull_url_matches?(pull_url, owner, repository, expected_number) do
+      issue
+      |> Map.delete("pull_request")
+      |> issue_from_json()
+    else
+      {:error, :invalid_response}
+    end
+  end
+
+  defp pull_issue_from_json(_issue, _owner, _repository, _expected_number),
+    do: {:error, :invalid_response}
+
+  defp pull_url_matches?(pull_url, owner, repository, expected_number)
+       when is_binary(pull_url) and byte_size(pull_url) <= 2_048 do
+    with {:ok,
+          %URI{
+            scheme: scheme,
+            host: host,
+            port: port,
+            userinfo: nil,
+            query: nil,
+            fragment: nil,
+            path: path
+          }} <- URI.new(pull_url),
+         true <- String.downcase(scheme || "") == "https",
+         true <- String.downcase(host || "") == "api.github.com",
+         true <- port in [nil, 443],
+         ["repos", response_owner, response_repository, "pulls", encoded_number] <-
+           String.split(path, "/", trim: true),
+         true <- String.downcase(response_owner) == String.downcase(owner),
+         true <- String.downcase(response_repository) == String.downcase(repository),
+         {^expected_number, ""} <- Integer.parse(encoded_number) do
+      true
+    else
+      _invalid -> false
+    end
+  rescue
+    _exception -> false
+  end
+
+  defp pull_url_matches?(_pull_url, _owner, _repository, _expected_number), do: false
 
   defp comment_from_json(
          %{

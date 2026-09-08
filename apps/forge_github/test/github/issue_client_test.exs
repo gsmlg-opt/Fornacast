@@ -97,6 +97,97 @@ defmodule ForgeGitHub.IssueClientTest do
              )
   end
 
+  test "fetches a pull request's distinct canonical issue identity" do
+    pull_issue =
+      issue_json(7, "pull body")
+      |> Map.put("pull_request", %{
+        "url" => "https://api.github.com/repos/octocat/Hello-World/pulls/7"
+      })
+
+    accepted_stub = stub_name()
+    Req.Test.expect(accepted_stub, &Req.Test.json(&1, pull_issue))
+
+    assert {:ok, %{"id" => 700, "node_id" => "I_7", "number" => 7}} =
+             IssueClient.get_pull_issue(
+               "installation_token",
+               "octocat",
+               "Hello-World",
+               7,
+               client_opts(accepted_stub)
+             )
+
+    wrong_number_stub = stub_name()
+    Req.Test.expect(wrong_number_stub, &Req.Test.json(&1, %{pull_issue | "number" => 8}))
+
+    assert {:error, %Error{kind: :invalid_response}} =
+             IssueClient.get_pull_issue(
+               "installation_token",
+               "octocat",
+               "Hello-World",
+               7,
+               client_opts(wrong_number_stub)
+             )
+
+    wrong_repository_stub = stub_name()
+
+    Req.Test.expect(wrong_repository_stub, fn conn ->
+      Req.Test.json(
+        conn,
+        put_in(
+          pull_issue,
+          ["pull_request", "url"],
+          "https://api.github.com/repos/octocat/private/pulls/7"
+        )
+      )
+    end)
+
+    assert {:error, %Error{kind: :invalid_response}} =
+             IssueClient.get_pull_issue(
+               "installation_token",
+               "octocat",
+               "Hello-World",
+               7,
+               client_opts(wrong_repository_stub)
+             )
+
+    ordinary_issue_stub = stub_name()
+    Req.Test.expect(ordinary_issue_stub, &Req.Test.json(&1, issue_json(7, "ordinary")))
+
+    assert {:error, %Error{kind: :invalid_response}} =
+             IssueClient.get_pull_issue(
+               "installation_token",
+               "octocat",
+               "Hello-World",
+               7,
+               client_opts(ordinary_issue_stub)
+             )
+
+    update_stub = stub_name()
+
+    Req.Test.expect(update_stub, fn conn ->
+      assert conn.method == "PATCH"
+      assert {:ok, encoded, conn} = Plug.Conn.read_body(conn)
+      assert JSON.decode!(encoded) == %{"state" => "closed", "state_reason" => "completed"}
+
+      Req.Test.json(
+        conn,
+        pull_issue
+        |> Map.put("state", "closed")
+        |> Map.put("state_reason", "completed")
+      )
+    end)
+
+    assert {:ok, %{"id" => 700, "state" => "closed", "state_reason" => "completed"}} =
+             IssueClient.update_pull_issue(
+               "installation_token",
+               "octocat",
+               "Hello-World",
+               7,
+               %{state: :closed, state_reason: :completed},
+               client_opts(update_stub)
+             )
+  end
+
   test "creates, gets, updates, and deletes issue comments" do
     parent = self()
     body = String.duplicate("c", 20_000)
