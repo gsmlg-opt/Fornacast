@@ -89,6 +89,54 @@ defmodule ForgeImports.CredentialProviderTest do
     assert run_id == run.id
   end
 
+  test "recovery authorization rechecks App state and destination management inside a transaction",
+       context do
+    %{
+      run: run,
+      organization: organization,
+      organization_mirror: mirror,
+      installation_id: installation_id
+    } = github_app_run_fixture(context.actor)
+
+    item = %RepositoryItem{destination_owner_id: organization.id}
+
+    check = fn ->
+      Repo.transaction(fn -> CredentialProvider.authorize_recovery_locked(run, item) end)
+    end
+
+    assert {:error, :invalid_context} = CredentialProvider.authorize_recovery_locked(run, item)
+    assert {:ok, :ok} = check.()
+
+    Repo.update_all(from(m in ForgeMirrors.OrganizationMirror, where: m.id == ^mirror.id),
+      set: [state: :paused]
+    )
+
+    assert {:ok, {:error, _}} = check.()
+
+    Repo.update_all(from(m in ForgeMirrors.OrganizationMirror, where: m.id == ^mirror.id),
+      set: [state: :bootstrapping]
+    )
+
+    Repo.update_all(
+      from(i in ForgeMirrors.GitHubAppInstallation,
+        where: i.github_installation_id == ^installation_id
+      ), set: [state: :revoked])
+
+    assert {:ok, {:error, _}} = check.()
+
+    Repo.update_all(
+      from(i in ForgeMirrors.GitHubAppInstallation,
+        where: i.github_installation_id == ^installation_id
+      ), set: [state: :active])
+
+    Repo.update_all(
+      from(m in ForgeAccounts.OrganizationMember,
+        where: m.organization_id == ^organization.id and m.user_id == ^context.actor.id
+      ), set: [role: :member])
+
+    assert {:ok, {:error, :forbidden}} = check.()
+  end
+
   test "GitHub App checkout derives the installation and never persists its token", context do
     %{run: run, installation_id: installation_id} = github_app_run_fixture(context.actor)
     parent = self()

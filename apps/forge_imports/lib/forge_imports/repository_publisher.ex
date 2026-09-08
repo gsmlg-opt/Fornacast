@@ -393,6 +393,9 @@ defmodule ForgeImports.RepositoryPublisher do
       {:error, _step, :publication_unavailable, _changes} ->
         {:error, :publication_unavailable}
 
+      {:error, :cleanup_fence, :metadata_not_ready, _changes} ->
+        {:error, :metadata_not_ready}
+
       {:error, _step, _reason, _changes} ->
         {:error, :persistence_unavailable}
     end
@@ -445,10 +448,12 @@ defmodule ForgeImports.RepositoryPublisher do
 
     case item do
       %RepositoryItem{} = item ->
-        case Persistence.ensure_adoption_safe_locked(repo, item) do
-          :ok -> {:ok, item.id}
-          {:error, :cleanup_conflict} -> {:error, :destination_changed}
-          {:error, :persistence_unavailable} -> {:error, :persistence_unavailable}
+        case {Persistence.ensure_adoption_safe_locked(repo, item),
+              ForgeImports.GitHub.MetadataImporter.validate_pull_issue_identities(item)} do
+          {:ok, :ok} -> {:ok, item.id}
+          {:ok, {:error, _}} -> {:error, :metadata_not_ready}
+          {{:error, :cleanup_conflict}, _} -> {:error, :destination_changed}
+          {{:error, :persistence_unavailable}, _} -> {:error, :persistence_unavailable}
         end
 
       nil ->
@@ -862,9 +867,10 @@ defmodule ForgeImports.RepositoryPublisher do
         {:ok, :queued}
 
       hidden? and staged? and valid_git_proof?(item) ->
-        if terminal_metadata?(item.id),
-          do: {:ok, :ready_to_publish},
-          else: {:ok, :git_staged}
+        if terminal_metadata?(item.id) and
+             ForgeImports.GitHub.MetadataImporter.validate_pull_issue_identities(item) == :ok,
+           do: {:ok, :ready_to_publish},
+           else: {:ok, :git_staged}
 
       true ->
         {:error, :inconsistent}

@@ -310,6 +310,23 @@ defmodule ForgeGitHub.Client do
   def issue_comments(_pat, _owner, _repository, _issue_number, _opts),
     do: error(:invalid_request)
 
+  @spec repository_issue(String.t(), String.t(), String.t(), pos_integer(), keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def repository_issue(pat, owner, repository, number, opts \\ [])
+
+  def repository_issue(pat, owner, repository, number, opts)
+      when is_integer(number) and number > 0 and number <= 999_999 do
+    with {:ok, paths} <- repository_paths(owner, repository) do
+      with_request_gate(pat, opts, fn ->
+        fetch_one("#{@api_base}#{paths.issues}/#{number}", pat, opts, &json_object/1)
+      end)
+    else
+      _ -> error(:invalid_request)
+    end
+  end
+
+  def repository_issue(_, _, _, _, _), do: error(:invalid_request)
+
   @spec pull_request(String.t(), String.t(), String.t(), pos_integer(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def pull_request(pat, owner, repository, pull_number, opts \\ [])

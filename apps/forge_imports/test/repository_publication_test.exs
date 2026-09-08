@@ -14,6 +14,7 @@ defmodule ForgeImports.RepositoryPublicationTest do
     Persistence,
     Reconciler,
     RepositoryItem,
+    RepositoryPublisher,
     RunAggregator
   }
 
@@ -49,6 +50,127 @@ defmodule ForgeImports.RepositoryPublicationTest do
     actor = user_fixture("publisher")
     identity = identity_fixture(actor)
     %{actor: actor, identity: identity}
+  end
+
+  test "legacy pull issue IDs cannot publish through terminal metadata checkpoints", context do
+    fixture = ready_publication_fixture(context)
+    assert {:ok, :ready_to_publish} = RepositoryPublisher.durable_proof_state(fixture.item)
+
+    issue =
+      %Issue{repository_id: fixture.shadow.id, kind: :pull_request}
+      |> Issue.import_changeset(%{
+        number: 7,
+        title: "Legacy PR",
+        body: "",
+        state: :open,
+        author_github_identity_id: context.identity.id,
+        inserted_at: @now,
+        updated_at: @now
+      })
+      |> Repo.insert!()
+
+    pull =
+      %PullRequest{repository_id: fixture.shadow.id, issue_id: issue.id}
+      |> PullRequest.import_changeset(
+        %{
+          head_ref: "refs/heads/feature",
+          base_ref: "refs/heads/trunk",
+          head_sha: String.duplicate("a", 40),
+          base_sha: String.duplicate("b", 40),
+          inserted_at: @now,
+          updated_at: @now
+        },
+        issue,
+        fixture.shadow
+      )
+      |> Repo.insert!()
+
+    for {kind, type, id} <- [
+          {"issue", "ForgeIssues.Issue", issue.id},
+          {"pull_request", "ForgePulls.PullRequest", pull.id}
+        ] do
+      %ObjectMapping{}
+      |> ObjectMapping.create_changeset(%{
+        repository_item_id: fixture.item.id,
+        hidden_repository_id: fixture.shadow.id,
+        github_repository_id: fixture.item.github_repository_id,
+        object_kind: kind,
+        github_object_id: 701,
+        local_resource_type: type,
+        local_resource_id: id
+      })
+      |> Repo.insert!()
+    end
+
+    assert {:ok, :git_staged} = RepositoryPublisher.durable_proof_state(fixture.item)
+
+    assert {:error, :metadata_not_ready} =
+             RepositoryPublisher.publish(
+               context.actor,
+               fixture.item.id,
+               request_metadata("legacy-identity")
+             )
+
+    assert Repo.get!(Repository, fixture.shadow.id).lifecycle == :importing
+
+    assert {:ok, %RepositoryItem{state: :git_staged}} =
+             ForgeImports.Worker.run(fixture.item.id, "identity-routing",
+               repository_worker: __MODULE__.MetadataRecoveryObserver
+             )
+  end
+
+  defmodule MetadataRecoveryObserver do
+    def stage(id, _options), do: {:ok, Fornacast.Repo.get!(ForgeImports.RepositoryItem, id)}
+  end
+
+  test "final publication fence rejects changed identity proof and legacy admitted recovery",
+       context do
+    for mode <- [:after_admission, :recovery] do
+      fixture = ready_publication_fixture(context, slug: "identity-fence-#{mode}")
+
+      invalidate = fn ->
+        %ObjectMapping{}
+        |> ObjectMapping.create_changeset(%{
+          repository_item_id: fixture.item.id,
+          hidden_repository_id: fixture.shadow.id,
+          github_repository_id: fixture.item.github_repository_id,
+          object_kind: "pull_request",
+          github_object_id: 701,
+          local_resource_type: "ForgePulls.PullRequest",
+          local_resource_id: 9_000_000_001
+        })
+        |> Repo.insert!()
+      end
+
+      result =
+        case mode do
+          :after_admission ->
+            RepositoryPublisher.with_test_after_admission_hook(
+              fn _ ->
+                invalidate.()
+                :ok
+              end,
+              fn ->
+                RepositoryPublisher.publish(
+                  context.actor,
+                  fixture.item.id,
+                  request_metadata("identity-race")
+                )
+              end
+            )
+
+          :recovery ->
+            admitted = admit_without_finish!(context.actor, fixture.item)
+            invalidate.()
+            assert admitted.state == :publishing
+            make_publication_due!(fixture.item.id)
+            RepositoryPublisher.recover(fixture.item.id)
+        end
+
+      assert {:error, :metadata_not_ready} = result
+      assert Repo.get!(Repository, fixture.shadow.id).lifecycle == :importing
+      assert Repo.get!(RepositoryItem, fixture.item.id).state == :publishing
+    end
   end
 
   test "validates request metadata before reading publication state", %{actor: actor} do

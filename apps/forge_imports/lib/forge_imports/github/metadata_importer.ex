@@ -26,17 +26,68 @@ defmodule ForgeImports.GitHub.MetadataImporter do
   @type credential_checkout :: ((String.t(), credential_metadata() -> term()) -> term())
 
   @spec stage(RepositoryItem.t(), credential_checkout(), keyword()) ::
-          :ok | {:error, atom()}
+          :ok | {:ok, :identity_recovered} | {:error, atom()}
   def stage(%RepositoryItem{} = item, credential_checkout, opts \\ [])
       when is_function(credential_checkout, 1) and is_list(opts) do
     opts = Keyword.put(opts, :credential_checkout, normalize_checkout(credential_checkout, opts))
 
-    Enum.reduce_while(@phases, :ok, fn phase, :ok ->
-      case stage_phase(item, phase, opts) do
-        :ok -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, reason}}
+    if validate_pull_issue_identities(item) == :ok do
+      Enum.reduce_while(@phases, :ok, fn phase, :ok ->
+        case stage_phase(item, phase, opts) do
+          :ok ->
+            {:cont, :ok}
+
+          {:error, :pull_issue_identity_requires_refetch} ->
+            {:halt, recover_next_pull_identity(item, opts)}
+
+          {:error, reason} ->
+            {:halt, {:error, reason}}
+        end
+      end)
+    else
+      report_unverified_pull_identity(item)
+      recover_next_pull_identity(item, opts)
+    end
+  end
+
+  defp recover_next_pull_identity(item, opts) do
+    mapped =
+      invalid_pull_identities(item)
+      |> select([_mapping, _pull, issue], issue.number)
+      |> order_by([_mapping, _pull, issue], asc: issue.number)
+      |> limit(1)
+      |> Repo.all()
+
+    number =
+      case mapped do
+        [number] ->
+          number
+
+        [] ->
+          Repo.one(
+            from candidate in ReportEntry,
+              left_join: page in PageCheckpoint,
+              on:
+                page.repository_item_id == candidate.repository_item_id and
+                  page.resource_kind == "pull_requests" and
+                  fragment("? = 'pull:' || ?::text", page.page_key, candidate.source_object_id),
+              where:
+                candidate.repository_item_id == ^item.id and
+                  candidate.classification == "pull_candidate" and is_nil(page.id),
+              order_by: candidate.source_object_id,
+              select: candidate.source_object_id,
+              limit: 1
+          )
       end
-    end)
+
+    if is_integer(number) and number > 0 do
+      case revalidate_pull_issue_identity(item, number, opts) do
+        :ok -> {:ok, :identity_recovered}
+        error -> error
+      end
+    else
+      {:error, :pull_issue_identity_requires_refetch}
+    end
   end
 
   @spec stage_phase(RepositoryItem.t(), atom(), keyword()) :: :ok | {:error, atom()}
@@ -44,10 +95,217 @@ defmodule ForgeImports.GitHub.MetadataImporter do
       when phase in @phases and is_list(opts) do
     resource = Atom.to_string(phase)
 
-    if phase_terminal?(item.id, resource) do
+    result =
+      with :ok <- validate_completed_pull_identities(item, phase) do
+        if phase_terminal?(item.id, resource), do: :ok, else: do_stage_phase(item, phase, opts)
+      end
+
+    case result do
+      {:error, :pull_issue_identity_requires_refetch} = error ->
+        report_unverified_pull_identity(item)
+        error
+
+      other ->
+        other
+    end
+  end
+
+  @doc false
+  def revalidate_pull_issue_identity(%RepositoryItem{} = item, number, opts)
+      when is_integer(number) and number > 0 and number <= 999_999 and is_list(opts) do
+    with {:ok, _} <- hidden_repository(item),
+         {:ok, {owner, name}} <- source_parts(item),
+         {:ok, {issue_id, pull_id}} <-
+           checkout_fetch(opts, fn credential, metadata ->
+             options = client_opts(opts, metadata)
+
+             with {:ok, remote} <- Client.repository(credential, owner, name, options),
+                  true <-
+                    remote.id == item.github_repository_id and
+                      remote.full_name == item.source_full_name,
+                  {:ok, issue} <-
+                    Client.repository_issue(credential, owner, name, number, options),
+                  {:skip, :pull_request_issue, %{number: ^number, github_issue_id: issue_id}} <-
+                    MetadataMapper.issue(issue),
+                  true <-
+                    get_in(issue, ["pull_request", "url"]) ==
+                      "https://api.github.com/repos/#{owner}/#{name}/pulls/#{number}",
+                  {:ok, pull} <- Client.pull_request(credential, owner, name, number, options),
+                  true <-
+                    pull["number"] == number and get_in(pull, ["base", "repo", "id"]) == remote.id,
+                  {:ok, pull_id} <- ForgeGitHub.User.id(pull["id"]) do
+               {:ok, {issue_id, pull_id}}
+             else
+               {:error, _} = error -> error
+               _ -> {:error, :pull_issue_identity_mismatch}
+             end
+           end) do
+      repair_pull_issue_identity(item, number, issue_id, pull_id)
+    end
+  end
+
+  defp repair_pull_issue_identity(item, number, issue_id, pull_id) do
+    Repo.transaction(fn ->
+      run =
+        Repo.one(
+          from r in ForgeImports.ImportRun, where: r.id == ^item.import_run_id, lock: "FOR UPDATE"
+        )
+
+      unless run && run.state == :running, do: Repo.rollback(:stale_item)
+      current = Repo.one(from i in RepositoryItem, where: i.id == ^item.id, lock: "FOR UPDATE")
+
+      unless current && current.lock_version == item.lock_version &&
+               current.state == item.state && current.lease_owner == item.lease_owner &&
+               current.state in [:git_staged, :staging_metadata, :ready_to_publish] &&
+               ((is_nil(current.lease_owner) && is_nil(current.lease_expires_at)) ||
+                  (is_binary(current.lease_owner) && is_struct(current.lease_expires_at, DateTime) &&
+                     DateTime.compare(current.lease_expires_at, DateTime.utc_now()) == :gt)) &&
+               current.hidden_repository_id == item.hidden_repository_id &&
+               current.destination_owner_id == item.destination_owner_id &&
+               current.github_repository_id == item.github_repository_id &&
+               current.source_full_name == item.source_full_name,
+             do: Repo.rollback(:stale_item)
+
+      repository =
+        Repo.one(
+          from r in Repository, where: r.id == ^current.hidden_repository_id, lock: "FOR UPDATE"
+        )
+
+      unless repository && repository.lifecycle == :importing && is_nil(repository.deleted_at),
+        do: Repo.rollback(:pull_issue_identity_requires_coordinated_repair)
+
+      unless repository.owner_user_id == current.destination_owner_id,
+        do: Repo.rollback(:stale_item)
+
+      case ForgeImports.CredentialProvider.authorize_recovery_locked(run, current) do
+        :ok -> :ok
+        {:error, reason} -> Repo.rollback(reason)
+      end
+
+      if Repo.exists?(
+           from m in ForgeMirrors.RepositoryMirror, where: m.repository_id == ^repository.id
+         ),
+         do: Repo.rollback(:pull_issue_identity_requires_coordinated_repair)
+
+      candidate =
+        Repo.one(
+          from c in ReportEntry,
+            where:
+              c.repository_item_id == ^item.id and c.import_run_id == ^item.import_run_id and
+                c.classification == "pull_candidate" and c.source_object_id == ^number,
+            lock: "FOR UPDATE"
+        )
+
+      unless candidate, do: Repo.rollback(:pull_issue_identity_mismatch)
+
+      case ForgeGitHub.User.id(candidate.metadata["github_id"]) do
+        {:ok, ^issue_id} -> :ok
+        {:ok, _contradictory_id} -> Repo.rollback(:pull_issue_identity_mismatch)
+        :error -> :ok
+      end
+
+      local_issue =
+        Repo.one(
+          from i in Issue,
+            where: i.repository_id == ^repository.id and i.number == ^number,
+            lock: "FOR UPDATE"
+        )
+
+      local_issue_id = if local_issue, do: local_issue.id, else: 0
+
+      mappings =
+        Repo.all(
+          from m in ObjectMapping,
+            where:
+              m.repository_item_id == ^item.id and
+                ((m.object_kind == "pull_request" and m.github_object_id == ^pull_id) or
+                   (m.object_kind == "issue" and m.local_resource_id == ^local_issue_id)),
+            order_by: m.id,
+            lock: "FOR UPDATE"
+        )
+
+      pull_mapping =
+        Enum.find(
+          mappings,
+          &(&1.object_kind == "pull_request" and &1.github_object_id == pull_id)
+        )
+
+      if pull_mapping do
+        pull = Repo.get(ForgePulls.PullRequest, pull_mapping.local_resource_id)
+        issue = if pull, do: Repo.get(Issue, pull.issue_id)
+
+        identity =
+          if issue,
+            do:
+              Enum.find(
+                mappings,
+                &(&1.object_kind == "issue" and &1.local_resource_id == issue.id)
+              )
+
+        unless pull && issue && identity &&
+                 pull_mapping.local_resource_type == "ForgePulls.PullRequest" &&
+                 pull.repository_id == repository.id && issue.repository_id == repository.id &&
+                 issue.number == number && issue.kind == :pull_request &&
+                 identity.local_resource_type == "ForgeIssues.Issue" &&
+                 Enum.all?(
+                   [identity, pull_mapping],
+                   &(&1.hidden_repository_id == repository.id &&
+                       &1.github_repository_id == item.github_repository_id)
+                 ) &&
+                 identity.github_object_id in [pull_id, issue_id],
+               do: Repo.rollback(:pull_issue_identity_mismatch)
+
+        if Repo.exists?(
+             from m in ObjectMapping,
+               where:
+                 m.repository_item_id == ^item.id and
+                   m.object_kind == "issue" and m.github_object_id == ^issue_id and
+                   m.id != ^identity.id
+           ),
+           do: Repo.rollback(:pull_issue_identity_mismatch)
+
+        identity |> Ecto.Changeset.change(github_object_id: issue_id) |> Repo.update!()
+      else
+        # Candidate-only recovery is safe only before any local PR for this number exists.
+        if Repo.exists?(
+             from i in Issue, where: i.repository_id == ^repository.id and i.number == ^number
+           ),
+           do: Repo.rollback(:pull_issue_identity_mismatch)
+      end
+
+      candidate
+      |> Ecto.Changeset.change(metadata: Map.put(candidate.metadata, "github_id", issue_id))
+      |> Repo.update!()
+
+      pending_evidence? =
+        Repo.exists?(
+          from c in ReportEntry,
+            where:
+              c.repository_item_id == ^item.id and c.classification == "pull_candidate" and
+                fragment("COALESCE(jsonb_typeof(?->'github_id'), '') <> 'number'", c.metadata)
+        )
+
+      if not pending_evidence? and
+           validate_completed_pull_identities(current, :pull_requests) == :ok do
+        Repo.update_all(
+          from(r in ReportEntry,
+            where:
+              r.repository_item_id == ^item.id and
+                r.classification == "pull_issue_identity_requires_refetch"
+          ),
+          set: [
+            outcome: :imported,
+            summary: "Pull request issue identity authenticated and revalidated",
+            metadata: %{"phase" => "pull_requests", "code" => "authenticated_refetch_completed"}
+          ]
+        )
+      end
+
       :ok
-    else
-      do_stage_phase(item, phase, opts)
+    end)
+    |> case do
+      {:ok, :ok} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -103,7 +361,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
                 import_issue_row(multi, item, repository, mapped, payload, now)
 
               {:skip, :pull_request_issue, details} ->
-                record_pull_candidate(multi, item, details[:number])
+                record_pull_candidate(multi, item, details)
 
               {:error, _} ->
                 multi
@@ -220,9 +478,21 @@ defmodule ForgeImports.GitHub.MetadataImporter do
 
       case MetadataMapper.pull(payload, item.github_repository_id, staged_refs: staged_refs) do
         {:ok, mapped} ->
-          commit_page(item, "pull_requests", page_key, 1, fn multi ->
-            import_pull_row(multi, item, repository, mapped, now)
-          end)
+          with true <- mapped.number == number,
+               {:ok, issue_id} <- candidate_issue_id(item, number) do
+            commit_page(item, "pull_requests", page_key, 1, fn multi ->
+              import_pull_row(
+                multi,
+                item,
+                repository,
+                Map.put(mapped, :github_issue_id, issue_id),
+                now
+              )
+            end)
+          else
+            false -> {:error, :invalid_pull}
+            {:error, _} = error -> error
+          end
 
         {:skip, code, details} ->
           commit_page(item, "pull_requests", page_key, 0, fn multi ->
@@ -390,7 +660,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
                  repo,
                  item,
                  "issue",
-                 mapped.github_id,
+                 mapped.github_issue_id,
                  "ForgeIssues.Issue",
                  issue.id,
                  source_url(item, "pulls", mapped.number)
@@ -699,6 +969,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
       from report in ReportEntry,
         where:
           report.repository_item_id == ^item_id and report.classification == "pull_candidate",
+        order_by: report.source_object_id,
         select: report.source_object_id
     )
   end
@@ -716,7 +987,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
        else: {:error, :parent_unsupported}
   end
 
-  defp record_pull_candidate(multi, item, number) do
+  defp record_pull_candidate(multi, item, %{number: number, github_issue_id: issue_id}) do
     Multi.insert(
       multi,
       {:pull_candidate, number},
@@ -730,12 +1001,98 @@ defmodule ForgeImports.GitHub.MetadataImporter do
         outcome: :skipped,
         classification: "pull_candidate",
         summary: "Pull request deferred to pull phase",
-        metadata: %{"count" => number},
+        metadata: %{"count" => number, "github_id" => issue_id},
         source_count: 0
       }),
       on_conflict: :nothing,
       conflict_target: [:import_run_id, :idempotency_key]
     )
+  end
+
+  defp candidate_issue_id(item, number) do
+    candidate =
+      Repo.get_by(ReportEntry,
+        import_run_id: item.import_run_id,
+        repository_item_id: item.id,
+        classification: "pull_candidate",
+        source_object_id: number
+      )
+
+    case candidate do
+      %ReportEntry{metadata: %{"github_id" => id}}
+      when is_integer(id) and id > 0 and id <= 9_223_372_036_854_775_807 ->
+        {:ok, id}
+
+      _ ->
+        {:error, :pull_issue_identity_requires_refetch}
+    end
+  end
+
+  # Completed legacy checkpoints are not sufficient identity proof. In particular,
+  # older imports used the PR ID for both mappings. Revalidation must fetch trusted
+  # issue evidence; this guard never repairs identities by matching a number alone.
+  @doc false
+  def validate_pull_issue_identities(%RepositoryItem{} = item),
+    do: validate_completed_pull_identities(item, :pull_requests)
+
+  defp validate_completed_pull_identities(item, :pull_requests) do
+    if Repo.exists?(invalid_pull_identities(item)),
+      do: {:error, :pull_issue_identity_requires_refetch},
+      else: :ok
+  end
+
+  defp validate_completed_pull_identities(_, _), do: :ok
+
+  defp invalid_pull_identities(item) do
+    from mapping in ObjectMapping,
+      left_join: pull in ForgePulls.PullRequest,
+      on:
+        pull.id == mapping.local_resource_id and
+          mapping.local_resource_type == "ForgePulls.PullRequest",
+      left_join: issue in Issue,
+      on:
+        issue.id == pull.issue_id and issue.repository_id == ^item.hidden_repository_id and
+          issue.kind == :pull_request,
+      left_join: identity in ObjectMapping,
+      on:
+        identity.repository_item_id == mapping.repository_item_id and
+          identity.object_kind == "issue" and
+          identity.local_resource_type == "ForgeIssues.Issue" and
+          identity.local_resource_id == issue.id,
+      left_join: candidate in ReportEntry,
+      on:
+        candidate.repository_item_id == mapping.repository_item_id and
+          candidate.import_run_id == ^item.import_run_id and
+          candidate.classification == "pull_candidate" and
+          candidate.source_object_id == issue.number,
+      where: mapping.repository_item_id == ^item.id and mapping.object_kind == "pull_request",
+      where:
+        is_nil(pull.id) or is_nil(issue.id) or is_nil(identity.id) or is_nil(candidate.id) or
+          fragment(
+            "COALESCE(jsonb_typeof(?->'github_id'), '') <> 'number'",
+            candidate.metadata
+          ) or
+          fragment(
+            "COALESCE(?->>'github_id', '') <> ?::text",
+            candidate.metadata,
+            identity.github_object_id
+          )
+  end
+
+  defp report_unverified_pull_identity(item) do
+    %ReportEntry{}
+    |> ReportEntry.create_changeset(%{
+      import_run_id: item.import_run_id,
+      repository_item_id: item.id,
+      idempotency_key: "pull-issue-identity-refetch-#{item.id}",
+      scope: :repository,
+      outcome: :failed,
+      classification: "pull_issue_identity_requires_refetch",
+      summary: "Pull request issue identity requires authenticated refetch before publication",
+      metadata: %{"phase" => "pull_requests", "code" => "authenticated_refetch_required"},
+      source_count: 0
+    })
+    |> Repo.insert(on_conflict: :nothing, conflict_target: [:import_run_id, :idempotency_key])
   end
 
   defp skip_object(multi, item, kind, github_id, code, details) do

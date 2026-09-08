@@ -55,6 +55,7 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
     pull_issue =
       fixture!("issues_page.json")
       |> hd()
+      |> Map.put("id", 302)
       |> Map.put("number", 7)
       |> Map.put("pull_request", %{
         "url" => "https://api.github.com/repos/octocat/Hello-World/pulls/7"
@@ -120,6 +121,14 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
              Repo.get_by!(Issue, repository_id: repository.id, number: 7)
 
     assert %PullRequest{id: pull_id} = Repo.get_by!(PullRequest, repository_id: repository.id)
+    pull_issue_row = Repo.get_by!(Issue, repository_id: repository.id, number: 7)
+
+    assert %ObjectMapping{github_object_id: 302} =
+             Repo.get_by!(ObjectMapping,
+               repository_item_id: item.id,
+               object_kind: "issue",
+               local_resource_id: pull_issue_row.id
+             )
 
     assert %ObjectMapping{local_resource_id: ^pull_id} =
              Repo.get_by!(ObjectMapping,
@@ -132,6 +141,305 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
            )
 
     refute ForgeRepos.get_repository(user_slug(run), item.destination_slug)
+  end
+
+  test "legacy candidate and completed mappings require authenticated issue identity revalidation",
+       %{run: run} do
+    {item, repository, _, head_sha, base_sha} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    issue =
+      hd(fixture!("issues_page.json"))
+      |> Map.put("pull_request", %{
+        "url" => "https://api.github.com/repos/octocat/Hello-World/pulls/7"
+      })
+
+    stub =
+      stub_client!(
+        labels: [],
+        issues: [issue],
+        comments: %{},
+        pull: align_pull_payload(fixture!("pull_same_repo.json"), head_sha, base_sha)
+      )
+
+    assert :ok = stage(item, stub, phases: [:issues])
+
+    candidate =
+      Repo.get_by!(ReportEntry, repository_item_id: item.id, classification: "pull_candidate")
+
+    assert candidate.metadata["github_id"] == issue["id"]
+    candidate |> Ecto.Changeset.change(metadata: %{"count" => 7}) |> Repo.update!()
+
+    assert {:error, :pull_issue_identity_requires_refetch} =
+             stage(item, stub, phases: [:pull_requests])
+
+    refute Repo.exists?(from p in PullRequest, where: p.repository_id == ^repository.id)
+
+    Repo.get!(ReportEntry, candidate.id)
+    |> Ecto.Changeset.change(metadata: candidate.metadata)
+    |> Repo.update!()
+
+    assert :ok = stage(item, stub, phases: [:pull_requests])
+
+    mappings =
+      Repo.all(from m in ObjectMapping, where: m.repository_item_id == ^item.id, order_by: m.id)
+
+    Repo.get!(ReportEntry, candidate.id)
+    |> Ecto.Changeset.change(metadata: %{"count" => 7})
+    |> Repo.update!()
+
+    assert {:error, :pull_issue_identity_requires_refetch} =
+             stage(item, stub, phases: [:pull_requests])
+
+    assert Repo.all(
+             from m in ObjectMapping, where: m.repository_item_id == ^item.id, order_by: m.id
+           ) == mappings
+
+    assert Repo.exists?(
+             from r in ReportEntry,
+               where:
+                 r.repository_item_id == ^item.id and
+                   r.classification == "pull_issue_identity_requires_refetch"
+           )
+  end
+
+  test "authenticated legacy identity recovery is atomic and idempotent", %{run: run} do
+    {item, _, _, head, base} = git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    issue =
+      hd(fixture!("issues_page.json"))
+      |> Map.put("pull_request", %{
+        "url" => "https://api.github.com/repos/octocat/Hello-World/pulls/7"
+      })
+
+    pull = align_pull_payload(fixture!("pull_same_repo.json"), head, base)
+    stub = stub_client!(labels: [], issues: [issue], comments: %{}, pull: pull)
+    assert :ok = stage(item, stub, phases: [:issues, :pull_requests])
+
+    candidate =
+      Repo.get_by!(ReportEntry, repository_item_id: item.id, classification: "pull_candidate")
+
+    candidate |> Ecto.Changeset.change(metadata: %{"count" => 7}) |> Repo.update!()
+    mapping = Repo.get_by!(ObjectMapping, repository_item_id: item.id, object_kind: "issue")
+    mapping |> Ecto.Changeset.change(github_object_id: pull["id"]) |> Repo.update!()
+
+    assert {:error, :pull_issue_identity_requires_refetch} =
+             stage(item, stub, phases: [:pull_requests])
+
+    for response <- [:denied, :wrong_repository, :wrong_pull, :wrong_signpost] do
+      recovery_stub!(stub, item, issue, pull, response)
+
+      assert {:error, _} =
+               MetadataImporter.revalidate_pull_issue_identity(item, 7, importer_opts(stub, item))
+
+      assert Repo.get!(ObjectMapping, mapping.id).github_object_id == pull["id"]
+      assert Repo.get!(ReportEntry, candidate.id).metadata == %{"count" => 7}
+    end
+
+    recovery_stub!(stub, item, issue, pull, :ok)
+
+    Repo.get!(ReportEntry, candidate.id)
+    |> Ecto.Changeset.change(metadata: %{"count" => 7, "github_id" => 999})
+    |> Repo.update!()
+
+    assert {:error, :pull_issue_identity_mismatch} =
+             MetadataImporter.revalidate_pull_issue_identity(item, 7, importer_opts(stub, item))
+
+    assert Repo.get!(ObjectMapping, mapping.id).github_object_id == pull["id"]
+
+    Repo.get!(ReportEntry, candidate.id)
+    |> Ecto.Changeset.change(metadata: %{"count" => 7})
+    |> Repo.update!()
+
+    other_owner = user_fixture("identity-recovery-other-owner")
+    hidden = Repo.get!(ForgeRepos.Repository, item.hidden_repository_id)
+    hidden |> Ecto.Changeset.change(owner_user_id: other_owner.id) |> Repo.update!()
+
+    assert {:error, :stale_item} =
+             MetadataImporter.revalidate_pull_issue_identity(item, 7, importer_opts(stub, item))
+
+    assert Repo.get!(ObjectMapping, mapping.id).github_object_id == pull["id"]
+
+    Repo.get!(ForgeRepos.Repository, hidden.id)
+    |> Ecto.Changeset.change(owner_user_id: hidden.owner_user_id)
+    |> Repo.update!()
+
+    current_run = Repo.get!(ForgeImports.ImportRun, run.id)
+
+    current_run
+    |> Ecto.Changeset.change(
+      credential_source: :github_app,
+      github_identity_id: nil,
+      credential_ciphertext: nil,
+      credential_nonce: nil,
+      credential_tag: nil,
+      credential_key_id: nil
+    )
+    |> Repo.update!()
+
+    assert {:error, _} =
+             MetadataImporter.revalidate_pull_issue_identity(item, 7, importer_opts(stub, item))
+
+    assert Repo.get!(ObjectMapping, mapping.id).github_object_id == pull["id"]
+
+    Repo.get!(ForgeImports.ImportRun, run.id)
+    |> Ecto.Changeset.change(
+      credential_source: current_run.credential_source,
+      github_identity_id: current_run.github_identity_id,
+      credential_ciphertext: current_run.credential_ciphertext,
+      credential_nonce: current_run.credential_nonce,
+      credential_tag: current_run.credential_tag,
+      credential_key_id: current_run.credential_key_id
+    )
+    |> Repo.update!()
+
+    Repo.get!(ForgeImports.ImportRun, run.id)
+    |> Ecto.Changeset.change(state: :cancel_requested)
+    |> Repo.update!()
+
+    assert {:error, :stale_item} =
+             MetadataImporter.revalidate_pull_issue_identity(item, 7, importer_opts(stub, item))
+
+    Repo.get!(ForgeImports.ImportRun, run.id)
+    |> Ecto.Changeset.change(state: :running)
+    |> Repo.update!()
+
+    expired =
+      Repo.get!(ForgeImports.RepositoryItem, item.id)
+      |> Ecto.Changeset.change(
+        lease_owner: "expired-recovery",
+        lease_expires_at: ~U[2020-01-01 00:00:00Z]
+      )
+      |> Repo.update!()
+
+    assert {:error, :stale_item} =
+             MetadataImporter.revalidate_pull_issue_identity(
+               expired,
+               7,
+               importer_opts(stub, expired)
+             )
+
+    expired |> Ecto.Changeset.change(lease_owner: nil, lease_expires_at: nil) |> Repo.update!()
+    assert Repo.get!(ObjectMapping, mapping.id).github_object_id == pull["id"]
+
+    assert :ok =
+             MetadataImporter.revalidate_pull_issue_identity(item, 7, importer_opts(stub, item))
+
+    assert Repo.get!(ObjectMapping, mapping.id).github_object_id == issue["id"]
+    assert Repo.get!(ReportEntry, candidate.id).metadata["github_id"] == issue["id"]
+
+    assert :ok =
+             MetadataImporter.revalidate_pull_issue_identity(item, 7, importer_opts(stub, item))
+
+    assert :ok = stage(item, stub, phases: [:pull_requests])
+
+    report =
+      Repo.get_by!(ReportEntry,
+        repository_item_id: item.id,
+        classification: "pull_issue_identity_requires_refetch"
+      )
+
+    assert report.outcome == :imported
+    assert report.metadata["code"] == "authenticated_refetch_completed"
+
+    Repo.get!(ReportEntry, candidate.id)
+    |> Ecto.Changeset.change(metadata: %{"count" => 7})
+    |> Repo.update!()
+
+    second =
+      %ReportEntry{}
+      |> ReportEntry.create_changeset(%{
+        import_run_id: run.id,
+        repository_item_id: item.id,
+        idempotency_key: "pull-candidate-#{item.id}-8",
+        scope: :object,
+        object_kind: "pull_request",
+        source_object_id: 8,
+        outcome: :skipped,
+        classification: "pull_candidate",
+        summary: "Legacy candidate",
+        metadata: %{"count" => 8},
+        source_count: 0
+      })
+      |> Repo.insert!()
+
+    opts = importer_opts(stub, item)
+
+    assert {:ok, :identity_recovered} =
+             MetadataImporter.stage(item, Keyword.fetch!(opts, :credential_checkout), opts)
+
+    assert Repo.get!(ReportEntry, candidate.id).metadata["github_id"] == issue["id"]
+    assert Repo.get!(ReportEntry, second.id).metadata == %{"count" => 8}
+
+    Repo.get!(ReportEntry, candidate.id)
+    |> Ecto.Changeset.change(metadata: %{"count" => 7})
+    |> Repo.update!()
+
+    %ForgeImports.ImportAttempt{}
+    |> ForgeImports.ImportAttempt.create_changeset(%{
+      repository_item_id: item.id,
+      attempt_number: 1,
+      state: :running,
+      decision: %{"action" => "create", "slug" => item.destination_slug},
+      started_at: DateTime.utc_now(:second)
+    })
+    |> Repo.insert!()
+
+    assert {:ok,
+            %ForgeImports.RepositoryItem{
+              state: :staging_metadata,
+              lease_owner: nil,
+              failure_kind: nil
+            }} =
+             ForgeImports.RepositoryWorker.stage(item.id,
+               owner: "bounded-identity-recovery",
+               keyring: @keyring,
+               client_options: client_opts(stub)
+             )
+
+    assert Repo.get!(ReportEntry, candidate.id).metadata["github_id"] == issue["id"]
+    assert Repo.get!(ReportEntry, second.id).metadata == %{"count" => 8}
+  end
+
+  defp recovery_stub!(stub, item, issue, pull, response) do
+    Req.Test.stub(stub, fn conn ->
+      cond do
+        response == :denied ->
+          Plug.Conn.send_resp(conn, 403, "{}")
+
+        String.ends_with?(conn.request_path, "/issues/7") ->
+          Req.Test.json(
+            conn,
+            if(response == :wrong_signpost,
+              do:
+                Map.put(issue, "pull_request", %{
+                  "url" => "https://api.github.com/repos/other/repo/pulls/7"
+                }),
+              else: issue
+            )
+          )
+
+        String.ends_with?(conn.request_path, "/pulls/7") ->
+          Req.Test.json(
+            conn,
+            if(response == :wrong_pull, do: Map.put(pull, "id", 999), else: pull)
+          )
+
+        true ->
+          Req.Test.json(conn, %{
+            "id" => if(response == :wrong_repository, do: 999, else: item.github_repository_id),
+            "name" => "Hello-World",
+            "full_name" => item.source_full_name,
+            "default_branch" => "main",
+            "visibility" => "public",
+            "has_issues" => true,
+            "fork" => false,
+            "archived" => false,
+            "private" => false,
+            "owner" => %{"id" => 583_231, "login" => "octocat"}
+          })
+      end
+    end)
   end
 
   test "skips cross-repository and draft pulls without creating issue rows", %{run: run} do
@@ -513,8 +821,6 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
   defp user_slug(%{actor_user_id: actor_id}) do
     Repo.get!(ForgeAccounts.User, actor_id).username
   end
-
-  defp user_slug(run), do: user_slug(%{actor_user_id: run.actor_user_id})
 
   defp identity_fixture(actor) do
     {:ok, identity} =

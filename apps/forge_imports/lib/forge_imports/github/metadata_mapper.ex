@@ -25,10 +25,20 @@ defmodule ForgeImports.GitHub.MetadataMapper do
 
   @spec issue(term()) :: {:ok, map()} | {:skip, atom(), map()} | {:error, atom()}
   def issue(%{} = payload) do
-    if Map.has_key?(payload, "pull_request") and not is_nil(payload["pull_request"]) do
-      {:skip, :pull_request_issue, %{number: payload["number"]}}
-    else
-      map_issue(payload)
+    case payload["pull_request"] do
+      nil ->
+        map_issue(payload)
+
+      %{} ->
+        with {:ok, id} <- User.id(payload["id"]),
+             {:ok, number} <- User.id(payload["number"]) do
+          {:skip, :pull_request_issue, %{number: number, github_issue_id: id}}
+        else
+          _ -> {:error, :invalid_issue}
+        end
+
+      _ ->
+        {:error, :invalid_issue}
     end
   end
 

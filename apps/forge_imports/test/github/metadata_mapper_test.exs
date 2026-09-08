@@ -26,7 +26,11 @@ defmodule ForgeImports.GitHub.MetadataMapperTest do
         "url" => "https://api.github.com/repos/octocat/Hello-World/pulls/7"
       })
 
-    assert {:skip, :pull_request_issue, %{number: 7}} = MetadataMapper.issue(pull_backed)
+    assert {:skip, :pull_request_issue, %{number: 7, github_issue_id: 301}} =
+             MetadataMapper.issue(pull_backed)
+
+    assert {:error, :invalid_issue} = MetadataMapper.issue(Map.put(pull_backed, "id", nil))
+    assert {:error, :invalid_issue} = MetadataMapper.issue(Map.put(pull_backed, "number", 0))
   end
 
   test "maps comment payloads and deleted authors to ghost semantics" do

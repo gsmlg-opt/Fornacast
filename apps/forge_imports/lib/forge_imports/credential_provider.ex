@@ -5,6 +5,59 @@ defmodule ForgeImports.CredentialProvider do
   alias ForgeImports.{ImportRun, RepositoryItem}
   alias ForgeImports.CredentialProvider.{GitHubApp, OneTimePAT, SavedPAT}
 
+  @doc false
+  def authorize_recovery_locked(%ImportRun{} = run, %RepositoryItem{} = item) do
+    import Ecto.Query
+    alias Fornacast.Repo
+
+    if Repo.in_transaction?() do
+      owners =
+        Repo.all(
+          from u in User,
+            where: u.id in ^[run.actor_user_id, item.destination_owner_id],
+            order_by: u.id,
+            lock: "FOR UPDATE"
+        )
+
+      actor =
+        Enum.find(
+          owners,
+          &(&1.id == run.actor_user_id and &1.kind == :user and &1.state == :active)
+        )
+
+      owner = Enum.find(owners, &(&1.id == item.destination_owner_id and &1.state == :active))
+
+      Repo.all(
+        from m in ForgeAccounts.OrganizationMember,
+          where:
+            m.organization_id == ^item.destination_owner_id and m.user_id == ^run.actor_user_id,
+          lock: "FOR UPDATE"
+      )
+
+      with true <- not is_nil(actor) and not is_nil(owner),
+           :ok <- recovery_destination(actor, owner) do
+        if run.credential_source == :github_app,
+          do: GitHubApp.authorize_recovery_locked(run, actor, owner.id),
+          else: :ok
+      else
+        _ -> {:error, :forbidden}
+      end
+    else
+      {:error, :invalid_context}
+    end
+  end
+
+  defp recovery_destination(%User{id: id}, %User{id: id, kind: :user}), do: :ok
+
+  defp recovery_destination(actor, %User{id: id, kind: :organization}) do
+    case ForgeAccounts.fetch_manageable_organization(actor, id) do
+      {:ok, _} -> :ok
+      error -> error
+    end
+  end
+
+  defp recovery_destination(_, _), do: {:error, :forbidden}
+
   @type capability :: ImportRun.t() | RepositoryItem.t()
   @type context :: %{actor: User.t(), run: ImportRun.t(), capability: capability()}
   @type metadata :: %{git_login: String.t(), gate_key: term()}
@@ -72,6 +125,35 @@ defmodule ForgeImports.CredentialProvider.GitHubApp do
   defmodule CallbackError do
     @moduledoc false
     defexception message: "credential callback failed"
+  end
+
+  @doc false
+  def authorize_recovery_locked(run, actor, destination_id) do
+    if Repo.in_transaction?() do
+      with {:ok, selected} <- bound_mirror(run.id),
+           %OrganizationMirror{} = mirror <-
+             Repo.one(
+               from m in OrganizationMirror, where: m.id == ^selected.id, lock: "FOR UPDATE"
+             ),
+           true <-
+             mirror.bootstrap_import_run_id == run.id and mirror.organization_id == destination_id,
+           :ok <- runnable_mirror(mirror),
+           :ok <- authorize_binding(actor, run, mirror),
+           _ <-
+             Repo.one(
+               from i in GitHubAppInstallation,
+                 where: i.github_installation_id == ^mirror.github_installation_id,
+                 lock: "FOR UPDATE"
+             ),
+           {:ok, _} <- active_installation(mirror) do
+        :ok
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :invalid_context}
+      end
+    else
+      {:error, :invalid_context}
+    end
   end
 
   @impl true

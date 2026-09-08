@@ -194,6 +194,7 @@ defmodule ForgeImports.RepositoryWorker do
          {:ok, updated} <- persist_ready_to_publish(item) do
       {:ok, updated}
     else
+      {:ok, :identity_recovered} -> persist_metadata_progress(capability)
       true -> persist_cancellation(capability)
       {:error, :cancelled} -> persist_cancellation(capability)
       {:error, reason} -> release_with_error(capability, reason)
@@ -218,6 +219,29 @@ defmodule ForgeImports.RepositoryWorker do
       )
 
     receive_metadata_result(checkout, reference)
+  end
+
+  # One authenticated identity repair consumes a claim. Keep its durable evidence
+  # and release immediately, without recording progress as a failed import.
+  defp persist_metadata_progress(capability) do
+    Repo.transaction(fn ->
+      with %ImportRun{state: :running} = run <- locked_run(capability.import_run_id),
+           %RepositoryItem{state: :staging_metadata} = item <- locked_error_item(capability),
+           now <- DateTime.utc_now(:second),
+           true <- live_lease?(item, now),
+           {:ok, released} <-
+             OperationLease.update_owned(RepositoryItem, item,
+               next_attempt_at: now,
+               wait_reason: nil,
+               failure_kind: nil,
+               failure_detail: nil
+             ),
+           :ok <- bump_run_after_retry(run, now) do
+        released
+      else
+        _ -> Repo.rollback(:lost_lease)
+      end
+    end)
   end
 
   defp metadata_importer_options(_item, options) do
