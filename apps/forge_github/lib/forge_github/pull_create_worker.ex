@@ -15,6 +15,7 @@ defmodule ForgeGitHub.PullCreateWorker do
     InstallationTokenBroker,
     IssueClient,
     IssueSyncProjection,
+    LabelClient,
     PullClient,
     PullCreateRecovery,
     PullSyncProjection,
@@ -235,7 +236,7 @@ defmodule ForgeGitHub.PullCreateWorker do
 
   defp prepare_assignee(operation, now, sync, pair, token, options) do
     if sync.intent.payload["issue_snapshot"]["assignee_github_ids"] == [] do
-      patch(operation, now, sync, pair, token, options)
+      prepare_labels(operation, now, sync, pair, token, options)
     else
       with {:ok, context} <-
              callback(
@@ -245,7 +246,7 @@ defmodule ForgeGitHub.PullCreateWorker do
              ).(operation) do
         case context.target do
           nil ->
-            patch(operation, now, sync, pair, token, options)
+            prepare_labels(operation, now, sync, pair, token, options)
 
           target ->
             with {:ok, %ForgeGitHub.User{} = user} <-
@@ -263,6 +264,62 @@ defmodule ForgeGitHub.PullCreateWorker do
                 now,
                 %{marker: context.marker, target: target},
                 Map.from_struct(user)
+              )
+            end
+        end
+      end
+    end
+  end
+
+  defp prepare_labels(operation, now, sync, pair, token, options) do
+    if sync.intent.payload["issue_snapshot"]["label_github_ids"] == [] do
+      patch(operation, now, sync, pair, token, options)
+    else
+      with {:ok, context} <-
+             callback(
+               options,
+               :label_node_context,
+               &ForgeMirrors.outbound_pull_label_node_context/1
+             ).(operation) do
+        case context.status do
+          :ready ->
+            patch(operation, now, sync, pair, token, options)
+
+          :unavailable ->
+            conflict(
+              operation,
+              now,
+              "relationship_unavailable",
+              %{"reason" => "missing_labels"},
+              options
+            )
+
+          :scanning ->
+            with :ok <- provider_refs(context, token, options),
+                 {:ok, page} <-
+                   LabelClient.list_labels_page(
+                     token,
+                     context.remote_owner,
+                     context.remote_repository,
+                     context.checkpoint["page"],
+                     request_options(context, options)
+                   ),
+                 :ok <- provider_refs(context, token, options) do
+              # Both repository observations authenticate this page's immutable
+              # repository identity; names in the inventory never rebind labels.
+              base = context.intent.payload["provider_repositories"]["base_repository"]
+
+              page =
+                Map.put(page, :repository, %{
+                  github_object_id: base["id"],
+                  github_node_id: base["node_id"]
+                })
+
+              callback(options, :seed_label_nodes, &ForgeMirrors.seed_outbound_pull_label_nodes/4).(
+                operation,
+                now,
+                Map.take(context, [:marker, :targets, :checkpoint]),
+                page
               )
             end
         end

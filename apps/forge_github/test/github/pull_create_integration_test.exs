@@ -208,6 +208,124 @@ defmodule ForgeGitHub.PullCreateIntegrationTest do
     assert Repo.get!(MirrorOperation, c.operation.id).state == :completed
   end
 
+  test "missing label node scans across claims and uses a fresh second rename for cleanup", c do
+    label =
+      Repo.insert!(%ForgeIssues.Label{
+        repository_id: c.base.repository_id,
+        name: "old-label",
+        normalized_name: "old-label",
+        color: "abcdef"
+      })
+
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: c.issue.id, label_id: label.id})
+    snapshot = %{"name" => label.name, "color" => label.color, "description" => nil}
+    {:ok, fingerprint} = ForgeMirrors.resource_fingerprint(snapshot)
+
+    mapping =
+      Repo.insert!(%MirrorResourceState{
+        repository_mirror_id: c.base.id,
+        resource_kind: :label,
+        local_resource_type: "ForgeIssues.Label",
+        local_resource_id: label.id,
+        github_object_id: 4301,
+        state: :confirmed,
+        confirmed_local_version: 1,
+        confirmed_snapshot: snapshot,
+        confirmed_fingerprint: fingerprint
+      })
+
+    stub_provider(c, seed_labels: true)
+    assert {:ok, _} = process(c)
+    marked = Repo.get!(MirrorOperation, c.operation.id)
+    intent = Repo.get_by!(PullCreationIntent, pull_id: c.pull.id)
+    assert intent.payload["issue_snapshot"]["label_github_ids"] == [4301]
+
+    for page <- [1, 2] do
+      assert {:ok, _} = process(c)
+      saved = Repo.get!(MirrorOperation, c.operation.id)
+      assert saved.state == :effect_pending and is_nil(saved.lease_owner)
+      assert saved.external_effect_marker == marked.external_effect_marker
+
+      assert saved.checkpoint["pull_creation_recovery"] ==
+               marked.checkpoint["pull_creation_recovery"]
+
+      assert Process.get(:label_pages) == Enum.to_list(1..page)
+      assert Process.get(:create_posts) == 1
+      assert is_nil(Process.get(:create_patches))
+      current_mapping = Repo.get!(MirrorResourceState, mapping.id)
+      assert current_mapping.github_node_id == if(page == 1, do: nil, else: "L_4301")
+      assert current_mapping.confirmed_snapshot == snapshot
+      assert current_mapping.confirmed_fingerprint == fingerprint
+      assert current_mapping.confirmed_local_version == 1
+      assert Repo.get!(ForgeIssues.Label, label.id).name == "old-label"
+      assert Repo.aggregate(MirrorResourceState, :count) == 1
+    end
+
+    assert {:ok, _} = process(c)
+    assert Process.get(:relationship_queries) == 1
+    assert Process.get(:patched_labels) == ["current-label"]
+    assert Process.get(:create_posts) == 1
+    assert Process.get(:create_patches) == 1
+    assert Repo.get!(MirrorOperation, c.operation.id).state == :completed
+
+    assert Repo.get_by!(MirrorResourceState,
+             repository_mirror_id: c.base.id,
+             resource_kind: :issue
+           ).confirmed_snapshot["label_github_ids"] == [4301]
+  end
+
+  test "exhausted label inventory becomes a visible conflict without cleanup or another scan",
+       c do
+    label =
+      Repo.insert!(%ForgeIssues.Label{
+        repository_id: c.base.repository_id,
+        name: "missing",
+        normalized_name: "missing",
+        color: "abcdef"
+      })
+
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: c.issue.id, label_id: label.id})
+    snapshot = %{"name" => label.name, "color" => label.color, "description" => nil}
+    {:ok, fingerprint} = ForgeMirrors.resource_fingerprint(snapshot)
+
+    mapping =
+      Repo.insert!(%MirrorResourceState{
+        repository_mirror_id: c.base.id,
+        resource_kind: :label,
+        local_resource_type: "ForgeIssues.Label",
+        local_resource_id: label.id,
+        github_object_id: 4301,
+        state: :confirmed,
+        confirmed_local_version: 1,
+        confirmed_snapshot: snapshot,
+        confirmed_fingerprint: fingerprint
+      })
+
+    stub_provider(c, seed_labels: true, empty_labels: true)
+
+    assert {:ok, _} = process(c)
+    marker = Repo.get!(MirrorOperation, c.operation.id).external_effect_marker
+    assert {:ok, _} = process(c)
+
+    assert Repo.get!(MirrorOperation, c.operation.id).checkpoint["pull_creation_label_nodes"][
+             "complete"
+           ]
+
+    assert {:ok, _} = process(c)
+    failed = Repo.get!(MirrorOperation, c.operation.id)
+    assert failed.state == :failed and failed.failure_disposition == :conflict
+    assert failed.checkpoint["conflicted_effect_marker"] == marker
+    conflict = Repo.get_by!(MirrorConflict, repository_mirror_id: c.base.id)
+    assert conflict.remote_snapshot["reason"] == "missing_labels"
+    assert conflict.remote_snapshot["missing_label_github_ids"] == [4301]
+    assert Process.get(:label_pages) == [1]
+    assert Process.get(:create_posts) == 1
+    assert is_nil(Process.get(:create_patches))
+    assert is_nil(Process.get(:relationship_queries))
+    assert Repo.get!(MirrorResourceState, mapping.id).confirmed_snapshot == snapshot
+    assert Repo.aggregate(MirrorResourceState, :count) == 1
+  end
+
   test "missing live local ref prevents intent and provider POST", c do
     git!(c.base_path, ["update-ref", "-d", c.pull.base_ref])
     stub_provider(c)
@@ -278,25 +396,79 @@ defmodule ForgeGitHub.PullCreateIntegrationTest do
     Req.Test.stub(c.stub, fn conn ->
       case {conn.method, conn.request_path} do
         {"POST", "/graphql"} ->
-          assert Keyword.get(options, :seed_assignees, false)
+          labels? = Keyword.get(options, :seed_labels, false)
+          assert labels? or Keyword.get(options, :seed_assignees, false)
           {:ok, body, conn} = Plug.Conn.read_body(conn)
 
           assert JSON.decode!(body)["variables"] == %{
-                   "labels" => [],
-                   "assignees" => ["U_4201", "U_4202"]
+                   "labels" => if(labels?, do: ["L_4301"], else: []),
+                   "assignees" => if(labels?, do: [], else: ["U_4201", "U_4202"])
                  }
 
           Process.put(:relationship_queries, Process.get(:relationship_queries, 0) + 1)
 
           Req.Test.json(conn, %{
             "data" => %{
-              "labels" => [],
+              "labels" =>
+                if(labels?,
+                  do: [
+                    %{
+                      "__typename" => "Label",
+                      "id" => "L_4301",
+                      "name" => "current-label",
+                      "repository" => %{"id" => "R_900"}
+                    }
+                  ],
+                  else: []
+                ),
               "assignees" =>
-                Enum.map([4201, 4202], fn id ->
+                Enum.map(if(labels?, do: [], else: [4201, 4202]), fn id ->
                   %{"__typename" => "User", "id" => "U_#{id}", "login" => "current-#{id}"}
                 end)
             }
           })
+
+        {"GET", "/repos/acme/base/labels"} ->
+          assert Keyword.get(options, :seed_labels, false)
+          query = URI.decode_query(conn.query_string)
+          assert query["per_page"] == "100"
+          page = String.to_integer(query["page"])
+          Process.put(:label_pages, Process.get(:label_pages, []) ++ [page])
+
+          case {Keyword.get(options, :empty_labels, false), page} do
+            {true, 1} ->
+              Req.Test.json(conn, [])
+
+            {false, 1} ->
+              conn
+              |> Plug.Conn.put_resp_header(
+                "link",
+                "<https://api.github.com/repos/acme/base/labels?page=2&per_page=100>; rel=\"next\""
+              )
+              |> Req.Test.json([
+                %{
+                  "id" => 4399,
+                  "node_id" => "L_4399",
+                  "name" => "unrelated",
+                  "color" => "abcdef",
+                  "description" => nil
+                }
+              ])
+
+            {false, 2} ->
+              Req.Test.json(conn, [
+                %{
+                  "id" => 4301,
+                  "node_id" => "L_4301",
+                  "name" => "renamed-label",
+                  "color" => "abcdef",
+                  "description" => nil
+                }
+              ])
+
+            _ ->
+              flunk("unexpected label page #{page}")
+          end
 
         {"GET", "/user/" <> id} ->
           assert Keyword.get(options, :seed_assignees, false)
@@ -336,6 +508,14 @@ defmodule ForgeGitHub.PullCreateIntegrationTest do
           Process.put(:create_body, attrs["body"])
           Process.put(:create_patches, Process.get(:create_patches, 0) + 1)
           Process.put(:patched_assignees, attrs["assignees"])
+          Process.put(:patched_labels, attrs["labels"])
+
+          Process.put(
+            :create_labels,
+            Enum.map(attrs["labels"] || [], fn name ->
+              %{"id" => 4301, "node_id" => "L_4301", "name" => name}
+            end)
+          )
 
           Process.put(
             :create_assignees,
@@ -405,7 +585,7 @@ defmodule ForgeGitHub.PullCreateIntegrationTest do
       "body" => Process.get(:create_body),
       "state" => "open",
       "state_reason" => nil,
-      "labels" => [],
+      "labels" => Process.get(:create_labels, []),
       "assignees" => Process.get(:create_assignees, []),
       "user" => user(),
       "closed_at" => nil,

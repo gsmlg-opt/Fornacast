@@ -442,6 +442,7 @@ defmodule ForgeGitHub.PullCreateWorkerTest do
 
     opts =
       c.options
+      |> Keyword.put(:label_node_context, fn _ -> {:ok, %{status: :ready}} end)
       |> Keyword.put(:recovery_context, fn op ->
         {:ok, %{c.recovery | marker: op.external_effect_marker}}
       end)

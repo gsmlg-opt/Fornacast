@@ -8,7 +8,7 @@ defmodule ForgeMirrors.PullCreationConflictBoundary do
   """
   import Ecto.Query
   alias Fornacast.Repo
-  alias ForgeMirrors.{MirrorOperation, PullOutboundCreation}
+  alias ForgeMirrors.{MirrorOperation, MirrorResourceState, PullOutboundCreation}
 
   @reasons %{
     "ambiguous_external_effect" => ~w(zero_complete_scan multiple_uuid_matches),
@@ -33,6 +33,7 @@ defmodule ForgeMirrors.PullCreationConflictBoundary do
              {:ok, intent} <- PullOutboundCreation.lock_recovery(persisted, scope, marker),
              :ok <- scan_evidence(persisted, evidence),
              {:ok, local} <- current_local(intent),
+             {:ok, evidence} <- relationship_evidence(persisted, intent, evidence),
              {:ok, conflict} <-
                ForgeMirrors.record_conflict(%{
                  organization_mirror_id: persisted.organization_mirror_id,
@@ -142,6 +143,9 @@ defmodule ForgeMirrors.PullCreationConflictBoundary do
     end
   end
 
+  defp valid_evidence?("relationship_unavailable", evidence),
+    do: evidence == %{"reason" => "missing_labels"}
+
   defp valid_evidence?(kind, evidence) do
     reasons = Map.get(@reasons, kind, [])
 
@@ -150,6 +154,57 @@ defmodule ForgeMirrors.PullCreationConflictBoundary do
       (not Map.has_key?(evidence, "observation") or is_map(evidence["observation"])) and
       match?({:ok, _}, ForgeMirrors.resource_fingerprint(evidence))
   end
+
+  defp relationship_evidence(operation, intent, %{"reason" => "missing_labels"}) do
+    checkpoint = operation.checkpoint["pull_creation_label_nodes"]
+    ids = intent.payload["issue_snapshot"]["label_github_ids"]
+
+    with %{"intent_id" => id, "intent_fingerprint" => hash, "page" => page, "complete" => true} <-
+           checkpoint,
+         true <-
+           map_size(checkpoint) == 4 and id == intent.id and hash == intent.payload_fingerprint,
+         true <- is_integer(page) and page in 1..2_147_483_647,
+         true <- is_list(ids) and length(ids) in 1..512 and Enum.all?(ids, &positive?/1),
+         true <- length(ids) == length(Enum.uniq(ids)) do
+      represented =
+        Repo.all(
+          from m in MirrorResourceState,
+            join: l in "repository_labels",
+            on: l.id == m.local_resource_id,
+            where:
+              m.repository_mirror_id == ^operation.repository_mirror_id and
+                m.resource_kind == :label and
+                m.local_resource_type == "ForgeIssues.Label" and m.state == :confirmed and
+                l.repository_id == ^intent.repository_id and m.github_object_id in ^ids,
+            select: %{id: m.github_object_id, node: m.github_node_id},
+            lock: "FOR UPDATE"
+        )
+
+      known = represented |> Enum.filter(&valid_label_node?(&1.node)) |> Enum.map(& &1.id)
+      missing = Enum.sort(ids -- known)
+
+      if missing != [],
+        do:
+          {:ok,
+           %{
+             "reason" => "missing_labels",
+             "missing_label_github_ids" => missing,
+             "label_inventory" => checkpoint
+           }},
+        else: {:error, :invalid_conflict_evidence}
+    else
+      _ -> {:error, :invalid_conflict_evidence}
+    end
+  end
+
+  defp relationship_evidence(_, _, evidence), do: {:ok, evidence}
+
+  defp valid_label_node?(node) when is_binary(node),
+    do:
+      byte_size(node) in 1..255 and
+        String.valid?(node) and String.trim(node) == node and not String.contains?(node, <<0>>)
+
+  defp valid_label_node?(_), do: false
 
   defp scan_evidence(operation, %{"reason" => "zero_complete_scan"}) do
     case operation.checkpoint["pull_creation_recovery"] do

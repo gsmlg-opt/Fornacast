@@ -1519,6 +1519,22 @@ defmodule ForgeMirrors do
     do: ForgeMirrors.PullOutboundCreation.context(operation, &lock_pull_creation_operation/1)
 
   @doc false
+  def outbound_pull_label_node_context(operation),
+    do: ForgeMirrors.PullLabelProofBoundary.context(operation, &lock_pull_creation_operation/1)
+
+  @doc false
+  def seed_outbound_pull_label_nodes(operation, now, expected, page),
+    do:
+      ForgeMirrors.PullLabelProofBoundary.seed(
+        operation,
+        now,
+        expected,
+        page,
+        &lock_pull_creation_operation/1,
+        &checkpoint_pull_creation_operation/4
+      )
+
+  @doc false
   def conflict_outbound_pull_creation(operation, now, marker, kind, evidence),
     do:
       ForgeMirrors.PullCreationConflictBoundary.conflict(
