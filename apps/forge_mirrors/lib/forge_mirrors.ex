@@ -890,6 +890,14 @@ defmodule ForgeMirrors do
   def mapped_pull_pair_context(operation),
     do: ForgeMirrors.PullPairBoundary.context(operation, &resource_operation_context/1)
 
+  @doc false
+  def mark_mapped_pull_effect(operation, now, expected_pair, marker, payload),
+    do: ForgeMirrors.PullMetadataEffects.mark(operation, now, expected_pair, marker, payload)
+
+  @doc false
+  def mapped_pull_effect_context(operation),
+    do: ForgeMirrors.PullMetadataEffects.context(operation)
+
   defp pull_resource_context(%{resource_kind: :pull} = scope, mapping),
     do: ForgeMirrors.PullResourceBoundary.context(scope, mapping)
 

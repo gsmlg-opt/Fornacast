@@ -40,8 +40,7 @@ defmodule ForgeMirrors.PullPairBoundary do
     Repo.transaction(fn ->
       with {:ok, sync} <- ForgeMirrors.mapped_pull_pair_context(operation),
            :ok <- same_pair(sync, expected),
-           %MirrorOperation{state: :processing, external_effect_marker: nil} <-
-             Repo.get(MirrorOperation, operation.id),
+           :ok <- confirmation_effect(operation, expected, confirmation),
            {:ok, saved} <-
              ForgeMirrors.confirm_pull_operation(
                operation,
@@ -74,39 +73,49 @@ defmodule ForgeMirrors.PullPairBoundary do
     if sync.pair == expected[:pair], do: :ok, else: {:error, :stale_paired_mapping}
   end
 
+  defp confirmation_effect(operation, expected, confirmation) do
+    case Repo.get(MirrorOperation, operation.id) do
+      %MirrorOperation{state: :processing, external_effect_marker: nil} ->
+        if is_nil(expected[:effect_marker]), do: :ok, else: {:error, :invalid_transition}
+
+      %MirrorOperation{state: :effect_pending} ->
+        with {:ok, evidence} <- ForgeMirrors.mapped_pull_effect_context(operation),
+             true <- evidence.marker == expected[:effect_marker],
+             true <- evidence.intent.payload["target_issue"] == confirmation[:issue_snapshot],
+             true <- evidence.intent.local_version == expected[:expected_local_version],
+             true <- is_map(confirmation[:confirmed_snapshot]),
+             true <-
+               Map.take(confirmation.confirmed_snapshot, @scalars) ==
+                 Map.take(confirmation.issue_snapshot, @scalars) do
+          :ok
+        else
+          false -> {:error, :invalid_paired_projection}
+          {:error, reason} -> {:error, reason}
+        end
+
+      _ ->
+        {:error, :invalid_transition}
+    end
+  end
+
   defp confirm_issue(operation, sync, expected, confirmation) do
     # forge_pulls depends on forge_mirrors; resolve its trusted public projection
     # at runtime rather than introducing an umbrella compile dependency cycle.
     with {:ok, local} <-
            apply(ForgePulls, :sync_projection, [sync.repository_id, :pull, sync.local_resource_id]),
-         {:ok, relationships} <-
-           ForgeMirrors.resolve_issue_relationships(
-             sync.repository_mirror_id,
-             :local,
-             local.label_ids,
-             local.assignee_refs
-           ),
-         snapshot =
-           Map.merge(Map.take(local.fields, @scalars), %{
-             "label_github_ids" =>
-               Enum.sort(Enum.map(relationships.labels, & &1.github_object_id)),
-             "assignee_github_ids" =>
-               Enum.sort(Enum.map(relationships.assignees, & &1.github_user_id))
-           }),
-         true <-
-           snapshot == confirmation[:issue_snapshot] and
-             local.fields == confirmation[:confirmed_snapshot] and
-             local.local_version == confirmation[:confirmed_local_version],
+         {:ok, snapshot} <- result_snapshot(local, sync, confirmation),
+         true <- valid_result?(local, snapshot, expected, confirmation),
+         :ok <- confirmation_effect(operation, expected, confirmation),
          {:ok, fresh} <- ForgeMirrors.mapped_pull_pair_context(operation),
          :ok <- same_pair(fresh, expected),
          mapping = Repo.get!(MirrorResourceState, sync.pair.issue.mapping_id),
          true <- valid_issue_time?(confirmation[:issue_remote_updated_at], mapping),
-         {:ok, fingerprint} <- ForgeMirrors.resource_fingerprint(snapshot) do
+         {:ok, fingerprint} <- ForgeMirrors.resource_fingerprint(confirmation.issue_snapshot) do
       mapping
       |> MirrorResourceState.persistence_changeset(%{
-        confirmed_snapshot: snapshot,
+        confirmed_snapshot: confirmation.issue_snapshot,
         confirmed_fingerprint: fingerprint,
-        confirmed_local_version: local.local_version,
+        confirmed_local_version: confirmation.confirmed_local_version,
         confirmed_remote_updated_at: confirmation.issue_remote_updated_at,
         lock_version: mapping.lock_version + 1
       })
@@ -114,6 +123,44 @@ defmodule ForgeMirrors.PullPairBoundary do
     else
       false -> {:error, :invalid_paired_projection}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp result_snapshot(local, sync, confirmation) do
+    if local.local_version > confirmation[:confirmed_local_version] do
+      # No claim is made about the newer membership's provider mapping. It may
+      # legitimately contain a newly created label not yet exported to GitHub.
+      {:ok, nil}
+    else
+      with {:ok, relationships} <-
+             ForgeMirrors.resolve_issue_relationships(
+               sync.repository_mirror_id,
+               :local,
+               local.label_ids,
+               local.assignee_refs
+             ) do
+        {:ok,
+         Map.merge(Map.take(local.fields, @scalars), %{
+           "label_github_ids" => Enum.sort(Enum.map(relationships.labels, & &1.github_object_id)),
+           "assignee_github_ids" =>
+             Enum.sort(Enum.map(relationships.assignees, & &1.github_user_id))
+         })}
+      end
+    end
+  end
+
+  defp valid_result?(local, snapshot, expected, confirmation) do
+    if local.local_version == confirmation[:confirmed_local_version] do
+      snapshot == confirmation[:issue_snapshot] and
+        local.fields == confirmation[:confirmed_snapshot]
+    else
+      # A recovered effect confirms its immutable old target, not the newer
+      # local edit. Its outbox event remains responsible for subsequent convergence.
+      is_map(expected[:effect_marker]) and
+        local.local_version > confirmation[:confirmed_local_version] and
+        confirmation[:confirmed_local_version] == expected[:expected_local_version] and
+        Map.take(local.fields, ~w(head_ref head_sha base_ref base_sha)) ==
+          Map.take(confirmation.confirmed_snapshot, ~w(head_ref head_sha base_ref base_sha))
     end
   end
 

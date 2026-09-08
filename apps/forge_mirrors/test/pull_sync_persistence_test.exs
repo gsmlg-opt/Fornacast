@@ -800,6 +800,491 @@ defmodule ForgeMirrors.PullSyncPersistenceTest do
     assert Repo.get!(ForgeMirrors.MirrorOperation, c.operation.id).external_effect_marker == nil
   end
 
+  test "mapped metadata admission retains full evidence and reloads without rebasing newer local sets",
+       c do
+    {expected, marker, payload, _label} = metadata_effect(c)
+
+    assert {:ok, effect} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               payload
+             )
+
+    assert effect.operation.state == :effect_pending
+    assert effect.intent.payload == payload
+    assert effect.marker["metadata_intent_id"] == effect.intent.id
+    assert effect.marker["metadata_intent_hash"] == effect.intent.payload_fingerprint
+    assert byte_size(JSON.encode!(effect.marker)) < 65_536
+    refute Map.has_key?(effect.marker["paired_mapping_proof"]["issue"], "snapshot")
+
+    Repo.update_all(from(i in ForgeIssues.Issue, where: i.id == ^c.issue.id),
+      set: [title: "Later", sync_version: 3]
+    )
+
+    assert {:ok, recovered} = ForgeMirrors.mapped_pull_effect_context(effect.operation)
+    assert recovered.intent.payload == payload
+    assert recovered.sync.local_version == 3
+    assert recovered.marker == effect.marker
+  end
+
+  test "mapped metadata admission rejects stale pair and arbitrary target without creating intents",
+       c do
+    {expected, marker, payload, _} = metadata_effect(c)
+
+    assert {:error, :stale_paired_mapping} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               put_in(expected.pair, [:issue, :lock_version], 999),
+               marker,
+               payload
+             )
+
+    assert {:error, :invalid_metadata_payload} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               put_in(payload, ["target_issue", "label_github_ids"], [999])
+             )
+
+    assert Repo.aggregate(
+             from(i in ForgeMirrors.PullMetadataIntent, where: i.operation_id == ^c.operation.id),
+             :count
+           ) == 0
+
+    assert Repo.get!(ForgeMirrors.MirrorOperation, c.operation.id).state == :processing
+  end
+
+  test "mapped metadata admission rejects stale local relationship evidence and expired lease",
+       c do
+    {expected, marker, payload, _} = metadata_effect(c)
+
+    assert {:error, :stale_local_relationships} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               put_in(payload, ["expected_local_issue", "label_github_ids"], [])
+             )
+
+    Repo.update_all(from(o in ForgeMirrors.MirrorOperation, where: o.id == ^c.operation.id),
+      set: [lease_expires_at: DateTime.add(c.now, -1)]
+    )
+
+    assert {:error, :lost_lease} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               payload
+             )
+
+    assert Repo.aggregate(
+             from(i in ForgeMirrors.PullMetadataIntent, where: i.operation_id == ^c.operation.id),
+             :count
+           ) == 0
+  end
+
+  test "mapped metadata reload rejects changed companion tokens and altered intent hash", c do
+    {expected, marker, payload, _} = metadata_effect(c)
+
+    assert {:ok, effect} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               payload
+             )
+
+    Repo.update_all(from(i in ForgeMirrors.PullMetadataIntent, where: i.id == ^effect.intent.id),
+      set: [payload_fingerprint: String.duplicate("0", 64)]
+    )
+
+    assert {:error, :invalid_metadata_intent} =
+             ForgeMirrors.mapped_pull_effect_context(effect.operation)
+
+    Repo.update_all(from(i in ForgeMirrors.PullMetadataIntent, where: i.id == ^effect.intent.id),
+      set: [payload_fingerprint: effect.intent.payload_fingerprint]
+    )
+
+    Repo.update_all(
+      from(m in MirrorResourceState, where: m.id == ^expected.pair.issue.mapping_id),
+      inc: [lock_version: 1]
+    )
+
+    assert {:error, :stale_paired_mapping} =
+             ForgeMirrors.mapped_pull_effect_context(effect.operation)
+  end
+
+  test "mapped draft admission accepts unchanged issue evidence and sequences replacement intents",
+       c do
+    Repo.update_all(from(p in ForgePulls.PullRequest, where: p.id == ^c.pull.id),
+      set: [draft: true]
+    )
+
+    c = %{c | local: %{c.local | fields: Map.put(c.local.fields, "draft", true)}}
+    {expected, marker, payload, _} = metadata_effect(c)
+    {:ok, first_hash} = ForgeMirrors.resource_fingerprint(Map.put(c.local.fields, "draft", false))
+
+    marker =
+      marker
+      |> Map.put("expected_local_draft", true)
+      |> Map.put("proposed_fingerprint", first_hash)
+
+    assert {:ok, first} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               payload
+             )
+
+    draft =
+      marker |> Map.put("action", "set_remote_pull_draft") |> Map.put("proposed_draft", true)
+
+    fields = c.local.fields |> Map.put("draft", true)
+    {:ok, fingerprint} = ForgeMirrors.resource_fingerprint(fields)
+    draft = Map.put(draft, "proposed_fingerprint", fingerprint)
+    payload = %{payload | "expected_remote_issue" => payload["target_issue"]}
+
+    assert {:ok, second} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               first.operation,
+               c.now,
+               expected.pair,
+               draft,
+               payload
+             )
+
+    assert second.intent.sequence == first.intent.sequence + 1
+
+    assert Repo.get!(ForgeMirrors.PullMetadataIntent, first.intent.id).payload ==
+             first.intent.payload
+
+    assert {:error, _} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               first.operation,
+               c.now,
+               expected.pair,
+               draft,
+               payload
+             )
+  end
+
+  test "paired effect confirmation records intended sets at the proven version", c do
+    {expected, marker, payload, _} = metadata_effect(c)
+
+    assert {:ok, effect} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               payload
+             )
+
+    {expected, result, request} = effect_confirmation(c, expected, effect, payload)
+
+    assert {:ok, saved} =
+             ForgeMirrors.confirm_mapped_pull_pair(
+               effect.operation,
+               c.now,
+               expected,
+               result,
+               &ForgePulls.append_sync_observe(&1, :resource, request)
+             )
+
+    assert saved.issue_resource_state.confirmed_snapshot == payload["target_issue"]
+    assert saved.issue_resource_state.confirmed_local_version == 1
+  end
+
+  test "paired effect confirmation rejects invented target sets", c do
+    {expected, marker, payload, _} = metadata_effect(c)
+
+    assert {:ok, effect} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               payload
+             )
+
+    {expected, result, request} = effect_confirmation(c, expected, effect, payload)
+    result = put_in(result, [:issue_snapshot, "label_github_ids"], [])
+
+    assert {:error, :invalid_paired_projection} =
+             ForgeMirrors.confirm_mapped_pull_pair(
+               effect.operation,
+               c.now,
+               expected,
+               result,
+               &ForgePulls.append_sync_observe(&1, :resource, request)
+             )
+
+    assert Repo.get!(ForgeMirrors.MirrorOperation, c.operation.id).state == :effect_pending
+  end
+
+  test "paired recovered effect keeps newer local sets while confirming the old intended baseline",
+       c do
+    {expected, marker, payload, _} = metadata_effect(c)
+
+    assert {:ok, effect} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               payload
+             )
+
+    Repo.delete_all(from(l in ForgeIssues.IssueLabel, where: l.issue_id == ^c.issue.id))
+
+    Repo.update_all(from(i in ForgeIssues.Issue, where: i.id == ^c.issue.id),
+      set: [sync_version: 2]
+    )
+
+    {expected, result, request} = effect_confirmation(c, expected, effect, payload)
+    request = request |> Map.delete(:expected_local_version) |> Map.put(:minimum_local_version, 1)
+
+    assert {:ok, saved} =
+             ForgeMirrors.confirm_mapped_pull_pair(
+               effect.operation,
+               c.now,
+               expected,
+               result,
+               &ForgePulls.append_sync_observe(&1, :resource, request)
+             )
+
+    assert saved.issue_resource_state.confirmed_snapshot["label_github_ids"] == [77]
+    assert saved.issue_resource_state.confirmed_local_version == 1
+    assert {:ok, local} = ForgePulls.sync_projection(c.binding.repository_id, :pull, c.pull.id)
+    assert local.local_version == 2
+    assert local.label_ids == []
+  end
+
+  test "draft-only admission cannot claim an issue relationship mutation", c do
+    {expected, marker, payload, _} = metadata_effect(c)
+    marker = Map.put(marker, "action", "set_remote_pull_draft")
+
+    assert {:error, :invalid_metadata_payload} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               payload
+             )
+
+    assert Repo.aggregate(
+             from(i in ForgeMirrors.PullMetadataIntent, where: i.operation_id == ^c.operation.id),
+             :count
+           ) == 0
+  end
+
+  test "old effect reload and confirmation preserve newer unmapped local labels", c do
+    {expected, marker, payload, _} = metadata_effect(c)
+
+    assert {:ok, effect} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               payload
+             )
+
+    label =
+      Repo.insert!(%ForgeIssues.Label{
+        repository_id: c.binding.repository_id,
+        name: "future",
+        normalized_name: "future",
+        color: "ffffff"
+      })
+
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: c.issue.id, label_id: label.id})
+
+    Repo.update_all(from(i in ForgeIssues.Issue, where: i.id == ^c.issue.id),
+      set: [sync_version: 2]
+    )
+
+    assert {:ok, recovered} = ForgeMirrors.mapped_pull_effect_context(effect.operation)
+    assert label.id in recovered.local_projection.label_ids
+    {expected, result, request} = effect_confirmation(c, expected, effect, payload)
+    request = request |> Map.delete(:expected_local_version) |> Map.put(:minimum_local_version, 1)
+
+    assert {:ok, saved} =
+             ForgeMirrors.confirm_mapped_pull_pair(
+               effect.operation,
+               c.now,
+               expected,
+               result,
+               &ForgePulls.append_sync_observe(&1, :resource, request)
+             )
+
+    assert saved.issue_resource_state.confirmed_local_version == 1
+    assert saved.issue_resource_state.confirmed_snapshot == payload["target_issue"]
+    assert Repo.get_by(ForgeIssues.IssueLabel, issue_id: c.issue.id, label_id: label.id)
+  end
+
+  test "replacement installation cannot recover an old mapped metadata intent", c do
+    {expected, marker, payload, _} = metadata_effect(c)
+
+    assert {:ok, effect} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               payload
+             )
+
+    old =
+      Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+        github_installation_id: c.organization.github_installation_id
+      )
+
+    replacement =
+      old
+      |> Map.from_struct()
+      |> Map.drop([:__meta__, :id, :inserted_at, :updated_at])
+      |> Map.put(:github_installation_id, System.unique_integer([:positive, :monotonic]))
+
+    Repo.insert!(struct(ForgeMirrors.GitHubAppInstallation, replacement))
+
+    Repo.update_all(from(o in ForgeMirrors.OrganizationMirror, where: o.id == ^c.organization.id),
+      set: [github_installation_id: replacement.github_installation_id]
+    )
+
+    assert {:error, :ineligible_pull} = ForgeMirrors.mapped_pull_effect_context(effect.operation)
+    assert Repo.get!(ForgeMirrors.PullMetadataIntent, effect.intent.id).payload == payload
+  end
+
+  test "maximum Unicode body stays in durable metadata intent not compact marker", c do
+    {expected, marker, payload, _} = metadata_effect(c)
+    body = String.duplicate("😀", 65_536)
+    Repo.update_all(from(i in ForgeIssues.Issue, where: i.id == ^c.issue.id), set: [body: body])
+    {:ok, hash} = ForgeMirrors.resource_fingerprint(Map.put(c.local.fields, "body", body))
+
+    marker =
+      Map.merge(marker, %{"expected_local_fingerprint" => hash, "proposed_fingerprint" => hash})
+
+    payload =
+      payload
+      |> put_in(["expected_local_issue", "body"], body)
+      |> put_in(["target_issue", "body"], body)
+
+    assert {:ok, effect} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               payload
+             )
+
+    assert byte_size(JSON.encode!(effect.intent.payload)) > 262_144
+    assert byte_size(JSON.encode!(effect.marker)) < 65_536
+    assert {:ok, recovered} = ForgeMirrors.mapped_pull_effect_context(effect.operation)
+    assert recovered.intent.payload["target_issue"]["body"] == body
+  end
+
+  test "mapped admission cannot substitute newly confirmed refs for its paired baseline", c do
+    {expected, marker, payload, _} = metadata_effect(c)
+    sha = String.duplicate("c", 40)
+
+    Repo.update_all(from(p in ForgePulls.PullRequest, where: p.id == ^c.pull.id),
+      set: [head_sha: sha]
+    )
+
+    Repo.update_all(from(r in MirrorRefState, where: r.repository_mirror_id == ^c.head.id),
+      set: [confirmed_oid: sha, last_local_oid: sha, last_remote_oid: sha]
+    )
+
+    {:ok, proof} =
+      PullEligibility.check(c.binding.id, c.head.repository_id, %{
+        head_ref: c.pull.head_ref,
+        base_ref: c.pull.base_ref,
+        head_sha: sha,
+        base_sha: c.pull.base_sha
+      })
+
+    {:ok, hash} = ForgeMirrors.resource_fingerprint(Map.put(c.local.fields, "head_sha", sha))
+
+    marker =
+      Map.merge(marker, %{
+        "pull_eligibility_proof" => proof |> JSON.encode!() |> JSON.decode!(),
+        "expected_local_fingerprint" => hash,
+        "proposed_fingerprint" => hash
+      })
+
+    assert {:error, :invalid_metadata_payload} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               payload
+             )
+  end
+
+  defp metadata_effect(c) do
+    {_paired, label, expected, _, _} = paired_confirmation(c)
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: c.issue.id, label_id: label.id})
+    baseline = expected.pair.issue.snapshot
+    local = %{baseline | "label_github_ids" => [77]}
+
+    payload = %{
+      "v" => 1,
+      "expected_local_issue" => local,
+      "expected_remote_issue" => baseline,
+      "target_issue" => local
+    }
+
+    marker =
+      marker(c)
+      |> Map.merge(%{
+        "expected_local_draft" => false,
+        "expected_remote_draft" => false,
+        "proposed_draft" => false
+      })
+
+    {expected, marker, payload, label}
+  end
+
+  defp effect_confirmation(c, expected, effect, payload) do
+    expected = Map.put(expected, :effect_marker, effect.marker)
+    {_, result} = confirmation(c)
+
+    result =
+      Map.merge(result, %{
+        confirmed_snapshot: c.local.fields,
+        confirmed_local_version: 1,
+        issue_snapshot: payload["target_issue"],
+        issue_remote_updated_at: c.now
+      })
+
+    request = %{
+      repository_id: c.binding.repository_id,
+      resource_kind: :pull,
+      local_resource_id: c.pull.id,
+      expected_local_version: 1,
+      expected_fields: c.local.fields,
+      expected_merge_state: %{merged_at: nil, merge_commit_sha: nil}
+    }
+
+    {expected, result, request}
+  end
+
   defp paired_confirmation(c) do
     snapshot =
       Map.take(c.local.fields, ~w(title body state state_reason))
