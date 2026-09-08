@@ -997,14 +997,14 @@ defmodule ForgeMirrors do
       )
 
     case issue do
-      %{kind: "issue", number: number}
-      when number == parent.github_number ->
+      %{kind: "issue"} ->
         if parent.local_resource_type == "ForgeIssues.Issue",
           do: {:ok, :issue},
           else: {:error, :identity_conflict}
 
-      %{kind: "pull_request", number: number}
-      when number == parent.github_number ->
+      %{kind: "pull_request"} ->
+        number = parent.github_number
+
         companion =
           Repo.one(
             from p in "pull_requests",

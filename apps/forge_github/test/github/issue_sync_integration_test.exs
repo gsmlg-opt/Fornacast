@@ -336,14 +336,16 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
     assert_confirmed(%{ctx | mapping: mapping}, operation, target, 1)
   end
 
-  test "a PR conversation comment uses canonical issue identity with pulls-only policy", ctx do
+  test "a PR conversation comment keeps local and provider numbers distinct with pulls-only policy",
+       ctx do
     now = DateTime.utc_now(:second)
 
     ctx.organization
     |> Ecto.Changeset.change(capabilities: %{"issues" => "disabled", "pulls" => "enabled"})
     |> Repo.update!()
 
-    issue = ctx.issue |> Ecto.Changeset.change(kind: :pull_request) |> Repo.update!()
+    issue = ctx.issue |> Ecto.Changeset.change(kind: :pull_request, number: 70) |> Repo.update!()
+    assert issue.number != ctx.mapping.github_number
 
     pull =
       Repo.insert!(%ForgePulls.PullRequest{
@@ -482,7 +484,7 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
                ctx.owner,
                ctx.owner_slug,
                ctx.repository.slug,
-               7,
+               issue.number,
                %{body: "Local PR conversation"},
                %{}
              )
