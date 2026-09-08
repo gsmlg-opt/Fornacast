@@ -134,6 +134,49 @@ defmodule FornacastAPI.PullControllerTest do
     end
   end
 
+  test "draft creation accepts booleans in both versions while REST updates reject draft" do
+    alice = user("alice")
+    repository = repository(alice, "create-draft")
+    create_branch!(repository, "main")
+    create_branch!(repository, "feature/api")
+    {_key, secret} = pat(alice, ["public_repo"])
+
+    for version <- ["2022-11-28", "2026-03-10"] do
+      created =
+        post_json(api_conn(secret, version), "/api/v3/repos/alice/create-draft/pulls", %{
+          "title" => "Draft #{version}",
+          "head" => "feature/api",
+          "base" => "main",
+          "draft" => true
+        })
+        |> json_response(201)
+
+      assert created["draft"] == true
+
+      invalid_update =
+        api_conn(secret, version)
+        |> put_req_header("content-type", "application/json")
+        |> patch(
+          "/api/v3/repos/alice/create-draft/pulls/#{created["number"]}",
+          ~s({"draft":false})
+        )
+
+      assert json_response(invalid_update, 422)["message"] == "Validation Failed"
+
+      for invalid <- [nil, "true", 1] do
+        invalid_create =
+          post_json(api_conn(secret, version), "/api/v3/repos/alice/create-draft/pulls", %{
+            "title" => "Invalid draft",
+            "head" => "feature/api",
+            "base" => "main",
+            "draft" => invalid
+          })
+
+        assert json_response(invalid_create, 422)["message"] == "Validation Failed"
+      end
+    end
+  end
+
   test "cross-repository heads require both actor access and token scope" do
     alice = user("alice")
     bob = user("bob")

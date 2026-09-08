@@ -54,7 +54,8 @@ defmodule FornacastAPI.PullContractTest do
         "title" => "Add API",
         "head" => "feature/api",
         "base" => "main",
-        "body" => "Implements the subset"
+        "body" => "Implements the subset",
+        "draft" => false
       },
       pull_update: %{"title" => "Updated", "body" => nil, "state" => "closed", "base" => "next"},
       pull_merge: %{
@@ -74,8 +75,8 @@ defmodule FornacastAPI.PullContractTest do
           {:pull_create, %{"head" => "h", "base" => "b"}, "title", :missing_field},
           {:pull_create, %{"title" => "x", "base" => "b"}, "head", :missing_field},
           {:pull_create, %{"title" => "x", "head" => "h"}, "base", :missing_field},
-          {:pull_create, %{"title" => "x", "head" => "h", "base" => "b", "draft" => false},
-           "draft", :unprocessable},
+          {:pull_create, %{"title" => "x", "head" => "h", "base" => "b", "draft" => "false"},
+           "draft", :invalid},
           {:pull_create, %{"title" => "x", "head" => "h", "base" => "b", "head_repo" => "x"},
            "head_repo", :unprocessable},
           {:pull_create, %{"title" => "x", "head" => "h", "base" => "b", "issue" => 1}, "issue",

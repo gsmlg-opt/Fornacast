@@ -9,7 +9,8 @@ defmodule FornacastAPI.Validators.V2026_03_10.Pull do
         "title" => &nonempty_string?/1,
         "head" => &nonempty_string?/1,
         "base" => &nonempty_string?/1,
-        "body" => &nullable_string?/1
+        "body" => &nullable_string?/1,
+        "draft" => &is_boolean/1
       },
       ~w(title head base)
     )

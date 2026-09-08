@@ -148,7 +148,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
       ~w(title body state state_reason assignee assignees labels),
     "POST /repos/{owner}/{repo}/issues/{issue_number}/comments" => ~w(body),
     "PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}" => ~w(body),
-    "POST /repos/{owner}/{repo}/pulls" => ~w(title head base body),
+    "POST /repos/{owner}/{repo}/pulls" => ~w(title head base body draft),
     "PATCH /repos/{owner}/{repo}/pulls/{pull_number}" => ~w(title body state base),
     "PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge" =>
       ~w(commit_title commit_message sha merge_method),
