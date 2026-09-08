@@ -34,12 +34,28 @@ defmodule ForgeMirrors.ResourceInventory do
            Repo.get(RepositoryMirror, repository_mirror_id) do
       query =
         from mapping in MirrorResourceState,
+          as: :mapping,
           where:
             mapping.repository_mirror_id == ^repository_mirror_id and
               mapping.resource_kind == ^kind,
           where:
             mapping.state == :confirmed or
               (mapping.state == :pending and not is_nil(mapping.github_object_id))
+
+      query =
+        if kind == :issue do
+          from mapping in query,
+            where:
+              not exists(
+                from issue in "issues",
+                  where:
+                    issue.id == parent_as(:mapping).local_resource_id and
+                      issue.repository_id == ^repository_id and issue.kind == "pull_request",
+                  select: 1
+              )
+        else
+          query
+        end
 
       through_id = through_id || Repo.one(from mapping in query, select: max(mapping.id)) || 0
 

@@ -945,28 +945,32 @@ defmodule ForgeMirrors do
       |> where(
         [s],
         s.repository_mirror_id == ^operation.repository_mirror_id and
-          s.resource_kind in [:issue, :pull]
+          s.resource_kind == :issue
       )
       |> where(^dynamic([s], ^local_match or ^remote_match or ^number_match))
       |> lock("FOR UPDATE")
       |> Repo.all()
 
     case parents do
-      [%MirrorResourceState{resource_kind: :pull}] ->
-        {:error, :unsupported_resource}
-
       [%MirrorResourceState{state: :confirmed} = parent] ->
         if positive_resource_id?(parent.local_resource_id) and
              positive_resource_id?(parent.github_number) and
              (is_nil(local_id) or parent.local_resource_id == local_id) and
              (is_nil(remote_id) or parent.github_object_id == remote_id) and
              (is_nil(number) or parent.github_number == number) do
-          {:ok,
-           %{
-             parent_issue_id: parent.local_resource_id,
-             github_number: parent.github_number,
-             github_issue_id: parent.github_object_id
-           }}
+          with {:ok, issue_kind} <- comment_parent_kind(operation, parent),
+               true <- cursor["issue_kind"] in [nil, Atom.to_string(issue_kind)] do
+            {:ok,
+             %{
+               parent_issue_id: parent.local_resource_id,
+               github_number: parent.github_number,
+               github_issue_id: parent.github_object_id,
+               issue_kind: issue_kind
+             }}
+          else
+            false -> {:error, :identity_conflict}
+            error -> error
+          end
         else
           {:error, :identity_conflict}
         end
@@ -980,6 +984,125 @@ defmodule ForgeMirrors do
   end
 
   defp resource_parent(_, _), do: {:ok, %{}}
+
+  defp comment_parent_kind(operation, parent) do
+    binding = Repo.get!(RepositoryMirror, operation.repository_mirror_id)
+
+    issue =
+      Repo.one(
+        from i in "issues",
+          where: i.id == ^parent.local_resource_id and i.repository_id == ^binding.repository_id,
+          select: %{id: i.id, kind: i.kind, number: i.number},
+          lock: "FOR UPDATE"
+      )
+
+    case issue do
+      %{kind: "issue", number: number}
+      when number == parent.github_number ->
+        if parent.local_resource_type == "ForgeIssues.Issue",
+          do: {:ok, :issue},
+          else: {:error, :identity_conflict}
+
+      %{kind: "pull_request", number: number}
+      when number == parent.github_number ->
+        companion =
+          Repo.one(
+            from p in "pull_requests",
+              join: m in MirrorResourceState,
+              on:
+                m.local_resource_id == p.id and m.local_resource_type == "ForgePulls.PullRequest",
+              where:
+                p.issue_id == ^issue.id and p.repository_id == ^binding.repository_id and
+                  m.repository_mirror_id == ^binding.id and m.resource_kind == :pull,
+              select: {m, p.head_repository_id},
+              lock: "FOR UPDATE"
+          )
+
+        case companion do
+          {%MirrorResourceState{github_number: ^number, github_object_id: provider_id} = mapping,
+           head_id}
+          when is_integer(provider_id) and provider_id > 0 ->
+            if parent.local_resource_type == "ForgeIssues.Issue" and
+                 comment_parent_identity?(mapping.provider_identity, parent, binding) and
+                 bounded_trimmed_string?(mapping.github_node_id, 255) do
+              cond do
+                is_nil(head_id) and mapping.state in [:confirmed, :unsupported] ->
+                  {:error, :read_only_pull_parent}
+
+                mapping.state == :confirmed ->
+                  with :ok <- comment_head_ready(binding, head_id, mapping.provider_identity),
+                       do: {:ok, :pull_request}
+
+                mapping.state == :pending ->
+                  {:error, :parent_mapping_missing}
+
+                true ->
+                  {:error, :identity_conflict}
+              end
+            else
+              {:error, :identity_conflict}
+            end
+
+          nil ->
+            {:error, :parent_mapping_missing}
+
+          _ ->
+            {:error, :identity_conflict}
+        end
+
+      _ ->
+        {:error, :identity_conflict}
+    end
+  end
+
+  defp comment_parent_identity?(
+         %{
+           "github_issue_object_id" => id,
+           "github_issue_node_id" => node,
+           "github_number" => number,
+           "base_repository" => %{"id" => repository_id, "node_id" => repository_node},
+           "head_repository" => %{"id" => head_id, "node_id" => head_node}
+         },
+         parent,
+         binding
+       ) do
+    positive_resource_id?(id) and id == parent.github_object_id and node == parent.github_node_id and
+      bounded_trimmed_string?(node, 255) and number == parent.github_number and
+      repository_id == binding.github_repository_id and repository_node == binding.github_node_id and
+      bounded_trimmed_string?(repository_node, 255) and positive_resource_id?(head_id) and
+      bounded_trimmed_string?(head_node, 255)
+  end
+
+  defp comment_parent_identity?(_, _, _), do: false
+
+  defp comment_head_ready(binding, head_id, %{"head_repository" => head}) when is_map(head) do
+    if head_id == binding.repository_id do
+      if head["id"] == binding.github_repository_id and head["node_id"] == binding.github_node_id,
+        do: :ok,
+        else: {:error, :identity_conflict}
+    else
+      organization = Repo.get!(OrganizationMirror, binding.organization_mirror_id)
+
+      head_binding =
+        Repo.one(
+          from m in RepositoryMirror,
+            join: r in "repositories",
+            on: r.id == m.repository_id,
+            where:
+              m.organization_mirror_id == ^binding.organization_mirror_id and
+                m.repository_id == ^head_id and m.state == :active and m.inventory_included and
+                m.github_repository_id == ^head["id"] and m.github_node_id == ^head["node_id"] and
+                r.lifecycle == "ready" and is_nil(r.deleted_at) and
+                r.owner_user_id == ^organization.organization_id and r.generation > 0,
+            select: m.id,
+            lock: "FOR UPDATE"
+        )
+
+      if head_binding, do: :ok, else: {:error, :pull_head_not_ready}
+    end
+  end
+
+  defp comment_head_ready(_, _, _), do: {:error, :identity_conflict}
 
   @doc false
   def checkpoint_resource_operation(%MirrorOperation{} = operation, checkpoint, %DateTime{} = now)
@@ -1029,6 +1152,57 @@ defmodule ForgeMirrors do
   end
 
   def checkpoint_resource_operation(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  @doc false
+  def defer_resource_effect(
+        %MirrorOperation{} = operation,
+        %DateTime{} = now,
+        %DateTime{} = retry_at,
+        failure_class,
+        reason_code
+      )
+      when failure_class in ["network", "primary_rate_limit", "secondary_rate_limit"] and
+             reason_code in [
+               "resource_context_unavailable",
+               "credential_unavailable",
+               "worker_crash"
+             ] do
+    with :ok <- validate_utc(now),
+         :ok <- validate_utc(retry_at),
+         true <- DateTime.after?(retry_at, now) do
+      Repo.transaction(fn ->
+        with :ok <- lock_effect_scope(operation),
+             {:ok, persisted} <- lock_owned_operation(operation, @resource_operation_kinds),
+             true <-
+               persisted.state == :effect_pending and
+                 persisted.kind == operation.kind and
+                 persisted.organization_mirror_id == operation.organization_mirror_id and
+                 is_map(persisted.external_effect_marker) and
+                 persisted.external_effect_marker == operation.external_effect_marker and
+                 persisted.cursor == operation.cursor and
+                 persisted.checkpoint == operation.checkpoint,
+             {:ok, deferred} <-
+               owned_transition(persisted, DateTime.truncate(now, :second), [:effect_pending],
+                 next_attempt_at: DateTime.truncate(retry_at, :second),
+                 failure_class: failure_class,
+                 failure_disposition: :retry,
+                 failure_detail: reason_code,
+                 lease_owner: nil,
+                 lease_expires_at: nil
+               ) do
+          deferred
+        else
+          false -> Repo.rollback(:invalid_transition)
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+    else
+      false -> {:error, :invalid_argument}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def defer_resource_effect(_, _, _, _, _), do: {:error, :invalid_argument}
 
   @doc false
   def requeue_reconciled_resource_effect(%MirrorOperation{} = operation, %DateTime{} = now) do
@@ -1087,7 +1261,7 @@ defmodule ForgeMirrors do
              {:ok, _} <- Ecto.UUID.cast(sweep),
              true <- valid_resource_next_cursor?(persisted, next_page) do
           children =
-            Enum.map(observations, fn observation ->
+            Enum.flat_map(observations, fn observation ->
               cursor = %{
                 "trigger" => "reconcile",
                 "resource_kind" => Atom.to_string(kind),
@@ -1100,16 +1274,25 @@ defmodule ForgeMirrors do
 
               {:ok, digest} = resource_fingerprint(cursor)
 
-              case enqueue_operation(%{
-                     organization_mirror_id: persisted.organization_mirror_id,
-                     repository_mirror_id: persisted.repository_mirror_id,
-                     kind: "sync.#{kind}",
-                     dedupe_key: "resource-sweep:#{persisted.repository_mirror_id}:#{digest}",
-                     cursor: cursor,
-                     next_attempt_at: now
-                   }) do
-                {:ok, child} -> child
-                {:error, reason} -> Repo.rollback(reason)
+              case resource_observation_cursor(persisted, kind, cursor) do
+                :skip ->
+                  []
+
+                {:error, reason} ->
+                  Repo.rollback(reason)
+
+                {:ok, cursor} ->
+                  case enqueue_operation(%{
+                         organization_mirror_id: persisted.organization_mirror_id,
+                         repository_mirror_id: persisted.repository_mirror_id,
+                         kind: "sync.#{kind}",
+                         dedupe_key: "resource-sweep:#{persisted.repository_mirror_id}:#{digest}",
+                         cursor: cursor,
+                         next_attempt_at: now
+                       }) do
+                    {:ok, child} -> [child]
+                    {:error, reason} -> Repo.rollback(reason)
+                  end
               end
             end)
 
@@ -1156,6 +1339,37 @@ defmodule ForgeMirrors do
   end
 
   def record_resource_reconciliation_page(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  defp resource_observation_cursor(operation, :issue_comment, cursor) do
+    child = %{operation | kind: "sync.issue_comment", cursor: cursor}
+
+    case resource_parent(child, nil) do
+      {:ok, parent} ->
+        organization = Repo.get!(OrganizationMirror, operation.organization_mirror_id)
+        kind = Atom.to_string(parent.issue_kind)
+
+        if issue_capability_enabled?(organization, kind),
+          do:
+            {:ok,
+             Map.merge(cursor, %{
+               "issue_kind" => kind,
+               "github_issue_id" => parent.github_issue_id
+             })},
+          else: :skip
+
+      # Let the sweep yield before queued issue imports create this parent (repository FIFO).
+      {:error, :parent_mapping_missing} ->
+        {:ok, cursor}
+
+      {:error, :read_only_pull_parent} ->
+        :skip
+
+      error ->
+        error
+    end
+  end
+
+  defp resource_observation_cursor(_, _, cursor), do: {:ok, cursor}
 
   defp valid_resource_next_cursor?(%{checkpoint: %{"phase" => "mapped"}} = operation, next) do
     previous = operation.checkpoint["mapping_cursor"]
@@ -1703,16 +1917,7 @@ defmodule ForgeMirrors do
          %OrganizationMirror{provider: "github", state: state}
          when state in [:catching_up, :active, :degraded, :conflicted] <- organization,
          true <- binding.organization_mirror_id == organization.id,
-         true <-
-           issue_capability_enabled?(
-             organization,
-             if(kind == :pull, do: "pull_request", else: cursor["issue_kind"] || "issue")
-           ),
-         true <-
-           if(kind == :pull,
-             do: cursor["issue_kind"] in [nil, "pull_request"],
-             else: cursor["issue_kind"] != "pull_request"
-           ),
+         {:ok, metadata_permissions} <- resource_capability(operation, organization, kind),
          true <- resource_trigger(cursor["trigger"]) != nil,
          true <- valid_resource_sweep?(operation),
          true <-
@@ -1738,13 +1943,67 @@ defmodule ForgeMirrors do
          repository_mirror_id: binding.id,
          github_repository_id: binding.github_repository_id,
          github_installation_id: organization.github_installation_id,
+         metadata_permissions: metadata_permissions,
          remote_owner: owner,
          remote_repository: name
        }}
     else
+      {:error, reason} -> {:error, reason}
       _ -> {:error, :invalid_transition}
     end
   end
+
+  defp resource_capability(%{kind: "sync.issue_comment"} = operation, organization, _) do
+    with {:ok, mapping} <- resource_mapping(operation, :issue_comment),
+         {:ok, parent} <- resource_parent(operation, mapping) do
+      if issue_capability_enabled?(organization, Atom.to_string(parent.issue_kind)),
+        do: {:ok, metadata_permissions([parent.issue_kind])},
+        else: {:error, :invalid_transition}
+    end
+  end
+
+  defp resource_capability(%{kind: "reconcile.repository.issue_comments"}, organization, _) do
+    kinds =
+      Enum.filter(
+        [:issue, :pull_request],
+        &issue_capability_enabled?(organization, Atom.to_string(&1))
+      )
+
+    if kinds != [], do: {:ok, metadata_permissions(kinds)}, else: {:error, :invalid_transition}
+  end
+
+  defp resource_capability(operation, organization, kind) do
+    expected = if kind == :pull, do: "pull_request", else: "issue"
+
+    if operation.cursor["issue_kind"] in [nil, expected] and
+         issue_capability_enabled?(organization, expected) do
+      with :ok <- ordinary_issue_identity(operation),
+           do: {:ok, metadata_permissions([if(kind == :pull, do: :pull_request, else: :issue)])}
+    else
+      {:error, :invalid_transition}
+    end
+  end
+
+  defp metadata_permissions(kinds) do
+    Map.new(kinds, fn kind ->
+      {if(kind == :pull_request, do: "pull_requests", else: "issues"), "write"}
+    end)
+    |> Map.put("metadata", "read")
+  end
+
+  defp ordinary_issue_identity(%{kind: "sync.issue"} = operation) do
+    with {:ok, mapping} <- resource_mapping(operation, :issue) do
+      local_id = resource_local_id(operation.cursor) || mapping_value(mapping, :local_resource_id)
+
+      if is_integer(local_id) and
+           Repo.exists?(
+             from i in "issues",
+               where: i.id == ^local_id and i.kind == "pull_request"
+           ), do: {:error, :unsupported_resource}, else: :ok
+    end
+  end
+
+  defp ordinary_issue_identity(_), do: :ok
 
   defp resource_mapping(operation, kind) do
     local_id =
@@ -4358,7 +4617,12 @@ defmodule ForgeMirrors do
     organization = Repo.get!(OrganizationMirror, repository.organization_mirror_id)
     item_id = repository.bootstrap_repository_item_id
 
-    if is_nil(item_id) or not issue_capability_enabled?(organization, "issue") do
+    required_kinds =
+      Enum.map(resource_sweep_kinds(organization), fn {_, collection} ->
+        "reconcile.repository.#{collection}"
+      end)
+
+    if is_nil(item_id) or required_kinds == [] do
       true
     else
       sweep_key = "bootstrap:item:#{item_id}"
@@ -4368,7 +4632,7 @@ defmodule ForgeMirrors do
           from op in MirrorOperation,
             where:
               op.repository_mirror_id == ^repository.id and
-                op.kind in ["reconcile.repository.issues", "reconcile.repository.issue_comments"] and
+                op.kind in ^required_kinds and
                 fragment(
                   "?->>'bootstrap_repository_item_id' = ?",
                   op.cursor,
@@ -4380,7 +4644,8 @@ defmodule ForgeMirrors do
 
       sweep_ids = Enum.map(required, & &1.cursor["sweep_id"])
 
-      length(required) == 2 and Enum.all?(required, &(&1.state == :completed)) and
+      Enum.sort(Enum.map(required, & &1.kind)) == Enum.sort(required_kinds) and
+        Enum.all?(required, &(&1.state == :completed)) and
         not Repo.exists?(
           from op in MirrorOperation,
             where:
@@ -5423,42 +5688,37 @@ defmodule ForgeMirrors do
              true <-
                repository.lifecycle in [:ready, :synchronizing] and
                  repository.owner_user_id == organization.organization_id do
-          if issue_capability_enabled?(organization, "issue") do
-            Enum.map([{"issue", "issues"}, {"issue_comment", "issue_comments"}], fn {kind,
-                                                                                     collection} ->
-              {:ok, digest} =
-                resource_fingerprint(%{
-                  "sweep_key" => sweep_key,
-                  "item_id" => binding.bootstrap_repository_item_id,
-                  "kind" => kind
-                })
+          Enum.map(resource_sweep_kinds(organization), fn {kind, collection} ->
+            {:ok, digest} =
+              resource_fingerprint(%{
+                "sweep_key" => sweep_key,
+                "item_id" => binding.bootstrap_repository_item_id,
+                "kind" => kind
+              })
 
-              key = "metadata-sweep:#{binding.id}:#{digest}"
+            key = "metadata-sweep:#{binding.id}:#{digest}"
 
-              Repo.get_by(MirrorOperation, dedupe_key: key) ||
-                case enqueue_operation(%{
-                       organization_mirror_id: organization.id,
-                       repository_mirror_id: binding.id,
-                       kind: "reconcile.repository.#{collection}",
-                       dedupe_key: key,
-                       cursor: %{
-                         "trigger" => "reconcile",
-                         "resource_kind" => kind,
-                         "since" => "1970-01-01T00:00:00Z",
-                         "page" => 1,
-                         "sweep_id" => Ecto.UUID.generate(),
-                         "sweep_key" => sweep_key,
-                         "bootstrap_repository_item_id" => binding.bootstrap_repository_item_id
-                       },
-                       next_attempt_at: now
-                     }) do
-                  {:ok, operation} -> operation
-                  {:error, reason} -> Repo.rollback(reason)
-                end
-            end)
-          else
-            []
-          end
+            Repo.get_by(MirrorOperation, dedupe_key: key) ||
+              case enqueue_operation(%{
+                     organization_mirror_id: organization.id,
+                     repository_mirror_id: binding.id,
+                     kind: "reconcile.repository.#{collection}",
+                     dedupe_key: key,
+                     cursor: %{
+                       "trigger" => "reconcile",
+                       "resource_kind" => kind,
+                       "since" => "1970-01-01T00:00:00Z",
+                       "page" => 1,
+                       "sweep_id" => Ecto.UUID.generate(),
+                       "sweep_key" => sweep_key,
+                       "bootstrap_repository_item_id" => binding.bootstrap_repository_item_id
+                     },
+                     next_attempt_at: now
+                   }) do
+                {:ok, operation} -> operation
+                {:error, reason} -> Repo.rollback(reason)
+              end
+          end)
         else
           _ -> Repo.rollback(:invalid_transition)
         end
@@ -5467,6 +5727,14 @@ defmodule ForgeMirrors do
   end
 
   def enqueue_repository_resource_reconciliations(_, _, _), do: {:error, :invalid_argument}
+
+  defp resource_sweep_kinds(organization) do
+    issues = issue_capability_enabled?(organization, "issue")
+    pulls = issue_capability_enabled?(organization, "pull_request")
+
+    if(issues, do: [{"issue", "issues"}], else: []) ++
+      if issues or pulls, do: [{"issue_comment", "issue_comments"}], else: []
+  end
 
   defp enqueue_inventory_git_reconciliations(organization_mirror_id, sweep_marker, now) do
     repository_ids =

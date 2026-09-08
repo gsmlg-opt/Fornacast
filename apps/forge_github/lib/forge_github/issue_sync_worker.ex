@@ -66,6 +66,7 @@ defmodule ForgeGitHub.IssueSyncWorker do
     :replace_effect,
     :requeue_effect,
     :checkpoint,
+    :defer_effect,
     :confirm,
     :confirm_label,
     :conflict,
@@ -290,7 +291,7 @@ defmodule ForgeGitHub.IssueSyncWorker do
         conflict(operation, now, sync, :ambiguous_external_effect, local, :missing, options)
 
       {:error, reason} ->
-        persist_failure(operation, now, reason, options, preserve_effect?: true)
+        persist_failure(operation, now, reason, options)
     end
   end
 
@@ -499,7 +500,10 @@ defmodule ForgeGitHub.IssueSyncWorker do
   defp installation_token(sync, options) do
     case callback(options, :token_fetch, &InstallationTokenBroker.fetch/2).(
            sync.github_installation_id,
-           %{permissions: %{"issues" => "write", "metadata" => "read"}}
+           %{
+             permissions:
+               Map.get(sync, :metadata_permissions, %{"issues" => "write", "metadata" => "read"})
+           }
          ) do
       %InstallationToken{token: token} -> {:ok, token}
       {:error, reason} -> {:error, reason}
@@ -884,8 +888,7 @@ defmodule ForgeGitHub.IssueSyncWorker do
           operation,
           now,
           reason,
-          options,
-          preserve_effect?: operation.state == :effect_pending
+          options
         )
 
       result ->
@@ -1767,7 +1770,7 @@ defmodule ForgeGitHub.IssueSyncWorker do
         conflict(operation, now, sync, :ambiguous_external_effect, local, :missing, options)
 
       {:error, reason} ->
-        persist_failure(operation, now, reason, options, preserve_effect?: true)
+        persist_failure(operation, now, reason, options)
     end
   end
 
@@ -2088,29 +2091,8 @@ defmodule ForgeGitHub.IssueSyncWorker do
   end
 
   defp schedule_effect_recovery(operation, now, reason, options) do
-    if effect_definitively_rejected?(reason) do
-      persist_failure(operation, now, reason, options)
-    else
-      {failure_class, retry_at} = retry_schedule(reason, now)
-
-      failure_class =
-        if failure_class in ["network", "primary_rate_limit", "secondary_rate_limit"],
-          do: failure_class,
-          else: "network"
-
-      checkpoint_operation(operation, %{}, retry_at, failure_class, now, options)
-    end
+    defer_unresolved_effect(operation, now, reason, options)
   end
-
-  defp effect_definitively_rejected?(%Error{kind: kind})
-       when kind in [:invalid_credential, :forbidden, :not_found, :invalid_request],
-       do: true
-
-  defp effect_definitively_rejected?(reason)
-       when reason in [:invalid_projection, :invalid_correlation_id],
-       do: true
-
-  defp effect_definitively_rejected?(_reason), do: false
 
   defp checkpoint_operation(operation, checkpoint, retry_at, failure_class, now, options) do
     callback(options, :checkpoint, &ForgeMirrors.checkpoint_resource_operation/5).(
@@ -2122,9 +2104,9 @@ defmodule ForgeGitHub.IssueSyncWorker do
     )
   end
 
-  defp persist_failure(operation, now, reason, options, extra \\ []) do
-    if Keyword.get(extra, :preserve_effect?, false) and operation.state == :effect_pending do
-      schedule_effect_recovery(operation, now, reason, options)
+  defp persist_failure(operation, now, reason, options) do
+    if operation.state == :effect_pending do
+      defer_unresolved_effect(operation, now, reason, options)
     else
       case failure(reason) do
         {:retry, failure_class, retry_at} ->
@@ -2147,6 +2129,37 @@ defmodule ForgeGitHub.IssueSyncWorker do
           )
       end
     end
+  end
+
+  defp defer_unresolved_effect(_operation, _now, :lost_lease, _options), do: {:error, :lost_lease}
+
+  defp defer_unresolved_effect(operation, now, reason, options) do
+    {failure_class, retry_at} = retry_schedule(reason, now)
+
+    failure_class =
+      if failure_class in ["network", "primary_rate_limit", "secondary_rate_limit"],
+        do: failure_class,
+        else: "network"
+
+    code =
+      case reason do
+        %Error{kind: kind} when kind in [:invalid_credential, :forbidden] ->
+          "credential_unavailable"
+
+        :worker_crash ->
+          "worker_crash"
+
+        _ ->
+          "resource_context_unavailable"
+      end
+
+    callback(options, :defer_effect, &ForgeMirrors.defer_resource_effect/5).(
+      operation,
+      now,
+      retry_at,
+      failure_class,
+      code
+    )
   end
 
   defp failure(%Error{kind: kind, retry_at: retry_at})

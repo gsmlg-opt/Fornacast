@@ -14,6 +14,44 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
     "assignee_github_ids" => [21]
   }
 
+  for stage <- [:context, :token_fetch, :remote_forbidden, :remote_not_found] do
+    test "#{stage} failure cannot discard an already pending external effect" do
+      marker = effect_marker("update_remote_issue", @base, Map.put(@base, "body", "sent"))
+      checkpoint = %{"recovery" => %{"page" => 2}}
+      operation = operation("sync.issue", :effect_pending, marker, checkpoint)
+
+      failure_callback =
+        case unquote(stage) do
+          :context ->
+            {:context, fn _ -> {:error, :pull_head_not_ready} end}
+
+          :token_fetch ->
+            {:token_fetch, fn _, _ -> {:error, %Error{kind: :invalid_credential}} end}
+
+          :remote_forbidden ->
+            {:get_issue, fn _, _, _, _, _ -> {:error, %Error{kind: :forbidden}} end}
+
+          :remote_not_found ->
+            {:get_issue, fn _, _, _, _, _ -> {:error, %Error{kind: :not_found}} end}
+        end
+
+      options =
+        options(operation, [
+          failure_callback,
+          {:defer_effect,
+           fn ^operation, @now, retry_at, "network", code ->
+             assert DateTime.after?(retry_at, @now)
+             assert code in ["resource_context_unavailable", "credential_unavailable"]
+             assert operation.checkpoint == checkpoint
+             {:ok, :effect_preserved}
+           end}
+        ])
+
+      assert {:ok, :effect_preserved} =
+               IssueSyncWorker.process_operation(operation, @now, options)
+    end
+  end
+
   test "applies an inbound issue update and confirms provenance in one transaction callback" do
     parent = self()
     operation = operation("sync.issue", :processing)
@@ -617,9 +655,9 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
         local_observe: fn _ -> {:ok, local_issue(local, 4)} end,
         mark_effect: mark_effect(parent, operation),
         update_issue: fn _, _, _, _, _, _ -> {:error, Error.new(:timeout)} end,
-        checkpoint: fn marked, checkpoint, retry_at, "network", @now ->
+        defer_effect: fn marked, @now, retry_at, "network", "resource_context_unavailable" ->
           assert marked.state == :effect_pending
-          assert checkpoint == %{}
+          assert marked.checkpoint == %{}
           assert DateTime.after?(retry_at, @now)
           send(parent, :recovery_retained)
           {:ok, %{marked | lease_owner: nil, lease_expires_at: nil}}

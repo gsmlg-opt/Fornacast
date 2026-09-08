@@ -89,7 +89,8 @@ defmodule ForgeMirrors.ResourceSyncPersistenceTest do
     assert {:error, :invalid_transition} = ForgeMirrors.resource_operation_context(operation)
   end
 
-  test "remote comments require an immutable issue parent and reject pull parents", c do
+  test "remote comments require a canonical issue mapping and never substitute a pull mapping",
+       c do
     operation =
       claimed(c, %{
         kind: "sync.issue_comment",
@@ -103,21 +104,37 @@ defmodule ForgeMirrors.ResourceSyncPersistenceTest do
       })
 
     assert {:error, :parent_mapping_missing} = ForgeMirrors.resource_operation_context(operation)
-    parent = mapping(c)
-    assert {:ok, %{parent_issue_id: 123}} = ForgeMirrors.resource_operation_context(operation)
+    parent = comment_parent_mapping(c)
+    parent_id = parent.local_resource_id
+
+    assert {:ok, %{parent_issue_id: ^parent_id}} =
+             ForgeMirrors.resource_operation_context(operation)
+
     parent |> Ecto.Changeset.change(resource_kind: :pull) |> Repo.update!()
+    assert {:error, :parent_mapping_missing} = ForgeMirrors.resource_operation_context(operation)
+  end
+
+  test "a canonical PR issue companion cannot execute through the ordinary issue worker", c do
+    parent = comment_parent_mapping(c)
+
+    Repo.get!(ForgeIssues.Issue, parent.local_resource_id)
+    |> Ecto.Changeset.change(kind: :pull_request)
+    |> Repo.update!()
+
+    operation = claimed(c)
     assert {:error, :unsupported_resource} = ForgeMirrors.resource_operation_context(operation)
   end
 
   test "local comment tombstones expose deletion and their mapped parent number", c do
-    mapping(c)
+    parent = comment_parent_mapping(c)
+    parent_id = parent.local_resource_id
 
     operation =
       claimed(c, %{
         kind: "sync.issue_comment",
         cursor: %{
           "trigger" => "local",
-          "issue_id" => 123,
+          "issue_id" => parent_id,
           "comment_id" => 999,
           "sync_version" => 2,
           "event_type" => "issue_comment.deleted",
@@ -126,7 +143,13 @@ defmodule ForgeMirrors.ResourceSyncPersistenceTest do
         }
       })
 
-    assert {:ok, %{local_deleted: true, local_version: 2, parent_issue_id: 123, github_number: 7}} =
+    assert {:ok,
+            %{
+              local_deleted: true,
+              local_version: 2,
+              parent_issue_id: ^parent_id,
+              github_number: 7
+            }} =
              ForgeMirrors.resource_operation_context(operation)
   end
 
@@ -144,6 +167,83 @@ defmodule ForgeMirrors.ResourceSyncPersistenceTest do
 
     assert {:error, :lost_lease} =
              ForgeMirrors.checkpoint_resource_operation(operation, checkpoint, c.now)
+  end
+
+  test "recovery-only deferral preserves evidence after policy loss without borrowing stale ownership",
+       c do
+    operation = claimed(c)
+    marker = %{"action" => "update_remote_issue", "github_object_id" => 456}
+    {:ok, marked} = ForgeMirrors.mark_external_effect(operation, c.now, marker)
+
+    marked =
+      marked
+      |> Ecto.Changeset.change(checkpoint: %{"recovery" => %{"page" => 2}})
+      |> Repo.update!()
+
+    c.organization
+    |> Ecto.Changeset.change(capabilities: %{"issues" => "disabled"})
+    |> Repo.update!()
+
+    assert {:error, :invalid_transition} = ForgeMirrors.resource_operation_context(marked)
+
+    for forged <- [
+          %{marked | external_effect_marker: %{"action" => "forged"}},
+          %{marked | checkpoint: %{}},
+          %{marked | organization_mirror_id: 0}
+        ] do
+      assert {:error, :invalid_transition} =
+               ForgeMirrors.defer_resource_effect(
+                 forged,
+                 c.now,
+                 DateTime.add(c.now, 30),
+                 "network",
+                 "resource_context_unavailable"
+               )
+    end
+
+    assert {:ok, deferred} =
+             ForgeMirrors.defer_resource_effect(
+               marked,
+               c.now,
+               DateTime.add(c.now, 30),
+               "network",
+               "resource_context_unavailable"
+             )
+
+    assert deferred.state == :effect_pending
+    assert deferred.external_effect_marker == marker
+    assert deferred.checkpoint == marked.checkpoint
+    assert deferred.cursor == marked.cursor
+    assert deferred.lease_owner == nil
+    assert deferred.failure_detail == "resource_context_unavailable"
+
+    assert {:error, :lost_lease} =
+             ForgeMirrors.defer_resource_effect(
+               marked,
+               c.now,
+               DateTime.add(c.now, 30),
+               "network",
+               "resource_context_unavailable"
+             )
+  end
+
+  test "revoked base scope rejects recovery-only deferral without erasing the marker", c do
+    operation = claimed(c)
+    marker = %{"action" => "update_remote_issue", "github_object_id" => 456}
+    {:ok, marked} = ForgeMirrors.mark_external_effect(operation, c.now, marker)
+    c.organization |> Ecto.Changeset.change(state: :revoked) |> Repo.update!()
+
+    assert {:error, _} =
+             ForgeMirrors.defer_resource_effect(
+               marked,
+               c.now,
+               DateTime.add(c.now, 30),
+               "network",
+               "resource_context_unavailable"
+             )
+
+    assert Repo.get!(MirrorOperation, marked.id).external_effect_marker == marker
+    assert Repo.get!(MirrorOperation, marked.id).state == :effect_pending
   end
 
   test "a reconciled unapplied effect releases its parent without discarding intent", c do
@@ -508,13 +608,26 @@ defmodule ForgeMirrors.ResourceSyncPersistenceTest do
     Enum.find(operations, &(&1.id == operation.id))
   end
 
-  defp mapping(c) do
+  defp comment_parent_mapping(c) do
+    issue =
+      Repo.insert!(%ForgeIssues.Issue{
+        repository_id: c.binding.repository_id,
+        number: 7,
+        kind: :issue,
+        title: "Parent",
+        author_user_id: user_fixture()
+      })
+
+    mapping(c, issue.id)
+  end
+
+  defp mapping(c, local_id \\ 123) do
     %MirrorResourceState{}
     |> MirrorResourceState.persistence_changeset(%{
       repository_mirror_id: c.binding.id,
       resource_kind: :issue,
       local_resource_type: "ForgeIssues.Issue",
-      local_resource_id: 123,
+      local_resource_id: local_id,
       github_object_id: 456,
       github_node_id: "I_456",
       github_number: 7,

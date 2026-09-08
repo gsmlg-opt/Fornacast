@@ -36,6 +36,25 @@ defmodule ForgeMirrors.ResourceInventoryTest do
     assert third.next_cursor == nil
   end
 
+  test "canonical PR issue companions are not ordinary issue reconciliation candidates", ctx do
+    issue =
+      Repo.insert!(%ForgeIssues.Issue{
+        repository_id: ctx.binding.repository_id,
+        number: 7,
+        kind: :pull_request,
+        title: "PR",
+        author_user_id: user_fixture()
+      })
+
+    mapping(ctx, %{local_resource_id: issue.id, github_number: 7})
+    ordinary = mapping(ctx)
+
+    assert {:ok, %{observations: [observation], next_cursor: nil}} =
+             ResourceInventory.page(ctx.binding.id, :issue)
+
+    assert observation.github_object_id == ordinary.github_object_id
+  end
+
   test "cursor scope and limits are validated before enumeration", ctx do
     mapping(ctx)
     mapping(ctx)

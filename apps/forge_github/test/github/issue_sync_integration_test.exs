@@ -96,10 +96,8 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
     assert event.origin == :github
     assert event.causation_id == "integration-delivery"
 
-    assert {:ok, results} =
-             OutboxDispatcher.dispatch_once("inbound-no-echo", DateTime.utc_now(:second))
-
-    assert {:ok, event.event_id, {:ignored, :non_local_event}} in results
+    assert {:ok, event.event_id, {:ignored, :non_local_event}} ==
+             dispatch_until(event.event_id, "inbound-no-echo", DateTime.utc_now(:second))
 
     assert Repo.aggregate(
              from(o in MirrorOperation, where: o.repository_mirror_id == ^ctx.binding.id),
@@ -338,6 +336,500 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
     assert_confirmed(%{ctx | mapping: mapping}, operation, target, 1)
   end
 
+  test "a PR conversation comment uses canonical issue identity with pulls-only policy", ctx do
+    now = DateTime.utc_now(:second)
+
+    ctx.organization
+    |> Ecto.Changeset.change(capabilities: %{"issues" => "disabled", "pulls" => "enabled"})
+    |> Repo.update!()
+
+    issue = ctx.issue |> Ecto.Changeset.change(kind: :pull_request) |> Repo.update!()
+
+    pull =
+      Repo.insert!(%ForgePulls.PullRequest{
+        issue_id: issue.id,
+        repository_id: ctx.repository.id,
+        head_repository_id: ctx.repository.id,
+        head_ref: "refs/heads/topic",
+        base_ref: "refs/heads/main",
+        head_sha: String.duplicate("a", 40),
+        base_sha: String.duplicate("b", 40)
+      })
+
+    ctx.mapping
+    |> Map.from_struct()
+    |> Map.drop([:id, :__meta__, :inserted_at, :updated_at])
+    |> Map.merge(%{
+      resource_kind: :pull,
+      local_resource_type: "ForgePulls.PullRequest",
+      local_resource_id: pull.id,
+      github_object_id: 1700,
+      github_node_id: "PR_1700",
+      provider_identity: comment_parent_identity(ctx, 700, "I_700", 7)
+    })
+    |> then(&MirrorResourceState.persistence_changeset(%MirrorResourceState{}, &1))
+    |> Repo.insert!()
+
+    operation =
+      operation_fixture(ctx.organization, %{
+        repository_mirror_id: ctx.binding.id,
+        kind: "sync.issue_comment",
+        cursor: %{
+          "trigger" => "remote",
+          "resource_kind" => "issue_comment",
+          "issue_kind" => "pull_request",
+          "github_object_id" => 900,
+          "github_issue_id" => 700,
+          "github_number" => 7,
+          "delivery_guid" => "pr-comment"
+        },
+        next_attempt_at: now
+      })
+      |> then(&claim(&1.id, now, "sync.issue_comment"))
+
+    assert {:ok, %{parent_issue_id: parent_id, github_issue_id: 700}} =
+             ForgeMirrors.resource_operation_context(operation)
+
+    assert parent_id == issue.id
+
+    Repo.get!(ForgeMirrors.OrganizationMirror, ctx.organization.id)
+    |> Ecto.Changeset.change(capabilities: %{"issues" => "enabled", "pulls" => "disabled"})
+    |> Repo.update!()
+
+    assert {:error, :invalid_transition} = ForgeMirrors.resource_operation_context(operation)
+
+    Repo.get!(ForgeMirrors.OrganizationMirror, ctx.organization.id)
+    |> Ecto.Changeset.change(capabilities: %{"issues" => "disabled", "pulls" => "enabled"})
+    |> Repo.update!()
+
+    # An omitted hint (full collection reconciliation) must derive the same locked parent kind.
+    operation =
+      operation
+      |> Ecto.Changeset.change(cursor: Map.delete(operation.cursor, "issue_kind"))
+      |> Repo.update!()
+
+    assert {:ok, %{github_issue_id: 700}} = ForgeMirrors.resource_operation_context(operation)
+
+    companion =
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: ctx.binding.id,
+        resource_kind: :pull,
+        github_object_id: 1700
+      )
+
+    companion |> Ecto.Changeset.change(github_object_id: 700) |> Repo.update!()
+    assert {:ok, %{github_issue_id: 700}} = ForgeMirrors.resource_operation_context(operation)
+
+    Repo.get!(MirrorResourceState, companion.id)
+    |> Ecto.Changeset.change(github_object_id: 1700)
+    |> Repo.update!()
+
+    Repo.get!(MirrorResourceState, companion.id)
+    |> Ecto.Changeset.change(provider_identity: nil)
+    |> Repo.update!()
+
+    assert {:error, :identity_conflict} = ForgeMirrors.resource_operation_context(operation)
+
+    Repo.get!(MirrorResourceState, companion.id)
+    |> Ecto.Changeset.change(provider_identity: comment_parent_identity(ctx, 1700, "PR_1700", 7))
+    |> Repo.update!()
+
+    assert {:error, :identity_conflict} = ForgeMirrors.resource_operation_context(operation)
+
+    Repo.get!(MirrorResourceState, companion.id)
+    |> Ecto.Changeset.change(provider_identity: comment_parent_identity(ctx, 700, "I_700", 7))
+    |> Repo.update!()
+
+    Req.Test.expect(ctx.stub, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/repos/acme/project/issues/comments/900"
+
+      Req.Test.json(conn, %{
+        "id" => 900,
+        "node_id" => "IC_900",
+        "body" => "PR conversation",
+        "user" => user_json(),
+        "issue_url" => "https://api.github.com/repos/acme/project/issues/7",
+        "created_at" => DateTime.to_iso8601(@source_time),
+        "updated_at" => DateTime.to_iso8601(now)
+      })
+    end)
+
+    worker_options =
+      Keyword.update!(options(ctx), :token_fetch, fn fetch ->
+        fn id, request ->
+          assert request.permissions == %{"pull_requests" => "write", "metadata" => "read"}
+          %{fetch.(id, request) | permissions: request.permissions}
+        end
+      end)
+
+    assert {:ok, _} = IssueSyncWorker.process_operation(operation, now, worker_options)
+
+    mapping =
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: ctx.binding.id,
+        resource_kind: :issue_comment,
+        github_object_id: 900
+      )
+
+    assert %{issue_id: ^parent_id, body: "PR conversation"} =
+             Repo.get!(ForgeIssues.Comment, mapping.local_resource_id)
+
+    assert Repo.get!(MirrorOperation, operation.id).state == :completed
+
+    assert {:ok, local_comment} =
+             ForgeIssues.create_comment(
+               ctx.owner,
+               ctx.owner_slug,
+               ctx.repository.slug,
+               7,
+               %{body: "Local PR conversation"},
+               %{}
+             )
+
+    local_event =
+      Repo.get_by!(DomainOutboxEvent,
+        aggregate_type: "issue_comment",
+        aggregate_id: to_string(local_comment.id),
+        event_type: "issue_comment.created"
+      )
+
+    assert local_event.payload["issue_kind"] == "pull_request"
+
+    Repo.get!(ForgeMirrors.OrganizationMirror, ctx.organization.id)
+    |> Ecto.Changeset.change(capabilities: single_metadata_capability(:issue))
+    |> Repo.update!()
+
+    assert {:ok, {:ignored, :capability_disabled}} =
+             ForgeMirrors.materialize_outbox_event(local_event)
+
+    refute Repo.exists?(
+             from o in MirrorOperation,
+               where: o.repository_mirror_id == ^ctx.binding.id and o.state == :failed
+           )
+
+    Repo.get!(ForgeMirrors.OrganizationMirror, ctx.organization.id)
+    |> Ecto.Changeset.change(capabilities: single_metadata_capability(:pull_request))
+    |> Repo.update!()
+
+    local_now = DateTime.utc_now(:second)
+
+    assert {:ok, _, {:materialized, [local_operation_id]}} =
+             dispatch_until(local_event.event_id, "pr-comment-outbox", local_now)
+
+    assert :ok =
+             ForgeIssues.delete_comment(
+               ctx.owner,
+               ctx.owner_slug,
+               ctx.repository.slug,
+               local_comment.id,
+               %{}
+             )
+
+    local_operation = claim(local_operation_id, local_now, "sync.issue_comment")
+
+    assert {:ok,
+            %{
+              parent_issue_id: ^parent_id,
+              github_issue_id: 700,
+              local_deleted: true,
+              local_version: 2
+            }} = ForgeMirrors.resource_operation_context(local_operation)
+  end
+
+  for enabled_kind <- [:issue, :pull_request] do
+    test "shared comment sweeps exclude policy-disabled parents with #{enabled_kind} enabled",
+         ctx do
+      enabled_kind = unquote(enabled_kind)
+      now = DateTime.utc_now(:second)
+
+      org =
+        ctx.organization
+        |> Ecto.Changeset.change(capabilities: single_metadata_capability(enabled_kind))
+        |> Repo.update!()
+
+      insert_pull_parent(ctx, now)
+
+      sweep =
+        operation_fixture(org, %{
+          repository_mirror_id: ctx.binding.id,
+          kind: "reconcile.repository.issue_comments",
+          next_attempt_at: now,
+          cursor: %{
+            "trigger" => "reconcile",
+            "resource_kind" => "issue_comment",
+            "since" => "1970-01-01T00:00:00Z",
+            "page" => 1,
+            "sweep_id" => Ecto.UUID.generate()
+          }
+        })
+
+      sweep = claim(sweep.id, now, sweep.kind)
+
+      observations =
+        for {id, number} <- [{900, 7}, {901, 8}],
+            do: %{
+              github_object_id: id,
+              github_number: number,
+              github_issue_id: nil,
+              remote_updated_at: now
+            }
+
+      assert {:ok, %{operations: [child], operation: pending}} =
+               ForgeMirrors.record_resource_reconciliation_page(
+                 sweep,
+                 :issue_comment,
+                 observations,
+                 nil,
+                 now
+               )
+
+      assert child.cursor["github_object_id"] == enabled_comment_id(enabled_kind)
+      assert child.cursor["issue_kind"] == Atom.to_string(enabled_kind)
+      assert pending.checkpoint["phase"] == "mapped"
+      sweep = claim(sweep.id, now, sweep.kind)
+
+      assert {:ok, %{operation: %{state: :completed}}} =
+               ForgeMirrors.record_resource_reconciliation_page(
+                 sweep,
+                 :issue_comment,
+                 [],
+                 nil,
+                 now
+               )
+    end
+  end
+
+  test "only proven external read-only PR parents are excluded from a shared sweep", ctx do
+    now = DateTime.utc_now(:second)
+
+    ctx.organization
+    |> Ecto.Changeset.change(capabilities: single_metadata_capability(:pull_request))
+    |> Repo.update!()
+
+    pull = insert_pull_parent(ctx, now)
+
+    companion =
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: ctx.binding.id,
+        resource_kind: :pull,
+        github_object_id: 1701
+      )
+
+    Repo.get!(MirrorResourceState, companion.id)
+    |> Ecto.Changeset.change(state: :unsupported)
+    |> Repo.update!()
+
+    sweep =
+      operation_fixture(ctx.organization, %{
+        repository_mirror_id: ctx.binding.id,
+        kind: "reconcile.repository.issue_comments",
+        next_attempt_at: now,
+        cursor: %{
+          "trigger" => "reconcile",
+          "resource_kind" => "issue_comment",
+          "since" => "1970-01-01T00:00:00Z",
+          "page" => 1,
+          "sweep_id" => Ecto.UUID.generate()
+        }
+      })
+
+    sweep = claim(sweep.id, now, sweep.kind)
+
+    observation = %{
+      github_object_id: 901,
+      github_number: 8,
+      github_issue_id: nil,
+      remote_updated_at: now
+    }
+
+    # A represented but unconfirmed/unsupported head must not become an exclusion.
+    assert {:error, :identity_conflict} =
+             ForgeMirrors.record_resource_reconciliation_page(
+               sweep,
+               :issue_comment,
+               [observation],
+               nil,
+               now
+             )
+
+    assert Repo.get!(MirrorOperation, sweep.id).checkpoint == %{}
+
+    pull |> Ecto.Changeset.change(head_repository_id: nil) |> Repo.update!()
+
+    companion
+    |> Ecto.Changeset.change(state: :unsupported, provider_identity: nil)
+    |> Repo.update!()
+
+    assert {:error, :identity_conflict} =
+             ForgeMirrors.record_resource_reconciliation_page(
+               sweep,
+               :issue_comment,
+               [observation],
+               nil,
+               now
+             )
+
+    Repo.get!(MirrorResourceState, companion.id)
+    |> Ecto.Changeset.change(
+      state: :unsupported,
+      provider_identity: comment_parent_identity(ctx, 701, "NODE_701", 8)
+    )
+    |> Repo.update!()
+
+    assert {:ok, %{operations: [], operation: pending}} =
+             ForgeMirrors.record_resource_reconciliation_page(
+               sweep,
+               :issue_comment,
+               [observation],
+               nil,
+               now
+             )
+
+    assert pending.checkpoint["phase"] == "mapped"
+  end
+
+  test "an undiscovered comment parent does not hold its sweep ahead of parent discovery", ctx do
+    now = DateTime.utc_now(:second)
+
+    ctx.organization
+    |> Ecto.Changeset.change(capabilities: %{"issues" => "enabled", "pulls" => "enabled"})
+    |> Repo.update!()
+
+    insert_pull_parent(ctx, now)
+
+    Repo.get_by!(MirrorResourceState,
+      repository_mirror_id: ctx.binding.id,
+      resource_kind: :pull,
+      github_object_id: 1701
+    )
+    |> Ecto.Changeset.change(state: :pending)
+    |> Repo.update!()
+
+    sweep =
+      operation_fixture(ctx.organization, %{
+        repository_mirror_id: ctx.binding.id,
+        kind: "reconcile.repository.issue_comments",
+        next_attempt_at: now,
+        cursor: %{
+          "trigger" => "reconcile",
+          "resource_kind" => "issue_comment",
+          "since" => "1970-01-01T00:00:00Z",
+          "page" => 1,
+          "sweep_id" => Ecto.UUID.generate()
+        }
+      })
+
+    sweep = claim(sweep.id, now, sweep.kind)
+
+    observation = %{
+      github_object_id: 990,
+      github_number: 99,
+      github_issue_id: nil,
+      remote_updated_at: now
+    }
+
+    pending_parent = %{observation | github_object_id: 991, github_number: 8}
+
+    assert {:ok, %{operations: [child, pending_child]}} =
+             ForgeMirrors.record_resource_reconciliation_page(
+               sweep,
+               :issue_comment,
+               [observation, pending_parent],
+               nil,
+               now
+             )
+
+    assert pending_child.cursor["github_number"] == 8
+    sweep = claim(sweep.id, now, sweep.kind)
+
+    assert {:ok, %{operation: %{state: :completed}}} =
+             ForgeMirrors.record_resource_reconciliation_page(sweep, :issue_comment, [], nil, now)
+
+    child = claim(child.id, now, child.kind)
+    assert {:error, :parent_mapping_missing} = ForgeMirrors.resource_operation_context(child)
+    assert Repo.get!(MirrorOperation, child.id).state == :processing
+
+    child
+    |> Ecto.Changeset.change(
+      state: :completed,
+      completed_at: now,
+      lease_owner: nil,
+      lease_expires_at: nil
+    )
+    |> Repo.update!()
+
+    pending_child = claim(pending_child.id, now, pending_child.kind)
+
+    assert {:error, :parent_mapping_missing} =
+             ForgeMirrors.resource_operation_context(pending_child)
+  end
+
+  test "represented cross-head PR comments wait for the exact active head binding", ctx do
+    now = DateTime.utc_now(:second)
+
+    ctx.organization
+    |> Ecto.Changeset.change(capabilities: single_metadata_capability(:pull_request))
+    |> Repo.update!()
+
+    pull = insert_pull_parent(ctx, now)
+    head = repository_mirror_fixture(ctx.organization)
+    pull |> Ecto.Changeset.change(head_repository_id: head.repository_id) |> Repo.update!()
+
+    companion =
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: ctx.binding.id,
+        resource_kind: :pull,
+        github_object_id: 1701
+      )
+
+    identity =
+      Map.put(companion.provider_identity, "head_repository", %{
+        "id" => head.github_repository_id,
+        "node_id" => head.github_node_id
+      })
+
+    companion |> Ecto.Changeset.change(provider_identity: identity) |> Repo.update!()
+    head |> Ecto.Changeset.change(state: :discovered) |> Repo.update!()
+
+    operation =
+      operation_fixture(ctx.organization, %{
+        repository_mirror_id: ctx.binding.id,
+        kind: "sync.issue_comment",
+        next_attempt_at: now,
+        cursor: %{
+          "trigger" => "remote",
+          "resource_kind" => "issue_comment",
+          "github_object_id" => 901,
+          "github_issue_id" => 701,
+          "github_number" => 8
+        }
+      })
+
+    operation = claim(operation.id, now, operation.kind)
+    assert {:error, :pull_head_not_ready} = ForgeMirrors.resource_operation_context(operation)
+
+    Repo.get!(ForgeMirrors.RepositoryMirror, head.id)
+    |> Ecto.Changeset.change(state: :active)
+    |> Repo.update!()
+
+    assert {:ok, %{github_issue_id: 701}} = ForgeMirrors.resource_operation_context(operation)
+    marker = %{"action" => "update_remote_comment", "github_object_id" => 901}
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, now, marker)
+
+    Repo.get!(ForgeMirrors.RepositoryMirror, head.id)
+    |> Ecto.Changeset.change(github_node_id: "wrong-node")
+    |> Repo.update!()
+
+    assert {:error, :pull_head_not_ready} = ForgeMirrors.resource_operation_context(marked)
+    assert {:ok, deferred} = IssueSyncWorker.process_operation(marked, now, options(ctx))
+    assert deferred.state == :effect_pending
+    assert deferred.external_effect_marker == marker
+    assert deferred.checkpoint == marked.checkpoint
+    assert deferred.lease_owner == nil
+    assert deferred.failure_detail == "resource_context_unavailable"
+  end
+
   test "a new remote conversation comment binds to the mapped local parent with a github-origin event",
        ctx do
     now = DateTime.utc_now(:second)
@@ -552,6 +1044,74 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
     end
   end
 
+  defp comment_parent_identity(ctx, id, node, number) do
+    repository = %{
+      "id" => ctx.binding.github_repository_id,
+      "node_id" => ctx.binding.github_node_id
+    }
+
+    %{
+      "github_issue_object_id" => id,
+      "github_issue_node_id" => node,
+      "github_number" => number,
+      "head_repository" => repository,
+      "base_repository" => repository
+    }
+  end
+
+  defp insert_pull_parent(ctx, now) do
+    issue =
+      Repo.insert!(%Issue{
+        repository_id: ctx.repository.id,
+        number: 8,
+        kind: :pull_request,
+        title: "PR",
+        author_user_id: ctx.owner.id
+      })
+
+    pull =
+      Repo.insert!(%ForgePulls.PullRequest{
+        issue_id: issue.id,
+        repository_id: ctx.repository.id,
+        head_repository_id: ctx.repository.id,
+        head_ref: "refs/heads/topic",
+        base_ref: "refs/heads/main",
+        head_sha: String.duplicate("a", 40),
+        base_sha: String.duplicate("b", 40)
+      })
+
+    for {kind, type, local_id, provider_id} <- [
+          {:issue, "ForgeIssues.Issue", issue.id, 701},
+          {:pull, "ForgePulls.PullRequest", pull.id, 1701}
+        ] do
+      %MirrorResourceState{}
+      |> MirrorResourceState.persistence_changeset(%{
+        repository_mirror_id: ctx.binding.id,
+        resource_kind: kind,
+        local_resource_type: type,
+        local_resource_id: local_id,
+        github_object_id: provider_id,
+        github_node_id: "NODE_#{provider_id}",
+        github_number: 8,
+        state: :confirmed,
+        confirmed_local_version: 1,
+        confirmed_remote_updated_at: now,
+        provider_identity: if(kind == :pull, do: comment_parent_identity(ctx, 701, "NODE_701", 8))
+      })
+      |> Repo.insert!()
+    end
+
+    pull
+  end
+
+  defp single_metadata_capability(:issue), do: %{"issues" => "enabled", "pulls" => "disabled"}
+
+  defp single_metadata_capability(:pull_request),
+    do: %{"issues" => "disabled", "pulls" => "enabled"}
+
+  defp enabled_comment_id(:issue), do: 900
+  defp enabled_comment_id(:pull_request), do: 901
+
   defp remote_operation(ctx, now, github_id \\ 700, number \\ 7) do
     operation =
       operation_fixture(ctx.organization, %{
@@ -581,15 +1141,35 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
 
   defp dispatch_issue_event(ctx, owner, now) do
     [event] = issue_events(ctx)
-    {:ok, results} = OutboxDispatcher.dispatch_once(owner, now)
 
     assert {:ok, _, {:materialized, [id]}} =
-             Enum.find(results, fn
-               {:ok, event_id, _} -> event_id == event.event_id
-               _ -> false
-             end)
+             dispatch_until(event.event_id, owner, now)
 
     id
+  end
+
+  defp dispatch_until(target_id, owner, now) do
+    # Real dispatcher batches may contain committed events from other test suites.
+    # Claims/acks here remain inside this test's sandbox transaction.
+    batches = div(Repo.aggregate(DomainOutboxEvent, :count), 25) + 1
+
+    result =
+      Enum.reduce_while(1..batches, nil, fn _, _ ->
+        assert {:ok, results} = OutboxDispatcher.dispatch_once(owner, now)
+
+        case Enum.find(results, fn
+               {_, event_id, _} -> event_id == target_id
+               _ -> false
+             end) do
+          nil -> {:cont, nil}
+          found -> {:halt, found}
+        end
+      end)
+
+    assert result,
+           "fixture outbox event #{target_id} was not reached in #{batches} bounded batches"
+
+    result
   end
 
   defp claim(id, now, kind \\ "sync.issue") do

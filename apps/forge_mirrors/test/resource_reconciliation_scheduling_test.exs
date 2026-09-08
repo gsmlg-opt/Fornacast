@@ -46,6 +46,53 @@ defmodule ForgeMirrors.ResourceReconciliationSchedulingTest do
     refute hd(later).id == issues.id
   end
 
+  test "pulls-only bootstrap requires the shared comment sweep and failed children block activation",
+       c do
+    c = bootstrap_binding(c)
+
+    c.organization
+    |> Ecto.Changeset.change(capabilities: %{"issues" => "disabled", "pulls" => "enabled"})
+    |> Repo.update!()
+
+    assert_git_does_not_activate(c)
+
+    assert {:ok, [comments]} =
+             ForgeMirrors.enqueue_repository_resource_reconciliations(
+               c.binding,
+               "bootstrap:item:#{c.item.id}",
+               c.now
+             )
+
+    assert comments.kind == "reconcile.repository.issue_comments"
+    leased = claim(c, comments.kind, comments.id)
+
+    assert {:ok, %{resource_kind: :issue_comment}} =
+             ForgeMirrors.resource_operation_context(leased)
+
+    Repo.get!(MirrorOperation, comments.id)
+    |> Ecto.Changeset.change(
+      state: :completed,
+      completed_at: c.now,
+      lease_owner: nil,
+      lease_expires_at: nil
+    )
+    |> Repo.update!()
+
+    operation_fixture(c.organization, %{
+      repository_mirror_id: c.binding.id,
+      kind: "sync.issue_comment",
+      cursor: %{"sweep_id" => comments.cursor["sweep_id"], "github_object_id" => 900}
+    })
+    |> Ecto.Changeset.change(
+      state: :failed,
+      failure_class: "provider_validation",
+      failure_disposition: :terminal
+    )
+    |> Repo.update!()
+
+    assert_git_does_not_activate(c)
+  end
+
   test "disabled issues and revoked connections cannot schedule metadata effects", c do
     c.organization
     |> Ecto.Changeset.change(capabilities: %{"issues" => "disabled"})
