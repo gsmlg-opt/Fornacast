@@ -56,6 +56,20 @@ PR13 integration audit additionally identified these concrete remaining gates:
 
 ## Current local verification
 
+- `0a25679` adds durable paged recovery and fresh eligibility without another
+  creator grant. A regression proved replacement-installation acceptance; the
+  fixed boundary pins both original organization and installation identities.
+- `a16155f` connects outbound creation to the pull worker. Fresh combined
+  verification passed 90 scoped PostgreSQL/provider tests (37 mirror, 53 GitHub),
+  and 13 changed files passed formatting. Real database/local Git integration
+  with stubbed HTTP proves original-intent cleanup after a newer local edit,
+  missing local refs blocking admission, and lost POST response recovery across
+  separate claims with exactly one POST. Provider tests prove identity-checked
+  ref reads, a post-wait lease check before PATCH, and 512-item relationship
+  payload/response bounds (listing pages remain 100). These are local proofs.
+  Visible intent-bound conflicts, missing/renamed relationship prerequisites,
+  checkpointed large relationship-name verification, and production activation
+  remain open; the current error path retains evidence but defers conflicts.
 - `5a78ec6` persists immutable outbound pull-create intents and implements paired
   identification/confirmation. A committed first marker alone grants creation;
   recovery and different operations cannot obtain a second grant. PostgreSQL
