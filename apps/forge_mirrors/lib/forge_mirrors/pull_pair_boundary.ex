@@ -26,6 +26,104 @@ defmodule ForgeMirrors.PullPairBoundary do
 
   def context(_, _), do: {:error, :invalid_argument}
 
+  # Internal trusted domain composition, like confirm_resource_operation/5.
+  # Callers must append only the target's ForgePulls apply/observe operation;
+  # this is not a sandbox for arbitrary callback writes or external effects.
+  def confirm(
+        %MirrorOperation{kind: "sync.pull"} = operation,
+        %DateTime{} = now,
+        expected,
+        confirmation,
+        callback
+      )
+      when is_map(expected) and is_map(confirmation) and is_function(callback, 1) do
+    Repo.transaction(fn ->
+      with {:ok, sync} <- ForgeMirrors.mapped_pull_pair_context(operation),
+           :ok <- same_pair(sync, expected),
+           %MirrorOperation{state: :processing, external_effect_marker: nil} <-
+             Repo.get(MirrorOperation, operation.id),
+           {:ok, saved} <-
+             ForgeMirrors.confirm_pull_operation(
+               operation,
+               now,
+               Map.delete(expected, :pair),
+               Map.drop(confirmation, [:issue_snapshot, :issue_remote_updated_at]),
+               fn multi ->
+                 multi
+                 |> callback.()
+                 |> Ecto.Multi.run(:paired_issue_confirmation, fn _, _ ->
+                   confirm_issue(operation, sync, expected, confirmation)
+                 end)
+               end
+             ) do
+        Map.put(
+          saved,
+          :issue_resource_state,
+          Repo.get!(MirrorResourceState, sync.pair.issue.mapping_id)
+        )
+      else
+        {:error, reason} -> Repo.rollback(reason)
+        _ -> Repo.rollback(:invalid_transition)
+      end
+    end)
+  end
+
+  def confirm(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  defp same_pair(sync, expected) do
+    if sync.pair == expected[:pair], do: :ok, else: {:error, :stale_paired_mapping}
+  end
+
+  defp confirm_issue(operation, sync, expected, confirmation) do
+    # forge_pulls depends on forge_mirrors; resolve its trusted public projection
+    # at runtime rather than introducing an umbrella compile dependency cycle.
+    with {:ok, local} <-
+           apply(ForgePulls, :sync_projection, [sync.repository_id, :pull, sync.local_resource_id]),
+         {:ok, relationships} <-
+           ForgeMirrors.resolve_issue_relationships(
+             sync.repository_mirror_id,
+             :local,
+             local.label_ids,
+             local.assignee_refs
+           ),
+         snapshot =
+           Map.merge(Map.take(local.fields, @scalars), %{
+             "label_github_ids" =>
+               Enum.sort(Enum.map(relationships.labels, & &1.github_object_id)),
+             "assignee_github_ids" =>
+               Enum.sort(Enum.map(relationships.assignees, & &1.github_user_id))
+           }),
+         true <-
+           snapshot == confirmation[:issue_snapshot] and
+             local.fields == confirmation[:confirmed_snapshot] and
+             local.local_version == confirmation[:confirmed_local_version],
+         {:ok, fresh} <- ForgeMirrors.mapped_pull_pair_context(operation),
+         :ok <- same_pair(fresh, expected),
+         mapping = Repo.get!(MirrorResourceState, sync.pair.issue.mapping_id),
+         true <- valid_issue_time?(confirmation[:issue_remote_updated_at], mapping),
+         {:ok, fingerprint} <- ForgeMirrors.resource_fingerprint(snapshot) do
+      mapping
+      |> MirrorResourceState.persistence_changeset(%{
+        confirmed_snapshot: snapshot,
+        confirmed_fingerprint: fingerprint,
+        confirmed_local_version: local.local_version,
+        confirmed_remote_updated_at: confirmation.issue_remote_updated_at,
+        lock_version: mapping.lock_version + 1
+      })
+      |> Repo.update()
+    else
+      false -> {:error, :invalid_paired_projection}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp valid_issue_time?(%DateTime{utc_offset: 0, std_offset: 0} = time, mapping),
+    do:
+      is_nil(mapping.confirmed_remote_updated_at) or
+        DateTime.compare(time, mapping.confirmed_remote_updated_at) != :lt
+
+  defp valid_issue_time?(_, _), do: false
+
   defp pair(sync) do
     # Existing context has acquired the organization operation lock. Acquire
     # both mapping rows in deterministic order and retain them to transaction end.

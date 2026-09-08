@@ -1519,6 +1519,11 @@ defmodule ForgeMirrors do
   def confirm_pull_operation(_, _, _, _, _), do: {:error, :invalid_argument}
 
   @doc false
+  defdelegate confirm_mapped_pull_pair(operation, now, expected, confirmation, callback),
+    to: ForgeMirrors.PullPairBoundary,
+    as: :confirm
+
+  @doc false
   def outbound_pull_creation_context(operation),
     do: ForgeMirrors.PullOutboundCreation.context(operation, &lock_pull_creation_operation/1)
 

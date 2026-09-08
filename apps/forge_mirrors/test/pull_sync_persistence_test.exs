@@ -665,6 +665,166 @@ defmodule ForgeMirrors.PullSyncPersistenceTest do
     assert result.resource_state.provider_identity == c.identity
   end
 
+  test "paired confirmation atomically applies relationships and confirms both views", c do
+    {paired, label, expected, result, request} = paired_confirmation(c)
+    before_events = Repo.aggregate(Fornacast.DomainOutboxEvent, :count)
+
+    assert {:ok, saved} =
+             ForgeMirrors.confirm_mapped_pull_pair(
+               c.operation,
+               c.now,
+               expected,
+               result,
+               &ForgePulls.append_sync_apply(&1, :resource, request)
+             )
+
+    assert saved.operation.state == :completed
+    assert saved.issue_resource_state.id == paired.id
+    assert saved.issue_resource_state.confirmed_snapshot == result.issue_snapshot
+
+    assert saved.issue_resource_state.confirmed_local_version ==
+             saved.resource_state.confirmed_local_version
+
+    assert saved.resource_state.confirmed_snapshot == result.confirmed_snapshot
+
+    assert Repo.exists?(
+             from l in ForgeIssues.IssueLabel,
+               where: l.issue_id == ^c.issue.id and l.label_id == ^label.id
+           )
+
+    assert Repo.get!(ForgeIssues.Issue, c.issue.id).sync_version == c.issue.sync_version + 1
+    assert Repo.aggregate(Fornacast.DomainOutboxEvent, :count) == before_events + 1
+  end
+
+  test "paired confirmation rolls back domain and mapping writes on incorrect resulting sets",
+       c do
+    {paired, _label, expected, result, request} = paired_confirmation(c)
+    result = put_in(result.issue_snapshot["label_github_ids"], [])
+    before_events = Repo.aggregate(Fornacast.DomainOutboxEvent, :count)
+
+    assert {:error, :invalid_paired_projection} =
+             ForgeMirrors.confirm_mapped_pull_pair(
+               c.operation,
+               c.now,
+               expected,
+               result,
+               &ForgePulls.append_sync_apply(&1, :resource, request)
+             )
+
+    assert Repo.get!(ForgeIssues.Issue, c.issue.id).title == c.issue.title
+    assert Repo.aggregate(ForgeIssues.IssueLabel, :count) == 0
+
+    assert Repo.get!(MirrorResourceState, paired.id).confirmed_snapshot ==
+             paired.confirmed_snapshot
+
+    assert Repo.get!(MirrorResourceState, c.mapping.id).confirmed_snapshot ==
+             c.mapping.confirmed_snapshot
+
+    assert Repo.get!(ForgeMirrors.MirrorOperation, c.operation.id).state == :processing
+    assert Repo.aggregate(Fornacast.DomainOutboxEvent, :count) == before_events
+  end
+
+  test "paired confirmation rejects changed companion before executing the domain callback", c do
+    {paired, _label, expected, result, _request} = paired_confirmation(c)
+
+    Repo.update_all(from(m in MirrorResourceState, where: m.id == ^paired.id),
+      inc: [lock_version: 1]
+    )
+
+    assert {:error, :stale_paired_mapping} =
+             ForgeMirrors.confirm_mapped_pull_pair(c.operation, c.now, expected, result, fn _ ->
+               flunk("stale pair must not invoke domain mutation")
+             end)
+  end
+
+  test "paired confirmation rejects regressing companion observation and rolls back apply", c do
+    {paired, _label, expected, result, request} = paired_confirmation(c)
+
+    Repo.update_all(from(m in MirrorResourceState, where: m.id == ^paired.id),
+      set: [confirmed_remote_updated_at: c.now]
+    )
+
+    result = %{result | issue_remote_updated_at: DateTime.add(c.now, -1, :second)}
+
+    assert {:error, :invalid_paired_projection} =
+             ForgeMirrors.confirm_mapped_pull_pair(
+               c.operation,
+               c.now,
+               expected,
+               result,
+               &ForgePulls.append_sync_apply(&1, :resource, request)
+             )
+
+    assert Repo.get!(ForgeIssues.Issue, c.issue.id).sync_version == c.issue.sync_version
+    assert Repo.get!(MirrorResourceState, paired.id).lock_version == paired.lock_version
+    assert Repo.get!(ForgeMirrors.MirrorOperation, c.operation.id).state == :processing
+  end
+
+  defp paired_confirmation(c) do
+    snapshot =
+      Map.take(c.local.fields, ~w(title body state state_reason))
+      |> Map.merge(%{"label_github_ids" => [], "assignee_github_ids" => []})
+
+    paired =
+      Repo.insert!(%MirrorResourceState{
+        repository_mirror_id: c.binding.id,
+        resource_kind: :issue,
+        local_resource_type: "ForgeIssues.Issue",
+        local_resource_id: c.issue.id,
+        github_object_id: 901,
+        github_node_id: "I_901",
+        github_number: 7,
+        confirmed_local_version: c.issue.sync_version,
+        confirmed_snapshot: snapshot,
+        state: :confirmed
+      })
+
+    label =
+      Repo.insert!(%ForgeIssues.Label{
+        repository_id: c.binding.repository_id,
+        name: "label",
+        normalized_name: "label",
+        color: "abcdef"
+      })
+
+    Repo.insert!(%MirrorResourceState{
+      repository_mirror_id: c.binding.id,
+      resource_kind: :label,
+      local_resource_type: "ForgeIssues.Label",
+      local_resource_id: label.id,
+      github_object_id: 77,
+      github_node_id: "L_77",
+      state: :confirmed,
+      confirmed_snapshot: %{"name" => "label", "color" => "abcdef", "description" => nil}
+    })
+
+    {:ok, context} = ForgeMirrors.mapped_pull_pair_context(c.operation)
+    {expected, result} = confirmation(c)
+    expected = Map.put(expected, :pair, context.pair)
+
+    result =
+      result
+      |> Map.put(:issue_snapshot, %{snapshot | "title" => "Remote", "label_github_ids" => [77]})
+      |> Map.put(:issue_remote_updated_at, c.now)
+
+    request = %{
+      action: :update,
+      repository_id: c.binding.repository_id,
+      resource_kind: :pull,
+      local_resource_id: c.pull.id,
+      expected_local_version: c.local.local_version,
+      expected_fields: c.local.fields,
+      expected_merge_state: %{merged_at: nil, merge_commit_sha: nil},
+      expected_relationships: c.local.relationship_preimage,
+      fields: result.confirmed_snapshot,
+      local_label_ids: [label.id],
+      assignee_refs: [],
+      provenance: %{origin: :github}
+    }
+
+    {paired, label, expected, result, request}
+  end
+
   defp confirmation(c) do
     expected = %{
       resource_state_lock_version: c.mapping.lock_version,
