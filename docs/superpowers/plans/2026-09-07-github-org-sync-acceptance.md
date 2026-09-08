@@ -56,6 +56,12 @@ PR13 integration audit additionally identified these concrete remaining gates:
 
 ## Current local verification
 
+- `7534f74` adds bounded, observation-only outbound pull-create recovery. The
+  scanner retains candidate identities across pages, requires a complete scan,
+  and treats zero or multiple UUID matches as ambiguous; it never grants another
+  POST. Eighteen focused recovery/client tests and scoped formatting passed.
+  This helper is not yet integrated into outbound worker orchestration and does
+  not establish paired identity confirmation, cleanup, or creation completion.
 - `3339b3a` commits the inbound pull worker path. Review caught attribution writes
   preceding immutable head/canonical issue validation; the real regression failed
   before the fix and the paired no-write preflight now runs first. Eighteen pull
