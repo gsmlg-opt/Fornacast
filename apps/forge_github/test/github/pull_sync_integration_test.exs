@@ -557,9 +557,13 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     now = DateTime.utc_now(:second)
     git!(ctx.head_path, ["update-ref", "-d", ctx.baseline["head_ref"]])
 
-    target = Map.put(ctx.baseline, "title", "Untrusted inbound title")
     operation = remote_operation(ctx, now)
-    expect_observation(ctx, target, now)
+    caller = self()
+
+    Req.Test.stub(ctx.stub, fn _ ->
+      send(caller, :provider_read)
+      flunk("unavailable local Git must prevent provider reads")
+    end)
 
     assert {:ok,
             %{
@@ -571,6 +575,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
 
     assert %{title: "Baseline", sync_version: 1} = Repo.get!(ForgeIssues.Issue, ctx.issue.id)
     assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_snapshot == ctx.baseline
+    refute_received :provider_read
   end
 
   test "a mismatched base ref blocks an outbound provider effect", ctx do
@@ -584,8 +589,12 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
       |> Repo.update!()
 
     operation = local_operation(ctx, issue.sync_version, now)
-    expect_observation(ctx, ctx.baseline, @source_time)
     caller = self()
+
+    Req.Test.stub(ctx.stub, fn _ ->
+      send(caller, :provider_read)
+      flunk("diverged local Git must prevent provider reads")
+    end)
 
     result =
       PullSyncWorker.process_operation(
@@ -607,6 +616,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
             }} = result
 
     refute_receive :provider_effect
+    refute_received :provider_read
     assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_snapshot == ctx.baseline
   end
 

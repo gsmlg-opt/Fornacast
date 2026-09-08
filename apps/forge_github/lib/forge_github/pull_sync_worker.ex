@@ -461,16 +461,16 @@ defmodule ForgeGitHub.PullSyncWorker do
   end
 
   defp observe_authorized(sync, token, local, now, options) do
-    with {:ok, remote} <- remote_observation(sync, token, now, options),
-         {:ok, provider_identity} <- provider_identity(remote),
-         {:ok, proof} <- eligibility(sync, local, options),
+    with {:ok, proof} <- eligibility(sync, local, options),
          :ok <- git_availability(proof, options),
-         {:ok, proof} <- json_safe(proof) do
+         {:ok, proof} <- json_safe(proof),
+         {:ok, remote} <- remote_observation(sync, token, local, proof, now, options),
+         {:ok, provider_identity} <- provider_identity(remote) do
       {:ok, remote, provider_identity, proof}
     end
   end
 
-  defp remote_observation(sync, token, now, options) do
+  defp remote_observation(sync, token, local, proof, now, options) do
     request_options = request_options(sync)
 
     with {:ok, pull} <-
@@ -489,11 +489,20 @@ defmodule ForgeGitHub.PullSyncWorker do
              sync.github_number,
              request_options
            ),
-         {:ok, relationships} <- remote_relationships(sync, issue, now, options),
-         {:ok, issue_observation} <-
-           IssueSyncProjection.from_remote_issue(issue, relationships),
-         {:ok, pull_observation} <- PullSyncProjection.from_remote(pull, issue_observation) do
-      {:ok, pull_observation}
+         {:ok, scalar} <- inbound_preflight(pull, issue),
+         {:ok, identity} <- provider_identity(scalar) do
+      case precondition(sync, local, scalar, identity, proof) do
+        :ok ->
+          with {:ok, relationships} <- remote_relationships(sync, issue, now, options),
+               {:ok, issue_observation} <-
+                 IssueSyncProjection.from_remote_issue(issue, relationships),
+               do: PullSyncProjection.from_remote(pull, issue_observation)
+
+        _rejected ->
+          # Return only diagnostic scalars to the caller's same precondition.
+          # Rejected observations must never write author/assignee attribution.
+          {:ok, scalar}
+      end
     else
       {:error, :inconsistent_observation} -> {:error, :inconsistent_observation}
       {:error, %Error{} = error} -> {:error, error}

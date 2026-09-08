@@ -314,6 +314,10 @@ defmodule ForgeGitHub.PullSyncWorkerTest do
           pull = put_in(github_pull(@base), ["head", "repo", "id"], 999)
           {:ok, pull}
         end,
+        remote_relationships: fn _, _, _ ->
+          send(parent, :unsafe_attribution)
+          {:ok, %{labels: [], assignees: [], author: nil}}
+        end,
         conflict: fn ^operation, @now, "pull_identity_mismatch", @base, @base, @base ->
           send(parent, :conflicted)
           {:ok, :conflicted}
@@ -324,6 +328,38 @@ defmodule ForgeGitHub.PullSyncWorkerTest do
 
     assert {:ok, :conflicted} = PullSyncWorker.process_operation(operation, @now, options)
     assert_received :conflicted
+    refute_received :unsafe_attribution
+  end
+
+  test "paired identity, ref and scalar rejection precedes attribution", _ do
+    parent = self()
+    operation = operation(:processing)
+
+    observations = [
+      {github_pull(@base), Map.put(github_issue(@base), "id", 999)},
+      {put_in(github_pull(@base), ["head", "sha"], String.duplicate("c", 40)),
+       github_issue(@base)},
+      {github_pull(@base), Map.put(github_issue(@base), "title", "Incoherent")}
+    ]
+
+    for {pull, issue} <- observations do
+      opts =
+        options(operation,
+          get_pull: fn _, _, _, _, _ -> {:ok, pull} end,
+          get_pull_issue: fn _, _, _, _, _ -> {:ok, issue} end,
+          remote_relationships: fn _, _, _ ->
+            send(parent, :unsafe_attribution)
+            {:ok, %{labels: [], assignees: [], author: nil}}
+          end,
+          conflict: fn _, _, _, _, _, _ -> {:ok, :rejected} end,
+          retry: fn _, _, _, _, _ -> {:ok, :rejected} end,
+          fail: fn _, _, _, _ -> {:ok, :rejected} end,
+          confirm: fn _, _, _, _, _ -> flunk("rejected observation confirmed") end
+        )
+
+      assert {:ok, :rejected} = PullSyncWorker.process_operation(operation, @now, opts)
+      refute_received :unsafe_attribution
+    end
   end
 
   defp options(operation, overrides) do
