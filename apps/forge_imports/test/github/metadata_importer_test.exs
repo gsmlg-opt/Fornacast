@@ -402,6 +402,9 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
   end
 
   defp recovery_stub!(stub, item, issue, pull, response) do
+    pull = authenticated_pull_payload(pull)
+    issue = authenticated_pull_issue(issue, pull)
+
     Req.Test.stub(stub, fn conn ->
       cond do
         response == :denied ->
@@ -937,7 +940,19 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
     issues = Keyword.fetch!(responses, :issues)
     comments = Keyword.fetch!(responses, :comments)
     pull = Keyword.get(responses, :pull)
-    pulls = Keyword.get(responses, :pulls, if(pull, do: [pull], else: []))
+
+    pulls =
+      responses
+      |> Keyword.get(:pulls, if(pull, do: [pull], else: []))
+      |> Enum.map(&authenticated_pull_payload/1)
+
+    issues =
+      Enum.map(issues, fn issue ->
+        case Enum.find(pulls, &(&1["number"] == issue["number"])) do
+          nil -> issue
+          pull -> authenticated_pull_issue(issue, pull)
+        end
+      end)
 
     Req.Test.stub(stub, fn conn ->
       send(parent, {:request, conn.request_path, conn.query_string})
@@ -955,6 +970,16 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
           number = conn.request_path |> String.split("/") |> Enum.at(5) |> String.to_integer()
           Req.Test.json(conn, Map.get(comments, number, []))
 
+        String.contains?(conn.request_path, "/issues/") ->
+          number = conn.request_path |> String.split("/") |> List.last() |> String.to_integer()
+          pull = Enum.find(pulls, &(&1["number"] == number))
+
+          payload =
+            Enum.find(issues, &(&1["number"] == number)) ||
+              authenticated_pull_issue(%{"id" => 300 + number}, pull)
+
+          if payload, do: Req.Test.json(conn, payload), else: Plug.Conn.send_resp(conn, 404, "{}")
+
         String.contains?(conn.request_path, "/pulls/") ->
           number = conn.request_path |> String.split("/") |> List.last() |> String.to_integer()
           payload = Enum.find(pulls, &(&1["number"] == number))
@@ -969,6 +994,51 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
   end
 
   defp stub_client!(responses), do: stub_client!(stub_name(), responses)
+
+  defp authenticated_pull_payload(%{} = pull) do
+    head_id = pull["head"]["repo"]["id"]
+    base_id = pull["base"]["repo"]["id"]
+
+    pull
+    |> Map.put_new("node_id", "PR_#{pull["id"]}")
+    |> put_in(
+      ["head", "repo"],
+      authenticated_repository(pull["head"]["repo"], head_id == base_id)
+    )
+    |> put_in(["base", "repo"], authenticated_repository(pull["base"]["repo"], true))
+  end
+
+  defp authenticated_pull_issue(_issue, nil), do: nil
+
+  defp authenticated_pull_issue(%{} = issue, %{} = pull) do
+    state_reason = if pull["state"] == "closed", do: "completed", else: nil
+
+    issue
+    |> Map.put_new("node_id", "I_#{issue["id"]}")
+    |> Map.put("number", pull["number"])
+    |> Map.put("title", pull["title"])
+    |> Map.put("body", pull["body"])
+    |> Map.put("state", pull["state"])
+    |> Map.put("state_reason", state_reason)
+    |> Map.put("updated_at", pull["updated_at"])
+    |> Map.put_new("labels", [])
+    |> Map.put_new("assignees", [])
+    |> Map.put("pull_request", %{
+      "url" => "https://api.github.com/repos/octocat/Hello-World/pulls/#{pull["number"]}"
+    })
+  end
+
+  defp authenticated_repository(repository, true) do
+    repository
+    |> Map.put_new("node_id", "R_repo")
+    |> Map.put_new("full_name", "octocat/Hello-World")
+  end
+
+  defp authenticated_repository(repository, false) do
+    repository
+    |> Map.put_new("node_id", "R_#{repository["id"]}")
+    |> Map.put_new("full_name", "fork-owner/#{repository["name"]}")
+  end
 
   defp importer_opts(stub, item) do
     [

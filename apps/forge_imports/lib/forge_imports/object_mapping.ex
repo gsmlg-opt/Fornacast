@@ -4,6 +4,7 @@ defmodule ForgeImports.ObjectMapping do
   import Ecto.Changeset
 
   @max_id 9_223_372_036_854_775_807
+  @max_source_evidence_bytes 16_384
 
   @derive {Inspect, except: [:source_url]}
   schema "github_import_object_mappings" do
@@ -15,6 +16,7 @@ defmodule ForgeImports.ObjectMapping do
     field :local_resource_type, :string
     field :local_resource_id, :integer
     field :source_url, :string
+    field :source_evidence, :map
 
     timestamps(type: :utc_datetime)
   end
@@ -29,7 +31,8 @@ defmodule ForgeImports.ObjectMapping do
       :github_object_id,
       :local_resource_type,
       :local_resource_id,
-      :source_url
+      :source_url,
+      :source_evidence
     ])
     |> validate_required([
       :repository_item_id,
@@ -48,6 +51,7 @@ defmodule ForgeImports.ObjectMapping do
     |> validate_safe_string(:object_kind, 120)
     |> validate_safe_string(:local_resource_type, 255)
     |> validate_classified_string(:source_url, 2_048)
+    |> validate_source_evidence()
     |> foreign_key_constraint(:repository_item_id)
     |> foreign_key_constraint(:hidden_repository_id)
     |> unique_constraint(
@@ -61,6 +65,9 @@ defmodule ForgeImports.ObjectMapping do
     )
     |> check_constraint(:github_object_id,
       name: :github_import_mappings_object_id_positive_check
+    )
+    |> check_constraint(:source_evidence,
+      name: :github_import_object_mappings_source_evidence_check
     )
   end
 
@@ -90,6 +97,21 @@ defmodule ForgeImports.ObjectMapping do
          ),
          do: [],
          else: [{field, "contains unsafe provenance"}]
+    end)
+  end
+
+  defp validate_source_evidence(changeset) do
+    validate_change(changeset, :source_evidence, fn :source_evidence, evidence ->
+      try do
+        if is_map(evidence) and not is_struct(evidence) and
+             ForgeImports.SafeValue.safe_nested?(evidence) and
+             byte_size(JSON.encode!(evidence)) <= @max_source_evidence_bytes,
+           do: [],
+           else: [source_evidence: "must be a safe JSON object of at most 16384 encoded bytes"]
+      rescue
+        _invalid ->
+          [source_evidence: "must be a safe JSON object of at most 16384 encoded bytes"]
+      end
     end)
   end
 end

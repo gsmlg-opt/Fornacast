@@ -60,6 +60,139 @@ defmodule ForgeImports.GitHub.MetadataMapperTest do
     assert pull.merger_github_user_id == 9001
   end
 
+  test "maps an authenticated pull and canonical issue observation without conflating ids" do
+    pull =
+      fixture!("pull_same_repo.json")
+      |> authenticated_pull_identity()
+
+    issue = pull_issue_payload(pull, 302, "I_kwDOIssue302")
+
+    staged_refs = %{
+      "refs/heads/feature" => pull["head"]["sha"],
+      "refs/heads/main" => pull["base"]["sha"]
+    }
+
+    assert {:ok, mapped} =
+             MetadataMapper.pull_observation(pull, issue, 1_296_269,
+               source_full_name: "octocat/Hello-World",
+               expected_issue_id: 302,
+               staged_refs: staged_refs
+             )
+
+    assert mapped.github_id == 701
+    assert mapped.github_node_id == "PR_kwDOPull701"
+    assert mapped.github_issue_id == 302
+    assert mapped.github_issue_node_id == "I_kwDOIssue302"
+
+    assert mapped.snapshot == %{
+             "title" => "Same repo pull",
+             "body" => "Pull body",
+             "state" => "closed",
+             "state_reason" => "completed",
+             "draft" => false,
+             "head_ref" => "refs/heads/feature",
+             "head_sha" => pull["head"]["sha"],
+             "base_ref" => "refs/heads/main",
+             "base_sha" => pull["base"]["sha"]
+           }
+
+    assert mapped.issue_snapshot == %{
+             "title" => "Same repo pull",
+             "body" => "Pull body",
+             "state" => "closed",
+             "state_reason" => "completed",
+             "label_github_ids" => [],
+             "assignee_github_ids" => []
+           }
+
+    assert mapped.provider_identity == %{
+             "github_issue_object_id" => 302,
+             "github_issue_node_id" => "I_kwDOIssue302",
+             "github_number" => 7,
+             "head_repository" => %{"id" => 1_296_269, "node_id" => "R_repo"},
+             "base_repository" => %{"id" => 1_296_269, "node_id" => "R_repo"}
+           }
+
+    assert mapped.merge_state == %{
+             "merged_at" => "2025-02-03T00:00:00Z",
+             "merge_commit_sha" => pull["merge_commit_sha"]
+           }
+
+    assert {:error, :pull_issue_identity_mismatch} =
+             MetadataMapper.pull_observation(pull, issue, 1_296_269,
+               source_full_name: "octocat/Hello-World",
+               expected_issue_id: 701,
+               staged_refs: staged_refs
+             )
+
+    assert {:error, :pull_issue_identity_mismatch} =
+             MetadataMapper.pull_observation(
+               pull,
+               Map.put(issue, "title", "raced title"),
+               1_296_269,
+               source_full_name: "octocat/Hello-World",
+               expected_issue_id: 302,
+               staged_refs: staged_refs
+             )
+
+    assert {:error, :pull_issue_identity_mismatch} =
+             MetadataMapper.pull_observation(
+               put_in(pull, ["head", "repo", "node_id"], "R_wrong"),
+               issue,
+               1_296_269,
+               source_full_name: "octocat/Hello-World",
+               expected_issue_id: 302,
+               staged_refs: staged_refs
+             )
+
+    assert {:error, :pull_issue_identity_mismatch} =
+             MetadataMapper.pull_observation(
+               pull,
+               Map.put(issue, "updated_at", nil),
+               1_296_269,
+               source_full_name: "octocat/Hello-World",
+               expected_issue_id: 302,
+               staged_refs: staged_refs
+             )
+  end
+
+  test "maps pull bodies up to 65536 four-byte codepoints" do
+    body = String.duplicate("😀", 65_536)
+
+    pull =
+      fixture!("pull_same_repo.json")
+      |> authenticated_pull_identity()
+      |> Map.put("body", body)
+
+    issue =
+      pull_issue_payload(pull, 302, "I_kwDOIssue302")
+      |> Map.put("body", body)
+
+    staged_refs = %{
+      "refs/heads/feature" => pull["head"]["sha"],
+      "refs/heads/main" => pull["base"]["sha"]
+    }
+
+    assert {:ok, %{body: ^body, issue_snapshot: %{"body" => ^body}}} =
+             MetadataMapper.pull_observation(pull, issue, 1_296_269,
+               source_full_name: "octocat/Hello-World",
+               expected_issue_id: 302,
+               staged_refs: staged_refs
+             )
+
+    too_long = body <> "a"
+
+    assert {:error, :invalid_pull} =
+             MetadataMapper.pull_observation(
+               Map.put(pull, "body", too_long),
+               Map.put(issue, "body", too_long),
+               1_296_269,
+               source_full_name: "octocat/Hello-World",
+               expected_issue_id: 302,
+               staged_refs: staged_refs
+             )
+  end
+
   test "maps external heads by provider identity and preserves drafts" do
     cross = fixture!("pull_cross_repo.json")
     staged = %{"refs/heads/main" => cross["base"]["sha"]}
@@ -109,5 +242,34 @@ defmodule ForgeImports.GitHub.MetadataMapperTest do
     |> Path.join(name)
     |> File.read!()
     |> Jason.decode!()
+  end
+
+  defp authenticated_pull_identity(pull) do
+    pull
+    |> Map.put("node_id", "PR_kwDOPull701")
+    |> put_in(["head", "repo", "node_id"], "R_repo")
+    |> put_in(["head", "repo", "full_name"], "octocat/Hello-World")
+    |> put_in(["base", "repo", "node_id"], "R_repo")
+    |> put_in(["base", "repo", "full_name"], "octocat/Hello-World")
+  end
+
+  defp pull_issue_payload(pull, issue_id, issue_node_id) do
+    fixture!("issues_page.json")
+    |> hd()
+    |> Map.merge(%{
+      "id" => issue_id,
+      "node_id" => issue_node_id,
+      "number" => pull["number"],
+      "title" => pull["title"],
+      "body" => pull["body"],
+      "state" => pull["state"],
+      "state_reason" => "completed",
+      "created_at" => pull["created_at"],
+      "updated_at" => pull["updated_at"],
+      "closed_at" => pull["merged_at"],
+      "pull_request" => %{
+        "url" => "https://api.github.com/repos/octocat/Hello-World/pulls/#{pull["number"]}"
+      }
+    })
   end
 end

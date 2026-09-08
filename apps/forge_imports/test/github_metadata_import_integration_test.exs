@@ -5,9 +5,9 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
 
   alias Ecto.Multi
   alias ForgeImports.GitHub.MetadataImporter
-  alias ForgeImports.{ImportAttempt, Persistence, ReportEntry, RepositoryItem}
+  alias ForgeImports.{ImportAttempt, ObjectMapping, Persistence, ReportEntry, RepositoryItem}
   alias ForgeIssues.{Issue, NumberSequence}
-  alias ForgeRepos.Repository
+  alias ForgeMirrors.{MirrorResourceState, RepositoryMirror}
   alias Fornacast.Repo
 
   @fixtures Path.expand("github", Path.join(__DIR__, "fixtures"))
@@ -26,14 +26,22 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
 
     actor = user_fixture("metadata-integration")
     identity = identity_fixture(actor)
-    run = running_run_fixture(actor, identity)
-    %{actor: actor, identity: identity, run: run}
+    %{actor: actor, identity: identity}
   end
 
   test "publishes imported metadata and allocates ordinary numbers afterward", %{
     actor: actor,
-    run: run
+    identity: identity
   } do
+    organization =
+      ForgeAccounts.create_organization(actor, %{
+        username: "metadata-org-#{System.unique_integer([:positive])}",
+        display_name: "Metadata import organization"
+      })
+      |> unwrap!()
+
+    run = running_run_fixture(actor, identity, organization)
+
     {item, shadow, stub, head_sha, base_sha} =
       git_staged_fixture(run, full_name: "octocat/Hello-World")
 
@@ -42,13 +50,20 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
       |> hd()
       |> Map.put("number", 3)
 
+    long_body = String.duplicate("😀", 4_096)
+
+    pull =
+      fixture!("pull_same_repo.json")
+      |> align_pull_payload(head_sha, base_sha)
+      |> authenticated_pull_identity()
+      |> Map.put("body", long_body)
+
+    label_payload = fixture!("labels_page.json") |> hd()
+
     pull_issue =
-      fixture!("issues_page.json")
-      |> hd()
-      |> Map.put("number", 7)
-      |> Map.put("pull_request", %{
-        "url" => "https://api.github.com/repos/octocat/Hello-World/pulls/7"
-      })
+      pull_issue_payload(pull, 302, "I_kwDOIssue302")
+      |> Map.put("labels", [label_payload])
+      |> Map.put("assignees", [issue_payload["user"]])
 
     cross = fixture!("pull_cross_repo.json")
 
@@ -57,7 +72,7 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
         labels: fixture!("labels_page.json"),
         issues: [issue_payload, pull_issue],
         comments: %{3 => fixture!("comments_page.json")},
-        pulls: [align_pull_payload(fixture!("pull_same_repo.json"), head_sha, base_sha), cross]
+        pulls: [pull, cross]
       )
 
     assert :ok =
@@ -70,27 +85,277 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
                    report.classification == "pull_candidate" and report.source_object_id == ^7
            )
 
+    assert_receive {:request, "/repos/octocat/Hello-World/issues/7"}
+
+    pull_mapping =
+      Repo.get_by!(ObjectMapping,
+        repository_item_id: item.id,
+        object_kind: "pull_request",
+        github_object_id: pull["id"]
+      )
+
+    expected_snapshot = %{
+      "title" => "Same repo pull",
+      "body" => long_body,
+      "state" => "closed",
+      "state_reason" => "completed",
+      "draft" => false,
+      "head_ref" => "refs/heads/feature",
+      "head_sha" => head_sha,
+      "base_ref" => "refs/heads/main",
+      "base_sha" => base_sha
+    }
+
+    {:ok, snapshot_fingerprint} = ForgeMirrors.resource_fingerprint(expected_snapshot)
+
+    expected_issue_snapshot = %{
+      "title" => "Same repo pull",
+      "body" => long_body,
+      "state" => "closed",
+      "state_reason" => "completed",
+      "label_github_ids" => [208_045_946],
+      "assignee_github_ids" => [583_231]
+    }
+
+    {:ok, issue_snapshot_fingerprint} =
+      ForgeMirrors.resource_fingerprint(expected_issue_snapshot)
+
+    assert pull_mapping.source_evidence == %{
+             "v" => 1,
+             "github_pull_object_id" => pull["id"],
+             "github_pull_node_id" => "PR_kwDOPull701",
+             "github_issue_object_id" => 302,
+             "github_issue_node_id" => "I_kwDOIssue302",
+             "github_number" => 7,
+             "head_repository" => %{"id" => 1_296_269, "node_id" => "R_repo"},
+             "base_repository" => %{"id" => 1_296_269, "node_id" => "R_repo"},
+             "snapshot_fingerprint" => snapshot_fingerprint,
+             "issue_snapshot_fingerprint" => issue_snapshot_fingerprint,
+             "remote_updated_at" => "2025-02-03T00:00:00Z",
+             "merge_state" => %{
+               "merged_at" => "2025-02-03T00:00:00Z",
+               "merge_commit_sha" => pull["merge_commit_sha"]
+             },
+             "imported_local_version" => 1
+           }
+
+    assert {2, _} =
+             Repo.delete_all(
+               from checkpoint in ForgeImports.PageCheckpoint,
+                 where:
+                   checkpoint.repository_item_id == ^item.id and
+                     checkpoint.resource_kind == "pull_requests"
+             )
+
+    assert :ok =
+             MetadataImporter.stage_phase(item, :pull_requests, importer_opts(stub, item))
+
+    assert Repo.get!(ObjectMapping, pull_mapping.id).source_evidence ==
+             pull_mapping.source_evidence
+
+    tampered =
+      pull_mapping.source_evidence
+      |> put_in(["github_pull_node_id"], "PR_wrong")
+
+    pull_mapping
+    |> Ecto.Changeset.change(source_evidence: tampered)
+    |> Repo.update!()
+
+    assert {2, _} =
+             Repo.delete_all(
+               from checkpoint in ForgeImports.PageCheckpoint,
+                 where:
+                   checkpoint.repository_item_id == ^item.id and
+                     checkpoint.resource_kind == "pull_requests"
+             )
+
+    assert {:error, :pull_baseline_requires_refetch} =
+             MetadataImporter.stage_phase(item, :pull_requests, importer_opts(stub, item))
+
+    Repo.get!(ObjectMapping, pull_mapping.id)
+    |> Ecto.Changeset.change(source_evidence: pull_mapping.source_evidence)
+    |> Repo.update!()
+
+    assert :ok =
+             MetadataImporter.stage_phase(item, :pull_requests, importer_opts(stub, item))
+
     ready_item = mark_ready_to_publish!(item)
     attempt_fixture(ready_item)
+    repository_mirror = bootstrap_mirror_fixture!(actor, organization, run, ready_item)
 
-    assert {:ok, %{repository: published, replaced: nil}} =
+    assert {1, _} =
+             Repo.update_all(
+               from(mirror in RepositoryMirror, where: mirror.id == ^repository_mirror.id),
+               set: [github_node_id: "R_contradictory"]
+             )
+
+    assert {:error, :persistence_unavailable} =
              ForgeImports.publish_repository(actor, ready_item.id, %{
-               "request_id" => "metadata-integration-publish",
+               "request_id" => "metadata-integration-contradictory-node",
                "user_agent" => "metadata-integration-test",
                "ip_address" => "127.0.0.1"
              })
 
+    assert %RepositoryMirror{github_node_id: "R_contradictory"} =
+             Repo.get!(RepositoryMirror, repository_mirror.id)
+
+    assert {1, _} =
+             Repo.update_all(
+               from(mirror in RepositoryMirror, where: mirror.id == ^repository_mirror.id),
+               set: [github_node_id: "R_repo"]
+             )
+
+    assert {1, _} =
+             Repo.update_all(
+               from(candidate in RepositoryItem, where: candidate.id == ^ready_item.id),
+               set: [
+                 lease_expires_at: DateTime.add(DateTime.utc_now(:second), -1),
+                 next_attempt_at: nil
+               ]
+             )
+
+    assert {:ok, _operation} =
+             ForgeMirrors.enqueue_operation(%{
+               organization_mirror_id: repository_mirror.organization_mirror_id,
+               repository_mirror_id: repository_mirror.id,
+               kind: "sync.issue_comment",
+               dedupe_key: "bootstrap-pr-comment:#{pull_mapping.id}",
+               cursor: %{
+                 "trigger" => "remote",
+                 "resource_kind" => "issue_comment",
+                 "issue_kind" => "pull_request",
+                 "github_object_id" => 900_001,
+                 "github_issue_id" => 302,
+                 "github_number" => 7
+               },
+               next_attempt_at: @now
+             })
+
+    assert {:ok, %{repository: published, replaced: nil}} =
+             ForgeImports.RepositoryPublisher.recover(ready_item.id)
+
     assert published.id == shadow.id
     assert Repo.get!(RepositoryItem, ready_item.id).state in [:published, :completed, :publishing]
 
-    published_repo = ForgeRepos.get_repository(actor.username, ready_item.destination_slug)
+    published_repo = ForgeRepos.get_repository(organization.username, ready_item.destination_slug)
     assert published_repo.id == shadow.id
+
+    assert %RepositoryMirror{
+             repository_id: published_repository_id,
+             github_node_id: "R_repo"
+           } = Repo.get!(RepositoryMirror, repository_mirror.id)
+
+    assert published_repository_id == published_repo.id
 
     assert %Issue{number: 3, inserted_at: ~U[2025-01-01 00:00:00Z]} =
              Repo.get_by!(Issue, repository_id: shadow.id, number: 3)
 
     assert %Issue{number: 7, kind: :pull_request} =
+             pull_issue =
              Repo.get_by!(Issue, repository_id: shadow.id, number: 7)
+
+    pull = Repo.get_by!(ForgePulls.PullRequest, issue_id: pull_issue.id)
+
+    assert %MirrorResourceState{
+             resource_kind: :pull,
+             local_resource_id: pull_id,
+             github_object_id: 701,
+             github_node_id: "PR_kwDOPull701",
+             github_number: 7,
+             confirmed_local_version: pull_version,
+             confirmed_remote_updated_at: ~U[2025-02-03 00:00:00Z],
+             confirmed_fingerprint: ^snapshot_fingerprint,
+             confirmed_snapshot: confirmed_snapshot,
+             confirmed_merge_state: %{
+               "merged_at" => "2025-02-03T00:00:00Z",
+               "merge_commit_sha" => merge_commit_sha
+             },
+             provider_identity: %{
+               "github_issue_object_id" => 302,
+               "github_issue_node_id" => "I_kwDOIssue302",
+               "github_number" => 7,
+               "head_repository" => %{"id" => 1_296_269, "node_id" => "R_repo"},
+               "base_repository" => %{"id" => 1_296_269, "node_id" => "R_repo"}
+             },
+             state: :confirmed
+           } =
+             Repo.get_by!(MirrorResourceState,
+               repository_mirror_id: repository_mirror.id,
+               resource_kind: :pull
+             )
+
+    assert pull_id == pull.id
+    assert pull_version == pull_issue.sync_version
+    assert confirmed_snapshot == expected_snapshot
+    assert merge_commit_sha == pull.merge_commit_sha
+
+    assert %MirrorResourceState{
+             resource_kind: :issue,
+             local_resource_id: parent_issue_id,
+             github_object_id: 302,
+             github_node_id: "I_kwDOIssue302",
+             github_number: 7,
+             confirmed_local_version: ^pull_version,
+             confirmed_snapshot: %{
+               "title" => "Same repo pull",
+               "body" => ^long_body,
+               "state" => "closed",
+               "state_reason" => "completed",
+               "label_github_ids" => [208_045_946],
+               "assignee_github_ids" => [583_231]
+             },
+             state: :confirmed
+           } =
+             Repo.get_by!(MirrorResourceState,
+               repository_mirror_id: repository_mirror.id,
+               resource_kind: :issue,
+               local_resource_id: pull_issue.id
+             )
+
+    assert parent_issue_id == pull_issue.id
+
+    assert Repo.aggregate(
+             from(relation in ForgeIssues.IssueLabel,
+               where: relation.issue_id == ^pull_issue.id
+             ),
+             :count
+           ) == 1
+
+    assert Repo.aggregate(
+             from(relation in ForgeIssues.IssueAssignee,
+               where: relation.issue_id == ^pull_issue.id
+             ),
+             :count
+           ) == 1
+
+    assert {:ok, _catching_up} =
+             repository_mirror.organization_mirror_id
+             |> then(&Repo.get!(ForgeMirrors.OrganizationMirror, &1))
+             |> then(&ForgeMirrors.transition_organization_mirror(actor, &1, :catching_up))
+
+    assert {:ok, _active_repository_mirror} =
+             repository_mirror
+             |> then(&Repo.get!(RepositoryMirror, &1.id))
+             |> then(&ForgeMirrors.transition_repository_mirror(actor, &1, :active))
+
+    claim_now = DateTime.utc_now(:second)
+
+    assert {:ok, [claimed]} =
+             ForgeMirrors.claim_operations(
+               "bootstrap-pr-comment-context",
+               claim_now,
+               60,
+               1,
+               ["sync.issue_comment"]
+             )
+
+    assert {:ok,
+            %{
+              resource_kind: :issue_comment,
+              parent_issue_id: ^parent_issue_id,
+              github_issue_id: 302,
+              github_number: 7
+            }} = ForgeMirrors.resource_operation_context(claimed)
 
     refute Repo.exists?(
              from issue in Issue,
@@ -175,7 +440,7 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
         },
         source_observed_at: @now,
         selected: true,
-        destination_owner_id: run.actor_user_id,
+        destination_owner_id: run.destination_organization_id || run.actor_user_id,
         destination_slug: slug,
         destination_visibility: :private,
         state: :queued,
@@ -186,10 +451,14 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
 
     {:ok, %{shadow: shadow}} =
       Multi.new()
-      |> ForgeRepos.create_import_shadow(:shadow, run.actor_user_id, %{
-        item_id: item.id,
-        generation: 1
-      })
+      |> ForgeRepos.create_import_shadow(
+        :shadow,
+        run.destination_organization_id || run.actor_user_id,
+        %{
+          item_id: item.id,
+          generation: 1
+        }
+      )
       |> Repo.transaction()
 
     staged_path = staged_repo_path!(shadow)
@@ -243,6 +512,11 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
           number = conn.request_path |> String.split("/") |> Enum.at(5) |> String.to_integer()
           Req.Test.json(conn, Map.get(comments, number, []))
 
+        String.contains?(conn.request_path, "/issues/") ->
+          number = conn.request_path |> String.split("/") |> List.last() |> String.to_integer()
+          payload = Enum.find(issues, &(&1["number"] == number))
+          if payload, do: Req.Test.json(conn, payload), else: Plug.Conn.send_resp(conn, 404, "{}")
+
         String.contains?(conn.request_path, "/pulls/") ->
           number = conn.request_path |> String.split("/") |> List.last() |> String.to_integer()
           payload = Enum.find(pulls, &(&1["number"] == number))
@@ -256,12 +530,39 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
     stub
   end
 
-  defp stub_client!(responses), do: stub_client!(stub_name(), responses)
-
   defp align_pull_payload(payload, head_sha, base_sha) do
     payload
     |> put_in(["head", "sha"], head_sha)
     |> put_in(["base", "sha"], base_sha)
+  end
+
+  defp authenticated_pull_identity(pull) do
+    pull
+    |> Map.put("node_id", "PR_kwDOPull701")
+    |> put_in(["head", "repo", "node_id"], "R_repo")
+    |> put_in(["head", "repo", "full_name"], "octocat/Hello-World")
+    |> put_in(["base", "repo", "node_id"], "R_repo")
+    |> put_in(["base", "repo", "full_name"], "octocat/Hello-World")
+  end
+
+  defp pull_issue_payload(pull, issue_id, issue_node_id) do
+    fixture!("issues_page.json")
+    |> hd()
+    |> Map.merge(%{
+      "id" => issue_id,
+      "node_id" => issue_node_id,
+      "number" => pull["number"],
+      "title" => pull["title"],
+      "body" => pull["body"],
+      "state" => pull["state"],
+      "state_reason" => "completed",
+      "created_at" => pull["created_at"],
+      "updated_at" => pull["updated_at"],
+      "closed_at" => pull["merged_at"],
+      "pull_request" => %{
+        "url" => "https://api.github.com/repos/octocat/Hello-World/pulls/#{pull["number"]}"
+      }
+    })
   end
 
   defp client_opts(stub) do
@@ -300,7 +601,7 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
       System.cmd("git", ["--git-dir=#{path}", "update-ref", ref, oid], stderr_to_stdout: true)
   end
 
-  defp running_run_fixture(actor, identity) do
+  defp running_run_fixture(actor, identity, owner) do
     run =
       %{
         actor_user_id: actor.id,
@@ -312,7 +613,8 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
         source_repository_github_id: 1_296_269,
         source_repository_full_name: "octocat/Hello-World",
         destination_organization_action: :existing,
-        destination_organization_slug: actor.username,
+        destination_organization_slug: owner.username,
+        destination_organization_id: if(owner.id == actor.id, do: nil, else: owner.id),
         destination_organization_status: :clean,
         state: :running,
         selected_count: 1,
@@ -332,6 +634,60 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
 
     ForgeImports.attach_one_time_credential(actor, run, envelope, @keyring) |> unwrap!()
     run
+  end
+
+  defp bootstrap_mirror_fixture!(actor, organization, run, item) do
+    installation_id = 8_400_000_000 + System.unique_integer([:positive])
+
+    pending =
+      ForgeMirrors.create_organization_mirror(actor, %{
+        organization_id: organization.id,
+        provider: "github",
+        github_installation_id: installation_id,
+        github_account_id: run.source_owner_github_id,
+        github_account_login: run.source_owner_login
+      })
+      |> unwrap!()
+
+    ready =
+      ForgeMirrors.transition_organization_mirror(actor, pending, :ready_to_bootstrap)
+      |> unwrap!()
+
+    configured =
+      ForgeMirrors.update_organization_mirror(actor, ready, %{
+        bootstrap_import_run_id: run.id,
+        capabilities: %{"git" => "enabled", "issues" => "enabled", "pulls" => "enabled"}
+      })
+      |> unwrap!()
+
+    mirror =
+      ForgeMirrors.transition_organization_mirror(actor, configured, :bootstrapping)
+      |> unwrap!()
+
+    {:ok, _installation} =
+      ForgeMirrors.observe_github_app_installation(%{
+        github_installation_id: installation_id,
+        github_account_id: run.source_owner_github_id,
+        github_account_login: run.source_owner_login,
+        account_type: :organization,
+        repository_selection: :all,
+        permissions: %{
+          "contents" => "write",
+          "issues" => "write",
+          "metadata" => "read",
+          "pull_requests" => "write"
+        },
+        state: :active,
+        last_verified_at: @now
+      })
+
+    ForgeMirrors.bind_repository(actor, %{
+      organization_mirror_id: mirror.id,
+      github_repository_id: item.github_repository_id,
+      github_node_id: "R_repo",
+      github_full_name: item.source_full_name
+    })
+    |> unwrap!()
   end
 
   defp user_fixture(prefix) do

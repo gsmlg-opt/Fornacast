@@ -10,8 +10,9 @@ defmodule ForgeImports.GitHub.MetadataImporter do
   alias ForgeImports.GitHub.MetadataMapper
   alias ForgeImports.{ObjectMapping, PageCheckpoint, Persistence, ReportEntry, RepositoryItem}
   alias ForgeIssues
-  alias ForgeIssues.{Issue, Label}
+  alias ForgeIssues.{Issue, IssueAssignee, IssueLabel, Label}
   alias ForgePulls
+  alias ForgePulls.PullRequest
   alias ForgeRepos.Repository
   alias Fornacast.Repo
   alias GitCore
@@ -473,13 +474,17 @@ defmodule ForgeImports.GitHub.MetadataImporter do
 
   defp import_pull(item, repository, number, page_key, staged_refs, opts) do
     with {:ok, {owner, repo}} <- source_parts(item),
-         {:ok, payload} <- fetch_pull(item, owner, repo, number, opts) do
+         {:ok, issue_id} <- candidate_issue_id(item, number),
+         {:ok, {payload, issue_payload}} <- fetch_pull(item, owner, repo, number, opts) do
       now = observed_at(item)
 
-      case MetadataMapper.pull(payload, item.github_repository_id, staged_refs: staged_refs) do
+      case MetadataMapper.pull_observation(payload, issue_payload, item.github_repository_id,
+             staged_refs: staged_refs,
+             source_full_name: item.source_full_name,
+             expected_issue_id: issue_id
+           ) do
         {:ok, mapped} ->
-          with true <- mapped.number == number,
-               {:ok, issue_id} <- candidate_issue_id(item, number) do
+          with true <- mapped.number == number do
             ForgeImports.GitHub.PullHeadBinding.with_binding(
               item,
               mapped,
@@ -493,9 +498,9 @@ defmodule ForgeImports.GitHub.MetadataImporter do
                     item,
                     repository,
                     Map.merge(mapped, %{
-                      github_issue_id: issue_id,
                       head_repository_id: head_repository_id
                     }),
+                    issue_payload,
                     now
                   )
                   |> Multi.run({:head_diagnostic, mapped.github_id}, fn _repo, _ ->
@@ -514,13 +519,15 @@ defmodule ForgeImports.GitHub.MetadataImporter do
             end
           else
             false -> {:error, :invalid_pull}
-            {:error, _} = error -> error
           end
 
         {:skip, code, details} ->
           commit_page(item, "pull_requests", page_key, 0, fn multi ->
             skip_pull(multi, item, number, code, details)
           end)
+
+        {:error, :pull_issue_identity_mismatch} = error ->
+          error
 
         {:error, _} ->
           {:error, :invalid_pull}
@@ -549,7 +556,12 @@ defmodule ForgeImports.GitHub.MetadataImporter do
   defp fetch_pull(_item, owner, repo, number, opts),
     do:
       checkout_fetch(opts, fn credential, metadata ->
-        Client.pull_request(credential, owner, repo, number, client_opts(opts, metadata))
+        options = client_opts(opts, metadata)
+
+        with {:ok, pull} <- Client.pull_request(credential, owner, repo, number, options),
+             {:ok, issue} <- Client.repository_issue(credential, owner, repo, number, options) do
+          {:ok, {pull, issue}}
+        end
       end)
 
   defp checkout_fetch(opts, callback) do
@@ -648,11 +660,13 @@ defmodule ForgeImports.GitHub.MetadataImporter do
     end
   end
 
-  defp import_pull_row(multi, item, repository, mapped, now) do
+  defp import_pull_row(multi, item, repository, mapped, issue_payload, now) do
     key = {:pull, mapped.number}
 
     if mapping_exists?(item.id, "pull_request", mapped.github_id) do
-      multi
+      Multi.run(multi, key, fn repo, _changes ->
+        validate_existing_pull_mapping(repo, item, repository, mapped)
+      end)
     else
       multi
       |> Multi.run(key, fn repo, _changes ->
@@ -689,6 +703,10 @@ defmodule ForgeImports.GitHub.MetadataImporter do
                  issue.id,
                  source_url(item, "pulls", mapped.number)
                ),
+             :ok <- import_assignees(repo, issue, issue_payload, now),
+             :ok <- import_labels(repo, issue, issue_payload, repository),
+             {:ok, source_evidence} <-
+               pull_source_evidence(repo, item, repository, issue, pull, mapped),
              {:ok, _} <-
                insert_mapping(
                  repo,
@@ -697,7 +715,8 @@ defmodule ForgeImports.GitHub.MetadataImporter do
                  mapped.github_id,
                  "ForgePulls.PullRequest",
                  pull.id,
-                 source_url(item, "pulls", mapped.number)
+                 source_url(item, "pulls", mapped.number),
+                 source_evidence
                ) do
           {:ok, issue}
         else
@@ -705,6 +724,158 @@ defmodule ForgeImports.GitHub.MetadataImporter do
         end
       end)
     end
+  end
+
+  defp validate_existing_pull_mapping(repo, item, repository, mapped) do
+    pull_mapping =
+      repo.one(
+        from mapping in ObjectMapping,
+          where:
+            mapping.repository_item_id == ^item.id and
+              mapping.object_kind == "pull_request" and
+              mapping.github_object_id == ^mapped.github_id,
+          lock: "FOR UPDATE"
+      )
+
+    with %ObjectMapping{} = pull_mapping <- pull_mapping,
+         %PullRequest{} = pull <-
+           repo.one(
+             from pull in PullRequest,
+               where: pull.id == ^pull_mapping.local_resource_id,
+               lock: "FOR UPDATE"
+           ),
+         %Issue{} = issue <-
+           repo.one(from issue in Issue, where: issue.id == ^pull.issue_id, lock: "FOR UPDATE"),
+         %ObjectMapping{} = issue_mapping <-
+           repo.one(
+             from mapping in ObjectMapping,
+               where:
+                 mapping.repository_item_id == ^item.id and mapping.object_kind == "issue" and
+                   mapping.github_object_id == ^mapped.github_issue_id and
+                   mapping.local_resource_id == ^issue.id,
+               lock: "FOR UPDATE"
+           ),
+         true <-
+           pull.repository_id == repository.id and issue.repository_id == repository.id and
+             issue.kind == :pull_request and issue.number == mapped.number and
+             issue_mapping.local_resource_type == "ForgeIssues.Issue" and
+             pull_mapping.local_resource_type == "ForgePulls.PullRequest",
+         {:ok, expected_evidence} <-
+           pull_source_evidence(repo, item, repository, issue, pull, mapped),
+         true <- pull_mapping.source_evidence == expected_evidence do
+      {:ok, issue}
+    else
+      _invalid -> {:error, :pull_baseline_requires_refetch}
+    end
+  end
+
+  defp pull_source_evidence(repo, item, repository, issue, pull, mapped) do
+    projection = %{
+      repository_id: repository.id,
+      resource_kind: :pull,
+      local_resource_id: pull.id,
+      local_resource_type: "ForgePulls.PullRequest",
+      local_version: issue.sync_version,
+      issue_id: issue.id,
+      issue_number: issue.number,
+      head_repository_id: pull.head_repository_id,
+      merge_state: Map.take(pull, [:merged_at, :merge_commit_sha]),
+      fields: %{
+        "title" => issue.title,
+        "body" => issue.body,
+        "state" => Atom.to_string(issue.state),
+        "state_reason" => if(issue.state_reason, do: Atom.to_string(issue.state_reason)),
+        "draft" => pull.draft,
+        "head_ref" => pull.head_ref,
+        "head_sha" => pull.head_sha,
+        "base_ref" => pull.base_ref,
+        "base_sha" => pull.base_sha
+      }
+    }
+
+    with {:ok, canonical} <- ForgeGitHub.PullSyncProjection.from_local(projection),
+         true <- canonical.snapshot == mapped.snapshot,
+         true <- persisted_merge_state(canonical.merge_state) == mapped.merge_state,
+         {:ok, fingerprint} <- ForgeMirrors.resource_fingerprint(canonical.snapshot),
+         {:ok, issue_snapshot} <- pull_issue_source_snapshot(repo, item, issue),
+         true <- issue_snapshot == mapped.issue_snapshot,
+         {:ok, issue_fingerprint} <- ForgeMirrors.resource_fingerprint(issue_snapshot) do
+      {:ok,
+       %{
+         "v" => 1,
+         "github_pull_object_id" => mapped.github_id,
+         "github_pull_node_id" => mapped.github_node_id,
+         "github_issue_object_id" => mapped.github_issue_id,
+         "github_issue_node_id" => mapped.github_issue_node_id,
+         "github_number" => mapped.number,
+         "head_repository" => mapped.provider_identity["head_repository"],
+         "base_repository" => mapped.provider_identity["base_repository"],
+         "snapshot_fingerprint" => fingerprint,
+         "issue_snapshot_fingerprint" => issue_fingerprint,
+         "remote_updated_at" => DateTime.to_iso8601(mapped.remote_updated_at),
+         "merge_state" => mapped.merge_state,
+         "imported_local_version" => canonical.local_version
+       }}
+    else
+      _invalid -> {:error, :pull_baseline_requires_refetch}
+    end
+  end
+
+  defp pull_issue_source_snapshot(repo, item, issue) do
+    label_ids =
+      repo.all(
+        from relation in IssueLabel,
+          left_join: mapping in ObjectMapping,
+          on:
+            mapping.repository_item_id == ^item.id and mapping.object_kind == "label" and
+              mapping.local_resource_type == "ForgeIssues.Label" and
+              mapping.local_resource_id == relation.label_id,
+          where: relation.issue_id == ^issue.id,
+          select: mapping.github_object_id
+      )
+
+    assignee_ids =
+      repo.all(
+        from relation in IssueAssignee,
+          left_join: identity in GitHubIdentity,
+          on: identity.id == relation.github_identity_id and identity.kind == :user,
+          where: relation.issue_id == ^issue.id,
+          select: identity.github_user_id
+      )
+
+    with {:ok, label_ids} <- canonical_provider_ids(label_ids),
+         {:ok, assignee_ids} <- canonical_provider_ids(assignee_ids) do
+      {:ok,
+       %{
+         "title" => issue.title,
+         "body" => issue.body,
+         "state" => Atom.to_string(issue.state),
+         "state_reason" => if(issue.state_reason, do: Atom.to_string(issue.state_reason)),
+         "label_github_ids" => label_ids,
+         "assignee_github_ids" => assignee_ids
+       }}
+    end
+  end
+
+  defp canonical_provider_ids(ids) when is_list(ids) and length(ids) <= 512 do
+    ids = Enum.sort(ids)
+
+    if Enum.all?(ids, &(is_integer(&1) and &1 > 0)) and length(ids) == length(Enum.uniq(ids)),
+      do: {:ok, ids},
+      else: {:error, :pull_baseline_requires_refetch}
+  end
+
+  defp canonical_provider_ids(_ids), do: {:error, :pull_baseline_requires_refetch}
+
+  defp persisted_merge_state(merge_state) do
+    %{
+      "merged_at" =>
+        case merge_state.merged_at do
+          %DateTime{} = at -> DateTime.to_iso8601(at)
+          nil -> nil
+        end,
+      "merge_commit_sha" => merge_state.merge_commit_sha
+    }
   end
 
   defp insert_imported_issue(_repo, repository, identity, mapped) do
@@ -1040,7 +1211,16 @@ defmodule ForgeImports.GitHub.MetadataImporter do
     end
   end
 
-  defp insert_mapping(repo, item, kind, github_object_id, local_type, local_id, source_url \\ nil) do
+  defp insert_mapping(
+         repo,
+         item,
+         kind,
+         github_object_id,
+         local_type,
+         local_id,
+         source_url \\ nil,
+         source_evidence \\ nil
+       ) do
     %ObjectMapping{}
     |> ObjectMapping.create_changeset(%{
       repository_item_id: item.id,
@@ -1050,7 +1230,8 @@ defmodule ForgeImports.GitHub.MetadataImporter do
       github_object_id: github_object_id,
       local_resource_type: local_type,
       local_resource_id: local_id,
-      source_url: source_url
+      source_url: source_url,
+      source_evidence: source_evidence
     })
     |> repo.insert()
   end

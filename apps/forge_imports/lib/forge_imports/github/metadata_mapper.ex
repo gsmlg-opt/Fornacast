@@ -100,11 +100,50 @@ defmodule ForgeImports.GitHub.MetadataMapper do
 
   def pull(_payload, _source_repository_id, _opts), do: {:error, :invalid_pull}
 
+  @spec pull_observation(term(), term(), pos_integer(), keyword()) ::
+          {:ok, map()}
+          | {:skip, atom(), map()}
+          | {:error, :invalid_pull | :pull_issue_identity_mismatch}
+  def pull_observation(pull, issue, source_repository_id, opts \\ [])
+
+  def pull_observation(%{} = pull, %{} = issue, source_repository_id, opts)
+      when is_integer(source_repository_id) and is_list(opts) do
+    with {:ok, expected_issue_id} <- expected_issue_id(opts),
+         {:ok, source_full_name} <- source_full_name(opts),
+         {:ok, mapped} <- pull(pull, source_repository_id, opts),
+         {:ok, identity} <-
+           pull_issue_identity(
+             pull,
+             issue,
+             mapped,
+             expected_issue_id,
+             source_repository_id,
+             source_full_name
+           ) do
+      {:ok,
+       mapped
+       |> Map.merge(identity)
+       |> Map.put(:title, identity.issue_title)
+       |> Map.put(:body, identity.issue_body)
+       |> Map.put(:state, identity.issue_state)
+       |> Map.put(:state_reason, identity.issue_state_reason)
+       |> Map.put(:updated_at, identity.remote_updated_at)
+       |> Map.drop([:issue_title, :issue_body, :issue_state, :issue_state_reason])}
+    else
+      {:skip, _, _} = skipped -> skipped
+      {:error, :invalid_pull} = error -> error
+      _invalid -> {:error, :pull_issue_identity_mismatch}
+    end
+  end
+
+  def pull_observation(_pull, _issue, _source_repository_id, _opts),
+    do: {:error, :invalid_pull}
+
   defp map_issue(payload) do
     with {:ok, github_id} <- User.id(payload["id"]),
          {:ok, number} <- User.id(payload["number"]),
          {:ok, title} <- User.string(payload["title"], 256, required?: true),
-         {:ok, body} <- User.string(payload["body"], 65_536),
+         {:ok, body} <- issue_body(payload["body"]),
          {:ok, state} <- issue_state(payload["state"]),
          {:ok, state_reason} <- issue_state_reason(payload, state),
          {:ok, inserted_at} <- User.datetime(payload["created_at"]),
@@ -137,7 +176,7 @@ defmodule ForgeImports.GitHub.MetadataMapper do
          {:ok, head_node_id} <- User.string(get_in(payload, ["head", "repo", "node_id"]), 255),
          {:ok, number} <- User.id(payload["number"]),
          {:ok, title} <- User.string(payload["title"], 256, required?: true),
-         {:ok, body} <- User.string(payload["body"], 65_536),
+         {:ok, body} <- issue_body(payload["body"]),
          {:ok, state} <- issue_state(payload["state"]),
          {:ok, inserted_at} <- User.datetime(payload["created_at"]),
          {:ok, updated_at} <- User.datetime(payload["updated_at"]),
@@ -173,6 +212,189 @@ defmodule ForgeImports.GitHub.MetadataMapper do
       _ -> {:error, :invalid_pull}
     end
   end
+
+  defp pull_issue_identity(
+         pull,
+         issue,
+         mapped,
+         expected_issue_id,
+         source_repository_id,
+         source_full_name
+       ) do
+    expected_url =
+      "https://api.github.com/repos/#{source_full_name}/pulls/#{mapped.number}"
+
+    with {:ok, pull_node_id} <- User.string(pull["node_id"], 255, required?: true),
+         {:ok, issue_id} <- User.id(issue["id"]),
+         true <- issue_id == expected_issue_id,
+         {:ok, issue_node_id} <- User.string(issue["node_id"], 255, required?: true),
+         {:ok, issue_number} <- User.id(issue["number"]),
+         true <- issue_number == mapped.number,
+         true <- get_in(issue, ["pull_request", "url"]) == expected_url,
+         {:ok, issue_title} <- User.string(issue["title"], 256, required?: true),
+         {:ok, issue_body} <- issue_body(issue["body"]),
+         {:ok, issue_state} <- issue_state(issue["state"]),
+         {:ok, issue_state_reason} <- issue_state_reason(issue, issue_state),
+         {:ok, label_github_ids} <- relationship_ids(issue["labels"]),
+         {:ok, assignee_github_ids} <- relationship_ids(issue["assignees"]),
+         true <-
+           issue_title == mapped.title and
+             normalize_body(issue_body) == normalize_body(mapped.body) and
+             issue_state == mapped.state,
+         {:ok, %DateTime{} = remote_updated_at} <- User.datetime(issue["updated_at"]),
+         {:ok, head_repository} <- repository_identity(pull["head"]),
+         {:ok, base_repository} <- repository_identity(pull["base"]),
+         true <- base_repository.id == source_repository_id,
+         true <- base_repository.full_name == source_full_name,
+         true <- consistent_repository_identities?(head_repository, base_repository) do
+      issue_body = normalize_body(issue_body)
+      issue_state_reason = if(issue_state_reason, do: Atom.to_string(issue_state_reason))
+
+      snapshot = %{
+        "title" => issue_title,
+        "body" => issue_body,
+        "state" => Atom.to_string(issue_state),
+        "state_reason" => issue_state_reason,
+        "draft" => mapped.draft,
+        "head_ref" => mapped.head_ref,
+        "head_sha" => mapped.head_sha,
+        "base_ref" => mapped.base_ref,
+        "base_sha" => mapped.base_sha
+      }
+
+      issue_snapshot = %{
+        "title" => issue_title,
+        "body" => issue_body,
+        "state" => Atom.to_string(issue_state),
+        "state_reason" => issue_state_reason,
+        "label_github_ids" => label_github_ids,
+        "assignee_github_ids" => assignee_github_ids
+      }
+
+      merge_state = %{
+        "merged_at" => datetime_value(mapped.merged_at),
+        "merge_commit_sha" => mapped.merge_commit_sha
+      }
+
+      provider_identity = %{
+        "github_issue_object_id" => issue_id,
+        "github_issue_node_id" => issue_node_id,
+        "github_number" => issue_number,
+        "head_repository" => Map.take(head_repository, [:id, :node_id]) |> stringify_keys(),
+        "base_repository" => Map.take(base_repository, [:id, :node_id]) |> stringify_keys()
+      }
+
+      {:ok,
+       %{
+         github_node_id: pull_node_id,
+         github_issue_id: issue_id,
+         github_issue_node_id: issue_node_id,
+         issue_title: issue_title,
+         issue_body: issue_body,
+         issue_state: issue_state,
+         issue_state_reason: issue_state_reason,
+         remote_updated_at: remote_updated_at,
+         snapshot: snapshot,
+         issue_snapshot: issue_snapshot,
+         merge_state: merge_state,
+         provider_identity: provider_identity,
+         base_github_repository_id: base_repository.id,
+         base_github_node_id: base_repository.node_id
+       }}
+    else
+      _invalid -> {:error, :pull_issue_identity_mismatch}
+    end
+  end
+
+  defp repository_identity(%{
+         "repo" => %{"id" => id, "node_id" => node_id, "full_name" => full_name}
+       }) do
+    with {:ok, id} <- User.id(id),
+         {:ok, node_id} <- User.string(node_id, 255, required?: true),
+         {:ok, full_name} <- User.string(full_name, 255, required?: true),
+         [owner, repository] <- String.split(full_name, "/", parts: 2),
+         true <- valid_repository_part?(owner) and valid_repository_part?(repository) do
+      {:ok, %{id: id, node_id: node_id, full_name: full_name}}
+    else
+      _invalid -> {:error, :invalid_repository_identity}
+    end
+  end
+
+  defp repository_identity(_side), do: {:error, :invalid_repository_identity}
+
+  defp consistent_repository_identities?(%{id: id} = head, %{id: id} = base),
+    do: head.node_id == base.node_id and head.full_name == base.full_name
+
+  defp consistent_repository_identities?(_head, _base), do: true
+
+  defp relationship_ids(values) when is_list(values) and length(values) <= 512 do
+    values
+    |> Enum.reduce_while({:ok, []}, fn
+      %{"id" => id}, {:ok, ids} ->
+        case User.id(id) do
+          {:ok, id} -> {:cont, {:ok, [id | ids]}}
+          _invalid -> {:halt, {:error, :invalid_relationships}}
+        end
+
+      _invalid, _acc ->
+        {:halt, {:error, :invalid_relationships}}
+    end)
+    |> case do
+      {:ok, ids} ->
+        ids = Enum.sort(ids)
+
+        if length(ids) == length(Enum.uniq(ids)),
+          do: {:ok, ids},
+          else: {:error, :invalid_relationships}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp relationship_ids(_values), do: {:error, :invalid_relationships}
+
+  defp expected_issue_id(opts) do
+    opts
+    |> Keyword.get(:expected_issue_id)
+    |> User.id()
+  end
+
+  defp source_full_name(opts) do
+    with value when is_binary(value) <- Keyword.get(opts, :source_full_name),
+         [owner, repository] <- String.split(value, "/", parts: 2),
+         true <- valid_repository_part?(owner) and valid_repository_part?(repository) do
+      {:ok, value}
+    else
+      _invalid -> {:error, :invalid_source_repository}
+    end
+  end
+
+  defp valid_repository_part?(value) do
+    value != "" and byte_size(value) <= 100 and
+      String.match?(value, ~r/^[A-Za-z0-9_.-]+$/)
+  end
+
+  defp stringify_keys(map),
+    do: Map.new(map, fn {key, value} -> {Atom.to_string(key), value} end)
+
+  defp normalize_body(nil), do: nil
+  defp normalize_body(""), do: nil
+  defp normalize_body(body), do: body
+
+  defp issue_body(nil), do: {:ok, nil}
+
+  defp issue_body(value) when is_binary(value) do
+    if String.valid?(value) and byte_size(value) <= 262_144 and
+         :binary.match(value, <<0>>) == :nomatch and length(String.codepoints(value)) <= 65_536,
+       do: {:ok, value},
+       else: :error
+  end
+
+  defp issue_body(_value), do: :error
+
+  defp datetime_value(nil), do: nil
+  defp datetime_value(%DateTime{} = value), do: DateTime.to_iso8601(value)
 
   defp classify_pull_shape(payload, source_repository_id) do
     with {:ok, _} <- User.boolean(payload["draft"]),
