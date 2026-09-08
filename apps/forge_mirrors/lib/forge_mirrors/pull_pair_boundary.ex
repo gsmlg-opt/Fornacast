@@ -109,7 +109,9 @@ defmodule ForgeMirrors.PullPairBoundary do
          {:ok, fresh} <- ForgeMirrors.mapped_pull_pair_context(operation),
          :ok <- same_pair(fresh, expected),
          mapping = Repo.get!(MirrorResourceState, sync.pair.issue.mapping_id),
-         true <- valid_issue_time?(confirmation[:issue_remote_updated_at], mapping),
+         true <- valid_observation_time?(confirmation[:issue_remote_updated_at], mapping),
+         pull_mapping = Repo.get!(MirrorResourceState, sync.pair.pull.mapping_id),
+         true <- valid_observation_time?(confirmation[:remote_updated_at], pull_mapping),
          {:ok, fingerprint} <- ForgeMirrors.resource_fingerprint(confirmation.issue_snapshot) do
       mapping
       |> MirrorResourceState.persistence_changeset(%{
@@ -164,12 +166,12 @@ defmodule ForgeMirrors.PullPairBoundary do
     end
   end
 
-  defp valid_issue_time?(%DateTime{utc_offset: 0, std_offset: 0} = time, mapping),
+  defp valid_observation_time?(%DateTime{utc_offset: 0, std_offset: 0} = time, mapping),
     do:
       is_nil(mapping.confirmed_remote_updated_at) or
         DateTime.compare(time, mapping.confirmed_remote_updated_at) != :lt
 
-  defp valid_issue_time?(_, _), do: false
+  defp valid_observation_time?(_, _), do: false
 
   defp pair(sync) do
     # Existing context has acquired the organization operation lock. Acquire

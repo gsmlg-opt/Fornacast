@@ -24,6 +24,7 @@ defmodule ForgeMirrors.PullMetadataEffects do
            persisted = Repo.get!(MirrorOperation, operation.id),
            :ok <- previous(persisted, operation, payload),
            :ok <- valid_payload(payload, marker),
+           :ok <- observation_versions(sync.pair, marker),
            {:ok, local} <- local_projection(sync),
            {:ok, snapshot} <- local_issue(sync, local),
            true <- snapshot == payload["expected_local_issue"],
@@ -55,6 +56,7 @@ defmodule ForgeMirrors.PullMetadataEffects do
            true <- is_map(marker),
            {:ok, intent} <- intent(persisted, sync, marker),
            :ok <- same_tokens(sync.pair, marker),
+           :ok <- observation_versions(sync.pair, marker),
            {:ok, local} <- local_projection(sync),
            true <- local.local_version >= intent.local_version,
            :ok <- recovery_precondition(sync, local, marker),
@@ -242,6 +244,8 @@ defmodule ForgeMirrors.PullMetadataEffects do
           &issue?(payload[&1])
         ) and
         marker["action"] in ~w(update_remote_pull_issue set_remote_pull_draft) and
+        utc?(marker["expected_remote_updated_at"]) and
+        utc?(marker["expected_remote_issue_updated_at"]) and
         ((marker["action"] == "set_remote_pull_draft" and
             payload["expected_remote_issue"] == payload["target_issue"]) or
            (marker["action"] == "update_remote_pull_issue" and
@@ -249,6 +253,31 @@ defmodule ForgeMirrors.PullMetadataEffects do
         byte_size(JSON.encode!(payload)) <= 2_000_000
 
     if valid, do: :ok, else: {:error, :invalid_metadata_payload}
+  end
+
+  defp utc?(value) when is_binary(value) and byte_size(value) <= 40 do
+    case DateTime.from_iso8601(value) do
+      {:ok, time, 0} -> DateTime.to_iso8601(time) == value
+      _ -> false
+    end
+  end
+
+  defp utc?(_), do: false
+
+  defp observation_versions(pair, marker) do
+    valid =
+      Enum.all?(
+        [{:pull, "expected_remote_updated_at"}, {:issue, "expected_remote_issue_updated_at"}],
+        fn {kind, key} ->
+          mapping = Repo.get!(ForgeMirrors.MirrorResourceState, pair[kind].mapping_id)
+          {:ok, observed, 0} = DateTime.from_iso8601(marker[key])
+
+          is_nil(mapping.confirmed_remote_updated_at) or
+            DateTime.compare(observed, mapping.confirmed_remote_updated_at) != :lt
+        end
+      )
+
+    if valid, do: :ok, else: {:error, :stale_remote_observation}
   end
 
   defp issue?(value) when is_map(value) do

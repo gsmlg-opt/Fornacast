@@ -763,6 +763,121 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_snapshot == ctx.baseline
   end
 
+  test "restored issue values with a newer issue timestamp cannot replay a lost effect", ctx do
+    now = DateTime.utc_now(:second)
+    {operation, _, _} = relationship_fixture(ctx, now)
+
+    remote =
+      start_supervised!(
+        {Agent,
+         fn ->
+           %{
+             labels: [331, 333],
+             users: [441, 443],
+             patches: 0,
+             queries: 0,
+             body: ctx.baseline["body"]
+           }
+         end}
+      )
+
+    relationship_provider(ctx, remote, now, :lost_response)
+
+    opts =
+      options(ctx)
+      |> Keyword.delete(:remote_relationships)
+      |> Keyword.put(:relationship_client_options, transport_options(ctx, []))
+
+    assert {:ok, %{state: :effect_pending}} =
+             PullSyncWorker.process_operation(operation, now, opts)
+
+    assert Agent.get(remote, & &1.patches) == 1
+
+    Agent.update(
+      remote,
+      &Map.merge(&1, %{labels: [331, 333], users: [441, 443], issue_time: DateTime.add(now, 1)})
+    )
+
+    pending = Repo.get!(MirrorOperation, operation.id)
+
+    assert {:ok, _} =
+             PullSyncWorker.process_operation(
+               claim(operation.id, pending.next_attempt_at),
+               pending.next_attempt_at,
+               opts
+             )
+
+    assert Agent.get(remote, & &1.patches) == 1
+    assert Repo.get!(MirrorOperation, operation.id).state == :failed
+  end
+
+  test "restored paired values with newer issue time during GraphQL cannot start PATCH", ctx do
+    now = DateTime.utc_now(:second)
+    {operation, _, _} = relationship_fixture(ctx, now)
+
+    remote =
+      start_supervised!(
+        {Agent,
+         fn ->
+           %{
+             labels: [331, 333],
+             users: [441, 443],
+             patches: 0,
+             queries: 0,
+             body: ctx.baseline["body"]
+           }
+         end}
+      )
+
+    relationship_provider(ctx, remote, now, :aba)
+
+    opts =
+      options(ctx)
+      |> Keyword.delete(:remote_relationships)
+      |> Keyword.put(:relationship_client_options, transport_options(ctx, []))
+
+    assert {:ok, _} = PullSyncWorker.process_operation(operation, now, opts)
+    assert Agent.get(remote, & &1.patches) == 0
+    assert Repo.get!(MirrorOperation, operation.id).state == :failed
+  end
+
+  test "restored draft preimage with newer pull timestamp cannot replay conversion", ctx do
+    now = DateTime.utc_now(:second)
+    ctx.issue |> Ecto.Changeset.change(sync_version: 2) |> Repo.update!()
+    ctx.pull |> Ecto.Changeset.change(draft: true) |> Repo.update!()
+    operation = local_operation(ctx, 2, now)
+    remote = start_supervised!({Agent, fn -> %{draft: false, pull_time: now, writes: 0} end})
+
+    opts =
+      options(ctx,
+        get_pull: fn _, _, _, _, _ ->
+          value = Agent.get(remote, & &1)
+          {:ok, pull_json(Map.put(ctx.baseline, "draft", value.draft), value.pull_time)}
+        end,
+        get_pull_issue: fn _, _, _, _, _ -> {:ok, issue_json(ctx.baseline, now)} end,
+        set_draft: fn _, _, true, _ ->
+          Agent.update(remote, &%{&1 | draft: true, writes: &1.writes + 1})
+          {:error, Error.new(:transport)}
+        end
+      )
+
+    assert {:ok, %{state: :effect_pending}} =
+             PullSyncWorker.process_operation(operation, now, opts)
+
+    Agent.update(remote, &%{&1 | draft: false, pull_time: DateTime.add(now, 1)})
+    pending = Repo.get!(MirrorOperation, operation.id)
+
+    assert {:ok, _} =
+             PullSyncWorker.process_operation(
+               claim(operation.id, pending.next_attempt_at),
+               pending.next_attempt_at,
+               opts
+             )
+
+    assert Agent.get(remote, & &1.writes) == 1
+    assert Repo.get!(MirrorOperation, operation.id).state == :failed
+  end
+
   test "an exact effect target observed after relationship lookup confirms without PATCH", ctx do
     now = DateTime.utc_now(:second)
     {operation, _, _} = relationship_fixture(ctx, now)
@@ -867,7 +982,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
 
         {"GET", "/repos/acme/project/issues/7"} ->
           issue =
-            issue_json(snapshot, now)
+            issue_json(snapshot, Map.get(current, :issue_time, now))
             |> Map.put(
               "labels",
               Enum.map(
@@ -902,7 +1017,18 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
           end)
 
           if mode == :applied,
-            do: Agent.update(remote, &%{&1 | labels: [332, 333], users: [442, 443]})
+            do:
+              Agent.update(
+                remote,
+                &Map.merge(&1, %{
+                  labels: [332, 333],
+                  users: [442, 443],
+                  issue_time: DateTime.add(now, 1)
+                })
+              )
+
+          if mode == :aba,
+            do: Agent.update(remote, &Map.put(&1, :issue_time, DateTime.add(now, 1)))
 
           Req.Test.json(conn, %{
             "data" => %{

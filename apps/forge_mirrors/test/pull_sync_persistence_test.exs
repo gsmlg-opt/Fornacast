@@ -1157,7 +1157,10 @@ defmodule ForgeMirrors.PullSyncPersistenceTest do
       old
       |> Map.from_struct()
       |> Map.drop([:__meta__, :id, :inserted_at, :updated_at])
-      |> Map.put(:github_installation_id, System.unique_integer([:positive, :monotonic]))
+      |> Map.put(
+        :github_installation_id,
+        Repo.aggregate(ForgeMirrors.GitHubAppInstallation, :max, :github_installation_id) + 1
+      )
 
     Repo.insert!(struct(ForgeMirrors.GitHubAppInstallation, replacement))
 
@@ -1237,6 +1240,129 @@ defmodule ForgeMirrors.PullSyncPersistenceTest do
              )
   end
 
+  test "paired metadata admission requires canonical UTC timestamps for both provider observations",
+       c do
+    {expected, marker, payload, _} = metadata_effect(c)
+
+    for key <- ~w(expected_remote_issue_updated_at expected_remote_updated_at),
+        invalid <- [
+          nil,
+          "",
+          "not-a-time",
+          "2026-09-08T12:00:00+01:00",
+          "2026-09-08T12:00:00+00:00"
+        ] do
+      invalid_marker =
+        if is_nil(invalid), do: Map.delete(marker, key), else: Map.put(marker, key, invalid)
+
+      assert {:error, :invalid_metadata_payload} =
+               ForgeMirrors.mark_mapped_pull_effect(
+                 c.operation,
+                 c.now,
+                 expected.pair,
+                 invalid_marker,
+                 payload
+               )
+
+      assert Repo.aggregate(
+               from(i in ForgeMirrors.PullMetadataIntent,
+                 where: i.operation_id == ^c.operation.id
+               ),
+               :count
+             ) == 0
+
+      assert Repo.get!(ForgeMirrors.MirrorOperation, c.operation.id).state == :processing
+    end
+  end
+
+  test "paired metadata reload preserves distinct observation times and rejects missing persisted version",
+       c do
+    {expected, marker, payload, _} = metadata_effect(c)
+    issue_time = DateTime.to_iso8601(DateTime.add(c.now, -1))
+    marker = Map.put(marker, "expected_remote_issue_updated_at", issue_time)
+
+    assert {:ok, effect} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               payload
+             )
+
+    assert {:ok, recovered} = ForgeMirrors.mapped_pull_effect_context(effect.operation)
+    assert recovered.marker["expected_remote_issue_updated_at"] == issue_time
+    assert recovered.marker["expected_remote_updated_at"] == DateTime.to_iso8601(c.now)
+
+    for invalid_marker <- [
+          Map.delete(effect.marker, "expected_remote_issue_updated_at"),
+          Map.put(effect.marker, "expected_remote_updated_at", "invalid")
+        ] do
+      Repo.update_all(from(o in ForgeMirrors.MirrorOperation, where: o.id == ^c.operation.id),
+        set: [external_effect_marker: invalid_marker]
+      )
+
+      assert {:error, :invalid_metadata_intent} =
+               ForgeMirrors.mapped_pull_effect_context(%{
+                 effect.operation
+                 | external_effect_marker: invalid_marker
+               })
+    end
+  end
+
+  test "paired admission rejects an issue observation older than the confirmed baseline", c do
+    {expected, marker, payload, _} = metadata_effect(c)
+
+    Repo.update_all(
+      from(m in MirrorResourceState, where: m.id == ^expected.pair.issue.mapping_id),
+      set: [confirmed_remote_updated_at: c.now]
+    )
+
+    marker =
+      Map.put(
+        marker,
+        "expected_remote_issue_updated_at",
+        DateTime.to_iso8601(DateTime.add(c.now, -1))
+      )
+
+    assert {:error, :stale_remote_observation} =
+             ForgeMirrors.mark_mapped_pull_effect(
+               c.operation,
+               c.now,
+               expected.pair,
+               marker,
+               payload
+             )
+
+    assert Repo.aggregate(
+             from(i in ForgeMirrors.PullMetadataIntent, where: i.operation_id == ^c.operation.id),
+             :count
+           ) == 0
+  end
+
+  test "paired confirmation cannot regress the pull observation version independently of the issue",
+       c do
+    {_paired, _label, expected, result, request} = paired_confirmation(c)
+
+    Repo.update_all(from(m in MirrorResourceState, where: m.id == ^c.mapping.id),
+      set: [confirmed_remote_updated_at: c.now]
+    )
+
+    result = %{result | remote_updated_at: DateTime.add(c.now, -1)}
+
+    assert {:error, :invalid_paired_projection} =
+             ForgeMirrors.confirm_mapped_pull_pair(
+               c.operation,
+               c.now,
+               expected,
+               result,
+               &ForgePulls.append_sync_apply(&1, :resource, request)
+             )
+
+    assert Repo.get!(ForgeIssues.Issue, c.issue.id).sync_version == c.issue.sync_version
+    assert Repo.get!(MirrorResourceState, c.mapping.id).confirmed_remote_updated_at == c.now
+  end
+
   defp metadata_effect(c) do
     {_paired, label, expected, _, _} = paired_confirmation(c)
     Repo.insert!(%ForgeIssues.IssueLabel{issue_id: c.issue.id, label_id: label.id})
@@ -1255,6 +1381,8 @@ defmodule ForgeMirrors.PullSyncPersistenceTest do
       |> Map.merge(%{
         "expected_local_draft" => false,
         "expected_remote_draft" => false,
+        "expected_remote_updated_at" => DateTime.to_iso8601(c.now),
+        "expected_remote_issue_updated_at" => DateTime.to_iso8601(c.now),
         "proposed_draft" => false
       })
 

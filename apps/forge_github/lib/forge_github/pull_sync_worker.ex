@@ -930,12 +930,14 @@ defmodule ForgeGitHub.PullSyncWorker do
       |> Map.put("draft", proposed_draft)
 
     with true <- depth < 3,
+         %DateTime{utc_offset: 0, std_offset: 0} = issue_time <- remote[:issue_remote_updated_at],
          {:ok, payload} <-
            pair_payload(action, local.issue_snapshot, remote.issue_snapshot, plan.target_issue),
          {:ok, marker} <-
            effect_marker(action, sync, local, remote, proposed, identity, proof, options),
          marker =
            Map.merge(marker, %{
+             "expected_remote_issue_updated_at" => DateTime.to_iso8601(issue_time),
              "expected_remote_draft" => remote.snapshot["draft"],
              "proposed_draft" => proposed_draft
            }),
@@ -965,6 +967,7 @@ defmodule ForgeGitHub.PullSyncWorker do
     else
       false -> persist_failure(operation, now, :invalid_projection, options)
       {:error, reason} -> persist_failure(operation, now, reason, options)
+      _ -> persist_failure(operation, now, :invalid_projection, options)
     end
   end
 
@@ -1108,7 +1111,8 @@ defmodule ForgeGitHub.PullSyncWorker do
             {:already_applied, remote, identity, proof}
 
           remote.snapshot == before and
-              remote[:issue_snapshot] == payload["expected_remote_issue"] ->
+            remote[:issue_snapshot] == payload["expected_remote_issue"] and
+              same_pair_remote_versions?(remote, marker) ->
             :ok
 
           true ->
@@ -1204,7 +1208,7 @@ defmodule ForgeGitHub.PullSyncWorker do
         end
 
       remote.snapshot == before and remote[:issue_snapshot] == payload["expected_remote_issue"] and
-          depth == 0 ->
+        same_pair_remote_versions?(remote, marker) and depth == 0 ->
         perform_pair_effect(
           operation,
           now,
@@ -1237,6 +1241,19 @@ defmodule ForgeGitHub.PullSyncWorker do
       |> Map.take(@ref_fields)
       |> Map.merge(Map.take(issue, @issue_fields))
       |> Map.put("draft", draft)
+
+  defp same_pair_remote_versions?(remote, marker) do
+    same_remote_time?(remote[:remote_updated_at], marker["expected_remote_updated_at"]) and
+      same_remote_time?(
+        remote[:issue_remote_updated_at],
+        marker["expected_remote_issue_updated_at"]
+      )
+  end
+
+  defp same_remote_time?(%DateTime{utc_offset: 0, std_offset: 0} = observed, expected),
+    do: DateTime.to_iso8601(observed) == expected
+
+  defp same_remote_time?(_, _), do: false
 
   defp confirm_pair_effect(
          operation,
