@@ -491,6 +491,96 @@ defmodule ForgeGitHub.PullCreateWorkerTest do
     assert_received {:confirmed, %{issue: %{confirmed_snapshot: %{"label_github_ids" => ^ids}}}}
   end
 
+  test "cleanup seeds one missing assignee by immutable ID and yields without PATCH", c do
+    c = identified(c)
+
+    intent = %{
+      c.intent
+      | payload: put_in(c.intent.payload, ["issue_snapshot", "assignee_github_ids"], [42])
+    }
+
+    c = %{c | intent: intent, recovery: %{c.recovery | intent: intent}}
+    target = %{identity_id: 5, github_user_id: 42, expected_node_id: nil}
+
+    opts =
+      c.options
+      |> Keyword.put(:recovery_context, fn op ->
+        {:ok, %{c.recovery | marker: op.external_effect_marker}}
+      end)
+      |> Keyword.put(:assignee_node_context, fn op ->
+        {:ok, %{target: target, marker: op.external_effect_marker}}
+      end)
+      |> Keyword.put(:seed_assignee_node, fn op, _, expected, user ->
+        assert expected == %{marker: op.external_effect_marker, target: target}
+        assert user.id == 42 and user.node_id == "U_42" and user.login == "renamed"
+        send(self(), :seeded_assignee)
+        {:ok, %{operation: %{op | lease_owner: nil}, identity: user}}
+      end)
+
+    Req.Test.stub(c.stub, fn conn ->
+      case {conn.method, conn.request_path} do
+        {"GET", "/user/42"} ->
+          Req.Test.json(conn, %{"id" => 42, "node_id" => "U_42", "login" => "renamed"})
+
+        {"GET", path} ->
+          Req.Test.json(
+            conn,
+            if(String.contains?(path, "/pulls/"),
+              do: pull(c, :transport),
+              else: issue(c, :transport)
+            )
+          )
+
+        _ ->
+          flunk("node preparation must not mutate provider metadata")
+      end
+    end)
+
+    assert {:ok, %{operation: %{state: :effect_pending, lease_owner: nil}}} =
+             PullCreateWorker.process_operation(c.marked, c.now, c.recovery, opts)
+
+    assert_received :seeded_assignee
+    refute_received {:confirmed, _}
+  end
+
+  test "failed assignee scope revalidation prevents lookup and cleanup", c do
+    c = identified(c)
+
+    intent = %{
+      c.intent
+      | payload: put_in(c.intent.payload, ["issue_snapshot", "assignee_github_ids"], [42])
+    }
+
+    c = %{c | intent: intent, recovery: %{c.recovery | intent: intent}}
+
+    opts =
+      c.options
+      |> Keyword.put(:recovery_context, fn op ->
+        {:ok, %{c.recovery | marker: op.external_effect_marker}}
+      end)
+      |> Keyword.put(:assignee_node_context, fn _ -> {:error, :stale_lease} end)
+      |> Keyword.put(:seed_assignee_node, fn _, _, _, _ ->
+        flunk("stale scope cannot seed identity")
+      end)
+
+    Req.Test.stub(c.stub, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path in ["/repos/acme/base/pulls/7", "/repos/acme/base/issues/7"]
+
+      Req.Test.json(
+        conn,
+        if(String.contains?(conn.request_path, "/pulls/"),
+          do: pull(c, :transport),
+          else: issue(c, :transport)
+        )
+      )
+    end)
+
+    assert {:ok, _} = PullCreateWorker.process_operation(c.marked, c.now, c.recovery, opts)
+    assert_received {:deferred, _, _}
+    refute_received {:confirmed, _}
+  end
+
   defp run(c), do: PullCreateWorker.process_operation(c.operation, c.now, c.sync, c.options)
 
   defp run_recovery(c),

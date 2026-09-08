@@ -163,6 +163,43 @@ defmodule ForgeGitHub.PullCreateIntegrationTest do
     assert Repo.aggregate(ForgePulls.PullRequest, :count) == 1
   end
 
+  test "missing assignee nodes seed across claims without another POST or metadata PATCH", c do
+    identities =
+      for id <- [4201, 4202] do
+        {:ok, identity} =
+          ForgeAccounts.observe_github_identity(%{id: id, login: "old-#{id}"}, c.now)
+
+        Repo.insert!(%ForgeIssues.IssueAssignee{
+          issue_id: c.issue.id,
+          github_identity_id: identity.id
+        })
+
+        identity
+      end
+
+    stub_provider(c, seed_assignees: true)
+    assert {:ok, _} = process(c)
+    marked = Repo.get!(MirrorOperation, c.operation.id)
+    intent = Repo.get_by!(PullCreationIntent, pull_id: c.pull.id)
+    assert intent.payload["issue_snapshot"]["assignee_github_ids"] == [4201, 4202]
+
+    for {identity, index} <- Enum.with_index(identities, 1) do
+      assert {:ok, _} = process(c)
+      saved = Repo.get!(MirrorOperation, c.operation.id)
+      assert saved.state == :effect_pending and is_nil(saved.lease_owner)
+      assert saved.external_effect_marker == marked.external_effect_marker
+      assert saved.checkpoint == marked.checkpoint
+
+      assert Repo.get!(ForgeAccounts.GitHubIdentity, identity.id).github_node_id ==
+               "U_#{identity.github_user_id}"
+
+      assert Process.get(:identity_gets) == index
+      assert Process.get(:create_posts) == 1
+      assert is_nil(Process.get(:create_patches))
+      assert Repo.aggregate(MirrorResourceState, :count) == 0
+    end
+  end
+
   test "missing live local ref prevents intent and provider POST", c do
     git!(c.base_path, ["update-ref", "-d", c.pull.base_ref])
     stub_provider(c)
@@ -232,6 +269,16 @@ defmodule ForgeGitHub.PullCreateIntegrationTest do
   defp stub_provider(c, options \\ []) do
     Req.Test.stub(c.stub, fn conn ->
       case {conn.method, conn.request_path} do
+        {"GET", "/user/" <> id} ->
+          assert Keyword.get(options, :seed_assignees, false)
+          Process.put(:identity_gets, Process.get(:identity_gets, 0) + 1)
+
+          Req.Test.json(conn, %{
+            "id" => String.to_integer(id),
+            "node_id" => "U_#{id}",
+            "login" => "renamed-#{id}"
+          })
+
         {"GET", "/repos/acme/base"} ->
           Req.Test.json(conn, repository(c.base))
 

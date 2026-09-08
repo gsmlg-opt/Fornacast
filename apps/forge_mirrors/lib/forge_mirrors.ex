@@ -1581,6 +1581,38 @@ defmodule ForgeMirrors do
   end
 
   @doc false
+  def outbound_pull_assignee_node_context(operation),
+    do:
+      ForgeMirrors.PullRelationshipProofBoundary.context(
+        operation,
+        &lock_pull_creation_operation/1
+      )
+
+  @doc false
+  def seed_outbound_pull_assignee_node(operation, now, expected, profile),
+    do:
+      ForgeMirrors.PullRelationshipProofBoundary.seed(
+        operation,
+        now,
+        expected,
+        profile,
+        &lock_pull_creation_operation/1,
+        &yield_pull_relationship_proof_operation/2
+      )
+
+  defp yield_pull_relationship_proof_operation(operation, now) do
+    owned_transition(operation, DateTime.truncate(now, :second), [:effect_pending],
+      state: :effect_pending,
+      next_attempt_at: DateTime.truncate(now, :second),
+      lease_owner: nil,
+      lease_expires_at: nil,
+      failure_class: nil,
+      failure_disposition: nil,
+      failure_detail: nil
+    )
+  end
+
+  @doc false
   def mark_outbound_pull_creation(operation, now, expected),
     do:
       ForgeMirrors.PullOutboundCreation.mark(

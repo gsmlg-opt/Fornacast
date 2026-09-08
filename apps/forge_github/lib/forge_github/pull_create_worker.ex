@@ -11,6 +11,7 @@ defmodule ForgeGitHub.PullCreateWorker do
   alias ForgeGitHub.{
     Client,
     Error,
+    IdentityClient,
     InstallationToken,
     InstallationTokenBroker,
     IssueClient,
@@ -209,7 +210,7 @@ defmodule ForgeGitHub.PullCreateWorker do
               confirm(operation, now, fresh, pair, token, options)
 
             :transport ->
-              patch(operation, now, fresh, pair, token, options)
+              prepare_assignee(operation, now, fresh, pair, token, options)
 
             :conflict ->
               conflict(
@@ -230,6 +231,43 @@ defmodule ForgeGitHub.PullCreateWorker do
       end)
     else
       {:error, reason} -> failure(operation, now, reason, options)
+    end
+  end
+
+  defp prepare_assignee(operation, now, sync, pair, token, options) do
+    if sync.intent.payload["issue_snapshot"]["assignee_github_ids"] == [] do
+      patch(operation, now, sync, pair, token, options)
+    else
+      with {:ok, context} <-
+             callback(
+               options,
+               :assignee_node_context,
+               &ForgeMirrors.outbound_pull_assignee_node_context/1
+             ).(operation) do
+        case context.target do
+          nil ->
+            patch(operation, now, sync, pair, token, options)
+
+          target ->
+            with {:ok, %ForgeGitHub.User{} = user} <-
+                   IdentityClient.get_user(
+                     token,
+                     target.github_user_id,
+                     request_options(sync, options)
+                   ) do
+              callback(
+                options,
+                :seed_assignee_node,
+                &ForgeMirrors.seed_outbound_pull_assignee_node/4
+              ).(
+                operation,
+                now,
+                %{marker: context.marker, target: target},
+                Map.from_struct(user)
+              )
+            end
+        end
+      end
     end
   end
 
