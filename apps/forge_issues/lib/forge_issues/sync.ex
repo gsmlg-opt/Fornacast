@@ -323,6 +323,82 @@ defmodule ForgeIssues.Sync do
     end
   end
 
+  @doc false
+  # Trusted aggregate callers must hold the canonical Issue lock. This helper
+  # replaces membership only; version and event ownership remain with the caller.
+  def replace_relationships(repo, %Issue{} = issue, request) when is_map(request) do
+    if repo.in_transaction?() and bounded_list?(request[:local_label_ids]) and
+         bounded_list?(request[:assignee_refs]),
+       do: relationships(repo, issue, request),
+       else: {:error, :invalid_relationship}
+  end
+
+  def replace_relationships(_, _, _), do: {:error, :invalid_relationship}
+
+  @doc false
+  # Canonical preimages use local identity row IDs, never provider names/logins.
+  # Known identity rows are share-locked until aggregate confirmation completes.
+  def relationship_projection(repo, %Issue{} = issue) do
+    if repo.in_transaction?() do
+      labels =
+        repo.all(
+          from l in IssueLabel,
+            where: l.issue_id == ^issue.id,
+            order_by: l.label_id,
+            select: l.label_id
+        )
+
+      refs = assignee_refs(repo, issue)
+      user_ids = for %{kind: :local_user, id: id} <- refs, do: id
+      identity_ids = for %{kind: :github_identity, id: id} <- refs, do: id
+
+      identities =
+        repo.all(
+          from i in ForgeAccounts.GitHubIdentity,
+            where: i.kind == :user and (i.local_user_id in ^user_ids or i.id in ^identity_ids),
+            order_by: i.id,
+            lock: "FOR SHARE"
+        )
+
+      with true <- bounded_list?(labels) and bounded_list?(refs),
+           {:ok, managed} <- managed_identities(refs, identities) do
+        {:ok,
+         %{
+           label_ids: labels,
+           assignee_refs: refs,
+           relationship_preimage: %{label_ids: labels, managed_assignee_identity_ids: managed}
+         }}
+      else
+        {:error, reason} -> {:error, reason}
+        _ -> {:error, :invalid_relationship}
+      end
+    else
+      {:error, :invalid_relationship}
+    end
+  end
+
+  def relationship_projection(_, _), do: {:error, :invalid_relationship}
+
+  defp managed_identities(refs, identities) do
+    Enum.reduce_while(refs, {:ok, []}, fn ref, {:ok, ids} ->
+      matches =
+        Enum.filter(identities, fn i ->
+          if ref.kind == :local_user, do: i.local_user_id == ref.id, else: i.id == ref.id
+        end)
+
+      case {ref.kind, matches} do
+        {:local_user, []} -> {:cont, {:ok, ids}}
+        {_, [identity]} -> {:cont, {:ok, [identity.id | ids]}}
+        {_, []} -> {:halt, {:error, :invalid_relationship}}
+        _ -> {:halt, {:error, :ambiguous_assignee_identity}}
+      end
+    end)
+    |> case do
+      {:ok, ids} -> {:ok, Enum.sort(Enum.uniq(ids))}
+      error -> error
+    end
+  end
+
   defp relationships(repo, issue, request) do
     labels = Enum.uniq(request.local_label_ids)
     refs = Enum.uniq(request.assignee_refs)

@@ -9,6 +9,19 @@ defmodule ForgePulls.Sync do
   merged row cannot acknowledge an earlier unmerged baseline. Merge state can be
   observed, but never applied here. Returned fields are normalized by the Issue
   changeset; coordinators must confirm the returned canonical fields.
+
+  Relationship updates require all of `local_label_ids`, `assignee_refs`, and
+  `expected_relationships`. The expected preimage contains sorted local label
+  IDs and `managed_assignee_identity_ids` (local GitHubIdentity row IDs), so a
+  verified link's user/identity representations compare equally. Unmanaged local
+  assignees are retained using the shared Issue replacement rules. Scalar-only
+  legacy requests leave membership unchanged. Every projection includes actual
+  `label_ids`, `assignee_refs`, and `relationship_preimage`.
+
+  Minimum-version effect recovery may return newer membership, never certify it
+  as the older baseline. The outer coordinator must validate the returned actual
+  projection. Known identity share locks fence unlinking, but new links to a
+  previously unmanaged user are not serialized by this API alone.
   """
   import Ecto.Query
   alias Ecto.{Changeset, Multi}
@@ -23,8 +36,10 @@ defmodule ForgePulls.Sync do
 
   def sync_projection(repository_id, :pull, id) when valid_id(repository_id) and valid_id(id) do
     Repo.transaction(fn ->
-      case resource(Repo, repository_id, id) do
-        {:ok, {pull, issue}} -> projection(pull, issue)
+      with {:ok, {pull, issue}} <- resource(Repo, repository_id, id),
+           {:ok, result} <- relationship_projection(Repo, pull, issue) do
+        result
+      else
         {:error, reason} -> Repo.rollback(reason)
       end
     end)
@@ -78,8 +93,8 @@ defmodule ForgePulls.Sync do
                  request.head_repository_id
                )
              ),
-           {:ok, relationships} <- create_relationships(repo, issue, request) do
-        {:ok, Map.merge(projection(pull, issue), relationships)}
+           {:ok, _relationships} <- create_relationships(repo, issue, request) do
+        relationship_projection(repo, pull, issue)
       else
         nil -> {:error, :invalid_author}
         {:error, reason} -> {:error, reason}
@@ -271,8 +286,10 @@ defmodule ForgePulls.Sync do
       with :ok <- validate_observation(expected),
            {:ok, {pull, issue}} <-
              resource(repo, expected.repository_id, expected.local_resource_id),
-           :ok <- expected_snapshot(pull, issue, expected) do
-        {:ok, projection(pull, issue)}
+           :ok <- expected_snapshot(pull, issue, expected),
+           {:ok, result} <- relationship_projection(repo, pull, issue),
+           :ok <- expected_relationships(result, expected) do
+        {:ok, result}
       end
     end)
   end
@@ -284,6 +301,8 @@ defmodule ForgePulls.Sync do
            {:ok, {pull, issue}} <-
              resource(repo, request.repository_id, request.local_resource_id),
            :ok <- expected_snapshot(pull, issue, request),
+           {:ok, before} <- relationship_projection(repo, pull, issue),
+           :ok <- expected_relationships(before, request),
            :ok <- mutable_metadata(pull, request.fields),
            {:ok, issue} <-
              repo.update(Issue.update_changeset(issue, request.fields),
@@ -296,8 +315,9 @@ defmodule ForgePulls.Sync do
                |> PullRequest.update_changeset(request.fields)
                |> Changeset.put_change(:mergeable, nil)
                |> Changeset.put_change(:mergeable_state, :unknown)
-             ) do
-        {:ok, projection(pull, issue)}
+             ),
+           :ok <- apply_relationships(repo, issue, request) do
+        relationship_projection(repo, pull, issue)
       end
     end)
     |> DomainOutbox.record_multi({key, :outbox}, fn changes ->
@@ -351,9 +371,11 @@ defmodule ForgePulls.Sync do
        )
        when valid_id(repository_id) and valid_id(id) and valid_id(version) and version < @max_id and
               not is_map_key(expected, :minimum_local_version) do
-    if valid_fields?(fields) and valid_merge_state?(merge_state),
-      do: :ok,
-      else: {:error, :invalid_sync_request}
+    if valid_fields?(fields) and valid_merge_state?(merge_state) and
+         (not Map.has_key?(expected, :expected_relationships) or
+            valid_relationship_preimage?(expected.expected_relationships)),
+       do: :ok,
+       else: {:error, :invalid_sync_request}
   end
 
   defp validate_expected(_), do: {:error, :invalid_sync_request}
@@ -372,7 +394,7 @@ defmodule ForgePulls.Sync do
          %{action: :update, fields: fields, provenance: %{origin: :github} = provenance} = request
        ) do
     with :ok <- validate_expected(request) do
-      if valid_fields?(fields) and
+      if valid_fields?(fields) and valid_relationship_request?(request) and
            Enum.all?([:causation_id, :correlation_id], &bounded_optional?(provenance[&1], 255)),
          do: :ok,
          else: {:error, :invalid_sync_request}
@@ -380,6 +402,60 @@ defmodule ForgePulls.Sync do
   end
 
   defp validate_request(_), do: {:error, :invalid_sync_request}
+
+  defp valid_relationship_request?(request) do
+    group = [:expected_relationships, :local_label_ids, :assignee_refs]
+
+    case Enum.count(group, &Map.has_key?(request, &1)) do
+      0 ->
+        true
+
+      3 ->
+        valid_relationship_preimage?(request.expected_relationships) and
+          is_list(request.local_label_ids) and length(request.local_label_ids) <= 512 and
+          Enum.all?(request.local_label_ids, &valid_id/1) and
+          is_list(request.assignee_refs) and length(request.assignee_refs) <= 512 and
+          Enum.all?(request.assignee_refs, &valid_assignee?/1)
+
+      _ ->
+        false
+    end
+  end
+
+  defp valid_relationship_preimage?(
+         %{label_ids: labels, managed_assignee_identity_ids: identities} = value
+       ),
+       do: map_size(value) == 2 and canonical_ids?(labels) and canonical_ids?(identities)
+
+  defp valid_relationship_preimage?(_), do: false
+
+  defp canonical_ids?(ids) when is_list(ids),
+    do:
+      length(ids) <= 512 and
+        Enum.all?(ids, &valid_id/1) and ids == Enum.sort(Enum.uniq(ids))
+
+  defp canonical_ids?(_), do: false
+
+  defp expected_relationships(%{local_version: current}, %{minimum_local_version: minimum})
+       when current > minimum, do: :ok
+
+  defp expected_relationships(projection, %{expected_relationships: expected}) do
+    if projection.relationship_preimage == expected,
+      do: :ok,
+      else: {:error, :stale_local_relationships}
+  end
+
+  defp expected_relationships(_, _), do: :ok
+
+  defp apply_relationships(repo, issue, %{expected_relationships: _} = request),
+    do: ForgeIssues.Sync.replace_relationships(repo, issue, request)
+
+  defp apply_relationships(_, _, _), do: :ok
+
+  defp relationship_projection(repo, pull, issue) do
+    with {:ok, relationships} <- ForgeIssues.Sync.relationship_projection(repo, issue),
+         do: {:ok, Map.merge(projection(pull, issue), relationships)}
+  end
 
   defp valid_fields?(fields) when is_map(fields) do
     Enum.sort(Map.keys(fields)) == @keys and bounded_string?(fields["title"], 1024) and

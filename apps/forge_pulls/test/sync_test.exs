@@ -247,6 +247,181 @@ defmodule ForgePulls.SyncTest do
     assert github_events(ctx) == []
   end
 
+  test "scalar draft and relationships apply once while retaining unmanaged assignees", ctx do
+    identity = relationship_identity(ctx)
+    label = relationship_label(ctx)
+    assign(ctx, :user_id, ctx.actor.id)
+    assign(ctx, :github_identity_id, identity.id)
+    expected = %{label_ids: [], managed_assignee_identity_ids: [identity.id]}
+    request = relationships_request(ctx, expected, [label.id], [])
+    assert {:ok, %{resource: projection}} = apply_request(request)
+    assert projection.label_ids == [label.id]
+    assert projection.assignee_refs == [%{kind: :local_user, id: ctx.actor.id}]
+
+    assert projection.relationship_preimage == %{
+             label_ids: [label.id],
+             managed_assignee_identity_ids: []
+           }
+
+    assert projection.fields["draft"]
+    assert projection.fields["title"] == "Remote"
+    assert projection.local_version == ctx.issue.sync_version + 1
+    assert [event] = github_events(ctx)
+    assert event.payload["sync_version"] == projection.local_version
+    assert event.origin == :github
+  end
+
+  test "relationship-only edit increments once and transaction failure rolls back every set",
+       ctx do
+    label = relationship_label(ctx)
+
+    request =
+      relationships_request(ctx, empty_relationships(), [label.id], [])
+      |> Map.put(:fields, ctx.fields)
+
+    assert {:error, :later, :rollback, _} =
+             Multi.new()
+             |> ForgePulls.append_sync_apply(:resource, request)
+             |> Multi.error(:later, :rollback)
+             |> Repo.transaction()
+
+    assert Repo.all(from l in ForgeIssues.IssueLabel, where: l.issue_id == ^ctx.issue.id) == []
+    assert github_events(ctx) == []
+    assert {:ok, %{resource: projection}} = apply_request(request)
+    assert projection.fields == ctx.fields
+    assert projection.local_version == 2
+    assert projection.label_ids == [label.id]
+    assert length(github_events(ctx)) == 1
+  end
+
+  test "relationship preimage rejects changes even when scalar version is unchanged", ctx do
+    label = relationship_label(ctx)
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: ctx.issue.id, label_id: label.id})
+    request = relationships_request(ctx, empty_relationships(), [], [])
+    assert {:error, _, :stale_local_relationships, _} = apply_request(request)
+    assert {:error, _, :stale_local_relationships, _} = observe(request)
+    assert Repo.get!(Issue, ctx.issue.id).title == "Original"
+    assert Repo.get!(Issue, ctx.issue.id).sync_version == 1
+    assert github_events(ctx) == []
+  end
+
+  test "verified linked user and identity representations share one managed preimage", ctx do
+    identity = relationship_identity(ctx)
+    {:ok, identity} = ForgeAccounts.link_github_identity(ctx.actor, identity)
+    assign(ctx, :github_identity_id, identity.id)
+    assert {:ok, original} = ForgePulls.sync_projection(ctx.repository.id, :pull, ctx.pull.id)
+    assert original.relationship_preimage.managed_assignee_identity_ids == [identity.id]
+    Repo.delete_all(from a in ForgeIssues.IssueAssignee, where: a.issue_id == ^ctx.issue.id)
+    assign(ctx, :user_id, ctx.actor.id)
+
+    request =
+      relationships_request(ctx, original.relationship_preimage, [], [
+        %{kind: :github_identity, id: identity.id}
+      ])
+
+    assert {:ok, %{resource: result}} = apply_request(request)
+    assert result.relationship_preimage == original.relationship_preimage
+    assert result.assignee_refs == [%{kind: :github_identity, id: identity.id}]
+  end
+
+  test "unlink invalidates old managed preimage then retains the newly unmanaged local member",
+       ctx do
+    identity = relationship_identity(ctx)
+    {:ok, identity} = ForgeAccounts.link_github_identity(ctx.actor, identity)
+    assign(ctx, :user_id, ctx.actor.id)
+    {:ok, before} = ForgePulls.sync_projection(ctx.repository.id, :pull, ctx.pull.id)
+    {:ok, _} = ForgeAccounts.unlink_github_identity(ctx.actor, identity)
+
+    request =
+      relationships_request(ctx, before.relationship_preimage, [], [
+        %{kind: :github_identity, id: identity.id}
+      ])
+
+    assert {:error, _, :stale_local_relationships, _} = apply_request(request)
+    {:ok, fresh} = ForgePulls.sync_projection(ctx.repository.id, :pull, ctx.pull.id)
+    assert fresh.relationship_preimage == empty_relationships()
+
+    assert {:ok, %{resource: result}} =
+             apply_request(%{request | expected_relationships: fresh.relationship_preimage})
+
+    assert result.assignee_refs == [
+             %{kind: :github_identity, id: identity.id},
+             %{kind: :local_user, id: ctx.actor.id}
+           ]
+
+    assert result.relationship_preimage.managed_assignee_identity_ids == [identity.id]
+  end
+
+  test "partial relationship requests and invalid targets cannot mutate scalar metadata", ctx do
+    request = relationships_request(ctx, empty_relationships(), [], [])
+
+    for key <- [:expected_relationships, :local_label_ids, :assignee_refs] do
+      assert {:error, _, :invalid_sync_request, _} = apply_request(Map.delete(request, key))
+    end
+
+    assert {:error, _, :invalid_relationship, _} =
+             apply_request(%{request | local_label_ids: [9_223_372_036_854_775_806]})
+
+    assert Repo.get!(Issue, ctx.issue.id).sync_version == 1
+    assert Repo.get!(Issue, ctx.issue.id).title == "Original"
+    assert github_events(ctx) == []
+  end
+
+  test "recovery observes newer relationships without acknowledging them as the older version",
+       ctx do
+    identity = relationship_identity(ctx)
+
+    request =
+      relationships_request(ctx, empty_relationships(), [], [])
+      |> Map.delete(:expected_local_version)
+      |> Map.put(:minimum_local_version, 1)
+
+    assign(ctx, :github_identity_id, identity.id)
+    assert {:error, _, :stale_local_relationships, _} = observe(request)
+    Repo.update!(Issue.update_changeset(ctx.issue, %{title: "New local edit"}))
+    assert {:ok, %{resource: current}} = observe(request)
+    assert current.local_version == 2
+    assert current.relationship_preimage.managed_assignee_identity_ids == [identity.id]
+    assert github_events(ctx) == []
+  end
+
+  defp empty_relationships, do: %{label_ids: [], managed_assignee_identity_ids: []}
+
+  defp relationships_request(ctx, expected, labels, refs),
+    do:
+      Map.merge(
+        ctx.request,
+        %{expected_relationships: expected, local_label_ids: labels, assignee_refs: refs}
+      )
+
+  defp relationship_identity(ctx) do
+    {:ok, identity} =
+      ForgeAccounts.observe_github_identity(
+        %{id: System.unique_integer([:positive]), login: ctx.actor.username},
+        DateTime.utc_now(:second)
+      )
+
+    identity
+  end
+
+  defp relationship_label(ctx),
+    do:
+      Repo.insert!(%ForgeIssues.Label{
+        repository_id: ctx.repository.id,
+        name: "Label",
+        normalized_name: "label",
+        color: "abcdef"
+      })
+
+  defp assign(ctx, key, id),
+    do:
+      Repo.insert!(
+        struct(
+          ForgeIssues.IssueAssignee,
+          Map.put(%{issue_id: ctx.issue.id}, key, id)
+        )
+      )
+
   defp apply_request(request),
     do: Multi.new() |> ForgePulls.append_sync_apply(:resource, request) |> Repo.transaction()
 
