@@ -56,6 +56,15 @@ PR13 integration audit additionally identified these concrete remaining gates:
 
 ## Current local verification
 
+- `25e69c2` adds atomic pull scalar/draft and relationship application with one
+  Issue version/event. The optional relationship group requires exact preimages;
+  managed assignee identity rows are representation-independent and share-locked,
+  while existing unmapped local assignees remain intact through shared Issue
+  replacement rules. Projection and observation return labels, refs, and canonical
+  managed preimages. Fresh regression verification passed 109 tests (12 issue,
+  22 mirror, 32 pull, 43 provider), with three files format-checked. This is not
+  mapped-worker integration. New account links into formerly unmanaged users are
+  still a required concurrency gate; known-row locks alone do not fence phantoms.
 - `6207654` adds a leased read-only paired-mapping gate and a pure paired-view
   metadata decision helper. The gate checks both canonical identities, repository
   identity shape, snapshots, equal scalar/version baselines, and stored hashes;
