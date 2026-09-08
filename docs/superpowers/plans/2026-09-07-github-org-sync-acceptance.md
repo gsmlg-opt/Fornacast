@@ -56,6 +56,16 @@ PR13 integration audit additionally identified these concrete remaining gates:
 
 ## Current local verification
 
+- `6207654` adds a leased read-only paired-mapping gate and a pure paired-view
+  metadata decision helper. The gate checks both canonical identities, repository
+  identity shape, snapshots, equal scalar/version baselines, and stored hashes;
+  legacy nil hashes are explicitly read-derived and are never persisted as a
+  repair. The decision merges relationship deltas against the issue baseline and
+  returns separate pull/issue targets plus exact observed issue preconditions.
+  Fifty-eight scoped tests passed (30 mirror, 28 provider); six files passed
+  formatting. Neither helper is wired into mapped confirmation yet. Atomic domain
+  relationship application, dual-mapping confirmation, full-set durable effects,
+  and concurrent new account-link fencing remain required.
 - `7efefd4` moves mapped-pull Git eligibility and immutable/scalar preflight ahead
   of author and assignee attribution writes. A regression reproduced attribution
   on a substituted repository before rejection; paired issue identity, changed
