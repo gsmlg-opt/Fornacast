@@ -10,6 +10,31 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 full relationship evidence and worker integration (2026-09-08)
+
+- `a4d0779` adds actual local paired relationship projections and independent
+  remote issue snapshots/timestamps. The scalar-only projection remains available
+  for existing bootstrap callers, not as evidence of synchronized relationships.
+- `03fbff8` stores immutable, hashed metadata evidence in a separate bounded 2 MB
+  intent table with per-operation sequence uniqueness. Pure recovery classification
+  compares complete saved remote preimage/target snapshots and preserves current
+  local sets; a third remote state is ambiguous. The operation marker's 64 KiB
+  limit is unchanged. Leased admission and compact marker reference wiring remain
+  to be implemented; a schema alone does not establish durable effect recovery.
+- Focused combined verification passed 52 tests (mirrors 30, provider 22), including
+  storage persistence/duplicate protection, seven recovery cases and four paired
+  worker cases. Projection/decision verification separately passed 13 tests.
+- Worker integration is still uncommitted work in progress. An initial broader
+  integration/lifecycle run passed 9/14: five failures exposed missing paired
+  fixture baselines and unfinished outbound/recovery integration. Existing outbound
+  assertions are retained, not skipped or weakened. Do not infer full worker
+  acceptance from the focused results.
+- After correcting the paired fixtures, the real inbound label and two Git-ref
+  safety cases passed. The broader matrix now passes 12/14; the remaining failures
+  are outbound issue/draft completion and pending disjoint-effect recovery, both
+  explicitly deferred by the incomplete paired-effect path. Eleven-file formatting
+  passed. Worker changes remain uncommitted until those effects are integrated.
+
 ### PR13 paired confirmation and identity-link fencing (2026-09-08)
 
 - `894f57e` fences current/target local assignee users and known GitHub identities
