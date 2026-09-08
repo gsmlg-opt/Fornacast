@@ -34,7 +34,7 @@ defmodule ForgePulls.Sync do
 
   def append_sync_observe(%Multi{} = multi, key, expected) do
     Multi.run(multi, key, fn repo, _ ->
-      with :ok <- validate_expected(expected),
+      with :ok <- validate_observation(expected),
            {:ok, {pull, issue}} <-
              resource(repo, expected.repository_id, expected.local_resource_id),
            :ok <- expected_snapshot(pull, issue, expected) do
@@ -124,6 +124,16 @@ defmodule ForgePulls.Sync do
 
   defp validate_expected(_), do: {:error, :invalid_sync_request}
 
+  defp validate_observation(%{minimum_local_version: minimum} = expected)
+       when not is_map_key(expected, :expected_local_version) do
+    expected
+    |> Map.delete(:minimum_local_version)
+    |> Map.put(:expected_local_version, minimum)
+    |> validate_expected()
+  end
+
+  defp validate_observation(expected), do: validate_expected(expected)
+
   defp validate_request(
          %{action: :update, fields: fields, provenance: %{origin: :github} = provenance} = request
        ) do
@@ -207,6 +217,26 @@ defmodule ForgePulls.Sync do
       end
     else
       {:error, :not_found}
+    end
+  end
+
+  # Only observation of an already-proven external effect may tolerate newer
+  # local metadata. Ref and merge facts must still match the recovery evidence.
+  defp expected_snapshot(pull, issue, %{minimum_local_version: minimum} = expected) do
+    refs = ~w(head_ref base_ref head_sha base_sha)
+
+    cond do
+      issue.sync_version < minimum ->
+        {:error, :stale_local_version}
+
+      Map.take(fields(pull, issue), refs) != Map.take(expected.expected_fields, refs) ->
+        {:error, :stale_local_snapshot}
+
+      merge_state(pull) != expected.expected_merge_state ->
+        {:error, :stale_local_snapshot}
+
+      true ->
+        :ok
     end
   end
 

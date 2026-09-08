@@ -133,6 +133,41 @@ defmodule ForgePulls.SyncTest do
     assert github_events(ctx) == []
   end
 
+  test "recovery observation preserves newer local metadata but requires matching refs and merge state",
+       ctx do
+    expected =
+      ctx.request
+      |> Map.delete(:expected_local_version)
+      |> Map.put(:minimum_local_version, ctx.issue.sync_version)
+
+    updated = ctx.issue |> Issue.update_changeset(%{title: "New local edit"}) |> Repo.update!()
+    assert {:ok, %{resource: projection}} = observe(expected)
+    assert projection.local_version == updated.sync_version
+    assert projection.fields["title"] == "New local edit"
+    assert github_events(ctx) == []
+
+    assert {:error, _, :invalid_sync_request, _} = apply_request(expected)
+
+    assert {:error, _, :invalid_sync_request, _} =
+             observe(Map.put(expected, :expected_local_version, ctx.issue.sync_version))
+
+    assert {:error, _, :stale_local_version, _} =
+             observe(%{expected | minimum_local_version: updated.sync_version + 1})
+
+    Repo.update!(Changeset.change(ctx.pull, head_sha: String.duplicate("c", 40)))
+    assert {:error, _, :stale_local_snapshot, _} = observe(expected)
+
+    Repo.get!(PullRequest, ctx.pull.id)
+    |> Changeset.change(
+      head_sha: ctx.pull.head_sha,
+      merged_at: ~U[2026-09-08 00:00:00Z],
+      merge_commit_sha: String.duplicate("d", 40)
+    )
+    |> Repo.update!()
+
+    assert {:error, _, :stale_local_snapshot, _} = observe(expected)
+  end
+
   test "stale versions and later transaction errors preserve both rows", ctx do
     assert {:error, _, :stale_local_version, _} =
              apply_request(%{ctx.request | expected_local_version: ctx.issue.sync_version + 1})
