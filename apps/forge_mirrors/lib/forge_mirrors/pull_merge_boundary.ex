@@ -1,10 +1,11 @@
 defmodule ForgeMirrors.PullMergeBoundary do
   @moduledoc """
-  Trusted leased preparation and pre-push fencing for coordinated pull merges.
+  Trusted leased preparation, pre-push fencing and marked-effect recovery.
 
   The caller supplies a domain Multi with key `:intent`; this module does not
   depend on ForgePulls or mutate its tables. No Git or provider effects occur
-  here. Only the pre-push phase is supported; remote success is NOT inferred.
+  here. Remote ref observations can record confirmation readiness, but never
+  complete a merge or infer that the provider pull has merged.
   """
   import Ecto.Query
   alias Ecto.Multi
@@ -78,6 +79,279 @@ defmodule ForgeMirrors.PullMergeBoundary do
     transaction(fn -> load_context(operation, now) end)
   end
 
+  @doc "Load durable marked evidence under its lease; this grants no permission to push."
+  def recovery_context(operation, now), do: transaction(fn -> load_recovery(operation, now) end)
+
+  def defer(operation, now, next_attempt_at, reason) do
+    transaction(fn ->
+      with {:ok, context} <- load_recovery(operation, now),
+           true <- valid_retry?(now, next_attempt_at) do
+        attrs =
+          if reason == :remote_confirmation_required or
+               context.operation.failure_disposition == :conflict,
+             do: confirmation_diagnostics(context.operation),
+             else: [
+               failure_class: "network",
+               failure_disposition: :retry,
+               failure_detail: diagnostic(reason)
+             ]
+
+        yield_recovery(context.operation, now, next_attempt_at, attrs)
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :invalid_transition}
+      end
+    end)
+  end
+
+  def record_observation(operation, now, next_attempt_at, observation) do
+    transaction(fn ->
+      with {:ok, context} <- load_recovery(operation, now),
+           true <- valid_retry?(now, next_attempt_at),
+           %{remote_base_oid: oid, provider_pull_id: provider_id} <- observation,
+           true <- map_size(observation) == 2 and oid?(oid),
+           %MirrorResourceState{} = mapping <-
+             Repo.get_by(MirrorResourceState,
+               repository_mirror_id: context.repository_mirror_id,
+               resource_kind: :pull,
+               local_resource_id: context.expected.pull_id
+             ),
+           true <-
+             mapping.provider_identity == context.expected.provider_identity and
+               provider_pull_identity(mapping) == context.provider_pull_identity and
+               context.provider_pull_identity["id"] == provider_id do
+        cond do
+          oid == context.intent.expected_base_oid ->
+            {:error, :remote_base_unchanged}
+
+          oid == context.intent.merge_oid ->
+            checkpoint =
+              Map.put(context.operation.checkpoint, "merge_observation", %{
+                "remote_base_oid" => oid,
+                "provider_pull_id" => provider_id,
+                "confirmation_ready" => true,
+                "observed_at" => DateTime.to_iso8601(now)
+              })
+
+            yield_recovery(
+              context.operation,
+              now,
+              next_attempt_at,
+              Keyword.put(confirmation_diagnostics(context.operation), :checkpoint, checkpoint)
+            )
+
+          true ->
+            with {:ok, _} <- observation_conflict(context, oid) do
+              yield_recovery(context.operation, now, next_attempt_at,
+                checkpoint: Map.delete(context.operation.checkpoint, "merge_observation"),
+                failure_class: "git_divergence",
+                failure_disposition: :conflict,
+                failure_detail: "Remote base differs from the prepared base and merge commit"
+              )
+            end
+        end
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :stale_merge_identity}
+      end
+    end)
+  end
+
+  def checkpoint_lfs(operation, now, checkpoint) do
+    transaction(fn ->
+      loader = if operation.external_effect_marker, do: &load_recovery/2, else: &load_context/2
+
+      with {:ok, context} <- loader.(operation, now),
+           true <- valid_lfs_checkpoint?(checkpoint) do
+        update_operation(context.operation,
+          checkpoint: Map.merge(context.operation.checkpoint, checkpoint),
+          state:
+            if(context.operation.external_effect_marker, do: :effect_pending, else: :pending),
+          lease_owner: nil,
+          lease_expires_at: nil,
+          next_attempt_at: DateTime.add(now, 1, :second),
+          updated_at: now
+        )
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :invalid_transition}
+      end
+    end)
+  end
+
+  defp load_recovery(
+         %MirrorOperation{
+           lease_owner: owner,
+           lease_expires_at: %DateTime{},
+           id: id,
+           organization_mirror_id: org_id,
+           repository_mirror_id: binding_id,
+           lock_version: version
+         } = operation,
+         %DateTime{} = now
+       )
+       when is_binary(owner) and byte_size(owner) > 0 and is_integer(id) and id > 0 and
+              is_integer(org_id) and org_id > 0 and is_integer(binding_id) and binding_id > 0 and
+              is_integer(version) and version > 0 do
+    with %MirrorOperation{} = current <-
+           Repo.one(capability_query(operation) |> lock("FOR UPDATE")),
+         true <-
+           current.state == :effect_pending and current.cursor == operation.cursor and
+             DateTime.compare(current.lease_expires_at, now) == :gt,
+         %RepositoryMirror{} = binding <- Repo.get(RepositoryMirror, current.repository_mirror_id),
+         true <- binding.organization_mirror_id == current.organization_mirror_id,
+         preparation when is_map(preparation) <- current.checkpoint["merge_preparation"],
+         intent when is_map(intent) <- load_intent(current.id),
+         expected =
+           Map.new(@expected_keys, fn key ->
+             {key,
+              if(key == :fields,
+                do: intent.commit_intent["resource"]["expected_fields"],
+                else: preparation[Atom.to_string(key)]
+              )}
+           end),
+         provider_identity when is_map(provider_identity) <- preparation["provider_pull_identity"],
+         true <- is_map(expected.pull_eligibility_proof),
+         true <-
+           is_map(expected.pull_eligibility_proof["base"]) and
+             is_map(expected.pull_eligibility_proof["head"]),
+         true <- valid_provider_pull_identity?(provider_identity),
+         true <-
+           preparation ==
+             Map.merge(compact(expected), %{
+               "merge_operation_id" => intent.id,
+               "provider_pull_identity" => provider_identity
+             }),
+         scope = %{
+           operation: current,
+           repository_id: binding.repository_id,
+           repository_mirror_id: binding.id,
+           organization_mirror_id: current.organization_mirror_id,
+           github_installation_id: expected.pull_eligibility_proof["github_installation_id"]
+         },
+         true <- positive?(scope.github_installation_id),
+         true <-
+           current.cursor == %{"issue_id" => expected.issue_id, "pull_id" => expected.pull_id},
+         true <- valid_intent?(intent, scope, expected),
+         marker when is_map(marker) <- current.external_effect_marker,
+         true <-
+           valid_marker?(
+             Map.take(marker, ["phase", "merge_operation_id", "merge_tree_oid", "merge_oid"]),
+             intent
+           ),
+         true <-
+           marker ==
+             Map.merge(
+               Map.take(marker, ["phase", "merge_operation_id", "merge_tree_oid", "merge_oid"]),
+               %{
+                 "preparation" => compact(expected),
+                 "provider_pull_identity" => provider_identity,
+                 "expected_base_oid" => intent.expected_base_oid,
+                 "expected_head_oid" => intent.expected_head_oid,
+                 "base_ref" => intent.base_ref,
+                 "head_ref" => intent.head_ref
+               }
+             ),
+         :ok <- live_capability(current) do
+      {:ok,
+       Map.merge(scope, %{
+         intent: intent,
+         expected: expected,
+         provider_pull_identity: provider_identity
+       })}
+    else
+      _ -> {:error, :stale_merge_identity}
+    end
+  end
+
+  defp load_recovery(_, _), do: {:error, :lost_lease}
+
+  defp yield_recovery(operation, now, next_attempt_at, attrs) do
+    update_operation(
+      operation,
+      Keyword.merge(
+        [
+          next_attempt_at: next_attempt_at,
+          lease_owner: nil,
+          lease_expires_at: nil,
+          updated_at: now
+        ],
+        attrs
+      )
+    )
+  end
+
+  defp update_operation(operation, attrs) do
+    case Repo.update_all(capability_query(operation), set: attrs, inc: [lock_version: 1]) do
+      {1, _} -> {:ok, Repo.get!(MirrorOperation, operation.id)}
+      _ -> {:error, :lost_lease}
+    end
+  end
+
+  defp observation_conflict(context, oid) do
+    attrs = %{
+      organization_mirror_id: context.organization_mirror_id,
+      repository_mirror_id: context.repository_mirror_id,
+      resource_kind: "pull_merge",
+      resource_identity: to_string(context.intent.id),
+      conflict_kind: "git_divergence",
+      baseline_snapshot: %{"oid" => context.intent.expected_base_oid},
+      local_snapshot: %{"oid" => context.intent.merge_oid},
+      remote_snapshot: %{"oid" => oid}
+    }
+
+    case Repo.get_by(ForgeMirrors.MirrorConflict,
+           organization_mirror_id: context.organization_mirror_id,
+           resource_kind: "pull_merge",
+           resource_identity: to_string(context.intent.id),
+           state: :open
+         ) do
+      nil ->
+        %ForgeMirrors.MirrorConflict{}
+        |> ForgeMirrors.MirrorConflict.record_changeset(attrs)
+        |> Repo.insert()
+
+      existing ->
+        if Map.take(existing, Map.keys(attrs)) == attrs,
+          do: {:ok, existing},
+          else: {:error, :dedupe_conflict}
+    end
+  end
+
+  defp valid_retry?(%DateTime{} = now, %DateTime{} = next), do: DateTime.compare(next, now) != :lt
+  defp valid_retry?(_, _), do: false
+  defp confirmation_diagnostics(%{failure_disposition: :conflict}), do: []
+
+  defp confirmation_diagnostics(_),
+    do: [failure_class: nil, failure_disposition: nil, failure_detail: nil]
+
+  defp diagnostic(reason) when is_atom(reason), do: diagnostic(Atom.to_string(reason))
+  defp diagnostic(reason) when is_binary(reason), do: diagnostic_prefix(reason, 512, 255, "")
+  defp diagnostic(_), do: "Unresolved remote merge effect"
+
+  # PostgreSQL stores this as varchar(255); additionally bound UTF-8 bytes.
+  defp diagnostic_prefix(<<codepoint::utf8, rest::binary>>, bytes, count, acc) when count > 0 do
+    encoded = <<codepoint::utf8>>
+
+    if byte_size(encoded) <= bytes,
+      do: diagnostic_prefix(rest, bytes - byte_size(encoded), count - 1, acc <> encoded),
+      else: acc
+  end
+
+  defp diagnostic_prefix(_, _, _, acc), do: acc
+
+  defp valid_lfs_checkpoint?(checkpoint) when is_map(checkpoint) do
+    Enum.sort(Map.keys(checkpoint)) ==
+      Enum.sort(["baseline_fingerprint", "direction", "phase", "requirement_cursor", "scan_key"]) and
+      checkpoint["direction"] == "outbound" and checkpoint["phase"] in ["scan", "transfer"] and
+      is_binary(checkpoint["baseline_fingerprint"]) and is_binary(checkpoint["scan_key"]) and
+      (is_nil(checkpoint["requirement_cursor"]) or is_binary(checkpoint["requirement_cursor"])) and
+      Enum.all?(Map.values(checkpoint), &(is_nil(&1) or String.valid?(&1))) and
+      byte_size(JSON.encode!(checkpoint)) <= 16_384
+  end
+
+  defp valid_lfs_checkpoint?(_), do: false
+
   @doc "Recheck the coordinator capability inside the staged writer's transaction."
   def authorize(operation, now, intent) do
     if Repo.in_transaction?() do
@@ -102,6 +376,7 @@ defmodule ForgeMirrors.PullMergeBoundary do
            full =
              Map.merge(marker, %{
                "preparation" => compact(context.expected),
+               "provider_pull_identity" => context.provider_pull_identity,
                "expected_base_oid" => context.intent.expected_base_oid,
                "expected_head_oid" => context.intent.expected_head_oid,
                "base_ref" => context.intent.base_ref,
@@ -359,7 +634,19 @@ defmodule ForgeMirrors.PullMergeBoundary do
   end
 
   defp save_preparation(operation, expected, intent_id) do
-    preparation = Map.put(compact(expected), "merge_operation_id", intent_id)
+    mapping =
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: operation.repository_mirror_id,
+        resource_kind: :pull,
+        local_resource_id: expected.pull_id
+      )
+
+    preparation =
+      Map.merge(compact(expected), %{
+        "merge_operation_id" => intent_id,
+        "provider_pull_identity" => provider_pull_identity(mapping)
+      })
+
     existing = operation.checkpoint["merge_preparation"]
 
     cond do
@@ -401,6 +688,13 @@ defmodule ForgeMirrors.PullMergeBoundary do
            end),
          :ok <- lock_reservations(scope.repository_id, expected),
          :ok <- validate_expected(scope, expected),
+         %MirrorResourceState{} = mapping <-
+           Repo.get_by(MirrorResourceState,
+             repository_mirror_id: scope.repository_mirror_id,
+             resource_kind: :pull,
+             local_resource_id: expected.pull_id
+           ),
+         true <- preparation["provider_pull_identity"] == provider_pull_identity(mapping),
          true <- valid_intent?(intent, scope, expected),
          :ok <- authorize_requester(intent, scope),
          :ok <-
@@ -414,7 +708,12 @@ defmodule ForgeMirrors.PullMergeBoundary do
            ),
          :ok <- no_ref_effect(scope, expected),
          :ok <- live_capability(scope.operation) do
-      {:ok, Map.merge(scope, %{intent: intent, expected: expected})}
+      {:ok,
+       Map.merge(scope, %{
+         intent: intent,
+         expected: expected,
+         provider_pull_identity: preparation["provider_pull_identity"]
+       })}
     else
       {:error, _} = error -> error
       _ -> {:error, :stale_merge_identity}
@@ -537,6 +836,15 @@ defmodule ForgeMirrors.PullMergeBoundary do
       end)
 
   defp positive?(id), do: is_integer(id) and id > 0 and id <= 9_223_372_036_854_775_807
+
+  defp provider_pull_identity(mapping),
+    do: %{"id" => mapping.github_object_id, "node_id" => mapping.github_node_id}
+
+  defp valid_provider_pull_identity?(%{"id" => id, "node_id" => node} = identity),
+    do:
+      map_size(identity) == 2 and positive?(id) and is_binary(node) and byte_size(node) in 1..512
+
+  defp valid_provider_pull_identity?(_), do: false
   defp oid?(oid), do: is_binary(oid) and Regex.match?(~r/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/, oid)
   defp json(value), do: value |> JSON.encode!() |> JSON.decode!()
 end

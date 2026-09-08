@@ -13,13 +13,17 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
   @allow_test_callbacks Mix.env() == :test
 
   @type direction :: :inbound | :outbound | :converge
-  @type option :: {:gate_key, {:github_installation, pos_integer()}}
+  @type option ::
+          {:gate_key, {:github_installation, pos_integer()}}
+          | {:authorize, (-> :ok | {:error, term()})}
 
   @doc """
   Synchronizes one completed pointer-scan page without advancing its cursor on failure.
 
   Requires `gate_key: {:github_installation, installation_id}` so every Batch request is
   serialized with other requests made using the same installation credential.
+  Trusted callers may supply a runtime `authorize` callback returning `:ok` or an error.
+  It is checked before every new provider request; it does not abort an in-flight request.
   """
   @spec process_page(
           Repository.t(),
@@ -30,7 +34,7 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
           String.t(),
           String.t() | nil,
           [option()]
-        ) :: {:ok, String.t() | nil} | {:error, Error.t()}
+        ) :: {:ok, String.t() | nil} | {:error, term()}
   def process_page(
         repository,
         scan,
@@ -58,6 +62,7 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
          :ok <- validate_remote(token, remote_owner, remote_repository),
          :ok <- validate_after_oid(after_oid),
          {:ok, gate_key, callbacks} <- coordinator_options(options),
+         :ok <- authorize!(callbacks),
          {:ok, page} <-
            call(callbacks.list_requirements, [
              scan,
@@ -82,6 +87,8 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
       {:error, reason} -> local_error(reason)
       _invalid -> error(:invalid_request)
     end
+  catch
+    {:lfs_authorization, reason} -> {:error, reason}
   end
 
   def process_page(
@@ -228,13 +235,20 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
     objects = Enum.map(requirements, &Map.take(&1, [:oid, :size]))
     options = [gate_key: gate_key]
 
+    options =
+      case callbacks.authorize do
+        :error -> options
+        {:ok, authorize} -> Keyword.put(options, :authorize, authorize)
+      end
+
     with {:ok, remote_objects} <-
-           call(callbacks.batch, [token, owner, remote, operation, objects, options]),
+           guarded_call(callbacks, :batch, [token, owner, remote, operation, objects, options]),
          true <- is_list(remote_objects) and length(remote_objects) == length(requirements),
          {:ok, remote_by_oid} <- validate_remote_objects(remote_objects, operation, objects) do
       {:ok, Enum.map(requirements, &{&1, Map.fetch!(remote_by_oid, &1.oid)})}
     else
       {:error, %Error{} = error} -> {:error, error}
+      {:error, reason} -> throw({:lfs_authorization, reason})
       _invalid -> error(:invalid_lfs_response)
     end
   end
@@ -414,7 +428,7 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
   defp stream_download(reservation, requirement, action, callbacks) do
     consumer = fn reader, source -> callbacks.stage_upload.(reservation, reader, source) end
 
-    case call(callbacks.consume_download, [action, requirement, consumer, []]) do
+    case guarded_call(callbacks, :consume_download, [action, requirement, consumer, []]) do
       {:ok, staged} ->
         commit_download(staged, requirement.first_seen_ref, callbacks)
 
@@ -493,7 +507,16 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
       end
     end
 
-    case call(callbacks.upload, [upload_action, requirement, reader, source, []]) do
+    result =
+      try do
+        guarded_call(callbacks, :upload, [upload_action, requirement, reader, source, []])
+      catch
+        {:lfs_authorization, _reason} = denied ->
+          _ = close_local(source, callbacks)
+          throw(denied)
+      end
+
+    case result do
       {:ok, final_source} ->
         with :ok <- close_local(final_source, callbacks),
              :ok <- verify_remote(verify_action, requirement, callbacks) do
@@ -524,7 +547,7 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
   defp verify_remote(nil, _requirement, _callbacks), do: :ok
 
   defp verify_remote(%Action{} = action, requirement, callbacks) do
-    case call(callbacks.verify_remote, [action, requirement, []]) do
+    case guarded_call(callbacks, :verify_remote, [action, requirement, []]) do
       :ok -> :ok
       {:error, %Error{} = error} -> {:error, error}
       _invalid -> error(:invalid_lfs_response)
@@ -657,7 +680,7 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
   if @allow_test_callbacks do
     defp coordinator_options(options) when is_list(options) do
       with true <- Keyword.keyword?(options),
-           [] <- Keyword.keys(options) -- [:gate_key, :callbacks],
+           [] <- Keyword.keys(options) -- [:gate_key, :callbacks, :authorize],
            true <- length(Keyword.keys(options)) == length(Enum.uniq(Keyword.keys(options))),
            {:ok, gate_key} <- Keyword.fetch(options, :gate_key),
            true <- valid_gate_key?(gate_key),
@@ -665,7 +688,7 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
            true <- is_map(overrides),
            callbacks <- Map.merge(default_callbacks(), overrides),
            true <- valid_callbacks?(callbacks) do
-        {:ok, gate_key, callbacks}
+        {:ok, gate_key, Map.put(callbacks, :authorize, Keyword.fetch(options, :authorize))}
       else
         _invalid -> error(:invalid_request)
       end
@@ -673,10 +696,12 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
   else
     defp coordinator_options(options) when is_list(options) do
       with true <- Keyword.keyword?(options),
-           [:gate_key] <- Keyword.keys(options),
+           [] <- Keyword.keys(options) -- [:gate_key, :authorize],
+           true <- length(Keyword.keys(options)) == length(Enum.uniq(Keyword.keys(options))),
            {:ok, gate_key} <- Keyword.fetch(options, :gate_key),
            true <- valid_gate_key?(gate_key) do
-        {:ok, gate_key, default_callbacks()}
+        {:ok, gate_key,
+         Map.put(default_callbacks(), :authorize, Keyword.fetch(options, :authorize))}
       else
         _invalid -> error(:invalid_request)
       end
@@ -732,7 +757,32 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
   rescue
     _exception -> {:error, :local_storage}
   catch
+    {:lfs_authorization, _reason} = denied -> throw(denied)
     _kind, _reason -> {:error, :local_storage}
+  end
+
+  defp guarded_call(callbacks, key, arguments) do
+    authorize!(callbacks)
+    call(Map.fetch!(callbacks, key), arguments)
+  end
+
+  defp authorize!(%{authorize: :error}), do: :ok
+
+  defp authorize!(%{authorize: {:ok, authorize}}) do
+    result =
+      try do
+        authorize.()
+      rescue
+        _ -> {:error, :invalid_authorization}
+      catch
+        _, _ -> {:error, :invalid_authorization}
+      end
+
+    case result do
+      :ok -> :ok
+      {:error, reason} -> throw({:lfs_authorization, reason})
+      _ -> throw({:lfs_authorization, :invalid_authorization})
+    end
   end
 
   defp local_error(reason)

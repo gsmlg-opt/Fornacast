@@ -10,6 +10,37 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 prepared merge execution and ambiguous-effect recovery (2026-09-08)
+
+- A bounded, deliberately unregistered merge worker executes an already written
+  deterministic merge commit through an exact expected-base Git compare-and-swap.
+  Fresh local/provider base and head evidence, paired pull/issue identity, current
+  coordinator authority, and LFS prerequisites are required before the immutable
+  pre-push marker. Provider observations use read-only credentials; LFS and Git
+  mutations use a base-repository-only write token.
+- Recovery observes the authenticated remote base before retrying. The original
+  base permits a freshly authorized retry of the same commit; the prepared merge
+  commit records confirmation readiness; a third commit records a durable conflict.
+  Yielding never clears the effect marker, merge reservation, or existing conflict.
+  Provider numeric/node identities and the original installation remain pinned.
+- Bounded LFS progress checkpoints yield without inventing a network failure.
+  Runtime authority checks fence scan/transfer preparation and new batch, upload,
+  and verification requests. These checks do not claim to cancel an external
+  request already in flight. Denial after opening an upload source closes it.
+  Batch authorization is rechecked after acquiring the installation request gate.
+- Final scoped PostgreSQL regression matrix: **157 passed** (Git transport 4,
+  mirrors 52, pull domain 22, provider 76, API merge 3). Tests include deterministic
+  merge writing, stale/ref divergence, ambiguous push recovery, revocation during
+  LFS preparation and gate waits, and upload source cleanup. Provider HTTP is
+  stubbed; domain transactions and Git fixtures are real. Existing unrelated
+  importer fixture warnings remain unchanged.
+- Push success is not merge completion. This worker does not update local public
+  refs, close the pull, or complete the mirror operation, and is not admitted by
+  the worker pool. Dedicated two-endpoint confirmation, atomic local/domain and
+  mapping confirmation, requester admission, and activation remain to implement.
+  PR14–16 and the full PRD acceptance matrix remain open. No push, deployment,
+  or live GitHub write validation occurred.
+
 ### PR13 read-only head reevaluation and discovery (2026-09-08)
 
 - Unsupported pulls now have a leased coordinator and worker path. An explicitly

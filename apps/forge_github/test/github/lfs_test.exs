@@ -6,6 +6,47 @@ defmodule ForgeGitHub.LFSTest do
 
   @oid String.duplicate("a", 64)
 
+  test "Batch rechecks authority after waiting for its installation gate" do
+    parent = self()
+    gate_key = {:github_installation, System.unique_integer([:positive])}
+    {:ok, authority} = Agent.start_link(fn -> :ok end)
+
+    holder =
+      Task.async(fn ->
+        ForgeGitHub.RequestGate.run(gate_key, fn ->
+          send(parent, :gate_held)
+
+          receive do
+            :release -> :ok
+          end
+        end)
+      end)
+
+    assert_receive :gate_held
+
+    options =
+      test_options(lfs_response(%{"objects" => []}))
+      |> Keyword.put(:gate_key, gate_key)
+      |> Keyword.put(:authorize, fn ->
+        result = Agent.get(authority, & &1)
+        send(parent, :authority_checked)
+        result
+      end)
+
+    caller =
+      Task.async(fn ->
+        LFS.batch("token", "octocat", "repo", :upload, [%{oid: @oid, size: 3}], options)
+      end)
+
+    assert_receive :authority_checked
+    Agent.update(authority, fn _ -> {:error, :lease_expired} end)
+    send(holder.pid, :release)
+    assert :ok = Task.await(holder)
+    assert {:error, :lease_expired} = Task.await(caller)
+    refute_received {:request, _, _, _, _, _}
+    Agent.stop(authority)
+  end
+
   test "requests Basic transfers from the fixed GitHub repository Batch endpoint" do
     response =
       lfs_response(%{

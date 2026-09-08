@@ -642,6 +642,404 @@ defmodule ForgeMirrors.PullMergeBoundaryTest do
     assert Repo.get!(ForgeMirrors.MirrorOperation, c.operation.id).checkpoint == before
   end
 
+  test "marked recovery retains evidence after authorization and local baseline change", c do
+    marked = marked(c)
+    c.organization |> Changeset.change(state: :paused) |> Repo.update!()
+    c.pull |> Changeset.change(base_sha: String.duplicate("e", 40)) |> Repo.update!()
+    assert {:error, _} = PullMergeBoundary.context(marked, c.now)
+    assert {:ok, recovery} = PullMergeBoundary.recovery_context(marked, c.now)
+    assert recovery.github_installation_id == c.organization.github_installation_id
+
+    assert {:ok, deferred} =
+             PullMergeBoundary.defer(marked, c.now, DateTime.add(c.now, 30), :network)
+
+    assert deferred.state == :effect_pending
+    assert deferred.lease_owner == nil
+    assert deferred.checkpoint == marked.checkpoint
+    assert deferred.external_effect_marker == marked.external_effect_marker
+    assert deferred.lock_version == marked.lock_version + 1
+    assert {:error, _} = PullMergeBoundary.recovery_context(marked, c.now)
+  end
+
+  test "marked recovery rejects forged expired and corrupted evidence", c do
+    marked = marked(c)
+
+    for forged <- [
+          %{marked | lease_owner: "forged"},
+          %{marked | cursor: %{}},
+          %{marked | lock_version: marked.lock_version + 1}
+        ] do
+      assert {:error, _} = PullMergeBoundary.recovery_context(forged, c.now)
+    end
+
+    assert {:error, _} = PullMergeBoundary.recovery_context(marked, DateTime.add(c.now, 120))
+
+    corrupted =
+      marked
+      |> Changeset.change(
+        external_effect_marker:
+          Map.put(marked.external_effect_marker, "merge_oid", String.duplicate("e", 40))
+      )
+      |> Repo.update!()
+
+    assert {:error, _} = PullMergeBoundary.recovery_context(corrupted, c.now)
+  end
+
+  test "defer diagnostics have a UTF8 safe byte bound even for combining marks", c do
+    marked = marked(c)
+    reason = "a" <> String.duplicate("\u0301", 1000)
+
+    assert {:ok, deferred} =
+             PullMergeBoundary.defer(marked, c.now, DateTime.add(c.now, 30), reason)
+
+    assert byte_size(deferred.failure_detail) <= 512
+    assert String.valid?(deferred.failure_detail)
+  end
+
+  test "normal confirmation wait does not invent a network failure", c do
+    marked = marked(c)
+
+    assert {:ok, deferred} =
+             PullMergeBoundary.defer(
+               marked,
+               c.now,
+               DateTime.add(c.now, 30),
+               :remote_confirmation_required
+             )
+
+    assert deferred.failure_class == nil
+    assert deferred.failure_disposition == nil
+    assert deferred.failure_detail == nil
+  end
+
+  test "M readiness clears an earlier network failure", c do
+    marked =
+      marked(c)
+      |> Changeset.change(
+        failure_class: "network",
+        failure_disposition: :retry,
+        failure_detail: "timeout"
+      )
+      |> Repo.update!()
+
+    assert {:ok, observed} =
+             PullMergeBoundary.record_observation(marked, c.now, DateTime.add(c.now, 30), %{
+               remote_base_oid: String.duplicate("d", 40),
+               provider_pull_id: 902
+             })
+
+    assert observed.failure_class == nil
+    assert observed.failure_disposition == nil
+    assert observed.failure_detail == nil
+  end
+
+  test "confirmation wait and M readiness retain an open conflict diagnostic", c do
+    marked = marked(c)
+
+    assert {:ok, conflicted} =
+             PullMergeBoundary.record_observation(marked, c.now, DateTime.add(c.now, 30), %{
+               remote_base_oid: String.duplicate("e", 40),
+               provider_pull_id: 902
+             })
+
+    reclaimed =
+      conflicted
+      |> Changeset.change(lease_owner: "recovery", lease_expires_at: DateTime.add(c.now, 60))
+      |> Repo.update!()
+
+    assert {:ok, deferred} =
+             PullMergeBoundary.defer(
+               reclaimed,
+               c.now,
+               DateTime.add(c.now, 30),
+               :remote_confirmation_required
+             )
+
+    assert deferred.failure_class == "git_divergence"
+
+    reclaimed =
+      deferred
+      |> Changeset.change(lease_owner: "recovery", lease_expires_at: DateTime.add(c.now, 60))
+      |> Repo.update!()
+
+    assert {:ok, observed} =
+             PullMergeBoundary.record_observation(reclaimed, c.now, DateTime.add(c.now, 30), %{
+               remote_base_oid: String.duplicate("d", 40),
+               provider_pull_id: 902
+             })
+
+    assert observed.failure_class == "git_divergence"
+    assert observed.failure_disposition == :conflict
+
+    assert Repo.get_by!(ForgeMirrors.MirrorConflict, organization_mirror_id: c.organization.id).state ==
+             :open
+  end
+
+  test "corrupted scalar eligibility proof is rejected without raising", c do
+    marked = marked(c)
+
+    corrupted =
+      marked
+      |> Changeset.change(
+        checkpoint:
+          put_in(marked.checkpoint, ["merge_preparation", "pull_eligibility_proof"], "corrupted")
+      )
+      |> Repo.update!()
+
+    assert {:error, :stale_merge_identity} = PullMergeBoundary.recovery_context(corrupted, c.now)
+  end
+
+  test "invalid UTF8 LFS checkpoint is rejected without raising", c do
+    marked = marked(c)
+
+    checkpoint = %{
+      "baseline_fingerprint" => <<255>>,
+      "direction" => "outbound",
+      "phase" => "scan",
+      "requirement_cursor" => nil,
+      "scan_key" => "key"
+    }
+
+    assert {:error, :invalid_transition} =
+             PullMergeBoundary.checkpoint_lfs(marked, c.now, checkpoint)
+  end
+
+  test "recovery can defer after installation revocation and requester removal", c do
+    marked = marked(c)
+
+    Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+      github_installation_id: c.organization.github_installation_id
+    )
+    |> Changeset.change(state: :revoked)
+    |> Repo.update!()
+
+    Repo.get_by!(ForgeAccounts.OrganizationMember,
+      organization_id: c.organization.organization_id,
+      user_id: c.request.actor_user_id
+    )
+    |> Repo.delete!()
+
+    assert {:error, _} = PullMergeBoundary.context(marked, c.now)
+
+    assert {:ok, deferred} =
+             PullMergeBoundary.defer(marked, c.now, DateTime.add(c.now, 30), :credential_revoked)
+
+    assert deferred.external_effect_marker == marked.external_effect_marker
+    assert deferred.checkpoint == marked.checkpoint
+  end
+
+  test "observing original B grants no confirmation readiness and retains the lease", c do
+    marked = marked(c)
+
+    assert {:error, :remote_base_unchanged} =
+             PullMergeBoundary.record_observation(marked, c.now, DateTime.add(c.now, 30), %{
+               remote_base_oid: c.pull.base_sha,
+               provider_pull_id: 902
+             })
+
+    assert Repo.get!(ForgeMirrors.MirrorOperation, marked.id) == marked
+  end
+
+  test "M observation only records confirmation readiness and yields", c do
+    marked = marked(c)
+
+    assert {:ok, observed} =
+             PullMergeBoundary.record_observation(marked, c.now, DateTime.add(c.now, 30), %{
+               remote_base_oid: String.duplicate("d", 40),
+               provider_pull_id: 902
+             })
+
+    assert observed.checkpoint["merge_observation"]["confirmation_ready"] == true
+    assert observed.external_effect_marker == marked.external_effect_marker
+    assert observed.state == :effect_pending
+    assert observed.lease_owner == nil
+    assert Repo.get!(ForgePulls.PullRequest, c.pull.id).merged_at == nil
+  end
+
+  test "recovery keeps original installation after rebind and rejects altered preparation", c do
+    marked = marked(c)
+
+    c.organization
+    |> Changeset.change(github_installation_id: c.organization.github_installation_id + 1)
+    |> Repo.update!()
+
+    assert {:error, _} = PullMergeBoundary.context(marked, c.now)
+    assert {:ok, recovery} = PullMergeBoundary.recovery_context(marked, c.now)
+    assert recovery.github_installation_id == c.organization.github_installation_id
+
+    corrupted =
+      marked
+      |> Changeset.change(
+        checkpoint: put_in(marked.checkpoint, ["merge_preparation", "local_version"], 999)
+      )
+      |> Repo.update!()
+
+    assert {:error, _} = PullMergeBoundary.recovery_context(corrupted, c.now)
+
+    assert {:error, _} =
+             PullMergeBoundary.defer(corrupted, c.now, DateTime.add(c.now, 30), :network)
+  end
+
+  test "observation cannot substitute the original provider pull object", c do
+    marked = marked(c)
+
+    c.mapping
+    |> Changeset.change(github_object_id: 903, github_node_id: "PR_903")
+    |> Repo.update!()
+
+    assert {:error, _} =
+             PullMergeBoundary.record_observation(marked, c.now, DateTime.add(c.now, 30), %{
+               remote_base_oid: String.duplicate("d", 40),
+               provider_pull_id: 903
+             })
+  end
+
+  test "third OID observation records conflict while preserving merge reservation", c do
+    marked = marked(c)
+
+    assert {:error, _} =
+             PullMergeBoundary.record_observation(marked, c.now, DateTime.add(c.now, 30), %{
+               remote_base_oid: String.duplicate("e", 40),
+               provider_pull_id: 999
+             })
+
+    assert {:ok, observed} =
+             PullMergeBoundary.record_observation(marked, c.now, DateTime.add(c.now, 30), %{
+               remote_base_oid: String.duplicate("e", 40),
+               provider_pull_id: 902
+             })
+
+    assert observed.failure_disposition == :conflict
+    assert observed.state == :effect_pending
+    assert observed.external_effect_marker == marked.external_effect_marker
+
+    conflict =
+      Repo.get_by!(ForgeMirrors.MirrorConflict, organization_mirror_id: c.organization.id)
+
+    assert conflict.baseline_snapshot == %{"oid" => c.pull.base_sha}
+    assert conflict.local_snapshot == %{"oid" => String.duplicate("d", 40)}
+    assert conflict.remote_snapshot == %{"oid" => String.duplicate("e", 40)}
+
+    reclaimed =
+      observed
+      |> Changeset.change(lease_owner: "recovery", lease_expires_at: DateTime.add(c.now, 60))
+      |> Repo.update!()
+
+    assert {:ok, replayed} =
+             PullMergeBoundary.record_observation(reclaimed, c.now, DateTime.add(c.now, 30), %{
+               remote_base_oid: String.duplicate("e", 40),
+               provider_pull_id: 902
+             })
+
+    assert Repo.aggregate(ForgeMirrors.MirrorConflict, :count) == 1
+
+    reclaimed =
+      replayed
+      |> Changeset.change(lease_owner: "recovery", lease_expires_at: DateTime.add(c.now, 60))
+      |> Repo.update!()
+
+    assert {:error, :dedupe_conflict} =
+             PullMergeBoundary.record_observation(reclaimed, c.now, DateTime.add(c.now, 30), %{
+               remote_base_oid: String.duplicate("f", 40),
+               provider_pull_id: 902
+             })
+
+    assert Repo.get!(ForgeMirrors.MirrorConflict, conflict.id) == conflict
+  end
+
+  test "observation rejects a changed provider node with unchanged numeric ID", c do
+    marked = marked(c)
+    c.mapping |> Changeset.change(github_node_id: "PR_OTHER") |> Repo.update!()
+
+    assert {:error, _} =
+             PullMergeBoundary.record_observation(marked, c.now, DateTime.add(c.now, 30), %{
+               remote_base_oid: String.duplicate("d", 40),
+               provider_pull_id: 902
+             })
+  end
+
+  test "LFS checkpoint retains preparation and marker", c do
+    marked = marked(c)
+
+    checkpoint = %{
+      "baseline_fingerprint" => "fingerprint",
+      "direction" => "outbound",
+      "phase" => "scan",
+      "requirement_cursor" => nil,
+      "scan_key" => "key"
+    }
+
+    for invalid <- [
+          Map.put(checkpoint, "scan_key", String.duplicate("x", 16_385)),
+          Map.put(checkpoint, "merge_preparation", %{})
+        ] do
+      assert {:error, _} = PullMergeBoundary.checkpoint_lfs(marked, c.now, invalid)
+    end
+
+    assert {:error, _} =
+             PullMergeBoundary.checkpoint_lfs(
+               %{marked | lease_owner: "forged"},
+               c.now,
+               checkpoint
+             )
+
+    assert {:ok, updated} = PullMergeBoundary.checkpoint_lfs(marked, c.now, checkpoint)
+    assert updated.checkpoint["merge_preparation"] == marked.checkpoint["merge_preparation"]
+    assert updated.external_effect_marker == marked.external_effect_marker
+    assert updated.checkpoint["scan_key"] == "key"
+    assert updated.state == :effect_pending
+    assert updated.lease_owner == nil
+    assert updated.lease_expires_at == nil
+    assert updated.next_attempt_at == DateTime.add(c.now, 1)
+    assert updated.lock_version == marked.lock_version + 1
+
+    assert {:error, _} =
+             PullMergeBoundary.checkpoint_lfs(updated, c.now, %{"merge_preparation" => %{}})
+  end
+
+  test "unmarked LFS checkpoint yields pending without losing preparation", c do
+    assert {:ok, %{reserved: _}} = prepare(c)
+
+    checkpoint = %{
+      "baseline_fingerprint" => "fingerprint",
+      "direction" => "outbound",
+      "phase" => "scan",
+      "requirement_cursor" => nil,
+      "scan_key" => "key"
+    }
+
+    assert {:ok, updated} = PullMergeBoundary.checkpoint_lfs(c.operation, c.now, checkpoint)
+    assert updated.state == :pending
+    assert updated.lease_owner == nil
+    assert updated.lease_expires_at == nil
+    assert updated.failure_class == nil
+    assert updated.external_effect_marker == nil
+    assert updated.next_attempt_at == DateTime.add(c.now, 1)
+    assert updated.checkpoint["merge_preparation"]["pull_id"] == c.pull.id
+  end
+
+  defp marked(c) do
+    assert {:ok, %{reserved: intent}} = prepare(c)
+
+    intent
+    |> Changeset.change(
+      state: :merge_written,
+      merge_tree_oid: String.duplicate("c", 40),
+      merge_oid: String.duplicate("d", 40)
+    )
+    |> Repo.update!()
+
+    assert {:ok, marked} =
+             PullMergeBoundary.mark(c.operation, c.now, nil, %{
+               "phase" => "remote_cas_pending",
+               "merge_operation_id" => intent.id,
+               "merge_tree_oid" => String.duplicate("c", 40),
+               "merge_oid" => String.duplicate("d", 40)
+             })
+
+    marked
+  end
+
   defp prepare(c),
     do:
       Multi.new()

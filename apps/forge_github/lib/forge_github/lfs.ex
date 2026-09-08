@@ -37,18 +37,40 @@ defmodule ForgeGitHub.LFS do
          true <- RepositoryReference.valid_repository?(repository),
          {:ok, objects} <- validate_objects(objects),
          true <- operation in [:download, :upload],
-         :ok <- validate_options(opts, [:ref]),
-         {:ok, gate_key} <- Keyword.fetch(opts, :gate_key) do
+         :ok <- validate_options(opts, [:ref, :authorize]),
+         {:ok, gate_key} <- Keyword.fetch(opts, :gate_key),
+         :ok <- authorize(opts) do
       case RequestGate.run(gate_key, fn ->
-             request_batch(token, owner, repository, operation, objects, opts)
+             with :ok <- authorize(opts) do
+               request_batch(token, owner, repository, operation, objects, opts)
+             end
            end) do
         {:error, :invalid_gate_key} -> error(:invalid_request)
         {:error, :busy} -> error(:request_gate_busy)
         result -> result
       end
     else
+      {:error, reason} -> {:error, reason}
       _invalid -> error(:invalid_request)
     end
+  end
+
+  defp authorize(opts) do
+    case Keyword.fetch(opts, :authorize) do
+      :error ->
+        :ok
+
+      {:ok, callback} ->
+        case callback.() do
+          :ok -> :ok
+          {:error, reason} -> {:error, reason}
+          _ -> {:error, :invalid_authorization}
+        end
+    end
+  rescue
+    _ -> {:error, :invalid_authorization}
+  catch
+    _, _ -> {:error, :invalid_authorization}
   end
 
   @doc "Streams one Basic download while checking its exact size and SHA-256 digest."

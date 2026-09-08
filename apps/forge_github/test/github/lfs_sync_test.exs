@@ -206,6 +206,43 @@ defmodule ForgeGitHub.LFSSyncTest do
     assert String.ends_with?(checkpoint["scan_key"], ":r91")
   end
 
+  test "authority expired during bounded expansion stops recording and transfer" do
+    work = %WorkItem{object_oid: @target, object_kind: :commit, tree_offset: 0}
+
+    options =
+      callbacks(
+        authorize: fn -> if Process.get(:expired), do: {:error, :lease_expired}, else: :ok end,
+        begin_scan: fn _, key, _, _ -> {:ok, scan(key, :scanning)} end,
+        claim_work: fn _, _, _ -> {:ok, [work]} end,
+        expand_object: fn _, _, _, _, _ ->
+          Process.put(:expired, true)
+          {:ok, %{object_kind: :commit, children: [], candidate: nil, next_offset: nil}}
+        end,
+        record_expansion: fn _, _, _ -> flunk("expired scan must stop") end,
+        transfer_page: fn _, _, _, _, _, _, _, _ -> flunk("expired scan must not transfer") end
+      )
+
+    assert {:error, :lease_expired} =
+             LFSSync.ensure(operation(), sync(), :outbound, @target, "token", %{}, options)
+  end
+
+  test "trusted authority callback is forwarded to transfer only as runtime options" do
+    authorize = fn -> :ok end
+
+    options =
+      callbacks(
+        authorize: authorize,
+        begin_scan: fn _, key, _, _ -> {:ok, scan(key, :complete)} end,
+        transfer_page: fn _, _, _, _, _, _, _, options ->
+          assert options[:authorize] == authorize
+          {:ok, nil}
+        end,
+        publish_scan: fn scan -> {:ok, %{scan | state: :prepared}} end
+      )
+
+    assert :ok = LFSSync.ensure(operation(), sync(), :outbound, @target, "token", %{}, options)
+  end
+
   defp operation do
     %MirrorOperation{id: 7, attempt_count: 1, state: :processing, checkpoint: %{}}
   end

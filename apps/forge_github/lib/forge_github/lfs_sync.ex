@@ -42,6 +42,7 @@ defmodule ForgeGitHub.LFSSync do
              is_list(options) do
     with :ok <- validate_inputs(operation, sync, target_oid, token),
          {:ok, callbacks} <- callbacks(options),
+         :ok <- authorize(callbacks),
          {:ok, %Repository{} = repository} <- callbacks.fetch_repository.(sync.repository_id),
          true <- repository.generation == sync.repository_generation,
          {:ok, refs} <- callbacks.list_refs.(sync.repository_path),
@@ -50,10 +51,12 @@ defmodule ForgeGitHub.LFSSync do
          scan_key <- scan_key(operation, fingerprint),
          checkpoint <- matching_checkpoint(operation.checkpoint, fingerprint, direction),
          selected_key <- Map.get(checkpoint, "scan_key", scan_key),
+         :ok <- authorize(callbacks),
          {:ok, %Scan{} = scan} <-
            callbacks.begin_scan.(repository, selected_key, baselines,
              batch_limit: @scan_batch_limit
-           ) do
+           ),
+         :ok <- authorize(callbacks) do
       advance(
         operation,
         sync,
@@ -111,9 +114,14 @@ defmodule ForgeGitHub.LFSSync do
        ) do
     owner = scan_owner(operation)
 
-    case callbacks.claim_work.(scan, owner, limit: 1, lease_seconds: @work_lease_seconds) do
+    case authorized_call(callbacks, :claim_work, [
+           scan,
+           owner,
+           [limit: 1, lease_seconds: @work_lease_seconds]
+         ]) do
       {:ok, [work_item]} ->
-        with {:ok, expansion} <-
+        with :ok <- authorize(callbacks),
+             {:ok, expansion} <-
                callbacks.expand_object.(
                  sync.repository_path,
                  work_item.object_oid,
@@ -121,8 +129,10 @@ defmodule ForgeGitHub.LFSSync do
                  work_item.tree_offset,
                  scan.batch_limit
                ),
+             :ok <- authorize(callbacks),
              {:ok, %{scan: next_scan}} <-
-               callbacks.record_expansion.(work_item, owner, expansion) do
+               callbacks.record_expansion.(work_item, owner, expansion),
+             :ok <- authorize(callbacks) do
           case next_scan.state do
             state when state in [:complete, :published] ->
               transfer(
@@ -147,7 +157,7 @@ defmodule ForgeGitHub.LFSSync do
         end
 
       {:ok, []} ->
-        case callbacks.resume_scan.(repository, scan.scan_key) do
+        case authorized_call(callbacks, :resume_scan, [repository, scan.scan_key]) do
           {:ok, %Scan{state: state} = resumed} when state in [:complete, :published] ->
             transfer(
               operation,
@@ -238,7 +248,13 @@ defmodule ForgeGitHub.LFSSync do
 
     options = [gate_key: {:github_installation, sync.github_installation_id}]
 
-    case callbacks.transfer_page.(
+    options =
+      case callbacks.authorize do
+        :error -> options
+        {:ok, authorize} -> Keyword.put(options, :authorize, authorize)
+      end
+
+    case authorized_call(callbacks, :transfer_page, [
            repository,
            scan,
            direction,
@@ -247,7 +263,7 @@ defmodule ForgeGitHub.LFSSync do
            sync.remote_repository,
            after_oid,
            options
-         ) do
+         ]) do
       {:ok, nil} ->
         publish(operation, direction, fingerprint, scan, callbacks)
 
@@ -263,19 +279,21 @@ defmodule ForgeGitHub.LFSSync do
   end
 
   defp publish(operation, direction, fingerprint, scan, callbacks) do
-    case callbacks.publish_scan.(scan) do
-      {:ok, %Scan{state: state}} when state in [:prepared, :published] ->
-        :ok
+    with :ok <- authorize(callbacks) do
+      case callbacks.publish_scan.(scan) do
+        {:ok, %Scan{state: state}} when state in [:prepared, :published] ->
+          :ok
 
-      {:error, :superseded} ->
-        retry_key = scan_key(operation, fingerprint) <> ":r#{scan.id}"
-        {:incomplete, checkpoint(retry_key, fingerprint, direction, "scan", nil)}
+        {:error, :superseded} ->
+          retry_key = scan_key(operation, fingerprint) <> ":r#{scan.id}"
+          {:incomplete, checkpoint(retry_key, fingerprint, direction, "scan", nil)}
 
-      {:error, reason} ->
-        normalize_error(reason)
+        {:error, reason} ->
+          normalize_error(reason)
 
-      _invalid ->
-        {:error, :invalid_lfs_state}
+        _invalid ->
+          {:error, :invalid_lfs_state}
+      end
     end
   end
 
@@ -377,6 +395,7 @@ defmodule ForgeGitHub.LFSSync do
 
   defp callbacks(options) do
     allowed = [
+      :authorize,
       :begin_scan,
       :claim_work,
       :expand_object,
@@ -389,10 +408,11 @@ defmodule ForgeGitHub.LFSSync do
     ]
 
     if Keyword.keyword?(options) and
-         (@allow_test_callbacks or Keyword.keys(options) == []) and
+         (@allow_test_callbacks or Keyword.keys(options) -- [:authorize] == []) and
          Enum.all?(Keyword.keys(options), &(&1 in allowed)) do
       {:ok,
        %{
+         authorize: Keyword.fetch(options, :authorize),
          begin_scan: callback(options, :begin_scan, &PointerScanner.begin_scan/4),
          claim_work: callback(options, :claim_work, &PointerScanner.claim_work/3),
          expand_object: callback(options, :expand_object, &GitCore.expand_lfs_scan_object/5),
@@ -417,5 +437,27 @@ defmodule ForgeGitHub.LFSSync do
       function when is_function(function) -> function
       _invalid -> raise ArgumentError, "invalid Git LFS synchronization callback"
     end
+  end
+
+  defp authorized_call(callbacks, key, args) do
+    with :ok <- authorize(callbacks),
+         result <- apply(Map.fetch!(callbacks, key), args),
+         :ok <- authorize(callbacks) do
+      result
+    end
+  end
+
+  defp authorize(%{authorize: :error}), do: :ok
+
+  defp authorize(%{authorize: {:ok, authorize}}) do
+    case authorize.() do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :invalid_authorization}
+    end
+  rescue
+    _ -> {:error, :invalid_authorization}
+  catch
+    _, _ -> {:error, :invalid_authorization}
   end
 end

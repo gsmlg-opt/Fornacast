@@ -316,7 +316,91 @@ defmodule ForgeGitHub.LFS.TransferCoordinatorTest do
     assert :counters.get(counter, 1) == 2
   end
 
-  defp process(direction, callbacks) do
+  for revoke_at <- [:batch, :upload] do
+    test "revocation after #{revoke_at} prevents further uploads and verification" do
+      revoke_at = revocation_stage(unquote(revoke_at))
+      parent = self()
+
+      callbacks =
+        callbacks(
+          list_requirements: fn _, _ -> {:ok, %{objects: requirements(), next_cursor: nil}} end,
+          verify_local: fn _, _, _ -> :ok end,
+          batch: fn _, _, _, :upload, objects, _ ->
+            if revoke_at == :batch, do: Process.put(:revoked, true)
+            {:ok, Enum.map(objects, &remote_upload(&1, verify?: true))}
+          end,
+          open_local: fn _, oid, size, _ -> {:ok, oid, %{size: size}} end,
+          upload: fn _, object, _, source, _ ->
+            send(parent, {:uploaded, object.oid})
+            Process.put(:revoked, true)
+            {:ok, source}
+          end,
+          close_local: fn _ -> :ok end,
+          verify_remote: fn _, _, _ ->
+            send(parent, :verified)
+            :ok
+          end
+        )
+
+      assert {:error, :lease_expired} =
+               process(:outbound, callbacks,
+                 authorize: fn ->
+                   if Process.get(:revoked), do: {:error, :lease_expired}, else: :ok
+                 end
+               )
+
+      if revoke_at == :upload, do: assert_received({:uploaded, _})
+      refute_received {:uploaded, _}
+      refute_received :verified
+    end
+  end
+
+  defp revocation_stage(stage), do: stage
+
+  test "revocation while opening the local source closes it without uploading" do
+    parent = self()
+
+    callbacks =
+      callbacks(
+        list_requirements: fn _, _ -> {:ok, %{objects: requirements(), next_cursor: nil}} end,
+        verify_local: fn _, _, _ -> :ok end,
+        batch: fn _, _, _, _, objects, _ ->
+          {:ok, Enum.map(objects, &remote_upload(&1, verify?: true))}
+        end,
+        open_local: fn _, oid, size, _ ->
+          Process.put(:revoked, true)
+          {:ok, oid, %{size: size}}
+        end,
+        close_local: fn oid ->
+          send(parent, {:closed, oid})
+          :ok
+        end
+      )
+
+    assert {:error, :lease_expired} =
+             process(:outbound, callbacks,
+               authorize: fn ->
+                 if Process.get(:revoked), do: {:error, :lease_expired}, else: :ok
+               end
+             )
+
+    assert_received {:closed, _}
+  end
+
+  test "invalid or crashing authority fails closed before Batch" do
+    for authorize <- [
+          nil,
+          :absent,
+          fn -> true end,
+          fn -> raise "revoked" end,
+          fn -> throw(:revoked) end
+        ] do
+      assert {:error, :invalid_authorization} =
+               process(:outbound, callbacks([]), authorize: authorize)
+    end
+  end
+
+  defp process(direction, callbacks, options \\ []) do
     TransferCoordinator.process_page(
       repository(),
       scan(),
@@ -325,8 +409,7 @@ defmodule ForgeGitHub.LFS.TransferCoordinatorTest do
       "octocat",
       "repo",
       nil,
-      gate_key: {:github_installation, 77},
-      callbacks: callbacks
+      [gate_key: {:github_installation, 77}, callbacks: callbacks] ++ options
     )
   end
 
