@@ -56,6 +56,17 @@ PR13 integration audit additionally identified these concrete remaining gates:
 
 ## Current local verification
 
+- `5b390d1` records intent-bound outbound creation conflicts instead of deferring
+  zero/multiple UUID matches and identity/metadata divergence as network errors.
+  The exact marker and scan survive in the failed operation checkpoint; the
+  immutable intent still reserves the local pull, and no candidate mapping is
+  invented. Zero-match claims require a persisted completed empty scan; multiple
+  matches require two distinct compact identities. Real integration proves one
+  POST followed by an open conflict and no cleanup/mapping for an empty scan.
+  Fresh combined verification passed 102 tests (46 mirror, 56 provider), with
+  eight changed files format-checked. A fixture timing race was corrected by
+  capturing claim time after operation materialization. Conflict resolution and
+  relationship prerequisite recovery remain open; this does not enable workers.
 - `0a25679` adds durable paged recovery and fresh eligibility without another
   creator grant. A regression proved replacement-installation acceptance; the
   fixed boundary pins both original organization and installation identities.
