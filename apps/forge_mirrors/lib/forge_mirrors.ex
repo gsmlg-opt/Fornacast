@@ -1835,10 +1835,15 @@ defmodule ForgeMirrors do
          is_nil(expected[:expected_local_fingerprint]) and
          positive_resource_id?(expected[:github_object_id]) and
          expected.github_object_id == confirmation[:github_object_id] do
+      lock_fun =
+        if Map.has_key?(expected, :pair),
+          do: &lock_mapped_pull_label_operation(&1, expected),
+          else: &lock_remote_pull_label_operation/1
+
       guarded = fn multi ->
         multi
         |> Ecto.Multi.run(:remote_pull_label_admission, fn repo, _ ->
-          with {:ok, _persisted, scope} <- lock_remote_pull_label_operation(operation) do
+          with {:ok, _persisted, scope} <- lock_fun.(operation) do
             {:ok, remote_pull_label_admission(repo, scope.repository_id)}
           end
         end)
@@ -1860,7 +1865,7 @@ defmodule ForgeMirrors do
         expected,
         confirmation,
         guarded,
-        &lock_remote_pull_label_operation/1
+        lock_fun
       )
     else
       {:error, :invalid_argument}
@@ -1868,6 +1873,32 @@ defmodule ForgeMirrors do
   end
 
   def confirm_remote_pull_label(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  defp lock_mapped_pull_label_operation(operation, expected) do
+    with true <- is_map(expected[:pull_precondition]),
+         {:ok, context} <- mapped_pull_pair_context(operation),
+         true <- context.pair == expected.pair,
+         {:ok, persisted, scope} <- lock_resource_operation(operation),
+         true <- persisted.state == :processing and is_nil(persisted.external_effect_marker),
+         {:ok, mapping} <- resource_mapping(persisted, :pull),
+         :ok <-
+           ForgeMirrors.PullResourceBoundary.validate_precondition(
+             scope,
+             mapping,
+             expected.pull_precondition
+           ) do
+      {:ok, persisted, scope}
+    else
+      false ->
+        case Repo.get(MirrorOperation, operation.id) do
+          %MirrorOperation{state: :effect_pending} -> {:error, :invalid_transition}
+          _ -> {:error, :stale_paired_mapping}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
 
   defp lock_remote_pull_label_operation(operation) do
     with {:ok, _context} <- remote_pull_creation_context(operation),

@@ -250,6 +250,221 @@ defmodule ForgeMirrors.RemotePullLabelTest do
     end
   end
 
+  test "mapped parent imports one label and yields without advancing either baseline", c do
+    c = mapped(c)
+    assert {:ok, result} = confirm(c)
+    assert result.operation.id == c.op.id
+    assert result.operation.state == :pending
+    assert result.operation.cursor == c.op.cursor
+    assert result.operation.checkpoint == c.op.checkpoint
+    assert Repo.get!(MirrorResourceState, c.pull_mapping.id) == c.pull_mapping
+    assert Repo.get!(MirrorResourceState, c.issue_mapping.id) == c.issue_mapping
+    assert Repo.get!(ForgeIssues.Issue, c.issue.id).sync_version == 1
+  end
+
+  test "mapped label admission rejects changed paired mapping before callback", c do
+    c = mapped(c)
+
+    Repo.update_all(from(m in MirrorResourceState, where: m.id == ^c.issue_mapping.id),
+      inc: [lock_version: 1]
+    )
+
+    assert {:error, :stale_paired_mapping} = confirm(c, fn _ -> flunk("stale pair callback") end)
+  end
+
+  test "mapped label admission fences installation and ref evidence", c do
+    c = mapped(c)
+
+    for precondition <- [
+          put_in(
+            c.expected.pull_precondition,
+            ["pull_eligibility_proof", "github_installation_id"],
+            999_999_999
+          ),
+          put_in(
+            c.expected.pull_precondition,
+            ["pull_eligibility_proof", "head", "oid"],
+            String.duplicate("c", 40)
+          )
+        ] do
+      assert {:error, :ineligible_pull} =
+               confirm(%{c | expected: %{c.expected | pull_precondition: precondition}}, fn _ ->
+                 flunk("invalid proof callback")
+               end)
+    end
+  end
+
+  test "mapped label admission rejects scalar drift even at the same canonical version", c do
+    c = mapped(c)
+
+    Repo.update_all(from(i in ForgeIssues.Issue, where: i.id == ^c.issue.id),
+      set: [title: "Changed without version"]
+    )
+
+    assert {:error, :stale_baseline} = confirm(c, fn _ -> flunk("stale scalar callback") end)
+
+    refute Repo.exists?(
+             from(l in ForgeIssues.Label, where: l.repository_id == ^c.binding.repository_id)
+           )
+  end
+
+  test "mapped label callback lease loss rolls back import and preserves pair", c do
+    c = mapped(c)
+
+    callback = fn multi ->
+      multi
+      |> ForgeIssues.append_sync_label_import(:resource, c.request)
+      |> Multi.run(:expire, fn repo, _ ->
+        repo.update_all(from(o in MirrorOperation, where: o.id == ^c.op.id),
+          set: [lease_expires_at: DateTime.add(c.now, -1)]
+        )
+
+        {:ok, :expired}
+      end)
+    end
+
+    assert {:error, :lost_lease} = confirm(c, callback)
+
+    refute Repo.exists?(
+             from(l in ForgeIssues.Label, where: l.repository_id == ^c.binding.repository_id)
+           )
+
+    assert Repo.get!(MirrorResourceState, c.pull_mapping.id) == c.pull_mapping
+    assert Repo.get!(MirrorOperation, c.op.id).state == :processing
+  end
+
+  test "mapped prerequisite cannot clear a pending parent metadata effect", c do
+    c = mapped(c)
+    marker = %{"action" => "update_remote_pull_issue"}
+
+    Repo.update_all(from(o in MirrorOperation, where: o.id == ^c.op.id),
+      set: [state: :effect_pending, external_effect_marker: marker, effect_marked_at: c.now]
+    )
+
+    assert {:error, :invalid_transition} =
+             confirm(%{c | op: Repo.get!(MirrorOperation, c.op.id)}, fn _ ->
+               flunk("pending effect callback")
+             end)
+
+    assert Repo.get!(MirrorOperation, c.op.id).external_effect_marker == marker
+  end
+
+  defp mapped(c) do
+    actor = organization_owner_fixture(c.org)
+
+    issue =
+      Repo.insert!(%ForgeIssues.Issue{
+        repository_id: c.binding.repository_id,
+        number: 7,
+        kind: :pull_request,
+        title: "Mapped",
+        author_user_id: actor.id
+      })
+
+    pull =
+      Repo.insert!(%ForgePulls.PullRequest{
+        repository_id: c.binding.repository_id,
+        issue_id: issue.id,
+        head_repository_id: c.binding.repository_id,
+        head_ref: "refs/heads/topic",
+        base_ref: "refs/heads/main",
+        head_sha: String.duplicate("a", 40),
+        base_sha: String.duplicate("b", 40)
+      })
+
+    for {ref, oid} <- [{pull.head_ref, pull.head_sha}, {pull.base_ref, pull.base_sha}],
+        do:
+          Repo.insert!(%ForgeMirrors.MirrorRefState{
+            repository_mirror_id: c.binding.id,
+            ref_name: ref,
+            ref_kind: :branch,
+            state: :confirmed,
+            confirmed_oid: oid,
+            last_local_oid: oid,
+            last_remote_oid: oid,
+            last_confirmed_at: c.now
+          })
+
+    {:ok, local} = ForgePulls.sync_projection(c.binding.repository_id, :pull, pull.id)
+    repository = %{"id" => c.binding.github_repository_id, "node_id" => c.binding.github_node_id}
+
+    identity = %{
+      "github_issue_object_id" => 1701,
+      "github_issue_node_id" => "I_1701",
+      "github_number" => 7,
+      "base_repository" => repository,
+      "head_repository" => repository
+    }
+
+    merge = %{"merged_at" => nil, "merge_commit_sha" => nil}
+
+    pull_mapping =
+      Repo.insert!(%MirrorResourceState{
+        repository_mirror_id: c.binding.id,
+        resource_kind: :pull,
+        local_resource_type: "ForgePulls.PullRequest",
+        local_resource_id: pull.id,
+        github_object_id: 1700,
+        github_node_id: "PR_1700",
+        github_number: 7,
+        confirmed_snapshot: local.fields,
+        confirmed_local_version: 1,
+        confirmed_merge_state: merge,
+        provider_identity: identity,
+        state: :confirmed
+      })
+
+    snapshot =
+      Map.merge(Map.take(local.fields, ~w(title body state state_reason)), %{
+        "label_github_ids" => [],
+        "assignee_github_ids" => []
+      })
+
+    issue_mapping =
+      Repo.insert!(%MirrorResourceState{
+        repository_mirror_id: c.binding.id,
+        resource_kind: :issue,
+        local_resource_type: "ForgeIssues.Issue",
+        local_resource_id: issue.id,
+        github_object_id: 1701,
+        github_node_id: "I_1701",
+        github_number: 7,
+        confirmed_snapshot: snapshot,
+        confirmed_local_version: 1,
+        state: :confirmed
+      })
+
+    {:ok, context} = ForgeMirrors.mapped_pull_pair_context(c.op)
+
+    {:ok, proof} =
+      ForgeMirrors.PullEligibility.check(
+        c.binding.id,
+        c.binding.repository_id,
+        Map.take(pull, [:head_ref, :head_sha, :base_ref, :base_sha])
+      )
+
+    {:ok, hash} = ForgeMirrors.resource_fingerprint(local.fields)
+
+    precondition = %{
+      "github_object_id" => 1700,
+      "github_node_id" => "PR_1700",
+      "github_number" => 7,
+      "resource_state_lock_version" => pull_mapping.lock_version,
+      "expected_local_version" => 1,
+      "expected_local_fingerprint" => hash,
+      "provider_identity" => identity,
+      "pull_eligibility_proof" => proof |> JSON.encode!() |> JSON.decode!(),
+      "expected_merge_state" => merge
+    }
+
+    Map.merge(c, %{
+      expected: Map.merge(c.expected, %{pair: context.pair, pull_precondition: precondition}),
+      pull_mapping: pull_mapping,
+      issue_mapping: issue_mapping,
+      issue: issue
+    })
+  end
+
   defp confirm(c, callback \\ nil),
     do:
       ForgeMirrors.confirm_remote_pull_label(

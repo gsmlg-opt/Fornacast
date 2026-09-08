@@ -10,6 +10,25 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 mapped inbound label materialization (2026-09-08)
+
+- Processing mapped pulls can import one unknown remote label and yield the same
+  parent operation before applying membership on the next claim. Both canonical
+  baselines remain unchanged during prerequisite creation.
+- Admission and finalization bind the exact paired mappings, current local
+  version/fingerprint, installation and ref eligibility. Live Git write fences
+  span label import. Lease loss rolls back the import; pending effects cannot
+  use this marker-clearing prerequisite path.
+- Worker integration proves two-claim convergence, live ref-loss rejection,
+  visible namespace collision and retained effect evidence without another PATCH
+  when an unknown remote label appears during recovery.
+- Combined scoped PostgreSQL verification passed 197 tests (mirrors 93, provider
+  104); four-file formatting and diff checks passed. Existing importer fixture
+  warnings remain unrelated to this scope.
+- New local unmapped-label export remains open, as do pending-effect third-state
+  resolution, remaining PR13 head/merge/activation gates, PR14–16 and full PRD
+  acceptance. No push, deployment or live GitHub write validation occurred.
+
 ### PR13 mapped relationship node proofs (2026-09-08)
 
 - Mapped metadata effects seed missing immutable user nodes one per claim and

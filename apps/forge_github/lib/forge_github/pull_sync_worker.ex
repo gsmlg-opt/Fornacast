@@ -228,7 +228,27 @@ defmodule ForgeGitHub.PullSyncWorker do
           persist_failure(operation, now, reason, options)
       end
     else
-      {:error, reason} -> persist_failure(operation, now, reason, options)
+      {:error, {:pull_label_prerequisite, candidate, local, remote, identity, proof, git_proof}}
+      when operation.state == :processing and is_map_key(sync, :pair) and
+             not is_map_key(sync, :metadata_intent) ->
+        import_mapped_label(
+          operation,
+          now,
+          sync,
+          candidate,
+          local,
+          remote,
+          identity,
+          proof,
+          git_proof,
+          options
+        )
+
+      {:error, {:pull_label_prerequisite, _, _, _, _, _, _}} ->
+        persist_failure(operation, now, :unsupported_resource, options)
+
+      {:error, reason} ->
+        persist_failure(operation, now, reason, options)
     end
   end
 
@@ -388,7 +408,58 @@ defmodule ForgeGitHub.PullSyncWorker do
     end
   end
 
-  defp import_inbound_label(operation, now, sync, candidate, options) do
+  defp import_mapped_label(
+         operation,
+         now,
+         sync,
+         candidate,
+         local,
+         remote,
+         identity,
+         proof,
+         git_proof,
+         options
+       ) do
+    with {:ok, local_fingerprint} <- fingerprint(local.snapshot, options) do
+      expected = %{
+        pair: sync.pair,
+        pull_precondition: %{
+          "github_object_id" => remote.github_object_id,
+          "github_node_id" => remote.github_node_id,
+          "github_number" => remote.github_number,
+          "resource_state_lock_version" => sync.resource_state_lock_version,
+          "expected_local_version" => local.local_version,
+          "expected_local_fingerprint" => local_fingerprint,
+          "provider_identity" => identity,
+          "pull_eligibility_proof" => proof,
+          "expected_merge_state" => persistent_merge_state(local.merge_state)
+        }
+      }
+
+      case with_ref_fences(git_proof, fn ->
+             import_inbound_label(operation, now, sync, candidate, options, expected)
+           end) do
+        {:error, :namespace_collision} ->
+          conflict(
+            operation,
+            now,
+            sync,
+            :label_namespace_collision,
+            local.snapshot,
+            remote.snapshot,
+            options
+          )
+
+        {:error, reason} ->
+          persist_failure(operation, now, reason, options)
+
+        result ->
+          result
+      end
+    end
+  end
+
+  defp import_inbound_label(operation, now, sync, candidate, options, extra_expected \\ %{}) do
     fields = %{
       "name" => candidate.name,
       "color" => candidate.color,
@@ -419,10 +490,11 @@ defmodule ForgeGitHub.PullSyncWorker do
     case ForgeMirrors.confirm_remote_pull_label(
            operation,
            now,
-           expected,
+           Map.merge(expected, extra_expected),
            confirmation,
            &ForgeIssues.append_sync_label_import(&1, :resource, request)
          ) do
+      {:error, reason} when map_size(extra_expected) > 0 -> {:error, reason}
       {:error, reason} -> persist_failure(operation, now, reason, options)
       result -> result
     end
@@ -537,12 +609,21 @@ defmodule ForgeGitHub.PullSyncWorker do
   end
 
   defp observe_authorized(sync, token, local, now, options) do
-    with {:ok, proof} <- eligibility(sync, local, options),
-         :ok <- git_availability(proof, options),
-         {:ok, proof} <- json_safe(proof),
-         {:ok, remote} <- remote_observation(sync, token, local, proof, now, options),
-         {:ok, provider_identity} <- provider_identity(remote) do
-      {:ok, remote, provider_identity, proof}
+    with {:ok, git_proof} <- eligibility(sync, local, options),
+         :ok <- git_availability(git_proof, options),
+         {:ok, proof} <- json_safe(git_proof) do
+      case remote_observation(sync, token, local, proof, now, options) do
+        {:ok, remote} ->
+          with {:ok, identity} <- provider_identity(remote),
+               do: {:ok, remote, identity, proof}
+
+        {:error, {:verified_unmapped_label, candidate, remote, identity}} ->
+          {:error,
+           {:pull_label_prerequisite, candidate, local, remote, identity, proof, git_proof}}
+
+        error ->
+          error
+      end
     end
   end
 
@@ -571,8 +652,15 @@ defmodule ForgeGitHub.PullSyncWorker do
         :ok ->
           with {:ok, relationships} <- remote_relationships(sync, issue, now, options),
                {:ok, issue_observation} <-
-                 IssueSyncProjection.from_remote_issue(issue, relationships),
-               do: PullSyncProjection.from_remote(pull, issue_observation)
+                 IssueSyncProjection.from_remote_issue(issue, relationships) do
+            PullSyncProjection.from_remote(pull, issue_observation)
+          else
+            {:error, {:unmapped_label, candidate}} ->
+              {:error, {:verified_unmapped_label, candidate, scalar, identity}}
+
+            error ->
+              error
+          end
 
         _rejected ->
           # Return only diagnostic scalars to the caller's same precondition.
@@ -604,9 +692,10 @@ defmodule ForgeGitHub.PullSyncWorker do
       {:ok, Map.put(relationships, :author, author)}
     else
       {:error, {:unmapped_label, candidate}} ->
-        if Map.get(sync, :mode) == :inbound_create,
-          do: {:error, {:unmapped_label, candidate}},
-          else: {:error, :unsupported_resource}
+        if Map.get(sync, :mode) == :inbound_create or
+             (Map.has_key?(sync, :pair) and not Map.has_key?(sync, :metadata_intent)),
+           do: {:error, {:unmapped_label, candidate}},
+           else: {:error, :unsupported_resource}
 
       {:error, reason} ->
         {:error, reason}

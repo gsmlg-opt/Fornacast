@@ -171,6 +171,216 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     }
   end
 
+  test "mapped inbound labels materialize one prerequisite before paired confirmation", ctx do
+    now = DateTime.utc_now(:second)
+    operation = remote_operation(ctx, now)
+    target = Map.put(ctx.baseline, "title", "Remote with new label")
+
+    label = %{
+      "id" => 933,
+      "node_id" => "LA_933",
+      "name" => "new-remote-label",
+      "color" => "abcdef",
+      "description" => "Imported prerequisite"
+    }
+
+    for _claim <- 1..2 do
+      Req.Test.expect(ctx.stub, &Req.Test.json(&1, pull_json(target, now)))
+
+      Req.Test.expect(
+        ctx.stub,
+        &Req.Test.json(&1, Map.put(issue_json(target, now), "labels", [label]))
+      )
+    end
+
+    opts = Keyword.delete(options(ctx), :remote_relationships)
+    assert {:ok, %{operation: pending}} = PullSyncWorker.process_operation(operation, now, opts)
+    assert pending.state == :pending
+    assert pending.cursor == operation.cursor
+    assert pending.external_effect_marker == nil
+    assert pending.lease_owner == nil
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id) == ctx.mapping
+    assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id) == ctx.issue_mapping
+
+    imported =
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: ctx.base.id,
+        resource_kind: :label,
+        github_object_id: 933
+      )
+
+    assert imported.github_node_id == "LA_933"
+
+    refute Repo.get_by(ForgeIssues.IssueLabel,
+             issue_id: ctx.issue.id,
+             label_id: imported.local_resource_id
+           )
+
+    assert {:ok, %{operation: %{state: :completed}}} =
+             PullSyncWorker.process_operation(claim(operation.id, now), now, opts)
+
+    assert Repo.get_by!(ForgeIssues.IssueLabel,
+             issue_id: ctx.issue.id,
+             label_id: imported.local_resource_id
+           )
+
+    assert_confirmed(ctx, operation, target, 2)
+
+    assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id).confirmed_snapshot[
+             "label_github_ids"
+           ] == [933]
+  end
+
+  test "effect-pending unknown remote label preserves intent without materializing", ctx do
+    now = DateTime.utc_now(:second)
+    {operation, _, _} = relationship_fixture(ctx, now)
+
+    remote =
+      start_supervised!(
+        {Agent,
+         fn ->
+           %{
+             labels: [331, 333],
+             users: [441, 443],
+             patches: 0,
+             queries: 0,
+             body: ctx.baseline["body"]
+           }
+         end}
+      )
+
+    relationship_provider(ctx, remote, now, :lost_response)
+    opts = relationship_options(ctx)
+
+    assert {:ok, %{state: :effect_pending}} =
+             PullSyncWorker.process_operation(operation, now, opts)
+
+    pending = Repo.get!(MirrorOperation, operation.id)
+    assert Agent.get(remote, & &1.patches) == 1
+    Agent.update(remote, &Map.put(&1, :labels, [999]))
+    next_now = pending.next_attempt_at
+    PullSyncWorker.process_operation(claim(operation.id, next_now), next_now, opts)
+    saved = Repo.get!(MirrorOperation, operation.id)
+    assert saved.state == :effect_pending
+    assert saved.external_effect_marker == pending.external_effect_marker
+    assert saved.checkpoint == pending.checkpoint
+    assert Agent.get(remote, & &1.patches) == 1
+
+    refute Repo.get_by(MirrorResourceState,
+             repository_mirror_id: ctx.base.id,
+             resource_kind: :label,
+             github_object_id: 999
+           )
+
+    refute Repo.get_by(ForgeIssues.Label,
+             repository_id: ctx.base.repository_id,
+             name: "current-label-999"
+           )
+  end
+
+  test "mapped unknown label cannot adopt a different local namespace occupant", ctx do
+    now = DateTime.utc_now(:second)
+    operation = remote_operation(ctx, now)
+
+    existing =
+      Repo.insert!(%ForgeIssues.Label{
+        repository_id: ctx.base.repository_id,
+        name: "occupied",
+        normalized_name: "occupied",
+        color: "000000"
+      })
+
+    Req.Test.expect(ctx.stub, &Req.Test.json(&1, pull_json(ctx.baseline, now)))
+
+    Req.Test.expect(
+      ctx.stub,
+      &Req.Test.json(
+        &1,
+        Map.put(issue_json(ctx.baseline, now), "labels", [
+          %{
+            "id" => 935,
+            "node_id" => "LA_935",
+            "name" => "occupied",
+            "color" => "ffffff",
+            "description" => nil
+          }
+        ])
+      )
+    )
+
+    PullSyncWorker.process_operation(
+      operation,
+      now,
+      Keyword.delete(options(ctx), :remote_relationships)
+    )
+
+    assert Repo.get!(ForgeIssues.Label, existing.id) == existing
+
+    refute Repo.get_by(MirrorResourceState,
+             repository_mirror_id: ctx.base.id,
+             resource_kind: :label,
+             github_object_id: 935
+           )
+
+    conflicted = Repo.get!(MirrorResourceState, ctx.mapping.id)
+    assert conflicted.state == :conflicted
+    assert conflicted.confirmed_snapshot == ctx.mapping.confirmed_snapshot
+    assert conflicted.confirmed_fingerprint == ctx.mapping.confirmed_fingerprint
+    assert conflicted.confirmed_local_version == ctx.mapping.confirmed_local_version
+    assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id) == ctx.issue_mapping
+    assert Repo.get!(MirrorOperation, operation.id).external_effect_marker == nil
+    assert Repo.get!(MirrorOperation, operation.id).state == :failed
+
+    assert Repo.get_by!(ForgeMirrors.MirrorConflict,
+             repository_mirror_id: ctx.base.id,
+             state: :open
+           ).conflict_kind == "label_namespace_collision"
+  end
+
+  test "mapped unknown label cannot import after a live ref changes during paired GET", ctx do
+    now = DateTime.utc_now(:second)
+    operation = remote_operation(ctx, now)
+    Req.Test.expect(ctx.stub, &Req.Test.json(&1, pull_json(ctx.baseline, now)))
+
+    Req.Test.expect(ctx.stub, fn conn ->
+      git!(ctx.head_path, ["update-ref", "-d", ctx.baseline["head_ref"]])
+
+      Req.Test.json(
+        conn,
+        Map.put(issue_json(ctx.baseline, now), "labels", [
+          %{
+            "id" => 934,
+            "node_id" => "LA_934",
+            "name" => "untrusted-ref-label",
+            "color" => "abcdef",
+            "description" => nil
+          }
+        ])
+      )
+    end)
+
+    PullSyncWorker.process_operation(
+      operation,
+      now,
+      Keyword.delete(options(ctx), :remote_relationships)
+    )
+
+    refute Repo.get_by(MirrorResourceState,
+             repository_mirror_id: ctx.base.id,
+             resource_kind: :label,
+             github_object_id: 934
+           )
+
+    refute Repo.get_by(ForgeIssues.Label,
+             repository_id: ctx.base.repository_id,
+             name: "untrusted-ref-label"
+           )
+
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id) == ctx.mapping
+    assert Repo.get!(MirrorOperation, operation.id).state == :pending
+    assert Repo.get!(MirrorOperation, operation.id).failure_class == "network"
+  end
+
   test "an unmapped inbound pull creates its canonical issue and both identities through the worker",
        ctx do
     Repo.delete!(ctx.mapping)
