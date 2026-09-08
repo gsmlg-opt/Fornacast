@@ -134,6 +134,28 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
       })
       |> Repo.insert!()
 
+    issue_baseline =
+      Map.take(baseline, ~w(title body state state_reason))
+      |> Map.merge(%{"label_github_ids" => [], "assignee_github_ids" => []})
+
+    {:ok, issue_fingerprint} = ForgeMirrors.resource_fingerprint(issue_baseline)
+
+    issue_mapping =
+      Repo.insert!(%MirrorResourceState{
+        repository_mirror_id: base.id,
+        resource_kind: :issue,
+        local_resource_type: "ForgeIssues.Issue",
+        local_resource_id: issue.id,
+        github_object_id: 801,
+        github_node_id: "I_801",
+        github_number: 7,
+        confirmed_local_version: issue.sync_version,
+        confirmed_remote_updated_at: @source_time,
+        confirmed_snapshot: issue_baseline,
+        confirmed_fingerprint: issue_fingerprint,
+        state: :confirmed
+      })
+
     %{
       organization: organization,
       base: base,
@@ -141,6 +163,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
       issue: issue,
       pull: pull,
       mapping: mapping,
+      issue_mapping: issue_mapping,
       baseline: baseline,
       base_path: base_path,
       head_path: head_path,
@@ -151,6 +174,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
   test "an unmapped inbound pull creates its canonical issue and both identities through the worker",
        ctx do
     Repo.delete!(ctx.mapping)
+    Repo.delete!(ctx.issue_mapping)
     now = DateTime.utc_now(:second)
     operation = remote_operation(ctx, now)
     expect_observation(ctx, ctx.baseline, now)
@@ -185,6 +209,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
 
   test "inbound creation checks live Git rather than trusting only mirrored ref rows", ctx do
     Repo.delete!(ctx.mapping)
+    Repo.delete!(ctx.issue_mapping)
     git!(ctx.head_path, ["update-ref", "-d", ctx.baseline["head_ref"]])
     now = DateTime.utc_now(:second)
     operation = remote_operation(ctx, now)
@@ -206,6 +231,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
   test "inbound creation rejects a substituted base identity before observing relationships",
        ctx do
     Repo.delete!(ctx.mapping)
+    Repo.delete!(ctx.issue_mapping)
     now = DateTime.utc_now(:second)
     operation = remote_operation(ctx, now)
 
@@ -236,6 +262,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
 
   test "an authenticated unrepresented head creates explicitly read-only metadata", ctx do
     Repo.delete!(ctx.mapping)
+    Repo.delete!(ctx.issue_mapping)
     now = DateTime.utc_now(:second)
     operation = remote_operation(ctx, now)
 
@@ -259,6 +286,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
   test "substituted head and canonical issue identities cannot persist author observations",
        ctx do
     Repo.delete!(ctx.mapping)
+    Repo.delete!(ctx.issue_mapping)
     now = DateTime.utc_now(:second)
     original = remote_operation(ctx, now)
 
@@ -321,20 +349,64 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     target = ctx.baseline |> Map.put("title", "GitHub title") |> Map.put("draft", true)
     operation = remote_operation(ctx, now)
 
-    expect_observation(ctx, target, now)
+    label =
+      Repo.insert!(%ForgeIssues.Label{
+        repository_id: ctx.base.repository_id,
+        name: "remote-label",
+        normalized_name: "remote-label",
+        color: "abcdef"
+      })
+
+    Repo.insert!(%MirrorResourceState{
+      repository_mirror_id: ctx.base.id,
+      resource_kind: :label,
+      local_resource_type: "ForgeIssues.Label",
+      local_resource_id: label.id,
+      github_object_id: 333,
+      github_node_id: "LA_333",
+      state: :confirmed
+    })
+
+    Req.Test.expect(ctx.stub, &Req.Test.json(&1, pull_json(target, now)))
+
+    Req.Test.expect(
+      ctx.stub,
+      &Req.Test.json(
+        &1,
+        Map.put(issue_json(target, now), "labels", [
+          %{"id" => 333, "node_id" => "LA_333", "name" => "remote-label"}
+        ])
+      )
+    )
 
     assert {:ok, %{operation: %{state: :completed}}} =
-             PullSyncWorker.process_operation(operation, now, options(ctx))
+             PullSyncWorker.process_operation(
+               operation,
+               now,
+               Keyword.delete(options(ctx), :remote_relationships)
+             )
 
     assert %{title: "GitHub title", sync_version: 2} =
              Repo.get!(ForgeIssues.Issue, ctx.issue.id)
 
     assert %{draft: true} = Repo.get!(PullRequest, ctx.pull.id)
     assert_confirmed(ctx, operation, target, 2)
+    assert Repo.get_by!(ForgeIssues.IssueLabel, issue_id: ctx.issue.id, label_id: label.id)
+    companion = Repo.get!(MirrorResourceState, ctx.issue_mapping.id)
+    assert companion.confirmed_local_version == 2
+
+    assert companion.confirmed_snapshot ==
+             Map.merge(
+               Map.take(target, ~w(title body state state_reason)),
+               %{"label_github_ids" => [333], "assignee_github_ids" => []}
+             )
+
+    assert companion.confirmed_remote_updated_at == now
   end
 
   test "unknown remote labels yield one per claim on the same inbound parent", ctx do
     Repo.delete!(ctx.mapping)
+    Repo.delete!(ctx.issue_mapping)
     now = DateTime.utc_now(:second)
     operation = remote_operation(ctx, now)
 
@@ -531,6 +603,16 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
       |> ForgeIssues.Issue.update_changeset(%{state: :closed, state_reason: :completed})
       |> Repo.update!()
 
+    unmapped =
+      Repo.insert!(%ForgeIssues.Label{
+        repository_id: ctx.base.repository_id,
+        name: "new-unmapped",
+        normalized_name: "new-unmapped",
+        color: "abcdef"
+      })
+
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: newer_issue.id, label_id: unmapped.id})
+
     pending = claim(operation.id, still_pending.next_attempt_at)
 
     recovery_options =
@@ -551,6 +633,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
              Repo.get!(ForgeIssues.Issue, newer_issue.id)
 
     assert_confirmed(ctx, operation, postcondition, 2)
+    assert Repo.get_by!(ForgeIssues.IssueLabel, issue_id: newer_issue.id, label_id: unmapped.id)
   end
 
   test "a removed cross-repository head ref blocks inbound confirmation", ctx do
@@ -576,6 +659,287 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     assert %{title: "Baseline", sync_version: 1} = Repo.get!(ForgeIssues.Issue, ctx.issue.id)
     assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_snapshot == ctx.baseline
     refute_received :provider_read
+  end
+
+  test "full relationship effects merge removals and additions and recover one lost PATCH", ctx do
+    now = DateTime.utc_now(:second)
+    {operation, labels, users} = relationship_fixture(ctx, now)
+
+    remote =
+      start_supervised!(
+        {Agent,
+         fn ->
+           %{
+             labels: [331, 333],
+             users: [441, 443],
+             patches: 0,
+             queries: 0,
+             body: ctx.baseline["body"]
+           }
+         end}
+      )
+
+    relationship_provider(ctx, remote, now, :lost_response)
+
+    opts =
+      options(ctx)
+      |> Keyword.delete(:remote_relationships)
+      |> Keyword.put(:relationship_client_options, transport_options(ctx, []))
+
+    assert {:ok, %{state: :effect_pending}} =
+             PullSyncWorker.process_operation(operation, now, opts)
+
+    assert Agent.get(remote, & &1.patches) == 1
+    assert Agent.get(remote, & &1.labels) == [332, 333]
+    assert Agent.get(remote, & &1.users) == [442, 443]
+    pending = Repo.get!(MirrorOperation, operation.id)
+    assert pending.external_effect_marker["metadata_intent_id"]
+    operation = claim(operation.id, pending.next_attempt_at)
+
+    assert {:ok, %{operation: %{state: :completed}}} =
+             PullSyncWorker.process_operation(operation, pending.next_attempt_at, opts)
+
+    assert Agent.get(remote, & &1.patches) == 1
+    assert Agent.get(remote, & &1.queries) == 1
+    issue_mapping = Repo.get!(MirrorResourceState, ctx.issue_mapping.id)
+    pull_mapping = Repo.get!(MirrorResourceState, ctx.mapping.id)
+    assert issue_mapping.confirmed_snapshot["label_github_ids"] == [332, 333]
+    assert issue_mapping.confirmed_snapshot["assignee_github_ids"] == [442, 443]
+    assert issue_mapping.confirmed_local_version == pull_mapping.confirmed_local_version
+    assert issue_mapping.confirmed_local_version == 3
+
+    for id <- [332, 333],
+        do:
+          assert(
+            Repo.get_by(ForgeIssues.IssueLabel, issue_id: ctx.issue.id, label_id: labels[id].id)
+          )
+
+    for id <- [442, 443],
+        do:
+          assert(
+            Repo.get_by(ForgeIssues.IssueAssignee,
+              issue_id: ctx.issue.id,
+              github_identity_id: users[id].id
+            )
+          )
+
+    refute Repo.get_by(ForgeIssues.IssueLabel, issue_id: ctx.issue.id, label_id: labels[331].id)
+
+    refute Repo.get_by(ForgeIssues.IssueAssignee,
+             issue_id: ctx.issue.id,
+             github_identity_id: users[441].id
+           )
+  end
+
+  test "provider metadata drift during relationship lookup prevents PATCH", ctx do
+    now = DateTime.utc_now(:second)
+    {operation, _, _} = relationship_fixture(ctx, now)
+
+    remote =
+      start_supervised!(
+        {Agent,
+         fn ->
+           %{
+             labels: [331, 333],
+             users: [441, 443],
+             patches: 0,
+             queries: 0,
+             body: ctx.baseline["body"]
+           }
+         end}
+      )
+
+    relationship_provider(ctx, remote, now, :drift)
+
+    opts =
+      options(ctx)
+      |> Keyword.delete(:remote_relationships)
+      |> Keyword.put(:relationship_client_options, transport_options(ctx, []))
+
+    assert {:ok, _} = PullSyncWorker.process_operation(operation, now, opts)
+    assert Agent.get(remote, & &1.queries) == 1
+    assert Agent.get(remote, & &1.patches) == 0
+    assert Repo.get!(MirrorOperation, operation.id).state == :failed
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_snapshot == ctx.baseline
+  end
+
+  test "an exact effect target observed after relationship lookup confirms without PATCH", ctx do
+    now = DateTime.utc_now(:second)
+    {operation, _, _} = relationship_fixture(ctx, now)
+
+    remote =
+      start_supervised!(
+        {Agent,
+         fn ->
+           %{
+             labels: [331, 333],
+             users: [441, 443],
+             patches: 0,
+             queries: 0,
+             body: ctx.baseline["body"]
+           }
+         end}
+      )
+
+    relationship_provider(ctx, remote, now, :applied)
+
+    opts =
+      options(ctx)
+      |> Keyword.delete(:remote_relationships)
+      |> Keyword.put(:relationship_client_options, transport_options(ctx, []))
+
+    assert {:ok, %{operation: %{state: :completed}}} =
+             PullSyncWorker.process_operation(operation, now, opts)
+
+    assert Agent.get(remote, & &1.queries) == 1
+    assert Agent.get(remote, & &1.patches) == 0
+
+    assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id).confirmed_snapshot[
+             "label_github_ids"
+           ] == [332, 333]
+  end
+
+  defp relationship_fixture(ctx, now) do
+    labels =
+      Map.new([331, 332, 333], fn id ->
+        label =
+          Repo.insert!(%ForgeIssues.Label{
+            repository_id: ctx.base.repository_id,
+            name: "label-#{id}",
+            normalized_name: "label-#{id}",
+            color: "abcdef"
+          })
+
+        Repo.insert!(%MirrorResourceState{
+          repository_mirror_id: ctx.base.id,
+          resource_kind: :label,
+          local_resource_type: "ForgeIssues.Label",
+          local_resource_id: label.id,
+          github_object_id: id,
+          github_node_id: "L_#{id}",
+          state: :confirmed
+        })
+
+        {id, label}
+      end)
+
+    users =
+      Map.new([441, 442, 443], fn id ->
+        {:ok, user} =
+          ForgeAccounts.observe_github_identity(
+            %{id: id, node_id: "U_#{id}", login: "old-#{id}"},
+            now
+          )
+
+        {id, user}
+      end)
+
+    baseline =
+      ctx.issue_mapping.confirmed_snapshot
+      |> Map.put("label_github_ids", [331])
+      |> Map.put("assignee_github_ids", [441])
+
+    {:ok, fingerprint} = ForgeMirrors.resource_fingerprint(baseline)
+
+    ctx.issue_mapping
+    |> Ecto.Changeset.change(confirmed_snapshot: baseline, confirmed_fingerprint: fingerprint)
+    |> Repo.update!()
+
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: ctx.issue.id, label_id: labels[332].id})
+
+    Repo.insert!(%ForgeIssues.IssueAssignee{
+      issue_id: ctx.issue.id,
+      github_identity_id: users[442].id
+    })
+
+    issue = ctx.issue |> Ecto.Changeset.change(sync_version: 2) |> Repo.update!()
+    {local_operation(ctx, issue.sync_version, now), labels, users}
+  end
+
+  defp relationship_provider(ctx, remote, now, mode) do
+    Req.Test.stub(ctx.stub, fn conn ->
+      current = Agent.get(remote, & &1)
+      snapshot = Map.put(ctx.baseline, "body", current.body)
+
+      case {conn.method, conn.request_path} do
+        {"GET", "/repos/acme/project/pulls/7"} ->
+          Req.Test.json(conn, pull_json(snapshot, now))
+
+        {"GET", "/repos/acme/project/issues/7"} ->
+          issue =
+            issue_json(snapshot, now)
+            |> Map.put(
+              "labels",
+              Enum.map(
+                current.labels,
+                &%{"id" => &1, "node_id" => "L_#{&1}", "name" => "current-label-#{&1}"}
+              )
+            )
+            |> Map.put(
+              "assignees",
+              Enum.map(
+                current.users,
+                &%{"id" => &1, "node_id" => "U_#{&1}", "login" => "current-#{&1}"}
+              )
+            )
+
+          Req.Test.json(conn, issue)
+
+        {"POST", "/graphql"} ->
+          {:ok, encoded, conn} = Plug.Conn.read_body(conn)
+
+          assert JSON.decode!(encoded)["variables"] == %{
+                   "labels" => ["L_332", "L_333"],
+                   "assignees" => ["U_442", "U_443"]
+                 }
+
+          Agent.update(remote, fn s ->
+            %{
+              s
+              | queries: s.queries + 1,
+                body: if(mode == :drift, do: "Third party body", else: s.body)
+            }
+          end)
+
+          if mode == :applied,
+            do: Agent.update(remote, &%{&1 | labels: [332, 333], users: [442, 443]})
+
+          Req.Test.json(conn, %{
+            "data" => %{
+              "labels" =>
+                Enum.map(
+                  [332, 333],
+                  &%{
+                    "__typename" => "Label",
+                    "id" => "L_#{&1}",
+                    "name" => "current-label-#{&1}",
+                    "repository" => %{"id" => "R_900"}
+                  }
+                ),
+              "assignees" =>
+                Enum.map(
+                  [442, 443],
+                  &%{"__typename" => "User", "id" => "U_#{&1}", "login" => "current-#{&1}"}
+                )
+            }
+          })
+
+        {"PATCH", "/repos/acme/project/issues/7"} ->
+          {:ok, encoded, conn} = Plug.Conn.read_body(conn)
+          attrs = JSON.decode!(encoded)
+          assert attrs["labels"] == ["current-label-332", "current-label-333"]
+          assert attrs["assignees"] == ["current-442", "current-443"]
+
+          Agent.update(remote, fn s ->
+            %{s | patches: s.patches + 1, labels: [332, 333], users: [442, 443]}
+          end)
+
+          Plug.Conn.send_resp(conn, 503, "lost after effect")
+
+        route ->
+          flunk("unexpected relationship route #{inspect(route)}")
+      end
+    end)
   end
 
   test "a mismatched base ref blocks an outbound provider effect", ctx do

@@ -10,6 +10,7 @@ defmodule ForgeGitHub.PullSyncWorker do
   """
 
   use GenServer
+  import Ecto.Query
 
   alias ForgeGitHub.{
     Error,
@@ -18,6 +19,9 @@ defmodule ForgeGitHub.PullSyncWorker do
     IssueClient,
     IssueSyncProjection,
     PullClient,
+    PullMetadataDecision,
+    PullMetadataRecovery,
+    RelationshipClient,
     PullSyncProjection
   }
 
@@ -33,6 +37,7 @@ defmodule ForgeGitHub.PullSyncWorker do
   @default_max_concurrency 2
   @default_processor_timeout_ms 50_000
   @lease_margin_ms 5_000
+  @test_client_options Mix.env() == :test
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(options) when is_list(options) do
@@ -158,8 +163,35 @@ defmodule ForgeGitHub.PullSyncWorker do
          {:ok, remote, provider_identity, proof} <-
            observe_authorized(sync, token, local, now, options) do
       case precondition(sync, local, remote, provider_identity, proof) do
+        :ok when operation.state == :effect_pending and is_map_key(sync, :metadata_intent) ->
+          recover_pair_effect(
+            operation,
+            now,
+            sync,
+            token,
+            local,
+            remote,
+            provider_identity,
+            proof,
+            0,
+            options
+          )
+
         :ok when operation.state == :effect_pending ->
           recover_effect(
+            operation,
+            now,
+            sync,
+            token,
+            local,
+            remote,
+            provider_identity,
+            proof,
+            options
+          )
+
+        :ok when is_map_key(sync, :pair) ->
+          reconcile_pair(
             operation,
             now,
             sync,
@@ -225,6 +257,17 @@ defmodule ForgeGitHub.PullSyncWorker do
     do: callback(options, :context, &default_context/1).(operation)
 
   defp default_context(operation) do
+    if operation.state == :effect_pending and is_map(operation.external_effect_marker) and
+         Map.has_key?(operation.external_effect_marker, "metadata_intent_id") do
+      with {:ok, context} <- ForgeMirrors.mapped_pull_effect_context(operation) do
+        {:ok, Map.put(context.sync, :metadata_intent, context.intent)}
+      end
+    else
+      legacy_or_processing_context(operation)
+    end
+  end
+
+  defp legacy_or_processing_context(operation) do
     case ForgeMirrors.resource_operation_context(operation) do
       {:error, :invalid_pull_mapping} ->
         if operation.cursor["trigger"] == "local" do
@@ -233,6 +276,9 @@ defmodule ForgeGitHub.PullSyncWorker do
         else
           ForgeMirrors.remote_pull_creation_context(operation)
         end
+
+      {:ok, _sync} when operation.state == :processing ->
+        ForgeMirrors.mapped_pull_pair_context(operation)
 
       result ->
         result
@@ -456,7 +502,34 @@ defmodule ForgeGitHub.PullSyncWorker do
   defp default_local_observation(sync) do
     with {:ok, projection} <-
            ForgePulls.sync_projection(sync.repository_id, :pull, sync.local_resource_id) do
-      PullSyncProjection.from_local(projection)
+      cond do
+        Map.has_key?(sync, :metadata_intent) and
+            projection.local_version > sync.metadata_intent.local_version ->
+          # A newer unmapped membership must not block proof of an older effect.
+          # Its canonical provider sets are unknown, not empty; only the retained
+          # intent supplies the historical baseline used by recovery.
+          with {:ok, local} <- PullSyncProjection.from_local(projection) do
+            {:ok,
+             Map.merge(local, %{
+               issue_snapshot: nil,
+               relationship_preimage: projection.relationship_preimage
+             })}
+          end
+
+        Map.has_key?(sync, :pair) ->
+          with {:ok, relationships} <-
+                 ForgeMirrors.resolve_issue_relationships(
+                   sync.repository_mirror_id,
+                   :local,
+                   projection.label_ids,
+                   projection.assignee_refs
+                 ) do
+            PullSyncProjection.from_local(projection, relationships)
+          end
+
+        true ->
+          PullSyncProjection.from_local(projection)
+      end
     end
   end
 
@@ -777,6 +850,618 @@ defmodule ForgeGitHub.PullSyncWorker do
           options
         )
     end
+  end
+
+  defp reconcile_pair(operation, now, sync, token, local, remote, identity, proof, options) do
+    with {:ok, plan} <-
+           PullMetadataDecision.decide(
+             sync.pair.pull.snapshot,
+             local.snapshot,
+             remote.snapshot,
+             sync.pair.issue.snapshot,
+             local[:issue_snapshot],
+             remote[:issue_snapshot]
+           ) do
+      if plan.remote_issue_effect? or plan.draft_effect? do
+        start_pair_effect(
+          operation,
+          now,
+          sync,
+          token,
+          local,
+          remote,
+          identity,
+          proof,
+          plan,
+          0,
+          options
+        )
+      else
+        confirm_pair_observation(
+          operation,
+          now,
+          sync,
+          local,
+          remote,
+          identity,
+          proof,
+          plan,
+          options
+        )
+      end
+    else
+      {:conflict, kind} ->
+        conflict(
+          operation,
+          now,
+          sync,
+          kind,
+          local[:issue_snapshot],
+          remote[:issue_snapshot],
+          options
+        )
+
+      {:error, reason} ->
+        persist_failure(operation, now, reason, options)
+    end
+  end
+
+  defp start_pair_effect(
+         operation,
+         now,
+         sync,
+         token,
+         local,
+         remote,
+         identity,
+         proof,
+         plan,
+         depth,
+         options
+       ) do
+    action =
+      if plan.remote_issue_effect?, do: "update_remote_pull_issue", else: "set_remote_pull_draft"
+
+    proposed_draft =
+      if plan.remote_issue_effect?, do: remote.snapshot["draft"], else: plan.target_pull["draft"]
+
+    proposed =
+      Map.merge(remote.snapshot, Map.take(plan.target_issue, @issue_fields))
+      |> Map.put("draft", proposed_draft)
+
+    with true <- depth < 3,
+         {:ok, payload} <-
+           pair_payload(action, local.issue_snapshot, remote.issue_snapshot, plan.target_issue),
+         {:ok, marker} <-
+           effect_marker(action, sync, local, remote, proposed, identity, proof, options),
+         marker =
+           Map.merge(marker, %{
+             "expected_remote_draft" => remote.snapshot["draft"],
+             "proposed_draft" => proposed_draft
+           }),
+         {:ok, marked_context} <-
+           callback(options, :mark_pair_effect, &ForgeMirrors.mark_mapped_pull_effect/5).(
+             operation,
+             now,
+             sync.pair,
+             marker,
+             payload
+           ) do
+      marked = marked_context.operation
+      marked_sync = Map.put(marked_context.sync, :metadata_intent, marked_context.intent)
+
+      perform_pair_effect(
+        marked,
+        now,
+        marked_sync,
+        token,
+        local,
+        remote,
+        identity,
+        proof,
+        depth,
+        options
+      )
+    else
+      false -> persist_failure(operation, now, :invalid_projection, options)
+      {:error, reason} -> persist_failure(operation, now, reason, options)
+    end
+  end
+
+  defp pair_payload("update_remote_pull_issue", local, remote, target),
+    do: PullMetadataRecovery.build(local, remote, target)
+
+  defp pair_payload("set_remote_pull_draft", local, remote, remote),
+    do:
+      {:ok,
+       %{
+         "v" => 1,
+         "expected_local_issue" => local,
+         "expected_remote_issue" => remote,
+         "target_issue" => remote
+       }}
+
+  defp pair_payload(_, _, _, _), do: {:error, :invalid_projection}
+
+  defp perform_pair_effect(
+         operation,
+         now,
+         sync,
+         token,
+         local,
+         _remote,
+         _identity,
+         _proof,
+         depth,
+         options
+       ) do
+    marker = operation.external_effect_marker
+    payload = sync.metadata_intent.payload
+
+    result =
+      with {:ok, attrs} <- pair_effect_attrs(operation, sync, token, payload, options),
+           :ok <- fresh_pair_after_relationships(operation, now, sync, token, local, options),
+           {:ok, fresh} <-
+             callback(options, :pair_effect_context, &ForgeMirrors.mapped_pull_effect_context/1).(
+               operation
+             ),
+           true <- fresh.marker == marker and fresh.intent == sync.metadata_intent do
+        case marker["action"] do
+          "update_remote_pull_issue" ->
+            callback(options, :update_pull_issue, &IssueClient.update_pull_issue/6).(
+              token,
+              sync.remote_owner,
+              sync.remote_repository,
+              sync.github_number,
+              attrs,
+              request_options(sync)
+            )
+
+          "set_remote_pull_draft" ->
+            callback(options, :set_draft, &PullClient.set_draft/4).(
+              token,
+              sync.github_node_id,
+              marker["proposed_draft"],
+              request_options(sync)
+            )
+        end
+      end
+
+    case result do
+      {:already_applied, remote, identity, proof} ->
+        recover_pair_effect(
+          operation,
+          now,
+          sync,
+          token,
+          local,
+          remote,
+          identity,
+          proof,
+          depth + 1,
+          options
+        )
+
+      {:remote_conflict, remote} ->
+        conflict(
+          operation,
+          now,
+          sync,
+          :ambiguous_external_effect,
+          local[:issue_snapshot],
+          remote[:issue_snapshot],
+          options
+        )
+
+      {:ok, _} ->
+        with {:ok, remote, identity, proof} <-
+               observe_authorized(sync, token, local, now, options),
+             :ok <- normalize_precondition(precondition(sync, local, remote, identity, proof)) do
+          recover_pair_effect(
+            operation,
+            now,
+            sync,
+            token,
+            local,
+            remote,
+            identity,
+            proof,
+            depth + 1,
+            options
+          )
+        else
+          {:error, reason} -> persist_failure(operation, now, reason, options)
+        end
+
+      {:error, reason} ->
+        persist_failure(operation, now, reason, options)
+
+      _ ->
+        persist_failure(operation, now, :invalid_projection, options)
+    end
+  rescue
+    _ -> persist_failure(operation, now, :worker_crash, options)
+  catch
+    _, _ -> persist_failure(operation, now, :worker_crash, options)
+  end
+
+  defp fresh_pair_after_relationships(operation, now, sync, token, local, options) do
+    marker = operation.external_effect_marker
+    payload = sync.metadata_intent.payload
+    target_issue = payload["target_issue"]
+
+    if marker["action"] == "update_remote_pull_issue" and
+         (target_issue["label_github_ids"] != [] or target_issue["assignee_github_ids"] != []) do
+      with {:ok, remote, identity, proof} <- observe_authorized(sync, token, local, now, options),
+           :ok <- normalize_precondition(precondition(sync, local, remote, identity, proof)) do
+        before =
+          pair_pull_snapshot(
+            sync,
+            payload["expected_remote_issue"],
+            marker["expected_remote_draft"]
+          )
+
+        target = pair_pull_snapshot(sync, target_issue, marker["proposed_draft"])
+
+        cond do
+          remote.snapshot == target and remote[:issue_snapshot] == target_issue ->
+            {:already_applied, remote, identity, proof}
+
+          remote.snapshot == before and
+              remote[:issue_snapshot] == payload["expected_remote_issue"] ->
+            :ok
+
+          true ->
+            {:remote_conflict, remote}
+        end
+      end
+    else
+      :ok
+    end
+  end
+
+  defp recover_pair_effect(
+         operation,
+         now,
+         sync,
+         token,
+         local,
+         remote,
+         identity,
+         proof,
+         depth,
+         options
+       ) do
+    marker = operation.external_effect_marker
+    payload = sync.metadata_intent.payload
+
+    before =
+      pair_pull_snapshot(sync, payload["expected_remote_issue"], marker["expected_remote_draft"])
+
+    target = pair_pull_snapshot(sync, payload["target_issue"], marker["proposed_draft"])
+
+    cond do
+      remote.snapshot == target and remote[:issue_snapshot] == payload["target_issue"] ->
+        old_local =
+          pair_pull_snapshot(
+            sync,
+            payload["expected_local_issue"],
+            marker["expected_local_draft"]
+          )
+
+        with {:ok, plan} <-
+               PullMetadataDecision.decide(
+                 sync.pair.pull.snapshot,
+                 old_local,
+                 remote.snapshot,
+                 sync.pair.issue.snapshot,
+                 payload["expected_local_issue"],
+                 remote.issue_snapshot
+               ) do
+          if local.local_version == marker["expected_local_version"] and
+               (plan.remote_issue_effect? or plan.draft_effect?) do
+            start_pair_effect(
+              operation,
+              now,
+              sync,
+              token,
+              local,
+              remote,
+              identity,
+              proof,
+              plan,
+              depth,
+              options
+            )
+          else
+            confirm_pair_effect(
+              operation,
+              now,
+              sync,
+              local,
+              remote,
+              identity,
+              proof,
+              target,
+              old_local,
+              options
+            )
+          end
+        else
+          {:conflict, kind} ->
+            conflict(
+              operation,
+              now,
+              sync,
+              kind,
+              local.issue_snapshot,
+              remote.issue_snapshot,
+              options
+            )
+
+          {:error, reason} ->
+            persist_failure(operation, now, reason, options)
+        end
+
+      remote.snapshot == before and remote[:issue_snapshot] == payload["expected_remote_issue"] and
+          depth == 0 ->
+        perform_pair_effect(
+          operation,
+          now,
+          sync,
+          token,
+          local,
+          remote,
+          identity,
+          proof,
+          depth,
+          options
+        )
+
+      true ->
+        conflict(
+          operation,
+          now,
+          sync,
+          :ambiguous_external_effect,
+          local[:issue_snapshot],
+          remote[:issue_snapshot],
+          options
+        )
+    end
+  end
+
+  defp pair_pull_snapshot(sync, issue, draft),
+    do:
+      sync.baseline
+      |> Map.take(@ref_fields)
+      |> Map.merge(Map.take(issue, @issue_fields))
+      |> Map.put("draft", draft)
+
+  defp confirm_pair_effect(
+         operation,
+         now,
+         sync,
+         local,
+         remote,
+         identity,
+         proof,
+         target,
+         old_local,
+         options
+       ) do
+    issue_target = sync.metadata_intent.payload["target_issue"]
+    advanced? = local.local_version > operation.external_effect_marker["expected_local_version"]
+    apply? = not advanced? and (local.snapshot != target or local.issue_snapshot != issue_target)
+    plan = %{target_issue: issue_target, apply_local?: apply?}
+
+    with {:ok, request} <- domain_request(operation, sync, local, target, apply?, old_local),
+         {:ok, request} <-
+           if(advanced?,
+             do: {:ok, request},
+             else: paired_relationship_request(request, local, remote, plan)
+           ),
+         {:ok, confirmed} <- confirmation(operation, local, remote, identity, target, apply?),
+         %DateTime{} = issue_time <- remote[:issue_remote_updated_at] do
+      expected =
+        confirmation_expected(operation, sync, local, remote, identity, proof, old_local)
+        |> Map.put(:pair, sync.pair)
+
+      confirmed =
+        Map.merge(confirmed, %{issue_snapshot: issue_target, issue_remote_updated_at: issue_time})
+
+      callback(options, :confirm_pair, &default_confirm_pair/5).(
+        operation,
+        now,
+        expected,
+        confirmed,
+        request
+      )
+    else
+      {:error, reason} -> persist_failure(operation, now, reason, options)
+      _ -> persist_failure(operation, now, :invalid_projection, options)
+    end
+  end
+
+  defp pair_effect_attrs(operation, sync, token, payload, options) do
+    if operation.external_effect_marker["action"] == "set_remote_pull_draft" do
+      {:ok, %{}}
+    else
+      callback(options, :pair_relationship_attrs, &default_pair_relationship_attrs/5).(
+        operation,
+        sync,
+        token,
+        payload["target_issue"],
+        options
+      )
+    end
+  end
+
+  defp default_pair_relationship_attrs(operation, sync, token, target, options) do
+    label_ids = target["label_github_ids"]
+    user_ids = target["assignee_github_ids"]
+
+    labels =
+      Fornacast.Repo.all(
+        from m in ForgeMirrors.MirrorResourceState,
+          where:
+            m.repository_mirror_id == ^sync.repository_mirror_id and m.resource_kind == :label and
+              m.state == :confirmed and m.github_object_id in ^label_ids,
+          order_by: m.github_object_id,
+          select: %{github_object_id: m.github_object_id, github_node_id: m.github_node_id}
+      )
+
+    users =
+      Fornacast.Repo.all(
+        from u in ForgeAccounts.GitHubIdentity,
+          where: u.kind == :user and u.github_user_id in ^user_ids,
+          order_by: u.github_user_id,
+          select: %{github_user_id: u.github_user_id, github_node_id: u.github_node_id}
+      )
+
+    base = sync.provider_identity["base_repository"]
+
+    deadline =
+      System.monotonic_time(:millisecond) +
+        DateTime.diff(operation.lease_expires_at, DateTime.utc_now(), :millisecond) - 2_000
+
+    extra =
+      if @test_client_options,
+        do: Keyword.get(options, :relationship_client_options, []),
+        else: []
+
+    request_opts =
+      Keyword.merge(extra, request_options(sync))
+      |> Keyword.put(:deadline_monotonic_ms, deadline)
+
+    with true <-
+           Enum.map(labels, & &1.github_object_id) == label_ids and
+             Enum.map(users, & &1.github_user_id) == user_ids,
+         {:ok, resolved} <-
+           RelationshipClient.resolve(
+             token,
+             %{github_object_id: base["id"], github_node_id: base["node_id"]},
+             labels,
+             users,
+             request_opts
+           ) do
+      {:ok,
+       Map.merge(Map.take(target, @issue_fields), %{
+         "labels" => Enum.map(resolved.labels, & &1.name),
+         "assignees" => Enum.map(resolved.assignees, & &1.login)
+       })}
+    else
+      false -> {:error, :relationship_prerequisite}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp confirm_pair_observation(
+         operation,
+         now,
+         sync,
+         local,
+         remote,
+         identity,
+         proof,
+         plan,
+         options
+       ) do
+    with {:ok, request} <-
+           domain_request(
+             operation,
+             sync,
+             local,
+             plan.target_pull,
+             plan.apply_local?,
+             local.snapshot
+           ),
+         {:ok, request} <- paired_relationship_request(request, local, remote, plan),
+         {:ok, confirmation} <-
+           confirmation(operation, local, remote, identity, plan.target_pull, plan.apply_local?),
+         %DateTime{} = issue_time <- remote[:issue_remote_updated_at] do
+      expected =
+        confirmation_expected(operation, sync, local, remote, identity, proof, local.snapshot)
+        |> Map.put(:pair, sync.pair)
+
+      confirmation =
+        Map.merge(confirmation, %{
+          issue_snapshot: plan.target_issue,
+          issue_remote_updated_at: issue_time
+        })
+
+      callback(options, :confirm_pair, &default_confirm_pair/5).(
+        operation,
+        now,
+        expected,
+        confirmation,
+        request
+      )
+    else
+      {:error, reason} -> persist_failure(operation, now, reason, options)
+      _ -> persist_failure(operation, now, :invalid_projection, options)
+    end
+  end
+
+  defp paired_relationship_request(request, local, remote, plan) do
+    with %{label_ids: labels, managed_assignee_identity_ids: assignees} = preimage <-
+           local[:relationship_preimage],
+         true <- is_list(labels) and is_list(assignees),
+         {:ok, label_ids} <-
+           target_relationships(
+             local,
+             remote,
+             :label_catalog,
+             :local_label_id,
+             plan.target_issue["label_github_ids"]
+           ),
+         {:ok, refs} <-
+           target_relationships(
+             local,
+             remote,
+             :assignee_catalog,
+             :ref,
+             plan.target_issue["assignee_github_ids"]
+           ) do
+      request = Map.put(request, :expected_relationships, preimage)
+
+      if plan.apply_local?,
+        do:
+          {:ok, Map.merge(request, %{local_label_ids: Enum.sort(label_ids), assignee_refs: refs})},
+        else: {:ok, request}
+    else
+      _ -> {:error, :invalid_projection}
+    end
+  end
+
+  defp target_relationships(local, remote, catalog_key, value_key, ids) do
+    left = Map.get(local, catalog_key, %{})
+    right = Map.get(remote, catalog_key, %{})
+
+    if is_map(left) and is_map(right) do
+      Enum.reduce_while(ids, {:ok, []}, fn id, {:ok, values} ->
+        old = get_in(left, [id, value_key])
+        fresh = get_in(right, [id, value_key])
+        value = fresh || old
+
+        if not is_nil(value) and (is_nil(old) or is_nil(fresh) or old == fresh),
+          do: {:cont, {:ok, values ++ [value]}},
+          else: {:halt, {:error, :invalid_projection}}
+      end)
+    else
+      {:error, :invalid_projection}
+    end
+  end
+
+  defp default_confirm_pair(operation, now, expected, confirmation, request) do
+    domain_multi = fn multi ->
+      case request.action do
+        :update -> ForgePulls.append_sync_apply(multi, :resource, request)
+        :observe -> ForgePulls.append_sync_observe(multi, :resource, request)
+      end
+    end
+
+    ForgeMirrors.confirm_mapped_pull_pair(operation, now, expected, confirmation, domain_multi)
   end
 
   defp reconcile(
