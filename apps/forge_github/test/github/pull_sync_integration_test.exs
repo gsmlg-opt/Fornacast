@@ -15,8 +15,6 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
   alias Fornacast.Repo
 
   @source_time ~U[2026-09-01 00:00:00Z]
-  @head_sha String.duplicate("a", 40)
-  @base_sha String.duplicate("b", 40)
   @base %{
     "title" => "Baseline",
     "body" => "Baseline body",
@@ -24,9 +22,9 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     "state_reason" => nil,
     "draft" => false,
     "head_ref" => "refs/heads/feature",
-    "head_sha" => @head_sha,
+    "head_sha" => nil,
     "base_ref" => "refs/heads/main",
-    "base_sha" => @base_sha
+    "base_sha" => nil
   }
 
   setup {Req.Test, :verify_on_exit!}
@@ -53,6 +51,15 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
         github_node_id: "R_901"
       })
 
+    {base_path, base_sha} = initialize_branch!(base.repository_id, @base["base_ref"])
+    {head_path, head_sha} = initialize_branch!(head.repository_id, @base["head_ref"])
+    baseline = @base |> Map.put("base_sha", base_sha) |> Map.put("head_sha", head_sha)
+
+    on_exit(fn ->
+      File.rm_rf!(base_path)
+      File.rm_rf!(head_path)
+    end)
+
     actor = organization_owner_fixture(organization)
 
     issue =
@@ -60,8 +67,8 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
         repository_id: base.repository_id,
         number: 7,
         kind: :pull_request,
-        title: @base["title"],
-        body: @base["body"],
+        title: baseline["title"],
+        body: baseline["body"],
         state: :open,
         author_user_id: actor.id
       })
@@ -72,16 +79,16 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
         repository_id: base.repository_id,
         head_repository_id: head.repository_id,
         draft: false,
-        head_ref: @base["head_ref"],
-        head_sha: @base["head_sha"],
-        base_ref: @base["base_ref"],
-        base_sha: @base["base_sha"],
+        head_ref: baseline["head_ref"],
+        head_sha: baseline["head_sha"],
+        base_ref: baseline["base_ref"],
+        base_sha: baseline["base_sha"],
         mergeable_state: :unknown
       })
 
     for {binding, ref, oid} <- [
-          {base, @base["base_ref"], @base["base_sha"]},
-          {head, @base["head_ref"], @base["head_sha"]}
+          {base, baseline["base_ref"], baseline["base_sha"]},
+          {head, baseline["head_ref"], baseline["head_sha"]}
         ] do
       %MirrorRefState{}
       |> MirrorRefState.persistence_changeset(%{
@@ -97,7 +104,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
       |> Repo.insert!()
     end
 
-    {:ok, fingerprint} = ForgeMirrors.resource_fingerprint(@base)
+    {:ok, fingerprint} = ForgeMirrors.resource_fingerprint(baseline)
 
     identity = %{
       "github_issue_object_id" => 801,
@@ -119,7 +126,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
         github_number: 7,
         confirmed_local_version: issue.sync_version,
         confirmed_remote_updated_at: @source_time,
-        confirmed_snapshot: @base,
+        confirmed_snapshot: baseline,
         confirmed_fingerprint: fingerprint,
         confirmed_merge_state: %{"merged_at" => nil, "merge_commit_sha" => nil},
         provider_identity: identity,
@@ -134,13 +141,16 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
       issue: issue,
       pull: pull,
       mapping: mapping,
+      baseline: baseline,
+      base_path: base_path,
+      head_path: head_path,
       stub: {__MODULE__, System.unique_integer([:positive])}
     }
   end
 
   test "real inbound pull metadata and draft observation commits with its mirror baseline", ctx do
     now = DateTime.utc_now(:second)
-    target = @base |> Map.put("title", "GitHub title") |> Map.put("draft", true)
+    target = ctx.baseline |> Map.put("title", "GitHub title") |> Map.put("draft", true)
     operation = remote_operation(ctx, now)
 
     expect_observation(ctx, target, now)
@@ -158,7 +168,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
   test "real outbound issue and draft effects use distinct durable markers before confirmation",
        ctx do
     now = DateTime.utc_now(:second)
-    target = @base |> Map.put("title", "Local title") |> Map.put("draft", true)
+    target = ctx.baseline |> Map.put("title", "Local title") |> Map.put("draft", true)
 
     issue =
       ctx.issue
@@ -170,7 +180,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     |> Repo.update!()
 
     operation = local_operation(ctx, issue.sync_version, now)
-    expect_observation(ctx, @base, @source_time)
+    expect_observation(ctx, ctx.baseline, @source_time)
 
     Req.Test.expect(ctx.stub, fn conn ->
       assert conn.method == "PATCH"
@@ -218,8 +228,8 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
   test "a pending disjoint effect survives GET failure and confirms its preimage after a newer edit",
        ctx do
     now = DateTime.utc_now(:second)
-    old_local = Map.put(@base, "title", "Sent title")
-    remote_before = Map.put(@base, "body", "Remote body")
+    old_local = Map.put(ctx.baseline, "title", "Sent title")
+    remote_before = Map.put(ctx.baseline, "body", "Remote body")
     postcondition = Map.put(remote_before, "title", "Sent title")
 
     issue =
@@ -291,6 +301,63 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
              Repo.get!(ForgeIssues.Issue, newer_issue.id)
 
     assert_confirmed(ctx, operation, postcondition, 2)
+  end
+
+  test "a removed cross-repository head ref blocks inbound confirmation", ctx do
+    now = DateTime.utc_now(:second)
+    git!(ctx.head_path, ["update-ref", "-d", ctx.baseline["head_ref"]])
+
+    target = Map.put(ctx.baseline, "title", "Untrusted inbound title")
+    operation = remote_operation(ctx, now)
+    expect_observation(ctx, target, now)
+
+    assert {:ok,
+            %{
+              state: :pending,
+              failure_class: "network",
+              failure_detail: "required Git ref or commit is unavailable"
+            }} =
+             PullSyncWorker.process_operation(operation, now, options(ctx))
+
+    assert %{title: "Baseline", sync_version: 1} = Repo.get!(ForgeIssues.Issue, ctx.issue.id)
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_snapshot == ctx.baseline
+  end
+
+  test "a mismatched base ref blocks an outbound provider effect", ctx do
+    now = DateTime.utc_now(:second)
+    replacement = commit!(ctx.base_path, "replacement")
+    git!(ctx.base_path, ["update-ref", ctx.baseline["base_ref"], replacement])
+
+    issue =
+      ctx.issue
+      |> ForgeIssues.Issue.update_changeset(%{title: "Untrusted outbound title"})
+      |> Repo.update!()
+
+    operation = local_operation(ctx, issue.sync_version, now)
+    expect_observation(ctx, ctx.baseline, @source_time)
+    caller = self()
+
+    result =
+      PullSyncWorker.process_operation(
+        operation,
+        now,
+        options(ctx,
+          update_pull_issue: fn _, _, _, _, _, _ ->
+            send(caller, :provider_effect)
+            {:error, Error.new(:transport)}
+          end
+        )
+      )
+
+    assert {:ok,
+            %{
+              state: :pending,
+              failure_class: "network",
+              failure_detail: "required Git ref or commit is unavailable"
+            }} = result
+
+    refute_receive :provider_effect
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_snapshot == ctx.baseline
   end
 
   defp remote_operation(ctx, now) do
@@ -465,5 +532,42 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     assert mapping.confirmed_local_version == version
     assert mapping.confirmed_merge_state == %{"merged_at" => nil, "merge_commit_sha" => nil}
     assert {:ok, mapping.confirmed_fingerprint} == ForgeMirrors.resource_fingerprint(snapshot)
+  end
+
+  defp initialize_branch!(repository_id, ref) do
+    repository = Repo.get!(ForgeRepos.Repository, repository_id)
+
+    repository =
+      repository
+      |> Ecto.Changeset.change(%{
+        storage_path: "pull-sync-integration/#{Ecto.UUID.generate()}.git"
+      })
+      |> Repo.update!()
+
+    path = ForgeRepos.absolute_storage_path(repository)
+    File.mkdir_p!(Path.dirname(path))
+    assert {:ok, ^path} = GitCore.init_bare(path)
+    oid = commit!(path, ref)
+    git!(path, ["update-ref", ref, oid])
+    {path, oid}
+  end
+
+  defp commit!(path, message) do
+    tree = git!(path, ["hash-object", "-t", "tree", "-w", "/dev/null"])
+    git!(path, ["commit-tree", tree, "-m", message])
+  end
+
+  defp git!(path, args) do
+    env = [
+      {"GIT_AUTHOR_NAME", "Pull Sync Test"},
+      {"GIT_AUTHOR_EMAIL", "pull-sync@example.test"},
+      {"GIT_COMMITTER_NAME", "Pull Sync Test"},
+      {"GIT_COMMITTER_EMAIL", "pull-sync@example.test"}
+    ]
+
+    {output, 0} =
+      System.cmd("git", ["--git-dir=#{path}" | args], env: env, stderr_to_stdout: true)
+
+    String.trim(output)
   end
 end

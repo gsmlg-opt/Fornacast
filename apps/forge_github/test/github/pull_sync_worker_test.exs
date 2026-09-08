@@ -238,6 +238,36 @@ defmodule ForgeGitHub.PullSyncWorkerTest do
     assert_received :marker_preserved
   end
 
+  test "effect recovery checkpoints a required Git availability failure without clearing its marker" do
+    parent = self()
+    proposed = Map.put(@base, "title", "Sent")
+    marker = effect_marker("update_remote_pull_issue", local_pull(proposed, 4), @base, proposed)
+    operation = operation(:effect_pending, marker)
+
+    options =
+      options(operation,
+        context: fn ^operation -> {:ok, context(marker)} end,
+        local_observe: fn _ -> {:ok, local_pull(proposed, 4)} end,
+        git_availability: fn _ -> {:error, :required_ref_unavailable} end,
+        checkpoint: fn ^operation,
+                       %{"failure_reason" => "required_ref_unavailable"},
+                       retry_at,
+                       "network",
+                       @now ->
+          assert DateTime.after?(retry_at, @now)
+          assert operation.external_effect_marker == marker
+          send(parent, :git_failure_preserved)
+          {:ok, %{operation | next_attempt_at: retry_at}}
+        end,
+        retry: fn _, _, _, _, _ -> flunk("unresolved marker used ordinary retry") end
+      )
+
+    assert {:ok, %MirrorOperation{external_effect_marker: ^marker}} =
+             PullSyncWorker.process_operation(operation, @now, options)
+
+    assert_received :git_failure_preserved
+  end
+
   test "repository identity substitution conflicts before either side is mutated" do
     parent = self()
     operation = operation(:processing)
@@ -286,6 +316,7 @@ defmodule ForgeGitHub.PullSyncWorkerTest do
 
         {:ok, eligibility_proof()}
       end,
+      git_availability: fn _proof -> :ok end,
       update_pull_issue: fn _, _, _, _, _, _ -> flunk("unexpected issue effect") end,
       set_draft: fn _, _, _, _ -> flunk("unexpected draft effect") end,
       mark_effect: mark_effect(self(), operation),

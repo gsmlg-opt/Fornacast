@@ -215,6 +215,7 @@ defmodule ForgeGitHub.PullSyncWorker do
     with {:ok, remote} <- remote_observation(sync, token, now, options),
          {:ok, provider_identity} <- provider_identity(remote),
          {:ok, proof} <- eligibility(sync, local, options),
+         :ok <- git_availability(proof, options),
          {:ok, proof} <- json_safe(proof) do
       {:ok, remote, provider_identity, proof}
     end
@@ -315,6 +316,76 @@ defmodule ForgeGitHub.PullSyncWorker do
       refs
     )
   end
+
+  defp git_availability(proof, options) do
+    callback(options, :git_availability, &default_git_availability/1).(proof)
+  end
+
+  defp default_git_availability(%{base: base, head: head}) do
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:ref_deadline_ms)
+
+    [base, head]
+    |> Enum.group_by(& &1.repository_id)
+    |> Enum.reduce_while(:ok, fn {repository_id, refs}, :ok ->
+      case verify_repository_refs(repository_id, refs, deadline) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} -> {:halt, {:error, :required_ref_unavailable}}
+      end
+    end)
+  rescue
+    _exception -> {:error, :required_ref_unavailable}
+  end
+
+  defp default_git_availability(_proof), do: {:error, :required_ref_unavailable}
+
+  defp verify_repository_refs(repository_id, refs, deadline)
+       when is_integer(repository_id) and repository_id > 0 and is_list(refs) do
+    with {:ok, repository} <- ForgeRepos.fetch_live_repository(repository_id),
+         true <-
+           Enum.all?(refs, fn
+             %{repository_generation: generation} -> generation == repository.generation
+             _invalid -> false
+           end) do
+      ForgeRepos.with_repository_read(repository, deadline, fn handle ->
+        path = ForgeRepos.repository_read_path(handle)
+
+        Enum.reduce_while(refs, :ok, fn ref, :ok ->
+          case verify_required_ref(path, ref, deadline) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end)
+    else
+      _invalid -> {:error, :required_ref_unavailable}
+    end
+  end
+
+  defp verify_repository_refs(_repository_id, _refs, _deadline),
+    do: {:error, :required_ref_unavailable}
+
+  defp verify_required_ref(
+         path,
+         %{ref: ref, oid: oid, repository_generation: generation},
+         deadline
+       )
+       when is_binary(path) and is_binary(ref) and is_binary(oid) and is_integer(generation) and
+              generation > 0 and is_integer(deadline) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    with true <- remaining > 0,
+         {:ok, ^oid} <- GitCore.exact_ref(path, ref, deadline_ms: remaining),
+         remaining = max(deadline - System.monotonic_time(:millisecond), 0),
+         true <- remaining > 0,
+         {:ok, true} <- GitCore.is_ancestor(path, oid, oid, deadline_ms: remaining) do
+      :ok
+    else
+      _invalid -> {:error, :required_ref_unavailable}
+    end
+  end
+
+  defp verify_required_ref(_path, _ref, _deadline),
+    do: {:error, :required_ref_unavailable}
 
   defp precondition(sync, local, remote, provider_identity, proof) do
     cond do
@@ -1156,7 +1227,7 @@ defmodule ForgeGitHub.PullSyncWorker do
 
     callback(options, :checkpoint, &ForgeMirrors.checkpoint_resource_operation/5).(
       operation,
-      %{},
+      recovery_checkpoint(reason),
       retry_at,
       failure_class,
       now
@@ -1181,7 +1252,7 @@ defmodule ForgeGitHub.PullSyncWorker do
           now,
           retry_at,
           failure_class,
-          []
+          retry_options(reason)
         )
 
       {:fail, failure_class, detail} ->
@@ -1247,6 +1318,16 @@ defmodule ForgeGitHub.PullSyncWorker do
 
   defp failure(:worker_crash), do: {:retry, "network", nil}
   defp failure(_reason), do: {:retry, "network", nil}
+
+  defp recovery_checkpoint(:required_ref_unavailable),
+    do: %{"failure_reason" => "required_ref_unavailable"}
+
+  defp recovery_checkpoint(_reason), do: %{}
+
+  defp retry_options(:required_ref_unavailable),
+    do: [failure_detail: "required Git ref or commit is unavailable"]
+
+  defp retry_options(_reason), do: []
 
   defp retry_schedule(reason, now) do
     case failure(reason) do
