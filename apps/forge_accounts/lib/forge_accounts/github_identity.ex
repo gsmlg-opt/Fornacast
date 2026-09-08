@@ -13,6 +13,7 @@ defmodule ForgeAccounts.GitHubIdentity do
   schema "github_identities" do
     field :kind, Ecto.Enum, values: @kinds
     field :github_user_id, :integer
+    field :github_node_id, :string
     field :login, :string
     field :avatar_url, :string
     field :profile_url, :string
@@ -31,6 +32,7 @@ defmodule ForgeAccounts.GitHubIdentity do
 
   def observed_changeset(%__MODULE__{} = identity, attrs) do
     identity
+    |> cast(attrs, [:github_node_id], empty_values: [])
     |> cast(attrs, [
       :github_user_id,
       :login,
@@ -42,6 +44,13 @@ defmodule ForgeAccounts.GitHubIdentity do
     |> put_change(:kind, :user)
     |> validate_required([:kind, :github_user_id, :login])
     |> validate_inclusion(:kind, [:user])
+    |> retain_node(identity)
+    |> validate_change(:github_node_id, fn :github_node_id, node ->
+      if is_binary(node) and String.valid?(node) and byte_size(node) in 1..512 and
+           String.trim(node) == node and not String.contains?(node, <<0>>),
+         do: [],
+         else: [github_node_id: "must be a nonempty trimmed node of at most 512 bytes"]
+    end)
     |> validate_number(:github_user_id,
       greater_than_or_equal_to: 0,
       less_than_or_equal_to: @max_github_user_id
@@ -53,6 +62,8 @@ defmodule ForgeAccounts.GitHubIdentity do
     |> validate_github_url(:profile_url, ["github.com"])
     |> unique_constraint(:github_user_id, name: :github_identities_user_id_index)
     |> unique_constraint(:github_user_id, name: ~r/github_identities_github_user_id/)
+    |> unique_constraint(:github_node_id)
+    |> check_constraint(:github_node_id, name: :github_identities_node_check)
   end
 
   def link_changeset(%__MODULE__{kind: :deleted} = identity, _local_user_id) do
@@ -77,6 +88,7 @@ defmodule ForgeAccounts.GitHubIdentity do
     |> change(%{
       kind: :deleted,
       github_user_id: nil,
+      github_node_id: nil,
       login: "ghost",
       avatar_url: nil,
       profile_url: nil,
@@ -90,6 +102,16 @@ defmodule ForgeAccounts.GitHubIdentity do
   end
 
   def display_name(%__MODULE__{login: login}), do: "Github:" <> login
+
+  defp retain_node(changeset, %{github_node_id: node}) when is_binary(node) do
+    case get_change(changeset, :github_node_id, node) do
+      nil -> delete_change(changeset, :github_node_id)
+      ^node -> changeset
+      _ -> add_error(changeset, :github_node_id, "is immutable")
+    end
+  end
+
+  defp retain_node(changeset, _), do: changeset
 
   defp validate_safe_string(changeset, field, max_length, opts \\ []) do
     required? = Keyword.get(opts, :required?, false)

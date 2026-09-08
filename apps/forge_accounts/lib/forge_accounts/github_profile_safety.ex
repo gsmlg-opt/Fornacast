@@ -2,6 +2,10 @@ defmodule ForgeAccounts.GitHubProfileSafety do
   @moduledoc false
 
   @profile_fields [
+    {:node_id, 512, :text},
+    {"node_id", 512, :text},
+    {:github_node_id, 512, :text},
+    {"github_node_id", 512, :text},
     {:login, 255, :text},
     {"login", 255, :text},
     {:owner_login, 255, :text},

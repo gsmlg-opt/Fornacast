@@ -18,6 +18,7 @@ defmodule ForgeGitHub.Client do
   @api_version "2026-03-10"
   @user_agent "Fornacast/0.2.0"
   @request_timeout 20_000
+  @request_gate_acquire_timeout 2_000
   @max_body_bytes 2_000_000
   @allowed_methods [:get, :post, :patch, :put, :delete]
   @max_pages 100
@@ -130,12 +131,18 @@ defmodule ForgeGitHub.Client do
     if installation_gate?(opts) do
       opts = Keyword.put(opts, :json, json)
 
-      with_request_gate(token, opts, [:json], fn ->
-        with {:ok, body} <- encode_request_body(opts),
-             {:ok, response} <- perform_request("/graphql", token, opts, :post, body) do
-          successful_response(response, opts, 200, :generic)
+      with_request_gate(
+        token,
+        opts,
+        [:json, :deadline_monotonic_ms],
+        fn -> validate_graphql_deadline(opts) end,
+        fn ->
+          with {:ok, body} <- encode_request_body(opts),
+               {:ok, response} <- perform_request("/graphql", token, opts, :post, body) do
+            successful_response(response, opts, 200, :generic)
+          end
         end
-      end)
+      )
     else
       error(:invalid_request)
     end
@@ -493,16 +500,37 @@ defmodule ForgeGitHub.Client do
   end
 
   defp with_request_gate(pat, opts, extra_allowed, fun) do
+    with_request_gate(pat, opts, extra_allowed, fn -> :ok end, fun)
+  end
+
+  defp with_request_gate(pat, opts, extra_allowed, pre_gate, fun) do
     with :ok <- validate_pat(pat),
          :ok <- validate_options(opts, extra_allowed),
-         {:ok, gate_key} <- fetch_gate_key(opts) do
+         {:ok, gate_key} <- fetch_gate_key(opts),
+         :ok <- pre_gate.() do
       case RequestGate.run(gate_key, fun) do
         {:error, :invalid_gate_key} -> error(:invalid_request)
         {:error, :busy} -> error(:request_gate_busy)
         result -> result
       end
     else
+      {:error, %Error{}} = error -> error
       _invalid -> error(:invalid_request)
+    end
+  end
+
+  defp validate_graphql_deadline(opts) do
+    case Keyword.fetch(opts, :deadline_monotonic_ms) do
+      :error ->
+        :ok
+
+      {:ok, deadline} when is_integer(deadline) ->
+        if deadline - monotonic_ms() >= @request_gate_acquire_timeout,
+          do: :ok,
+          else: error(:timeout)
+
+      _invalid ->
+        :error
     end
   end
 
@@ -710,7 +738,8 @@ defmodule ForgeGitHub.Client do
 
   defp perform_request(url, pat, opts, method, body) do
     started = System.monotonic_time()
-    deadline = monotonic_ms() + Keyword.get(opts, :request_timeout, @request_timeout)
+    request_deadline = monotonic_ms() + Keyword.get(opts, :request_timeout, @request_timeout)
+    deadline = min(request_deadline, Keyword.get(opts, :deadline_monotonic_ms, request_deadline))
 
     result =
       with :ok <- validate_request_url(url),

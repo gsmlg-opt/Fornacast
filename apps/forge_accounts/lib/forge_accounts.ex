@@ -1044,11 +1044,18 @@ defmodule ForgeAccounts do
 
   defp upsert_github_identity(changeset, github_user_id) do
     GitHubIdentityWrite.with_retry(fn ->
+      options = [
+        on_conflict: observed_identity_on_conflict(),
+        conflict_target: github_identity_conflict_target(),
+        stale_error_field: :github_node_id,
+        stale_error_message: "is immutable"
+      ]
+
+      options =
+        if Repo.in_transaction?(), do: Keyword.put(options, :mode, :savepoint), else: options
+
       with {:ok, _identity} <-
-             Repo.insert(changeset,
-               on_conflict: observed_identity_on_conflict(),
-               conflict_target: github_identity_conflict_target()
-             ) do
+             Repo.insert(changeset, options) do
         {:ok, Repo.get_by!(GitHubIdentity, github_user_id: github_user_id)}
       end
     end)
@@ -1062,8 +1069,16 @@ defmodule ForgeAccounts do
 
   defp postgres_observed_identity_on_conflict do
     from(identity in GitHubIdentity,
+      where:
+        fragment(
+          "? IS NULL OR EXCLUDED.github_node_id IS NULL OR ? = EXCLUDED.github_node_id",
+          identity.github_node_id,
+          identity.github_node_id
+        ),
       update: [
         set: [
+          github_node_id:
+            fragment("COALESCE(?, EXCLUDED.github_node_id)", identity.github_node_id),
           login:
             fragment(
               "CASE WHEN ? IS NULL OR EXCLUDED.last_observed_at >= ? THEN EXCLUDED.login ELSE ? END",
@@ -1113,8 +1128,13 @@ defmodule ForgeAccounts do
 
   defp turso_observed_identity_on_conflict do
     from(_identity in GitHubIdentity,
+      where:
+        fragment(
+          "github_user_id = EXCLUDED.github_user_id AND (github_node_id IS NULL OR EXCLUDED.github_node_id IS NULL OR github_node_id = EXCLUDED.github_node_id)"
+        ),
       update: [
         set: [
+          github_node_id: fragment("COALESCE(github_node_id, EXCLUDED.github_node_id)"),
           login:
             fragment(
               "CASE WHEN last_observed_at IS NULL OR EXCLUDED.last_observed_at >= last_observed_at THEN EXCLUDED.login ELSE login END"
@@ -1261,6 +1281,8 @@ defmodule ForgeAccounts do
     %{
       github_user_id:
         github_profile_value(profile, [:github_user_id, "github_user_id", :id, "id"]),
+      github_node_id:
+        github_profile_value(profile, [:github_node_id, "github_node_id", :node_id, "node_id"]),
       login: github_profile_value(profile, [:login, "login"]),
       avatar_url: github_profile_value(profile, [:avatar_url, "avatar_url"]),
       profile_url:

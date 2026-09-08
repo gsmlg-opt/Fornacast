@@ -3,10 +3,11 @@ defmodule ForgeGitHub.User do
 
   @derive {Inspect, only: [:id, :login, :name, :avatar_url, :html_url]}
   @enforce_keys [:id, :login]
-  defstruct [:id, :login, :name, :avatar_url, :html_url]
+  defstruct [:id, :node_id, :login, :name, :avatar_url, :html_url]
 
   @type t :: %__MODULE__{
           id: pos_integer(),
+          node_id: String.t() | nil,
           login: String.t(),
           name: String.t() | nil,
           avatar_url: String.t() | nil,
@@ -16,6 +17,7 @@ defmodule ForgeGitHub.User do
   @spec from_json(term()) :: {:ok, t()} | {:error, :invalid_response}
   def from_json(%{} = value) do
     with {:ok, id} <- id(value["id"]),
+         {:ok, node_id} <- parse_node(value["node_id"]),
          {:ok, login} <- string(value["login"], 255, required?: true),
          {:ok, name} <- string(value["name"], 255),
          {:ok, avatar_url} <- url(value["avatar_url"], ["avatars.githubusercontent.com"]),
@@ -23,6 +25,7 @@ defmodule ForgeGitHub.User do
       {:ok,
        %__MODULE__{
          id: id,
+         node_id: node_id,
          login: login,
          name: name,
          avatar_url: avatar_url,
@@ -34,6 +37,17 @@ defmodule ForgeGitHub.User do
   end
 
   def from_json(_value), do: {:error, :invalid_response}
+
+  defp parse_node(nil), do: {:ok, nil}
+
+  defp parse_node(value) do
+    with {:ok, node} <- string(value, 512, required?: true),
+         true <- String.trim(node) == node do
+      {:ok, node}
+    else
+      _ -> :error
+    end
+  end
 
   @doc false
   def id(value) when is_integer(value) and value > 0 and value <= 9_223_372_036_854_775_807,
