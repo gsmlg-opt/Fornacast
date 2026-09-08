@@ -56,6 +56,16 @@ PR13 integration audit additionally identified these concrete remaining gates:
 
 ## Current local verification
 
+- `cf3aaed` adds immutable nullable user node identities, authenticated numeric-ID
+  lookup, and fresh node-based relationship resolution. Exact node sets, label
+  repository ownership, credential-echo rejection, and absolute GraphQL request
+  deadlines are checked. Existing node associations cannot be replaced; absent
+  nodes can be seeded without regressing newer profile observations. Fresh scoped
+  verification passed 27 new tests and 97 existing identity/profile/client
+  regressions (124 total); all 13 changed files passed formatting. These are
+  provider/domain prerequisites, not worker integration or activation. Durable
+  missing-node preparation and worker wiring remain open. Two 512-node GraphQL
+  arrays have local fixture coverage only, not live GitHub limit acceptance.
 - `5b390d1` records intent-bound outbound creation conflicts instead of deferring
   zero/multiple UUID matches and identity/metadata divergence as network errors.
   The exact marker and scan survive in the failed operation checkpoint; the
