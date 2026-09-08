@@ -3,6 +3,64 @@ defmodule ForgeGitHub.LabelClient do
 
   alias ForgeGitHub.{Client, Error, RepositoryReference}
 
+  @max_page 2_147_483_647
+
+  @doc "Reads at most 100 labels; the validated next cursor is never fetched eagerly."
+  def list_labels_page(token, owner, repository, cursor, opts) do
+    page = if is_nil(cursor), do: 1, else: cursor
+
+    with {:ok, path} <- base_path(owner, repository),
+         true <- is_integer(page) and page in 1..@max_page and valid_options?(opts) do
+      with {:ok, %{json: json, next_url: next_url}} <-
+             Client.label_metadata_page(token, "#{path}?page=#{page}&per_page=100", opts),
+           {:ok, labels} <- decode_page(json, token),
+           {:ok, next_cursor} <- next_cursor(next_url, path, page) do
+        {:ok, %{labels: labels, next_cursor: next_cursor}}
+      end
+    else
+      _invalid -> error(:invalid_request)
+    end
+  end
+
+  defp decode_page(labels, token) when is_list(labels) and length(labels) <= 100 do
+    if Enum.all?(labels, &match?({:ok, _}, decode_label({:ok, &1}))) and
+         Enum.all?(labels, &safe_page_label?(&1, token)) and
+         length(Enum.uniq_by(labels, & &1["id"])) == length(labels) and
+         length(Enum.uniq_by(labels, & &1["node_id"])) == length(labels),
+       do: {:ok, Enum.map(labels, &Map.take(&1, ~w(id node_id name color description)))},
+       else: error(:invalid_response)
+  end
+
+  defp decode_page(_json, _token), do: error(:invalid_response)
+
+  defp safe_page_label?(label, token) do
+    node = label["node_id"]
+
+    byte_size(node) <= 512 and node == String.trim(node) and
+      Enum.all?(~w(node_id name color description), fn field ->
+        # Metadata bounds above are in codepoints; the description safety slot
+        # preserves those limits while checking every retained string for credentials.
+        ForgeAccounts.GitHubProfileSafety.validate(%{description: label[field]}, token) == :ok
+      end)
+  end
+
+  defp next_cursor(nil, _path, _page), do: {:ok, nil}
+  defp next_cursor(_url, _path, @max_page), do: error(:pagination_limit)
+
+  defp next_cursor(url, path, page) do
+    with {:ok, %URI{path: ^path, query: query}} <- URI.new(url),
+         true <- is_binary(query),
+         pairs <- Enum.to_list(URI.query_decoder(query)),
+         true <- length(pairs) == 2,
+         true <- Map.new(pairs) == %{"page" => Integer.to_string(page + 1), "per_page" => "100"} do
+      {:ok, page + 1}
+    else
+      _invalid -> error(:invalid_pagination)
+    end
+  rescue
+    _exception -> error(:invalid_pagination)
+  end
+
   def create_label(token, owner, repository, attrs, opts) do
     with {:ok, path} <- base_path(owner, repository),
          true <- valid_options?(opts),

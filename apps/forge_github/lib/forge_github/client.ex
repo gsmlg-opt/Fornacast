@@ -106,6 +106,49 @@ defmodule ForgeGitHub.Client do
     metadata_page(token, path, opts, &pull_metadata_request_kind/2)
   end
 
+  @doc false
+  def label_metadata_page(token, path, opts) do
+    metadata_page(token, path, opts, fn
+      :get, path when is_binary(path) ->
+        with {:ok,
+              %URI{
+                scheme: nil,
+                host: nil,
+                userinfo: nil,
+                fragment: nil,
+                path: route,
+                query: query
+              }} <- URI.new(path),
+             true <- valid_label_page_query?(query),
+             ["", "repos", owner, repository, "labels"] <- String.split(route, "/"),
+             true <- RepositoryReference.valid_owner?(owner),
+             true <- RepositoryReference.valid_repository?(repository) do
+          {:ok, :page}
+        else
+          _invalid -> :error
+        end
+
+      _, _ ->
+        :error
+    end)
+  end
+
+  defp valid_label_page_query?(query) when is_binary(query) do
+    with pairs <- Enum.to_list(URI.query_decoder(query)),
+         true <- length(pairs) == 2,
+         %{"page" => encoded, "per_page" => "100"} <- Map.new(pairs),
+         {page, ""} <- Integer.parse(encoded),
+         true <- page in 1..2_147_483_647 and encoded == Integer.to_string(page) do
+      true
+    else
+      _invalid -> false
+    end
+  rescue
+    _exception -> false
+  end
+
+  defp valid_label_page_query?(_query), do: false
+
   defp metadata_page(token, path, opts, classify) do
     with {:ok, :page} <- classify.(:get, path),
          true <- installation_gate?(opts),
