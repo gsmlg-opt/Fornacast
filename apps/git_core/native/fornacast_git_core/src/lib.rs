@@ -4218,6 +4218,7 @@ fn merge_analysis(
         byte_limit,
         deadline_ms,
         None,
+        false,
     ) {
         DeferredMergeResult::Complete(Ok((analysis, _))) => NativeMergeAnalysisReply::Ok(analysis),
         DeferredMergeResult::Complete(Err(error)) => NativeMergeAnalysisReply::Error(error),
@@ -4269,6 +4270,7 @@ fn write_merge_commit(
         byte_limit,
         deadline_ms,
         Some(commit),
+        false,
     ) {
         DeferredMergeResult::Complete(Ok((_, Some(merge_oid)))) => {
             NativeMergeWriteReply::Ok(merge_oid)
@@ -4285,6 +4287,128 @@ fn write_merge_commit(
     }
 }
 
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::too_many_arguments)]
+fn write_merge_tree(
+    path: String,
+    base_oid: String,
+    head_oid: String,
+    commit_limit: usize,
+    tree_entry_limit: usize,
+    changed_path_limit: usize,
+    byte_limit: u64,
+    deadline_ms: u64,
+) -> NativeMergeWriteReply {
+    match bounded_merge_deferred(
+        &path,
+        &base_oid,
+        &head_oid,
+        commit_limit,
+        tree_entry_limit,
+        changed_path_limit,
+        byte_limit,
+        deadline_ms,
+        None,
+        true,
+    ) {
+        DeferredMergeResult::Complete(Ok((_, Some(tree)))) => NativeMergeWriteReply::Ok(tree),
+        DeferredMergeResult::Complete(Ok((_, None))) => NativeMergeWriteReply::Error(native_error(
+            "corrupt_repository",
+            "merge tree was not produced",
+        )),
+        DeferredMergeResult::Complete(Err(error)) => NativeMergeWriteReply::Error(error),
+        DeferredMergeResult::Deferred { error, ticket } => NativeMergeWriteReply::Deferred(
+            error,
+            rustler::ResourceArc::new(MergeWorkerTicketResource { ticket }),
+        ),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::too_many_arguments)]
+fn write_commit_from_tree(
+    path: String,
+    tree_oid: String,
+    base_oid: String,
+    head_oid: String,
+    author: NativeSignature,
+    committer: NativeSignature,
+    message: Vec<u8>,
+    byte_limit: u64,
+    deadline_ms: u64,
+) -> NativeMergeWriteReply {
+    let commit = match (
+        validated_merge_signature(author),
+        validated_merge_signature(committer),
+        validated_merge_message(message),
+    ) {
+        (Ok(author), Ok(committer), Ok(message)) => PreparedMergeCommit {
+            author,
+            committer,
+            message,
+        },
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+            return NativeMergeWriteReply::Error(error);
+        }
+    };
+    let deadline = Instant::now() + merge_scan_duration(deadline_ms);
+    let worker_path = path.clone();
+    let completed = match run_merge_worker(deadline, true, move |cancelled| {
+        check_merge_worker(&cancelled, deadline)?;
+        let mut repo = open_physical_bare_repository(&worker_path)?.with_object_memory();
+        let budget = MergeByteBudget::new(merge_byte_limit(byte_limit));
+        let base = parse_merge_commit_oid(&repo, &base_oid, &budget, deadline)?;
+        let head = parse_merge_commit_oid(&repo, &head_oid, &budget, deadline)?;
+        let tree = gix_hash::ObjectId::from_hex(tree_oid.as_bytes())
+            .map_err(|error| native_error("object_not_found", error))?;
+        charge_merge_object(&repo, tree, &budget)?;
+        if repo.find_header(tree).map_err(diff_read_error)?.kind() != gix_object::Kind::Tree {
+            return Err(native_error(
+                "invalid_input",
+                "expected an existing tree object",
+            ));
+        }
+        // No merge/filter configuration participates: every commit byte comes
+        // from this durable tree, the two explicit parents and fixed metadata.
+        let object = gix_object::Commit {
+            tree,
+            parents: vec![base, head].into(),
+            author: commit.author,
+            committer: commit.committer,
+            encoding: None,
+            message: commit.message.into(),
+            extra_headers: Vec::new(),
+        };
+        check_merge_worker(&cancelled, deadline)?;
+        let oid = gix_object::Write::write(&repo, &object).map_err(merge_boxed_operation_error)?;
+        charge_merge_object(&repo, oid, &budget)?;
+        check_merge_worker(&cancelled, deadline)?;
+        Ok((oid.to_string(), take_merge_object_memory(&mut repo)?))
+    }) {
+        NativeMergeWorkerResult::Complete(Ok(completed)) => completed,
+        NativeMergeWorkerResult::Complete(Err(error)) => {
+            return NativeMergeWriteReply::Error(error);
+        }
+        NativeMergeWorkerResult::Deferred { error, ticket } => {
+            return NativeMergeWriteReply::Deferred(
+                error,
+                rustler::ResourceArc::new(MergeWorkerTicketResource { ticket }),
+            );
+        }
+    };
+    let CompletedMergeWorker {
+        value: (oid, objects),
+        _permit: permit,
+    } = completed;
+    if let Err(error) =
+        check_merge_deadline(deadline).and_then(|()| publish_merge_objects(path, objects))
+    {
+        return NativeMergeWriteReply::Error(error);
+    }
+    drop(permit);
+    NativeMergeWriteReply::Ok(oid)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn bounded_merge_deferred(
     path: &str,
@@ -4296,13 +4420,14 @@ fn bounded_merge_deferred(
     byte_limit: u64,
     deadline_ms: u64,
     commit: Option<PreparedMergeCommit>,
+    tree_only: bool,
 ) -> DeferredMergeResult {
     let deadline = Instant::now() + merge_scan_duration(deadline_ms);
     if let Err(error) = check_merge_deadline(deadline) {
         return DeferredMergeResult::Complete(Err(error));
     }
 
-    let publish = commit.is_some();
+    let publish = commit.is_some() || tree_only;
     let worker_path = path.to_owned();
     let publish_path = worker_path.clone();
     let base_oid = base_oid.to_owned();
@@ -4318,6 +4443,7 @@ fn bounded_merge_deferred(
             byte_limit,
             deadline,
             commit,
+            tree_only,
             cancelled,
         )
     }) {
@@ -4374,6 +4500,7 @@ fn bounded_merge(
         byte_limit,
         deadline_ms,
         commit,
+        false,
     ) {
         DeferredMergeResult::Complete(result) => result,
         DeferredMergeResult::Deferred { error, ticket } => {
@@ -4524,6 +4651,7 @@ fn compute_bounded_merge(
     byte_limit: u64,
     deadline: Instant,
     commit: Option<PreparedMergeCommit>,
+    tree_only: bool,
     cancelled: Arc<AtomicBool>,
 ) -> Result<ComputedMerge, NativeError> {
     check_merge_worker(&cancelled, deadline)?;
@@ -4675,7 +4803,7 @@ fn compute_bounded_merge(
     );
 
     if !mergeable {
-        return if commit.is_some() {
+        return if commit.is_some() || tree_only {
             Err(native_error(
                 "merge_conflict",
                 "base and head have unresolved merge conflicts",
@@ -4704,6 +4832,21 @@ fn compute_bounded_merge(
         &byte_budget,
         deadline,
     )?;
+
+    if tree_only {
+        check_merge_worker(&cancelled, deadline)?;
+        // Recursive/crisscross merge-base computation may create virtual
+        // commits in object memory. A tree checkpoint must publish no commit.
+        let mut objects = take_merge_object_memory(&mut repo)?;
+        objects.retain(|(_, (kind, _))| {
+            matches!(kind, gix_object::Kind::Tree | gix_object::Kind::Blob)
+        });
+        return Ok(ComputedMerge {
+            analysis: native_analysis,
+            merge_oid: Some(merged_tree.to_string()),
+            objects,
+        });
+    }
 
     let Some(commit) = commit else {
         return Ok(ComputedMerge {

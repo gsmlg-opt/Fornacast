@@ -145,6 +145,22 @@ defmodule GitCore.Native do
 
   def await_merge_worker(_ticket), do: :erlang.nif_error(:nif_not_loaded)
 
+  def write_merge_tree(_path, _base, _head, _commits, _entries, _paths, _bytes, _deadline),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def write_commit_from_tree(
+        _path,
+        _tree,
+        _base,
+        _head,
+        _author,
+        _committer,
+        _message,
+        _bytes,
+        _deadline
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   def compare_and_swap_ref(
         _path,
         _full_ref,

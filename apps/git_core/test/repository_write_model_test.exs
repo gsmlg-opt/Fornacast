@@ -428,6 +428,146 @@ defmodule GitCore.RepositoryWriteModelTest do
              fixture.base_oid
   end
 
+  test "tree-only merge and fixed-tree commit replay do not advance refs", %{tmp_dir: tmp_dir} do
+    fixture = clean_fixture!(tmp_dir)
+    before_refs = refs(fixture.repo_path)
+
+    before_commits =
+      git!([
+        "--git-dir",
+        fixture.repo_path,
+        "cat-file",
+        "--batch-all-objects",
+        "--batch-check=%(objecttype)"
+      ])
+      |> String.split("\n")
+      |> Enum.count(&(&1 == "commit"))
+
+    assert {:ok, tree} =
+             GitCore.write_merge_tree(fixture.repo_path, fixture.base_oid, fixture.head_oid)
+
+    assert git!(["--git-dir", fixture.repo_path, "cat-file", "-t", tree]) == "tree"
+
+    after_commits =
+      git!([
+        "--git-dir",
+        fixture.repo_path,
+        "cat-file",
+        "--batch-all-objects",
+        "--batch-check=%(objecttype)"
+      ])
+      |> String.split("\n")
+      |> Enum.count(&(&1 == "commit"))
+
+    assert after_commits == before_commits
+
+    args = [
+      fixture.repo_path,
+      tree,
+      fixture.base_oid,
+      fixture.head_oid,
+      signature(),
+      signature(),
+      "Fixed tree"
+    ]
+
+    assert {:ok, oid} = apply(GitCore, :write_commit_from_tree, args)
+    git!(["--git-dir", fixture.repo_path, "config", "merge.renormalize", "true"])
+    git!(["--git-dir", fixture.repo_path, "config", "core.autocrlf", "true"])
+    assert {:ok, ^oid} = apply(GitCore, :write_commit_from_tree, args)
+    assert {:ok, commit} = GitCore.commit(fixture.repo_path, oid)
+    assert commit.parents == [fixture.base_oid, fixture.head_oid]
+    assert git!(["--git-dir", fixture.repo_path, "show", "-s", "--format=%T", oid]) == tree
+    assert refs(fixture.repo_path) == before_refs
+  end
+
+  test "fixed-tree commit rejects wrong object kinds and invalid signatures", %{tmp_dir: tmp_dir} do
+    fixture = clean_fixture!(tmp_dir)
+
+    assert {:ok, tree} =
+             GitCore.write_merge_tree(fixture.repo_path, fixture.base_oid, fixture.head_oid)
+
+    before = git!(["--git-dir", fixture.repo_path, "count-objects", "-v"])
+
+    assert {:error, _} =
+             GitCore.write_commit_from_tree(
+               fixture.repo_path,
+               fixture.base_oid,
+               fixture.base_oid,
+               fixture.head_oid,
+               signature(),
+               signature(),
+               "bad tree"
+             )
+
+    assert {:error, _} =
+             GitCore.write_commit_from_tree(
+               fixture.repo_path,
+               tree,
+               tree,
+               fixture.head_oid,
+               signature(),
+               signature(),
+               "bad parent"
+             )
+
+    assert {:error, _} =
+             GitCore.write_commit_from_tree(
+               fixture.repo_path,
+               tree,
+               fixture.base_oid,
+               fixture.head_oid,
+               signature(name: "bad\nname"),
+               signature(),
+               "bad author"
+             )
+
+    assert git!(["--git-dir", fixture.repo_path, "count-objects", "-v"]) == before
+  end
+
+  test "tree checkpoint publishes no virtual commits for crisscross merge bases", %{
+    tmp_dir: tmp_dir
+  } do
+    fixture = clean_fixture!(tmp_dir)
+    tree = git!(["--git-dir", fixture.repo_path, "rev-parse", "#{fixture.base_oid}^{tree}"])
+
+    commit = fn parents, message ->
+      git!(
+        [
+          "--git-dir",
+          fixture.repo_path,
+          "-c",
+          "user.name=Crisscross",
+          "-c",
+          "user.email=cross@example.test",
+          "commit-tree",
+          tree
+        ] ++ Enum.flat_map(parents, &["-p", &1]) ++ ["-m", message]
+      )
+    end
+
+    a = commit.([fixture.base_oid], "a")
+    b = commit.([fixture.base_oid], "b")
+    left = commit.([a, b], "left")
+    right = commit.([b, a], "right")
+
+    commits = fn ->
+      git!([
+        "--git-dir",
+        fixture.repo_path,
+        "cat-file",
+        "--batch-all-objects",
+        "--batch-check=%(objecttype)"
+      ])
+      |> String.split("\n")
+      |> Enum.count(&(&1 == "commit"))
+    end
+
+    before = commits.()
+    assert {:ok, _} = GitCore.write_merge_tree(fixture.repo_path, left, right)
+    assert commits.() == before
+  end
+
   test "validates UTF-8 and signature/message size before inserting any object", %{
     tmp_dir: tmp_dir
   } do

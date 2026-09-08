@@ -27,6 +27,7 @@ defmodule ForgePulls.MergeOperation do
     field :coordination_mode, Ecto.Enum, values: [:standalone, :mirror], default: :standalone
     field :coordinator_operation_id, :integer
     field :commit_intent, :map
+    field :merge_tree_oid, :string
     field :api_version, :string
     field :ip_address, :string
     field :user_agent, :string

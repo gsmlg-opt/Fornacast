@@ -821,6 +821,58 @@ defmodule GitCore do
   end
 
   @doc """
+  Publishes only the merged tree and blobs, never a commit or ref.
+  The caller must hold the repository writer permit and durably checkpoint the
+  returned tree before constructing a coordinated merge commit from it.
+  """
+  def write_merge_tree(path, base_oid, head_oid, opts \\ []) do
+    {commits, entries, paths, bytes, deadline} = merge_bounds(opts)
+
+    GitCore.Native.write_merge_tree(
+      path,
+      base_oid,
+      head_oid,
+      commits,
+      entries,
+      paths,
+      bytes,
+      deadline
+    )
+    |> wrap_read(:write_merge_tree)
+  end
+
+  @doc """
+  Publishes one fixed-tree two-parent commit without consulting merge configuration.
+  The caller must hold the repository writer permit. Tree and parent objects must
+  already exist in this repository. No reference is updated.
+  """
+  def write_commit_from_tree(
+        path,
+        tree,
+        base,
+        head,
+        %GitCore.Signature{} = author,
+        %GitCore.Signature{} = committer,
+        message,
+        opts \\ []
+      ) do
+    {_, _, _, bytes, deadline} = merge_bounds(opts)
+
+    GitCore.Native.write_commit_from_tree(
+      path,
+      tree,
+      base,
+      head,
+      signature_to_native(author),
+      signature_to_native(committer),
+      :binary.bin_to_list(message),
+      bytes,
+      deadline
+    )
+    |> wrap_read(:write_commit_from_tree)
+  end
+
+  @doc """
   Atomically creates or fast-forwards a canonical full ref from the exact expected target.
 
   The proposed object must already exist. Branch targets must be commits; tag targets may be any

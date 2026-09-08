@@ -55,6 +55,7 @@ defmodule ForgePullsTest do
         "coordination_mode" => %{type: :text, nullable: false, default: "standalone"},
         "coordinator_operation_id" => %{type: :bigint, nullable: true, default: nil},
         "commit_intent" => %{type: :map, nullable: true, default: nil},
+        "merge_tree_oid" => %{type: :text, nullable: true, default: nil},
         "id" => %{type: :bigint, nullable: false, default: :generated},
         "pull_request_id" => %{type: :bigint, nullable: false, default: nil},
         "repository_id" => %{type: :bigint, nullable: false, default: nil},
