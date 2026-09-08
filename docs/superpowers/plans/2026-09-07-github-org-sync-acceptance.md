@@ -56,6 +56,13 @@ PR13 integration audit additionally identified these concrete remaining gates:
 
 ## Current local verification
 
+- `f336fae` adds a single-page authenticated label inventory client. Pagination
+  is fixed to the exact repository, advancing page, and 100-item page size;
+  responses retain only bounded canonical fields and reject credential echoes,
+  duplicate identities, and malformed node IDs. Seventy scoped label/client/pull
+  client tests passed and three files passed formatting. Durable label-node
+  seeding and worker integration are still required; this is not an activation
+  or end-to-end acceptance result.
 - `cf3aaed` adds immutable nullable user node identities, authenticated numeric-ID
   lookup, and fresh node-based relationship resolution. Exact node sets, label
   repository ownership, credential-echo rejection, and absolute GraphQL request
