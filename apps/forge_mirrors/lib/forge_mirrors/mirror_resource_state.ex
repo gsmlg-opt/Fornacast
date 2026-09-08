@@ -23,6 +23,8 @@ defmodule ForgeMirrors.MirrorResourceState do
     field :confirmed_remote_updated_at, :utc_datetime
     field :confirmed_fingerprint, :string
     field :confirmed_snapshot, :map
+    field :confirmed_merge_state, :map
+    field :provider_identity, :map
     field :state, Ecto.Enum, values: [:pending, :confirmed, :conflicted, :deleted, :unsupported]
     field :lock_version, :integer, default: 1
     timestamps(type: :utc_datetime)
@@ -42,14 +44,40 @@ defmodule ForgeMirrors.MirrorResourceState do
       :confirmed_remote_updated_at,
       :confirmed_fingerprint,
       :confirmed_snapshot,
+      :confirmed_merge_state,
+      :provider_identity,
       :state,
       :lock_version
     ])
     |> validate_required([:repository_mirror_id, :resource_kind, :state, :lock_version])
     |> validate_number(:lock_version, greater_than: 0)
     |> validate_change(:confirmed_snapshot, &validate_snapshot/2)
+    |> validate_change(:confirmed_merge_state, &validate_metadata/2)
+    |> validate_change(:provider_identity, &validate_metadata/2)
+    |> immutable_provider_identity(state)
     |> check_constraint(:confirmed_snapshot, name: :mirror_resource_states_snapshot_check)
+    |> check_constraint(:provider_identity, name: :mirror_resource_states_provider_identity_check)
+    |> check_constraint(:confirmed_merge_state,
+      name: :mirror_resource_states_confirmed_merge_state_check
+    )
     |> validate_identity()
+  end
+
+  defp immutable_provider_identity(changeset, %{provider_identity: identity})
+       when not is_nil(identity) do
+    if get_field(changeset, :provider_identity) == identity,
+      do: changeset,
+      else: add_error(changeset, :provider_identity, "is immutable")
+  end
+
+  defp immutable_provider_identity(changeset, _), do: changeset
+
+  defp validate_metadata(field, value) do
+    if is_map(value) and byte_size(JSON.encode!(value)) <= 16_384,
+      do: [],
+      else: [{field, "must be a JSON object of at most 16384 encoded bytes"}]
+  rescue
+    _ -> [{field, "must be a JSON object"}]
   end
 
   defp validate_snapshot(field, snapshot) do

@@ -818,6 +818,7 @@ defmodule ForgeMirrors do
   def retain_webhook_resource_trigger(_, _), do: {:error, :invalid_argument}
 
   @resource_operation_kinds [
+    "sync.pull",
     "sync.issue",
     "sync.issue_comment",
     "reconcile.repository.issues",
@@ -835,11 +836,13 @@ defmodule ForgeMirrors do
       with {:ok, persisted, scope} <- lock_resource_operation(operation),
            {:ok, mapping} <- resource_mapping(persisted, scope.resource_kind),
            false <- mapping_value(mapping, :state) == :conflicted,
-           {:ok, parent} <- resource_parent(persisted, mapping) do
+           {:ok, parent} <- resource_parent(persisted, mapping),
+           {:ok, pull_context} <- pull_resource_context(scope, mapping) do
         cursor = persisted.cursor
         local_state = resource_local_state(persisted, scope)
 
-        Map.merge(scope, %{
+        scope
+        |> Map.merge(%{
           trigger: resource_trigger(cursor["trigger"]),
           local_resource_id:
             resource_local_id(cursor) || mapping_value(mapping, :local_resource_id),
@@ -873,6 +876,7 @@ defmodule ForgeMirrors do
             correlation_id: cursor["correlation_id"]
           }
         })
+        |> Map.merge(pull_context)
       else
         true -> Repo.rollback(:resource_conflicted)
         {:error, reason} -> Repo.rollback(reason)
@@ -881,6 +885,11 @@ defmodule ForgeMirrors do
   end
 
   def resource_operation_context(_), do: {:error, :invalid_transition}
+
+  defp pull_resource_context(%{resource_kind: :pull} = scope, mapping),
+    do: ForgeMirrors.PullResourceBoundary.context(scope, mapping)
+
+  defp pull_resource_context(_, _), do: {:ok, %{}}
 
   defp resource_local_state(operation, scope) do
     cursor = operation.cursor
@@ -1029,7 +1038,7 @@ defmodule ForgeMirrors do
              true <-
                persisted.state == :effect_pending and
                  persisted.external_effect_marker == operation.external_effect_marker and
-                 persisted.external_effect_marker["action"] in ~w(create_remote_issue update_remote_issue create_remote_comment update_remote_comment delete_remote_comment),
+                 persisted.external_effect_marker["action"] in ~w(create_remote_issue update_remote_issue create_remote_comment update_remote_comment delete_remote_comment update_remote_pull_issue set_remote_pull_draft),
              {:ok, pending} <-
                owned_transition(persisted, now, [:effect_pending],
                  state: :pending,
@@ -1244,6 +1253,7 @@ defmodule ForgeMirrors do
       Repo.transaction(fn ->
         with {:ok, persisted, scope} <- lock_resource_operation(operation),
              {:ok, mapping} <- resource_mapping(persisted, scope.resource_kind),
+             :ok <- pull_confirmation_precondition(scope, mapping, expected, confirmation),
              :ok <-
                resource_confirmation_precondition(
                  persisted,
@@ -1277,6 +1287,28 @@ defmodule ForgeMirrors do
   end
 
   def confirm_resource_operation(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  @doc false
+  def confirm_pull_operation(
+        %MirrorOperation{kind: "sync.pull"} = operation,
+        now,
+        expected,
+        confirmation,
+        callback
+      ),
+      do: confirm_resource_operation(operation, now, expected, confirmation, callback)
+
+  def confirm_pull_operation(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  defp pull_confirmation_precondition(
+         %{resource_kind: :pull} = scope,
+         mapping,
+         expected,
+         confirmation
+       ),
+       do: ForgeMirrors.PullResourceBoundary.confirm(scope, mapping, expected, confirmation)
+
+  defp pull_confirmation_precondition(_, _, _, _), do: :ok
 
   @doc false
   def confirm_label_for_resource_operation(
@@ -1502,7 +1534,7 @@ defmodule ForgeMirrors do
 
   defp validate_resource_projection(projection, scope, expected, confirmation)
        when is_map(projection) do
-    type = if scope.resource_kind == :issue, do: "ForgeIssues.Issue", else: "ForgeIssues.Comment"
+    type = resource_type(scope.resource_kind)
 
     if projection[:repository_id] == scope.repository_id and
          projection[:resource_kind] == scope.resource_kind and
@@ -1512,9 +1544,13 @@ defmodule ForgeMirrors do
          projection.local_version >= confirmation.confirmed_local_version and
          (is_nil(expected[:local_resource_id]) or
             expected.local_resource_id == projection.local_resource_id) and
-         (confirmation.state != :deleted or projection[:deleted] == true),
-       do: :ok,
-       else: {:error, :invalid_projection}
+         (confirmation.state != :deleted or projection[:deleted] == true) do
+      if scope.resource_kind == :pull,
+        do: ForgeMirrors.PullResourceBoundary.projection(projection, expected, confirmation),
+        else: :ok
+    else
+      {:error, :invalid_projection}
+    end
   end
 
   defp validate_resource_projection(_, _, _, _), do: {:error, :invalid_projection}
@@ -1543,6 +1579,10 @@ defmodule ForgeMirrors do
         confirmed_local_version: confirmation.confirmed_local_version,
         confirmed_remote_updated_at: confirmation.remote_updated_at,
         confirmed_snapshot: confirmation.confirmed_snapshot,
+        provider_identity:
+          confirmation[:provider_identity] || mapping_value(mapping, :provider_identity),
+        confirmed_merge_state:
+          confirmation[:confirmed_merge_state] || mapping_value(mapping, :confirmed_merge_state),
         confirmed_fingerprint: fingerprint,
         state: confirmation.state,
         lock_version: (mapping_value(mapping, :lock_version) || 0) + 1
@@ -1595,10 +1635,7 @@ defmodule ForgeMirrors do
                        resource_local_id(persisted.cursor),
                    local_resource_type:
                      mapping_value(mapping, :local_resource_type) ||
-                       if(scope.resource_kind == :issue,
-                         do: "ForgeIssues.Issue",
-                         else: "ForgeIssues.Comment"
-                       ),
+                       resource_type(scope.resource_kind),
                    github_object_id:
                      mapping_value(mapping, :github_object_id) ||
                        persisted.cursor["github_object_id"],
@@ -1655,17 +1692,27 @@ defmodule ForgeMirrors do
     cursor = operation.cursor
 
     kind =
-      if operation.kind in ["sync.issue", "reconcile.repository.issues"],
-        do: :issue,
-        else: :issue_comment
+      case operation.kind do
+        "sync.pull" -> :pull
+        kind when kind in ["sync.issue", "reconcile.repository.issues"] -> :issue
+        _ -> :issue_comment
+      end
 
     with %RepositoryMirror{inventory_included: true, repository_id: id} when is_integer(id) <-
            binding,
          %OrganizationMirror{provider: "github", state: state}
          when state in [:catching_up, :active, :degraded, :conflicted] <- organization,
          true <- binding.organization_mirror_id == organization.id,
-         true <- issue_capability_enabled?(organization, cursor["issue_kind"] || "issue"),
-         true <- cursor["issue_kind"] != "pull_request",
+         true <-
+           issue_capability_enabled?(
+             organization,
+             if(kind == :pull, do: "pull_request", else: cursor["issue_kind"] || "issue")
+           ),
+         true <-
+           if(kind == :pull,
+             do: cursor["issue_kind"] in [nil, "pull_request"],
+             else: cursor["issue_kind"] != "pull_request"
+           ),
          true <- resource_trigger(cursor["trigger"]) != nil,
          true <- valid_resource_sweep?(operation),
          true <-
@@ -1700,15 +1747,14 @@ defmodule ForgeMirrors do
   end
 
   defp resource_mapping(operation, kind) do
-    local_id = resource_local_id(operation.cursor)
+    local_id =
+      if kind == :pull,
+        do: ForgeMirrors.PullResourceBoundary.local_id(operation),
+        else: resource_local_id(operation.cursor)
+
     remote_id = operation.cursor["github_object_id"]
 
-    type =
-      case kind do
-        :issue -> "ForgeIssues.Issue"
-        :issue_comment -> "ForgeIssues.Comment"
-        :label -> "ForgeIssues.Label"
-      end
+    type = resource_type(kind)
 
     if (is_nil(local_id) or positive_resource_id?(local_id)) and
          (is_nil(remote_id) or positive_resource_id?(remote_id)) do
@@ -1732,7 +1778,7 @@ defmodule ForgeMirrors do
 
       case mappings do
         [] ->
-          {:ok, nil}
+          if kind == :pull, do: {:error, :invalid_pull_mapping}, else: {:ok, nil}
 
         [mapping] ->
           if (is_nil(local_id) or is_nil(mapping.local_resource_id) or
@@ -1751,6 +1797,11 @@ defmodule ForgeMirrors do
       {:error, :invalid_transition}
     end
   end
+
+  defp resource_type(:issue), do: "ForgeIssues.Issue"
+  defp resource_type(:issue_comment), do: "ForgeIssues.Comment"
+  defp resource_type(:label), do: "ForgeIssues.Label"
+  defp resource_type(:pull), do: "ForgePulls.PullRequest"
 
   defp valid_resource_sweep?(%{kind: kind, cursor: cursor, checkpoint: checkpoint} = operation)
        when kind in ["reconcile.repository.issues", "reconcile.repository.issue_comments"] do
@@ -2314,6 +2365,7 @@ defmodule ForgeMirrors do
 
       Repo.transaction(fn ->
         with :ok <- lock_effect_scope(operation),
+             :ok <- validate_pull_effect(operation, canonical_map(marker)),
              {:ok, marked} <-
                owned_transition(operation, now, [:processing],
                  state: :effect_pending,
@@ -2367,6 +2419,7 @@ defmodule ForgeMirrors do
         with :ok <- lock_effect_scope(operation),
              {:ok, persisted} <- lock_owned_operation(operation, [operation.kind]),
              true <- persisted.external_effect_marker == expected_marker,
+             :ok <- validate_pull_effect(persisted, replacement_marker),
              {:ok, replaced} <-
                owned_transition(persisted, now, [:effect_pending],
                  external_effect_marker: replacement_marker,
@@ -2398,6 +2451,19 @@ defmodule ForgeMirrors do
 
   def replace_external_effect(_operation, _now, _expected, _replacement),
     do: {:error, :invalid_argument}
+
+  defp validate_pull_effect(operation, marker) do
+    case Repo.get(MirrorOperation, operation.id) do
+      %MirrorOperation{kind: "sync.pull"} ->
+        with {:ok, persisted, scope} <- lock_resource_operation(operation),
+             {:ok, mapping} <- resource_mapping(persisted, :pull) do
+          ForgeMirrors.PullResourceBoundary.mark(scope, mapping, marker)
+        end
+
+      _ ->
+        :ok
+    end
+  end
 
   @spec failure_disposition(String.t()) ::
           {:ok, :retry | :degraded | :conflict | :terminal} | {:error, :invalid_argument}
