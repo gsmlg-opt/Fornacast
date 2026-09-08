@@ -3,8 +3,9 @@ defmodule ForgeGitHub.PullMergeWorker do
   Bounded remote CAS execution for an already written coordinated merge.
 
   A successful push only yields the durable pre-push marker. A subsequent
-  authenticated observation can mark confirmation readiness; this module never
-  updates local refs or closes a pull, and is not admitted by the worker pool.
+  authenticated observation of the exact merged result and shared metadata can
+  finalize locally through the coordinator boundary. Ref-only readiness never
+  closes a pull. This module is not yet admitted by the worker pool.
   """
   alias ForgeGitHub.{
     InstallationToken,
@@ -12,11 +13,19 @@ defmodule ForgeGitHub.PullMergeWorker do
     IssueClient,
     LFSSync,
     PullClient,
+    PullMergeObservation,
     PullSyncWorker,
     RefObservation
   }
 
-  alias ForgeMirrors.{MirrorOperation, OrganizationMirror, PullMergeBoundary, RepositoryMirror}
+  alias ForgeMirrors.{
+    MirrorOperation,
+    OrganizationMirror,
+    PullMergeBoundary,
+    PullMergeConfirmation,
+    RepositoryMirror
+  }
+
   alias Fornacast.Repo
   alias GitCore.Remote.{RefUpdate, SyncRequest}
 
@@ -48,24 +57,57 @@ defmodule ForgeGitHub.PullMergeWorker do
            {:ok, token} <- token(sync, options),
            {:ok, remote} <- observe(sync, :base, token, options),
            {:ok, pair} <- pair(sync, token, options) do
-        if remote.oid == context.intent.expected_base_oid do
-          # An unchanged remote ref is the only recovery observation that may
-          # authorize another attempt, and it still requires fresh authority.
-          with {:ok, fresh} <- PullMergeBoundary.context(operation, now),
-               {:ok, fresh_sync} <- execution_context(fresh) do
-            push(operation, now, fresh_sync, token, options)
-          end
-        else
-          PullMergeBoundary.record_observation(operation, now, next(now), %{
-            remote_base_oid: remote.oid,
-            provider_pull_id: pair.pull["id"]
-          })
+        cond do
+          remote.oid == context.intent.expected_base_oid ->
+            # An unchanged remote ref is the only recovery observation that may
+            # authorize another attempt, and it still requires fresh authority.
+            with {:ok, fresh} <- PullMergeBoundary.context(operation, now),
+                 {:ok, fresh_sync} <- execution_context(fresh) do
+              push(operation, now, fresh_sync, token, options)
+            end
+
+          remote.oid == context.intent.merge_oid and pair.pull["merged"] == true ->
+            finalize(operation, sync, pair, remote.oid)
+
+          true ->
+            PullMergeBoundary.record_observation(operation, now, next(now), %{
+              remote_base_oid: remote.oid,
+              provider_pull_id: pair.pull["id"]
+            })
         end
       end
 
     case result do
       {:error, reason} -> PullMergeBoundary.defer(operation, now, next(now), reason)
       other -> other
+    end
+  end
+
+  defp finalize(operation, sync, pair, remote_base_oid) do
+    with {:ok, observation} <- PullMergeObservation.build(sync, pair, remote_base_oid),
+         {:ok, merged_at, 0} <-
+           DateTime.from_iso8601(observation.pull.confirmed_merge_state["merged_at"]),
+         {:ok, result} <-
+           ForgePulls.finalize_coordinated_merge(sync.intent.id, operation.id, merged_at,
+             authorize: fn intent ->
+               PullMergeConfirmation.authorize(
+                 operation,
+                 DateTime.utc_now(:second),
+                 intent,
+                 observation
+               )
+             end,
+             confirm: fn projection, intent ->
+               PullMergeConfirmation.confirm(
+                 operation,
+                 DateTime.utc_now(:second),
+                 intent,
+                 observation,
+                 projection
+               )
+             end
+           ) do
+      {:ok, result.confirmation.operation}
     end
   end
 

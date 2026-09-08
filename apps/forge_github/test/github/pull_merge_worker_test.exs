@@ -612,6 +612,214 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     ]
   end
 
+  test "confirmed provider merge atomically finalizes the local result and paired baselines", c do
+    issue_mapping = paired_issue_mapping(c)
+    marked = mark(c)
+    assert {:ok, completed} = PullMergeWorker.process_operation(marked, c.now, merged_options(c))
+    assert completed.state == :completed
+    assert completed.external_effect_marker == nil
+    assert completed.lease_owner == nil
+    assert {:ok, oid} = GitCore.exact_ref(c.path, "refs/heads/main")
+    assert oid == c.intent.merge_oid
+    assert Repo.get!(ForgePulls.MergeOperation, c.intent.id).state == :completed
+    assert Repo.get!(ForgePulls.PullRequest, c.pull.id).merge_commit_sha == oid
+    issue = Repo.get!(ForgeIssues.Issue, c.issue.id)
+    assert issue.state == :closed
+
+    pull_mapping =
+      Repo.get_by!(MirrorResourceState, resource_kind: :pull, local_resource_id: c.pull.id)
+
+    issue_mapping = Repo.get!(MirrorResourceState, issue_mapping.id)
+    assert pull_mapping.confirmed_local_version == issue.sync_version
+    assert issue_mapping.confirmed_local_version == issue.sync_version
+    assert pull_mapping.confirmed_snapshot["base_sha"] == oid
+    assert pull_mapping.confirmed_merge_state["merge_commit_sha"] == oid
+    assert issue_mapping.confirmed_snapshot["state"] == "closed"
+
+    ref =
+      Repo.get_by!(MirrorRefState,
+        repository_mirror_id: c.binding.id,
+        ref_name: "refs/heads/main"
+      )
+
+    assert {ref.confirmed_oid, ref.last_local_oid, ref.last_remote_oid} == {oid, oid, oid}
+  end
+
+  test "newer local metadata is never falsely confirmed by the merge", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    c.issue |> ForgeIssues.Issue.update_changeset(%{title: "Newer local title"}) |> Repo.update!()
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, merged_options(c))
+    assert pending.state == :effect_pending
+    assert pending.external_effect_marker == marked.external_effect_marker
+    assert pending.failure_detail == "merge_metadata_unconfirmed"
+    assert Repo.get!(ForgeIssues.Issue, c.issue.id).title == "Newer local title"
+    assert Repo.get!(ForgeIssues.Issue, c.issue.id).state == :open
+    assert Repo.get!(ForgePulls.MergeOperation, c.intent.id).state == :merge_written
+
+    mapping =
+      Repo.get_by!(MirrorResourceState, resource_kind: :pull, local_resource_id: c.pull.id)
+
+    assert mapping.confirmed_snapshot["title"] == "Merge"
+    assert mapping.confirmed_snapshot["base_sha"] == c.base
+  end
+
+  test "newer metadata actually represented on both sides confirms its real final version", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+
+    c.issue
+    |> ForgeIssues.Issue.update_changeset(%{title: "Shared newer title"})
+    |> Repo.update!()
+
+    assert {:ok, completed} =
+             PullMergeWorker.process_operation(
+               marked,
+               c.now,
+               merged_options(c, "Shared newer title")
+             )
+
+    assert completed.state == :completed
+    issue = Repo.get!(ForgeIssues.Issue, c.issue.id)
+
+    mapping =
+      Repo.get_by!(MirrorResourceState, resource_kind: :pull, local_resource_id: c.pull.id)
+
+    assert mapping.confirmed_snapshot["title"] == issue.title
+    assert mapping.confirmed_local_version == issue.sync_version
+  end
+
+  test "a different provider merge commit cannot finalize the reserved merge", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    opts = merged_options(c)
+    read_pull = opts[:get_pull]
+
+    opts =
+      Keyword.put(opts, :get_pull, fn a, b, d, e, f ->
+        {:ok, pull} = read_pull.(a, b, d, e, f)
+        {:ok, Map.put(pull, "merge_commit_sha", c.head)}
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert pending.state == :effect_pending
+    assert_unfinished(c)
+  end
+
+  test "confirmation recovers an already advanced local ref and refreshed snapshot", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    git!(c.path, ["update-ref", "refs/heads/main", c.intent.merge_oid])
+
+    attrs =
+      Map.put(
+        Map.take(c.pull, [:base_ref, :base_sha, :head_ref, :head_sha]),
+        :base_sha,
+        c.intent.merge_oid
+      )
+
+    assert {:ok, _} = ForgePulls.SnapshotRefresh.persist(c.pull, attrs)
+    assert {:ok, completed} = PullMergeWorker.process_operation(marked, c.now, merged_options(c))
+    assert completed.state == :completed
+    assert Repo.get!(ForgePulls.PullRequest, c.pull.id).merge_commit_sha == c.intent.merge_oid
+  end
+
+  test "revocation after provider observation retains the unresolved merge without local effects",
+       c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    opts = merged_options(c)
+    read_issue = opts[:get_pull_issue]
+
+    opts =
+      Keyword.put(opts, :get_pull_issue, fn a, b, d, e, f ->
+        result = read_issue.(a, b, d, e, f)
+
+        Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+          github_installation_id: c.organization.github_installation_id
+        )
+        |> Changeset.change(state: :revoked)
+        |> Repo.update!()
+
+        result
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert pending.external_effect_marker == marked.external_effect_marker
+    assert_unfinished(c)
+  end
+
+  defp paired_issue_mapping(c) do
+    %MirrorResourceState{}
+    |> MirrorResourceState.persistence_changeset(%{
+      repository_mirror_id: c.binding.id,
+      resource_kind: :issue,
+      local_resource_type: "ForgeIssues.Issue",
+      local_resource_id: c.issue.id,
+      github_object_id: 901,
+      github_node_id: "I_901",
+      github_number: 7,
+      confirmed_local_version: c.issue.sync_version,
+      confirmed_remote_updated_at: c.now,
+      confirmed_snapshot: %{
+        "title" => "Merge",
+        "body" => nil,
+        "state" => "open",
+        "state_reason" => nil,
+        "label_github_ids" => [],
+        "assignee_github_ids" => []
+      },
+      state: :confirmed
+    })
+    |> Repo.insert!()
+  end
+
+  defp merged_options(c, title \\ "Merge") do
+    now = DateTime.to_iso8601(c.now)
+    repo = Map.put(c.remote_repository, "full_name", c.binding.github_full_name)
+
+    options(c, c.intent.merge_oid)
+    |> Keyword.put(:get_pull, fn _, _, _, _, _ ->
+      {:ok,
+       %{
+         "id" => 902,
+         "node_id" => "PR_902",
+         "number" => 7,
+         "title" => title,
+         "body" => nil,
+         "state" => "closed",
+         "draft" => false,
+         "merged" => true,
+         "merged_at" => now,
+         "merge_commit_sha" => c.intent.merge_oid,
+         "created_at" => now,
+         "updated_at" => now,
+         "mergeable" => nil,
+         "rebaseable" => nil,
+         "mergeable_state" => "unknown",
+         "head" => %{"ref" => "feature", "sha" => c.head, "repo" => repo},
+         "base" => %{"ref" => "main", "sha" => c.base, "repo" => repo}
+       }}
+    end)
+    |> Keyword.put(:get_pull_issue, fn _, _, _, _, _ ->
+      {:ok,
+       %{
+         "id" => 901,
+         "node_id" => "I_901",
+         "number" => 7,
+         "title" => title,
+         "body" => nil,
+         "state" => "closed",
+         "state_reason" => nil,
+         "labels" => [],
+         "assignees" => [],
+         "user" => nil,
+         "created_at" => now,
+         "updated_at" => now
+       }}
+    end)
+  end
+
   defp mark(c) do
     {:ok, operation} =
       PullMergeBoundary.mark(c.operation, c.now, nil, %{

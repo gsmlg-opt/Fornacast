@@ -10,6 +10,30 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 exact merged-result confirmation integration (2026-09-08)
+
+- The unregistered merge worker now connects authenticated paired provider
+  observations to the trusted domain finalizer and transactional mirror
+  confirmation. Actual resulting metadata and resolved relationships must match
+  before both mappings advance at the actual local version and the base ref,
+  operation, and domain intent complete atomically.
+- Provider evidence retains the raw PR base OID and issue state reason. A raw
+  historical base B or M and null/completed reason are normalized only alongside
+  separately observed branch M and exact merged-commit proof. Third bases,
+  incompatible reasons, substituted identities, and unknown relationships reject.
+- Connected scoped PostgreSQL tests: **64 passed** (confirmation 17, domain
+  finalization 14, provider worker and observation 33). These include newer local
+  metadata preservation, local-M recovery, and revocation after observation.
+  Provider HTTP is stubbed; database transactions and Git objects are real.
+- Broader scoped regression matrix: **174 passed** (Git transport 4, mirrors
+  55, pull domain/recovery 79, provider 33, API merge 3). Production compilation
+  with warnings-as-errors, scoped formatting, and diff checks passed. Spec and
+  code-quality reviews found no actionable issues in this bounded integration.
+- Different metadata retains the effect marker, reservation, and original paired
+  baselines. Merge-owned metadata reconciliation and conflict resolution remain
+  unfinished, as do requester admission and worker activation. This is not full
+  FR-083, PR13, or PRD acceptance. No push, deployment, or live GitHub writes.
+
 ### PR13 local merge finalization boundary (2026-09-08)
 
 - A dedicated trusted domain finalizer can apply an already written merge commit

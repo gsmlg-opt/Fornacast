@@ -82,6 +82,35 @@ defmodule ForgeMirrors.PullMergeBoundary do
   @doc "Load durable marked evidence under its lease; this grants no permission to push."
   def recovery_context(operation, now), do: transaction(fn -> load_recovery(operation, now) end)
 
+  @doc false
+  def finalization_context(operation, now) do
+    if Repo.in_transaction?() do
+      with {:ok, scope} <- lock_scope(operation, now),
+           {:ok, recovery} <- load_recovery(operation, now),
+           true <- scope.github_installation_id == recovery.github_installation_id,
+           :ok <- lock_reservations(scope.repository_id, recovery.expected),
+           :ok <- authorize_requester(recovery.intent, scope),
+           :ok <-
+             check_unreserved(
+               scope.repository_id,
+               recovery.intent.base_ref,
+               recovery.expected.pull_id,
+               operation.id,
+               recovery.expected.pull_eligibility_proof["head"]["repository_id"],
+               recovery.intent.head_ref
+             ),
+           :ok <- no_ref_effect(scope, recovery.expected),
+           :ok <- live_capability(scope.operation) do
+        {:ok, recovery}
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :stale_merge_identity}
+      end
+    else
+      {:error, :transaction_required}
+    end
+  end
+
   def defer(operation, now, next_attempt_at, reason) do
     transaction(fn ->
       with {:ok, context} <- load_recovery(operation, now),
