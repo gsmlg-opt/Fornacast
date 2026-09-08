@@ -740,6 +740,27 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id).confirmed_local_version == 2
   end
 
+  test "corrupt unsupported pull identity fails without a network retry", ctx do
+    unsupported_head_fixture(ctx, nil)
+
+    Repo.get!(MirrorResourceState, ctx.mapping.id)
+    |> Ecto.Changeset.change(local_resource_type: "ForgeIssues.Issue")
+    |> Repo.update!()
+
+    now = DateTime.utc_now(:second)
+    operation = remote_operation(ctx, now)
+
+    PullSyncWorker.process_operation(operation, now,
+      token_fetch: fn _, _ -> flunk("corrupt identity must not request credentials") end
+    )
+
+    persisted = Repo.get!(MirrorOperation, operation.id)
+    assert persisted.state == :failed
+    assert persisted.failure_class == "local_validation"
+    assert persisted.failure_detail == "read-only pull has an invalid persisted identity"
+    assert Repo.get!(PullRequest, ctx.pull.id).head_repository_id == nil
+  end
+
   for original <- [nil, :known] do
     test "unsupported #{inspect(original)} head becomes represented only through exact paired evidence",
          ctx do

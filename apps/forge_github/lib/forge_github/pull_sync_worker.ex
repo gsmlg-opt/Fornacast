@@ -3186,6 +3186,9 @@ defmodule ForgeGitHub.PullSyncWorker do
   defp failure(:unsupported_resource),
     do: {:fail, "unsupported_resource", "pull request cannot be represented locally"}
 
+  defp failure(:invalid_unsupported_pull),
+    do: {:fail, "local_validation", "read-only pull has an invalid persisted identity"}
+
   defp failure(:unsupported_metadata_conflict),
     do: {:fail, "local_validation", "read-only pull metadata differs from confirmed baseline"}
 

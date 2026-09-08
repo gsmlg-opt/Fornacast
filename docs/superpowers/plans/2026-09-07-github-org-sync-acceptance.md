@@ -35,6 +35,10 @@ remain open.
   paired metadata, creation, relationship/label recovery, and read-only rendering
   regressions. Provider HTTP is stubbed; Git repositories and database boundaries
   are real. Existing unrelated importer fixture warnings remain unchanged.
+- Follow-up error-routing regression: a corrupt unsupported local identity now
+  fails as explicit local validation before requesting credentials, rather than
+  being retried as a network fault. The four-file scoped matrix passed 86 tests
+  (mirror boundary 14 and provider 72) after reproducing the incorrect retry.
 - This closes the locally verified reevaluation gap described below, not PR13
   merge orchestration, overall activation, PR14–16, or full PRD acceptance.
   No push, deployment, or live GitHub write validation occurred.
