@@ -1515,6 +1515,29 @@ defmodule ForgeMirrors do
   def confirm_pull_operation(_, _, _, _, _), do: {:error, :invalid_argument}
 
   @doc false
+  def outbound_pull_creation_context(operation),
+    do: ForgeMirrors.PullOutboundCreation.context(operation, &lock_pull_creation_operation/1)
+
+  @doc false
+  def mark_outbound_pull_creation(operation, now, expected),
+    do:
+      ForgeMirrors.PullOutboundCreation.mark(
+        operation,
+        now,
+        expected,
+        &lock_pull_creation_operation/1,
+        &mark_pull_creation_operation/3
+      )
+
+  defp mark_pull_creation_operation(operation, now, marker) do
+    owned_transition(operation, DateTime.truncate(now, :second), [:processing],
+      state: :effect_pending,
+      external_effect_marker: marker,
+      effect_marked_at: DateTime.truncate(now, :second)
+    )
+  end
+
+  @doc false
   def remote_pull_creation_context(operation),
     do: ForgeMirrors.PullCreationBoundary.context(operation, &lock_pull_creation_operation/1)
 
@@ -1543,6 +1566,59 @@ defmodule ForgeMirrors do
 
   defp complete_pull_creation_operation(operation, now) do
     with {:ok, completed} <- complete_operation(operation, now) do
+      maybe_activate_resource_repository(completed, now)
+      {:ok, completed}
+    end
+  end
+
+  @doc false
+  def identify_outbound_pull_creation(operation, now, marker, observation),
+    do:
+      ForgeMirrors.PullOutboundFinalization.identify(
+        operation,
+        now,
+        marker,
+        observation,
+        &lock_pull_creation_operation/1,
+        &identify_pull_creation_operation/3
+      )
+
+  @doc false
+  def confirm_outbound_pull_creation(operation, now, marker, observation, callback),
+    do:
+      ForgeMirrors.PullOutboundFinalization.confirm(
+        operation,
+        now,
+        marker,
+        observation,
+        callback,
+        &lock_pull_creation_operation/1,
+        &complete_outbound_pull_creation_operation/2
+      )
+
+  # Only the intent-bound recovery boundary may replace or consume this marker.
+  # Generic operation completion/retry intentionally cannot grant this transition.
+  defp identify_pull_creation_operation(operation, now, marker),
+    do:
+      owned_transition(operation, DateTime.truncate(now, :second), [:effect_pending],
+        external_effect_marker: marker
+      )
+
+  defp complete_outbound_pull_creation_operation(operation, now) do
+    now = DateTime.truncate(now, :second)
+
+    with {:ok, completed} <-
+           owned_transition(operation, now, [:effect_pending],
+             state: :completed,
+             lease_owner: nil,
+             lease_expires_at: nil,
+             external_effect_marker: nil,
+             effect_marked_at: nil,
+             completed_at: now,
+             failure_class: nil,
+             failure_disposition: nil,
+             failure_detail: nil
+           ) do
       maybe_activate_resource_repository(completed, now)
       {:ok, completed}
     end
@@ -3063,6 +3139,14 @@ defmodule ForgeMirrors do
     # transition's exact lease/version CAS also fences any intervening phase change.
     case Repo.get(MirrorOperation, operation.id) do
       %{kind: "merge.pull", state: state} when target == :completed or state == :effect_pending ->
+        {:error, :invalid_transition}
+
+      %{
+        kind: "sync.pull",
+        state: :effect_pending,
+        external_effect_marker: %{"action" => "create_remote_pull"}
+      } ->
+        # Only paired identity confirmation may release an ambiguous creation.
         {:error, :invalid_transition}
 
       _ ->
