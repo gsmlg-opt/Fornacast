@@ -10,6 +10,32 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 explicit unknown-head import (2026-09-08)
+
+- Pull transport and projection accept explicit `head.repo: null` while rejecting
+  omitted/malformed head repository objects and null base repositories. Head refs
+  and SHAs are retained without inventing a repository identity from a name.
+- The authenticated paired preflight still checks canonical issue coherence and
+  exact base identity before attribution. Resolution and creation require the
+  base Git proof before and after the domain callback; no head proof is invented.
+  The pull mapping is unsupported/read-only with explicit nil provider head,
+  while the canonical issue mapping is retained. Known but unready heads remain
+  retryable and cannot be downgraded through this creation-only path.
+- Final combined scoped PostgreSQL verification passed 333 tests (issues 11,
+  mirrors 134, provider 186, one API and one HTML read-only regression). The API
+  retains null head repository/user without borrowing the base identity; the UI
+  identifies read-only external pulls and omits merge/comment controls. Ten-file
+  formatting, diff checks and focused review passed.
+- Reevaluation remains open: the existing `ForgePulls.HeadRepresentation` domain
+  transition has no mirror coordinator/worker path. That path must validate the
+  unsupported pull and canonical issue pair, prove fresh immutable head identity
+  and active refs, and bind head identity atomically without silently confirming
+  newer local or remote edits. A known head identity must never be replaced;
+  explicit unknown-to-known admission needs its own proof boundary.
+- This is nullable inbound creation proof only, not complete FR-080–082, merge
+  orchestration, activation, PR14–16 or full PRD acceptance. No push, deployment
+  or live GitHub write validation occurred.
+
 ### PR13 mapped outbound label prerequisites (2026-09-08)
 
 - A new local label assigned to a mapped pull is adopted only on an exact remote

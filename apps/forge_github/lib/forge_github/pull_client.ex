@@ -363,7 +363,7 @@ defmodule ForgeGitHub.PullClient do
          true <- valid_optional_timestamp?(closed_at),
          true <- valid_optional_timestamp?(merged_at),
          true <- valid_optional_oid?(merge_commit_sha),
-         :ok <- validate_side(head),
+         :ok <- validate_head_side(head),
          :ok <- validate_side(base),
          :ok <- validate_repository_pair(head, base),
          :ok <- validate_base_repository(base, owner, repository),
@@ -376,6 +376,16 @@ defmodule ForgeGitHub.PullClient do
 
   defp pull_from_json(_pull, _owner, _repository, _mode, _expected_number),
     do: {:error, :invalid_response}
+
+  defp validate_head_side(%{"ref" => ref, "sha" => sha, "repo" => nil}) do
+    with :ok <- validate_ref(ref), true <- valid_oid?(sha) do
+      :ok
+    else
+      _ -> :error
+    end
+  end
+
+  defp validate_head_side(side), do: validate_side(side)
 
   defp validate_side(%{"ref" => ref, "sha" => sha, "repo" => repository}) do
     with :ok <- validate_ref(ref),
@@ -404,6 +414,8 @@ defmodule ForgeGitHub.PullClient do
   end
 
   defp validate_repository_identity(_repository), do: :error
+
+  defp validate_repository_pair(%{"repo" => nil}, %{"repo" => base}) when is_map(base), do: :ok
 
   defp validate_repository_pair(%{"repo" => head}, %{"repo" => base}) do
     coordinates = [

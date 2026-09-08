@@ -171,12 +171,12 @@ defmodule ForgeGitHub.PullSyncProjection do
              issue_number,
              issue_snapshot
            ),
-         {:ok, head_ref, head_repository, head_sha} <- remote_side(head),
+         {:ok, head_ref, head_repository, head_sha} <- remote_head_side(head),
          {:ok, base_ref, base_repository, base_sha} <- remote_side(base),
          true <-
            distinct_ref_identities?(
              head_ref,
-             head_repository.github_object_id,
+             if(head_repository, do: head_repository.github_object_id),
              base_ref,
              base_repository.github_object_id
            ),
@@ -325,6 +325,17 @@ defmodule ForgeGitHub.PullSyncProjection do
 
   defp consistent_issue(_number, _title, _body, _state, _issue_number, _snapshot),
     do: {:error, :inconsistent_observation}
+
+  defp remote_head_side(%{"ref" => ref, "sha" => sha, "repo" => nil}) do
+    with {:ok, ref} <- canonicalize_branch_ref(ref),
+         true <- valid_oid?(sha) do
+      {:ok, ref, nil, sha}
+    else
+      _invalid -> {:error, :invalid_projection}
+    end
+  end
+
+  defp remote_head_side(side), do: remote_side(side)
 
   defp remote_side(%{
          "ref" => ref,

@@ -2859,10 +2859,13 @@ defmodule ForgeGitHub.PullSyncWorker do
       "github_issue_object_id" => remote.github_issue_object_id,
       "github_issue_node_id" => remote.github_issue_node_id,
       "github_number" => remote.github_number,
-      "head_repository" => %{
-        "id" => remote.head_repository.github_object_id,
-        "node_id" => remote.head_repository.github_node_id
-      },
+      "head_repository" =>
+        if remote.head_repository do
+          %{
+            "id" => remote.head_repository.github_object_id,
+            "node_id" => remote.head_repository.github_node_id
+          }
+        end,
       "base_repository" => %{
         "id" => remote.base_repository.github_object_id,
         "node_id" => remote.base_repository.github_node_id

@@ -109,6 +109,25 @@ defmodule ForgeGitHub.PullClientTest do
              )
   end
 
+  test "gets an explicit inaccessible head without relaxing base or missing-field checks" do
+    stub = stub_name()
+    pull = pull_json(7, "body", head_repo: nil)
+    Req.Test.expect(stub, &Req.Test.json(&1, pull))
+
+    assert {:ok, %{"head" => %{"repo" => nil}, "base" => %{"repo" => %{"id" => 1001}}}} =
+             PullClient.get_pull("installation_token", "acme", "base", 7, client_opts(stub))
+
+    for invalid <- [
+          put_in(pull, ["base", "repo"], nil),
+          Map.update!(pull, "head", &Map.delete(&1, "repo"))
+        ] do
+      Req.Test.expect(stub, &Req.Test.json(&1, invalid))
+
+      assert {:error, %Error{kind: :invalid_response}} =
+               PullClient.get_pull("installation_token", "acme", "base", 7, client_opts(stub))
+    end
+  end
+
   test "gets and updates supported pull request metadata without hiding draft effects" do
     get_stub = stub_name()
     Req.Test.expect(get_stub, &Req.Test.json(&1, pull_json(7, "body")))

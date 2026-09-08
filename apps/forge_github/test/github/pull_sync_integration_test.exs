@@ -699,6 +699,104 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     assert Repo.get!(MirrorOperation, operation.id).failure_class == "network"
   end
 
+  test "authenticated opaque head imports read-only without guessing repository identity", ctx do
+    Repo.delete!(ctx.mapping)
+    Repo.delete!(ctx.issue_mapping)
+    now = DateTime.utc_now(:second)
+    operation = remote_operation(ctx, now)
+
+    Req.Test.expect(
+      ctx.stub,
+      &Req.Test.json(&1, put_in(pull_json(ctx.baseline, now), ["head", "repo"], nil))
+    )
+
+    Req.Test.expect(ctx.stub, &Req.Test.json(&1, issue_json(ctx.baseline, now)))
+
+    assert {:ok,
+            %{
+              operation: %{state: :completed},
+              resource: created,
+              pull_state: %{state: :unsupported}
+            }} =
+             PullSyncWorker.process_operation(
+               operation,
+               now,
+               Keyword.delete(options(ctx), :remote_relationships)
+             )
+
+    assert created.head_repository_id == nil
+
+    mapping =
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: ctx.base.id,
+        resource_kind: :pull,
+        github_object_id: 802
+      )
+
+    assert mapping.provider_identity["head_repository"] == nil
+    assert mapping.provider_identity["base_repository"] == %{"id" => 900, "node_id" => "R_900"}
+    assert Repo.get!(PullRequest, created.local_resource_id).head_repository_id == nil
+
+    assert Repo.get_by!(MirrorResourceState,
+             repository_mirror_id: ctx.base.id,
+             resource_kind: :issue,
+             github_object_id: 801
+           ).local_resource_id == created.issue_id
+  end
+
+  for invalid <- [:incoherent_issue, :base_git_missing] do
+    test "opaque head #{invalid} cannot import or bypass authenticated preflight", ctx do
+      Repo.delete!(ctx.mapping)
+      Repo.delete!(ctx.issue_mapping)
+      now = DateTime.utc_now(:second)
+      operation = remote_operation(ctx, now)
+
+      if unquote(invalid) == :base_git_missing,
+        do: git!(ctx.base_path, ["update-ref", "-d", ctx.baseline["base_ref"]])
+
+      Req.Test.expect(
+        ctx.stub,
+        &Req.Test.json(&1, put_in(pull_json(ctx.baseline, now), ["head", "repo"], nil))
+      )
+
+      author_id = System.unique_integer([:positive]) + 10_000_000
+
+      Req.Test.expect(ctx.stub, fn conn ->
+        issue = issue_json(ctx.baseline, now)
+
+        issue =
+          if unquote(invalid) == :incoherent_issue,
+            do:
+              issue
+              |> Map.put("title", "incoherent")
+              |> Map.put("user", %{
+                "id" => author_id,
+                "node_id" => "U_#{author_id}",
+                "login" => "untrusted-null-head",
+                "type" => "User"
+              }),
+            else: issue
+
+        Req.Test.json(conn, issue)
+      end)
+
+      PullSyncWorker.process_operation(
+        operation,
+        now,
+        Keyword.delete(options(ctx), :remote_relationships)
+      )
+
+      refute Repo.get_by(MirrorResourceState,
+               repository_mirror_id: ctx.base.id,
+               resource_kind: :pull,
+               github_object_id: 802
+             )
+
+      refute Repo.get_by(ForgeAccounts.GitHubIdentity, github_user_id: author_id)
+      assert Repo.get!(MirrorOperation, operation.id).state != :completed
+    end
+  end
+
   test "an unmapped inbound pull creates its canonical issue and both identities through the worker",
        ctx do
     Repo.delete!(ctx.mapping)

@@ -131,6 +131,46 @@ defmodule ForgeGitHub.PullSyncProjectionTest do
     refute Map.has_key?(snapshot, "head_repository_id")
   end
 
+  test "explicit inaccessible head repository stays unknown while refs and base remain exact" do
+    pull = put_in(remote_pull(), ["head", "repo"], nil)
+    assert {:ok, projection} = PullSyncProjection.from_remote(pull, remote_issue_observation())
+    assert projection.head_repository == nil
+    assert projection.base_repository.github_object_id == 1_001
+    assert projection.snapshot["head_ref"] == "refs/heads/feature"
+    assert projection.snapshot["head_sha"] == String.duplicate("a", 40)
+    assert projection.github_issue_object_id == 800
+
+    assert {:ok, _} =
+             PullSyncProjection.from_remote(
+               put_in(pull, ["head", "ref"], "main"),
+               remote_issue_observation()
+             )
+
+    assert {:error, :invalid_projection} =
+             PullSyncProjection.from_remote(
+               put_in(pull, ["head", "repo"], %{}),
+               remote_issue_observation()
+             )
+
+    assert {:error, :invalid_projection} =
+             PullSyncProjection.from_remote(
+               put_in(pull, ["base", "repo"], nil),
+               remote_issue_observation()
+             )
+
+    assert {:error, :invalid_projection} =
+             PullSyncProjection.from_remote(
+               Map.update!(pull, "head", &Map.delete(&1, "repo")),
+               remote_issue_observation()
+             )
+
+    assert {:error, :invalid_projection} =
+             PullSyncProjection.from_remote(
+               put_in(pull, ["head", "sha"], "invalid"),
+               remote_issue_observation()
+             )
+  end
+
   test "composes remote pull metadata with its distinct canonical issue evidence" do
     pull = remote_pull()
     issue = remote_issue_observation()

@@ -174,5 +174,33 @@ defmodule ForgeMirrors.PullHeadResolutionTest do
     assert {:error, _} = resolve(c)
   end
 
+  test "explicit unavailable head repository resolves readonly with only a base proof", c do
+    c = put_in(c.identity.provider_identity["head_repository"], nil)
+    assert {:ok, result} = resolve(c)
+    assert result.status == :unrepresented
+    assert result.head_repository_id == nil
+    assert result.pull_eligibility_proof == nil
+    assert result.git_proof.head == nil
+    assert result.git_proof.base.repository_id == c.base.repository_id
+
+    assert {:error, :ineligible_pull} =
+             resolve(put_in(c.fields["base_sha"], String.duplicate("c", 40)))
+  end
+
+  test "missing or malformed head identity is never treated as an explicit unavailable repository",
+       c do
+    for provider <- [
+          Map.delete(c.identity.provider_identity, "head_repository"),
+          Map.put(c.identity.provider_identity, "head_repository", %{}),
+          Map.put(c.identity.provider_identity, "head_repository", %{
+            "id" => nil,
+            "node_id" => nil
+          })
+        ] do
+      assert {:error, :identity_conflict} =
+               resolve(%{c | identity: %{c.identity | provider_identity: provider}})
+    end
+  end
+
   defp resolve(c), do: ForgeMirrors.resolve_remote_pull_head(c.operation, c.identity, c.fields)
 end

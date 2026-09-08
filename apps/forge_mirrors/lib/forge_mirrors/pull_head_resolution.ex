@@ -47,24 +47,35 @@ defmodule ForgeMirrors.PullHeadResolution do
     base = Repo.get!(RepositoryMirror, scope.repository_mirror_id)
     head_identity = identity["head_repository"]
 
+    candidates =
+      if is_nil(head_identity),
+        do: dynamic([b], b.id == ^base.id),
+        else:
+          dynamic(
+            [b],
+            b.id == ^base.id or b.github_repository_id == ^head_identity["id"] or
+              b.github_node_id == ^head_identity["node_id"]
+          )
+
     bindings =
       Repo.all(
         from b in RepositoryMirror,
-          where:
-            b.organization_mirror_id == ^base.organization_mirror_id and
-              (b.id == ^base.id or b.github_repository_id == ^head_identity["id"] or
-                 b.github_node_id == ^head_identity["node_id"]),
+          where: b.organization_mirror_id == ^base.organization_mirror_id,
+          where: ^candidates,
           order_by: b.id,
           limit: 4,
           lock: "FOR UPDATE"
       )
 
     heads =
-      Enum.filter(
-        bindings,
-        &(&1.github_repository_id == head_identity["id"] or
-            &1.github_node_id == head_identity["node_id"])
-      )
+      if is_nil(head_identity),
+        do: [],
+        else:
+          Enum.filter(
+            bindings,
+            &(&1.github_repository_id == head_identity["id"] or
+                &1.github_node_id == head_identity["node_id"])
+          )
 
     repository_ids =
       bindings
@@ -207,7 +218,7 @@ defmodule ForgeMirrors.PullHeadResolution do
          positive?(provider["github_issue_object_id"]) and node?(provider["github_issue_node_id"]) and
          provider["github_issue_node_id"] != node and
          provider["github_number"] == number and repository_identity?(provider["base_repository"]) and
-         repository_identity?(provider["head_repository"]),
+         (is_nil(provider["head_repository"]) or repository_identity?(provider["head_repository"])),
        do: :ok,
        else: {:error, :identity_conflict}
   end

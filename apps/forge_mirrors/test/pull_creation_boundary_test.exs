@@ -397,6 +397,68 @@ defmodule ForgeMirrors.PullCreationBoundaryTest do
     assert result.resource.head_repository_id == nil
   end
 
+  test "explicit unavailable provider head imports a read-only pull preserving refs", c do
+    observation = put_in(c.observation, [:pull, :provider_identity, "head_repository"], nil)
+
+    c = %{
+      c
+      | expected: %{head_repository_id: nil, pull_eligibility_proof: nil},
+        request: %{c.request | head_repository_id: nil},
+        observation: observation
+    }
+
+    assert {:ok, result} = confirm(c)
+    assert result.pull_state.state == :unsupported
+    assert result.pull_state.provider_identity["head_repository"] == nil
+    assert result.resource.head_repository_id == nil
+    assert result.resource.fields["head_ref"] == c.request.fields["head_ref"]
+    assert result.resource.fields["head_sha"] == c.request.fields["head_sha"]
+  end
+
+  test "unavailable provider head cannot be represented or bypass a stale base proof", c do
+    observation = put_in(c.observation, [:pull, :provider_identity, "head_repository"], nil)
+    assert {:error, :ineligible_pull} = confirm(%{c | observation: observation})
+
+    c = %{
+      c
+      | expected: %{head_repository_id: nil, pull_eligibility_proof: nil},
+        request: %{c.request | head_repository_id: nil},
+        observation: observation
+    }
+
+    callback = fn multi ->
+      multi
+      |> ForgePulls.append_sync_create(:resource, c.request)
+      |> Ecto.Multi.run(:stale_base, fn repo, _ ->
+        repo.update_all(
+          from(r in MirrorRefState,
+            where: r.repository_mirror_id == ^c.operation.repository_mirror_id
+          ),
+          set: [state: :conflicted]
+        )
+
+        {:ok, :changed}
+      end)
+    end
+
+    assert {:error, :ineligible_pull} = confirm(c, callback)
+
+    refute Repo.exists?(
+             from(p in ForgePulls.PullRequest, where: p.repository_id == ^c.request.repository_id)
+           )
+  end
+
+  test "creation requires explicit head repository key even when unavailable", c do
+    observation =
+      update_in(
+        c.observation,
+        [:pull, :provider_identity],
+        &(&1 |> Map.delete("head_repository") |> Map.put("unknown", nil))
+      )
+
+    assert {:error, :identity_conflict} = confirm(%{c | observation: observation})
+  end
+
   defp confirm(c, callback \\ nil),
     do:
       ForgeMirrors.confirm_remote_pull_creation(

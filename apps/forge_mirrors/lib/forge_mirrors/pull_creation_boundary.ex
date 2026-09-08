@@ -199,9 +199,11 @@ defmodule ForgeMirrors.PullCreationBoundary do
       map_size(expected) == 2 and map_size(observation) == 2 and
         (is_nil(head) or id?(head)) and (is_nil(proof) or is_map(proof)) and
         valid_observation?(pull) and valid_observation?(issue) and
-        is_map(identity) and map_size(identity) == 5 and
+        is_map(identity) and
+        Enum.sort(Map.keys(identity)) ==
+          ~w(base_repository github_issue_node_id github_issue_object_id github_number head_repository) and
         repository_identity?(identity["base_repository"]) and
-        repository_identity?(identity["head_repository"]) and
+        (is_nil(identity["head_repository"]) or repository_identity?(identity["head_repository"])) and
         identity["github_issue_object_id"] == issue.github_object_id and
         identity["github_issue_node_id"] == issue.github_node_id and
         identity["github_number"] == issue.github_number and
@@ -277,27 +279,39 @@ defmodule ForgeMirrors.PullCreationBoundary do
     identity = pull.provider_identity
     head_identity = identity["head_repository"]
     head_repository_id = expected.head_repository_id || scope.repository_id
+
+    candidates =
+      if is_nil(head_identity),
+        do: dynamic([b], b.id == ^base.id or b.repository_id == ^head_repository_id),
+        else:
+          dynamic(
+            [b],
+            b.id == ^base.id or b.github_repository_id == ^head_identity["id"] or
+              b.github_node_id == ^head_identity["node_id"] or
+              b.repository_id == ^head_repository_id
+          )
+
     # The organization lock serializes binding changes, including the absence
     # proof. Read only the exact possible head identities, never the whole org.
     bindings =
       Repo.all(
         from b in RepositoryMirror,
-          where:
-            b.organization_mirror_id == ^base.organization_mirror_id and
-              (b.id == ^base.id or b.github_repository_id == ^head_identity["id"] or
-                 b.github_node_id == ^head_identity["node_id"] or
-                 b.repository_id == ^head_repository_id),
+          where: b.organization_mirror_id == ^base.organization_mirror_id,
+          where: ^candidates,
           order_by: b.id,
           limit: 4,
           lock: "FOR UPDATE"
       )
 
     heads =
-      Enum.filter(
-        bindings,
-        &(&1.github_repository_id == head_identity["id"] or
-            &1.github_node_id == head_identity["node_id"])
-      )
+      if is_nil(head_identity),
+        do: [],
+        else:
+          Enum.filter(
+            bindings,
+            &(&1.github_repository_id == head_identity["id"] or
+                &1.github_node_id == head_identity["node_id"])
+          )
 
     repository_ids =
       [scope.repository_id, expected.head_repository_id]
