@@ -357,6 +357,147 @@ defmodule ForgeMirrors.PullOutboundCreationTest do
     assert changeset.errors[:payload]
   end
 
+  test "fresh recovery proof allows newer scalar edits without granting POST", c do
+    assert {:ok, first} = mark(c, expected(c))
+
+    Repo.update_all(from(i in ForgeIssues.Issue, where: i.id == ^c.issue.id),
+      set: [body: "New", sync_version: 2]
+    )
+
+    assert {:ok, recovery} = ForgeMirrors.outbound_pull_creation_recovery_context(first.operation)
+    assert recovery.current_projection.local_version == 2
+    assert recovery.current_projection.fields["body"] == "New"
+    assert recovery.intent.payload["pull_snapshot"]["body"] == "Original body"
+    assert recovery.git_proof.head.repository_id == c.head.repository_id
+    assert recovery.routing.head.github_node_id == c.head.github_node_id
+    refute Map.has_key?(recovery, :newly_marked)
+  end
+
+  test "changed refs cannot acquire recovery effect proof", c do
+    assert {:ok, first} = mark(c, expected(c))
+
+    Repo.update_all(from(p in ForgePulls.PullRequest, where: p.id == ^c.pull.id),
+      set: [head_sha: String.duplicate("c", 40)]
+    )
+
+    assert {:error, :ineligible_pull} =
+             ForgeMirrors.outbound_pull_creation_recovery_context(first.operation)
+  end
+
+  test "scan checkpoints persist cursor and marker while releasing the lease", c do
+    assert {:ok, first} = mark(c, expected(c))
+    next = %{"page" => 2, "candidate" => nil, "complete" => false}
+    assert {:ok, op} = checkpoint(c, first.operation, initial_scan(), next)
+    assert op.state == :effect_pending
+    assert op.lease_owner == nil
+    assert op.external_effect_marker == first.marker
+    assert op.checkpoint["pull_creation_recovery"] == next
+    assert {:error, :lost_lease} = checkpoint(c, first.operation, initial_scan(), next)
+  end
+
+  test "stale checkpoint cannot overwrite persisted scan progress", c do
+    assert {:ok, first} = mark(c, expected(c))
+    stale = %{"page" => 2, "candidate" => nil, "complete" => false}
+
+    assert {:error, :invalid_recovery_checkpoint} =
+             checkpoint(c, first.operation, stale, %{stale | "page" => 3})
+
+    assert Repo.get!(MirrorOperation, first.operation.id).checkpoint == %{}
+  end
+
+  test "completed scan cannot reopen or substitute its candidate", c do
+    assert {:ok, first} = mark(c, expected(c))
+    candidate = %{"github_object_id" => 900, "github_node_id" => "PR_900", "github_number" => 9}
+    complete = %{"page" => 1, "candidate" => candidate, "complete" => true}
+
+    Repo.update_all(from(o in MirrorOperation, where: o.id == ^first.operation.id),
+      set: [checkpoint: %{"pull_creation_recovery" => complete}]
+    )
+
+    op = Repo.get!(MirrorOperation, first.operation.id)
+
+    assert {:error, :invalid_recovery_checkpoint} =
+             checkpoint(c, op, complete, %{complete | "complete" => false, "page" => 2})
+
+    assert {:error, :invalid_recovery_checkpoint} =
+             checkpoint(c, op, complete, put_in(complete["candidate"]["github_object_id"], 901))
+
+    assert {:ok, deferred} = checkpoint(c, op, complete, complete)
+    assert deferred.checkpoint["pull_creation_recovery"] == complete
+  end
+
+  test "inactive head prevents cleanup proof but not marker-preserving defer", c do
+    assert {:ok, first} = mark(c, expected(c))
+
+    Repo.update_all(from(b in ForgeMirrors.RepositoryMirror, where: b.id == ^c.head.id),
+      set: [state: :discovered]
+    )
+
+    assert {:error, :ineligible_pull} =
+             ForgeMirrors.outbound_pull_creation_recovery_context(first.operation)
+
+    assert {:ok, deferred} = checkpoint(c, first.operation, initial_scan(), initial_scan())
+    assert deferred.external_effect_marker == first.marker
+  end
+
+  test "expired lease cannot persist a scan checkpoint", c do
+    assert {:ok, first} = mark(c, expected(c))
+    expired = DateTime.add(c.now, -1)
+
+    Repo.update_all(from(o in MirrorOperation, where: o.id == ^first.operation.id),
+      set: [lease_expires_at: expired]
+    )
+
+    assert {:error, :lost_lease} =
+             checkpoint(
+               c,
+               %{first.operation | lease_expires_at: expired},
+               initial_scan(),
+               initial_scan()
+             )
+
+    assert Repo.get!(MirrorOperation, first.operation.id).checkpoint == %{}
+  end
+
+  test "replacement installation cannot authorize cleanup of an older creation intent", c do
+    assert {:ok, first} = mark(c, expected(c))
+    replacement_id = System.unique_integer([:positive, :monotonic])
+
+    assert {:ok, _} =
+             ForgeMirrors.observe_github_app_installation(%{
+               github_installation_id: replacement_id,
+               github_account_id: c.org.github_account_id,
+               github_account_login: c.org.github_account_login,
+               account_type: :organization,
+               repository_selection: :all,
+               permissions: %{"metadata" => "read"},
+               state: :active,
+               last_verified_at: DateTime.utc_now()
+             })
+
+    Repo.update_all(from(o in ForgeMirrors.OrganizationMirror, where: o.id == ^c.org.id),
+      set: [github_installation_id: replacement_id],
+      inc: [lock_version: 1]
+    )
+
+    assert {:error, :ineligible_pull} =
+             ForgeMirrors.outbound_pull_creation_recovery_context(first.operation)
+
+    assert Repo.get!(MirrorOperation, first.operation.id).external_effect_marker == first.marker
+  end
+
+  defp initial_scan, do: %{"page" => 1, "candidate" => nil, "complete" => false}
+
+  defp checkpoint(c, op, expected, next),
+    do:
+      ForgeMirrors.checkpoint_outbound_pull_creation(
+        op,
+        expected,
+        next,
+        DateTime.add(c.now, 5),
+        c.now
+      )
+
   defp expected(c) do
     {:ok, context} = ForgeMirrors.outbound_pull_creation_context(c.operation)
 

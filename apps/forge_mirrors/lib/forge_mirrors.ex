@@ -1519,6 +1519,36 @@ defmodule ForgeMirrors do
     do: ForgeMirrors.PullOutboundCreation.context(operation, &lock_pull_creation_operation/1)
 
   @doc false
+  def outbound_pull_creation_recovery_context(operation),
+    do:
+      ForgeMirrors.PullCreationRecoveryBoundary.context(
+        operation,
+        &lock_pull_creation_operation/1
+      )
+
+  @doc false
+  def checkpoint_outbound_pull_creation(operation, expected, next, retry_at, now),
+    do:
+      ForgeMirrors.PullCreationRecoveryBoundary.checkpoint(
+        operation,
+        expected,
+        next,
+        retry_at,
+        now,
+        &lock_pull_creation_operation/1,
+        &checkpoint_pull_creation_operation/4
+      )
+
+  defp checkpoint_pull_creation_operation(operation, checkpoint, retry_at, now) do
+    owned_transition(operation, DateTime.truncate(now, :second), [:effect_pending],
+      checkpoint: checkpoint,
+      next_attempt_at: DateTime.truncate(retry_at, :second),
+      lease_owner: nil,
+      lease_expires_at: nil
+    )
+  end
+
+  @doc false
   def mark_outbound_pull_creation(operation, now, expected),
     do:
       ForgeMirrors.PullOutboundCreation.mark(

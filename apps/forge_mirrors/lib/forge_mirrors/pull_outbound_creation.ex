@@ -145,6 +145,58 @@ defmodule ForgeMirrors.PullOutboundCreation do
 
   def lock_recovery(_, _, _), do: {:error, :invalid_creation_intent}
 
+  @doc false
+  def active_recovery(operation, scope, intent) do
+    stable =
+      ~w(repository_mirror_id repository_id github_repository_id repository_generation ref oid)
+
+    with :ok <- PullMergeBoundary.check_pull_unreserved(scope.repository_id, intent.pull_id),
+         {:ok, pull} <- load_local(operation, scope),
+         true <-
+           pull.pull_id == intent.pull_id and pull.issue_id == intent.issue_id and
+             pull.local_version >= intent.local_version,
+         true <-
+           Map.take(pull.fields, ~w(base_ref base_sha head_ref head_sha)) ==
+             Map.take(intent.payload["pull_snapshot"], ~w(base_ref base_sha head_ref head_sha)),
+         {:ok, proof, repositories} <- eligibility(scope, pull),
+         true <- repositories == intent.payload["provider_repositories"],
+         fresh = json(proof),
+         true <-
+           Map.take(fresh, ~w(organization_mirror_id github_installation_id)) ==
+             Map.take(
+               intent.payload["pull_eligibility_proof"],
+               ~w(organization_mirror_id github_installation_id)
+             ),
+         true <-
+           Enum.all?(
+             ~w(base head),
+             &(Map.take(fresh[&1], stable) ==
+                 Map.take(intent.payload["pull_eligibility_proof"][&1], stable))
+           ),
+         {:ok, routing} <- routes(proof) do
+      {:ok,
+       %{
+         git_proof: proof,
+         pull_eligibility_proof: fresh,
+         routing: routing,
+         current_projection: %{
+           repository_id: scope.repository_id,
+           resource_kind: :pull,
+           local_resource_type: "ForgePulls.PullRequest",
+           local_resource_id: pull.pull_id,
+           issue_id: pull.issue_id,
+           local_version: pull.local_version,
+           fields: pull.fields,
+           head_repository_id: pull.head_repository_id,
+           merge_state: %{merged_at: nil, merge_commit_sha: nil}
+         }
+       }}
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :ineligible_pull}
+    end
+  end
+
   defp context_locked(%{state: :effect_pending} = operation, scope) do
     with {:ok, intent} <- lock_recovery(operation, scope, operation.external_effect_marker) do
       {:ok,
@@ -168,7 +220,8 @@ defmodule ForgeMirrors.PullOutboundCreation do
          {:ok, pull} <- load_local(operation, scope),
          :ok <- unmapped(scope, pull),
          {:ok, proof, repositories} <- eligibility(scope, pull),
-         {:ok, issue_snapshot} <- issue_snapshot(scope, pull) do
+         {:ok, issue_snapshot} <- issue_snapshot(scope, pull),
+         {:ok, routing} <- routes(proof) do
       {:ok,
        Map.merge(scope, %{
          phase: :unmarked,
@@ -181,7 +234,8 @@ defmodule ForgeMirrors.PullOutboundCreation do
          head_repository_id: pull.head_repository_id,
          provider_repositories: repositories,
          pull_eligibility_proof: json(proof),
-         git_proof: proof
+         git_proof: proof,
+         routing: routing
        })}
     end
   end
@@ -419,6 +473,29 @@ defmodule ForgeMirrors.PullOutboundCreation do
       "issue_id" => intent.issue_id,
       "expected_local_version" => intent.local_version
     }
+
+  defp routes(proof) do
+    Enum.reduce_while([:base, :head], {:ok, %{}}, fn side, {:ok, acc} ->
+      binding = Repo.get!(RepositoryMirror, proof[side].repository_mirror_id)
+
+      case String.split(binding.github_full_name || "", "/") do
+        [owner, name] when byte_size(owner) > 0 and byte_size(name) > 0 ->
+          route = %{
+            repository_mirror_id: binding.id,
+            repository_id: binding.repository_id,
+            github_repository_id: binding.github_repository_id,
+            github_node_id: binding.github_node_id,
+            remote_owner: owner,
+            remote_repository: name
+          }
+
+          {:cont, {:ok, Map.put(acc, side, route)}}
+
+        _ ->
+          {:halt, {:error, :ineligible_pull}}
+      end
+    end)
+  end
 
   defp json(value), do: JSON.decode!(JSON.encode!(value))
 end
