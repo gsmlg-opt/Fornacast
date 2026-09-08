@@ -1835,10 +1835,17 @@ defmodule ForgeMirrors do
          is_nil(expected[:expected_local_fingerprint]) and
          positive_resource_id?(expected[:github_object_id]) and
          expected.github_object_id == confirmation[:github_object_id] do
-      lock_fun =
+      scope_lock =
         if Map.has_key?(expected, :pair),
           do: &lock_mapped_pull_label_operation(&1, expected),
           else: &lock_remote_pull_label_operation/1
+
+      lock_fun = fn operation ->
+        with {:ok, persisted, scope} <- scope_lock.(operation),
+             :ok <- remote_pull_label_node_available(persisted, confirmation) do
+          {:ok, persisted, scope}
+        end
+      end
 
       guarded = fn multi ->
         multi
@@ -1873,6 +1880,32 @@ defmodule ForgeMirrors do
   end
 
   def confirm_remote_pull_label(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  defp remote_pull_label_node_available(operation, confirmation) do
+    # scope_lock holds the organization lock also used by node-proof seeding.
+    # Ignore only this exact mapping, including the final post-insert recheck.
+    own =
+      Repo.get_by(MirrorResourceState,
+        repository_mirror_id: operation.repository_mirror_id,
+        resource_kind: :label,
+        github_object_id: confirmation.github_object_id
+      )
+
+    own_id = if own, do: own.id, else: 0
+
+    collision =
+      Repo.exists?(
+        from m in MirrorResourceState,
+          join: b in RepositoryMirror,
+          on: b.id == m.repository_mirror_id,
+          where:
+            b.organization_mirror_id == ^operation.organization_mirror_id and
+              m.resource_kind == :label and m.github_node_id == ^confirmation.github_node_id and
+              m.id != ^own_id
+      )
+
+    if collision, do: {:error, :identity_conflict}, else: :ok
+  end
 
   defp lock_mapped_pull_label_operation(operation, expected) do
     with true <- is_map(expected[:pull_precondition]),

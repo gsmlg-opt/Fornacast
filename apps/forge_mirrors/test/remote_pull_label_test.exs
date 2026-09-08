@@ -349,6 +349,63 @@ defmodule ForgeMirrors.RemotePullLabelTest do
     assert Repo.get!(MirrorOperation, c.op.id).external_effect_marker == marker
   end
 
+  for mode <- [:creation, :mapped] do
+    test "#{mode} label import rejects another numeric identity bound to the same organization node",
+         c do
+      c = if unquote(mode) == :mapped, do: mapped(c), else: c
+      other = repository_mirror_fixture(c.org)
+
+      collision =
+        Repo.insert!(%MirrorResourceState{
+          repository_mirror_id: other.id,
+          resource_kind: :label,
+          github_object_id: 501,
+          github_node_id: c.confirmation.github_node_id,
+          state: :confirmed
+        })
+
+      assert {:error, :identity_conflict} =
+               confirm(c, fn _ -> flunk("node collision must reject before import") end)
+
+      assert Repo.get!(MirrorResourceState, collision.id) == collision
+
+      refute Repo.exists?(
+               from(l in ForgeIssues.Label, where: l.repository_id == ^c.binding.repository_id)
+             )
+
+      assert Repo.get!(MirrorOperation, c.op.id).state == :processing
+    end
+  end
+
+  test "node collision appearing inside callback rolls back label and conflicting mapping", c do
+    c = mapped(c)
+    other = repository_mirror_fixture(c.org)
+
+    callback = fn multi ->
+      multi
+      |> ForgeIssues.append_sync_label_import(:resource, c.request)
+      |> Multi.run(:collision, fn repo, _ ->
+        repo.insert(%MirrorResourceState{
+          repository_mirror_id: other.id,
+          resource_kind: :label,
+          github_object_id: 501,
+          github_node_id: c.confirmation.github_node_id,
+          state: :confirmed
+        })
+      end)
+    end
+
+    assert {:error, :identity_conflict} = confirm(c, callback)
+
+    refute Repo.exists?(
+             from(l in ForgeIssues.Label, where: l.repository_id == ^c.binding.repository_id)
+           )
+
+    refute Repo.exists?(
+             from(m in MirrorResourceState, where: m.repository_mirror_id == ^other.id)
+           )
+  end
+
   defp mapped(c) do
     actor = organization_owner_fixture(c.org)
 

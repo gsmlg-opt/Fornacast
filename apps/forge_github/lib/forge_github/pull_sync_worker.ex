@@ -439,16 +439,8 @@ defmodule ForgeGitHub.PullSyncWorker do
       case with_ref_fences(git_proof, fn ->
              import_inbound_label(operation, now, sync, candidate, options, expected)
            end) do
-        {:error, :namespace_collision} ->
-          conflict(
-            operation,
-            now,
-            sync,
-            :label_namespace_collision,
-            local.snapshot,
-            remote.snapshot,
-            options
-          )
+        {:error, reason} when reason in [:namespace_collision, :identity_conflict] ->
+          mapped_label_conflict(operation, now, sync, reason, candidate, local, remote, options)
 
         {:error, reason} ->
           persist_failure(operation, now, reason, options)
@@ -457,6 +449,67 @@ defmodule ForgeGitHub.PullSyncWorker do
           result
       end
     end
+  end
+
+  defp mapped_label_conflict(operation, now, sync, reason, candidate, local, remote, options) do
+    # This is a fresh diagnostic read after the rejected import, not an atomic
+    # preimage or authorization to adopt the current namespace occupant.
+    label =
+      if reason == :namespace_collision do
+        Fornacast.Repo.get_by(ForgeIssues.Label,
+          repository_id: sync.repository_id,
+          normalized_name: ForgeIssues.DefaultLabels.normalize_name(candidate.name)
+        )
+      else
+        Fornacast.Repo.one(
+          from label in ForgeIssues.Label,
+            join: mapping in ForgeMirrors.MirrorResourceState,
+            on: mapping.local_resource_id == label.id,
+            where:
+              label.repository_id == ^sync.repository_id and
+                mapping.repository_mirror_id == ^sync.repository_mirror_id and
+                mapping.resource_kind == :label and
+                mapping.local_resource_type == "ForgeIssues.Label" and
+                mapping.github_node_id == ^candidate.node_id,
+            order_by: [asc: mapping.id],
+            limit: 1,
+            select: label
+        )
+      end
+
+    local_label =
+      if label do
+        %{
+          "local_resource_id" => label.id,
+          "local_version" => label.sync_version,
+          "name" => label.name,
+          "color" => label.color,
+          "description" => label.description
+        }
+      end
+
+    remote_label = %{
+      "github_object_id" => candidate.github_object_id,
+      "github_node_id" => candidate.node_id,
+      "name" => candidate.name,
+      "color" => candidate.color,
+      "description" => candidate.description
+    }
+
+    kind =
+      if reason == :namespace_collision,
+        do: :label_namespace_collision,
+        else: :label_identity_collision
+
+    conflict(
+      operation,
+      now,
+      %{sync | baseline: %{"pull" => sync.baseline}},
+      kind,
+      %{"pull" => local.snapshot, "label" => local_label},
+      %{"pull" => remote.snapshot, "label" => remote_label},
+      options
+    )
   end
 
   defp import_inbound_label(operation, now, sync, candidate, options, extra_expected \\ %{}) do

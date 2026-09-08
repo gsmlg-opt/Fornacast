@@ -331,10 +331,105 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     assert Repo.get!(MirrorOperation, operation.id).external_effect_marker == nil
     assert Repo.get!(MirrorOperation, operation.id).state == :failed
 
-    assert Repo.get_by!(ForgeMirrors.MirrorConflict,
+    conflict =
+      Repo.get_by!(ForgeMirrors.MirrorConflict,
+        repository_mirror_id: ctx.base.id,
+        state: :open
+      )
+
+    assert conflict.conflict_kind == "label_namespace_collision"
+    assert conflict.baseline_snapshot == %{"pull" => ctx.baseline}
+
+    assert conflict.local_snapshot == %{
+             "pull" => ctx.baseline,
+             "label" => %{
+               "local_resource_id" => existing.id,
+               "local_version" => existing.sync_version,
+               "name" => "occupied",
+               "color" => "000000",
+               "description" => nil
+             }
+           }
+
+    assert conflict.remote_snapshot == %{
+             "pull" => ctx.baseline,
+             "label" => %{
+               "github_object_id" => 935,
+               "github_node_id" => "LA_935",
+               "name" => "occupied",
+               "color" => "ffffff",
+               "description" => nil
+             }
+           }
+  end
+
+  test "mapped unknown label node collision becomes an actionable identity conflict", ctx do
+    now = DateTime.utc_now(:second)
+    operation = remote_operation(ctx, now)
+
+    existing =
+      Repo.insert!(%ForgeIssues.Label{
+        repository_id: ctx.base.repository_id,
+        name: "existing-node-label",
+        normalized_name: "existing-node-label",
+        color: "000000"
+      })
+
+    mapping =
+      Repo.insert!(%MirrorResourceState{
+        repository_mirror_id: ctx.base.id,
+        resource_kind: :label,
+        local_resource_type: "ForgeIssues.Label",
+        local_resource_id: existing.id,
+        github_object_id: 936,
+        github_node_id: "LA_collision",
+        state: :confirmed
+      })
+
+    candidate = %{
+      "id" => 937,
+      "node_id" => "LA_collision",
+      "name" => "new-node-label",
+      "color" => "ffffff",
+      "description" => nil
+    }
+
+    Req.Test.expect(ctx.stub, &Req.Test.json(&1, pull_json(ctx.baseline, now)))
+
+    Req.Test.expect(
+      ctx.stub,
+      &Req.Test.json(&1, Map.put(issue_json(ctx.baseline, now), "labels", [candidate]))
+    )
+
+    PullSyncWorker.process_operation(
+      operation,
+      now,
+      Keyword.delete(options(ctx), :remote_relationships)
+    )
+
+    assert Repo.get!(MirrorOperation, operation.id).state == :failed
+    assert Repo.get!(MirrorResourceState, mapping.id) == mapping
+
+    refute Repo.get_by(MirrorResourceState,
              repository_mirror_id: ctx.base.id,
-             state: :open
-           ).conflict_kind == "label_namespace_collision"
+             resource_kind: :label,
+             github_object_id: 937
+           )
+
+    conflict =
+      Repo.get_by!(ForgeMirrors.MirrorConflict, repository_mirror_id: ctx.base.id, state: :open)
+
+    assert conflict.conflict_kind == "label_identity_collision"
+
+    assert conflict.remote_snapshot["label"] == %{
+             "github_object_id" => 937,
+             "github_node_id" => "LA_collision",
+             "name" => "new-node-label",
+             "color" => "ffffff",
+             "description" => nil
+           }
+
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_snapshot == ctx.baseline
   end
 
   test "mapped unknown label cannot import after a live ref changes during paired GET", ctx do

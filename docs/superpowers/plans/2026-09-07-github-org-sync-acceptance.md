@@ -28,6 +28,15 @@ remain open.
 - New local unmapped-label export remains open, as do pending-effect third-state
   resolution, remaining PR13 head/merge/activation gates, PR14–16 and full PRD
   acceptance. No push, deployment or live GitHub write validation occurred.
+- Follow-up review hardening rejects organization-wide label node collisions
+  before and after the domain callback; a collision introduced during the callback
+  rolls back the transaction. Namespace and immutable-node conflicts retain nested
+  pull and remote-label identity/field evidence, plus diagnostic local-label data
+  where available. Cross-repository collisions retain the remote candidate but do
+  not include the other repository's local label in this diagnostic view.
+- Final hardened combined verification passed 201 tests (mirrors 96, provider
+  105), with four-file formatting and diff checks passing. Targeted re-review
+  found no remaining blocker in these two fixes.
 
 ### PR13 mapped relationship node proofs (2026-09-08)
 
