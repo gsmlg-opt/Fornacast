@@ -1142,6 +1142,47 @@ defmodule ForgeGitHub.ClientTest do
     assert_received {:request, "/repos/octocat/Hello-World/issues/7/comments", "per_page=100"}
   end
 
+  test "paired App bootstrap GETs retain bounded multibyte pull and issue bodies" do
+    body = String.duplicate("😀", 65_536)
+
+    for endpoint <- [:pull_request, :repository_issue] do
+      stub = stub_name()
+      Req.Test.expect(stub, fn conn -> Req.Test.json(conn, %{"body" => body}) end)
+
+      assert {:ok, %{"body" => ^body}} =
+               apply(Client, endpoint, [
+                 "app_token",
+                 "octocat",
+                 "Hello-World",
+                 7,
+                 client_opts(stub, 1,
+                   gate_key: {:github_installation, System.unique_integer([:positive])}
+                 )
+               ])
+    end
+  end
+
+  test "paired bootstrap GET body allowance does not widen PAT or unrelated JSON fields" do
+    for endpoint <- [:pull_request, :repository_issue],
+        {key, value, gate} <- [
+          {"body", String.duplicate("a", 16_385), :one_time_run},
+          {"title", String.duplicate("a", 16_385), :github_installation},
+          {"body", String.duplicate("a", 262_145), :github_installation}
+        ] do
+      stub = stub_name()
+      Req.Test.expect(stub, fn conn -> Req.Test.json(conn, %{key => value}) end)
+
+      assert {:error, %Error{kind: :invalid_response}} =
+               apply(Client, endpoint, [
+                 "token",
+                 "octocat",
+                 "Hello-World",
+                 7,
+                 client_opts(stub, 1, gate_key: {gate, System.unique_integer([:positive])})
+               ])
+    end
+  end
+
   test "pull_request fetches a single pull payload" do
     stub = stub_name()
     parent = self()

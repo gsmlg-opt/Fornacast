@@ -318,7 +318,13 @@ defmodule ForgeGitHub.Client do
       when is_integer(number) and number > 0 and number <= 999_999 do
     with {:ok, paths} <- repository_paths(owner, repository) do
       with_request_gate(pat, opts, fn ->
-        fetch_one("#{@api_base}#{paths.issues}/#{number}", pat, opts, &json_object/1)
+        fetch_one(
+          "#{@api_base}#{paths.issues}/#{number}",
+          pat,
+          opts,
+          &json_object/1,
+          if(installation_gate?(opts), do: :issue_metadata, else: :generic)
+        )
       end)
     else
       _ -> error(:invalid_request)
@@ -340,7 +346,8 @@ defmodule ForgeGitHub.Client do
           "#{@api_base}#{paths.pulls}/#{pull_number}",
           pat,
           opts,
-          &json_object/1
+          &json_object/1,
+          if(installation_gate?(opts), do: :issue_metadata, else: :generic)
         )
       end)
     else
@@ -562,9 +569,9 @@ defmodule ForgeGitHub.Client do
     end
   end
 
-  defp fetch_one(url, pat, opts, decoder) do
+  defp fetch_one(url, pat, opts, decoder, json_profile \\ :generic) do
     with {:ok, response} <- perform_request(url, pat, opts, :get, nil),
-         {:ok, json} <- successful_json(response, opts),
+         {:ok, json} <- successful_json(response, opts, json_profile),
          {:ok, value} <- decoder.(json) do
       {:ok, value}
     else
@@ -976,9 +983,12 @@ defmodule ForgeGitHub.Client do
   defp successful_response(%Req.Response{} = response, opts, _expected_status, _json_profile),
     do: classify_response(response, opts)
 
-  defp successful_json(%Req.Response{status: 200, body: body}, _opts), do: decode_json(body)
+  defp successful_json(response, opts, json_profile \\ :generic)
 
-  defp successful_json(%Req.Response{} = response, opts),
+  defp successful_json(%Req.Response{status: 200, body: body}, _opts, json_profile),
+    do: decode_json(body, json_profile)
+
+  defp successful_json(%Req.Response{} = response, opts, _json_profile),
     do: classify_response(response, opts)
 
   defp decode_json(body), do: decode_json(body, :generic)
