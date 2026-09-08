@@ -67,7 +67,7 @@ defmodule ForgeGitHub.LabelClient do
          {:ok, attrs} <- normalize_attrs(attrs),
          true <- valid_metadata?(attrs) do
       Client.request(token, :post, path, Keyword.put(opts, :json, attrs))
-      |> decode_label()
+      |> decode_safe_label(token)
     else
       _invalid -> error(:invalid_request)
     end
@@ -81,7 +81,7 @@ defmodule ForgeGitHub.LabelClient do
       # label name to alter the repository endpoint or query string.
       segment = URI.encode(name, &URI.char_unreserved?/1)
       segment = if segment in [".", ".."], do: String.replace(segment, ".", "%2E"), else: segment
-      Client.request(token, :get, path <> "/" <> segment, opts) |> decode_label()
+      Client.request(token, :get, path <> "/" <> segment, opts) |> decode_safe_label(token)
     else
       _invalid -> error(:invalid_request)
     end
@@ -135,6 +135,14 @@ defmodule ForgeGitHub.LabelClient do
 
   defp decode_label({:error, %Error{}} = error), do: error
   defp decode_label(_response), do: error(:invalid_response)
+
+  defp decode_safe_label(response, token) do
+    with {:ok, label} <- decode_label(response) do
+      if safe_page_label?(label, token) and Map.get(label, "archived", false) == false,
+        do: {:ok, Map.take(label, ~w(id node_id name color description))},
+        else: error(:invalid_response)
+    end
+  end
 
   defp text?(value, maximum) when is_binary(value) and byte_size(value) <= maximum * 4 do
     String.valid?(value) and :binary.match(value, <<0>>) == :nomatch and

@@ -47,6 +47,45 @@ defmodule ForgeGitHub.LabelClientTest do
     end
   end
 
+  test "single label reads and creates reject credential echoes before returning evidence" do
+    for action <- [:get, :create],
+        {field, value} <- [{"name", "token"}, {"description", "ghp_secret"}, {"node_id", "token"}] do
+      stub = stub()
+      Req.Test.expect(stub, &Req.Test.json(&1, Map.put(label(), field, value)))
+
+      result =
+        if action == :get,
+          do: LabelClient.get_label("token", "acme", "repo", "bug", opts(stub)),
+          else:
+            LabelClient.create_label(
+              "token",
+              "acme",
+              "repo",
+              %{name: "bug", color: "aabbcc"},
+              opts(stub)
+            )
+
+      assert {:error, %Error{kind: :invalid_response}} = result
+    end
+  end
+
+  test "single label responses retain only canonical evidence fields" do
+    stub = stub()
+    Req.Test.expect(stub, &Req.Test.json(&1, Map.put(label(), "unchecked", "token")))
+    assert {:ok, result} = LabelClient.get_label("token", "acme", "repo", "bug", opts(stub))
+    assert result == label()
+  end
+
+  test "single label evidence cannot hide archived or malformed archive state" do
+    for archived <- [true, "false", nil] do
+      stub = stub()
+      Req.Test.expect(stub, &Req.Test.json(&1, Map.put(label(), "archived", archived)))
+
+      assert {:error, %Error{kind: :invalid_response}} =
+               LabelClient.get_label("token", "acme", "repo", "bug", opts(stub))
+    end
+  end
+
   test "lists exactly one bounded page and preserves numeric and node identity" do
     stub = stub()
 

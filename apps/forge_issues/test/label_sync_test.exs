@@ -125,6 +125,55 @@ defmodule ForgeIssues.LabelSyncTest do
     assert Repo.get!(Label, old.id).color == "ffffff"
   end
 
+  test "historical observation preserves newer label metadata and returns its actual projection",
+       ctx do
+    {:ok, %{resource: first}} = import_label(ctx, fields())
+
+    expected = %{
+      repository_id: ctx.repository.id,
+      local_resource_id: first.local_resource_id,
+      minimum_local_version: 1,
+      expected_fields: first.fields
+    }
+
+    assert {:ok, %{resource: ^first}} = observe(expected)
+    row = Repo.get!(Label, first.local_resource_id)
+
+    {:ok, changed} =
+      row |> Label.changeset(%{name: "Renamed", description: "Newer"}) |> Repo.update()
+
+    events = Repo.aggregate(DomainOutboxEvent, :count)
+    assert {:ok, %{resource: actual}} = observe(expected)
+    assert actual.local_version == 2
+    assert actual.fields["name"] == "Renamed"
+    assert actual.fields["description"] == "Newer"
+    assert Repo.get!(Label, row.id) == changed
+    assert Repo.aggregate(DomainOutboxEvent, :count) == events
+  end
+
+  test "historical label observation rejects equal-version drift, future versions and mixed modes",
+       ctx do
+    {:ok, %{resource: first}} = import_label(ctx, fields())
+
+    expected = %{
+      repository_id: ctx.repository.id,
+      local_resource_id: first.local_resource_id,
+      minimum_local_version: 1,
+      expected_fields: first.fields
+    }
+
+    assert {:error, _, :stale_local_snapshot, _} =
+             observe(%{expected | expected_fields: %{first.fields | "color" => "ffffff"}})
+
+    assert {:error, _, :stale_local_version, _} = observe(%{expected | minimum_local_version: 2})
+
+    assert {:error, _, :invalid_sync_request, _} =
+             observe(Map.put(expected, :expected_local_version, 1))
+
+    Repo.delete!(Repo.get!(Label, first.local_resource_id))
+    assert {:error, _, :not_found, _} = observe(expected)
+  end
+
   test "downstream failure rolls back label, event, and audit together", ctx do
     multi =
       Multi.new()

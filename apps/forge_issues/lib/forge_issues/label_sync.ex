@@ -34,10 +34,7 @@ defmodule ForgeIssues.LabelSync do
            {:ok, fields} <- canonical_fields(expected.expected_fields),
            :ok <- repository(repo, expected.repository_id),
            {:ok, label} <- label(repo, expected.repository_id, expected.local_resource_id),
-           true <-
-             label.sync_version == expected.expected_local_version ||
-               {:error, :stale_local_version},
-           true <- fields(label) == fields || {:error, :stale_local_snapshot} do
+           :ok <- observation_matches(label, expected, fields) do
         {:ok, projection(label)}
       end
     end)
@@ -123,16 +120,54 @@ defmodule ForgeIssues.LabelSync do
 
   defp validate_import(_), do: {:error, :invalid_sync_request}
 
-  defp validate_expected(%{
-         repository_id: repository_id,
-         local_resource_id: id,
-         expected_local_version: version,
-         expected_fields: fields
-       })
-       when valid_id(repository_id) and valid_id(id) and valid_id(version) and is_map(fields),
+  defp validate_expected(
+         %{
+           repository_id: repository_id,
+           local_resource_id: id,
+           expected_local_version: version,
+           expected_fields: fields
+         } = expected
+       )
+       when valid_id(repository_id) and valid_id(id) and valid_id(version) and is_map(fields) and
+              not is_map_key(expected, :minimum_local_version),
+       do: :ok
+
+  defp validate_expected(
+         %{
+           repository_id: repository_id,
+           local_resource_id: id,
+           minimum_local_version: version,
+           expected_fields: fields
+         } = expected
+       )
+       when valid_id(repository_id) and valid_id(id) and valid_id(version) and is_map(fields) and
+              not is_map_key(expected, :expected_local_version),
        do: :ok
 
   defp validate_expected(_), do: {:error, :invalid_sync_request}
+
+  # Historical effect recovery observes the current row without acknowledging or
+  # overwriting newer metadata. Only the coordinator may confirm its saved target.
+  defp observation_matches(label, %{minimum_local_version: minimum}, expected_fields) do
+    cond do
+      label.sync_version < minimum ->
+        {:error, :stale_local_version}
+
+      label.sync_version == minimum and fields(label) != expected_fields ->
+        {:error, :stale_local_snapshot}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp observation_matches(label, %{expected_local_version: version}, expected_fields) do
+    cond do
+      label.sync_version != version -> {:error, :stale_local_version}
+      fields(label) != expected_fields -> {:error, :stale_local_snapshot}
+      true -> :ok
+    end
+  end
 
   defp canonical_fields(
          %{"name" => name, "color" => color, "description" => description} = fields
