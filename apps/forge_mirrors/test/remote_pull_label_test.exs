@@ -406,6 +406,289 @@ defmodule ForgeMirrors.RemotePullLabelTest do
            )
   end
 
+  test "mapped local label effect retains small immutable evidence and confirms same parent", c do
+    c = local_label(c)
+    assert {:ok, marked} = mark_local_label(c)
+    assert marked.operation.state == :effect_pending
+    assert {:ok, recovered} = ForgeMirrors.mapped_pull_label_effect_context(marked.operation)
+    assert recovered.resource == c.label_projection
+    assert recovered.marker["proposed_snapshot"] == c.request.fields
+    refute Map.has_key?(recovered.marker["paired_mapping_proof"]["pull"], "snapshot")
+    expected = %{c.expected | effect_marker: recovered.marker}
+    assert {:ok, confirmed} = confirm_local_label(c, marked.operation, expected)
+    assert confirmed.operation.id == c.op.id
+    assert confirmed.operation.state == :pending
+    assert confirmed.operation.external_effect_marker == nil
+    assert confirmed.resource_state.local_resource_id == c.label_projection.local_resource_id
+    assert Repo.get!(MirrorResourceState, c.pull_mapping.id) == c.pull_mapping
+    assert Repo.get!(MirrorResourceState, c.issue_mapping.id) == c.issue_mapping
+  end
+
+  test "mapped local label processing may adopt matching provider label without marking", c do
+    c = local_label(c)
+    assert {:ok, result} = confirm_local_label(c, c.op, c.expected)
+    assert result.operation.state == :pending
+    assert result.resource_state.confirmed_snapshot == c.request.fields
+  end
+
+  test "mapped local label mark rejects stale pair and incorrect retained snapshot", c do
+    c = local_label(c)
+
+    assert {:error, :stale_paired_mapping} =
+             mark_local_label(%{
+               c
+               | expected: put_in(c.expected, [:pair, :issue, :lock_version], 999)
+             })
+
+    marker = put_in(c.label_marker, ["proposed_snapshot", "name"], "incorrect")
+    assert {:error, :label_metadata_conflict} = mark_local_label(%{c | label_marker: marker})
+    assert Repo.get!(MirrorOperation, c.op.id).state == :processing
+  end
+
+  test "mapped label recovery confirms original metadata while preserving newer local edits", c do
+    c = local_label(c)
+    {:ok, marked} = mark_local_label(c)
+
+    Repo.update_all(from(i in ForgeIssues.Issue, where: i.id == ^c.issue.id),
+      set: [title: "Later pull", sync_version: 2]
+    )
+
+    assert {:ok, recovered} = ForgeMirrors.mapped_pull_label_effect_context(marked.operation)
+    assert recovered.marker == marked.operation.external_effect_marker
+
+    Repo.update_all(
+      from(l in ForgeIssues.Label, where: l.id == ^c.label_projection.local_resource_id),
+      set: [description: "Later label", sync_version: 2]
+    )
+
+    assert {:ok, newer} = ForgeMirrors.mapped_pull_label_effect_context(marked.operation)
+    assert newer.resource.local_version == 2
+    expected = %{c.expected | effect_marker: recovered.marker}
+
+    callback = fn multi ->
+      ForgeIssues.append_sync_label_observe(multi, :resource, %{
+        repository_id: c.binding.repository_id,
+        local_resource_id: c.label_projection.local_resource_id,
+        minimum_local_version: 1,
+        expected_fields: c.label_projection.fields
+      })
+    end
+
+    assert {:ok, confirmed} =
+             ForgeMirrors.confirm_mapped_pull_label(
+               marked.operation,
+               c.now,
+               expected,
+               c.confirmation,
+               callback
+             )
+
+    assert confirmed.resource_state.confirmed_local_version == 1
+    assert confirmed.resource_state.confirmed_snapshot == c.request.fields
+
+    assert Repo.get!(ForgeIssues.Label, c.label_projection.local_resource_id).description ==
+             "Later label"
+
+    assert Repo.get!(MirrorOperation, c.op.id).state == :pending
+  end
+
+  test "mapped label effect cannot be marked twice or recovered under a substituted ref proof",
+       c do
+    c = local_label(c)
+    {:ok, marked} = mark_local_label(c)
+    assert {:error, _} = mark_local_label(%{c | op: marked.operation})
+
+    Repo.update_all(
+      from(r in ForgeMirrors.MirrorRefState, where: r.repository_mirror_id == ^c.binding.id),
+      set: [state: :conflicted]
+    )
+
+    assert {:error, :ineligible_pull} =
+             ForgeMirrors.mapped_pull_label_effect_context(marked.operation)
+  end
+
+  test "mapped label finalization rejects colliding node and stale lease without mapping", c do
+    c = local_label(c)
+    {:ok, marked} = mark_local_label(c)
+    expected = %{c.expected | effect_marker: marked.operation.external_effect_marker}
+    other = repository_mirror_fixture(c.org)
+
+    collision =
+      Repo.insert!(%MirrorResourceState{
+        repository_mirror_id: other.id,
+        resource_kind: :label,
+        github_object_id: 501,
+        github_node_id: c.confirmation.github_node_id,
+        state: :confirmed
+      })
+
+    assert {:error, :identity_conflict} = confirm_local_label(c, marked.operation, expected)
+    Repo.delete!(collision)
+
+    Repo.update_all(from(o in MirrorOperation, where: o.id == ^c.op.id),
+      set: [lease_expires_at: DateTime.add(c.now, -1)]
+    )
+
+    assert {:error, :lost_lease} = confirm_local_label(c, marked.operation, expected)
+
+    refute Repo.exists?(
+             from(m in MirrorResourceState,
+               where: m.repository_mirror_id == ^c.binding.id and m.resource_kind == :label
+             )
+           )
+  end
+
+  test "mapped label mark cannot export a label removed from the canonical issue", c do
+    c = local_label(c)
+    Repo.delete_all(from(l in ForgeIssues.IssueLabel, where: l.issue_id == ^c.issue.id))
+    assert {:error, :label_not_assigned} = mark_local_label(c)
+    assert Repo.get!(MirrorOperation, c.op.id).state == :processing
+  end
+
+  test "mapped label recovery rejects a caller with substituted marker or state", c do
+    c = local_label(c)
+    {:ok, marked} = mark_local_label(c)
+
+    for caller <- [
+          %{
+            marked.operation
+            | external_effect_marker:
+                Map.put(marked.operation.external_effect_marker, "label_name", "substituted")
+          },
+          %{marked.operation | state: :processing}
+        ] do
+      assert {:error, :invalid_label_effect} =
+               ForgeMirrors.mapped_pull_label_effect_context(caller)
+    end
+  end
+
+  test "mapped local label marker omits maximum-sized paired pull bodies", c do
+    c = local_label(c)
+    body = String.duplicate("😀", 65_536)
+    Repo.update_all(from(i in ForgeIssues.Issue, where: i.id == ^c.issue.id), set: [body: body])
+
+    for mapping <- [c.pull_mapping, c.issue_mapping] do
+      Repo.update_all(from(m in MirrorResourceState, where: m.id == ^mapping.id),
+        set: [confirmed_snapshot: Map.put(mapping.confirmed_snapshot, "body", body)]
+      )
+    end
+
+    {:ok, sync} = ForgeMirrors.mapped_pull_pair_context(c.op)
+    {:ok, hash} = ForgeMirrors.resource_fingerprint(sync.pair.pull.snapshot)
+
+    expected = %{
+      c.expected
+      | pair: sync.pair,
+        pull_precondition:
+          Map.put(c.expected.pull_precondition, "expected_local_fingerprint", hash)
+    }
+
+    assert {:ok, marked} = mark_local_label(%{c | expected: expected})
+    assert byte_size(JSON.encode!(marked.operation.external_effect_marker)) < 65_536
+    refute String.contains?(JSON.encode!(marked.operation.external_effect_marker), "😀")
+  end
+
+  test "deleted marked local label is a visible metadata conflict, not a retryable lookup", c do
+    c = local_label(c)
+    {:ok, marked} = mark_local_label(c)
+    Repo.delete_all(from(l in ForgeIssues.IssueLabel, where: l.issue_id == ^c.issue.id))
+
+    Repo.delete_all(
+      from(l in ForgeIssues.Label, where: l.id == ^c.label_projection.local_resource_id)
+    )
+
+    assert {:error, {:label_metadata_conflict, evidence}} =
+             ForgeMirrors.mapped_pull_label_effect_context(marked.operation)
+
+    assert evidence.operation.id == c.op.id
+    assert evidence.marker == marked.operation.external_effect_marker
+    assert evidence.resource == nil
+
+    assert Repo.get!(MirrorOperation, c.op.id).external_effect_marker ==
+             marked.operation.external_effect_marker
+  end
+
+  test "unversioned marked label drift returns verified conflict evidence", c do
+    c = local_label(c)
+    {:ok, marked} = mark_local_label(c)
+
+    Repo.update_all(
+      from(l in ForgeIssues.Label, where: l.id == ^c.label_projection.local_resource_id),
+      set: [description: "Unversioned drift"]
+    )
+
+    assert {:error, {:label_metadata_conflict, evidence}} =
+             ForgeMirrors.mapped_pull_label_effect_context(marked.operation)
+
+    assert evidence.marker == marked.operation.external_effect_marker
+    assert evidence.resource.fields["description"] == "Unversioned drift"
+    assert evidence.sync.pair == c.expected.pair
+  end
+
+  defp local_label(c) do
+    c = mapped(c)
+
+    {:ok, %{resource: label}} =
+      Multi.new()
+      |> ForgeIssues.append_sync_label_import(:resource, c.request)
+      |> Repo.transaction()
+
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: c.issue.id, label_id: label.local_resource_id})
+    {:ok, hash} = ForgeMirrors.resource_fingerprint(label.fields)
+
+    expected =
+      Map.merge(c.expected, %{
+        local_label_id: label.local_resource_id,
+        expected_local_version: label.local_version,
+        expected_local_fingerprint: hash,
+        github_object_id: nil
+      })
+
+    marker = %{
+      "v" => 1,
+      "action" => "create_remote_label",
+      "resource_kind" => "label",
+      "local_label_id" => label.local_resource_id,
+      "expected_local_version" => label.local_version,
+      "expected_local_fingerprint" => hash,
+      "expected_remote_absent" => true,
+      "label_name" => label.fields["name"],
+      "proposed_fingerprint" => hash,
+      "proposed_snapshot" => label.fields
+    }
+
+    Map.merge(c, %{label_projection: label, expected: expected, label_marker: marker})
+  end
+
+  defp observe_label(c, multi),
+    do:
+      ForgeIssues.append_sync_label_observe(multi, :resource, %{
+        repository_id: c.binding.repository_id,
+        local_resource_id: c.label_projection.local_resource_id,
+        expected_local_version: c.label_projection.local_version,
+        expected_fields: c.label_projection.fields
+      })
+
+  defp mark_local_label(c),
+    do:
+      ForgeMirrors.mark_mapped_pull_label_effect(
+        c.op,
+        c.now,
+        c.expected,
+        c.label_marker,
+        &observe_label(c, &1)
+      )
+
+  defp confirm_local_label(c, operation, expected),
+    do:
+      ForgeMirrors.confirm_mapped_pull_label(
+        operation,
+        c.now,
+        expected,
+        c.confirmation,
+        &observe_label(c, &1)
+      )
+
   defp mapped(c) do
     actor = organization_owner_fixture(c.org)
 

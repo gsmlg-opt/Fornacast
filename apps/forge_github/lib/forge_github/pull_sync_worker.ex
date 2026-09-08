@@ -123,6 +123,9 @@ defmodule ForgeGitHub.PullSyncWorker do
       when state in [:processing, :effect_pending] and is_list(options) do
     with {:ok, sync} <- context(operation, options) do
       case Map.get(sync, :mode) do
+        :mapped_label_recovery ->
+          recover_mapped_local_label(operation, now, sync, options)
+
         :inbound_create ->
           create_inbound(operation, now, sync, options)
 
@@ -148,7 +151,26 @@ defmodule ForgeGitHub.PullSyncWorker do
           process_mapped(operation, now, sync, options)
       end
     else
-      {:error, reason} -> persist_failure(operation, now, reason, options)
+      {:error,
+       {:label_metadata_conflict,
+        %{operation: persisted, sync: sync, marker: marker, resource: resource}}} ->
+        # Only the dedicated boundary supplies this evidence, after verifying
+        # persisted marker, paired mappings, ownership and the final live lease.
+        # The intended label is not represented as an observed remote result.
+        baseline = %{"pull" => sync.baseline, "intended_label" => marker["proposed_snapshot"]}
+
+        conflict(
+          persisted,
+          now,
+          %{sync | baseline: baseline},
+          :label_metadata_conflict,
+          %{"label" => if(resource, do: resource.fields)},
+          %{"unresolved_label_effect" => true},
+          options
+        )
+
+      {:error, reason} ->
+        persist_failure(operation, now, reason, options)
     end
   rescue
     _exception -> persist_failure(operation, now, :worker_crash, options)
@@ -162,8 +184,24 @@ defmodule ForgeGitHub.PullSyncWorker do
 
   defp process_mapped(operation, now, sync, options) do
     with {:ok, token} <- installation_token(sync, options),
-         {:ok, local} <- local_observation(sync, options),
-         {:ok, remote, provider_identity, proof} <-
+         {:ok, local} <- local_observation(sync, options) do
+      case local[:unmapped_label] do
+        nil ->
+          process_ready_mapped(operation, now, sync, token, local, options)
+
+        candidate when operation.state == :processing ->
+          materialize_mapped_local_label(operation, now, sync, token, local, candidate, options)
+
+        _ ->
+          persist_failure(operation, now, :unsupported_resource, options)
+      end
+    else
+      {:error, reason} -> persist_failure(operation, now, reason, options)
+    end
+  end
+
+  defp process_ready_mapped(operation, now, sync, token, local, options) do
+    with {:ok, remote, provider_identity, proof} <-
            observe_authorized(sync, token, local, now, options) do
       case precondition(sync, local, remote, provider_identity, proof) do
         :ok when operation.state == :effect_pending and is_map_key(sync, :metadata_intent) ->
@@ -280,6 +318,18 @@ defmodule ForgeGitHub.PullSyncWorker do
     do: callback(options, :context, &default_context/1).(operation)
 
   defp default_context(operation) do
+    if operation.state == :effect_pending and is_map(operation.external_effect_marker) and
+         operation.external_effect_marker["action"] == "create_remote_label" do
+      with {:ok, context} <- ForgeMirrors.mapped_pull_label_effect_context(operation) do
+        {:ok,
+         Map.merge(context.sync, %{mode: :mapped_label_recovery, label_resource: context.resource})}
+      end
+    else
+      metadata_or_legacy_context(operation)
+    end
+  end
+
+  defp metadata_or_legacy_context(operation) do
     if operation.state == :effect_pending and is_map(operation.external_effect_marker) and
          Map.has_key?(operation.external_effect_marker, "metadata_intent_id") do
       with {:ok, context} <- ForgeMirrors.mapped_pull_effect_context(operation) do
@@ -449,6 +499,406 @@ defmodule ForgeGitHub.PullSyncWorker do
           result
       end
     end
+  end
+
+  defp materialize_mapped_local_label(operation, now, sync, token, local, candidate, options) do
+    with {:ok, label} <-
+           ForgeIssues.label_sync_projection(sync.repository_id, candidate.local_label_id),
+         {:ok, remote, identity, proof, git_proof} <-
+           label_pull_preflight(sync, token, local, options),
+         {:ok, repository} <- pair_repository_identity(sync, token, options) do
+      result =
+        LabelClient.get_label(
+          token,
+          sync.remote_owner,
+          sync.remote_repository,
+          label.fields["name"],
+          pair_client_options(sync, options)
+        )
+
+      with {:ok, ^repository} <- pair_repository_identity(sync, token, options) do
+        case result do
+          {:ok, observed} ->
+            if canonical_provider_label(observed) == label.fields do
+              confirm_local_label(
+                operation,
+                now,
+                sync,
+                label,
+                observed,
+                local,
+                remote,
+                identity,
+                proof,
+                git_proof,
+                options
+              )
+            else
+              local_label_conflict(
+                operation,
+                now,
+                sync,
+                :label_namespace_collision,
+                label.fields,
+                observed,
+                options
+              )
+            end
+
+          {:error, %Error{kind: :not_found}} ->
+            create_mapped_local_label(
+              operation,
+              now,
+              sync,
+              token,
+              label,
+              local,
+              remote,
+              identity,
+              proof,
+              git_proof,
+              options
+            )
+
+          {:error, reason} ->
+            persist_failure(operation, now, reason, options)
+        end
+      else
+        {:error, reason} -> persist_failure(operation, now, reason, options)
+      end
+    else
+      {:conflict, kind} -> conflict(operation, now, sync, kind, local.snapshot, %{}, options)
+      {:error, reason} -> persist_failure(operation, now, reason, options)
+    end
+  end
+
+  defp label_pull_preflight(sync, token, local, options) do
+    with {:ok, git_proof} <- eligibility(sync, local, options),
+         :ok <- git_availability(git_proof, options),
+         {:ok, proof} <- json_safe(git_proof),
+         {:ok, pull} <-
+           callback(options, :get_pull, &PullClient.get_pull/5).(
+             token,
+             sync.remote_owner,
+             sync.remote_repository,
+             sync.github_number,
+             request_options(sync)
+           ),
+         {:ok, issue} <-
+           callback(options, :get_pull_issue, &IssueClient.get_pull_issue/5).(
+             token,
+             sync.remote_owner,
+             sync.remote_repository,
+             sync.github_number,
+             request_options(sync)
+           ),
+         {:ok, remote} <- inbound_preflight(pull, issue),
+         {:ok, identity} <- provider_identity(remote),
+         :ok <- precondition(sync, local, remote, identity, proof),
+         do: {:ok, remote, identity, proof, git_proof}
+  end
+
+  defp local_label_expected(operation, sync, label, local, remote, identity, proof) do
+    {:ok, label_hash} = ForgeMirrors.resource_fingerprint(label.fields)
+    {:ok, pull_hash} = ForgeMirrors.resource_fingerprint(local.snapshot)
+
+    %{
+      resource_state_lock_version: :missing,
+      local_label_id: label.local_resource_id,
+      expected_local_version: label.local_version,
+      expected_local_fingerprint: label_hash,
+      github_object_id: nil,
+      effect_marker: operation.external_effect_marker,
+      pair: sync.pair,
+      pull_precondition: %{
+        "github_object_id" => remote.github_object_id,
+        "github_node_id" => remote.github_node_id,
+        "github_number" => remote.github_number,
+        "resource_state_lock_version" => sync.resource_state_lock_version,
+        "expected_local_version" => local.local_version,
+        "expected_local_fingerprint" => pull_hash,
+        "provider_identity" => identity,
+        "pull_eligibility_proof" => proof,
+        "expected_merge_state" => persistent_merge_state(local.merge_state)
+      }
+    }
+  end
+
+  defp label_observe_request(sync, label) do
+    %{
+      repository_id: sync.repository_id,
+      local_resource_id: label.local_resource_id,
+      expected_local_version: label.local_version,
+      expected_fields: label.fields
+    }
+  end
+
+  defp create_mapped_local_label(
+         operation,
+         now,
+         sync,
+         token,
+         label,
+         local,
+         remote,
+         identity,
+         proof,
+         git_proof,
+         options
+       ) do
+    expected = local_label_expected(operation, sync, label, local, remote, identity, proof)
+
+    marker = %{
+      "v" => 1,
+      "action" => "create_remote_label",
+      "resource_kind" => "label",
+      "local_label_id" => label.local_resource_id,
+      "expected_local_version" => label.local_version,
+      "expected_local_fingerprint" => expected.expected_local_fingerprint,
+      "expected_remote_absent" => true,
+      "label_name" => label.fields["name"],
+      "proposed_fingerprint" => expected.expected_local_fingerprint,
+      "proposed_snapshot" => label.fields
+    }
+
+    request = label_observe_request(sync, label)
+
+    result =
+      with_ref_fences(git_proof, fn ->
+        ForgeMirrors.mark_mapped_pull_label_effect(
+          operation,
+          now,
+          expected,
+          marker,
+          &ForgeIssues.append_sync_label_observe(&1, :resource, request)
+        )
+      end)
+
+    case result do
+      {:ok, %{operation: marked}} ->
+        # Every post-mark exit uses the marked capability. An ambiguous response
+        # never sends this prerequisite through the original processing retry.
+        try do
+          with {:ok, _repository} <- pair_repository_identity(sync, token, options),
+               {:ok, _context} <- ForgeMirrors.mapped_pull_label_effect_context(marked) do
+            result =
+              with_ref_fences(git_proof, fn ->
+                with {:ok, observed} <-
+                       LabelClient.create_label(
+                         token,
+                         sync.remote_owner,
+                         sync.remote_repository,
+                         label.fields,
+                         pair_client_options(sync, options)
+                       ),
+                     {:ok, _repository} <- pair_repository_identity(sync, token, options) do
+                  if canonical_provider_label(observed) == label.fields do
+                    confirm_local_label(
+                      marked,
+                      now,
+                      sync,
+                      label,
+                      observed,
+                      local,
+                      remote,
+                      identity,
+                      proof,
+                      git_proof,
+                      options,
+                      true
+                    )
+                  else
+                    local_label_conflict(
+                      marked,
+                      now,
+                      sync,
+                      :ambiguous_label_create,
+                      label.fields,
+                      observed,
+                      options
+                    )
+                  end
+                end
+              end)
+
+            case result do
+              {:error, reason} -> persist_failure(marked, now, reason, options)
+              result -> result
+            end
+          else
+            {:error, reason} -> persist_failure(marked, now, reason, options)
+          end
+        rescue
+          _ -> persist_failure(marked, now, :worker_crash, options)
+        catch
+          _, _ -> persist_failure(marked, now, :worker_crash, options)
+        end
+
+      {:error, reason} ->
+        persist_failure(operation, now, reason, options)
+    end
+  end
+
+  defp recover_mapped_local_label(operation, now, sync, options) do
+    marker = operation.external_effect_marker
+
+    label = %{
+      local_resource_id: marker["local_label_id"],
+      local_version: marker["expected_local_version"],
+      fields: marker["proposed_snapshot"]
+    }
+
+    with {:ok, token} <- installation_token(sync, options),
+         {:ok, projection} <-
+           ForgePulls.sync_projection(sync.repository_id, :pull, sync.local_resource_id),
+         {:ok, local} <- PullSyncProjection.from_local(projection),
+         {:ok, remote, identity, proof, git_proof} <-
+           label_pull_preflight(sync, token, local, options),
+         {:ok, repository} <- pair_repository_identity(sync, token, options) do
+      result =
+        LabelClient.get_label(
+          token,
+          sync.remote_owner,
+          sync.remote_repository,
+          marker["label_name"],
+          pair_client_options(sync, options)
+        )
+
+      with {:ok, ^repository} <- pair_repository_identity(sync, token, options) do
+        case result do
+          {:ok, observed} ->
+            if canonical_provider_label(observed) == label.fields do
+              confirm_local_label(
+                operation,
+                now,
+                sync,
+                label,
+                observed,
+                local,
+                remote,
+                identity,
+                proof,
+                git_proof,
+                options
+              )
+            else
+              local_label_conflict(
+                operation,
+                now,
+                sync,
+                :ambiguous_label_create,
+                label.fields,
+                observed,
+                options
+              )
+            end
+
+          {:error, %Error{kind: :not_found}} ->
+            local_label_conflict(
+              operation,
+              now,
+              sync,
+              :ambiguous_label_create,
+              label.fields,
+              %{},
+              options
+            )
+
+          {:error, reason} ->
+            persist_failure(operation, now, reason, options)
+        end
+      else
+        {:error, reason} -> persist_failure(operation, now, reason, options)
+      end
+    else
+      {:conflict, kind} ->
+        local_label_conflict(operation, now, sync, kind, label.fields, %{}, options)
+
+      {:error, reason} ->
+        persist_failure(operation, now, reason, options)
+    end
+  end
+
+  defp confirm_local_label(
+         operation,
+         now,
+         sync,
+         label,
+         observed,
+         local,
+         remote,
+         identity,
+         proof,
+         git_proof,
+         options,
+         fenced \\ false
+       ) do
+    expected = local_label_expected(operation, sync, label, local, remote, identity, proof)
+
+    confirmation = %{
+      github_object_id: observed["id"],
+      github_node_id: observed["node_id"],
+      confirmed_snapshot: label.fields
+    }
+
+    request = label_observe_request(sync, label)
+
+    request =
+      if operation.state == :effect_pending,
+        do:
+          request
+          |> Map.delete(:expected_local_version)
+          |> Map.put(:minimum_local_version, label.local_version),
+        else: request
+
+    confirm = fn ->
+      ForgeMirrors.confirm_mapped_pull_label(
+        operation,
+        now,
+        expected,
+        confirmation,
+        &ForgeIssues.append_sync_label_observe(&1, :resource, request)
+      )
+    end
+
+    result = if fenced, do: confirm.(), else: with_ref_fences(git_proof, confirm)
+
+    case result do
+      {:error, reason}
+      when reason in [:namespace_collision, :identity_conflict, :label_metadata_conflict] ->
+        local_label_conflict(operation, now, sync, reason, label.fields, observed, options)
+
+      {:error, reason} ->
+        persist_failure(operation, now, reason, options)
+
+      result ->
+        result
+    end
+  end
+
+  defp local_label_conflict(operation, now, sync, kind, fields, observed, options) do
+    conflict(
+      operation,
+      now,
+      %{sync | baseline: %{"pull" => sync.baseline}},
+      kind,
+      %{"label" => fields},
+      %{"label" => Map.take(observed, ~w(id node_id name color description))},
+      options
+    )
+  end
+
+  defp canonical_provider_label(observed) do
+    description = observed["description"]
+
+    description =
+      if is_binary(description) and String.trim(description) == "", do: nil, else: description
+
+    %{
+      "name" => observed["name"],
+      "color" => String.downcase(observed["color"]),
+      "description" => description
+    }
   end
 
   defp mapped_label_conflict(operation, now, sync, reason, candidate, local, remote, options) do
@@ -653,6 +1103,13 @@ defmodule ForgeGitHub.PullSyncWorker do
                    projection.assignee_refs
                  ) do
             PullSyncProjection.from_local(projection, relationships)
+          else
+            {:error, {:unmapped_label, candidate}} ->
+              with {:ok, local} <- PullSyncProjection.from_local(projection),
+                   do: {:ok, Map.put(local, :unmapped_label, candidate)}
+
+            error ->
+              error
           end
 
         true ->

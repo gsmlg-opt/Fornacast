@@ -171,6 +171,229 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     }
   end
 
+  for recovery <- [:applied, :absent, :different, :local_changed, :deleted, :corrupted] do
+    test "new mapped local label #{recovery} recovery never repeats POST", ctx do
+      now = DateTime.utc_now(:second)
+
+      label =
+        Repo.insert!(%ForgeIssues.Label{
+          repository_id: ctx.base.repository_id,
+          name: "new-local-label",
+          normalized_name: "new-local-label",
+          color: "abcdef",
+          description: "Local label"
+        })
+
+      Repo.insert!(%ForgeIssues.IssueLabel{issue_id: ctx.issue.id, label_id: label.id})
+      Repo.update!(Ecto.Changeset.change(ctx.issue, sync_version: 2))
+      operation = local_operation(ctx, 2, now)
+      state = start_supervised!({Agent, fn -> %{posts: 0, gets: 0} end})
+      local_label_provider(ctx, state, now, unquote(recovery))
+      opts = relationship_options(ctx)
+
+      assert {:ok, %{state: :effect_pending}} =
+               PullSyncWorker.process_operation(operation, now, opts)
+
+      pending = Repo.get!(MirrorOperation, operation.id)
+      assert pending.external_effect_marker["action"] == "create_remote_label"
+      assert pending.external_effect_marker["proposed_snapshot"]["name"] == label.name
+      assert Agent.get(state, & &1.posts) == 1
+      assert Repo.get!(MirrorResourceState, ctx.mapping.id) == ctx.mapping
+      assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id) == ctx.issue_mapping
+
+      if unquote(recovery) == :local_changed do
+        Repo.update!(
+          Ecto.Changeset.change(label,
+            name: "newer-label-name",
+            normalized_name: "newer-label-name",
+            sync_version: 2
+          )
+        )
+      end
+
+      if unquote(recovery) == :deleted do
+        Repo.get_by!(ForgeIssues.IssueLabel, issue_id: ctx.issue.id, label_id: label.id)
+        |> Repo.delete!()
+
+        Repo.delete!(label)
+      end
+
+      if unquote(recovery) == :corrupted,
+        do: Repo.update!(Ecto.Changeset.change(label, color: "000000"))
+
+      next_now = pending.next_attempt_at
+      PullSyncWorker.process_operation(claim(operation.id, next_now), next_now, opts)
+      assert Agent.get(state, & &1.posts) == 1
+      saved = Repo.get!(MirrorOperation, operation.id)
+
+      if unquote(recovery) in [:applied, :local_changed] do
+        assert saved.state == :pending
+        assert saved.external_effect_marker == nil
+
+        mapping =
+          Repo.get_by!(MirrorResourceState,
+            repository_mirror_id: ctx.base.id,
+            resource_kind: :label,
+            local_resource_id: label.id
+          )
+
+        assert mapping.github_object_id == 938
+        assert mapping.github_node_id == "LA_938"
+        assert mapping.confirmed_local_version == 1
+        assert mapping.confirmed_snapshot["name"] == "new-local-label"
+
+        if unquote(recovery) == :local_changed,
+          do: assert(Repo.get!(ForgeIssues.Label, label.id).name == "newer-label-name")
+
+        assert Repo.get!(MirrorResourceState, ctx.mapping.id) == ctx.mapping
+        assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id) == ctx.issue_mapping
+      else
+        assert saved.state == :failed
+
+        expected_kind =
+          if unquote(recovery) in [:deleted, :corrupted],
+            do: "label_metadata_conflict",
+            else: "ambiguous_label_create"
+
+        assert Repo.get_by!(ForgeMirrors.MirrorConflict,
+                 repository_mirror_id: ctx.base.id,
+                 state: :open
+               ).conflict_kind == expected_kind
+
+        if unquote(recovery) in [:deleted, :corrupted] do
+          assert saved.checkpoint["conflicted_effect_marker"] == pending.external_effect_marker
+        end
+
+        refute Repo.get_by(MirrorResourceState,
+                 repository_mirror_id: ctx.base.id,
+                 resource_kind: :label,
+                 local_resource_id: label.id
+               )
+
+        if unquote(recovery) == :local_changed,
+          do: assert(Repo.get!(ForgeIssues.Label, label.id).name == "newer-label-name")
+      end
+    end
+  end
+
+  for outcome <- [:adopt, :created] do
+    test "new mapped local label #{outcome} yields after exact confirmation", ctx do
+      now = DateTime.utc_now(:second)
+
+      label =
+        Repo.insert!(%ForgeIssues.Label{
+          repository_id: ctx.base.repository_id,
+          name: "new-local-label",
+          normalized_name: "new-local-label",
+          color: "abcdef",
+          description: "Local label"
+        })
+
+      Repo.insert!(%ForgeIssues.IssueLabel{issue_id: ctx.issue.id, label_id: label.id})
+      Repo.update!(Ecto.Changeset.change(ctx.issue, sync_version: 2))
+      operation = local_operation(ctx, 2, now)
+      state = start_supervised!({Agent, fn -> %{posts: 0, gets: 0} end})
+      local_label_provider(ctx, state, now, unquote(outcome))
+
+      assert {:ok, %{operation: %{state: :pending}}} =
+               PullSyncWorker.process_operation(operation, now, relationship_options(ctx))
+
+      assert Agent.get(state, & &1.posts) == if(unquote(outcome) == :adopt, do: 0, else: 1)
+
+      assert Repo.get_by!(MirrorResourceState,
+               repository_mirror_id: ctx.base.id,
+               resource_kind: :label,
+               local_resource_id: label.id
+             ).github_object_id == 938
+
+      assert Repo.get!(MirrorResourceState, ctx.mapping.id) == ctx.mapping
+      assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id) == ctx.issue_mapping
+
+      pending = Repo.get!(MirrorOperation, operation.id)
+
+      assert {:ok, %{operation: %{state: :completed}}} =
+               PullSyncWorker.process_operation(
+                 claim(operation.id, pending.next_attempt_at),
+                 pending.next_attempt_at,
+                 relationship_options(ctx)
+               )
+
+      assert Agent.get(state, &Map.get(&1, :patches, 0)) == 1
+      assert Agent.get(state, & &1.posts) == if(unquote(outcome) == :adopt, do: 0, else: 1)
+      assert_confirmed(ctx, operation, ctx.baseline, 2)
+
+      assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id).confirmed_snapshot[
+               "label_github_ids"
+             ] == [938]
+    end
+  end
+
+  for substitution <- [:replaced_before_post, :replaced_after_post] do
+    test "new mapped local label #{substitution} preserves marked evidence", ctx do
+      now = DateTime.utc_now(:second)
+
+      label =
+        Repo.insert!(%ForgeIssues.Label{
+          repository_id: ctx.base.repository_id,
+          name: "new-local-label",
+          normalized_name: "new-local-label",
+          color: "abcdef",
+          description: "Local label"
+        })
+
+      Repo.insert!(%ForgeIssues.IssueLabel{issue_id: ctx.issue.id, label_id: label.id})
+      Repo.update!(Ecto.Changeset.change(ctx.issue, sync_version: 2))
+      operation = local_operation(ctx, 2, now)
+      state = start_supervised!({Agent, fn -> %{posts: 0, gets: 0} end})
+      local_label_provider(ctx, state, now, unquote(substitution))
+      PullSyncWorker.process_operation(operation, now, relationship_options(ctx))
+      saved = Repo.get!(MirrorOperation, operation.id)
+      assert saved.state == :effect_pending
+      assert saved.external_effect_marker["action"] == "create_remote_label"
+
+      assert Agent.get(state, & &1.posts) ==
+               if(unquote(substitution) == :replaced_before_post, do: 0, else: 1)
+
+      refute Repo.get_by(MirrorResourceState,
+               repository_mirror_id: ctx.base.id,
+               resource_kind: :label,
+               local_resource_id: label.id
+             )
+    end
+  end
+
+  test "new mapped local label rejects substituted pull identity before label HTTP", ctx do
+    now = DateTime.utc_now(:second)
+
+    label =
+      Repo.insert!(%ForgeIssues.Label{
+        repository_id: ctx.base.repository_id,
+        name: "new-local-label",
+        normalized_name: "new-local-label",
+        color: "abcdef"
+      })
+
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: ctx.issue.id, label_id: label.id})
+    Repo.update!(Ecto.Changeset.change(ctx.issue, sync_version: 2))
+    operation = local_operation(ctx, 2, now)
+
+    Req.Test.expect(
+      ctx.stub,
+      &Req.Test.json(&1, Map.put(pull_json(ctx.baseline, now), "id", 999_802))
+    )
+
+    Req.Test.expect(ctx.stub, &Req.Test.json(&1, issue_json(ctx.baseline, now)))
+    PullSyncWorker.process_operation(operation, now, relationship_options(ctx))
+    assert Repo.get!(MirrorOperation, operation.id).state == :failed
+    assert Repo.get!(MirrorOperation, operation.id).external_effect_marker == nil
+
+    refute Repo.get_by(MirrorResourceState,
+             repository_mirror_id: ctx.base.id,
+             resource_kind: :label,
+             local_resource_id: label.id
+           )
+  end
+
   test "mapped inbound labels materialize one prerequisite before paired confirmation", ctx do
     now = DateTime.utc_now(:second)
     operation = remote_operation(ctx, now)
@@ -1764,6 +1987,131 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
       ForgeMirrors.claim_operations("pull-integration", now, 60, 100, ["sync.pull"])
 
     Enum.find(operations, &(&1.id == id)) || flunk("operation was not claimable")
+  end
+
+  defp local_label_provider(ctx, state, now, recovery) do
+    Req.Test.stub(ctx.stub, fn conn ->
+      issue =
+        Map.put(
+          issue_json(ctx.baseline, now),
+          "labels",
+          Agent.get(state, &Map.get(&1, :labels, []))
+        )
+
+      case {conn.method, conn.request_path} do
+        {"GET", "/repos/acme/project/pulls/7"} ->
+          Req.Test.json(conn, pull_json(ctx.baseline, now))
+
+        {"GET", "/repos/acme/project/issues/7"} ->
+          Req.Test.json(conn, issue)
+
+        {"POST", "/graphql"} ->
+          {:ok, body, conn} = Plug.Conn.read_body(conn)
+          assert JSON.decode!(body)["variables"] == %{"labels" => ["LA_938"], "assignees" => []}
+
+          Req.Test.json(conn, %{
+            "data" => %{
+              "labels" => [
+                %{
+                  "__typename" => "Label",
+                  "id" => "LA_938",
+                  "name" => "new-local-label",
+                  "repository" => %{"id" => "R_900"}
+                }
+              ],
+              "assignees" => []
+            }
+          })
+
+        {"PATCH", "/repos/acme/project/issues/7"} ->
+          {:ok, body, conn} = Plug.Conn.read_body(conn)
+          assert JSON.decode!(body)["labels"] == ["new-local-label"]
+
+          labels = [
+            %{
+              "id" => 938,
+              "node_id" => "LA_938",
+              "name" => "new-local-label",
+              "color" => "abcdef",
+              "description" => "Local label"
+            }
+          ]
+
+          Agent.update(
+            state,
+            &(&1 |> Map.put(:labels, labels) |> Map.update(:patches, 1, fn n -> n + 1 end))
+          )
+
+          Req.Test.json(conn, Map.put(issue, "labels", labels))
+
+        {"GET", "/repos/acme/project"} ->
+          marked =
+            Repo.get_by(MirrorOperation,
+              repository_mirror_id: ctx.base.id,
+              state: :effect_pending
+            )
+
+          replaced =
+            (recovery == :replaced_before_post and not is_nil(marked)) or
+              (recovery == :replaced_after_post and Agent.get(state, & &1.posts) > 0)
+
+          Req.Test.json(conn, %{
+            "id" => if(replaced, do: 999_900, else: 900),
+            "node_id" => if(replaced, do: "R_replaced", else: "R_900"),
+            "name" => "project",
+            "full_name" => "acme/project",
+            "owner" => %{"id" => 12, "login" => "acme"},
+            "visibility" => "private",
+            "default_branch" => "main",
+            "has_issues" => true,
+            "allow_merge_commit" => true,
+            "fork" => false,
+            "archived" => false
+          })
+
+        {"GET", "/repos/acme/project/labels/new-local-label"} ->
+          count =
+            Agent.get_and_update(state, fn value ->
+              {value.gets, %{value | gets: value.gets + 1}}
+            end)
+
+          if (count == 0 and recovery != :adopt) or recovery == :absent do
+            conn |> Plug.Conn.put_status(404) |> Req.Test.json(%{"message" => "Not Found"})
+          else
+            color = if recovery == :different, do: "000000", else: "abcdef"
+
+            Req.Test.json(conn, %{
+              "id" => 938,
+              "node_id" => "LA_938",
+              "name" => "new-local-label",
+              "color" => color,
+              "description" => "Local label"
+            })
+          end
+
+        {"POST", "/repos/acme/project/labels"} ->
+          assert Repo.get_by!(MirrorOperation,
+                   repository_mirror_id: ctx.base.id,
+                   state: :effect_pending
+                 ).external_effect_marker["action"] == "create_remote_label"
+
+          Agent.update(state, &%{&1 | posts: &1.posts + 1})
+
+          if recovery in [:replaced_after_post, :created] do
+            Req.Test.json(conn, %{
+              "id" => 938,
+              "node_id" => "LA_938",
+              "name" => "new-local-label",
+              "color" => "abcdef",
+              "description" => "Local label"
+            })
+          else
+            conn
+            |> Plug.Conn.put_status(503)
+            |> Req.Test.json(%{"message" => "lost after label create"})
+          end
+      end
+    end)
   end
 
   defp options(ctx, overrides \\ []) do

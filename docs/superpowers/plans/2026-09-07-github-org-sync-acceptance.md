@@ -10,6 +10,35 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 mapped outbound label prerequisites (2026-09-08)
+
+- A new local label assigned to a mapped pull is adopted only on an exact remote
+  snapshot match, or created after an immutable label effect is persisted.
+  Admission binds actual membership, label version/snapshot, paired mapping
+  tokens, local pull fingerprint, original installation and provider/ref proof.
+- Repository identity is checked around name lookup and immediately before and
+  after POST. Git fences span the write and immediate mapping confirmation.
+  Both canonical pull/issue baselines remain unchanged until the later metadata
+  claim; real integration proves that claim PATCHes membership and confirms both.
+- Lost-response recovery queries the original saved name and never repeats POST.
+  Exact matches confirm the original label version while preserving newer local
+  metadata. Missing/third-state remote results, deleted labels and unversioned
+  local drift become visible conflicts retaining effect evidence. Stale caller
+  markers are rejected before recovery evidence is exposed.
+- Label GET/POST responses reject credential echoes, archived/malformed archive
+  state and unsafe node identities before retaining canonical evidence fields.
+  Historical label observation returns the actual locked row without mutations.
+- Final combined scoped PostgreSQL verification passed 299 tests (issues 11,
+  mirrors 107, provider 181), including existing issue-sync regressions. Nine-file
+  formatting, diff checks and focused review passed. Existing importer fixture
+  warnings remain outside these edits.
+- Existing pull-request write permission is sufficient for label creation;
+  token scope was not expanded ([GitHub permission reference](https://docs.github.com/en/rest/issues/labels#create-a-label)).
+- This closes the mapped new-local-label prerequisite path, not ongoing label
+  metadata convergence after later renames. Remaining head/merge/activation work,
+  pending-metadata-effect third-state resolution, PR14–16 and full PRD acceptance
+  remain open. No push, deployment or live GitHub write validation occurred.
+
 ### PR13 mapped inbound label materialization (2026-09-08)
 
 - Processing mapped pulls can import one unknown remote label and yield the same

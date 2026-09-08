@@ -2009,13 +2009,26 @@ defmodule ForgeMirrors do
 
   defp verify_remote_pull_label(_, _, _), do: {:error, :invalid_projection}
 
+  defp confirm_label_operation(operation, now, expected, confirmation, callback, lock_fun),
+    do:
+      confirm_label_operation(
+        operation,
+        now,
+        expected,
+        confirmation,
+        callback,
+        lock_fun,
+        fn projection -> {:ok, projection} end
+      )
+
   defp confirm_label_operation(
          %MirrorOperation{} = operation,
          %DateTime{} = now,
          expected,
          confirmation,
          domain_multi_fun,
-         lock_fun
+         lock_fun,
+         normalize_projection
        )
        when is_map(expected) and is_map(confirmation) and is_function(domain_multi_fun, 1) do
     with :ok <- validate_utc(now),
@@ -2032,6 +2045,7 @@ defmodule ForgeMirrors do
              true <- label_identity_compatible?(mapping, confirmation),
              {:ok, %{resource: projection}} <-
                Repo.transaction(domain_multi_fun.(Ecto.Multi.new())),
+             {:ok, projection} <- normalize_projection.(projection),
              {:ok, persisted, scope} <- lock_fun.(operation),
              {:ok, current_mapping} <-
                label_operation_mapping(persisted, expected, confirmation.github_object_id),
@@ -2086,7 +2100,61 @@ defmodule ForgeMirrors do
     end
   end
 
-  defp confirm_label_operation(_, _, _, _, _, _), do: {:error, :invalid_argument}
+  defp confirm_label_operation(_, _, _, _, _, _, _), do: {:error, :invalid_argument}
+
+  @doc false
+  def mark_mapped_pull_label_effect(operation, now, expected, marker, callback) do
+    with :ok <- validate_utc(now), :ok <- validate_bounded_object(marker) do
+      ForgeMirrors.PullLabelEffects.mark(
+        operation,
+        now,
+        expected,
+        marker,
+        callback,
+        &lock_resource_operation/1,
+        &publish_mapped_pull_label_effect/3
+      )
+    end
+  end
+
+  defp publish_mapped_pull_label_effect(operation, now, marker) do
+    owned_transition(operation, DateTime.truncate(now, :second), [:processing],
+      state: :effect_pending,
+      external_effect_marker: marker,
+      effect_marked_at: DateTime.truncate(now, :second)
+    )
+  end
+
+  @doc false
+  def mapped_pull_label_effect_context(operation),
+    do: ForgeMirrors.PullLabelEffects.context(operation, &lock_resource_operation/1)
+
+  @doc false
+  def confirm_mapped_pull_label(operation, now, expected, confirmation, callback) do
+    lock_fun = fn operation ->
+      with {:ok, persisted, scope} <-
+             ForgeMirrors.PullLabelEffects.lock_confirmation(
+               operation,
+               expected,
+               confirmation,
+               &lock_resource_operation/1
+             ),
+           :ok <- remote_pull_label_node_available(persisted, confirmation) do
+        {:ok, persisted, scope}
+      end
+    end
+
+    normalize = fn projection ->
+      ForgeMirrors.PullLabelEffects.normalize(
+        operation,
+        expected,
+        projection,
+        &lock_resource_operation/1
+      )
+    end
+
+    confirm_label_operation(operation, now, expected, confirmation, callback, lock_fun, normalize)
+  end
 
   @doc false
   def mark_label_effect_for_resource_operation(
