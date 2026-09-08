@@ -56,6 +56,29 @@ PR13 integration audit additionally identified these concrete remaining gates:
 
 ## Current local verification
 
+- `3a2ef63` label-node preparation consumes one authenticated inventory page per claim,
+  saves intent-bound progress, and seeds only existing confirmed local mappings
+  without modifying their metadata baseline. Existing and newly seeded node
+  collisions are rejected. Completed inventories with missing desired labels
+  produce `relationship_unavailable` conflicts from persisted evidence, retaining
+  the original creation marker and intent reservation. Real DB/local-Git/HTTP-stub
+  integration proves two-page resume, a subsequent fresh label rename, one POST
+  and one cleanup PATCH; empty inventory proves one scan, no PATCH, and a visible
+  conflict. Fresh verification passed 79 tests (58 mirror, 21 provider), and all
+  seven changed files passed formatting. This completes this outbound prerequisite
+  path locally, not mapped-PR synchronization, merge coordination, activation, or
+  the complete PRD acceptance gates.
+- `00f46fc` seeds one intended assignee node per leased recovery claim without
+  changing the creation marker or checkpoint. Database tests reject wrong IDs,
+  node collisions, expired leases, replacement installations, and removed users.
+  `767f705` resolves retained relationship nodes through one fresh GraphQL query,
+  replacing per-name HTTP lookups. Real database/local-Git/stubbed-HTTP integration
+  seeds two users across claims, then uses newly renamed logins for one cleanup
+  PATCH and confirms the original intent after exactly one creation POST. The
+  GraphQL deadline is bounded by the lease; it is not an end-to-end cleanup
+  deadline. Combined verification passed 69 tests (43 mirror, 26 provider),
+  including the pending label-proof boundary. Label worker preparation, exhausted
+  inventory conflicts, mapped-PR reconciliation, and activation remain open.
 - `f336fae` adds a single-page authenticated label inventory client. Pagination
   is fixed to the exact repository, advancing page, and 100-item page size;
   responses retain only bounded canonical fields and reject credential echoes,
