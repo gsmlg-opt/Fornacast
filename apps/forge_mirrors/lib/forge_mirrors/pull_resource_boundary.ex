@@ -53,8 +53,14 @@ defmodule ForgeMirrors.PullResourceBoundary do
   end
 
   def mark(scope, mapping, marker) do
-    with true <- marker["action"] in ~w(update_remote_pull_issue set_remote_pull_draft),
-         true <- mapping != nil and marker["github_object_id"] == mapping.github_object_id,
+    if marker["action"] in ~w(update_remote_pull_issue set_remote_pull_draft),
+      do: validate_precondition(scope, mapping, marker),
+      else: {:error, :stale_baseline}
+  end
+
+  @doc false
+  def validate_precondition(scope, mapping, marker) do
+    with true <- mapping != nil and marker["github_object_id"] == mapping.github_object_id,
          true <- marker["resource_state_lock_version"] == mapping.lock_version,
          true <-
            marker["github_node_id"] == mapping.github_node_id and

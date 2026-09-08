@@ -1892,13 +1892,25 @@ defmodule ForgeMirrors do
          true <-
            persisted.cursor == operation.cursor and
              persisted.organization_mirror_id == operation.organization_mirror_id,
-         {:ok, scope} <- resource_scope(persisted) do
+         {:ok, scope} <- resource_scope(persisted),
+         :ok <- resource_merge_reservation(persisted, scope) do
       {:ok, persisted, scope}
     else
       false -> {:error, :invalid_transition}
       {:error, reason} -> {:error, reason}
     end
   end
+
+  defp resource_merge_reservation(%{kind: "sync.pull"} = operation, scope) do
+    with {:ok, mapping} <- resource_mapping(operation, :pull) do
+      ForgeMirrors.PullMergeBoundary.check_pull_unreserved(
+        scope.repository_id,
+        mapping.local_resource_id
+      )
+    end
+  end
+
+  defp resource_merge_reservation(_, _), do: :ok
 
   defp resource_scope(operation) do
     binding = Repo.get(RepositoryMirror, operation.repository_mirror_id)
@@ -2640,7 +2652,8 @@ defmodule ForgeMirrors do
         {:ok, marked} ->
           {:ok, marked}
 
-        {:error, reason} when reason in [:lost_lease, :invalid_transition, :paused] ->
+        {:error, reason}
+        when reason in [:lost_lease, :invalid_transition, :paused, :merge_reserved] ->
           {:error, reason}
 
         {:error, _reason} ->
@@ -2694,7 +2707,8 @@ defmodule ForgeMirrors do
         {:ok, replaced} ->
           {:ok, replaced}
 
-        {:error, reason} when reason in [:lost_lease, :invalid_transition, :paused] ->
+        {:error, reason}
+        when reason in [:lost_lease, :invalid_transition, :paused, :merge_reserved] ->
           {:error, reason}
 
         {:error, _reason} ->
@@ -2713,6 +2727,13 @@ defmodule ForgeMirrors do
 
   defp validate_pull_effect(operation, marker) do
     case Repo.get(MirrorOperation, operation.id) do
+      %MirrorOperation{kind: "merge.pull"} ->
+        # Coordinated merge effects require persisted T/M and their own proof boundary.
+        {:error, :invalid_transition}
+
+      %MirrorOperation{kind: "sync.git_ref"} = persisted ->
+        ref_merge_reservation(persisted)
+
       %MirrorOperation{kind: "sync.pull"} ->
         with {:ok, persisted, scope} <- lock_resource_operation(operation),
              {:ok, mapping} <- resource_mapping(persisted, :pull) do
@@ -2738,7 +2759,8 @@ defmodule ForgeMirrors do
           | {:error, :lost_lease | :invalid_transition | :invalid_argument}
   def complete_operation(%MirrorOperation{state: state} = operation, %DateTime{} = now)
       when state in [:processing, :effect_pending] do
-    with :ok <- validate_utc(now) do
+    with :ok <- validate_utc(now),
+         :ok <- validate_generic_merge_transition(operation, :completed) do
       now = DateTime.truncate(now, :second)
 
       owned_transition(operation, now, [state],
@@ -2782,6 +2804,7 @@ defmodule ForgeMirrors do
          :ok <- validate_retryable_failure_class(failure_class),
          :ok <- validate_keyword(options),
          :ok <- validate_failure_detail(Keyword.get(options, :failure_detail)),
+         :ok <- validate_generic_merge_transition(operation, :pending),
          :ok <- validate_effect_retry(state, options) do
       owned_transition(operation, DateTime.truncate(now, :second), [state],
         state: :pending,
@@ -2817,6 +2840,7 @@ defmodule ForgeMirrors do
       when state in [:processing, :effect_pending] do
     with :ok <- validate_utc(now),
          {:ok, failure_disposition} <- nonretryable_failure_disposition(failure_class),
+         :ok <- validate_generic_merge_transition(operation, :failed),
          :ok <- validate_failure_detail(failure_detail) do
       owned_transition(operation, DateTime.truncate(now, :second), [state],
         state: :failed,
@@ -2836,6 +2860,18 @@ defmodule ForgeMirrors do
 
   def fail_operation(_operation, _now, _failure_class, _failure_detail),
     do: {:error, :invalid_argument}
+
+  defp validate_generic_merge_transition(operation, target) do
+    # Inspect the persisted kind, not caller-provided struct routing. The final
+    # transition's exact lease/version CAS also fences any intervening phase change.
+    case Repo.get(MirrorOperation, operation.id) do
+      %{kind: "merge.pull", state: state} when target == :completed or state == :effect_pending ->
+        {:error, :invalid_transition}
+
+      _ ->
+        :ok
+    end
+  end
 
   @spec recover_expired_operations(DateTime.t()) ::
           {:ok, non_neg_integer()} | {:error, :invalid_argument | :unavailable}
@@ -4149,11 +4185,24 @@ defmodule ForgeMirrors do
   defp valid_git_baseline?(baseline), do: optional_oid?(baseline)
 
   defp lock_owned_git_ref_operation(operation, ref_name) do
-    with {:ok, persisted} <- lock_owned_operation(operation, ["sync.git_ref"]),
-         %MirrorOperation{cursor: %{"ref_name" => ^ref_name}} <- persisted do
+    with :ok <- lock_effect_scope(operation),
+         {:ok, persisted} <- lock_owned_operation(operation, ["sync.git_ref"]),
+         %MirrorOperation{cursor: %{"ref_name" => ^ref_name}} <- persisted,
+         :ok <- ref_merge_reservation(persisted) do
       {:ok, persisted}
     else
+      {:error, _} = error -> error
       _missing -> {:error, :lost_lease}
+    end
+  end
+
+  defp ref_merge_reservation(operation) do
+    case Repo.get(RepositoryMirror, operation.repository_mirror_id) do
+      %{repository_id: id} when is_integer(id) ->
+        ForgeMirrors.PullMergeBoundary.check_ref_unreserved(id, operation.cursor["ref_name"])
+
+      _ ->
+        {:error, :lost_lease}
     end
   end
 

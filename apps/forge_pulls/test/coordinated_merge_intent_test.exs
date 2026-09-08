@@ -104,6 +104,109 @@ defmodule ForgePulls.CoordinatedMergeIntentTest do
     assert Repo.get!(MergeOperation, first.id).commit_intent == first.commit_intent
   end
 
+  test "another coordinator cannot reserve the same pull or base while intent is nonterminal",
+       c do
+    assert {:ok, %{prepared: first}} = prepare(c.request)
+
+    competing = %{
+      c.request
+      | coordinator_operation_id: c.request.coordinator_operation_id + 1,
+        request_id: "another-coordinator"
+    }
+
+    assert {:error, :prepared, :merge_reserved, _} = prepare(competing)
+    assert {:ok, %{prepared: replay}} = prepare(c.request)
+    assert replay.id == first.id
+
+    issue =
+      Repo.insert!(%Issue{
+        repository_id: c.repository.id,
+        number: 99,
+        kind: :pull_request,
+        title: "Another",
+        author_user_id: c.actor.id
+      })
+
+    pull =
+      Repo.insert!(%PullRequest{
+        repository_id: c.repository.id,
+        issue_id: issue.id,
+        head_repository_id: c.repository.id,
+        head_ref: c.pull.head_ref,
+        base_ref: c.pull.base_ref,
+        head_sha: c.pull.head_sha,
+        base_sha: c.pull.base_sha
+      })
+
+    {:ok, projection} = ForgePulls.sync_projection(c.repository.id, :pull, pull.id)
+
+    competing = %{
+      competing
+      | local_resource_id: pull.id,
+        expected_fields: projection.fields,
+        expected_local_version: projection.local_version
+    }
+
+    assert {:error, :prepared, :merge_reserved, _} = prepare(competing)
+    assert operation_count(c.repository.id) == 1
+  end
+
+  test "bare domain preparation rejects both directions of base/head overlap", c do
+    {:ok, second} =
+      ForgeRepos.create_repository(c.actor, %{
+        name: "second",
+        slug: "second",
+        visibility: :private
+      })
+
+    {:ok, third} =
+      ForgeRepos.create_repository(c.actor, %{name: "third", slug: "third", visibility: :private})
+
+    c.pull |> Changeset.change(head_repository_id: second.id) |> Repo.update!()
+    request = %{c.request | expected_head_repository_id: second.id}
+    assert {:ok, %{prepared: _}} = prepare(request)
+
+    for {base, head, base_ref, head_ref} <- [
+          {second, third, c.pull.head_ref, "refs/heads/topic"},
+          {third, c.repository, "refs/heads/other", c.pull.base_ref}
+        ] do
+      issue =
+        Repo.insert!(%Issue{
+          repository_id: base.id,
+          number: 1,
+          kind: :pull_request,
+          title: "Competing",
+          author_user_id: c.actor.id
+        })
+
+      pull =
+        Repo.insert!(%PullRequest{
+          repository_id: base.id,
+          issue_id: issue.id,
+          head_repository_id: head.id,
+          head_ref: head_ref,
+          base_ref: base_ref,
+          head_sha: c.pull.head_sha,
+          base_sha: c.pull.base_sha
+        })
+
+      {:ok, projection} = ForgePulls.sync_projection(base.id, :pull, pull.id)
+
+      competing = %{
+        request
+        | repository_id: base.id,
+          local_resource_id: pull.id,
+          expected_head_repository_id: head.id,
+          expected_fields: projection.fields,
+          expected_local_version: projection.local_version,
+          coordinator_operation_id: request.coordinator_operation_id + 1,
+          request_id: "competing-cross-repository"
+      }
+
+      assert {:error, :prepared, :merge_reserved, _} = prepare(competing)
+    end
+  end
+
   test "stale aggregate version fields and head identity cannot prepare", c do
     for request <- [
           %{c.request | expected_local_version: c.issue.sync_version + 1},

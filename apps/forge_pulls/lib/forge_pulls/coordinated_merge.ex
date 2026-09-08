@@ -256,8 +256,26 @@ defmodule ForgePulls.CoordinatedMerge do
 
   def append_prepare_coordinated_merge(%Multi{} = multi, key, request) when is_map(request) do
     multi
-    |> Multi.run({key, :request}, fn _, _ ->
-      if valid_request?(request), do: {:ok, :validated}, else: {:error, :invalid_merge_intent}
+    |> Multi.run({key, :request}, fn repo, _ ->
+      if valid_request?(request) and positive?(request[:repository_id]) do
+        # Same transaction advisory key as ForgeMirrors.PullMergeBoundary.
+        # Acquire before Issue/Pull locks, never a repository-row -> Issue inversion.
+        [request.repository_id, request[:expected_head_repository_id]]
+        |> Enum.filter(&positive?/1)
+        |> Enum.uniq()
+        |> Enum.sort()
+        |> Enum.each(fn id ->
+          Ecto.Adapters.SQL.query!(
+            repo,
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            ["fornacast:merge-reservation:#{id}"]
+          )
+        end)
+
+        {:ok, :validated}
+      else
+        {:error, :invalid_merge_intent}
+      end
     end)
     |> Sync.append_sync_observe({key, :snapshot}, request)
     |> Multi.run(key, fn repo, changes ->
@@ -282,7 +300,27 @@ defmodule ForgePulls.CoordinatedMerge do
                  lock: "FOR UPDATE"
              ) do
           nil ->
-            repo.insert(MergeOperation.prepare_coordinated_changeset(%MergeOperation{}, attrs))
+            if repo.exists?(
+                 from operation in MergeOperation,
+                   where:
+                     operation.coordination_mode == :mirror and
+                       operation.state not in [:completed, :failed] and
+                       (operation.pull_request_id == ^attrs.pull_request_id or
+                          (operation.repository_id == ^attrs.repository_id and
+                             operation.base_ref == ^attrs.base_ref) or
+                          (operation.head_ref == ^attrs.base_ref and
+                             fragment(
+                               "?->'resource'->>'head_repository_id' = ?",
+                               operation.commit_intent,
+                               ^to_string(attrs.repository_id)
+                             )) or
+                          (operation.repository_id == ^head_repository.id and
+                             operation.base_ref == ^attrs.head_ref))
+               ) do
+              {:error, :merge_reserved}
+            else
+              repo.insert(MergeOperation.prepare_coordinated_changeset(%MergeOperation{}, attrs))
+            end
 
           existing ->
             if existing.coordination_mode == :mirror and
