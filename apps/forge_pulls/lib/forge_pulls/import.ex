@@ -24,6 +24,36 @@ defmodule ForgePulls.Import do
         attrs
       )
       when is_map(attrs) do
+    import_pull_request_multi(
+      multi,
+      key,
+      repository,
+      canonical_issue,
+      merger_identity,
+      attrs,
+      repository.id
+    )
+  end
+
+  @spec import_pull_request_multi(
+          Multi.t(),
+          Multi.name(),
+          Repository.t(),
+          Issue.t(),
+          GitHubIdentity.t() | nil,
+          map(),
+          pos_integer() | nil
+        ) :: Multi.t()
+  def import_pull_request_multi(
+        multi,
+        key,
+        %Repository{} = repository,
+        %Issue{} = canonical_issue,
+        merger_identity,
+        attrs,
+        head_repository_id
+      )
+      when is_map(attrs) do
     Multi.insert(multi, key, fn _changes ->
       attrs = Map.merge(attrs, merger_fields(merger_identity))
 
@@ -31,7 +61,7 @@ defmodule ForgePulls.Import do
         issue_id: canonical_issue.id,
         repository_id: repository.id
       }
-      |> PullRequest.import_changeset(attrs, canonical_issue, repository)
+      |> PullRequest.import_changeset(attrs, canonical_issue, repository, head_repository_id)
     end)
   end
 

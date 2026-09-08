@@ -473,6 +473,22 @@ defmodule ForgePulls do
               ),
               to: ForgePulls.Import
 
+  @doc """
+  Appends a trusted import with an explicit represented head repository, or nil
+  for external read-only metadata. The caller verifies provider/mirror identity;
+  the head choice is never taken from attrs. The six-argument form stays local.
+  """
+  defdelegate import_pull_request_multi(
+                multi,
+                key,
+                repository,
+                canonical_issue,
+                merger_identity,
+                attrs,
+                head_repository_id
+              ),
+              to: ForgePulls.Import
+
   @spec update_pull_request(ForgeRepos.Repository.t(), PullRequest.t(), map(), map(), map()) ::
           {:ok, PullRequest.t()} | {:error, error_reason()}
   def update_pull_request(

@@ -96,6 +96,69 @@ defmodule ForgePulls.GitHubImportTest do
     assert is_nil(pull.merged_by_user_id)
   end
 
+  test "trusted import head choice cannot be replaced by attrs", ctx do
+    represented = repository_fixture(ctx.owner)
+
+    for {head_id, number} <- [{nil, 91}, {represented.id, 92}] do
+      issue = import_issue!(ctx.repository, ctx.merger, number, :pull_request, "Head import")
+
+      attrs =
+        Map.merge(head_import_attrs(), %{head_repository_id: ctx.repository.id, draft: true})
+
+      assert {:ok, %{pull: pull}} =
+               Multi.new()
+               |> ForgePulls.import_pull_request_multi(
+                 :pull,
+                 ctx.repository,
+                 issue,
+                 nil,
+                 attrs,
+                 head_id
+               )
+               |> Repo.transaction()
+
+      assert pull.head_repository_id == head_id
+      assert pull.draft
+    end
+  end
+
+  test "trusted head import preserves canonical repository checks and invalid head errors", ctx do
+    other = repository_fixture(ctx.owner)
+    foreign_issue = import_issue!(other, ctx.merger, 91, :pull_request, "Foreign")
+
+    assert {:error, :pull, changeset, _} =
+             Multi.new()
+             |> ForgePulls.import_pull_request_multi(
+               :pull,
+               ctx.repository,
+               foreign_issue,
+               nil,
+               head_import_attrs(),
+               nil
+             )
+             |> Repo.transaction()
+
+    assert changeset.errors[:repository_id]
+
+    issue = import_issue!(ctx.repository, ctx.merger, 92, :pull_request, "Invalid head")
+
+    for head_id <- [-1, "123", 9_223_372_036_854_775_808] do
+      assert {:error, :pull, changeset, _} =
+               Multi.new()
+               |> ForgePulls.import_pull_request_multi(
+                 :pull,
+                 ctx.repository,
+                 issue,
+                 nil,
+                 head_import_attrs(),
+                 head_id
+               )
+               |> Repo.transaction()
+
+      assert changeset.errors[:head_repository_id]
+    end
+  end
+
   test "records ghost mergers through the deleted github identity", %{
     repository: repository,
     merger: merger,
@@ -222,7 +285,12 @@ defmodule ForgePulls.GitHubImportTest do
              ForgePulls.create_pull_request(
                repository,
                owner,
-               %{"title" => "Live pull", "head" => "feature", "base" => "main"},
+               %{
+                 "title" => "Live pull",
+                 "head" => "feature",
+                 "base" => "main",
+                 "head_repository_id" => nil
+               },
                %{}
              )
 
@@ -435,24 +503,30 @@ defmodule ForgePulls.GitHubImportTest do
   defp import_head_pull!(ctx, head_repository_id) do
     issue = import_issue!(ctx.repository, ctx.merger, 70, :pull_request, "Remote head")
 
-    {:ok, pull} =
-      %PullRequest{issue_id: issue.id, repository_id: ctx.repository.id}
-      |> PullRequest.import_changeset(
-        %{
-          head_ref: "refs/heads/remote-feature",
-          base_ref: "refs/heads/main",
-          head_sha: String.duplicate("a", 40),
-          base_sha: String.duplicate("b", 40),
-          inserted_at: @inserted_at,
-          updated_at: @updated_at
-        },
-        issue,
+    {:ok, %{pull: pull}} =
+      Multi.new()
+      |> ForgePulls.import_pull_request_multi(
+        :pull,
         ctx.repository,
+        issue,
+        nil,
+        head_import_attrs(),
         head_repository_id
       )
-      |> Repo.insert()
+      |> Repo.transaction()
 
     {issue, pull}
+  end
+
+  defp head_import_attrs do
+    %{
+      head_ref: "refs/heads/remote-feature",
+      base_ref: "refs/heads/main",
+      head_sha: String.duplicate("a", 40),
+      base_sha: String.duplicate("b", 40),
+      inserted_at: @inserted_at,
+      updated_at: @updated_at
+    }
   end
 
   defp import_issue!(repository, identity, number, kind, title) do
