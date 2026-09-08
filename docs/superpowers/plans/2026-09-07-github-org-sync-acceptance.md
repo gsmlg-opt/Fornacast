@@ -10,6 +10,25 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 paired confirmation and identity-link fencing (2026-09-08)
+
+- `894f57e` fences current/target local assignee users and known GitHub identities
+  with PostgreSQL NOWAIT/savepoint locks. Four independent-connection tests cover
+  linking existing identities, inserting linked identities, inverse lock contention,
+  and rollback of scalar/version/outbox changes. Contention returns
+  `:relationship_lock_busy`; mapped worker integration must retry it.
+- Processing-only `confirm_mapped_pull_pair/5` validates both baseline tokens,
+  reads the actual resulting domain relationship projection, and confirms both
+  mappings in the same transaction as the local mutation and operation completion.
+  Regressing companion observation times and incorrect resulting sets roll back.
+  Its callback is trusted internal domain composition, not a sandbox for arbitrary
+  writes. Effect-pending recovery and worker integration are still outstanding.
+- Root combined verification: 58 scoped tests passed (issues 12, mirrors 26,
+  pulls 20), including four independent PostgreSQL tests; six-file format check
+  passed. Existing importer test-support warnings remain unrelated.
+- These are local prerequisites, not PR13 completion, activation, live GitHub
+  validation, or full PRD acceptance. Nothing was pushed or deployed.
+
 PR13 integration audit additionally identified these concrete remaining gates:
 
 - Bootstrap draft and cross-repository mapping exclusions were removed in
