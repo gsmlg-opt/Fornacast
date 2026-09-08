@@ -56,6 +56,13 @@ PR13 integration audit additionally identified these concrete remaining gates:
 
 ## Current local verification
 
+- `7efefd4` moves mapped-pull Git eligibility and immutable/scalar preflight ahead
+  of author and assignee attribution writes. A regression reproduced attribution
+  on a substituted repository before rejection; paired issue identity, changed
+  refs, and incoherent scalar observations are also rejected before attribution.
+  Unavailable local refs now prevent provider reads. Forty-six scoped mapped,
+  creation, and lifecycle tests passed; three files passed formatting. Mapped
+  label/assignee set reconciliation remains the next integration gate.
 - `3a2ef63` label-node preparation consumes one authenticated inventory page per claim,
   saves intent-bound progress, and seeds only existing confirmed local mappings
   without modifying their metadata baseline. Existing and newly seeded node
