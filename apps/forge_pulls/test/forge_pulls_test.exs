@@ -1665,6 +1665,71 @@ defmodule ForgePullsTest do
     refute Map.has_key?(audit_metadata, "unsafe")
   end
 
+  test "mirrored merges require one coordinator even for paused or revoked bindings" do
+    owner = user_fixture(unique("mirror-merge-owner"))
+    organization = organization_fixture(owner, unique("mirror-merge-org"))
+    repository = repository_fixture(organization)
+    {base_oid, head_oid} = create_mergeable_branches!(repository)
+    assert {:ok, pull} = create_pull(repository, owner, "Mirrored merge", "feature", "main")
+    now = DateTime.utc_now(:second)
+
+    %{rows: [[mirror_id]]} =
+      SQL.query!(
+        Repo,
+        "INSERT INTO organization_mirrors (organization_id, provider, state, inserted_at, updated_at) VALUES ($1, 'github', 'active', $2, $2) RETURNING id",
+        [organization.id, now]
+      )
+
+    SQL.query!(
+      Repo,
+      "INSERT INTO repository_mirrors (organization_mirror_id, repository_id, github_repository_id, github_node_id, github_full_name, state, inserted_at, updated_at) VALUES ($1, $2, $2, $4, $5, 'active', $3, $3)",
+      [
+        mirror_id,
+        repository.id,
+        now,
+        "R_#{repository.id}",
+        "#{organization.username}/#{repository.slug}"
+      ]
+    )
+
+    for {organization_state, resume_state, binding_state} <- [
+          {"active", nil, "active"},
+          {"paused", "active", "active"},
+          {"revoked", nil, "revoked"}
+        ] do
+      SQL.query!(
+        Repo,
+        "UPDATE organization_mirrors SET state = $1, resume_state = $2 WHERE id = $3",
+        [organization_state, resume_state, mirror_id]
+      )
+
+      SQL.query!(
+        Repo,
+        "UPDATE repository_mirrors SET state = $1 WHERE organization_mirror_id = $2",
+        [binding_state, mirror_id]
+      )
+
+      assert {:error, {:unavailable, :mirror_merge_coordinator_required}} =
+               ForgePulls.merge(
+                 repository,
+                 pull,
+                 owner,
+                 %{sha: head_oid},
+                 request_metadata(unique("mirrored-merge"))
+               )
+
+      assert {:ok, ^base_oid} =
+               GitCore.exact_ref(ForgeRepos.absolute_storage_path(repository), "refs/heads/main")
+
+      refute Repo.exists?(
+               from operation in MergeOperation, where: operation.pull_request_id == ^pull.id
+             )
+
+      assert Repo.get!(Issue, pull.issue_id).state == :open
+      assert Repo.get!(PullRequest, pull.id).merge_commit_sha == nil
+    end
+  end
+
   test "draft pull requests cannot merge even through a stale non-draft handle" do
     owner = user_fixture(unique("draft-merge"))
     repository = repository_fixture(owner)

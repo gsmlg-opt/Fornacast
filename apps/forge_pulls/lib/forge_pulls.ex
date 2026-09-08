@@ -682,13 +682,25 @@ defmodule ForgePulls do
          :ok <- same_pull_refs(pull, expected_pull),
          %Issue{kind: :pull_request} = issue <- current_issue(pull.issue_id, repository),
          true <- pull.head_repository_id == repository.id,
-         true <- Fornacast.Access.allowed?(actor, :repository_write, repository) do
+         true <- Fornacast.Access.allowed?(actor, :repository_write, repository),
+         :ok <- require_unmirrored_merge(repository.id) do
       {:ok, %{actor: actor, repository: repository, pull: pull, issue: issue}}
     else
       false -> {:error, :forbidden}
       nil -> {:error, :not_found}
       {:error, _reason} = error -> error
     end
+  end
+
+  # Read mirror ownership without a dependency on the provider/coordinator apps.
+  # Paused or revoked bindings are not permission to create an independent merge.
+  # authorize_merge runs before recovery and again inside the repository write fence.
+  defp require_unmirrored_merge(repository_id) do
+    if Repo.exists?(
+         from binding in "repository_mirrors", where: binding.repository_id == ^repository_id
+       ),
+       do: {:error, {:unavailable, :mirror_merge_coordinator_required}},
+       else: :ok
   end
 
   defp same_pull_refs(
