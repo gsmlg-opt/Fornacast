@@ -328,16 +328,22 @@ defmodule ForgeIssues.Sync do
   # replaces membership only; version and event ownership remain with the caller.
   def replace_relationships(repo, %Issue{} = issue, request) when is_map(request) do
     if repo.in_transaction?() and bounded_list?(request[:local_label_ids]) and
-         bounded_list?(request[:assignee_refs]),
-       do: relationships(repo, issue, request),
-       else: {:error, :invalid_relationship}
+         bounded_list?(request[:assignee_refs]) and
+         Enum.all?(request.assignee_refs, &relationship_ref?/1) do
+      with {:ok, _} <-
+             lock_assignee_identities(repo, assignee_refs(repo, issue) ++ request.assignee_refs),
+           do: relationships(repo, issue, request)
+    else
+      {:error, :invalid_relationship}
+    end
   end
 
   def replace_relationships(_, _, _), do: {:error, :invalid_relationship}
 
   @doc false
   # Canonical preimages use local identity row IDs, never provider names/logins.
-  # Known identity rows are share-locked until aggregate confirmation completes.
+  # User FK fences prevent new identity links; known identity share locks prevent
+  # unlinking. NOWAIT avoids waiting against Accounts' identity-first write order.
   def relationship_projection(repo, %Issue{} = issue) do
     if repo.in_transaction?() do
       labels =
@@ -349,18 +355,9 @@ defmodule ForgeIssues.Sync do
         )
 
       refs = assignee_refs(repo, issue)
-      user_ids = for %{kind: :local_user, id: id} <- refs, do: id
-      identity_ids = for %{kind: :github_identity, id: id} <- refs, do: id
-
-      identities =
-        repo.all(
-          from i in ForgeAccounts.GitHubIdentity,
-            where: i.kind == :user and (i.local_user_id in ^user_ids or i.id in ^identity_ids),
-            order_by: i.id,
-            lock: "FOR SHARE"
-        )
 
       with true <- bounded_list?(labels) and bounded_list?(refs),
+           {:ok, identities} <- lock_assignee_identities(repo, refs),
            {:ok, managed} <- managed_identities(refs, identities) do
         {:ok,
          %{
@@ -378,6 +375,44 @@ defmodule ForgeIssues.Sync do
   end
 
   def relationship_projection(_, _), do: {:error, :invalid_relationship}
+
+  defp relationship_ref?(%{kind: kind, id: id} = ref)
+       when kind in [:local_user, :github_identity] and valid_id(id), do: map_size(ref) == 2
+
+  defp relationship_ref?(_), do: false
+
+  defp lock_assignee_identities(repo, refs) do
+    user_ids = for %{kind: :local_user, id: id} <- refs, do: id
+    identity_ids = for %{kind: :github_identity, id: id} <- refs, do: id
+
+    # Each lock query uses a savepoint so NOWAIT rejection leaves the caller's
+    # transaction usable long enough to return a typed Multi rollback reason.
+    repo.all(
+      from(u in ForgeAccounts.User,
+        where: u.id in ^user_ids,
+        order_by: u.id,
+        lock: "FOR UPDATE NOWAIT"
+      ),
+      mode: :savepoint
+    )
+
+    identities =
+      repo.all(
+        from(i in ForgeAccounts.GitHubIdentity,
+          where: i.kind == :user and (i.local_user_id in ^user_ids or i.id in ^identity_ids),
+          order_by: i.id,
+          lock: "FOR SHARE NOWAIT"
+        ),
+        mode: :savepoint
+      )
+
+    {:ok, identities}
+  rescue
+    error in Postgrex.Error ->
+      if error.postgres[:code] == :lock_not_available,
+        do: {:error, :relationship_lock_busy},
+        else: reraise(error, __STACKTRACE__)
+  end
 
   defp managed_identities(refs, identities) do
     Enum.reduce_while(refs, {:ok, []}, fn ref, {:ok, ids} ->

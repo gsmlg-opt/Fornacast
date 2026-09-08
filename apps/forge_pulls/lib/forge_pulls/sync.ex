@@ -20,8 +20,8 @@ defmodule ForgePulls.Sync do
 
   Minimum-version effect recovery may return newer membership, never certify it
   as the older baseline. The outer coordinator must validate the returned actual
-  projection. Known identity share locks fence unlinking, but new links to a
-  previously unmanaged user are not serialized by this API alone.
+  projection. Shared relationship helpers hold user FK fences and known identity
+  locks; contention returns `:relationship_lock_busy` for a fresh retry.
   """
   import Ecto.Query
   alias Ecto.{Changeset, Multi}
