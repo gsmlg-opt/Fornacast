@@ -198,6 +198,14 @@ defmodule ForgeGitHub.PullCreateIntegrationTest do
       assert is_nil(Process.get(:create_patches))
       assert Repo.aggregate(MirrorResourceState, :count) == 0
     end
+
+    assert {:ok, _} = process(c)
+    assert Process.get(:relationship_queries) == 1
+    assert Process.get(:identity_gets) == 2
+    assert Process.get(:create_posts) == 1
+    assert Process.get(:create_patches) == 1
+    assert Process.get(:patched_assignees) == ["current-4201", "current-4202"]
+    assert Repo.get!(MirrorOperation, c.operation.id).state == :completed
   end
 
   test "missing live local ref prevents intent and provider POST", c do
@@ -269,6 +277,27 @@ defmodule ForgeGitHub.PullCreateIntegrationTest do
   defp stub_provider(c, options \\ []) do
     Req.Test.stub(c.stub, fn conn ->
       case {conn.method, conn.request_path} do
+        {"POST", "/graphql"} ->
+          assert Keyword.get(options, :seed_assignees, false)
+          {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+          assert JSON.decode!(body)["variables"] == %{
+                   "labels" => [],
+                   "assignees" => ["U_4201", "U_4202"]
+                 }
+
+          Process.put(:relationship_queries, Process.get(:relationship_queries, 0) + 1)
+
+          Req.Test.json(conn, %{
+            "data" => %{
+              "labels" => [],
+              "assignees" =>
+                Enum.map([4201, 4202], fn id ->
+                  %{"__typename" => "User", "id" => "U_#{id}", "login" => "current-#{id}"}
+                end)
+            }
+          })
+
         {"GET", "/user/" <> id} ->
           assert Keyword.get(options, :seed_assignees, false)
           Process.put(:identity_gets, Process.get(:identity_gets, 0) + 1)
@@ -306,6 +335,16 @@ defmodule ForgeGitHub.PullCreateIntegrationTest do
           attrs = JSON.decode!(body)
           Process.put(:create_body, attrs["body"])
           Process.put(:create_patches, Process.get(:create_patches, 0) + 1)
+          Process.put(:patched_assignees, attrs["assignees"])
+
+          Process.put(
+            :create_assignees,
+            Enum.map(attrs["assignees"] || [], fn login ->
+              id = login |> String.split("-") |> List.last() |> String.to_integer()
+              %{"id" => id, "node_id" => "U_#{id}", "login" => login}
+            end)
+          )
+
           Req.Test.json(conn, issue(c))
 
         {"GET", "/repos/acme/base/pulls/7"} ->
@@ -367,7 +406,7 @@ defmodule ForgeGitHub.PullCreateIntegrationTest do
       "state" => "open",
       "state_reason" => nil,
       "labels" => [],
-      "assignees" => [],
+      "assignees" => Process.get(:create_assignees, []),
       "user" => user(),
       "closed_at" => nil,
       "created_at" => "2026-09-08T00:00:00Z",

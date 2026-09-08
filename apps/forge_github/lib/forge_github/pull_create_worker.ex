@@ -9,19 +9,18 @@ defmodule ForgeGitHub.PullCreateWorker do
   import Ecto.Query
 
   alias ForgeGitHub.{
-    Client,
     Error,
     IdentityClient,
     InstallationToken,
     InstallationTokenBroker,
     IssueClient,
     IssueSyncProjection,
-    LabelClient,
     PullClient,
     PullCreateRecovery,
     PullSyncProjection,
     PullSyncWorker,
-    RefObservation
+    RefObservation,
+    RelationshipClient
   }
 
   alias ForgeMirrors.{CorrelationMarker, MirrorOperation, MirrorResourceState}
@@ -277,7 +276,7 @@ defmodule ForgeGitHub.PullCreateWorker do
              sync,
              sync.intent,
              token,
-             options
+             Keyword.put(options, :relationship_deadline, relationship_deadline(operation))
            ),
          # Re-read after relationship HTTP calls; do not overwrite intervening
          # metadata from a third party while removing the correlation marker.
@@ -534,65 +533,58 @@ defmodule ForgeGitHub.PullCreateWorker do
 
   defp relationship_attrs(sync, intent, token, options) do
     snapshot = intent.payload["issue_snapshot"]
+    label_ids = snapshot["label_github_ids"]
+    assignee_ids = snapshot["assignee_github_ids"]
 
-    with {:ok, labels} <- label_names(sync, snapshot["label_github_ids"], token, options),
-         {:ok, assignees} <-
-           assignee_logins(sync, snapshot["assignee_github_ids"], token, options) do
-      {:ok, %{"labels" => labels, "assignees" => assignees}}
-    end
-  end
-
-  defp label_names(sync, ids, token, options) do
-    rows =
+    labels =
       Repo.all(
         from m in MirrorResourceState,
           where:
             m.repository_mirror_id == ^sync.repository_mirror_id and m.resource_kind == :label and
-              m.state == :confirmed and m.github_object_id in ^ids,
-          select: {m.github_object_id, m.confirmed_snapshot}
+              m.state == :confirmed and m.github_object_id in ^label_ids,
+          order_by: m.github_object_id,
+          select: %{github_object_id: m.github_object_id, github_node_id: m.github_node_id}
       )
-      |> Map.new()
 
-    Enum.reduce_while(ids, {:ok, []}, fn id, {:ok, names} ->
-      name = get_in(rows, [id, "name"])
-
-      with true <- is_binary(name),
-           {:ok, %{"id" => ^id, "name" => ^name}} <-
-             LabelClient.get_label(
-               token,
-               sync.remote_owner,
-               sync.remote_repository,
-               name,
-               request_options(sync, options)
-             ) do
-        {:cont, {:ok, names ++ [name]}}
-      else
-        _ -> {:halt, {:error, :relationship_prerequisite}}
-      end
-    end)
-  end
-
-  defp assignee_logins(sync, ids, token, options) do
-    rows =
+    assignees =
       Repo.all(
         from u in ForgeAccounts.GitHubIdentity,
-          where: u.kind == :user and u.github_user_id in ^ids,
-          select: {u.github_user_id, u.login}
+          where: u.kind == :user and u.github_user_id in ^assignee_ids,
+          order_by: u.github_user_id,
+          select: %{github_user_id: u.github_user_id, github_node_id: u.github_node_id}
       )
-      |> Map.new()
 
-    Enum.reduce_while(ids, {:ok, []}, fn id, {:ok, logins} ->
-      login = rows[id]
+    base = intent.payload["provider_repositories"]["base_repository"]
+    repository = %{github_object_id: base["id"], github_node_id: base["node_id"]}
 
-      with true <- ForgeGitHub.RepositoryReference.valid_owner?(login),
-           {:ok, %{"id" => ^id, "login" => ^login}} <-
-             Client.request(token, :get, "/users/#{login}", request_options(sync, options)) do
-        {:cont, {:ok, logins ++ [login]}}
-      else
-        _ -> {:halt, {:error, :relationship_prerequisite}}
-      end
-    end)
+    request_opts =
+      Keyword.put(
+        request_options(sync, options),
+        :deadline_monotonic_ms,
+        Keyword.fetch!(options, :relationship_deadline)
+      )
+
+    with true <- Enum.map(labels, & &1.github_object_id) == label_ids,
+         true <- Enum.map(assignees, & &1.github_user_id) == assignee_ids,
+         {:ok, resolved} <-
+           RelationshipClient.resolve(token, repository, labels, assignees, request_opts) do
+      {:ok,
+       %{
+         "labels" => Enum.map(resolved.labels, & &1.name),
+         "assignees" => Enum.map(resolved.assignees, & &1.login)
+       }}
+    else
+      false -> {:error, :relationship_prerequisite}
+      {:error, reason} -> {:error, reason}
+    end
   end
+
+  defp relationship_deadline(%{lease_expires_at: %DateTime{} = expires}) do
+    System.monotonic_time(:millisecond) + DateTime.diff(expires, DateTime.utc_now(), :millisecond) -
+      2_000
+  end
+
+  defp relationship_deadline(_), do: System.monotonic_time(:millisecond)
 
   defp token(sync, options) do
     case callback(options, :token_fetch, &InstallationTokenBroker.fetch/2).(
