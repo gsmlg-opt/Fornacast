@@ -10,6 +10,32 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 merge-owned metadata decisions and durable conflicts (2026-09-08)
+
+- A separate pure merge-time decision uses authentic paired baselines for
+  title/body and relationship set deltas. It returns metadata targets only, not
+  invented closed/ref baselines. Ordinary pull metadata decisions remain intact.
+  Proposed relationship sets retain the 512-entry limit after delta composition.
+- The merge worker routes competing scalar edits and incompatible draft/state
+  changes to independently validated durable conflicts. Confirmation authority,
+  paired mappings, current domain projection, and provider evidence are rechecked;
+  Issue then Pull row locks prevent stale conflict classification. Conflict
+  insertion and lease yielding preserve the effect marker and original baselines.
+- Authorization inside finalization rejects incompatible newer local closure
+  states before domain mutation, so a not-planned/reopened edit cannot silently
+  become completed. Existing open conflicts continue to block confirmation.
+- Connected scoped PostgreSQL matrix: **87 passed** (confirmation 25, finalizer
+  14, provider worker/observation/decision 48). Tests cover real worker routing,
+  invalid evidence, current authority, row-lock order, and preserved snapshots.
+- Final broader scoped matrix: **197 passed** (Git 4, mirrors 63, pull domain
+  79, provider 48, API 3). Production warnings-as-errors compilation, scoped
+  formatting and diff checks passed; spec and quality reviews approved. Existing
+  unrelated importer fixture warnings remain unchanged.
+- Nonconflicting differences still await merge-owned durable metadata effects;
+  unknown/different provider relationships still need observation/materialization
+  integration. Conflict resolution, admission, activation, PR14–16, and the full
+  PRD acceptance matrix remain unfinished. No push, deployment, or GitHub writes.
+
 ### PR13 exact merged-result confirmation integration (2026-09-08)
 
 - The unregistered merge worker now connects authenticated paired provider

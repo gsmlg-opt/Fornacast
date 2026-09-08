@@ -13,6 +13,7 @@ defmodule ForgeGitHub.PullMergeWorker do
     IssueClient,
     LFSSync,
     PullClient,
+    PullMetadataDecision,
     PullMergeObservation,
     PullSyncWorker,
     RefObservation
@@ -84,8 +85,57 @@ defmodule ForgeGitHub.PullMergeWorker do
   end
 
   defp finalize(operation, sync, pair, remote_base_oid) do
-    with {:ok, observation} <- PullMergeObservation.build(sync, pair, remote_base_oid),
-         {:ok, merged_at, 0} <-
+    with {:ok, observation} <- PullMergeObservation.build(sync, pair, remote_base_oid) do
+      case metadata_decision(operation, sync, observation) do
+        {:ok, %{apply_local?: false, remote_issue_effect?: false}} ->
+          confirm_merge(operation, sync, observation)
+
+        {:ok, _plan} ->
+          # Metadata effects need their own durable intent under this merge's
+          # reservation. Do not falsely acknowledge them through finalization.
+          {:error, :merge_metadata_unconfirmed}
+
+        {:conflict, _kind} ->
+          now = DateTime.utc_now(:second)
+          PullMergeConfirmation.record_metadata_conflict(operation, now, next(now), observation)
+
+        {:error, _} = error ->
+          error
+      end
+    end
+  end
+
+  defp metadata_decision(operation, sync, observation) do
+    with {:ok, context} <- PullMergeConfirmation.context(operation, DateTime.utc_now(:second)),
+         {:ok, local} <-
+           ForgePulls.sync_projection(sync.repository_id, :pull, sync.expected.pull_id),
+         {:ok, relationships} <-
+           ForgeMirrors.resolve_issue_relationships(
+             sync.repository_mirror_id,
+             :local,
+             local.label_ids,
+             local.assignee_refs
+           ) do
+      local_issue =
+        Map.merge(Map.take(local.fields, ~w(title body state state_reason)), %{
+          "label_github_ids" => Enum.sort(Enum.map(relationships.labels, & &1.github_object_id)),
+          "assignee_github_ids" =>
+            Enum.sort(Enum.map(relationships.assignees, & &1.github_user_id))
+        })
+
+      PullMetadataDecision.decide_merge(
+        context.pull.confirmed_snapshot,
+        local.fields,
+        observation.pull.confirmed_snapshot,
+        context.issue.confirmed_snapshot,
+        local_issue,
+        observation.issue.confirmed_snapshot
+      )
+    end
+  end
+
+  defp confirm_merge(operation, sync, observation) do
+    with {:ok, merged_at, 0} <-
            DateTime.from_iso8601(observation.pull.confirmed_merge_state["merged_at"]),
          {:ok, result} <-
            ForgePulls.finalize_coordinated_merge(sync.intent.id, operation.id, merged_at,

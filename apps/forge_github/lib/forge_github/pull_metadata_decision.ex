@@ -63,6 +63,87 @@ defmodule ForgeGitHub.PullMetadataDecision do
     end
   end
 
+  @doc """
+  Decides merge-time metadata using six authentic paired snapshots.
+
+  This pure decision grants no merge authority. The coordinator owns state,
+  state reason and refs; they are validated as snapshot fields but never decided
+  or returned here. An incompatible newer local state is rejected, rather than
+  reconciled. Draft merges require all three views to be non-draft.
+  """
+  def decide_merge(
+        pull_baseline,
+        pull_local,
+        pull_remote,
+        issue_baseline,
+        issue_local,
+        issue_remote
+      ) do
+    with :ok <- validate_pull_views(pull_baseline, pull_local, pull_remote),
+         :ok <- validate_issue_views(issue_baseline, issue_local, issue_remote),
+         true <- companion?(pull_baseline, issue_baseline),
+         true <- companion?(pull_local, issue_local),
+         true <- companion?(pull_remote, issue_remote),
+         :ok <- compatible_merge_state(issue_baseline, issue_local) do
+      if Enum.all?([pull_baseline, pull_local, pull_remote], &(&1["draft"] == false)) do
+        initial = %{target: %{"draft" => false}, apply_local?: false, remote_issue_effect?: false}
+
+        Enum.reduce_while(~w(title body) ++ @set_fields, {:ok, initial}, fn field,
+                                                                            {:ok, decision} ->
+          result =
+            if field in @set_fields do
+              ResourceDecision.set(
+                MapSet.new(issue_baseline[field]),
+                MapSet.new(issue_local[field]),
+                MapSet.new(issue_remote[field])
+              )
+            else
+              ResourceDecision.scalar(
+                issue_baseline[field],
+                issue_local[field],
+                issue_remote[field]
+              )
+            end
+
+          case merge_issue_decision(decision, field, result) do
+            {:ok, next} -> {:cont, {:ok, next}}
+            {:conflict, _} = conflict -> {:halt, conflict}
+          end
+        end)
+        |> case do
+          {:ok, decision} ->
+            if Enum.all?(@set_fields, &valid_identity_set?(decision.target[&1])) do
+              {:ok,
+               %{
+                 target_metadata: decision.target,
+                 apply_local?: decision.apply_local?,
+                 remote_issue_effect?: decision.remote_issue_effect?
+               }}
+            else
+              {:error, :invalid_projection}
+            end
+
+          conflict ->
+            conflict
+        end
+      else
+        {:conflict, :merged_draft_conflict}
+      end
+    else
+      {:conflict, :merged_state_conflict} = conflict -> conflict
+      _ -> {:error, :invalid_projection}
+    end
+  end
+
+  defp compatible_merge_state(baseline, local) do
+    fields = ~w(state state_reason)
+
+    if Map.take(local, fields) == Map.take(baseline, fields) or
+         Map.take(local, fields) == %{"state" => "closed", "state_reason" => "completed"},
+       do: :ok,
+       else: {:conflict, :merged_state_conflict}
+  end
+
   defp decide_metadata(
          pull_baseline,
          pull_local,

@@ -24,15 +24,152 @@ defmodule ForgeMirrors.PullMergeConfirmation do
     end)
   end
 
+  @doc "Record only independently proven concurrent metadata edits for a marked merge."
+  def record_metadata_conflict(
+        operation,
+        %DateTime{} = now,
+        %DateTime{} = next_attempt_at,
+        observation
+      ) do
+    Repo.transaction(fn ->
+      with true <- DateTime.compare(next_attempt_at, now) != :lt,
+           {:ok, context} <- load(operation, now),
+           :ok <- validate_observation(context, observation),
+           {:ok, local} <- locked_projection(context),
+           {:ok, relationships} <-
+             ForgeMirrors.resolve_issue_relationships(
+               context.repository_mirror_id,
+               :local,
+               local.label_ids,
+               local.assignee_refs
+             ),
+           {:ok, kind} <- metadata_conflict_kind(context, local, observation),
+           issue =
+             Map.merge(Map.take(local.fields, @scalars), %{
+               "label_github_ids" =>
+                 Enum.sort(Enum.map(relationships.labels, & &1.github_object_id)),
+               "assignee_github_ids" =>
+                 Enum.sort(Enum.map(relationships.assignees, & &1.github_user_id))
+             }),
+           {:ok, _} <-
+             %ForgeMirrors.MirrorConflict{}
+             |> ForgeMirrors.MirrorConflict.record_changeset(%{
+               organization_mirror_id: context.organization_mirror_id,
+               repository_mirror_id: context.repository_mirror_id,
+               resource_kind: "pull_merge",
+               resource_identity: to_string(context.intent.id),
+               conflict_kind: kind,
+               baseline_snapshot: %{
+                 "pull" => context.pull.confirmed_snapshot,
+                 "issue" => context.issue.confirmed_snapshot
+               },
+               local_snapshot: %{"pull" => local.fields, "issue" => issue},
+               remote_snapshot: %{
+                 "pull" => observation.pull.confirmed_snapshot,
+                 "issue" => observation.issue.confirmed_snapshot
+               }
+             })
+             |> Repo.insert(),
+           {:ok, yielded} <- yield_conflict(context.operation, now, next_attempt_at, kind) do
+        yielded
+      else
+        {:error, reason} -> Repo.rollback(reason)
+        _ -> Repo.rollback(:invalid_transition)
+      end
+    end)
+  end
+
+  def record_metadata_conflict(_, _, _, _), do: {:error, :invalid_transition}
+
+  defp metadata_conflict_kind(context, local, observation) do
+    baseline = context.pull.confirmed_snapshot
+    remote = observation.pull.confirmed_snapshot
+
+    cond do
+      baseline["draft"] == false and
+        local.fields["draft"] == true and remote["draft"] == false ->
+        {:ok, "merged_draft_conflict"}
+
+      not compatible_merge_state?(baseline, local.fields) ->
+        {:ok, "merged_state_conflict"}
+
+      Enum.any?(~w(title body), fn field ->
+        ForgeMirrors.ResourceDecision.scalar(baseline[field], local.fields[field], remote[field]) ==
+            {:conflict, :concurrent_edit}
+      end) ->
+        {:ok, "concurrent_edit"}
+
+      true ->
+        {:error, :merge_metadata_not_conflicting}
+    end
+  end
+
+  defp yield_conflict(operation, now, next_attempt_at, kind) do
+    query =
+      from op in MirrorOperation,
+        where:
+          op.id == ^operation.id and op.state == :effect_pending and
+            op.lease_owner == ^operation.lease_owner and
+            op.lock_version == ^operation.lock_version and
+            op.lease_expires_at == ^operation.lease_expires_at and op.lease_expires_at > ^now and
+            op.lease_expires_at > fragment("timezone('UTC', clock_timestamp())")
+
+    case Repo.update_all(query,
+           set: [
+             lease_owner: nil,
+             lease_expires_at: nil,
+             next_attempt_at: next_attempt_at,
+             updated_at: now,
+             failure_disposition: :conflict,
+             failure_class: "stale_baseline",
+             failure_detail: kind
+           ],
+           inc: [lock_version: 1]
+         ) do
+      {1, _} -> {:ok, Repo.get!(MirrorOperation, operation.id)}
+      _ -> {:error, :lost_lease}
+    end
+  end
+
   def authorize(operation, now, intent, observation) do
     if Repo.in_transaction?() do
       with {:ok, context} <- load(operation, now),
            :ok <- same_intent(context.intent, intent),
-           :ok <- validate_observation(context, observation) do
+           :ok <- validate_observation(context, observation),
+           {:ok, local} <- locked_projection(context),
+           true <- compatible_merge_state?(context.pull.confirmed_snapshot, local.fields) do
         :ok
+      else
+        false -> {:error, :merge_metadata_unconfirmed}
+        {:error, _} = error -> error
       end
     else
       {:error, :transaction_required}
+    end
+  end
+
+  defp compatible_merge_state?(baseline, fields) do
+    state = Map.take(fields, ~w(state state_reason))
+
+    state == Map.take(baseline, ~w(state state_reason)) or
+      state == %{"state" => "closed", "state_reason" => "completed"}
+  end
+
+  defp locked_projection(context) do
+    # Sync.resource/3 locks canonical Issue then Pull. Its nested transaction
+    # retains both locks until this enclosing confirmation transaction ends.
+    with {:ok, local} <-
+           apply(ForgePulls, :sync_projection, [
+             context.repository_id,
+             :pull,
+             context.expected.pull_id
+           ]),
+         true <-
+           local.issue_id == context.expected.issue_id and
+             local.local_version >= context.expected.local_version do
+      {:ok, local}
+    else
+      _ -> {:error, :stale_merge_identity}
     end
   end
 

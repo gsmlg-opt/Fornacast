@@ -158,6 +158,190 @@ defmodule ForgeGitHub.PullMetadataDecisionTest do
     end
   end
 
+  test "merge decision follows scalar three-way changes and returns only metadata" do
+    for {local, remote, target, local?, remote?} <- [
+          {"Baseline", "Baseline", "Baseline", false, false},
+          {"Local", "Baseline", "Local", false, true},
+          {"Baseline", "Remote", "Remote", true, false},
+          {"Same", "Same", "Same", false, false}
+        ] do
+      local_issue = issue(%{"title" => local})
+      remote_issue = issue(%{"title" => remote})
+
+      assert {:ok, result} =
+               PullMetadataDecision.decide_merge(
+                 pull(),
+                 companion(pull(), local_issue),
+                 companion(pull(), remote_issue),
+                 issue(),
+                 local_issue,
+                 remote_issue
+               )
+
+      assert result == %{
+               target_metadata: %{
+                 "title" => target,
+                 "body" => "Body",
+                 "draft" => false,
+                 "label_github_ids" => [10],
+                 "assignee_github_ids" => [20]
+               },
+               apply_local?: local?,
+               remote_issue_effect?: remote?
+             }
+    end
+
+    local = issue(%{"title" => "Local"})
+    remote = issue(%{"title" => "Remote"})
+
+    assert {:conflict, :concurrent_edit} =
+             PullMetadataDecision.decide_merge(
+               pull(),
+               companion(pull(), local),
+               companion(pull(), remote),
+               issue(),
+               local,
+               remote
+             )
+  end
+
+  test "merge decision combines independent scalar edits and relationship deltas" do
+    local =
+      issue(%{"title" => "Local", "label_github_ids" => [10, 11], "assignee_github_ids" => []})
+
+    remote =
+      issue(%{
+        "body" => "Remote",
+        "label_github_ids" => [10, 12],
+        "assignee_github_ids" => [20, 21]
+      })
+
+    assert {:ok, result} =
+             PullMetadataDecision.decide_merge(
+               pull(),
+               companion(pull(), local),
+               companion(pull(), remote),
+               issue(),
+               local,
+               remote
+             )
+
+    assert result == %{
+             target_metadata: %{
+               "title" => "Local",
+               "body" => "Remote",
+               "draft" => false,
+               "label_github_ids" => [10, 11, 12],
+               "assignee_github_ids" => [21]
+             },
+             apply_local?: true,
+             remote_issue_effect?: true
+           }
+  end
+
+  test "merge decision ignores valid coordinator-owned state and refs without projecting them" do
+    remote_issue = issue(%{"state" => "closed", "state_reason" => "completed"})
+
+    remote_pull =
+      companion(pull(), remote_issue)
+      |> Map.put("base_sha", String.duplicate("c", 40))
+      |> Map.put("head_ref", "refs/heads/other")
+
+    assert {:ok, result} =
+             PullMetadataDecision.decide_merge(
+               pull(),
+               pull(),
+               remote_pull,
+               issue(),
+               issue(),
+               remote_issue
+             )
+
+    refute result.apply_local?
+    refute result.remote_issue_effect?
+
+    assert Enum.sort(Map.keys(result.target_metadata)) ==
+             ~w(assignee_github_ids body draft label_github_ids title)
+
+    assert remote_pull["base_sha"] == String.duplicate("c", 40)
+    assert remote_issue["state_reason"] == "completed"
+  end
+
+  test "merge decision rejects drafts in every view and malformed paired snapshots" do
+    for position <- 0..2 do
+      args =
+        [pull(), pull(), pull(), issue(), issue(), issue()]
+        |> List.update_at(position, &Map.put(&1, "draft", true))
+
+      assert {:conflict, :merged_draft_conflict} =
+               apply(PullMetadataDecision, :decide_merge, args)
+    end
+
+    for {position, field, value} <- [
+          {0, "base_sha", "bad"},
+          {1, "extra", true},
+          {2, "title", "mismatch"},
+          {3, "label_github_ids", [10, 10]},
+          {4, "assignee_github_ids", [0]},
+          {5, "title", "mismatch"}
+        ] do
+      args =
+        [pull(), pull(), pull(), issue(), issue(), issue()]
+        |> List.update_at(position, &Map.put(&1, field, value))
+
+      assert {:error, :invalid_projection} = apply(PullMetadataDecision, :decide_merge, args)
+    end
+  end
+
+  test "merge decision rejects relationship unions exceeding the target limit" do
+    for field <- ~w(label_github_ids assignee_github_ids) do
+      baseline = issue(%{field => []})
+      local = issue(%{field => Enum.to_list(1..512)})
+      remote = issue(%{field => Enum.to_list(513..1024)})
+
+      assert {:error, :invalid_projection} =
+               PullMetadataDecision.decide_merge(
+                 pull(),
+                 companion(pull(), local),
+                 companion(pull(), remote),
+                 baseline,
+                 local,
+                 remote
+               )
+    end
+  end
+
+  test "merge decision rejects incompatible newer local state and allows baseline or final state" do
+    for {state, reason} <- [{"closed", "not_planned"}, {"open", "reopened"}] do
+      local = issue(%{"state" => state, "state_reason" => reason})
+
+      assert {:conflict, :merged_state_conflict} =
+               PullMetadataDecision.decide_merge(
+                 pull(),
+                 companion(pull(), local),
+                 pull(),
+                 issue(),
+                 local,
+                 issue()
+               )
+    end
+
+    for local <- [issue(), issue(%{"state" => "closed", "state_reason" => "completed"})] do
+      assert {:ok, %{target_metadata: metadata}} =
+               PullMetadataDecision.decide_merge(
+                 pull(),
+                 companion(pull(), local),
+                 pull(),
+                 issue(),
+                 local,
+                 issue()
+               )
+
+      refute Map.has_key?(metadata, "state")
+      refute Map.has_key?(metadata, "state_reason")
+    end
+  end
+
   defp pull do
     %{
       "title" => "Baseline",

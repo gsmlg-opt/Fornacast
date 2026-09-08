@@ -485,6 +485,276 @@ defmodule ForgeMirrors.PullMergeConfirmationTest do
     end
   end
 
+  test "competing merge titles record authentic paired evidence without advancing baselines", c do
+    {operation, intent} = marked(c)
+    c.issue |> Changeset.change(title: "Local title", sync_version: 2) |> Repo.update!()
+    remote = observation(c, intent)
+    remote = put_in(remote, [:pull, :confirmed_snapshot, "title"], "Remote title")
+    remote = put_in(remote, [:issue, :confirmed_snapshot, "title"], "Remote title")
+
+    assert {:ok, yielded} =
+             Confirmation.record_metadata_conflict(
+               operation,
+               c.now,
+               DateTime.add(c.now, 1),
+               remote
+             )
+
+    conflict =
+      Repo.get_by!(ForgeMirrors.MirrorConflict,
+        resource_kind: "pull_merge",
+        resource_identity: to_string(intent.id)
+      )
+
+    assert conflict.conflict_kind == "concurrent_edit"
+
+    assert conflict.baseline_snapshot == %{
+             "pull" => c.expected.fields,
+             "issue" => c.issue_mapping.confirmed_snapshot
+           }
+
+    assert conflict.local_snapshot["pull"]["title"] == "Local title"
+    assert conflict.local_snapshot["issue"]["title"] == "Local title"
+
+    assert conflict.remote_snapshot == %{
+             "pull" => remote.pull.confirmed_snapshot,
+             "issue" => remote.issue.confirmed_snapshot
+           }
+
+    assert yielded.failure_disposition == :conflict
+    assert yielded.external_effect_marker == operation.external_effect_marker
+    assert yielded.lease_owner == nil
+    assert yielded.state == :effect_pending
+    assert Repo.get!(MirrorResourceState, c.mapping.id).confirmed_snapshot == c.expected.fields
+    assert Repo.get!(ForgePulls.MergeOperation, intent.id).state == :merge_written
+
+    assert {:error, _} =
+             Confirmation.record_metadata_conflict(
+               operation,
+               c.now,
+               DateTime.add(c.now, 1),
+               remote
+             )
+
+    assert Repo.get!(ForgeMirrors.MirrorConflict, conflict.id).lock_version == 1
+  end
+
+  test "a newer local draft against the merged provider records a durable draft conflict", c do
+    {operation, intent} = marked(c)
+    c.pull |> Changeset.change(draft: true) |> Repo.update!()
+    c.issue |> Changeset.change(sync_version: 2) |> Repo.update!()
+
+    assert {:ok, _} =
+             Confirmation.record_metadata_conflict(
+               operation,
+               c.now,
+               DateTime.add(c.now, 1),
+               observation(c, intent)
+             )
+
+    conflict =
+      Repo.get_by!(ForgeMirrors.MirrorConflict,
+        resource_identity: to_string(intent.id),
+        resource_kind: "pull_merge"
+      )
+
+    assert conflict.conflict_kind == "merged_draft_conflict"
+    assert conflict.local_snapshot["pull"]["draft"] == true
+    assert conflict.remote_snapshot["pull"]["draft"] == false
+  end
+
+  test "matching and one-sided metadata cannot be classified as a conflict by a caller", c do
+    {operation, intent} = marked(c)
+    remote = observation(c, intent)
+
+    assert {:error, :merge_metadata_not_conflicting} =
+             Confirmation.record_metadata_conflict(
+               operation,
+               c.now,
+               DateTime.add(c.now, 1),
+               remote
+             )
+
+    changed = put_in(remote, [:pull, :confirmed_snapshot, "title"], "Remote only")
+    changed = put_in(changed, [:issue, :confirmed_snapshot, "title"], "Remote only")
+
+    assert {:error, :merge_metadata_not_conflicting} =
+             Confirmation.record_metadata_conflict(
+               operation,
+               c.now,
+               DateTime.add(c.now, 1),
+               changed
+             )
+
+    c.issue |> Changeset.change(title: "Local only", sync_version: 2) |> Repo.update!()
+
+    assert {:error, :merge_metadata_not_conflicting} =
+             Confirmation.record_metadata_conflict(
+               operation,
+               c.now,
+               DateTime.add(c.now, 1),
+               remote
+             )
+
+    assert {:error, _} =
+             Confirmation.record_metadata_conflict(
+               operation,
+               c.now,
+               DateTime.add(c.now, 1),
+               Map.put(changed, :classification, :concurrent_edit)
+             )
+
+    refute Repo.exists?(ForgeMirrors.MirrorConflict)
+
+    assert Repo.get!(ForgeMirrors.MirrorOperation, operation.id).lease_owner ==
+             operation.lease_owner
+  end
+
+  test "conflict recording rejects stale lease and revoked authorization without writes", c do
+    {operation, intent} = marked(c)
+    c.issue |> Changeset.change(title: "Local", sync_version: 2) |> Repo.update!()
+    remote = observation(c, intent)
+    remote = put_in(remote, [:pull, :confirmed_snapshot, "title"], "Remote")
+    remote = put_in(remote, [:issue, :confirmed_snapshot, "title"], "Remote")
+
+    assert {:error, _} =
+             Confirmation.record_metadata_conflict(
+               %{operation | lease_owner: "stale"},
+               c.now,
+               DateTime.add(c.now, 1),
+               remote
+             )
+
+    installation =
+      Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+        github_installation_id: c.organization.github_installation_id
+      )
+
+    installation
+    |> Changeset.change(permissions: Map.put(installation.permissions, "contents", "read"))
+    |> Repo.update!()
+
+    assert {:error, _} =
+             Confirmation.record_metadata_conflict(
+               operation,
+               c.now,
+               DateTime.add(c.now, 1),
+               remote
+             )
+
+    refute Repo.exists?(ForgeMirrors.MirrorConflict)
+
+    assert Repo.get!(ForgeMirrors.MirrorOperation, operation.id).external_effect_marker ==
+             operation.external_effect_marker
+  end
+
+  test "newer local closure reasons cannot be overwritten by merge finalization", c do
+    {operation, intent} = marked(c)
+    remote = observation(c, intent)
+
+    c.issue
+    |> Changeset.change(state: :closed, state_reason: :not_planned, sync_version: 2)
+    |> Repo.update!()
+
+    assert {:ok, {:error, :merge_metadata_unconfirmed}} =
+             Repo.transaction(fn ->
+               Confirmation.authorize(operation, c.now, intent, remote)
+             end)
+
+    assert {:ok, _} =
+             Confirmation.record_metadata_conflict(
+               operation,
+               c.now,
+               DateTime.add(c.now, 1),
+               remote
+             )
+
+    conflict =
+      Repo.get_by!(ForgeMirrors.MirrorConflict,
+        resource_kind: "pull_merge",
+        resource_identity: to_string(intent.id)
+      )
+
+    assert conflict.conflict_kind == "merged_state_conflict"
+    assert conflict.local_snapshot["issue"]["state_reason"] == "not_planned"
+  end
+
+  test "explicit local reopening is incompatible but unchanged open state permits finalization",
+       c do
+    {operation, intent} = marked(c)
+    remote = observation(c, intent)
+
+    assert {:ok, :ok} =
+             Repo.transaction(fn -> Confirmation.authorize(operation, c.now, intent, remote) end)
+
+    c.issue |> Changeset.change(state_reason: :reopened, sync_version: 2) |> Repo.update!()
+
+    assert {:ok, {:error, :merge_metadata_unconfirmed}} =
+             Repo.transaction(fn -> Confirmation.authorize(operation, c.now, intent, remote) end)
+  end
+
+  test "current local draft conflict does not require a synthetic version increment", c do
+    {operation, intent} = marked(c)
+    c.pull |> Changeset.change(draft: true) |> Repo.update!()
+
+    assert {:ok, _} =
+             Confirmation.record_metadata_conflict(
+               operation,
+               c.now,
+               DateTime.add(c.now, 1),
+               observation(c, intent)
+             )
+  end
+
+  test "conflict classification locks issue and pull before reading the current projection", c do
+    {operation, intent} = marked(c)
+    owner = self()
+    handler = "merge-conflict-locks-#{operation.id}"
+
+    :telemetry.attach(
+      handler,
+      [:fornacast, :repo, :query],
+      fn _, _, metadata, _ -> send(owner, {:query, metadata.query}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    assert {:error, :merge_metadata_not_conflicting} =
+             Confirmation.record_metadata_conflict(
+               operation,
+               c.now,
+               DateTime.add(c.now, 1),
+               observation(c, intent)
+             )
+
+    queries = collect_queries([])
+
+    issue_lock =
+      Enum.find_index(
+        queries,
+        &(String.contains?(&1, "FROM \"issues\"") and String.contains?(&1, "FOR UPDATE"))
+      )
+
+    pull_lock =
+      Enum.find_index(
+        queries,
+        &(String.contains?(&1, "FROM \"pull_requests\"") and
+            not String.contains?(&1, "FROM \"issues\"") and String.contains?(&1, "FOR UPDATE"))
+      )
+
+    assert is_integer(issue_lock) and is_integer(pull_lock)
+    assert issue_lock < pull_lock
+  end
+
+  defp collect_queries(acc) do
+    receive do
+      {:query, query} -> collect_queries([query | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
   defp observation(c, intent) do
     fields =
       Map.merge(c.expected.fields, %{

@@ -664,6 +664,80 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     assert mapping.confirmed_snapshot["base_sha"] == c.base
   end
 
+  test "incompatible concurrent merge metadata records authentic conflict snapshots", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    c.issue |> ForgeIssues.Issue.update_changeset(%{title: "Local title"}) |> Repo.update!()
+
+    assert {:ok, pending} =
+             PullMergeWorker.process_operation(marked, c.now, merged_options(c, "Remote title"))
+
+    assert pending.failure_disposition == :conflict
+    assert pending.external_effect_marker == marked.external_effect_marker
+    assert pending.lease_owner == nil
+
+    conflict =
+      Repo.get_by!(ForgeMirrors.MirrorConflict,
+        resource_kind: "pull_merge",
+        resource_identity: to_string(c.intent.id),
+        state: :open
+      )
+
+    assert conflict.conflict_kind == "concurrent_edit"
+    assert conflict.baseline_snapshot["pull"]["title"] == "Merge"
+    assert conflict.local_snapshot["pull"]["title"] == "Local title"
+    assert conflict.remote_snapshot["pull"]["title"] == "Remote title"
+    assert conflict.baseline_snapshot["pull"]["base_sha"] == c.base
+    assert conflict.remote_snapshot["pull"]["base_sha"] == c.intent.merge_oid
+    assert_unfinished(c)
+  end
+
+  test "a newer local draft request after remote merge becomes a durable conflict", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    c.pull |> Changeset.change(draft: true) |> Repo.update!()
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, merged_options(c))
+    assert pending.failure_disposition == :conflict
+    assert pending.external_effect_marker == marked.external_effect_marker
+
+    conflict =
+      Repo.get_by!(ForgeMirrors.MirrorConflict,
+        resource_kind: "pull_merge",
+        resource_identity: to_string(c.intent.id),
+        state: :open
+      )
+
+    assert conflict.conflict_kind == "merged_draft_conflict"
+    assert conflict.local_snapshot["pull"]["draft"]
+    assert Repo.get!(ForgePulls.PullRequest, c.pull.id).draft
+    assert_unfinished(c)
+  end
+
+  test "a newer incompatible local closure is not overwritten by the merged result", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+
+    c.issue
+    |> ForgeIssues.Issue.update_changeset(%{state: :closed, state_reason: :not_planned})
+    |> Repo.update!()
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, merged_options(c))
+    assert pending.failure_disposition == :conflict
+
+    conflict =
+      Repo.get_by!(ForgeMirrors.MirrorConflict,
+        resource_kind: "pull_merge",
+        resource_identity: to_string(c.intent.id),
+        state: :open
+      )
+
+    assert conflict.conflict_kind == "merged_state_conflict"
+    assert conflict.local_snapshot["issue"]["state_reason"] == "not_planned"
+    assert Repo.get!(ForgeIssues.Issue, c.issue.id).state_reason == :not_planned
+    assert Repo.get!(ForgePulls.MergeOperation, c.intent.id).state == :merge_written
+  end
+
   test "newer metadata actually represented on both sides confirms its real final version", c do
     paired_issue_mapping(c)
     marked = mark(c)
