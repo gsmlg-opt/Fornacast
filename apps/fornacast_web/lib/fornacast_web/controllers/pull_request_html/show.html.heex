@@ -43,6 +43,15 @@
       <.pull_navigation result={@result} active={:conversation} />
     </header>
 
+    <.dm_alert
+      :if={is_nil(@result.content.pull.head_repository_id)}
+      variant="info"
+      data-pull-sync-read-only
+    >
+      <span class="font-semibold">Read-only external pull request.</span>
+      The head repository is not represented locally, so this pull request cannot be fully synchronized.
+    </.dm_alert>
+
     <article class="rounded-lg border border-outline-variant bg-surface-container text-on-surface">
       <header class="border-b border-outline-variant px-4 py-3 text-sm">
         <span class="font-semibold">{author_name(@result.content.pull.issue.author)}</span>
@@ -186,6 +195,7 @@
       <.dm_alert
         :if={
           is_nil(@result.content.pull.merged_at) and
+            @result.content.pull.head_repository_id == @result.content.pull.repository_id and
             @result.content.pull.issue.state == :open and
             @result.content.pull.analysis.mergeable == false
         }

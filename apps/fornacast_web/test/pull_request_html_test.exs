@@ -186,6 +186,36 @@ defmodule FornacastWeb.PullRequestHTMLTest do
     assert primary_action_count(html) <= 1
   end
 
+  test "external-head conversation explains read-only synchronization without claiming merge conflicts" do
+    external =
+      pull(7, "External contribution", :open, head_repository_id: nil)
+      |> Map.put(:analysis, analysis(false))
+
+    html =
+      render_component(&PullRequestHTML.show/1,
+        result: result(:pull, %{pull: external, comments: empty_comments()})
+      )
+
+    assert html =~ "data-pull-sync-read-only"
+    assert html =~ "Read-only external pull request"
+    assert html =~ "head repository is not represented locally"
+    assert html =~ "cannot be fully synchronized"
+    refute html =~ "This pull request has merge conflicts."
+    refute html =~ ~s(action="/alice/demo/pulls/7/merge")
+    refute html =~ ~s(action="/alice/demo/issues/7/comments")
+
+    for head_repository_id <- [1, 2] do
+      represented = %{external | head_repository_id: head_repository_id}
+
+      represented_html =
+        render_component(&PullRequestHTML.show/1,
+          result: result(:pull, %{pull: represented, comments: empty_comments()})
+        )
+
+      refute represented_html =~ "data-pull-sync-read-only"
+    end
+  end
+
   test "conversation exposes only capability-gated canonical comment controls and retained errors" do
     editable =
       comment(1, "Editable original")
@@ -393,6 +423,7 @@ defmodule FornacastWeb.PullRequestHTMLTest do
       id: number,
       issue_id: number,
       repository_id: 1,
+      head_repository_id: Keyword.get(opts, :head_repository_id, 1),
       head_ref: "refs/heads/feature",
       base_ref: "refs/heads/main",
       head_sha: String.duplicate("a", 40),
