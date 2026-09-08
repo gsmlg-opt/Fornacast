@@ -3,6 +3,93 @@ defmodule ForgeGitHub.PullSyncProjectionTest do
 
   alias ForgeGitHub.PullSyncProjection
 
+  test "resolved local issue relationships accompany pull metadata and preserve domain preimage" do
+    domain = domain_projection()
+    assert {:ok, result} = PullSyncProjection.from_local(domain, resolved_relationships())
+    assert result.issue_snapshot == remote_issue_observation().snapshot
+    assert result.snapshot == fields()
+
+    assert result.relationship_snapshot == %{
+             "label_github_ids" => [11],
+             "assignee_github_ids" => [22]
+           }
+
+    assert result.relationship_preimage == domain.relationship_preimage
+    assert result.label_catalog == %{11 => %{name: "bug", local_label_id: 111}}
+
+    assert result.assignee_catalog == %{
+             22 => %{login: "octocat", ref: %{kind: :github_identity, id: 333}}
+           }
+
+    refute 444 in result.issue_snapshot["assignee_github_ids"]
+  end
+
+  test "resolved local projection rejects missing or unrelated identity mappings" do
+    for relationships <- [
+          %{resolved_relationships() | labels: []},
+          %{resolved_relationships() | assignees: []},
+          %{
+            resolved_relationships()
+            | labels: [%{github_object_id: 11, local_label_id: 999, name: "bug"}]
+          }
+        ] do
+      assert {:error, :invalid_projection} =
+               PullSyncProjection.from_local(domain_projection(), relationships)
+    end
+
+    assert {:error, :invalid_projection} =
+             PullSyncProjection.from_local(
+               Map.delete(domain_projection(), :relationship_preimage),
+               resolved_relationships()
+             )
+  end
+
+  test "remote issue snapshot and timestamp retain their independent observation provenance" do
+    issue = Map.put(remote_issue_observation(), :remote_updated_at, ~U[2030-01-03 01:02:03Z])
+    assert {:ok, result} = PullSyncProjection.from_remote(remote_pull(), issue)
+    assert result.issue_snapshot == issue.snapshot
+    assert result.issue_remote_updated_at == issue.remote_updated_at
+    assert result.remote_updated_at == ~U[2030-01-02 00:00:00Z]
+
+    assert {:ok, legacy} =
+             PullSyncProjection.from_remote(remote_pull(), remote_issue_observation())
+
+    assert legacy.issue_remote_updated_at == nil
+
+    assert {:error, :invalid_projection} =
+             PullSyncProjection.from_remote(
+               remote_pull(),
+               Map.put(issue, :remote_updated_at, "invalid")
+             )
+  end
+
+  defp domain_projection do
+    %{
+      repository_id: 10,
+      resource_kind: :pull,
+      local_resource_id: 20,
+      local_resource_type: "ForgePulls.PullRequest",
+      local_version: 3,
+      issue_id: 30,
+      issue_number: 7,
+      head_repository_id: 10,
+      merge_state: %{merged_at: nil, merge_commit_sha: nil},
+      fields: fields(),
+      label_ids: [111],
+      assignee_refs: [%{kind: :github_identity, id: 333}, %{kind: :local_user, id: 444}],
+      relationship_preimage: %{label_ids: [111], managed_assignee_identity_ids: [333]}
+    }
+  end
+
+  defp resolved_relationships do
+    %{
+      labels: [%{github_object_id: 11, local_label_id: 111, name: "bug"}],
+      assignees: [
+        %{github_user_id: 22, login: "octocat", ref: %{kind: :github_identity, id: 333}}
+      ]
+    }
+  end
+
   test "projects canonical local pull metadata without mixing identity into the snapshot" do
     projection = %{
       repository_id: 10,

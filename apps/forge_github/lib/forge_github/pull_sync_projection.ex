@@ -9,6 +9,8 @@ defmodule ForgeGitHub.PullSyncProjection do
   """
 
   @field_keys ~w(base_ref base_sha body draft head_ref head_sha state state_reason title)
+  @issue_fields ~w(title body state state_reason)
+  @relationship_fields ~w(label_github_ids assignee_github_ids)
   @oid ~r/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
 
   @spec from_local(map()) :: {:ok, map()} | {:error, :invalid_projection}
@@ -63,6 +65,68 @@ defmodule ForgeGitHub.PullSyncProjection do
 
   def from_local(_projection), do: {:error, :invalid_projection}
 
+  @doc "Composes the actual pull domain projection with resolved canonical issue relationships."
+  def from_local(
+        %{label_ids: labels, assignee_refs: refs, relationship_preimage: preimage} = projection,
+        relationships
+      ) do
+    with {:ok, pull} <- from_local(projection),
+         true <- valid_relationship_preimage?(preimage, labels),
+         true <- is_list(refs) and length(refs) <= 512,
+         {:ok, issue} <-
+           ForgeGitHub.IssueSyncProjection.from_local(
+             %{
+               resource_kind: :issue,
+               local_resource_id: pull.issue_id,
+               local_resource_type: "ForgeIssues.Issue",
+               local_version: pull.local_version,
+               fields: Map.take(pull.snapshot, @issue_fields),
+               label_ids: labels,
+               assignee_refs: refs
+             },
+             relationships
+           ),
+         true <-
+           map_size(issue.assignee_catalog) == length(preimage.managed_assignee_identity_ids),
+         true <-
+           Enum.all?(refs, fn
+             %{kind: :github_identity, id: id} -> id in preimage.managed_assignee_identity_ids
+             %{kind: :local_user} -> true
+             _ -> false
+           end) do
+      {:ok,
+       Map.merge(pull, %{
+         snapshot: Map.merge(pull.snapshot, Map.take(issue.snapshot, @issue_fields)),
+         issue_snapshot: issue.snapshot,
+         relationship_snapshot: Map.take(issue.snapshot, @relationship_fields),
+         label_catalog: issue.label_catalog,
+         assignee_catalog: issue.assignee_catalog,
+         relationship_preimage: preimage
+       })}
+    else
+      _ -> {:error, :invalid_projection}
+    end
+  end
+
+  def from_local(_, _), do: {:error, :invalid_projection}
+
+  defp valid_relationship_preimage?(
+         %{label_ids: ids, managed_assignee_identity_ids: managed} = value,
+         labels
+       ),
+       do:
+         map_size(value) == 2 and canonical_ids?(ids) and canonical_ids?(managed) and
+           is_list(labels) and ids == Enum.sort(labels)
+
+  defp valid_relationship_preimage?(_, _), do: false
+
+  defp canonical_ids?(ids) when is_list(ids),
+    do:
+      length(ids) <= 512 and
+        Enum.all?(ids, &valid_id?/1) and ids == Enum.sort(Enum.uniq(ids))
+
+  defp canonical_ids?(_), do: false
+
   @spec from_remote(map(), map()) ::
           {:ok, map()} | {:error, :invalid_projection | :inconsistent_observation}
   def from_remote(
@@ -94,7 +158,7 @@ defmodule ForgeGitHub.PullSyncProjection do
           snapshot: issue_snapshot,
           label_catalog: label_catalog,
           assignee_catalog: assignee_catalog
-        }
+        } = issue_observation
       ) do
     with true <- Enum.all?([pull_id, number, issue_id, issue_number], &valid_id?/1),
          true <- valid_identity_text?(pull_node_id) and valid_identity_text?(issue_node_id),
@@ -118,6 +182,7 @@ defmodule ForgeGitHub.PullSyncProjection do
            ),
          {:ok, created_at} <- datetime(created_at),
          {:ok, updated_at} <- datetime(updated_at),
+         {:ok, issue_updated_at} <- issue_observation_time(issue_observation[:remote_updated_at]),
          {:ok, merge_state} <- remote_merge_state(merged, merged_at, merge_commit_sha, pull_state),
          {:ok, coordinator} <- coordinator(mergeable, rebaseable, mergeable_state),
          {:ok, relationship_snapshot} <-
@@ -148,7 +213,9 @@ defmodule ForgeGitHub.PullSyncProjection do
            base_repository: base_repository,
            remote_created_at: created_at,
            remote_updated_at: updated_at,
+           issue_remote_updated_at: issue_updated_at,
            snapshot: fields,
+           issue_snapshot: Map.merge(Map.take(fields, @issue_fields), relationship_snapshot),
            merge_state: merge_state,
            coordinator: coordinator,
            relationship_snapshot: relationship_snapshot,
@@ -163,6 +230,10 @@ defmodule ForgeGitHub.PullSyncProjection do
   end
 
   def from_remote(_pull, _issue), do: {:error, :invalid_projection}
+
+  defp issue_observation_time(nil), do: {:ok, nil}
+  defp issue_observation_time(%DateTime{utc_offset: 0, std_offset: 0} = time), do: {:ok, time}
+  defp issue_observation_time(_), do: {:error, :invalid_projection}
 
   defp local_merge_state(%{merged_at: nil, merge_commit_sha: nil} = state)
        when map_size(state) == 2,
