@@ -20,7 +20,7 @@ defmodule ForgeGitHub.IssueClient do
   @max_body_bytes 262_144
   @max_title_codepoints 256
   @max_title_bytes 1_024
-  @max_set_items 100
+  @max_set_items 512
   @max_name_codepoints 255
   @max_name_bytes 1_020
   @max_login_codepoints 105

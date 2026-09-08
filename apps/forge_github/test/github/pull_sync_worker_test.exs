@@ -19,6 +19,42 @@ defmodule ForgeGitHub.PullSyncWorkerTest do
     "base_sha" => @base_sha
   }
 
+  test "routes both first creation and recovery without observing a mapped pull" do
+    for state <- [:processing, :effect_pending] do
+      operation = operation(state)
+
+      sync = %{
+        mode: :outbound_create,
+        phase: if(state == :processing, do: :unmarked, else: :recovery)
+      }
+
+      options = [
+        context: fn ^operation -> {:ok, sync} end,
+        outbound_create: fn ^operation, @now, ^sync, _options -> {:ok, :creation_routed} end,
+        local_observe: fn _ -> flunk("an unmapped pull entered mapped observation") end,
+        token_fetch: fn _, _ -> flunk("parent must delegate creation token handling") end,
+        retry: fn _, _, _, _, _ -> {:error, :unexpected_retry} end,
+        fail: fn _, _, _, _ -> {:error, :unexpected_failure} end
+      ]
+
+      assert {:ok, :creation_routed} = PullSyncWorker.process_operation(operation, @now, options)
+    end
+  end
+
+  test "only explicitly unmarked outbound errors use the original processing capability" do
+    operation = operation(:processing)
+
+    options = [
+      context: fn _ -> {:ok, %{mode: :outbound_create}} end,
+      outbound_create: fn _, _, _, _ -> {:unmarked_error, :busy} end,
+      retry: fn ^operation, @now, _, "network", _ -> {:ok, :unmarked_retry} end
+    ]
+
+    assert {:ok, :unmarked_retry} = PullSyncWorker.process_operation(operation, @now, options)
+    options = Keyword.put(options, :outbound_create, fn _, _, _, _ -> {:error, :lost_lease} end)
+    assert {:error, :lost_lease} = PullSyncWorker.process_operation(operation, @now, options)
+  end
+
   test "applies mapped inbound metadata and draft state in the atomic confirmation" do
     parent = self()
     operation = operation(:processing)

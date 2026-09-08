@@ -7,6 +7,66 @@ defmodule ForgeGitHub.IssueClientTest do
 
   setup {Req.Test, :verify_on_exit!}
 
+  test "relationship payloads accept 512 names and reject 513 without transport" do
+    for field <- ["labels", "assignees"] do
+      names = Enum.map(1..512, &"member-#{&1}")
+      stub = stub_name()
+
+      Req.Test.expect(stub, fn conn ->
+        assert {:ok, encoded, conn} = Plug.Conn.read_body(conn)
+        assert JSON.decode!(encoded)[field] == names
+        Req.Test.json(conn, issue_json(7, "body"))
+      end)
+
+      assert {:ok, _} =
+               IssueClient.update_issue(
+                 "installation_token",
+                 "octocat",
+                 "Hello-World",
+                 7,
+                 %{field => names},
+                 client_opts(stub)
+               )
+
+      assert {:error, %Error{kind: :invalid_request}} =
+               IssueClient.update_issue(
+                 "installation_token",
+                 "octocat",
+                 "Hello-World",
+                 7,
+                 %{field => names ++ ["member-513"]},
+                 client_opts(stub_name())
+               )
+    end
+  end
+
+  test "relationship responses accept 512 identities and reject 513 independently of page limits" do
+    for field <- ["labels", "assignees"], count <- [512, 513] do
+      values =
+        Enum.map(1..count, fn id ->
+          if field == "labels",
+            do: %{"id" => id, "node_id" => "L_#{id}", "name" => "member-#{id}"},
+            else: %{"id" => id, "node_id" => "U_#{id}", "login" => "member-#{id}"}
+        end)
+
+      stub = stub_name()
+      Req.Test.expect(stub, &Req.Test.json(&1, Map.put(issue_json(7, "body"), field, values)))
+
+      result =
+        IssueClient.get_issue(
+          "installation_token",
+          "octocat",
+          "Hello-World",
+          7,
+          client_opts(stub)
+        )
+
+      if count == 512,
+        do: assert({:ok, _} = result),
+        else: assert({:error, %Error{kind: :invalid_response}} = result)
+    end
+  end
+
   test "creates, gets, and updates issues with supported synchronization fields" do
     parent = self()
     body = String.duplicate("é", 20_000)

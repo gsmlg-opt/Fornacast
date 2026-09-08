@@ -1,9 +1,10 @@
 defmodule ForgeGitHub.PullSyncWorker do
   @moduledoc """
-  Bounded synchronization for mapped pulls and authenticated inbound creation.
+  Bounded synchronization for mapped pulls and authenticated pull creation.
 
-  This worker still excludes outbound pull creation, ref retargeting, merging,
-  deletion, and reconciliation sweeps. GitHub issue metadata and draft
+  Outbound creation uses its own durable intent and recovery coordinator. This
+  worker still excludes ref retargeting, merging, deletion, and reconciliation
+  sweeps. GitHub issue metadata and draft
   conversion are separate durable effects. Every effect and confirmation is
   guarded by the same persisted pull/ref eligibility proof.
   """
@@ -113,10 +114,30 @@ defmodule ForgeGitHub.PullSyncWorker do
       )
       when state in [:processing, :effect_pending] and is_list(options) do
     with {:ok, sync} <- context(operation, options) do
-      if Map.get(sync, :mode) == :inbound_create do
-        create_inbound(operation, now, sync, options)
-      else
-        process_mapped(operation, now, sync, options)
+      case Map.get(sync, :mode) do
+        :inbound_create ->
+          create_inbound(operation, now, sync, options)
+
+        :outbound_create ->
+          case callback(
+                 options,
+                 :outbound_create,
+                 &ForgeGitHub.PullCreateWorker.process_operation/4
+               ).(
+                 operation,
+                 now,
+                 sync,
+                 options
+               ) do
+            {:unmarked_error, reason} when operation.state == :processing ->
+              persist_failure(operation, now, reason, options)
+
+            result ->
+              result
+          end
+
+        _ ->
+          process_mapped(operation, now, sync, options)
       end
     else
       {:error, reason} -> persist_failure(operation, now, reason, options)
@@ -205,8 +226,16 @@ defmodule ForgeGitHub.PullSyncWorker do
 
   defp default_context(operation) do
     case ForgeMirrors.resource_operation_context(operation) do
-      {:error, :invalid_pull_mapping} -> ForgeMirrors.remote_pull_creation_context(operation)
-      result -> result
+      {:error, :invalid_pull_mapping} ->
+        if operation.cursor["trigger"] == "local" do
+          with {:ok, context} <- ForgeMirrors.outbound_pull_creation_context(operation),
+               do: {:ok, Map.put(context, :mode, :outbound_create)}
+        else
+          ForgeMirrors.remote_pull_creation_context(operation)
+        end
+
+      result ->
+        result
     end
   end
 
