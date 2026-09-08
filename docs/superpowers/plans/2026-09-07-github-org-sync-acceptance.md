@@ -10,6 +10,34 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 paired effect admission and historical confirmation (2026-09-08)
+
+- `9bce29e` atomically persists immutable full metadata evidence and its compact
+  operation marker. Admission rederives scalar/set targets from the locked paired
+  baseline, exact current local preimage, and observed remote preimage; checks
+  unchanged refs and action-specific draft semantics; and binds identity, hash,
+  paired mapping tokens and original installation/ref eligibility evidence.
+- Reload preserves the intent while permitting newer local metadata. Paired
+  confirmation can retain a proven historical baseline without overwriting newer
+  local changes, including a new label that has no provider mapping yet.
+- Forty scoped PostgreSQL tests passed, including stale proof/lease rejection,
+  replacement intents, draft-only issue immutability, ref continuity, original
+  installation substitution, maximum Unicode bodies and unmapped-label recovery.
+- `96c6ba1` wires paired local and outbound metadata decisions, separate issue and
+  draft effects, exact pre/post recovery, historical confirmation, and fresh name
+  resolution into the worker. Nonempty labels/assignees merge independent additions
+  and removals; lost PATCH responses recover with one write. A fresh paired read
+  after GraphQL detects remote drift before PATCH and recognizes an already-applied
+  target without replay. Newer unmapped local labels survive recovery end to end.
+- Final combined verification passed 134 tests (mirrors 43, provider 91), including
+  creation/client/projection/recovery regressions and the real local Git + database
+  + HTTP-stub worker cases. Seven-file formatting passed. Earlier 12/14 and 64-test
+  snapshots below are historical, not current failures.
+- Missing immutable node proofs for mapped relationship effects still retry rather
+  than being seeded by this path. Worker activation, unsupported-head handling,
+  merge orchestration, other remaining PR13 gates and PR14–16/full PRD acceptance
+  remain open. No live GitHub, push, deployment, or full acceptance claim is made.
+
 ### PR13 full relationship evidence and worker integration (2026-09-08)
 
 - `a4d0779` adds actual local paired relationship projections and independent
