@@ -464,7 +464,7 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
     assert_received :older_create_confirmed
   end
 
-  test "effect-pending create clears its completed no-match scan before a newer unmapped label" do
+  test "effect-pending create retains ambiguity before a newer unmapped label" do
     parent = self()
     proposed = Map.put(@base, "title", "created")
     correlation_id = "e7e9e395-b50f-4d28-bca9-9fa20e05e6af"
@@ -480,9 +480,10 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
         local_observe: fn _ ->
           {:label_required, local_label_candidate(), %{local_resource_id: 100, local_version: 2}}
         end,
-        requeue_effect: fn ^operation, @now ->
-          send(parent, :create_reconciled_not_applied)
-          {:ok, %{operation | state: :pending, external_effect_marker: nil}}
+        requeue_effect: fn _, _ -> flunk("absence of a marker cannot clear a possible create") end,
+        conflict: fn ^operation, @now, "ambiguous_external_effect", _, _, %{} ->
+          send(parent, :create_remains_ambiguous)
+          {:ok, :conflicted}
         end,
         get_label: fn _, _, _, _, _ -> flunk("label effect replaced an unreconciled create") end,
         create_issue: fn _, _, _, _, _ ->
@@ -490,10 +491,10 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
         end
       )
 
-    assert {:ok, %MirrorOperation{state: :pending, external_effect_marker: nil}} =
+    assert {:ok, :conflicted} =
              IssueSyncWorker.process_operation(operation, @now, options)
 
-    assert_received :create_reconciled_not_applied
+    assert_received :create_remains_ambiguous
   end
 
   test "an ambiguous issue create scans one full-list page per claim and retains no body" do
@@ -605,7 +606,7 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
     assert_received :adopted
   end
 
-  test "zero matches after the complete create scan performs one create with the persisted marker" do
+  test "zero matches after the complete create scan never repeats a possibly successful POST" do
     parent = self()
     proposed = Map.put(@base, "title", "created")
     correlation_id = "e7e9e395-b50f-4d28-bca9-9fa20e05e6af"
@@ -619,30 +620,43 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
           {:ok, context(marker, github_object_id: nil, github_number: nil)}
         end,
         local_observe: fn _ -> {:ok, local_issue(proposed, 1)} end,
-        create_issue: fn _, _, _, attrs, _ ->
-          assert String.ends_with?(
-                   attrs["body"],
-                   "<!-- fornacast:sync:v1:#{correlation_id} -->"
-                 )
-
-          send(parent, :created)
-
-          {:ok,
-           github_issue(proposed,
-             id: 501,
-             number: 9,
-             body: attrs["body"],
-             updated_at: "2026-09-07T08:00:01Z"
-           )}
-        end,
-        confirm: fn _, _, _, confirmation, _ ->
-          assert confirmation.confirmed_snapshot == proposed
-          {:ok, :confirmed}
+        create_issue: fn _, _, _, _, _ -> flunk("possibly successful POST was repeated") end,
+        conflict: fn ^operation, @now, "ambiguous_external_effect", _, ^proposed, %{} ->
+          send(parent, :ambiguous_create)
+          {:ok, :conflicted}
         end
       )
 
-    assert {:ok, :confirmed} = IssueSyncWorker.process_operation(operation, @now, options)
-    assert_received :created
+    assert {:ok, :conflicted} = IssueSyncWorker.process_operation(operation, @now, options)
+    assert_received :ambiguous_create
+  end
+
+  test "a completed empty comment recovery scan cannot repeat a possibly successful POST" do
+    snapshot = %{"body" => "local comment"}
+    marker = create_marker("create_remote_comment", snapshot, Ecto.UUID.generate())
+    checkpoint = %{"recovery" => %{"complete" => true, "match" => nil}}
+    operation = operation("sync.issue_comment", :effect_pending, marker, checkpoint)
+
+    options =
+      options(operation,
+        context: fn ^operation ->
+          {:ok,
+           comment_context(:missing,
+             github_object_id: nil,
+             github_node_id: nil,
+             effect_marker: marker
+           )}
+        end,
+        local_observe: fn _ -> {:ok, local_comment(snapshot, 1)} end,
+        create_comment: fn _, _, _, _, _, _ ->
+          flunk("possibly successful comment POST repeated")
+        end,
+        conflict: fn ^operation, @now, "ambiguous_external_effect", _, ^snapshot, %{} ->
+          {:ok, :conflicted}
+        end
+      )
+
+    assert {:ok, :conflicted} = IssueSyncWorker.process_operation(operation, @now, options)
   end
 
   test "provider timeout after a marked write preserves effect_pending recovery state" do

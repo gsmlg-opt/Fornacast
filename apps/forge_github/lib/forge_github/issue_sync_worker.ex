@@ -300,7 +300,7 @@ defmodule ForgeGitHub.IssueSyncWorker do
          {:ok, recovery} <- recovery_checkpoint(operation.checkpoint) do
       case recovery do
         %{complete: true, match: nil} ->
-          requeue_reconciled_effect(operation, now, options)
+          conflict(operation, now, sync, :ambiguous_external_effect, local, :missing, options)
 
         %{complete: true, match: match} ->
           adopt_created_match_before_label(operation, now, sync, token, local, match, options)
@@ -1524,7 +1524,7 @@ defmodule ForgeGitHub.IssueSyncWorker do
          remote,
          apply_local?,
          options,
-         catalogs \\ nil
+         catalogs
        ) do
     target = if remote == :deleted, do: :deleted, else: remote.snapshot
     catalogs = catalogs || merged_catalogs(local, remote)
@@ -1740,7 +1740,9 @@ defmodule ForgeGitHub.IssueSyncWorker do
          {:ok, recovery} <- recovery_checkpoint(operation.checkpoint) do
       case recovery do
         %{complete: true, match: nil} ->
-          retry_create_after_scan(operation, now, sync, token, local, options)
+          # A removed marker or a changing paginated list can hide a successful POST.
+          # No match is not proof that this non-idempotent effect never happened.
+          conflict(operation, now, sync, :ambiguous_external_effect, local, :missing, options)
 
         %{complete: true, match: match} ->
           adopt_created_match(operation, now, sync, token, local, match, options)
@@ -1821,39 +1823,6 @@ defmodule ForgeGitHub.IssueSyncWorker do
       "github_number" => raw["number"] || raw["issue_number"],
       "remote_updated_at" => raw["updated_at"]
     }
-  end
-
-  defp retry_create_after_scan(operation, now, sync, token, local, options) do
-    with {:ok, current_fingerprint} <- observation_fingerprint(local, options),
-         {:ok, prepared} <-
-           maybe_replace_create_marker(operation, now, current_fingerprint, options),
-         {:ok, attrs} <-
-           target_remote_attrs(sync, local.snapshot, merged_catalogs(local, :missing)),
-         {:ok, postcondition} <-
-           execute_remote_effect(prepared, sync, token, attrs, local.snapshot, now, options) do
-      confirm_observation(prepared, now, sync, local, postcondition, false, options)
-    else
-      {:effect_error, marked, reason} -> schedule_effect_recovery(marked, now, reason, options)
-      {:error, reason} -> persist_failure(operation, now, reason, options)
-    end
-  end
-
-  defp maybe_replace_create_marker(operation, now, fingerprint, options) do
-    if operation.external_effect_marker["proposed_fingerprint"] == fingerprint do
-      {:ok, operation}
-    else
-      replacement =
-        operation.external_effect_marker
-        |> Map.put("expected_local_fingerprint", fingerprint)
-        |> Map.put("proposed_fingerprint", fingerprint)
-
-      callback(options, :replace_effect, &ForgeMirrors.replace_external_effect/4).(
-        operation,
-        now,
-        operation.external_effect_marker,
-        replacement
-      )
-    end
   end
 
   defp adopt_created_match(operation, now, sync, token, local, match, options) do
