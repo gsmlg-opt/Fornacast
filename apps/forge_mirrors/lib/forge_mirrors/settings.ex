@@ -199,14 +199,20 @@ defmodule ForgeMirrors.Settings do
 
   defp conflicts(mirror_id) do
     MirrorConflict
-    |> where([conflict], conflict.organization_mirror_id == ^mirror_id)
-    |> order_by([conflict], asc: conflict.state, desc: conflict.inserted_at, desc: conflict.id)
+    |> where(
+      [conflict],
+      conflict.organization_mirror_id == ^mirror_id and conflict.state == :open
+    )
+    |> order_by([conflict], desc: conflict.inserted_at, desc: conflict.id)
     |> limit(@conflict_limit)
     |> select([conflict], %{
       id: conflict.id,
+      repository_mirror_id: conflict.repository_mirror_id,
+      resource_kind: conflict.resource_kind,
       resource: conflict.resource_identity,
       kind: conflict.conflict_kind,
-      state: conflict.state
+      state: conflict.state,
+      lock_version: conflict.lock_version
     })
     |> Repo.all()
   end

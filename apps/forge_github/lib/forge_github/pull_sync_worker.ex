@@ -85,7 +85,7 @@ defmodule ForgeGitHub.PullSyncWorker do
 
     with {:ok, operations} <-
            claim.(owner, now, lease_seconds, min(batch_size, max_concurrency), @operation_kinds) do
-      supervisor = Keyword.get(options, :task_supervisor, ForgeGitHub.IssueSyncTaskSupervisor)
+      supervisor = Keyword.get(options, :task_supervisor, ForgeGitHub.PullSyncTaskSupervisor)
 
       results =
         supervisor
@@ -310,11 +310,37 @@ defmodule ForgeGitHub.PullSyncWorker do
     interval_ms = Keyword.get(options, :interval_ms, @default_interval_ms)
     owner = Keyword.get_lazy(options, :owner, &Ecto.UUID.generate/0)
     enabled = Keyword.get(options, :enabled, config(:pull_sync_worker_enabled, false))
-    run_options = Keyword.drop(options, [:interval_ms, :owner, :name, :enabled])
+
+    run_options =
+      Keyword.drop(options, [
+        :interval_ms,
+        :owner,
+        :name,
+        :enabled,
+        :loop_task_supervisor,
+        :runner
+      ])
 
     if is_integer(interval_ms) and interval_ms > 0 and is_binary(owner) and is_boolean(enabled) do
+      state = %{
+        interval_ms: interval_ms,
+        owner: owner,
+        run_options: run_options,
+        enabled: enabled,
+        loop_task_supervisor:
+          Keyword.get(
+            options,
+            :loop_task_supervisor,
+            ForgeGitHub.PullSyncLoopTaskSupervisor
+          ),
+        task_supervisor:
+          Keyword.get(options, :task_supervisor, ForgeGitHub.PullSyncTaskSupervisor),
+        runner: Keyword.get(options, :runner, fn -> run_once(owner, run_options) end),
+        task_ref: nil
+      }
+
       if enabled, do: schedule(0)
-      {:ok, %{interval_ms: interval_ms, owner: owner, run_options: run_options, enabled: enabled}}
+      {:ok, state}
     else
       {:stop, :invalid_options}
     end
@@ -323,11 +349,25 @@ defmodule ForgeGitHub.PullSyncWorker do
   @impl true
   def handle_info(:tick, %{enabled: false} = state), do: {:noreply, state}
 
-  def handle_info(:tick, %{enabled: true} = state) do
-    _ = run_once(state.owner, state.run_options)
-    schedule(state.interval_ms)
-    {:noreply, state}
+  def handle_info(:tick, %{enabled: true, task_ref: nil} = state) do
+    case Task.Supervisor.start_child(state.loop_task_supervisor, state.runner) do
+      {:ok, pid} ->
+        {:noreply, %{state | task_ref: Process.monitor(pid)}}
+
+      {:error, _reason} ->
+        schedule(state.interval_ms)
+        {:noreply, state}
+    end
   end
+
+  def handle_info(:tick, state), do: {:noreply, state}
+
+  def handle_info({:DOWN, reference, :process, _pid, _reason}, %{task_ref: reference} = state) do
+    if state.enabled, do: schedule(state.interval_ms)
+    {:noreply, %{state | task_ref: nil}}
+  end
+
+  def handle_info(_message, state), do: {:noreply, state}
 
   defp context(operation, options),
     do: callback(options, :context, &default_context/1).(operation)

@@ -10,6 +10,47 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 pull-sync activation and merge-conflict external recheck (2026-09-13)
+
+- Ordinary pull synchronization is now registered in the production supervision
+  tree behind explicit GitHub App activation. It owns a dedicated two-slot task
+  supervisor, retains the exact `sync.pull`/pull-head-reevaluation allowlist and
+  restarts its scheduled claim loop after a processor task exits or crashes.
+  This removes the inactive-worker FIFO prerequisite before merge activation;
+  merge work itself is not yet admitted or supervised.
+- A specialized owner/admin boundary now supports only the canonical
+  `external_recheck` action for an open `pull_merge` conflict. It locks and
+  correlates the persisted organization, active repository binding, coordinated
+  merge intent, retained `merge.pull` operation, cursor and external-effect
+  marker; rejects stale, forged, leased or unrelated capabilities; then resolves
+  with optimistic CAS, audits the action and makes the same operation due in one
+  transaction. The merge reservation, intent, marker, checkpoint and cursor are
+  retained byte-for-byte. The browser action itself performs no provider or Git
+  effect.
+- The bounded organization settings projection now lists open conflicts only
+  and exposes the resource kind and lock version needed for that action. The
+  authenticated native-CSRF form is implemented for open pull-merge conflicts,
+  strictly parses the conflict/version/action capability, masks unauthorized
+  organizations, and redirects back to the conflict list after the durable
+  transaction. Production rendering and facade execution remain explicitly
+  disabled until the dedicated merge worker is active, so an accepted recheck
+  cannot be stranded in the queue. Full snapshot comparison, filters, `accept
+  GitHub`, and `keep Fornacast` remain PR16 work.
+- Fresh PostgreSQL scoped verification passed **58 tests**: mirror effect and
+  resolution **23**, GitHub supervision/lifecycle **9**, organization facade
+  **5**, and web authorization/CSRF/controller behavior **21**. The deliberate
+  task-crash lifecycle test emits its expected error log. Existing unrelated
+  importer fixture warnings remain unchanged. Production compilation with
+  warnings as errors, scoped formatting and diff checks also passed.
+- A source/coverage audit corrected the prior broad remainder description:
+  represented cross-repository metadata sync and core nil-to-represented
+  promotion are implemented. Remaining PR13 cross-repository work is a genuine
+  disjoint-object-database merge test and bounded head-object materialization,
+  plus late-binding and nil-to-same-base integration cases. Request admission,
+  prepared-intent writing, unmarked failure lease release, the dedicated
+  long-lease merge worker, controller completion semantics and final two-endpoint
+  proof also remain open. PR14-PR16 and full PRD acceptance remain unfinished.
+
 ### PR13 merge-owned outbound relationship effects (2026-09-14)
 
 - The dedicated merge metadata intent now admits exact three-way label and

@@ -98,6 +98,10 @@ defmodule FornacastWeb.Router do
         OrganizationGitHubSettingsController,
         :conflicts
 
+    patch "/organizations/:organization/settings/github/conflicts/:conflict_id",
+          OrganizationGitHubSettingsController,
+          :resolve_pull_merge_conflict
+
     get "/settings/github", GitHubSettingsController, :index
     post "/settings/github", GitHubSettingsController, :create
     post "/settings/github/:identity_id/reverify", GitHubSettingsController, :reverify

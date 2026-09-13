@@ -16,8 +16,14 @@ defmodule ForgeImports.OrganizationSync do
   @intent_seconds 600
   @state_pattern ~r/\A[A-Za-z0-9_-]{43}\z/
 
-  def get_settings(%User{} = actor, %Organization{id: organization_id}),
-    do: ForgeMirrors.organization_settings(actor, organization_id)
+  def get_settings(%User{} = actor, %Organization{id: organization_id}) do
+    with {:ok, view} <- ForgeMirrors.organization_settings(actor, organization_id) do
+      {:ok,
+       update_in(view, [:actions], fn actions ->
+         Map.put(actions, :resolve_pull_merge_conflict, pull_merge_worker_enabled?())
+       end)}
+    end
+  end
 
   def get_settings(_actor, _organization), do: {:error, :forbidden}
 
@@ -100,6 +106,34 @@ defmodule ForgeImports.OrganizationSync do
   end
 
   def update_settings(_actor, _organization, _attrs, _request_metadata),
+    do: {:error, :forbidden}
+
+  def resolve_pull_merge_conflict(
+        %User{} = actor,
+        %Organization{id: organization_id},
+        %{conflict_id: conflict_id, lock_version: lock_version, action: action},
+        request_metadata
+      )
+      when is_integer(conflict_id) and conflict_id > 0 and is_integer(lock_version) and
+             lock_version > 0 and is_binary(action) and is_map(request_metadata) do
+    with {:ok, safe_metadata} <-
+           ForgeAccounts.validate_github_request_metadata(request_metadata),
+         true <- pull_merge_worker_enabled?() do
+      ForgeMirrors.recheck_pull_merge_conflict(
+        actor,
+        organization_id,
+        %ForgeMirrors.MirrorConflict{id: conflict_id, lock_version: lock_version},
+        action,
+        DateTime.utc_now(:second),
+        safe_metadata
+      )
+    else
+      false -> {:error, :not_configured}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def resolve_pull_merge_conflict(_actor, _organization, _attrs, _request_metadata),
     do: {:error, :forbidden}
 
   def bootstrap(%User{} = actor, %Organization{} = organization, attrs, request_metadata)
@@ -203,4 +237,7 @@ defmodule ForgeImports.OrganizationSync do
   defp normalize_error(%Error{kind: :not_found}), do: :invalid_installation
   defp normalize_error(%Error{kind: kind}), do: kind
   defp normalize_error(reason), do: reason
+
+  defp pull_merge_worker_enabled?,
+    do: is_pid(Process.whereis(ForgeGitHub.PullMergeWorker))
 end

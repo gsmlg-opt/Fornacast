@@ -14,7 +14,7 @@ defmodule ForgeMirrors.PullMergeLocalLabelEffectsTest do
     PullMergeMetadataEffects
   }
 
-  alias Fornacast.Repo
+  alias Fornacast.{AuditEvent, Repo}
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
@@ -900,6 +900,229 @@ defmodule ForgeMirrors.PullMergeLocalLabelEffectsTest do
              PullMergeLocalLabelEffects.context(substituted, c.now)
   end
 
+  test "an owner atomically resolves a merge conflict for external recheck and wakes its operation",
+       c do
+    {conflict, operation, intent} = conflicted(c)
+    actor = organization_owner_fixture(c.organization)
+    checkpoint = operation.checkpoint
+    marker = operation.external_effect_marker
+    cursor = operation.cursor
+
+    metadata = %{
+      "request_id" => "recheck-#{conflict.id}",
+      "operation_id" => "recheck-operation-#{conflict.id}",
+      "ip_address" => "127.0.0.1",
+      "user_agent" => "merge-conflict-test"
+    }
+
+    assert {:ok, before_view} =
+             ForgeMirrors.organization_settings(actor, c.organization.organization_id)
+
+    assert [summary] = Enum.filter(before_view.conflicts, &(&1.id == conflict.id))
+    assert summary.resource_kind == "pull_merge"
+    assert summary.lock_version == conflict.lock_version
+
+    assert {:ok, result} =
+             ForgeMirrors.recheck_pull_merge_conflict(
+               actor,
+               c.organization.organization_id,
+               conflict,
+               "external_recheck",
+               c.now,
+               metadata
+             )
+
+    assert result.conflict.state == :resolved
+    assert result.conflict.resolution == %{"action" => "external_recheck", "v" => 1}
+    assert result.conflict.resolved_by_user_id == actor.id
+    assert result.operation.id == operation.id
+    assert result.operation.state == :effect_pending
+    assert result.operation.next_attempt_at == c.now
+    assert result.operation.failure_class == nil
+    assert result.operation.failure_disposition == nil
+    assert result.operation.failure_detail == nil
+    assert result.operation.lease_owner == nil
+    assert result.operation.lease_expires_at == nil
+    assert result.operation.checkpoint == checkpoint
+    assert result.operation.external_effect_marker == marker
+    assert result.operation.cursor == cursor
+
+    assert %AuditEvent{
+             action: "github.pull_merge_conflict.external_recheck",
+             actor_user_id: actor_id,
+             target_type: "mirror_conflict",
+             target_id: target_id,
+             request_id: request_id,
+             operation_id: operation_id
+           } =
+             audit =
+             Repo.get_by!(AuditEvent,
+               action: "github.pull_merge_conflict.external_recheck",
+               target_id: to_string(conflict.id)
+             )
+
+    assert actor_id == actor.id
+    assert target_id == to_string(conflict.id)
+    assert request_id == metadata["request_id"]
+    assert operation_id == "pull-merge-conflict-recheck:#{conflict.id}"
+    assert audit.metadata["operation_id"] == metadata["operation_id"]
+
+    persisted_intent = Repo.get!(ForgePulls.MergeOperation, intent.id)
+    assert persisted_intent.state == :merge_written
+    assert persisted_intent.merge_oid == intent.merge_oid
+
+    assert {:ok, after_view} =
+             ForgeMirrors.organization_settings(actor, c.organization.organization_id)
+
+    refute Enum.any?(after_view.conflicts, &(&1.id == conflict.id))
+
+    assert {:ok, replay} =
+             ForgeMirrors.recheck_pull_merge_conflict(
+               actor,
+               c.organization.organization_id,
+               conflict,
+               "external_recheck",
+               DateTime.add(c.now, 1, :second),
+               metadata
+             )
+
+    assert replay.conflict.id == result.conflict.id
+    assert replay.conflict.resolved_at == result.conflict.resolved_at
+
+    assert Repo.aggregate(
+             from(event in AuditEvent,
+               where:
+                 event.action == "github.pull_merge_conflict.external_recheck" and
+                   event.target_id == ^to_string(conflict.id)
+             ),
+             :count
+           ) == 1
+  end
+
+  test "external recheck rejects stale conflict capabilities and actively leased operations", c do
+    {conflict, operation, _intent} = conflicted(c)
+    actor = organization_owner_fixture(c.organization)
+
+    assert {:error, :stale} =
+             ForgeMirrors.recheck_pull_merge_conflict(
+               actor,
+               c.organization.organization_id,
+               %{conflict | lock_version: conflict.lock_version + 1},
+               "external_recheck",
+               c.now,
+               %{}
+             )
+
+    leased =
+      operation
+      |> Changeset.change(
+        lease_owner: "racing-worker",
+        lease_expires_at: DateTime.add(c.now, 60, :second),
+        lock_version: operation.lock_version + 1
+      )
+      |> Repo.update!()
+
+    assert leased.lease_owner == "racing-worker"
+
+    assert {:error, :busy} =
+             ForgeMirrors.recheck_pull_merge_conflict(
+               actor,
+               c.organization.organization_id,
+               conflict,
+               "external_recheck",
+               c.now,
+               %{}
+             )
+
+    assert Repo.get!(MirrorConflict, conflict.id).state == :open
+  end
+
+  test "external recheck atomically clears an expired operation lease", c do
+    {conflict, operation, _intent} = conflicted(c)
+    actor = organization_owner_fixture(c.organization)
+
+    operation
+    |> Changeset.change(
+      lease_owner: "expired-worker",
+      lease_expires_at: DateTime.add(c.now, -1, :second),
+      lock_version: operation.lock_version + 1
+    )
+    |> Repo.update!()
+
+    assert {:ok, result} =
+             ForgeMirrors.recheck_pull_merge_conflict(
+               actor,
+               c.organization.organization_id,
+               conflict,
+               "external_recheck",
+               c.now,
+               %{}
+             )
+
+    assert result.conflict.state == :resolved
+    assert result.operation.lease_owner == nil
+    assert result.operation.lease_expires_at == nil
+    assert result.operation.next_attempt_at == c.now
+  end
+
+  test "external recheck rejects unauthorized actors, arbitrary actions, and non-merge conflicts",
+       c do
+    {conflict, _operation, _intent} = conflicted(c)
+    outsider = ForgeAccounts.User |> Repo.get!(user_fixture())
+
+    assert {:error, :forbidden} =
+             ForgeMirrors.recheck_pull_merge_conflict(
+               outsider,
+               c.organization.organization_id,
+               conflict,
+               "external_recheck",
+               c.now,
+               %{}
+             )
+
+    assert {:error, :invalid_transition} =
+             ForgeMirrors.recheck_pull_merge_conflict(
+               organization_owner_fixture(c.organization),
+               c.organization.organization_id + 1,
+               conflict,
+               "external_recheck",
+               c.now,
+               %{}
+             )
+
+    assert {:error, :invalid_argument} =
+             ForgeMirrors.recheck_pull_merge_conflict(
+               organization_owner_fixture(c.organization),
+               c.organization.organization_id,
+               conflict,
+               "keep_fornacast",
+               c.now,
+               %{}
+             )
+
+    {:ok, other} =
+      ForgeMirrors.record_conflict(%{
+        organization_mirror_id: c.organization.id,
+        repository_mirror_id: c.binding.id,
+        resource_kind: "pull",
+        resource_identity: "pull:#{c.pull.id}",
+        conflict_kind: "concurrent_edit",
+        baseline_snapshot: %{},
+        local_snapshot: %{},
+        remote_snapshot: %{}
+      })
+
+    assert {:error, :invalid_transition} =
+             ForgeMirrors.recheck_pull_merge_conflict(
+               organization_owner_fixture(c.organization),
+               c.organization.organization_id,
+               other,
+               "external_recheck",
+               c.now,
+               %{}
+             )
+  end
+
   defp assigned_label(c, name) do
     projection = repository_label(c.binding.repository_id, name)
 
@@ -909,6 +1132,25 @@ defmodule ForgeMirrors.PullMergeLocalLabelEffectsTest do
     })
 
     projection
+  end
+
+  defp conflicted(c) do
+    {operation, intent} = marked(c)
+    merge_locally(c, intent)
+    candidate = assigned_label(c, "conflicted-label")
+
+    assert {:ok, result} =
+             PullMergeLocalLabelEffects.conflict(
+               operation,
+               c.now,
+               intent,
+               observation(c, intent),
+               candidate,
+               :label_namespace_collision,
+               %{}
+             )
+
+    {result.conflict, result.operation, intent}
   end
 
   defp repository_label(repository_id, name) do

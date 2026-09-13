@@ -12,6 +12,22 @@ defmodule FornacastWeb.OrganizationGitHubSettingsController do
   def index(conn, params), do: render_settings(conn, params, :index)
   def conflicts(conn, params), do: render_settings(conn, params, :conflicts)
 
+  def resolve_pull_merge_conflict(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
+    with {:ok, organization} <- manageable_organization(actor, params),
+         {:ok, attrs} <- pull_merge_conflict_params(params),
+         result <-
+           organization_sync(conn).resolve_pull_merge_conflict(
+             actor,
+             organization,
+             attrs,
+             RequestMetadata.from_conn(conn)
+           ) do
+      handle_conflict_action_result(conn, organization, result)
+    else
+      {:error, reason} -> render_error(conn, reason)
+    end
+  end
+
   def install(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
     with {:ok, organization} <- manageable_organization(actor, params),
          state = installation_state(),
@@ -151,6 +167,18 @@ defmodule FornacastWeb.OrganizationGitHubSettingsController do
   defp handle_action_result(conn, _organization, _unexpected),
     do: render_error(conn, :unavailable)
 
+  defp handle_conflict_action_result(conn, organization, {:ok, _result}) do
+    conn
+    |> put_status(:see_other)
+    |> redirect(to: conflicts_path(organization))
+  end
+
+  defp handle_conflict_action_result(conn, _organization, {:error, reason}),
+    do: render_error(conn, reason)
+
+  defp handle_conflict_action_result(conn, _organization, _unexpected),
+    do: render_error(conn, :unavailable)
+
   defp manageable_organization(actor, %{"organization" => slug}) when is_binary(slug),
     do: ForgeAccounts.fetch_manageable_organization_by_slug(actor, slug)
 
@@ -162,6 +190,30 @@ defmodule FornacastWeb.OrganizationGitHubSettingsController do
       _invalid -> {:error, :invalid_request}
     end
   end
+
+  defp pull_merge_conflict_params(%{
+         "conflict_id" => conflict_id,
+         "conflict" => %{"lock_version" => lock_version, "action" => "external_recheck"} = attrs
+       })
+       when map_size(attrs) == 2 do
+    with {:ok, conflict_id} <- canonical_positive_id(conflict_id),
+         {:ok, lock_version} <- canonical_positive_id(lock_version) do
+      {:ok, %{conflict_id: conflict_id, lock_version: lock_version, action: "external_recheck"}}
+    end
+  end
+
+  defp pull_merge_conflict_params(_params), do: {:error, :invalid_request}
+
+  defp canonical_positive_id(value) when is_binary(value) and byte_size(value) <= 19 do
+    with true <- Regex.match?(@canonical_id, value),
+         {id, ""} when id <= @max_id <- Integer.parse(value) do
+      {:ok, id}
+    else
+      _invalid -> {:error, :invalid_request}
+    end
+  end
+
+  defp canonical_positive_id(_value), do: {:error, :invalid_request}
 
   defp callback_params(%{
          "installation_id" => installation_id,
@@ -249,6 +301,8 @@ defmodule FornacastWeb.OrganizationGitHubSettingsController do
   defp settings_path(organization),
     do: "/organizations/#{organization.username}/settings/github"
 
+  defp conflicts_path(organization), do: settings_path(organization) <> "/conflicts"
+
   defp render_error(conn, :invalid_callback) do
     conn
     |> put_status(:bad_request)
@@ -273,7 +327,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsController do
     )
   end
 
-  defp render_error(conn, reason) when reason in [:busy, :stale, :conflict] do
+  defp render_error(conn, reason) when reason in [:busy, :leased, :stale, :conflict] do
     conn
     |> put_status(:conflict)
     |> page(

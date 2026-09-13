@@ -4399,6 +4399,18 @@ defmodule ForgeMirrors do
 
   def resolve_conflict(_actor, _conflict, _resolution, _now), do: {:error, :forbidden}
 
+  @doc "Resolve one durable pull-merge conflict after an operator corrected external evidence."
+  defdelegate recheck_pull_merge_conflict(
+                actor,
+                organization_id,
+                conflict,
+                action,
+                now,
+                request_metadata
+              ),
+              to: ForgeMirrors.PullMergeConflictResolution,
+              as: :recheck
+
   @spec organization_status(pos_integer()) ::
           {:ok, map()} | {:error, :not_found | :invalid_argument}
   def organization_status(id) when is_integer(id) and id > 0 do

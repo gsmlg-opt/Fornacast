@@ -36,7 +36,31 @@
           <tr :for={conflict <- @view.conflicts}>
             <th scope="row">{item_label(conflict, [:resource, :resource_identity])}</th>
             <td>{humanize(item_label(conflict, [:kind, :conflict_kind]))}</td>
-            <td>{item_label(conflict, [:state])}</td>
+            <td>
+              <div class="grid gap-2">
+                <span>{item_label(conflict, [:state])}</span>
+                <form
+                  :if={
+                    action_enabled?(@view, :resolve_pull_merge_conflict) &&
+                      pull_merge_recheckable?(conflict)
+                  }
+                  action={"/organizations/#{@organization.username}/settings/github/conflicts/#{value(conflict, :id)}"}
+                  method="post"
+                >
+                  <input type="hidden" name="_csrf_token" value={csrf_token()} />
+                  <input type="hidden" name="_method" value="patch" />
+                  <input
+                    type="hidden"
+                    name="conflict[lock_version]"
+                    value={value(conflict, :lock_version)}
+                  />
+                  <input type="hidden" name="conflict[action]" value="external_recheck" />
+                  <.dm_btn type="submit" variant="secondary" size="sm">
+                    Recheck after external resolution
+                  </.dm_btn>
+                </form>
+              </div>
+            </td>
           </tr>
         </tbody>
       </table>

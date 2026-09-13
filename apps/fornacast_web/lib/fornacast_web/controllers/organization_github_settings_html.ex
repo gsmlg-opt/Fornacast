@@ -133,6 +133,15 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTML do
 
   def item_label(_item, _preferred_keys), do: "Unknown"
 
+  def pull_merge_recheckable?(conflict) when is_map(conflict) do
+    value(conflict, :resource_kind) in ["pull_merge", :pull_merge] and
+      value(conflict, :state) in ["open", :open] and
+      is_integer(value(conflict, :id)) and value(conflict, :id) > 0 and
+      is_integer(value(conflict, :lock_version)) and value(conflict, :lock_version) > 0
+  end
+
+  def pull_merge_recheckable?(_conflict), do: false
+
   def humanize(true), do: "Enabled"
   def humanize(false), do: "Disabled"
   def humanize(value) when is_atom(value), do: value |> Atom.to_string() |> humanize()

@@ -48,6 +48,11 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
       operation_result(:update_settings, {:ok, :updated})
     end
 
+    def resolve_pull_merge_conflict(actor, organization, attrs, metadata) do
+      record(:resolve_pull_merge_conflict, [actor, organization, attrs, metadata])
+      operation_result(:resolve_pull_merge_conflict, {:ok, :accepted})
+    end
+
     def bootstrap(actor, organization, attrs, metadata) do
       record(:bootstrap, [actor, organization, attrs, metadata])
       operation_result(:bootstrap, {:ok, :started})
@@ -124,7 +129,8 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
       {"POST", "/organizations/acme/settings/github/pause", :pause},
       {"POST", "/organizations/acme/settings/github/resume", :resume},
       {"DELETE", "/organizations/acme/settings/github", :delete},
-      {"GET", "/organizations/acme/settings/github/conflicts", :conflicts}
+      {"GET", "/organizations/acme/settings/github/conflicts", :conflicts},
+      {"PATCH", "/organizations/acme/settings/github/conflicts/42", :resolve_pull_merge_conflict}
     ]
 
     for {method, path, action} <- routes do
@@ -276,6 +282,136 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
     assert html =~ "Diverged"
     assert [{:get_settings, [_actor, _organization]}] = TestOrganizationSync.calls()
     assert_private_no_store(conn)
+  end
+
+  test "owner requests an external recheck for an open pull merge conflict", %{
+    owner: owner,
+    organization: organization
+  } do
+    view =
+      organization
+      |> settings_view()
+      |> put_in([:actions, :resolve_pull_merge_conflict], true)
+      |> Map.put(:conflicts, [
+        %{
+          id: 42,
+          lock_version: 7,
+          resource: "pull request #12",
+          resource_kind: "pull_merge",
+          kind: :diverged,
+          state: :open
+        }
+      ])
+
+    TestOrganizationSync.result(:get_settings, {:ok, view})
+
+    form = request_conn(owner) |> get(github_settings_path(organization) <> "/conflicts")
+    action = github_settings_path(organization) <> "/conflicts/42"
+    token = extract_form_csrf_token(form.resp_body, action)
+
+    assert form.resp_body =~ "Recheck after external resolution"
+    refute form.resp_body =~ "snapshot"
+
+    accepted =
+      form
+      |> recycle_request()
+      |> with_production_csrf()
+      |> patch(action, %{
+        "_csrf_token" => token,
+        "conflict" => %{"lock_version" => "7", "action" => "external_recheck"}
+      })
+
+    assert redirected_to(accepted, 303) == github_settings_path(organization) <> "/conflicts"
+
+    assert [
+             {:get_settings, [%User{}, %Organization{}]},
+             {:resolve_pull_merge_conflict,
+              [%User{id: actor_id}, %Organization{id: organization_id}, attrs, metadata]}
+           ] = TestOrganizationSync.calls()
+
+    assert actor_id == owner.id
+    assert organization_id == organization.id
+    assert attrs == %{conflict_id: 42, lock_version: 7, action: "external_recheck"}
+    assert metadata.user_agent == "organization-github-settings-controller-test"
+    assert_private_no_store(accepted)
+  end
+
+  test "only open pull merge conflicts expose the external recheck form", %{
+    owner: owner,
+    organization: organization
+  } do
+    view =
+      organization
+      |> settings_view()
+      |> Map.put(:conflicts, [
+        %{id: 11, lock_version: 2, resource_kind: "issue", state: :open},
+        %{id: 12, lock_version: 3, resource_kind: "pull_merge", state: :resolved},
+        %{id: 13, lock_version: 4, resource_kind: "pull_merge", state: :open}
+      ])
+
+    TestOrganizationSync.result(:get_settings, {:ok, view})
+
+    conn = request_conn(owner) |> get(github_settings_path(organization) <> "/conflicts")
+
+    refute conn.resp_body =~ "conflicts/11"
+    refute conn.resp_body =~ "conflicts/12"
+    refute conn.resp_body =~ "conflicts/13"
+    refute conn.resp_body =~ "Recheck after external resolution"
+  end
+
+  test "external recheck rejects malformed input before facade access and masks authorization", %{
+    owner: owner,
+    outsider: outsider,
+    organization: organization
+  } do
+    action = github_settings_path(organization) <> "/conflicts/42"
+
+    for params <- [
+          %{},
+          %{"conflict" => "forged"},
+          %{"conflict" => %{"lock_version" => "0", "action" => "external_recheck"}},
+          %{"conflict" => %{"lock_version" => "7", "action" => "accept_github"}}
+        ] do
+      TestOrganizationSync.reset()
+      conn = request_conn(owner) |> patch(action, params)
+
+      assert html_response(conn, 422) =~ "parameters are invalid"
+      assert TestOrganizationSync.calls() == []
+      assert_private_no_store(conn)
+    end
+
+    TestOrganizationSync.reset()
+
+    conn =
+      request_conn(outsider)
+      |> patch(action, %{"conflict" => %{"lock_version" => "7", "action" => "external_recheck"}})
+
+    assert html_response(conn, 404) =~ "Organization settings not found."
+    assert TestOrganizationSync.calls() == []
+    assert_private_no_store(conn)
+  end
+
+  test "external recheck stale and leased results are fixed conflicts", %{
+    owner: owner,
+    organization: organization
+  } do
+    action = github_settings_path(organization) <> "/conflicts/42"
+
+    for reason <- [:stale, :leased] do
+      TestOrganizationSync.reset()
+      TestOrganizationSync.result(:resolve_pull_merge_conflict, {:error, reason})
+
+      conn =
+        request_conn(owner)
+        |> patch(action, %{"conflict" => %{"lock_version" => "7", "action" => "external_recheck"}})
+
+      assert html_response(conn, 409) =~ "changed or is busy"
+
+      assert [{:resolve_pull_merge_conflict, [_actor, _organization, _attrs, _metadata]}] =
+               TestOrganizationSync.calls()
+
+      assert_private_no_store(conn)
+    end
   end
 
   test "installation start stores an unguessable actor and organization bound correlation", %{
