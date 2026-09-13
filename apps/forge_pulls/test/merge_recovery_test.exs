@@ -895,7 +895,8 @@ defmodule ForgePulls.MergeRecoveryTest do
     end
 
     start_supervised!(
-      {MergeReconciler, name: nil, task_supervisor: task_supervisor, task: task, interval_ms: 20},
+      {MergeReconciler,
+       name: nil, enabled: true, task_supervisor: task_supervisor, task: task, interval_ms: 20},
       id: make_ref()
     )
 
@@ -918,7 +919,12 @@ defmodule ForgePulls.MergeRecoveryTest do
 
     start_supervised!(
       {MergeReconciler,
-       name: nil, task_supervisor: task_supervisor, task: task, interval_ms: 20, runtime_ms: 80},
+       name: nil,
+       enabled: true,
+       task_supervisor: task_supervisor,
+       task: task,
+       interval_ms: 20,
+       runtime_ms: 80},
       id: make_ref()
     )
 
@@ -943,7 +949,12 @@ defmodule ForgePulls.MergeRecoveryTest do
     reconciler =
       start_supervised!(
         {MergeReconciler,
-         name: nil, task_supervisor: task_supervisor, task: task, interval_ms: 20, runtime_ms: 200},
+         name: nil,
+         enabled: true,
+         task_supervisor: task_supervisor,
+         task: task,
+         interval_ms: 20,
+         runtime_ms: 200},
         id: make_ref()
       )
 
@@ -975,7 +986,13 @@ defmodule ForgePulls.MergeRecoveryTest do
         {ForgePulls.RecoverySupervisor,
          name: nil,
          task_supervisor: task_supervisor,
-         reconciler: [name: nil, task: task, interval_ms: 30_000, runtime_ms: 500]},
+         reconciler: [
+           name: nil,
+           enabled: true,
+           task: task,
+           interval_ms: 30_000,
+           runtime_ms: 500
+         ]},
         id: make_ref()
       )
 
@@ -990,7 +1007,14 @@ defmodule ForgePulls.MergeRecoveryTest do
     assert Process.alive?(second_pid)
     send(second_pid, :finish)
 
-    assert %{task_fun: task_fun, interval_ms: 30_000, runtime_ms: 30_000} =
+    assert %{
+             enabled: false,
+             task: nil,
+             tick_timer: nil,
+             task_fun: task_fun,
+             interval_ms: 30_000,
+             runtime_ms: 30_000
+           } =
              :sys.get_state(Process.whereis(MergeReconciler))
 
     assert {:module, MergeReconciler} = Function.info(task_fun, :module)

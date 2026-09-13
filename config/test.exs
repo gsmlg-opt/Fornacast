@@ -5,6 +5,8 @@ config :forge_imports,
   recovery_max_concurrency: 1,
   repository_cleanup_enabled: false
 
+config :forge_pulls, merge_reconciler_enabled: false
+
 config :forge_mirrors,
   operation_reconciler_enabled: false,
   outbox_dispatcher_enabled: false,

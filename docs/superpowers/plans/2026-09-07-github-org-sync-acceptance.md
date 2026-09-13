@@ -55,7 +55,7 @@ remain open.
   changes complete atomically. Permanent provider numeric IDs remain the intent
   identity; node IDs may legitimately advance from missing to authenticated and
   are immutable through supported mapping writes.
-- Fresh connected PostgreSQL verification completed with **295 passing
+- Fresh connected PostgreSQL verification completed cleanly with **295 passing
   assertions**: merge mirror boundaries and proofs **119**, coordinated merge
   domain/recovery **73**, and provider observation/decision/recovery **103**.
   The generalized exact-ref path
@@ -64,11 +64,14 @@ remain open.
   Independent cross-review approved the prerequisite boundaries and worker
   integration after repairing repository-scoped dangling-label admission; exact
   preexisting label adoption was retained as the established inbound contract.
-- The broad matrix is not yet a clean final gate: after its passing assertions,
-  a standalone `MergeReconciler` task twice outlived its SQL sandbox owner and
-  logged `DBConnection.OwnershipError`. The focused relationship tests do not
-  reproduce it, but PR13/final acceptance must repair and re-run that lifecycle
-  path rather than treating the assertion count as complete proof.
+- The previous post-assertion `DBConnection.OwnershipError` was traced to the
+  application-wide `MergeReconciler` continuing its periodic task after a
+  shared ExUnit SQL sandbox owner exited. Test configuration now disables only
+  that global scheduler; isolated scheduler tests explicitly enable their own
+  supervised instances. The lifecycle regression, all 33 reconciler/recovery
+  tests and the complete 295-assertion matrix passed without an orphaned task or
+  ownership error. Production remains enabled by default and passed
+  warnings-as-errors compilation.
 - This closes mapped merge-owned effects, node proofs and unknown provider label/
   assignee materialization, not all of PR13. Local unmapped outbound label
   creation/adoption, durable conflict-resolution UX, runtime admission and

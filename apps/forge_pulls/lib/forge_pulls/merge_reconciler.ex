@@ -30,6 +30,12 @@ defmodule ForgePulls.MergeReconciler do
   @impl true
   def init(opts) do
     state = %{
+      enabled:
+        Keyword.get(
+          opts,
+          :enabled,
+          Application.get_env(:forge_pulls, :merge_reconciler_enabled, true)
+        ),
       task: nil,
       runtime_timer: nil,
       tick_timer: nil,
@@ -44,15 +50,19 @@ defmodule ForgePulls.MergeReconciler do
   end
 
   @impl true
-  def handle_continue(:startup, state) do
+  def handle_continue(:startup, %{enabled: true} = state) do
     {:noreply, state |> schedule_tick() |> start_task()}
   end
 
+  def handle_continue(:startup, state), do: {:noreply, state}
+
   @impl true
-  def handle_info(:tick, state) do
+  def handle_info(:tick, %{enabled: true} = state) do
     state = schedule_tick(state)
     {:noreply, if(state.task == nil, do: start_task(state), else: state)}
   end
+
+  def handle_info(:tick, state), do: {:noreply, state}
 
   def handle_info({ref, _result}, %{task: %Task{ref: ref}} = state) do
     Process.demonitor(ref, [:flush])
