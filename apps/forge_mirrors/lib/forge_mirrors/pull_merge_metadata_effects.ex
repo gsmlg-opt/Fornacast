@@ -81,11 +81,13 @@ defmodule ForgeMirrors.PullMergeMetadataEffects do
            :ok <- require_write_permission(merge.github_installation_id),
            {:ok, local} <- local_projection(merge),
            true <- local.local_version >= metadata_intent.local_version,
-           {:ok, current_issue} <- merged_issue(merge, local) do
+           {:ok, current_issue, unmapped_label} <-
+             recovery_issue(merge, local, metadata_intent) do
         Map.merge(merge, %{
           marker: merge.operation.external_effect_marker,
           local_projection: local,
-          current_local_issue: current_issue
+          current_local_issue: current_issue,
+          unmapped_label: unmapped_label
         })
       else
         false -> Repo.rollback(:stale_local_projection)
@@ -250,6 +252,20 @@ defmodule ForgeMirrors.PullMergeMetadataEffects do
          "assignee_github_ids" =>
            Enum.sort(Enum.map(relationships.assignees, & &1.github_user_id))
        }}
+    end
+  end
+
+  defp recovery_issue(merge, local, metadata_intent) do
+    case merged_issue(merge, local) do
+      {:ok, issue} ->
+        {:ok, issue, nil}
+
+      {:error, {:unmapped_label, candidate}}
+      when local.local_version > metadata_intent.local_version ->
+        {:ok, metadata_intent.payload["expected_local_issue"], candidate}
+
+      {:error, _} = error ->
+        error
     end
   end
 

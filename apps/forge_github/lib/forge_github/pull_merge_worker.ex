@@ -11,6 +11,7 @@ defmodule ForgeGitHub.PullMergeWorker do
 
   alias ForgeGitHub.{
     Client,
+    Error,
     IdentityClient,
     InstallationToken,
     InstallationTokenBroker,
@@ -51,6 +52,9 @@ defmodule ForgeGitHub.PullMergeWorker do
       )
       when is_list(options) do
     case operation.external_effect_marker do
+      %{"phase" => "metadata_label_pending"} ->
+        recover_local_label(operation, now, options)
+
       %{"phase" => "metadata_issue_pending"} ->
         recover_metadata(operation, now, options, 0)
 
@@ -158,6 +162,15 @@ defmodule ForgeGitHub.PullMergeWorker do
         {:conflict, _kind} ->
           now = DateTime.utc_now(:second)
           PullMergeConfirmation.record_metadata_conflict(operation, now, next(now), observation)
+
+        {:error, {:unmapped_label, candidate}} ->
+          materialize_local_label(
+            operation,
+            sync,
+            observation,
+            candidate,
+            options
+          )
 
         {:error, _} = error ->
           error
@@ -267,28 +280,482 @@ defmodule ForgeGitHub.PullMergeWorker do
        ) do
     payload = metadata_intent(context).payload
 
-    if context.current_local_issue in [payload["expected_local_issue"], payload["target_issue"]] do
-      finalize(
-        operation,
-        sync,
-        pair,
-        observation.remote_base_oid,
-        read_token,
-        options,
-        effect_count
-      )
-    else
-      mark_and_apply_metadata(
-        operation,
-        sync,
-        observation,
-        context.local_projection,
-        context.current_local_issue,
-        read_token,
-        options,
-        effect_count
-      )
+    case context[:unmapped_label] do
+      candidate when is_map(candidate) ->
+        materialize_local_label(
+          operation,
+          sync,
+          observation,
+          candidate,
+          options
+        )
+
+      nil ->
+        if context.current_local_issue in [
+             payload["expected_local_issue"],
+             payload["target_issue"]
+           ] do
+          finalize(
+            operation,
+            sync,
+            pair,
+            observation.remote_base_oid,
+            read_token,
+            options,
+            effect_count
+          )
+        else
+          mark_and_apply_metadata(
+            operation,
+            sync,
+            observation,
+            context.local_projection,
+            context.current_local_issue,
+            read_token,
+            options,
+            effect_count
+          )
+        end
     end
+  end
+
+  defp materialize_local_label(
+         operation,
+         sync,
+         observation,
+         candidate,
+         options
+       ) do
+    result =
+      PullSyncWorker.with_merge_ref_fences(sync.git_proof, sync.intent.merge_oid, fn ->
+        with {:ok, label} <-
+               ForgeIssues.label_sync_projection(sync.repository_id, candidate.local_label_id),
+             {:ok, write_token} <- metadata_write_token(sync, options),
+             :ok <- local_label_preflight(operation, options),
+             {:ok, repository} <- relationship_repository(sync, write_token, options),
+             :ok <- local_label_preflight(operation, options) do
+          observed =
+            callback(options, :get_label, &LabelClient.get_label/5).(
+              write_token,
+              sync.routing.base.owner,
+              sync.routing.base.repository,
+              label.fields["name"],
+              request_options(sync, options)
+            )
+
+          with :ok <- local_label_preflight(operation, options),
+               {:ok, ^repository} <- relationship_repository(sync, write_token, options),
+               :ok <- local_label_preflight(operation, options) do
+            case observed do
+              {:ok, remote_label} ->
+                if canonical_provider_label(remote_label) == label.fields do
+                  with {:ok, fresh_observation} <-
+                         refresh_merge_observation(operation, sync, write_token, options) do
+                    confirm_local_label(
+                      operation,
+                      sync,
+                      fresh_observation,
+                      label,
+                      remote_label,
+                      options
+                    )
+                  end
+                else
+                  with {:ok, fresh_observation} <-
+                         refresh_merge_observation(operation, sync, write_token, options) do
+                    conflict_local_label(
+                      operation,
+                      sync,
+                      fresh_observation,
+                      label,
+                      :label_namespace_collision,
+                      remote_label,
+                      options
+                    )
+                  end
+                end
+
+              {:error, %Error{kind: :not_found}} ->
+                create_local_label(
+                  operation,
+                  sync,
+                  observation,
+                  label,
+                  label,
+                  write_token,
+                  repository,
+                  options
+                )
+
+              {:error, _} = error ->
+                error
+
+              _ ->
+                {:error, :invalid_remote_result}
+            end
+          end
+        end
+      end)
+
+    defer_local_label_error(operation, result)
+  end
+
+  defp create_local_label(
+         operation,
+         sync,
+         observation,
+         candidate,
+         label,
+         write_token,
+         repository,
+         options
+       ) do
+    now = DateTime.utc_now(:second)
+
+    case callback(
+           options,
+           :mark_merge_local_label,
+           &ForgeMirrors.mark_pull_merge_local_label/5
+         ).(operation, now, sync.intent, observation, candidate) do
+      {:ok, %{operation: marked}} ->
+        result =
+          with {:ok, _context} <-
+                 callback(
+                   options,
+                   :merge_local_label_context,
+                   &ForgeMirrors.pull_merge_local_label_context/2
+                 ).(marked, now),
+               :ok <- local_label_preflight(marked, options),
+               {:ok, ^repository} <- relationship_repository(sync, write_token, options),
+               :ok <- local_label_preflight(marked, options) do
+            created =
+              callback(options, :create_label, &LabelClient.create_label/5).(
+                write_token,
+                sync.routing.base.owner,
+                sync.routing.base.repository,
+                label.fields,
+                request_options(sync, options)
+              )
+
+            with :ok <- local_label_preflight(marked, options),
+                 {:ok, ^repository} <- relationship_repository(sync, write_token, options),
+                 :ok <- local_label_preflight(marked, options) do
+              case created do
+                {:ok, remote_label} ->
+                  if canonical_provider_label(remote_label) == label.fields do
+                    with {:ok, fresh_observation} <-
+                           refresh_merge_observation(marked, sync, write_token, options) do
+                      confirm_local_label(
+                        marked,
+                        sync,
+                        fresh_observation,
+                        candidate,
+                        remote_label,
+                        options
+                      )
+                    end
+                  else
+                    with {:ok, fresh_observation} <-
+                           refresh_merge_observation(marked, sync, write_token, options) do
+                      conflict_local_label(
+                        marked,
+                        sync,
+                        fresh_observation,
+                        candidate,
+                        :ambiguous_label_create,
+                        remote_label,
+                        options
+                      )
+                    end
+                  end
+
+                {:error, _} = error ->
+                  error
+
+                _ ->
+                  {:error, :invalid_remote_result}
+              end
+            end
+          end
+
+        case result do
+          {:error, reason} -> PullMergeBoundary.defer(marked, now, next(now), reason)
+          other -> other
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp recover_local_label(operation, now, options) do
+    result =
+      with {:ok, context} <-
+             callback(
+               options,
+               :merge_local_label_context,
+               &ForgeMirrors.pull_merge_local_label_context/2
+             ).(operation, now),
+           {:ok, sync} <- execution_context(context),
+           {:ok, write_token} <- metadata_write_token(sync, options),
+           :ok <- local_label_preflight(operation, options) do
+        PullSyncWorker.with_merge_ref_fences(sync.git_proof, sync.intent.merge_oid, fn ->
+          with :ok <- local_label_preflight(operation, options),
+               {:ok, observation} <-
+                 refresh_merge_observation(operation, sync, write_token, options),
+               :ok <- local_label_preflight(operation, options),
+               {:ok, repository} <- relationship_repository(sync, write_token, options),
+               :ok <- local_label_preflight(operation, options) do
+            candidate = context.candidate
+
+            case context.label_conflict do
+              :label_metadata_conflict ->
+                conflict_local_label(
+                  operation,
+                  sync,
+                  observation,
+                  candidate,
+                  :label_metadata_conflict,
+                  %{},
+                  options
+                )
+
+              nil ->
+                recover_local_label_identity(
+                  operation,
+                  sync,
+                  observation,
+                  candidate,
+                  write_token,
+                  repository,
+                  options
+                )
+            end
+          end
+        end)
+      end
+
+    case result do
+      {:error, reason} -> PullMergeBoundary.defer(operation, now, next(now), reason)
+      other -> other
+    end
+  end
+
+  defp recover_local_label_identity(
+         operation,
+         sync,
+         _observation,
+         candidate,
+         write_token,
+         repository,
+         options
+       ) do
+    observed =
+      callback(options, :get_label, &LabelClient.get_label/5).(
+        write_token,
+        sync.routing.base.owner,
+        sync.routing.base.repository,
+        label_fields(candidate)["name"],
+        request_options(sync, options)
+      )
+
+    with :ok <- local_label_preflight(operation, options),
+         {:ok, ^repository} <- relationship_repository(sync, write_token, options),
+         :ok <- local_label_preflight(operation, options),
+         {:ok, fresh_observation} <-
+           refresh_merge_observation(operation, sync, write_token, options) do
+      case observed do
+        {:ok, remote_label} ->
+          if canonical_provider_label(remote_label) == label_fields(candidate) do
+            confirm_local_label(
+              operation,
+              sync,
+              fresh_observation,
+              candidate,
+              remote_label,
+              options
+            )
+          else
+            conflict_local_label(
+              operation,
+              sync,
+              fresh_observation,
+              candidate,
+              :ambiguous_label_create,
+              remote_label,
+              options
+            )
+          end
+
+        {:error, %Error{kind: :not_found}} ->
+          conflict_local_label(
+            operation,
+            sync,
+            fresh_observation,
+            candidate,
+            :ambiguous_label_create,
+            %{},
+            options
+          )
+
+        {:error, _} = error ->
+          error
+
+        _ ->
+          {:error, :invalid_remote_result}
+      end
+    end
+  end
+
+  defp confirm_local_label(
+         operation,
+         sync,
+         observation,
+         candidate,
+         remote_label,
+         options
+       ) do
+    request = %{
+      repository_id: sync.repository_id,
+      local_resource_id: candidate.local_resource_id,
+      expected_fields: label_fields(candidate)
+    }
+
+    request =
+      if operation.external_effect_marker["phase"] == "metadata_label_pending",
+        do: Map.put(request, :minimum_local_version, candidate.local_version),
+        else: Map.put(request, :expected_local_version, candidate.local_version)
+
+    confirmation = %{
+      github_object_id: remote_label["id"],
+      github_node_id: remote_label["node_id"],
+      confirmed_snapshot: label_fields(candidate)
+    }
+
+    result =
+      callback(
+        options,
+        :confirm_merge_local_label,
+        &ForgeMirrors.confirm_pull_merge_local_label/7
+      ).(
+        operation,
+        DateTime.utc_now(:second),
+        sync.intent,
+        observation,
+        candidate,
+        confirmation,
+        fn multi -> ForgeIssues.append_sync_label_observe(multi, :resource, request) end
+      )
+
+    case result do
+      {:ok, %{operation: yielded}} ->
+        {:ok, yielded}
+
+      {:error, :identity_conflict} ->
+        conflict_local_label(
+          operation,
+          sync,
+          observation,
+          candidate,
+          :label_identity_conflict,
+          remote_label,
+          options
+        )
+
+      {:error, :label_metadata_conflict} = error ->
+        if match?(%{"phase" => "metadata_label_pending"}, operation.external_effect_marker) do
+          conflict_local_label(
+            operation,
+            sync,
+            observation,
+            candidate,
+            :label_metadata_conflict,
+            remote_label,
+            options
+          )
+        else
+          error
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp conflict_local_label(
+         operation,
+         sync,
+         observation,
+         candidate,
+         kind,
+         remote_label,
+         options
+       ) do
+    callback(
+      options,
+      :conflict_merge_local_label,
+      &ForgeMirrors.conflict_pull_merge_local_label/7
+    ).(
+      operation,
+      DateTime.utc_now(:second),
+      sync.intent,
+      observation,
+      candidate,
+      kind,
+      Map.take(remote_label, ~w(id node_id name color description))
+    )
+    |> case do
+      {:ok, %{operation: yielded}} -> {:ok, yielded}
+      other -> other
+    end
+  end
+
+  defp refresh_merge_observation(operation, sync, token, options) do
+    with {:ok, remote} <- observe(sync, :base, token, options),
+         {:ok, pair} <- pair(sync, token, options),
+         {:ok, observation} <- merge_observation(operation, sync, pair, remote.oid) do
+      {:ok, observation}
+    end
+  end
+
+  defp local_label_preflight(operation, options) do
+    callback(
+      options,
+      :merge_local_label_preflight,
+      &ForgeMirrors.pull_merge_local_label_preflight/2
+    ).(operation, DateTime.utc_now(:second))
+    |> case do
+      {:ok, _context} -> :ok
+      {:error, _} = error -> error
+      _ -> {:error, :invalid_label_effect}
+    end
+  end
+
+  defp defer_local_label_error(operation, {:error, reason}) do
+    now = DateTime.utc_now(:second)
+    PullMergeBoundary.defer(operation, now, next(now), reason)
+  end
+
+  defp defer_local_label_error(_operation, result), do: result
+
+  defp label_fields(%{fields: fields}), do: fields
+
+  defp label_fields(candidate),
+    do: %{
+      "name" => candidate.name,
+      "color" => String.downcase(candidate.color),
+      "description" => candidate.description
+    }
+
+  defp canonical_provider_label(observed) do
+    description = observed["description"]
+
+    %{
+      "name" => observed["name"],
+      "color" => if(is_binary(observed["color"]), do: String.downcase(observed["color"])),
+      "description" =>
+        if(is_binary(description) and String.trim(description) == "", do: nil, else: description)
+    }
   end
 
   defp mark_and_apply_metadata(

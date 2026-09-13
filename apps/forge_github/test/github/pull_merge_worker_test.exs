@@ -3,7 +3,7 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
   import ForgeMirrors.TestSupport.MirrorFixtures
   import Ecto.Query
   alias Ecto.{Changeset, Multi}
-  alias ForgeGitHub.{InstallationToken, PullMergeWorker}
+  alias ForgeGitHub.{Error, InstallationToken, PullMergeWorker}
 
   alias ForgeMirrors.{
     MirrorOperation,
@@ -1323,6 +1323,712 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     assert Repo.aggregate(PullMetadataIntent, :count) == 1
   end
 
+  test "merge-owned local label is durably created before its membership patch", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    label = assigned_unmapped_label(c, "merge-local")
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+    opts =
+      relationship_effect_options(
+        c,
+        provider,
+        fn labels, [] ->
+          assert labels == [
+                   %{github_object_id: 880, github_node_id: "L_880"}
+                 ]
+
+          {:ok,
+           %{
+             labels: [
+               %{github_object_id: 880, github_node_id: "L_880", name: "merge-local"}
+             ],
+             assignees: []
+           }}
+        end,
+        fn _, attrs ->
+          assert attrs == %{"labels" => ["merge-local"]}
+          send(self(), :relationship_patch)
+
+          Agent.update(
+            provider,
+            &%{&1 | labels: [remote_import_label(880, "L_880", "merge-local")]}
+          )
+
+          {:ok, %{}}
+        end
+      )
+      |> Keyword.put(:get_label, fn _, _, _, "merge-local", _ ->
+        {:error, Error.new(:not_found)}
+      end)
+      |> Keyword.put(:create_label, fn _, _, _, attrs, _ ->
+        assert attrs == %{
+                 "name" => "merge-local",
+                 "color" => "abcdef",
+                 "description" => "remote"
+               }
+
+        send(self(), :merge_label_created)
+        {:ok, remote_import_label(880, "L_880", "merge-local")}
+      end)
+
+    assert {:ok, after_label} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert_received :merge_label_created
+
+    assert %MirrorResourceState{
+             github_object_id: 880,
+             github_node_id: "L_880",
+             local_resource_id: local_label_id,
+             state: :confirmed
+           } =
+             Repo.get_by!(MirrorResourceState,
+               repository_mirror_id: c.binding.id,
+               resource_kind: :label,
+               local_resource_id: label.id
+             )
+
+    assert local_label_id == label.id
+    assert after_label.external_effect_marker["phase"] == "remote_cas_pending"
+    refute_received :relationship_patch
+
+    after_label = reclaim(after_label, c.now, "merge-local-label-membership")
+    assert {:ok, completed} = PullMergeWorker.process_operation(after_label, c.now, opts)
+    assert_received :relationship_patch
+    assert completed.state == :completed
+  end
+
+  test "merge-owned local label adopts an exact provider label without creating it", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    label = assigned_unmapped_label(c, "merge-local")
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+    opts =
+      relationship_effect_options(
+        c,
+        provider,
+        fn labels, [] ->
+          assert labels == [%{github_object_id: 880, github_node_id: "L_880"}]
+
+          {:ok,
+           %{
+             labels: [
+               %{github_object_id: 880, github_node_id: "L_880", name: "merge-local"}
+             ],
+             assignees: []
+           }}
+        end,
+        fn _, attrs ->
+          assert attrs == %{"labels" => ["merge-local"]}
+          send(self(), :adopted_label_membership_patch)
+
+          Agent.update(
+            provider,
+            &%{&1 | labels: [remote_import_label(880, "L_880", "merge-local")]}
+          )
+
+          {:ok, %{}}
+        end
+      )
+      |> Keyword.put(:get_label, fn _, _, _, "merge-local", _ ->
+        {:ok, remote_import_label(880, "L_880", "merge-local")}
+      end)
+      |> Keyword.put(:create_label, fn _, _, _, _, _ ->
+        flunk("an exact provider label must be adopted without POST")
+      end)
+
+    assert {:ok, after_label} = PullMergeWorker.process_operation(marked, c.now, opts)
+
+    assert %MirrorResourceState{github_object_id: 880, local_resource_id: id} =
+             Repo.get_by!(MirrorResourceState,
+               repository_mirror_id: c.binding.id,
+               resource_kind: :label,
+               local_resource_id: label.id
+             )
+
+    assert id == label.id
+    assert after_label.external_effect_marker["phase"] == "remote_cas_pending"
+    refute_received :adopted_label_membership_patch
+
+    after_label = reclaim(after_label, c.now, "merge-local-label-adopt-membership")
+    assert {:ok, completed} = PullMergeWorker.process_operation(after_label, c.now, opts)
+    assert_received :adopted_label_membership_patch
+    assert completed.state == :completed
+  end
+
+  test "merge-owned local label recovers a lost create response with GET only", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    label = assigned_unmapped_label(c, "merge-local")
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+    {:ok, label_created?} = Agent.start_link(fn -> false end)
+
+    opts =
+      relationship_effect_options(
+        c,
+        provider,
+        fn labels, [] ->
+          assert labels == [%{github_object_id: 880, github_node_id: "L_880"}]
+
+          {:ok,
+           %{
+             labels: [
+               %{github_object_id: 880, github_node_id: "L_880", name: "merge-local"}
+             ],
+             assignees: []
+           }}
+        end,
+        fn _, attrs ->
+          assert attrs == %{"labels" => ["merge-local"]}
+          send(self(), :recovered_label_membership_patch)
+
+          Agent.update(
+            provider,
+            &%{&1 | labels: [remote_import_label(880, "L_880", "merge-local")]}
+          )
+
+          {:ok, %{}}
+        end
+      )
+      |> Keyword.put(:get_label, fn _, _, _, "merge-local", _ ->
+        if Agent.get(label_created?, & &1),
+          do: {:ok, remote_import_label(880, "L_880", "merge-local")},
+          else: {:error, Error.new(:not_found)}
+      end)
+      |> Keyword.put(:create_label, fn _, _, _, _, _ ->
+        send(self(), :merge_label_create_attempt)
+        Agent.update(label_created?, fn _ -> true end)
+        {:error, Error.new(:timeout)}
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert_received :merge_label_create_attempt
+    assert pending.external_effect_marker["phase"] == "metadata_label_pending"
+    refute_received :recovered_label_membership_patch
+
+    pending = reclaim(pending, c.now, "merge-local-label-create-recovery")
+
+    recovery_opts =
+      Keyword.put(opts, :create_label, fn _, _, _, _, _ ->
+        flunk("marked label recovery must never repeat POST")
+      end)
+
+    assert {:ok, after_label} = PullMergeWorker.process_operation(pending, c.now, recovery_opts)
+    refute_received :merge_label_create_attempt
+    refute_received :recovered_label_membership_patch
+    assert after_label.external_effect_marker["phase"] == "remote_cas_pending"
+
+    assert %MirrorResourceState{github_object_id: 880, local_resource_id: id} =
+             Repo.get_by!(MirrorResourceState,
+               repository_mirror_id: c.binding.id,
+               resource_kind: :label,
+               local_resource_id: label.id
+             )
+
+    assert id == label.id
+
+    after_label = reclaim(after_label, c.now, "merge-local-label-recovered-membership")
+    assert {:ok, completed} = PullMergeWorker.process_operation(after_label, c.now, recovery_opts)
+    assert_received :recovered_label_membership_patch
+    assert completed.state == :completed
+  end
+
+  test "merge-owned local label recovery records an absent create as a conflict", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    label = assigned_unmapped_label(c, "merge-local")
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+    opts =
+      relationship_effect_options(
+        c,
+        provider,
+        fn _, _ -> flunk("a missing label recovery must not resolve membership names") end,
+        fn _, _ -> flunk("a missing label recovery must not patch issue membership") end
+      )
+      |> Keyword.put(:get_label, fn _, _, _, "merge-local", _ ->
+        {:error, Error.new(:not_found)}
+      end)
+      |> Keyword.put(:create_label, fn _, _, _, _, _ ->
+        send(self(), :ambiguous_label_create_attempt)
+        {:error, Error.new(:timeout)}
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert_received :ambiguous_label_create_attempt
+    pending = reclaim(pending, c.now, "merge-local-label-absent-recovery")
+
+    recovery_opts =
+      Keyword.put(opts, :create_label, fn _, _, _, _, _ ->
+        flunk("marked absent recovery must never repeat POST")
+      end)
+
+    assert {:ok, conflicted} = PullMergeWorker.process_operation(pending, c.now, recovery_opts)
+    assert conflicted.failure_disposition == :conflict
+    assert conflicted.failure_detail == "ambiguous_label_create"
+    assert conflicted.external_effect_marker["phase"] == "metadata_label_pending"
+
+    refute Repo.get_by(MirrorResourceState,
+             repository_mirror_id: c.binding.id,
+             resource_kind: :label,
+             local_resource_id: label.id
+           )
+
+    conflicted = reclaim(conflicted, c.now, "merge-local-label-open-conflict")
+
+    blocked_opts =
+      recovery_opts
+      |> Keyword.put(:get_label, fn _, _, _, _, _ ->
+        flunk("an unresolved label conflict must stop provider access")
+      end)
+
+    assert {:ok, blocked} = PullMergeWorker.process_operation(conflicted, c.now, blocked_opts)
+    assert blocked.failure_disposition == :conflict
+    assert blocked.external_effect_marker["phase"] == "metadata_label_pending"
+
+    refute Repo.get_by(MirrorResourceState,
+             repository_mirror_id: c.binding.id,
+             resource_kind: :label,
+             local_resource_id: label.id
+           )
+  end
+
+  test "merge-owned label recovery records a provider identity collision", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    label = assigned_unmapped_label(c, "merge-local")
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+    {:ok, remote_created?} = Agent.start_link(fn -> false end)
+
+    opts =
+      relationship_effect_options(
+        c,
+        provider,
+        fn _, _ -> flunk("identity conflict must stop relationship resolution") end,
+        fn _, _ -> flunk("identity conflict must stop metadata mutation") end
+      )
+      |> Keyword.put(:get_label, fn _, _, _, "merge-local", _ ->
+        if Agent.get(remote_created?, & &1),
+          do: {:ok, remote_import_label(880, "L_880", "merge-local")},
+          else: {:error, Error.new(:not_found)}
+      end)
+      |> Keyword.put(:create_label, fn _, _, _, _, _ ->
+        Agent.update(remote_created?, fn _ -> true end)
+        {:error, Error.new(:timeout)}
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert pending.external_effect_marker["phase"] == "metadata_label_pending"
+
+    collision =
+      %ForgeIssues.Label{repository_id: c.repository.id}
+      |> ForgeIssues.Label.changeset(%{
+        name: "collision",
+        normalized_name: "collision",
+        color: "123456"
+      })
+      |> Repo.insert!()
+
+    %MirrorResourceState{}
+    |> MirrorResourceState.persistence_changeset(%{
+      repository_mirror_id: c.binding.id,
+      resource_kind: :label,
+      local_resource_type: "ForgeIssues.Label",
+      local_resource_id: collision.id,
+      github_object_id: 999,
+      github_node_id: "L_880",
+      confirmed_snapshot: %{},
+      state: :confirmed
+    })
+    |> Repo.insert!()
+
+    pending = reclaim(pending, c.now, "merge-local-label-identity-conflict")
+
+    recovery_opts =
+      Keyword.put(opts, :create_label, fn _, _, _, _, _ ->
+        flunk("marked identity-conflict recovery must never repeat POST")
+      end)
+
+    assert {:ok, conflicted} = PullMergeWorker.process_operation(pending, c.now, recovery_opts)
+    assert conflicted.failure_disposition == :conflict
+    assert conflicted.failure_detail == "label_identity_conflict"
+
+    refute Repo.get_by(MirrorResourceState,
+             repository_mirror_id: c.binding.id,
+             resource_kind: :label,
+             local_resource_id: label.id
+           )
+  end
+
+  test "merge-owned label recovery records deleted local evidence without provider mutation", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    label = assigned_unmapped_label(c, "merge-local")
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+    opts =
+      relationship_effect_options(
+        c,
+        provider,
+        fn _, _ -> flunk("deleted evidence must stop relationship resolution") end,
+        fn _, _ -> flunk("deleted evidence must stop metadata mutation") end
+      )
+      |> Keyword.put(:get_label, fn _, _, _, "merge-local", _ ->
+        {:error, Error.new(:not_found)}
+      end)
+      |> Keyword.put(:create_label, fn _, _, _, _, _ ->
+        {:error, Error.new(:timeout)}
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert pending.external_effect_marker["phase"] == "metadata_label_pending"
+
+    Repo.delete_all(
+      from membership in ForgeIssues.IssueLabel,
+        where: membership.issue_id == ^c.issue.id and membership.label_id == ^label.id
+    )
+
+    Repo.delete!(label)
+    pending = reclaim(pending, c.now, "merge-local-label-deleted-evidence")
+
+    recovery_opts =
+      opts
+      |> Keyword.put(:get_label, fn _, _, _, _, _ ->
+        flunk("deleted marked evidence must conflict before provider label access")
+      end)
+      |> Keyword.put(:create_label, fn _, _, _, _, _ ->
+        flunk("deleted marked evidence must never repeat POST")
+      end)
+
+    assert {:ok, conflicted} = PullMergeWorker.process_operation(pending, c.now, recovery_opts)
+    assert conflicted.failure_disposition == :conflict
+    assert conflicted.failure_detail == "label_metadata_conflict"
+  end
+
+  test "a newer local label waits for an applied merge metadata effect and restores its marker",
+       c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    edit_issue(c, %{title: "First local edit"})
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+    {:ok, local_label_id} = Agent.start_link(fn -> nil end)
+
+    first =
+      relationship_effect_options(
+        c,
+        provider,
+        fn _, _ -> flunk("the first scalar effect has no relationship nodes") end,
+        fn _, attrs ->
+          assert attrs == %{"title" => "First local edit"}
+
+          Agent.update(provider, &%{&1 | title: "First local edit"})
+          label = assigned_unmapped_label(c, "metadata-local")
+          Agent.update(local_label_id, fn _ -> label.id end)
+          edit_issue(c, %{body: "newer local edit"})
+          send(self(), :first_metadata_effect_applied)
+          {:error, Error.new(:timeout)}
+        end
+      )
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, first)
+    assert_received :first_metadata_effect_applied
+    assert pending.external_effect_marker["phase"] == "metadata_issue_pending"
+
+    pending = reclaim(pending, c.now, "merge-metadata-local-label")
+
+    recovery =
+      relationship_effect_options(
+        c,
+        provider,
+        fn _, _ -> flunk("label creation must precede the next membership patch") end,
+        fn _, _ -> flunk("the already-applied metadata effect must not be repeated") end
+      )
+      |> Keyword.put(:get_label, fn _, _, _, "metadata-local", _ ->
+        {:error, Error.new(:not_found)}
+      end)
+      |> Keyword.put(:create_label, fn _, _, _, attrs, _ ->
+        assert attrs == %{
+                 "name" => "metadata-local",
+                 "color" => "abcdef",
+                 "description" => "remote"
+               }
+
+        send(self(), :metadata_local_label_created)
+        {:ok, remote_import_label(881, "L_881", "metadata-local")}
+      end)
+
+    assert {:ok, after_label} = PullMergeWorker.process_operation(pending, c.now, recovery)
+    assert_received :metadata_local_label_created
+    assert after_label.external_effect_marker["phase"] == "metadata_issue_pending"
+    refute_received :first_metadata_effect_applied
+
+    assert %MirrorResourceState{github_object_id: 881, local_resource_id: id} =
+             Repo.get_by!(MirrorResourceState,
+               repository_mirror_id: c.binding.id,
+               resource_kind: :label,
+               local_resource_id: Agent.get(local_label_id, & &1)
+             )
+
+    assert id == Agent.get(local_label_id, & &1)
+  end
+
+  test "a newer local label retries the prior metadata preimage before label creation", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    edit_issue(c, %{title: "First local edit"})
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+    {:ok, local_label_id} = Agent.start_link(fn -> nil end)
+    {:ok, prior_effect_applied?} = Agent.start_link(fn -> false end)
+
+    first =
+      relationship_effect_options(
+        c,
+        provider,
+        fn _, _ -> flunk("the first scalar effect has no relationship nodes") end,
+        fn _, attrs ->
+          assert attrs == %{"title" => "First local edit"}
+          label = assigned_unmapped_label(c, "metadata-local")
+          Agent.update(local_label_id, fn _ -> label.id end)
+          edit_issue(c, %{body: "newer local edit"})
+          {:error, Error.new(:timeout)}
+        end
+      )
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, first)
+    assert pending.external_effect_marker["phase"] == "metadata_issue_pending"
+    pending = reclaim(pending, c.now, "merge-metadata-preimage-before-label")
+
+    recovery =
+      relationship_effect_options(
+        c,
+        provider,
+        fn _, _ -> flunk("label creation must precede the next membership patch") end,
+        fn _, attrs ->
+          assert attrs == %{"title" => "First local edit"}
+          Agent.update(provider, &%{&1 | title: "First local edit"})
+          Agent.update(prior_effect_applied?, fn _ -> true end)
+          send(self(), :prior_metadata_preimage_applied)
+          {:ok, %{}}
+        end
+      )
+      |> Keyword.put(:get_label, fn _, _, _, "metadata-local", _ ->
+        assert Agent.get(prior_effect_applied?, & &1)
+        {:error, Error.new(:not_found)}
+      end)
+      |> Keyword.put(:create_label, fn _, _, _, attrs, _ ->
+        assert Agent.get(prior_effect_applied?, & &1)
+        assert attrs["name"] == "metadata-local"
+        send(self(), :post_preimage_label_created)
+        {:ok, remote_import_label(882, "L_882", "metadata-local")}
+      end)
+
+    assert {:ok, after_label} = PullMergeWorker.process_operation(pending, c.now, recovery)
+    assert_received :post_preimage_label_created
+    assert after_label.external_effect_marker["phase"] == "metadata_issue_pending"
+
+    assert %MirrorResourceState{github_object_id: 882} =
+             Repo.get_by!(MirrorResourceState,
+               repository_mirror_id: c.binding.id,
+               resource_kind: :label,
+               local_resource_id: Agent.get(local_label_id, & &1)
+             )
+  end
+
+  test "a third metadata state conflicts before inspecting a newer local label", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    edit_issue(c, %{title: "First local edit"})
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+    {:ok, local_label_id} = Agent.start_link(fn -> nil end)
+
+    first =
+      relationship_effect_options(
+        c,
+        provider,
+        fn _, _ -> flunk("the first scalar effect has no relationship nodes") end,
+        fn _, attrs ->
+          assert attrs == %{"title" => "First local edit"}
+          label = assigned_unmapped_label(c, "metadata-local")
+          Agent.update(local_label_id, fn _ -> label.id end)
+          edit_issue(c, %{body: "newer local edit"})
+          Agent.update(provider, &%{&1 | title: "Third provider state"})
+          {:error, Error.new(:timeout)}
+        end
+      )
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, first)
+    pending = reclaim(pending, c.now, "merge-metadata-third-state-before-label")
+
+    recovery =
+      relationship_effect_options(
+        c,
+        provider,
+        fn _, _ -> flunk("ambiguous metadata must stop relationship resolution") end,
+        fn _, _ -> flunk("ambiguous metadata must not be patched") end
+      )
+      |> Keyword.put(:get_label, fn _, _, _, _, _ ->
+        flunk("ambiguous metadata must stop before provider label access")
+      end)
+      |> Keyword.put(:create_label, fn _, _, _, _, _ ->
+        flunk("ambiguous metadata must stop before label POST")
+      end)
+
+    assert {:ok, conflicted} = PullMergeWorker.process_operation(pending, c.now, recovery)
+    assert conflicted.failure_disposition == :conflict
+    assert conflicted.failure_detail == "ambiguous_external_effect"
+
+    refute Repo.get_by(MirrorResourceState,
+             repository_mirror_id: c.binding.id,
+             resource_kind: :label,
+             local_resource_id: Agent.get(local_label_id, & &1)
+           )
+  end
+
+  test "provider drift during label lookup cannot persist a stale namespace conflict", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    _label = assigned_unmapped_label(c, "merge-local")
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+    {:ok, remote_base} = Agent.start_link(fn -> c.intent.merge_oid end)
+
+    opts =
+      relationship_effect_options(
+        c,
+        provider,
+        fn _, _ -> flunk("provider drift must stop relationship resolution") end,
+        fn _, _ -> flunk("provider drift must stop metadata mutation") end
+      )
+
+    observe_ref = Keyword.fetch!(opts, :observe_ref)
+
+    opts =
+      opts
+      |> Keyword.put(:observe_ref, fn token, owner, repository, identity, ref, request_options ->
+        if ref == "refs/heads/main" do
+          {:ok,
+           %{
+             repository: identity,
+             ref_name: ref,
+             oid: Agent.get(remote_base, & &1)
+           }}
+        else
+          observe_ref.(token, owner, repository, identity, ref, request_options)
+        end
+      end)
+      |> Keyword.put(:get_label, fn _, _, _, "merge-local", _ ->
+        Agent.update(remote_base, fn _ -> c.base end)
+
+        {:ok,
+         remote_import_label(880, "L_880", "merge-local")
+         |> Map.put("color", "000000")}
+      end)
+      |> Keyword.put(:create_label, fn _, _, _, _, _ ->
+        flunk("a present provider namespace must never be created")
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert pending.failure_disposition == :retry
+
+    refute Repo.get_by(ForgeMirrors.MirrorConflict,
+             resource_kind: "pull_merge",
+             resource_identity: to_string(c.intent.id),
+             conflict_kind: "label_namespace_collision"
+           )
+
+    assert_unfinished(c)
+  end
+
+  test "write-token revocation stops merge label provider access", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    label = assigned_unmapped_label(c, "merge-local")
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+    opts =
+      relationship_effect_options(
+        c,
+        provider,
+        fn _, _ -> flunk("revoked authority must stop relationship resolution") end,
+        fn _, _ -> flunk("revoked authority must stop metadata mutation") end
+      )
+      |> Keyword.put(:token_fetch, fn _, scope ->
+        if scope.permissions == %{"metadata" => "read", "pull_requests" => "write"} do
+          Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+            github_installation_id: c.organization.github_installation_id
+          )
+          |> Changeset.change(state: :revoked)
+          |> Repo.update!()
+        end
+
+        %InstallationToken{
+          token: "test-credential",
+          expires_at: DateTime.add(c.now, 3600),
+          permissions: scope.permissions
+        }
+      end)
+      |> Keyword.put(:get_relationship_repository, fn _, _, _ ->
+        flunk("revocation after token acquisition must stop repository access")
+      end)
+      |> Keyword.put(:get_label, fn _, _, _, _, _ ->
+        flunk("revocation after token acquisition must stop label access")
+      end)
+      |> Keyword.put(:create_label, fn _, _, _, _, _ ->
+        flunk("revocation after token acquisition must stop label creation")
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert pending.external_effect_marker == marked.external_effect_marker
+
+    refute Repo.get_by(MirrorResourceState,
+             repository_mirror_id: c.binding.id,
+             resource_kind: :label,
+             local_resource_id: label.id
+           )
+  end
+
+  test "authority lost in post-mark repository validation stops label POST", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    _label = assigned_unmapped_label(c, "merge-local")
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+    {:ok, repository_reads} = Agent.start_link(fn -> 0 end)
+
+    opts =
+      relationship_effect_options(
+        c,
+        provider,
+        fn _, _ -> flunk("label identity must be confirmed before relationship resolution") end,
+        fn _, _ -> flunk("label identity must be confirmed before metadata mutation") end
+      )
+      |> Keyword.put(:get_relationship_repository, fn _, _, _ ->
+        read = Agent.get_and_update(repository_reads, &{&1 + 1, &1 + 1})
+
+        if read == 3 do
+          Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+            github_installation_id: c.organization.github_installation_id
+          )
+          |> Changeset.change(state: :revoked)
+          |> Repo.update!()
+        end
+
+        {:ok,
+         %{
+           github_object_id: c.binding.github_repository_id,
+           github_node_id: c.binding.github_node_id
+         }}
+      end)
+      |> Keyword.put(:get_label, fn _, _, _, "merge-local", _ ->
+        {:error, Error.new(:not_found)}
+      end)
+      |> Keyword.put(:create_label, fn _, _, _, _, _ ->
+        flunk("authority lost after marking must stop label POST")
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert Agent.get(repository_reads, & &1) == 3
+    assert pending.external_effect_marker["phase"] == "metadata_label_pending"
+  end
+
   test "missing assignee and label nodes are authenticated one per claim before merge metadata patch",
        c do
     paired_issue_mapping(c)
@@ -2100,6 +2806,21 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
       state: :confirmed
     })
     |> Repo.insert!()
+  end
+
+  defp assigned_unmapped_label(c, name) do
+    label =
+      %ForgeIssues.Label{repository_id: c.repository.id}
+      |> ForgeIssues.Label.changeset(%{
+        name: name,
+        normalized_name: name,
+        color: "abcdef",
+        description: "remote"
+      })
+      |> Repo.insert!()
+
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: c.issue.id, label_id: label.id})
+    label
   end
 
   defp merged_options(c, title \\ "Merge") do

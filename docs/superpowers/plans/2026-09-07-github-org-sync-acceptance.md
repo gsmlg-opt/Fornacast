@@ -72,9 +72,33 @@ remain open.
   tests and the complete 295-assertion matrix passed without an orphaned task or
   ownership error. Production remains enabled by default and passed
   warnings-as-errors compilation.
-- This closes mapped merge-owned effects, node proofs and unknown provider label/
-  assignee materialization, not all of PR13. Local unmapped outbound label
-  creation/adoption, durable conflict-resolution UX, runtime admission and
+- Merge-owned local labels without provider mappings now materialize one lowest-ID
+  prerequisite per claim. An exact provider namespace is adopted without POST;
+  an absent namespace is marked before creation with a composite
+  `metadata_label_pending` marker that retains the exact merge-CAS or metadata
+  parent. Confirmation inserts the mapping and restores that parent without
+  clearing the merge reservation, checkpoint or paired baselines.
+- Recovery of an uncertain create is GET-only. Exact recorded output confirms;
+  an absent or different result, local evidence drift, and provider identity
+  collisions become durable visible conflicts without another POST, metadata
+  PATCH or Git push. Removed membership and newly assigned lower-ID labels cannot
+  strand an already-issued create. Open conflicts fence every recovery/commit
+  path until explicitly resolved.
+- Local ref/generation fences cover the effect. Installation write authority and
+  repository identity are rechecked around token acquisition and every provider
+  boundary. Provider drift is reobserved before conflict recording. When a newer
+  unmapped label appears under `metadata_issue_pending`, the prior metadata
+  target must first be proven applied; its exact preimage is retried before label
+  creation, while a third state conflicts before label access.
+- Fresh PostgreSQL verification passed **183 tests**: merge boundary, metadata,
+  confirmation and local-label effects **104**, plus provider merge-worker
+  integration **79**. Production warnings-as-errors compilation, scoped format
+  checks and diff checks passed. Independent spec and quality reviews approved
+  after repairing post-response authority checks, marked-label drift recovery,
+  deterministic conflict routing and the unresolved-conflict fence.
+- This closes mapped merge-owned effects, node proofs, unknown provider label/
+  assignee materialization and local unmapped outbound label creation/adoption,
+  not all of PR13. Durable conflict-resolution UX, runtime admission and
   activation, remaining cross-repository/head transitions, PR14–16 and full PRD
   acceptance remain unfinished. No push, deployment or live GitHub write
   validation occurred.

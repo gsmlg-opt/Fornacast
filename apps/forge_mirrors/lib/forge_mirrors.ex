@@ -849,6 +849,47 @@ defmodule ForgeMirrors do
     as: :recovery_context
 
   @doc false
+  defdelegate mark_pull_merge_local_label(operation, now, intent, observation, candidate),
+    to: ForgeMirrors.PullMergeLocalLabelEffects,
+    as: :mark
+
+  @doc false
+  defdelegate pull_merge_local_label_preflight(operation, now),
+    to: ForgeMirrors.PullMergeLocalLabelEffects,
+    as: :preflight
+
+  @doc false
+  defdelegate pull_merge_local_label_context(operation, now),
+    to: ForgeMirrors.PullMergeLocalLabelEffects,
+    as: :context
+
+  @doc false
+  defdelegate confirm_pull_merge_local_label(
+                operation,
+                now,
+                intent,
+                observation,
+                candidate,
+                confirmation,
+                domain_multi_fun
+              ),
+              to: ForgeMirrors.PullMergeLocalLabelEffects,
+              as: :confirm
+
+  @doc false
+  defdelegate conflict_pull_merge_local_label(
+                operation,
+                now,
+                intent,
+                observation,
+                candidate,
+                kind,
+                remote
+              ),
+              to: ForgeMirrors.PullMergeLocalLabelEffects,
+              as: :conflict
+
+  @doc false
   def pull_merge_assignee_node_context(operation, now),
     do: ForgeMirrors.PullMergeAssigneeProof.context(operation, now)
 

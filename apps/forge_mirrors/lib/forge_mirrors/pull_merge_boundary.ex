@@ -487,6 +487,141 @@ defmodule ForgeMirrors.PullMergeBoundary do
   def replace_metadata_marker(_, _, _, _), do: {:error, :invalid_transition}
 
   @doc false
+  def replace_local_label_marker(
+        %MirrorOperation{kind: "merge.pull", state: :effect_pending} = operation,
+        %DateTime{} = now,
+        parent_marker,
+        label_effect
+      )
+      when is_map(parent_marker) and is_map(label_effect) do
+    transaction(fn ->
+      with {:ok, context} <- load_recovery(operation, now, :current),
+           true <- context.operation.external_effect_marker == parent_marker,
+           true <- parent_marker["phase"] in ["remote_cas_pending", "metadata_issue_pending"],
+           replacement = %{
+             "phase" => "metadata_label_pending",
+             "parent_marker" => parent_marker,
+             "label_effect" => label_effect
+           },
+           true <- ForgeMirrors.PullMergeLocalLabelEffects.valid_marker?(replacement),
+           {:ok, _metadata_intent} <-
+             recovery_marker(
+               context.operation,
+               Repo.get!(RepositoryMirror, context.repository_mirror_id),
+               context.expected,
+               context.intent,
+               context.provider_pull_identity,
+               replacement,
+               :current
+             ),
+           true <- byte_size(JSON.encode!(replacement)) <= 65_536,
+           :ok <- live_capability(context.operation) do
+        case Repo.update_all(capability_query(context.operation),
+               set: [external_effect_marker: replacement, updated_at: now],
+               inc: [lock_version: 1]
+             ) do
+          {1, _} -> {:ok, Repo.get!(MirrorOperation, context.operation.id)}
+          {0, _} -> {:error, :lost_lease}
+        end
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :stale_merge_identity}
+      end
+    end)
+  end
+
+  def replace_local_label_marker(_, _, _, _), do: {:error, :invalid_transition}
+
+  @doc false
+  def finish_local_label_marker(
+        %MirrorOperation{kind: "merge.pull", state: :effect_pending} = operation,
+        %DateTime{} = now,
+        expected_marker,
+        parent_marker
+      )
+      when is_map(expected_marker) and is_map(parent_marker) do
+    transaction(fn ->
+      with {:ok, context} <- load_recovery(operation, now, :current),
+           true <- context.operation.external_effect_marker == expected_marker,
+           true <- parent_marker["phase"] in ["remote_cas_pending", "metadata_issue_pending"],
+           true <-
+             expected_marker == parent_marker or
+               expected_marker == %{
+                 "phase" => "metadata_label_pending",
+                 "parent_marker" => parent_marker,
+                 "label_effect" => expected_marker["label_effect"]
+               },
+           {:ok, _metadata_intent} <-
+             recovery_marker(
+               context.operation,
+               Repo.get!(RepositoryMirror, context.repository_mirror_id),
+               context.expected,
+               context.intent,
+               context.provider_pull_identity,
+               parent_marker,
+               :current
+             ),
+           :ok <- live_capability(context.operation) do
+        case Repo.update_all(capability_query(context.operation),
+               set: [
+                 external_effect_marker: parent_marker,
+                 lease_owner: nil,
+                 lease_expires_at: nil,
+                 next_attempt_at: now,
+                 updated_at: now
+               ],
+               inc: [lock_version: 1]
+             ) do
+          {1, _} -> {:ok, Repo.get!(MirrorOperation, context.operation.id)}
+          {0, _} -> {:error, :lost_lease}
+        end
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :stale_merge_identity}
+      end
+    end)
+  end
+
+  def finish_local_label_marker(_, _, _, _), do: {:error, :invalid_transition}
+
+  @doc false
+  def release_local_label_conflict(
+        %MirrorOperation{kind: "merge.pull", state: :effect_pending} = operation,
+        %DateTime{} = now,
+        expected_marker,
+        kind
+      )
+      when is_map(expected_marker) and is_binary(kind) do
+    transaction(fn ->
+      with {:ok, context} <- load_recovery(operation, now, :current),
+           true <- context.operation.external_effect_marker == expected_marker,
+           true <- byte_size(kind) in 1..255,
+           :ok <- live_capability(context.operation) do
+        case Repo.update_all(capability_query(context.operation),
+               set: [
+                 lease_owner: nil,
+                 lease_expires_at: nil,
+                 next_attempt_at: now,
+                 failure_class: "stale_baseline",
+                 failure_disposition: :conflict,
+                 failure_detail: kind,
+                 updated_at: now
+               ],
+               inc: [lock_version: 1]
+             ) do
+          {1, _} -> {:ok, Repo.get!(MirrorOperation, context.operation.id)}
+          {0, _} -> {:error, :lost_lease}
+        end
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :stale_merge_identity}
+      end
+    end)
+  end
+
+  def release_local_label_conflict(_, _, _, _), do: {:error, :invalid_transition}
+
+  @doc false
   def check_unreserved(repository_id, base_ref, pull_id, coordinator_id, head_id, head_ref) do
     if Repo.in_transaction?() do
       [repository_id, head_id] |> Enum.uniq() |> Enum.sort() |> Enum.each(&reservation_lock/1)
@@ -952,6 +1087,25 @@ defmodule ForgeMirrors.PullMergeBoundary do
                row.payload_fingerprint == hash and metadata["metadata_intent_hash"] == hash and
                  ForgeMirrors.PullMergeMetadataEffects.valid_payload?(row.payload) do
           {:ok, row}
+        else
+          _ -> {:error, :stale_merge_identity}
+        end
+
+      "metadata_label_pending" ->
+        with true <- ForgeMirrors.PullMergeLocalLabelEffects.valid_marker?(marker),
+             parent when is_map(parent) <- marker["parent_marker"],
+             true <- parent["phase"] in ["remote_cas_pending", "metadata_issue_pending"],
+             {:ok, metadata_intent} <-
+               recovery_marker(
+                 operation,
+                 binding,
+                 expected,
+                 intent,
+                 provider_identity,
+                 parent,
+                 sequence_mode
+               ) do
+          {:ok, metadata_intent}
         else
           _ -> {:error, :stale_merge_identity}
         end
