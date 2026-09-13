@@ -725,7 +725,7 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
 
         {:ok,
          Map.merge(raw, %{
-           "labels" => [%{"id" => 800, "node_id" => "L_800", "name" => "known"}],
+           "labels" => [remote_import_label(800, "L_800", "known")],
            "assignees" => [%{"id" => 801, "node_id" => "U_801", "login" => "known"}]
          })}
       end)
@@ -745,6 +745,252 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     assert mapping.confirmed_local_version == actual.local_version
   end
 
+  test "unknown remote assignees are authenticated from the merged issue before local confirmation",
+       c do
+    paired_issue_mapping(c)
+
+    Repo.insert!(%ForgeIssues.IssueAssignee{
+      issue_id: c.issue.id,
+      user_id: c.issue.author_user_id
+    })
+
+    marked = mark(c)
+    opts = merged_options(c)
+    fetch = Keyword.fetch!(opts, :get_pull_issue)
+
+    opts =
+      opts
+      |> Keyword.put(:get_pull_issue, fn a, b, d, e, f ->
+        {:ok, raw} = fetch.(a, b, d, e, f)
+
+        {:ok,
+         Map.put(raw, "assignees", [
+           %{"id" => 899, "node_id" => "U_899", "login" => "new-merge-user"}
+         ])}
+      end)
+      |> Keyword.put(:get_relationship_user, fn _, _, _ ->
+        flunk("the authenticated merged issue already contains the complete assignee profile")
+      end)
+
+    assert {:ok, completed} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert completed.state == :completed
+
+    identity = Repo.get_by!(ForgeAccounts.GitHubIdentity, github_user_id: 899)
+    assert identity.github_node_id == "U_899"
+    assert identity.login == "new-merge-user"
+
+    assert {:ok, actual} = ForgePulls.sync_projection(c.repository.id, :pull, c.pull.id)
+    assert %{kind: :github_identity, id: identity.id} in actual.assignee_refs
+    assert %{kind: :local_user, id: c.issue.author_user_id} in actual.assignee_refs
+
+    mapping =
+      Repo.get_by!(MirrorResourceState, resource_kind: :issue, local_resource_id: c.issue.id)
+
+    assert mapping.confirmed_snapshot["assignee_github_ids"] == [899]
+    assert mapping.confirmed_local_version == actual.local_version
+  end
+
+  test "a dangling label mapping cannot authorize an unknown merge assignee observation", c do
+    paired_issue_mapping(c)
+
+    Repo.insert!(
+      MirrorResourceState.persistence_changeset(%MirrorResourceState{}, %{
+        repository_mirror_id: c.binding.id,
+        resource_kind: :label,
+        local_resource_type: "ForgeIssues.Label",
+        local_resource_id: System.unique_integer([:positive]) + 9_000_000_000,
+        github_object_id: 898,
+        github_node_id: "L_898",
+        confirmed_snapshot: %{},
+        state: :confirmed
+      })
+    )
+
+    marked = mark(c)
+    opts = merged_options(c)
+    fetch = Keyword.fetch!(opts, :get_pull_issue)
+
+    opts =
+      Keyword.put(opts, :get_pull_issue, fn a, b, d, e, f ->
+        {:ok, raw} = fetch.(a, b, d, e, f)
+
+        {:ok,
+         Map.merge(raw, %{
+           "labels" => [remote_import_label(898, "L_898", "dangling")],
+           "assignees" => [
+             %{"id" => 899, "node_id" => "U_899", "login" => "must-not-persist"}
+           ]
+         })}
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert pending.state == :effect_pending
+    refute Repo.get_by(ForgeAccounts.GitHubIdentity, github_user_id: 899)
+    assert_unfinished(c)
+  end
+
+  test "an unknown merge label is imported one claim before the paired assignee and merge", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    opts = merged_options(c)
+    fetch = Keyword.fetch!(opts, :get_pull_issue)
+
+    opts =
+      Keyword.put(opts, :get_pull_issue, fn a, b, d, e, f ->
+        {:ok, raw} = fetch.(a, b, d, e, f)
+
+        {:ok,
+         Map.merge(raw, %{
+           "labels" => [remote_import_label(898, "L_898", "observed")],
+           "assignees" => [
+             %{"id" => 899, "node_id" => "U_899", "login" => "observed-user"}
+           ]
+         })}
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert pending.state == :effect_pending
+    assert pending.lease_owner == nil
+    refute Repo.get_by(ForgeAccounts.GitHubIdentity, github_user_id: 899)
+
+    mapping =
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: c.binding.id,
+        resource_kind: :label,
+        github_object_id: 898
+      )
+
+    label = Repo.get!(ForgeIssues.Label, mapping.local_resource_id)
+    assert {label.name, label.color, label.description} == {"observed", "abcdef", "remote"}
+    assert_unfinished(c)
+
+    pending = reclaim(pending, c.now, "merge-unknown-relationships")
+    assert {:ok, completed} = PullMergeWorker.process_operation(pending, c.now, opts)
+    assert completed.state == :completed
+
+    identity = Repo.get_by!(ForgeAccounts.GitHubIdentity, github_user_id: 899)
+    assert {:ok, actual} = ForgePulls.sync_projection(c.repository.id, :pull, c.pull.id)
+    assert actual.label_ids == [label.id]
+    assert actual.assignee_refs == [%{kind: :github_identity, id: identity.id}]
+  end
+
+  test "live merge ref drift prevents unknown label import", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    opts = merged_options(c)
+    fetch = Keyword.fetch!(opts, :get_pull_issue)
+
+    opts =
+      Keyword.put(opts, :get_pull_issue, fn a, b, d, e, f ->
+        result = fetch.(a, b, d, e, f)
+        git!(c.path, ["update-ref", "refs/heads/main", c.head])
+
+        with {:ok, raw} <- result do
+          {:ok, Map.put(raw, "labels", [remote_import_label(898, "L_898", "observed")])}
+        end
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert pending.state == :effect_pending
+
+    refute Repo.get_by(MirrorResourceState,
+             repository_mirror_id: c.binding.id,
+             resource_kind: :label,
+             github_object_id: 898
+           )
+
+    assert Repo.get!(ForgePulls.PullRequest, c.pull.id).merged_at == nil
+    assert Repo.get!(ForgeIssues.Issue, c.issue.id).state == :open
+    assert Repo.get!(ForgePulls.MergeOperation, c.intent.id).state == :merge_written
+    refute Repo.get!(MirrorOperation, c.operation.id).state == :completed
+  end
+
+  test "an already advanced local merge ref remains eligible for unknown label import", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    git!(c.path, ["update-ref", "refs/heads/main", c.intent.merge_oid])
+    opts = merged_options(c)
+    fetch = Keyword.fetch!(opts, :get_pull_issue)
+
+    opts =
+      Keyword.put(opts, :get_pull_issue, fn a, b, d, e, f ->
+        with {:ok, raw} <- fetch.(a, b, d, e, f) do
+          {:ok, Map.put(raw, "labels", [remote_import_label(898, "L_898", "observed")])}
+        end
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert pending.state == :effect_pending
+    assert pending.lease_owner == nil
+
+    assert Repo.get_by!(MirrorResourceState,
+             repository_mirror_id: c.binding.id,
+             resource_kind: :label,
+             github_object_id: 898
+           )
+
+    assert Repo.get!(ForgePulls.PullRequest, c.pull.id).merged_at == nil
+    assert Repo.get!(ForgePulls.MergeOperation, c.intent.id).state == :merge_written
+  end
+
+  test "multiple unknown merge labels are imported in provider order across claims", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    opts = merged_options(c)
+    fetch = Keyword.fetch!(opts, :get_pull_issue)
+
+    opts =
+      Keyword.put(opts, :get_pull_issue, fn a, b, d, e, f ->
+        with {:ok, raw} <- fetch.(a, b, d, e, f) do
+          {:ok,
+           Map.put(raw, "labels", [
+             remote_import_label(899, "L_899", "second"),
+             remote_import_label(898, "L_898", "first")
+           ])}
+        end
+      end)
+
+    assert {:ok, first} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert Repo.get_by(MirrorResourceState, github_object_id: 898, resource_kind: :label)
+    refute Repo.get_by(MirrorResourceState, github_object_id: 899, resource_kind: :label)
+
+    first = reclaim(first, c.now, "merge-unknown-label-second")
+    assert {:ok, second} = PullMergeWorker.process_operation(first, c.now, opts)
+    assert Repo.get_by(MirrorResourceState, github_object_id: 899, resource_kind: :label)
+    assert_unfinished(c)
+
+    second = reclaim(second, c.now, "merge-unknown-label-complete")
+    assert {:ok, completed} = PullMergeWorker.process_operation(second, c.now, opts)
+    assert completed.state == :completed
+  end
+
+  test "live head ref drift prevents unknown label import", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    git!(c.path, ["update-ref", "refs/heads/feature", c.base])
+    opts = merged_options(c)
+    fetch = Keyword.fetch!(opts, :get_pull_issue)
+
+    opts =
+      Keyword.put(opts, :get_pull_issue, fn a, b, d, e, f ->
+        with {:ok, raw} <- fetch.(a, b, d, e, f) do
+          {:ok, Map.put(raw, "labels", [remote_import_label(898, "L_898", "observed")])}
+        end
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert pending.state == :effect_pending
+
+    refute Repo.get_by(MirrorResourceState,
+             repository_mirror_id: c.binding.id,
+             resource_kind: :label,
+             github_object_id: 898
+           )
+
+    assert Repo.get!(ForgePulls.PullRequest, c.pull.id).merged_at == nil
+    assert Repo.get!(ForgePulls.MergeOperation, c.intent.id).state == :merge_written
+  end
+
   test "relationship node drift after initial observation cannot be acknowledged by merge", c do
     paired_issue_mapping(c)
     {label, _identity} = known_relationships(c)
@@ -758,7 +1004,7 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
 
         {:ok,
          Map.merge(raw, %{
-           "labels" => [%{"id" => 800, "node_id" => "L_800", "name" => "known"}],
+           "labels" => [remote_import_label(800, "L_800", "known")],
            "assignees" => [%{"id" => 801, "node_id" => "U_801", "login" => "known"}]
          })}
       end)
@@ -1352,6 +1598,39 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     assert conflict.failure_disposition == :conflict
     assert conflict.failure_detail == "ambiguous_external_effect"
     assert conflict.external_effect_marker["phase"] == "metadata_issue_pending"
+  end
+
+  test "an unknown label in a third metadata state becomes a conflict without import or replay",
+       c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    edit_issue(c, %{title: "Local title"})
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+    first = scalar_effect_options(c, provider, fn _, _ -> {:error, :timeout} end)
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, first)
+
+    Agent.update(provider, fn state ->
+      %{state | labels: [remote_import_label(898, "L_898", "third-state")]}
+    end)
+
+    pending = reclaim(pending, c.now, "merge-unknown-label-third-state")
+
+    retry =
+      scalar_effect_options(c, provider, fn _, _ ->
+        flunk("ambiguous metadata must not retry PATCH")
+      end)
+      |> Keyword.put(:push_remote, fn _, _, _, _ -> flunk("metadata recovery retried Git") end)
+
+    assert {:ok, conflict} = PullMergeWorker.process_operation(pending, c.now, retry)
+    assert conflict.failure_disposition == :conflict
+    assert conflict.failure_detail == "ambiguous_external_effect"
+
+    refute Repo.get_by(MirrorResourceState,
+             repository_mirror_id: c.binding.id,
+             resource_kind: :label,
+             github_object_id: 898
+           )
   end
 
   test "mixed local title and remote body converge without overwriting the remote body", c do
@@ -1954,10 +2233,19 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
   end
 
   defp remote_label,
-    do: %{"id" => 800, "node_id" => "L_800", "name" => "fresh-label"}
+    do: remote_import_label(800, "L_800", "fresh-label")
 
   defp remote_label(id, node),
-    do: %{"id" => id, "node_id" => node, "name" => "fresh-label"}
+    do: remote_import_label(id, node, "fresh-label")
+
+  defp remote_import_label(id, node, name),
+    do: %{
+      "id" => id,
+      "node_id" => node,
+      "name" => name,
+      "color" => "ABCDEF",
+      "description" => "remote"
+    }
 
   defp remote_assignee,
     do: %{"id" => 801, "node_id" => "U_801", "login" => "fresh-user"}

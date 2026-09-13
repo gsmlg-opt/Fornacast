@@ -24,6 +24,23 @@ remain open.
   success, preserve both immutable intents and the merge reservation, and never
   rewrite a confirmed resource baseline. Exhausted label inventory records a
   visible `relationship_unavailable` conflict and does not restart.
+- Exact merged issue observations now materialize provider relationships that
+  were not in the local catalogs. The read-only preflight validates the complete
+  pull/issue envelope, every bounded label profile and every assignee numeric-ID/
+  node-ID pair before returning the lowest missing label. A merge-specific
+  boundary imports or exactly adopts one label per claim, then releases only the
+  lease while preserving the merge marker, checkpoint, coordinator intent,
+  metadata intent, reservation and paired baselines byte-for-byte. The next
+  claim observes all assignee profiles atomically from the already-authenticated
+  issue response without an extra user request; unmanaged local assignees remain
+  attached until the final domain transaction applies the provider memberships.
+- Label import holds both repository writer fences through the domain and
+  mapping transaction. The base ref may be the prepared `B` or already-applied
+  merge `M`; the head must remain exactly `H`, and both repository generations
+  remain pinned. Tests reject malformed later labels, identity collisions,
+  dangling/wrong-repository mappings, fabricated callbacks, unsafe metadata
+  preimage/target timestamps, lease/capability/intent/ref drift and catalog
+  writes preceding invalid label evidence.
 - Before PATCH, the worker loads exact confirmed numeric-ID/node-ID rows and
   resolves fresh label names and assignee logins through the bounded GraphQL
   relationship client. It sends total `labels` or `assignees` sets only when
@@ -38,15 +55,23 @@ remain open.
   changes complete atomically. Permanent provider numeric IDs remain the intent
   identity; node IDs may legitimately advance from missing to authenticated and
   are immutable through supported mapping writes.
-- Fresh connected PostgreSQL verification passed **227 tests**: merge mirror
-  boundaries and proofs **101**, coordinated merge domain **40**, and provider
-  observation/decision/recovery **86**. Focused relationship verification passed
-  **97 tests**. Scoped formatting and diff checks passed. Independent spec and
-  quality reviews approved after repairing fabricated-yield acceptance in both
-  node-proof boundaries and adding relationship ambiguity coverage.
-- This closes mapped merge-owned label/known-assignee effects and node proofs,
-  not all of PR13. Unknown provider relationship materialization, local unmapped
-  label creation/adoption, durable conflict-resolution UX, runtime admission and
+- Fresh connected PostgreSQL verification completed with **295 passing
+  assertions**: merge mirror boundaries and proofs **119**, coordinated merge
+  domain/recovery **73**, and provider observation/decision/recovery **103**.
+  The generalized exact-ref path
+  retained another **12** ordinary pull-worker tests. Production
+  warnings-as-errors compilation, scoped formatting and diff checks passed.
+  Independent cross-review approved the prerequisite boundaries and worker
+  integration after repairing repository-scoped dangling-label admission; exact
+  preexisting label adoption was retained as the established inbound contract.
+- The broad matrix is not yet a clean final gate: after its passing assertions,
+  a standalone `MergeReconciler` task twice outlived its SQL sandbox owner and
+  logged `DBConnection.OwnershipError`. The focused relationship tests do not
+  reproduce it, but PR13/final acceptance must repair and re-run that lifecycle
+  path rather than treating the assertion count as complete proof.
+- This closes mapped merge-owned effects, node proofs and unknown provider label/
+  assignee materialization, not all of PR13. Local unmapped outbound label
+  creation/adoption, durable conflict-resolution UX, runtime admission and
   activation, remaining cross-repository/head transitions, PR14–16 and full PRD
   acceptance remain unfinished. No push, deployment or live GitHub write
   validation occurred.

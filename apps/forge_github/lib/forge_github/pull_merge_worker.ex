@@ -33,6 +33,8 @@ defmodule ForgeGitHub.PullMergeWorker do
     PullMergeBoundary,
     PullMergeConfirmation,
     PullMergeMetadataEffects,
+    PullMergeRemoteAssigneeObservation,
+    PullMergeRemoteLabelObservation,
     RepositoryMirror
   }
 
@@ -100,7 +102,8 @@ defmodule ForgeGitHub.PullMergeWorker do
   end
 
   defp finalize(operation, sync, pair, remote_base_oid, read_token, options, effect_count) do
-    with {:ok, observation} <- PullMergeObservation.build(sync, pair, remote_base_oid) do
+    with {:ok, observation} <-
+           merge_observation(operation, sync, pair, remote_base_oid) do
       case metadata_decision(operation, sync, observation) do
         {:ok, %{apply_local?: false, remote_issue_effect?: false}, _local} ->
           confirm_merge(operation, sync, pair, observation, nil)
@@ -159,6 +162,9 @@ defmodule ForgeGitHub.PullMergeWorker do
         {:error, _} = error ->
           error
       end
+    else
+      {:yielded, %MirrorOperation{} = yielded} -> {:ok, yielded}
+      {:error, _} = error -> error
     end
   end
 
@@ -171,7 +177,7 @@ defmodule ForgeGitHub.PullMergeWorker do
            true <- metadata_intent(current).id == metadata_intent(context).id,
            {:ok, remote} <- observe(sync, :base, read_token, options),
            {:ok, pair} <- pair(sync, read_token, options),
-           {:ok, observation} <- PullMergeObservation.build(sync, pair, remote.oid),
+           {:ok, observation} <- merge_observation(operation, sync, pair, remote.oid),
            {:ok, classification} <-
              classify_metadata_recovery(current, observation) do
         case classification.status do
@@ -207,6 +213,9 @@ defmodule ForgeGitHub.PullMergeWorker do
             end
         end
       else
+        {:yielded, %MirrorOperation{} = yielded} ->
+          {:ok, yielded}
+
         {:conflict, :ambiguous_external_effect, observation} ->
           PullMergeConfirmation.record_ambiguous_effect(
             operation,
@@ -366,6 +375,9 @@ defmodule ForgeGitHub.PullMergeWorker do
          true <- metadata_intent(current).id == metadata_intent(context).id,
          {:ok, attrs} <- metadata_effect_attrs(operation, sync, write_token, current, options) do
       case pre_patch_metadata_state(operation, sync, read_token, current, options) do
+        {:yielded, %MirrorOperation{} = yielded} ->
+          {:ok, yielded}
+
         {:ok, :preimage} ->
           with {:ok, fresh} <- PullMergeMetadataEffects.recovery_context(operation, now),
                true <- metadata_intent(fresh).id == metadata_intent(current).id,
@@ -688,7 +700,7 @@ defmodule ForgeGitHub.PullMergeWorker do
            PullMergeMetadataEffects.recovery_context(operation, DateTime.utc_now(:second)),
          true <- metadata_intent(before_pair).id == expected_id,
          {:ok, pair} <- pair(sync, read_token, options),
-         {:ok, observation} <- PullMergeObservation.build(sync, pair, remote.oid),
+         {:ok, observation} <- merge_observation(operation, sync, pair, remote.oid),
          {:ok, fresh} <-
            PullMergeMetadataEffects.recovery_context(operation, DateTime.utc_now(:second)),
          true <- metadata_intent(fresh).id == expected_id do
@@ -708,8 +720,17 @@ defmodule ForgeGitHub.PullMergeWorker do
           error
       end
     else
-      false -> {:error, :stale_merge_identity}
-      {:error, _} = error -> error
+      {:yielded, %MirrorOperation{} = yielded} ->
+        {:yielded, yielded}
+
+      {:conflict, :ambiguous_external_effect, observation} ->
+        {:conflict, observation}
+
+      false ->
+        {:error, :stale_merge_identity}
+
+      {:error, _} = error ->
+        error
     end
   end
 
@@ -729,7 +750,7 @@ defmodule ForgeGitHub.PullMergeWorker do
            PullMergeMetadataEffects.recovery_context(operation, DateTime.utc_now(:second)),
          true <- metadata_intent(before_pair).id == expected_metadata_intent_id,
          {:ok, pair} <- pair(sync, read_token, options),
-         {:ok, observation} <- PullMergeObservation.build(sync, pair, remote.oid),
+         {:ok, observation} <- merge_observation(operation, sync, pair, remote.oid),
          {:ok, context} <-
            PullMergeMetadataEffects.recovery_context(operation, DateTime.utc_now(:second)),
          true <- metadata_intent(context).id == expected_metadata_intent_id,
@@ -756,6 +777,9 @@ defmodule ForgeGitHub.PullMergeWorker do
           )
       end
     else
+      {:yielded, %MirrorOperation{} = yielded} ->
+        {:ok, yielded}
+
       {:conflict, :ambiguous_external_effect, observation} ->
         now = DateTime.utc_now(:second)
         PullMergeConfirmation.record_ambiguous_effect(operation, now, next(now), observation)
@@ -775,6 +799,78 @@ defmodule ForgeGitHub.PullMergeWorker do
       DateTime.to_iso8601(observation.pull.remote_updated_at) and
       marker["expected_remote_issue_updated_at"] ==
         DateTime.to_iso8601(observation.issue.remote_updated_at)
+  end
+
+  defp merge_observation(operation, sync, pair, remote_base_oid) do
+    now = DateTime.utc_now(:second)
+
+    with {:ok, label} <- PullMergeObservation.label_candidate(sync, pair, remote_base_oid) do
+      case label do
+        %{status: :ready} ->
+          with {:ok, profiles} <-
+                 PullMergeObservation.assignee_profiles(sync, pair, remote_base_oid),
+               {:ok, context} <- PullMergeRemoteAssigneeObservation.context(operation, now),
+               expected = Map.take(context, [:marker, :coordinator_intent, :metadata_intent]),
+               validation = fn ->
+                 case PullMergeObservation.label_candidate(sync, pair, remote_base_oid) do
+                   {:ok, %{status: :ready, observation: observation}} -> {:ok, observation}
+                   {:ok, %{status: :missing}} -> {:error, :merge_metadata_unconfirmed}
+                   {:error, _} = error -> error
+                 end
+               end,
+               {:ok, %{validation: observation}} <-
+                 PullMergeRemoteAssigneeObservation.observe(
+                   operation,
+                   now,
+                   expected,
+                   profiles,
+                   validation
+                 ) do
+            {:ok, observation}
+          end
+
+        %{status: :missing, candidate: candidate, observation: observation} ->
+          import_remote_label(operation, now, sync, observation, candidate)
+      end
+    end
+  end
+
+  defp import_remote_label(operation, now, sync, observation, candidate) do
+    result =
+      PullSyncWorker.with_merge_ref_fences(sync.git_proof, sync.intent.merge_oid, fn ->
+        PullMergeRemoteLabelObservation.import(
+          operation,
+          now,
+          sync.intent,
+          observation,
+          candidate,
+          fn multi ->
+            ForgeIssues.append_sync_label_import(multi, :resource, %{
+              repository_id: sync.repository_id,
+              fields: %{
+                "name" => candidate.name,
+                "color" => candidate.color,
+                "description" => candidate.description
+              },
+              provenance: %{origin: :github, correlation_id: "merge-#{operation.id}"}
+            })
+          end
+        )
+      end)
+
+    case result do
+      {:ok, %{operation: %MirrorOperation{} = yielded}} ->
+        {:yielded, yielded}
+
+      {:error, :ambiguous_external_effect} ->
+        {:conflict, :ambiguous_external_effect, observation}
+
+      {:error, _} = error ->
+        error
+
+      _ ->
+        {:error, :invalid_label_observation}
+    end
   end
 
   defp metadata_timestamps_nonregressed?(marker, observation) do

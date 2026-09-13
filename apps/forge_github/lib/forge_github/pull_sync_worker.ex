@@ -1163,6 +1163,25 @@ defmodule ForgeGitHub.PullSyncWorker do
   # A successful ref read followed by releasing its fence would leave a race.
   @doc false
   def with_ref_fences(%{base: base, head: head}, fun) when is_function(fun, 0) do
+    do_with_ref_fences(base, head, %{}, fun)
+  end
+
+  @doc false
+  def with_merge_ref_fences(%{base: base, head: head}, merge_oid, fun)
+      when is_binary(merge_oid) and is_function(fun, 0) do
+    accepted_oids =
+      %{}
+      |> Map.put({base.repository_id, base.ref}, [base.oid, merge_oid])
+      |> Map.update(
+        {head.repository_id, head.ref},
+        [head.oid],
+        &Enum.uniq([head.oid | &1])
+      )
+
+    do_with_ref_fences(base, head, accepted_oids, fun)
+  end
+
+  defp do_with_ref_fences(base, head, accepted_oids, fun) do
     refs = [base, head] |> Enum.reject(&is_nil/1) |> Enum.group_by(& &1.repository_id)
     deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:ref_deadline_ms)
 
@@ -1170,7 +1189,10 @@ defmodule ForgeGitHub.PullSyncWorker do
       with :ok <-
              Enum.reduce_while(refs, :ok, fn {id, required}, :ok ->
                case Enum.reduce_while(required, :ok, fn ref, :ok ->
-                      case verify_required_ref(Map.fetch!(paths, id), ref, deadline) do
+                      accepted =
+                        Map.get(accepted_oids, {ref.repository_id, ref.ref}, [ref.oid])
+
+                      case verify_required_ref(Map.fetch!(paths, id), ref, accepted, deadline) do
                         :ok -> {:cont, :ok}
                         error -> {:halt, error}
                       end
@@ -1437,27 +1459,32 @@ defmodule ForgeGitHub.PullSyncWorker do
   defp verify_repository_refs(_repository_id, _refs, _deadline),
     do: {:error, :required_ref_unavailable}
 
+  defp verify_required_ref(path, %{oid: oid} = ref, deadline),
+    do: verify_required_ref(path, ref, [oid], deadline)
+
   defp verify_required_ref(
          path,
          %{ref: ref, oid: oid, repository_generation: generation},
+         accepted_oids,
          deadline
        )
        when is_binary(path) and is_binary(ref) and is_binary(oid) and is_integer(generation) and
-              generation > 0 and is_integer(deadline) do
+              generation > 0 and is_list(accepted_oids) and is_integer(deadline) do
     remaining = max(deadline - System.monotonic_time(:millisecond), 0)
 
     with true <- remaining > 0,
-         {:ok, ^oid} <- GitCore.exact_ref(path, ref, deadline_ms: remaining),
+         {:ok, actual_oid} <- GitCore.exact_ref(path, ref, deadline_ms: remaining),
+         true <- actual_oid in accepted_oids,
          remaining = max(deadline - System.monotonic_time(:millisecond), 0),
          true <- remaining > 0,
-         {:ok, true} <- GitCore.is_ancestor(path, oid, oid, deadline_ms: remaining) do
+         {:ok, true} <- GitCore.is_ancestor(path, actual_oid, actual_oid, deadline_ms: remaining) do
       :ok
     else
       _invalid -> {:error, :required_ref_unavailable}
     end
   end
 
-  defp verify_required_ref(_path, _ref, _deadline),
+  defp verify_required_ref(_path, _ref, _accepted_oids, _deadline),
     do: {:error, :required_ref_unavailable}
 
   defp precondition(sync, local, remote, provider_identity, proof) do

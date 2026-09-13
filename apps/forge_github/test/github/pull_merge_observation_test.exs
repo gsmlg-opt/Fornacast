@@ -394,4 +394,368 @@ defmodule ForgeGitHub.PullMergeObservationTest do
     assert before ==
              {Repo.all(ForgeAccounts.GitHubIdentity), Repo.all(ForgeMirrors.MirrorResourceState)}
   end
+
+  test "returns normalized unique assignee profiles after validating the complete merge pair",
+       c do
+    pair =
+      put_in(c.pair, [:issue, "assignees"], [
+        %{
+          "id" => 803,
+          "node_id" => "U_803",
+          "login" => "second",
+          "name" => "Second",
+          "avatar_url" => "https://avatars.githubusercontent.com/u/803?v=4",
+          "html_url" => "https://github.com/second",
+          "ignored" => "transport-only"
+        },
+        %{"id" => 802, "node_id" => "U_802", "login" => "first"}
+      ])
+
+    before = Repo.all(ForgeAccounts.GitHubIdentity)
+
+    assert {:ok, profiles} = PullMergeObservation.assignee_profiles(c.sync, pair, c.m)
+
+    assert profiles == [
+             %{
+               id: 802,
+               node_id: "U_802",
+               login: "first",
+               name: nil,
+               avatar_url: nil,
+               html_url: nil
+             },
+             %{
+               id: 803,
+               node_id: "U_803",
+               login: "second",
+               name: "Second",
+               avatar_url: "https://avatars.githubusercontent.com/u/803?v=4",
+               html_url: "https://github.com/second"
+             }
+           ]
+
+    assert Repo.all(ForgeAccounts.GitHubIdentity) == before
+  end
+
+  test "assignee profiles reject malformed, duplicate and substituted node identities", c do
+    collision =
+      Repo.insert!(
+        ForgeAccounts.GitHubIdentity.observed_changeset(%ForgeAccounts.GitHubIdentity{}, %{
+          github_user_id: 804,
+          github_node_id: "U_804",
+          login: "collision"
+        })
+      )
+
+    for assignees <- [
+          [%{"id" => 802, "node_id" => nil, "login" => "missing-node"}],
+          [%{"id" => 802, "node_id" => "U_802", "login" => ""}],
+          [%{"id" => 802, "node_id" => "U_802", "login" => "ghp_secret-token"}],
+          [
+            %{"id" => 802, "node_id" => "U_802", "login" => "one"},
+            %{"id" => 802, "node_id" => "U_other", "login" => "two"}
+          ],
+          [
+            %{"id" => 802, "node_id" => "U_same", "login" => "one"},
+            %{"id" => 803, "node_id" => "U_same", "login" => "two"}
+          ],
+          [%{"id" => 801, "node_id" => "U_wrong", "login" => "known"}],
+          [%{"id" => 805, "node_id" => collision.github_node_id, "login" => "substituted"}]
+        ] do
+      assert {:error, :merge_metadata_unconfirmed} =
+               PullMergeObservation.assignee_profiles(
+                 c.sync,
+                 put_in(c.pair, [:issue, "assignees"], assignees),
+                 c.m
+               )
+    end
+  end
+
+  test "assignee profiles authenticate the exact merged envelope before returning transport data",
+       c do
+    pair =
+      put_in(c.pair, [:issue, "assignees"], [
+        %{"id" => 802, "node_id" => "U_802", "login" => "unknown"}
+      ])
+
+    for {path, value} <- [
+          {[:pull, "id"], 999},
+          {[:pull, "base", "sha"], String.duplicate("e", 40)},
+          {[:issue, "node_id"], "I_substituted"},
+          {[:issue, "updated_at"], "invalid"},
+          {[:issue, "labels", Access.at(0), "node_id"], "L_substituted"}
+        ] do
+      assert {:error, _} =
+               PullMergeObservation.assignee_profiles(c.sync, put_in(pair, path, value), c.m)
+    end
+
+    assert {:error, :invalid_merge_observation} =
+             PullMergeObservation.assignee_profiles(
+               c.sync,
+               pair,
+               c.sync.intent.expected_base_oid
+             )
+  end
+
+  test "label candidate returns the ready normalized observation without writes", c do
+    pair = put_in(c.pair, [:issue, "labels"], [full_label(800, "L_800", "known")])
+    before = catalog_state()
+
+    assert {:ok, %{status: :ready, observation: observation}} =
+             PullMergeObservation.label_candidate(c.sync, pair, c.m)
+
+    assert observation.remote_base_oid == c.m
+    assert observation.issue.confirmed_snapshot["label_github_ids"] == [800]
+    assert catalog_state() == before
+  end
+
+  test "label candidate returns only the first sorted missing label after validating every label",
+       c do
+    pair =
+      put_in(c.pair, [:issue, "labels"], [
+        full_label(803, "L_803", "third", "AABBCC", "later"),
+        full_label(800, "L_800", "known"),
+        full_label(802, "L_802", "first", "ABCDEF", "")
+      ])
+      |> put_in([:issue, "assignees"], [
+        %{"id" => 899, "node_id" => "U_899", "login" => "unknown-is-allowed"}
+      ])
+
+    before = catalog_state()
+
+    assert {:ok,
+            %{
+              status: :missing,
+              candidate: candidate,
+              observation: observation
+            }} = PullMergeObservation.label_candidate(c.sync, pair, c.m)
+
+    assert candidate == %{
+             github_object_id: 802,
+             node_id: "L_802",
+             name: "first",
+             color: "abcdef",
+             description: nil
+           }
+
+    assert observation.issue.confirmed_snapshot["label_github_ids"] == [800, 802, 803]
+    assert observation.issue.confirmed_snapshot["assignee_github_ids"] == [899]
+    assert catalog_state() == before
+  end
+
+  test "label candidate rejects malformed later labels and exact merge contradictions", c do
+    valid = full_label(802, "L_802", "first")
+
+    invalid_labels = [
+      [valid, full_label(803, "L_803", "later", "bad", nil)],
+      [valid, full_label(803, "L_802", "duplicate-node")],
+      [valid, full_label(802, "L_other", "duplicate-id")],
+      [
+        valid,
+        Map.put(full_label(803, "L_803", "later"), "description", String.duplicate("x", 101))
+      ]
+    ]
+
+    for labels <- invalid_labels do
+      assert {:error, :merge_metadata_unconfirmed} =
+               PullMergeObservation.label_candidate(
+                 c.sync,
+                 put_in(c.pair, [:issue, "labels"], labels),
+                 c.m
+               )
+    end
+
+    pair = put_in(c.pair, [:issue, "labels"], [valid])
+
+    assert {:error, :invalid_merge_observation} =
+             PullMergeObservation.label_candidate(
+               c.sync,
+               put_in(pair, [:pull, "merge_commit_sha"], String.duplicate("f", 40)),
+               c.m
+             )
+  end
+
+  test "label candidate rejects dangling, wrong-type and wrong-repository known mappings", c do
+    pair = put_in(c.pair, [:issue, "labels"], [full_label(800, "L_800", "known")])
+
+    mapping =
+      Repo.get_by!(ForgeMirrors.MirrorResourceState,
+        repository_mirror_id: c.sync.repository_mirror_id,
+        resource_kind: :label,
+        github_object_id: 800
+      )
+
+    assert {:error, :done} =
+             Repo.transaction(fn ->
+               mapping
+               |> Ecto.Changeset.change(
+                 local_resource_id: System.unique_integer([:positive]) + 9_000_000_000
+               )
+               |> Repo.update!()
+
+               assert_label_candidate_rejected(c, pair)
+               Repo.rollback(:done)
+             end)
+
+    assert {:error, :done} =
+             Repo.transaction(fn ->
+               mapping
+               |> Ecto.Changeset.change(local_resource_type: "ForgeIssues.Issue")
+               |> Repo.update!()
+
+               assert_label_candidate_rejected(c, pair)
+               Repo.rollback(:done)
+             end)
+
+    organization =
+      c.sync.repository_mirror_id
+      |> then(&Repo.get!(ForgeMirrors.RepositoryMirror, &1))
+      |> then(&Repo.get!(ForgeMirrors.OrganizationMirror, &1.organization_mirror_id))
+
+    other = repository_mirror_fixture(organization)
+
+    foreign_label =
+      Repo.insert!(
+        ForgeIssues.Label.changeset(%ForgeIssues.Label{repository_id: other.repository_id}, %{
+          name: "foreign",
+          normalized_name: "foreign",
+          color: "112233"
+        })
+      )
+
+    assert {:error, :done} =
+             Repo.transaction(fn ->
+               mapping
+               |> Ecto.Changeset.change(local_resource_id: foreign_label.id)
+               |> Repo.update!()
+
+               assert_label_candidate_rejected(c, pair)
+               Repo.rollback(:done)
+             end)
+  end
+
+  test "label candidate rejects known node substitution and organization node collision", c do
+    substituted =
+      put_in(c.pair, [:issue, "labels"], [full_label(800, "L_wrong", "known")])
+
+    assert {:error, :merge_metadata_unconfirmed} =
+             PullMergeObservation.label_candidate(c.sync, substituted, c.m)
+
+    repository_id = c.sync.repository_id
+
+    label =
+      Repo.insert!(
+        ForgeIssues.Label.changeset(%ForgeIssues.Label{repository_id: repository_id}, %{
+          name: "collision",
+          normalized_name: "collision",
+          color: "112233"
+        })
+      )
+
+    Repo.insert!(
+      ForgeMirrors.MirrorResourceState.persistence_changeset(
+        %ForgeMirrors.MirrorResourceState{},
+        %{
+          repository_mirror_id: c.sync.repository_mirror_id,
+          resource_kind: :label,
+          local_resource_type: "ForgeIssues.Label",
+          local_resource_id: label.id,
+          github_object_id: 804,
+          github_node_id: "L_collision",
+          confirmed_snapshot: %{},
+          state: :confirmed
+        }
+      )
+    )
+
+    collision =
+      put_in(c.pair, [:issue, "labels"], [full_label(805, "L_collision", "unknown")])
+
+    assert {:error, :merge_metadata_unconfirmed} =
+             PullMergeObservation.label_candidate(c.sync, collision, c.m)
+  end
+
+  test "label candidate returns lock busy without writes when an assignee identity is contended",
+       c do
+    owner = self()
+    github_id = System.unique_integer([:positive]) + 8_100_000_000
+
+    task =
+      Task.async(fn ->
+        Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+          identity =
+            Repo.insert!(
+              ForgeAccounts.GitHubIdentity.observed_changeset(%ForgeAccounts.GitHubIdentity{}, %{
+                github_user_id: github_id,
+                github_node_id: "U_BUSY_#{github_id}",
+                login: "busy-#{github_id}"
+              })
+            )
+
+          try do
+            Repo.transaction(fn ->
+              Ecto.Adapters.SQL.query!(
+                Repo,
+                "SELECT id FROM github_identities WHERE id = $1 FOR UPDATE",
+                [identity.id]
+              )
+
+              send(owner, {:candidate_identity_locked, github_id})
+
+              receive do
+                :release -> :ok
+              after
+                10_000 -> raise "identity lock was not released"
+              end
+            end)
+          after
+            Repo.delete!(identity)
+          end
+        end)
+      end)
+
+    try do
+      assert_receive {:candidate_identity_locked, ^github_id}, 5_000
+
+      pair =
+        c.pair
+        |> put_in([:issue, "labels"], [])
+        |> put_in([:issue, "assignees"], [
+          %{"id" => github_id, "node_id" => "U_BUSY_#{github_id}", "login" => "busy-#{github_id}"}
+        ])
+
+      before = catalog_state()
+
+      assert {:error, :relationship_lock_busy} =
+               PullMergeObservation.label_candidate(c.sync, pair, c.m)
+
+      assert catalog_state() == before
+    after
+      send(task.pid, :release)
+      Task.await(task, 5_000)
+    end
+  end
+
+  defp full_label(id, node, name, color \\ "112233", description \\ nil),
+    do: %{
+      "id" => id,
+      "node_id" => node,
+      "name" => name,
+      "color" => color,
+      "description" => description
+    }
+
+  defp assert_label_candidate_rejected(c, pair) do
+    before = catalog_state()
+
+    assert {:error, :merge_metadata_unconfirmed} =
+             PullMergeObservation.label_candidate(c.sync, pair, c.m)
+
+    assert catalog_state() == before
+  end
+
+  defp catalog_state do
+    {Repo.all(ForgeAccounts.GitHubIdentity), Repo.all(ForgeMirrors.MirrorResourceState),
+     Repo.all(ForgeIssues.Label)}
+  end
 end
