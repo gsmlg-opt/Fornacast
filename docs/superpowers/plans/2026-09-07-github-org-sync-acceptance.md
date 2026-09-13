@@ -10,6 +10,42 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 merge-owned scalar outbound metadata effects (2026-09-14)
+
+- A coordinated merge can now advance from its exact Git CAS marker to a
+  dedicated `metadata_issue_pending` phase after an authenticated observation
+  proves base `M` and the merged pull. The phase change preserves every merge
+  proof field, reservation and `merge_written` intent while atomically storing
+  the full title/body preimage and target in an immutable `PullMetadataIntent`.
+  No migration was required.
+- The provider worker obtains a separate base-repository-only
+  `metadata:read`/`pull_requests:write` token and patches only changed title/body
+  fields. It never writes merged state, reason, draft, refs, SHAs or merge facts,
+  and it never trusts the PATCH response. Fresh base, pull and canonical issue
+  observations must match the durable target and nonregressed marker-relative
+  timestamps before final confirmation can clear the marker.
+- Recovery distinguishes an unchanged exact preimage, an exact applied target,
+  and a third or ABA state. Only the exact preimage with both retained timestamps
+  can retry. Third states and marker-relative timestamp regressions record a
+  durable `ambiguous_external_effect` conflict. Lease and installation authority
+  are rechecked after each token acquisition and after PATCH before any further
+  provider read.
+- Mixed independent scalar changes retain provider-only fields for atomic local
+  application. A genuinely newer local scalar edit advances to a contiguous
+  immutable intent sequence only after the prior target is observed; an exact
+  replay remains idempotent. Same-call sequencing is bounded and metadata
+  recovery cannot retry the Git push.
+- Fresh connected PostgreSQL verification passed **201 tests**: mirror merge
+  boundaries **81**, coordinated merge domain **40**, and provider
+  observation/decision/recovery **80**. Production warnings-as-errors compile,
+  scoped formatting and diff checks passed. Independent spec and quality reviews
+  approved after mixed-field, timestamp and post-PATCH authority repairs.
+- This is the scalar title/body outbound slice only. Merge-owned outbound
+  label/assignee effects and their node proofs, unknown relationship
+  materialization, conflict resolution, worker admission/activation, PR14–16 and
+  full PRD acceptance remain unfinished. No push, deployment or live GitHub
+  writes occurred.
+
 ### PR13 atomic inbound metadata convergence during merge (2026-09-08)
 
 - Compatible provider-only title/body and already-mapped label/assignee changes

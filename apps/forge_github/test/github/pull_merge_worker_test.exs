@@ -1,6 +1,7 @@
 defmodule ForgeGitHub.PullMergeWorkerTest do
   use ExUnit.Case, async: false
   import ForgeMirrors.TestSupport.MirrorFixtures
+  import Ecto.Query
   alias Ecto.{Changeset, Multi}
   alias ForgeGitHub.{InstallationToken, PullMergeWorker}
 
@@ -9,7 +10,8 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     MirrorRefState,
     MirrorResourceState,
     PullEligibility,
-    PullMergeBoundary
+    PullMergeBoundary,
+    PullMetadataIntent
   }
 
   alias Fornacast.Repo
@@ -28,7 +30,7 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     |> Changeset.change(
       permissions: %{
         "contents" => "write",
-        "pull_requests" => "read",
+        "pull_requests" => "write",
         "issues" => "read",
         "metadata" => "read"
       }
@@ -645,14 +647,20 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     assert {ref.confirmed_oid, ref.last_local_oid, ref.last_remote_oid} == {oid, oid, oid}
   end
 
-  test "newer local metadata is never falsely confirmed by the merge", c do
+  test "newer local metadata is durably marked but never falsely confirmed by the merge", c do
     paired_issue_mapping(c)
     marked = mark(c)
     c.issue |> ForgeIssues.Issue.update_changeset(%{title: "Newer local title"}) |> Repo.update!()
-    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, merged_options(c))
+
+    opts =
+      Keyword.put(merged_options(c), :update_pull_issue, fn _, _, _, _, _, _ ->
+        {:error, :timeout}
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
     assert pending.state == :effect_pending
-    assert pending.external_effect_marker == marked.external_effect_marker
-    assert pending.failure_detail == "merge_metadata_unconfirmed"
+    assert pending.external_effect_marker["phase"] == "metadata_issue_pending"
+    assert is_integer(pending.external_effect_marker["metadata_intent_id"])
     assert Repo.get!(ForgeIssues.Issue, c.issue.id).title == "Newer local title"
     assert Repo.get!(ForgeIssues.Issue, c.issue.id).state == :open
     assert Repo.get!(ForgePulls.MergeOperation, c.intent.id).state == :merge_written
@@ -944,6 +952,394 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     assert mapping.confirmed_local_version == issue.sync_version
   end
 
+  test "local-only title and body are durably marked before the exact issue patch", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    edit_issue(c, %{title: "Local title", body: "Local body"})
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+    opts =
+      scalar_effect_options(c, provider, fn token, attrs ->
+        stored = Repo.get!(MirrorOperation, marked.id)
+        assert stored.state == :effect_pending
+        assert stored.external_effect_marker["phase"] == "metadata_issue_pending"
+        assert token == "metadata-write"
+        assert attrs == %{"body" => "Local body", "title" => "Local title"}
+
+        intent =
+          Repo.get!(PullMetadataIntent, stored.external_effect_marker["metadata_intent_id"])
+
+        assert intent.payload["expected_remote_issue"]["title"] == "Merge"
+        assert intent.payload["target_issue"]["title"] == "Local title"
+
+        Agent.update(provider, &Map.merge(&1, %{title: "Local title", body: "Local body"}))
+        {:ok, %{"untrusted" => true}}
+      end)
+
+    assert {:ok, completed} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert completed.state == :completed
+    assert Agent.get(provider, & &1.issue_reads) >= 2
+    assert Repo.get!(ForgeIssues.Issue, c.issue.id).state == :closed
+  end
+
+  test "metadata mutation token is base-only with exact write scope", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    edit_issue(c, %{title: "Local title"})
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+    opts =
+      scalar_effect_options(c, provider, fn _, _ ->
+        Agent.update(provider, &Map.put(&1, :title, "Local title"))
+        {:ok, %{}}
+      end)
+      |> Keyword.put(:token_fetch, fn _, scope ->
+        token =
+          case scope.permissions do
+            %{"metadata" => "read", "pull_requests" => "write"} = permissions
+            when map_size(permissions) == 2 ->
+              assert scope.repository_ids == [c.binding.github_repository_id]
+              "metadata-write"
+
+            _ ->
+              "observation"
+          end
+
+        %InstallationToken{
+          token: token,
+          expires_at: DateTime.add(c.now, 3600),
+          permissions: scope.permissions
+        }
+      end)
+
+    assert {:ok, completed} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert completed.state == :completed
+  end
+
+  test "mixed local title and remote body converge without overwriting the remote body", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    edit_issue(c, %{title: "Local title"})
+    {:ok, provider} = Agent.start_link(fn -> %{provider_state(c) | body: "Remote body"} end)
+
+    opts =
+      scalar_effect_options(c, provider, fn _, attrs ->
+        assert attrs == %{"title" => "Local title"}
+        Agent.update(provider, &Map.put(&1, :title, attrs["title"]))
+        send(self(), :mixed_scalar_patch)
+        {:ok, %{}}
+      end)
+
+    assert {:ok, completed} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert_received :mixed_scalar_patch
+    refute_received :mixed_scalar_patch
+    assert completed.state == :completed
+    assert Repo.aggregate(PullMetadataIntent, :count) == 1
+    issue = Repo.get!(ForgeIssues.Issue, c.issue.id)
+    assert {issue.title, issue.body} == {"Local title", "Remote body"}
+  end
+
+  test "an applied metadata patch after timeout is observed without a second patch", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    edit_issue(c, %{title: "Local title"})
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+    opts =
+      scalar_effect_options(c, provider, fn _, _ ->
+        Agent.update(provider, &Map.put(&1, :title, "Local title"))
+        send(self(), :metadata_patch)
+        {:error, :timeout}
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert_received :metadata_patch
+    reclaimed = reclaim(pending, c.now, "metadata-timeout-recovery")
+
+    opts = Keyword.put(opts, :update_pull_issue, fn _, _, _, _, _, _ -> flunk("second patch") end)
+    assert {:ok, completed} = PullMergeWorker.process_operation(reclaimed, c.now, opts)
+    assert completed.state == :completed
+  end
+
+  test "exact metadata preimage with retained timestamps safely retries without a Git push", c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    edit_issue(c, %{title: "Local title"})
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+    first =
+      scalar_effect_options(c, provider, fn _, _ ->
+        send(self(), :first_metadata_patch)
+        {:error, :timeout}
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, first)
+    assert_received :first_metadata_patch
+    reclaimed = reclaim(pending, c.now, "metadata-preimage-recovery")
+
+    retry =
+      scalar_effect_options(c, provider, fn _, _ ->
+        Agent.update(provider, &Map.put(&1, :title, "Local title"))
+        send(self(), :retried_metadata_patch)
+        {:ok, %{}}
+      end)
+      |> Keyword.put(:push_remote, fn _, _, _, _ -> flunk("metadata recovery retried Git") end)
+
+    assert {:ok, completed} = PullMergeWorker.process_operation(reclaimed, c.now, retry)
+    assert_received :retried_metadata_patch
+    assert completed.state == :completed
+  end
+
+  test "third metadata state records ambiguity without patch", c do
+    {reclaimed, provider} = pending_scalar_effect(c, "metadata-third-state")
+    Agent.update(provider, &Map.put(&1, :title, "Third title"))
+    assert_ambiguous_effect(c, reclaimed, provider)
+  end
+
+  test "metadata preimage with changed timestamp records ABA ambiguity without patch", c do
+    {reclaimed, provider} = pending_scalar_effect(c, "metadata-aba")
+    Agent.update(provider, &Map.put(&1, :issue_updated_at, DateTime.add(c.now, 1)))
+    assert_ambiguous_effect(c, reclaimed, provider)
+  end
+
+  for endpoint <- [:pull, :issue] do
+    test "regressed #{endpoint} timestamp on the applied metadata target records ambiguity", c do
+      paired_issue_mapping(c)
+      marked = mark(c)
+      edit_issue(c, %{title: "Local title"})
+      marked_at = DateTime.add(c.now, 2)
+
+      {:ok, provider} =
+        Agent.start_link(fn ->
+          provider_state(c)
+          |> Map.put(:pull_updated_at, marked_at)
+          |> Map.put(:issue_updated_at, marked_at)
+        end)
+
+      first = scalar_effect_options(c, provider, fn _, _ -> {:error, :timeout} end)
+      assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, first)
+      reclaimed = reclaim(pending, c.now, "metadata-regressed-#{unquote(endpoint)}")
+
+      Agent.update(provider, fn state ->
+        state = Map.put(state, :title, "Local title")
+
+        case unquote(endpoint) do
+          :pull -> Map.put(state, :pull_updated_at, DateTime.add(c.now, 1))
+          :issue -> Map.put(state, :issue_updated_at, DateTime.add(c.now, 1))
+        end
+      end)
+
+      assert_ambiguous_effect(c, reclaimed, provider)
+    end
+  end
+
+  for change <- [:revoked, :lost_lease] do
+    test "#{change} during metadata recovery read-token fetch prevents all provider access", c do
+      {reclaimed, provider} = pending_scalar_effect(c, "metadata-read-token-#{unquote(change)}")
+
+      opts =
+        scalar_effect_options(c, provider, fn _, _ ->
+          flunk("metadata mutation after lost authority")
+        end)
+        |> Keyword.put(:observe_ref, fn _, _, _, _, _, _ ->
+          flunk("provider read after lost authority")
+        end)
+        |> Keyword.put(:get_pull, fn _, _, _, _, _ -> flunk("pull read after lost authority") end)
+        |> Keyword.put(:get_pull_issue, fn _, _, _, _, _ ->
+          flunk("issue read after lost authority")
+        end)
+        |> Keyword.put(:token_fetch, fn _, scope ->
+          if scope.permissions["contents"] == "read" do
+            case unquote(change) do
+              :revoked ->
+                Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+                  github_installation_id: c.organization.github_installation_id
+                )
+                |> Changeset.change(state: :revoked)
+                |> Repo.update!()
+
+              :lost_lease ->
+                Repo.get!(MirrorOperation, reclaimed.id)
+                |> Changeset.change(lease_owner: "stolen-during-read-token")
+                |> Repo.update!()
+            end
+          end
+
+          %InstallationToken{
+            token: "credential",
+            expires_at: DateTime.add(c.now, 3600),
+            permissions: scope.permissions
+          }
+        end)
+
+      result = PullMergeWorker.process_operation(reclaimed, c.now, opts)
+
+      case result do
+        {:ok, pending} ->
+          assert pending.state == :effect_pending
+
+        {:error, reason} ->
+          assert reason in [:credential_revoked, :lost_lease, :stale_merge_identity]
+      end
+
+      assert Repo.get!(MirrorOperation, reclaimed.id).external_effect_marker["phase"] ==
+               "metadata_issue_pending"
+    end
+  end
+
+  for change <- [:revoked, :lost_lease] do
+    test "#{change} after metadata marking prevents provider mutation", c do
+      paired_issue_mapping(c)
+      marked = mark(c)
+      edit_issue(c, %{title: "Local title"})
+      {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+      opts =
+        scalar_effect_options(c, provider, fn _, _ -> flunk("revoked capability mutated") end)
+        |> Keyword.put(:token_fetch, fn _, scope ->
+          if scope.permissions == %{"metadata" => "read", "pull_requests" => "write"} do
+            case unquote(change) do
+              :revoked ->
+                Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+                  github_installation_id: c.organization.github_installation_id
+                )
+                |> Changeset.change(state: :revoked)
+                |> Repo.update!()
+
+              :lost_lease ->
+                Repo.get!(MirrorOperation, marked.id)
+                |> Changeset.change(lease_owner: "stolen-after-mark")
+                |> Repo.update!()
+            end
+          end
+
+          %InstallationToken{
+            token: "credential",
+            expires_at: DateTime.add(c.now, 3600),
+            permissions: scope.permissions
+          }
+        end)
+
+      result = PullMergeWorker.process_operation(marked, c.now, opts)
+
+      if unquote(change) == :lost_lease do
+        assert {:error, reason} = result
+        assert reason in [:lost_lease, :stale_merge_identity]
+      else
+        assert {:ok, _pending} = result
+      end
+
+      persisted = Repo.get!(MirrorOperation, marked.id)
+      assert persisted.state == :effect_pending
+      assert persisted.external_effect_marker["phase"] == "metadata_issue_pending"
+    end
+  end
+
+  for change <- [:revoked, :lost_lease] do
+    test "#{change} after metadata PATCH prevents all confirmation provider reads", c do
+      paired_issue_mapping(c)
+      marked = mark(c)
+      edit_issue(c, %{title: "Local title"})
+      {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+      base = scalar_effect_options(c, provider, fn _, _ -> {:ok, %{}} end)
+      observe_ref = Keyword.fetch!(base, :observe_ref)
+      get_pull = Keyword.fetch!(base, :get_pull)
+      get_issue = Keyword.fetch!(base, :get_pull_issue)
+
+      opts =
+        base
+        |> Keyword.put(:observe_ref, fn a, b, d, e, f, g ->
+          if Agent.get(provider, & &1.post_patch?),
+            do: flunk("confirmation provider read after lost authority"),
+            else: observe_ref.(a, b, d, e, f, g)
+        end)
+        |> Keyword.put(:get_pull, fn a, b, d, e, f ->
+          if Agent.get(provider, & &1.post_patch?),
+            do: flunk("confirmation provider read after lost authority"),
+            else: get_pull.(a, b, d, e, f)
+        end)
+        |> Keyword.put(:get_pull_issue, fn a, b, d, e, f ->
+          if Agent.get(provider, & &1.post_patch?),
+            do: flunk("confirmation provider read after lost authority"),
+            else: get_issue.(a, b, d, e, f)
+        end)
+        |> Keyword.put(:update_pull_issue, fn _, _, _, _, attrs, _ ->
+          Agent.update(provider, fn state ->
+            state
+            |> Map.put(:title, attrs["title"])
+            |> Map.put(:post_patch?, true)
+          end)
+
+          case unquote(change) do
+            :revoked ->
+              Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+                github_installation_id: c.organization.github_installation_id
+              )
+              |> Changeset.change(state: :revoked)
+              |> Repo.update!()
+
+            :lost_lease ->
+              Repo.get!(MirrorOperation, marked.id)
+              |> Changeset.change(lease_owner: "stolen-after-patch")
+              |> Repo.update!()
+          end
+
+          {:ok, %{"untrusted" => true}}
+        end)
+
+      result = PullMergeWorker.process_operation(marked, c.now, opts)
+
+      case result do
+        {:ok, pending} ->
+          assert pending.state == :effect_pending
+
+        {:error, reason} ->
+          assert reason in [:credential_revoked, :lost_lease, :stale_merge_identity]
+      end
+
+      persisted = Repo.get!(MirrorOperation, marked.id)
+      assert persisted.external_effect_marker["phase"] == "metadata_issue_pending"
+    end
+  end
+
+  test "newer local metadata after target observation creates sequence two and confirms actual version",
+       c do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    edit_issue(c, %{title: "Local A"})
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+    opts =
+      scalar_effect_options(c, provider, fn _, attrs ->
+        Agent.update(provider, &Map.put(&1, :title, attrs["title"]))
+
+        if attrs["title"] == "Local A" do
+          edit_issue(c, %{title: "Local C"})
+        end
+
+        {:ok, %{}}
+      end)
+
+    assert {:ok, completed} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert completed.state == :completed
+    assert Agent.get(provider, & &1.title) == "Local C"
+
+    assert Repo.all(
+             from i in PullMetadataIntent,
+               where: i.operation_id == ^marked.id,
+               order_by: i.sequence,
+               select: i.sequence
+           ) == [1, 2]
+
+    issue = Repo.get!(ForgeIssues.Issue, c.issue.id)
+
+    mapping =
+      Repo.get_by!(MirrorResourceState, resource_kind: :pull, local_resource_id: c.pull.id)
+
+    assert mapping.confirmed_local_version == issue.sync_version
+    assert mapping.confirmed_snapshot["title"] == "Local C"
+  end
+
   test "a different provider merge commit cannot finalize the reserved merge", c do
     paired_issue_mapping(c)
     marked = mark(c)
@@ -1106,6 +1502,91 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
          "updated_at" => now
        }}
     end)
+  end
+
+  defp edit_issue(c, attrs) do
+    c.issue
+    |> Repo.reload!()
+    |> ForgeIssues.Issue.update_changeset(attrs)
+    |> Repo.update!()
+  end
+
+  defp provider_state(c) do
+    %{
+      title: "Merge",
+      body: nil,
+      pull_updated_at: c.now,
+      issue_updated_at: c.now,
+      issue_reads: 0,
+      post_patch?: false
+    }
+  end
+
+  defp scalar_effect_options(c, provider, update) do
+    base = merged_options(c)
+    get_pull = Keyword.fetch!(base, :get_pull)
+    get_issue = Keyword.fetch!(base, :get_pull_issue)
+
+    base
+    |> Keyword.put(:token_fetch, fn _, scope ->
+      token =
+        if scope.permissions == %{"metadata" => "read", "pull_requests" => "write"},
+          do: "metadata-write",
+          else: "observation"
+
+      %InstallationToken{
+        token: token,
+        expires_at: DateTime.add(c.now, 3600),
+        permissions: scope.permissions
+      }
+    end)
+    |> Keyword.put(:get_pull, fn a, b, d, e, f ->
+      {:ok, raw} = get_pull.(a, b, d, e, f)
+      state = Agent.get(provider, & &1)
+
+      {:ok,
+       raw
+       |> Map.put("title", state.title)
+       |> Map.put("body", state.body)
+       |> Map.put("updated_at", DateTime.to_iso8601(state.pull_updated_at))}
+    end)
+    |> Keyword.put(:get_pull_issue, fn a, b, d, e, f ->
+      {:ok, raw} = get_issue.(a, b, d, e, f)
+
+      state =
+        Agent.get_and_update(provider, &{&1, Map.update!(&1, :issue_reads, fn n -> n + 1 end)})
+
+      {:ok,
+       raw
+       |> Map.put("title", state.title)
+       |> Map.put("body", state.body)
+       |> Map.put("updated_at", DateTime.to_iso8601(state.issue_updated_at))}
+    end)
+    |> Keyword.put(:update_pull_issue, fn token, _, _, _, attrs, _ -> update.(token, attrs) end)
+  end
+
+  defp reclaim(pending, now, owner) do
+    pending |> Changeset.change(next_attempt_at: now) |> Repo.update!()
+    {:ok, claimed} = ForgeMirrors.claim_operations(owner, now, 60, 100, ["merge.pull"])
+    Enum.find(claimed, &(&1.id == pending.id))
+  end
+
+  defp pending_scalar_effect(c, owner) do
+    paired_issue_mapping(c)
+    marked = mark(c)
+    edit_issue(c, %{title: "Local title"})
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+    first = scalar_effect_options(c, provider, fn _, _ -> {:error, :timeout} end)
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, first)
+    {reclaim(pending, c.now, owner), provider}
+  end
+
+  defp assert_ambiguous_effect(c, reclaimed, provider) do
+    opts = scalar_effect_options(c, provider, fn _, _ -> flunk("ambiguous effect retried") end)
+    assert {:ok, conflict} = PullMergeWorker.process_operation(reclaimed, c.now, opts)
+    assert conflict.failure_disposition == :conflict
+    assert conflict.failure_detail == "ambiguous_external_effect"
+    assert conflict.external_effect_marker["phase"] == "metadata_issue_pending"
   end
 
   defp mark(c) do

@@ -81,6 +81,86 @@ defmodule ForgeMirrors.PullMergeConfirmation do
 
   def record_metadata_conflict(_, _, _, _), do: {:error, :invalid_transition}
 
+  @doc "Record an authenticated ambiguous provider outcome for a pending merge metadata effect."
+  def record_ambiguous_effect(
+        operation,
+        %DateTime{} = now,
+        %DateTime{} = next_attempt_at,
+        observation
+      ) do
+    Repo.transaction(fn ->
+      with true <- DateTime.compare(next_attempt_at, now) != :lt,
+           {:ok, context} <- load(operation, now),
+           %ForgeMirrors.PullMetadataIntent{} <- context.metadata_intent,
+           :ok <- validate_observation(context, observation),
+           :ok <- ambiguous_effect?(context, observation),
+           {:ok, _conflict} <- record_ambiguous_conflict(context, observation),
+           {:ok, yielded} <-
+             yield_conflict(
+               context.operation,
+               now,
+               next_attempt_at,
+               "ambiguous_external_effect"
+             ) do
+        yielded
+      else
+        false -> Repo.rollback(:invalid_transition)
+        {:error, reason} -> Repo.rollback(reason)
+        _ -> Repo.rollback(:invalid_transition)
+      end
+    end)
+  end
+
+  def record_ambiguous_effect(_, _, _, _), do: {:error, :invalid_transition}
+
+  defp ambiguous_effect?(context, observation) do
+    payload = context.metadata_intent.payload
+    preimage = payload["expected_remote_issue"]
+    target = payload["target_issue"]
+    remote = observation.issue.confirmed_snapshot
+    marker = context.operation.external_effect_marker
+
+    with {:ok, expected_pull_time, 0} <-
+           DateTime.from_iso8601(marker["expected_remote_updated_at"]),
+         {:ok, expected_issue_time, 0} <-
+           DateTime.from_iso8601(marker["expected_remote_issue_updated_at"]) do
+      exact_preimage_time? =
+        DateTime.compare(observation.pull.remote_updated_at, expected_pull_time) == :eq and
+          DateTime.compare(observation.issue.remote_updated_at, expected_issue_time) == :eq
+
+      nonregressed_time? =
+        DateTime.compare(observation.pull.remote_updated_at, expected_pull_time) != :lt and
+          DateTime.compare(observation.issue.remote_updated_at, expected_issue_time) != :lt
+
+      cond do
+        remote == target and nonregressed_time? -> {:error, :external_effect_not_ambiguous}
+        remote == target -> :ok
+        remote == preimage and exact_preimage_time? -> {:error, :external_effect_not_ambiguous}
+        remote == preimage -> :ok
+        true -> :ok
+      end
+    else
+      _ -> {:error, :stale_merge_identity}
+    end
+  end
+
+  defp record_ambiguous_conflict(context, observation) do
+    attrs = %{
+      organization_mirror_id: context.organization_mirror_id,
+      repository_mirror_id: context.repository_mirror_id,
+      resource_kind: "pull_merge",
+      resource_identity: to_string(context.intent.id),
+      conflict_kind: "ambiguous_external_effect",
+      baseline_snapshot: context.metadata_intent.payload["expected_remote_issue"],
+      local_snapshot: context.metadata_intent.payload["target_issue"],
+      remote_snapshot: observation.issue.confirmed_snapshot
+    }
+
+    %ForgeMirrors.MirrorConflict{}
+    |> ForgeMirrors.MirrorConflict.record_changeset(attrs)
+    |> Repo.insert()
+  end
+
   defp metadata_conflict_kind(context, local, observation) do
     baseline = context.pull.confirmed_snapshot
     remote = observation.pull.confirmed_snapshot
@@ -133,18 +213,38 @@ defmodule ForgeMirrors.PullMergeConfirmation do
 
   def authorize(operation, now, intent, observation) do
     if Repo.in_transaction?() do
-      with {:ok, context} <- load(operation, now),
-           :ok <- same_intent(context.intent, intent),
-           :ok <- validate_observation(context, observation),
-           {:ok, local} <- locked_projection(context),
-           true <- compatible_merge_state?(context.pull.confirmed_snapshot, local.fields) do
+      with {:ok, {context, _local}} <-
+             authorized_observation(operation, now, intent, observation),
+           :ok <- metadata_target(context, observation) do
         :ok
-      else
-        false -> {:error, :merge_metadata_unconfirmed}
-        {:error, _} = error -> error
       end
     else
       {:error, :transaction_required}
+    end
+  end
+
+  @doc false
+  def authorize_effect_observation(operation, now, intent, observation) do
+    if Repo.in_transaction?() do
+      with {:ok, {_context, _local}} <-
+             authorized_observation(operation, now, intent, observation) do
+        :ok
+      end
+    else
+      {:error, :transaction_required}
+    end
+  end
+
+  defp authorized_observation(operation, now, intent, observation) do
+    with {:ok, context} <- load(operation, now),
+         :ok <- same_intent(context.intent, intent),
+         :ok <- validate_observation(context, observation),
+         {:ok, local} <- locked_projection(context),
+         true <- compatible_merge_state?(context.pull.confirmed_snapshot, local.fields) do
+      {:ok, {context, local}}
+    else
+      false -> {:error, :merge_metadata_unconfirmed}
+      {:error, _} = error -> error
     end
   end
 
@@ -178,6 +278,7 @@ defmodule ForgeMirrors.PullMergeConfirmation do
       with {:ok, context} <- load(operation, now),
            :ok <- same_intent(context.intent, intent),
            :ok <- validate_observation(context, observation),
+           :ok <- metadata_target(context, observation),
            {:ok, actual} <- actual_projection(context, actual_projection, observation) do
         # Any write failure aborts the caller's enclosing domain transaction too.
         Repo.transaction(fn ->
@@ -203,6 +304,31 @@ defmodule ForgeMirrors.PullMergeConfirmation do
          {:ok, base_ref} <- eligibility(context),
          {:ok, pull, issue} <- pair(context) do
       {:ok, Map.merge(context, %{pull: pull, issue: issue, base_ref: base_ref})}
+    end
+  end
+
+  defp metadata_target(%{metadata_intent: nil}, _observation), do: :ok
+
+  defp metadata_target(%{metadata_intent: metadata_intent, operation: operation}, observation) do
+    target = metadata_intent.payload["target_issue"]
+
+    if observation.issue.confirmed_snapshot == target and
+         Map.take(observation.pull.confirmed_snapshot, ~w(title body)) ==
+           Map.take(target, ~w(title body)) and
+         metadata_observation_current?(observation, operation.external_effect_marker),
+       do: :ok,
+       else: {:error, :merge_metadata_unconfirmed}
+  end
+
+  defp metadata_observation_current?(observation, marker) do
+    with {:ok, expected_pull, 0} <-
+           DateTime.from_iso8601(marker["expected_remote_updated_at"]),
+         {:ok, expected_issue, 0} <-
+           DateTime.from_iso8601(marker["expected_remote_issue_updated_at"]) do
+      DateTime.compare(observation.pull.remote_updated_at, expected_pull) != :lt and
+        DateTime.compare(observation.issue.remote_updated_at, expected_issue) != :lt
+    else
+      _ -> false
     end
   end
 

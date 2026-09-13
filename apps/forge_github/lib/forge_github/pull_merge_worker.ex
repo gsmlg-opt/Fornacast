@@ -15,6 +15,7 @@ defmodule ForgeGitHub.PullMergeWorker do
     LFSSync,
     PullClient,
     PullMetadataDecision,
+    PullMetadataRecovery,
     PullMergeObservation,
     PullSyncWorker,
     RefObservation
@@ -25,6 +26,7 @@ defmodule ForgeGitHub.PullMergeWorker do
     OrganizationMirror,
     PullMergeBoundary,
     PullMergeConfirmation,
+    PullMergeMetadataEffects,
     RepositoryMirror
   }
 
@@ -32,6 +34,7 @@ defmodule ForgeGitHub.PullMergeWorker do
   alias GitCore.Remote.{RefUpdate, SyncRequest}
 
   @test_callbacks Mix.env() == :test
+  @max_metadata_effects 3
 
   def process_operation(
         %MirrorOperation{kind: "merge.pull"} = operation,
@@ -39,14 +42,19 @@ defmodule ForgeGitHub.PullMergeWorker do
         options
       )
       when is_list(options) do
-    if operation.external_effect_marker do
-      recover(operation, now, options)
-    else
-      with {:ok, context} <- PullMergeBoundary.context(operation, now),
-           {:ok, sync} <- execution_context(context),
-           {:ok, token} <- token(sync, options) do
-        push(operation, now, sync, token, options)
-      end
+    case operation.external_effect_marker do
+      %{"phase" => "metadata_issue_pending"} ->
+        recover_metadata(operation, now, options, 0)
+
+      marker when is_map(marker) ->
+        recover(operation, now, options)
+
+      nil ->
+        with {:ok, context} <- PullMergeBoundary.context(operation, now),
+             {:ok, sync} <- execution_context(context),
+             {:ok, token} <- token(sync, options) do
+          push(operation, now, sync, token, options)
+        end
     end
   end
 
@@ -69,7 +77,7 @@ defmodule ForgeGitHub.PullMergeWorker do
             end
 
           remote.oid == context.intent.merge_oid and pair.pull["merged"] == true ->
-            finalize(operation, sync, pair, remote.oid)
+            finalize(operation, sync, pair, remote.oid, token, options, 0)
 
           true ->
             PullMergeBoundary.record_observation(operation, now, next(now), %{
@@ -85,7 +93,7 @@ defmodule ForgeGitHub.PullMergeWorker do
     end
   end
 
-  defp finalize(operation, sync, pair, remote_base_oid) do
+  defp finalize(operation, sync, pair, remote_base_oid, read_token, options, effect_count) do
     with {:ok, observation} <- PullMergeObservation.build(sync, pair, remote_base_oid) do
       case metadata_decision(operation, sync, observation) do
         {:ok, %{apply_local?: false, remote_issue_effect?: false}, _local} ->
@@ -124,10 +132,19 @@ defmodule ForgeGitHub.PullMergeWorker do
             confirm_merge(operation, sync, pair, observation, request)
           end
 
-        {:ok, _plan, _local} ->
-          # Outbound metadata needs its own durable intent under this merge's
-          # reservation. Do not falsely acknowledge them through finalization.
-          {:error, :merge_metadata_unconfirmed}
+        {:ok, %{remote_issue_effect?: true} = plan, local} ->
+          target_issue = merge_target_issue(plan.target_metadata)
+
+          mark_and_apply_metadata(
+            operation,
+            sync,
+            observation,
+            local,
+            target_issue,
+            read_token,
+            options,
+            effect_count
+          )
 
         {:conflict, _kind} ->
           now = DateTime.utc_now(:second)
@@ -138,6 +155,297 @@ defmodule ForgeGitHub.PullMergeWorker do
       end
     end
   end
+
+  defp recover_metadata(operation, now, options, effect_count) do
+    result =
+      with {:ok, context} <- PullMergeMetadataEffects.recovery_context(operation, now),
+           {:ok, sync} <- execution_context(context),
+           {:ok, read_token} <- token(sync, options),
+           {:ok, current} <- PullMergeMetadataEffects.recovery_context(operation, now),
+           true <- metadata_intent(current).id == metadata_intent(context).id,
+           {:ok, remote} <- observe(sync, :base, read_token, options),
+           {:ok, pair} <- pair(sync, read_token, options),
+           {:ok, observation} <- PullMergeObservation.build(sync, pair, remote.oid),
+           {:ok, classification} <-
+             classify_metadata_recovery(current, observation) do
+        case classification.status do
+          :applied ->
+            continue_after_applied_effect(
+              operation,
+              sync,
+              pair,
+              observation,
+              current,
+              read_token,
+              options,
+              effect_count
+            )
+
+          :not_applied ->
+            if retained_metadata_timestamps?(context.marker, observation) do
+              apply_marked_metadata(
+                operation,
+                sync,
+                current,
+                read_token,
+                options,
+                effect_count
+              )
+            else
+              PullMergeConfirmation.record_ambiguous_effect(
+                operation,
+                now,
+                next(now),
+                observation
+              )
+            end
+        end
+      else
+        {:conflict, :ambiguous_external_effect, observation} ->
+          PullMergeConfirmation.record_ambiguous_effect(
+            operation,
+            now,
+            next(now),
+            observation
+          )
+
+        {:error, _} = error ->
+          error
+
+        false ->
+          {:error, :stale_merge_identity}
+      end
+
+    case result do
+      {:error, reason} -> PullMergeBoundary.defer(operation, now, next(now), reason)
+      other -> other
+    end
+  end
+
+  defp classify_metadata_recovery(context, observation) do
+    if metadata_timestamps_nonregressed?(context.marker, observation) do
+      case PullMetadataRecovery.classify(
+             metadata_intent(context).payload,
+             context.current_local_issue,
+             observation.issue.confirmed_snapshot
+           ) do
+        {:conflict, :ambiguous_external_effect} ->
+          {:conflict, :ambiguous_external_effect, observation}
+
+        other ->
+          other
+      end
+    else
+      {:conflict, :ambiguous_external_effect, observation}
+    end
+  end
+
+  defp continue_after_applied_effect(
+         operation,
+         sync,
+         pair,
+         observation,
+         context,
+         read_token,
+         options,
+         effect_count
+       ) do
+    payload = metadata_intent(context).payload
+
+    if context.current_local_issue in [payload["expected_local_issue"], payload["target_issue"]] do
+      finalize(
+        operation,
+        sync,
+        pair,
+        observation.remote_base_oid,
+        read_token,
+        options,
+        effect_count
+      )
+    else
+      mark_and_apply_metadata(
+        operation,
+        sync,
+        observation,
+        context.local_projection,
+        context.current_local_issue,
+        read_token,
+        options,
+        effect_count
+      )
+    end
+  end
+
+  defp mark_and_apply_metadata(
+         operation,
+         sync,
+         observation,
+         local,
+         target_issue,
+         read_token,
+         options,
+         effect_count
+       ) do
+    if effect_count >= @max_metadata_effects do
+      PullMergeBoundary.defer(
+        operation,
+        DateTime.utc_now(:second),
+        next(DateTime.utc_now(:second)),
+        :merge_metadata_effect_limit
+      )
+    else
+      now = DateTime.utc_now(:second)
+
+      with {:ok, marked} <-
+             PullMergeMetadataEffects.mark(
+               operation,
+               now,
+               sync.intent,
+               observation,
+               local.local_version,
+               target_issue
+             ) do
+        apply_marked_metadata(
+          marked.operation,
+          sync,
+          marked,
+          read_token,
+          options,
+          effect_count
+        )
+      end
+    end
+  end
+
+  defp apply_marked_metadata(operation, sync, context, read_token, options, effect_count) do
+    now = DateTime.utc_now(:second)
+
+    result =
+      with {:ok, write_token} <- metadata_write_token(sync, options),
+           {:ok, current} <- PullMergeMetadataEffects.recovery_context(operation, now),
+           true <- metadata_intent(current).id == metadata_intent(context).id,
+           attrs = scalar_effect_attrs(metadata_intent(current).payload),
+           {:ok, _untrusted} <-
+             callback(options, :update_pull_issue, &IssueClient.update_pull_issue/6).(
+               write_token,
+               sync.routing.base.owner,
+               sync.routing.base.repository,
+               sync.expected.provider_identity["github_number"],
+               attrs,
+               request_options(sync, options)
+             ) do
+        confirm_metadata_effect(
+          operation,
+          sync,
+          metadata_intent(current).id,
+          read_token,
+          options,
+          effect_count + 1
+        )
+      else
+        false -> {:error, :stale_merge_identity}
+        {:error, _} = error -> error
+        _ -> {:error, :invalid_remote_result}
+      end
+
+    case result do
+      {:error, reason} -> PullMergeBoundary.defer(operation, now, next(now), reason)
+      other -> other
+    end
+  end
+
+  defp confirm_metadata_effect(
+         operation,
+         sync,
+         expected_metadata_intent_id,
+         read_token,
+         options,
+         effect_count
+       ) do
+    with {:ok, before_ref} <-
+           PullMergeMetadataEffects.recovery_context(operation, DateTime.utc_now(:second)),
+         true <- metadata_intent(before_ref).id == expected_metadata_intent_id,
+         {:ok, remote} <- observe(sync, :base, read_token, options),
+         {:ok, before_pair} <-
+           PullMergeMetadataEffects.recovery_context(operation, DateTime.utc_now(:second)),
+         true <- metadata_intent(before_pair).id == expected_metadata_intent_id,
+         {:ok, pair} <- pair(sync, read_token, options),
+         {:ok, observation} <- PullMergeObservation.build(sync, pair, remote.oid),
+         {:ok, context} <-
+           PullMergeMetadataEffects.recovery_context(operation, DateTime.utc_now(:second)),
+         true <- metadata_intent(context).id == expected_metadata_intent_id,
+         {:ok, classification} <- classify_metadata_recovery(context, observation) do
+      case classification.status do
+        :applied ->
+          continue_after_applied_effect(
+            operation,
+            sync,
+            pair,
+            observation,
+            context,
+            read_token,
+            options,
+            effect_count
+          )
+
+        :not_applied ->
+          PullMergeBoundary.defer(
+            operation,
+            DateTime.utc_now(:second),
+            next(DateTime.utc_now(:second)),
+            :remote_confirmation_required
+          )
+      end
+    else
+      {:conflict, :ambiguous_external_effect, observation} ->
+        now = DateTime.utc_now(:second)
+        PullMergeConfirmation.record_ambiguous_effect(operation, now, next(now), observation)
+
+      {:error, reason} ->
+        now = DateTime.utc_now(:second)
+        PullMergeBoundary.defer(operation, now, next(now), reason)
+
+      false ->
+        now = DateTime.utc_now(:second)
+        PullMergeBoundary.defer(operation, now, next(now), :stale_merge_identity)
+    end
+  end
+
+  defp scalar_effect_attrs(payload) do
+    expected = payload["expected_remote_issue"]
+    target = payload["target_issue"]
+
+    Map.new(~w(title body), fn field -> {field, target[field]} end)
+    |> Enum.reject(fn {field, value} -> expected[field] == value end)
+    |> Map.new()
+  end
+
+  defp retained_metadata_timestamps?(marker, observation) do
+    marker["expected_remote_updated_at"] ==
+      DateTime.to_iso8601(observation.pull.remote_updated_at) and
+      marker["expected_remote_issue_updated_at"] ==
+        DateTime.to_iso8601(observation.issue.remote_updated_at)
+  end
+
+  defp metadata_timestamps_nonregressed?(marker, observation) do
+    with {:ok, pull_time, 0} <- DateTime.from_iso8601(marker["expected_remote_updated_at"]),
+         {:ok, issue_time, 0} <-
+           DateTime.from_iso8601(marker["expected_remote_issue_updated_at"]) do
+      DateTime.compare(observation.pull.remote_updated_at, pull_time) != :lt and
+        DateTime.compare(observation.issue.remote_updated_at, issue_time) != :lt
+    else
+      _ -> false
+    end
+  end
+
+  defp merge_target_issue(target) do
+    target
+    |> Map.take(~w(title body label_github_ids assignee_github_ids))
+    |> Map.merge(%{"state" => "closed", "state_reason" => "completed"})
+  end
+
+  defp metadata_intent(%{metadata_intent: intent}) when not is_nil(intent), do: intent
+  defp metadata_intent(%{intent: intent}), do: intent
 
   defp metadata_decision(operation, sync, observation) do
     with {:ok, context} <- PullMergeConfirmation.context(operation, DateTime.utc_now(:second)),
@@ -472,6 +780,22 @@ defmodule ForgeGitHub.PullMergeWorker do
     scope = %{
       repository_ids: [sync.expected.provider_identity["base_repository"]["id"]],
       permissions: %{"contents" => "write"}
+    }
+
+    case callback(options, :token_fetch, &InstallationTokenBroker.fetch/2).(
+           sync.github_installation_id,
+           scope
+         ) do
+      %InstallationToken{token: token} -> {:ok, token}
+      {:error, _} = error -> error
+      _ -> {:error, :credential_unavailable}
+    end
+  end
+
+  defp metadata_write_token(sync, options) do
+    scope = %{
+      repository_ids: [sync.expected.provider_identity["base_repository"]["id"]],
+      permissions: %{"metadata" => "read", "pull_requests" => "write"}
     }
 
     case callback(options, :token_fetch, &InstallationTokenBroker.fetch/2).(

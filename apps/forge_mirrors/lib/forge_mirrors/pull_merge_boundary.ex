@@ -16,6 +16,7 @@ defmodule ForgeMirrors.PullMergeBoundary do
     MirrorOperation,
     MirrorResourceState,
     OrganizationMirror,
+    PullMetadataIntent,
     PullResourceBoundary,
     RepositoryMirror
   }
@@ -208,6 +209,8 @@ defmodule ForgeMirrors.PullMergeBoundary do
     end)
   end
 
+  defp load_recovery(operation, now), do: load_recovery(operation, now, :current)
+
   defp load_recovery(
          %MirrorOperation{
            lease_owner: owner,
@@ -217,7 +220,8 @@ defmodule ForgeMirrors.PullMergeBoundary do
            repository_mirror_id: binding_id,
            lock_version: version
          } = operation,
-         %DateTime{} = now
+         %DateTime{} = now,
+         sequence_mode
        )
        when is_binary(owner) and byte_size(owner) > 0 and is_integer(id) and id > 0 and
               is_integer(org_id) and org_id > 0 and is_integer(binding_id) and binding_id > 0 and
@@ -263,37 +267,30 @@ defmodule ForgeMirrors.PullMergeBoundary do
            current.cursor == %{"issue_id" => expected.issue_id, "pull_id" => expected.pull_id},
          true <- valid_intent?(intent, scope, expected),
          marker when is_map(marker) <- current.external_effect_marker,
-         true <-
-           valid_marker?(
-             Map.take(marker, ["phase", "merge_operation_id", "merge_tree_oid", "merge_oid"]),
-             intent
+         {:ok, metadata_intent} <-
+           recovery_marker(
+             current,
+             binding,
+             expected,
+             intent,
+             provider_identity,
+             marker,
+             sequence_mode
            ),
-         true <-
-           marker ==
-             Map.merge(
-               Map.take(marker, ["phase", "merge_operation_id", "merge_tree_oid", "merge_oid"]),
-               %{
-                 "preparation" => compact(expected),
-                 "provider_pull_identity" => provider_identity,
-                 "expected_base_oid" => intent.expected_base_oid,
-                 "expected_head_oid" => intent.expected_head_oid,
-                 "base_ref" => intent.base_ref,
-                 "head_ref" => intent.head_ref
-               }
-             ),
          :ok <- live_capability(current) do
       {:ok,
        Map.merge(scope, %{
          intent: intent,
          expected: expected,
-         provider_pull_identity: provider_identity
+         provider_pull_identity: provider_identity,
+         metadata_intent: metadata_intent
        })}
     else
       _ -> {:error, :stale_merge_identity}
     end
   end
 
-  defp load_recovery(_, _), do: {:error, :lost_lease}
+  defp load_recovery(_, _, _), do: {:error, :lost_lease}
 
   defp yield_recovery(operation, now, next_attempt_at, attrs) do
     update_operation(
@@ -435,6 +432,59 @@ defmodule ForgeMirrors.PullMergeBoundary do
       end
     end)
   end
+
+  @doc false
+  def replace_metadata_marker(
+        %MirrorOperation{kind: "merge.pull", state: :effect_pending} = operation,
+        %DateTime{} = now,
+        expected_marker,
+        metadata
+      )
+      when is_map(expected_marker) and is_map(metadata) do
+    transaction(fn ->
+      with {:ok, context} <- load_recovery(operation, now, :current_or_previous),
+           true <- context.operation.external_effect_marker == expected_marker,
+           true <- expected_marker["phase"] in ["remote_cas_pending", "metadata_issue_pending"],
+           true <-
+             Enum.sort(Map.keys(metadata)) ==
+               Enum.sort([
+                 "action",
+                 "metadata_intent_id",
+                 "metadata_intent_hash",
+                 "expected_remote_updated_at",
+                 "expected_remote_issue_updated_at"
+               ]),
+           replacement =
+             expected_marker
+             |> Map.put("phase", "metadata_issue_pending")
+             |> Map.merge(metadata),
+           {:ok, _metadata_intent} <-
+             recovery_marker(
+               context.operation,
+               Repo.get!(RepositoryMirror, context.repository_mirror_id),
+               context.expected,
+               context.intent,
+               context.provider_pull_identity,
+               replacement,
+               :current
+             ),
+           true <- byte_size(JSON.encode!(replacement)) <= 65_536,
+           :ok <- live_capability(context.operation) do
+        case Repo.update_all(capability_query(context.operation),
+               set: [external_effect_marker: replacement, effect_marked_at: now, updated_at: now],
+               inc: [lock_version: 1]
+             ) do
+          {1, _} -> {:ok, Repo.get!(MirrorOperation, context.operation.id)}
+          {0, _} -> {:error, :lost_lease}
+        end
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :stale_merge_identity}
+      end
+    end)
+  end
+
+  def replace_metadata_marker(_, _, _, _), do: {:error, :invalid_transition}
 
   @doc false
   def check_unreserved(repository_id, base_ref, pull_id, coordinator_id, head_id, head_ref) do
@@ -835,6 +885,140 @@ defmodule ForgeMirrors.PullMergeBoundary do
   end
 
   defp valid_marker?(_, _), do: false
+
+  defp recovery_marker(
+         operation,
+         binding,
+         expected,
+         intent,
+         provider_identity,
+         marker,
+         sequence_mode
+       ) do
+    common = %{
+      "preparation" => compact(expected),
+      "provider_pull_identity" => provider_identity,
+      "expected_base_oid" => intent.expected_base_oid,
+      "expected_head_oid" => intent.expected_head_oid,
+      "base_ref" => intent.base_ref,
+      "head_ref" => intent.head_ref
+    }
+
+    core = %{
+      "phase" => marker["phase"],
+      "merge_operation_id" => intent.id,
+      "merge_tree_oid" => intent.merge_tree_oid,
+      "merge_oid" => intent.merge_oid
+    }
+
+    case marker["phase"] do
+      "remote_cas_pending" ->
+        if valid_marker?(core, intent) and marker == Map.merge(core, common),
+          do: {:ok, nil},
+          else: {:error, :stale_merge_identity}
+
+      "metadata_issue_pending" ->
+        metadata = %{
+          "action" => marker["action"],
+          "metadata_intent_id" => marker["metadata_intent_id"],
+          "metadata_intent_hash" => marker["metadata_intent_hash"],
+          "expected_remote_updated_at" => marker["expected_remote_updated_at"],
+          "expected_remote_issue_updated_at" => marker["expected_remote_issue_updated_at"]
+        }
+
+        with true <- marker == core |> Map.merge(common) |> Map.merge(metadata),
+             true <- metadata["action"] == "update_remote_pull_issue",
+             true <-
+               to_string(intent.state) == "merge_written" and oid?(intent.merge_tree_oid) and
+                 oid?(intent.merge_oid),
+             true <- utc_iso8601?(metadata["expected_remote_updated_at"]),
+             true <- utc_iso8601?(metadata["expected_remote_issue_updated_at"]),
+             metadata_intent_id when is_integer(metadata_intent_id) and metadata_intent_id > 0 <-
+               metadata["metadata_intent_id"],
+             %PullMetadataIntent{} = row <-
+               Repo.one(
+                 from i in PullMetadataIntent,
+                   where: i.id == ^metadata_intent_id,
+                   lock: "FOR SHARE"
+               ),
+             true <-
+               row.operation_id == operation.id and row.repository_mirror_id == binding.id and
+                 row.pull_id == expected.pull_id and row.issue_id == expected.issue_id and
+                 row.local_version >= expected.local_version and
+                 valid_metadata_sequence?(row, sequence_mode),
+             true <- observation_versions?(binding.id, expected, metadata),
+             {:ok, hash} <- ForgeMirrors.resource_fingerprint(row.payload),
+             true <-
+               row.payload_fingerprint == hash and metadata["metadata_intent_hash"] == hash and
+                 ForgeMirrors.PullMergeMetadataEffects.valid_payload?(row.payload) do
+          {:ok, row}
+        else
+          _ -> {:error, :stale_merge_identity}
+        end
+
+      _ ->
+        {:error, :stale_merge_identity}
+    end
+  end
+
+  defp utc_iso8601?(value) when is_binary(value) and byte_size(value) <= 40 do
+    case DateTime.from_iso8601(value) do
+      {:ok, time, 0} -> DateTime.to_iso8601(time) == value
+      _ -> false
+    end
+  end
+
+  defp utc_iso8601?(_), do: false
+
+  defp observation_versions?(binding_id, expected, metadata) do
+    rows =
+      Repo.all(
+        from m in MirrorResourceState,
+          where:
+            m.repository_mirror_id == ^binding_id and
+              ((m.resource_kind == :pull and m.local_resource_id == ^expected.pull_id) or
+                 (m.resource_kind == :issue and m.local_resource_id == ^expected.issue_id)),
+          lock: "FOR SHARE"
+      )
+
+    Enum.all?(
+      [
+        {:pull, "expected_remote_updated_at"},
+        {:issue, "expected_remote_issue_updated_at"}
+      ],
+      fn {kind, key} ->
+        mapping = Enum.find(rows, &(&1.resource_kind == kind))
+        {:ok, observed, 0} = DateTime.from_iso8601(metadata[key])
+
+        match?(%MirrorResourceState{}, mapping) and
+          (is_nil(mapping.confirmed_remote_updated_at) or
+             DateTime.compare(observed, mapping.confirmed_remote_updated_at) != :lt)
+      end
+    )
+  end
+
+  defp valid_metadata_sequence?(row, mode) do
+    sequences =
+      Repo.all(
+        from i in PullMetadataIntent,
+          where: i.operation_id == ^row.operation_id,
+          order_by: i.sequence,
+          select: i.sequence,
+          lock: "FOR SHARE"
+      )
+
+    latest = List.last(sequences)
+
+    expected_position? =
+      case mode do
+        :current -> latest == row.sequence
+        :current_or_previous -> latest in [row.sequence, row.sequence + 1]
+        _ -> false
+      end
+
+    row.sequence > 0 and expected_position? and
+      Enum.all?(Enum.with_index(sequences, 1), fn {sequence, index} -> sequence == index end)
+  end
 
   defp reservation_lock(id),
     do:

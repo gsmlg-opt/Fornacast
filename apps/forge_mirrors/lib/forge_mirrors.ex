@@ -832,6 +832,33 @@ defmodule ForgeMirrors do
     as: :resolve
 
   @doc false
+  defdelegate mark_pull_merge_metadata_effect(
+                operation,
+                now,
+                intent,
+                observation,
+                expected_local_version,
+                target_issue
+              ),
+              to: ForgeMirrors.PullMergeMetadataEffects,
+              as: :mark
+
+  @doc false
+  defdelegate pull_merge_metadata_effect_context(operation, now),
+    to: ForgeMirrors.PullMergeMetadataEffects,
+    as: :recovery_context
+
+  @doc false
+  defdelegate record_pull_merge_ambiguous_effect(
+                operation,
+                now,
+                next_attempt_at,
+                observation
+              ),
+              to: ForgeMirrors.PullMergeConfirmation,
+              as: :record_ambiguous_effect
+
+  @doc false
   def resource_operation_context(%MirrorOperation{} = operation) do
     Repo.transaction(fn ->
       with {:ok, persisted, scope} <- lock_resource_operation(operation),
