@@ -169,6 +169,76 @@ defmodule ForgePulls do
   defdelegate finalize_coordinated_merge(intent_id, coordinator_operation_id, merged_at, opts),
     to: ForgePulls.CoordinatedMergeFinalization
 
+  @doc false
+  def coordinated_merge_request(
+        projection,
+        %ForgeAccounts.User{state: :active, kind: :user} = actor,
+        attrs,
+        request_metadata,
+        %DateTime{} = now
+      )
+      when is_map(projection) and is_map(attrs) and is_map(request_metadata) do
+    safe_metadata = ForgePulls.Mutations.safe_request_metadata(request_metadata)
+
+    with {:ok, merge_attrs} <- normalize_merge_attrs(attrs),
+         :ok <- coordinated_projection_open(projection),
+         :ok <- expected_head(merge_attrs.sha, projection.fields["head_sha"]),
+         request_id when is_binary(request_id) <- safe_metadata[:request_id],
+         true <- bounded_request_id?(request_id),
+         signature <- coordinated_signature(actor, now),
+         message <- coordinated_merge_message(projection, merge_attrs) do
+      {:ok,
+       %{
+         request_id: request_id,
+         commit_intent: %{
+           "message" => message,
+           "author" => signature,
+           "committer" => signature
+         }
+       }}
+    else
+      false -> merge_validation("request_id", :invalid)
+      nil -> merge_validation("request_id", :missing)
+      {:error, _} = error -> error
+      _ -> {:error, :conflict}
+    end
+  end
+
+  def coordinated_merge_request(_projection, _actor, _attrs, _metadata, _now),
+    do: {:error, :forbidden}
+
+  @doc false
+  def coordinated_merge_request_fingerprint(attrs, request_metadata)
+      when is_map(attrs) and is_map(request_metadata) do
+    safe_metadata = ForgePulls.Mutations.safe_request_metadata(request_metadata)
+
+    with {:ok, merge_attrs} <- normalize_merge_attrs(attrs),
+         request_id when is_binary(request_id) <- safe_metadata[:request_id],
+         true <- bounded_request_id?(request_id) do
+      canonical = %{
+        "commit_message" => merge_attrs.commit_message,
+        "commit_title" => merge_attrs.commit_title,
+        "merge_method" => "merge",
+        "request_id" => request_id,
+        "sha" => merge_attrs.sha
+      }
+
+      {:ok,
+       canonical
+       |> JSON.encode!()
+       |> then(&:crypto.hash(:sha256, &1))
+       |> Base.url_encode64(padding: false)}
+    else
+      false -> merge_validation("request_id", :invalid)
+      nil -> merge_validation("request_id", :missing)
+      {:error, _} = error -> error
+      _ -> merge_validation("request_id", :invalid)
+    end
+  end
+
+  def coordinated_merge_request_fingerprint(_attrs, _request_metadata),
+    do: {:error, :forbidden}
+
   if Mix.env() == :test do
     @read_phase_hook_key {__MODULE__, :read_phase_hook}
 
@@ -879,6 +949,39 @@ defmodule ForgePulls do
     title = attrs.commit_title || default_merge_title(context)
     body = attrs.commit_message || context.issue.title
     if body == "", do: title, else: title <> "\n\n" <> body
+  end
+
+  defp coordinated_projection_open(%{
+         fields: %{"state" => "open", "draft" => false},
+         merge_state: %{merged_at: nil, merge_commit_sha: nil}
+       }),
+       do: :ok
+
+  defp coordinated_projection_open(_projection), do: {:error, :conflict}
+
+  defp coordinated_signature(actor, now) do
+    %{
+      "name" => actor.username,
+      "email" => actor.email,
+      "seconds" => DateTime.to_unix(now),
+      "offset_minutes" => 0
+    }
+  end
+
+  defp coordinated_merge_message(projection, attrs) do
+    title = attrs.commit_title || coordinated_default_merge_title(projection)
+    body = attrs.commit_message || projection.fields["title"]
+    if body == "", do: title, else: title <> "\n\n" <> body
+  end
+
+  defp coordinated_default_merge_title(projection) do
+    branch = String.replace_prefix(projection.fields["head_ref"], "refs/heads/", "")
+    "Merge pull request ##{projection.issue_number} from #{branch}"
+  end
+
+  defp bounded_request_id?(request_id) do
+    byte_size(request_id) in 1..255 and String.valid?(request_id) and
+      not String.contains?(request_id, <<0>>)
   end
 
   defp default_merge_title(context) do

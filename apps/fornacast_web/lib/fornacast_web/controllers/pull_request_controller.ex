@@ -169,7 +169,7 @@ defmodule FornacastWeb.PullRequestController do
          {:ok, attrs} <- merge_attrs(params),
          {:ok, pull} <- pulls(conn).get_pull_request(context.repository, number, context.viewer),
          {:ok, _result} <-
-           pulls(conn).merge(
+           pull_merges(conn).merge(
              context.repository,
              pull,
              context.viewer,
@@ -470,5 +470,9 @@ defmodule FornacastWeb.PullRequestController do
     do: conn.private[:repository_collaboration_page] || RepositoryCollaborationPage
 
   defp pulls(conn), do: conn.private[:forge_pulls] || ForgePulls
+
+  defp pull_merges(conn),
+    do: conn.private[:pull_merge_coordinator] || conn.private[:forge_pulls] || ForgeGitHub
+
   defp html_module(conn), do: conn.private[:pull_request_html] || PullRequestHTML
 end

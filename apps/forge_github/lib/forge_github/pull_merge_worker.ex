@@ -1,12 +1,13 @@
 defmodule ForgeGitHub.PullMergeWorker do
   @moduledoc """
-  Bounded remote CAS execution for an already written coordinated merge.
+  Bounded remote CAS execution for a prepared coordinated merge.
 
   A successful push only yields the durable pre-push marker. A subsequent
   authenticated observation of the exact merged result and shared metadata can
   finalize locally through the coordinator boundary. Ref-only readiness never
-  closes a pull. This module is not yet admitted by the worker pool.
+  closes a pull.
   """
+  use GenServer
   import Ecto.Query
 
   alias ForgeGitHub.{
@@ -44,6 +45,87 @@ defmodule ForgeGitHub.PullMergeWorker do
 
   @test_callbacks Mix.env() == :test
   @max_metadata_effects 3
+  @operation_kinds ["merge.pull"]
+  @default_interval_ms 1_000
+  @default_lease_seconds 1_860
+  @default_batch_size 2
+  @default_max_concurrency 2
+  @default_processor_timeout_ms 1_850_000
+  @lease_margin_ms 5_000
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(options) when is_list(options) do
+    case Keyword.get(options, :name, __MODULE__) do
+      nil -> GenServer.start_link(__MODULE__, options)
+      name -> GenServer.start_link(__MODULE__, options, name: name)
+    end
+  end
+
+  @doc false
+  @spec run_once(String.t(), keyword()) :: {:ok, list()} | {:error, atom()}
+  def run_once(owner, options \\ [])
+
+  def run_once(owner, options) when is_binary(owner) and is_list(options) do
+    now = callback(options, :now, fn -> DateTime.utc_now(:second) end).()
+    lease_seconds = bounded_option(options, :lease_seconds, @default_lease_seconds, 1, 3_600)
+    batch_size = bounded_option(options, :batch_size, @default_batch_size, 1, 100)
+
+    max_concurrency =
+      bounded_option(
+        options,
+        :max_concurrency,
+        config(:pull_merge_worker_max_concurrency, @default_max_concurrency),
+        1,
+        8
+      )
+
+    processor_timeout_ms =
+      bounded_option(
+        options,
+        :processor_timeout_ms,
+        config(:pull_merge_worker_processor_timeout_ms, @default_processor_timeout_ms),
+        1,
+        3_594_999
+      )
+
+    unless processor_timeout_ms < lease_seconds * 1_000 - @lease_margin_ms do
+      raise ArgumentError, "pull merge processor timeout must finish inside its lease"
+    end
+
+    claim = callback(options, :claim, &ForgeMirrors.claim_operations/5)
+
+    with {:ok, operations} <-
+           claim.(owner, now, lease_seconds, min(batch_size, max_concurrency), @operation_kinds) do
+      supervisor = Keyword.get(options, :task_supervisor, ForgeGitHub.PullMergeTaskSupervisor)
+
+      results =
+        supervisor
+        |> Task.Supervisor.async_stream_nolink(
+          operations,
+          &process_claimed_operation(&1, now, options),
+          max_concurrency: max_concurrency,
+          ordered: true,
+          on_timeout: :kill_task,
+          timeout: processor_timeout_ms
+        )
+        |> Stream.zip(operations)
+        |> Enum.map(fn
+          {{:ok, result}, operation} ->
+            {operation.id, result}
+
+          {{:exit, _reason}, operation} ->
+            {operation.id, recover_worker_crash(operation, now, options)}
+        end)
+
+      {:ok, results}
+    end
+  rescue
+    _exception -> {:error, :unavailable}
+  catch
+    _kind, _reason -> {:error, :unavailable}
+  end
+
+  def run_once(_owner, _options), do: {:error, :invalid_argument}
 
   def process_operation(
         %MirrorOperation{kind: "merge.pull"} = operation,
@@ -62,15 +144,184 @@ defmodule ForgeGitHub.PullMergeWorker do
         recover(operation, now, options)
 
       nil ->
-        with {:ok, context} <- PullMergeBoundary.context(operation, now),
-             {:ok, sync} <- execution_context(context),
-             {:ok, token} <- token(sync, options) do
-          push(operation, now, sync, token, options)
-        end
+        result =
+          with {:ok, context} <- merge_context(operation, now, options),
+               {:ok, context} <- ensure_merge_written(operation, context, options),
+               result <-
+                 callback(options, :unmarked_execute, &execute_unmarked/4).(
+                   operation,
+                   now,
+                   context,
+                   options
+                 ) do
+            result
+          end
+
+        normalize_unmarked_result(operation, now, result, options)
     end
+  rescue
+    _exception -> normalize_worker_crash(operation, now, options)
+  catch
+    _kind, _reason -> normalize_worker_crash(operation, now, options)
   end
 
   def process_operation(_, _, _), do: {:error, :invalid_argument}
+
+  @impl true
+  def init(options) do
+    interval_ms = Keyword.get(options, :interval_ms, @default_interval_ms)
+    owner = Keyword.get_lazy(options, :owner, &Ecto.UUID.generate/0)
+    enabled = Keyword.get(options, :enabled, config(:pull_merge_worker_enabled, false))
+
+    run_options =
+      Keyword.drop(options, [
+        :interval_ms,
+        :owner,
+        :name,
+        :enabled,
+        :loop_task_supervisor,
+        :runner
+      ])
+
+    if is_integer(interval_ms) and interval_ms > 0 and is_binary(owner) and is_boolean(enabled) do
+      state = %{
+        interval_ms: interval_ms,
+        owner: owner,
+        run_options: run_options,
+        enabled: enabled,
+        loop_task_supervisor:
+          Keyword.get(
+            options,
+            :loop_task_supervisor,
+            ForgeGitHub.PullMergeLoopTaskSupervisor
+          ),
+        task_supervisor:
+          Keyword.get(options, :task_supervisor, ForgeGitHub.PullMergeTaskSupervisor),
+        runner: Keyword.get(options, :runner, fn -> run_once(owner, run_options) end),
+        task_ref: nil
+      }
+
+      if enabled, do: schedule(0)
+      {:ok, state}
+    else
+      {:stop, :invalid_options}
+    end
+  end
+
+  @impl true
+  def handle_info(:tick, %{enabled: false} = state), do: {:noreply, state}
+
+  def handle_info(:tick, %{enabled: true, task_ref: nil} = state) do
+    case Task.Supervisor.start_child(state.loop_task_supervisor, state.runner) do
+      {:ok, pid} ->
+        {:noreply, %{state | task_ref: Process.monitor(pid)}}
+
+      {:error, _reason} ->
+        schedule(state.interval_ms)
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(:tick, state), do: {:noreply, state}
+
+  def handle_info({:DOWN, reference, :process, _pid, _reason}, %{task_ref: reference} = state) do
+    if state.enabled, do: schedule(state.interval_ms)
+    {:noreply, %{state | task_ref: nil}}
+  end
+
+  def handle_info(_message, state), do: {:noreply, state}
+
+  defp process_claimed_operation(operation, now, options) do
+    callback(options, :processor, &process_operation/3).(operation, now, options)
+  end
+
+  defp recover_worker_crash(%MirrorOperation{} = operation, now, options) do
+    case marked_after_crash(operation, options) do
+      %MirrorOperation{} = marked ->
+        callback(options, :defer, &PullMergeBoundary.defer/4).(
+          marked,
+          now,
+          next(now),
+          :worker_crash
+        )
+
+      nil ->
+        persist_unmarked_failure(operation, now, :worker_crash, options)
+    end
+  end
+
+  defp normalize_worker_crash(%MirrorOperation{} = operation, now, options) do
+    _ = recover_worker_crash(operation, now, options)
+    {:error, :worker_crash}
+  end
+
+  defp marked_after_crash(%MirrorOperation{external_effect_marker: marker} = operation, _options)
+       when is_map(marker),
+       do: operation
+
+  defp marked_after_crash(%MirrorOperation{} = operation, options) do
+    case callback(options, :current_operation, &Repo.get(MirrorOperation, &1)).(operation.id) do
+      %MirrorOperation{
+        id: id,
+        kind: "merge.pull",
+        state: :effect_pending,
+        external_effect_marker: marker,
+        lease_owner: owner
+      } = current
+      when id == operation.id and is_map(marker) and owner == operation.lease_owner ->
+        current
+
+      _ ->
+        nil
+    end
+  rescue
+    _exception -> nil
+  catch
+    _kind, _reason -> nil
+  end
+
+  defp normalize_unmarked_result(operation, now, {:error, reason} = error, options) do
+    _ = persist_unmarked_failure(operation, now, reason, options)
+    error
+  end
+
+  defp normalize_unmarked_result(_operation, _now, result, _options), do: result
+
+  defp execute_unmarked(operation, now, context, options) do
+    with {:ok, sync} <- execution_context(context),
+         {:ok, token} <- token(sync, options) do
+      push(operation, now, sync, token, options)
+    end
+  end
+
+  defp merge_context(operation, now, options),
+    do: callback(options, :merge_context, &PullMergeBoundary.context/2).(operation, now)
+
+  defp ensure_merge_written(_operation, %{intent: %{state: "merge_written"}} = context, _options),
+    do: {:ok, context}
+
+  defp ensure_merge_written(operation, %{intent: %{state: "prepared"} = intent}, options) do
+    authorize = fn writer_intent ->
+      PullMergeBoundary.authorize(operation, DateTime.utc_now(:second), writer_intent)
+    end
+
+    with {:ok, _written} <-
+           callback(options, :write_coordinated_merge, &ForgePulls.write_coordinated_merge/3).(
+             intent.id,
+             operation.id,
+             authorize: authorize
+           ),
+         {:ok, context} <- merge_context(operation, DateTime.utc_now(:second), options),
+         true <- context.intent.state == "merge_written" do
+      {:ok, context}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :stale_merge_identity}
+    end
+  end
+
+  defp ensure_merge_written(_operation, _context, _options),
+    do: {:error, :stale_merge_identity}
 
   defp recover(operation, now, options) do
     result =
@@ -1747,5 +1998,65 @@ defmodule ForgeGitHub.PullMergeWorker do
   defp callback(options, key, default),
     do: if(@test_callbacks, do: Keyword.get(options, key, default), else: default)
 
+  defp persist_unmarked_failure(operation, now, reason, options) do
+    case failure(reason) do
+      {:retry, failure_class, retry_at} ->
+        retry_at = retry_at || DateTime.add(now, 30, :second)
+
+        callback(options, :retry, &ForgeMirrors.retry_operation/5).(
+          operation,
+          now,
+          retry_at,
+          failure_class,
+          []
+        )
+
+      {:fail, failure_class, detail} ->
+        callback(options, :fail, &ForgeMirrors.fail_operation/4).(
+          operation,
+          now,
+          failure_class,
+          detail
+        )
+    end
+  end
+
+  defp failure(%Error{kind: kind, retry_at: retry_at})
+       when kind in [:primary_rate_limit, :secondary_rate_limit],
+       do: {:retry, Atom.to_string(kind), retry_at}
+
+  defp failure(%Error{kind: kind})
+       when kind in [
+              :transport,
+              :timeout,
+              :upstream_unavailable,
+              :host_unavailable,
+              :request_gate_busy
+            ],
+       do: {:retry, "network", nil}
+
+  defp failure(%Error{kind: :invalid_credential}),
+    do: {:fail, "credential_revoked", "GitHub rejected the installation token"}
+
+  defp failure(%Error{kind: :forbidden}),
+    do: {:fail, "permission_missing", "GitHub denied pull-request merge synchronization"}
+
+  defp failure(reason) when reason in [:revoked, :credential_unavailable],
+    do: {:fail, "credential_revoked", "GitHub installation credential is unavailable"}
+
+  defp failure(reason) when reason in [:busy, :timeout, :unavailable, :worker_crash],
+    do: {:retry, "network", nil}
+
+  defp failure(_reason), do: {:fail, "local_validation", "coordinated merge state is invalid"}
+
+  defp bounded_option(options, key, default, minimum, maximum) do
+    case Keyword.get(options, key, default) do
+      value when is_integer(value) and value >= minimum and value <= maximum -> value
+      _invalid -> raise ArgumentError, "invalid #{key}"
+    end
+  end
+
+  defp schedule(interval_ms), do: Process.send_after(self(), :tick, interval_ms)
+  defp config(key, default), do: Application.get_env(:forge_github, key, default)
   defp next(now), do: DateTime.add(now, 1, :second)
 end

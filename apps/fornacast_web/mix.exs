@@ -28,6 +28,7 @@ defmodule FornacastWeb.MixProject do
     [
       {:fornacast, in_umbrella: true},
       {:forge_accounts, in_umbrella: true},
+      {:forge_github, in_umbrella: true},
       {:forge_imports, in_umbrella: true},
       {:forge_issues, in_umbrella: true},
       {:forge_pulls, in_umbrella: true},

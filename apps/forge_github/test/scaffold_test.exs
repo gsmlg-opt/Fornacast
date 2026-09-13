@@ -37,6 +37,11 @@ defmodule ForgeGitHub.ScaffoldTest do
     assert is_pid(webhook_worker)
     assert %{enabled: false} = :sys.get_state(webhook_worker)
 
+    refute List.keyfind(children, ForgeGitHub.PullMergeWorker, 0)
+    refute Process.whereis(ForgeGitHub.PullMergeWorker)
+    refute Process.whereis(ForgeGitHub.PullMergeLoopTaskSupervisor)
+    refute Process.whereis(ForgeGitHub.PullMergeTaskSupervisor)
+
     assert %{
              enabled: false,
              loop_task_supervisor: ForgeGitHub.PullSyncLoopTaskSupervisor,

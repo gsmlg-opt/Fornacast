@@ -20,28 +20,43 @@ defmodule ForgeGitHub.Application do
         do: [enabled: false],
         else: [enabled: true]
 
-    children = [
-      {Task.Supervisor, name: ForgeGitHub.TokenTaskSupervisor, max_children: 16},
-      {Task.Supervisor, name: ForgeGitHub.InventoryTaskSupervisor, max_children: 9},
-      {Task.Supervisor, name: ForgeGitHub.GitRefTaskSupervisor, max_children: 5},
-      {Task.Supervisor, name: ForgeGitHub.IssueSyncTaskSupervisor, max_children: 2},
-      {Task.Supervisor, name: ForgeGitHub.PullSyncLoopTaskSupervisor, max_children: 1},
-      {Task.Supervisor, name: ForgeGitHub.PullSyncTaskSupervisor, max_children: 8},
-      {ForgeGitHub.InstallationTokenBroker,
-       task_supervisor: ForgeGitHub.TokenTaskSupervisor, max_inflight: 16, max_entries: 256},
-      {ForgeMirrors.WebhookWorker, processor: ForgeGitHub.WebhookProcessor},
-      {ForgeGitHub.InventoryWorker,
-       [task_supervisor: ForgeGitHub.InventoryTaskSupervisor] ++ inventory_options},
-      {ForgeGitHub.GitRefWorker,
-       [task_supervisor: ForgeGitHub.GitRefTaskSupervisor] ++ inventory_options},
-      {ForgeGitHub.IssueSyncWorker,
-       [task_supervisor: ForgeGitHub.IssueSyncTaskSupervisor] ++ inventory_options},
-      {ForgeGitHub.PullSyncWorker,
-       [
-         loop_task_supervisor: ForgeGitHub.PullSyncLoopTaskSupervisor,
-         task_supervisor: ForgeGitHub.PullSyncTaskSupervisor
-       ] ++ pull_sync_options}
-    ]
+    pull_merge_children =
+      if app_configuration == :disabled do
+        []
+      else
+        [
+          {Task.Supervisor, name: ForgeGitHub.PullMergeLoopTaskSupervisor, max_children: 1},
+          {Task.Supervisor, name: ForgeGitHub.PullMergeTaskSupervisor, max_children: 8},
+          {ForgeGitHub.PullMergeWorker,
+           loop_task_supervisor: ForgeGitHub.PullMergeLoopTaskSupervisor,
+           task_supervisor: ForgeGitHub.PullMergeTaskSupervisor,
+           enabled: true}
+        ]
+      end
+
+    children =
+      [
+        {Task.Supervisor, name: ForgeGitHub.TokenTaskSupervisor, max_children: 16},
+        {Task.Supervisor, name: ForgeGitHub.InventoryTaskSupervisor, max_children: 9},
+        {Task.Supervisor, name: ForgeGitHub.GitRefTaskSupervisor, max_children: 5},
+        {Task.Supervisor, name: ForgeGitHub.IssueSyncTaskSupervisor, max_children: 2},
+        {Task.Supervisor, name: ForgeGitHub.PullSyncLoopTaskSupervisor, max_children: 1},
+        {Task.Supervisor, name: ForgeGitHub.PullSyncTaskSupervisor, max_children: 8},
+        {ForgeGitHub.InstallationTokenBroker,
+         task_supervisor: ForgeGitHub.TokenTaskSupervisor, max_inflight: 16, max_entries: 256},
+        {ForgeMirrors.WebhookWorker, processor: ForgeGitHub.WebhookProcessor},
+        {ForgeGitHub.InventoryWorker,
+         [task_supervisor: ForgeGitHub.InventoryTaskSupervisor] ++ inventory_options},
+        {ForgeGitHub.GitRefWorker,
+         [task_supervisor: ForgeGitHub.GitRefTaskSupervisor] ++ inventory_options},
+        {ForgeGitHub.IssueSyncWorker,
+         [task_supervisor: ForgeGitHub.IssueSyncTaskSupervisor] ++ inventory_options},
+        {ForgeGitHub.PullSyncWorker,
+         [
+           loop_task_supervisor: ForgeGitHub.PullSyncLoopTaskSupervisor,
+           task_supervisor: ForgeGitHub.PullSyncTaskSupervisor
+         ] ++ pull_sync_options}
+      ] ++ pull_merge_children
 
     Supervisor.start_link(children, strategy: :one_for_one, name: ForgeGitHub.Supervisor)
   end

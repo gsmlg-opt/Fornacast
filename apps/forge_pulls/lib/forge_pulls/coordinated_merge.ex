@@ -282,6 +282,7 @@ defmodule ForgePulls.CoordinatedMerge do
       projection = Map.fetch!(changes, {key, :snapshot})
 
       with {:ok, repository, head_repository} <- repositories(repo, projection, request),
+           :ok <- merge_commits_enabled(repository),
            %ForgeAccounts.User{} = actor <-
              repo.get_by(ForgeAccounts.User,
                id: request.actor_user_id,
@@ -359,6 +360,9 @@ defmodule ForgePulls.CoordinatedMerge do
             repository.id == ^id and repository.lifecycle == :ready and
               is_nil(repository.deleted_at)
       )
+
+  defp merge_commits_enabled(%Repository{allow_merge_commit: true}), do: :ok
+  defp merge_commits_enabled(%Repository{}), do: {:error, :merge_commits_disabled}
 
   defp intent_attrs(request, projection, repository, head) do
     resource = %{

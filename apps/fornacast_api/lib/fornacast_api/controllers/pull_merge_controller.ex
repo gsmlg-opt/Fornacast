@@ -44,7 +44,7 @@ defmodule FornacastAPI.PullMergeController do
         {:ok, body, body_conn} ->
           with {:ok, attrs} <- RequestValidator.validate(version, :pull_merge, body),
                {:ok, result} <-
-                 ForgePulls.merge(
+                 ForgeGitHub.merge_pull(
                    repository,
                    pull,
                    actor,

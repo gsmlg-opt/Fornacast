@@ -47,34 +47,77 @@ defmodule ForgeMirrors.PullMergeBoundary do
 
   def append_prepare(%Multi{} = multi, key, operation, now, expected, %Multi{} = domain) do
     Multi.run(multi, key, fn _, _ ->
-      with {:ok, scope} <- lock_scope(operation, now),
-           true <- scope.operation.state == :processing,
-           :ok <- lock_reservations(scope.repository_id, expected),
-           :ok <- validate_expected(scope, expected),
-           :ok <-
-             check_unreserved(
-               scope.repository_id,
-               expected.fields["base_ref"],
-               expected.pull_id,
-               operation.id,
-               expected.pull_eligibility_proof["head"]["repository_id"],
-               expected.fields["head_ref"]
-             ),
-           :ok <- no_ref_effect(scope, expected),
-           {:ok, %{intent: intent}} <- Repo.transaction(domain),
-           true <- valid_intent?(intent, scope, expected),
-           stored when is_map(stored) <- load_intent(operation.id),
-           true <- Map.take(stored, @intent_fields) == Map.take(intent, @intent_fields),
-           :ok <- live_capability(scope.operation),
-           :ok <- save_preparation(scope.operation, expected, intent.id) do
-        {:ok, intent}
-      else
-        {:error, _, reason, _} -> {:error, reason}
-        {:error, reason} -> {:error, reason}
-        _ -> {:error, :invalid_merge_intent}
+      with {:ok, scope} <- lock_scope(operation, now) do
+        prepare(scope, operation, expected, domain, :leased, nil)
       end
     end)
   end
+
+  @doc "Atomically prepare a newly admitted, unleased merge operation."
+  def append_admit(
+        %Multi{} = multi,
+        key,
+        operation,
+        %DateTime{} = now,
+        expected,
+        request_fingerprint,
+        %Multi{} = domain
+      ) do
+    Multi.run(multi, key, fn _, _ ->
+      with true <- request_fingerprint?(request_fingerprint),
+           {:ok, scope} <- lock_admission_scope(operation, now) do
+        prepare(scope, operation, expected, domain, :admission, request_fingerprint)
+      else
+        false -> {:error, :invalid_merge_intent}
+        {:error, _} = error -> error
+      end
+    end)
+  end
+
+  defp prepare(scope, operation, expected, domain, capability_mode, request_fingerprint) do
+    with :ok <- expected_operation_state(scope.operation, capability_mode),
+         :ok <- lock_reservations(scope.repository_id, expected),
+         :ok <- validate_expected(scope, expected),
+         :ok <-
+           check_unreserved(
+             scope.repository_id,
+             expected.fields["base_ref"],
+             expected.pull_id,
+             operation.id,
+             expected.pull_eligibility_proof["head"]["repository_id"],
+             expected.fields["head_ref"]
+           ),
+         :ok <- no_ref_effect(scope, expected),
+         {:ok, %{intent: intent}} <- Repo.transaction(domain),
+         true <- valid_intent?(intent, scope, expected),
+         stored when is_map(stored) <- load_intent(operation.id),
+         true <- Map.take(stored, @intent_fields) == Map.take(intent, @intent_fields),
+         :ok <- live_capability(scope.operation, capability_mode),
+         :ok <-
+           save_preparation(
+             scope.operation,
+             expected,
+             intent.id,
+             capability_mode,
+             request_fingerprint
+           ) do
+      {:ok, intent}
+    else
+      {:error, _, reason, _} -> {:error, reason}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :invalid_merge_intent}
+    end
+  end
+
+  defp expected_operation_state(%MirrorOperation{state: :processing}, :leased), do: :ok
+
+  defp expected_operation_state(
+         %MirrorOperation{state: :pending, lease_owner: nil, lease_expires_at: nil},
+         :admission
+       ),
+       do: :ok
+
+  defp expected_operation_state(_, _), do: {:error, :lost_lease}
 
   def context(operation, now) do
     transaction(fn -> load_context(operation, now) end)
@@ -761,6 +804,51 @@ defmodule ForgeMirrors.PullMergeBoundary do
 
   defp lock_scope(_, _), do: {:error, :lost_lease}
 
+  defp lock_admission_scope(
+         %MirrorOperation{
+           id: id,
+           organization_mirror_id: organization_id,
+           repository_mirror_id: binding_id,
+           lock_version: version
+         } = operation,
+         %DateTime{}
+       )
+       when is_integer(id) and id > 0 and is_integer(organization_id) and organization_id > 0 and
+              is_integer(binding_id) and binding_id > 0 and is_integer(version) and version > 0 do
+    with %OrganizationMirror{state: :active} = organization <-
+           Repo.one(
+             from org in OrganizationMirror,
+               where: org.id == ^operation.organization_mirror_id,
+               lock: "FOR UPDATE"
+           ),
+         %RepositoryMirror{state: :active, inventory_included: true} = binding <-
+           Repo.one(
+             from binding in RepositoryMirror,
+               where:
+                 binding.id == ^operation.repository_mirror_id and
+                   binding.organization_mirror_id == ^organization.id,
+               lock: "FOR UPDATE"
+           ),
+         %MirrorOperation{} = current <-
+           Repo.one(admission_capability_query(operation) |> lock("FOR UPDATE")),
+         true <- current.cursor == operation.cursor,
+         :ok <- permission(organization) do
+      {:ok,
+       %{
+         operation: current,
+         repository_id: binding.repository_id,
+         repository_mirror_id: binding.id,
+         github_installation_id: organization.github_installation_id,
+         organization_mirror_id: organization.id
+       }}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :lost_lease}
+    end
+  end
+
+  defp lock_admission_scope(_, _), do: {:error, :lost_lease}
+
   defp permission(organization) do
     case Repo.one(
            from i in GitHubAppInstallation,
@@ -847,7 +935,13 @@ defmodule ForgeMirrors.PullMergeBoundary do
        end), do: {:error, :ref_effect_pending}, else: :ok
   end
 
-  defp save_preparation(operation, expected, intent_id) do
+  defp save_preparation(
+         operation,
+         expected,
+         intent_id,
+         capability_mode,
+         request_fingerprint
+       ) do
     mapping =
       Repo.get_by!(MirrorResourceState,
         repository_mirror_id: operation.repository_mirror_id,
@@ -856,10 +950,12 @@ defmodule ForgeMirrors.PullMergeBoundary do
       )
 
     preparation =
-      Map.merge(compact(expected), %{
+      compact(expected)
+      |> Map.merge(%{
         "merge_operation_id" => intent_id,
         "provider_pull_identity" => provider_pull_identity(mapping)
       })
+      |> maybe_put_request_fingerprint(request_fingerprint)
 
     existing = operation.checkpoint["merge_preparation"]
 
@@ -874,9 +970,9 @@ defmodule ForgeMirrors.PullMergeBoundary do
         {:error, :invalid_merge_intent}
 
       true ->
-        # Write-once subordinate proof under the live lease/row lock. It does not
+        # Write-once subordinate proof under the live capability/row lock. It does not
         # transition the operation or invalidate the caller's current capability.
-        case Repo.update_all(capability_query(operation),
+        case Repo.update_all(capability_query(operation, capability_mode),
                set: [checkpoint: Map.put(operation.checkpoint, "merge_preparation", preparation)]
              ) do
           {1, _} -> :ok
@@ -886,6 +982,16 @@ defmodule ForgeMirrors.PullMergeBoundary do
   end
 
   defp compact(expected), do: expected |> Map.delete(:fields) |> json()
+
+  defp maybe_put_request_fingerprint(preparation, nil), do: preparation
+
+  defp maybe_put_request_fingerprint(preparation, request_fingerprint),
+    do: Map.put(preparation, "request_fingerprint", request_fingerprint)
+
+  defp request_fingerprint?(value),
+    do:
+      is_binary(value) and byte_size(value) == 43 and String.valid?(value) and
+        not String.contains?(value, <<0>>)
 
   defp load_context(operation, now) do
     with {:ok, scope} <- lock_scope(operation, now),
@@ -934,11 +1040,17 @@ defmodule ForgeMirrors.PullMergeBoundary do
     end
   end
 
-  defp live_capability(operation) do
-    if Repo.exists?(capability_query(operation)), do: :ok, else: {:error, :lost_lease}
+  defp live_capability(operation), do: live_capability(operation, :leased)
+
+  defp live_capability(operation, capability_mode) do
+    if Repo.exists?(capability_query(operation, capability_mode)),
+      do: :ok,
+      else: {:error, :lost_lease}
   end
 
-  defp capability_query(operation) do
+  defp capability_query(operation), do: capability_query(operation, :leased)
+
+  defp capability_query(operation, :leased) do
     from op in MirrorOperation,
       where:
         op.id == ^operation.id and op.kind == "merge.pull" and
@@ -948,6 +1060,18 @@ defmodule ForgeMirrors.PullMergeBoundary do
           op.lease_expires_at == ^operation.lease_expires_at and
           op.lock_version == ^operation.lock_version and
           op.lease_expires_at > fragment("timezone('UTC', clock_timestamp())")
+  end
+
+  defp capability_query(operation, :admission), do: admission_capability_query(operation)
+
+  defp admission_capability_query(operation) do
+    from op in MirrorOperation,
+      where:
+        op.id == ^operation.id and op.kind == "merge.pull" and
+          op.organization_mirror_id == ^operation.organization_mirror_id and
+          op.repository_mirror_id == ^operation.repository_mirror_id and op.state == :pending and
+          is_nil(op.lease_owner) and is_nil(op.lease_expires_at) and
+          op.lock_version == ^operation.lock_version
   end
 
   defp load_intent(coordinator_id) do

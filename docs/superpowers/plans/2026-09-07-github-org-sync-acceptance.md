@@ -10,6 +10,48 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 coordinated merge runtime and requester admission (2026-09-14)
+
+- A configured GitHub App now starts a dedicated `merge.pull` claim loop and a
+  separate bounded operation pool. The worker uses the exact merge-only
+  allowlist, a 1,860-second lease with a strictly shorter processor timeout,
+  defaults to two concurrent operations and enforces the validated maximum of
+  eight. Claim-loop and operation-task crashes restart or durably release/defer
+  their leases without rewriting an existing effect marker.
+- API and web merge entry points now route every mirror-owned repository through
+  one coordinator admission path. Unmirrored repositories retain the ordinary
+  local merge path; a paused, unavailable or unsupported mirror never falls
+  back to an independent local merge. Admission atomically commits the pending
+  scheduler operation, prepared domain intent and exact preparation checkpoint
+  before the worker can perform a Git or provider effect.
+- Request replay is bound to a write-once canonical fingerprint of normalized
+  merge method, expected head SHA, title/message and request identity. The same
+  request is byte-stable, while changed evidence is rejected in pending,
+  processing, effect-pending, completed and failed states. Preparation reloads
+  the repository merge policy inside its transaction; nonpending replay reloads
+  the active requester and current repository-write authorization.
+- The synchronous compatibility wait is capped at 25 seconds and returns success
+  only when the scheduler operation, domain intent and local pull all confirm the
+  same merge OID. Queued work remains recoverable after timeout; terminal worker
+  failures return immediately, while durable conflict failures remain conflicts.
+- True late head binding now has integration coverage: a missing represented head
+  stays read-only through wrong-identity/missing-ref observations and promotes
+  only from exact active-mirror/ref evidence. Opaque same-base heads promote
+  atomically when a distinct represented head ref becomes available.
+- Fresh scoped PostgreSQL verification passed **239 tests**: mirror admission
+  boundary **41**, coordinated domain preparation **10**, GitHub admission,
+  runtime, worker and pull-sync behavior **164**, web merge routing **21**, and
+  API merge routing **3**. Production warnings-as-errors compilation, scoped
+  formatting and diff checks passed. Deliberate crash tests emit expected error
+  logs; existing ForgeImports fixture warnings remain unrelated.
+- This slice does **not** complete FR-083. Admission still rejects a represented
+  cross-repository pull because the deterministic writer cannot yet materialize
+  a head commit that exists only in the head repository object database. A
+  disjoint-object-store regression, bounded content-addressed transfer under
+  ordered repository fences, removal of that temporary restriction, and exact
+  two-endpoint result confirmation remain required. PR14–16 and the full 22-item
+  PRD acceptance boundary also remain open.
+
 ### PR13 pull-sync activation and merge-conflict external recheck (2026-09-13)
 
 - Ordinary pull synchronization is now registered in the production supervision

@@ -740,6 +740,173 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id).confirmed_local_version == 2
   end
 
+  test "late head binding remains read-only until discovery finds the exact active head baseline",
+       ctx do
+    unsupported_head_fixture(ctx, %{"id" => 901, "node_id" => "R_901"})
+    remove_head_binding!(ctx)
+    now = DateTime.utc_now(:second)
+    operation = remote_operation(ctx, now)
+    expect_observation(ctx, ctx.baseline, now)
+
+    assert {:ok, %{operation: %{state: :completed}}} =
+             PullSyncWorker.process_operation(
+               operation,
+               now,
+               Keyword.delete(options(ctx), :remote_relationships)
+             )
+
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).state == :unsupported
+    assert Repo.get!(PullRequest, ctx.pull.id).head_repository_id == nil
+
+    wrong =
+      repository_mirror_fixture(ctx.organization, %{
+        github_full_name: "acme/not-the-head",
+        github_repository_id: 9901,
+        github_node_id: "R_9901"
+      })
+
+    assert %{id: _id} = wrong
+    assert %{operations: [wrong_child]} = run_pull_head_discovery!(ctx, now, "wrong-head")
+    expect_observation(ctx, ctx.baseline, now)
+
+    assert {:ok, _} =
+             PullSyncWorker.process_operation(
+               claim(wrong_child.id, now),
+               now,
+               Keyword.delete(options(ctx), :remote_relationships)
+             )
+
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).state == :unsupported
+    assert Repo.get!(PullRequest, ctx.pull.id).head_repository_id == nil
+
+    head =
+      repository_mirror_fixture(ctx.organization, %{
+        repository_id: ctx.head.repository_id,
+        github_full_name: "acme/head",
+        github_repository_id: 901,
+        github_node_id: "R_901"
+      })
+
+    assert %{operations: [unready_child]} = run_pull_head_discovery!(ctx, now, "unready-head")
+    expect_observation(ctx, ctx.baseline, now)
+
+    assert {:ok, _} =
+             PullSyncWorker.process_operation(
+               claim(unready_child.id, now),
+               now,
+               Keyword.delete(options(ctx), :remote_relationships)
+             )
+
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).state == :unsupported
+    assert Repo.get!(PullRequest, ctx.pull.id).head_repository_id == nil
+
+    head_ref_baseline!(head, ctx.baseline)
+
+    unready = Repo.get!(MirrorOperation, unready_child.id)
+    expect_observation(ctx, ctx.baseline, unready.next_attempt_at)
+
+    assert {:ok, %{operation: %{state: :completed}}} =
+             PullSyncWorker.process_operation(
+               claim(unready.id, unready.next_attempt_at),
+               unready.next_attempt_at,
+               Keyword.delete(options(ctx), :remote_relationships)
+             )
+
+    assert Repo.get!(PullRequest, ctx.pull.id).head_repository_id == ctx.head.repository_id
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).state == :confirmed
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_local_version == 2
+    assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id).confirmed_local_version == 2
+  end
+
+  test "an opaque head promotes atomically when it later authenticates as the base repository",
+       ctx do
+    same_base_baseline = Map.put(ctx.baseline, "head_sha", ctx.baseline["base_sha"])
+
+    Repo.update!(Ecto.Changeset.change(ctx.pull, head_sha: same_base_baseline["head_sha"]))
+
+    {:ok, same_base_fingerprint} = ForgeMirrors.resource_fingerprint(same_base_baseline)
+
+    Repo.update!(
+      Ecto.Changeset.change(ctx.mapping,
+        confirmed_snapshot: same_base_baseline,
+        confirmed_fingerprint: same_base_fingerprint
+      )
+    )
+
+    git!(ctx.base_path, [
+      "update-ref",
+      same_base_baseline["head_ref"],
+      same_base_baseline["head_sha"]
+    ])
+
+    head_ref_baseline!(ctx.base, same_base_baseline)
+    unsupported_head_fixture(ctx, nil)
+    now = DateTime.utc_now(:second)
+    opaque = remote_operation(ctx, now)
+
+    Req.Test.expect(
+      ctx.stub,
+      &Req.Test.json(&1, put_in(pull_json(same_base_baseline, now), ["head", "repo"], nil))
+    )
+
+    Req.Test.expect(ctx.stub, &Req.Test.json(&1, issue_json(same_base_baseline, now)))
+
+    assert {:ok, %{operation: %{state: :completed}}} =
+             PullSyncWorker.process_operation(
+               opaque,
+               now,
+               Keyword.delete(options(ctx), :remote_relationships)
+             )
+
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).state == :unsupported
+
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).provider_identity["head_repository"] ==
+             nil
+
+    assert Repo.get!(PullRequest, ctx.pull.id).head_repository_id == nil
+
+    reveal = remote_operation(ctx, now)
+
+    expect_head_observation(ctx, same_base_baseline, now, %{
+      "id" => 900,
+      "node_id" => "R_900",
+      "full_name" => "acme/project"
+    })
+
+    assert {:ok, %{operation: %{state: :pending}}} =
+             PullSyncWorker.process_operation(
+               reveal,
+               now,
+               Keyword.delete(options(ctx), :remote_relationships)
+             )
+
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).state == :unsupported
+
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).provider_identity["head_repository"] ==
+             %{
+               "id" => 900,
+               "node_id" => "R_900"
+             }
+
+    expect_head_observation(ctx, same_base_baseline, now, %{
+      "id" => 900,
+      "node_id" => "R_900",
+      "full_name" => "acme/project"
+    })
+
+    assert {:ok, %{operation: %{state: :completed}}} =
+             PullSyncWorker.process_operation(
+               claim(reveal.id, now),
+               now,
+               Keyword.delete(options(ctx), :remote_relationships)
+             )
+
+    assert Repo.get!(PullRequest, ctx.pull.id).head_repository_id == ctx.base.repository_id
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).state == :confirmed
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_local_version == 2
+    assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id).confirmed_local_version == 2
+  end
+
   test "corrupt unsupported pull identity fails without a network retry", ctx do
     unsupported_head_fixture(ctx, nil)
 
@@ -2401,6 +2568,53 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     )
   end
 
+  defp remove_head_binding!(ctx) do
+    ctx.head
+    |> then(
+      &Repo.get_by!(MirrorRefState,
+        repository_mirror_id: &1.id,
+        ref_name: ctx.baseline["head_ref"]
+      )
+    )
+    |> Repo.delete!()
+
+    Repo.delete!(ctx.head)
+  end
+
+  defp head_ref_baseline!(head, baseline) do
+    %MirrorRefState{}
+    |> MirrorRefState.persistence_changeset(%{
+      repository_mirror_id: head.id,
+      ref_name: baseline["head_ref"],
+      ref_kind: :branch,
+      confirmed_oid: baseline["head_sha"],
+      last_local_oid: baseline["head_sha"],
+      last_remote_oid: baseline["head_sha"],
+      state: :confirmed,
+      last_confirmed_at: @source_time
+    })
+    |> Repo.insert!()
+  end
+
+  defp run_pull_head_discovery!(ctx, now, sweep_key) do
+    assert {:ok, sweep} =
+             ForgeMirrors.enqueue_repository_pull_head_reconciliation(ctx.base, sweep_key, now)
+
+    assert {:ok, claimed} =
+             ForgeMirrors.claim_operations("head-discovery-integration", now, 60, 100, [
+               sweep.kind
+             ])
+
+    page = Enum.find(claimed, &(&1.id == sweep.id)) || flunk("head sweep was not claimable")
+
+    assert {:ok, result} =
+             PullSyncWorker.process_operation(page, now,
+               token_fetch: fn _, _ -> flunk("discovery page must not request a token") end
+             )
+
+    result
+  end
+
   defp local_label_provider(ctx, state, now, recovery) do
     Req.Test.stub(ctx.stub, fn conn ->
       issue =
@@ -2589,6 +2803,18 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
       assert conn.request_path == "/repos/acme/project/issues/7"
       Req.Test.json(conn, issue_json(snapshot, updated_at))
     end)
+  end
+
+  defp expect_head_observation(ctx, snapshot, updated_at, head_repository) do
+    Req.Test.expect(
+      ctx.stub,
+      &Req.Test.json(
+        &1,
+        put_in(pull_json(snapshot, updated_at), ["head", "repo"], head_repository)
+      )
+    )
+
+    Req.Test.expect(ctx.stub, &Req.Test.json(&1, issue_json(snapshot, updated_at)))
   end
 
   defp pull_json(snapshot, updated_at) do

@@ -177,6 +177,69 @@ defmodule ForgeMirrors.PullMergeBoundaryTest do
     assert Repo.get!(ForgePulls.PullRequest, c.pull.id).merged_at == nil
   end
 
+  test "pending admission atomically persists one exact replayable reservation", c do
+    c = pending(c)
+
+    assert {:ok, %{admitted: intent}} = admit(c)
+    assert intent.coordinator_operation_id == c.operation.id
+    assert {:ok, %{admitted: replay}} = admit(c)
+    assert replay.id == intent.id
+
+    persisted = Repo.get!(ForgeMirrors.MirrorOperation, c.operation.id)
+    assert persisted.state == :pending
+    assert persisted.lease_owner == nil
+    assert persisted.lease_expires_at == nil
+    assert persisted.checkpoint["merge_preparation"]["merge_operation_id"] == intent.id
+    assert persisted.checkpoint["merge_preparation"]["pull_id"] == c.pull.id
+  end
+
+  test "pending operation, coordinated intent and preparation checkpoint roll back together", c do
+    c = pending(c)
+
+    multi =
+      Multi.new()
+      |> PullMergeBoundary.append_admit(
+        :admitted,
+        c.operation,
+        c.now,
+        c.expected,
+        request_fingerprint(c),
+        domain(c)
+      )
+      |> Multi.error(:abort, :deliberate)
+
+    assert {:error, :abort, :deliberate, _} = Repo.transaction(multi)
+    assert Repo.get_by(ForgePulls.MergeOperation, coordinator_operation_id: c.operation.id) == nil
+    assert Repo.get!(ForgeMirrors.MirrorOperation, c.operation.id).checkpoint == %{}
+  end
+
+  test "pending admission rejects changed request evidence without rewriting its checkpoint", c do
+    c = pending(c)
+    assert {:ok, %{admitted: intent}} = admit(c)
+    checkpoint = Repo.get!(ForgeMirrors.MirrorOperation, c.operation.id).checkpoint
+
+    changed = %{
+      c.request
+      | commit_intent: Map.put(c.request.commit_intent, "message", "Different merge")
+    }
+
+    assert {:error, :admitted, :merge_intent_conflict, _} =
+             Multi.new()
+             |> PullMergeBoundary.append_admit(
+               :admitted,
+               c.operation,
+               c.now,
+               c.expected,
+               request_fingerprint(c),
+               Multi.new()
+               |> ForgePulls.append_prepare_coordinated_merge(:intent, changed)
+             )
+             |> Repo.transaction()
+
+    assert Repo.get!(ForgeMirrors.MirrorOperation, c.operation.id).checkpoint == checkpoint
+    assert Repo.get!(ForgePulls.MergeOperation, intent.id).commit_intent == intent.commit_intent
+  end
+
   test "domain and reservation roll back together", c do
     multi =
       Multi.new()
@@ -1045,6 +1108,38 @@ defmodule ForgeMirrors.PullMergeBoundaryTest do
       Multi.new()
       |> PullMergeBoundary.append_prepare(:reserved, c.operation, c.now, c.expected, domain(c))
       |> Repo.transaction()
+
+  defp admit(c),
+    do:
+      Multi.new()
+      |> PullMergeBoundary.append_admit(
+        :admitted,
+        c.operation,
+        c.now,
+        c.expected,
+        request_fingerprint(c),
+        domain(c)
+      )
+      |> Repo.transaction()
+
+  defp request_fingerprint(c) do
+    {:ok, fingerprint} =
+      ForgePulls.coordinated_merge_request_fingerprint(
+        %{"merge_method" => "merge", "sha" => c.pull.head_sha},
+        %{request_id: c.request.request_id}
+      )
+
+    fingerprint
+  end
+
+  defp pending(c) do
+    operation =
+      c.operation
+      |> Changeset.change(state: :pending, lease_owner: nil, lease_expires_at: nil)
+      |> Repo.update!()
+
+    %{c | operation: operation, request: %{c.request | coordinator_operation_id: operation.id}}
+  end
 
   defp domain(c),
     do: Multi.new() |> ForgePulls.append_prepare_coordinated_merge(:intent, c.request)

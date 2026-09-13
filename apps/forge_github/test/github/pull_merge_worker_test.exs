@@ -221,6 +221,29 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     assert_unfinished(c)
   end
 
+  test "a prepared intent is written and reloaded before any remote push", c do
+    c.intent
+    |> Changeset.change(state: :prepared, merge_tree_oid: nil, merge_oid: nil)
+    |> Repo.update!()
+
+    opts =
+      Keyword.put(options(c, c.base), :push_remote, fn _, _, [update], _ ->
+        written = Repo.get!(ForgePulls.MergeOperation, c.intent.id)
+        assert written.state == :merge_written
+        assert is_binary(written.merge_tree_oid)
+        assert is_binary(written.merge_oid)
+        assert update.proposed_oid == written.merge_oid
+        :ok
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(c.operation, c.now, opts)
+    assert pending.state == :effect_pending
+
+    written = Repo.get!(ForgePulls.MergeOperation, c.intent.id)
+    assert pending.external_effect_marker["merge_oid"] == written.merge_oid
+    assert_unfinished(c)
+  end
+
   test "remote M is observed without a second push", c do
     marked = mark(c)
 
