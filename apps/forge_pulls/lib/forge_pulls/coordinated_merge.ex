@@ -73,12 +73,26 @@ defmodule ForgePulls.CoordinatedMerge do
         with %MergeOperation{} = intent <- Repo.get(MergeOperation, id),
              true <- writable_intent?(intent, coordinator_id),
              %Repository{} = repository <- live_repository(Repo, intent.repository_id),
+             %Repository{} = head_repository <-
+               live_repository(Repo, intent.commit_intent["resource"]["head_repository_id"]),
              true <-
-               repository.generation == intent.commit_intent["resource"]["repository_generation"] do
-          ForgeRepos.with_write_fence(repository, :merge, fn path, remaining ->
-            deadline = System.monotonic_time(:millisecond) + remaining
+               repository.generation == intent.commit_intent["resource"]["repository_generation"] and
+                 head_repository.generation ==
+                   intent.commit_intent["resource"]["head_repository_generation"] and
+                 head_repository.owner_user_id == repository.owner_user_id do
+          with_merge_paths(repository, head_repository, fn paths, deadline ->
+            path = paths[repository.id]
 
-            with {:ok, checkpoint} <-
+            with :ok <-
+                   materialize_head(
+                     intent,
+                     opts[:authorize],
+                     path,
+                     paths[head_repository.id],
+                     deadline
+                   ),
+                 :ok <- writer_hook(:after_head_materialization, intent.expected_head_oid),
+                 {:ok, checkpoint} <-
                    writer_transaction(intent, opts[:authorize], path, deadline, :tree),
                  :ok <- writer_hook(:after_tree_checkpoint, checkpoint.merge_tree_oid) do
               writer_transaction(checkpoint, opts[:authorize], path, deadline, :commit)
@@ -127,6 +141,82 @@ defmodule ForgePulls.CoordinatedMerge do
       else
         {:error, reason} -> Repo.rollback(reason)
         _ -> Repo.rollback(:stale_merge_identity)
+      end
+    end)
+  end
+
+  defp materialize_head(intent, authorize, base_path, head_path, deadline) do
+    if intent.repository_id == intent.commit_intent["resource"]["head_repository_id"] do
+      :ok
+    else
+      do_materialize_head(intent, authorize, base_path, head_path, deadline)
+    end
+  end
+
+  defp do_materialize_head(expected, authorize, base_path, head_path, deadline) do
+    Repo.transaction(fn ->
+      with :ok <- authorize.(expected),
+           {:ok, projection} <- observe_intent(expected),
+           {:ok, repository, head} <-
+             repositories(Repo, projection, %{
+               expected_head_repository_id:
+                 expected.commit_intent["resource"]["head_repository_id"]
+             }),
+           true <-
+             repository.generation ==
+               expected.commit_intent["resource"]["repository_generation"] and
+               head.generation ==
+                 expected.commit_intent["resource"]["head_repository_generation"],
+           %MergeOperation{} = locked <-
+             Repo.one(
+               from operation in MergeOperation,
+                 where: operation.id == ^expected.id,
+                 lock: "FOR UPDATE"
+             ),
+           true <- same_writer_intent?(locked, expected),
+           {:ok, remaining} <- writer_remaining(deadline),
+           {:ok, materialized_head_oid} <-
+             GitCore.materialize_merge_head(
+               head_path,
+               base_path,
+               expected.expected_head_oid,
+               deadline_ms: remaining
+             ),
+           true <- materialized_head_oid == expected.expected_head_oid do
+        :ok
+      else
+        {:error, reason} -> Repo.rollback(reason)
+        _ -> Repo.rollback(:stale_merge_identity)
+      end
+    end)
+    |> case do
+      {:ok, :ok} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp with_merge_paths(repository, head_repository, fun) do
+    ForgeRepos.with_write_fence(repository, :merge, fn base_path, remaining ->
+      deadline = System.monotonic_time(:millisecond) + remaining
+
+      if repository.id == head_repository.id do
+        fun.(%{repository.id => base_path}, deadline)
+      else
+        ForgeRepos.with_repository_read(head_repository, deadline, fn handle ->
+          head = ForgeRepos.repository_read_repository(handle)
+
+          if head.generation == head_repository.generation do
+            fun.(
+              %{
+                repository.id => base_path,
+                head_repository.id => ForgeRepos.repository_read_path(handle)
+              },
+              deadline
+            )
+          else
+            {:error, :stale_merge_identity}
+          end
+        end)
       end
     end)
   end

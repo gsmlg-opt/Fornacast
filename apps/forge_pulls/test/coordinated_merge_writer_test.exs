@@ -265,6 +265,59 @@ defmodule ForgePulls.CoordinatedMergeWriterTest do
     assert_untouched(c)
   end
 
+  test "materializes a represented cross-repository head before writing one merge", c do
+    cross = cross_repository(c)
+
+    assert_raise RuntimeError, "after head materialization", fn ->
+      CoordinatedMerge.with_test_writer_hook(
+        fn stage, _oid ->
+          if stage == :after_head_materialization, do: raise("after head materialization")
+        end,
+        fn -> write(cross) end
+      )
+    end
+
+    assert git_commit_exists?(c.path, cross.head)
+    assert Repo.get!(MergeOperation, cross.intent.id).merge_tree_oid == nil
+    assert_untouched(cross)
+
+    assert {:ok, written} = write(cross)
+
+    assert git!(c.path, ["show", "-s", "--format=%P", written.merge_oid]) ==
+             "#{c.base} #{cross.head}"
+
+    _fsck_output = git!(c.path, ["fsck", "--strict"])
+    assert {:ok, base} = GitCore.exact_ref(c.path, "refs/heads/main")
+    assert base == c.base
+    assert {:ok, head} = GitCore.exact_ref(cross.head_path, "refs/heads/feature")
+    assert head == cross.head
+    assert {:ok, nil} = GitCore.exact_ref(c.path, "refs/heads/feature")
+    assert Repo.get!(PullRequest, cross.pull.id).merged_at == nil
+  end
+
+  test "missing exact cross-repository head fails before materialization", c do
+    cross = cross_repository(c)
+    File.rm!(loose_object_path(cross.head_path, cross.head))
+
+    assert {:error, %GitCore.Error{kind: :commit_not_found}} = write(cross)
+    refute git_commit_exists?(c.path, cross.head)
+    assert Repo.get!(MergeOperation, cross.intent.id).merge_tree_oid == nil
+    assert_untouched(cross)
+  end
+
+  test "cross-repository head generation replacement is fenced", c do
+    cross = cross_repository(c)
+
+    cross.head_repository
+    |> Changeset.change(generation: cross.head_repository.generation + 1)
+    |> Repo.update!()
+
+    assert {:error, :stale_merge_identity} = write(cross)
+    refute git_commit_exists?(c.path, cross.head)
+    assert Repo.get!(MergeOperation, cross.intent.id).merge_tree_oid == nil
+    assert_untouched(cross)
+  end
+
   test "intent mutation during capability check and repository replacement are fenced", c do
     before = git!(c.path, ["count-objects", "-v"])
 
@@ -294,6 +347,63 @@ defmodule ForgePulls.CoordinatedMergeWriterTest do
 
   defp namespace(c), do: "merge-#{c.intent.id}"
 
+  defp cross_repository(c) do
+    suffix = System.unique_integer([:positive])
+
+    {:ok, head_repository} =
+      ForgeRepos.create_repository(Repo.get!(ForgeAccounts.User, c.repository.owner_user_id), %{
+        name: "writer-head-#{suffix}",
+        slug: "writer-head-#{suffix}",
+        visibility: :private
+      })
+
+    head_path = ForgeRepos.absolute_storage_path(head_repository)
+    assert {:ok, pack} = GitCore.pack_objects(c.path, [c.base])
+    assert {:ok, []} = GitCore.receive_pack(head_path, pack, [])
+
+    work_path = Path.join(System.tmp_dir!(), "fornacast-merge-head-#{suffix}")
+    File.mkdir_p!(work_path)
+    File.write!(Path.join(work_path, "feature.txt"), "head only\n")
+    on_exit(fn -> File.rm_rf(work_path) end)
+    git!(head_path, ["--work-tree=#{work_path}", "add", "feature.txt"])
+    tree = git!(head_path, ["write-tree"])
+
+    head = git!(head_path, ["commit-tree", tree, "-p", c.base, "-m", "head only"])
+    git!(head_path, ["update-ref", "refs/heads/feature", head])
+    git!(c.path, ["update-ref", "-d", "refs/heads/feature"])
+    refute git_commit_exists?(c.path, head)
+
+    pull =
+      c.pull
+      |> Changeset.change(head_repository_id: head_repository.id, head_sha: head)
+      |> Repo.update!()
+
+    {:ok, projection} = ForgePulls.sync_projection(c.repository.id, :pull, pull.id)
+
+    resource =
+      c.intent.commit_intent["resource"]
+      |> Map.put("expected_fields", projection.fields)
+      |> Map.put("expected_local_version", projection.local_version)
+      |> Map.put("head_repository_id", head_repository.id)
+      |> Map.put("head_repository_generation", head_repository.generation)
+
+    intent =
+      c.intent
+      |> Changeset.change(
+        expected_head_oid: head,
+        commit_intent: put_in(c.intent.commit_intent, ["resource"], resource)
+      )
+      |> Repo.update!()
+
+    Map.merge(c, %{
+      head: head,
+      head_path: head_path,
+      head_repository: head_repository,
+      intent: intent,
+      pull: pull
+    })
+  end
+
   defp assert_untouched(c) do
     assert {:ok, actual} = GitCore.exact_ref(c.path, "refs/heads/main")
     assert actual == c.base
@@ -313,5 +423,23 @@ defmodule ForgePulls.CoordinatedMergeWriterTest do
       )
 
     String.trim(output)
+  end
+
+  defp git_commit_exists?(path, oid) do
+    case System.cmd("git", ["--git-dir=#{path}", "cat-file", "-e", "#{oid}^{commit}"],
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} -> true
+      {_output, _status} -> false
+    end
+  end
+
+  defp loose_object_path(repository_path, oid) do
+    Path.join([
+      repository_path,
+      "objects",
+      binary_part(oid, 0, 2),
+      binary_part(oid, 2, byte_size(oid) - 2)
+    ])
   end
 end

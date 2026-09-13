@@ -63,7 +63,7 @@ defmodule ForgeGitHub.PullMergeAdmission do
     with %DateTime{} <- now,
          %ForgeMirrors.RepositoryMirror{} = binding <- repository_binding(repository),
          true <- repository.allow_merge_commit,
-         true <- pull.repository_id == repository.id and pull.head_repository_id == repository.id do
+         true <- pull.repository_id == repository.id do
       Repo.transaction(fn ->
         with {:ok, dedupe_key} <- merge_dedupe_key(binding, pull, actor, request_metadata),
              {:ok, request_fingerprint} <-

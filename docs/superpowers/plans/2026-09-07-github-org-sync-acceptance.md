@@ -10,6 +10,50 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 represented cross-repository merge materialization (2026-09-14)
+
+- A coordinated merge whose active head mirror is a distinct repository now
+  holds the base writer fence and head cleanup/read fence under one absolute
+  deadline. Every materialization, tree and commit transaction rechecks the
+  coordinator capability, immutable pull observation, repository generations,
+  owner relationship and locked intent before object work.
+- `GitCore.materialize_merge_head/4` copies only missing content-addressed
+  objects without consulting refs or repository merge configuration. It
+  checksum-validates the exact source head and every visited destination or
+  source body, validates repeated edges against their required object kind,
+  repairs partial destination closures, and collects the complete bounded write
+  set before publishing children first and the requested head commit last.
+- Header kind and size are checked before body decoding. A hard 64 MiB
+  per-allocation ceiling and gitoxide allocation override protect loose and
+  packed objects; missing bodies additionally share the existing aggregate
+  64 MiB transfer budget and 8 MiB blob ceiling. Commit/tree traversal and the
+  one-slot native write pool bound CPU, retained memory and concurrent
+  publication. A timed-out native worker is joined before repository leases are
+  released.
+- Crash/replay integration proves that a failure after head materialization may
+  leave only unreachable content-addressed objects: no ref, config, tree
+  checkpoint, public merge result or pull state changes. The same durable intent
+  then replays to the exact `B,H` merge. Missing `H` and head-generation
+  replacement fail closed.
+- Represented cross-repository admission now uses the same active mirror,
+  provider identity and exact-ref eligibility proof as metadata synchronization;
+  unrepresented heads remain read-only as required by FR-082. SHA-1 and SHA-256
+  materialization, disjoint object stores, partial closures, corrupt destination
+  bodies, conflicting repeated edges and oversized source/destination headers
+  have focused regression coverage.
+- Fresh verification passed **179 scoped Elixir tests**: GitCore **43**,
+  coordinated ForgePulls **43**, and GitHub admission/worker **93**. The native
+  crate passed all **85 Rust tests**; the materializer-specific suite passed
+  **12**. Production warnings-as-errors compilation, Rust/Elixir formatting and
+  diff checks passed. Two independent security/cross-repository reviews reported
+  no remaining blocker after the allocation, closure and concurrency repairs.
+- This closes bounded cross-repository object materialization and writer
+  admission, not all of FR-083 or PR13. The merge worker still needs one genuine
+  two-repository, two-endpoint effect/confirmation integration proving the exact
+  merge commit and PR state converge on both sides. PR14-PR16 and the full
+  22-item PRD acceptance boundary remain open. No push, deployment or live
+  GitHub write validation occurred.
+
 ### PR13 coordinated merge runtime and requester admission (2026-09-14)
 
 - A configured GitHub App now starts a dedicated `merge.pull` claim loop and a

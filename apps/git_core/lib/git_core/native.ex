@@ -161,6 +161,17 @@ defmodule GitCore.Native do
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
+  def materialize_merge_head(
+        _source_path,
+        _destination_path,
+        _head_oid,
+        _commit_limit,
+        _tree_entry_limit,
+        _byte_limit,
+        _deadline_ms
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   def compare_and_swap_ref(
         _path,
         _full_ref,

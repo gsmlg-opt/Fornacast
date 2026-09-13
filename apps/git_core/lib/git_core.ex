@@ -873,6 +873,50 @@ defmodule GitCore do
   end
 
   @doc """
+  Copies the missing object closure for one commit between bare repositories.
+
+  Source objects are checksum-verified and fully collected within the merge commit, tree-entry,
+  byte, and deadline limits before publication starts. Objects are published children-first with
+  the requested head commit last. The operation never reads or updates a reference and never
+  changes repository configuration. The caller must hold the destination repository writer
+  permit.
+  """
+  @spec materialize_merge_head(Path.t(), Path.t(), String.t(), keyword()) ::
+          {:ok, String.t()} | {:error, GitCore.Error.t()}
+  def materialize_merge_head(source_path, destination_path, head_oid, opts \\ [])
+
+  def materialize_merge_head(source_path, destination_path, head_oid, opts)
+      when is_binary(source_path) and is_binary(destination_path) and is_binary(head_oid) and
+             is_list(opts) do
+    if Keyword.keyword?(opts) and
+         Enum.all?(
+           [:commit_limit, :tree_entry_limit, :changed_path_limit, :byte_limit, :deadline_ms],
+           fn key ->
+             is_integer(Keyword.get(opts, key, 0))
+           end
+         ) do
+      {commits, entries, _paths, bytes, deadline} = merge_bounds(opts)
+
+      GitCore.Native.materialize_merge_head(
+        source_path,
+        destination_path,
+        head_oid,
+        commits,
+        entries,
+        bytes,
+        deadline
+      )
+      |> wrap_read(:materialize_merge_head)
+    else
+      invalid_input(:materialize_merge_head, "limits and deadline_ms must be integers")
+    end
+  end
+
+  def materialize_merge_head(_source_path, _destination_path, _head_oid, _opts) do
+    invalid_input(:materialize_merge_head, "invalid materialization arguments")
+  end
+
+  @doc """
   Atomically creates or fast-forwards a canonical full ref from the exact expected target.
 
   The proposed object must already exist. Branch targets must be commits; tag targets may be any

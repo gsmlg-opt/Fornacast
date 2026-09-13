@@ -862,6 +862,21 @@ fn open_physical_bare_repository(path: &str) -> Result<gix::Repository, NativeEr
     Ok(repo)
 }
 
+fn open_bounded_physical_bare_repository(
+    path: &str,
+    allocation_limit: u64,
+) -> Result<gix::Repository, NativeError> {
+    std::fs::metadata(path).map_err(|error| native_error("storage_unavailable", error))?;
+    let options = gix::open::Options::isolated()
+        .config_overrides([format!("gitoxide.objects.allocLimit={allocation_limit}")]);
+    let mut repo = gix::open_opts(Path::new(path), options).map_err(open_error)?;
+    if !repo.is_bare() {
+        return Err(native_error("invalid_repository", "repository is not bare"));
+    }
+    repo.objects.ignore_replacements = true;
+    Ok(repo)
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
 fn init_bare(path: String) -> Result<String, String> {
     let repo = gix::init_bare(Path::new(&path)).map_err(to_error)?;
@@ -5141,6 +5156,507 @@ fn publish_merge_objects_on_worker(
             .map_err(|error| native_error("storage_unavailable", error))?;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MaterializeObjectKind {
+    Commit,
+    Tree,
+    Blob,
+}
+
+enum MaterializeFrame {
+    Visit {
+        oid: gix_hash::ObjectId,
+        expected: MaterializeObjectKind,
+        head: bool,
+    },
+    Finish {
+        oid: gix_hash::ObjectId,
+        kind: gix_object::Kind,
+        data: Option<Vec<u8>>,
+    },
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn materialize_merge_head(
+    source_path: String,
+    destination_path: String,
+    head_oid: String,
+    commit_limit: usize,
+    tree_entry_limit: usize,
+    byte_limit: u64,
+    deadline_ms: u64,
+) -> NativeMergeWriteReply {
+    let deadline = Instant::now() + merge_scan_duration(deadline_ms);
+    let publish_path = destination_path.clone();
+    let completed = match run_merge_worker(deadline, true, move |cancelled| {
+        compute_materialize_merge_head(
+            source_path,
+            destination_path,
+            head_oid,
+            commit_limit,
+            tree_entry_limit,
+            byte_limit,
+            deadline,
+            cancelled,
+        )
+    }) {
+        NativeMergeWorkerResult::Complete(Ok(completed)) => completed,
+        NativeMergeWorkerResult::Complete(Err(error)) => {
+            return NativeMergeWriteReply::Error(error);
+        }
+        NativeMergeWorkerResult::Deferred { error, ticket } => {
+            // The caller owns repository read/write leases. Keep this NIF invocation inside those
+            // leases until the cancelled bounded worker has actually stopped touching either ODB.
+            return match await_merge_worker_impl(ticket) {
+                Ok(()) => NativeMergeWriteReply::Error(error),
+                Err(join_error) => NativeMergeWriteReply::Error(join_error),
+            };
+        }
+    };
+    let CompletedMergeWorker {
+        value: (head, objects),
+        _permit: permit,
+    } = completed;
+
+    // This is the last deadline boundary. Publication may leave unreachable objects on a storage
+    // failure, but all source and destination validation completes before the first write. The
+    // native write-pool permit remains held through publication, bounding publisher concurrency.
+    if let Err(error) =
+        check_merge_deadline(deadline).and_then(|()| publish_merge_objects(publish_path, objects))
+    {
+        return NativeMergeWriteReply::Error(error);
+    }
+    drop(permit);
+    NativeMergeWriteReply::Ok(head)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_materialize_merge_head(
+    source_path: String,
+    destination_path: String,
+    head_oid: String,
+    commit_limit: usize,
+    tree_entry_limit: usize,
+    byte_limit: u64,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(String, MergeObjectMemory), NativeError> {
+    check_merge_worker(&cancelled, deadline)?;
+    let byte_limit = merge_byte_limit(byte_limit);
+    let source = open_bounded_physical_bare_repository(&source_path, MERGE_BYTE_LIMIT)?;
+    let destination = open_bounded_physical_bare_repository(&destination_path, MERGE_BYTE_LIMIT)?;
+    if source.object_hash() != destination.object_hash() {
+        return Err(native_error(
+            "invalid_input",
+            "source and destination repository object formats differ",
+        ));
+    }
+
+    let head = gix_hash::ObjectId::from_hex(head_oid.as_bytes())
+        .map_err(|error| native_error("commit_not_found", error))?;
+    if head.kind() != source.object_hash() {
+        return Err(native_error(
+            "invalid_input",
+            "head object ID format does not match the repositories",
+        ));
+    }
+
+    let commit_limit = merge_commit_limit(commit_limit);
+    let tree_entry_limit = merge_tree_entry_limit(tree_entry_limit);
+    let byte_budget = MergeByteBudget::new(byte_limit);
+    let mut commits = 0_usize;
+    let mut validated_commits = 0_usize;
+    let mut tree_entries = 0_usize;
+    let mut validated_tree_entries = 0_usize;
+    let mut visiting = BTreeSet::new();
+    let mut complete = BTreeMap::new();
+    let mut objects = Vec::new();
+    let mut pending = vec![MaterializeFrame::Visit {
+        oid: head,
+        expected: MaterializeObjectKind::Commit,
+        head: true,
+    }];
+
+    while let Some(frame) = pending.pop() {
+        check_merge_worker(&cancelled, deadline)?;
+        match frame {
+            MaterializeFrame::Visit {
+                oid,
+                expected,
+                head: is_head,
+            } => {
+                if let Some(kind) = complete.get(&oid).copied() {
+                    validate_materialize_kind(kind, expected, is_head)?;
+                    continue;
+                }
+                if !visiting.insert(oid) {
+                    return Err(native_error(
+                        "corrupt_repository",
+                        "materialized object graph contains a cycle",
+                    ));
+                }
+
+                let destination_header =
+                    destination.try_find_header(oid).map_err(diff_read_error)?;
+                if let Some(header) = destination_header {
+                    validate_materialize_kind(header.kind(), expected, is_head)?;
+                }
+
+                let missing = destination_header.is_none();
+                let (kind, data) = if let Some(header) = destination_header {
+                    if is_head {
+                        // Replay still requires the exact source H to exist and checksum correctly.
+                        // Its identity proves the destination body must have the same kind and size.
+                        let (source_kind, source_data) = load_verified_materialize_object(
+                            &source,
+                            oid,
+                            expected,
+                            true,
+                            deadline,
+                            &cancelled,
+                            &byte_budget,
+                            None,
+                            true,
+                        )?;
+                        if (header.kind(), header.size()) != (source_kind, source_data.len() as u64)
+                        {
+                            return Err(native_error(
+                                "corrupt_repository",
+                                "destination head header differs from the verified source head",
+                            ));
+                        }
+                    }
+
+                    // Existing boundary objects are body-checksummed and traversed as well. That
+                    // both detects corrupt objects and repairs a partial destination closure, while
+                    // processing their bytes transiently instead of charging retained-copy budget.
+                    load_verified_materialize_object(
+                        &destination,
+                        oid,
+                        expected,
+                        false,
+                        deadline,
+                        &cancelled,
+                        &byte_budget,
+                        Some((header.kind(), header.size())),
+                        false,
+                    )?
+                } else {
+                    // Missing source bodies are charged before decode and retained for publication.
+                    load_verified_materialize_object(
+                        &source,
+                        oid,
+                        expected,
+                        is_head,
+                        deadline,
+                        &cancelled,
+                        &byte_budget,
+                        None,
+                        true,
+                    )?
+                };
+                let size = u64::try_from(data.len()).map_err(|_| {
+                    native_error("merge_byte_limit", "object size does not fit u64")
+                })?;
+
+                let children = match kind {
+                    gix_object::Kind::Commit => {
+                        if validated_commits >= MERGE_COMMIT_LIMIT {
+                            return Err(native_error(
+                                "commit_limit",
+                                "merge-head materialization exceeded the 50,000-commit limit",
+                            ));
+                        }
+                        validated_commits = validated_commits.checked_add(1).ok_or_else(|| {
+                            native_error("corrupt_repository", "materialized commit count overflow")
+                        })?;
+                        if missing {
+                            if commits >= commit_limit {
+                                return Err(native_error(
+                                    "commit_limit",
+                                    "merge-head materialization exceeded the 50,000-commit limit",
+                                ));
+                            }
+                            commits = commits.checked_add(1).ok_or_else(|| {
+                                native_error(
+                                    "corrupt_repository",
+                                    "materialized commit count overflow",
+                                )
+                            })?;
+                        }
+                        materialize_commit_children(&data, oid.kind())?
+                    }
+                    gix_object::Kind::Tree => {
+                        let before = validated_tree_entries;
+                        let children = materialize_tree_children(
+                            &data,
+                            oid.kind(),
+                            &mut validated_tree_entries,
+                            MERGE_TREE_ENTRY_LIMIT,
+                            deadline,
+                            &cancelled,
+                        )?;
+                        if missing {
+                            let added =
+                                validated_tree_entries.checked_sub(before).ok_or_else(|| {
+                                    native_error(
+                                        "corrupt_repository",
+                                        "materialized tree-entry count underflow",
+                                    )
+                                })?;
+                            if added > tree_entry_limit.saturating_sub(tree_entries) {
+                                return Err(native_error(
+                                    "tree_entry_limit",
+                                    "merge-head materialization exceeded the 100,000-tree-entry limit",
+                                ));
+                            }
+                            tree_entries = tree_entries.checked_add(added).ok_or_else(|| {
+                                native_error(
+                                    "corrupt_repository",
+                                    "materialized tree-entry count overflow",
+                                )
+                            })?;
+                        }
+                        children
+                    }
+                    gix_object::Kind::Blob => Vec::new(),
+                    gix_object::Kind::Tag => {
+                        return Err(native_error(
+                            "corrupt_repository",
+                            "merge-head closure unexpectedly contains a tag",
+                        ));
+                    }
+                };
+
+                let data = if let Some(header) = destination_header {
+                    if (header.kind(), header.size()) != (kind, size) {
+                        return Err(native_error(
+                            "corrupt_repository",
+                            "destination object header differs from its verified source object",
+                        ));
+                    }
+                    None
+                } else {
+                    Some(data)
+                };
+
+                pending.push(MaterializeFrame::Finish { oid, kind, data });
+                for (child, child_kind) in children.into_iter().rev() {
+                    pending.push(MaterializeFrame::Visit {
+                        oid: child,
+                        expected: child_kind,
+                        head: false,
+                    });
+                }
+            }
+            MaterializeFrame::Finish { oid, kind, data } => {
+                visiting.remove(&oid);
+                complete.insert(oid, kind);
+                if let Some(data) = data {
+                    objects.push((oid, (kind, data)));
+                }
+            }
+        }
+    }
+
+    check_merge_worker(&cancelled, deadline)?;
+    Ok((head.to_string(), objects))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_verified_materialize_object(
+    repo: &gix::Repository,
+    oid: gix_hash::ObjectId,
+    expected: MaterializeObjectKind,
+    head: bool,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+    byte_budget: &MergeByteBudget,
+    expected_header: Option<(gix_object::Kind, u64)>,
+    charge: bool,
+) -> Result<(gix_object::Kind, Vec<u8>), NativeError> {
+    check_merge_worker(cancelled, deadline)?;
+    let header = match repo.try_find_header(oid).map_err(diff_read_error)? {
+        Some(header) => header,
+        None => {
+            return Err(native_error(
+                if head {
+                    "commit_not_found"
+                } else {
+                    "corrupt_repository"
+                },
+                format_args!("object {oid} was not found"),
+            ));
+        }
+    };
+    validate_materialize_kind(header.kind(), expected, head)?;
+    if let Some((expected_kind, expected_size)) = expected_header
+        && (header.kind(), header.size()) != (expected_kind, expected_size)
+    {
+        return Err(native_error(
+            "corrupt_repository",
+            "object header changed between bounded validation steps",
+        ));
+    }
+    if header.size() > MERGE_BYTE_LIMIT {
+        return Err(native_error(
+            "merge_byte_limit",
+            format_args!(
+                "object size {} exceeds the {}-byte materialization allocation limit",
+                header.size(),
+                MERGE_BYTE_LIMIT
+            ),
+        ));
+    }
+    if charge {
+        byte_budget
+            .charge_object(oid, header.kind(), header.size())
+            .map_err(|error| native_error("merge_byte_limit", error))?;
+    } else {
+        byte_budget
+            .preflight_object(header.kind(), header.size())
+            .map_err(|error| native_error("merge_byte_limit", error))?;
+    }
+    let size = usize::try_from(header.size())
+        .map_err(|_| native_error("merge_byte_limit", "object size does not fit in memory"))?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(size)
+        .map_err(|error| native_error("storage_unavailable", error))?;
+    let (kind, actual_size, actual) = {
+        let object = match gix_object::Find::try_find(repo, &oid, &mut buffer).map_err(|error| {
+            if error_chain_contains_storage_io(error.as_ref()) {
+                native_error("storage_unavailable", error)
+            } else {
+                native_error("corrupt_repository", error)
+            }
+        })? {
+            Some(object) => object,
+            None => {
+                return Err(native_error(
+                    if head {
+                        "commit_not_found"
+                    } else {
+                        "corrupt_repository"
+                    },
+                    format_args!("object {oid} disappeared during materialization"),
+                ));
+            }
+        };
+        validate_materialize_kind(object.kind, expected, head)?;
+        let actual = gix_object::compute_hash(repo.object_hash(), object.kind, object.data)
+            .map_err(|error| native_error("corrupt_repository", error))?;
+        (object.kind, object.data.len(), actual)
+    };
+    if kind != header.kind() || actual_size != size || buffer.len() != size {
+        return Err(native_error(
+            "corrupt_repository",
+            "decoded object body differs from its bounded header",
+        ));
+    }
+    if actual != oid {
+        return Err(native_error(
+            "corrupt_repository",
+            format_args!("object checksum mismatch: expected {oid}, computed {actual}"),
+        ));
+    }
+    check_merge_worker(cancelled, deadline)?;
+    Ok((kind, buffer))
+}
+
+fn validate_materialize_kind(
+    actual: gix_object::Kind,
+    expected: MaterializeObjectKind,
+    head: bool,
+) -> Result<(), NativeError> {
+    let matches = matches!(
+        (actual, expected),
+        (gix_object::Kind::Commit, MaterializeObjectKind::Commit)
+            | (gix_object::Kind::Tree, MaterializeObjectKind::Tree)
+            | (gix_object::Kind::Blob, MaterializeObjectKind::Blob)
+    );
+    if matches {
+        Ok(())
+    } else {
+        Err(native_error(
+            if head {
+                "commit_not_found"
+            } else {
+                "corrupt_repository"
+            },
+            format_args!("materialized object is {actual}, but its edge requires another kind"),
+        ))
+    }
+}
+
+fn materialize_commit_children(
+    data: &[u8],
+    hash_kind: gix_hash::Kind,
+) -> Result<Vec<(gix_hash::ObjectId, MaterializeObjectKind)>, NativeError> {
+    let commit = gix_object::CommitRef::from_bytes(data, hash_kind)
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let author = commit
+        .author()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    author
+        .time()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let committer = commit
+        .committer()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    committer
+        .time()
+        .map_err(|error| native_error("corrupt_repository", error))?;
+    let mut children = Vec::with_capacity(commit.parents.len().saturating_add(1));
+    children.push((commit.tree(), MaterializeObjectKind::Tree));
+    children.extend(
+        commit
+            .parents()
+            .map(|parent| (parent, MaterializeObjectKind::Commit)),
+    );
+    Ok(children)
+}
+
+fn materialize_tree_children(
+    data: &[u8],
+    hash_kind: gix_hash::Kind,
+    entries: &mut usize,
+    entry_limit: usize,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<Vec<(gix_hash::ObjectId, MaterializeObjectKind)>, NativeError> {
+    let mut children = Vec::new();
+    let mut previous = None;
+    for entry in gix_object::TreeRefIter::from_bytes(data, hash_kind) {
+        check_merge_worker(cancelled, deadline)?;
+        if *entries >= entry_limit {
+            return Err(native_error(
+                "tree_entry_limit",
+                "merge-head materialization exceeded the 100,000-tree-entry limit",
+            ));
+        }
+        *entries = entries.checked_add(1).ok_or_else(|| {
+            native_error(
+                "corrupt_repository",
+                "materialized tree-entry count overflow",
+            )
+        })?;
+        let entry = entry.map_err(|error| native_error("corrupt_repository", error))?;
+        validate_tree_entry(&mut previous, entry.filename.as_ref(), entry.mode.value())?;
+        let expected = match entry.mode.value() {
+            0o040000 => Some(MaterializeObjectKind::Tree),
+            0o100644 | 0o100755 | 0o120000 => Some(MaterializeObjectKind::Blob),
+            // Gitlinks identify a commit in another repository and are not part of this object DB.
+            0o160000 => None,
+            _ => unreachable!("validate_tree_entry accepted only known modes"),
+        };
+        if let Some(expected) = expected {
+            children.push((entry.oid.to_owned(), expected));
+        }
+    }
+    Ok(children)
 }
 
 fn parse_merge_commit_oid(

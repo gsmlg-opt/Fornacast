@@ -122,6 +122,7 @@ defmodule ForgeGitHub.PullMergeAdmissionTest do
       binding: binding,
       issue: issue,
       now: now,
+      organization: organization,
       pull: pull,
       repository: repository
     }
@@ -425,6 +426,79 @@ defmodule ForgeGitHub.PullMergeAdmissionTest do
     assert_received {^repository, ^pull, ^actor, attrs, metadata}
     assert attrs == attrs(c)
     assert metadata == metadata(c)
+  end
+
+  test "an active represented cross-repository pull admits through the coordinator", c do
+    head_binding = repository_mirror_fixture(c.organization)
+
+    head_repository =
+      head_binding.repository_id
+      |> ForgeRepos.fetch_live_repository()
+      |> then(fn {:ok, repository} -> repository end)
+
+    %MirrorRefState{}
+    |> MirrorRefState.persistence_changeset(%{
+      repository_mirror_id: head_binding.id,
+      ref_name: c.pull.head_ref,
+      ref_kind: :branch,
+      confirmed_oid: c.pull.head_sha,
+      last_local_oid: c.pull.head_sha,
+      last_remote_oid: c.pull.head_sha,
+      state: :confirmed,
+      last_confirmed_at: c.now
+    })
+    |> Repo.insert!()
+
+    pull =
+      c.pull
+      |> Changeset.change(head_repository_id: head_repository.id)
+      |> Repo.update!()
+
+    mapping =
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: c.binding.id,
+        resource_kind: :pull,
+        local_resource_id: pull.id
+      )
+
+    identity =
+      put_in(mapping.provider_identity, ["head_repository"], %{
+        "id" => head_binding.github_repository_id,
+        "node_id" => head_binding.github_node_id
+      })
+
+    Repo.delete!(mapping)
+
+    %MirrorResourceState{}
+    |> MirrorResourceState.persistence_changeset(%{
+      repository_mirror_id: mapping.repository_mirror_id,
+      resource_kind: mapping.resource_kind,
+      local_resource_type: mapping.local_resource_type,
+      local_resource_id: mapping.local_resource_id,
+      github_object_id: mapping.github_object_id,
+      github_node_id: mapping.github_node_id,
+      github_number: mapping.github_number,
+      confirmed_local_version: mapping.confirmed_local_version,
+      confirmed_remote_updated_at: mapping.confirmed_remote_updated_at,
+      confirmed_snapshot: mapping.confirmed_snapshot,
+      confirmed_merge_state: mapping.confirmed_merge_state,
+      provider_identity: identity,
+      state: :confirmed
+    })
+    |> Repo.insert!()
+
+    assert {:ok, admitted} =
+             ForgeGitHub.PullMergeAdmission.admit(
+               c.repository,
+               pull,
+               c.actor,
+               %{"merge_method" => "merge", "sha" => pull.head_sha},
+               metadata(c),
+               now: fn -> c.now end
+             )
+
+    assert admitted.operation.state == :pending
+    assert admitted.intent.commit_intent["resource"]["head_repository_id"] == head_repository.id
   end
 
   defp admit(c) do
