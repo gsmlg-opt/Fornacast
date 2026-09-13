@@ -7,17 +7,23 @@ defmodule ForgeGitHub.PullMergeWorker do
   finalize locally through the coordinator boundary. Ref-only readiness never
   closes a pull. This module is not yet admitted by the worker pool.
   """
+  import Ecto.Query
+
   alias ForgeGitHub.{
+    Client,
+    IdentityClient,
     InstallationToken,
     InstallationTokenBroker,
     IssueClient,
     IssueSyncProjection,
+    LabelClient,
     LFSSync,
     PullClient,
     PullMetadataDecision,
     PullMetadataRecovery,
     PullMergeObservation,
     PullSyncWorker,
+    RelationshipClient,
     RefObservation
   }
 
@@ -321,36 +327,389 @@ defmodule ForgeGitHub.PullMergeWorker do
     now = DateTime.utc_now(:second)
 
     result =
-      with {:ok, write_token} <- metadata_write_token(sync, options),
-           {:ok, current} <- PullMergeMetadataEffects.recovery_context(operation, now),
-           true <- metadata_intent(current).id == metadata_intent(context).id,
-           attrs = scalar_effect_attrs(metadata_intent(current).payload),
-           {:ok, _untrusted} <-
-             callback(options, :update_pull_issue, &IssueClient.update_pull_issue/6).(
-               write_token,
-               sync.routing.base.owner,
-               sync.routing.base.repository,
-               sync.expected.provider_identity["github_number"],
-               attrs,
-               request_options(sync, options)
-             ) do
-        confirm_metadata_effect(
-          operation,
-          sync,
-          metadata_intent(current).id,
-          read_token,
-          options,
-          effect_count + 1
-        )
-      else
-        false -> {:error, :stale_merge_identity}
-        {:error, _} = error -> error
-        _ -> {:error, :invalid_remote_result}
+      case prepare_metadata_nodes(operation, now, sync, read_token, context, options) do
+        {:ok, :ready} ->
+          mutate_marked_metadata(
+            operation,
+            sync,
+            context,
+            read_token,
+            options,
+            effect_count,
+            now
+          )
+
+        {:ok, %MirrorOperation{} = yielded} ->
+          {:ok, yielded}
+
+        {:error, _} = error ->
+          error
       end
 
     case result do
       {:error, reason} -> PullMergeBoundary.defer(operation, now, next(now), reason)
       other -> other
+    end
+  end
+
+  defp mutate_marked_metadata(
+         operation,
+         sync,
+         context,
+         read_token,
+         options,
+         effect_count,
+         now
+       ) do
+    with {:ok, write_token} <- metadata_write_token(sync, options),
+         {:ok, current} <- PullMergeMetadataEffects.recovery_context(operation, now),
+         true <- metadata_intent(current).id == metadata_intent(context).id,
+         {:ok, attrs} <- metadata_effect_attrs(operation, sync, write_token, current, options) do
+      case pre_patch_metadata_state(operation, sync, read_token, current, options) do
+        {:ok, :preimage} ->
+          with {:ok, fresh} <- PullMergeMetadataEffects.recovery_context(operation, now),
+               true <- metadata_intent(fresh).id == metadata_intent(current).id,
+               {:ok, _untrusted} <-
+                 callback(options, :update_pull_issue, &IssueClient.update_pull_issue/6).(
+                   write_token,
+                   sync.routing.base.owner,
+                   sync.routing.base.repository,
+                   sync.expected.provider_identity["github_number"],
+                   attrs,
+                   request_options(sync, options)
+                 ) do
+            confirm_metadata_effect(
+              operation,
+              sync,
+              metadata_intent(current).id,
+              read_token,
+              options,
+              effect_count + 1
+            )
+          else
+            false -> {:error, :stale_merge_identity}
+            {:error, _} = error -> error
+            _ -> {:error, :invalid_remote_result}
+          end
+
+        {:ok, {:applied, pair, observation, fresh}} ->
+          continue_after_applied_effect(
+            operation,
+            sync,
+            pair,
+            observation,
+            fresh,
+            read_token,
+            options,
+            effect_count
+          )
+
+        {:conflict, observation} ->
+          PullMergeConfirmation.record_ambiguous_effect(operation, now, next(now), observation)
+
+        {:error, _} = error ->
+          error
+      end
+    else
+      false -> {:error, :stale_merge_identity}
+      {:error, _} = error -> error
+      _ -> {:error, :invalid_remote_result}
+    end
+  end
+
+  defp prepare_metadata_nodes(operation, now, sync, token, context, options) do
+    payload = metadata_intent(context).payload
+
+    if relationship_effect?(payload) do
+      with {:ok, fresh} <- PullMergeMetadataEffects.recovery_context(operation, now),
+           true <- metadata_intent(fresh).id == metadata_intent(context).id do
+        prepare_assignee_node(operation, now, sync, token, fresh, options)
+      else
+        false -> {:error, :stale_merge_identity}
+        {:error, _} = error -> error
+      end
+    else
+      {:ok, :ready}
+    end
+  end
+
+  defp prepare_assignee_node(operation, now, sync, token, context, options) do
+    if metadata_intent(context).payload["target_issue"]["assignee_github_ids"] == [] do
+      prepare_label_nodes(operation, now, sync, token, context, options)
+    else
+      with {:ok, proof} <-
+             callback(
+               options,
+               :merge_assignee_node_context,
+               &ForgeMirrors.pull_merge_assignee_node_context/2
+             ).(operation, now) do
+        case proof.target do
+          nil ->
+            prepare_label_nodes(operation, now, sync, token, context, options)
+
+          target ->
+            with {:ok, user} <-
+                   callback(options, :get_relationship_user, &IdentityClient.get_user/3).(
+                     token,
+                     target.github_user_id,
+                     request_options(sync, options)
+                   ),
+                 {:ok, fresh} <- PullMergeMetadataEffects.recovery_context(operation, now),
+                 true <- metadata_intent(fresh).id == metadata_intent(context).id,
+                 {:ok, saved} <-
+                   callback(
+                     options,
+                     :seed_merge_assignee_node,
+                     &ForgeMirrors.seed_pull_merge_assignee_node/4
+                   ).(
+                     operation,
+                     now,
+                     Map.take(proof, [:marker, :target]),
+                     Map.from_struct(user)
+                   ) do
+              {:ok, saved.operation}
+            else
+              false -> {:error, :stale_merge_identity}
+              {:error, _} = error -> error
+            end
+        end
+      end
+    end
+  end
+
+  defp prepare_label_nodes(operation, now, sync, token, context, options) do
+    if metadata_intent(context).payload["target_issue"]["label_github_ids"] == [] do
+      {:ok, :ready}
+    else
+      with {:ok, proof} <-
+             callback(
+               options,
+               :merge_label_node_context,
+               &ForgeMirrors.pull_merge_label_node_context/2
+             ).(operation, now) do
+        case proof.status do
+          :ready ->
+            {:ok, :ready}
+
+          :unavailable ->
+            case PullMergeConfirmation.record_relationship_unavailable(
+                   operation,
+                   now,
+                   next(now)
+                 ) do
+              {:ok, yielded} -> {:ok, yielded}
+              {:error, _} = error -> error
+            end
+
+          :scanning ->
+            with {:ok, repository} <- relationship_repository(sync, token, options),
+                 {:ok, page} <-
+                   callback(
+                     options,
+                     :list_relationship_labels,
+                     &LabelClient.list_labels_page/5
+                   ).(
+                     token,
+                     sync.routing.base.owner,
+                     sync.routing.base.repository,
+                     proof.checkpoint["page"],
+                     request_options(sync, options)
+                   ),
+                 {:ok, ^repository} <- relationship_repository(sync, token, options),
+                 {:ok, fresh} <- PullMergeMetadataEffects.recovery_context(operation, now),
+                 true <- metadata_intent(fresh).id == metadata_intent(context).id,
+                 {:ok, saved} <-
+                   callback(
+                     options,
+                     :seed_merge_label_nodes,
+                     &ForgeMirrors.seed_pull_merge_label_nodes/4
+                   ).(
+                     operation,
+                     now,
+                     Map.take(proof, [:marker, :targets, :checkpoint]),
+                     Map.put(page, :repository, repository)
+                   ) do
+              {:ok, saved.operation}
+            else
+              false -> {:error, :stale_merge_identity}
+              {:error, _} = error -> error
+            end
+        end
+      end
+    end
+  end
+
+  defp relationship_repository(sync, token, options) do
+    callback(options, :get_relationship_repository, &default_relationship_repository/3).(
+      sync,
+      token,
+      options
+    )
+  end
+
+  defp default_relationship_repository(sync, token, options) do
+    expected = sync.expected.provider_identity["base_repository"]
+
+    with {:ok, repository} <-
+           Client.repository(
+             token,
+             sync.routing.base.owner,
+             sync.routing.base.repository,
+             request_options(sync, options)
+           ),
+         true <-
+           repository.id == expected["id"] and repository.node_id == expected["node_id"] and
+             repository.full_name ==
+               sync.routing.base.owner <> "/" <> sync.routing.base.repository do
+      {:ok, %{github_object_id: repository.id, github_node_id: repository.node_id}}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :identity_conflict}
+    end
+  end
+
+  defp metadata_effect_attrs(operation, sync, token, context, options) do
+    payload = metadata_intent(context).payload
+    expected = payload["expected_remote_issue"]
+    target = payload["target_issue"]
+
+    scalars =
+      Map.new(~w(title body), &{&1, target[&1]})
+      |> Enum.reject(fn {field, value} -> expected[field] == value end)
+      |> Map.new()
+
+    if relationship_effect?(payload) do
+      with {:ok, labels, assignees} <- relationship_nodes(sync, target),
+           {:ok, resolved} <-
+             resolve_relationship_names(operation, sync, token, labels, assignees, options) do
+        relationships =
+          %{}
+          |> maybe_relationship_attr(
+            "labels",
+            expected["label_github_ids"],
+            target["label_github_ids"],
+            Enum.map(resolved.labels, & &1.name)
+          )
+          |> maybe_relationship_attr(
+            "assignees",
+            expected["assignee_github_ids"],
+            target["assignee_github_ids"],
+            Enum.map(resolved.assignees, & &1.login)
+          )
+
+        {:ok, Map.merge(scalars, relationships)}
+      end
+    else
+      {:ok, scalars}
+    end
+  end
+
+  defp resolve_relationship_names(_operation, _sync, _token, [], [], _options),
+    do: {:ok, %{labels: [], assignees: []}}
+
+  defp resolve_relationship_names(operation, sync, token, labels, assignees, options) do
+    callback(options, :resolve_relationships, &RelationshipClient.resolve/5).(
+      token,
+      %{
+        github_object_id: sync.expected.provider_identity["base_repository"]["id"],
+        github_node_id: sync.expected.provider_identity["base_repository"]["node_id"]
+      },
+      labels,
+      assignees,
+      relationship_request_options(operation, sync, options)
+    )
+  end
+
+  defp relationship_nodes(sync, target) do
+    label_ids = target["label_github_ids"]
+    assignee_ids = target["assignee_github_ids"]
+
+    labels =
+      Repo.all(
+        from m in ForgeMirrors.MirrorResourceState,
+          where:
+            m.repository_mirror_id == ^sync.repository_mirror_id and
+              m.resource_kind == :label and m.state == :confirmed and
+              m.github_object_id in ^label_ids,
+          order_by: m.github_object_id,
+          select: %{github_object_id: m.github_object_id, github_node_id: m.github_node_id}
+      )
+
+    assignees =
+      Repo.all(
+        from identity in ForgeAccounts.GitHubIdentity,
+          where: identity.kind == :user and identity.github_user_id in ^assignee_ids,
+          order_by: identity.github_user_id,
+          select: %{
+            github_user_id: identity.github_user_id,
+            github_node_id: identity.github_node_id
+          }
+      )
+
+    if Enum.map(labels, & &1.github_object_id) == label_ids and
+         Enum.map(assignees, & &1.github_user_id) == assignee_ids and
+         Enum.all?(
+           labels ++ assignees,
+           &(is_binary(&1.github_node_id) and &1.github_node_id != "")
+         ),
+       do: {:ok, labels, assignees},
+       else: {:error, :relationship_prerequisite}
+  end
+
+  defp relationship_request_options(operation, sync, options) do
+    deadline =
+      System.monotonic_time(:millisecond) +
+        DateTime.diff(operation.lease_expires_at, DateTime.utc_now(), :millisecond) - 2_000
+
+    request_options(sync, options)
+    |> Keyword.put(:deadline_monotonic_ms, deadline)
+  end
+
+  defp maybe_relationship_attr(attrs, _field, same, same, _values), do: attrs
+
+  defp maybe_relationship_attr(attrs, field, _before, _target, values),
+    do: Map.put(attrs, field, values)
+
+  defp relationship_effect?(payload) do
+    before = payload["expected_remote_issue"]
+    target = payload["target_issue"]
+
+    Enum.any?(~w(label_github_ids assignee_github_ids), &(before[&1] != target[&1]))
+  end
+
+  defp pre_patch_metadata_state(operation, sync, read_token, context, options) do
+    expected_id = metadata_intent(context).id
+
+    with {:ok, before_ref} <-
+           PullMergeMetadataEffects.recovery_context(operation, DateTime.utc_now(:second)),
+         true <- metadata_intent(before_ref).id == expected_id,
+         {:ok, remote} <- observe(sync, :base, read_token, options),
+         {:ok, before_pair} <-
+           PullMergeMetadataEffects.recovery_context(operation, DateTime.utc_now(:second)),
+         true <- metadata_intent(before_pair).id == expected_id,
+         {:ok, pair} <- pair(sync, read_token, options),
+         {:ok, observation} <- PullMergeObservation.build(sync, pair, remote.oid),
+         {:ok, fresh} <-
+           PullMergeMetadataEffects.recovery_context(operation, DateTime.utc_now(:second)),
+         true <- metadata_intent(fresh).id == expected_id do
+      case classify_metadata_recovery(fresh, observation) do
+        {:ok, %{status: :applied}} ->
+          {:ok, {:applied, pair, observation, fresh}}
+
+        {:ok, %{status: :not_applied}} ->
+          if retained_metadata_timestamps?(fresh.marker, observation),
+            do: {:ok, :preimage},
+            else: {:conflict, observation}
+
+        {:conflict, :ambiguous_external_effect, _} ->
+          {:conflict, observation}
+
+        {:error, _} = error ->
+          error
+      end
+    else
+      false -> {:error, :stale_merge_identity}
+      {:error, _} = error -> error
     end
   end
 
@@ -409,15 +768,6 @@ defmodule ForgeGitHub.PullMergeWorker do
         now = DateTime.utc_now(:second)
         PullMergeBoundary.defer(operation, now, next(now), :stale_merge_identity)
     end
-  end
-
-  defp scalar_effect_attrs(payload) do
-    expected = payload["expected_remote_issue"]
-    target = payload["target_issue"]
-
-    Map.new(~w(title body), fn field -> {field, target[field]} end)
-    |> Enum.reject(fn {field, value} -> expected[field] == value end)
-    |> Map.new()
   end
 
   defp retained_metadata_timestamps?(marker, observation) do

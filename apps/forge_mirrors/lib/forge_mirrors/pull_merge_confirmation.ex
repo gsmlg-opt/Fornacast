@@ -113,6 +113,34 @@ defmodule ForgeMirrors.PullMergeConfirmation do
 
   def record_ambiguous_effect(_, _, _, _), do: {:error, :invalid_transition}
 
+  @doc "Record exhausted merge label-node discovery as a visible durable conflict."
+  def record_relationship_unavailable(
+        operation,
+        %DateTime{} = now,
+        %DateTime{} = next_attempt_at
+      ) do
+    Repo.transaction(fn ->
+      with true <- DateTime.compare(next_attempt_at, now) != :lt,
+           {:ok, context} <- load(operation, now),
+           %ForgeMirrors.PullMetadataIntent{} <- context.metadata_intent,
+           {:ok, proof} <- ForgeMirrors.PullMergeLabelProof.context(operation, now),
+           true <- proof.status == :unavailable,
+           true <- proof.intent.id == context.metadata_intent.id,
+           true <- proof.marker == context.operation.external_effect_marker,
+           {:ok, _conflict} <- record_relationship_conflict(context, proof),
+           {:ok, yielded} <-
+             yield_conflict(context.operation, now, next_attempt_at, "relationship_unavailable") do
+        yielded
+      else
+        false -> Repo.rollback(:invalid_transition)
+        {:error, reason} -> Repo.rollback(reason)
+        _ -> Repo.rollback(:invalid_transition)
+      end
+    end)
+  end
+
+  def record_relationship_unavailable(_, _, _), do: {:error, :invalid_transition}
+
   defp ambiguous_effect?(context, observation) do
     payload = context.metadata_intent.payload
     preimage = payload["expected_remote_issue"]
@@ -154,6 +182,27 @@ defmodule ForgeMirrors.PullMergeConfirmation do
       baseline_snapshot: context.metadata_intent.payload["expected_remote_issue"],
       local_snapshot: context.metadata_intent.payload["target_issue"],
       remote_snapshot: observation.issue.confirmed_snapshot
+    }
+
+    %ForgeMirrors.MirrorConflict{}
+    |> ForgeMirrors.MirrorConflict.record_changeset(attrs)
+    |> Repo.insert()
+  end
+
+  defp record_relationship_conflict(context, proof) do
+    attrs = %{
+      organization_mirror_id: context.organization_mirror_id,
+      repository_mirror_id: context.repository_mirror_id,
+      resource_kind: "pull_merge",
+      resource_identity: to_string(context.intent.id),
+      conflict_kind: "relationship_unavailable",
+      baseline_snapshot: context.metadata_intent.payload["expected_remote_issue"],
+      local_snapshot: context.metadata_intent.payload["target_issue"],
+      remote_snapshot: %{
+        "reason" => "missing_labels",
+        "missing_label_github_ids" => proof.missing_github_ids,
+        "label_inventory" => proof.checkpoint
+      }
     }
 
     %ForgeMirrors.MirrorConflict{}

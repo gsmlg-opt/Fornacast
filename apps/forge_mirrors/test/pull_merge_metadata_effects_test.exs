@@ -276,6 +276,127 @@ defmodule ForgeMirrors.PullMergeMetadataEffectsTest do
     assert Repo.aggregate(PullMetadataIntent, :count) == 1
   end
 
+  test "accepts an exact outbound label and assignee set-only target", c do
+    {label, identity} = known_relationships(c, 800, 801)
+    {operation, intent} = marked(c)
+    version = c.expected.local_version + 1
+    set_local_relationships(c, [label], [identity], version)
+
+    remote = merged_issue(c.issue_mapping.confirmed_snapshot)
+
+    target =
+      remote
+      |> Map.put("label_github_ids", [800])
+      |> Map.put("assignee_github_ids", [801])
+
+    assert {:ok, result} =
+             PullMergeMetadataEffects.mark(
+               operation,
+               c.now,
+               intent,
+               observation(c, intent, remote),
+               version,
+               target
+             )
+
+    assert result.intent.payload["expected_remote_issue"] == remote
+    assert result.intent.payload["target_issue"] == target
+  end
+
+  test "merges independent label additions and removals against the confirmed set", c do
+    {baseline, _} = known_relationships(c, 810, 811)
+    {local, _} = known_relationships(c, 820, 821)
+    {_remote, _} = known_relationships(c, 830, 831)
+    set_confirmed_relationships(c, [810], [])
+    set_local_relationships(c, [baseline], [], c.expected.local_version)
+    {operation, intent} = marked(c)
+    version = c.expected.local_version + 1
+    set_local_relationships(c, [local], [], version)
+
+    remote_issue =
+      MirrorResourceState
+      |> Repo.get!(c.issue_mapping.id)
+      |> Map.fetch!(:confirmed_snapshot)
+      |> merged_issue()
+      |> Map.put("label_github_ids", [810, 830])
+
+    target = Map.put(remote_issue, "label_github_ids", [820, 830])
+
+    assert {:ok, result} =
+             PullMergeMetadataEffects.mark(
+               operation,
+               c.now,
+               intent,
+               observation(c, intent, remote_issue),
+               version,
+               target
+             )
+
+    assert result.intent.payload["target_issue"]["label_github_ids"] == [820, 830]
+  end
+
+  test "accepts a mixed scalar and relationship delta target", c do
+    {local_label, _} = known_relationships(c, 840, 841)
+    {_remote_label, _} = known_relationships(c, 850, 851)
+    {operation, intent} = marked(c)
+    version = c.expected.local_version + 1
+
+    c.issue
+    |> Changeset.change(title: "Local title", sync_version: version)
+    |> Repo.update!()
+
+    set_local_relationships(c, [local_label], [], version)
+
+    remote =
+      c.issue_mapping.confirmed_snapshot
+      |> merged_issue()
+      |> Map.put("body", "Remote body")
+      |> Map.put("label_github_ids", [850])
+
+    target =
+      remote
+      |> Map.put("title", "Local title")
+      |> Map.put("label_github_ids", [840, 850])
+
+    observed =
+      observation(c, intent, remote)
+      |> update_in([:pull, :confirmed_snapshot], &Map.merge(&1, Map.take(remote, ~w(title body))))
+
+    assert {:ok, result} =
+             PullMergeMetadataEffects.mark(operation, c.now, intent, observed, version, target)
+
+    assert result.intent.payload["target_issue"] == target
+  end
+
+  test "rejects fabricated and over-budget relationship targets", c do
+    {label, _} = known_relationships(c, 860, 861)
+    {operation, intent} = marked(c)
+    version = c.expected.local_version + 1
+    set_local_relationships(c, [label], [], version)
+    remote = merged_issue(c.issue_mapping.confirmed_snapshot)
+    exact = Map.put(remote, "label_github_ids", [860])
+
+    invalid = [
+      Map.put(exact, "label_github_ids", []),
+      Map.put(exact, "label_github_ids", [860, 870]),
+      Map.put(exact, "label_github_ids", Enum.to_list(1..513))
+    ]
+
+    for target <- invalid do
+      assert {:error, _} =
+               PullMergeMetadataEffects.mark(
+                 operation,
+                 c.now,
+                 intent,
+                 observation(c, intent, remote),
+                 version,
+                 target
+               )
+    end
+
+    assert Repo.aggregate(PullMetadataIntent, :count) == 0
+  end
+
   test "invalid observation target local version and lease create no metadata intent", c do
     {operation, intent} = marked(c)
     {version, target, observation} = local_edit(c, intent)
@@ -885,6 +1006,82 @@ defmodule ForgeMirrors.PullMergeMetadataEffectsTest do
     target = remote_issue |> Map.put("title", title) |> Map.put("body", body)
     {version, target, observation(c, intent, remote_issue)}
   end
+
+  defp known_relationships(c, label_id, user_id) do
+    label =
+      Repo.insert!(
+        ForgeIssues.Label.changeset(
+          %ForgeIssues.Label{repository_id: c.binding.repository_id},
+          %{
+            name: "label-#{label_id}",
+            normalized_name: "label-#{label_id}",
+            color: "112233"
+          }
+        )
+      )
+
+    Repo.insert!(
+      MirrorResourceState.persistence_changeset(%MirrorResourceState{}, %{
+        repository_mirror_id: c.binding.id,
+        resource_kind: :label,
+        local_resource_type: "ForgeIssues.Label",
+        local_resource_id: label.id,
+        github_object_id: label_id,
+        github_node_id: "L_#{label_id}",
+        confirmed_snapshot: %{},
+        state: :confirmed
+      })
+    )
+
+    identity =
+      Repo.insert!(
+        ForgeAccounts.GitHubIdentity.observed_changeset(
+          %ForgeAccounts.GitHubIdentity{},
+          %{github_user_id: user_id, github_node_id: "U_#{user_id}", login: "user-#{user_id}"}
+        )
+      )
+
+    {label, identity}
+  end
+
+  defp set_local_relationships(c, labels, identities, version) do
+    Repo.delete_all(from row in ForgeIssues.IssueLabel, where: row.issue_id == ^c.issue.id)
+    Repo.delete_all(from row in ForgeIssues.IssueAssignee, where: row.issue_id == ^c.issue.id)
+
+    Enum.each(labels, fn label ->
+      Repo.insert!(%ForgeIssues.IssueLabel{issue_id: c.issue.id, label_id: label.id})
+    end)
+
+    Enum.each(identities, fn identity ->
+      Repo.insert!(%ForgeIssues.IssueAssignee{
+        issue_id: c.issue.id,
+        github_identity_id: identity.id
+      })
+    end)
+
+    Repo.update_all(from(issue in ForgeIssues.Issue, where: issue.id == ^c.issue.id),
+      set: [sync_version: version]
+    )
+  end
+
+  defp set_confirmed_relationships(c, label_ids, assignee_ids) do
+    mapping = Repo.get!(MirrorResourceState, c.issue_mapping.id)
+
+    snapshot =
+      Map.merge(mapping.confirmed_snapshot, %{
+        "label_github_ids" => Enum.sort(label_ids),
+        "assignee_github_ids" => Enum.sort(assignee_ids)
+      })
+
+    {:ok, fingerprint} = ForgeMirrors.resource_fingerprint(snapshot)
+
+    mapping
+    |> Changeset.change(confirmed_snapshot: snapshot, confirmed_fingerprint: fingerprint)
+    |> Repo.update!()
+  end
+
+  defp merged_issue(snapshot),
+    do: Map.merge(snapshot, %{"state" => "closed", "state_reason" => "completed"})
 
   defp assert_target_timestamp_ambiguity(c, regressed_kind) do
     {operation, intent} = marked(c)

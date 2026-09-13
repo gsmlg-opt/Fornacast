@@ -1016,6 +1016,344 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     assert completed.state == :completed
   end
 
+  test "merge-owned mapped relationship additions use fresh names in one durable issue effect",
+       c do
+    paired_issue_mapping(c)
+    {label, identity} = known_relationships(c)
+    marked = mark(c)
+    edit_issue(c, %{title: "Local relationship title"})
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: c.issue.id, label_id: label.id})
+
+    Repo.insert!(%ForgeIssues.IssueAssignee{
+      issue_id: c.issue.id,
+      github_identity_id: identity.id
+    })
+
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+    opts =
+      relationship_effect_options(
+        c,
+        provider,
+        fn labels, assignees ->
+          assert labels == [
+                   %{github_object_id: 800, github_node_id: "L_800"}
+                 ]
+
+          assert assignees == [
+                   %{github_user_id: 801, github_node_id: "U_801"}
+                 ]
+
+          {:ok,
+           %{
+             labels: [%{github_object_id: 800, github_node_id: "L_800", name: "fresh-label"}],
+             assignees: [
+               %{github_user_id: 801, github_node_id: "U_801", login: "fresh-user"}
+             ]
+           }}
+        end,
+        fn _, attrs ->
+          assert attrs == %{
+                   "assignees" => ["fresh-user"],
+                   "labels" => ["fresh-label"],
+                   "title" => "Local relationship title"
+                 }
+
+          Agent.update(provider, fn state ->
+            %{
+              state
+              | title: "Local relationship title",
+                labels: [remote_label()],
+                assignees: [remote_assignee()]
+            }
+          end)
+
+          {:ok, %{}}
+        end
+      )
+
+    assert {:ok, completed} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert completed.state == :completed
+    assert Repo.aggregate(PullMetadataIntent, :count) == 1
+  end
+
+  test "missing assignee and label nodes are authenticated one per claim before merge metadata patch",
+       c do
+    paired_issue_mapping(c)
+    {label, identity} = known_relationships(c)
+
+    Repo.update_all(
+      from(m in MirrorResourceState,
+        where: m.resource_kind == :label and m.local_resource_id == ^label.id
+      ),
+      set: [github_node_id: nil]
+    )
+
+    Repo.update_all(from(i in ForgeAccounts.GitHubIdentity, where: i.id == ^identity.id),
+      set: [github_node_id: nil]
+    )
+
+    marked = mark(c)
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: c.issue.id, label_id: label.id})
+
+    Repo.insert!(%ForgeIssues.IssueAssignee{
+      issue_id: c.issue.id,
+      github_identity_id: identity.id
+    })
+
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+    opts =
+      relationship_effect_options(
+        c,
+        provider,
+        fn _, _ ->
+          {:ok,
+           %{
+             labels: [%{github_object_id: 800, github_node_id: "L_800", name: "fresh-label"}],
+             assignees: [
+               %{github_user_id: 801, github_node_id: "U_801", login: "fresh-user"}
+             ]
+           }}
+        end,
+        fn _, _ ->
+          send(self(), :relationship_patch)
+
+          Agent.update(provider, fn state ->
+            %{state | labels: [remote_label()], assignees: [remote_assignee()]}
+          end)
+
+          {:ok, %{}}
+        end
+      )
+      |> Keyword.put(:get_relationship_user, fn _, 801, _ ->
+        send(self(), :assignee_proof)
+
+        {:ok,
+         %ForgeGitHub.User{
+           id: 801,
+           login: "fresh-user",
+           node_id: "U_801",
+           name: nil,
+           avatar_url: nil,
+           html_url: nil
+         }}
+      end)
+      |> Keyword.put(:list_relationship_labels, fn _, _, _, 1, _ ->
+        send(self(), :label_proof)
+
+        {:ok,
+         %{
+           labels: [
+             %{
+               "id" => 800,
+               "node_id" => "L_800",
+               "name" => "fresh-label",
+               "color" => "112233",
+               "description" => nil
+             }
+           ],
+           next_cursor: nil
+         }}
+      end)
+
+    assert {:ok, after_user} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert_received :assignee_proof
+    refute_received :label_proof
+    refute_received :relationship_patch
+
+    after_user = reclaim(after_user, c.now, "merge-label-proof")
+    assert {:ok, after_label} = PullMergeWorker.process_operation(after_user, c.now, opts)
+    assert_received :label_proof
+    refute_received :relationship_patch
+
+    after_label = reclaim(after_label, c.now, "merge-relationship-patch")
+    assert {:ok, completed} = PullMergeWorker.process_operation(after_label, c.now, opts)
+    assert_received :relationship_patch
+    assert completed.state == :completed
+  end
+
+  test "merge-owned relationship removals patch explicit empty sets without node lookup", c do
+    issue_mapping = paired_issue_mapping(c)
+    {label, identity} = known_relationships(c)
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: c.issue.id, label_id: label.id})
+
+    Repo.insert!(%ForgeIssues.IssueAssignee{
+      issue_id: c.issue.id,
+      github_identity_id: identity.id
+    })
+
+    issue_mapping
+    |> Changeset.change(
+      confirmed_snapshot:
+        Map.merge(issue_mapping.confirmed_snapshot, %{
+          "label_github_ids" => [800],
+          "assignee_github_ids" => [801]
+        })
+    )
+    |> Repo.update!()
+
+    marked = mark(c)
+    Repo.delete_all(from(l in ForgeIssues.IssueLabel, where: l.issue_id == ^c.issue.id))
+    Repo.delete_all(from(a in ForgeIssues.IssueAssignee, where: a.issue_id == ^c.issue.id))
+
+    {:ok, provider} =
+      Agent.start_link(fn ->
+        %{provider_state(c) | labels: [remote_label()], assignees: [remote_assignee()]}
+      end)
+
+    opts =
+      relationship_effect_options(
+        c,
+        provider,
+        fn _, _ ->
+          flunk("empty relationship targets do not require GraphQL resolution")
+        end,
+        fn _, attrs ->
+          assert attrs == %{"assignees" => [], "labels" => []}
+          Agent.update(provider, &%{&1 | labels: [], assignees: []})
+          {:ok, %{}}
+        end
+      )
+      |> Keyword.put(:get_relationship_user, fn _, _, _ -> flunk("unexpected user lookup") end)
+      |> Keyword.put(:list_relationship_labels, fn _, _, _, _, _ ->
+        flunk("unexpected label inventory")
+      end)
+
+    assert {:ok, completed} = PullMergeWorker.process_operation(marked, c.now, opts)
+    assert completed.state == :completed
+  end
+
+  test "exhausted merge label proof becomes a visible conflict without metadata patch", c do
+    paired_issue_mapping(c)
+    {label, _identity} = known_relationships(c)
+
+    Repo.update_all(
+      from(m in MirrorResourceState,
+        where: m.resource_kind == :label and m.local_resource_id == ^label.id
+      ),
+      set: [github_node_id: nil]
+    )
+
+    marked = mark(c)
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: c.issue.id, label_id: label.id})
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+    opts =
+      relationship_effect_options(
+        c,
+        provider,
+        fn _, _ ->
+          flunk("unavailable labels cannot be resolved")
+        end,
+        fn _, _ ->
+          flunk("unavailable labels cannot be patched")
+        end
+      )
+      |> Keyword.put(:list_relationship_labels, fn _, _, _, 1, _ ->
+        {:ok, %{labels: [], next_cursor: nil}}
+      end)
+
+    assert {:ok, scanned} = PullMergeWorker.process_operation(marked, c.now, opts)
+    scanned = reclaim(scanned, c.now, "merge-label-exhausted")
+    assert {:ok, conflicted} = PullMergeWorker.process_operation(scanned, c.now, opts)
+    assert conflicted.failure_disposition == :conflict
+    assert conflicted.failure_detail == "relationship_unavailable"
+    assert conflicted.external_effect_marker["phase"] == "metadata_issue_pending"
+
+    conflict =
+      Repo.get_by!(ForgeMirrors.MirrorConflict,
+        resource_kind: "pull_merge",
+        resource_identity: to_string(c.intent.id),
+        state: :open
+      )
+
+    assert conflict.conflict_kind == "relationship_unavailable"
+    assert conflict.remote_snapshot["missing_label_github_ids"] == [800]
+  end
+
+  test "applied relationship patch after timeout is confirmed without a second patch", c do
+    paired_issue_mapping(c)
+    {label, _identity} = known_relationships(c)
+    marked = mark(c)
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: c.issue.id, label_id: label.id})
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+    resolver = fn _, _ ->
+      {:ok,
+       %{
+         labels: [%{github_object_id: 800, github_node_id: "L_800", name: "fresh-label"}],
+         assignees: []
+       }}
+    end
+
+    first =
+      relationship_effect_options(c, provider, resolver, fn _, attrs ->
+        assert attrs == %{"labels" => ["fresh-label"]}
+        Agent.update(provider, &%{&1 | labels: [remote_label()]})
+        send(self(), :relationship_patch_timeout)
+        {:error, :timeout}
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, first)
+    assert_received :relationship_patch_timeout
+    pending = reclaim(pending, c.now, "merge-relationship-timeout")
+
+    retry =
+      relationship_effect_options(c, provider, resolver, fn _, _ ->
+        flunk("applied relationship effect must not be patched twice")
+      end)
+
+    assert {:ok, completed} = PullMergeWorker.process_operation(pending, c.now, retry)
+    assert completed.state == :completed
+  end
+
+  test "third relationship state after an ambiguous write becomes a conflict without retry", c do
+    paired_issue_mapping(c)
+    {label, _identity} = known_relationships(c)
+    other = additional_known_label(c, 802)
+    marked = mark(c)
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: c.issue.id, label_id: label.id})
+    {:ok, provider} = Agent.start_link(fn -> provider_state(c) end)
+
+    resolver = fn labels, _ ->
+      {:ok,
+       %{
+         labels:
+           Enum.map(labels, fn label ->
+             %{
+               github_object_id: label.github_object_id,
+               github_node_id: label.github_node_id,
+               name: "fresh-label"
+             }
+           end),
+         assignees: []
+       }}
+    end
+
+    first =
+      relationship_effect_options(c, provider, resolver, fn _, _ -> {:error, :timeout} end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, first)
+
+    Agent.update(provider, fn state ->
+      %{state | labels: [remote_label(other.github_object_id, other.github_node_id)]}
+    end)
+
+    pending = reclaim(pending, c.now, "merge-relationship-third-state")
+
+    retry =
+      relationship_effect_options(c, provider, resolver, fn _, _ ->
+        flunk("third relationship state must not retry PATCH")
+      end)
+      |> Keyword.put(:push_remote, fn _, _, _, _ -> flunk("metadata recovery retried Git") end)
+
+    assert {:ok, conflict} = PullMergeWorker.process_operation(pending, c.now, retry)
+    assert conflict.failure_disposition == :conflict
+    assert conflict.failure_detail == "ambiguous_external_effect"
+    assert conflict.external_effect_marker["phase"] == "metadata_issue_pending"
+  end
+
   test "mixed local title and remote body converge without overwriting the remote body", c do
     paired_issue_mapping(c)
     marked = mark(c)
@@ -1433,6 +1771,33 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     {label, identity}
   end
 
+  defp additional_known_label(c, github_object_id) do
+    label =
+      Repo.insert!(
+        ForgeIssues.Label.changeset(
+          %ForgeIssues.Label{repository_id: c.repository.id},
+          %{
+            name: "known-#{github_object_id}",
+            normalized_name: "known-#{github_object_id}",
+            color: "445566"
+          }
+        )
+      )
+
+    Repo.insert!(
+      MirrorResourceState.persistence_changeset(%MirrorResourceState{}, %{
+        repository_mirror_id: c.binding.id,
+        resource_kind: :label,
+        local_resource_type: "ForgeIssues.Label",
+        local_resource_id: label.id,
+        github_object_id: github_object_id,
+        github_node_id: "L_#{github_object_id}",
+        confirmed_snapshot: %{},
+        state: :confirmed
+      })
+    )
+  end
+
   defp paired_issue_mapping(c) do
     %MirrorResourceState{}
     |> MirrorResourceState.persistence_changeset(%{
@@ -1515,6 +1880,8 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     %{
       title: "Merge",
       body: nil,
+      labels: [],
+      assignees: [],
       pull_updated_at: c.now,
       issue_updated_at: c.now,
       issue_reads: 0,
@@ -1560,10 +1927,40 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
        raw
        |> Map.put("title", state.title)
        |> Map.put("body", state.body)
+       |> Map.put("labels", state.labels)
+       |> Map.put("assignees", state.assignees)
        |> Map.put("updated_at", DateTime.to_iso8601(state.issue_updated_at))}
     end)
     |> Keyword.put(:update_pull_issue, fn token, _, _, _, attrs, _ -> update.(token, attrs) end)
   end
+
+  defp relationship_effect_options(c, provider, resolve, update) do
+    scalar_effect_options(c, provider, update)
+    |> Keyword.put(:get_relationship_repository, fn _, _, _ ->
+      {:ok,
+       %{
+         github_object_id: c.binding.github_repository_id,
+         github_node_id: c.binding.github_node_id
+       }}
+    end)
+    |> Keyword.put(:resolve_relationships, fn _, repository, labels, assignees, _ ->
+      assert repository == %{
+               github_object_id: c.binding.github_repository_id,
+               github_node_id: c.binding.github_node_id
+             }
+
+      resolve.(labels, assignees)
+    end)
+  end
+
+  defp remote_label,
+    do: %{"id" => 800, "node_id" => "L_800", "name" => "fresh-label"}
+
+  defp remote_label(id, node),
+    do: %{"id" => id, "node_id" => node, "name" => "fresh-label"}
+
+  defp remote_assignee,
+    do: %{"id" => 801, "node_id" => "U_801", "login" => "fresh-user"}
 
   defp reclaim(pending, now, owner) do
     pending |> Changeset.change(next_attempt_at: now) |> Repo.update!()

@@ -1,6 +1,6 @@
 defmodule ForgeMirrors.PullMergeMetadataEffects do
   @moduledoc """
-  Durable scalar issue-metadata effects subordinate to a coordinated merge.
+  Durable issue-metadata effects subordinate to a coordinated merge.
 
   The operation marker remains a compact pointer. Full expected-local,
   expected-remote and target evidence is retained in an immutable
@@ -25,7 +25,7 @@ defmodule ForgeMirrors.PullMergeMetadataEffects do
   @scalars ~w(title body)
   @intent_keys ~w(id repository_id pull_request_id actor_user_id coordinator_operation_id commit_intent base_ref head_ref expected_base_oid expected_head_oid merge_tree_oid merge_oid)a
 
-  @doc "Persist an exact outbound title/body effect after authenticating the merged provider pair."
+  @doc "Persist an exact outbound issue effect after authenticating the merged provider pair."
   def mark(
         %MirrorOperation{kind: "merge.pull"} = operation,
         %DateTime{} = now,
@@ -106,7 +106,7 @@ defmodule ForgeMirrors.PullMergeMetadataEffects do
         valid_issue?(payload[key])
       end) and
       payload["expected_remote_issue"] != payload["target_issue"] and
-      scalar_payload?(payload) and byte_size(JSON.encode!(payload)) <= 2_000_000
+      effect_payload?(payload) and byte_size(JSON.encode!(payload)) <= 2_000_000
   end
 
   def valid_payload?(_), do: false
@@ -189,7 +189,7 @@ defmodule ForgeMirrors.PullMergeMetadataEffects do
   end
 
   defp persist_exact(operation, now, merge, observation, local, payload) do
-    case exact_scalar_target(merge, local, observation, payload) do
+    case exact_target(merge, local, observation, payload) do
       :ok -> persist(operation, now, merge, observation, local, payload)
       {:error, reason} -> Repo.rollback(reason)
     end
@@ -266,7 +266,7 @@ defmodule ForgeMirrors.PullMergeMetadataEffects do
       else: {:error, :invalid_metadata_payload}
   end
 
-  defp exact_scalar_target(merge, local, observation, payload) do
+  defp exact_target(merge, local, observation, payload) do
     baseline =
       Repo.one(
         from m in MirrorResourceState,
@@ -287,14 +287,22 @@ defmodule ForgeMirrors.PullMergeMetadataEffects do
       remote_issue = payload["expected_remote_issue"]
       target_issue = payload["target_issue"]
 
-      scalar_target =
-        Map.new(@scalars, fn field ->
+      decided_target =
+        Map.new(@scalars ++ @sets, fn field ->
           decision =
-            ResourceDecision.scalar(
-              baseline_issue[field],
-              local_issue[field],
-              remote_issue[field]
-            )
+            if field in @sets do
+              ResourceDecision.set(
+                MapSet.new(baseline_issue[field]),
+                MapSet.new(local_issue[field]),
+                MapSet.new(remote_issue[field])
+              )
+            else
+              ResourceDecision.scalar(
+                baseline_issue[field],
+                local_issue[field],
+                remote_issue[field]
+              )
+            end
 
           {field, decision_value(decision)}
         end)
@@ -305,12 +313,8 @@ defmodule ForgeMirrors.PullMergeMetadataEffects do
           Map.take(local_issue, ~w(state state_reason)) == closed_state() and
           Map.take(remote_issue, ~w(state state_reason)) == closed_state() and
           Map.take(target_issue, ~w(state state_reason)) == closed_state() and
-          Enum.all?(@sets, fn field ->
-            baseline_issue[field] == local_issue[field] and
-              local_issue[field] == remote_issue[field] and
-              remote_issue[field] == target_issue[field]
-          end) and scalar_target == Map.take(target_issue, @scalars) and
-          Enum.all?(Map.values(scalar_target), &(&1 != :conflict))
+          decided_target == Map.take(target_issue, @scalars ++ @sets) and
+          Enum.all?(Map.values(decided_target), &(&1 != :conflict))
 
       if valid, do: :ok, else: {:error, :invalid_metadata_payload}
     else
@@ -319,16 +323,21 @@ defmodule ForgeMirrors.PullMergeMetadataEffects do
   end
 
   defp decision_value({:conflict, _}), do: :conflict
-  defp decision_value(decision), do: elem(decision, tuple_size(decision) - 1)
 
-  defp scalar_payload?(payload) do
+  defp decision_value(decision) do
+    case elem(decision, tuple_size(decision) - 1) do
+      %MapSet{} = value -> value |> MapSet.to_list() |> Enum.sort()
+      value -> value
+    end
+  end
+
+  defp effect_payload?(payload) do
     local = payload["expected_local_issue"]
     remote = payload["expected_remote_issue"]
     target = payload["target_issue"]
 
     Enum.all?([local, remote, target], &(Map.take(&1, ~w(state state_reason)) == closed_state())) and
-      Enum.all?(@sets, &(local[&1] == remote[&1] and remote[&1] == target[&1])) and
-      Enum.any?(@scalars, &(remote[&1] != target[&1]))
+      Enum.any?(@scalars ++ @sets, &(remote[&1] != target[&1]))
   end
 
   defp valid_issue?(issue) when is_map(issue) do

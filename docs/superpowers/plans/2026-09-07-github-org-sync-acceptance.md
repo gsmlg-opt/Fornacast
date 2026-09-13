@@ -10,6 +10,47 @@ remain open.
 
 ## Requirement-by-requirement gates
 
+### PR13 merge-owned outbound relationship effects (2026-09-14)
+
+- The dedicated merge metadata intent now admits exact three-way label and
+  known-assignee set deltas in addition to title/body changes. Set-only and
+  mixed scalar/set effects retain the same compact `metadata_issue_pending`
+  marker, immutable full preimage/target, closed-state and merge-result fences;
+  the ordinary `sync.pull` effect boundary remains unchanged.
+- Missing assignee node IDs are authenticated one user per claim. Missing label
+  nodes are authenticated one bounded repository-inventory page per claim with
+  an intent-bound cursor. Both proof boundaries reload and lock the durable
+  yielded operation before committing node evidence, reject fabricated callback
+  success, preserve both immutable intents and the merge reservation, and never
+  rewrite a confirmed resource baseline. Exhausted label inventory records a
+  visible `relationship_unavailable` conflict and does not restart.
+- Before PATCH, the worker loads exact confirmed numeric-ID/node-ID rows and
+  resolves fresh label names and assignee logins through the bounded GraphQL
+  relationship client. It sends total `labels` or `assignees` sets only when
+  that set changed, explicitly sends empty sets for removals, and still omits
+  state, reason, draft, refs, SHAs and merge facts. It reobserves the merged base,
+  pull and canonical issue after name resolution and rechecks the exact intent
+  and capability immediately before mutation.
+- Relationship effects use the same exact-target, exact-preimage/timestamp and
+  third-state recovery rules as scalar effects. Tests prove a lost PATCH response
+  is confirmed without a second PATCH, a third relationship set becomes durable
+  `ambiguous_external_effect` without PATCH or Git retry, and mixed scalar/set
+  changes complete atomically. Permanent provider numeric IDs remain the intent
+  identity; node IDs may legitimately advance from missing to authenticated and
+  are immutable through supported mapping writes.
+- Fresh connected PostgreSQL verification passed **227 tests**: merge mirror
+  boundaries and proofs **101**, coordinated merge domain **40**, and provider
+  observation/decision/recovery **86**. Focused relationship verification passed
+  **97 tests**. Scoped formatting and diff checks passed. Independent spec and
+  quality reviews approved after repairing fabricated-yield acceptance in both
+  node-proof boundaries and adding relationship ambiguity coverage.
+- This closes mapped merge-owned label/known-assignee effects and node proofs,
+  not all of PR13. Unknown provider relationship materialization, local unmapped
+  label creation/adoption, durable conflict-resolution UX, runtime admission and
+  activation, remaining cross-repository/head transitions, PR14–16 and full PRD
+  acceptance remain unfinished. No push, deployment or live GitHub write
+  validation occurred.
+
 ### PR13 merge-owned scalar outbound metadata effects (2026-09-14)
 
 - A coordinated merge can now advance from its exact Git CAS marker to a

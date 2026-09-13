@@ -849,6 +849,36 @@ defmodule ForgeMirrors do
     as: :recovery_context
 
   @doc false
+  def pull_merge_assignee_node_context(operation, now),
+    do: ForgeMirrors.PullMergeAssigneeProof.context(operation, now)
+
+  @doc false
+  def seed_pull_merge_assignee_node(operation, now, expected, profile),
+    do:
+      ForgeMirrors.PullMergeAssigneeProof.seed(
+        operation,
+        now,
+        expected,
+        profile,
+        &yield_pull_merge_relationship_proof_operation/2
+      )
+
+  @doc false
+  def pull_merge_label_node_context(operation, now),
+    do: ForgeMirrors.PullMergeLabelProof.context(operation, now)
+
+  @doc false
+  def seed_pull_merge_label_nodes(operation, now, expected, page),
+    do:
+      ForgeMirrors.PullMergeLabelProof.seed(
+        operation,
+        now,
+        expected,
+        page,
+        &yield_pull_merge_label_proof_operation/4
+      )
+
+  @doc false
   defdelegate record_pull_merge_ambiguous_effect(
                 operation,
                 now,
@@ -1731,6 +1761,31 @@ defmodule ForgeMirrors do
     owned_transition(operation, DateTime.truncate(now, :second), [:effect_pending],
       state: :effect_pending,
       next_attempt_at: DateTime.truncate(now, :second),
+      lease_owner: nil,
+      lease_expires_at: nil,
+      failure_class: nil,
+      failure_disposition: nil,
+      failure_detail: nil
+    )
+  end
+
+  defp yield_pull_merge_relationship_proof_operation(operation, now) do
+    owned_transition(operation, DateTime.truncate(now, :second), [:effect_pending],
+      state: :effect_pending,
+      next_attempt_at: DateTime.truncate(now, :second),
+      lease_owner: nil,
+      lease_expires_at: nil,
+      failure_class: nil,
+      failure_disposition: nil,
+      failure_detail: nil
+    )
+  end
+
+  defp yield_pull_merge_label_proof_operation(operation, checkpoint, retry_at, now) do
+    owned_transition(operation, DateTime.truncate(now, :second), [:effect_pending],
+      state: :effect_pending,
+      checkpoint: checkpoint,
+      next_attempt_at: DateTime.truncate(retry_at, :second),
       lease_owner: nil,
       lease_expires_at: nil,
       failure_class: nil,
