@@ -22,13 +22,13 @@ defmodule ForgeMirrors.ResourceInventory do
   defguardp valid_id(id) when is_integer(id) and id > 0 and id <= @max_id
   defguardp valid_cursor_id(id) when is_integer(id) and id >= 0 and id <= @max_id
 
-  @spec page(pos_integer(), :issue | :issue_comment | :pull, map() | nil, 1..100) ::
+  @spec page(pos_integer(), :issue | :issue_comment | :pull | :release, map() | nil, 1..100) ::
           {:ok, %{observations: [map()], next_cursor: map() | nil}}
           | {:error, :invalid_argument | :unbound_repository | :invalid_mapping}
   def page(repository_mirror_id, kind, cursor \\ nil, limit \\ 100)
 
   def page(repository_mirror_id, kind, cursor, limit)
-      when valid_id(repository_mirror_id) and kind in [:issue, :issue_comment, :pull] and
+      when valid_id(repository_mirror_id) and kind in [:issue, :issue_comment, :pull, :release] and
              is_integer(limit) and limit in 1..100 do
     with {:ok, {after_id, through_id}} <- bounds(cursor, repository_mirror_id, kind),
          %RepositoryMirror{repository_id: repository_id} when valid_id(repository_id) <-
@@ -81,9 +81,11 @@ defmodule ForgeMirrors.ResourceInventory do
                 :local_resource_id,
                 :github_object_id,
                 :github_number,
-                :confirmed_remote_updated_at
+                :confirmed_remote_updated_at,
+                :confirmed_snapshot
               ])
         )
+        |> enrich_release_inventory(kind, repository_id)
 
       if Enum.all?(rows, &valid_mapping?(&1, kind)) do
         entries = Enum.take(rows, limit)
@@ -98,7 +100,8 @@ defmodule ForgeMirrors.ResourceInventory do
             }
           end
 
-        {:ok, %{observations: Enum.map(entries, &observation/1), next_cursor: next_cursor}}
+        {:ok,
+         %{observations: Enum.map(entries, &observation(&1, kind)), next_cursor: next_cursor}}
       else
         {:error, :invalid_mapping}
       end
@@ -132,10 +135,16 @@ defmodule ForgeMirrors.ResourceInventory do
   defp bounds(_, _, _), do: {:error, :invalid_argument}
 
   defp valid_mapping?(mapping, kind) do
-    valid_id(mapping.github_object_id) and valid_id(mapping.github_number) and
+    valid_id(mapping.github_object_id) and valid_remote_identity?(mapping, kind) and
       valid_local_identity?(mapping, kind) and
       valid_timestamp?(mapping.confirmed_remote_updated_at)
   end
+
+  defp valid_remote_identity?(mapping, :release) do
+    valid_tag_name?(mapping[:inventory_tag_name])
+  end
+
+  defp valid_remote_identity?(mapping, _kind), do: valid_id(mapping.github_number)
 
   defp valid_local_identity?(%{state: :pending, local_resource_id: nil} = mapping, kind),
     do: mapping.local_resource_type in [nil, local_type(kind)]
@@ -146,11 +155,49 @@ defmodule ForgeMirrors.ResourceInventory do
   defp local_type(:issue), do: "ForgeIssues.Issue"
   defp local_type(:issue_comment), do: "ForgeIssues.Comment"
   defp local_type(:pull), do: "ForgePulls.PullRequest"
+  defp local_type(:release), do: "ForgeReleases.Release"
+
+  defp valid_tag_name?(value) do
+    is_binary(value) and String.valid?(value) and String.length(value) in 1..255 and
+      value == String.trim(value) and :binary.match(value, <<0>>) == :nomatch
+  end
+
+  defp enrich_release_inventory(rows, :release, repository_id) do
+    local_ids =
+      rows
+      |> Enum.map(& &1.local_resource_id)
+      |> Enum.filter(&valid_local_id?/1)
+
+    local_tags =
+      Repo.all(
+        from release in "releases",
+          where: release.repository_id == ^repository_id and release.id in ^local_ids,
+          select: {release.id, release.tag_name}
+      )
+      |> Map.new()
+
+    Enum.map(rows, fn mapping ->
+      snapshot_tag = get_in(mapping.confirmed_snapshot || %{}, ["tag_name"])
+      Map.put(mapping, :inventory_tag_name, snapshot_tag || local_tags[mapping.local_resource_id])
+    end)
+  end
+
+  defp enrich_release_inventory(rows, _kind, _repository_id), do: rows
+
+  defp valid_local_id?(id), do: is_integer(id) and id > 0 and id <= @max_id
+
   defp valid_timestamp?(nil), do: true
   defp valid_timestamp?(%DateTime{utc_offset: 0, std_offset: 0}), do: true
   defp valid_timestamp?(_), do: false
 
-  defp observation(mapping),
+  defp observation(mapping, :release),
+    do: %{
+      github_object_id: mapping.github_object_id,
+      tag_name: mapping.inventory_tag_name,
+      remote_updated_at: mapping.confirmed_remote_updated_at || @epoch
+    }
+
+  defp observation(mapping, _kind),
     do: %{
       github_object_id: mapping.github_object_id,
       github_number: mapping.github_number,

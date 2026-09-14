@@ -210,6 +210,70 @@ defmodule ForgeMirrors.ResourceReconciliationSchedulingTest do
     assert_git_does_not_activate(c)
   end
 
+  test "unfinished release children prevent Git finalizer activation", c do
+    c = bootstrap_binding(c)
+
+    c.organization
+    |> Ecto.Changeset.change(capabilities: %{"issues" => "enabled", "releases" => "enabled"})
+    |> Repo.update!()
+
+    root =
+      completed_operation(c, "reconcile.repository.bootstrap", %{
+        "bootstrap_repository_item_id" => c.item.id
+      })
+
+    completed_operation(c, "finalize.repository.git", %{"reconciliation_operation_id" => root.id})
+
+    {:ok, sweeps} =
+      ForgeMirrors.enqueue_repository_resource_reconciliations(
+        c.binding,
+        "bootstrap:item:#{c.item.id}",
+        c.now
+      )
+
+    release_sweep = Enum.find(sweeps, &(&1.kind == "reconcile.repository.releases"))
+
+    sweeps
+    |> Enum.reject(&(&1.id == release_sweep.id))
+    |> Enum.each(
+      &(&1
+        |> Ecto.Changeset.change(state: :completed, completed_at: c.now)
+        |> Repo.update!())
+    )
+
+    release_sweep = claim(c, release_sweep.kind, release_sweep.id)
+
+    assert {:ok, %{operation: yielded, operations: [release_child]}} =
+             ForgeMirrors.record_resource_reconciliation_page(
+               release_sweep,
+               :release,
+               [
+                 %{
+                   github_object_id: 55,
+                   tag_name: "v1.0.0",
+                   remote_updated_at: c.now
+                 }
+               ],
+               nil,
+               c.now
+             )
+
+    assert release_child.state == :pending
+    release_sweep = claim(c, yielded.kind, yielded.id)
+
+    assert {:ok, %{operation: completed}} =
+             ForgeMirrors.record_resource_reconciliation_page(
+               release_sweep,
+               :release,
+               [],
+               nil,
+               c.now
+             )
+
+    assert completed.state == :completed
+    assert Repo.get!(RepositoryMirror, c.binding.id).state == :discovered
+  end
+
   test "mapped cursor survives reclaim and rejects scope or high-water replacement", c do
     {:ok, [sweep | _]} =
       ForgeMirrors.enqueue_repository_resource_reconciliations(c.binding, "cursor-proof", c.now)

@@ -76,10 +76,10 @@ defmodule ForgeMirrors.WebhookInboxTest do
     assert {:ok, []} = ForgeMirrors.claim_webhook_deliveries("worker-a", 30, 10)
   end
 
-  test "claims safely backfill eligible legacy pull deliveries but not releases or paused mirrors" do
+  test "claims safely backfill eligible legacy resource deliveries but not paused mirrors" do
     active =
       active_organization_mirror_fixture(%{
-        capabilities: %{"pulls" => "enabled"}
+        capabilities: %{"pulls" => "enabled", "releases" => "enabled"}
       })
 
     binding = repository_mirror_fixture(active)
@@ -111,17 +111,26 @@ defmodule ForgeMirrors.WebhookInboxTest do
         pull_delivery_attrs(paused.github_installation_id, paused_binding.github_repository_id)
       )
 
-    assert {:ok, [claimed]} = ForgeMirrors.claim_webhook_deliveries("backfill-worker", 30, 10)
-    assert claimed.id == legacy_pull.id
-    assert claimed.organization_mirror_id == active.id
+    assert {:ok, [claimed_pull]} =
+             ForgeMirrors.claim_webhook_deliveries("backfill-worker", 30, 10)
 
-    assert {:ok, completed} =
-             ForgeMirrors.complete_webhook_delivery(claimed, "backfill-worker")
+    assert claimed_pull.id == legacy_pull.id
+    assert claimed_pull.organization_mirror_id == active.id
 
-    assert completed.state == :completed
+    assert {:ok, %{state: :completed}} =
+             ForgeMirrors.complete_webhook_delivery(claimed_pull, "backfill-worker")
+
+    assert {:ok, [claimed_release]} =
+             ForgeMirrors.claim_webhook_deliveries("backfill-worker", 30, 10)
+
+    assert claimed_release.id == legacy_release.id
+    assert claimed_release.organization_mirror_id == active.id
+
+    assert {:ok, %{state: :completed}} =
+             ForgeMirrors.complete_webhook_delivery(claimed_release, "backfill-worker")
+
     assert {:ok, []} = ForgeMirrors.claim_webhook_deliveries("backfill-worker", 30, 10)
 
-    assert Repo.get!(MirrorWebhookDelivery, legacy_release.id).state == :pending_unsupported
     assert Repo.get!(MirrorWebhookDelivery, paused_pull.id).state == :pending_unsupported
 
     processable_paused_pull =

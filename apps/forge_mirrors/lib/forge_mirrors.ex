@@ -361,7 +361,7 @@ defmodule ForgeMirrors do
     with :ok <- validate_owner(owner) do
       Repo.transaction(fn ->
         now = database_now!()
-        activate_legacy_pull_request_deliveries!(now)
+        activate_legacy_resource_deliveries!(now)
         recover_expired_webhook_deliveries!(now, max_internal_attempts)
         # `:utc_datetime` truncates fractional seconds. One extra stored second
         # keeps the requested lease duration from being shortened by that truncation.
@@ -791,7 +791,8 @@ defmodule ForgeMirrors do
                        Map.merge(hints, %{
                          "trigger" => "remote",
                          "delivery_guid" => stored.delivery_guid
-                       }),
+                       })
+                       |> maybe_put_release_action(stored.action),
                      next_attempt_at: now
                    }),
                  {:ok, _} <-
@@ -818,13 +819,21 @@ defmodule ForgeMirrors do
 
   def retain_webhook_resource_trigger(_, _), do: {:error, :invalid_argument}
 
+  defp maybe_put_release_action(cursor, action) do
+    if cursor["resource_kind"] == "release",
+      do: Map.put(cursor, "release_action", action),
+      else: cursor
+  end
+
   @resource_operation_kinds [
     "sync.pull",
     "sync.issue",
     "sync.issue_comment",
+    "sync.release",
     "reconcile.repository.pull_heads",
     "reconcile.repository.issues",
-    "reconcile.repository.issue_comments"
+    "reconcile.repository.issue_comments",
+    "reconcile.repository.releases"
   ]
 
   @doc false
@@ -987,6 +996,395 @@ defmodule ForgeMirrors do
   def resource_operation_context(_), do: {:error, :invalid_transition}
 
   @doc false
+  def release_operation_context(%MirrorOperation{} = operation) do
+    Repo.transaction(fn ->
+      with {:ok, persisted, %{resource_kind: :release} = scope} <-
+             lock_resource_operation(operation),
+           {:ok, mapping} <- resource_mapping(persisted, :release),
+           false <- mapping_value(mapping, :state) == :conflicted,
+           {:ok, local} <- release_local_state(persisted, scope, mapping),
+           tag_name <- release_target_tag(persisted, local),
+           {:ok, tag_proof} <-
+             release_tag_proof(persisted, scope, tag_name, local.local_deleted) do
+        %{
+          resource_kind: :release,
+          repository_id: scope.repository_id,
+          repository_mirror_id: scope.repository_mirror_id,
+          github_repository_id: scope.github_repository_id,
+          github_installation_id: scope.github_installation_id,
+          metadata_permissions: scope.metadata_permissions,
+          remote_owner: scope.remote_owner,
+          remote_repository: scope.remote_repository,
+          trigger: resource_trigger(persisted.cursor["trigger"]),
+          local_resource_id: local.local_resource_id,
+          github_object_id:
+            persisted.cursor["github_object_id"] || mapping_value(mapping, :github_object_id),
+          github_node_id: mapping_value(mapping, :github_node_id),
+          local_version: local.local_version,
+          local_deleted: local.local_deleted,
+          tag_name: tag_name,
+          fields: local.fields,
+          baseline: mapping_value(mapping, :confirmed_snapshot) || :missing,
+          confirmed_local_version: mapping_value(mapping, :confirmed_local_version),
+          confirmed_remote_updated_at: mapping_value(mapping, :confirmed_remote_updated_at),
+          resource_state_lock_version: mapping_value(mapping, :lock_version) || :missing,
+          effect_marker: persisted.external_effect_marker,
+          tag_proof: tag_proof,
+          since:
+            if(persisted.kind == "reconcile.repository.releases",
+              do: ~U[1970-01-01 00:00:00Z]
+            ),
+          page: persisted.checkpoint["page"] || 1,
+          phase: if(persisted.checkpoint["phase"] == "mapped", do: :mapped, else: :remote),
+          mapping_cursor: persisted.checkpoint["mapping_cursor"],
+          provenance: %{
+            delivery_guid: persisted.cursor["delivery_guid"],
+            outbox_event_id: persisted.cursor["outbox_event_id"],
+            causation_id: persisted.cursor["causation_id"],
+            correlation_id: persisted.cursor["correlation_id"]
+          }
+        }
+      else
+        true -> Repo.rollback(:resource_conflicted)
+        {:error, reason} -> Repo.rollback(reason)
+        _ -> Repo.rollback(:invalid_transition)
+      end
+    end)
+    |> normalize_transaction_result()
+  end
+
+  def release_operation_context(_), do: {:error, :invalid_transition}
+
+  @doc false
+  def record_release_canonical_observation(
+        %MirrorOperation{} = operation,
+        observation,
+        %DateTime{} = now
+      )
+      when is_map(observation) do
+    with :ok <- validate_utc(now),
+         true <-
+           Enum.sort(Map.keys(observation)) ==
+             [:github_object_id, :remote_updated_at, :tag_name],
+         true <- positive_resource_id?(observation[:github_object_id]),
+         true <- valid_release_tag_name?(observation[:tag_name]),
+         :ok <- validate_utc(observation[:remote_updated_at]) do
+      Repo.transaction(fn ->
+        with {:ok, persisted, %{resource_kind: :release}} <- lock_resource_operation(operation),
+             true <- persisted.state == :processing and is_nil(persisted.external_effect_marker),
+             true <- persisted.cursor["trigger"] in ["remote", "reconcile"],
+             true <- persisted.cursor["github_object_id"] == observation.github_object_id,
+             :ok <- newer_release_observation(persisted.checkpoint, observation),
+             {:ok, yielded} <-
+               owned_transition(persisted, now, [:processing],
+                 state: :pending,
+                 checkpoint:
+                   persisted.checkpoint
+                   |> Map.delete("canonical_release_deletion")
+                   |> Map.put("canonical_release", %{
+                     "github_object_id" => observation.github_object_id,
+                     "tag_name" => observation.tag_name,
+                     "remote_updated_at" => DateTime.to_iso8601(observation.remote_updated_at)
+                   }),
+                 next_attempt_at: now,
+                 lease_owner: nil,
+                 lease_expires_at: nil,
+                 failure_class: nil,
+                 failure_disposition: nil,
+                 failure_detail: nil
+               ) do
+          yielded
+        else
+          false -> Repo.rollback(:invalid_transition)
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+      |> normalize_transaction_result()
+    else
+      false -> {:error, :invalid_argument}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def record_release_canonical_observation(_, _, _), do: {:error, :invalid_argument}
+
+  @doc false
+  def record_release_canonical_deletion(
+        %MirrorOperation{} = operation,
+        evidence,
+        %DateTime{} = now
+      )
+      when is_map(evidence) do
+    with :ok <- validate_utc(now),
+         true <- Enum.sort(Map.keys(evidence)) == [:github_object_id, :observed_at],
+         true <- positive_resource_id?(evidence[:github_object_id]),
+         :ok <- validate_utc(evidence[:observed_at]) do
+      Repo.transaction(fn ->
+        with {:ok, persisted, %{resource_kind: :release}} <- lock_resource_operation(operation),
+             true <- persisted.state == :processing and is_nil(persisted.external_effect_marker),
+             true <- persisted.cursor["trigger"] in ["remote", "reconcile"],
+             {:ok,
+              %MirrorResourceState{
+                resource_kind: :release,
+                local_resource_type: "ForgeReleases.Release",
+                local_resource_id: local_resource_id,
+                github_object_id: github_object_id,
+                state: mapping_state
+              }} <- resource_mapping(persisted, :release),
+             true <- positive_resource_id?(local_resource_id),
+             true <- mapping_state in [:pending, :confirmed, :deleted],
+             true <- persisted.cursor["github_object_id"] == evidence.github_object_id,
+             true <- github_object_id == evidence.github_object_id,
+             :ok <- newer_release_deletion(persisted.checkpoint, evidence),
+             {:ok, yielded} <-
+               owned_transition(persisted, now, [:processing],
+                 state: :pending,
+                 checkpoint:
+                   persisted.checkpoint
+                   |> Map.delete("canonical_release")
+                   |> Map.put("canonical_release_deletion", %{
+                     "github_object_id" => evidence.github_object_id,
+                     "observed_at" => DateTime.to_iso8601(evidence.observed_at)
+                   }),
+                 next_attempt_at: now,
+                 lease_owner: nil,
+                 lease_expires_at: nil,
+                 failure_class: nil,
+                 failure_disposition: nil,
+                 failure_detail: nil
+               ) do
+          yielded
+        else
+          false -> Repo.rollback(:invalid_transition)
+          {:error, reason} -> Repo.rollback(reason)
+          _ -> Repo.rollback(:invalid_transition)
+        end
+      end)
+      |> normalize_transaction_result()
+    else
+      false -> {:error, :invalid_argument}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def record_release_canonical_deletion(_, _, _), do: {:error, :invalid_argument}
+
+  defp newer_release_observation(checkpoint, observation) do
+    with :ok <- newer_than_release_presence(checkpoint["canonical_release"], observation),
+         :ok <- newer_than_release_deletion(checkpoint["canonical_release_deletion"], observation) do
+      :ok
+    end
+  end
+
+  defp newer_than_release_presence(nil, _observation), do: :ok
+
+  defp newer_than_release_presence(previous, observation) when is_map(previous) do
+    with {:ok, previous_at, 0} <- DateTime.from_iso8601(previous["remote_updated_at"]),
+         true <- previous["github_object_id"] == observation.github_object_id do
+      case DateTime.compare(observation.remote_updated_at, previous_at) do
+        :gt ->
+          :ok
+
+        :eq ->
+          if previous["tag_name"] == observation.tag_name,
+            do: :ok,
+            else: {:error, :stale_baseline}
+
+        _ ->
+          {:error, :stale_baseline}
+      end
+    else
+      _ -> {:error, :stale_baseline}
+    end
+  end
+
+  defp newer_than_release_presence(_previous, _observation), do: {:error, :stale_baseline}
+
+  defp newer_than_release_deletion(nil, _observation), do: :ok
+
+  defp newer_than_release_deletion(previous, observation) when is_map(previous) do
+    with {:ok, previous_at, 0} <- DateTime.from_iso8601(previous["observed_at"]),
+         true <- previous["github_object_id"] == observation.github_object_id,
+         :gt <- DateTime.compare(observation.remote_updated_at, previous_at) do
+      :ok
+    else
+      _ -> {:error, :stale_baseline}
+    end
+  end
+
+  defp newer_than_release_deletion(_previous, _observation), do: {:error, :stale_baseline}
+
+  defp newer_release_deletion(checkpoint, evidence) do
+    with :ok <- newer_deletion_than_release_presence(checkpoint["canonical_release"], evidence),
+         :ok <-
+           newer_deletion_than_release_deletion(
+             checkpoint["canonical_release_deletion"],
+             evidence
+           ) do
+      :ok
+    end
+  end
+
+  defp newer_deletion_than_release_presence(nil, _evidence), do: :ok
+
+  defp newer_deletion_than_release_presence(previous, evidence) when is_map(previous) do
+    with {:ok, previous_at, 0} <- DateTime.from_iso8601(previous["remote_updated_at"]),
+         true <- previous["github_object_id"] == evidence.github_object_id,
+         :gt <- DateTime.compare(evidence.observed_at, previous_at) do
+      :ok
+    else
+      _ -> {:error, :stale_baseline}
+    end
+  end
+
+  defp newer_deletion_than_release_presence(_previous, _evidence),
+    do: {:error, :stale_baseline}
+
+  defp newer_deletion_than_release_deletion(nil, _evidence), do: :ok
+
+  defp newer_deletion_than_release_deletion(previous, evidence) when is_map(previous) do
+    with {:ok, previous_at, 0} <- DateTime.from_iso8601(previous["observed_at"]),
+         true <- previous["github_object_id"] == evidence.github_object_id,
+         comparison when comparison in [:eq, :gt] <-
+           DateTime.compare(evidence.observed_at, previous_at) do
+      :ok
+    else
+      _ -> {:error, :stale_baseline}
+    end
+  end
+
+  defp newer_deletion_than_release_deletion(_previous, _evidence),
+    do: {:error, :stale_baseline}
+
+  @doc false
+  def prepare_release_tag_proof(
+        %MirrorOperation{} = operation,
+        tag_name,
+        %DateTime{} = now
+      ) do
+    ref_name = "refs/tags/#{tag_name}"
+
+    with :ok <- validate_utc(now),
+         true <- valid_release_tag_name?(tag_name) and standard_git_ref?(ref_name) do
+      Repo.transaction(fn ->
+        persisted =
+          MirrorOperation
+          |> where([candidate], candidate.id == ^operation.id)
+          |> lock("FOR UPDATE")
+          |> Repo.one()
+
+        case persisted do
+          %MirrorOperation{kind: "sync.release", state: :completed} ->
+            recover_release_tag_proof_split(persisted, operation, tag_name)
+
+          %MirrorOperation{kind: "sync.release"} ->
+            with :ok <- lock_effect_scope(operation),
+                 {:ok, owned} <- lock_owned_operation(operation, ["sync.release"]),
+                 true <- owned.cursor == operation.cursor,
+                 true <- owned.state == :processing and is_nil(owned.external_effect_marker),
+                 {:ok, scope} <- resource_scope(owned),
+                 true <- scope.resource_kind == :release,
+                 {:ok, mapping} <- resource_mapping(owned, :release),
+                 {:ok, local} <- release_local_state(owned, scope, mapping),
+                 true <- release_proof_tag_allowed?(owned, local, tag_name),
+                 true <- is_nil(owned.cursor["tag_proof_operation_id"]),
+                 {:ok, result} <- create_release_tag_proof_split(owned, tag_name, now) do
+              result
+            else
+              false -> Repo.rollback(:invalid_transition)
+              {:error, reason} -> Repo.rollback(reason)
+            end
+
+          _ ->
+            Repo.rollback(:invalid_transition)
+        end
+      end)
+      |> normalize_transaction_result()
+    else
+      false -> {:error, :invalid_argument}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def prepare_release_tag_proof(_, _, _), do: {:error, :invalid_argument}
+
+  defp create_release_tag_proof_split(operation, tag_name, now) do
+    ref_name = "refs/tags/#{tag_name}"
+    existing = locked_git_ref_state(operation.repository_mirror_id, ref_name)
+    digest = :crypto.hash(:sha256, ref_name) |> Base.encode16(case: :lower)
+
+    with {:ok, tag_operation} <-
+           enqueue_operation(%{
+             organization_mirror_id: operation.organization_mirror_id,
+             repository_mirror_id: operation.repository_mirror_id,
+             kind: "sync.git_ref",
+             dedupe_key: "release-tag-proof:#{operation.id}:#{digest}",
+             cursor: %{
+               "initial_absence" => is_nil(existing) or existing.state == :deleted,
+               "ref_name" => ref_name,
+               "release_parent_operation_id" => operation.id,
+               "trigger" => "reconcile"
+             },
+             next_attempt_at: now
+           }),
+         {:ok, continuation} <-
+           enqueue_operation(%{
+             organization_mirror_id: operation.organization_mirror_id,
+             repository_mirror_id: operation.repository_mirror_id,
+             kind: "sync.release",
+             dedupe_key: "release-continuation:#{operation.id}:#{digest}",
+             cursor:
+               Map.merge(operation.cursor, %{
+                 "tag_proof_operation_id" => tag_operation.id,
+                 "tag_proof_parent_operation_id" => operation.id,
+                 "tag_proof_tag_name" => tag_name,
+                 "tag_proof_previous_oid" => confirmed_tag_oid(existing),
+                 "tag_proof_previous_lock_version" =>
+                   if(existing, do: existing.lock_version, else: 0)
+               }),
+             next_attempt_at: now
+           }),
+         {:ok, completed} <- complete_operation(operation, now) do
+      {:ok, %{operation: completed, tag_operation: tag_operation, continuation: continuation}}
+    end
+  end
+
+  defp recover_release_tag_proof_split(persisted, supplied, tag_name) do
+    digest =
+      :crypto.hash(:sha256, "refs/tags/#{tag_name}")
+      |> Base.encode16(case: :lower)
+
+    tag_operation =
+      Repo.get_by(MirrorOperation,
+        dedupe_key: "release-tag-proof:#{persisted.id}:#{digest}"
+      )
+
+    continuation =
+      Repo.get_by(MirrorOperation,
+        dedupe_key: "release-continuation:#{persisted.id}:#{digest}"
+      )
+
+    if persisted.organization_mirror_id == supplied.organization_mirror_id and
+         persisted.repository_mirror_id == supplied.repository_mirror_id and
+         persisted.cursor == supplied.cursor and match?(%MirrorOperation{}, tag_operation) and
+         match?(%MirrorOperation{}, continuation) and
+         tag_operation.cursor["release_parent_operation_id"] == persisted.id and
+         continuation.cursor["tag_proof_operation_id"] == tag_operation.id and
+         continuation.cursor["tag_proof_parent_operation_id"] == persisted.id and
+         continuation.cursor["tag_proof_tag_name"] == tag_name do
+      %{operation: persisted, tag_operation: tag_operation, continuation: continuation}
+    else
+      Repo.rollback(:invalid_transition)
+    end
+  end
+
+  defp confirmed_tag_oid(%MirrorRefState{state: :confirmed, confirmed_oid: oid})
+       when is_binary(oid),
+       do: oid
+
+  defp confirmed_tag_oid(_), do: nil
+
+  @doc false
   def mapped_pull_pair_context(operation),
     do: ForgeMirrors.PullPairBoundary.context(operation, &resource_operation_context/1)
 
@@ -1030,6 +1428,243 @@ defmodule ForgeMirrors do
       initial
     end
   end
+
+  defp release_local_state(operation, scope, mapping) do
+    local_id = resource_local_id(operation.cursor) || mapping_value(mapping, :local_resource_id)
+    mapped_tag_name = get_in(mapping_value(mapping, :confirmed_snapshot) || %{}, ["tag_name"])
+
+    local =
+      if positive_resource_id?(local_id) do
+        Repo.one(
+          from release in "releases",
+            where: release.id == ^local_id and release.repository_id == ^scope.repository_id,
+            select: %{
+              local_resource_id: release.id,
+              local_version: release.sync_version,
+              local_deleted: not is_nil(release.deleted_at),
+              tag_name: release.tag_name,
+              fields: %{
+                "tag_name" => release.tag_name,
+                "name" => release.name,
+                "body" => release.body,
+                "draft" => release.draft,
+                "prerelease" => release.prerelease,
+                "target_commitish" => release.target_commitish,
+                "published_at" => release.published_at
+              }
+            },
+            lock: "FOR UPDATE"
+        )
+      end
+
+    local =
+      local ||
+        %{
+          local_resource_id: local_id,
+          local_version: operation.cursor["sync_version"],
+          local_deleted: operation.cursor["deleted"] == true,
+          tag_name: operation.cursor["tag_name"] || mapped_tag_name,
+          fields: nil
+        }
+
+    if (is_nil(local.local_resource_id) or positive_resource_id?(local.local_resource_id)) and
+         (is_nil(local.local_version) or positive_resource_id?(local.local_version)) and
+         (operation.kind == "reconcile.repository.releases" or
+            valid_release_tag_name?(local.tag_name)) do
+      {:ok, local}
+    else
+      {:error, :invalid_transition}
+    end
+  end
+
+  defp release_target_tag(%{cursor: %{"trigger" => "local"}}, local), do: local.tag_name
+
+  defp release_target_tag(operation, local) do
+    canonical = operation.checkpoint["canonical_release"] || %{}
+
+    operation.cursor["tag_proof_tag_name"] || canonical["tag_name"] ||
+      operation.cursor["tag_name"] || local.tag_name
+  end
+
+  defp release_proof_tag_allowed?(%{cursor: %{"trigger" => "local"}}, local, tag_name),
+    do: local.tag_name == tag_name
+
+  defp release_proof_tag_allowed?(operation, _local, tag_name) do
+    case operation.checkpoint["canonical_release"] do
+      %{
+        "github_object_id" => github_object_id,
+        "tag_name" => ^tag_name,
+        "remote_updated_at" => remote_updated_at
+      } = canonical
+      when map_size(canonical) == 3 ->
+        github_object_id == operation.cursor["github_object_id"] and
+          is_binary(remote_updated_at) and
+          match?({:ok, %DateTime{}, 0}, DateTime.from_iso8601(remote_updated_at))
+
+      nil ->
+        operation.cursor["tag_name"] == tag_name
+
+      _ ->
+        false
+    end
+  end
+
+  defp release_tag_proof(
+         %{kind: "reconcile.repository.releases"},
+         _scope,
+         _tag_name,
+         _local_deleted
+       ),
+       do: {:ok, :not_required}
+
+  defp release_tag_proof(operation, scope, tag_name, local_deleted) do
+    case operation.cursor["tag_proof_operation_id"] do
+      nil ->
+        if release_tag_required?(operation, local_deleted),
+          do: {:ok, :required},
+          else: {:ok, :not_required}
+
+      child_id when is_integer(child_id) and child_id > 0 ->
+        load_release_tag_proof(operation, scope, tag_name, child_id)
+
+      _ ->
+        {:error, :invalid_transition}
+    end
+  end
+
+  defp release_tag_required?(%{cursor: %{"trigger" => "local"}}, local_deleted),
+    do: not local_deleted
+
+  defp release_tag_required?(%{cursor: %{"trigger" => "remote"}} = operation, _local_deleted),
+    do: not canonical_release_deletion?(operation)
+
+  defp release_tag_required?(operation, _local_deleted),
+    do: not canonical_release_deletion?(operation)
+
+  defp canonical_release_deletion?(operation) do
+    case operation.checkpoint["canonical_release_deletion"] do
+      %{"github_object_id" => github_object_id, "observed_at" => observed_at} = evidence
+      when map_size(evidence) == 2 ->
+        github_object_id == operation.cursor["github_object_id"] and
+          positive_resource_id?(github_object_id) and is_binary(observed_at) and
+          match?({:ok, %DateTime{}, 0}, DateTime.from_iso8601(observed_at))
+
+      _ ->
+        false
+    end
+  end
+
+  defp load_release_tag_proof(operation, scope, tag_name, child_id) do
+    ref_name = "refs/tags/#{tag_name}"
+    parent_id = operation.cursor["tag_proof_parent_operation_id"]
+    previous_oid = operation.cursor["tag_proof_previous_oid"]
+    previous_lock_version = operation.cursor["tag_proof_previous_lock_version"]
+
+    child =
+      MirrorOperation
+      |> where([candidate], candidate.id == ^child_id)
+      |> lock("FOR UPDATE")
+      |> Repo.one()
+
+    parent =
+      MirrorOperation
+      |> where([candidate], candidate.id == ^parent_id)
+      |> lock("FOR UPDATE")
+      |> Repo.one()
+
+    ref_state = locked_git_ref_state(operation.repository_mirror_id, ref_name)
+    child_proof = child && child.checkpoint["release_tag_proof"]
+
+    exact_child =
+      match?(%MirrorOperation{kind: "sync.git_ref"}, child) and
+        child.organization_mirror_id == operation.organization_mirror_id and
+        child.repository_mirror_id == operation.repository_mirror_id and
+        Enum.sort(Map.keys(child.cursor)) ==
+          ~w(initial_absence ref_name release_parent_operation_id trigger) and
+        is_boolean(child.cursor["initial_absence"]) and child.cursor["ref_name"] == ref_name and
+        child.cursor["release_parent_operation_id"] == parent_id and
+        child.cursor["trigger"] == "reconcile" and
+        match?(%MirrorOperation{kind: "sync.release", state: :completed}, parent) and
+        parent.organization_mirror_id == operation.organization_mirror_id and
+        parent.repository_mirror_id == operation.repository_mirror_id
+
+    cond do
+      not is_integer(parent_id) or parent_id <= 0 or not is_integer(previous_lock_version) or
+        previous_lock_version < 0 or operation.cursor["tag_proof_tag_name"] != tag_name ->
+        {:error, :invalid_transition}
+
+      not exact_child ->
+        {:error, :invalid_transition}
+
+      child.state == :failed ->
+        if (not is_nil(previous_oid) and ref_state) && ref_state.confirmed_oid != previous_oid,
+          do: {:error, :tag_retarget},
+          else: {:error, :release_tag_missing}
+
+      child.state != :completed or not match?(%DateTime{}, child.completed_at) ->
+        {:error, :invalid_transition}
+
+      not valid_release_child_proof?(
+        child_proof,
+        child,
+        parent_id,
+        ref_name,
+        previous_lock_version
+      ) ->
+        {:error, :invalid_transition}
+
+      child_proof["state"] == "deleted" or is_nil(child_proof["confirmed_oid"]) ->
+        {:error, :release_tag_missing}
+
+      not is_nil(previous_oid) and child_proof["confirmed_oid"] != previous_oid ->
+        {:error, :tag_retarget}
+
+      is_nil(ref_state) or ref_state.state == :deleted or is_nil(ref_state.confirmed_oid) ->
+        {:error, :release_tag_missing}
+
+      ref_state.confirmed_oid != child_proof["confirmed_oid"] ->
+        {:error, :tag_retarget}
+
+      ref_state.state != :confirmed or ref_state.ref_kind != :tag or
+        ref_state.last_local_oid != child_proof["local_oid"] or
+        ref_state.last_remote_oid != child_proof["remote_oid"] or
+        ref_state.lock_version != child_proof["ref_state_lock_version"] or
+        not match?(%DateTime{}, ref_state.last_confirmed_at) or
+          DateTime.to_iso8601(ref_state.last_confirmed_at) != child_proof["confirmed_at"] ->
+        {:error, :invalid_transition}
+
+      true ->
+        {:ok,
+         %{
+           tag_name: tag_name,
+           ref_name: ref_name,
+           confirmed_oid: ref_state.confirmed_oid,
+           local_oid: ref_state.last_local_oid,
+           remote_oid: ref_state.last_remote_oid,
+           confirmed_at: ref_state.last_confirmed_at,
+           ref_state_lock_version: ref_state.lock_version,
+           repository_id: scope.repository_id
+         }}
+    end
+  end
+
+  defp valid_release_child_proof?(proof, child, parent_id, ref_name, previous_lock_version)
+       when is_map(proof) do
+    Enum.sort(Map.keys(proof)) ==
+      ~w(confirmed_at confirmed_oid local_oid ref_name ref_state_lock_version release_parent_operation_id remote_oid state) and
+      proof["release_parent_operation_id"] == parent_id and proof["ref_name"] == ref_name and
+      is_integer(proof["ref_state_lock_version"]) and
+      proof["ref_state_lock_version"] > previous_lock_version and
+      proof["confirmed_at"] == DateTime.to_iso8601(child.completed_at) and
+      proof["state"] in ["confirmed", "deleted"] and
+      ((proof["state"] == "deleted" and is_nil(proof["confirmed_oid"]) and
+          is_nil(proof["local_oid"]) and is_nil(proof["remote_oid"])) or
+         (proof["state"] == "confirmed" and canonical_oid?(proof["confirmed_oid"]) and
+            proof["local_oid"] == proof["confirmed_oid"] and
+            proof["remote_oid"] == proof["confirmed_oid"]))
+  end
+
+  defp valid_release_child_proof?(_, _, _, _, _), do: false
 
   defp resource_parent(%{kind: "sync.issue_comment"} = operation, mapping) do
     cursor = operation.cursor
@@ -1392,10 +2027,10 @@ defmodule ForgeMirrors do
         next_page,
         %DateTime{} = now
       )
-      when kind in [:issue, :issue_comment, :pull] and is_list(observations) and
+      when kind in [:issue, :issue_comment, :pull, :release] and is_list(observations) and
              length(observations) <= 100 do
     with :ok <- validate_utc(now),
-         true <- Enum.all?(observations, &valid_resource_observation?/1) do
+         true <- Enum.all?(observations, &valid_resource_observation?(&1, kind)) do
       Repo.transaction(fn ->
         with {:ok, persisted, scope} <- lock_resource_operation(operation),
              true <-
@@ -1409,15 +2044,27 @@ defmodule ForgeMirrors do
              true <- valid_resource_next_cursor?(persisted, next_page) do
           children =
             Enum.flat_map(observations, fn observation ->
-              cursor = %{
-                "trigger" => "reconcile",
-                "resource_kind" => Atom.to_string(kind),
-                "github_object_id" => observation.github_object_id,
-                "github_number" => observation.github_number,
-                "github_issue_id" => observation[:github_issue_id],
-                "remote_updated_at" => DateTime.to_iso8601(observation.remote_updated_at),
-                "sweep_id" => sweep
-              }
+              cursor =
+                if kind == :release do
+                  %{
+                    "trigger" => "reconcile",
+                    "resource_kind" => "release",
+                    "github_object_id" => observation.github_object_id,
+                    "tag_name" => observation.tag_name,
+                    "remote_updated_at" => DateTime.to_iso8601(observation.remote_updated_at),
+                    "sweep_id" => sweep
+                  }
+                else
+                  %{
+                    "trigger" => "reconcile",
+                    "resource_kind" => Atom.to_string(kind),
+                    "github_object_id" => observation.github_object_id,
+                    "github_number" => observation.github_number,
+                    "github_issue_id" => observation[:github_issue_id],
+                    "remote_updated_at" => DateTime.to_iso8601(observation.remote_updated_at),
+                    "sweep_id" => sweep
+                  }
+                end
 
               {:ok, digest} = resource_fingerprint(cursor)
 
@@ -1543,7 +2190,14 @@ defmodule ForgeMirrors do
 
   defp valid_mapping_cursor?(_, _), do: false
 
-  defp valid_resource_observation?(value) when is_map(value) do
+  defp valid_resource_observation?(value, :release) when is_map(value) do
+    Enum.sort(Map.keys(value)) == [:github_object_id, :remote_updated_at, :tag_name] and
+      positive_resource_id?(value[:github_object_id]) and
+      valid_release_tag_name?(value[:tag_name]) and
+      validate_utc(value[:remote_updated_at]) == :ok
+  end
+
+  defp valid_resource_observation?(value, _kind) when is_map(value) do
     Enum.all?(
       Map.keys(value),
       &(&1 in [:github_object_id, :github_number, :github_issue_id, :remote_updated_at])
@@ -1554,7 +2208,7 @@ defmodule ForgeMirrors do
       validate_utc(value[:remote_updated_at]) == :ok
   end
 
-  defp valid_resource_observation?(_), do: false
+  defp valid_resource_observation?(_, _), do: false
 
   @doc false
   def resource_fingerprint(snapshot) when is_map(snapshot) and not is_struct(snapshot) do
@@ -1648,6 +2302,253 @@ defmodule ForgeMirrors do
   end
 
   def confirm_resource_operation(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  @doc false
+  def confirm_release_operation(
+        %MirrorOperation{} = operation,
+        %DateTime{} = now,
+        expected,
+        confirmation,
+        domain_multi_fun
+      )
+      when is_map(expected) and is_map(confirmation) and is_function(domain_multi_fun, 1) do
+    with :ok <- validate_utc(now),
+         :ok <- validate_release_confirmation(confirmation),
+         {:ok, confirmed_snapshot} <-
+           canonical_release_snapshot(confirmation.confirmed_snapshot),
+         {:ok, fingerprint} <- resource_fingerprint(confirmed_snapshot) do
+      Repo.transaction(fn ->
+        with {:ok, persisted, %{resource_kind: :release} = scope} <-
+               lock_resource_operation(operation),
+             {:ok, mapping} <- resource_mapping(persisted, :release),
+             {:ok, local} <- release_local_state(persisted, scope, mapping),
+             tag_name <- release_target_tag(persisted, local),
+             {:ok, tag_proof} <-
+               release_tag_proof(persisted, scope, tag_name, local.local_deleted),
+             :ok <-
+               release_confirmation_precondition(
+                 persisted,
+                 mapping,
+                 local,
+                 tag_name,
+                 expected,
+                 confirmation,
+                 tag_proof
+               ),
+             {:ok, %{resource: projection}} <-
+               Repo.transaction(domain_multi_fun.(Ecto.Multi.new())),
+             :ok <-
+               validate_release_projection(
+                 projection,
+                 scope,
+                 local,
+                 tag_name,
+                 confirmation,
+                 confirmed_snapshot,
+                 fingerprint
+               ),
+             {:ok, resource_state} <-
+               persist_release_confirmation(
+                 persisted,
+                 mapping,
+                 projection,
+                 confirmation,
+                 confirmed_snapshot,
+                 fingerprint
+               ),
+             {:ok, completed} <- complete_operation(persisted, now) do
+          maybe_activate_resource_repository(completed, now)
+          %{operation: completed, resource_state: resource_state, resource: projection}
+        else
+          {:error, _step, reason, _changes} -> Repo.rollback(reason)
+          {:error, reason} -> Repo.rollback(reason)
+          _ -> Repo.rollback(:invalid_projection)
+        end
+      end)
+      |> normalize_transaction_result()
+    end
+  end
+
+  def confirm_release_operation(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  defp validate_release_confirmation(confirmation) do
+    keys =
+      ~w(confirmed_local_version confirmed_snapshot github_node_id github_object_id remote_updated_at state tag_proof)a
+
+    if Enum.sort(Map.keys(confirmation)) == Enum.sort(keys) and
+         positive_resource_id?(confirmation[:github_object_id]) and
+         positive_resource_id?(confirmation[:confirmed_local_version]) and
+         bounded_trimmed_string?(confirmation[:github_node_id], 255) and
+         confirmation[:state] in [:confirmed, :deleted] and
+         is_map(confirmation[:confirmed_snapshot]) and
+         validate_utc(confirmation[:remote_updated_at]) == :ok,
+       do: :ok,
+       else: {:error, :invalid_confirmation}
+  end
+
+  defp canonical_release_snapshot(snapshot) when is_map(snapshot) do
+    keys = ~w(body draft name prerelease published_at tag_name target_commitish)
+
+    with true <- Enum.sort(Map.keys(snapshot)) == keys,
+         true <- valid_release_tag_name?(snapshot["tag_name"]),
+         true <- is_nil(snapshot["name"]) or is_binary(snapshot["name"]),
+         true <- is_nil(snapshot["body"]) or is_binary(snapshot["body"]),
+         true <- is_boolean(snapshot["draft"]),
+         true <- is_boolean(snapshot["prerelease"]),
+         true <- bounded_trimmed_string?(snapshot["target_commitish"], 255),
+         {:ok, published_at} <- canonical_release_published_at(snapshot["published_at"]) do
+      {:ok, Map.put(snapshot, "published_at", published_at)}
+    else
+      _ -> {:error, :invalid_confirmation}
+    end
+  end
+
+  defp canonical_release_snapshot(_), do: {:error, :invalid_confirmation}
+
+  defp canonical_release_published_at(nil), do: {:ok, nil}
+
+  defp canonical_release_published_at(%DateTime{} = published_at) do
+    with :ok <- validate_utc(published_at) do
+      {:ok, DateTime.to_iso8601(published_at)}
+    end
+  end
+
+  defp canonical_release_published_at(published_at) when is_binary(published_at) do
+    with {:ok, parsed, 0} <- DateTime.from_iso8601(published_at),
+         :ok <- validate_utc(parsed) do
+      {:ok, DateTime.to_iso8601(parsed)}
+    else
+      _ -> {:error, :invalid_confirmation}
+    end
+  end
+
+  defp canonical_release_published_at(_), do: {:error, :invalid_confirmation}
+
+  defp release_confirmation_precondition(
+         operation,
+         mapping,
+         local,
+         tag_name,
+         expected,
+         confirmation,
+         tag_proof
+       ) do
+    proof_matches =
+      if release_tag_required?(operation, local.local_deleted),
+        do:
+          is_map(tag_proof) and expected[:tag_proof] == tag_proof and
+            confirmation.tag_proof == tag_proof,
+        else:
+          expected[:tag_proof] == :not_required and confirmation.tag_proof == :not_required and
+            confirmation.state == :deleted
+
+    if expected[:resource_state_lock_version] ==
+         (mapping_value(mapping, :lock_version) || :missing) and
+         expected[:effect_marker] == operation.external_effect_marker and
+         expected[:local_resource_id] == local.local_resource_id and
+         expected[:local_version] == local.local_version and
+         expected[:local_deleted] == local.local_deleted and
+         expected[:tag_name] == tag_name and
+         expected[:baseline] == (mapping_value(mapping, :confirmed_snapshot) || :missing) and
+         expected[:github_node_id] == mapping_value(mapping, :github_node_id) and
+         (is_nil(mapping_value(mapping, :github_node_id)) or
+            mapping.github_node_id == confirmation.github_node_id) and
+         (is_nil(expected[:github_object_id]) or
+            expected.github_object_id == confirmation.github_object_id) and proof_matches,
+       do: :ok,
+       else: {:error, :stale_baseline}
+  end
+
+  defp validate_release_projection(
+         projection,
+         scope,
+         local,
+         tag_name,
+         confirmation,
+         confirmed_snapshot,
+         fingerprint
+       )
+       when is_map(projection) do
+    fields = projection[:fields]
+
+    with true <-
+           projection[:repository_id] == scope.repository_id and
+             projection[:resource_kind] == :release and
+             projection[:local_resource_type] == "ForgeReleases.Release" and
+             positive_resource_id?(projection[:local_resource_id]) and
+             positive_resource_id?(projection[:local_version]) and
+             projection.local_version >= confirmation.confirmed_local_version and
+             is_boolean(projection[:deleted]) and is_map(fields),
+         true <-
+           is_nil(local.local_resource_id) or
+             local.local_resource_id == projection.local_resource_id,
+         true <- fields["tag_name"] == tag_name,
+         {:ok, projection_snapshot} <- canonical_release_snapshot(fields),
+         {:ok, projection_fingerprint} <- resource_fingerprint(projection_snapshot),
+         true <-
+           release_projection_confirms_or_supersedes?(
+             projection,
+             confirmation,
+             projection_snapshot,
+             projection_fingerprint,
+             confirmed_snapshot,
+             fingerprint
+           ) do
+      :ok
+    else
+      _ -> {:error, :invalid_projection}
+    end
+  end
+
+  defp validate_release_projection(_, _, _, _, _, _, _), do: {:error, :invalid_projection}
+
+  defp release_projection_confirms_or_supersedes?(
+         projection,
+         confirmation,
+         projection_snapshot,
+         projection_fingerprint,
+         confirmed_snapshot,
+         fingerprint
+       ) do
+    if projection.local_version == confirmation.confirmed_local_version do
+      projection.deleted == (confirmation.state == :deleted) and
+        projection_snapshot == confirmed_snapshot and projection_fingerprint == fingerprint
+    else
+      projection.local_version > confirmation.confirmed_local_version
+    end
+  end
+
+  defp persist_release_confirmation(
+         operation,
+         mapping,
+         projection,
+         confirmation,
+         confirmed_snapshot,
+         fingerprint
+       ) do
+    if mapping && mapping.local_resource_id &&
+         mapping.local_resource_id != projection.local_resource_id do
+      {:error, :identity_conflict}
+    else
+      (mapping || %MirrorResourceState{})
+      |> MirrorResourceState.persistence_changeset(%{
+        repository_mirror_id: operation.repository_mirror_id,
+        resource_kind: :release,
+        local_resource_type: "ForgeReleases.Release",
+        local_resource_id: projection.local_resource_id,
+        github_object_id: confirmation.github_object_id,
+        github_node_id: confirmation.github_node_id,
+        confirmed_local_version: confirmation.confirmed_local_version,
+        confirmed_remote_updated_at: confirmation.remote_updated_at,
+        confirmed_snapshot: confirmed_snapshot,
+        confirmed_fingerprint: fingerprint,
+        provider_identity: mapping_value(mapping, :provider_identity),
+        state: confirmation.state,
+        lock_version: (mapping_value(mapping, :lock_version) || 0) + 1
+      })
+      |> Repo.insert_or_update()
+    end
+  end
 
   @doc false
   def confirm_pull_operation(
@@ -2704,6 +3605,7 @@ defmodule ForgeMirrors do
       case operation.kind do
         kind when kind in ["sync.pull", "reconcile.repository.pull_heads"] -> :pull
         kind when kind in ["sync.issue", "reconcile.repository.issues"] -> :issue
+        kind when kind in ["sync.release", "reconcile.repository.releases"] -> :release
         _ -> :issue_comment
       end
 
@@ -2765,6 +3667,13 @@ defmodule ForgeMirrors do
       )
 
     if kinds != [], do: {:ok, metadata_permissions(kinds)}, else: {:error, :invalid_transition}
+  end
+
+  defp resource_capability(%{kind: kind}, organization, :release)
+       when kind in ["sync.release", "reconcile.repository.releases"] do
+    if release_capability_enabled?(organization),
+      do: {:ok, %{"contents" => "write", "metadata" => "read"}},
+      else: {:error, :invalid_transition}
   end
 
   defp resource_capability(operation, organization, kind) do
@@ -2856,12 +3765,14 @@ defmodule ForgeMirrors do
   defp resource_type(:issue_comment), do: "ForgeIssues.Comment"
   defp resource_type(:label), do: "ForgeIssues.Label"
   defp resource_type(:pull), do: "ForgePulls.PullRequest"
+  defp resource_type(:release), do: "ForgeReleases.Release"
 
   defp valid_resource_sweep?(%{kind: kind, cursor: cursor, checkpoint: checkpoint} = operation)
        when kind in [
               "reconcile.repository.issues",
               "reconcile.repository.issue_comments",
-              "reconcile.repository.pull_heads"
+              "reconcile.repository.pull_heads",
+              "reconcile.repository.releases"
             ] do
     cursor["trigger"] == "reconcile" and cursor["since"] == "1970-01-01T00:00:00Z" and
       cursor["page"] == 1 and match?({:ok, _}, Ecto.UUID.cast(cursor["sweep_id"])) and
@@ -2887,20 +3798,29 @@ defmodule ForgeMirrors do
   defp valid_webhook_resource_hints?(hints) do
     common = ~w(resource_kind github_object_id github_number issue_kind)
     kind = hints["resource_kind"]
-    keys = if kind == "issue_comment", do: ["github_issue_id" | common], else: common
+
+    keys =
+      case kind do
+        "issue_comment" -> ["github_issue_id" | common]
+        "release" -> ~w(resource_kind github_object_id tag_name)
+        _ -> common
+      end
 
     Enum.sort(Map.keys(hints)) == Enum.sort(keys) and
       positive_resource_id?(hints["github_object_id"]) and
-      positive_resource_id?(hints["github_number"]) and
       case {kind, hints["issue_kind"]} do
         {"issue", "issue"} ->
-          true
+          positive_resource_id?(hints["github_number"])
 
         {"pull", "pull_request"} ->
-          true
+          positive_resource_id?(hints["github_number"])
 
         {"issue_comment", issue_kind} when issue_kind in ["issue", "pull_request"] ->
-          positive_resource_id?(hints["github_issue_id"])
+          positive_resource_id?(hints["github_number"]) and
+            positive_resource_id?(hints["github_issue_id"])
+
+        {"release", nil} ->
+          valid_release_tag_name?(hints["tag_name"])
 
         _ ->
           false
@@ -2973,14 +3893,27 @@ defmodule ForgeMirrors do
       comment["id"] == hints["github_object_id"] and issue_kind == hints["issue_kind"]
   end
 
+  defp resource_payload_identity?(
+         "release",
+         %{"release" => release},
+         %{"resource_kind" => "release"} = hints
+       )
+       when is_map(release) do
+    release["id"] == hints["github_object_id"] and release["tag_name"] == hints["tag_name"]
+  end
+
   defp resource_payload_identity?(_, _, _), do: false
 
   defp resource_webhook_enabled?(%OrganizationMirror{} = organization, hints) do
     state =
       if organization.state == :paused, do: organization.resume_state, else: organization.state
 
-    state in [:catching_up, :active, :degraded, :conflicted] and
-      issue_capability_enabled?(organization, hints["issue_kind"])
+    capability_enabled =
+      if hints["resource_kind"] == "release",
+        do: release_capability_enabled?(organization),
+        else: issue_capability_enabled?(organization, hints["issue_kind"])
+
+    state in [:catching_up, :active, :degraded, :conflicted] and capability_enabled
   end
 
   defp resource_webhook_enabled?(_, _), do: false
@@ -4172,7 +5105,7 @@ defmodule ForgeMirrors do
              false <- open_git_ref_conflict?(persisted, ref_name),
              {:ok, ref_state} <-
                persist_git_ref_state(persisted, ref_name, local_oid, remote_oid, now),
-             {:ok, completed} <- complete_operation(persisted, now) do
+             {:ok, completed} <- complete_confirmed_git_ref(persisted, ref_state, now) do
           %{operation: completed, ref_state: ref_state}
         else
           true -> Repo.rollback(:invalid_transition)
@@ -4190,6 +5123,40 @@ defmodule ForgeMirrors do
 
   def confirm_git_ref(_operation, _ref_name, _local_oid, _remote_oid, _now),
     do: {:error, :invalid_argument}
+
+  defp complete_confirmed_git_ref(
+         %MirrorOperation{cursor: %{"release_parent_operation_id" => parent_id}} = operation,
+         %MirrorRefState{} = ref_state,
+         now
+       )
+       when is_integer(parent_id) and parent_id > 0 do
+    proof = %{
+      "release_parent_operation_id" => parent_id,
+      "ref_name" => ref_state.ref_name,
+      "ref_state_lock_version" => ref_state.lock_version,
+      "state" => Atom.to_string(ref_state.state),
+      "confirmed_oid" => ref_state.confirmed_oid,
+      "local_oid" => ref_state.last_local_oid,
+      "remote_oid" => ref_state.last_remote_oid,
+      "confirmed_at" => DateTime.to_iso8601(ref_state.last_confirmed_at)
+    }
+
+    owned_transition(operation, now, [operation.state],
+      state: :completed,
+      checkpoint: Map.put(operation.checkpoint || %{}, "release_tag_proof", proof),
+      lease_owner: nil,
+      lease_expires_at: nil,
+      external_effect_marker: nil,
+      effect_marked_at: nil,
+      completed_at: now,
+      failure_class: nil,
+      failure_disposition: nil,
+      failure_detail: nil
+    )
+  end
+
+  defp complete_confirmed_git_ref(operation, _ref_state, now),
+    do: complete_operation(operation, now)
 
   @doc false
   @spec degrade_git_ref(
@@ -4508,6 +5475,9 @@ defmodule ForgeMirrors do
       %DomainOutboxEvent{aggregate_type: type} when type in ["issue", "issue_comment"] ->
         materialize_issue_event(event)
 
+      %DomainOutboxEvent{aggregate_type: "release"} ->
+        materialize_release_event(event)
+
       %DomainOutboxEvent{aggregate_type: "repository", origin: origin}
       when origin != :fornacast ->
         ignore_repository_event(event, :non_local_event)
@@ -4524,6 +5494,117 @@ defmodule ForgeMirrors do
       %DomainOutboxEvent{} ->
         {:ok, {:ignored, :non_repository_event}}
     end
+  end
+
+  defp materialize_release_event(event) do
+    with {:ok, cursor} <- release_event_cursor(event) do
+      materialize_in_transaction(fn ->
+        with :ok <- validate_release_event_scope(event, cursor),
+             {:ok, repository} <- ForgeRepos.fetch_live_repository(cursor["repository_id"]),
+             :ok <- resource_repository_published(repository),
+             :fornacast <- event.origin,
+             {:ok, organization} <- lock_non_revoked_organization_mirror(repository.owner_user_id),
+             true <- release_capability_enabled?(organization),
+             %RepositoryMirror{state: state, inventory_included: true} = binding
+             when state in [:discovered, :active] <-
+               find_bound_repository_mirror(organization.id, repository.id),
+             {:ok, operation} <- enqueue_release_event(binding, event, cursor) do
+          {:materialized, [operation]}
+        else
+          origin when origin in [:github, :system] -> {:ignored, :non_local_event}
+          false -> {:ignored, :capability_disabled}
+          nil -> Repo.rollback(:unbound_repository)
+          %RepositoryMirror{} -> {:ignored, :inactive_repository}
+          {:error, :not_found} -> {:ignored, :repository_missing}
+          {:error, :unmirrored_owner} -> {:ignored, :unmirrored_owner}
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+    end
+  end
+
+  defp release_event_cursor(event) do
+    payload = event.payload
+    event_types = ~w(release.created release.updated release.deleted)
+
+    with true <- is_map(payload),
+         true <- event.event_type in event_types,
+         true <- event.origin in [:fornacast, :github, :system],
+         true <- bounded_trimmed_string?(event.event_id, 255),
+         true <-
+           Enum.all?(
+             [event.causation_id, event.correlation_id],
+             &(is_nil(&1) or bounded_trimmed_string?(&1, 255))
+           ),
+         :ok <- validate_utc(event.available_at),
+         true <-
+           Enum.all?(
+             ~w(repository_id release_id sync_version),
+             &positive_resource_id?(payload[&1])
+           ),
+         true <- event.aggregate_id == to_string(payload["release_id"]),
+         true <- valid_release_tag_name?(payload["tag_name"]),
+         true <- is_boolean(payload["deleted"]),
+         true <- payload["deleted"] == (event.event_type == "release.deleted"),
+         true <-
+           Enum.sort(Map.keys(payload)) ==
+             ~w(deleted release_id repository_id sync_version tag_name) do
+      {:ok,
+       Map.merge(payload, %{
+         "event_type" => event.event_type,
+         "local_resource_id" => payload["release_id"],
+         "outbox_event_id" => event.event_id,
+         "trigger" => "local",
+         "origin" => Atom.to_string(event.origin),
+         "causation_id" => event.causation_id,
+         "correlation_id" => event.correlation_id
+       })
+       |> Map.delete("release_id")}
+    else
+      _invalid -> {:error, :invalid_payload}
+    end
+  end
+
+  defp validate_release_event_scope(_event, cursor) do
+    release =
+      Repo.one(
+        from release in "releases",
+          where: release.id == ^cursor["local_resource_id"],
+          select: %{
+            repository_id: release.repository_id,
+            tag_name: release.tag_name,
+            sync_version: release.sync_version,
+            deleted: not is_nil(release.deleted_at)
+          }
+      )
+
+    case release do
+      %{
+        repository_id: repository_id,
+        sync_version: version,
+        tag_name: _tag_name,
+        deleted: _deleted
+      } ->
+        if repository_id == cursor["repository_id"] and version >= cursor["sync_version"],
+          do: :ok,
+          else: {:error, :invalid_payload}
+
+      _missing_or_mismatched ->
+        {:error, :invalid_payload}
+    end
+  end
+
+  defp enqueue_release_event(binding, event, cursor) do
+    digest = :crypto.hash(:sha256, event.event_id) |> Base.encode16(case: :lower)
+
+    enqueue_operation(%{
+      organization_mirror_id: binding.organization_mirror_id,
+      repository_mirror_id: binding.id,
+      kind: "sync.release",
+      cursor: cursor,
+      dedupe_key: "outbox-release:#{digest}:#{binding.id}",
+      next_attempt_at: event.available_at
+    })
   end
 
   defp materialize_issue_event(event) do
@@ -4722,6 +5803,16 @@ defmodule ForgeMirrors do
     capability = if kind == "pull_request", do: "pulls", else: "issues"
 
     Map.get(organization.capabilities || %{}, capability) in [
+      true,
+      :enabled,
+      :active,
+      "enabled",
+      "active"
+    ]
+  end
+
+  defp release_capability_enabled?(organization) do
+    Map.get(organization.capabilities || %{}, "releases") in [
       true,
       :enabled,
       :active,
@@ -4987,6 +6078,8 @@ defmodule ForgeMirrors do
     do: String.match?(oid, ~r/\A[0-9a-f]+\z/)
 
   defp optional_oid?(_oid), do: false
+
+  defp canonical_oid?(oid), do: is_binary(oid) and optional_oid?(oid)
 
   defp valid_git_baseline?(:missing), do: true
   defp valid_git_baseline?(baseline), do: optional_oid?(baseline)
@@ -5506,7 +6599,8 @@ defmodule ForgeMirrors do
           from op in MirrorOperation,
             where:
               op.repository_mirror_id == ^repository.id and
-                op.kind in ["sync.issue", "sync.issue_comment"] and op.state != :completed and
+                op.kind in ["sync.issue", "sync.issue_comment", "sync.release"] and
+                op.state != :completed and
                 fragment("?->>'sweep_id'", op.cursor) in ^sweep_ids
         ) and
         not Repo.exists?(
@@ -5942,7 +7036,7 @@ defmodule ForgeMirrors do
     Enum.map(rows, fn [id] -> claim_webhook_delivery!(id, owner, now, expires_at) end)
   end
 
-  defp activate_legacy_pull_request_deliveries!(now) do
+  defp activate_legacy_resource_deliveries!(now) do
     candidates =
       Repo.all(
         from organization in OrganizationMirror,
@@ -5960,16 +7054,19 @@ defmodule ForgeMirrors do
           where:
             organization.provider == "github" and
               organization.state in [:catching_up, :active, :degraded, :conflicted] and
-              delivery.state == :pending_unsupported and delivery.event == "pull_request",
+              delivery.state == :pending_unsupported and
+              delivery.event in ["pull_request", "release"],
           lock: "FOR UPDATE",
-          select: {organization, binding.github_repository_id}
+          select: {organization, binding.github_repository_id, delivery.event}
       )
-      |> Enum.filter(fn {organization, _repository_id} ->
-        issue_capability_enabled?(organization, "pull_request")
+      |> Enum.filter(fn {organization, _repository_id, event} ->
+        legacy_resource_capability_enabled?(organization, event)
       end)
-      |> Enum.uniq_by(fn {organization, repository_id} -> {organization.id, repository_id} end)
+      |> Enum.uniq_by(fn {organization, repository_id, event} ->
+        {organization.id, repository_id, event}
+      end)
 
-    Enum.reduce(candidates, 0, fn {organization, repository_id}, count ->
+    Enum.reduce(candidates, 0, fn {organization, repository_id, event}, count ->
       {activated, _rows} =
         Repo.update_all(
           from(delivery in MirrorWebhookDelivery,
@@ -5978,7 +7075,7 @@ defmodule ForgeMirrors do
                 delivery.github_repository_id == ^repository_id and
                 (is_nil(delivery.organization_mirror_id) or
                    delivery.organization_mirror_id == ^organization.id) and
-                delivery.state == :pending_unsupported and delivery.event == "pull_request"
+                delivery.state == :pending_unsupported and delivery.event == ^event
           ),
           set: [
             organization_mirror_id: organization.id,
@@ -5992,6 +7089,12 @@ defmodule ForgeMirrors do
       count + activated
     end)
   end
+
+  defp legacy_resource_capability_enabled?(organization, "pull_request"),
+    do: issue_capability_enabled?(organization, "pull_request")
+
+  defp legacy_resource_capability_enabled?(organization, "release"),
+    do: release_capability_enabled?(organization)
 
   defp claim_webhook_delivery!(id, owner, now, expires_at) do
     delivery = Repo.get!(MirrorWebhookDelivery, id)
@@ -6346,6 +7449,11 @@ defmodule ForgeMirrors do
 
   defp bounded_trimmed_string?(value, max_bytes) do
     is_binary(value) and byte_size(value) in 1..max_bytes and String.valid?(value) and
+      value == String.trim(value) and :binary.match(value, <<0>>) == :nomatch
+  end
+
+  defp valid_release_tag_name?(value) do
+    is_binary(value) and String.valid?(value) and String.length(value) in 1..255 and
       value == String.trim(value) and :binary.match(value, <<0>>) == :nomatch
   end
 
@@ -6725,9 +7833,11 @@ defmodule ForgeMirrors do
   defp resource_sweep_kinds(organization) do
     issues = issue_capability_enabled?(organization, "issue")
     pulls = issue_capability_enabled?(organization, "pull_request")
+    releases = release_capability_enabled?(organization)
 
     if(issues, do: [{"issue", "issues"}], else: []) ++
-      if issues or pulls, do: [{"issue_comment", "issue_comments"}], else: []
+      if(issues or pulls, do: [{"issue_comment", "issue_comments"}], else: []) ++
+      if releases, do: [{"release", "releases"}], else: []
   end
 
   defp enqueue_inventory_git_reconciliations(organization_mirror_id, sweep_marker, now) do

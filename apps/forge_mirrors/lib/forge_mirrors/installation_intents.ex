@@ -406,7 +406,7 @@ defmodule ForgeMirrors.InstallationIntents do
       "lfs" => "enabled",
       "issues" => "enabled",
       "pulls" => "enabled",
-      "releases" => "unavailable"
+      "releases" => "enabled"
     }
   end
 end
