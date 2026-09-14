@@ -320,6 +320,92 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliationTest do
     assert marked.external_effect_marker["expected_remote"] == sync.baseline.confirmed_snapshot
   end
 
+  test "pausing after a prepared metadata effect preserves it for a safe resume", c do
+    _baseline = confirm_baseline(c)
+    repository = Repo.get!(Repository, c.binding.repository_id)
+
+    repository
+    |> Ecto.Changeset.change(description: "pause after prepare")
+    |> Ecto.Changeset.optimistic_lock(:write_version)
+    |> Repo.update!()
+
+    claimed = claim_metadata_operation(c, "metadata:pause-after-prepare", "metadata-pause-worker")
+    assert {:ok, sync} = ForgeMirrors.repository_metadata_operation_context(claimed)
+
+    observed_baseline =
+      sync.baseline.confirmed_snapshot
+      |> atomize_remote(sync)
+      |> Map.put(:updated_at, DateTime.add(c.now, 1))
+
+    assert {:ok, %{action: :update_remote, operation: marked}} =
+             ForgeMirrors.record_repository_metadata_observation(
+               claimed,
+               observed_baseline,
+               c.now
+             )
+
+    assert {:ok, paused} =
+             ForgeMirrors.pause(organization_owner_fixture(c.organization), c.organization)
+
+    assert {:error, :paused} = ForgeMirrors.authorize_repository_metadata_effect(marked, c.now)
+
+    assert {:ok, deferred} =
+             ForgeMirrors.defer_repository_metadata_effect(marked, c.now, c.now, "paused")
+
+    assert deferred.state == :effect_pending
+    assert deferred.lease_owner == nil
+    assert deferred.lease_expires_at == nil
+    assert deferred.external_effect_marker == marked.external_effect_marker
+
+    assert {:ok, resumed} = ForgeMirrors.resume(organization_owner_fixture(paused), paused)
+    assert resumed.state == :active
+
+    assert {:ok, [%MirrorOperation{id: operation_id, state: :effect_pending}]} =
+             ForgeMirrors.claim_operations(
+               "metadata-resume-worker",
+               c.now,
+               60,
+               1,
+               ["reconcile.repository.metadata"]
+             )
+
+    assert operation_id == marked.id
+  end
+
+  test "pausing after claim releases unmarked metadata work for resume", c do
+    claimed = claim_metadata_operation(c, "metadata:pause-after-claim", "metadata-pause-claim")
+
+    assert {:ok, paused} =
+             ForgeMirrors.pause(organization_owner_fixture(c.organization), c.organization)
+
+    assert {:error, :paused} = ForgeMirrors.repository_metadata_operation_context(claimed)
+
+    assert {:ok, deferred} =
+             ForgeMirrors.defer_repository_metadata_operation(claimed, c.now, c.now, "paused")
+
+    assert deferred.state == :pending
+    assert deferred.lease_owner == nil
+    assert deferred.lease_expires_at == nil
+    assert deferred.external_effect_marker == nil
+    assert deferred.failure_class == nil
+    assert deferred.failure_disposition == nil
+    assert deferred.failure_detail == nil
+
+    assert {:ok, resumed} = ForgeMirrors.resume(organization_owner_fixture(paused), paused)
+    assert resumed.state == :active
+
+    assert {:ok, [%MirrorOperation{id: operation_id, state: :processing}]} =
+             ForgeMirrors.claim_operations(
+               "metadata-pause-claim-resume",
+               c.now,
+               60,
+               1,
+               ["reconcile.repository.metadata"]
+             )
+
+    assert operation_id == claimed.id
+  end
+
   test "outbound repository names use the canonical local slug rather than display name", c do
     _baseline = confirm_baseline(c)
     repository = Repo.get!(Repository, c.binding.repository_id)

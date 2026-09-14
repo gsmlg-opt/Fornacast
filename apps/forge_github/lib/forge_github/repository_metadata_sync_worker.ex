@@ -237,6 +237,9 @@ defmodule ForgeGitHub.RepositoryMetadataSyncWorker do
        when reason in [:busy, :timeout, :unavailable, :invalidated, :worker_crash],
        do: retry(operation, now, DateTime.add(now, 60), "network", options)
 
+  defp persist_reason(operation, now, :paused, options),
+    do: defer(operation, now, now, "paused", options)
+
   defp persist_reason(operation, now, :revoked, options),
     do: fail(operation, now, "credential_revoked", options)
 
@@ -283,6 +286,9 @@ defmodule ForgeGitHub.RepositoryMetadataSyncWorker do
        when reason in [:busy, :timeout, :unavailable, :invalidated, :worker_crash],
        do: defer_effect(operation, now, DateTime.add(now, 60), "network", options)
 
+  defp persist_effect_reason(operation, now, :paused, options),
+    do: defer_effect(operation, now, now, "paused", options)
+
   defp persist_effect_reason(operation, now, reason, options)
        when reason in [:revoked, :credential_unavailable],
        do: fail(operation, now, "credential_revoked", options)
@@ -300,6 +306,15 @@ defmodule ForgeGitHub.RepositoryMetadataSyncWorker do
       now,
       retry_at,
       failure_class
+    )
+  end
+
+  defp defer(operation, now, retry_at, reason, options) do
+    callback(options, :defer, &ForgeMirrors.defer_repository_metadata_operation/4).(
+      operation,
+      now,
+      retry_at,
+      reason
     )
   end
 

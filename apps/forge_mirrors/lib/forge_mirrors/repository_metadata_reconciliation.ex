@@ -175,24 +175,54 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliation do
 
   def record(_, _, _), do: {:error, :invalid_argument}
 
+  def defer(
+        %MirrorOperation{state: :processing} = supplied,
+        %DateTime{} = now,
+        %DateTime{} = next_attempt_at,
+        "paused"
+      ) do
+    Repo.transaction(fn ->
+      with {:ok, operation} <- lock_owned(supplied),
+           true <- operation.state == :processing and is_nil(operation.external_effect_marker),
+           {:ok, deferred} <-
+             transition(operation, now, :pending,
+               next_attempt_at: DateTime.truncate(next_attempt_at, :second),
+               lease_owner: nil,
+               lease_expires_at: nil,
+               failure_class: nil,
+               failure_disposition: nil,
+               failure_detail: nil
+             ) do
+        deferred
+      else
+        false -> Repo.rollback(:invalid_transition)
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> unwrap()
+  end
+
+  def defer(%MirrorOperation{}, %DateTime{}, %DateTime{}, _reason),
+    do: {:error, :invalid_transition}
+
+  def defer(_, _, _, _), do: {:error, :invalid_argument}
+
   def defer_effect(
         %MirrorOperation{state: :effect_pending} = supplied,
         %DateTime{} = now,
         %DateTime{} = next_attempt_at,
         failure_class
       )
-      when failure_class in ["network", "primary_rate_limit", "secondary_rate_limit"] do
+      when failure_class in ["network", "paused", "primary_rate_limit", "secondary_rate_limit"] do
     Repo.transaction(fn ->
       with {:ok, operation} <- lock_owned(supplied),
            true <- operation.state == :effect_pending and is_map(operation.external_effect_marker),
            {:ok, deferred} <-
-             transition(operation, now, :effect_pending,
-               next_attempt_at: DateTime.truncate(next_attempt_at, :second),
-               lease_owner: nil,
-               lease_expires_at: nil,
-               failure_class: failure_class,
-               failure_disposition: :retry,
-               failure_detail: "remote repository metadata effect requires canonical recheck"
+             transition(
+               operation,
+               now,
+               :effect_pending,
+               deferred_effect_attrs(next_attempt_at, failure_class)
              ) do
         deferred
       else
@@ -1113,7 +1143,7 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliation do
          true <- state in [:discovered, :active],
          %OrganizationMirror{provider: "github", state: organization_state} = organization <-
            organization,
-         true <- organization_state in [:catching_up, :active, :degraded, :conflicted],
+         :ok <- repository_metadata_lifecycle(organization_state),
          true <- binding.organization_mirror_id == organization.id,
          true <-
            is_integer(repository_id) and repository_id > 0 and is_integer(github_id) and
@@ -1129,6 +1159,13 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliation do
       _ -> {:error, :invalid_transition}
     end
   end
+
+  defp repository_metadata_lifecycle(state)
+       when state in [:catching_up, :active, :degraded, :conflicted],
+       do: :ok
+
+  defp repository_metadata_lifecycle(:paused), do: {:error, :paused}
+  defp repository_metadata_lifecycle(_state), do: {:error, :invalid_transition}
 
   defp lock_owned(operation) do
     current =
@@ -1221,6 +1258,28 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliation do
   end
 
   defp valid_iso8601?(_), do: false
+
+  defp deferred_effect_attrs(next_attempt_at, "paused") do
+    [
+      next_attempt_at: DateTime.truncate(next_attempt_at, :second),
+      lease_owner: nil,
+      lease_expires_at: nil,
+      failure_class: nil,
+      failure_disposition: nil,
+      failure_detail: nil
+    ]
+  end
+
+  defp deferred_effect_attrs(next_attempt_at, failure_class) do
+    [
+      next_attempt_at: DateTime.truncate(next_attempt_at, :second),
+      lease_owner: nil,
+      lease_expires_at: nil,
+      failure_class: failure_class,
+      failure_disposition: :retry,
+      failure_detail: "remote repository metadata effect requires canonical recheck"
+    ]
+  end
 
   defp complete(operation, now) do
     transition(operation, now, :completed,

@@ -26,6 +26,28 @@ defmodule ForgeMirrors.ResourceReconciliationSchedulingTest do
 
     assert issues.cursor["since"] == "1970-01-01T00:00:00Z"
     assert {:ok, _} = Ecto.UUID.cast(issues.cursor["sweep_id"])
+    assert issues.cursor["inventory_reconciliation_sweep"] == "one"
+    assert comments.cursor["inventory_reconciliation_sweep"] == "one"
+
+    leased = claim(c, issues.kind, issues.id)
+
+    assert {:ok, %{operations: [child]}} =
+             ForgeMirrors.record_resource_reconciliation_page(
+               leased,
+               :issue,
+               [
+                 %{
+                   github_object_id: 501,
+                   github_number: 7,
+                   github_issue_id: nil,
+                   remote_updated_at: c.now
+                 }
+               ],
+               nil,
+               c.now
+             )
+
+    assert child.cursor["inventory_reconciliation_sweep"] == "one"
 
     assert {:ok, replay} =
              ForgeMirrors.enqueue_repository_resource_reconciliations(
@@ -57,6 +79,7 @@ defmodule ForgeMirrors.ResourceReconciliationSchedulingTest do
     assert operation.kind == "reconcile.repository.metadata"
 
     assert operation.cursor == %{
+             "inventory_reconciliation_sweep" => "repository-metadata",
              "sweep_key" => "inventory:repository-metadata",
              "trigger" => "reconcile"
            }

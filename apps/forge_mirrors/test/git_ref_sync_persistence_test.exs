@@ -241,7 +241,10 @@ defmodule ForgeMirrors.GitRefSyncPersistenceTest do
         repository_mirror_id: context.repository_mirror.id,
         kind: "reconcile.repository.bootstrap",
         dedupe_key: Ecto.UUID.generate(),
-        cursor: %{"baseline" => "seeded"},
+        cursor: %{
+          "baseline" => "seeded",
+          "inventory_reconciliation_sweep" => "inventory-operation:17"
+        },
         next_attempt_at: now
       })
 
@@ -262,6 +265,12 @@ defmodule ForgeMirrors.GitRefSyncPersistenceTest do
            ]
 
     assert Enum.all?([branch, tag], &(&1.kind == "sync.git_ref"))
+
+    assert Enum.all?(
+             [branch, tag, finalizer],
+             &(&1.cursor["inventory_reconciliation_sweep"] == "inventory-operation:17")
+           )
+
     assert finalizer.kind == "finalize.repository.git"
     assert finalizer.id > tag.id
   end
@@ -332,6 +341,45 @@ defmodule ForgeMirrors.GitRefSyncPersistenceTest do
              ForgeMirrors.claim_operations("git-ref-test", now, 30, 1)
 
     assert replacement.kind == "reconcile.repository.git"
+  end
+
+  test "an inventory Git proof does not borrow an unmarked later reconciliation", context do
+    now = DateTime.utc_now(:second)
+    marker = "inventory-operation:901"
+
+    finalizer =
+      finalizer_operation(
+        context,
+        %{
+          "reconciliation_operation_id" => 901,
+          "inventory_reconciliation_sweep" => marker
+        },
+        now
+      )
+
+    {:ok, later} =
+      ForgeMirrors.enqueue_operation(%{
+        organization_mirror_id: context.organization_mirror.id,
+        repository_mirror_id: context.repository_mirror.id,
+        kind: "reconcile.repository.git",
+        dedupe_key: Ecto.UUID.generate(),
+        cursor: %{"trigger" => "remote"},
+        next_attempt_at: now
+      })
+
+    finalizer = claim!(finalizer, now)
+
+    assert {:ok,
+            %{
+              operation: %{state: :completed},
+              replacement: replacement,
+              repository_mirror: nil
+            }} = ForgeMirrors.preflight_git_ref_reconciliation(finalizer, now)
+
+    assert replacement.id > later.id
+    assert replacement.id != later.id
+    assert replacement.kind == "reconcile.repository.git"
+    assert replacement.cursor["inventory_reconciliation_sweep"] == marker
   end
 
   test "finalization rechecks for repository work queued after preflight", context do

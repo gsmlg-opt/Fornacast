@@ -5,9 +5,10 @@ defmodule ForgeMirrors.InventoryTest do
   import ForgeMirrors.TestSupport.MirrorFixtures
 
   alias Fornacast.Repo
-  alias ForgeMirrors.{MirrorOperation, RepositoryMirror}
+  alias ForgeMirrors.{MirrorOperation, OrganizationMirror, RepositoryMirror}
 
   @inventory_kind "reconcile.organization_inventory"
+  @finalizer_kind "finalize.organization.reconciliation"
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
@@ -255,6 +256,18 @@ defmodule ForgeMirrors.InventoryTest do
     assert bootstrap.repository_mirror_id == hd(mirrors).id
     assert bootstrap.cursor == %{"github_repository_id" => 501, "source" => "inventory"}
 
+    assert {:ok, [finalizer]} =
+             ForgeMirrors.claim_operations(
+               "auto-import-finalizer",
+               context.now,
+               30,
+               1,
+               [@finalizer_kind]
+             )
+
+    assert {:ok, %{status: :completed}} =
+             ForgeMirrors.finalize_organization_reconciliation(finalizer, context.now)
+
     # A new sweep observing the same repository cannot duplicate the bootstrap intent.
     replay = inventory_operation(auto_mirror, context.now, "auto-import-replay")
     replay_claim = claim_inventory!(replay, context.now)
@@ -424,6 +437,318 @@ defmodule ForgeMirrors.InventoryTest do
              )
 
     assert repository_mirror_id == repository_mirror.id
+  end
+
+  test "inventory completion keeps the reconciliation watermark behind durable child work",
+       context do
+    repository_mirror = repository_mirror_fixture(context.organization_mirror)
+    operation = inventory_operation(context.organization_mirror, context.now, "durable-finalizer")
+    claimed = claim_inventory!(operation, context.now)
+
+    observation = %{
+      github_repository_id: repository_mirror.github_repository_id,
+      github_node_id: repository_mirror.github_node_id,
+      github_full_name: repository_mirror.github_full_name,
+      github_archived: false
+    }
+
+    assert {:ok, %{operation: %MirrorOperation{state: :completed}}} =
+             ForgeMirrors.record_inventory_page(claimed, [observation], nil, context.now)
+
+    assert Repo.get!(OrganizationMirror, context.organization_mirror.id).last_reconciled_at == nil
+
+    marker = "inventory-operation:#{operation.id}"
+
+    assert %MirrorOperation{
+             state: :pending,
+             repository_mirror_id: nil,
+             cursor: %{
+               "inventory_operation_id" => operation_id,
+               "inventory_reconciliation_sweep" => ^marker,
+               "observed_at" => observed_at,
+               "version" => 1
+             }
+           } =
+             finalizer =
+             Repo.get_by!(MirrorOperation,
+               organization_mirror_id: context.organization_mirror.id,
+               kind: @finalizer_kind
+             )
+
+    assert operation_id == operation.id
+    expected_observed_at = context.now
+    assert {:ok, ^expected_observed_at, 0} = DateTime.from_iso8601(observed_at)
+
+    marker_operations =
+      Repo.all(
+        from candidate in MirrorOperation,
+          where:
+            candidate.organization_mirror_id == ^context.organization_mirror.id and
+              candidate.id != ^finalizer.id and
+              fragment(
+                "?->>'inventory_reconciliation_sweep' = ?",
+                candidate.cursor,
+                ^marker
+              )
+      )
+
+    assert marker_operations != []
+    assert Enum.all?(marker_operations, &(&1.state == :pending))
+
+    assert {:ok, [claimed_finalizer]} =
+             ForgeMirrors.claim_operations(
+               "organization-finalizer",
+               context.now,
+               30,
+               1,
+               [@finalizer_kind]
+             )
+
+    assert claimed_finalizer.id == finalizer.id
+
+    assert {:ok, %{status: :waiting, operation: %MirrorOperation{state: :pending}}} =
+             ForgeMirrors.finalize_organization_reconciliation(
+               claimed_finalizer,
+               context.now
+             )
+
+    assert Repo.get!(OrganizationMirror, context.organization_mirror.id).last_reconciled_at == nil
+
+    Repo.update_all(
+      from(candidate in MirrorOperation,
+        where:
+          candidate.organization_mirror_id == ^context.organization_mirror.id and
+            candidate.id != ^finalizer.id and
+            fragment(
+              "?->>'inventory_reconciliation_sweep' = ?",
+              candidate.cursor,
+              ^marker
+            )
+      ),
+      set: [state: :completed, completed_at: context.now]
+    )
+
+    retry_at = DateTime.add(context.now, 5)
+
+    assert {:ok, [reclaimed]} =
+             ForgeMirrors.claim_operations(
+               "organization-finalizer-retry",
+               retry_at,
+               30,
+               1,
+               [@finalizer_kind]
+             )
+
+    assert {:ok,
+            %{
+              status: :completed,
+              operation: %MirrorOperation{state: :completed},
+              organization_mirror: %OrganizationMirror{last_reconciled_at: reconciled_at}
+            }} = ForgeMirrors.finalize_organization_reconciliation(reclaimed, retry_at)
+
+    assert reconciled_at == context.now
+
+    assert Repo.get!(OrganizationMirror, context.organization_mirror.id).last_reconciled_at ==
+             context.now
+  end
+
+  test "a failed sweep child fails its finalizer without moving the watermark", context do
+    repository_mirror = repository_mirror_fixture(context.organization_mirror)
+    operation = inventory_operation(context.organization_mirror, context.now, "failed-finalizer")
+    claimed = claim_inventory!(operation, context.now)
+
+    observation = %{
+      github_repository_id: repository_mirror.github_repository_id,
+      github_node_id: repository_mirror.github_node_id,
+      github_full_name: repository_mirror.github_full_name,
+      github_archived: false
+    }
+
+    assert {:ok, _result} =
+             ForgeMirrors.record_inventory_page(claimed, [observation], nil, context.now)
+
+    marker = "inventory-operation:#{operation.id}"
+
+    child =
+      Repo.one!(
+        from candidate in MirrorOperation,
+          where:
+            candidate.organization_mirror_id == ^context.organization_mirror.id and
+              not is_nil(candidate.repository_mirror_id) and
+              fragment(
+                "?->>'inventory_reconciliation_sweep' = ?",
+                candidate.cursor,
+                ^marker
+              ),
+          order_by: [asc: candidate.id],
+          limit: 1
+      )
+
+    Repo.update_all(from(candidate in MirrorOperation, where: candidate.id == ^child.id),
+      set: [
+        state: :failed,
+        failure_class: "provider_validation",
+        failure_disposition: :terminal,
+        failure_detail: "canonical child failed"
+      ]
+    )
+
+    assert {:ok, [finalizer]} =
+             ForgeMirrors.claim_operations(
+               "organization-finalizer-failed",
+               context.now,
+               30,
+               1,
+               [@finalizer_kind]
+             )
+
+    assert {:ok,
+            %{
+              status: :failed,
+              operation: %MirrorOperation{
+                state: :failed,
+                failure_class: "provider_validation",
+                failure_disposition: :terminal,
+                failure_detail: "canonical child failed"
+              }
+            }} = ForgeMirrors.finalize_organization_reconciliation(finalizer, context.now)
+
+    assert Repo.get!(OrganizationMirror, context.organization_mirror.id).last_reconciled_at == nil
+  end
+
+  test "a pause after finalizer claim preserves the sweep for resume", context do
+    operation = inventory_operation(context.organization_mirror, context.now, "paused-finalizer")
+    claimed = claim_inventory!(operation, context.now)
+
+    assert {:ok, _result} =
+             ForgeMirrors.record_inventory_page(claimed, [], nil, context.now)
+
+    assert {:ok, [finalizer]} =
+             ForgeMirrors.claim_operations(
+               "organization-finalizer-paused",
+               context.now,
+               30,
+               1,
+               [@finalizer_kind]
+             )
+
+    context.organization_mirror
+    |> Ecto.Changeset.change(state: :paused, resume_state: :active)
+    |> Repo.update!()
+
+    assert {:ok, %{status: :deferred, operation: %MirrorOperation{state: :pending}}} =
+             ForgeMirrors.finalize_organization_reconciliation(finalizer, context.now)
+
+    assert Repo.get!(OrganizationMirror, context.organization_mirror.id).last_reconciled_at == nil
+
+    OrganizationMirror
+    |> Repo.get!(context.organization_mirror.id)
+    |> Ecto.Changeset.change(state: :active, resume_state: nil)
+    |> Repo.update!()
+
+    retry_at = DateTime.add(context.now, 5)
+
+    assert {:ok, [reclaimed]} =
+             ForgeMirrors.claim_operations(
+               "organization-finalizer-resumed",
+               retry_at,
+               30,
+               1,
+               [@finalizer_kind]
+             )
+
+    assert {:ok, %{status: :completed}} =
+             ForgeMirrors.finalize_organization_reconciliation(reclaimed, retry_at)
+
+    assert Repo.get!(OrganizationMirror, context.organization_mirror.id).last_reconciled_at ==
+             context.now
+  end
+
+  test "revocation after finalizer claim freezes the durable sweep without a watermark",
+       context do
+    operation = inventory_operation(context.organization_mirror, context.now, "revoked-finalizer")
+    claimed = claim_inventory!(operation, context.now)
+
+    assert {:ok, _result} =
+             ForgeMirrors.record_inventory_page(claimed, [], nil, context.now)
+
+    assert {:ok, [finalizer]} =
+             ForgeMirrors.claim_operations(
+               "organization-finalizer-revoked",
+               context.now,
+               30,
+               1,
+               [@finalizer_kind]
+             )
+
+    context.organization_mirror
+    |> Ecto.Changeset.change(state: :revoked)
+    |> Repo.update!()
+
+    assert {:ok, %{status: :deferred, operation: %MirrorOperation{state: :pending}}} =
+             ForgeMirrors.finalize_organization_reconciliation(finalizer, context.now)
+
+    assert Repo.get!(OrganizationMirror, context.organization_mirror.id).last_reconciled_at == nil
+
+    assert {:ok, []} =
+             ForgeMirrors.claim_operations(
+               "organization-finalizer-after-revocation",
+               DateTime.add(context.now, 1),
+               30,
+               1,
+               [@finalizer_kind]
+             )
+  end
+
+  test "an expired finalizer lease is reclaimed once without accepting the stale owner",
+       context do
+    operation =
+      inventory_operation(context.organization_mirror, context.now, "reclaimed-finalizer")
+
+    claimed = claim_inventory!(operation, context.now)
+
+    assert {:ok, _result} =
+             ForgeMirrors.record_inventory_page(claimed, [], nil, context.now)
+
+    assert {:ok, [stale]} =
+             ForgeMirrors.claim_operations(
+               "organization-finalizer-stale",
+               context.now,
+               30,
+               1,
+               [@finalizer_kind]
+             )
+
+    expired_at = DateTime.add(context.now, -1)
+
+    Repo.update_all(from(candidate in MirrorOperation, where: candidate.id == ^stale.id),
+      set: [lease_expires_at: expired_at]
+    )
+
+    assert {:ok, 1} = ForgeMirrors.recover_expired_operations(context.now)
+
+    assert {:error, :lost_lease} =
+             ForgeMirrors.finalize_organization_reconciliation(
+               %{stale | lease_expires_at: expired_at},
+               context.now
+             )
+
+    assert {:ok, [reclaimed]} =
+             ForgeMirrors.claim_operations(
+               "organization-finalizer-reclaimed",
+               context.now,
+               30,
+               1,
+               [@finalizer_kind]
+             )
+
+    assert reclaimed.id == stale.id
+
+    assert {:ok, %{status: :completed}} =
+             ForgeMirrors.finalize_organization_reconciliation(reclaimed, context.now)
+
+    assert Repo.get!(OrganizationMirror, context.organization_mirror.id).last_reconciled_at ==
+             context.now
   end
 
   test "a completed inventory sweep schedules bounded pull head discovery when pulls are enabled",

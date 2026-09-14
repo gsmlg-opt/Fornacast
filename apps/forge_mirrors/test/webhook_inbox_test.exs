@@ -5,7 +5,7 @@ defmodule ForgeMirrors.WebhookInboxTest do
   import ForgeMirrors.TestSupport.MirrorFixtures
 
   alias Fornacast.Repo
-  alias ForgeMirrors.MirrorWebhookDelivery
+  alias ForgeMirrors.{MirrorOperation, MirrorWebhookDelivery, OrganizationMirror}
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
@@ -314,6 +314,16 @@ defmodule ForgeMirrors.WebhookInboxTest do
 
     owner = organization_owner_fixture(mirror)
 
+    github_repository_id = System.unique_integer([:positive, :monotonic])
+
+    assert {:ok, binding} =
+             ForgeMirrors.bind_repository(owner, %{
+               organization_mirror_id: mirror.id,
+               github_repository_id: github_repository_id,
+               github_node_id: "R_health_#{github_repository_id}",
+               github_full_name: "health/repository-#{github_repository_id}"
+             })
+
     pending =
       enqueue!(
         delivery_attrs(%{
@@ -350,9 +360,89 @@ defmodule ForgeMirrors.WebhookInboxTest do
     assert health.latest_failure.failure_class == "invalid_webhook_payload"
     refute Map.has_key?(health, :raw_payload)
 
-    mirror
-    |> Ecto.Changeset.change(last_reconciled_at: DateTime.add(DateTime.utc_now(:second), 1))
+    reconciled_at = DateTime.add(DateTime.utc_now(:second), 5)
+
+    inventory =
+      operation_fixture(mirror, %{
+        kind: "reconcile.organization_inventory",
+        dedupe_key: Ecto.UUID.generate(),
+        next_attempt_at: reconciled_at
+      })
+
+    marker = "inventory-operation:#{inventory.id}"
+
+    inventory
+    |> Ecto.Changeset.change(
+      state: :completed,
+      checkpoint: %{"completed_sweep" => marker},
+      completed_at: reconciled_at
+    )
     |> Repo.update!()
+
+    child =
+      operation_fixture(mirror, %{
+        repository_mirror_id: binding.id,
+        kind: "reconcile.repository.metadata",
+        dedupe_key: Ecto.UUID.generate(),
+        cursor: %{"inventory_reconciliation_sweep" => marker},
+        next_attempt_at: reconciled_at
+      })
+
+    finalizer =
+      operation_fixture(mirror, %{
+        kind: "finalize.organization.reconciliation",
+        dedupe_key: Ecto.UUID.generate(),
+        cursor: %{
+          "version" => 1,
+          "inventory_operation_id" => inventory.id,
+          "inventory_reconciliation_sweep" => marker,
+          "observed_at" => DateTime.to_iso8601(reconciled_at)
+        },
+        next_attempt_at: reconciled_at
+      })
+
+    assert {:ok, [claimed_finalizer]} =
+             ForgeMirrors.claim_operations(
+               "webhook-gap-finalizer",
+               reconciled_at,
+               30,
+               1,
+               ["finalize.organization.reconciliation"]
+             )
+
+    assert claimed_finalizer.id == finalizer.id
+
+    assert {:ok, %{status: :waiting}} =
+             ForgeMirrors.finalize_organization_reconciliation(
+               claimed_finalizer,
+               reconciled_at
+             )
+
+    assert {:ok, still_unrepaired} = ForgeMirrors.webhook_health(owner, mirror.organization_id)
+    assert still_unrepaired.gap?
+
+    child
+    |> Ecto.Changeset.change(state: :completed, completed_at: reconciled_at)
+    |> Repo.update!()
+
+    retry_at = DateTime.add(reconciled_at, 5)
+
+    assert {:ok, [reclaimed_finalizer]} =
+             ForgeMirrors.claim_operations(
+               "webhook-gap-finalizer-retry",
+               retry_at,
+               30,
+               1,
+               ["finalize.organization.reconciliation"]
+             )
+
+    assert {:ok,
+            %{
+              status: :completed,
+              organization_mirror: %OrganizationMirror{last_reconciled_at: ^reconciled_at},
+              operation: %MirrorOperation{state: :completed}
+            }} =
+             ForgeMirrors.finalize_organization_reconciliation(reclaimed_finalizer, retry_at)
 
     assert {:ok, repaired} = ForgeMirrors.webhook_health(owner, mirror.organization_id)
     refute repaired.gap?

@@ -138,6 +138,44 @@ defmodule ForgeGitHub.RepositoryMetadataSyncWorkerTest do
              )
   end
 
+  test "a pause after effect preparation defers without a write token or PATCH" do
+    operation = operation()
+    marked = %{operation | state: :effect_pending, lock_version: 2}
+    remote = remote()
+
+    assert {:ok, :paused} =
+             RepositoryMetadataSyncWorker.process_operation(operation, @now,
+               context: fn ^operation -> {:ok, sync()} end,
+               token_fetch: fn
+                 7, %{permissions: %{"metadata" => "read"}} ->
+                   token()
+
+                 7, %{permissions: %{"administration" => "write"}} ->
+                   flunk("paused reconciliation must not acquire write permission")
+               end,
+               repository_fetch: fn _, _, _, _ -> {:ok, remote} end,
+               record: fn ^operation, ^remote, @now ->
+                 {:ok, %{action: :update_remote, operation: marked, target: target()}}
+               end,
+               authorize_effect: fn ^marked, @now -> {:error, :paused} end,
+               repository_update: fn _, _, _, _, _ ->
+                 flunk("paused reconciliation must not PATCH GitHub")
+               end,
+               defer_effect: fn ^marked, @now, @now, "paused" -> {:ok, :paused} end
+             )
+  end
+
+  test "a pause after claim releases unmarked work without fetching a token" do
+    operation = operation()
+
+    assert {:ok, :paused} =
+             RepositoryMetadataSyncWorker.process_operation(operation, @now,
+               context: fn ^operation -> {:error, :paused} end,
+               token_fetch: fn _, _ -> flunk("paused reconciliation must not fetch a token") end,
+               defer: fn ^operation, @now, @now, "paused" -> {:ok, :paused} end
+             )
+  end
+
   test "recovers a timed-out rename through the marked target path and immutable identity" do
     operation = %{operation() | state: :effect_pending}
     remote = %{remote() | name: "forge-next"}

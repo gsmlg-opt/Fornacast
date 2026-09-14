@@ -136,6 +136,46 @@ defmodule ForgeGitHub.InventoryWorkerTest do
              InventoryWorker.run_once("inventory-test", options)
   end
 
+  test "finalizes a completed organization sweep without fetching a provider token" do
+    now = ~U[2026-09-05 03:00:00Z]
+
+    operation = %{
+      claimed_operation(now)
+      | kind: "finalize.organization.reconciliation",
+        repository_mirror_id: nil,
+        cursor: %{
+          "version" => 1,
+          "inventory_operation_id" => 41,
+          "inventory_reconciliation_sweep" => "inventory-operation:41",
+          "observed_at" => DateTime.to_iso8601(now)
+        }
+    }
+
+    parent = self()
+
+    options =
+      worker_options(now, operation,
+        context: fn _operation ->
+          flunk("finalization must not load provider inventory context")
+        end,
+        token_fetch: fn _installation_id, _scope ->
+          flunk("finalization must not request an installation token")
+        end,
+        page_fetch: fn _token, _cursor, _options ->
+          flunk("finalization must not call GitHub")
+        end,
+        finalize_reconciliation: fn ^operation, ^now ->
+          send(parent, :finalized)
+          {:ok, %{status: :completed, operation: %{operation | state: :completed}}}
+        end
+      )
+
+    assert {:ok, [{1, {:ok, %{status: :completed}}}]} =
+             InventoryWorker.run_once("inventory-test", options)
+
+    assert_received :finalized
+  end
+
   defp worker_options(now, operation, overrides) do
     defaults = [
       now: fn -> now end,
@@ -143,7 +183,11 @@ defmodule ForgeGitHub.InventoryWorkerTest do
       batch_size: 1,
       max_concurrency: 1,
       processor_timeout_ms: 5_000,
-      claim: fn "inventory-test", ^now, 30, 1, ["reconcile.organization_inventory"] ->
+      claim: fn "inventory-test",
+                ^now,
+                30,
+                1,
+                ["reconcile.organization_inventory", "finalize.organization.reconciliation"] ->
         {:ok, [operation]}
       end,
       context: fn ^operation ->

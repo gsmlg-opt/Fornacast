@@ -11,7 +11,9 @@ defmodule ForgeGitHub.InventoryWorker do
 
   alias ForgeGitHub.{Client, Error, InstallationToken, InstallationTokenBroker, Repository}
 
-  @operation_kind "reconcile.organization_inventory"
+  @inventory_operation_kind "reconcile.organization_inventory"
+  @finalizer_operation_kind "finalize.organization.reconciliation"
+  @operation_kinds [@inventory_operation_kind, @finalizer_operation_kind]
   @default_interval_ms 1_000
   @default_lease_seconds 30
   @default_batch_size 8
@@ -29,6 +31,7 @@ defmodule ForgeGitHub.InventoryWorker do
     :token_fetch,
     :page_fetch,
     :page_record,
+    :finalize_reconciliation,
     :operation_retry,
     :operation_fail,
     :now
@@ -76,7 +79,7 @@ defmodule ForgeGitHub.InventoryWorker do
     claim = callback(options, :claim, &ForgeMirrors.claim_operations/5)
 
     with {:ok, operations} <-
-           claim.(owner, now, lease_seconds, min(batch_size, max_concurrency), [@operation_kind]) do
+           claim.(owner, now, lease_seconds, min(batch_size, max_concurrency), @operation_kinds) do
       task_supervisor =
         Keyword.get(options, :task_supervisor, ForgeGitHub.InventoryTaskSupervisor)
 
@@ -152,7 +155,15 @@ defmodule ForgeGitHub.InventoryWorker do
 
   def handle_info(_message, state), do: {:noreply, state}
 
-  defp process_operation(operation, now, options) do
+  defp process_operation(%{kind: @finalizer_operation_kind} = operation, now, options) do
+    callback(
+      options,
+      :finalize_reconciliation,
+      &ForgeMirrors.finalize_organization_reconciliation/2
+    ).(operation, now)
+  end
+
+  defp process_operation(%{kind: @inventory_operation_kind} = operation, now, options) do
     context = callback(options, :context, &ForgeMirrors.inventory_operation_context/1)
     token_fetch = callback(options, :token_fetch, &InstallationTokenBroker.fetch/2)
     page_fetch = callback(options, :page_fetch, &Client.installation_repositories_page/3)

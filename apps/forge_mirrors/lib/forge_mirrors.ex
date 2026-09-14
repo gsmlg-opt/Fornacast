@@ -25,6 +25,9 @@ defmodule ForgeMirrors do
 
   @max_claim_batch 100
   @inventory_operation_kind "reconcile.organization_inventory"
+  @organization_reconciliation_finalizer_kind "finalize.organization.reconciliation"
+  @inventory_reconciliation_sweep_key "inventory_reconciliation_sweep"
+  @organization_reconciliation_poll_seconds 5
 
   @type provider :: :github
   @type direction :: :inbound | :outbound
@@ -44,6 +47,11 @@ defmodule ForgeMirrors do
   defdelegate defer_repository_metadata_effect(operation, now, next_attempt_at, failure_class),
     to: ForgeMirrors.RepositoryMetadataReconciliation,
     as: :defer_effect
+
+  @doc false
+  defdelegate defer_repository_metadata_operation(operation, now, next_attempt_at, reason),
+    to: ForgeMirrors.RepositoryMetadataReconciliation,
+    as: :defer
 
   @doc false
   defdelegate fail_repository_metadata_operation(operation, now, failure_class, failure_detail),
@@ -1433,12 +1441,14 @@ defmodule ForgeMirrors do
              repository_mirror_id: operation.repository_mirror_id,
              kind: "sync.git_ref",
              dedupe_key: "release-tag-proof:#{operation.id}:#{digest}",
-             cursor: %{
-               "initial_absence" => is_nil(existing) or existing.state == :deleted,
-               "ref_name" => ref_name,
-               "release_parent_operation_id" => operation.id,
-               "trigger" => "reconcile"
-             },
+             cursor:
+               %{
+                 "initial_absence" => is_nil(existing) or existing.state == :deleted,
+                 "ref_name" => ref_name,
+                 "release_parent_operation_id" => operation.id,
+                 "trigger" => "reconcile"
+               }
+               |> copy_cursor(operation.cursor, @inventory_reconciliation_sweep_key),
              next_attempt_at: now
            }),
          {:ok, continuation} <-
@@ -2179,6 +2189,7 @@ defmodule ForgeMirrors do
                     "sweep_id" => sweep
                   }
                 end
+                |> copy_cursor(persisted.cursor, @inventory_reconciliation_sweep_key)
 
               {:ok, digest} = resource_fingerprint(cursor)
 
@@ -4445,6 +4456,7 @@ defmodule ForgeMirrors do
                maybe_finish_inventory_sweep(
                  organization,
                  next_cursor,
+                 persisted.id,
                  sweep_marker,
                  observed_at,
                  classifications
@@ -4938,6 +4950,232 @@ defmodule ForgeMirrors do
   end
 
   @doc false
+  def finalize_organization_reconciliation(
+        %MirrorOperation{} = operation,
+        %DateTime{} = now
+      ) do
+    with :ok <- validate_utc(now) do
+      now = DateTime.truncate(now, :second)
+
+      Repo.transaction(fn ->
+        with {:ok, organization} <- lock_organization_reconciliation_scope(operation),
+             {:ok, persisted} <- lock_owned_organization_finalizer(operation),
+             {:ok, sweep} <- organization_reconciliation_sweep(persisted) do
+          case organization.state do
+            state
+            when state in [:bootstrapping, :catching_up, :active, :degraded, :conflicted] ->
+              finalize_ready_organization_reconciliation(
+                organization,
+                persisted,
+                sweep,
+                now
+              )
+
+            state when state in [:paused, :revoked] ->
+              yield_organization_reconciliation(persisted, now, :deferred)
+
+            _state ->
+              Repo.rollback(:invalid_transition)
+          end
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+      |> normalize_transaction_result()
+    end
+  rescue
+    _exception -> {:error, :lost_lease}
+  end
+
+  def finalize_organization_reconciliation(_operation, _now),
+    do: {:error, :invalid_argument}
+
+  defp finalize_ready_organization_reconciliation(organization, operation, sweep, now) do
+    case organization_reconciliation_completion(operation, sweep) do
+      :complete ->
+        reconciled_at =
+          latest_reconciliation_at(organization.last_reconciled_at, sweep.observed_at)
+
+        with {:ok, updated_organization} <-
+               organization
+               |> OrganizationMirror.update_changeset(%{last_reconciled_at: reconciled_at})
+               |> cas_update(),
+             {:ok, completed} <- complete_operation(operation, now) do
+          %{
+            status: :completed,
+            operation: completed,
+            organization_mirror: updated_organization
+          }
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+
+      :waiting ->
+        yield_organization_reconciliation(operation, now, :waiting)
+
+      {:failed, child} ->
+        fail_organization_reconciliation(operation, child, now)
+    end
+  end
+
+  defp organization_reconciliation_completion(operation, sweep) do
+    scope =
+      MirrorOperation
+      |> where(
+        [candidate],
+        candidate.organization_mirror_id == ^operation.organization_mirror_id and
+          candidate.id != ^operation.id and
+          fragment(
+            "?->>? = ?",
+            candidate.cursor,
+            ^@inventory_reconciliation_sweep_key,
+            ^sweep.marker
+          )
+      )
+
+    failed =
+      scope
+      |> where([candidate], candidate.state == :failed)
+      |> order_by([candidate], asc: candidate.id)
+      |> limit(1)
+      |> Repo.one()
+
+    case failed do
+      %MirrorOperation{} = operation ->
+        {:failed, operation}
+
+      nil ->
+        if Repo.exists?(where(scope, [candidate], candidate.state != :completed)),
+          do: :waiting,
+          else: :complete
+    end
+  end
+
+  defp yield_organization_reconciliation(operation, now, status) do
+    case owned_transition(operation, now, [:processing],
+           state: :pending,
+           next_attempt_at: DateTime.add(now, @organization_reconciliation_poll_seconds),
+           lease_owner: nil,
+           lease_expires_at: nil,
+           failure_class: nil,
+           failure_disposition: nil,
+           failure_detail: nil
+         ) do
+      {:ok, yielded} -> %{status: status, operation: yielded}
+      {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+
+  defp fail_organization_reconciliation(operation, child, now) do
+    failure_class = child.failure_class || "local_validation"
+
+    failure_disposition =
+      child.failure_disposition ||
+        case failure_disposition(failure_class) do
+          {:ok, disposition} -> disposition
+          {:error, :invalid_argument} -> :terminal
+        end
+
+    failure_detail = child.failure_detail || "reconciliation child operation failed"
+
+    case owned_transition(operation, now, [:processing],
+           state: :failed,
+           lease_owner: nil,
+           lease_expires_at: nil,
+           completed_at: nil,
+           failure_class: failure_class,
+           failure_disposition: failure_disposition,
+           failure_detail: failure_detail
+         ) do
+      {:ok, failed} -> %{status: :failed, operation: failed, failed_operation: child}
+      {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+
+  defp latest_reconciliation_at(nil, observed_at), do: observed_at
+
+  defp latest_reconciliation_at(last_reconciled_at, observed_at) do
+    if DateTime.before?(last_reconciled_at, observed_at),
+      do: observed_at,
+      else: last_reconciled_at
+  end
+
+  defp organization_reconciliation_sweep(operation) do
+    cursor = operation.cursor
+    inventory_operation_id = cursor["inventory_operation_id"]
+    marker = cursor[@inventory_reconciliation_sweep_key]
+
+    with true <-
+           Enum.sort(Map.keys(cursor)) ==
+             Enum.sort([
+               "version",
+               "inventory_operation_id",
+               @inventory_reconciliation_sweep_key,
+               "observed_at"
+             ]),
+         1 <- cursor["version"],
+         true <- is_integer(inventory_operation_id) and inventory_operation_id > 0,
+         true <- marker == inventory_sweep_marker(inventory_operation_id),
+         {:ok, observed_at, 0} <- DateTime.from_iso8601(cursor["observed_at"] || ""),
+         :ok <- validate_utc(observed_at),
+         %MirrorOperation{
+           organization_mirror_id: organization_mirror_id,
+           repository_mirror_id: nil,
+           kind: @inventory_operation_kind,
+           state: :completed,
+           checkpoint: %{"completed_sweep" => ^marker}
+         } <- Repo.get(MirrorOperation, inventory_operation_id),
+         true <- organization_mirror_id == operation.organization_mirror_id do
+      {:ok, %{marker: marker, observed_at: observed_at}}
+    else
+      _invalid -> {:error, :invalid_transition}
+    end
+  end
+
+  defp lock_organization_reconciliation_scope(%MirrorOperation{id: id})
+       when is_integer(id) and id > 0 do
+    with %MirrorOperation{organization_mirror_id: organization_mirror_id} <-
+           Repo.get(MirrorOperation, id),
+         %OrganizationMirror{} = organization <-
+           OrganizationMirror
+           |> where([candidate], candidate.id == ^organization_mirror_id)
+           |> lock("FOR UPDATE")
+           |> Repo.one() do
+      {:ok, organization}
+    else
+      _missing -> {:error, :lost_lease}
+    end
+  end
+
+  defp lock_organization_reconciliation_scope(_operation), do: {:error, :lost_lease}
+
+  defp lock_owned_organization_finalizer(operation) do
+    if owned_capability?(operation) do
+      query =
+        from candidate in MirrorOperation,
+          where:
+            candidate.id == ^operation.id and
+              candidate.organization_mirror_id == ^operation.organization_mirror_id and
+              is_nil(candidate.repository_mirror_id) and
+              candidate.kind == @organization_reconciliation_finalizer_kind and
+              candidate.state == :processing and
+              candidate.lease_owner == ^operation.lease_owner and
+              candidate.lease_expires_at == ^operation.lease_expires_at and
+              candidate.lease_expires_at >
+                fragment("timezone('UTC', clock_timestamp())") and
+              candidate.lock_version == ^operation.lock_version,
+          lock: "FOR UPDATE"
+
+      case Repo.one(query) do
+        %MirrorOperation{} = persisted -> {:ok, persisted}
+        nil -> {:error, :lost_lease}
+      end
+    else
+      {:error, :lost_lease}
+    end
+  end
+
+  @doc false
   def checkpoint_git_reconciliation(operation, checkpoint, now) when is_map(checkpoint) do
     with :ok <- validate_bounded_object(checkpoint),
          :ok <- validate_utc(now) do
@@ -5153,6 +5391,18 @@ defmodule ForgeMirrors do
     end
   end
 
+  defp replacement_git_reconciliation(
+         %{cursor: %{@inventory_reconciliation_sweep_key => _marker}} = operation,
+         %{kind: kind},
+         now
+       )
+       when kind in [
+              "reconcile.repository.bootstrap",
+              "reconcile.repository.git",
+              "finalize.repository.git"
+            ],
+       do: enqueue_replacement_git_reconciliation(operation, now)
+
   defp replacement_git_reconciliation(_operation, %{kind: kind} = later, _now)
        when kind in [
               "reconcile.repository.bootstrap",
@@ -5161,13 +5411,18 @@ defmodule ForgeMirrors do
             ],
        do: {:ok, later}
 
-  defp replacement_git_reconciliation(operation, _later, now) do
+  defp replacement_git_reconciliation(operation, _later, now),
+    do: enqueue_replacement_git_reconciliation(operation, now)
+
+  defp enqueue_replacement_git_reconciliation(operation, now) do
     enqueue_operation(%{
       organization_mirror_id: operation.organization_mirror_id,
       repository_mirror_id: operation.repository_mirror_id,
       kind: "reconcile.repository.git",
       dedupe_key: "reconcile:finalizer:#{operation.id}:replacement",
-      cursor: %{"superseded_finalizer_operation_id" => operation.id},
+      cursor:
+        %{"superseded_finalizer_operation_id" => operation.id}
+        |> copy_cursor(operation.cursor, @inventory_reconciliation_sweep_key),
       next_attempt_at: now
     })
   end
@@ -6595,12 +6850,14 @@ defmodule ForgeMirrors do
         repository_mirror_id: operation.repository_mirror_id,
         kind: "sync.git_ref",
         dedupe_key: "reconcile:#{operation.id}:#{digest}",
-        cursor: %{
-          "initial_absence" => false,
-          "reconciliation_operation_id" => operation.id,
-          "ref_name" => ref_name,
-          "trigger" => "reconcile"
-        },
+        cursor:
+          %{
+            "initial_absence" => false,
+            "reconciliation_operation_id" => operation.id,
+            "ref_name" => ref_name,
+            "trigger" => "reconcile"
+          }
+          |> copy_cursor(operation.cursor, @inventory_reconciliation_sweep_key),
         next_attempt_at: now
       }
 
@@ -6624,7 +6881,8 @@ defmodule ForgeMirrors do
       cursor:
         %{"reconciliation_operation_id" => operation.id}
         |> copy_cursor(operation.cursor, "repository_creation_operation_id")
-        |> copy_cursor(operation.cursor, "post_git_metadata_reconciliation"),
+        |> copy_cursor(operation.cursor, "post_git_metadata_reconciliation")
+        |> copy_cursor(operation.cursor, @inventory_reconciliation_sweep_key),
       next_attempt_at: now
     })
   end
@@ -7910,6 +8168,7 @@ defmodule ForgeMirrors do
   defp maybe_finish_inventory_sweep(
          _organization,
          next_cursor,
+         _inventory_operation_id,
          _sweep_marker,
          _observed_at,
          classifications
@@ -7920,6 +8179,7 @@ defmodule ForgeMirrors do
   defp maybe_finish_inventory_sweep(
          organization,
          nil,
+         inventory_operation_id,
          sweep_marker,
          observed_at,
          classifications
@@ -7939,21 +8199,44 @@ defmodule ForgeMirrors do
       inc: [lock_version: 1]
     )
 
-    with {:ok, _organization} <-
-           organization
-           |> OrganizationMirror.update_changeset(%{last_reconciled_at: observed_at})
-           |> cas_update(),
-         {:ok, _operations} <-
+    with {:ok, _operations} <-
            enqueue_inventory_git_reconciliations(
              organization.id,
+             sweep_marker,
+             observed_at
+           ),
+         {:ok, _finalizer} <-
+           enqueue_organization_reconciliation_finalizer(
+             organization.id,
+             inventory_operation_id,
              sweep_marker,
              observed_at
            ) do
       {:ok, Map.put(classifications, :access_revoked, unseen_ids)}
     else
-      {:error, :stale} -> {:error, :lost_lease}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp enqueue_organization_reconciliation_finalizer(
+         organization_mirror_id,
+         inventory_operation_id,
+         sweep_marker,
+         observed_at
+       ) do
+    enqueue_operation(%{
+      organization_mirror_id: organization_mirror_id,
+      kind: @organization_reconciliation_finalizer_kind,
+      dedupe_key:
+        "reconcile:organization:#{organization_mirror_id}:#{inventory_operation_id}:finalize",
+      cursor: %{
+        "version" => 1,
+        "inventory_operation_id" => inventory_operation_id,
+        @inventory_reconciliation_sweep_key => sweep_marker,
+        "observed_at" => DateTime.to_iso8601(observed_at)
+      },
+      next_attempt_at: observed_at
+    })
   end
 
   @doc false
@@ -8003,15 +8286,17 @@ defmodule ForgeMirrors do
                      repository_mirror_id: binding.id,
                      kind: "reconcile.repository.#{collection}",
                      dedupe_key: key,
-                     cursor: %{
-                       "trigger" => "reconcile",
-                       "resource_kind" => kind,
-                       "since" => "1970-01-01T00:00:00Z",
-                       "page" => 1,
-                       "sweep_id" => Ecto.UUID.generate(),
-                       "sweep_key" => sweep_key,
-                       "bootstrap_repository_item_id" => binding.bootstrap_repository_item_id
-                     },
+                     cursor:
+                       %{
+                         "trigger" => "reconcile",
+                         "resource_kind" => kind,
+                         "since" => "1970-01-01T00:00:00Z",
+                         "page" => 1,
+                         "sweep_id" => Ecto.UUID.generate(),
+                         "sweep_key" => sweep_key,
+                         "bootstrap_repository_item_id" => binding.bootstrap_repository_item_id
+                       }
+                       |> maybe_put_inventory_reconciliation_sweep(sweep_key),
                      next_attempt_at: now
                    }) do
                 {:ok, operation} -> operation
@@ -8078,7 +8363,9 @@ defmodule ForgeMirrors do
                      repository_mirror_id: binding.id,
                      kind: "reconcile.repository.metadata",
                      dedupe_key: key,
-                     cursor: %{"trigger" => "reconcile", "sweep_key" => sweep_key},
+                     cursor:
+                       %{"trigger" => "reconcile", "sweep_key" => sweep_key}
+                       |> maybe_put_inventory_reconciliation_sweep(sweep_key),
                      next_attempt_at: now
                    }) do
                 {:ok, operation} -> operation
@@ -8145,15 +8432,17 @@ defmodule ForgeMirrors do
                        repository_mirror_id: binding.id,
                        kind: "reconcile.repository.pull_heads",
                        dedupe_key: key,
-                       cursor: %{
-                         "trigger" => "reconcile",
-                         "resource_kind" => "pull",
-                         "since" => "1970-01-01T00:00:00Z",
-                         "page" => 1,
-                         "sweep_id" => Ecto.UUID.generate(),
-                         "sweep_key" => sweep_key,
-                         "bootstrap_repository_item_id" => binding.bootstrap_repository_item_id
-                       },
+                       cursor:
+                         %{
+                           "trigger" => "reconcile",
+                           "resource_kind" => "pull",
+                           "since" => "1970-01-01T00:00:00Z",
+                           "page" => 1,
+                           "sweep_id" => Ecto.UUID.generate(),
+                           "sweep_key" => sweep_key,
+                           "bootstrap_repository_item_id" => binding.bootstrap_repository_item_id
+                         }
+                         |> maybe_put_inventory_reconciliation_sweep(sweep_key),
                        next_attempt_at: now
                      }) do
                   {:ok, operation} ->
@@ -8173,6 +8462,11 @@ defmodule ForgeMirrors do
 
   def enqueue_repository_pull_head_reconciliation(_, _, _),
     do: {:error, :invalid_argument}
+
+  defp maybe_put_inventory_reconciliation_sweep(cursor, "inventory:" <> sweep_marker),
+    do: Map.put(cursor, @inventory_reconciliation_sweep_key, sweep_marker)
+
+  defp maybe_put_inventory_reconciliation_sweep(cursor, _sweep_key), do: cursor
 
   defp resource_sweep_kinds(organization) do
     issues = issue_capability_enabled?(organization, "issue")
@@ -8204,7 +8498,10 @@ defmodule ForgeMirrors do
         repository_mirror_id: repository_mirror_id,
         kind: "reconcile.repository.git",
         dedupe_key: "inventory-git:#{sweep_marker}:#{repository_mirror_id}",
-        cursor: %{"inventory_sweep" => sweep_marker},
+        cursor: %{
+          "inventory_sweep" => sweep_marker,
+          @inventory_reconciliation_sweep_key => sweep_marker
+        },
         next_attempt_at: now
       }
 
