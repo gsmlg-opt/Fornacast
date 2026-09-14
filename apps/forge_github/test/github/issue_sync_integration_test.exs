@@ -133,6 +133,7 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
       @base
       |> Map.put("title", "Changed on GitHub without a webhook")
       |> Map.put("label_github_ids", [333])
+      |> Map.put("assignee_github_ids", [801])
 
     label = %{
       "id" => 333,
@@ -141,6 +142,19 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
       "color" => "aabbcc",
       "description" => "Discovered during reconciliation"
     }
+
+    assignee = %{
+      "id" => 801,
+      "node_id" => "U_801",
+      "login" => "reconciled-assignee",
+      "type" => "User"
+    }
+
+    remote_issue =
+      target
+      |> issue_json(observed_at)
+      |> Map.put("labels", [label])
+      |> Map.put("assignees", [assignee])
 
     {:ok, %{comment: comment}} =
       Multi.new()
@@ -265,13 +279,13 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
 
       case conn.request_path do
         "/repos/acme/project/issues" ->
-          Req.Test.json(conn, [Map.put(issue_json(target, observed_at), "labels", [label])])
+          Req.Test.json(conn, [remote_issue])
 
         "/repos/acme/project/issues/comments" ->
           Req.Test.json(conn, [])
 
         "/repos/acme/project/issues/7" ->
-          Req.Test.json(conn, Map.put(issue_json(target, observed_at), "labels", [label]))
+          Req.Test.json(conn, remote_issue)
 
         "/repos/acme/project/issues/comments/900" ->
           conn |> Plug.Conn.put_status(404) |> Req.Test.json(%{"message" => "Not Found"})
@@ -359,6 +373,20 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
     assert "sync.issue_comment" in claimed_kinds
 
     assert %{title: "Changed on GitHub without a webhook"} = Repo.get!(Issue, ctx.issue.id)
+
+    assert {:ok, %{assignee_refs: [%{kind: :github_identity, id: assignee_identity_id}]}} =
+             ForgeIssues.sync_projection(ctx.repository.id, :issue, ctx.issue.id)
+
+    assert %{github_user_id: 801, github_node_id: "U_801", login: "reconciled-assignee"} =
+             Repo.get!(ForgeAccounts.GitHubIdentity, assignee_identity_id)
+
+    assert %ForgeIssues.IssueAssignee{
+             user_id: nil,
+             github_identity_id: ^assignee_identity_id
+           } = Repo.get_by!(ForgeIssues.IssueAssignee, issue_id: ctx.issue.id)
+
+    assert %{"assignee_github_ids" => [801]} =
+             Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_snapshot
 
     assert [] ==
              Repo.all(
