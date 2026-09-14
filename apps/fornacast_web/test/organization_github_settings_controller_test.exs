@@ -29,6 +29,11 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
       operation_result(:get_settings, {:ok, %{}})
     end
 
+    def get_conflicts(actor, organization, filters) do
+      record(:get_conflicts, [actor, organization, filters])
+      operation_result(:get_conflicts, {:ok, %{}})
+    end
+
     def begin_installation(actor, organization, state, metadata) do
       record(:begin_installation, [actor, organization, state, metadata])
 
@@ -190,6 +195,32 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
     end
   end
 
+  test "owner sees a webhook delivery gap from the bounded settings view", %{
+    owner: owner,
+    organization: organization
+  } do
+    view =
+      organization
+      |> settings_view()
+      |> Map.put(:mirror, %{state: :active})
+      |> Map.put(:webhook_health, %{
+        state_counts: %{failed: 1},
+        oldest_unprocessed_at: ~U[2026-09-05 00:30:00Z],
+        latest_failure: %{failure_class: "invalid_webhook_payload"},
+        unreconciled_failed_count: 1,
+        gap?: true
+      })
+
+    TestOrganizationSync.result(:get_settings, {:ok, view})
+
+    conn = request_conn(owner) |> get(github_settings_path(organization))
+    html = html_response(conn, 200)
+
+    assert html =~ "Webhook delivery gap"
+    assert html =~ "Latest failure: Invalid webhook payload"
+    assert_private_no_store(conn)
+  end
+
   test "member outsider disabled actor and missing or disabled organizations are masked", %{
     owner: owner,
     admin: admin,
@@ -272,7 +303,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
         %{resource: "refs/heads/main", kind: :diverged, state: :open}
       ])
 
-    TestOrganizationSync.result(:get_settings, {:ok, view})
+    TestOrganizationSync.result(:get_conflicts, {:ok, view})
 
     conn = request_conn(owner) |> get(github_settings_path(organization) <> "/conflicts")
     html = html_response(conn, 200)
@@ -280,8 +311,40 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
     assert html =~ "GitHub synchronization conflicts"
     assert html =~ "refs/heads/main"
     assert html =~ "Diverged"
-    assert [{:get_settings, [_actor, _organization]}] = TestOrganizationSync.calls()
+    assert [{:get_conflicts, [_actor, _organization, %{}]}] = TestOrganizationSync.calls()
     assert_private_no_store(conn)
+  end
+
+  test "conflicts apply only bounded filters through the conflict facade", %{
+    owner: owner,
+    organization: organization
+  } do
+    view = %{
+      conflicts: [],
+      filters: %{repository: 7, resource: "refs/heads/main", type: "git_ref"},
+      repositories: [%{id: 7, full_name: "acme/widgets"}],
+      types: ["git_ref"],
+      actions: %{}
+    }
+
+    TestOrganizationSync.result(:get_conflicts, {:ok, view})
+
+    conn =
+      request_conn(owner)
+      |> get(
+        github_settings_path(organization) <>
+          "/conflicts?repository=7&type=git_ref&resource=refs/heads/main"
+      )
+
+    assert html_response(conn, 200) =~ "Filter conflicts"
+
+    assert [
+             {:get_conflicts, [%User{id: actor_id}, %Organization{id: organization_id}, filters]}
+           ] = TestOrganizationSync.calls()
+
+    assert actor_id == owner.id
+    assert organization_id == organization.id
+    assert filters == %{"repository" => "7", "resource" => "refs/heads/main", "type" => "git_ref"}
   end
 
   test "owner requests an external recheck for an open pull merge conflict", %{
@@ -303,7 +366,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
         }
       ])
 
-    TestOrganizationSync.result(:get_settings, {:ok, view})
+    TestOrganizationSync.result(:get_conflicts, {:ok, view})
 
     form = request_conn(owner) |> get(github_settings_path(organization) <> "/conflicts")
     action = github_settings_path(organization) <> "/conflicts/42"
@@ -324,7 +387,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
     assert redirected_to(accepted, 303) == github_settings_path(organization) <> "/conflicts"
 
     assert [
-             {:get_settings, [%User{}, %Organization{}]},
+             {:get_conflicts, [%User{}, %Organization{}, %{}]},
              {:resolve_pull_merge_conflict,
               [%User{id: actor_id}, %Organization{id: organization_id}, attrs, metadata]}
            ] = TestOrganizationSync.calls()
@@ -349,7 +412,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
         %{id: 13, lock_version: 4, resource_kind: "pull_merge", state: :open}
       ])
 
-    TestOrganizationSync.result(:get_settings, {:ok, view})
+    TestOrganizationSync.result(:get_conflicts, {:ok, view})
 
     conn = request_conn(owner) |> get(github_settings_path(organization) <> "/conflicts")
 

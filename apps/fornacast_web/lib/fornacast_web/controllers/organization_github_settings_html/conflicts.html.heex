@@ -20,6 +20,51 @@
 
   <.dm_card id="github-organization-conflicts" variant="bordered" shadow="sm" padding="lg">
     <:title><span class="text-lg font-semibold">Outstanding conflicts</span></:title>
+    <form
+      action={"/organizations/#{@organization.username}/settings/github/conflicts"}
+      method="get"
+      class="grid gap-3 md:grid-cols-3"
+    >
+      <label class="grid gap-1 text-sm">
+        <span>Repository</span>
+        <select name="repository" class="select">
+          <option value="">All repositories</option>
+          <option
+            :for={repository <- value(@view, :repositories, [])}
+            value={value(repository, :id)}
+            selected={value(@view, :filters, %{}) |> value(:repository) == value(repository, :id)}
+          >
+            {item_label(repository, [:full_name])}
+          </option>
+        </select>
+      </label>
+      <label class="grid gap-1 text-sm">
+        <span>Resource</span>
+        <input
+          type="text"
+          name="resource"
+          value={value(@view, :filters, %{}) |> value(:resource, "")}
+          class="input"
+          maxlength="512"
+        />
+      </label>
+      <label class="grid gap-1 text-sm">
+        <span>Type</span>
+        <select name="type" class="select">
+          <option value="">All types</option>
+          <option
+            :for={type <- value(@view, :types, [])}
+            value={type}
+            selected={value(@view, :filters, %{}) |> value(:type) == type}
+          >
+            {humanize(type)}
+          </option>
+        </select>
+      </label>
+      <div class="md:col-span-3">
+        <.dm_btn type="submit" variant="secondary" size="sm">Filter conflicts</.dm_btn>
+      </div>
+    </form>
     <p :if={@view.conflicts == []} class="text-sm text-on-surface-variant">
       No outstanding synchronization conflicts.
     </p>
@@ -29,6 +74,7 @@
           <tr>
             <th scope="col">Resource</th>
             <th scope="col">Conflict</th>
+            <th scope="col">Comparison</th>
             <th scope="col">State</th>
           </tr>
         </thead>
@@ -37,8 +83,37 @@
             <th scope="row">{item_label(conflict, [:resource, :resource_identity])}</th>
             <td>{humanize(item_label(conflict, [:kind, :conflict_kind]))}</td>
             <td>
+              <details :if={is_binary(value(conflict, :baseline))} class="grid gap-2">
+                <summary class="cursor-pointer text-primary">Compare retained snapshots</summary>
+                <dl class="grid gap-2 text-xs">
+                  <div class="grid gap-1">
+                    <dt class="font-semibold">Baseline</dt>
+                    <dd>
+                      <pre class="whitespace-pre-wrap break-words">{value(conflict, :baseline)}</pre>
+                    </dd>
+                  </div>
+                  <div class="grid gap-1">
+                    <dt class="font-semibold">Fornacast</dt>
+                    <dd>
+                      <pre class="whitespace-pre-wrap break-words">{value(conflict, :local)}</pre>
+                    </dd>
+                  </div>
+                  <div class="grid gap-1">
+                    <dt class="font-semibold">GitHub</dt>
+                    <dd>
+                      <pre class="whitespace-pre-wrap break-words">{value(conflict, :remote)}</pre>
+                    </dd>
+                  </div>
+                </dl>
+              </details>
+              <span :if={not is_binary(value(conflict, :baseline))}>Retained comparison unavailable</span>
+            </td>
+            <td>
               <div class="grid gap-2">
                 <span>{item_label(conflict, [:state])}</span>
+                <p :if={git_conflict?(conflict)} class="text-xs text-on-surface-variant">
+                  Git conflicts are read-only here. Resolve the ref with an explicit Git action, then run reconciliation.
+                </p>
                 <form
                   :if={
                     action_enabled?(@view, :resolve_pull_merge_conflict) &&

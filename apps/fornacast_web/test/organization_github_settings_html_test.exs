@@ -135,6 +135,34 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTMLTest do
     assert html =~ ~s(href="/organizations/acme/settings/github/conflicts")
   end
 
+  test "webhook delivery gaps are visible without exposing delivery payloads" do
+    view =
+      :active
+      |> connected_view(:all)
+      |> Map.put(:webhook_health, %{
+        state_counts: %{failed: 2, pending: 1},
+        oldest_unprocessed_at: ~U[2026-09-05 00:30:00Z],
+        latest_failure: %{
+          failure_class: "invalid_webhook_payload",
+          received_at: ~U[2026-09-05 00:45:00Z]
+        },
+        unreconciled_failed_count: 2,
+        gap?: true
+      })
+
+    html =
+      render_component(&OrganizationGitHubSettingsHTML.index/1,
+        organization: organization(),
+        view: view
+      )
+
+    assert html =~ "Webhook delivery gap"
+    assert html =~ "2 failed deliveries require reconciliation"
+    assert html =~ "Invalid webhook payload"
+    assert html =~ "Sep 05, 2026 at 00:30 UTC"
+    refute html =~ "raw_payload"
+  end
+
   test "every mutation uses native CSRF forms and method overrides with one primary action" do
     view =
       :ready_to_bootstrap
@@ -209,6 +237,45 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTMLTest do
     assert empty =~ "No outstanding synchronization conflicts."
   end
 
+  test "conflicts screen renders bounded escaped comparisons and read-only filters" do
+    view = %{
+      conflicts: [
+        %{
+          id: 1,
+          repository_mirror_id: 7,
+          resource_kind: "git_ref",
+          resource_identity: "refs/heads/main",
+          conflict_kind: "concurrent_edit",
+          state: :open,
+          baseline: ~s({"name":"before"}),
+          local: ~s({"name":"&lt;local&gt;"}),
+          remote: ~s({"name":"remote"})
+        }
+      ],
+      filters: %{repository: 7, resource: "refs/heads/main", type: "git_ref"},
+      repositories: [%{id: 7, full_name: "acme/widgets"}],
+      types: ["git_ref"],
+      actions: %{}
+    }
+
+    html =
+      render_component(&OrganizationGitHubSettingsHTML.conflicts/1,
+        organization: organization(),
+        view: view
+      )
+
+    assert html =~ ~s(name="repository")
+    assert html =~ ~s(name="resource" value="refs/heads/main")
+    assert html =~ "Baseline"
+    assert html =~ "Fornacast"
+    assert html =~ "GitHub"
+    assert html =~ "Git conflicts are read-only here"
+    assert html =~ "&amp;lt;local&amp;gt;"
+    refute html =~ "<local>"
+    refute html =~ "Accept GitHub"
+    refute html =~ "Accept Fornacast"
+  end
+
   defp organization do
     %Organization{id: 71, username: "acme", display_name: "Acme Engineering", state: :active}
   end
@@ -226,6 +293,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTMLTest do
       repositories: [],
       operations: [],
       conflicts: [],
+      webhook_health: %{},
       actions: %{install: true}
     }
   end

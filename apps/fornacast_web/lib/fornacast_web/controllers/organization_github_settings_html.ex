@@ -23,6 +23,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTML do
         repositories: [],
         operations: [],
         conflicts: [],
+        webhook_health: %{},
         actions: %{}
       }
       |> Map.merge(view)
@@ -31,6 +32,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTML do
     with true <- is_map(normalized.policy),
          true <- is_map(normalized.capabilities),
          true <- is_map(normalized.repository_counts),
+         true <- is_map(normalized.webhook_health),
          true <- is_map(normalized.actions),
          true <- bounded_list?(normalized.missing_permissions, 50),
          true <- bounded_list?(normalized.repositories, @max_repositories),
@@ -141,6 +143,28 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTML do
   end
 
   def pull_merge_recheckable?(_conflict), do: false
+
+  def git_conflict?(conflict) when is_map(conflict),
+    do: value(conflict, :resource_kind) in ["git_ref", :git_ref]
+
+  def git_conflict?(_conflict), do: false
+
+  def webhook_gap?(view), do: value(value(view, :webhook_health, %{}), :gap?, false) == true
+
+  def webhook_failed_count(view) do
+    view
+    |> value(:webhook_health, %{})
+    |> value(:unreconciled_failed_count, 0)
+    |> case do
+      count when is_integer(count) and count >= 0 -> count
+      _invalid -> 0
+    end
+  end
+
+  def webhook_gap_label(view) do
+    count = webhook_failed_count(view)
+    "#{count} failed #{if(count == 1, do: "delivery", else: "deliveries")} require reconciliation"
+  end
 
   def humanize(true), do: "Enabled"
   def humanize(false), do: "Disabled"

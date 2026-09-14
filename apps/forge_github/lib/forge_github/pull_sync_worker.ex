@@ -3,8 +3,7 @@ defmodule ForgeGitHub.PullSyncWorker do
   Bounded synchronization for mapped pulls and authenticated pull creation.
 
   Outbound creation uses its own durable intent and recovery coordinator. This
-  worker still excludes ref retargeting, merging, deletion, and reconciliation
-  sweeps. GitHub issue metadata and draft
+  worker still excludes ref retargeting, merging, and deletion. GitHub issue metadata and draft
   conversion are separate durable effects. Every effect and confirmation is
   guarded by the same persisted pull/ref eligibility proof.
   """
@@ -121,10 +120,23 @@ defmodule ForgeGitHub.PullSyncWorker do
         options
       )
       when is_list(options) do
-    callback(options, :reconcile_pull_heads, &ForgeMirrors.reconcile_pull_head_page/2).(
-      operation,
-      now
-    )
+    with {:ok, sync} <- reconciliation_context(operation, options),
+         {:ok, page} <- pull_reconciliation_page(sync, options),
+         {:ok, observations} <- pull_page_observations(page) do
+      callback(options, :record_page, &ForgeMirrors.record_resource_reconciliation_page/5).(
+        operation,
+        :pull,
+        observations,
+        page.next_cursor,
+        now
+      )
+    else
+      {:error, reason} -> persist_failure(operation, now, reason, options)
+    end
+  rescue
+    _exception -> persist_failure(operation, now, :worker_crash, options)
+  catch
+    _kind, _reason -> persist_failure(operation, now, :worker_crash, options)
   end
 
   def process_operation(
@@ -371,6 +383,76 @@ defmodule ForgeGitHub.PullSyncWorker do
 
   defp context(operation, options),
     do: callback(options, :context, &default_context/1).(operation)
+
+  defp reconciliation_context(operation, options),
+    do:
+      callback(
+        options,
+        :reconciliation_context,
+        &ForgeMirrors.pull_reconciliation_context/1
+      ).(operation)
+
+  defp pull_reconciliation_page(%{phase: :mapped} = sync, options) do
+    callback(options, :resource_inventory, &ForgeMirrors.ResourceInventory.page/4).(
+      sync.repository_mirror_id,
+      :pull,
+      sync.mapping_cursor,
+      100
+    )
+  end
+
+  defp pull_reconciliation_page(sync, options) do
+    with {:ok, token} <- installation_token(sync, options) do
+      callback(options, :list_pulls, &PullClient.list_pulls_page/5).(
+        token,
+        sync.remote_owner,
+        sync.remote_repository,
+        sync.page,
+        request_options(sync)
+      )
+    end
+  end
+
+  defp pull_page_observations(%{observations: observations}) when is_list(observations),
+    do: {:ok, observations}
+
+  defp pull_page_observations(%{pulls: pulls}) when is_list(pulls) and length(pulls) <= 100 do
+    observations =
+      Enum.map(pulls, fn raw ->
+        %{
+          github_object_id: raw["id"],
+          github_number: raw["number"],
+          github_issue_id: nil,
+          remote_updated_at: parse_datetime!(raw["updated_at"])
+        }
+      end)
+
+    if Enum.all?(observations, &valid_pull_reconciliation_observation?/1) and
+         unique_pull_reconciliation_identities?(observations),
+       do: {:ok, observations},
+       else: {:error, :invalid_remote_resource}
+  rescue
+    _exception -> {:error, :invalid_remote_resource}
+  end
+
+  defp pull_page_observations(_page), do: {:error, :invalid_remote_resource}
+
+  defp valid_pull_reconciliation_observation?(observation) do
+    is_integer(observation.github_object_id) and observation.github_object_id > 0 and
+      is_integer(observation.github_number) and observation.github_number > 0 and
+      match?(%DateTime{utc_offset: 0, std_offset: 0}, observation.remote_updated_at)
+  end
+
+  defp unique_pull_reconciliation_identities?(observations) do
+    object_ids = Enum.map(observations, & &1.github_object_id)
+    numbers = Enum.map(observations, & &1.github_number)
+    Enum.uniq(object_ids) == object_ids and Enum.uniq(numbers) == numbers
+  end
+
+  defp parse_datetime!(value) when is_binary(value) do
+    {:ok, datetime, 0} = DateTime.from_iso8601(value)
+    DateTime.truncate(datetime, :second)
+  end
 
   defp default_context(operation) do
     if operation.state == :effect_pending and is_map(operation.external_effect_marker) and

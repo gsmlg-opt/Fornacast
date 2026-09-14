@@ -43,6 +43,7 @@ defmodule ForgeGitHub.Application do
         {Task.Supervisor, name: ForgeGitHub.PullSyncLoopTaskSupervisor, max_children: 1},
         {Task.Supervisor, name: ForgeGitHub.PullSyncTaskSupervisor, max_children: 8},
         {Task.Supervisor, name: ForgeGitHub.ReleaseSyncTaskSupervisor, max_children: 2},
+        {Task.Supervisor, name: ForgeGitHub.RepositoryMetadataTaskSupervisor, max_children: 4},
         {ForgeGitHub.InstallationTokenBroker,
          task_supervisor: ForgeGitHub.TokenTaskSupervisor, max_inflight: 16, max_entries: 256},
         {ForgeMirrors.WebhookWorker, processor: ForgeGitHub.WebhookProcessor},
@@ -58,7 +59,8 @@ defmodule ForgeGitHub.Application do
            task_supervisor: ForgeGitHub.PullSyncTaskSupervisor
          ] ++ pull_sync_options},
         {ForgeGitHub.ReleaseSyncWorker,
-         [task_supervisor: ForgeGitHub.ReleaseSyncTaskSupervisor] ++ pull_sync_options}
+         [task_supervisor: ForgeGitHub.ReleaseSyncTaskSupervisor] ++ pull_sync_options},
+        {ForgeGitHub.RepositoryMetadataSyncWorker, [enabled: app_configuration != :disabled]}
       ] ++ pull_merge_children
 
     Supervisor.start_link(children, strategy: :one_for_one, name: ForgeGitHub.Supervisor)

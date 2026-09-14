@@ -103,7 +103,33 @@
             </time>
           </dd>
         </div>
+        <div class="grid gap-1">
+          <dt class="text-on-surface-variant">Oldest pending webhook</dt>
+          <dd>
+            <time datetime={datetime_value(value(@view.webhook_health, :oldest_unprocessed_at))}>
+              {datetime_label(value(@view.webhook_health, :oldest_unprocessed_at))}
+            </time>
+          </dd>
+        </div>
       </dl>
+      <.dm_alert
+        :if={webhook_gap?(@view)}
+        id="github-organization-webhook-gap"
+        class="mt-4"
+        variant="warning"
+        outlined
+      >
+        <p class="font-semibold">Webhook delivery gap</p>
+        <p>{webhook_gap_label(@view)}</p>
+        <p :if={value(value(@view.webhook_health, :latest_failure, %{}), :failure_class)}>
+          Latest failure: {humanize(
+            value(value(@view.webhook_health, :latest_failure, %{}), :failure_class)
+          )}
+        </p>
+      </.dm_alert>
+      <p :if={!webhook_gap?(@view)} class="mt-4 text-sm text-on-surface-variant">
+        No known webhook delivery gaps.
+      </p>
       <ul class="mt-4 flex flex-wrap gap-2" aria-label="Repository counts">
         <li :for={{state, count} <- map_entries(@view.repository_counts)}>
           <.dm_badge variant="neutral" soft>{humanize(state)} {humanize(count)}</.dm_badge>

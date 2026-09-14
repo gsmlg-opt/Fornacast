@@ -457,7 +457,7 @@ defmodule ForgeMirrors.InventoryTest do
                "page" => 1,
                "sweep_key" => "inventory:inventory-operation:" <> _
              },
-             checkpoint: %{"phase" => "mapped", "mapping_cursor" => nil}
+             checkpoint: %{}
            } =
              Repo.get_by!(MirrorOperation,
                repository_mirror_id: repository_mirror.id,

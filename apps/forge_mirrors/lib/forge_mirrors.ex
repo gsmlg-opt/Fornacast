@@ -29,6 +29,16 @@ defmodule ForgeMirrors do
   @type direction :: :inbound | :outbound
   @type resource_kind :: :organization | :repository | :git | :lfs | :issue | :pull | :release
 
+  @doc false
+  defdelegate repository_metadata_operation_context(operation),
+    to: ForgeMirrors.RepositoryMetadataReconciliation,
+    as: :context
+
+  @doc false
+  defdelegate record_repository_metadata_observation(operation, remote, now),
+    to: ForgeMirrors.RepositoryMetadataReconciliation,
+    as: :record
+
   @spec observe_github_app_installation(map()) ::
           {:ok, GitHubAppInstallation.t()}
           | {:error, Ecto.Changeset.t() | :identity_mismatch | :invalid_transition}
@@ -994,6 +1004,28 @@ defmodule ForgeMirrors do
   end
 
   def resource_operation_context(_), do: {:error, :invalid_transition}
+
+  @doc false
+  def pull_reconciliation_context(
+        %MirrorOperation{kind: "reconcile.repository.pull_heads"} = operation
+      ) do
+    Repo.transaction(fn ->
+      with {:ok, persisted, %{resource_kind: :pull} = scope} <-
+             lock_resource_operation(operation),
+           true <- persisted.state == :processing and is_nil(persisted.external_effect_marker) do
+        Map.merge(scope, %{
+          page: persisted.checkpoint["page"] || 1,
+          phase: if(persisted.checkpoint["phase"] == "mapped", do: :mapped, else: :remote),
+          mapping_cursor: persisted.checkpoint["mapping_cursor"]
+        })
+      else
+        {:error, reason} -> Repo.rollback(reason)
+        _ -> Repo.rollback(:invalid_transition)
+      end
+    end)
+  end
+
+  def pull_reconciliation_context(_), do: {:error, :invalid_transition}
 
   @doc false
   def release_operation_context(%MirrorOperation{} = operation) do
@@ -4029,6 +4061,15 @@ defmodule ForgeMirrors do
           {:ok, map()} | {:error, term()}
   def organization_settings(actor, organization_id),
     do: ForgeMirrors.Settings.view(actor, organization_id)
+
+  @spec organization_conflicts(ForgeAccounts.User.t(), pos_integer(), map()) ::
+          {:ok, map()} | {:error, term()}
+  def organization_conflicts(actor, organization_id, filters),
+    do: ForgeMirrors.Settings.conflicts(actor, organization_id, filters)
+
+  @spec webhook_health(ForgeAccounts.User.t(), pos_integer()) :: {:ok, map()} | {:error, term()}
+  def webhook_health(actor, organization_id),
+    do: ForgeMirrors.Settings.webhook_health(actor, organization_id)
 
   @spec update_organization_settings(ForgeAccounts.User.t(), pos_integer(), map()) ::
           {:ok, OrganizationMirror.t()} | {:error, term()}
@@ -7744,6 +7785,73 @@ defmodule ForgeMirrors do
   def enqueue_repository_resource_reconciliations(_, _, _), do: {:error, :invalid_argument}
 
   @doc false
+  def enqueue_repository_metadata_reconciliation(
+        %RepositoryMirror{} = supplied,
+        sweep_key,
+        %DateTime{} = now
+      )
+      when is_binary(sweep_key) and byte_size(sweep_key) in 1..255 do
+    with :ok <- validate_utc(now) do
+      Repo.transaction(fn ->
+        organization =
+          Repo.one(
+            from m in OrganizationMirror,
+              where: m.id == ^supplied.organization_mirror_id,
+              lock: "FOR UPDATE"
+          )
+
+        binding =
+          Repo.one(from m in RepositoryMirror, where: m.id == ^supplied.id, lock: "FOR UPDATE")
+
+        with %OrganizationMirror{provider: "github", state: state} <- organization,
+             true <-
+               state in [:bootstrapping, :catching_up, :active, :degraded, :conflicted, :paused],
+             %RepositoryMirror{
+               inventory_included: true,
+               state: binding_state,
+               repository_id: repository_id
+             } <-
+               binding,
+             true <- binding_state in [:discovered, :active],
+             true <-
+               binding.organization_mirror_id == organization.id and
+                 binding.repository_id == supplied.repository_id,
+             {:ok, repository} <- ForgeRepos.fetch_live_repository(repository_id),
+             true <-
+               repository.lifecycle in [:ready, :synchronizing] and
+                 repository.owner_user_id == organization.organization_id do
+          {:ok, digest} =
+            resource_fingerprint(%{"sweep_key" => sweep_key, "kind" => "repository_metadata"})
+
+          key = "repository-metadata-sweep:#{binding.id}:#{digest}"
+
+          case Repo.get_by(MirrorOperation, dedupe_key: key) do
+            %MirrorOperation{} = operation ->
+              operation
+
+            nil ->
+              case enqueue_operation(%{
+                     organization_mirror_id: organization.id,
+                     repository_mirror_id: binding.id,
+                     kind: "reconcile.repository.metadata",
+                     dedupe_key: key,
+                     cursor: %{"trigger" => "reconcile", "sweep_key" => sweep_key},
+                     next_attempt_at: now
+                   }) do
+                {:ok, operation} -> operation
+                {:error, reason} -> Repo.rollback(reason)
+              end
+          end
+        else
+          _ -> Repo.rollback(:invalid_transition)
+        end
+      end)
+    end
+  end
+
+  def enqueue_repository_metadata_reconciliation(_, _, _), do: {:error, :invalid_argument}
+
+  @doc false
   def enqueue_repository_pull_head_reconciliation(
         %RepositoryMirror{} = supplied,
         sweep_key,
@@ -7806,14 +7914,7 @@ defmodule ForgeMirrors do
                        next_attempt_at: now
                      }) do
                   {:ok, operation} ->
-                    case operation
-                         |> Ecto.Changeset.change(
-                           checkpoint: %{"phase" => "mapped", "mapping_cursor" => nil}
-                         )
-                         |> Repo.update() do
-                      {:ok, operation} -> operation
-                      {:error, reason} -> Repo.rollback(reason)
-                    end
+                    operation
 
                   {:error, reason} ->
                     Repo.rollback(reason)
@@ -7874,14 +7975,27 @@ defmodule ForgeMirrors do
                  now
                ) do
             {:ok, metadata} ->
-              case enqueue_repository_pull_head_reconciliation(
+              case enqueue_repository_metadata_reconciliation(
                      binding,
                      "inventory:#{sweep_marker}",
                      now
                    ) do
-                {:ok, pull_heads} ->
-                  scheduled = metadata ++ if(pull_heads, do: [pull_heads], else: [])
-                  {:cont, {:ok, Enum.reverse(scheduled) ++ [operation | operations]}}
+                {:ok, repository_metadata} ->
+                  case enqueue_repository_pull_head_reconciliation(
+                         binding,
+                         "inventory:#{sweep_marker}",
+                         now
+                       ) do
+                    {:ok, pull_heads} ->
+                      scheduled =
+                        metadata ++
+                          [repository_metadata] ++ if(pull_heads, do: [pull_heads], else: [])
+
+                      {:cont, {:ok, Enum.reverse(scheduled) ++ [operation | operations]}}
+
+                    {:error, reason} ->
+                      {:halt, {:error, reason}}
+                  end
 
                 {:error, reason} ->
                   {:halt, {:error, reason}}

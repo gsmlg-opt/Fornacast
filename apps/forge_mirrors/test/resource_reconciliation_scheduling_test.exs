@@ -46,6 +46,31 @@ defmodule ForgeMirrors.ResourceReconciliationSchedulingTest do
     refute hd(later).id == issues.id
   end
 
+  test "inventory sweep schedules one repository metadata reconciliation idempotently", c do
+    assert {:ok, operation} =
+             ForgeMirrors.enqueue_repository_metadata_reconciliation(
+               c.binding,
+               "inventory:repository-metadata",
+               c.now
+             )
+
+    assert operation.kind == "reconcile.repository.metadata"
+
+    assert operation.cursor == %{
+             "sweep_key" => "inventory:repository-metadata",
+             "trigger" => "reconcile"
+           }
+
+    assert {:ok, replay} =
+             ForgeMirrors.enqueue_repository_metadata_reconciliation(
+               c.binding,
+               "inventory:repository-metadata",
+               c.now
+             )
+
+    assert replay.id == operation.id
+  end
+
   test "pulls-only bootstrap requires the shared comment sweep and failed children block activation",
        c do
     c = bootstrap_binding(c)

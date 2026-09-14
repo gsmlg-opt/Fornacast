@@ -9,8 +9,9 @@ defmodule ForgeMirrors.ResourceInventory do
 
   Confirmed mappings and unfinished provider-bound mappings are eligible.
   Local-only pending rows, tombstones, conflicts and unsupported resources are
-  not remote discovery candidates for issues and comments. Pull head discovery
-  instead selects only unsupported pulls. The coordinator owns authorization, leases
+  not remote discovery candidates for issues and comments. Pull reconciliation
+  revisits confirmed and unfinished provider-bound mappings as well as unsupported
+  heads. The coordinator owns authorization, leases
   and durable checkpointing; this module performs no mutations or HTTP calls.
   """
   import Ecto.Query
@@ -42,7 +43,10 @@ defmodule ForgeMirrors.ResourceInventory do
 
       query =
         if kind == :pull do
-          from mapping in query, where: mapping.state == :unsupported
+          from mapping in query,
+            where:
+              mapping.state in [:confirmed, :unsupported] or
+                (mapping.state == :pending and not is_nil(mapping.github_object_id))
         else
           from mapping in query,
             where:

@@ -10,7 +10,33 @@ defmodule FornacastWeb.OrganizationGitHubSettingsController do
   @max_install_url_bytes 2_048
 
   def index(conn, params), do: render_settings(conn, params, :index)
-  def conflicts(conn, params), do: render_settings(conn, params, :conflicts)
+
+  def conflicts(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
+    with {:ok, organization} <- manageable_organization(actor, params),
+         {:ok, %{} = view} <-
+           organization_sync(conn).get_conflicts(
+             actor,
+             organization,
+             Map.take(params, ["repository", "resource", "type"])
+           ),
+         {:ok, view} <- OrganizationGitHubSettingsHTML.normalize_view(organization, view) do
+      rendered =
+        OrganizationGitHubSettingsHTML.conflicts(%{
+          organization: organization,
+          view: view,
+          __changed__: nil
+        })
+
+      page(
+        conn,
+        "#{organization.display_name || organization.username} GitHub settings",
+        rendered |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary()
+      )
+    else
+      {:error, reason} -> render_error(conn, reason)
+      _unexpected -> render_error(conn, :unavailable)
+    end
+  end
 
   def resolve_pull_merge_conflict(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
     with {:ok, organization} <- manageable_organization(actor, params),

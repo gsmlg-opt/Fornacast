@@ -306,6 +306,60 @@ defmodule ForgeMirrors.WebhookInboxTest do
              ForgeMirrors.revoke_bound_organization_from_webhook(installation_id + 1)
   end
 
+  test "organization webhook health is bounded and exposes delivery gaps without payloads" do
+    mirror =
+      active_organization_mirror_fixture()
+      |> Ecto.Changeset.change(last_reconciled_at: DateTime.add(DateTime.utc_now(:second), -120))
+      |> Repo.update!()
+
+    owner = organization_owner_fixture(mirror)
+
+    pending =
+      enqueue!(
+        delivery_attrs(%{
+          organization_mirror_id: mirror.id,
+          installation_id: mirror.github_installation_id,
+          received_at: DateTime.add(DateTime.utc_now(:second), -60, :second)
+        })
+      )
+
+    failed =
+      enqueue!(
+        delivery_attrs(%{
+          delivery_guid: Ecto.UUID.generate(),
+          organization_mirror_id: mirror.id,
+          installation_id: mirror.github_installation_id
+        })
+      )
+
+    assert {:ok, [claimed]} = ForgeMirrors.claim_webhook_deliveries("health-worker", 30, 10)
+    assert claimed.id == pending.id or claimed.id == failed.id
+
+    assert {:ok, _failed} =
+             ForgeMirrors.fail_webhook_delivery(
+               claimed,
+               "health-worker",
+               "invalid_webhook_payload"
+             )
+
+    assert {:ok, health} = ForgeMirrors.webhook_health(owner, mirror.organization_id)
+    assert health.state_counts.pending + health.state_counts.failed == 2
+    assert health.gap?
+    assert health.unreconciled_failed_count == 1
+    assert health.oldest_unprocessed_at
+    assert health.latest_failure.failure_class == "invalid_webhook_payload"
+    refute Map.has_key?(health, :raw_payload)
+
+    mirror
+    |> Ecto.Changeset.change(last_reconciled_at: DateTime.add(DateTime.utc_now(:second), 1))
+    |> Repo.update!()
+
+    assert {:ok, repaired} = ForgeMirrors.webhook_health(owner, mirror.organization_id)
+    refute repaired.gap?
+    assert repaired.state_counts.failed == 1
+    assert repaired.unreconciled_failed_count == 0
+  end
+
   defp enqueue!(attrs) do
     assert {:ok, delivery, :enqueued} = ForgeMirrors.enqueue_webhook_delivery(attrs, :pending)
     delivery

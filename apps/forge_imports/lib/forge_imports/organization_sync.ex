@@ -27,6 +27,15 @@ defmodule ForgeImports.OrganizationSync do
 
   def get_settings(_actor, _organization), do: {:error, :forbidden}
 
+  def get_conflicts(%User{} = actor, %Organization{id: organization_id}, filters)
+      when is_map(filters) do
+    with {:ok, view} <- ForgeMirrors.organization_conflicts(actor, organization_id, filters) do
+      {:ok, Map.put(view, :actions, %{resolve_pull_merge_conflict: pull_merge_worker_enabled?()})}
+    end
+  end
+
+  def get_conflicts(_actor, _organization, _filters), do: {:error, :forbidden}
+
   def begin_installation(
         %User{} = actor,
         %Organization{id: organization_id},

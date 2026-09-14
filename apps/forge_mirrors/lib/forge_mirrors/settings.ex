@@ -10,6 +10,7 @@ defmodule ForgeMirrors.Settings do
     InventoryPolicy,
     MirrorConflict,
     MirrorOperation,
+    MirrorWebhookDelivery,
     OrganizationMirror,
     RepositoryMirror
   }
@@ -20,6 +21,9 @@ defmodule ForgeMirrors.Settings do
   @repository_limit 100
   @operation_limit 50
   @conflict_limit 50
+  @max_id 9_223_372_036_854_775_807
+  @snapshot_display_limit 4_000
+  @webhook_states [:pending, :pending_unsupported, :processing, :completed, :failed, :ignored]
   @capabilities ~w(git lfs issues pulls releases)
   @all_capabilities @capabilities
   @update_states [:ready_to_bootstrap, :active, :paused, :degraded, :conflicted]
@@ -41,6 +45,41 @@ defmodule ForgeMirrors.Settings do
   end
 
   def view(_actor, _organization_id), do: {:error, :forbidden}
+
+  @spec webhook_health(User.t(), pos_integer()) :: {:ok, map()} | {:error, term()}
+  def webhook_health(%User{} = actor, organization_id) when is_integer(organization_id) do
+    with {:ok, organization} <-
+           ForgeAccounts.fetch_manageable_organization(actor, organization_id) do
+      {:ok,
+       case active_mirror(organization.id) do
+         nil -> empty_webhook_health()
+         mirror -> webhook_health_for_mirror(mirror)
+       end}
+    end
+  rescue
+    _exception -> {:error, :unavailable}
+  end
+
+  def webhook_health(_actor, _organization_id), do: {:error, :forbidden}
+
+  @spec conflicts(User.t(), pos_integer(), map()) :: {:ok, map()} | {:error, term()}
+  def conflicts(%User{} = actor, organization_id, filters)
+      when is_integer(organization_id) and is_map(filters) do
+    with {:ok, organization} <-
+           ForgeAccounts.fetch_manageable_organization(actor, organization_id) do
+      case active_mirror(organization.id) do
+        nil ->
+          {:ok, %{conflicts: [], filters: empty_conflict_filters(), repositories: [], types: []}}
+
+        mirror ->
+          conflict_view(mirror, filters)
+      end
+    end
+  rescue
+    _exception -> {:error, :unavailable}
+  end
+
+  def conflicts(_actor, _organization_id, _filters), do: {:error, :forbidden}
 
   def update(%User{} = actor, organization_id, attrs)
       when is_integer(organization_id) and is_map(attrs) do
@@ -84,7 +123,8 @@ defmodule ForgeMirrors.Settings do
        repository_counts: repository_counts,
        repositories: repositories(mirror.id),
        operations: operations(mirror.id),
-       conflicts: conflicts(mirror.id),
+       conflicts: conflict_summaries(mirror.id),
+       webhook_health: webhook_health_for_mirror(mirror),
        actions: actions(mirror, missing_permissions)
      }}
   end
@@ -102,6 +142,7 @@ defmodule ForgeMirrors.Settings do
       repositories: [],
       operations: [],
       conflicts: [],
+      webhook_health: empty_webhook_health(),
       actions: %{
         install: true,
         update: false,
@@ -197,7 +238,7 @@ defmodule ForgeMirrors.Settings do
     |> Repo.all()
   end
 
-  defp conflicts(mirror_id) do
+  defp conflict_summaries(mirror_id) do
     MirrorConflict
     |> where(
       [conflict],
@@ -215,6 +256,191 @@ defmodule ForgeMirrors.Settings do
       lock_version: conflict.lock_version
     })
     |> Repo.all()
+  end
+
+  defp conflict_view(mirror, raw_filters) do
+    types = conflict_types(mirror.id)
+    filters = normalize_conflict_filters(mirror.id, types, raw_filters)
+
+    {:ok,
+     %{
+       conflicts: conflict_details(mirror.id, filters),
+       filters: filters,
+       repositories: repositories(mirror.id),
+       types: types
+     }}
+  end
+
+  defp conflict_details(mirror_id, filters) do
+    MirrorConflict
+    |> where(
+      [conflict],
+      conflict.organization_mirror_id == ^mirror_id and conflict.state == :open
+    )
+    |> maybe_conflict_repository(filters.repository)
+    |> maybe_conflict_resource(filters.resource)
+    |> maybe_conflict_type(filters.type)
+    |> order_by([conflict], desc: conflict.inserted_at, desc: conflict.id)
+    |> limit(@conflict_limit)
+    |> select([conflict], %{
+      id: conflict.id,
+      repository_mirror_id: conflict.repository_mirror_id,
+      resource_kind: conflict.resource_kind,
+      resource_identity: conflict.resource_identity,
+      conflict_kind: conflict.conflict_kind,
+      state: conflict.state,
+      lock_version: conflict.lock_version,
+      baseline:
+        fragment("left(CAST(? AS text), ?)", conflict.baseline_snapshot, ^@snapshot_display_limit),
+      local:
+        fragment("left(CAST(? AS text), ?)", conflict.local_snapshot, ^@snapshot_display_limit),
+      remote:
+        fragment("left(CAST(? AS text), ?)", conflict.remote_snapshot, ^@snapshot_display_limit)
+    })
+    |> Repo.all()
+  end
+
+  defp conflict_types(mirror_id) do
+    MirrorConflict
+    |> where(
+      [conflict],
+      conflict.organization_mirror_id == ^mirror_id and conflict.state == :open
+    )
+    |> distinct([conflict], conflict.resource_kind)
+    |> order_by([conflict], asc: conflict.resource_kind)
+    |> limit(@conflict_limit)
+    |> select([conflict], conflict.resource_kind)
+    |> Repo.all()
+  end
+
+  defp normalize_conflict_filters(mirror_id, types, raw_filters) do
+    %{
+      repository: scoped_repository_id(mirror_id, Map.get(raw_filters, "repository")),
+      resource: bounded_filter(Map.get(raw_filters, "resource")),
+      type: normalize_type(Map.get(raw_filters, "type"), types)
+    }
+  end
+
+  defp empty_conflict_filters, do: %{repository: nil, resource: nil, type: nil}
+
+  defp scoped_repository_id(mirror_id, value) do
+    with {:ok, id} <- positive_id(value),
+         %RepositoryMirror{} <-
+           Repo.one(
+             from(repository in RepositoryMirror,
+               where: repository.id == ^id and repository.organization_mirror_id == ^mirror_id,
+               select: repository
+             )
+           ) do
+      id
+    else
+      _invalid -> nil
+    end
+  end
+
+  defp positive_id(value) when is_binary(value) and byte_size(value) in 1..19 do
+    case Integer.parse(value) do
+      {id, ""} when id > 0 and id <= @max_id -> {:ok, id}
+      _invalid -> {:error, :invalid_filter}
+    end
+  end
+
+  defp positive_id(_value), do: {:error, :invalid_filter}
+
+  defp bounded_filter(value) when is_binary(value) and byte_size(value) in 1..512 do
+    if value == String.trim(value) and String.valid?(value) and
+         not String.contains?(value, ["\n", "\r", "\0"]),
+       do: value,
+       else: nil
+  end
+
+  defp bounded_filter(_value), do: nil
+
+  defp normalize_type(value, types) do
+    if value in types, do: value, else: nil
+  end
+
+  defp maybe_conflict_repository(query, nil), do: query
+
+  defp maybe_conflict_repository(query, repository_id),
+    do: where(query, [conflict], conflict.repository_mirror_id == ^repository_id)
+
+  defp maybe_conflict_resource(query, nil), do: query
+
+  defp maybe_conflict_resource(query, resource),
+    do: where(query, [conflict], conflict.resource_identity == ^resource)
+
+  defp maybe_conflict_type(query, nil), do: query
+
+  defp maybe_conflict_type(query, type),
+    do: where(query, [conflict], conflict.resource_kind == ^type)
+
+  defp webhook_health_for_mirror(%OrganizationMirror{} = mirror) do
+    state_counts =
+      MirrorWebhookDelivery
+      |> where([delivery], delivery.organization_mirror_id == ^mirror.id)
+      |> group_by([delivery], delivery.state)
+      |> select([delivery], {delivery.state, count(delivery.id)})
+      |> Repo.all()
+      |> Map.new()
+      |> then(&Map.merge(empty_webhook_health().state_counts, &1))
+
+    oldest_unprocessed_at =
+      MirrorWebhookDelivery
+      |> where(
+        [delivery],
+        delivery.organization_mirror_id == ^mirror.id and
+          delivery.state in [:pending, :pending_unsupported, :processing]
+      )
+      |> select([delivery], min(delivery.received_at))
+      |> Repo.one()
+
+    latest_failure =
+      MirrorWebhookDelivery
+      |> where(
+        [delivery],
+        delivery.organization_mirror_id == ^mirror.id and delivery.state == :failed
+      )
+      |> order_by([delivery], desc: delivery.processed_at, desc: delivery.id)
+      |> limit(1)
+      |> select([delivery], %{
+        failure_class: delivery.failure_class,
+        received_at: delivery.received_at,
+        failed_at: delivery.processed_at
+      })
+      |> Repo.one()
+
+    unreconciled_failed_count =
+      MirrorWebhookDelivery
+      |> where(
+        [delivery],
+        delivery.organization_mirror_id == ^mirror.id and delivery.state == :failed
+      )
+      |> maybe_after_reconciliation(mirror.last_reconciled_at)
+      |> Repo.aggregate(:count, :id)
+
+    %{
+      state_counts: state_counts,
+      oldest_unprocessed_at: oldest_unprocessed_at,
+      latest_failure: latest_failure,
+      unreconciled_failed_count: unreconciled_failed_count,
+      gap?: unreconciled_failed_count > 0
+    }
+  end
+
+  defp maybe_after_reconciliation(query, nil), do: query
+
+  defp maybe_after_reconciliation(query, %DateTime{} = last_reconciled_at),
+    do: where(query, [delivery], delivery.received_at > ^last_reconciled_at)
+
+  defp empty_webhook_health do
+    %{
+      state_counts: Map.new(@webhook_states, &{&1, 0}),
+      oldest_unprocessed_at: nil,
+      latest_failure: nil,
+      unreconciled_failed_count: 0,
+      gap?: false
+    }
   end
 
   defp grouped_counts(schema, mirror_id) do

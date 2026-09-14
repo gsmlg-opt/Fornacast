@@ -19,14 +19,136 @@ defmodule ForgeGitHub.PullSyncWorkerTest do
     "base_sha" => @base_sha
   }
 
-  test "routes a pull-head reconciliation page without provider or mapped pull observation" do
+  test "a pull reconciliation claim fetches and records exactly one provider page" do
+    parent = self()
     operation = %MirrorOperation{kind: "reconcile.repository.pull_heads", state: :processing}
+
+    sync = %{
+      github_installation_id: 44,
+      remote_owner: "acme",
+      remote_repository: "project",
+      repository_mirror_id: 3,
+      phase: :remote,
+      page: 2
+    }
+
+    pulls = [github_pull(@base)]
 
     assert {:ok, :page_recorded} =
              PullSyncWorker.process_operation(operation, @now,
-               reconcile_pull_heads: fn ^operation, @now -> {:ok, :page_recorded} end,
-               context: fn _ -> flunk("page must not load a pull context") end,
-               token_fetch: fn _, _ -> flunk("page must not request a token") end
+               reconciliation_context: fn ^operation -> {:ok, sync} end,
+               token_fetch: fn 44,
+                               %{permissions: %{"metadata" => "read", "pull_requests" => "write"}} ->
+                 %InstallationToken{
+                   token: "ephemeral",
+                   expires_at: DateTime.add(@now, 3_600),
+                   permissions: %{"metadata" => "read", "pull_requests" => "write"}
+                 }
+               end,
+               list_pulls: fn "ephemeral", "acme", "project", 2, _ ->
+                 send(parent, :page_fetched)
+                 {:ok, %{pulls: pulls, next_cursor: 3}}
+               end,
+               record_page: fn ^operation, :pull, observations, 3, @now ->
+                 assert [
+                          %{
+                            github_object_id: 802,
+                            github_number: 7,
+                            github_issue_id: nil,
+                            remote_updated_at: ~U[2026-09-08 07:00:00Z]
+                          }
+                        ] = observations
+
+                 send(parent, :page_recorded)
+                 {:ok, :page_recorded}
+               end
+             )
+
+    assert collect_events(2) == [:page_fetched, :page_recorded]
+  end
+
+  test "a mapped pull reconciliation claim enumerates exactly one pinned inventory page" do
+    parent = self()
+    operation = %MirrorOperation{kind: "reconcile.repository.pull_heads", state: :processing}
+
+    mapping_cursor = %{
+      "repository_mirror_id" => 3,
+      "resource_kind" => "pull",
+      "after_id" => 40,
+      "through_id" => 90
+    }
+
+    next_cursor = %{mapping_cursor | "after_id" => 55}
+
+    observations = [
+      %{
+        github_object_id: 802,
+        github_number: 7,
+        github_issue_id: nil,
+        remote_updated_at: @now
+      }
+    ]
+
+    sync = %{
+      github_installation_id: 44,
+      remote_owner: "acme",
+      remote_repository: "project",
+      repository_mirror_id: 3,
+      phase: :mapped,
+      mapping_cursor: mapping_cursor
+    }
+
+    assert {:ok, :page_recorded} =
+             PullSyncWorker.process_operation(operation, @now,
+               reconciliation_context: fn ^operation -> {:ok, sync} end,
+               token_fetch: fn _, _ -> flunk("mapped phase requested an installation token") end,
+               resource_inventory: fn 3, :pull, ^mapping_cursor, 100 ->
+                 send(parent, :inventory_fetched)
+                 {:ok, %{observations: observations, next_cursor: next_cursor}}
+               end,
+               list_pulls: fn _, _, _, _, _ ->
+                 flunk("mapped phase fetched the provider list")
+               end,
+               record_page: fn ^operation, :pull, ^observations, ^next_cursor, @now ->
+                 send(parent, :inventory_recorded)
+                 {:ok, :page_recorded}
+               end
+             )
+
+    assert collect_events(2) == [:inventory_fetched, :inventory_recorded]
+  end
+
+  test "a provider reconciliation page rejects duplicate immutable identities" do
+    operation = %MirrorOperation{kind: "reconcile.repository.pull_heads", state: :processing}
+
+    sync = %{
+      github_installation_id: 44,
+      remote_owner: "acme",
+      remote_repository: "project",
+      repository_mirror_id: 3,
+      phase: :remote,
+      page: 1
+    }
+
+    assert {:ok, :rejected} =
+             PullSyncWorker.process_operation(operation, @now,
+               reconciliation_context: fn ^operation -> {:ok, sync} end,
+               token_fetch: fn 44, _ ->
+                 %InstallationToken{
+                   token: "ephemeral",
+                   expires_at: DateTime.add(@now, 3_600),
+                   permissions: %{"metadata" => "read", "pull_requests" => "write"}
+                 }
+               end,
+               list_pulls: fn _, _, _, _, _ ->
+                 {:ok,
+                  %{
+                    pulls: [github_pull(@base), github_pull(@base) |> Map.put("number", 8)],
+                    next_cursor: nil
+                  }}
+               end,
+               record_page: fn _, _, _, _, _ -> flunk("invalid page was persisted") end,
+               fail: fn ^operation, @now, "local_validation", _ -> {:ok, :rejected} end
              )
   end
 
