@@ -55,9 +55,34 @@ the complete acceptance matrix remain open.
   ForgeMirrors matrix passed **122 of 123** tests; the sole failure was the
   already-documented operation-scheduler aggregate assertion observing committed
   stale rows in the shared test database. Two final reviews reported no remaining
-  P0/P1/P2 finding. Criterion 20 still needs intentional omitted-event convergence
-  through real resource workers; criteria 21 and 22 still require the remaining
-  cross-worker lifecycle matrix and live/two-endpoint proof.
+  P0/P1/P2 finding.
+- Commits `940e8af`, `fae7690`, and `008fb7e` extend that same owner-scheduled
+  inventory boundary through the remaining Git/LFS and release workers. A release
+  deleted on GitHub without a webhook is discovered by the remote and mapped
+  release sweeps, canonically re-read as absent, soft-deleted locally, confirmed
+  in its durable mapping, and allowed to advance the organization watermark only
+  after all marker-bearing work completes. Persisted JSON release timestamps are
+  normalized back to UTC-second `DateTime` values before three-way comparison, so
+  an equivalent local release does not become a false concurrent edit.
+- The Git/LFS path creates a branch and LFS pointer only in a separate controlled
+  bare remote, proves the commit is initially absent from the local object store,
+  fetches it into the private tracking namespace, and then runs the real
+  `LFSSync` pointer scanner and `TransferCoordinator`. Only the GitHub Batch and
+  object-download transport responses are controlled. The public ref remains
+  absent across a durable `effect_pending` scan checkpoint, LFS bytes are staged,
+  verified, and attached before ref confirmation, and the real LFS reachability
+  finalizer persists another bounded checkpoint while the organization finalizer
+  remains waiting. The ref, LFS reachability, sweep operations, and watermark all
+  converge with zero webhook inbox rows.
+- The combined gate passed **30 ForgeGitHub tests**. The complete **28-test** Git
+  persistence file encountered only the already-documented shared numeric fixture
+  collisions; both affected selectors passed together in isolation. Exact changed-
+  file formatting, diff checks, warnings-as-errors compilation, and two independent
+  P0/P1/P2 reviews passed. Criterion 20 now has local omitted-event evidence for
+  repository metadata, Git/LFS, issues, labels, comments, pull requests, and
+  releases; assignee-delta coverage remains before local acceptance. Criterion 11
+  still requires real clone/checkout proof from both endpoints, and criteria 21
+  and 22 still require the complete cross-worker lifecycle matrix.
 
 - Organization owners and active site administrators now have three bounded,
   durable repository-metadata conflict actions: accept the exact canonical
