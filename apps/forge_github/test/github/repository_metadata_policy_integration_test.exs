@@ -4,8 +4,17 @@ defmodule ForgeGitHub.RepositoryMetadataPolicyIntegrationTest do
   import Ecto.Query
   import ForgeMirrors.TestSupport.MirrorFixtures
 
-  alias ForgeGitHub.{Error, InstallationToken, RepositoryMetadataSyncWorker}
-  alias ForgeMirrors.{MirrorConflict, MirrorOperation, RepositoryMirror}
+  alias ForgeGitHub.{Error, InstallationToken, InventoryWorker, RepositoryMetadataSyncWorker}
+  alias ForgeGitHub.Repository, as: GitHubRepository
+
+  alias ForgeMirrors.{
+    MirrorConflict,
+    MirrorOperation,
+    MirrorWebhookDelivery,
+    OrganizationMirror,
+    RepositoryMirror
+  }
+
   alias ForgeRepos.Repository
   alias Fornacast.Repo
 
@@ -116,6 +125,160 @@ defmodule ForgeGitHub.RepositoryMetadataPolicyIntegrationTest do
     assert Repo.get!(Repository, repository.id).slug == "archived-renamed"
     assert Repo.get!(RepositoryMirror, c.binding.id).github_archived == false
     assert Repo.get!(MirrorConflict, conflict.id).state == :resolved
+  end
+
+  test "full inventory repairs an intentionally omitted repository metadata webhook", c do
+    Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+    task_supervisor = start_supervised!(Task.Supervisor)
+    observed_at = DateTime.add(c.now, 10)
+    owner = c.actor
+
+    repository = Repo.get!(Repository, c.binding.repository_id)
+
+    github_repository = %GitHubRepository{
+      id: c.binding.github_repository_id,
+      node_id: c.binding.github_node_id,
+      owner_id: c.organization.github_account_id,
+      name: repository.slug,
+      full_name: c.binding.github_full_name,
+      owner_login: c.organization.github_account_login,
+      description: "changed on GitHub without a webhook",
+      visibility: repository.visibility,
+      default_branch: repository.default_branch,
+      has_issues: true,
+      allow_merge_commit: true,
+      fork: false,
+      archived: false,
+      updated_at: observed_at
+    }
+
+    assert Repo.aggregate(
+             from(delivery in MirrorWebhookDelivery,
+               where: delivery.organization_mirror_id == ^c.organization.id
+             ),
+             :count
+           ) == 0
+
+    assert {:ok, %MirrorOperation{} = inventory} =
+             ForgeMirrors.schedule_reconciliation(owner, c.organization, observed_at)
+
+    assert {:ok, [{inventory_id, {:ok, %{operation: completed_inventory}}}]} =
+             InventoryWorker.run_once("omitted-metadata-inventory",
+               now: fn -> observed_at end,
+               task_supervisor: task_supervisor,
+               max_concurrency: 1,
+               batch_size: 1,
+               token_fetch: token_fetch(self()),
+               page_fetch: fn "metadata-policy-token", 1, options ->
+                 assert options[:gate_key] ==
+                          {:github_installation, c.organization.github_installation_id}
+
+                 {:ok, %{repositories: [github_repository], next_cursor: nil}}
+               end
+             )
+
+    assert inventory_id == inventory.id
+    assert completed_inventory.state == :completed
+    marker = "inventory-operation:#{inventory.id}"
+
+    children =
+      Repo.all(
+        from operation in MirrorOperation,
+          where:
+            operation.organization_mirror_id == ^c.organization.id and
+              operation.id != ^inventory.id and
+              operation.kind != "finalize.organization.reconciliation" and
+              fragment(
+                "?->>'inventory_reconciliation_sweep' = ?",
+                operation.cursor,
+                ^marker
+              ),
+          order_by: [asc: operation.id]
+      )
+
+    assert Enum.map(children, & &1.kind) == [
+             "reconcile.repository.git",
+             "reconcile.repository.metadata"
+           ]
+
+    assert Repo.get!(OrganizationMirror, c.organization.id).last_reconciled_at == nil
+
+    assert {:ok, [{_finalizer_id, {:ok, %{status: :waiting}}}]} =
+             InventoryWorker.run_once("omitted-metadata-finalizer-waiting",
+               now: fn -> observed_at end,
+               task_supervisor: task_supervisor,
+               max_concurrency: 1,
+               batch_size: 1,
+               token_fetch: fn _, _ -> flunk("finalizer must not fetch a token") end,
+               page_fetch: fn _, _, _ -> flunk("finalizer must not call GitHub") end
+             )
+
+    assert Repo.get!(OrganizationMirror, c.organization.id).last_reconciled_at == nil
+
+    assert {:ok, [git_operation]} =
+             ForgeMirrors.claim_operations(
+               "omitted-metadata-git-scaffolding",
+               observed_at,
+               30,
+               1,
+               ["reconcile.repository.git"]
+             )
+
+    assert {:ok, %MirrorOperation{state: :completed}} =
+             ForgeMirrors.complete_operation(git_operation, observed_at)
+
+    assert {:ok, [{_metadata_id, {:ok, %{action: :confirmed}}}]} =
+             RepositoryMetadataSyncWorker.run_once("omitted-metadata-worker",
+               now: fn -> observed_at end,
+               token_fetch: token_fetch(self()),
+               repository_fetch: fn _, _, _, _ -> {:ok, github_repository} end,
+               repository_update: fn _, _, _, _, _ ->
+                 send(self(), :unexpected_repository_patch)
+                 flunk("remote-only reconciliation must not patch GitHub")
+               end
+             )
+
+    assert Repo.get!(Repository, repository.id).description ==
+             "changed on GitHub without a webhook"
+
+    refute_received :administration_token
+    refute_received :unexpected_repository_patch
+
+    assert Enum.all?(
+             Repo.all(
+               from operation in MirrorOperation,
+                 where:
+                   operation.organization_mirror_id == ^c.organization.id and
+                     operation.kind != "finalize.organization.reconciliation" and
+                     fragment(
+                       "?->>'inventory_reconciliation_sweep' = ?",
+                       operation.cursor,
+                       ^marker
+                     )
+             ),
+             &(&1.state == :completed)
+           )
+
+    finalizer_retry_at = DateTime.add(observed_at, 5)
+
+    assert {:ok, [{_finalizer_id, {:ok, %{status: :completed}}}]} =
+             InventoryWorker.run_once("omitted-metadata-finalizer-completed",
+               now: fn -> finalizer_retry_at end,
+               task_supervisor: task_supervisor,
+               max_concurrency: 1,
+               batch_size: 1,
+               token_fetch: fn _, _ -> flunk("finalizer must not fetch a token") end,
+               page_fetch: fn _, _, _ -> flunk("finalizer must not call GitHub") end
+             )
+
+    assert Repo.get!(OrganizationMirror, c.organization.id).last_reconciled_at == observed_at
+
+    assert Repo.aggregate(
+             from(delivery in MirrorWebhookDelivery,
+               where: delivery.organization_mirror_id == ^c.organization.id
+             ),
+             :count
+           ) == 0
   end
 
   test "keep Fornacast recovers a committed PATCH after timeout without a second effect", c do
