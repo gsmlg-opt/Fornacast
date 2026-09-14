@@ -5,6 +5,119 @@ defmodule ForgeGitHub.RepositoryClientTest do
 
   setup {Req.Test, :verify_on_exit!}
 
+  test "creates an organization repository through an installation-gated POST" do
+    stub = stub_name()
+
+    Req.Test.expect(stub, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/orgs/acme/repos"
+      assert conn.query_string == ""
+      assert {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      assert JSON.decode!(body) == %{
+               "description" => "Canonical widgets",
+               "name" => "widgets",
+               "visibility" => "private"
+             }
+
+      conn
+      |> Plug.Conn.put_status(201)
+      |> Req.Test.json(repository_json(description: "Canonical widgets"))
+    end)
+
+    assert {:ok, %Repository{id: 41, node_id: "R_kgDOAAAoAQ", name: "widgets"}} =
+             RepositoryClient.create_organization_repository(
+               "installation-token",
+               "acme",
+               %{name: "widgets", description: "Canonical widgets", visibility: :private},
+               client_opts(stub)
+             )
+  end
+
+  test "omits a nil create description and requires the exact canonical full name" do
+    stub = stub_name()
+
+    Req.Test.expect(stub, fn conn ->
+      assert {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert JSON.decode!(body) == %{"name" => "widgets", "visibility" => "private"}
+
+      conn
+      |> Plug.Conn.put_status(201)
+      |> Req.Test.json(
+        repository_json([])
+        |> Map.put("full_name", "other/widgets")
+      )
+    end)
+
+    assert {:error, %Error{kind: :invalid_response}} =
+             RepositoryClient.create_organization_repository(
+               "installation-token",
+               "acme",
+               %{name: "widgets", description: nil, visibility: :private},
+               client_opts(stub)
+             )
+  end
+
+  test "rejects unsafe organization-create inputs before a request" do
+    for {owner, attrs} <- [
+          {"acme/other", %{name: "widgets", visibility: :private}},
+          {"acme", %{visibility: :private}},
+          {"acme", %{name: "widgets", visibility: :internal}},
+          {"acme", %{name: "widgets", visibility: :private, archived: false}},
+          {"acme", %{name: "widgets", visibility: :private, default_branch: "main"}},
+          {"acme", %{name: "widgets?x=1", visibility: :private}},
+          {"acme",
+           %{name: "widgets", description: String.duplicate("x", 1_001), visibility: :private}}
+        ] do
+      assert {:error, %Error{kind: :invalid_request}} =
+               RepositoryClient.create_organization_repository(
+                 "installation-token",
+                 owner,
+                 attrs,
+                 client_opts(stub_name())
+               )
+    end
+
+    assert {:error, %Error{kind: :invalid_request}} =
+             RepositoryClient.create_organization_repository(
+               "installation-token",
+               "acme",
+               %{name: "widgets", visibility: :private},
+               client_opts(stub_name(), json: %{"name" => "override"})
+             )
+  end
+
+  test "requires exactly 201 for organization repository creation" do
+    stub = stub_name()
+    Req.Test.expect(stub, fn conn -> Req.Test.json(conn, repository_json([])) end)
+
+    assert {:error, %Error{kind: :unexpected_status}} =
+             RepositoryClient.create_organization_repository(
+               "installation-token",
+               "acme",
+               %{name: "widgets", visibility: :private},
+               client_opts(stub)
+             )
+  end
+
+  test "classifies an organization repository name collision separately from validation failures" do
+    stub = stub_name()
+
+    Req.Test.expect(stub, fn conn ->
+      conn
+      |> Plug.Conn.put_status(422)
+      |> Req.Test.json(%{"message" => "name already exists on this account"})
+    end)
+
+    assert {:error, %Error{kind: :unprocessable_entity}} =
+             RepositoryClient.create_organization_repository(
+               "installation-token",
+               "acme",
+               %{name: "widgets", visibility: :private},
+               client_opts(stub)
+             )
+  end
+
   test "updates representable repository metadata through an installation-gated PATCH" do
     stub = stub_name()
 

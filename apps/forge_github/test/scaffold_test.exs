@@ -34,6 +34,14 @@ defmodule ForgeGitHub.ScaffoldTest do
             [ForgeGitHub.ReleaseSyncWorker]} =
              List.keyfind(children, ForgeGitHub.ReleaseSyncWorker, 0)
 
+    assert {ForgeGitHub.RepositoryCreationTaskSupervisor, repository_creation_task_supervisor,
+            :supervisor, [Task.Supervisor]} =
+             List.keyfind(children, ForgeGitHub.RepositoryCreationTaskSupervisor, 0)
+
+    assert {ForgeGitHub.RepositoryCreationWorker, repository_creation_worker, :worker,
+            [ForgeGitHub.RepositoryCreationWorker]} =
+             List.keyfind(children, ForgeGitHub.RepositoryCreationWorker, 0)
+
     assert {ForgeMirrors.WebhookWorker, webhook_worker, :worker, [ForgeMirrors.WebhookWorker]} =
              List.keyfind(children, ForgeMirrors.WebhookWorker, 0)
 
@@ -44,6 +52,8 @@ defmodule ForgeGitHub.ScaffoldTest do
     assert is_pid(pull_sync_worker)
     assert is_pid(release_sync_task_supervisor)
     assert is_pid(release_sync_worker)
+    assert is_pid(repository_creation_task_supervisor)
+    assert is_pid(repository_creation_worker)
     assert is_pid(webhook_worker)
     assert %{enabled: false} = :sys.get_state(webhook_worker)
 
@@ -61,6 +71,8 @@ defmodule ForgeGitHub.ScaffoldTest do
 
     assert %{enabled: false, task_supervisor: ForgeGitHub.ReleaseSyncTaskSupervisor} =
              :sys.get_state(release_sync_worker)
+
+    assert %{enabled: false} = :sys.get_state(repository_creation_worker)
   end
 
   test "context exposes stable provider boundary types" do

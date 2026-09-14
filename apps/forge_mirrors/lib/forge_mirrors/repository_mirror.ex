@@ -81,6 +81,7 @@ defmodule ForgeMirrors.RepositoryMirror do
       :github_repository_id,
       :github_node_id,
       :github_full_name,
+      :github_archived,
       :bootstrap_repository_item_id,
       :last_inventory_at
     ])

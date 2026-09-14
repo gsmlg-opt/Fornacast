@@ -19,6 +19,7 @@ defmodule ForgeMirrors do
     MirrorResourceState,
     MirrorWebhookDelivery,
     OrganizationMirror,
+    RepositoryCreationPolicy,
     RepositoryMirror
   }
 
@@ -43,6 +44,60 @@ defmodule ForgeMirrors do
   defdelegate defer_repository_metadata_effect(operation, now, next_attempt_at, failure_class),
     to: ForgeMirrors.RepositoryMetadataReconciliation,
     as: :defer_effect
+
+  @doc false
+  def activate_repository_after_metadata(
+        %MirrorOperation{kind: "reconcile.repository.metadata", state: :completed} = operation,
+        %DateTime{} = now
+      ),
+      do: maybe_activate_resource_repository(operation, now)
+
+  def activate_repository_after_metadata(_, _), do: {:error, :invalid_argument}
+
+  @doc false
+  defdelegate repository_creation_context(operation),
+    to: ForgeMirrors.RepositoryCreation,
+    as: :context
+
+  @doc false
+  defdelegate mark_repository_creation_effect(operation, expected, now),
+    to: ForgeMirrors.RepositoryCreation,
+    as: :mark_effect
+
+  @doc false
+  defdelegate authorize_repository_creation_effect(operation),
+    to: ForgeMirrors.RepositoryCreation,
+    as: :authorize_effect
+
+  @doc false
+  defdelegate confirm_repository_creation(operation, remote, now),
+    to: ForgeMirrors.RepositoryCreation,
+    as: :confirm
+
+  @doc false
+  defdelegate defer_repository_creation_effect(
+                operation,
+                now,
+                next_attempt_at,
+                failure_class
+              ),
+              to: ForgeMirrors.RepositoryCreation,
+              as: :defer_effect
+
+  @doc false
+  defdelegate conflict_repository_creation(operation, remote, kind, now),
+    to: ForgeMirrors.RepositoryCreation,
+    as: :conflict
+
+  @doc false
+  defdelegate halt_repository_creation_effect(operation, now, failure_class),
+    to: ForgeMirrors.RepositoryCreation,
+    as: :halt_effect
+
+  @doc false
+  defdelegate pause_repository_creation(operation, now),
+    to: ForgeMirrors.RepositoryCreation,
+    as: :pause
 
   @spec observe_github_app_installation(map()) ::
           {:ok, GitHubAppInstallation.t()}
@@ -4988,19 +5043,20 @@ defmodule ForgeMirrors do
              :clear <- git_ref_reconciliation_blocker(repository, persisted),
              :ok <- release_bootstrap_publication(repository, persisted),
              {:ok, updated_repository} <-
-               persist_successful_git_reconciliation(repository, now),
+               persist_successful_git_reconciliation_for_operation(repository, persisted, now),
              {:ok, _organization_mirror} <- maybe_restore_git_mirror_health(persisted),
+             {:ok, metadata_reconciliation} <-
+               enqueue_post_git_metadata_reconciliation(updated_repository, persisted, now),
              {:ok, proved} <-
                owned_transition(persisted, now, [:processing, :effect_pending],
-                 checkpoint:
-                   Map.put(
-                     persisted.checkpoint,
-                     "successful_bootstrap_item_id",
-                     repository.bootstrap_repository_item_id
-                   )
+                 checkpoint: successful_git_checkpoint(persisted, repository)
                ),
              {:ok, completed} <- complete_operation(proved, now) do
-          %{operation: completed, repository_mirror: updated_repository}
+          %{
+            operation: completed,
+            repository_mirror: updated_repository,
+            metadata_reconciliation: metadata_reconciliation
+          }
         else
           {:blocked, _failure_class, _failure_detail} = blocker ->
             fail_git_ref_reconciliation(operation, now, blocker)
@@ -5512,6 +5568,8 @@ defmodule ForgeMirrors do
              {:ignored,
               :non_repository_event
               | :non_local_event
+              | :repository_create_disabled
+              | :repository_create_capability_disabled
               | :repository_missing
               | :unbound_repository
               | :unmirrored_owner}}
@@ -5921,14 +5979,36 @@ defmodule ForgeMirrors do
       materialize_in_transaction(fn ->
         with :ok <- validate_local_repository_identity(owner_id, repository_id),
              {:ok, organization_mirror} <- lock_non_revoked_organization_mirror(owner_id),
+             :ok <-
+               RepositoryCreationPolicy.authorize(
+                 organization_mirror.policy,
+                 organization_mirror.capabilities
+               ),
              {:ok, repository_mirror} <-
                find_or_create_local_repository_mirror(organization_mirror, repository_id),
              {:ok, operations} <- materialize_repository_operations(repository_mirror, event) do
           {:materialized, operations}
         else
-          {:error, :repository_missing} -> {:ignored, :repository_missing}
-          {:error, :unmirrored_owner} -> {:ignored, :unmirrored_owner}
-          {:error, reason} -> Repo.rollback(reason)
+          {:error, :repository_missing} ->
+            {:ignored, :repository_missing}
+
+          {:error, :unmirrored_owner} ->
+            {:ignored, :unmirrored_owner}
+
+          {:error, :policy_disabled} ->
+            {:ignored, :repository_create_disabled}
+
+          {:error, :capability_disabled} ->
+            {:ignored, :repository_create_capability_disabled}
+
+          {:error, :invalid_policy} ->
+            Repo.rollback(:invalid_policy)
+
+          {:error, :invalid_capabilities} ->
+            Repo.rollback(:invalid_capabilities)
+
+          {:error, reason} ->
+            Repo.rollback(reason)
         end
       end)
     end
@@ -6066,6 +6146,28 @@ defmodule ForgeMirrors do
            organization_mirror_id: repository.organization_mirror_id,
            repository_mirror_id: repository.id,
            kind: "reconcile.repository.metadata",
+           dedupe_key: "outbox:#{event.event_id}:#{repository.id}",
+           cursor: %{
+             "outbox_event_id" => event.event_id,
+             "trigger" => "local",
+             "causation_id" => event.causation_id,
+             "correlation_id" => event.correlation_id
+           },
+           next_attempt_at: event.available_at
+         }) do
+      {:ok, operation} -> {:ok, [operation]}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp materialize_repository_operations(
+         repository,
+         %{event_type: "repository.created"} = event
+       ) do
+    case enqueue_operation(%{
+           organization_mirror_id: repository.organization_mirror_id,
+           repository_mirror_id: repository.id,
+           kind: "sync.repository.create",
            dedupe_key: "outbox:#{event.event_id}:#{repository.id}",
            cursor: %{
              "outbox_event_id" => event.event_id,
@@ -6497,9 +6599,43 @@ defmodule ForgeMirrors do
       repository_mirror_id: operation.repository_mirror_id,
       kind: "finalize.repository.git",
       dedupe_key: "reconcile:#{operation.id}:finalize",
-      cursor: %{"reconciliation_operation_id" => operation.id},
+      cursor:
+        %{"reconciliation_operation_id" => operation.id}
+        |> copy_cursor(operation.cursor, "repository_creation_operation_id")
+        |> copy_cursor(operation.cursor, "post_git_metadata_reconciliation"),
       next_attempt_at: now
     })
+  end
+
+  defp copy_cursor(target, source, key) do
+    case Map.fetch(source, key) do
+      {:ok, value} -> Map.put(target, key, value)
+      :error -> target
+    end
+  end
+
+  defp successful_git_checkpoint(operation, repository) do
+    operation.checkpoint
+    |> Map.put("successful_bootstrap_item_id", repository.bootstrap_repository_item_id)
+    |> copy_cursor(operation.cursor, "repository_creation_operation_id")
+  end
+
+  defp enqueue_post_git_metadata_reconciliation(repository, operation, now) do
+    case operation.cursor do
+      %{
+        "post_git_metadata_reconciliation" => true,
+        "repository_creation_operation_id" => creation_operation_id
+      }
+      when is_integer(creation_operation_id) and creation_operation_id > 0 ->
+        enqueue_repository_metadata_reconciliation(
+          repository,
+          "repository-create:#{creation_operation_id}:post-git",
+          now
+        )
+
+      _cursor ->
+        {:ok, nil}
+    end
   end
 
   defp repository_has_open_git_conflicts?(repository_mirror_id) do
@@ -6589,9 +6725,10 @@ defmodule ForgeMirrors do
 
   defp persist_successful_git_reconciliation(
          %RepositoryMirror{state: :discovered} = repository,
-         now
+         now,
+         activate?
        ) do
-    if bootstrap_metadata_complete?(repository) do
+    if activate? and bootstrap_metadata_complete?(repository) do
       repository
       |> RepositoryMirror.transition_changeset(:active)
       |> Ecto.Changeset.put_change(:last_synced_at, now)
@@ -6602,10 +6739,15 @@ defmodule ForgeMirrors do
     end
   end
 
-  defp persist_successful_git_reconciliation(%RepositoryMirror{} = repository, now) do
+  defp persist_successful_git_reconciliation(%RepositoryMirror{} = repository, now, _activate?) do
     repository
     |> RepositoryMirror.update_changeset(%{last_synced_at: now})
     |> Repo.update()
+  end
+
+  defp persist_successful_git_reconciliation_for_operation(repository, operation, now) do
+    activate? = operation.cursor["post_git_metadata_reconciliation"] != true
+    persist_successful_git_reconciliation(repository, now, activate?)
   end
 
   defp maybe_activate_resource_repository(%{state: :completed} = operation, now) do
@@ -6615,7 +6757,7 @@ defmodule ForgeMirrors do
     if organization.state in [:catching_up, :active, :degraded] and
          bootstrap_metadata_complete?(repository) do
       if repository.state == :discovered and completed_bootstrap_git?(repository) do
-        case persist_successful_git_reconciliation(repository, now) do
+        case persist_successful_git_reconciliation(repository, now, true) do
           {:ok, _} -> :ok
           {:error, reason} -> Repo.rollback(reason)
         end
@@ -6626,6 +6768,8 @@ defmodule ForgeMirrors do
         {:error, reason} -> Repo.rollback(reason)
       end
     end
+
+    :ok
   end
 
   defp maybe_activate_resource_repository(_, _), do: :ok
@@ -6639,55 +6783,105 @@ defmodule ForgeMirrors do
         "reconcile.repository.#{collection}"
       end)
 
-    if is_nil(item_id) or required_kinds == [] do
-      true
+    if is_nil(item_id) do
+      local_creation_metadata_complete?(repository)
     else
-      sweep_key = "bootstrap:item:#{item_id}"
+      bootstrap_resource_metadata_complete?(repository, item_id, required_kinds)
+    end
+  end
 
-      required =
-        Repo.all(
-          from op in MirrorOperation,
+  defp local_creation_metadata_complete?(repository) do
+    creation_operation_id =
+      MirrorOperation
+      |> where(
+        [operation],
+        operation.repository_mirror_id == ^repository.id and
+          operation.kind == "sync.repository.create" and operation.state == :completed
+      )
+      |> order_by([operation], asc: operation.id)
+      |> select([operation], operation.id)
+      |> limit(1)
+      |> Repo.one()
+
+    case creation_operation_id do
+      nil ->
+        true
+
+      id ->
+        sweep_key = "repository-create:#{id}:post-git"
+
+        Repo.exists?(
+          from operation in MirrorOperation,
             where:
-              op.repository_mirror_id == ^repository.id and
-                op.kind in ^required_kinds and
-                fragment(
-                  "?->>'bootstrap_repository_item_id' = ?",
-                  op.cursor,
-                  ^Integer.to_string(item_id)
-                ) and
-                fragment("?->>'sweep_key' = ?", op.cursor, ^sweep_key),
-            limit: 3
-        )
-
-      sweep_ids = Enum.map(required, & &1.cursor["sweep_id"])
-
-      Enum.sort(Enum.map(required, & &1.kind)) == Enum.sort(required_kinds) and
-        Enum.all?(required, &(&1.state == :completed)) and
-        not Repo.exists?(
-          from op in MirrorOperation,
-            where:
-              op.repository_mirror_id == ^repository.id and
-                op.kind in ["sync.issue", "sync.issue_comment", "sync.release"] and
-                op.state != :completed and
-                fragment("?->>'sweep_id'", op.cursor) in ^sweep_ids
-        ) and
-        not Repo.exists?(
-          from conflict in MirrorConflict,
-            where: conflict.repository_mirror_id == ^repository.id and conflict.state == :open
+              operation.repository_mirror_id == ^repository.id and
+                operation.kind == "reconcile.repository.metadata" and
+                operation.state == :completed and
+                fragment("?->>'sweep_key' = ?", operation.cursor, ^sweep_key)
         )
     end
   end
 
-  defp completed_bootstrap_git?(repository) do
-    item = to_string(repository.bootstrap_repository_item_id)
+  defp bootstrap_resource_metadata_complete?(_repository, _item_id, []), do: true
 
-    Repo.exists?(
-      from finalizer in MirrorOperation,
-        where:
-          finalizer.repository_mirror_id == ^repository.id and
-            finalizer.kind == "finalize.repository.git" and finalizer.state == :completed and
-            fragment("?->>'successful_bootstrap_item_id' = ?", finalizer.checkpoint, ^item)
-    )
+  defp bootstrap_resource_metadata_complete?(repository, item_id, required_kinds) do
+    sweep_key = "bootstrap:item:#{item_id}"
+
+    required =
+      Repo.all(
+        from op in MirrorOperation,
+          where:
+            op.repository_mirror_id == ^repository.id and
+              op.kind in ^required_kinds and
+              fragment(
+                "?->>'bootstrap_repository_item_id' = ?",
+                op.cursor,
+                ^Integer.to_string(item_id)
+              ) and
+              fragment("?->>'sweep_key' = ?", op.cursor, ^sweep_key),
+          limit: 3
+      )
+
+    sweep_ids = Enum.map(required, & &1.cursor["sweep_id"])
+
+    Enum.sort(Enum.map(required, & &1.kind)) == Enum.sort(required_kinds) and
+      Enum.all?(required, &(&1.state == :completed)) and
+      not Repo.exists?(
+        from op in MirrorOperation,
+          where:
+            op.repository_mirror_id == ^repository.id and
+              op.kind in ["sync.issue", "sync.issue_comment", "sync.release"] and
+              op.state != :completed and
+              fragment("?->>'sweep_id'", op.cursor) in ^sweep_ids
+      ) and
+      not Repo.exists?(
+        from conflict in MirrorConflict,
+          where: conflict.repository_mirror_id == ^repository.id and conflict.state == :open
+      )
+  end
+
+  defp completed_bootstrap_git?(repository) do
+    if is_nil(repository.bootstrap_repository_item_id) do
+      Repo.exists?(
+        from finalizer in MirrorOperation,
+          where:
+            finalizer.repository_mirror_id == ^repository.id and
+              finalizer.kind == "finalize.repository.git" and finalizer.state == :completed and
+              fragment(
+                "(?->>'repository_creation_operation_id')::bigint > 0",
+                finalizer.checkpoint
+              )
+      )
+    else
+      item = to_string(repository.bootstrap_repository_item_id)
+
+      Repo.exists?(
+        from finalizer in MirrorOperation,
+          where:
+            finalizer.repository_mirror_id == ^repository.id and
+              finalizer.kind == "finalize.repository.git" and finalizer.state == :completed and
+              fragment("?->>'successful_bootstrap_item_id' = ?", finalizer.checkpoint, ^item)
+      )
+    end
   end
 
   defp maybe_restore_git_mirror_health(operation) do

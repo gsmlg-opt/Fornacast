@@ -480,7 +480,8 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliation do
          },
          state = baseline(binding.id),
          {:ok, state} <- persist_baseline(state, attrs),
-         {:ok, completed} <- complete(operation, now) do
+         {:ok, completed} <- complete(operation, now),
+         :ok <- ForgeMirrors.activate_repository_after_metadata(completed, now) do
       {:ok, %{action: :confirmed, operation: completed, baseline: state}}
     end
   end
@@ -621,7 +622,7 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliation do
 
   defp local_snapshot(repository) do
     %{
-      "name" => repository.name,
+      "name" => repository.slug,
       "description" => repository.description,
       "visibility" => Atom.to_string(repository.visibility),
       "default_branch" => repository.default_branch,

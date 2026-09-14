@@ -12,6 +12,7 @@ defmodule ForgeGitHub.Error do
           | :secondary_rate_limit
           | :upstream_unavailable
           | :unexpected_status
+          | :unprocessable_entity
           | :transport
           | :timeout
           | :host_unavailable
@@ -50,6 +51,7 @@ defmodule ForgeGitHub.Error do
   defp message_for(:secondary_rate_limit), do: "GitHub's secondary rate limit was reached"
   defp message_for(:upstream_unavailable), do: "GitHub is temporarily unavailable"
   defp message_for(:unexpected_status), do: "GitHub returned an unexpected response"
+  defp message_for(:unprocessable_entity), do: "GitHub rejected the requested resource state"
   defp message_for(:transport), do: "The GitHub request could not be completed"
   defp message_for(:timeout), do: "The GitHub request timed out"
   defp message_for(:host_unavailable), do: "The GitHub API host could not be resolved"

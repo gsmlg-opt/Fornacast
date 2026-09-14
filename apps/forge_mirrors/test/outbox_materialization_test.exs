@@ -15,7 +15,7 @@ defmodule ForgeMirrors.OutboxMaterializationTest do
   end
 
   test "repository.created creates a local discovered binding and durable outbound intent" do
-    organization_mirror = active_organization_mirror_fixture()
+    organization_mirror = active_organization_mirror_fixture(create_policy())
     repository_id = repository_fixture(organization_mirror.organization_id)
     event = created_event(repository_id, organization_mirror.organization_id)
 
@@ -27,12 +27,85 @@ defmodule ForgeMirrors.OutboxMaterializationTest do
     assert repository_mirror.state == :discovered
     assert repository_mirror.github_repository_id == nil
     assert operation.repository_mirror_id == repository_mirror.id
-    assert operation.kind == "repository.created"
+    assert operation.kind == "sync.repository.create"
     assert operation.state == :pending
   end
 
-  test "repository.created replay is idempotent after materialization but before acknowledgement" do
+  test "repository.created is acknowledged without a binding when remote creation is disabled" do
     organization_mirror = active_organization_mirror_fixture()
+    repository_id = repository_fixture(organization_mirror.organization_id)
+    event = created_event(repository_id, organization_mirror.organization_id)
+
+    assert {:ok, {:ignored, :repository_create_disabled}} =
+             ForgeMirrors.materialize_outbox_event(event)
+
+    refute Repo.get_by(RepositoryMirror, repository_id: repository_id)
+
+    refute Repo.exists?(
+             from operation in MirrorOperation,
+               where:
+                 operation.organization_mirror_id == ^organization_mirror.id and
+                   operation.kind == "sync.repository.create"
+           )
+  end
+
+  test "repository.created is acknowledged without a binding when Git capability is disabled" do
+    organization_mirror =
+      active_organization_mirror_fixture(%{
+        policy: %{"auto_create_remote_repositories" => true},
+        capabilities: %{"git" => "disabled"}
+      })
+
+    repository_id = repository_fixture(organization_mirror.organization_id)
+    event = created_event(repository_id, organization_mirror.organization_id)
+
+    assert {:ok, {:ignored, :repository_create_capability_disabled}} =
+             ForgeMirrors.materialize_outbox_event(event)
+
+    refute Repo.exists?(
+             from mirror in RepositoryMirror,
+               where: mirror.repository_id == ^repository_id
+           )
+  end
+
+  test "repository.created rejects malformed remote-creation policy" do
+    organization_mirror =
+      active_organization_mirror_fixture(%{
+        policy: %{"auto_create_remote_repositories" => "yes"},
+        capabilities: %{"git" => "enabled"}
+      })
+
+    repository_id = repository_fixture(organization_mirror.organization_id)
+    event = created_event(repository_id, organization_mirror.organization_id)
+
+    assert {:error, :invalid_policy} = ForgeMirrors.materialize_outbox_event(event)
+
+    refute Repo.exists?(
+             from mirror in RepositoryMirror,
+               where: mirror.repository_id == ^repository_id
+           )
+  end
+
+  test "repository.created rejects malformed Git capability state" do
+    organization_mirror =
+      active_organization_mirror_fixture(%{
+        policy: %{"auto_create_remote_repositories" => true},
+        capabilities: %{"git" => "sometimes"}
+      })
+
+    repository_id = repository_fixture(organization_mirror.organization_id)
+    event = created_event(repository_id, organization_mirror.organization_id)
+
+    assert {:error, :invalid_capabilities} = ForgeMirrors.materialize_outbox_event(event)
+
+    refute Repo.exists?(
+             from mirror in RepositoryMirror,
+               where: mirror.repository_id == ^repository_id
+           )
+  end
+
+  test "repository.created replay is idempotent after materialization but before acknowledgement" do
+    organization_mirror = active_organization_mirror_fixture(create_policy())
     repository_id = repository_fixture(organization_mirror.organization_id)
     event = created_event(repository_id, organization_mirror.organization_id)
 
@@ -181,7 +254,7 @@ defmodule ForgeMirrors.OutboxMaterializationTest do
   end
 
   test "repository.created persists paused intent but the scheduler cannot claim it" do
-    organization_mirror = active_organization_mirror_fixture()
+    organization_mirror = active_organization_mirror_fixture(create_policy())
     actor = organization_owner_fixture(organization_mirror)
     assert {:ok, paused} = ForgeMirrors.pause(actor, organization_mirror)
     repository_id = repository_fixture(paused.organization_id)
@@ -370,6 +443,12 @@ defmodule ForgeMirrors.OutboxMaterializationTest do
     |> DomainOutbox.record_multi(:event, Map.from_struct(event))
     |> Repo.transaction()
   end
+
+  defp create_policy,
+    do: %{
+      policy: %{"auto_create_remote_repositories" => true},
+      capabilities: %{"git" => "enabled"}
+    }
 end
 
 defmodule ForgeMirrors.OutboxMaterializationRaceTest do
@@ -385,7 +464,12 @@ defmodule ForgeMirrors.OutboxMaterializationRaceTest do
   test "concurrent repository.created materialization converges on one binding and operation" do
     {organization_id, organization_mirror, repository_id} =
       Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
-        organization_mirror = active_organization_mirror_fixture()
+        organization_mirror =
+          active_organization_mirror_fixture(%{
+            policy: %{"auto_create_remote_repositories" => true},
+            capabilities: %{"git" => "enabled"}
+          })
+
         repository_id = repository_fixture(organization_mirror.organization_id)
         {organization_mirror.organization_id, organization_mirror, repository_id}
       end)

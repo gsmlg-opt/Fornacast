@@ -85,14 +85,22 @@ defmodule ForgeGitHub.Client do
   end
 
   @doc false
-  @spec repository_metadata_request(String.t(), :patch, String.t(), 200, keyword()) ::
+  @spec repository_metadata_request(
+          String.t(),
+          :post | :patch,
+          String.t(),
+          200 | 201,
+          keyword()
+        ) ::
           {:ok, term()} | {:error, Error.t()}
-  def repository_metadata_request(token, :patch, path, 200, opts) do
+  def repository_metadata_request(token, method, path, expected_status, opts)
+      when (method == :patch and expected_status == 200) or
+             (method == :post and expected_status == 201) do
     metadata_request(
       token,
-      :patch,
+      method,
       path,
-      200,
+      expected_status,
       opts,
       &repository_metadata_request_kind/2,
       :repository_metadata
@@ -118,9 +126,10 @@ defmodule ForgeGitHub.Client do
         with {:ok, body} <- encode_request_body(opts, json_profile),
              {:ok, response} <- perform_request(path, token, opts, method, body),
              {:ok, value} <-
-               successful_response(
+               metadata_response(
                  response,
                  opts,
+                 request_kind,
                  expected_status,
                  json_profile
                ) do
@@ -133,6 +142,18 @@ defmodule ForgeGitHub.Client do
       _invalid -> error(:invalid_request)
     end
   end
+
+  defp metadata_response(
+         %Req.Response{status: 422},
+         _opts,
+         :create,
+         _expected_status,
+         _json_profile
+       ),
+       do: error(:unprocessable_entity)
+
+  defp metadata_response(response, opts, _request_kind, expected_status, json_profile),
+    do: successful_response(response, opts, expected_status, json_profile)
 
   @doc false
   @spec issue_metadata_page(String.t(), String.t(), keyword()) ::
@@ -508,15 +529,25 @@ defmodule ForgeGitHub.Client do
 
   defp pull_metadata_request_kind(_, _), do: :error
 
-  defp repository_metadata_request_kind(:patch, path) when is_binary(path) do
+  defp repository_metadata_request_kind(method, path)
+       when method in [:post, :patch] and is_binary(path) do
     with {:ok,
           %URI{scheme: nil, host: nil, userinfo: nil, fragment: nil, path: parsed, query: nil}} <-
            URI.new(path),
-         false <- String.contains?(parsed, "//"),
-         ["repos", owner, repository] <- String.split(parsed, "/", trim: true),
-         true <- RepositoryReference.valid_owner?(owner),
-         true <- RepositoryReference.valid_repository?(repository) do
-      {:ok, :update}
+         false <- String.contains?(parsed, "//") do
+      case {method, String.split(parsed, "/", trim: true)} do
+        {:patch, ["repos", owner, repository]} ->
+          if RepositoryReference.valid_owner?(owner) and
+               RepositoryReference.valid_repository?(repository),
+             do: {:ok, :update},
+             else: :error
+
+        {:post, ["orgs", owner, "repos"]} ->
+          if RepositoryReference.valid_owner?(owner), do: {:ok, :create}, else: :error
+
+        _invalid ->
+          :error
+      end
     else
       _invalid -> :error
     end

@@ -159,6 +159,33 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliationTest do
     assert marked.external_effect_marker["expected_remote"] == sync.baseline.confirmed_snapshot
   end
 
+  test "outbound repository names use the canonical local slug rather than display name", c do
+    _baseline = confirm_baseline(c)
+    repository = Repo.get!(Repository, c.binding.repository_id)
+
+    repository
+    |> Ecto.Changeset.change(name: "Display Name", slug: "display-name")
+    |> Ecto.Changeset.optimistic_lock(:write_version)
+    |> Repo.update!()
+
+    claimed = claim_metadata_operation(c, "metadata:slug", "repository-metadata-slug")
+    assert {:ok, sync} = ForgeMirrors.repository_metadata_operation_context(claimed)
+
+    observed_baseline =
+      sync.baseline.confirmed_snapshot
+      |> atomize_remote(sync)
+      |> Map.put(:updated_at, DateTime.add(c.now, 1))
+
+    assert {:ok, %{action: :update_remote, target: target}} =
+             ForgeMirrors.record_repository_metadata_observation(
+               claimed,
+               observed_baseline,
+               c.now
+             )
+
+    assert target["name"] == "display-name"
+  end
+
   test "an ambiguous outbound effect confirms from a canonical recovery read", c do
     _baseline = confirm_baseline(c)
     repository = Repo.get!(Repository, c.binding.repository_id)
