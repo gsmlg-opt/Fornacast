@@ -361,6 +361,7 @@ defmodule ForgeMirrors do
     with :ok <- validate_owner(owner) do
       Repo.transaction(fn ->
         now = database_now!()
+        activate_legacy_pull_request_deliveries!(now)
         recover_expired_webhook_deliveries!(now, max_internal_attempts)
         # `:utc_datetime` truncates fractional seconds. One extra stored second
         # keeps the requested lease duration from being shortened by that truncation.
@@ -5939,6 +5940,57 @@ defmodule ForgeMirrors do
       Ecto.Adapters.SQL.query!(Repo, sql, [now, max_per_installation, limit])
 
     Enum.map(rows, fn [id] -> claim_webhook_delivery!(id, owner, now, expires_at) end)
+  end
+
+  defp activate_legacy_pull_request_deliveries!(now) do
+    candidates =
+      Repo.all(
+        from organization in OrganizationMirror,
+          join: binding in RepositoryMirror,
+          on:
+            binding.organization_mirror_id == organization.id and
+              binding.state in [:discovered, :active] and binding.inventory_included == true and
+              not is_nil(binding.repository_id) and not is_nil(binding.github_repository_id),
+          join: delivery in MirrorWebhookDelivery,
+          on:
+            delivery.installation_id == organization.github_installation_id and
+              delivery.github_repository_id == binding.github_repository_id and
+              (is_nil(delivery.organization_mirror_id) or
+                 delivery.organization_mirror_id == organization.id),
+          where:
+            organization.provider == "github" and
+              organization.state in [:catching_up, :active, :degraded, :conflicted] and
+              delivery.state == :pending_unsupported and delivery.event == "pull_request",
+          lock: "FOR UPDATE",
+          select: {organization, binding.github_repository_id}
+      )
+      |> Enum.filter(fn {organization, _repository_id} ->
+        issue_capability_enabled?(organization, "pull_request")
+      end)
+      |> Enum.uniq_by(fn {organization, repository_id} -> {organization.id, repository_id} end)
+
+    Enum.reduce(candidates, 0, fn {organization, repository_id}, count ->
+      {activated, _rows} =
+        Repo.update_all(
+          from(delivery in MirrorWebhookDelivery,
+            where:
+              delivery.installation_id == ^organization.github_installation_id and
+                delivery.github_repository_id == ^repository_id and
+                (is_nil(delivery.organization_mirror_id) or
+                   delivery.organization_mirror_id == ^organization.id) and
+                delivery.state == :pending_unsupported and delivery.event == "pull_request"
+          ),
+          set: [
+            organization_mirror_id: organization.id,
+            state: :pending,
+            next_attempt_at: now,
+            failure_class: nil,
+            updated_at: now
+          ]
+        )
+
+      count + activated
+    end)
   end
 
   defp claim_webhook_delivery!(id, owner, now, expires_at) do

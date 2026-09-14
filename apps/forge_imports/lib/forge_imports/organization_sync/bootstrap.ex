@@ -108,14 +108,23 @@ defmodule ForgeImports.OrganizationSync.Bootstrap do
       from(delivery in ForgeMirrors.MirrorWebhookDelivery,
         join: binding in RepositoryMirror,
         on:
-          binding.organization_mirror_id == delivery.organization_mirror_id and
+          binding.organization_mirror_id == ^mirror.id and
             binding.github_repository_id == delivery.github_repository_id,
         where:
-          delivery.organization_mirror_id == ^mirror.id and
+          delivery.installation_id == ^mirror.github_installation_id and
+            (is_nil(delivery.organization_mirror_id) or
+               delivery.organization_mirror_id == ^mirror.id) and
             delivery.state == :pending_unsupported and
-            delivery.event in ["issues", "issue_comment"] and not is_nil(binding.repository_id)
+            delivery.event in ["issues", "issue_comment", "pull_request"] and
+            not is_nil(binding.repository_id)
       ),
-      set: [state: :pending, next_attempt_at: now, failure_class: nil, updated_at: now]
+      set: [
+        organization_mirror_id: mirror.id,
+        state: :pending,
+        next_attempt_at: now,
+        failure_class: nil,
+        updated_at: now
+      ]
     )
 
     :ok

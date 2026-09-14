@@ -360,36 +360,47 @@ defmodule ForgeImports.OrganizationSyncTest do
     bound_mirror = Repo.get_by!(OrganizationMirror, bootstrap_import_run_id: run_id)
     binding = ForgeMirrors.TestSupport.MirrorFixtures.repository_mirror_fixture(bound_mirror)
 
-    {:ok, deferred, :enqueued} =
-      ForgeMirrors.enqueue_webhook_delivery(
-        %{
-          organization_mirror_id: bound_mirror.id,
-          delivery_guid: Ecto.UUID.generate(),
-          hook_id: System.unique_integer([:positive]),
-          event: "issues",
-          action: "edited",
-          installation_id: installation_id,
-          github_repository_id: binding.github_repository_id,
-          signature_version: "sha256",
-          raw_payload: JSON.encode!(%{"action" => "edited"})
-        },
-        :pending_unsupported
-      )
-
-    retained =
-      for {event, repository_id} <- [
-            {"issues", binding.github_repository_id + 1},
-            {"pull_request", binding.github_repository_id}
+    replayed =
+      for {event, organization_mirror_id} <- [
+            {"issues", bound_mirror.id},
+            {"pull_request", nil}
           ] do
         {:ok, delivery, :enqueued} =
           ForgeMirrors.enqueue_webhook_delivery(
             %{
-              organization_mirror_id: bound_mirror.id,
+              organization_mirror_id: organization_mirror_id,
               delivery_guid: Ecto.UUID.generate(),
               hook_id: System.unique_integer([:positive]),
               event: event,
               action: "edited",
               installation_id: installation_id,
+              github_repository_id: binding.github_repository_id,
+              signature_version: "sha256",
+              raw_payload: JSON.encode!(%{"action" => "edited"})
+            },
+            :pending_unsupported
+          )
+
+        delivery
+      end
+
+    foreign_mirror = ForgeMirrors.TestSupport.MirrorFixtures.organization_mirror_fixture()
+
+    retained =
+      for {event, repository_id, delivery_installation_id, organization_mirror_id} <- [
+            {"issues", binding.github_repository_id + 1, installation_id, nil},
+            {"pull_request", binding.github_repository_id, installation_id + 1, nil},
+            {"pull_request", binding.github_repository_id, installation_id, foreign_mirror.id}
+          ] do
+        {:ok, delivery, :enqueued} =
+          ForgeMirrors.enqueue_webhook_delivery(
+            %{
+              organization_mirror_id: organization_mirror_id,
+              delivery_guid: Ecto.UUID.generate(),
+              hook_id: System.unique_integer([:positive]),
+              event: event,
+              action: "edited",
+              installation_id: delivery_installation_id,
               github_repository_id: repository_id,
               signature_version: "sha256",
               raw_payload: JSON.encode!(%{"action" => "edited"})
@@ -409,7 +420,13 @@ defmodule ForgeImports.OrganizationSyncTest do
     mirror = Repo.get_by!(OrganizationMirror, bootstrap_import_run_id: run_id)
     assert mirror.state == :degraded
     assert mirror.next_reconcile_at == now
-    assert Repo.get!(ForgeMirrors.MirrorWebhookDelivery, deferred.id).state == :pending
+
+    for delivery <- replayed do
+      assert %{state: :pending, organization_mirror_id: organization_mirror_id} =
+               Repo.get!(ForgeMirrors.MirrorWebhookDelivery, delivery.id)
+
+      assert organization_mirror_id == bound_mirror.id
+    end
 
     for delivery <- retained do
       assert Repo.get!(ForgeMirrors.MirrorWebhookDelivery, delivery.id).state ==

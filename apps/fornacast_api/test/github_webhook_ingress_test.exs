@@ -192,7 +192,10 @@ defmodule FornacastAPI.GitHubWebhookIngressTest do
     assert duplicate_signature.status == 401
   end
 
-  test "stores deferred supported and ignored combinations without claiming them", %{conn: conn} do
+  test "queues pull requests without trusting a local organization binding and defers releases",
+       %{
+         conn: conn
+       } do
     repository_guid = Ecto.UUID.generate()
 
     assert request(conn, payload("opened", 44, 99),
@@ -200,9 +203,29 @@ defmodule FornacastAPI.GitHubWebhookIngressTest do
              delivery: repository_guid
            ).status == 202
 
-    assert Repo.get_by!(MirrorWebhookDelivery, delivery_guid: repository_guid).state ==
+    pull = Repo.get_by!(MirrorWebhookDelivery, delivery_guid: repository_guid)
+    assert pull.state == :pending
+    assert is_nil(pull.organization_mirror_id)
+
+    release_guid = Ecto.UUID.generate()
+
+    assert request(conn, payload("published", 44, 99),
+             event: "release",
+             delivery: release_guid
+           ).status == 202
+
+    assert Repo.get_by!(MirrorWebhookDelivery, delivery_guid: release_guid).state ==
              :pending_unsupported
 
+    assert {:ok, [claimed]} = ForgeMirrors.claim_webhook_deliveries("ingress-pull", 30, 10)
+    assert claimed.id == pull.id
+    assert is_nil(claimed.organization_mirror_id)
+
+    assert {:ok, deferred} = ForgeMirrors.defer_webhook_delivery(claimed, "ingress-pull")
+    assert deferred.state == :pending_unsupported
+  end
+
+  test "stores ignored combinations as terminal", %{conn: conn} do
     unknown_guid = Ecto.UUID.generate()
 
     assert request(conn, ~s({"future":"payload"}), event: "future", delivery: unknown_guid).status ==

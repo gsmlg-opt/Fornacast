@@ -222,7 +222,7 @@ defmodule ForgeGitHub.WebhookTest do
     end
   end
 
-  test "marks Git refs and supported issue metadata processable while later resources remain pending" do
+  test "marks Git refs and supported issue and pull metadata processable while releases remain pending" do
     for event <- ~w(push create delete) do
       assert :processable = Webhook.classify(event, nil)
     end
@@ -230,21 +230,17 @@ defmodule ForgeGitHub.WebhookTest do
     issue_actions = %{
       "issues" =>
         ~w(assigned closed deleted edited labeled opened reopened transferred unassigned unlabeled),
-      "issue_comment" => ~w(created edited deleted)
+      "issue_comment" => ~w(created edited deleted),
+      "pull_request" =>
+        ~w(assigned closed converted_to_draft edited labeled opened ready_for_review reopened synchronize unassigned unlabeled)
     }
 
     for {event, actions} <- issue_actions, action <- actions do
       assert :processable = Webhook.classify(event, action)
     end
 
-    pending_actions = %{
-      "pull_request" =>
-        ~w(assigned closed converted_to_draft edited labeled opened ready_for_review reopened synchronize unassigned unlabeled),
-      "release" => ~w(created deleted edited prereleased published released unpublished)
-    }
-
-    for {event, actions} <- pending_actions, action <- actions do
-      assert :pending_unsupported = Webhook.classify(event, action)
+    for action <- ~w(created deleted edited prereleased published released unpublished) do
+      assert :pending_unsupported = Webhook.classify("release", action)
     end
   end
 

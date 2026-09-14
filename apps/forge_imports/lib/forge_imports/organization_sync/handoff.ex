@@ -25,7 +25,8 @@ defmodule ForgeImports.OrganizationSync.Handoff do
     "create",
     "delete",
     "issues",
-    "issue_comment"
+    "issue_comment",
+    "pull_request"
   ]
 
   def append(%Multi{} = multi, name, run_id, item_id, %DateTime{} = now)
@@ -765,12 +766,20 @@ defmodule ForgeImports.OrganizationSync.Handoff do
       repo.update_all(
         from(delivery in MirrorWebhookDelivery,
           where:
-            delivery.organization_mirror_id == ^organization_mirror.id and
+            delivery.installation_id == ^organization_mirror.github_installation_id and
+              (is_nil(delivery.organization_mirror_id) or
+                 delivery.organization_mirror_id == ^organization_mirror.id) and
               delivery.github_repository_id == ^item.github_repository_id and
               delivery.state == :pending_unsupported and
               delivery.event in ^@supported_repository_events
         ),
-        set: [state: :pending, next_attempt_at: now, failure_class: nil, updated_at: now]
+        set: [
+          organization_mirror_id: organization_mirror.id,
+          state: :pending,
+          next_attempt_at: now,
+          failure_class: nil,
+          updated_at: now
+        ]
       )
 
     {:ok, count}

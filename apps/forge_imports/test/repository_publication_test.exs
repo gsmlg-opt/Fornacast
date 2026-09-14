@@ -5,6 +5,7 @@ defmodule ForgeImports.RepositoryPublicationTest do
 
   alias Ecto.Multi
   alias ForgeAccounts.OrganizationMember
+  alias ForgeGitHub.WebhookProcessor
 
   alias ForgeImports.{
     ImportAttempt,
@@ -28,6 +29,8 @@ defmodule ForgeImports.RepositoryPublicationTest do
     OrganizationMirror,
     RepositoryMirror
   }
+
+  alias ForgeMirrors.WebhookWorker
 
   alias ForgePulls.{MergeOperation, PullRequest}
   alias ForgeRepos.{Collaborator, GitWriteOperation, Repository}
@@ -296,6 +299,151 @@ defmodule ForgeImports.RepositoryPublicationTest do
     assert snapshot_counts() == before_replay
   end
 
+  test "replays an ingress-shaped pull webhook across bootstrap handoff into one sync operation",
+       context do
+    organization =
+      ForgeAccounts.create_organization(context.actor, %{
+        username: "pull-replay-org-#{System.unique_integer([:positive])}",
+        display_name: "Pull Replay Organization"
+      })
+      |> unwrap!()
+
+    fixture =
+      ready_publication_fixture(context,
+        owner: organization,
+        slug: "pull-replay-repository"
+      )
+
+    shadow_path = ForgeRepos.absolute_storage_path(fixture.shadow)
+    File.mkdir_p!(Path.dirname(shadow_path))
+    assert {:ok, ^shadow_path} = GitCore.init_bare(shadow_path)
+
+    installation_id = 8_350_000_000 + System.unique_integer([:positive])
+
+    pending_mirror =
+      ForgeMirrors.create_organization_mirror(context.actor, %{
+        organization_id: organization.id,
+        provider: "github",
+        github_installation_id: installation_id,
+        github_account_id: fixture.run.source_owner_github_id,
+        github_account_login: fixture.run.source_owner_login,
+        capabilities: %{"pulls" => "enabled"}
+      })
+      |> unwrap!()
+
+    ready_mirror =
+      ForgeMirrors.transition_organization_mirror(
+        context.actor,
+        pending_mirror,
+        :ready_to_bootstrap
+      )
+      |> unwrap!()
+
+    bound_mirror =
+      ForgeMirrors.update_organization_mirror(context.actor, ready_mirror, %{
+        bootstrap_import_run_id: fixture.run.id
+      })
+      |> unwrap!()
+
+    organization_mirror =
+      ForgeMirrors.transition_organization_mirror(
+        context.actor,
+        bound_mirror,
+        :bootstrapping
+      )
+      |> unwrap!()
+
+    repository_mirror =
+      ForgeMirrors.bind_repository(context.actor, %{
+        organization_mirror_id: organization_mirror.id,
+        github_repository_id: fixture.item.github_repository_id,
+        github_node_id: "R_pull_replay_#{fixture.item.id}",
+        github_full_name: fixture.item.source_full_name
+      })
+      |> unwrap!()
+
+    pull_id = 8_360_000_000 + System.unique_integer([:positive])
+    delivery_guid = Ecto.UUID.generate()
+
+    {:ok, delivery, :enqueued} =
+      ForgeMirrors.enqueue_webhook_delivery(
+        %{
+          delivery_guid: delivery_guid,
+          hook_id: 8_370_000_000 + System.unique_integer([:positive]),
+          event: "pull_request",
+          action: "synchronize",
+          installation_id: installation_id,
+          github_repository_id: fixture.item.github_repository_id,
+          signature_version: "sha256",
+          raw_payload:
+            JSON.encode!(%{
+              "action" => "synchronize",
+              "installation" => %{"id" => installation_id},
+              "repository" => %{"id" => fixture.item.github_repository_id},
+              "pull_request" => %{"id" => pull_id, "number" => 7}
+            })
+        },
+        :pending
+      )
+
+    assert is_nil(delivery.organization_mirror_id)
+
+    assert {:ok, [{delivery_id, {:ok, first_defer}}]} =
+             WebhookWorker.run_once("bootstrap-pull-before-handoff",
+               processor: WebhookProcessor
+             )
+
+    assert delivery_id == delivery.id
+    assert first_defer.state == :pending_unsupported
+
+    assert {:ok, %{repository: published, replaced: nil}} =
+             ForgeImports.publish_repository(
+               context.actor,
+               fixture.item.id,
+               request_metadata("pull-replay-handoff")
+             )
+
+    assert %{state: :pending, organization_mirror_id: organization_mirror_id} =
+             Repo.get!(MirrorWebhookDelivery, delivery.id)
+
+    assert organization_mirror_id == organization_mirror.id
+    assert Repo.get!(RepositoryMirror, repository_mirror.id).repository_id == published.id
+
+    assert {:ok, [{^delivery_id, {:ok, second_defer}}]} =
+             WebhookWorker.run_once("bootstrap-pull-after-handoff",
+               processor: WebhookProcessor
+             )
+
+    assert second_defer.state == :pending_unsupported
+
+    assert {:ok, %ImportRun{state: :completed}} =
+             RunAggregator.finish_if_terminal(fixture.run.id, now: @now)
+
+    assert %{state: :pending, organization_mirror_id: ^organization_mirror_id} =
+             Repo.get!(MirrorWebhookDelivery, delivery.id)
+
+    assert {:ok, [{^delivery_id, {:ok, processed}}]} =
+             WebhookWorker.run_once("bootstrap-pull-final-replay", processor: WebhookProcessor)
+
+    assert processed.state == :completed
+
+    assert %MirrorOperation{
+             organization_mirror_id: ^organization_mirror_id,
+             repository_mirror_id: repository_mirror_id,
+             kind: "sync.pull",
+             cursor: %{
+               "delivery_guid" => ^delivery_guid,
+               "resource_kind" => "pull",
+               "github_object_id" => ^pull_id,
+               "github_number" => 7,
+               "issue_kind" => "pull_request",
+               "trigger" => "remote"
+             }
+           } = Repo.get_by!(MirrorOperation, kind: "sync.pull")
+
+    assert repository_mirror_id == repository_mirror.id
+  end
+
   test "atomically hands an organization bootstrap publication to permanent mirror state",
        context do
     organization =
@@ -459,11 +607,14 @@ defmodule ForgeImports.RepositoryPublicationTest do
       )
 
     metadata_deliveries =
-      for {event, action} <- [{"issues", "edited"}, {"issue_comment", "created"}] do
+      for {event, action} <- [
+            {"issues", "edited"},
+            {"issue_comment", "created"},
+            {"pull_request", "synchronize"}
+          ] do
         {:ok, metadata, :enqueued} =
           ForgeMirrors.enqueue_webhook_delivery(
             %{
-              organization_mirror_id: organization_mirror.id,
               delivery_guid: Ecto.UUID.generate(),
               hook_id: 8_500_000_000 + System.unique_integer([:positive]),
               event: event,
@@ -492,8 +643,14 @@ defmodule ForgeImports.RepositoryPublicationTest do
              )
 
     for metadata <- metadata_deliveries do
-      assert %{state: :pending, failure_class: nil} =
+      assert %{
+               state: :pending,
+               organization_mirror_id: organization_mirror_id,
+               failure_class: nil
+             } =
                Repo.get!(MirrorWebhookDelivery, metadata.id)
+
+      assert organization_mirror_id == organization_mirror.id
     end
 
     assert %RepositoryMirror{

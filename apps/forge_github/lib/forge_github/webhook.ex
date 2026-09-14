@@ -137,7 +137,7 @@ defmodule ForgeGitHub.Webhook do
     do: :processable
 
   def classify("pull_request", action) when action in @pull_request_actions,
-    do: :pending_unsupported
+    do: :processable
 
   def classify("release", action) when action in @release_actions,
     do: :pending_unsupported

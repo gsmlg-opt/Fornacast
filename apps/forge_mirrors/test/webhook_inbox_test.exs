@@ -76,6 +76,80 @@ defmodule ForgeMirrors.WebhookInboxTest do
     assert {:ok, []} = ForgeMirrors.claim_webhook_deliveries("worker-a", 30, 10)
   end
 
+  test "claims safely backfill eligible legacy pull deliveries but not releases or paused mirrors" do
+    active =
+      active_organization_mirror_fixture(%{
+        capabilities: %{"pulls" => "enabled"}
+      })
+
+    binding = repository_mirror_fixture(active)
+
+    legacy_pull =
+      enqueue_deferred!(
+        pull_delivery_attrs(active.github_installation_id, binding.github_repository_id)
+      )
+
+    legacy_release =
+      enqueue_deferred!(
+        pull_delivery_attrs(active.github_installation_id, binding.github_repository_id, %{
+          event: "release",
+          action: "published"
+        })
+      )
+
+    paused_source =
+      active_organization_mirror_fixture(%{
+        capabilities: %{"pulls" => "enabled"}
+      })
+
+    paused_binding = repository_mirror_fixture(paused_source)
+    paused_actor = organization_owner_fixture(paused_source)
+    assert {:ok, paused} = ForgeMirrors.pause(paused_actor, paused_source)
+
+    paused_pull =
+      enqueue_deferred!(
+        pull_delivery_attrs(paused.github_installation_id, paused_binding.github_repository_id)
+      )
+
+    assert {:ok, [claimed]} = ForgeMirrors.claim_webhook_deliveries("backfill-worker", 30, 10)
+    assert claimed.id == legacy_pull.id
+    assert claimed.organization_mirror_id == active.id
+
+    assert {:ok, completed} =
+             ForgeMirrors.complete_webhook_delivery(claimed, "backfill-worker")
+
+    assert completed.state == :completed
+    assert {:ok, []} = ForgeMirrors.claim_webhook_deliveries("backfill-worker", 30, 10)
+
+    assert Repo.get!(MirrorWebhookDelivery, legacy_release.id).state == :pending_unsupported
+    assert Repo.get!(MirrorWebhookDelivery, paused_pull.id).state == :pending_unsupported
+
+    processable_paused_pull =
+      enqueue!(
+        pull_delivery_attrs(paused.github_installation_id, paused_binding.github_repository_id)
+      )
+
+    assert {:ok, {:scheduled, paused_operation}} =
+             ForgeMirrors.retain_webhook_resource_trigger(processable_paused_pull, %{
+               "resource_kind" => "pull",
+               "github_object_id" => pull_object_id(processable_paused_pull),
+               "github_number" => pull_object_id(processable_paused_pull),
+               "issue_kind" => "pull_request"
+             })
+
+    assert paused_operation.state == :pending
+    assert paused_operation.organization_mirror_id == paused.id
+
+    assert {:ok, []} =
+             ForgeMirrors.claim_operations(
+               "paused-pull-effects",
+               DateTime.utc_now(:second),
+               30,
+               1,
+               ["sync.pull"]
+             )
+  end
+
   test "claims one due head per installation and enforces lease-owned transitions" do
     first = enqueue!(delivery_attrs(%{delivery_guid: Ecto.UUID.generate(), installation_id: 10}))
     second = enqueue!(delivery_attrs(%{delivery_guid: Ecto.UUID.generate(), installation_id: 10}))
@@ -226,6 +300,43 @@ defmodule ForgeMirrors.WebhookInboxTest do
   defp enqueue!(attrs) do
     assert {:ok, delivery, :enqueued} = ForgeMirrors.enqueue_webhook_delivery(attrs, :pending)
     delivery
+  end
+
+  defp enqueue_deferred!(attrs) do
+    assert {:ok, delivery, :enqueued} =
+             ForgeMirrors.enqueue_webhook_delivery(attrs, :pending_unsupported)
+
+    delivery
+  end
+
+  defp pull_delivery_attrs(installation_id, repository_id, overrides \\ %{}) do
+    pull_id = System.unique_integer([:positive, :monotonic])
+
+    delivery_attrs(
+      Map.merge(
+        %{
+          delivery_guid: Ecto.UUID.generate(),
+          event: "pull_request",
+          action: "synchronize",
+          installation_id: installation_id,
+          github_repository_id: repository_id,
+          raw_payload:
+            JSON.encode!(%{
+              "action" => "synchronize",
+              "installation" => %{"id" => installation_id},
+              "repository" => %{"id" => repository_id},
+              "pull_request" => %{"id" => pull_id, "number" => pull_id}
+            })
+        },
+        overrides
+      )
+    )
+  end
+
+  defp pull_object_id(delivery) do
+    delivery.raw_payload
+    |> JSON.decode!()
+    |> get_in(["pull_request", "id"])
   end
 
   defp delivery_attrs(overrides \\ %{}) do
