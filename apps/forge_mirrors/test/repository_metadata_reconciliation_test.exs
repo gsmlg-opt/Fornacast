@@ -1,11 +1,12 @@
 defmodule ForgeMirrors.RepositoryMetadataReconciliationTest do
   use ExUnit.Case, async: false
 
+  import Ecto.Query
   import ForgeMirrors.TestSupport.MirrorFixtures
 
-  alias ForgeMirrors.{MirrorConflict, MirrorOperation, MirrorResourceState}
+  alias ForgeMirrors.{MirrorConflict, MirrorOperation, MirrorResourceState, RepositoryMirror}
   alias ForgeRepos.Repository
-  alias Fornacast.Repo
+  alias Fornacast.{DomainOutboxEvent, Repo}
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
@@ -95,6 +96,165 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliationTest do
     assert conflict.conflict_kind == "repository_metadata_diverged"
     assert conflict.remote_snapshot["name"] == "remote-renamed"
     assert %MirrorConflict{state: :open} = Repo.get!(MirrorConflict, conflict.id)
+  end
+
+  test "an archived GitHub repository is observed as an explicit unrepresentable conflict", c do
+    _baseline = confirm_baseline(c)
+    repository = Repo.get!(Repository, c.binding.repository_id)
+    claimed = claim_metadata_operation(c, "metadata:archived", "repository-metadata-archived")
+    assert {:ok, sync} = ForgeMirrors.repository_metadata_operation_context(claimed)
+
+    remote =
+      sync.baseline.confirmed_snapshot
+      |> atomize_remote(sync)
+      |> Map.put(:archived, true)
+      |> Map.put(:updated_at, DateTime.add(c.now, 1))
+
+    assert {:ok, %{action: :conflict, operation: failed, conflict: conflict}} =
+             ForgeMirrors.record_repository_metadata_observation(claimed, remote, c.now)
+
+    assert failed.state == :failed
+    assert failed.failure_class == "unsupported_resource"
+    assert conflict.conflict_kind == "repository_archived_unrepresentable"
+    assert conflict.remote_snapshot["archived"] == true
+    assert Repo.get!(RepositoryMirror, c.binding.id).github_archived == true
+    assert Repo.get!(Repository, repository.id) == repository
+    refute repository_outbox_event?(repository.id)
+  end
+
+  test "GitHub internal visibility is explicit and never coerced to private", c do
+    _baseline = confirm_baseline(c)
+    repository = Repo.get!(Repository, c.binding.repository_id)
+    claimed = claim_metadata_operation(c, "metadata:internal", "repository-metadata-internal")
+    assert {:ok, sync} = ForgeMirrors.repository_metadata_operation_context(claimed)
+
+    remote =
+      sync.baseline.confirmed_snapshot
+      |> atomize_remote(sync)
+      |> Map.put(:name, "internal-renamed")
+      |> Map.put(:visibility, :internal)
+      |> Map.put(:updated_at, DateTime.add(c.now, 1))
+
+    assert {:ok, %{action: :conflict, operation: failed, conflict: conflict}} =
+             ForgeMirrors.record_repository_metadata_observation(claimed, remote, c.now)
+
+    assert failed.state == :failed
+    assert failed.failure_class == "unsupported_resource"
+    assert conflict.conflict_kind == "repository_internal_visibility_unrepresentable"
+    assert conflict.remote_snapshot["visibility"] == "internal"
+
+    assert Repo.get!(RepositoryMirror, c.binding.id).github_full_name ==
+             remote_full_name(c.binding, "internal-renamed")
+
+    assert Repo.get!(Repository, repository.id) == repository
+    refute repository_outbox_event?(repository.id)
+  end
+
+  test "combined archived and internal state has one deterministic policy conflict", c do
+    _baseline = confirm_baseline(c)
+    claimed = claim_metadata_operation(c, "metadata:archived-internal", "metadata-combined")
+    assert {:ok, sync} = ForgeMirrors.repository_metadata_operation_context(claimed)
+
+    remote =
+      sync.baseline.confirmed_snapshot
+      |> atomize_remote(sync)
+      |> Map.merge(%{visibility: :internal, archived: true, updated_at: DateTime.add(c.now, 1)})
+
+    assert {:ok, %{action: :conflict, conflict: conflict}} =
+             ForgeMirrors.record_repository_metadata_observation(claimed, remote, c.now)
+
+    assert conflict.conflict_kind == "repository_archived_internal_unrepresentable"
+    assert Repo.get!(RepositoryMirror, c.binding.id).github_archived == true
+  end
+
+  test "an unrepresentable remote change fences a previously marked outbound update", c do
+    _baseline = confirm_baseline(c)
+    _repository = update_description(c.binding.repository_id, "local update must not overwrite")
+    claimed = claim_metadata_operation(c, "metadata:archive-race", "metadata-archive-race")
+    assert {:ok, sync} = ForgeMirrors.repository_metadata_operation_context(claimed)
+
+    observed_baseline =
+      sync.baseline.confirmed_snapshot
+      |> atomize_remote(sync)
+      |> Map.put(:updated_at, DateTime.add(c.now, 1))
+
+    assert {:ok, %{action: :update_remote, operation: marked}} =
+             ForgeMirrors.record_repository_metadata_observation(
+               claimed,
+               observed_baseline,
+               c.now
+             )
+
+    archived_remote =
+      observed_baseline
+      |> Map.put(:archived, true)
+      |> Map.put(:updated_at, DateTime.add(c.now, 2))
+
+    assert {:ok, %{action: :conflict, operation: failed, conflict: conflict}} =
+             ForgeMirrors.record_repository_metadata_observation(
+               marked,
+               archived_remote,
+               DateTime.add(c.now, 2)
+             )
+
+    assert failed.state == :failed
+    assert failed.external_effect_marker == nil
+    assert conflict.conflict_kind == "repository_archived_unrepresentable"
+
+    assert Repo.get!(Repository, c.binding.repository_id).description ==
+             "local update must not overwrite"
+  end
+
+  test "a later representable observation recovers the provider path and resolves the policy conflict",
+       c do
+    _baseline = confirm_baseline(c)
+    archived = claim_metadata_operation(c, "metadata:archive-rename", "metadata-archive-rename")
+    assert {:ok, sync} = ForgeMirrors.repository_metadata_operation_context(archived)
+
+    archived_remote =
+      sync.baseline.confirmed_snapshot
+      |> atomize_remote(sync)
+      |> Map.merge(%{
+        name: "archived-renamed",
+        archived: true,
+        updated_at: DateTime.add(c.now, 1)
+      })
+
+    assert {:ok, %{action: :conflict, conflict: conflict}} =
+             ForgeMirrors.record_repository_metadata_observation(archived, archived_remote, c.now)
+
+    assert Repo.get!(RepositoryMirror, c.binding.id).github_full_name ==
+             remote_full_name(c.binding, "archived-renamed")
+
+    recovery =
+      claim_metadata_operation(c, "metadata:archive-recovery", "metadata-archive-recovery")
+
+    assert {:ok, recovery_sync} =
+             ForgeMirrors.repository_metadata_operation_context(recovery)
+
+    assert recovery_sync.remote_repository == "archived-renamed"
+
+    representable_remote =
+      archived_remote
+      |> Map.put(:archived, false)
+      |> Map.put(:updated_at, DateTime.add(c.now, 2))
+
+    assert {:ok, %{action: :confirmed, operation: completed}} =
+             ForgeMirrors.record_repository_metadata_observation(
+               recovery,
+               representable_remote,
+               DateTime.add(c.now, 2)
+             )
+
+    assert completed.state == :completed
+    assert Repo.get!(Repository, c.binding.repository_id).slug == "archived-renamed"
+    assert Repo.get!(RepositoryMirror, c.binding.id).github_archived == false
+
+    assert %MirrorConflict{
+             state: :resolved,
+             resolution: %{"action" => "system_reconciled", "v" => 1},
+             resolved_by_user_id: nil
+           } = Repo.get!(MirrorConflict, conflict.id)
   end
 
   test "a remote-only representable change is applied locally and confirmed", c do
@@ -434,5 +594,19 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliationTest do
     |> Ecto.Changeset.change(description: description)
     |> Ecto.Changeset.optimistic_lock(:write_version)
     |> Repo.update!()
+  end
+
+  defp repository_outbox_event?(repository_id) do
+    Repo.exists?(
+      from event in DomainOutboxEvent,
+        where:
+          event.aggregate_type == "repository" and
+            event.aggregate_id == ^Integer.to_string(repository_id)
+    )
+  end
+
+  defp remote_full_name(binding, name) do
+    owner = binding.github_full_name |> String.split("/", parts: 2) |> hd()
+    "#{owner}/#{name}"
   end
 end

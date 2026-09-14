@@ -196,6 +196,25 @@ defmodule ForgeGitHub.RepositoryMetadataSyncWorkerTest do
              )
   end
 
+  test "unrepresentable archived or internal observations never acquire write permission or PATCH" do
+    for remote <- [%{remote() | archived: true}, %{remote() | visibility: :internal}] do
+      operation = operation()
+
+      assert {:ok, %{action: :conflict, operation: ^operation}} =
+               RepositoryMetadataSyncWorker.process_operation(operation, @now,
+                 context: fn ^operation -> {:ok, sync()} end,
+                 token_fetch: fn 7, %{permissions: %{"metadata" => "read"}} -> token() end,
+                 repository_fetch: fn _, _, _, _ -> {:ok, remote} end,
+                 record: fn ^operation, ^remote, @now ->
+                   {:ok, %{action: :conflict, operation: operation}}
+                 end,
+                 repository_update: fn _, _, _, _, _ ->
+                   flunk("unrepresentable repository metadata must not be patched")
+                 end
+               )
+    end
+  end
+
   test "an invalidated installation token retries as a network failure" do
     operation = operation()
 

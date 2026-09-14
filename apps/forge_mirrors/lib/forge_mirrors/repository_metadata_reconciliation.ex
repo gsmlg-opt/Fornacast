@@ -9,6 +9,7 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliation do
     MirrorOperation,
     MirrorResourceState,
     OrganizationMirror,
+    RepositoryMetadataRepresentationPolicy,
     RepositoryMirror,
     ResourceDecision
   }
@@ -17,6 +18,11 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliation do
 
   @kind "reconcile.repository.metadata"
   @fields ~w(name description visibility default_branch archived)
+  @representation_conflict_kinds ~w(
+    repository_archived_unrepresentable
+    repository_internal_visibility_unrepresentable
+    repository_archived_internal_unrepresentable
+  )
   @effect_keys ~w(action baseline_lock_version expected_local_write_version expected_remote expected_remote_updated_at target target_fingerprint)
 
   def context(%MirrorOperation{} = operation) do
@@ -63,29 +69,47 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliation do
            {:ok, remote_snapshot, remote_updated_at} <- remote_snapshot(remote, binding),
            local_snapshot <- local_snapshot(repository),
            baseline <- baseline(binding.id) do
-        if operation.state == :effect_pending do
-          recover_effect(
-            operation,
-            binding,
-            organization,
-            repository,
-            local_snapshot,
-            remote_snapshot,
-            remote_updated_at,
-            now
-          )
-        else
-          reconcile(
-            operation,
-            binding,
-            organization,
-            repository,
-            baseline,
-            local_snapshot,
-            remote_snapshot,
-            remote_updated_at,
-            now
-          )
+        case RepositoryMetadataRepresentationPolicy.classify(remote_snapshot) do
+          :representable ->
+            if operation.state == :effect_pending do
+              recover_effect(
+                operation,
+                binding,
+                organization,
+                repository,
+                local_snapshot,
+                remote_snapshot,
+                remote_updated_at,
+                now
+              )
+            else
+              reconcile(
+                operation,
+                binding,
+                organization,
+                repository,
+                baseline,
+                local_snapshot,
+                remote_snapshot,
+                remote_updated_at,
+                now
+              )
+            end
+
+          {:unrepresentable, kind} ->
+            with {:ok, binding} <- observe_remote_archive(binding, remote_snapshot, now) do
+              persist_conflict(
+                operation,
+                binding,
+                organization,
+                baseline,
+                local_snapshot,
+                remote_snapshot,
+                kind,
+                "unsupported_resource",
+                now
+              )
+            end
         end
       else
         {:error, reason} -> Repo.rollback(reason)
@@ -480,6 +504,7 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliation do
          },
          state = baseline(binding.id),
          {:ok, state} <- persist_baseline(state, attrs),
+         :ok <- resolve_reconciled_conflict(binding, now),
          {:ok, completed} <- complete(operation, now),
          :ok <- ForgeMirrors.activate_repository_after_metadata(completed, now) do
       {:ok, %{action: :confirmed, operation: completed, baseline: state}}
@@ -497,6 +522,53 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliation do
     })
     |> Ecto.Changeset.optimistic_lock(:lock_version)
     |> Repo.update(stale_error_field: :lock_version, stale_error_message: "is stale")
+  end
+
+  defp observe_remote_archive(binding, snapshot, now) do
+    owner = binding.github_full_name |> String.split("/", parts: 2) |> hd()
+
+    binding
+    |> RepositoryMirror.metadata_update_changeset(%{
+      github_full_name: "#{owner}/#{snapshot["name"]}",
+      github_archived: snapshot["archived"],
+      last_synced_at: now
+    })
+    |> Ecto.Changeset.optimistic_lock(:lock_version)
+    |> Repo.update(stale_error_field: :lock_version, stale_error_message: "is stale")
+  end
+
+  defp resolve_reconciled_conflict(binding, now) do
+    conflict =
+      Repo.one(
+        from conflict in MirrorConflict,
+          where:
+            conflict.organization_mirror_id == ^binding.organization_mirror_id and
+              conflict.repository_mirror_id == ^binding.id and
+              conflict.resource_kind == "repository" and
+              conflict.resource_identity == ^Integer.to_string(binding.github_repository_id) and
+              conflict.conflict_kind in ^@representation_conflict_kinds and
+              conflict.state == :open,
+          lock: "FOR UPDATE"
+      )
+
+    case conflict do
+      nil ->
+        :ok
+
+      %MirrorConflict{} = conflict ->
+        conflict
+        |> MirrorConflict.resolve_changeset(
+          %{"action" => "system_reconciled", "v" => 1},
+          nil,
+          now
+        )
+        |> Ecto.Changeset.optimistic_lock(:lock_version)
+        |> Repo.update(stale_error_field: :lock_version, stale_error_message: "is stale")
+        |> case do
+          {:ok, _resolved} -> :ok
+          {:error, _changeset} -> {:error, :stale_conflict}
+        end
+    end
   end
 
   defp persist_conflict(
