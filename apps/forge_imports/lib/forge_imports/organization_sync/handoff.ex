@@ -17,6 +17,7 @@ defmodule ForgeImports.OrganizationSync.Handoff do
   }
 
   alias ForgePulls.PullRequest
+  alias ForgeReleases.Release
   alias ForgeRepos.Repository
 
   @supported_repository_events [
@@ -26,7 +27,8 @@ defmodule ForgeImports.OrganizationSync.Handoff do
     "delete",
     "issues",
     "issue_comment",
-    "pull_request"
+    "pull_request",
+    "release"
   ]
 
   def append(%Multi{} = multi, name, run_id, item_id, %DateTime{} = now)
@@ -188,6 +190,9 @@ defmodule ForgeImports.OrganizationSync.Handoff do
 
         kind == :pull ->
           pull_resource_attrs(repo, repository_mirror, mapping, resource, now)
+
+        kind == :release ->
+          release_resource_attrs(repository_mirror, mapping, resource, now)
 
         true ->
           ordinary_resource_attrs(repo, repository_mirror, mapping, kind, resource, now)
@@ -554,6 +559,7 @@ defmodule ForgeImports.OrganizationSync.Handoff do
   defp resource_kind("issue"), do: {:ok, :issue}
   defp resource_kind("comment"), do: {:ok, :issue_comment}
   defp resource_kind("pull_request"), do: {:ok, :pull}
+  defp resource_kind("release"), do: {:ok, :release}
   defp resource_kind(_kind), do: {:error, :bootstrap_mapping_unsupported}
 
   defp local_resource(repo, %{object_kind: "label", local_resource_id: id}),
@@ -577,6 +583,9 @@ defmodule ForgeImports.OrganizationSync.Handoff do
         end
     end
   end
+
+  defp local_resource(repo, %{object_kind: "release", local_resource_id: id}),
+    do: fetch_resource(repo, Release, id)
 
   defp fetch_resource(repo, schema, id) when is_integer(id) and id > 0 do
     case repo.get(schema, id) do
@@ -606,6 +615,9 @@ defmodule ForgeImports.OrganizationSync.Handoff do
          repository_id
        ),
        do: :ok
+
+  defp validate_local_resource(_repo, %Release{repository_id: repository_id}, repository_id),
+    do: :ok
 
   defp validate_local_resource(_repo, _resource, _repository_id),
     do: {:error, :bootstrap_mapping_mismatch}
@@ -651,6 +663,40 @@ defmodule ForgeImports.OrganizationSync.Handoff do
         {:error, :bootstrap_mapping_missing}
     end
   end
+
+  defp release_resource_attrs(repository_mirror, mapping, release, now) do
+    with {:ok, evidence} <- release_evidence(mapping.source_evidence) do
+      {:ok,
+       %{
+         repository_mirror_id: repository_mirror.id,
+         resource_kind: :release,
+         local_resource_type: "ForgeReleases.Release",
+         local_resource_id: release.id,
+         github_object_id: mapping.github_object_id,
+         github_node_id: evidence["github_node_id"],
+         state: :pending,
+         lock_version: 1,
+         inserted_at: now,
+         updated_at: now
+       }}
+    end
+  end
+
+  @release_evidence_keys ~w(github_node_id remote_created_at remote_updated_at v)
+
+  defp release_evidence(evidence) when is_map(evidence) do
+    with true <- Enum.sort(Map.keys(evidence)) == @release_evidence_keys,
+         1 <- evidence["v"],
+         true <- valid_identity_text?(evidence["github_node_id"]),
+         {:ok, _} <- evidence_datetime(evidence["remote_created_at"]),
+         {:ok, _} <- evidence_datetime(evidence["remote_updated_at"]) do
+      {:ok, evidence}
+    else
+      _invalid -> {:error, :release_baseline_requires_refetch}
+    end
+  end
+
+  defp release_evidence(_evidence), do: {:error, :release_baseline_requires_refetch}
 
   defp canonical_issue_snapshot(repository_id, kind, local_id, mirror_id) do
     with {:ok, projection} <- ForgeIssues.sync_projection(repository_id, kind, local_id),
@@ -762,6 +808,17 @@ defmodule ForgeImports.OrganizationSync.Handoff do
   end
 
   defp make_buffered_deliveries_eligible(repo, organization_mirror, item, now) do
+    supported_events =
+      if Map.get(organization_mirror.capabilities || %{}, "releases") in [
+           true,
+           :enabled,
+           :active,
+           "enabled",
+           "active"
+         ],
+         do: @supported_repository_events,
+         else: List.delete(@supported_repository_events, "release")
+
     {count, _rows} =
       repo.update_all(
         from(delivery in MirrorWebhookDelivery,
@@ -771,7 +828,7 @@ defmodule ForgeImports.OrganizationSync.Handoff do
                  delivery.organization_mirror_id == ^organization_mirror.id) and
               delivery.github_repository_id == ^item.github_repository_id and
               delivery.state == :pending_unsupported and
-              delivery.event in ^@supported_repository_events
+              delivery.event in ^supported_events
         ),
         set: [
           organization_mirror_id: organization_mirror.id,

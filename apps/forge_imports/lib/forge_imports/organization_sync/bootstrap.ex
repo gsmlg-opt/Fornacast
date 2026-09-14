@@ -104,6 +104,17 @@ defmodule ForgeImports.OrganizationSync.Bootstrap do
   defp replay_bound_metadata(%OrganizationMirror{state: state} = mirror, run_state, now)
        when state in [:catching_up, :degraded] and
               run_state in [:completed, :completed_with_warnings] do
+    events =
+      if Map.get(mirror.capabilities || %{}, "releases") in [
+           true,
+           :enabled,
+           :active,
+           "enabled",
+           "active"
+         ],
+         do: ["issues", "issue_comment", "pull_request", "release"],
+         else: ["issues", "issue_comment", "pull_request"]
+
     Repo.update_all(
       from(delivery in ForgeMirrors.MirrorWebhookDelivery,
         join: binding in RepositoryMirror,
@@ -115,8 +126,10 @@ defmodule ForgeImports.OrganizationSync.Bootstrap do
             (is_nil(delivery.organization_mirror_id) or
                delivery.organization_mirror_id == ^mirror.id) and
             delivery.state == :pending_unsupported and
-            delivery.event in ["issues", "issue_comment", "pull_request"] and
-            not is_nil(binding.repository_id)
+            delivery.event in ^events and
+            not is_nil(binding.repository_id) and
+            binding.inventory_included == true and
+            binding.state in [:discovered, :active]
       ),
       set: [
         organization_mirror_id: mirror.id,

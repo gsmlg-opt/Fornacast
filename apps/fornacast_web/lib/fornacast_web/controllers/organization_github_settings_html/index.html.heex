@@ -271,7 +271,7 @@
             type="checkbox"
             name="github[capabilities][]"
             value={capability}
-            checked={state in [:active, :enabled, true]}
+            checked={state in [:active, :enabled, true, "active", "enabled"]}
             disabled={state in [:unavailable, "unavailable"]}
           />
           <span>{humanize(capability)} — {humanize(state)}</span>

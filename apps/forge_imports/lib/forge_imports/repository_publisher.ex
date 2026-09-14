@@ -23,7 +23,7 @@ defmodule ForgeImports.RepositoryPublisher do
   @lease_seconds 60
   @retry_seconds 5
   @terminal_page_key "__terminal_v1__"
-  @terminal_resources ~w(labels issues comments pull_requests number_sequence)
+  @terminal_resources ~w(labels issues comments pull_requests releases number_sequence)
   @intent_keys ~w(version state attempt_number action hidden_repository_id operation_id request_metadata)
   @committed_keys @intent_keys ++
                     ~w(repository_id owner_user_id slug generation replaced_repository_id run_id published_count_after run_lock_version_after)

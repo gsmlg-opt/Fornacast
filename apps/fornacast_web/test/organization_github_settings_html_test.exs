@@ -86,7 +86,11 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTMLTest do
     assert html =~ "Selected"
     assert html =~ "Git"
     assert html =~ "Lfs — Unavailable"
-    assert html =~ "Releases — Unavailable"
+    assert html =~ "Releases — Enabled"
+
+    [release_input] = Regex.run(~r/<input[^>]*value="releases"[^>]*>/, html)
+    assert release_input =~ "checked"
+    refute release_input =~ "disabled"
     assert html =~ "Automatically import newly visible GitHub repositories"
     assert html =~ "Automatically create GitHub repositories for new local repositories"
     assert html =~ "Repository deletion policy"
@@ -254,7 +258,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTMLTest do
         issues: :active,
         pulls: :active,
         lfs: :unavailable,
-        releases: :unavailable
+        releases: "enabled"
       },
       repository_counts: %{active: 3},
       actions: %{

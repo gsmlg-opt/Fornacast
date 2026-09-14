@@ -1,10 +1,23 @@
 defmodule ForgeImports.GitHubAppPullBootstrapTest do
   use ExUnit.Case, async: false
 
+  import Ecto.Query
+
   alias Ecto.{Changeset, Multi}
   alias ForgeGitHub.{InstallationToken, InstallationTokenBroker}
-  alias ForgeImports.{ImportAttempt, ObjectMapping, Persistence, RepositoryItem, RepositoryWorker}
+  alias ForgeImports.GitHub.MetadataImporter
+
+  alias ForgeImports.{
+    ImportAttempt,
+    ObjectMapping,
+    PageCheckpoint,
+    Persistence,
+    RepositoryItem,
+    RepositoryWorker
+  }
+
   alias ForgeMirrors.MirrorResourceState
+  alias ForgeReleases.Release
   alias Fornacast.Repo
 
   @scope %{permissions: %{"contents" => "read", "issues" => "read", "pull_requests" => "read"}}
@@ -82,7 +95,12 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
 
     {:ok, mirror} =
       ForgeMirrors.update_organization_mirror(actor, mirror, %{
-        capabilities: %{"git" => "enabled", "issues" => "enabled", "pulls" => "enabled"}
+        capabilities: %{
+          "git" => "enabled",
+          "issues" => "enabled",
+          "pulls" => "enabled",
+          "releases" => "enabled"
+        }
       })
 
     {:ok, mirror} = ForgeMirrors.transition_organization_mirror(actor, mirror, :bootstrapping)
@@ -143,6 +161,23 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
         "pull_request" => %{"url" => "https://api.github.com/repos/octocat/Hello-World/pulls/7"}
       })
 
+    release = %{
+      "id" => 501,
+      "node_id" => "RE_bootstrap",
+      "url" => "https://api.github.com/repos/octocat/Hello-World/releases/501",
+      "tag_name" => "v1.0.0",
+      "name" => "Version 1",
+      "body" => "Release notes",
+      "draft" => false,
+      "prerelease" => false,
+      "target_commitish" => "main",
+      "published_at" => "2026-08-28T00:00:00Z",
+      "created_at" => "2026-08-27T00:00:00Z",
+      "updated_at" => "2026-08-28T00:00:00Z",
+      "author" => %{"id" => account_id, "node_id" => "U_release", "login" => "octocat"},
+      "assets" => []
+    }
+
     stub = {__MODULE__, suffix}
     parent = self()
 
@@ -151,12 +186,42 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
       send(parent, {:app_request, conn.request_path})
 
       case conn.request_path do
-        "/repos/octocat/Hello-World/labels" -> Req.Test.json(conn, [])
-        "/repos/octocat/Hello-World/issues" -> Req.Test.json(conn, [issue])
-        "/repos/octocat/Hello-World/issues/7" -> Req.Test.json(conn, issue)
-        "/repos/octocat/Hello-World/issues/7/comments" -> Req.Test.json(conn, [])
-        "/repos/octocat/Hello-World/pulls/7" -> Req.Test.json(conn, pull)
-        _ -> Plug.Conn.send_resp(conn, 404, "{}")
+        "/repos/octocat/Hello-World/labels" ->
+          Req.Test.json(conn, [])
+
+        "/repos/octocat/Hello-World/issues" ->
+          Req.Test.json(conn, [issue])
+
+        "/repos/octocat/Hello-World/issues/7" ->
+          Req.Test.json(conn, issue)
+
+        "/repos/octocat/Hello-World/issues/7/comments" ->
+          Req.Test.json(conn, [])
+
+        "/repos/octocat/Hello-World/pulls/7" ->
+          Req.Test.json(conn, pull)
+
+        "/repos/octocat/Hello-World/releases" ->
+          case conn.query_string |> URI.decode_query() |> Map.fetch!("page") do
+            "1" ->
+              Repo.update_all(
+                from(candidate in RepositoryItem, where: candidate.id == ^item.id),
+                set: [lease_expires_at: DateTime.add(DateTime.utc_now(:second), 10)]
+              )
+
+              conn
+              |> Plug.Conn.put_resp_header(
+                "link",
+                "<https://api.github.com/repos/octocat/Hello-World/releases?page=2&per_page=100>; rel=\"next\""
+              )
+              |> Req.Test.json([release])
+
+            "2" ->
+              Req.Test.json(conn, [])
+          end
+
+        _ ->
+          Plug.Conn.send_resp(conn, 404, "{}")
       end
     end)
 
@@ -174,17 +239,19 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
         suffix
       )
 
-    assert {:ok, %RepositoryItem{state: :ready_to_publish} = ready} =
-             RepositoryWorker.stage(item.id,
-               owner: "app-pull-bootstrap",
-               lease_seconds: 60,
-               token_broker: broker,
-               token_scope: @scope,
-               client_options: [
-                 plug: {Req.Test, stub},
-                 resolver: fn "api.github.com" -> {:ok, [{140, 82, 114, 5}]} end
-               ]
-             )
+    result =
+      RepositoryWorker.stage(item.id,
+        owner: "app-pull-bootstrap",
+        lease_seconds: 60,
+        token_broker: broker,
+        token_scope: @scope,
+        client_options: [
+          plug: {Req.Test, stub},
+          resolver: fn "api.github.com" -> {:ok, [{140, 82, 114, 5}]} end
+        ]
+      )
+
+    assert {:ok, %RepositoryItem{state: :ready_to_publish} = ready} = result
 
     assert_receive {:installation_checkout, ^installation_id, @scope}
     assert_receive {:app_request, "/repos/octocat/Hello-World/pulls/7"}
@@ -197,6 +264,22 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
     assert local.body == body
     assert mapping.source_evidence["github_issue_object_id"] == 302
     refute inspect(mapping.source_evidence) =~ "app-pull-test-token"
+
+    assert {:ok, buffered_release, :enqueued} =
+             ForgeMirrors.enqueue_webhook_delivery(
+               %{
+                 organization_mirror_id: nil,
+                 delivery_guid: Ecto.UUID.generate(),
+                 hook_id: System.unique_integer([:positive, :monotonic]),
+                 event: "release",
+                 action: "edited",
+                 installation_id: installation_id,
+                 github_repository_id: item.github_repository_id,
+                 signature_version: "sha256",
+                 raw_payload: JSON.encode!(%{"action" => "edited"})
+               },
+               :pending_unsupported
+             )
 
     assert {:ok, %{repository: published}} =
              ForgeImports.publish_repository(actor, ready.id, %{
@@ -222,6 +305,129 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
     assert pull_state.provider_identity["github_issue_object_id"] == issue_state.github_object_id
     assert pull_state.confirmed_local_version == local.sync_version
     assert pull_state.state == :confirmed
+
+    imported_release = Repo.get_by!(Release, repository_id: shadow.id, tag_name: "v1.0.0")
+
+    release_state =
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: binding.id,
+        resource_kind: :release,
+        local_resource_id: imported_release.id
+      )
+
+    assert release_state.state == :pending
+    assert release_state.github_object_id == 501
+    assert release_state.github_node_id == "RE_bootstrap"
+    assert release_state.provider_identity == nil
+    assert release_state.confirmed_local_version == nil
+    assert release_state.confirmed_remote_updated_at == nil
+    assert release_state.confirmed_fingerprint == nil
+    assert release_state.confirmed_snapshot == nil
+
+    assert %{state: :pending, organization_mirror_id: organization_mirror_id} =
+             Repo.get!(ForgeMirrors.MirrorWebhookDelivery, buffered_release.id)
+
+    assert organization_mirror_id == mirror.id
+  end
+
+  @tag :tmp_dir
+  test "disabled release capability skips bootstrap release requests and data", %{
+    tmp_dir: tmp_dir
+  } do
+    :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+    Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+    previous_root = Application.fetch_env!(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, tmp_dir)
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, previous_root) end)
+
+    suffix = System.unique_integer([:positive])
+    now = DateTime.utc_now(:second)
+
+    {:ok, actor} =
+      ForgeAccounts.create_user(%{
+        username: "app-release-disabled-#{suffix}",
+        email: "app-release-disabled-#{suffix}@example.test",
+        password: "correct horse battery staple"
+      })
+
+    {:ok, organization} =
+      ForgeAccounts.create_organization(
+        actor,
+        %{username: "app-release-disabled-org-#{suffix}", display_name: "Disabled release import"}
+      )
+
+    installation_id = 9_710_000_000 + suffix
+    account_id = 9_810_000_000 + suffix
+
+    {:ok, run} =
+      Persistence.insert_run(%{
+        actor_user_id: actor.id,
+        source_kind: :organization,
+        credential_source: :github_app,
+        source_owner_github_id: account_id,
+        source_owner_login: "octocat",
+        destination_organization_action: :existing,
+        destination_organization_id: organization.id,
+        destination_organization_slug: organization.username,
+        destination_organization_status: :clean,
+        selected_count: 1,
+        state: :running,
+        request_metadata: %{}
+      })
+
+    {:ok, mirror} =
+      ForgeMirrors.create_organization_mirror(actor, %{
+        organization_id: organization.id,
+        provider: "github",
+        github_installation_id: installation_id,
+        github_account_id: account_id,
+        github_account_login: "octocat",
+        bootstrap_import_run_id: run.id
+      })
+
+    {:ok, mirror} =
+      ForgeMirrors.transition_organization_mirror(actor, mirror, :ready_to_bootstrap)
+
+    {:ok, mirror} =
+      ForgeMirrors.update_organization_mirror(actor, mirror, %{
+        capabilities: %{"git" => "enabled", "issues" => "enabled", "pulls" => "enabled"}
+      })
+
+    {:ok, mirror} = ForgeMirrors.transition_organization_mirror(actor, mirror, :bootstrapping)
+
+    {:ok, _binding} =
+      ForgeMirrors.bind_repository(actor, %{
+        organization_mirror_id: mirror.id,
+        github_repository_id: 1_296_269,
+        github_node_id: "R_disabled_release",
+        github_full_name: "octocat/Hello-World"
+      })
+
+    {item, shadow, _base, _head} = staged_item(run, organization, now)
+    stub = {__MODULE__, "disabled-release-#{suffix}"}
+
+    Req.Test.stub(stub, fn _conn ->
+      flunk("disabled release capability must not issue a GitHub request")
+    end)
+
+    assert :ok =
+             MetadataImporter.stage_phase(item, :releases,
+               credential_checkout: fn _callback ->
+                 flunk("disabled release capability must not check out a credential")
+               end,
+               client_options: [
+                 plug: {Req.Test, stub},
+                 resolver: fn "api.github.com" -> {:ok, [{140, 82, 114, 5}]} end
+               ]
+             )
+
+    assert Repo.get_by!(PageCheckpoint,
+             repository_item_id: item.id,
+             resource_kind: "releases",
+             page_key: "__terminal_v1__"
+           )
+
+    refute Repo.get_by(Release, repository_id: shadow.id)
   end
 
   defp staged_item(run, organization, now) do
@@ -265,6 +471,7 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
     head = git(path, ["commit-tree", tree, "-p", base, "-m", "head"])
     git(path, ["update-ref", "refs/heads/main", base])
     git(path, ["update-ref", "refs/heads/feature", head])
+    git(path, ["update-ref", "refs/tags/v1.0.0", base])
 
     item =
       item

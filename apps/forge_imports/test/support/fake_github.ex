@@ -14,7 +14,8 @@ defmodule ForgeImports.TestSupport.FakeGitHub do
           optional(:labels) => list(),
           optional(:issues) => list(),
           optional(:comments) => map(),
-          optional(:pulls) => list()
+          optional(:pulls) => list(),
+          optional(:releases) => list()
         }
 
   @type config :: %{
@@ -148,6 +149,9 @@ defmodule ForgeImports.TestSupport.FakeGitHub do
     repo = find_repo!(config, owner, name)
 
     cond do
+      String.ends_with?(conn.request_path, "/releases") ->
+        Req.Test.json(conn, Map.get(repo, :releases, []))
+
       String.contains?(conn.request_path, "/labels") ->
         Req.Test.json(conn, Map.get(repo, :labels, fixture!("labels_page.json")))
 

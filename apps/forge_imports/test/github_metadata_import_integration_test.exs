@@ -500,6 +500,9 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
       send(parent, {:request, conn.request_path})
 
       cond do
+        String.ends_with?(conn.request_path, "/releases") ->
+          Req.Test.json(conn, [])
+
         String.ends_with?(conn.request_path, "/labels") ->
           Req.Test.json(conn, labels)
 

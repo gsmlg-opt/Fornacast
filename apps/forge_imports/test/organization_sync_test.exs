@@ -23,7 +23,7 @@ defmodule ForgeImports.OrganizationSyncTest do
     %{actor: actor, organization: organization}
   end
 
-  test "settings projection is actor scoped, bounded, and marks unavailable capabilities",
+  test "settings projection is actor scoped and exposes disabled capabilities",
        context do
     assert {:ok, disconnected} =
              ForgeImports.OrganizationSync.get_settings(context.actor, context.organization)
@@ -32,7 +32,7 @@ defmodule ForgeImports.OrganizationSyncTest do
     assert disconnected.actions.install
     refute disconnected.actions.resolve_pull_merge_conflict
     assert disconnected.capabilities["lfs"] == "disabled"
-    assert disconnected.capabilities["releases"] == "unavailable"
+    assert disconnected.capabilities["releases"] == "disabled"
 
     outsider = user_fixture()
 
@@ -93,7 +93,7 @@ defmodule ForgeImports.OrganizationSyncTest do
       "auto_create_remote" => "false",
       "repository_deletion_policy" => "retain",
       "conflict_notification_policy" => "dashboard_only",
-      "capabilities" => ["git", "issues"]
+      "capabilities" => ["git", "issues", "releases"]
     }
 
     assert {:error, :missing_permissions} =
@@ -116,6 +116,7 @@ defmodule ForgeImports.OrganizationSyncTest do
     assert updated.policy["selected_repository_ids"] == [101, 202]
     assert updated.policy["auto_import_new_repositories"]
     assert updated.capabilities["git"] == "enabled"
+    assert updated.capabilities["releases"] == "enabled"
     assert updated.capabilities["lfs"] == "disabled"
 
     assert {:ok, view} =
@@ -272,7 +273,7 @@ defmodule ForgeImports.OrganizationSyncTest do
                  "issues" => "enabled",
                  "pulls" => "enabled",
                  "lfs" => "enabled",
-                 "releases" => "unavailable"
+                 "releases" => "enabled"
                },
                policy: %{
                  "repository_selection" => "all",
@@ -363,7 +364,8 @@ defmodule ForgeImports.OrganizationSyncTest do
     replayed =
       for {event, organization_mirror_id} <- [
             {"issues", bound_mirror.id},
-            {"pull_request", nil}
+            {"pull_request", nil},
+            {"release", nil}
           ] do
         {:ok, delivery, :enqueued} =
           ForgeMirrors.enqueue_webhook_delivery(
@@ -390,7 +392,9 @@ defmodule ForgeImports.OrganizationSyncTest do
       for {event, repository_id, delivery_installation_id, organization_mirror_id} <- [
             {"issues", binding.github_repository_id + 1, installation_id, nil},
             {"pull_request", binding.github_repository_id, installation_id + 1, nil},
-            {"pull_request", binding.github_repository_id, installation_id, foreign_mirror.id}
+            {"pull_request", binding.github_repository_id, installation_id, foreign_mirror.id},
+            {"release", binding.github_repository_id + 1, installation_id, nil},
+            {"release", binding.github_repository_id, installation_id, foreign_mirror.id}
           ] do
         {:ok, delivery, :enqueued} =
           ForgeMirrors.enqueue_webhook_delivery(
@@ -432,6 +436,93 @@ defmodule ForgeImports.OrganizationSyncTest do
       assert Repo.get!(ForgeMirrors.MirrorWebhookDelivery, delivery.id).state ==
                :pending_unsupported
     end
+
+    {:ok, excluded, :enqueued} =
+      ForgeMirrors.enqueue_webhook_delivery(
+        %{
+          organization_mirror_id: nil,
+          delivery_guid: Ecto.UUID.generate(),
+          hook_id: System.unique_integer([:positive]),
+          event: "issues",
+          action: "edited",
+          installation_id: installation_id,
+          github_repository_id: binding.github_repository_id,
+          signature_version: "sha256",
+          raw_payload: JSON.encode!(%{"action" => "edited"})
+        },
+        :pending_unsupported
+      )
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(mirror in ForgeMirrors.RepositoryMirror, where: mirror.id == ^binding.id),
+               set: [inventory_included: false]
+             )
+
+    assert :ok = ForgeImports.OrganizationSync.Bootstrap.finish(completed, DateTime.add(now, 1))
+
+    assert Repo.get!(ForgeMirrors.MirrorWebhookDelivery, excluded.id).state ==
+             :pending_unsupported
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(mirror in ForgeMirrors.RepositoryMirror, where: mirror.id == ^binding.id),
+               set: [inventory_included: true, state: :revoked]
+             )
+
+    {:ok, revoked, :enqueued} =
+      ForgeMirrors.enqueue_webhook_delivery(
+        %{
+          organization_mirror_id: nil,
+          delivery_guid: Ecto.UUID.generate(),
+          hook_id: System.unique_integer([:positive]),
+          event: "issues",
+          action: "edited",
+          installation_id: installation_id,
+          github_repository_id: binding.github_repository_id,
+          signature_version: "sha256",
+          raw_payload: JSON.encode!(%{"action" => "edited"})
+        },
+        :pending_unsupported
+      )
+
+    assert :ok = ForgeImports.OrganizationSync.Bootstrap.finish(completed, DateTime.add(now, 2))
+
+    assert Repo.get!(ForgeMirrors.MirrorWebhookDelivery, revoked.id).state ==
+             :pending_unsupported
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(mirror in ForgeMirrors.RepositoryMirror, where: mirror.id == ^binding.id),
+               set: [state: :active]
+             )
+
+    assert {:ok, disabled_releases} =
+             ForgeMirrors.update_organization_mirror(context.actor, mirror, %{
+               capabilities: Map.put(mirror.capabilities, "releases", "unavailable")
+             })
+
+    {:ok, capability_fenced, :enqueued} =
+      ForgeMirrors.enqueue_webhook_delivery(
+        %{
+          organization_mirror_id: nil,
+          delivery_guid: Ecto.UUID.generate(),
+          hook_id: System.unique_integer([:positive]),
+          event: "release",
+          action: "edited",
+          installation_id: installation_id,
+          github_repository_id: binding.github_repository_id,
+          signature_version: "sha256",
+          raw_payload: JSON.encode!(%{"action" => "edited"})
+        },
+        :pending_unsupported
+      )
+
+    assert disabled_releases.state == :degraded
+    assert :ok = ForgeImports.OrganizationSync.Bootstrap.finish(completed, DateTime.add(now, 1))
+
+    assert Repo.get!(ForgeMirrors.MirrorWebhookDelivery, capability_fenced.id).state ==
+             :pending_unsupported
   end
 
   defp user_fixture do

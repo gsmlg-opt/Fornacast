@@ -300,7 +300,6 @@ defmodule ForgeImports.Destination do
     |> maybe_warning(repository.visibility == :internal, "visibility_downgraded")
     |> maybe_warning(repository.fork, "unsupported_fork_relationship")
     |> maybe_warning(repository.archived, "unsupported_archived_state")
-    |> then(&["unsupported_releases" | &1])
     |> Enum.reverse()
   end
 

@@ -39,7 +39,7 @@ defmodule ForgeImports.RepositoryPublicationTest do
   @now ~U[2026-08-28 01:00:00Z]
   @pat "github_pat_publication_test_secret"
   @keyring %{active: "test-v1", keys: %{"test-v1" => :binary.copy(<<9>>, 32)}}
-  @terminal_resources ~w(labels issues comments pull_requests number_sequence)
+  @terminal_resources ~w(labels issues comments pull_requests releases number_sequence)
 
   setup do
     if postgres?() do

@@ -6,9 +6,19 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
   alias Ecto.Multi
   alias ForgeAccounts
   alias ForgeImports.GitHub.MetadataImporter
-  alias ForgeImports.{ObjectMapping, PageCheckpoint, Persistence, ReportEntry, RepositoryItem}
+
+  alias ForgeImports.{
+    ImportRun,
+    ObjectMapping,
+    PageCheckpoint,
+    Persistence,
+    ReportEntry,
+    RepositoryItem
+  }
+
   alias ForgeIssues.{Comment, Issue, IssueAssignee, Label, NumberSequence}
   alias ForgePulls.PullRequest
+  alias ForgeReleases.Release
   alias ForgeRepos.Repository
   alias Fornacast.Repo
 
@@ -16,7 +26,7 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
   @now ~U[2026-08-28 01:00:00Z]
   @pat "github_pat_metadata_importer_secret"
   @keyring %{active: "test-v1", keys: %{"test-v1" => :binary.copy(<<11>>, 32)}}
-  @terminal_resources ~w(labels issues comments pull_requests number_sequence)
+  @terminal_resources ~w(labels issues comments pull_requests releases number_sequence)
 
   setup do
     if postgres?() do
@@ -825,7 +835,7 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
         pull: nil
       )
 
-    for phase <- [:labels, :issues, :comments, :pull_requests] do
+    for phase <- [:labels, :issues, :comments, :pull_requests, :releases] do
       refute terminal?(item.id, Atom.to_string(phase))
       assert :ok = MetadataImporter.stage_phase(item, phase, importer_opts(stub, item))
       assert terminal?(item.id, Atom.to_string(phase))
@@ -841,6 +851,454 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
     assert Repo.exists?(
              from sequence in NumberSequence, where: sequence.repository_id == ^repository.id
            )
+  end
+
+  test "release pages atomically import canonical metadata, mappings, checkpoints, and bounded asset evidence",
+       %{run: run} do
+    {item, repository, stub, head_sha, _base_sha} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    for tag <- ["v1.0.0", "v1.1.0", "v2.0.0"],
+        do: update_ref!(item.staged_storage_path, head_sha, "refs/tags/#{tag}")
+
+    first =
+      release_payload(41, asset_count: 2, tag_name: "v1.0.0")
+      |> Map.put("html_url", "https://github.com/octocat/Hello-World/releases/tag/v1.0.0")
+
+    second = release_payload(42, tag_name: "v1.1.0", draft: true, published_at: nil)
+    third = release_payload(43, tag_name: "v2.0.0", prerelease: true)
+
+    stub_client!(stub,
+      labels: [],
+      issues: [],
+      comments: %{},
+      releases: [[first, second], [third]]
+    )
+
+    assert :ok = MetadataImporter.stage_phase(item, :releases, importer_opts(stub, item))
+
+    assert terminal?(item.id, "releases")
+
+    assert [
+             %PageCheckpoint{page_key: "page:1", item_count: 2},
+             %PageCheckpoint{page_key: "page:2", item_count: 1},
+             %PageCheckpoint{page_key: "__terminal_v1__", item_count: 0}
+           ] =
+             Repo.all(
+               from checkpoint in PageCheckpoint,
+                 where:
+                   checkpoint.repository_item_id == ^item.id and
+                     checkpoint.resource_kind == "releases",
+                 order_by: checkpoint.id
+             )
+
+    releases =
+      Repo.all(
+        from release in Release,
+          where: release.repository_id == ^repository.id,
+          order_by: release.tag_name
+      )
+
+    assert Enum.map(releases, & &1.tag_name) == ["v1.0.0", "v1.1.0", "v2.0.0"]
+    assert Enum.find(releases, &(&1.tag_name == "v1.1.0")).published_at == nil
+
+    first_author =
+      releases
+      |> Enum.find(&(&1.tag_name == "v1.0.0"))
+      |> then(&Repo.get!(ForgeAccounts.GitHubIdentity, &1.author_github_identity_id))
+
+    assert first_author.github_node_id == "U_41"
+
+    mappings =
+      Repo.all(
+        from mapping in ObjectMapping,
+          where: mapping.repository_item_id == ^item.id and mapping.object_kind == "release",
+          order_by: mapping.github_object_id
+      )
+
+    assert Enum.map(mappings, & &1.github_object_id) == [41, 42, 43]
+    assert Enum.all?(mappings, &(&1.local_resource_type == "ForgeReleases.Release"))
+
+    warning =
+      Repo.get_by!(ReportEntry,
+        repository_item_id: item.id,
+        classification: "unsupported_release_assets",
+        source_object_id: 41
+      )
+
+    assert warning.outcome == :warning
+    assert warning.metadata == %{"category" => "release_assets", "count" => 2, "github_id" => 41}
+
+    assert Repo.aggregate(
+             from(report in ReportEntry,
+               where:
+                 report.repository_item_id == ^item.id and
+                   report.classification == "unsupported_release_assets"
+             ),
+             :count,
+             :id
+           ) == 1
+
+    unsupported_fields =
+      Repo.get_by!(ReportEntry,
+        repository_item_id: item.id,
+        classification: "unsupported_release_fields",
+        source_object_id: 41
+      )
+
+    assert unsupported_fields.metadata == %{
+             "category" => "release_fields",
+             "field" => "html_url,upload_url",
+             "github_id" => 41
+           }
+
+    assert unsupported_fields.source_count == 2
+
+    assert Repo.aggregate(
+             from(report in ReportEntry,
+               where:
+                 report.repository_item_id == ^item.id and
+                   report.classification == "unsupported_release_fields" and
+                   report.source_object_id == 41
+             ),
+             :count,
+             :id
+           ) == 1
+
+    persisted = inspect({releases, mappings, warning})
+    refute persisted =~ "browser_download_url"
+    refute persisted =~ "upload_url"
+    refute persisted =~ "asset-sentinel"
+    refute persisted =~ "https://github.com/octocat/Hello-World/releases/tag/v1.0.0"
+
+    assert :ok = MetadataImporter.stage_phase(item, :releases, importer_opts(stub, item))
+
+    assert Repo.aggregate(from(r in Release, where: r.repository_id == ^repository.id), :count) ==
+             3
+  end
+
+  test "release restart skips committed pages and retries an uncommitted page as one transaction",
+       %{run: run} do
+    {item, repository, stub, head_sha, _base_sha} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    for tag <- ["v1", "v2"],
+        do: update_ref!(item.staged_storage_path, head_sha, "refs/tags/#{tag}")
+
+    first = release_payload(51, tag_name: "v1")
+    conflicting = release_payload(52, tag_name: "v1")
+    repaired = release_payload(52, tag_name: "v2")
+    parent = self()
+
+    Req.Test.stub(stub, fn conn ->
+      assert conn.request_path == "/repos/octocat/Hello-World/releases"
+      page = URI.decode_query(conn.query_string)["page"]
+      send(parent, {:release_page, page})
+
+      case page do
+        "1" ->
+          conn
+          |> Plug.Conn.put_resp_header(
+            "link",
+            "<https://api.github.com/repos/octocat/Hello-World/releases?page=2&per_page=100>; rel=\"next\""
+          )
+          |> Req.Test.json([first])
+
+        "2" ->
+          Req.Test.json(conn, [conflicting])
+      end
+    end)
+
+    assert {:error, _reason} =
+             MetadataImporter.stage_phase(item, :releases, importer_opts(stub, item))
+
+    assert_receive {:release_page, "1"}
+    assert_receive {:release_page, "2"}
+    assert Repo.get_by!(Release, repository_id: repository.id, tag_name: "v1")
+    refute Repo.get_by(Release, repository_id: repository.id, tag_name: "v2")
+    refute Repo.get_by(ForgeAccounts.GitHubIdentity, github_user_id: 90_052)
+
+    assert Repo.get_by!(PageCheckpoint,
+             repository_item_id: item.id,
+             resource_kind: "releases",
+             page_key: "page:1"
+           )
+
+    refute Repo.get_by(PageCheckpoint,
+             repository_item_id: item.id,
+             resource_kind: "releases",
+             page_key: "page:2"
+           )
+
+    Req.Test.stub(stub, fn conn ->
+      assert URI.decode_query(conn.query_string)["page"] == "2"
+      send(parent, :release_page_two_retried)
+      Req.Test.json(conn, [repaired])
+    end)
+
+    assert :ok = MetadataImporter.stage_phase(item, :releases, importer_opts(stub, item))
+    assert_receive :release_page_two_retried
+    refute_receive {:release_page, "1"}, 25
+    assert Repo.get_by!(Release, repository_id: repository.id, tag_name: "v2")
+    assert terminal?(item.id, "releases")
+  end
+
+  test "release completion checkpoint bypasses staged Git ref reads during final-page recovery",
+       %{run: run} do
+    {item, repository, stub, _head_sha, _base_sha} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    assert {:ok, _checkpoint} =
+             %PageCheckpoint{}
+             |> PageCheckpoint.create_changeset(%{
+               repository_item_id: item.id,
+               resource_kind: "releases",
+               page_key: "page:1",
+               item_count: 0,
+               cursor_metadata: %{"cursor" => "complete"},
+               committed_at: @now
+             })
+             |> Repo.insert()
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(candidate in Repository, where: candidate.id == ^repository.id),
+               set: [storage_path: "missing-release-ref-proof-#{repository.id}"]
+             )
+
+    assert :ok = MetadataImporter.stage_phase(item, :releases, importer_opts(stub, item))
+    assert terminal?(item.id, "releases")
+  end
+
+  test "release page transaction rejects a reassigned repository-item lease", %{run: run} do
+    {item, repository, stub, head_sha, _base_sha} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    update_ref!(item.staged_storage_path, head_sha, "refs/tags/v81")
+
+    item =
+      item
+      |> Ecto.Changeset.change(
+        state: :staging_metadata,
+        lease_owner: "release-page-owner",
+        lease_expires_at: DateTime.add(DateTime.utc_now(:second), 60)
+      )
+      |> Repo.update!()
+
+    parent = self()
+
+    Req.Test.stub(stub, fn conn ->
+      send(parent, :release_page_fetched_before_reassignment)
+
+      Repo.update_all(
+        from(candidate in RepositoryItem, where: candidate.id == ^item.id),
+        set: [lease_owner: "replacement-owner"]
+      )
+
+      Req.Test.json(conn, [release_payload(81, tag_name: "v81")])
+    end)
+
+    opts =
+      stub
+      |> importer_opts(item)
+      |> Keyword.put(:heartbeat, fn ->
+        send(parent, :release_page_heartbeat)
+        :ok
+      end)
+
+    assert {:error, :lost_lease} = MetadataImporter.stage_phase(item, :releases, opts)
+    assert_receive :release_page_heartbeat
+    assert_receive :release_page_fetched_before_reassignment
+    refute Repo.exists?(from release in Release, where: release.repository_id == ^repository.id)
+    refute Repo.get_by(PageCheckpoint, repository_item_id: item.id, resource_kind: "releases")
+    refute Repo.get_by(ForgeAccounts.GitHubIdentity, github_user_id: 90_081)
+  end
+
+  test "release page transaction rejects cancellation after a fetched page", %{run: run} do
+    {item, repository, stub, head_sha, _base_sha} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    update_ref!(item.staged_storage_path, head_sha, "refs/tags/v82")
+
+    item =
+      item
+      |> Ecto.Changeset.change(
+        state: :staging_metadata,
+        lease_owner: "release-cancel-owner",
+        lease_expires_at: DateTime.add(DateTime.utc_now(:second), 60)
+      )
+      |> Repo.update!()
+
+    Req.Test.stub(stub, fn conn ->
+      Repo.update_all(
+        from(candidate in ImportRun, where: candidate.id == ^run.id),
+        set: [state: :cancel_requested]
+      )
+
+      Req.Test.json(conn, [release_payload(82, tag_name: "v82")])
+    end)
+
+    opts = Keyword.put(importer_opts(stub, item), :heartbeat, fn -> :ok end)
+
+    assert {:error, :lost_lease} = MetadataImporter.stage_phase(item, :releases, opts)
+    refute Repo.exists?(from release in Release, where: release.repository_id == ^repository.id)
+    refute Repo.get_by(PageCheckpoint, repository_item_id: item.id, resource_kind: "releases")
+    refute Repo.get_by(ForgeAccounts.GitHubIdentity, github_user_id: 90_082)
+  end
+
+  test "missing release tag reporting rejects a reassigned repository-item lease", %{run: run} do
+    {item, _repository, stub, _head_sha, _base_sha} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    item =
+      item
+      |> Ecto.Changeset.change(
+        state: :staging_metadata,
+        lease_owner: "release-missing-tag-owner",
+        lease_expires_at: DateTime.add(DateTime.utc_now(:second), 60)
+      )
+      |> Repo.update!()
+
+    Req.Test.stub(stub, fn conn ->
+      Repo.update_all(
+        from(candidate in RepositoryItem, where: candidate.id == ^item.id),
+        set: [lease_owner: "replacement-owner"]
+      )
+
+      Req.Test.json(conn, [release_payload(83, tag_name: "missing-v83")])
+    end)
+
+    opts = Keyword.put(importer_opts(stub, item), :heartbeat, fn -> :ok end)
+
+    assert {:error, :lost_lease} = MetadataImporter.stage_phase(item, :releases, opts)
+
+    refute Repo.get_by(ReportEntry,
+             repository_item_id: item.id,
+             source_object_id: 83,
+             classification: "release_tag_missing"
+           )
+
+    refute Repo.get_by(PageCheckpoint, repository_item_id: item.id, resource_kind: "releases")
+  end
+
+  test "release metadata with a missing staged tag records one durable failure and no page writes",
+       %{run: run} do
+    {item, repository, stub, _head_sha, _base_sha} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    stub_client!(stub,
+      labels: [],
+      issues: [],
+      comments: %{},
+      releases: [[release_payload(61, tag_name: "missing-tag", asset_count: 1)]]
+    )
+
+    assert {:error, :release_tag_missing} =
+             MetadataImporter.stage_phase(item, :releases, importer_opts(stub, item))
+
+    assert %ReportEntry{
+             outcome: :failed,
+             classification: "release_tag_missing",
+             metadata: %{
+               "code" => "staged_tag_required",
+               "github_id" => 61,
+               "phase" => "releases"
+             }
+           } =
+             Repo.get_by!(ReportEntry,
+               repository_item_id: item.id,
+               source_object_id: 61,
+               classification: "release_tag_missing"
+             )
+
+    refute Repo.exists?(from release in Release, where: release.repository_id == ^repository.id)
+
+    refute Repo.exists?(
+             from mapping in ObjectMapping,
+               where: mapping.repository_item_id == ^item.id and mapping.object_kind == "release"
+           )
+
+    refute Repo.exists?(
+             from checkpoint in PageCheckpoint,
+               where:
+                 checkpoint.repository_item_id == ^item.id and
+                   checkpoint.resource_kind == "releases"
+           )
+
+    assert {:error, :release_tag_missing} =
+             MetadataImporter.stage_phase(item, :releases, importer_opts(stub, item))
+
+    assert Repo.aggregate(
+             from(report in ReportEntry,
+               where:
+                 report.repository_item_id == ^item.id and
+                   report.classification == "release_tag_missing"
+             ),
+             :count,
+             :id
+           ) == 1
+  end
+
+  test "release pagination skips an immutable id repeated by provider page drift and commits the page",
+       %{run: run} do
+    {item, repository, stub, head_sha, _base_sha} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    update_ref!(item.staged_storage_path, head_sha, "refs/tags/v1")
+    first = release_payload(71, tag_name: "v1")
+    repeated = release_payload(71, tag_name: "provider-drifted-tag")
+    parent = self()
+
+    Req.Test.stub(stub, fn conn ->
+      page = URI.decode_query(conn.query_string)["page"]
+      send(parent, {:duplicate_release_page, page})
+
+      case page do
+        "1" ->
+          conn
+          |> Plug.Conn.put_resp_header(
+            "link",
+            "<https://api.github.com/repos/octocat/Hello-World/releases?page=2&per_page=100>; rel=\"next\""
+          )
+          |> Req.Test.json([first])
+
+        "2" ->
+          Req.Test.json(conn, [repeated])
+      end
+    end)
+
+    assert :ok = MetadataImporter.stage_phase(item, :releases, importer_opts(stub, item))
+    assert_receive {:duplicate_release_page, "1"}
+    assert_receive {:duplicate_release_page, "2"}
+
+    assert [%Release{tag_name: "v1"}] =
+             Repo.all(from release in Release, where: release.repository_id == ^repository.id)
+
+    assert %PageCheckpoint{item_count: 1} =
+             Repo.get_by!(PageCheckpoint,
+               repository_item_id: item.id,
+               resource_kind: "releases",
+               page_key: "page:2"
+             )
+
+    assert terminal?(item.id, "releases")
+
+    refute Repo.get_by(ReportEntry,
+             repository_item_id: item.id,
+             source_object_id: 71,
+             classification: "release_tag_missing"
+           )
+
+    assert Repo.aggregate(
+             from(report in ReportEntry,
+               where:
+                 report.repository_item_id == ^item.id and
+                   report.source_object_id == 71 and
+                   report.classification == "unsupported_release_fields"
+             ),
+             :count,
+             :id
+           ) == 1
   end
 
   defp stage(item, stub, opts \\ []) do
@@ -940,6 +1398,7 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
     issues = Keyword.fetch!(responses, :issues)
     comments = Keyword.fetch!(responses, :comments)
     pull = Keyword.get(responses, :pull)
+    release_pages = Keyword.get(responses, :releases, [[]])
 
     pulls =
       responses
@@ -958,6 +1417,25 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
       send(parent, {:request, conn.request_path, conn.query_string})
 
       cond do
+        String.ends_with?(conn.request_path, "/releases") ->
+          page =
+            conn.query_string |> URI.decode_query() |> Map.fetch!("page") |> String.to_integer()
+
+          payloads = Enum.at(release_pages, page - 1, [])
+
+          conn =
+            if page < length(release_pages) do
+              Plug.Conn.put_resp_header(
+                conn,
+                "link",
+                "<https://api.github.com/repos/octocat/Hello-World/releases?page=#{page + 1}&per_page=100>; rel=\"next\""
+              )
+            else
+              conn
+            end
+
+          Req.Test.json(conn, payloads)
+
         String.ends_with?(conn.request_path, "/labels") ->
           Req.Test.json(conn, labels)
 
@@ -1006,6 +1484,40 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
       authenticated_repository(pull["head"]["repo"], head_id == base_id)
     )
     |> put_in(["base", "repo"], authenticated_repository(pull["base"]["repo"], true))
+  end
+
+  defp release_payload(id, overrides) do
+    overrides = Map.new(overrides)
+    asset_count = Map.get(overrides, :asset_count, 0)
+
+    %{
+      "id" => id,
+      "node_id" => "RE_#{id}",
+      "url" => "https://api.github.com/repos/octocat/Hello-World/releases/#{id}",
+      "upload_url" => "https://uploads.github.com/asset-sentinel{?name}",
+      "tag_name" => Map.get(overrides, :tag_name, "v#{id}"),
+      "name" => Map.get(overrides, :name, "Release #{id}"),
+      "body" => Map.get(overrides, :body, "Release notes #{id}"),
+      "draft" => Map.get(overrides, :draft, false),
+      "prerelease" => Map.get(overrides, :prerelease, false),
+      "target_commitish" => Map.get(overrides, :target_commitish, "main"),
+      "published_at" => Map.get(overrides, :published_at, "2026-08-27T01:00:00Z"),
+      "created_at" => "2026-08-26T01:00:00Z",
+      "updated_at" => "2026-08-28T01:00:00Z",
+      "author" => %{"id" => 90_000 + id, "node_id" => "U_#{id}", "login" => "user-#{id}"},
+      "assets" =>
+        if asset_count == 0 do
+          []
+        else
+          for asset_id <- 1..asset_count do
+            %{
+              "id" => asset_id,
+              "name" => "asset-sentinel",
+              "browser_download_url" => "https://objects.example/asset-sentinel"
+            }
+          end
+        end
+    }
   end
 
   defp authenticated_pull_issue(_issue, nil), do: nil
@@ -1188,6 +1700,7 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
           "labels",
           "number_sequences",
           "pull_requests",
+          "releases",
           "github_identities",
           "repositories",
           "users"

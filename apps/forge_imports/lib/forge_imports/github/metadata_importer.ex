@@ -6,18 +6,29 @@ defmodule ForgeImports.GitHub.MetadataImporter do
   alias Ecto.Multi
   alias ForgeAccounts
   alias ForgeAccounts.GitHubIdentity
-  alias ForgeGitHub.Client
+  alias ForgeGitHub.{Client, ReleaseClient, ReleaseSyncProjection}
   alias ForgeImports.GitHub.MetadataMapper
-  alias ForgeImports.{ObjectMapping, PageCheckpoint, Persistence, ReportEntry, RepositoryItem}
+
+  alias ForgeImports.{
+    ImportRun,
+    ObjectMapping,
+    PageCheckpoint,
+    Persistence,
+    ReportEntry,
+    RepositoryItem
+  }
+
   alias ForgeIssues
   alias ForgeIssues.{Issue, IssueAssignee, IssueLabel, Label}
+  alias ForgeMirrors.{OrganizationMirror, RepositoryMirror}
   alias ForgePulls
   alias ForgePulls.PullRequest
+  alias ForgeReleases
   alias ForgeRepos.Repository
   alias Fornacast.Repo
   alias GitCore
 
-  @phases [:labels, :issues, :comments, :pull_requests, :number_sequence]
+  @phases [:labels, :issues, :comments, :pull_requests, :releases, :number_sequence]
   @terminal_page_key "__terminal_v1__"
 
   @type credential_metadata :: %{
@@ -314,6 +325,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
   defp do_stage_phase(item, :issues, opts), do: import_issues(item, opts)
   defp do_stage_phase(item, :comments, opts), do: import_comments(item, opts)
   defp do_stage_phase(item, :pull_requests, opts), do: import_pulls(item, opts)
+  defp do_stage_phase(item, :releases, opts), do: import_releases(item, opts)
   defp do_stage_phase(item, :number_sequence, opts), do: finalize_sequence(item, opts)
 
   defp import_labels(item, opts) do
@@ -426,6 +438,407 @@ defmodule ForgeImports.GitHub.MetadataImporter do
         error -> error
       end
     end
+  end
+
+  defp import_releases(item, opts) do
+    with {:ok, enabled?} <- release_import_enabled?(item) do
+      if enabled? do
+        with {:ok, repository} <- hidden_repository(item),
+             {:ok, {owner, repo}} <- source_parts(item),
+             {:ok, cursor} <- release_resume_cursor(item.id) do
+          case cursor do
+            :complete ->
+              commit_release_terminal(item, opts)
+
+            cursor ->
+              with {:ok, staged_tags} <- staged_tag_refs(repository),
+                   :ok <-
+                     import_release_pages(
+                       item,
+                       repository,
+                       owner,
+                       repo,
+                       cursor,
+                       staged_tags,
+                       opts
+                     ) do
+                commit_release_terminal(item, opts)
+              end
+          end
+        end
+      else
+        commit_release_terminal(item, opts)
+      end
+    end
+  end
+
+  defp import_release_pages(
+         _item,
+         _repository,
+         _owner,
+         _repo,
+         :complete,
+         _staged_tags,
+         _opts
+       ),
+       do: :ok
+
+  defp import_release_pages(item, repository, owner, repo, cursor, staged_tags, opts) do
+    with :ok <- refresh_release_lease(opts),
+         {:ok, %{releases: releases, next_cursor: next_cursor}} <-
+           fetch_release_page(item, owner, repo, cursor, opts),
+         {:ok, imports} <- prepare_release_imports(releases, item, staged_tags),
+         :ok <-
+           commit_release_page(
+             item,
+             repository,
+             cursor || 1,
+             next_cursor,
+             length(releases),
+             imports
+           ) do
+      import_release_pages(
+        item,
+        repository,
+        owner,
+        repo,
+        next_cursor || :complete,
+        staged_tags,
+        opts
+      )
+    end
+  end
+
+  defp prepare_release_imports(releases, item, staged_tags) when is_list(releases) do
+    Enum.reduce_while(releases, {:ok, []}, fn remote, {:ok, imports} ->
+      case ReleaseSyncProjection.from_remote(remote) do
+        {:ok, projection} ->
+          if mapping_exists?(item.id, "release", projection.github_object_id) do
+            {:cont, {:ok, imports}}
+          else
+            with :ok <- staged_release_tag?(item, projection, staged_tags) do
+              {:cont, {:ok, [projection | imports]}}
+            else
+              {:error, _reason} = error -> {:halt, error}
+            end
+          end
+
+        _invalid ->
+          {:halt, {:error, :invalid_release}}
+      end
+    end)
+    |> case do
+      {:ok, imports} -> {:ok, Enum.reverse(imports)}
+      error -> error
+    end
+  end
+
+  defp prepare_release_imports(_releases, _item, _staged_tags), do: {:error, :invalid_release}
+
+  defp staged_tag_refs(repository) do
+    case GitCore.list_refs(ForgeRepos.absolute_storage_path(repository)) do
+      {:ok, refs} ->
+        {:ok,
+         refs
+         |> Enum.filter(&String.starts_with?(&1.name, "refs/tags/"))
+         |> MapSet.new(& &1.name)}
+
+      {:error, _reason} ->
+        {:error, :release_tag_proof_unavailable}
+    end
+  end
+
+  defp staged_release_tag?(item, projection, staged_tags) do
+    ref_name = "refs/tags/#{projection.snapshot["tag_name"]}"
+
+    if MapSet.member?(staged_tags, ref_name) do
+      :ok
+    else
+      case report_missing_release_tag(item, projection) do
+        {:ok, _report} -> {:error, :release_tag_missing}
+        {:error, :lost_lease} -> {:error, :lost_lease}
+        {:error, _changeset} -> {:error, :persistence_unavailable}
+      end
+    end
+  end
+
+  defp report_missing_release_tag(item, projection) do
+    changeset =
+      ReportEntry.create_changeset(%ReportEntry{}, %{
+        import_run_id: item.import_run_id,
+        repository_item_id: item.id,
+        idempotency_key: "release-tag-missing-#{item.id}-#{projection.github_object_id}",
+        scope: :object,
+        object_kind: "release",
+        source_object_id: projection.github_object_id,
+        outcome: :failed,
+        classification: "release_tag_missing",
+        summary: "Release metadata references a tag absent from staged Git data",
+        metadata: %{
+          "code" => "staged_tag_required",
+          "github_id" => projection.github_object_id,
+          "phase" => "releases"
+        },
+        source_count: 0
+      })
+
+    Multi.new()
+    |> release_page_fence(item, {:missing_tag, projection.github_object_id})
+    |> Multi.insert(:report, changeset,
+      on_conflict: :nothing,
+      conflict_target: [:import_run_id, :idempotency_key]
+    )
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{report: report}} -> {:ok, report}
+      {:error, {:release_page_fence, _page_key}, :lost_lease, _changes} -> {:error, :lost_lease}
+      {:error, :report, reason, _changes} -> {:error, reason}
+    end
+  end
+
+  defp commit_release_page(item, repository, cursor, next_cursor, source_count, imports) do
+    cursor_metadata = %{
+      "cursor" => if(next_cursor, do: Integer.to_string(next_cursor), else: "complete")
+    }
+
+    commit_page(
+      item,
+      "releases",
+      "page:#{cursor}",
+      source_count,
+      cursor_metadata,
+      fn multi ->
+        multi
+        |> release_page_fence(item, cursor)
+        |> then(fn multi ->
+          Enum.reduce(imports, multi, fn projection, multi ->
+            import_release_row(multi, item, repository, projection)
+          end)
+        end)
+      end
+    )
+  end
+
+  defp commit_release_terminal(item, opts) do
+    if phase_terminal?(item.id, "releases") do
+      :ok
+    else
+      with :ok <- refresh_release_lease(opts) do
+        commit_page(item, "releases", @terminal_page_key, 0, fn multi ->
+          release_page_fence(multi, item, @terminal_page_key)
+        end)
+      end
+    end
+  end
+
+  defp refresh_release_lease(opts) do
+    case Keyword.get(opts, :heartbeat) do
+      nil ->
+        :ok
+
+      heartbeat when is_function(heartbeat, 0) ->
+        if heartbeat.() == :ok, do: :ok, else: {:error, :lost_lease}
+
+      _invalid ->
+        {:error, :lost_lease}
+    end
+  end
+
+  defp release_page_fence(multi, %RepositoryItem{lease_owner: owner} = item, page_key)
+       when is_binary(owner) and owner != "" do
+    Multi.run(multi, {:release_page_fence, page_key}, fn repo, _changes ->
+      now = DateTime.utc_now(:second)
+
+      run =
+        repo.one(from run in ImportRun, where: run.id == ^item.import_run_id, lock: "FOR UPDATE")
+
+      current =
+        repo.one(
+          from candidate in RepositoryItem, where: candidate.id == ^item.id, lock: "FOR UPDATE"
+        )
+
+      if run && run.state == :running && current && current.import_run_id == item.import_run_id &&
+           current.state == :staging_metadata && current.selected == true &&
+           current.lease_owner == owner && is_struct(current.lease_expires_at, DateTime) &&
+           DateTime.compare(current.lease_expires_at, now) == :gt &&
+           is_nil(current.cleanup_state) &&
+           current.hidden_repository_id == item.hidden_repository_id &&
+           current.github_repository_id == item.github_repository_id &&
+           current.source_full_name == item.source_full_name do
+        {:ok, current.lock_version}
+      else
+        {:error, :lost_lease}
+      end
+    end)
+  end
+
+  defp release_page_fence(multi, _item, _page_key), do: multi
+
+  defp release_import_enabled?(%RepositoryItem{} = item) do
+    case Repo.get(ImportRun, item.import_run_id) do
+      %ImportRun{credential_source: :github_app} = run ->
+        organization_release_import_enabled?(run, item)
+
+      %ImportRun{} ->
+        {:ok, true}
+
+      nil ->
+        {:error, :stale_item}
+    end
+  end
+
+  defp organization_release_import_enabled?(run, item) do
+    mirrors =
+      Repo.all(
+        from mirror in OrganizationMirror,
+          where:
+            mirror.bootstrap_import_run_id == ^run.id and mirror.provider == "github" and
+              mirror.github_account_id == ^run.source_owner_github_id and
+              mirror.organization_id == ^run.destination_organization_id and
+              mirror.state in [:bootstrapping, :catching_up],
+          order_by: [desc: mirror.id],
+          limit: 2
+      )
+
+    case mirrors do
+      [%OrganizationMirror{} = mirror] ->
+        if release_capability_enabled?(mirror.capabilities) do
+          case Repo.get_by(RepositoryMirror,
+                 organization_mirror_id: mirror.id,
+                 github_repository_id: item.github_repository_id
+               ) do
+            %RepositoryMirror{inventory_included: true, state: state}
+            when state in [:discovered, :active] ->
+              {:ok, true}
+
+            _missing_or_excluded ->
+              {:error, :release_binding_unavailable}
+          end
+        else
+          {:ok, false}
+        end
+
+      _missing_or_ambiguous ->
+        {:error, :release_binding_unavailable}
+    end
+  end
+
+  defp release_capability_enabled?(capabilities) when is_map(capabilities),
+    do: Map.get(capabilities, "releases") in [true, :enabled, :active, "enabled", "active"]
+
+  defp release_capability_enabled?(_capabilities), do: false
+
+  defp import_release_row(multi, item, repository, projection) do
+    github_id = projection.github_object_id
+    author_key = {:release_author, github_id}
+    release_key = {:release, github_id}
+
+    multi
+    |> Multi.run(author_key, fn _repo, _changes ->
+      resolve_release_author(projection.raw_author, observed_at(item))
+    end)
+    |> Multi.merge(fn changes ->
+      ForgeReleases.append_import_release(
+        Multi.new(),
+        release_key,
+        repository,
+        release_import_attrs(projection, Map.fetch!(changes, author_key))
+      )
+    end)
+    |> Multi.insert({:release_mapping, github_id}, fn changes ->
+      release = Map.fetch!(changes, release_key)
+
+      ObjectMapping.create_changeset(%ObjectMapping{}, %{
+        repository_item_id: item.id,
+        hidden_repository_id: item.hidden_repository_id,
+        github_repository_id: item.github_repository_id,
+        object_kind: "release",
+        github_object_id: github_id,
+        local_resource_type: "ForgeReleases.Release",
+        local_resource_id: release.id,
+        source_evidence: %{
+          "v" => 1,
+          "github_node_id" => projection.github_node_id,
+          "remote_created_at" => DateTime.to_iso8601(projection.remote_created_at),
+          "remote_updated_at" => DateTime.to_iso8601(projection.remote_updated_at)
+        }
+      })
+    end)
+    |> maybe_report_release_assets(item, projection)
+    |> maybe_report_unsupported_release_fields(item, projection)
+  end
+
+  defp release_import_attrs(projection, author) do
+    fields = projection.snapshot
+
+    %{
+      author_github_identity_id: author.id,
+      body: fields["body"],
+      draft: fields["draft"],
+      inserted_at: projection.remote_created_at,
+      name: fields["name"],
+      prerelease: fields["prerelease"],
+      published_at: fields["published_at"],
+      tag_name: fields["tag_name"],
+      target_commitish: fields["target_commitish"],
+      updated_at: projection.remote_updated_at
+    }
+  end
+
+  defp maybe_report_release_assets(multi, _item, %{asset_count: 0}), do: multi
+
+  defp maybe_report_release_assets(multi, item, projection) do
+    Multi.insert(
+      multi,
+      {:release_assets, projection.github_object_id},
+      ReportEntry.create_changeset(%ReportEntry{}, %{
+        import_run_id: item.import_run_id,
+        repository_item_id: item.id,
+        idempotency_key: "release-assets-#{item.id}-#{projection.github_object_id}",
+        scope: :object,
+        object_kind: "release",
+        source_object_id: projection.github_object_id,
+        outcome: :warning,
+        classification: "unsupported_release_assets",
+        summary: "Release asset binaries are not imported",
+        metadata: %{
+          "category" => "release_assets",
+          "count" => projection.asset_count,
+          "github_id" => projection.github_object_id
+        },
+        source_count: projection.asset_count
+      }),
+      on_conflict: :nothing,
+      conflict_target: [:import_run_id, :idempotency_key]
+    )
+  end
+
+  defp maybe_report_unsupported_release_fields(multi, _item, %{unsupported_fields: []}), do: multi
+
+  defp maybe_report_unsupported_release_fields(multi, item, projection) do
+    Multi.insert(
+      multi,
+      {:release_fields, projection.github_object_id},
+      ReportEntry.create_changeset(%ReportEntry{}, %{
+        import_run_id: item.import_run_id,
+        repository_item_id: item.id,
+        idempotency_key: "release-fields-#{item.id}-#{projection.github_object_id}",
+        scope: :object,
+        object_kind: "release",
+        source_object_id: projection.github_object_id,
+        outcome: :warning,
+        classification: "unsupported_release_fields",
+        summary: "Unsupported release metadata fields are not imported",
+        metadata: %{
+          "category" => "release_fields",
+          "field" => Enum.join(projection.unsupported_fields, ","),
+          "github_id" => projection.github_object_id
+        },
+        source_count: length(projection.unsupported_fields)
+      }),
+      on_conflict: :nothing,
+      conflict_target: [:import_run_id, :idempotency_key]
+    )
   end
 
   defp finalize_sequence(item, _opts) do
@@ -562,6 +975,18 @@ defmodule ForgeImports.GitHub.MetadataImporter do
              {:ok, issue} <- Client.repository_issue(credential, owner, repo, number, options) do
           {:ok, {pull, issue}}
         end
+      end)
+
+  defp fetch_release_page(_item, owner, repo, cursor, opts),
+    do:
+      checkout_fetch(opts, fn credential, metadata ->
+        ReleaseClient.list_releases_page(
+          credential,
+          owner,
+          repo,
+          cursor,
+          client_opts(opts, metadata)
+        )
       end)
 
   defp checkout_fetch(opts, callback) do
@@ -1082,7 +1507,10 @@ defmodule ForgeImports.GitHub.MetadataImporter do
     :ok
   end
 
-  defp commit_page(item, resource_kind, page_key, item_count, fun) do
+  defp commit_page(item, resource_kind, page_key, item_count, fun),
+    do: commit_page(item, resource_kind, page_key, item_count, %{}, fun)
+
+  defp commit_page(item, resource_kind, page_key, item_count, cursor_metadata, fun) do
     now = DateTime.utc_now(:second)
 
     multi =
@@ -1093,7 +1521,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
           resource_kind: resource_kind,
           page_key: page_key,
           item_count: item_count,
-          cursor_metadata: %{},
+          cursor_metadata: cursor_metadata,
           committed_at: now
         })
       end)
@@ -1131,6 +1559,37 @@ defmodule ForgeImports.GitHub.MetadataImporter do
             checkpoint.resource_kind == ^resource_kind and
             checkpoint.page_key == ^page_key
     )
+  end
+
+  defp release_resume_cursor(item_id) do
+    checkpoints =
+      Repo.all(
+        from checkpoint in PageCheckpoint,
+          where:
+            checkpoint.repository_item_id == ^item_id and
+              checkpoint.resource_kind == "releases" and
+              like(checkpoint.page_key, "page:%"),
+          order_by: [desc: checkpoint.id],
+          limit: 1,
+          select: checkpoint.cursor_metadata
+      )
+
+    case checkpoints do
+      [] ->
+        {:ok, nil}
+
+      [%{"cursor" => "complete"}] ->
+        {:ok, :complete}
+
+      [%{"cursor" => cursor}] when is_binary(cursor) ->
+        case Integer.parse(cursor) do
+          {value, ""} when value > 0 -> {:ok, value}
+          _invalid -> {:error, :invalid_release_checkpoint}
+        end
+
+      _invalid ->
+        {:error, :invalid_release_checkpoint}
+    end
   end
 
   defp mapping_exists?(item_id, kind, github_object_id) do
@@ -1185,6 +1644,23 @@ defmodule ForgeImports.GitHub.MetadataImporter do
     do: {:ok, ForgeAccounts.github_deleted_identity()}
 
   defp resolve_comment_author(%{author_github_user_id: id}, now), do: observe_user(id, now)
+
+  defp resolve_release_author(%{"id" => id, "node_id" => node_id, "login" => login}, now) do
+    existing = Repo.get_by(GitHubIdentity, github_user_id: id)
+
+    ForgeAccounts.observe_github_identity(
+      %{
+        github_user_id: id,
+        github_node_id: node_id,
+        login: login,
+        avatar_url: existing && existing.avatar_url,
+        profile_url: existing && existing.profile_url
+      },
+      now
+    )
+  end
+
+  defp resolve_release_author(_author, _now), do: {:error, :invalid_release}
 
   defp resolve_merger(%{merger_github_user_id: nil}, _now), do: {:ok, nil}
 

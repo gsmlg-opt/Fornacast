@@ -527,10 +527,6 @@ defmodule ForgeImports.DiscoveryWorker do
   defp warning_summary("unsupported_archived_state"),
     do: "GitHub archived state is not imported"
 
-  defp warning_summary("unsupported_releases"),
-    do: "GitHub releases and release assets are not enumerated or imported"
-
-  defp warning_source_count("unsupported_releases"), do: 0
   defp warning_source_count(_classification), do: 1
 
   defp failure(reason) do

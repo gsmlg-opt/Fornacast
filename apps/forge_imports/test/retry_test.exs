@@ -22,7 +22,7 @@ defmodule ForgeImports.RetryTest do
   @now ~U[2026-08-25 12:00:00Z]
   @pat "github_pat_retry_test_secret"
   @keyring %{active: "test-v1", keys: %{"test-v1" => :binary.copy(<<11>>, 32)}}
-  @terminal_resources ~w(labels issues comments pull_requests number_sequence)
+  @terminal_resources ~w(labels issues comments pull_requests releases number_sequence)
 
   setup do
     if postgres?() do

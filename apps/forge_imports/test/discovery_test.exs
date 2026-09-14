@@ -75,12 +75,6 @@ defmodule ForgeImports.DiscoveryTest do
     assert "visibility_downgraded" in classifications
     assert "unsupported_fork_relationship" in classifications
     assert "unsupported_archived_state" in classifications
-    assert "unsupported_releases" in classifications
-
-    assert %{source_count: 0} =
-             Enum.find(view.reports, &(&1.classification == "unsupported_releases"))
-
-    refute_receive :release_enumeration_called, 50
 
     assert %GitHubIdentity{local_user_id: nil} =
              identity = Repo.get_by!(GitHubIdentity, github_user_id: 71_001)

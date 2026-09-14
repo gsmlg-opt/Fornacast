@@ -191,7 +191,8 @@ defmodule ForgeImports.RepositoryWorker do
              &metadata_checkout(actor, run, item, &1, options),
              metadata_importer_options(item, options)
            ),
-         {:ok, updated} <- persist_ready_to_publish(item) do
+         {:ok, %{item: current}} <- current_context(item.id, item.lease_owner),
+         {:ok, updated} <- persist_ready_to_publish(current) do
       {:ok, updated}
     else
       {:ok, :identity_recovered} -> persist_metadata_progress(capability)
@@ -204,19 +205,22 @@ defmodule ForgeImports.RepositoryWorker do
       release_with_error(capability, :persistence_unavailable)
   end
 
-  defp metadata_checkout(actor, run, item, callback, options) do
+  defp metadata_checkout(_actor, _run, item, callback, options) do
     reference = make_ref()
     parent = self()
 
     checkout =
-      CredentialProvider.checkout(
-        %{actor: actor, run: run, capability: item},
-        fn credential, metadata ->
-          send(parent, {reference, callback.(credential, metadata)})
-          :ok
-        end,
-        credential_options(options)
-      )
+      with {:ok, %{actor: actor, run: run, item: current}} <-
+             current_context(item.id, item.lease_owner) do
+        CredentialProvider.checkout(
+          %{actor: actor, run: run, capability: current},
+          fn credential, metadata ->
+            send(parent, {reference, callback.(credential, metadata)})
+            :ok
+          end,
+          credential_options(options)
+        )
+      end
 
     receive_metadata_result(checkout, reference)
   end
@@ -244,10 +248,11 @@ defmodule ForgeImports.RepositoryWorker do
     end)
   end
 
-  defp metadata_importer_options(_item, options) do
+  defp metadata_importer_options(item, options) do
     [
       client: Map.get(options, :client, Client),
-      client_options: Map.get(options, :client_options, [])
+      client_options: Map.get(options, :client_options, []),
+      heartbeat: fn -> heartbeat(item.id, item.lease_owner, options.lease_seconds) end
     ]
   end
 
