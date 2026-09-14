@@ -294,10 +294,15 @@ defmodule ForgeMirrors.PullMergeBoundary do
          true <- valid_provider_pull_identity?(provider_identity),
          true <-
            preparation ==
-             Map.merge(compact(expected), %{
+             compact(expected)
+             |> Map.merge(%{
                "merge_operation_id" => intent.id,
                "provider_pull_identity" => provider_identity
-             }),
+             })
+             |> maybe_put_request_fingerprint(preparation["request_fingerprint"]),
+         true <-
+           is_nil(preparation["request_fingerprint"]) or
+             request_fingerprint?(preparation["request_fingerprint"]),
          scope = %{
            operation: current,
            repository_id: binding.repository_id,
@@ -444,7 +449,11 @@ defmodule ForgeMirrors.PullMergeBoundary do
            true <- valid_marker?(marker, context.intent),
            full =
              Map.merge(marker, %{
-               "preparation" => compact(context.expected),
+               "preparation" =>
+                 compact_with_request_fingerprint(
+                   context.expected,
+                   context.operation.checkpoint["merge_preparation"]
+                 ),
                "provider_pull_identity" => context.provider_pull_identity,
                "expected_base_oid" => context.intent.expected_base_oid,
                "expected_head_oid" => context.intent.expected_head_oid,
@@ -983,6 +992,11 @@ defmodule ForgeMirrors.PullMergeBoundary do
 
   defp compact(expected), do: expected |> Map.delete(:fields) |> json()
 
+  defp compact_with_request_fingerprint(expected, preparation) do
+    compact(expected)
+    |> maybe_put_request_fingerprint(preparation["request_fingerprint"])
+  end
+
   defp maybe_put_request_fingerprint(preparation, nil), do: preparation
 
   defp maybe_put_request_fingerprint(preparation, request_fingerprint),
@@ -1155,7 +1169,11 @@ defmodule ForgeMirrors.PullMergeBoundary do
          sequence_mode
        ) do
     common = %{
-      "preparation" => compact(expected),
+      "preparation" =>
+        compact_with_request_fingerprint(
+          expected,
+          operation.checkpoint["merge_preparation"]
+        ),
       "provider_pull_identity" => provider_identity,
       "expected_base_oid" => intent.expected_base_oid,
       "expected_head_oid" => intent.expected_head_oid,

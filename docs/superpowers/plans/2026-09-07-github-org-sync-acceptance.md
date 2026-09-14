@@ -4,11 +4,42 @@ Source: `docs/fornacast-github-org-sync-prd.md`, section 13 (all 22 criteria).
 
 This is a working evidence ledger, not a completion declaration. A test entrypoint
 below identifies relevant coverage; its existence alone does not prove acceptance.
-The full goal remains open. PR11 and PR12 have local implementation and focused
-integration proof; PR13 is in progress. PR14–16 and the complete acceptance matrix
-remain open.
+The full goal remains open. PR11 through PR13 have local implementation and
+focused integration proof. PR14–16 and the complete acceptance matrix remain
+open.
 
 ## Requirement-by-requirement gates
+
+### PR13 connected merge acceptance and admission recovery (2026-09-14)
+
+- One API integration now drives a represented pull whose base and head are
+  distinct active mirrors with disjoint local object databases. It enters
+  through the real authenticated `PUT /merge`, starts the production-named
+  merge worker, materializes the exact head closure, and performs an exact
+  `B -> M` CAS through `GitCore.Remote` into a filesystem-backed provider base
+  repository while the provider head remains `H`.
+- The provider applies that CAS but the transport reports a timeout. The test
+  waits for the durable effect-pending operation, stops the worker, starts a new
+  worker owner, and proves recovery observes the provider through the real
+  GitHub ref/pull/issue clients, does not push again, and atomically confirms
+  the local base, pull, issue, paired mappings, ref baseline, domain intent and
+  scheduler operation at the same `M`. Both local and provider pull endpoints
+  are read after completion; the merge commit has exactly parents `B,H`, both
+  head refs remain `H`, and strict Git fsck passes.
+- This connected path exposed an admission/recovery mismatch: atomic admission
+  persists a canonical request fingerprint in its preparation checkpoint, but
+  marked recovery previously reconstructed a fingerprint-free proof and failed
+  after the external effect. Recovery now retains the fingerprint in its
+  write-once marker, validates the current checkpoint against that evidence,
+  and rejects a different same-length fingerprint.
+- Fresh focused verification passed **127 tests**: mirror merge boundary **42**,
+  merge worker **81**, and API merge integration **4**. Scoped formatting and
+  diff checks passed. An independent architecture review reported no remaining
+  PR13 finding after the fingerprint binding repair.
+- PR13 and FR-080 through FR-083 are locally accepted. Live GitHub App write
+  validation remains unproven external delivery evidence and is still required
+  before full production/PRD acceptance. PR14-PR16 and the full 22-item PRD
+  acceptance boundary remain open.
 
 ### PR13 represented cross-repository merge materialization (2026-09-14)
 
@@ -665,8 +696,8 @@ PR13 integration audit additionally identified these concrete remaining gates:
 | 11 | LFS clone and checkout succeed from either endpoint after sync | Actual Fornacast smart-HTTP clone with official git-lfs 3.7.1 checks out 128 KiB with matching SHA-256. Existing official SSH LFS transfer coverage is also present. Remote endpoint plus full synchronization-to-clone chain remain unproven. |
 | 12 | Missing/corrupt LFS blocks confirmation and degrades sync | Focused worker, storage, durable 101-pointer replay, and authoritative-scan tests pass. Finalizer queue/catch-up review fixes are committed in `acedead`; retain the full integrated gate in final acceptance. |
 | 13 | Issue/comment changes converge both ways | PR12 local worker, mapping, effect recovery, label materialization, signed ingress and bootstrap activation are implemented through `f45097e`; combined activation matrix: 150 passed. Real domain/lease/HTTP-stub tests cover both directions and omitted comment deletion. Complete end-to-end acceptance and restart matrix remain open. |
-| 14 | Same-repository PR metadata converges both ways | PR13 remains open. Bootstrap import is not two-way synchronization. FR-080 additionally requires cross-repository PR synchronization when both head and base repositories have active mirrors; FR-082 permits read-only metadata only when the head repository is not represented locally. Include a trusted nil-to-represented head binding transition when its mirror later becomes available; current immutable import identity alone cannot perform that transition. |
-| 15 | Coordinated PR merge produces one confirmed Git result | PR13 remains open; verify effect-boundary recovery, exact expected SHAs, and both resulting endpoints. |
+| 14 | Same-repository PR metadata converges both ways | Locally accepted in PR13, including represented cross-repository synchronization, unrepresented read-only behavior and trusted late head representation. Retain live GitHub validation in final acceptance. |
+| 15 | Coordinated PR merge produces one confirmed Git result | Locally accepted through real API admission, disjoint repositories, exact provider Git CAS, lost-response worker restart, provider re-observation, one merge result and matching local/provider pull state. Retain live GitHub validation in final acceptance. |
 | 16 | Release metadata converges and stays bound to a confirmed tag | PR14–15 remain open. Existing scaffold is not proof of implementation. |
 | 17 | Release assets and wiki never synchronize | Verify explicit negative fixtures across import, inbound events, outbound events, and reconciliation when release sync is implemented. |
 | 18 | Duplicate/out-of-order webhooks neither duplicate nor regress | Inbox foundation tests exist. Extend resource-specific fixtures for issues/comments, PRs, and releases. |

@@ -193,6 +193,55 @@ defmodule ForgeMirrors.PullMergeBoundaryTest do
     assert persisted.checkpoint["merge_preparation"]["pull_id"] == c.pull.id
   end
 
+  test "pending admission fingerprint remains valid after marking for recovery", c do
+    c = pending(c)
+    assert {:ok, %{admitted: intent}} = admit(c)
+
+    {:ok, claimed} =
+      ForgeMirrors.claim_operations("admitted-recovery", c.now, 60, 100, ["merge.pull"])
+
+    operation = Enum.find(claimed, &(&1.id == c.operation.id))
+
+    intent
+    |> Changeset.change(
+      state: :merge_written,
+      merge_tree_oid: String.duplicate("c", 40),
+      merge_oid: String.duplicate("d", 40)
+    )
+    |> Repo.update!()
+
+    assert {:ok, marked} =
+             PullMergeBoundary.mark(operation, c.now, nil, %{
+               "phase" => "remote_cas_pending",
+               "merge_operation_id" => intent.id,
+               "merge_tree_oid" => String.duplicate("c", 40),
+               "merge_oid" => String.duplicate("d", 40)
+             })
+
+    assert {:ok, recovery} = PullMergeBoundary.recovery_context(marked, c.now)
+    assert recovery.intent.id == intent.id
+
+    assert recovery.operation.checkpoint["merge_preparation"]["request_fingerprint"] ==
+             request_fingerprint(c)
+
+    forged_fingerprint = String.duplicate("x", 43)
+
+    forged =
+      marked
+      |> Changeset.change(
+        checkpoint:
+          put_in(
+            marked.checkpoint,
+            ["merge_preparation", "request_fingerprint"],
+            forged_fingerprint
+          )
+      )
+      |> Repo.update!()
+
+    assert {:error, :stale_merge_identity} =
+             PullMergeBoundary.recovery_context(forged, c.now)
+  end
+
   test "pending operation, coordinated intent and preparation checkpoint roll back together", c do
     c = pending(c)
 

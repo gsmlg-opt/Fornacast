@@ -3,7 +3,7 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
   import ForgeMirrors.TestSupport.MirrorFixtures
   import Ecto.Query
   alias Ecto.{Changeset, Multi}
-  alias ForgeGitHub.{Error, InstallationToken, PullMergeWorker}
+  alias ForgeGitHub.{Error, InstallationToken, PullMergeAdmission, PullMergeWorker}
 
   alias ForgeMirrors.{
     MirrorOperation,
@@ -18,6 +18,7 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+    Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
 
     organization =
       active_organization_mirror_fixture(%{
@@ -188,6 +189,8 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
       )
 
     %{
+      actor: actor,
+      owner: owner,
       operation: operation,
       intent: intent,
       now: now,
@@ -668,6 +671,98 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
       )
 
     assert {ref.confirmed_oid, ref.last_local_oid, ref.last_remote_oid} == {oid, oid, oid}
+  end
+
+  test "represented cross-repository worker converges one exact merge after uncertain push", c do
+    c = cross_repository_worker_case(c)
+    _issue_mapping = paired_issue_mapping(c)
+    {:ok, provider} = Agent.start_link(fn -> cross_provider_state(c) end)
+
+    refute git_commit_exists?(c.path, c.head)
+    assert {:ok, c.base} == GitCore.exact_ref(c.path, "refs/heads/main")
+    assert {:ok, nil} == GitCore.exact_ref(c.path, "refs/heads/feature")
+    assert {:ok, c.head} == GitCore.exact_ref(c.head_path, "refs/heads/feature")
+
+    assert {:ok, pending} =
+             PullMergeWorker.process_operation(
+               c.operation,
+               c.now,
+               cross_repository_options(c, provider)
+             )
+
+    assert pending.state == :effect_pending
+    assert pending.external_effect_marker["phase"] == "remote_cas_pending"
+    written = Repo.get!(ForgePulls.MergeOperation, c.intent.id)
+    assert written.state == :merge_written
+    assert is_binary(written.merge_oid)
+    assert pending.external_effect_marker["merge_oid"] == written.merge_oid
+    assert git_commit_exists?(c.path, c.head)
+
+    assert git!(c.path, ["show", "-s", "--format=%P", written.merge_oid]) ==
+             "#{c.base} #{c.head}"
+
+    assert Agent.get(provider, & &1) == %{
+             base_oid: written.merge_oid,
+             merge_oid: written.merge_oid,
+             merged: true,
+             push_count: 1
+           }
+
+    assert {:ok, c.base} == GitCore.exact_ref(c.path, "refs/heads/main")
+    assert Repo.get!(ForgePulls.PullRequest, c.pull.id).merged_at == nil
+
+    recovered = reclaim(pending, c.now, "cross-repository-recovery")
+
+    assert {:ok, completed} =
+             PullMergeWorker.process_operation(
+               recovered,
+               c.now,
+               cross_repository_options(%{c | intent: written}, provider)
+             )
+
+    assert completed.state == :completed
+    assert completed.external_effect_marker == nil
+    assert Agent.get(provider, & &1).push_count == 1
+    assert {:ok, written.merge_oid} == GitCore.exact_ref(c.path, "refs/heads/main")
+    assert {:ok, nil} == GitCore.exact_ref(c.path, "refs/heads/feature")
+    assert {:ok, c.head} == GitCore.exact_ref(c.head_path, "refs/heads/feature")
+    assert Repo.get!(ForgePulls.MergeOperation, c.intent.id).state == :completed
+
+    pull = Repo.get!(ForgePulls.PullRequest, c.pull.id)
+    issue = Repo.get!(ForgeIssues.Issue, c.issue.id)
+    assert pull.merge_commit_sha == written.merge_oid
+    assert not is_nil(pull.merged_at)
+    assert issue.state == :closed
+
+    mapping =
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: c.binding.id,
+        resource_kind: :pull,
+        local_resource_id: c.pull.id
+      )
+
+    assert mapping.confirmed_snapshot["base_sha"] == written.merge_oid
+    assert mapping.confirmed_merge_state["merge_commit_sha"] == written.merge_oid
+
+    base_ref =
+      Repo.get_by!(MirrorRefState,
+        repository_mirror_id: c.binding.id,
+        ref_name: "refs/heads/main"
+      )
+
+    head_ref =
+      Repo.get_by!(MirrorRefState,
+        repository_mirror_id: c.head_binding.id,
+        ref_name: "refs/heads/feature"
+      )
+
+    assert {base_ref.confirmed_oid, base_ref.last_local_oid, base_ref.last_remote_oid} ==
+             {written.merge_oid, written.merge_oid, written.merge_oid}
+
+    assert {head_ref.confirmed_oid, head_ref.last_local_oid, head_ref.last_remote_oid} ==
+             {c.head, c.head, c.head}
+
+    _fsck = git!(c.path, ["fsck", "--strict"])
   end
 
   test "newer local metadata is durably marked but never falsely confirmed by the merge", c do
@@ -2778,6 +2873,312 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
 
     {label, identity}
   end
+
+  defp cross_repository_worker_case(c) do
+    Repo.delete!(c.intent)
+    Repo.delete!(c.operation)
+
+    {:ok, head_repository} =
+      ForgeRepos.create_repository(c.owner, %{
+        name: "merge-worker-head",
+        slug: "merge-worker-head",
+        visibility: :private
+      })
+
+    head_binding =
+      repository_mirror_fixture(c.organization, %{repository_id: head_repository.id})
+
+    head_path = ForgeRepos.absolute_storage_path(head_repository)
+
+    git!(head_path, [
+      "fetch",
+      "--quiet",
+      "--no-write-fetch-head",
+      c.path,
+      "#{c.base}:refs/heads/base-seed"
+    ])
+
+    tree = git!(head_path, ["hash-object", "-t", "tree", "-w", "/dev/null"])
+    head = git!(head_path, ["commit-tree", tree, "-p", c.base, "-m", "cross repository head"])
+    git!(head_path, ["update-ref", "refs/heads/feature", head])
+    git!(head_path, ["update-ref", "-d", "refs/heads/base-seed", c.base])
+    git!(c.path, ["update-ref", "-d", "refs/heads/feature"])
+
+    pull =
+      c.pull
+      |> Changeset.change(head_repository_id: head_repository.id, head_sha: head)
+      |> Repo.update!()
+
+    now = DateTime.utc_now(:second)
+
+    %MirrorRefState{}
+    |> MirrorRefState.persistence_changeset(%{
+      repository_mirror_id: head_binding.id,
+      ref_name: pull.head_ref,
+      ref_kind: :branch,
+      confirmed_oid: head,
+      last_local_oid: head,
+      last_remote_oid: head,
+      state: :confirmed,
+      last_confirmed_at: now
+    })
+    |> Repo.insert!()
+
+    {:ok, local} = ForgePulls.sync_projection(c.repository.id, :pull, pull.id)
+    base_remote = %{"id" => c.binding.github_repository_id, "node_id" => c.binding.github_node_id}
+
+    head_remote = %{
+      "id" => head_binding.github_repository_id,
+      "node_id" => head_binding.github_node_id
+    }
+
+    identity = %{
+      "github_issue_object_id" => 901,
+      "github_issue_node_id" => "I_901",
+      "github_number" => 7,
+      "base_repository" => base_remote,
+      "head_repository" => head_remote
+    }
+
+    Repo.get_by!(MirrorResourceState,
+      repository_mirror_id: c.binding.id,
+      resource_kind: :pull,
+      local_resource_id: pull.id
+    )
+    |> Changeset.change(
+      confirmed_local_version: local.local_version,
+      confirmed_snapshot: local.fields,
+      provider_identity: identity,
+      lock_version: 2
+    )
+    |> Repo.update!()
+
+    request_id = "cross-repository-#{Ecto.UUID.generate()}"
+
+    assert {:ok, admission} =
+             PullMergeAdmission.admit(
+               c.repository,
+               pull,
+               c.actor,
+               %{sha: head, merge_method: "merge"},
+               %{request_id: request_id}
+             )
+
+    {:ok, claimed} =
+      ForgeMirrors.claim_operations("cross-repository", now, 60, 100, ["merge.pull"])
+
+    operation = Enum.find(claimed, &(&1.id == admission.operation.id))
+    tmp_root = Path.join(System.tmp_dir!(), "fornacast-cross-merge-#{Ecto.UUID.generate()}")
+    provider_base_path = Path.join(tmp_root, "provider-base.git")
+    provider_head_path = Path.join(tmp_root, "provider-head.git")
+    File.mkdir_p!(tmp_root)
+    git = System.find_executable("git") || flunk("git executable is required")
+    bash = System.find_executable("bash") || flunk("bash executable is required")
+    git_cli!(["init", "--bare", provider_base_path])
+    git_cli!(["init", "--bare", provider_head_path])
+
+    git_cli!([
+      "--git-dir",
+      provider_base_path,
+      "fetch",
+      "--quiet",
+      "--no-write-fetch-head",
+      c.path,
+      "#{c.base}:refs/heads/main"
+    ])
+
+    git_cli!([
+      "--git-dir",
+      provider_head_path,
+      "fetch",
+      "--quiet",
+      "--no-write-fetch-head",
+      head_path,
+      "#{head}:refs/heads/feature"
+    ])
+
+    adapter = git_adapter!(tmp_root, bash, git, c.binding.github_full_name, provider_base_path)
+    on_exit(fn -> File.rm_rf!(tmp_root) end)
+
+    Map.merge(c, %{
+      operation: operation,
+      intent: admission.intent,
+      now: now,
+      pull: pull,
+      head: head,
+      head_repository: head_repository,
+      head_binding: head_binding,
+      head_path: head_path,
+      remote_repository: base_remote,
+      head_remote_repository: head_remote,
+      provider_base_path: provider_base_path,
+      provider_head_path: provider_head_path,
+      git_adapter: adapter,
+      credential_root: Path.join(tmp_root, "credentials")
+    })
+  end
+
+  defp cross_provider_state(c),
+    do: %{base_oid: c.base, merge_oid: nil, merged: false, push_count: 0}
+
+  defp cross_repository_options(c, provider) do
+    now = DateTime.to_iso8601(c.now)
+
+    [
+      token_fetch: fn _, scope ->
+        %InstallationToken{
+          token: "test-credential",
+          expires_at: DateTime.add(c.now, 3600),
+          permissions: scope.permissions
+        }
+      end,
+      observe_ref: fn _, _, _, identity, ref, _ ->
+        path =
+          if identity.github_object_id == c.binding.github_repository_id,
+            do: c.provider_base_path,
+            else: c.provider_head_path
+
+        {:ok, %{repository: identity, ref_name: ref, oid: remote_ref(path, ref)}}
+      end,
+      get_pull: fn _, _, _, _, _ ->
+        state = Agent.get(provider, & &1)
+        base_oid = remote_ref(c.provider_base_path, "refs/heads/main")
+        merged? = state.merged and base_oid == state.merge_oid
+
+        {:ok,
+         %{
+           "id" => 902,
+           "node_id" => "PR_902",
+           "number" => 7,
+           "title" => "Merge",
+           "body" => nil,
+           "state" => if(merged?, do: "closed", else: "open"),
+           "draft" => false,
+           "merged" => merged?,
+           "merged_at" => if(merged?, do: now),
+           "merge_commit_sha" => if(merged?, do: state.merge_oid),
+           "created_at" => now,
+           "updated_at" => now,
+           "mergeable" => nil,
+           "rebaseable" => nil,
+           "mergeable_state" => "unknown",
+           "head" => %{
+             "ref" => "feature",
+             "sha" => c.head,
+             "repo" =>
+               Map.put(c.head_remote_repository, "full_name", c.head_binding.github_full_name)
+           },
+           "base" => %{
+             "ref" => "main",
+             "sha" => base_oid,
+             "repo" => Map.put(c.remote_repository, "full_name", c.binding.github_full_name)
+           }
+         }}
+      end,
+      get_pull_issue: fn _, _, _, _, _ ->
+        merged? = Agent.get(provider, & &1.merged)
+
+        {:ok,
+         %{
+           "id" => 901,
+           "node_id" => "I_901",
+           "number" => 7,
+           "title" => "Merge",
+           "body" => nil,
+           "state" => if(merged?, do: "closed", else: "open"),
+           "state_reason" => nil,
+           "labels" => [],
+           "assignees" => [],
+           "user" => nil,
+           "created_at" => now,
+           "updated_at" => now
+         }}
+      end,
+      push_remote: fn request, token, [update], transport_options ->
+        opts =
+          Keyword.merge(transport_options,
+            git: c.git_adapter,
+            resolver: public_resolver(),
+            credential_root: c.credential_root
+          )
+
+        case GitCore.Remote.push_refs(request, token, [update], opts) do
+          :ok ->
+            Agent.update(provider, fn state ->
+              %{
+                state
+                | base_oid: update.proposed_oid,
+                  merge_oid: update.proposed_oid,
+                  merged: true,
+                  push_count: state.push_count + 1
+              }
+            end)
+
+            {:error, :timeout}
+
+          {:error, _} = error ->
+            error
+        end
+      end
+    ]
+  end
+
+  defp git_commit_exists?(path, oid) do
+    case System.cmd("git", ["--git-dir=#{path}", "cat-file", "-e", "#{oid}^{commit}"],
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} -> true
+      {_output, _status} -> false
+    end
+  end
+
+  defp remote_ref(path, ref) do
+    case System.cmd("git", ["--git-dir=#{path}", "rev-parse", "--verify", "--quiet", ref],
+           stderr_to_stdout: true
+         ) do
+      {output, 0} -> String.trim(output)
+      {_output, 1} -> nil
+      {output, status} -> flunk("remote ref read failed (#{status}): #{output}")
+    end
+  end
+
+  defp git_adapter!(tmp_root, bash, git, full_name, remote_path) do
+    adapter = Path.join(tmp_root, "git-adapter")
+
+    File.write!(adapter, """
+    #!#{bash}
+    set -euo pipefail
+    translated=()
+    for argument in "$@"; do
+      case "$argument" in
+        https://github.com/#{full_name}.git) translated+=(#{shell_quote(remote_path)}) ;;
+        protocol.file.allow=never) translated+=(protocol.file.allow=always) ;;
+        *) translated+=("$argument") ;;
+      esac
+    done
+    export GIT_ALLOW_PROTOCOL=https:file
+    exec #{shell_quote(git)} "${translated[@]}"
+    """)
+
+    File.chmod!(adapter, 0o700)
+    adapter
+  end
+
+  defp public_resolver do
+    fn
+      "github.com", :a -> [{140, 82, 121, 3}]
+      "github.com", :aaaa -> [{0x2606, 0x50C0, 0x8000, 0, 0, 0, 0, 0x154}]
+    end
+  end
+
+  defp git_cli!(args) do
+    case System.cmd("git", args, stderr_to_stdout: true) do
+      {output, 0} -> String.trim(output)
+      {output, status} -> flunk("git #{Enum.join(args, " ")} failed (#{status}): #{output}")
+    end
+  end
+
+  defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
 
   defp additional_known_label(c, github_object_id) do
     label =
