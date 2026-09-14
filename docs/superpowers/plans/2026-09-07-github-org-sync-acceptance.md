@@ -12,6 +12,37 @@ the complete acceptance matrix remain open.
 
 ### PR16 reconciliation and operator foundations (2026-09-14)
 
+- Commit `ed6b551` makes `last_reconciled_at` a proof of the complete durable
+  organization sweep rather than an inventory-listing timestamp. The final
+  inventory page atomically tags every admitted Git/LFS, repository-metadata,
+  issue/comment, pull-head, and release branch with one immutable sweep marker
+  and queues an organization-scoped finalizer. Dynamically created Git-ref,
+  resource, release-tag, continuation, and superseding Git operations retain the
+  same marker, so the finalizer cannot borrow an unrelated later reconciliation.
+- The finalizer uses bounded first-failure and incomplete-existence probes. It
+  advances the watermark only after every marker-bearing operation completes;
+  pending/effect-pending work yields its lease, a terminal child fails the sweep,
+  and pause or revocation retains the pending finalizer without moving the
+  watermark. Organization FIFO serializes sweep generations, while expired-lease
+  recovery rejects the stale owner and reclaims the same operation. A webhook
+  health regression proves a failed-delivery gap remains visible until this full
+  finalizer succeeds.
+- Repository-metadata pause fencing now covers both sides of effect preparation.
+  A pause immediately after claim returns unmarked processing work to `pending`
+  without fetching a token. A pause after durable preparation retains the exact
+  `effect_pending` marker and stops before Administration-write token checkout or
+  PATCH; resume re-enters canonical GET-first recovery. Both paths retain clean
+  failure diagnostics and use the existing binding-then-organization lock order.
+- The final focused gate passed **12 ForgeMirrors lifecycle tests** and **100
+  ForgeGitHub worker tests**, with exact changed-file formatting, diff checks,
+  and production warnings-as-errors compilation. A broader nine-file
+  ForgeMirrors matrix passed **122 of 123** tests; the sole failure was the
+  already-documented operation-scheduler aggregate assertion observing committed
+  stale rows in the shared test database. Two final reviews reported no remaining
+  P0/P1/P2 finding. Criterion 20 still needs intentional omitted-event convergence
+  through real resource workers; criteria 21 and 22 still require the remaining
+  cross-worker lifecycle matrix and live/two-endpoint proof.
+
 - Organization owners and active site administrators now have three bounded,
   durable repository-metadata conflict actions: accept the exact canonical
   GitHub snapshot, keep the exact Fornacast snapshot and push it, or recheck
@@ -957,9 +988,9 @@ PR13 integration audit additionally identified these concrete remaining gates:
 | 17 | Release assets and wiki never synchronize | PR14 exposes no asset API/UI. PR15 strips provider asset payloads, retains only a bounded warning count, reports bootstrap exclusions, ignores release-asset identities and keeps wiki unsupported. Retain full PR16 reconciliation negatives and live proof. |
 | 18 | Duplicate/out-of-order webhooks neither duplicate nor regress | Inbox foundation tests exist. Extend resource-specific fixtures for issues/comments, PRs, and releases. |
 | 19 | Every operation boundary recovers after restart | Git/LFS checkpoint, lease, marker-replacement and rate-limit recovery tests pass. Metadata create/update/delete/merge boundaries and full restart matrix remain open. |
-| 20 | Full reconciliation repairs omitted deliveries | Inventory and Git/LFS reconciliation exist. Complete metadata sweeps and intentionally omitted-event acceptance in PR16. |
-| 21 | Pause prevents new effects but retains work | Foundation lifecycle/scheduler tests exist. Recheck each new worker at the external-effect boundary, including a pause during long LFS work. |
-| 22 | Disconnect/revocation stops token use and retains local repos | App credential/lifecycle foundation exists. Verify every new worker and in-flight recovery path in final acceptance. |
+| 20 | Full reconciliation repairs omitted deliveries | One immutable sweep now spans inventory, Git/LFS, repository metadata, issues/comments, pull heads, and releases; `last_reconciled_at` advances only after its durable finalizer proves every branch complete, and failed-delivery health remains gapped until then. Complete intentionally omitted-event convergence through real workers and two endpoints. |
+| 21 | Pause prevents new effects but retains work | Organization finalization and repository-metadata processing/effect-pending boundaries retain work with no token/PATCH while paused, including resume and expired-lease proof. Complete the same matrix for the remaining workers, including long LFS work. |
+| 22 | Disconnect/revocation stops token use and retains local repos | Revocation after finalizer claim freezes the durable sweep without a false watermark; repository-metadata prepared effects already stop before write-token/PATCH. Verify every remaining worker, in-flight recovery path, local-repository retention, and live disconnect flow. |
 
 ## Current local verification
 
