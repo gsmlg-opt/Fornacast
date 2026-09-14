@@ -1101,6 +1101,15 @@ PR13 integration audit additionally identified these concrete remaining gates:
   reconciler, credential-provider, and publication tests, and production
   compilation passes with warnings as errors. Independent Critical/Important
   review reports no remaining finding.
+- The final local Git/LFS acceptance audit found no missing production path for
+  criteria 7-10 or 12. Fresh scoped verification passes 28 GitHub Git/LFS worker
+  and reconciliation tests, 38 mirror decision/persistence tests, four real bare-
+  remote transport tests, and the official smart-HTTP `git-lfs` clone/checkout
+  test. Together these prove bidirectional create/fast-forward decisions and
+  effects, exact-baseline branch/tag deletion, durable visible divergence without
+  mutation, ref publication only after LFS transfer, and missing/corrupt-object
+  degradation. They remain local controlled-endpoint evidence; criterion 11 still
+  requires a synchronized clone/checkout from a real GitHub endpoint.
 - These are local acceptance results. Live GitHub App installation and provider
   endpoint validation remain required before the complete 22-item PRD can be
   declared finished.
@@ -1113,12 +1122,12 @@ PR13 integration audit additionally identified these concrete remaining gates:
 | 4 | Bootstrap-time webhooks replay after baseline | Locally accepted: six supported delivery families remain buffered during real App staging and become eligible only after publication handoff; a valid pull delivery is deferred by the real worker before baseline and completes into the exact bound `sync.pull` operation after the run finishes. Dedicated Git/LFS and resource webhook tests cover the other processors. Retain live delivery proof. |
 | 5 | GitHub-created repository imports according to policy | Locally accepted: the production inventory consumer follows policy-created work through one App-backed run/item, retryable discovery successor recovery, publication handoff, parent FIFO release, and exact child reconciliation claim while preserving the active organization binding. Retain live GitHub creation/import proof. |
 | 6 | Local organization repository is created on GitHub according to policy | Locally accepted in PR16: typed policy/capability admission, strict installation-gated create, absence marker, immediate pre-POST lifecycle fence, timeout and 422 recovery, per-binding collision evidence, immutable binding/baseline, and ordered Git-then-metadata activation are covered. Retain live GitHub proof in final acceptance. |
-| 7 | Local branch create/fast-forward reaches GitHub | Git ref worker and exact remote primitives have focused tests. Run the complete outbound Git+LFS workflow against the remote fixture. |
-| 8 | GitHub branch create/fast-forward reaches Fornacast | Inbound ref worker coverage exists. Verify the public ref changes only after required LFS availability. |
-| 9 | Safe ref deletion only from unchanged baseline | `git_ref_decision_test.exs` and worker/persistence tests cover policy and CAS. Include branch/tag deletion in final two-endpoint acceptance. |
-| 10 | Divergence is visible and neither side overwritten | Conflict persistence/worker tests exist. Finish and verify conflict UX in PR16. |
+| 7 | Local branch create/fast-forward reaches GitHub | Locally accepted by composition: the worker persists/authorizes the outbound effect and the real fixed-host transport fixture advances the exact remote branch/tag without force. Retain live GitHub proof. |
+| 8 | GitHub branch create/fast-forward reaches Fornacast | Locally accepted: owner reconciliation fetches a commit from a separate bare remote into the private namespace, holds the public ref across LFS checkpoints, and applies the exact local CAS only after object verification. Retain live GitHub proof. |
+| 9 | Safe ref deletion only from unchanged baseline | Locally accepted: decision, persistence, worker, local CAS, and real remote transport tests cover branch/tag deletion only at the exact confirmed OID and preserve stale refs. Retain live two-endpoint proof. |
+| 10 | Divergence is visible and neither side overwritten | Locally accepted: the worker records the exact baseline/local/remote conflict and conflicted ref state without calling either mutation boundary; the production owner conflict route renders bounded comparisons and keeps Git conflicts read-only. Retain live conflict proof. |
 | 11 | LFS clone and checkout succeed from either endpoint after sync | Actual Fornacast smart-HTTP clone with official git-lfs 3.7.1 checks out 128 KiB with matching SHA-256. Existing official SSH LFS transfer coverage is also present. Remote endpoint plus full synchronization-to-clone chain remain unproven. |
-| 12 | Missing/corrupt LFS blocks confirmation and degrades sync | Focused worker, storage, durable 101-pointer replay, and authoritative-scan tests pass. Finalizer queue/catch-up review fixes are committed in `acedead`; retain the full integrated gate in final acceptance. |
+| 12 | Missing/corrupt LFS blocks confirmation and degrades sync | Locally accepted: worker, storage, durable 101-pointer replay, authoritative scan, and finalizer tests prove the public ref and baseline remain unchanged while the operation/repository is degraded; verified bytes are required before later confirmation. Retain live GitHub failure/recovery proof. |
 | 13 | Issue/comment changes converge both ways | PR12 local worker, mapping, effect recovery, label materialization, signed ingress and bootstrap activation are implemented through `f45097e`; combined activation matrix: 150 passed. Real domain/lease/HTTP-stub tests cover both directions and omitted comment deletion. Retain live two-endpoint acceptance. |
 | 14 | Same-repository PR metadata converges both ways | Locally accepted in PR13, including represented cross-repository synchronization, unrepresented read-only behavior and trusted late head representation. Retain live GitHub validation in final acceptance. |
 | 15 | Coordinated PR merge produces one confirmed Git result | Locally accepted through real API admission, disjoint repositories, exact provider Git CAS, lost-response worker restart, provider re-observation, one merge result and matching local/provider pull state. Retain live GitHub validation in final acceptance. |
