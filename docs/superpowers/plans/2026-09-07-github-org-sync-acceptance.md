@@ -1060,12 +1060,44 @@ PR13 integration audit additionally identified these concrete remaining gates:
   case. Add an explicit opaque read-only identity path and authenticated later
   representation; never invent provider IDs or bind by branch/repository names.
 
+### Final connection and unsupported-resource acceptance (2026-09-14)
+
+- `fe1a8fd` adds a real web/domain acceptance boundary for criteria 1 and 2.
+  An organization owner starts an installation through the production route,
+  correlates the one-time state, binds a distinct immutable GitHub organization,
+  and sees the bound installation through the settings route. A linked outsider
+  and an immutable installation-identity mismatch are rejected. Partial repository
+  selection and missing required permissions are rendered before bootstrap, and
+  bootstrap is refused without creating an import run. Two focused PostgreSQL web
+  acceptance tests pass; the existing callback-controller tests retain their
+  parsing, expiry, one-time-consumption, and mismatch coverage.
+- `757bf18` completes the local negative boundary for criterion 17. Repository
+  reconciliation now admits only `refs/heads/*` and `refs/tags/*` from both local
+  and provider observations, so `refs/wiki/*` cannot fan out into Git work. The
+  owner-driven reconciliation acceptance also carries asset-bearing release data
+  through the real reconciliation parent and proves that neither wiki nor release
+  assets create operations or mappings. The combined unsupported-resource matrix
+  passes 66 focused tests across GitHub, mirrors, imports, and release persistence.
+- The App-backed bootstrap acceptance now imports real issue, comment,
+  same-repository pull, and release fixtures through `RepositoryWorker`, publishes
+  their permanent mappings/baselines, and proves six supported delivery families
+  remain buffered through staging and become eligible only after handoff. A valid
+  pull delivery is run through the production webhook worker before and after the
+  baseline: it defers before handoff, then completes and creates the exact bound
+  `sync.pull` operation after the run finishes. The focused file passes two tests.
+  Dedicated Git/LFS publication, scan, transport, and finalizer tests remain the
+  evidence for the Git/LFS portion rather than treating an empty LFS fixture as
+  a transfer proof.
+- These are local acceptance results. Live GitHub App installation and provider
+  endpoint validation remain required before the complete 22-item PRD can be
+  declared finished.
+
 | # | Required outcome | Current evidence / next gate |
 |---|---|---|
-| 1 | Owner connects the App to the correct organization | Foundation installation/authorization tests exist in `apps/forge_mirrors/test/`. Re-run the complete connection flow with owner and mismatched-account cases in final acceptance. |
-| 2 | Permission and partial-access problems visible before bootstrap | Installation intent and settings checks exist. Final acceptance must verify rendered diagnostics and prevent bootstrap with missing required permissions. |
-| 3 | All enabled supported resources bootstrap to active bindings | `apps/forge_imports/test/repository_publication_test.exs` covers atomic handoff and hidden LFS bootstrap. Release metadata and complete collaboration convergence remain open. |
-| 4 | Bootstrap-time webhooks replay after baseline | Handoff and durable inbox tests exist. Re-run a complete buffered replay with Git, LFS, and metadata resources after PR12–16. |
+| 1 | Owner connects the App to the correct organization | Locally accepted in `fe1a8fd` through the production install/settings routes, correlated callback domain handoff, distinct immutable GitHub organization identity, owner success, linked-outsider rejection, and installation mismatch rejection. Retain live GitHub App proof. |
+| 2 | Permission and partial-access problems visible before bootstrap | Locally accepted in `fe1a8fd`: settings render partial selection and missing permissions, while the production bootstrap route refuses the request and creates no import run. Retain live provider-permission proof. |
+| 3 | All enabled supported resources bootstrap to active bindings | Locally accepted by composition: the App-backed acceptance imports and publishes real issue/comment/pull/release mappings and baselines; publication tests cover Git refs and LFS hold; Git/LFS persistence tests prove the finalizer activates the repository and organization only after required confirmations. Retain live GitHub bootstrap proof. |
+| 4 | Bootstrap-time webhooks replay after baseline | Locally accepted: six supported delivery families remain buffered during real App staging and become eligible only after publication handoff; a valid pull delivery is deferred by the real worker before baseline and completes into the exact bound `sync.pull` operation after the run finishes. Dedicated Git/LFS and resource webhook tests cover the other processors. Retain live delivery proof. |
 | 5 | GitHub-created repository imports according to policy | Inventory worker and persistence tests exist. Final gate must follow inventory through completed bootstrap, not stop at enqueue. |
 | 6 | Local organization repository is created on GitHub according to policy | Locally accepted in PR16: typed policy/capability admission, strict installation-gated create, absence marker, immediate pre-POST lifecycle fence, timeout and 422 recovery, per-binding collision evidence, immutable binding/baseline, and ordered Git-then-metadata activation are covered. Retain live GitHub proof in final acceptance. |
 | 7 | Local branch create/fast-forward reaches GitHub | Git ref worker and exact remote primitives have focused tests. Run the complete outbound Git+LFS workflow against the remote fixture. |
@@ -1078,7 +1110,7 @@ PR13 integration audit additionally identified these concrete remaining gates:
 | 14 | Same-repository PR metadata converges both ways | Locally accepted in PR13, including represented cross-repository synchronization, unrepresented read-only behavior and trusted late head representation. Retain live GitHub validation in final acceptance. |
 | 15 | Coordinated PR merge produces one confirmed Git result | Locally accepted through real API admission, disjoint repositories, exact provider Git CAS, lost-response worker restart, provider re-observation, one merge result and matching local/provider pull state. Retain live GitHub validation in final acceptance. |
 | 16 | Release metadata converges and stays bound to a confirmed tag | PR14 local domain/API/web and PR15 bootstrap/incremental synchronization are locally accepted. Fresh two-sided tag proof, retarget conflicts, immutable provider identity, marker replacement and newer-local recovery are covered. Retain live GitHub proof in final acceptance. |
-| 17 | Release assets and wiki never synchronize | PR14 exposes no asset API/UI. PR15 strips provider asset payloads, retains only a bounded warning count, reports bootstrap exclusions, ignores release-asset identities and keeps wiki unsupported. Retain full PR16 reconciliation negatives and live proof. |
+| 17 | Release assets and wiki never synchronize | Locally accepted in `757bf18`: bootstrap/import/persistence paths strip release assets, owner-driven reconciliation creates no asset work or mappings, and remote `refs/wiki/*` observations are excluded before Git fanout. Retain live negative proof. |
 | 18 | Duplicate/out-of-order webhooks neither duplicate nor regress | Locally accepted in PR16. Distinct issue, comment, pull, and release deliveries retain immutable hints, re-read canonical provider state, converge one domain version/mapping baseline, and emit no duplicate provider-origin event. |
 | 19 | Every operation boundary recovers after restart | Locally accepted across inventory/finalization, Git/LFS, repository create/metadata, issues/comments, pull create/sync/merge, and release create/update/delete. Durable leases, cursors, checkpoints, exact effect markers, ambiguous-result reads, and no-replay recovery are covered. |
 | 20 | Full reconciliation repairs omitted deliveries | Locally accepted in PR16. One immutable owner-scheduled sweep now repairs intentionally omitted repository metadata, Git/LFS, issue/comment/label/assignee, pull, and release deliveries through real workers with zero inbox rows; `last_reconciled_at` advances only after every marker-bearing branch and finalizer completes. Retain two-endpoint/live GitHub proof in final acceptance. |

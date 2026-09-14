@@ -4,7 +4,7 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
   import Ecto.Query
 
   alias Ecto.{Changeset, Multi}
-  alias ForgeGitHub.{InstallationToken, InstallationTokenBroker}
+  alias ForgeGitHub.{InstallationToken, InstallationTokenBroker, WebhookProcessor}
   alias ForgeImports.GitHub.MetadataImporter
 
   alias ForgeImports.{
@@ -13,10 +13,12 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
     PageCheckpoint,
     Persistence,
     RepositoryItem,
-    RepositoryWorker
+    RepositoryWorker,
+    RunAggregator
   }
 
-  alias ForgeMirrors.MirrorResourceState
+  alias ForgeMirrors.{MirrorOperation, MirrorResourceState, WebhookWorker}
+  alias ForgeIssues.Comment
   alias ForgeReleases.Release
   alias Fornacast.Repo
 
@@ -24,9 +26,10 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
   @fixtures Path.join(__DIR__, "fixtures/github")
 
   @tag :tmp_dir
-  test "installation checkout imports and publishes full multibyte pull bodies", %{
-    tmp_dir: tmp_dir
-  } do
+  test "installation checkout establishes baselines before eligible buffered webhook processing",
+       %{
+         tmp_dir: tmp_dir
+       } do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
     Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
     previous_root = Application.fetch_env!(:fornacast, :repo_storage_root)
@@ -161,6 +164,13 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
         "pull_request" => %{"url" => "https://api.github.com/repos/octocat/Hello-World/pulls/7"}
       })
 
+    ordinary_issue =
+      issue
+      |> Map.merge(%{"id" => 303, "node_id" => "I_app_issue", "number" => 8, "title" => "Issue"})
+      |> Map.delete("pull_request")
+
+    comment = fixture("comments_page.json") |> hd()
+
     release = %{
       "id" => 501,
       "node_id" => "RE_bootstrap",
@@ -178,6 +188,57 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
       "assets" => []
     }
 
+    pull_delivery_guid = Ecto.UUID.generate()
+    pull_id = 9_690_000_000 + suffix
+
+    assert {:ok, buffered_pull, :enqueued} =
+             ForgeMirrors.enqueue_webhook_delivery(
+               %{
+                 delivery_guid: pull_delivery_guid,
+                 hook_id: System.unique_integer([:positive, :monotonic]),
+                 event: "pull_request",
+                 action: "synchronize",
+                 installation_id: installation_id,
+                 github_repository_id: item.github_repository_id,
+                 signature_version: "sha256",
+                 raw_payload:
+                   JSON.encode!(%{
+                     "action" => "synchronize",
+                     "installation" => %{"id" => installation_id},
+                     "repository" => %{"id" => item.github_repository_id},
+                     "pull_request" => %{"id" => pull_id, "number" => 7}
+                   })
+               },
+               :pending
+             )
+
+    eligible_delivery_matrix =
+      for {event, action} <- [
+            {"repository", "renamed"},
+            {"push", ""},
+            {"issues", "edited"},
+            {"issue_comment", "created"},
+            {"release", "edited"}
+          ] do
+        assert {:ok, delivery, :enqueued} =
+                 ForgeMirrors.enqueue_webhook_delivery(
+                   %{
+                     organization_mirror_id: nil,
+                     delivery_guid: Ecto.UUID.generate(),
+                     hook_id: System.unique_integer([:positive, :monotonic]),
+                     event: event,
+                     action: action,
+                     installation_id: installation_id,
+                     github_repository_id: item.github_repository_id,
+                     signature_version: "sha256",
+                     raw_payload: JSON.encode!(%{"action" => action})
+                   },
+                   :pending_unsupported
+                 )
+
+        delivery
+      end
+
     stub = {__MODULE__, suffix}
     parent = self()
 
@@ -190,13 +251,16 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
           Req.Test.json(conn, [])
 
         "/repos/octocat/Hello-World/issues" ->
-          Req.Test.json(conn, [issue])
+          Req.Test.json(conn, [ordinary_issue, issue])
 
         "/repos/octocat/Hello-World/issues/7" ->
           Req.Test.json(conn, issue)
 
         "/repos/octocat/Hello-World/issues/7/comments" ->
           Req.Test.json(conn, [])
+
+        "/repos/octocat/Hello-World/issues/8/comments" ->
+          Req.Test.json(conn, [comment])
 
         "/repos/octocat/Hello-World/pulls/7" ->
           Req.Test.json(conn, pull)
@@ -253,6 +317,19 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
 
     assert {:ok, %RepositoryItem{state: :ready_to_publish} = ready} = result
 
+    assert {:ok, [{pull_delivery_id, {:ok, deferred_pull}}]} =
+             WebhookWorker.run_once("app-bootstrap-pull-before-handoff",
+               processor: WebhookProcessor
+             )
+
+    assert pull_delivery_id == buffered_pull.id
+    assert deferred_pull.state == :pending_unsupported
+
+    assert Enum.all?(eligible_delivery_matrix, fn delivery ->
+             Repo.get!(ForgeMirrors.MirrorWebhookDelivery, delivery.id).state ==
+               :pending_unsupported
+           end)
+
     assert_receive {:installation_checkout, ^installation_id, @scope}
     assert_receive {:app_request, "/repos/octocat/Hello-World/pulls/7"}
     assert_receive {:app_request, "/repos/octocat/Hello-World/issues/7"}
@@ -265,21 +342,11 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
     assert mapping.source_evidence["github_issue_object_id"] == 302
     refute inspect(mapping.source_evidence) =~ "app-pull-test-token"
 
-    assert {:ok, buffered_release, :enqueued} =
-             ForgeMirrors.enqueue_webhook_delivery(
-               %{
-                 organization_mirror_id: nil,
-                 delivery_guid: Ecto.UUID.generate(),
-                 hook_id: System.unique_integer([:positive, :monotonic]),
-                 event: "release",
-                 action: "edited",
-                 installation_id: installation_id,
-                 github_repository_id: item.github_repository_id,
-                 signature_version: "sha256",
-                 raw_payload: JSON.encode!(%{"action" => "edited"})
-               },
-               :pending_unsupported
+    assert Repo.exists?(
+             from(mapping in ObjectMapping,
+               where: mapping.repository_item_id == ^item.id and mapping.object_kind == "issue"
              )
+           )
 
     assert {:ok, %{repository: published}} =
              ForgeImports.publish_repository(actor, ready.id, %{
@@ -306,6 +373,22 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
     assert pull_state.confirmed_local_version == local.sync_version
     assert pull_state.state == :confirmed
 
+    ordinary_local = Repo.get_by!(ForgeIssues.Issue, repository_id: shadow.id, number: 8)
+    comment = Repo.get_by!(Comment, issue_id: ordinary_local.id)
+
+    comment_state =
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: binding.id,
+        resource_kind: :issue_comment,
+        local_resource_id: comment.id
+      )
+
+    assert comment_state.state == :confirmed
+    assert comment_state.confirmed_snapshot == %{"body" => "Comment body"}
+
+    assert Repo.get_by!(ObjectMapping, repository_item_id: item.id, object_kind: "comment").local_resource_id ==
+             comment.id
+
     imported_release = Repo.get_by!(Release, repository_id: shadow.id, tag_name: "v1.0.0")
 
     release_state =
@@ -323,11 +406,44 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
     assert release_state.confirmed_remote_updated_at == nil
     assert release_state.confirmed_fingerprint == nil
     assert release_state.confirmed_snapshot == nil
+    assert Repo.get_by!(ObjectMapping, repository_item_id: item.id, object_kind: "release")
 
     assert %{state: :pending, organization_mirror_id: organization_mirror_id} =
-             Repo.get!(ForgeMirrors.MirrorWebhookDelivery, buffered_release.id)
+             Repo.get!(ForgeMirrors.MirrorWebhookDelivery, buffered_pull.id)
 
     assert organization_mirror_id == mirror.id
+
+    assert Enum.all?(eligible_delivery_matrix, fn delivery ->
+             %{state: state, organization_mirror_id: organization_mirror_id} =
+               Repo.get!(ForgeMirrors.MirrorWebhookDelivery, delivery.id)
+
+             state == :pending and organization_mirror_id == mirror.id
+           end)
+
+    assert {:ok, %{state: :completed}} = RunAggregator.finish_if_terminal(run.id, now: now)
+
+    assert {:ok, [{^pull_delivery_id, {:ok, processed_pull}}]} =
+             WebhookWorker.run_once("app-bootstrap-pull-after-baseline",
+               processor: WebhookProcessor
+             )
+
+    assert processed_pull.state == :completed
+
+    assert %MirrorOperation{
+             organization_mirror_id: ^organization_mirror_id,
+             repository_mirror_id: repository_mirror_id,
+             kind: "sync.pull",
+             cursor: %{
+               "delivery_guid" => ^pull_delivery_guid,
+               "resource_kind" => "pull",
+               "github_object_id" => ^pull_id,
+               "github_number" => 7,
+               "issue_kind" => "pull_request",
+               "trigger" => "remote"
+             }
+           } = Repo.get_by!(MirrorOperation, kind: "sync.pull")
+
+    assert repository_mirror_id == binding.id
   end
 
   @tag :tmp_dir
