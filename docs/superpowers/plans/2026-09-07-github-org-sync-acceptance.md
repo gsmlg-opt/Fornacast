@@ -85,7 +85,34 @@ the complete acceptance matrix remain open.
   P0/P1/P2 review pass. Criterion 20 is locally accepted for repository metadata,
   Git/LFS, issues, labels, assignees, comments, pull requests, and releases.
   Criterion 11 still requires real clone/checkout proof from both endpoints, and
-  criteria 21 and 22 still require the complete cross-worker lifecycle matrix.
+  criteria 18 and 19 still require their complete event-order and restart matrices.
+- Commits `0a1d78b`, `f33d5d3`, and `da72c12` complete the local pause and
+  revocation matrix across inventory, repository creation/metadata, Git/LFS,
+  issues/comments, pull synchronization/creation/merge, releases, and the
+  organization finalizer. Inventory and Git reconciliation roots now return
+  typed lifecycle failures before token or provider access; paused work releases
+  its lease without losing its cursor/marker, while revocation and missing
+  capability stop terminally. Real PostgreSQL scope tests cover organization
+  pause/revocation, installation suspension, disabled Git, finalizer watermark
+  retention, and later resume.
+- Pull-merge LFS publication now persists the exact merge marker before requesting
+  a write token or transferring an object. Recovery reclaims the marker and saved
+  LFS cursor, every transfer step receives exact-marker authorization, and a fresh
+  fence runs after LFS before provider re-observation and again around the Git CAS
+  credential. Installation revocation at either token boundary or as LFS returns
+  stops further reads, transfer, and push while retaining the durable marker.
+  Installation deletion is also exercised through the real webhook processor:
+  authorization is revoked before token invalidation, queued effects cannot be
+  claimed, and the local bare repository, public ref, LFS object, and repository
+  row remain intact.
+- The final lifecycle gate passed **99 ForgeGitHub inventory/Git/issue/release/
+  webhook tests**, **84 of 86 pull-merge tests**, and **47 of 49 ForgeMirrors
+  inventory/Git persistence tests**. Each pair of failures was the documented
+  shared numeric-fixture collision and every affected selector passed directly
+  with the new lifecycle/LFS selectors. Warnings-as-errors compilation, exact
+  changed-file formatting, diff checks, and two final P0/P1/P2 cross-reviews
+  passed. Criteria 21 and 22 are locally accepted; live GitHub disconnect proof
+  remains part of final external acceptance.
 
 - Organization owners and active site administrators now have three bounded,
   durable repository-metadata conflict actions: accept the exact canonical
@@ -1031,10 +1058,10 @@ PR13 integration audit additionally identified these concrete remaining gates:
 | 16 | Release metadata converges and stays bound to a confirmed tag | PR14 local domain/API/web and PR15 bootstrap/incremental synchronization are locally accepted. Fresh two-sided tag proof, retarget conflicts, immutable provider identity, marker replacement and newer-local recovery are covered. Retain live GitHub proof in final acceptance. |
 | 17 | Release assets and wiki never synchronize | PR14 exposes no asset API/UI. PR15 strips provider asset payloads, retains only a bounded warning count, reports bootstrap exclusions, ignores release-asset identities and keeps wiki unsupported. Retain full PR16 reconciliation negatives and live proof. |
 | 18 | Duplicate/out-of-order webhooks neither duplicate nor regress | Inbox foundation tests exist. Extend resource-specific fixtures for issues/comments, PRs, and releases. |
-| 19 | Every operation boundary recovers after restart | Git/LFS checkpoint, lease, marker-replacement and rate-limit recovery tests pass. Metadata create/update/delete/merge boundaries and full restart matrix remain open. |
-| 20 | Full reconciliation repairs omitted deliveries | One immutable sweep now spans inventory, Git/LFS, repository metadata, issues/comments, pull heads, and releases; `last_reconciled_at` advances only after its durable finalizer proves every branch complete, and failed-delivery health remains gapped until then. Real owner-scheduled inventory -> resource-worker -> finalizer integrations now repair intentionally omitted repository metadata, issue/comment/label, and pull deliveries with no outbound echo. Complete the equivalent Git/LFS and release worker paths plus two-endpoint proof. |
-| 21 | Pause prevents new effects but retains work | Organization finalization and repository-metadata processing/effect-pending boundaries retain work with no token/PATCH while paused, including resume and expired-lease proof. Complete the same matrix for the remaining workers, including long LFS work. |
-| 22 | Disconnect/revocation stops token use and retains local repos | Revocation after finalizer claim freezes the durable sweep without a false watermark; repository-metadata prepared effects already stop before write-token/PATCH. Verify every remaining worker, in-flight recovery path, local-repository retention, and live disconnect flow. |
+| 19 | Every operation boundary recovers after restart | Git/LFS checkpoint, lease, marker-replacement and rate-limit recovery tests pass. Pull-merge LFS now marks before transfer and reclaims the exact saved cursor without blind replay. Metadata create/update/delete/merge boundaries and the consolidated restart matrix remain open. |
+| 20 | Full reconciliation repairs omitted deliveries | Locally accepted in PR16. One immutable owner-scheduled sweep now repairs intentionally omitted repository metadata, Git/LFS, issue/comment/label/assignee, pull, and release deliveries through real workers with zero inbox rows; `last_reconciled_at` advances only after every marker-bearing branch and finalizer completes. Retain two-endpoint/live GitHub proof in final acceptance. |
+| 21 | Pause prevents new effects but retains work | Locally accepted in PR16 across inventory/finalizers, repository creation/metadata, Git/LFS, issues/comments, pulls/create/merge, and releases. Pre-effect and post-marker fences stop credentials/provider effects while preserving queued work, lease recovery, markers, and LFS cursors for resume. |
+| 22 | Disconnect/revocation stops token use and retains local repos | Locally accepted in PR16 across all worker families and in-flight marked recovery. Real deletion processing revokes authorization before token invalidation, prevents later claims/provider use, and retains the local repository, refs, LFS data, and durable marker. Retain the live GitHub disconnect flow in final external acceptance. |
 
 ## Current local verification
 
