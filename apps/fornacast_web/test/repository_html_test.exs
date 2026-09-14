@@ -162,8 +162,10 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     assert html =~ "href=\"/alice/demo/commits/refs/heads/feature/forge"
     assert html =~ "href=\"/alice/demo/branches"
     assert html =~ "href=\"/alice/demo/tags"
+    assert html =~ "href=\"/alice/demo/releases"
     assert html =~ "href=\"/alice/demo/issues"
     assert html =~ "href=\"/alice/demo/pulls"
+    assert navigation =~ "Releases"
     assert navigation =~ "Issues"
     assert navigation =~ "Pull Requests"
 
@@ -174,12 +176,19 @@ defmodule FornacastWeb.RepositoryHTMLTest do
       |> List.flatten()
       |> Enum.map(&String.trim/1)
 
-    assert labels == ["Code", "Commits", "Branches", "Tags", "Issues", "Pull Requests"]
+    assert labels == [
+             "Code",
+             "Commits",
+             "Branches",
+             "Tags",
+             "Releases",
+             "Issues",
+             "Pull Requests"
+           ]
 
     refute html =~ ">Actions<"
     refute html =~ ">Packages<"
     refute html =~ ">Projects<"
-    refute html =~ ">Releases<"
     refute html =~ ">Wiki<"
     refute html =~ ">Star<"
     refute html =~ ">Fork<"
@@ -770,13 +779,14 @@ defmodule FornacastWeb.RepositoryHTMLTest do
   test "repository navigation has one active collaboration tab and exact collaboration paths" do
     result = code_result()
 
-    for {active, label} <- [issues: "Issues", pulls: "Pull Requests"] do
+    for {active, label} <- [releases: "Releases", issues: "Issues", pulls: "Pull Requests"] do
       html =
         render_component(&RepositoryHTML.repository_navigation/1, result: result, active: active)
 
       assert active_navigation_label(html) == label
     end
 
+    assert RepositoryHTML.releases_path(result.chrome) == "/alice/demo/releases"
     assert RepositoryHTML.issues_path(result.chrome) == "/alice/demo/issues"
     assert RepositoryHTML.new_issue_path(result.chrome) == "/alice/demo/issues/new"
     assert RepositoryHTML.issue_path(result.chrome, 17) == "/alice/demo/issues/17"

@@ -1,0 +1,58 @@
+<RepositoryHTML.repository_frame result={@result} active={:releases}>
+  <section class="grid min-w-0 gap-3 p-4" data-releases-page>
+    <header class="flex flex-wrap items-center justify-between gap-3 bg-surface-container text-on-surface rounded-lg p-4">
+      <div>
+        <p class="text-xs text-on-surface-variant">Repository releases</p>
+        <h2 class="text-lg font-semibold">Releases</h2>
+      </div>
+      <form
+        :if={@result.content.can_create}
+        action={new_release_path(@result.chrome)}
+        method="get"
+      >
+        <.dm_btn type="submit" variant="primary">Create release</.dm_btn>
+      </form>
+    </header>
+
+    <ul :if={@result.content.releases.entries != []} class="grid gap-3" role="list">
+      <li
+        :for={release <- @result.content.releases.entries}
+        class="bg-surface-container text-on-surface rounded-lg border border-outline-variant p-4"
+        data-release-row
+      >
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div class="min-w-0">
+            <.dm_link
+              href={release_tag_path(@result.chrome, release.tag_name)}
+              class="font-semibold text-primary"
+            >
+              {release_name(release)}
+            </.dm_link>
+            <p class="mt-1 text-sm text-on-surface-variant">
+              <code>{release.tag_name}</code>
+              · by {author_name(release.author)} · {format_time(
+                release.published_at || release.inserted_at
+              )}
+            </p>
+          </div>
+          <.dm_badge variant={state_variant(release)} soft size="sm">
+            {release_state(release)}
+          </.dm_badge>
+        </div>
+      </li>
+    </ul>
+
+    <RepositoryHTML.optional_panel
+      :if={@result.content.releases.entries == []}
+      title="No releases"
+      message="No releases have been published for this repository."
+      kind="empty"
+    />
+
+    <RepositoryHTML.server_pagination
+      page={@result.content.releases.page}
+      total_pages={total_pages(@result.content.releases)}
+      base_href={pagination_base(@result)}
+    />
+  </section>
+</RepositoryHTML.repository_frame>

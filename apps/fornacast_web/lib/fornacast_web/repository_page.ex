@@ -86,7 +86,18 @@ defmodule FornacastWeb.RepositoryPage do
   @inline_blob_limit 1_048_576
   @complete_blob_limit 100_000_000
 
-  @collaboration_kinds [:issues, :issue, :pulls, :pull, :pull_commits, :pull_files]
+  @collaboration_kinds [
+    :issues,
+    :issue,
+    :pulls,
+    :pull,
+    :pull_commits,
+    :pull_files,
+    :releases,
+    :release,
+    :release_new,
+    :release_edit
+  ]
 
   if Mix.env() == :test do
     @read_phase_hook_key {__MODULE__, :read_phase_hook}

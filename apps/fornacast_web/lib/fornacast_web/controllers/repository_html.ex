@@ -121,6 +121,12 @@ defmodule FornacastWeb.RepositoryHTML do
         count={@summary.tag_count}
       />
       <:item
+        label="Releases"
+        href={releases_path(@result.chrome)}
+        active={@active == :releases}
+        icon="tag-outline"
+      />
+      <:item
         label="Issues"
         href={issues_path(@result.chrome)}
         active={@active == :issues}
@@ -361,6 +367,7 @@ defmodule FornacastWeb.RepositoryHTML do
 
   def refs_path(chrome, :branch), do: repository_base(chrome) <> "/branches"
   def refs_path(chrome, :tag), do: repository_base(chrome) <> "/tags"
+  def releases_path(chrome), do: repository_base(chrome) <> "/releases"
   def issues_path(chrome), do: repository_base(chrome) <> "/issues"
   def new_issue_path(chrome), do: issues_path(chrome) <> "/new"
   def issue_path(chrome, number), do: issues_path(chrome) <> "/" <> encode_segment(number)

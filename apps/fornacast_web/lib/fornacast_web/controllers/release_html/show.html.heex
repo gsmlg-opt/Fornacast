@@ -1,0 +1,55 @@
+<RepositoryHTML.repository_frame result={@result} active={:releases}>
+  <section class="grid min-w-0 gap-3 p-4" data-release-page>
+    <header class="bg-surface-container text-on-surface rounded-lg p-4">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div class="min-w-0">
+          <p class="text-xs text-on-surface-variant">
+            Release {@result.content.release.tag_name}
+          </p>
+          <h2 class="text-lg font-semibold">{release_name(@result.content.release)}</h2>
+          <p class="mt-1 text-sm text-on-surface-variant">
+            Published by {author_name(@result.content.release.author)} · {format_time(
+              @result.content.release.published_at || @result.content.release.inserted_at
+            )}
+          </p>
+        </div>
+        <.dm_badge variant={state_variant(@result.content.release)} soft size="sm">
+          {release_state(@result.content.release)}
+        </.dm_badge>
+      </div>
+
+      <dl class="mt-4 grid gap-2 text-sm md:grid-cols-2">
+        <div>
+          <dt class="text-on-surface-variant">Tag</dt>
+          <dd><code>{@result.content.release.tag_name}</code></dd>
+        </div>
+        <div>
+          <dt class="text-on-surface-variant">Target</dt>
+          <dd><code>{@result.content.release.target_commitish}</code></dd>
+        </div>
+      </dl>
+
+      <div class="mt-4 flex flex-wrap gap-3">
+        <.dm_link
+          :if={@result.content.release.capabilities.can_edit}
+          href={edit_release_path(@result.chrome, @result.content.release.id)}
+        >
+          Edit release
+        </.dm_link>
+        <form
+          :if={@result.content.release.capabilities.can_delete}
+          action={release_path(@result.chrome, @result.content.release.id)}
+          method="post"
+        >
+          <input type="hidden" name="_csrf_token" value={csrf_token()} />
+          <input type="hidden" name="_method" value="delete" />
+          <.dm_btn type="submit" variant="error" size="sm">Delete release</.dm_btn>
+        </form>
+      </div>
+    </header>
+
+    <article class="prose max-w-none bg-surface-container text-on-surface rounded-lg border border-outline-variant p-4">
+      {markdown(@result.content.release.body)}
+    </article>
+  </section>
+</RepositoryHTML.repository_frame>

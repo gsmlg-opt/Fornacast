@@ -1,13 +1,24 @@
 defmodule FornacastWeb.RepositoryCollaborationPage do
   @moduledoc """
-  Composes issue and pull domain reads with the shared repository chrome.
+  Composes issue, pull, and release domain reads with the shared repository chrome.
   """
 
   alias ForgeAccounts.User
   alias ForgeRepos.Repository
   alias FornacastWeb.RepositoryPage
 
-  @collaboration_kinds [:issues, :issue, :pulls, :pull, :pull_commits, :pull_files]
+  @collaboration_kinds [
+    :issues,
+    :issue,
+    :pulls,
+    :pull,
+    :pull_commits,
+    :pull_files,
+    :releases,
+    :release,
+    :release_new,
+    :release_edit
+  ]
 
   @type result :: {:ok, %RepositoryPage.Result{}} | {:error, term()}
 
@@ -107,6 +118,107 @@ defmodule FornacastWeb.RepositoryCollaborationPage do
     end
   end
 
+  @spec releases(Repository.t(), User.t(), User.t() | nil, map(), keyword()) :: result()
+  def releases(repository, owner, viewer, filters, opts \\ [])
+      when is_map(filters) and is_list(opts) do
+    releases = Keyword.get(opts, :forge_releases, ForgeReleases)
+
+    with {:ok, page} <- releases.list(viewer, owner.username, repository.slug, filters) do
+      compose(
+        repository,
+        owner,
+        viewer,
+        :releases,
+        %{
+          releases: page,
+          can_create: Fornacast.Access.allowed?(viewer, :repository_write, repository)
+        },
+        opts
+      )
+    end
+  end
+
+  @spec release(Repository.t(), User.t(), User.t() | nil, pos_integer(), keyword()) :: result()
+  def release(repository, owner, viewer, id, opts \\ [])
+      when is_integer(id) and id > 0 and is_list(opts) do
+    releases = Keyword.get(opts, :forge_releases, ForgeReleases)
+
+    with {:ok, release} <- releases.get(viewer, owner.username, repository.slug, id) do
+      compose(repository, owner, viewer, :release, %{release: release}, opts)
+    end
+  end
+
+  @spec release_by_tag(Repository.t(), User.t(), User.t() | nil, String.t(), keyword()) ::
+          result()
+  def release_by_tag(repository, owner, viewer, tag, opts \\ [])
+      when is_binary(tag) and is_list(opts) do
+    releases = Keyword.get(opts, :forge_releases, ForgeReleases)
+
+    with {:ok, release} <- releases.get_by_tag(viewer, owner.username, repository.slug, tag) do
+      compose(repository, owner, viewer, :release, %{release: release}, opts)
+    end
+  end
+
+  @spec release_form(
+          Repository.t(),
+          User.t(),
+          User.t(),
+          :new | {:edit, pos_integer()},
+          map(),
+          list(),
+          keyword()
+        ) :: result()
+  def release_form(repository, owner, viewer, mode, values, errors, opts \\ [])
+
+  def release_form(repository, owner, %User{} = viewer, :new, values, errors, opts)
+      when is_map(values) and is_list(errors) and is_list(opts) do
+    if Fornacast.Access.allowed?(viewer, :repository_write, repository) do
+      compose(
+        repository,
+        owner,
+        viewer,
+        :release_new,
+        %{release: nil, values: values, errors: errors},
+        opts
+      )
+    else
+      {:error, :forbidden}
+    end
+  end
+
+  def release_form(
+        repository,
+        owner,
+        %User{} = viewer,
+        {:edit, id},
+        values,
+        errors,
+        opts
+      )
+      when is_integer(id) and id > 0 and is_map(values) and is_list(errors) and is_list(opts) do
+    releases = Keyword.get(opts, :forge_releases, ForgeReleases)
+
+    with {:ok, release} <- releases.get(viewer, owner.username, repository.slug, id),
+         true <- release.capabilities.can_edit do
+      values = if values == %{}, do: release_values(release), else: values
+
+      compose(
+        repository,
+        owner,
+        viewer,
+        :release_edit,
+        %{release: release, values: values, errors: errors},
+        opts
+      )
+    else
+      false -> {:error, :forbidden}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def release_form(_repository, _owner, _viewer, _mode, _values, _errors, _opts),
+    do: {:error, :forbidden}
+
   defp compose(repository, owner, viewer, kind, content, opts) do
     repository_page = Keyword.get(opts, :repository_page, RepositoryPage)
     git_core = Keyword.get(opts, :git_core, GitCore)
@@ -130,6 +242,17 @@ defmodule FornacastWeb.RepositoryCollaborationPage do
       {:error, _reason} ->
         %{issues: nil, pull_requests: nil}
     end
+  end
+
+  defp release_values(release) do
+    %{
+      "tag_name" => release.tag_name,
+      "name" => release.name,
+      "body" => release.body,
+      "target_commitish" => release.target_commitish,
+      "draft" => release.draft,
+      "prerelease" => release.prerelease
+    }
   end
 
   defp pull_page_options(params) do
