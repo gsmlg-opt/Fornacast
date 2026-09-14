@@ -4,9 +4,9 @@ Source: `docs/fornacast-github-org-sync-prd.md`, section 13 (all 22 criteria).
 
 This is a working evidence ledger, not a completion declaration. A test entrypoint
 below identifies relevant coverage; its existence alone does not prove acceptance.
-The full goal remains open. PR11 through PR15 and bounded PR16 foundations have
-local implementation and focused integration proof. The remaining PR16 work and
-the complete acceptance matrix remain open.
+The full goal remains open. PR11 through PR16 have local implementation and
+focused integration proof. The remaining gate is the external, two-endpoint
+acceptance matrix, including a synchronized clone/checkout from GitHub.
 
 ## Requirement-by-requirement gates
 
@@ -84,8 +84,7 @@ the complete acceptance matrix remain open.
   and confirmed assignee-ID baseline. Its focused integration test and independent
   P0/P1/P2 review pass. Criterion 20 is locally accepted for repository metadata,
   Git/LFS, issues, labels, assignees, comments, pull requests, and releases.
-  Criterion 11 still requires real clone/checkout proof from both endpoints, and
-  criteria 18 and 19 still require their complete event-order and restart matrices.
+  Criterion 11 still requires real clone/checkout proof from both endpoints.
 - Commits `0a1d78b`, `f33d5d3`, and `da72c12` complete the local pause and
   revocation matrix across inventory, repository creation/metadata, Git/LFS,
   issues/comments, pull synchronization/creation/merge, releases, and the
@@ -113,6 +112,29 @@ the complete acceptance matrix remain open.
   changed-file formatting, diff checks, and two final P0/P1/P2 cross-reviews
   passed. Criteria 21 and 22 are locally accepted; live GitHub disconnect proof
   remains part of final external acceptance.
+- Commit `68fbacd` completes the local duplicate/out-of-order matrix. Distinct
+  issue, comment, pull-request, and release delivery GUIDs retain only immutable
+  routing identities, and every resource worker re-reads the same canonical
+  provider state. The first operation applies one domain version/event; the
+  older operation confirms the same mapping without another mutation or
+  provider-origin outbox event. The release path uses the real metadata client,
+  durable tag-proof split, Git-ref confirmation, and release continuation for
+  both deliveries rather than stopping at webhook scheduling.
+- Commit `b2156f9` closes the remaining restart evidence for release deletion. A
+  real persisted `sync.release` operation moves to `effect_pending`, releases
+  its lease while retaining the exact delete marker, and is reclaimed by a new
+  owner with the same marker and mark time. The restarted worker then confirms
+  immutable-ID absence and completes without a second DELETE. Together with the
+  existing inventory, Git/LFS, repository create/metadata, issue/comment,
+  pull-create/sync/merge, release create/update, checkpoint, lease-expiry, and
+  marker-replacement cases, this completes the local operation-boundary restart
+  matrix.
+- The final event/restart gate passed **21 ForgeMirrors tests** and **113 of 115
+  ForgeGitHub tests**. The two failures were the documented shared numeric
+  fixture collisions; all **8 changed acceptance selectors** passed together.
+  Exact formatting, diff checks, warnings-as-errors compilation, and two
+  independent P0/P1/P2 reviews passed. Criteria 18 and 19 are locally accepted;
+  live two-endpoint acceptance remains external.
 
 - Organization owners and active site administrators now have three bounded,
   durable repository-metadata conflict actions: accept the exact canonical
@@ -1052,13 +1074,13 @@ PR13 integration audit additionally identified these concrete remaining gates:
 | 10 | Divergence is visible and neither side overwritten | Conflict persistence/worker tests exist. Finish and verify conflict UX in PR16. |
 | 11 | LFS clone and checkout succeed from either endpoint after sync | Actual Fornacast smart-HTTP clone with official git-lfs 3.7.1 checks out 128 KiB with matching SHA-256. Existing official SSH LFS transfer coverage is also present. Remote endpoint plus full synchronization-to-clone chain remain unproven. |
 | 12 | Missing/corrupt LFS blocks confirmation and degrades sync | Focused worker, storage, durable 101-pointer replay, and authoritative-scan tests pass. Finalizer queue/catch-up review fixes are committed in `acedead`; retain the full integrated gate in final acceptance. |
-| 13 | Issue/comment changes converge both ways | PR12 local worker, mapping, effect recovery, label materialization, signed ingress and bootstrap activation are implemented through `f45097e`; combined activation matrix: 150 passed. Real domain/lease/HTTP-stub tests cover both directions and omitted comment deletion. Complete end-to-end acceptance and restart matrix remain open. |
+| 13 | Issue/comment changes converge both ways | PR12 local worker, mapping, effect recovery, label materialization, signed ingress and bootstrap activation are implemented through `f45097e`; combined activation matrix: 150 passed. Real domain/lease/HTTP-stub tests cover both directions and omitted comment deletion. Retain live two-endpoint acceptance. |
 | 14 | Same-repository PR metadata converges both ways | Locally accepted in PR13, including represented cross-repository synchronization, unrepresented read-only behavior and trusted late head representation. Retain live GitHub validation in final acceptance. |
 | 15 | Coordinated PR merge produces one confirmed Git result | Locally accepted through real API admission, disjoint repositories, exact provider Git CAS, lost-response worker restart, provider re-observation, one merge result and matching local/provider pull state. Retain live GitHub validation in final acceptance. |
 | 16 | Release metadata converges and stays bound to a confirmed tag | PR14 local domain/API/web and PR15 bootstrap/incremental synchronization are locally accepted. Fresh two-sided tag proof, retarget conflicts, immutable provider identity, marker replacement and newer-local recovery are covered. Retain live GitHub proof in final acceptance. |
 | 17 | Release assets and wiki never synchronize | PR14 exposes no asset API/UI. PR15 strips provider asset payloads, retains only a bounded warning count, reports bootstrap exclusions, ignores release-asset identities and keeps wiki unsupported. Retain full PR16 reconciliation negatives and live proof. |
-| 18 | Duplicate/out-of-order webhooks neither duplicate nor regress | Inbox foundation tests exist. Extend resource-specific fixtures for issues/comments, PRs, and releases. |
-| 19 | Every operation boundary recovers after restart | Git/LFS checkpoint, lease, marker-replacement and rate-limit recovery tests pass. Pull-merge LFS now marks before transfer and reclaims the exact saved cursor without blind replay. Metadata create/update/delete/merge boundaries and the consolidated restart matrix remain open. |
+| 18 | Duplicate/out-of-order webhooks neither duplicate nor regress | Locally accepted in PR16. Distinct issue, comment, pull, and release deliveries retain immutable hints, re-read canonical provider state, converge one domain version/mapping baseline, and emit no duplicate provider-origin event. |
+| 19 | Every operation boundary recovers after restart | Locally accepted across inventory/finalization, Git/LFS, repository create/metadata, issues/comments, pull create/sync/merge, and release create/update/delete. Durable leases, cursors, checkpoints, exact effect markers, ambiguous-result reads, and no-replay recovery are covered. |
 | 20 | Full reconciliation repairs omitted deliveries | Locally accepted in PR16. One immutable owner-scheduled sweep now repairs intentionally omitted repository metadata, Git/LFS, issue/comment/label/assignee, pull, and release deliveries through real workers with zero inbox rows; `last_reconciled_at` advances only after every marker-bearing branch and finalizer completes. Retain two-endpoint/live GitHub proof in final acceptance. |
 | 21 | Pause prevents new effects but retains work | Locally accepted in PR16 across inventory/finalizers, repository creation/metadata, Git/LFS, issues/comments, pulls/create/merge, and releases. Pre-effect and post-marker fences stop credentials/provider effects while preserving queued work, lease recovery, markers, and LFS cursors for resume. |
 | 22 | Disconnect/revocation stops token use and retains local repos | Locally accepted in PR16 across all worker families and in-flight marked recovery. Real deletion processing revokes authorization before token invalidation, prevents later claims/provider use, and retains the local repository, refs, LFS data, and durable marker. Retain the live GitHub disconnect flow in final external acceptance. |
