@@ -126,9 +126,10 @@ defmodule ForgeGitHub.ReleaseSyncWorker do
         options
       ) do
     with {:ok, sync} <- context(operation, options),
+         {:ok, authorized_operation} <- authorize_recovery(operation, options),
          {:ok, token} <- installation_token(sync, options),
          {:ok, local} <- local_observation(sync, options) do
-      continue(operation, now, sync, token, local, options)
+      continue(authorized_operation, now, sync, token, local, options)
     else
       {:error, reason} -> handle_context_failure(operation, now, reason, options)
     end
@@ -469,10 +470,11 @@ defmodule ForgeGitHub.ReleaseSyncWorker do
   defp effect_action(_remote, :deleted), do: "delete_remote_release"
   defp effect_action(_remote, _target), do: "update_remote_release"
 
-  defp execute_marked_effect(operation, now, sync, token, local, _remote, options) do
+  defp execute_marked_effect(operation, now, sync, _token, local, _remote, options) do
     marker = operation.external_effect_marker
 
-    with {:ok, attrs} <- target_attrs(marker, local),
+    with {:ok, token} <- authorize_effect_token(operation, sync, options),
+         {:ok, attrs} <- target_attrs(marker, local),
          {:ok, postcondition} <- execute_effect(marker, sync, token, attrs, now, options) do
       apply_local? = local_needs_provider_canonical?(local, postcondition)
       confirm_observation(operation, now, sync, local, postcondition, apply_local?, options)
@@ -482,6 +484,36 @@ defmodule ForgeGitHub.ReleaseSyncWorker do
   rescue
     _exception -> schedule_effect_recovery(operation, now, :worker_crash, options)
   end
+
+  defp authorize_effect_token(
+         %MirrorOperation{external_effect_marker: marker} = operation,
+         sync,
+         options
+       )
+       when is_map(marker) do
+    with {:ok, _authorized} <-
+           callback(options, :authorize_effect, &ForgeMirrors.authorize_external_effect/2).(
+             operation,
+             marker
+           ),
+         {:ok, token} <- installation_token(sync, options) do
+      {:ok, token}
+    end
+  end
+
+  defp authorize_effect_token(_operation, _sync, _options), do: {:error, :invalid_transition}
+
+  defp authorize_recovery(%MirrorOperation{state: :effect_pending} = operation, options) do
+    callback(options, :authorize_effect, &ForgeMirrors.authorize_external_effect/2).(
+      operation,
+      operation.external_effect_marker
+    )
+  end
+
+  defp authorize_recovery(%MirrorOperation{state: :processing} = operation, _options),
+    do: {:ok, operation}
+
+  defp authorize_recovery(%MirrorOperation{}, _options), do: {:error, :invalid_transition}
 
   defp target_attrs(%{"action" => "delete_remote_release"}, _local), do: {:ok, %{}}
 

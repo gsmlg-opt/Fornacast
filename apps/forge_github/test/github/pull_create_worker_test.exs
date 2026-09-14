@@ -125,6 +125,10 @@ defmodule ForgeGitHub.PullCreateWorkerTest do
         send(self(), :marked)
         {:ok, %{operation: marked, intent: intent, marker: marker, newly_marked: true}}
       end,
+      authorize_effect: fn operation, expected_marker ->
+        assert operation.external_effect_marker == expected_marker
+        {:ok, operation}
+      end,
       recovery_context: fn op -> {:ok, %{recovery | marker: op.external_effect_marker}} end,
       identify: fn op, _, _, pair ->
         send(self(), {:identified, pair})
@@ -226,6 +230,44 @@ defmodule ForgeGitHub.PullCreateWorkerTest do
     assert_received {:checkpoint, _, _}
     refute_received :posted
     refute_received {:confirmed, _}
+  end
+
+  for reason <- [:paused, :revoked, :permission_missing] do
+    test "a post-marker #{reason} fence stops pull creation before a fresh token or POST", c do
+      parent = self()
+
+      options =
+        Keyword.merge(c.options,
+          token_fetch: fn _, %{permissions: permissions} ->
+            send(parent, :token_fetched)
+
+            %InstallationToken{
+              token: "fixture-installation-token",
+              expires_at: DateTime.add(c.now, 3600),
+              permissions: permissions
+            }
+          end,
+          authorize_effect: fn operation, expected_marker ->
+            assert operation.state == :effect_pending
+            assert operation.external_effect_marker == expected_marker
+            send(parent, :effect_authorized)
+            {:error, unquote(reason)}
+          end,
+          create_pull: fn _, _, _, _, _ ->
+            flunk("denied post-marker creation must not POST")
+          end
+        )
+
+      assert {:ok, _deferred} =
+               PullCreateWorker.process_operation(c.operation, c.now, c.sync, options)
+
+      assert_received :marked
+      assert_received :token_fetched
+      assert_received :effect_authorized
+      assert_received {:deferred, marker, "resource_context_unavailable"}
+      assert marker == c.marker
+      refute_received :token_fetched
+    end
   end
 
   test "ambiguous POST retains marked operation and never retries POST", c do
@@ -427,6 +469,55 @@ defmodule ForgeGitHub.PullCreateWorkerTest do
     assert {:ok, _} = PullCreateWorker.process_operation(c.marked, c.now, c.recovery, opts)
     assert Process.get(:contexts) == 3
     refute_received {:confirmed, _}
+  end
+
+  test "a post-preflight pause fence prevents cleanup PATCH and a fresh token", c do
+    c = identified(c)
+    parent = self()
+    Process.put(:cleanup_authorizations, 0)
+
+    opts =
+      c.options
+      |> Keyword.put(:token_fetch, fn _, %{permissions: permissions} ->
+        send(parent, :token_fetched)
+
+        %InstallationToken{
+          token: "fixture-installation-token",
+          expires_at: DateTime.add(c.now, 3_600),
+          permissions: permissions
+        }
+      end)
+      |> Keyword.put(:authorize_effect, fn operation, expected_marker ->
+        assert operation.external_effect_marker == expected_marker
+        calls = Process.get(:cleanup_authorizations) + 1
+        Process.put(:cleanup_authorizations, calls)
+        send(parent, :cleanup_authorized)
+
+        if calls == 1, do: {:ok, operation}, else: {:error, :paused}
+      end)
+      |> Keyword.put(:update_pull_issue, fn _, _, _, _, _, _ ->
+        flunk("paused cleanup must not PATCH")
+      end)
+
+    Req.Test.stub(c.stub, fn conn ->
+      assert conn.method == "GET"
+
+      Req.Test.json(
+        conn,
+        if(String.contains?(conn.request_path, "/pulls/"),
+          do: pull(c, :transport),
+          else: issue(c, :transport)
+        )
+      )
+    end)
+
+    assert {:ok, _} = PullCreateWorker.process_operation(c.marked, c.now, c.recovery, opts)
+    assert_received :token_fetched
+    assert_received :cleanup_authorized
+    assert_received :cleanup_authorized
+    assert_received {:deferred, marker, "resource_context_unavailable"}
+    assert marker == c.marked.external_effect_marker
+    refute_received :token_fetched
   end
 
   test "cleanup preserves supported relationship sets larger than one listing page", c do

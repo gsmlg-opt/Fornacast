@@ -148,6 +148,203 @@ defmodule ForgeMirrors.GitRefSyncPersistenceTest do
     assert reclaimed.external_effect_marker == marker
   end
 
+  test "post-marker pause denies an external effect without changing its durable marker",
+       context do
+    now = DateTime.utc_now(:second)
+    operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)
+    marker = %{"action" => "apply_remote", "ref" => "refs/heads/main", "proposed_oid" => @oid}
+
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, now, marker)
+    authorize_ready!(context, marked, marker)
+
+    organization = Repo.get!(ForgeMirrors.OrganizationMirror, context.organization_mirror.id)
+
+    assert {:ok, _paused} =
+             ForgeMirrors.pause(
+               organization_owner_fixture(organization),
+               organization
+             )
+
+    assert {:error, :paused} = ForgeMirrors.authorize_external_effect(marked, marker)
+    assert Repo.get!(MirrorOperation, marked.id).external_effect_marker == marker
+    assert Repo.get!(MirrorOperation, marked.id).state == :effect_pending
+  end
+
+  test "a long-running Git LFS effect reauthorization observes a later pause", context do
+    now = DateTime.utc_now(:second)
+    operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)
+
+    marker = %{
+      "action" => "apply_remote",
+      "ref" => "refs/heads/main",
+      "expected_oid" => nil,
+      "proposed_oid" => @oid,
+      "lfs_required" => true
+    }
+
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, now, marker)
+    prepare_git_ref_authorization!(context, %{"git" => "enabled", "lfs" => "enabled"})
+
+    assert {:ok, authorized} = ForgeMirrors.authorize_git_lfs_effect(marked, marker)
+    assert authorized.id == marked.id
+
+    organization = Repo.get!(ForgeMirrors.OrganizationMirror, context.organization_mirror.id)
+
+    organization
+    |> Ecto.Changeset.change(capabilities: %{"git" => "enabled", "lfs" => "disabled"})
+    |> Repo.update!()
+
+    assert {:error, :permission_missing} =
+             ForgeMirrors.authorize_git_lfs_effect(marked, marker)
+
+    organization =
+      organization
+      |> Ecto.Changeset.change(capabilities: %{"git" => "enabled", "lfs" => "enabled"})
+      |> Repo.update!()
+
+    assert {:ok, _paused} =
+             ForgeMirrors.pause(
+               organization_owner_fixture(organization),
+               organization
+             )
+
+    assert {:error, :paused} = ForgeMirrors.authorize_git_lfs_effect(marked, marker)
+  end
+
+  test "Git LFS authorization rejects an ordinary exact Git effect marker", context do
+    now = DateTime.utc_now(:second)
+    operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)
+    marker = %{"action" => "apply_remote", "ref" => "refs/heads/main", "proposed_oid" => @oid}
+
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, now, marker)
+    prepare_git_ref_authorization!(context, %{"git" => "enabled", "lfs" => "enabled"})
+
+    assert {:error, :invalid_transition} =
+             ForgeMirrors.authorize_git_lfs_effect(marked, marker)
+  end
+
+  test "Git LFS authorization rejects a marker for a different ref", context do
+    now = DateTime.utc_now(:second)
+    operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)
+
+    marker = %{
+      "action" => "apply_remote",
+      "ref" => "refs/heads/other",
+      "expected_oid" => nil,
+      "proposed_oid" => @oid,
+      "lfs_required" => true
+    }
+
+    operation_marker = %{marker | "ref" => "refs/heads/main"}
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, now, operation_marker)
+    prepare_git_ref_authorization!(context, %{"git" => "enabled", "lfs" => "enabled"})
+
+    assert {:error, :invalid_transition} =
+             ForgeMirrors.authorize_git_lfs_effect(marked, marker)
+  end
+
+  test "post-marker revocation denies an external effect without changing its durable marker",
+       context do
+    now = DateTime.utc_now(:second)
+    operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)
+    marker = %{"action" => "apply_remote", "ref" => "refs/heads/main", "proposed_oid" => @oid}
+
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, now, marker)
+    authorize_ready!(context, marked, marker)
+
+    installation =
+      Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+        github_installation_id: context.organization_mirror.github_installation_id
+      )
+
+    installation
+    |> Ecto.Changeset.change(state: :revoked)
+    |> Repo.update!()
+
+    assert {:error, :revoked} = ForgeMirrors.authorize_external_effect(marked, marker)
+    assert Repo.get!(MirrorOperation, marked.id).external_effect_marker == marker
+    assert Repo.get!(MirrorOperation, marked.id).state == :effect_pending
+  end
+
+  test "post-marker permission downgrade denies an external effect without changing its marker",
+       context do
+    now = DateTime.utc_now(:second)
+    operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)
+    marker = %{"action" => "apply_remote", "ref" => "refs/heads/main", "proposed_oid" => @oid}
+
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, now, marker)
+    authorize_ready!(context, marked, marker)
+
+    installation =
+      Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+        github_installation_id: context.organization_mirror.github_installation_id
+      )
+
+    installation
+    |> Ecto.Changeset.change(permissions: %{"metadata" => "read"})
+    |> Repo.update!()
+
+    assert {:error, :permission_missing} = ForgeMirrors.authorize_external_effect(marked, marker)
+    assert Repo.get!(MirrorOperation, marked.id).external_effect_marker == marker
+    assert Repo.get!(MirrorOperation, marked.id).state == :effect_pending
+  end
+
+  test "post-marker Git capability downgrade denies an external effect without changing its marker",
+       context do
+    now = DateTime.utc_now(:second)
+    operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)
+    marker = %{"action" => "apply_remote", "ref" => "refs/heads/main", "proposed_oid" => @oid}
+
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, now, marker)
+    authorize_ready!(context, marked, marker)
+
+    Repo.get!(ForgeMirrors.OrganizationMirror, context.organization_mirror.id)
+    |> Ecto.Changeset.change(capabilities: %{"git" => "disabled"})
+    |> Repo.update!()
+
+    assert {:error, :permission_missing} = ForgeMirrors.authorize_external_effect(marked, marker)
+    assert Repo.get!(MirrorOperation, marked.id).external_effect_marker == marker
+    assert Repo.get!(MirrorOperation, marked.id).state == :effect_pending
+  end
+
+  test "external effect authorization rejects a mismatched marker without changing the marker",
+       context do
+    now = DateTime.utc_now(:second)
+    operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)
+    marker = %{"action" => "apply_remote", "ref" => "refs/heads/main", "proposed_oid" => @oid}
+
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, now, marker)
+    authorize_ready!(context, marked, marker)
+
+    assert {:error, :invalid_transition} =
+             ForgeMirrors.authorize_external_effect(
+               marked,
+               Map.put(marker, "proposed_oid", @other_oid)
+             )
+
+    assert Repo.get!(MirrorOperation, marked.id).external_effect_marker == marker
+    assert Repo.get!(MirrorOperation, marked.id).state == :effect_pending
+  end
+
+  test "external effect authorization rejects a stale lease without changing the marker",
+       context do
+    now = DateTime.utc_now(:second)
+    operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)
+    marker = %{"action" => "apply_remote", "ref" => "refs/heads/main", "proposed_oid" => @oid}
+
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, now, marker)
+    authorize_ready!(context, marked, marker)
+
+    Repo.update_all(
+      from(operation in MirrorOperation, where: operation.id == ^marked.id),
+      set: [lease_expires_at: DateTime.add(now, -1)]
+    )
+
+    assert {:error, :lost_lease} = ForgeMirrors.authorize_external_effect(marked, marker)
+    assert Repo.get!(MirrorOperation, marked.id).external_effect_marker == marker
+    assert Repo.get!(MirrorOperation, marked.id).state == :effect_pending
+  end
+
   test "effect marker replacement compares and swaps the recorded recovery intent", context do
     now = DateTime.utc_now(:second)
     operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)
@@ -692,6 +889,40 @@ defmodule ForgeMirrors.GitRefSyncPersistenceTest do
     assert sync.ref_kind == :branch
     assert sync.remote_repository != ""
     assert sync.github_installation_id == installation.github_installation_id
+  end
+
+  defp authorize_ready!(context, operation, marker) do
+    prepare_git_ref_authorization!(context)
+
+    assert {:ok, authorized} = ForgeMirrors.authorize_external_effect(operation, marker)
+    assert authorized.external_effect_marker == marker
+  end
+
+  defp prepare_git_ref_authorization!(context, capabilities \\ %{"git" => "enabled"}) do
+    prepare_git_ref_repository!(context)
+
+    Repo.get!(ForgeMirrors.OrganizationMirror, context.organization_mirror.id)
+    |> Ecto.Changeset.change(capabilities: capabilities)
+    |> Repo.update!()
+
+    Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+      github_installation_id: context.organization_mirror.github_installation_id
+    )
+    |> Ecto.Changeset.change(permissions: %{"contents" => "write", "metadata" => "read"})
+    |> Repo.update!()
+  end
+
+  defp prepare_git_ref_repository!(context) do
+    relative_path = "git-ref-external-effect/#{Ecto.UUID.generate()}.git"
+    repository_path = Fornacast.Storage.repository_path!(relative_path)
+    File.mkdir_p!(Path.dirname(repository_path))
+    assert {:ok, _path} = GitCore.init_bare(repository_path)
+    on_exit(fn -> File.rm_rf!(repository_path) end)
+
+    context.repository_mirror.repository_id
+    |> then(&Repo.get!(Repository, &1))
+    |> Ecto.Changeset.change(storage_path: relative_path)
+    |> Repo.update!()
   end
 
   defp operation(context, ref_name, dedupe_key, now) do

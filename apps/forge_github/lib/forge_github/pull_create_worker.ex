@@ -34,10 +34,11 @@ defmodule ForgeGitHub.PullCreateWorker do
       when is_map(sync) and is_list(options) do
     guarded(operation, now, options, fn ->
       result =
-        with {:ok, token} <- token(sync, options) do
-          if operation.state == :processing and sync.phase == :unmarked,
-            do: first(operation, now, sync, token, options),
-            else: recover(operation, now, sync, token, options)
+        with {:ok, authorized_operation} <- authorize_recovery(operation, options),
+             {:ok, token} <- token(sync, options) do
+          if authorized_operation.state == :processing and sync.phase == :unmarked,
+            do: first(authorized_operation, now, sync, token, options),
+            else: recover(authorized_operation, now, sync, token, options)
         else
           {:error, reason} ->
             if operation.state == :processing,
@@ -76,18 +77,21 @@ defmodule ForgeGitHub.PullCreateWorker do
 
               if marked.newly_marked do
                 with {:ok, attrs} <- create_attrs(recovery),
+                     {:ok, authorized} <-
+                       authorize_effect(marked.operation, marked.marker, options),
+                     {:ok, fresh_token} <- token(sync, options),
                      {:ok, created} <-
                        callback(options, :create_pull, &PullClient.create_pull/5).(
-                         token,
+                         fresh_token,
                          sync.remote_owner,
                          sync.remote_repository,
                          attrs,
                          request_options(sync, options)
                        ),
-                     {:ok, pair} <- observe_pair(sync, token, created["number"], options),
+                     {:ok, pair} <- observe_pair(sync, fresh_token, created["number"], options),
                      true <- candidate_matches?(candidate(created), pair),
                      {:ok, identified} <-
-                       identify(marked.operation, now, marked.marker, pair, options) do
+                       identify(authorized, now, marked.marker, pair, options) do
                   yield_identified(identified.operation, now, options)
                 else
                   false -> failure(marked.operation, now, :identity_conflict, options)
@@ -120,6 +124,21 @@ defmodule ForgeGitHub.PullCreateWorker do
 
   defp recover(operation, now, _sync, _token, options),
     do: failure(operation, now, :invalid_transition, options)
+
+  defp authorize_effect(operation, marker, options) do
+    callback(options, :authorize_effect, &ForgeMirrors.authorize_external_effect/2).(
+      operation,
+      marker
+    )
+  end
+
+  defp authorize_recovery(%MirrorOperation{state: :effect_pending} = operation, options),
+    do: authorize_effect(operation, operation.external_effect_marker, options)
+
+  defp authorize_recovery(%MirrorOperation{state: :processing} = operation, _options),
+    do: {:ok, operation}
+
+  defp authorize_recovery(%MirrorOperation{}, _options), do: {:error, :invalid_transition}
 
   defp recover_unresolved(operation, now, sync, token, options) do
     scan = Map.get(sync, :recovery_checkpoint) || scan(operation)
@@ -347,6 +366,9 @@ defmodule ForgeGitHub.PullCreateWorker do
              &ForgeMirrors.outbound_pull_creation_recovery_context/1
            ).(operation),
          true <- same_active_context?(sync, authorized),
+         {:ok, authorized_operation} <-
+           authorize_effect(operation, operation.external_effect_marker, options),
+         {:ok, fresh_token} <- token(sync, options),
          attrs =
            Map.merge(
              Map.take(sync.intent.payload["issue_snapshot"], ~w(title body state state_reason)),
@@ -354,17 +376,18 @@ defmodule ForgeGitHub.PullCreateWorker do
            ),
          {:ok, _} <-
            callback(options, :update_pull_issue, &IssueClient.update_pull_issue/6).(
-             token,
+             fresh_token,
              sync.remote_owner,
              sync.remote_repository,
              before.pull.github_number,
              attrs,
              request_options(sync, options)
            ),
-         {:ok, after_effect} <- observe_pair(sync, token, before.pull.github_number, options),
+         {:ok, after_effect} <-
+           observe_pair(sync, fresh_token, before.pull.github_number, options),
          true <-
            identified_pair?(sync, after_effect) and phase(sync.intent, after_effect) == :desired do
-      confirm(operation, now, sync, after_effect, token, options)
+      confirm(authorized_operation, now, sync, after_effect, fresh_token, options)
     else
       false -> failure(operation, now, :identity_conflict, options)
       {:error, reason} -> failure(operation, now, reason, options)

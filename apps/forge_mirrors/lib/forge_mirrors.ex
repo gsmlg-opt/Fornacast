@@ -4477,9 +4477,133 @@ defmodule ForgeMirrors do
   def record_inventory_page(_operation, _repositories, _next_cursor, _observed_at),
     do: {:error, :invalid_argument}
 
+  @doc false
+  @spec authorize_external_effect(MirrorOperation.t(), map()) ::
+          {:ok, MirrorOperation.t()}
+          | {:error,
+             :invalid_argument
+             | :invalid_transition
+             | :lost_lease
+             | :paused
+             | :permission_missing
+             | :revoked}
+  def authorize_external_effect(
+        %MirrorOperation{state: :effect_pending} = supplied,
+        expected_marker
+      )
+      when is_map(expected_marker) do
+    Repo.transaction(fn ->
+      with {:ok, operation, scope} <- lock_authorized_external_effect(supplied, expected_marker),
+           :ok <- authorize_external_effect_installation(operation, scope) do
+        operation
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> normalize_transaction_result()
+  rescue
+    _exception -> {:error, :lost_lease}
+  end
+
+  def authorize_external_effect(%MirrorOperation{}, _expected_marker),
+    do: {:error, :invalid_transition}
+
+  def authorize_external_effect(_, _), do: {:error, :invalid_argument}
+
+  @doc false
+  @spec authorize_git_lfs_effect(MirrorOperation.t(), map()) ::
+          {:ok, MirrorOperation.t()}
+          | {:error,
+             :invalid_argument
+             | :invalid_transition
+             | :lost_lease
+             | :paused
+             | :permission_missing
+             | :revoked}
+  def authorize_git_lfs_effect(
+        %MirrorOperation{kind: "sync.git_ref", state: :effect_pending} = supplied,
+        expected_marker
+      )
+      when is_map(expected_marker) do
+    Repo.transaction(fn ->
+      with ref_name when is_binary(ref_name) <- supplied.cursor["ref_name"],
+           :ok <- validate_git_lfs_effect_marker(expected_marker, ref_name),
+           :ok <- lock_effect_scope(supplied),
+           {:ok, operation} <- lock_owned_git_ref_operation(supplied, ref_name),
+           true <- operation.state == :effect_pending,
+           true <- operation.external_effect_marker == expected_marker,
+           {:ok, scope} <- load_git_ref_scope(operation),
+           true <- scope.git_enabled and scope.lfs_enabled,
+           :ok <-
+             authorize_external_effect_installation(operation, %{
+               github_installation_id: scope.github_installation_id,
+               permissions: %{"contents" => "write", "metadata" => "read"}
+             }) do
+        operation
+      else
+        false -> Repo.rollback(:permission_missing)
+        {:error, reason} -> Repo.rollback(reason)
+        _ -> Repo.rollback(:invalid_transition)
+      end
+    end)
+    |> normalize_transaction_result()
+  rescue
+    _exception -> {:error, :lost_lease}
+  end
+
+  def authorize_git_lfs_effect(%MirrorOperation{}, _), do: {:error, :invalid_transition}
+  def authorize_git_lfs_effect(_, _), do: {:error, :invalid_argument}
+
+  defp validate_git_lfs_effect_marker(
+         %{
+           "lfs_required" => true,
+           "action" => action,
+           "ref" => ref,
+           "expected_oid" => expected_oid,
+           "proposed_oid" => proposed_oid
+         },
+         ref
+       )
+       when action in ["apply_local", "apply_remote"] do
+    if standard_git_ref?(ref) and optional_oid?(expected_oid) and canonical_oid?(proposed_oid),
+      do: :ok,
+      else: {:error, :invalid_transition}
+  end
+
+  defp validate_git_lfs_effect_marker(
+         %{
+           "lfs_required" => true,
+           "action" => action,
+           "ref" => ref,
+           "expected_oid" => expected_oid
+         },
+         ref
+       )
+       when action in ["delete_local", "delete_remote"] do
+    if standard_git_ref?(ref) and canonical_oid?(expected_oid),
+      do: :ok,
+      else: {:error, :invalid_transition}
+  end
+
+  defp validate_git_lfs_effect_marker(
+         %{
+           "lfs_required" => true,
+           "action" => "converge_lfs",
+           "ref" => ref,
+           "target_oid" => target_oid
+         },
+         ref
+       ) do
+    if standard_git_ref?(ref) and canonical_oid?(target_oid),
+      do: :ok,
+      else: {:error, :invalid_transition}
+  end
+
+  defp validate_git_lfs_effect_marker(_marker, _ref), do: {:error, :invalid_transition}
+
   @spec mark_external_effect(MirrorOperation.t(), DateTime.t(), map()) ::
           {:ok, MirrorOperation.t()}
-          | {:error, :lost_lease | :invalid_transition | :invalid_argument | :paused}
+          | {:error, :lost_lease | :invalid_transition | :invalid_argument | :paused | :revoked}
   def mark_external_effect(
         %MirrorOperation{state: :processing} = operation,
         %DateTime{} = now,
@@ -4508,7 +4632,7 @@ defmodule ForgeMirrors do
           {:ok, marked}
 
         {:error, reason}
-        when reason in [:lost_lease, :invalid_transition, :paused, :merge_reserved] ->
+        when reason in [:lost_lease, :invalid_transition, :paused, :revoked, :merge_reserved] ->
           {:error, reason}
 
         {:error, _reason} ->
@@ -4526,7 +4650,7 @@ defmodule ForgeMirrors do
 
   @spec replace_external_effect(MirrorOperation.t(), DateTime.t(), map(), map()) ::
           {:ok, MirrorOperation.t()}
-          | {:error, :lost_lease | :invalid_transition | :invalid_argument | :paused}
+          | {:error, :lost_lease | :invalid_transition | :invalid_argument | :paused | :revoked}
   def replace_external_effect(
         %MirrorOperation{state: :effect_pending} = operation,
         %DateTime{} = now,
@@ -4563,7 +4687,7 @@ defmodule ForgeMirrors do
           {:ok, replaced}
 
         {:error, reason}
-        when reason in [:lost_lease, :invalid_transition, :paused, :merge_reserved] ->
+        when reason in [:lost_lease, :invalid_transition, :paused, :revoked, :merge_reserved] ->
           {:error, reason}
 
         {:error, _reason} ->
@@ -6192,6 +6316,16 @@ defmodule ForgeMirrors do
     ]
   end
 
+  defp git_capability_enabled?(capabilities) do
+    Map.get(capabilities || %{}, "git") in [
+      true,
+      :enabled,
+      :active,
+      "enabled",
+      "active"
+    ]
+  end
+
   defp release_capability_enabled?(organization) do
     Map.get(organization.capabilities || %{}, "releases") in [
       true,
@@ -6607,7 +6741,7 @@ defmodule ForgeMirrors do
          }
          when organization_state not in [:paused, :revoked] and is_integer(installation_id) <-
            organization_mirror,
-         %GitHubAppInstallation{state: :active, permissions: %{"contents" => "write"}} <-
+         %GitHubAppInstallation{state: :active, permissions: permissions} <-
            GitHubAppInstallation
            |> where(
              [installation],
@@ -6615,6 +6749,7 @@ defmodule ForgeMirrors do
            )
            |> lock("FOR UPDATE")
            |> Repo.one(),
+         true <- permissions["contents"] == "write",
          {:ok,
           %ForgeRepos.Repository{
             id: repository_id,
@@ -6630,6 +6765,7 @@ defmodule ForgeMirrors do
       {:ok,
        %{
          github_installation_id: installation_id,
+         git_enabled: git_capability_enabled?(capabilities),
          lfs_enabled:
            Map.get(capabilities || %{}, "lfs") in [
              true,
@@ -6645,6 +6781,8 @@ defmodule ForgeMirrors do
          repository_path: ForgeRepos.absolute_storage_path(repository)
        }}
     else
+      %GitHubAppInstallation{} -> {:error, :revoked}
+      false -> {:error, :permission_missing}
       _invalid -> {:error, :invalid_transition}
     end
   end
@@ -7450,6 +7588,130 @@ defmodule ForgeMirrors do
 
   defp lock_effect_scope(_operation), do: {:error, :lost_lease}
 
+  defp lock_authorized_external_effect(supplied, expected_marker) do
+    with :ok <- lock_effect_scope(supplied),
+         {:ok, operation} <-
+           lock_owned_operation(supplied, [
+             "sync.git_ref",
+             "sync.issue",
+             "sync.issue_comment",
+             "sync.pull",
+             "sync.release"
+           ]),
+         true <- operation.state == :effect_pending,
+         true <- operation.external_effect_marker == expected_marker do
+      lock_authorized_external_effect_scope(operation, expected_marker)
+    else
+      false -> {:error, :invalid_transition}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp lock_authorized_external_effect_scope(
+         %MirrorOperation{kind: "sync.git_ref"} = operation,
+         _expected_marker
+       ) do
+    with ref_name when is_binary(ref_name) <- operation.cursor["ref_name"],
+         {:ok, persisted} <- lock_owned_git_ref_operation(operation, ref_name),
+         {:ok, scope} <- load_git_ref_scope(persisted),
+         true <- scope.git_enabled do
+      {:ok, persisted,
+       %{
+         github_installation_id: scope.github_installation_id,
+         permissions: %{
+           "contents" => "write",
+           "metadata" => "read"
+         }
+       }}
+    else
+      {:error, reason} -> {:error, reason}
+      false -> {:error, :permission_missing}
+      _ -> {:error, :invalid_transition}
+    end
+  end
+
+  defp lock_authorized_external_effect_scope(
+         %MirrorOperation{kind: "sync.pull"} = operation,
+         %{"action" => "create_remote_pull"} = expected_marker
+       ) do
+    with {:ok, persisted, scope} <- lock_pull_creation_operation(operation),
+         {:ok, _intent} <-
+           ForgeMirrors.PullOutboundCreation.lock_recovery(persisted, scope, expected_marker) do
+      {:ok, persisted,
+       %{
+         github_installation_id: scope.github_installation_id,
+         permissions: %{
+           "contents" => "read",
+           "issues" => "write",
+           "metadata" => "read",
+           "pull_requests" => "write"
+         }
+       }}
+    end
+  end
+
+  defp lock_authorized_external_effect_scope(operation, _expected_marker) do
+    with {:ok, persisted, scope} <- lock_resource_operation(operation) do
+      {:ok, persisted,
+       %{
+         github_installation_id: scope.github_installation_id,
+         permissions: scope.metadata_permissions
+       }}
+    end
+  end
+
+  defp authorize_external_effect_installation(operation, %{
+         github_installation_id: installation_id,
+         permissions: required_permissions
+       })
+       when is_integer(installation_id) and is_map(required_permissions) do
+    organization = Repo.get(OrganizationMirror, operation.organization_mirror_id)
+
+    with %OrganizationMirror{state: state, github_account_id: account_id} <- organization,
+         :ok <- authorize_external_effect_organization(state),
+         installation <-
+           GitHubAppInstallation
+           |> where(
+             [record],
+             record.github_installation_id == ^installation_id and
+               record.github_account_id == ^account_id
+           )
+           |> lock("FOR UPDATE")
+           |> Repo.one(),
+         %GitHubAppInstallation{state: :active, permissions: permissions} <- installation,
+         true <- external_effect_permissions_granted?(permissions, required_permissions) do
+      :ok
+    else
+      %GitHubAppInstallation{} -> {:error, :revoked}
+      false -> {:error, :permission_missing}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :revoked}
+    end
+  end
+
+  defp authorize_external_effect_installation(_operation, _scope),
+    do: {:error, :invalid_transition}
+
+  defp authorize_external_effect_organization(:paused), do: {:error, :paused}
+  defp authorize_external_effect_organization(:revoked), do: {:error, :revoked}
+
+  defp authorize_external_effect_organization(state)
+       when state in [:catching_up, :active, :degraded, :conflicted],
+       do: :ok
+
+  defp authorize_external_effect_organization(_state), do: {:error, :invalid_transition}
+
+  defp external_effect_permissions_granted?(permissions, required_permissions)
+       when is_map(permissions) and is_map(required_permissions) do
+    Enum.all?(required_permissions, fn
+      {permission, "read"} -> Map.get(permissions, permission) in ["read", "write"]
+      {permission, "write"} -> Map.get(permissions, permission) == "write"
+      _ -> false
+    end)
+  end
+
+  defp external_effect_permissions_granted?(_permissions, _required_permissions), do: false
+
   defp lock_effect_repository(nil), do: {:ok, nil}
 
   defp lock_effect_repository(repository_mirror_id) do
@@ -7464,8 +7726,7 @@ defmodule ForgeMirrors do
 
   defp validate_effect_organization(%OrganizationMirror{state: :paused}), do: {:error, :paused}
 
-  defp validate_effect_organization(%OrganizationMirror{state: :revoked}),
-    do: {:error, :invalid_transition}
+  defp validate_effect_organization(%OrganizationMirror{state: :revoked}), do: {:error, :revoked}
 
   defp validate_effect_organization(%OrganizationMirror{}), do: :ok
 
@@ -8446,7 +8707,18 @@ defmodule ForgeMirrors do
                        next_attempt_at: now
                      }) do
                   {:ok, operation} ->
-                    operation
+                    if String.starts_with?(sweep_key, "inventory:") do
+                      operation
+                    else
+                      case operation
+                           |> Ecto.Changeset.change(
+                             checkpoint: %{"phase" => "mapped", "mapping_cursor" => nil}
+                           )
+                           |> Repo.update() do
+                        {:ok, operation} -> operation
+                        {:error, reason} -> Repo.rollback(reason)
+                      end
+                    end
 
                   {:error, reason} ->
                     Repo.rollback(reason)

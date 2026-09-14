@@ -50,6 +50,19 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
         capabilities: %{"git" => "enabled", "pulls" => "enabled"}
       })
 
+    Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+      github_installation_id: organization.github_installation_id
+    )
+    |> Ecto.Changeset.change(
+      permissions: %{
+        "contents" => "read",
+        "issues" => "write",
+        "metadata" => "read",
+        "pull_requests" => "write"
+      }
+    )
+    |> Repo.update!()
+
     base =
       repository_mirror_fixture(organization, %{
         github_full_name: "acme/project",
@@ -287,6 +300,44 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
           do: assert(Repo.get!(ForgeIssues.Label, label.id).name == "newer-label-name")
       end
     end
+  end
+
+  test "a post-marker pause fence prevents mapped label creation", ctx do
+    now = DateTime.utc_now(:second)
+
+    label =
+      Repo.insert!(%ForgeIssues.Label{
+        repository_id: ctx.base.repository_id,
+        name: "new-local-label",
+        normalized_name: "new-local-label",
+        color: "abcdef",
+        description: "Local label"
+      })
+
+    Repo.insert!(%ForgeIssues.IssueLabel{issue_id: ctx.issue.id, label_id: label.id})
+    Repo.update!(Ecto.Changeset.change(ctx.issue, sync_version: 2))
+    operation = local_operation(ctx, 2, now)
+    state = start_supervised!({Agent, fn -> %{posts: 0, gets: 0, tokens: 0} end})
+    local_label_provider(ctx, state, now, :absent)
+
+    opts =
+      relationship_options(ctx)
+      |> Keyword.put(:token_fetch, fn id, scope ->
+        Agent.update(state, &Map.update!(&1, :tokens, fn count -> count + 1 end))
+        options(ctx)[:token_fetch].(id, scope)
+      end)
+      |> Keyword.put(:authorize_effect, fn marked, marker ->
+        assert marked.state == :effect_pending
+        assert marked.external_effect_marker == marker
+        {:error, :paused}
+      end)
+
+    assert {:ok, _} = PullSyncWorker.process_operation(operation, now, opts)
+    saved = Repo.get!(MirrorOperation, operation.id)
+    assert saved.state == :effect_pending
+    assert saved.external_effect_marker["action"] == "create_remote_label"
+    assert Agent.get(state, & &1.posts) == 0
+    assert Agent.get(state, & &1.tokens) == 1
   end
 
   for outcome <- [:adopt, :created] do

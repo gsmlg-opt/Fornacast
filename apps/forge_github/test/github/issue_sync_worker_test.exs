@@ -119,6 +119,47 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
            ]
   end
 
+  test "post-marker pause defers an issue write without a fresh token or provider call" do
+    parent = self()
+    operation = operation("sync.issue", :processing)
+    local = Map.put(@base, "body", "local body")
+
+    options =
+      options(operation,
+        local_observe: fn _ -> {:ok, local_issue(local, 4)} end,
+        token_fetch: fn 44, _ ->
+          send(parent, :token_fetch)
+
+          %InstallationToken{
+            token: "ephemeral",
+            expires_at: DateTime.add(@now, 3_600),
+            permissions: %{"issues" => "write", "metadata" => "read"}
+          }
+        end,
+        mark_effect: fn ^operation, @now, marker ->
+          send(parent, {:effect_marked, marker})
+          {:ok, %{operation | state: :effect_pending, external_effect_marker: marker}}
+        end,
+        authorize_effect: fn marked, marker ->
+          assert marked.state == :effect_pending
+          assert marked.external_effect_marker == marker
+          {:error, :paused}
+        end,
+        update_issue: fn _, _, _, _, _, _ -> flunk("paused effect wrote GitHub") end,
+        defer_effect: fn marked, @now, retry_at, "network", "resource_context_unavailable" ->
+          assert DateTime.after?(retry_at, @now)
+          assert marked.state == :effect_pending
+          assert is_map(marked.external_effect_marker)
+          {:ok, :deferred}
+        end
+      )
+
+    assert {:ok, :deferred} = IssueSyncWorker.process_operation(operation, @now, options)
+    assert_received :token_fetch
+    assert_received {:effect_marked, _marker}
+    refute_received :token_fetch
+  end
+
   test "merges independent label and assignee additions and applies both sides" do
     parent = self()
     operation = operation("sync.issue", :processing)
@@ -1183,6 +1224,10 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
          }}
       end,
       mark_effect: mark_effect(self(), operation),
+      authorize_effect: fn marked, marker ->
+        assert marked.external_effect_marker == marker
+        {:ok, marked}
+      end,
       replace_effect: fn _, _, _, _ -> flunk("unexpected effect replacement") end,
       checkpoint: fn _, _, _, _, _ -> flunk("unexpected checkpoint") end,
       create_issue: fn _, _, _, _, _ -> flunk("unexpected issue create") end,

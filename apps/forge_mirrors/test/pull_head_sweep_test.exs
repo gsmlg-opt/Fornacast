@@ -70,6 +70,23 @@ defmodule ForgeMirrors.PullHeadSweepTest do
              ForgeMirrors.reconcile_pull_head_page(next, c.now)
   end
 
+  test "standalone head discovery begins with the mapped inventory phase", c do
+    assert {:ok, sweep} =
+             ForgeMirrors.enqueue_repository_pull_head_reconciliation(
+               c.binding,
+               "standalone-head-discovery",
+               c.now
+             )
+
+    assert sweep.checkpoint == %{"phase" => "mapped", "mapping_cursor" => nil}
+
+    assert {:ok, [claimed]} =
+             ForgeMirrors.claim_operations("head-sweep", c.now, 60, 1, [sweep.kind])
+
+    assert {:ok, %{phase: :mapped, mapping_cursor: nil}} =
+             ForgeMirrors.pull_reconciliation_context(claimed)
+  end
+
   test "revocation after scheduling prevents discovery writes", c do
     assert {:ok, sweep} =
              ForgeMirrors.enqueue_repository_pull_head_reconciliation(

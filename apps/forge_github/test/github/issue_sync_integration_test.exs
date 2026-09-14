@@ -32,6 +32,13 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
     organization = active_organization_mirror_fixture(%{capabilities: %{"issues" => "enabled"}})
+
+    Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+      github_installation_id: organization.github_installation_id
+    )
+    |> Ecto.Changeset.change(permissions: %{"issues" => "write", "metadata" => "read"})
+    |> Repo.update!()
+
     binding = repository_mirror_fixture(organization, %{github_full_name: "acme/project"})
     repository = Repo.get!(ForgeRepos.Repository, binding.repository_id)
     owner = organization_owner_fixture(organization)

@@ -309,6 +309,49 @@ defmodule ForgeGitHub.PullSyncWorkerTest do
            ]
   end
 
+  for reason <- [:paused, :revoked, :permission_missing] do
+    test "a post-marker #{reason} fence stops the pull effect before a fresh token or write" do
+      parent = self()
+      operation = operation(:processing)
+      local = Map.put(@base, "body", "Local")
+
+      options =
+        options(operation,
+          local_observe: fn _ -> {:ok, local_pull(local, 4)} end,
+          token_fetch: fn 44,
+                          %{permissions: %{"metadata" => "read", "pull_requests" => "write"}} ->
+            send(parent, :token_fetched)
+
+            %InstallationToken{
+              token: "ephemeral",
+              expires_at: DateTime.add(@now, 3_600),
+              permissions: %{"metadata" => "read", "pull_requests" => "write"}
+            }
+          end,
+          authorize_effect: fn marked, marker ->
+            assert marked.state == :effect_pending
+            assert marked.external_effect_marker == marker
+            send(parent, :effect_authorized)
+            {:error, unquote(reason)}
+          end,
+          update_pull_issue: fn _, _, _, _, _, _ ->
+            flunk("denied post-marker effect must not update GitHub")
+          end,
+          checkpoint: fn marked, _checkpoint, _retry_at, _failure_class, @now ->
+            assert marked.state == :effect_pending
+            send(parent, {:effect_deferred, marked.external_effect_marker})
+            {:ok, :deferred}
+          end
+        )
+
+      assert {:ok, :deferred} = PullSyncWorker.process_operation(operation, @now, options)
+      assert_received :token_fetched
+      assert_received :effect_authorized
+      assert_received {:effect_deferred, %{"action" => "update_remote_pull_issue"}}
+      refute_received :token_fetched
+    end
+  end
+
   test "effect recovery confirms an observed postcondition without replaying after a newer local edit" do
     parent = self()
     sent = Map.put(@base, "title", "Sent")
@@ -525,6 +568,10 @@ defmodule ForgeGitHub.PullSyncWorkerTest do
       update_pull_issue: fn _, _, _, _, _, _ -> flunk("unexpected issue effect") end,
       set_draft: fn _, _, _, _ -> flunk("unexpected draft effect") end,
       mark_effect: mark_effect(self(), operation),
+      authorize_effect: fn marked, marker ->
+        assert marked.external_effect_marker == marker
+        {:ok, marked}
+      end,
       replace_effect: fn _, _, _, _ -> flunk("unexpected replacement effect") end,
       checkpoint: fn _, _, _, _, _ -> flunk("unexpected effect checkpoint") end,
       confirm: fn _, _, _, _, _ -> {:ok, :confirmed} end,

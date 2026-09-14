@@ -42,8 +42,10 @@ defmodule ForgeGitHub.GitRefWorker do
     :lfs_gate,
     :checkpoint_lfs,
     :degrade_lfs,
+    :authorize_lfs_effect,
     :mark_effect,
     :replace_effect,
+    :authorize_effect,
     :apply_local,
     :delete_local,
     :push_remote,
@@ -262,6 +264,7 @@ defmodule ForgeGitHub.GitRefWorker do
     token_fetch = callback(options, :token_fetch, &InstallationTokenBroker.fetch/2)
 
     with {:ok, sync} <- context.(operation),
+         {:ok, authorized_operation} <- authorize_recovery(operation, options),
          %InstallationToken{token: token} <-
            token_fetch.(sync.github_installation_id, %{
              permissions: %{"contents" => "write", "metadata" => "read"}
@@ -272,7 +275,7 @@ defmodule ForgeGitHub.GitRefWorker do
          remote_oid <- observed_oid(observations, sync.ref_name),
          decision <- decide(sync, local_oid, remote_oid, options) do
       continue_after_observation(
-        operation,
+        authorized_operation,
         now,
         sync,
         request,
@@ -371,17 +374,52 @@ defmodule ForgeGitHub.GitRefWorker do
        ) do
     case reconcile_recorded_effect(operation, sync, local_oid, remote_oid) do
       :ok ->
-        continue_after_lfs(
-          operation,
-          now,
-          sync,
-          request,
-          token,
-          local_oid,
-          remote_oid,
-          decision,
-          options
-        )
+        case prepare_lfs_effect(operation, now, sync, decision, options) do
+          {:ok, prepared, true} ->
+            case authorize_lfs_effect(prepared, sync, options) do
+              {:ok, authorized, fresh_token} ->
+                continue_after_lfs(
+                  authorized,
+                  now,
+                  sync,
+                  request,
+                  fresh_token,
+                  local_oid,
+                  remote_oid,
+                  decision,
+                  true,
+                  options
+                )
+
+              {:error, reason} ->
+                persist_effect_failure(
+                  prepared,
+                  now,
+                  sync,
+                  local_oid,
+                  remote_oid,
+                  reason,
+                  options
+                )
+            end
+
+          {:ok, prepared, false} ->
+            continue_after_lfs(
+              prepared,
+              now,
+              sync,
+              request,
+              token,
+              local_oid,
+              remote_oid,
+              decision,
+              false,
+              options
+            )
+
+          {:error, reason} ->
+            persist_failure(operation, now, reason, options)
+        end
 
       {:error, :ambiguous_external_effect} ->
         persist_conflict(
@@ -454,6 +492,18 @@ defmodule ForgeGitHub.GitRefWorker do
     validate_recorded_condition(marker_ref, ref, remote_oid, expected, nil, true, false)
   end
 
+  defp recorded_effect_condition(
+         %{"action" => "converge_lfs", "ref" => marker_ref, "target_oid" => target_oid},
+         ref,
+         local_oid,
+         remote_oid
+       ) do
+    if marker_ref == ref and valid_effect_oid?(target_oid) and local_oid == target_oid and
+         remote_oid == target_oid,
+       do: :ok,
+       else: {:error, :ambiguous_external_effect}
+  end
+
   defp recorded_effect_condition(_marker, _ref, _local_oid, _remote_oid),
     do: {:error, :ambiguous_external_effect}
 
@@ -500,6 +550,7 @@ defmodule ForgeGitHub.GitRefWorker do
          local_oid,
          remote_oid,
          decision,
+         effect_prepared?,
          options
        ) do
     case lfs_gate(decision, operation, sync, request, token, options) do
@@ -513,6 +564,7 @@ defmodule ForgeGitHub.GitRefWorker do
           local_oid,
           remote_oid,
           decision,
+          effect_prepared?,
           options
         )
 
@@ -561,16 +613,26 @@ defmodule ForgeGitHub.GitRefWorker do
   defp lfs_gate(_decision, _operation, %{lfs_enabled: false}, _request, _token, _options), do: :ok
 
   defp lfs_gate(decision, operation, sync, request, token, options) do
+    if operation.state == :effect_pending and
+         (not is_map(operation.external_effect_marker) or
+            operation.external_effect_marker["lfs_required"] != true) do
+      :ok
+    else
+      run_lfs_gate(decision, operation, sync, request, token, options)
+    end
+  end
+
+  defp run_lfs_gate(decision, operation, sync, request, token, options) do
     {direction, target_oid} = lfs_target(decision)
 
-    case callback(options, :lfs_gate, &ForgeGitHub.LFSSync.ensure/6).(
-           operation,
-           sync,
-           direction,
-           target_oid,
-           token,
-           request
-         ) do
+    gate =
+      callback(options, :lfs_gate, fn operation, sync, direction, target_oid, token, request ->
+        ForgeGitHub.LFSSync.ensure(operation, sync, direction, target_oid, token, request,
+          authorize: fn -> reauthorize_lfs_effect(operation, options) end
+        )
+      end)
+
+    case gate.(operation, sync, direction, target_oid, token, request) do
       {:error, %Error{kind: :object_missing}} ->
         {:error, :lfs_missing}
 
@@ -608,6 +670,7 @@ defmodule ForgeGitHub.GitRefWorker do
          _local_oid,
          _remote_oid,
          {:confirm, oid},
+         _effect_prepared?,
          options
        ) do
     callback(options, :confirm, &ForgeMirrors.confirm_git_ref/5).(
@@ -628,33 +691,45 @@ defmodule ForgeGitHub.GitRefWorker do
          local_oid,
          remote_oid,
          decision,
+         effect_prepared?,
          options
        )
        when elem(decision, 0) in [:apply_local, :apply_remote, :delete_local, :delete_remote] do
-    case mark_effect(operation, now, sync.effect_marker, sync.ref_name, decision, options) do
+    mark_result =
+      if effect_prepared?,
+        do: {:ok, operation},
+        else: mark_effect(operation, now, sync.effect_marker, sync.ref_name, decision, options)
+
+    case mark_result do
       {:ok, marked} ->
-        case execute_effect(decision, sync, request, token, options) do
-          :ok ->
-            expected_oid = resulting_oid(decision)
+        with {:ok, authorized} <- authorize_effect(marked, options),
+             {:ok, effect_token} <- effect_token(decision, sync, token, options) do
+          case execute_effect(decision, sync, request, effect_token, options) do
+            :ok ->
+              expected_oid = resulting_oid(decision)
 
-            callback(options, :confirm, &ForgeMirrors.confirm_git_ref/5).(
-              marked,
-              sync.ref_name,
-              expected_oid,
-              expected_oid,
-              now
-            )
+              callback(options, :confirm, &ForgeMirrors.confirm_git_ref/5).(
+                authorized,
+                sync.ref_name,
+                expected_oid,
+                expected_oid,
+                now
+              )
 
+            {:error, reason} ->
+              persist_effect_failure(
+                authorized,
+                now,
+                sync,
+                local_oid,
+                remote_oid,
+                reason,
+                options
+              )
+          end
+        else
           {:error, reason} ->
-            persist_effect_failure(
-              marked,
-              now,
-              sync,
-              local_oid,
-              remote_oid,
-              reason,
-              options
-            )
+            persist_effect_failure(marked, now, sync, local_oid, remote_oid, reason, options)
         end
 
       {:error, reason} ->
@@ -671,6 +746,7 @@ defmodule ForgeGitHub.GitRefWorker do
          local_oid,
          remote_oid,
          {:conflict, kind},
+         _effect_prepared?,
          options
        ) do
     persist_conflict(operation, now, sync, local_oid, remote_oid, kind, options)
@@ -685,6 +761,7 @@ defmodule ForgeGitHub.GitRefWorker do
          _local_oid,
          _remote_oid,
          {:error, reason},
+         _effect_prepared?,
          options
        ),
        do: persist_failure(operation, now, reason, options)
@@ -698,8 +775,22 @@ defmodule ForgeGitHub.GitRefWorker do
          options
        )
        when is_map(recorded_marker) do
-    replacement_marker = effect_marker(ref, decision)
+    mark_effect_marker(operation, now, recorded_marker, effect_marker(ref, decision), options)
+  end
 
+  defp mark_effect(operation, now, _recorded_marker, ref, decision, options) do
+    marker = effect_marker(ref, decision)
+    callback(options, :mark_effect, &ForgeMirrors.mark_external_effect/3).(operation, now, marker)
+  end
+
+  defp mark_effect_marker(
+         %MirrorOperation{state: :effect_pending} = operation,
+         now,
+         recorded_marker,
+         replacement_marker,
+         options
+       )
+       when is_map(recorded_marker) do
     if replacement_marker == recorded_marker do
       {:ok, operation}
     else
@@ -712,10 +803,88 @@ defmodule ForgeGitHub.GitRefWorker do
     end
   end
 
-  defp mark_effect(operation, now, _recorded_marker, ref, decision, options) do
-    marker = effect_marker(ref, decision)
+  defp mark_effect_marker(operation, now, _recorded_marker, marker, options) do
     callback(options, :mark_effect, &ForgeMirrors.mark_external_effect/3).(operation, now, marker)
   end
+
+  defp prepare_lfs_effect(operation, now, sync, decision, options) do
+    lfs_required? =
+      (operation.state == :processing and Map.get(sync, :lfs_enabled, true)) or
+        (operation.state == :effect_pending and is_map(sync.effect_marker) and
+           sync.effect_marker["lfs_required"] == true)
+
+    if lfs_required? and
+         elem(decision, 0) in [
+           :confirm,
+           :apply_local,
+           :apply_remote,
+           :delete_local,
+           :delete_remote
+         ] do
+      marker = sync.ref_name |> effect_marker(decision) |> Map.put("lfs_required", true)
+
+      case mark_effect_marker(operation, now, sync.effect_marker, marker, options) do
+        {:ok, marked} -> {:ok, marked, true}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:ok, operation, false}
+    end
+  end
+
+  defp authorize_lfs_effect(operation, sync, options) do
+    with {:ok, authorized} <-
+           callback(
+             options,
+             :authorize_lfs_effect,
+             &ForgeMirrors.authorize_git_lfs_effect/2
+           ).(operation, operation.external_effect_marker),
+         {:ok, fresh_token} <- effect_token({:apply_remote, nil, nil}, sync, nil, options) do
+      {:ok, authorized, fresh_token}
+    end
+  end
+
+  defp reauthorize_lfs_effect(operation, options) do
+    case callback(
+           options,
+           :authorize_lfs_effect,
+           &ForgeMirrors.authorize_git_lfs_effect/2
+         ).(operation, operation.external_effect_marker) do
+      {:ok, %MirrorOperation{}} -> :ok
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :invalid_authorization}
+    end
+  end
+
+  defp authorize_effect(operation, options) do
+    callback(options, :authorize_effect, &ForgeMirrors.authorize_external_effect/2).(
+      operation,
+      operation.external_effect_marker
+    )
+  end
+
+  defp authorize_recovery(%MirrorOperation{state: :effect_pending} = operation, options),
+    do: authorize_effect(operation, options)
+
+  defp authorize_recovery(%MirrorOperation{state: :processing} = operation, _options),
+    do: {:ok, operation}
+
+  defp authorize_recovery(%MirrorOperation{}, _options), do: {:error, :invalid_transition}
+
+  defp effect_token(decision, sync, _token, options)
+       when elem(decision, 0) in [:apply_remote, :delete_remote] do
+    token_fetch = callback(options, :token_fetch, &InstallationTokenBroker.fetch/2)
+
+    case token_fetch.(sync.github_installation_id, %{
+           permissions: %{"contents" => "write", "metadata" => "read"}
+         }) do
+      %InstallationToken{token: fresh_token} -> {:ok, fresh_token}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :credential_unavailable}
+    end
+  end
+
+  defp effect_token(_decision, _sync, token, _options), do: {:ok, token}
 
   defp execute_effect({:apply_local, expected, proposed}, sync, _request, _token, options) do
     with_write_fence(sync.repository_id, fn ->
@@ -968,6 +1137,9 @@ defmodule ForgeGitHub.GitRefWorker do
 
   defp effect_marker(ref, {:delete_remote, expected}),
     do: %{"action" => "delete_remote", "expected_oid" => expected, "ref" => ref}
+
+  defp effect_marker(ref, {:confirm, oid}),
+    do: %{"action" => "converge_lfs", "ref" => ref, "target_oid" => oid}
 
   defp resulting_oid({:apply_local, _expected, proposed}), do: proposed
   defp resulting_oid({:apply_remote, _expected, proposed}), do: proposed

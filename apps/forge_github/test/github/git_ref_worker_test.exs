@@ -19,7 +19,9 @@ defmodule ForgeGitHub.GitRefWorkerTest do
       options(operation,
         remote_oid: @head,
         ancestor?: fn "/repos/example.git", @base, @head -> {:ok, true} end,
-        lfs_gate: fn ^operation, sync, :inbound, @head, "installation-secret", %SyncRequest{} ->
+        lfs_gate: fn marked, sync, :inbound, @head, "installation-secret", %SyncRequest{} ->
+          assert marked.state == :effect_pending
+          assert marked.external_effect_marker["lfs_required"]
           assert sync.ref_name == "refs/heads/main"
           send(parent, :lfs_ready)
           :ok
@@ -39,8 +41,8 @@ defmodule ForgeGitHub.GitRefWorkerTest do
     assert {:ok, :confirmed} = GitRefWorker.process_operation(operation, @now, options)
 
     assert collect_events(4) == [
-             :lfs_ready,
              {:effect_marked, %{"action" => "apply_local"}},
+             :lfs_ready,
              :local_cas,
              :confirmed
            ]
@@ -94,7 +96,9 @@ defmodule ForgeGitHub.GitRefWorkerTest do
         local_oid: @head,
         remote_oid: @base,
         ancestor?: fn "/repos/example.git", @base, @head -> {:ok, true} end,
-        lfs_gate: fn ^operation, _sync, :outbound, @head, "installation-secret", %SyncRequest{} ->
+        lfs_gate: fn marked, _sync, :outbound, @head, "installation-secret", %SyncRequest{} ->
+          assert marked.state == :effect_pending
+          assert marked.external_effect_marker["lfs_required"]
           send(parent, :lfs_ready)
           :ok
         end,
@@ -116,11 +120,112 @@ defmodule ForgeGitHub.GitRefWorkerTest do
     assert {:ok, :confirmed} = GitRefWorker.process_operation(operation, @now, options)
 
     assert collect_events(4) == [
-             :lfs_ready,
              {:effect_marked, %{"action" => "apply_remote"}},
+             :lfs_ready,
              :remote_push,
              :confirmed
            ]
+  end
+
+  test "a post-marker pause fence prevents a fresh token and remote push" do
+    parent = self()
+    operation = operation()
+
+    options =
+      options(operation,
+        context: fn ^operation ->
+          {:ok,
+           %{
+             baseline: @base,
+             effect_marker: nil,
+             github_installation_id: 44,
+             lfs_enabled: false,
+             ref_kind: :branch,
+             ref_name: "refs/heads/main",
+             remote_owner: "acme",
+             remote_repository: "project",
+             repository_id: 10,
+             repository_path: "/repos/example.git",
+             tracking_namespace: "repository-3"
+           }}
+        end,
+        local_oid: @head,
+        remote_oid: @base,
+        ancestor?: fn "/repos/example.git", @base, @head -> {:ok, true} end,
+        token_fetch: fn 44, %{permissions: %{"contents" => "write", "metadata" => "read"}} ->
+          send(parent, :token_fetched)
+
+          %InstallationToken{
+            token: "installation-secret",
+            expires_at: DateTime.add(@now, 3_600),
+            permissions: %{"contents" => "write", "metadata" => "read"}
+          }
+        end,
+        mark_effect: mark_effect(parent, operation),
+        authorize_effect: fn marked, marker ->
+          assert marked.state == :effect_pending
+          assert marked.external_effect_marker == marker
+          send(parent, :effect_authorized)
+          {:error, :paused}
+        end,
+        push_remote: fn _, _, _ -> flunk("paused Git effect must not push") end,
+        retry: fn marked, @now, _retry_at, "network", external_effect_reconciled: true ->
+          assert marked.state == :effect_pending
+          assert marked.external_effect_marker["action"] == "apply_remote"
+          send(parent, :effect_deferred)
+          {:ok, :deferred}
+        end
+      )
+
+    assert {:ok, :deferred} = GitRefWorker.process_operation(operation, @now, options)
+    assert_received :token_fetched
+    assert_received {:effect_marked, %{"action" => "apply_remote"}}
+    assert_received :effect_authorized
+    assert_received :effect_deferred
+    refute_received :token_fetched
+  end
+
+  test "an LFS capability downgrade after marking prevents a fresh token and transfer" do
+    parent = self()
+    operation = operation()
+
+    options =
+      options(operation,
+        local_oid: @head,
+        remote_oid: @base,
+        ancestor?: fn "/repos/example.git", @base, @head -> {:ok, true} end,
+        token_fetch: fn 44, %{permissions: %{"contents" => "write", "metadata" => "read"}} ->
+          send(parent, :token_fetched)
+
+          %InstallationToken{
+            token: "installation-secret",
+            expires_at: DateTime.add(@now, 3_600),
+            permissions: %{"contents" => "write", "metadata" => "read"}
+          }
+        end,
+        mark_effect: mark_effect(parent, operation),
+        authorize_lfs_effect: fn marked, marker ->
+          assert marked.external_effect_marker == marker
+          assert marker["lfs_required"]
+          send(parent, :lfs_effect_authorized)
+          {:error, :permission_missing}
+        end,
+        lfs_gate: fn _, _, _, _, _, _ -> flunk("disabled LFS must not transfer") end,
+        push_remote: fn _, _, _ -> flunk("disabled LFS must not publish the ref") end,
+        fail: fn marked, @now, "permission_missing", _detail ->
+          assert marked.state == :effect_pending
+          assert marked.external_effect_marker["lfs_required"]
+          send(parent, :lfs_effect_failed)
+          {:ok, :disabled}
+        end
+      )
+
+    assert {:ok, :disabled} = GitRefWorker.process_operation(operation, @now, options)
+    assert_received :token_fetched
+    assert_received {:effect_marked, %{"action" => "apply_remote"}}
+    assert_received :lfs_effect_authorized
+    assert_received :lfs_effect_failed
+    refute_received :token_fetched
   end
 
   test "equal Git refs still require LFS convergence before confirmation" do
@@ -131,18 +236,26 @@ defmodule ForgeGitHub.GitRefWorkerTest do
       options(operation,
         local_oid: @head,
         remote_oid: @head,
-        lfs_gate: fn ^operation, _sync, :converge, @head, _token, _request ->
+        mark_effect: mark_effect(parent, operation),
+        lfs_gate: fn marked, _sync, :converge, @head, _token, _request ->
+          assert marked.external_effect_marker["action"] == "converge_lfs"
           send(parent, :lfs_ready)
           :ok
         end,
-        confirm: fn ^operation, "refs/heads/main", @head, @head, @now ->
+        confirm: fn marked, "refs/heads/main", @head, @head, @now ->
+          assert marked.external_effect_marker["action"] == "converge_lfs"
           send(parent, :confirmed)
           {:ok, :confirmed}
         end
       )
 
     assert {:ok, :confirmed} = GitRefWorker.process_operation(operation, @now, options)
-    assert collect_events(2) == [:lfs_ready, :confirmed]
+
+    assert collect_events(3) == [
+             {:effect_marked, %{"action" => "converge_lfs"}},
+             :lfs_ready,
+             :confirmed
+           ]
   end
 
   test "a remote deletion publishes the future LFS reachability before deleting locally" do
@@ -152,7 +265,7 @@ defmodule ForgeGitHub.GitRefWorkerTest do
     options =
       options(operation,
         remote_oid: nil,
-        lfs_gate: fn ^operation, _sync, :inbound, nil, _token, _request ->
+        lfs_gate: fn _marked, _sync, :inbound, nil, _token, _request ->
           send(parent, :lfs_ready)
           :ok
         end,
@@ -171,8 +284,8 @@ defmodule ForgeGitHub.GitRefWorkerTest do
     assert {:ok, :deleted} = GitRefWorker.process_operation(operation, @now, options)
 
     assert collect_events(4) == [
-             :lfs_ready,
              {:effect_marked, %{"action" => "delete_local"}},
+             :lfs_ready,
              :local_delete,
              :confirmed
            ]
@@ -186,7 +299,7 @@ defmodule ForgeGitHub.GitRefWorkerTest do
       options(operation,
         local_oid: nil,
         remote_oid: @base,
-        lfs_gate: fn ^operation, _sync, :outbound, nil, _token, _request ->
+        lfs_gate: fn _marked, _sync, :outbound, nil, _token, _request ->
           send(parent, :lfs_ready)
           :ok
         end,
@@ -205,14 +318,14 @@ defmodule ForgeGitHub.GitRefWorkerTest do
     assert {:ok, :deleted} = GitRefWorker.process_operation(operation, @now, options)
 
     assert collect_events(4) == [
-             :lfs_ready,
              {:effect_marked, %{"action" => "delete_remote"}},
+             :lfs_ready,
              :remote_delete,
              :confirmed
            ]
   end
 
-  test "a missing LFS object degrades without marking or writing the Git ref" do
+  test "a missing LFS object degrades the durably marked ref without writing it" do
     parent = self()
     operation = operation()
 
@@ -220,16 +333,13 @@ defmodule ForgeGitHub.GitRefWorkerTest do
       options(operation,
         remote_oid: @head,
         ancestor?: fn "/repos/example.git", @base, @head -> {:ok, true} end,
-        lfs_gate: fn ^operation, _sync, :inbound, @head, _token, _request ->
+        mark_effect: mark_effect(parent, operation),
+        lfs_gate: fn marked, _sync, :inbound, @head, _token, _request ->
+          assert marked.state == :effect_pending
           {:error, :lfs_missing}
         end,
-        degrade_lfs: fn ^operation,
-                        "refs/heads/main",
-                        @base,
-                        @head,
-                        @now,
-                        "lfs_missing",
-                        detail ->
+        degrade_lfs: fn marked, "refs/heads/main", @base, @head, @now, "lfs_missing", detail ->
+          assert marked.state == :effect_pending
           assert detail =~ "missing"
           send(parent, :degraded)
           {:ok, :degraded}
@@ -238,12 +348,13 @@ defmodule ForgeGitHub.GitRefWorkerTest do
 
     assert {:ok, :degraded} = GitRefWorker.process_operation(operation, @now, options)
     assert_received :degraded
-    refute_received {:effect_marked, _marker}
+    assert_received {:effect_marked, %{"action" => "apply_local"}}
     refute_received :local_cas
     refute_received :confirmed
   end
 
   test "an incomplete pointer scan yields the operation with its durable scan identity" do
+    parent = self()
     operation = operation()
     checkpoint = %{"lfs_scan_key" => "operation-1-head", "phase" => "scan"}
 
@@ -251,10 +362,13 @@ defmodule ForgeGitHub.GitRefWorkerTest do
       options(operation,
         remote_oid: @head,
         ancestor?: fn "/repos/example.git", @base, @head -> {:ok, true} end,
-        lfs_gate: fn ^operation, _sync, :inbound, @head, _token, _request ->
+        mark_effect: mark_effect(parent, operation),
+        lfs_gate: fn marked, _sync, :inbound, @head, _token, _request ->
+          assert marked.state == :effect_pending
           {:incomplete, checkpoint}
         end,
-        checkpoint_lfs: fn ^operation, "refs/heads/main", ^checkpoint, @now ->
+        checkpoint_lfs: fn marked, "refs/heads/main", ^checkpoint, @now ->
+          assert marked.state == :effect_pending
           {:ok, :yielded}
         end
       )
@@ -331,9 +445,8 @@ defmodule ForgeGitHub.GitRefWorkerTest do
         local_oid: @base,
         remote_oid: @head,
         ancestor?: fn "/repos/example.git", @base, @head -> {:ok, true} end,
-        lfs_gate: fn ^operation, _sync, :inbound, @head, _token, _request ->
-          send(parent, :lfs_ready)
-          :ok
+        lfs_gate: fn _, _, _, _, _, _ ->
+          flunk("legacy effect markers already passed their LFS gate before marking")
         end,
         replace_effect: fn ^operation, @now, ^marker, replacement ->
           assert replacement == %{
@@ -364,7 +477,7 @@ defmodule ForgeGitHub.GitRefWorkerTest do
       )
 
     assert {:ok, :recovered} = GitRefWorker.process_operation(operation, @now, options)
-    assert collect_events(4) == [:lfs_ready, :effect_replaced, :local_cas, :confirmed]
+    assert collect_events(3) == [:effect_replaced, :local_cas, :confirmed]
   end
 
   test "effect-pending recovery fails closed when the recorded endpoint matches neither condition" do
@@ -443,6 +556,7 @@ defmodule ForgeGitHub.GitRefWorkerTest do
         external_effect_marker: %{
           "action" => "apply_remote",
           "expected_oid" => @base,
+          "lfs_required" => true,
           "proposed_oid" => @head,
           "ref" => "refs/heads/main"
         }
@@ -452,7 +566,21 @@ defmodule ForgeGitHub.GitRefWorkerTest do
       options(operation,
         local_oid: @head,
         remote_oid: @head,
-        lfs_gate: fn ^operation, _sync, :converge, @head, _token, _request ->
+        replace_effect: fn ^operation, @now, previous, replacement ->
+          assert previous == operation.external_effect_marker
+          assert replacement["action"] == "converge_lfs"
+          assert replacement["lfs_required"]
+
+          {:ok,
+           %{
+             operation
+             | external_effect_marker: replacement,
+               lock_version: operation.lock_version + 1
+           }}
+        end,
+        lfs_gate: fn marked, _sync, :converge, @head, _token, _request ->
+          assert marked.external_effect_marker["action"] == "converge_lfs"
+
           {:error,
            %ForgeGitHub.Error{
              kind: :primary_rate_limit,
@@ -460,11 +588,12 @@ defmodule ForgeGitHub.GitRefWorkerTest do
              retry_at: retry_at
            }}
         end,
-        retry: fn ^operation,
+        retry: fn marked,
                   @now,
                   ^retry_at,
                   "primary_rate_limit",
                   external_effect_reconciled: true ->
+          assert marked.external_effect_marker["action"] == "converge_lfs"
           {:ok, :rate_limited}
         end
       )
@@ -612,6 +741,7 @@ defmodule ForgeGitHub.GitRefWorkerTest do
            baseline: @base,
            effect_marker: operation.external_effect_marker,
            github_installation_id: 44,
+           lfs_enabled: true,
            ref_kind: :branch,
            ref_name: "refs/heads/main",
            remote_owner: "acme",
@@ -639,6 +769,14 @@ defmodule ForgeGitHub.GitRefWorkerTest do
         flunk("unexpected LFS degradation")
       end,
       mark_effect: fn _operation, _now, _marker -> flunk("unexpected effect") end,
+      authorize_lfs_effect: fn marked, marker ->
+        assert marked.external_effect_marker == marker
+        {:ok, marked}
+      end,
+      authorize_effect: fn marked, marker ->
+        assert marked.external_effect_marker == marker
+        {:ok, marked}
+      end,
       apply_local: fn _path, _ref, _expected, _proposed -> flunk("unexpected local write") end,
       delete_local: fn _path, _ref, _expected -> flunk("unexpected local delete") end,
       push_remote: fn _request, _token, _update -> flunk("unexpected remote write") end,
@@ -657,7 +795,14 @@ defmodule ForgeGitHub.GitRefWorkerTest do
   defp mark_effect(parent, operation) do
     fn ^operation, @now, marker ->
       send(parent, {:effect_marked, Map.take(marker, ["action"])})
-      {:ok, %{operation | state: :effect_pending, lock_version: operation.lock_version + 1}}
+
+      {:ok,
+       %{
+         operation
+         | state: :effect_pending,
+           external_effect_marker: marker,
+           lock_version: operation.lock_version + 1
+       }}
     end
   end
 

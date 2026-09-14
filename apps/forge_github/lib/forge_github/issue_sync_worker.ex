@@ -64,6 +64,7 @@ defmodule ForgeGitHub.IssueSyncWorker do
     :mark_effect,
     :mark_label_effect,
     :replace_effect,
+    :authorize_effect,
     :requeue_effect,
     :checkpoint,
     :defer_effect,
@@ -176,11 +177,12 @@ defmodule ForgeGitHub.IssueSyncWorker do
   def process_operation(%MirrorOperation{kind: kind} = operation, %DateTime{} = now, options)
       when kind in @resource_kinds do
     with {:ok, sync} <- context(operation, options),
+         {:ok, authorized_operation} <- authorize_recovery(operation, options),
          {:ok, token} <- installation_token(sync, options) do
-      if label_effect?(operation, sync) do
-        recover_label_effect(operation, now, sync, token, options)
+      if label_effect?(authorized_operation, sync) do
+        recover_label_effect(authorized_operation, now, sync, token, options)
       else
-        continue_resource_operation(operation, now, sync, token, options)
+        continue_resource_operation(authorized_operation, now, sync, token, options)
       end
     else
       {:error, reason} -> persist_failure(operation, now, reason, options)
@@ -751,7 +753,7 @@ defmodule ForgeGitHub.IssueSyncWorker do
     end
   end
 
-  defp create_local_label(operation, now, sync, token, candidate, options) do
+  defp create_local_label(operation, now, sync, _token, candidate, options) do
     with {:ok, marker} <- label_effect_marker(candidate, options),
          expected <- label_expected(candidate, nil),
          domain_request <- label_domain_request(sync, operation, candidate),
@@ -761,40 +763,57 @@ defmodule ForgeGitHub.IssueSyncWorker do
              :mark_label_effect,
              &default_mark_label_effect/5
            ).(operation, now, expected, marker, domain_request) do
-      case callback(options, :create_label, &LabelClient.create_label/5).(
-             token,
-             sync.remote_owner,
-             sync.remote_repository,
-             candidate.snapshot,
-             request_options(sync)
-           ) do
-        {:ok, raw} ->
-          with {:ok, remote} <- provider_label(raw) do
-            if remote.snapshot == candidate.snapshot do
-              confirm_label_mapping(marked, now, sync, candidate, remote, options)
-            else
-              label_conflict(
-                marked,
-                now,
-                sync,
-                :ambiguous_label_create,
-                candidate.snapshot,
-                remote.snapshot,
-                options
-              )
-            end
-          else
-            {:error, reason} -> schedule_effect_recovery(marked, now, reason, options)
-          end
+      case authorize_effect_token(marked, sync, options) do
+        {:ok, fresh_token} ->
+          create_local_label_after_authorization(
+            marked,
+            now,
+            sync,
+            fresh_token,
+            candidate,
+            options
+          )
 
         {:error, reason} ->
           schedule_effect_recovery(marked, now, reason, options)
-
-        _invalid ->
-          schedule_effect_recovery(marked, now, :invalid_remote_resource, options)
       end
     else
       {:error, reason} -> persist_failure(operation, now, reason, options)
+    end
+  end
+
+  defp create_local_label_after_authorization(marked, now, sync, token, candidate, options) do
+    case callback(options, :create_label, &LabelClient.create_label/5).(
+           token,
+           sync.remote_owner,
+           sync.remote_repository,
+           candidate.snapshot,
+           request_options(sync)
+         ) do
+      {:ok, raw} ->
+        with {:ok, remote} <- provider_label(raw) do
+          if remote.snapshot == candidate.snapshot do
+            confirm_label_mapping(marked, now, sync, candidate, remote, options)
+          else
+            label_conflict(
+              marked,
+              now,
+              sync,
+              :ambiguous_label_create,
+              candidate.snapshot,
+              remote.snapshot,
+              options
+            )
+          end
+        else
+          {:error, reason} -> schedule_effect_recovery(marked, now, reason, options)
+        end
+
+      {:error, reason} ->
+        schedule_effect_recovery(marked, now, reason, options)
+
+      _invalid ->
+        schedule_effect_recovery(marked, now, :invalid_remote_resource, options)
     end
   end
 
@@ -1423,7 +1442,15 @@ defmodule ForgeGitHub.IssueSyncWorker do
   defp effect_action(:issue_comment, _remote, :deleted), do: "delete_remote_comment"
   defp effect_action(:issue_comment, _remote, _proposed), do: "update_remote_comment"
 
-  defp execute_remote_effect(marked, sync, token, attrs, target, now, options) do
+  defp execute_remote_effect(marked, sync, _token, attrs, target, now, options) do
+    with {:ok, token} <- authorize_effect_token(marked, sync, options) do
+      execute_authorized_remote_effect(marked, sync, token, attrs, target, now, options)
+    else
+      {:error, reason} -> {:effect_error, marked, reason}
+    end
+  end
+
+  defp execute_authorized_remote_effect(marked, sync, token, attrs, target, now, options) do
     result =
       case marked.external_effect_marker["action"] do
         "create_remote_issue" ->
@@ -1508,6 +1535,36 @@ defmodule ForgeGitHub.IssueSyncWorker do
   rescue
     _exception -> {:effect_error, marked, :worker_crash}
   end
+
+  defp authorize_effect_token(
+         %MirrorOperation{external_effect_marker: marker} = marked,
+         sync,
+         options
+       )
+       when is_map(marker) do
+    with {:ok, _authorized} <-
+           callback(options, :authorize_effect, &ForgeMirrors.authorize_external_effect/2).(
+             marked,
+             marker
+           ),
+         {:ok, token} <- installation_token(sync, options) do
+      {:ok, token}
+    end
+  end
+
+  defp authorize_effect_token(_operation, _sync, _options), do: {:error, :invalid_transition}
+
+  defp authorize_recovery(%MirrorOperation{state: :effect_pending} = operation, options) do
+    callback(options, :authorize_effect, &ForgeMirrors.authorize_external_effect/2).(
+      operation,
+      operation.external_effect_marker
+    )
+  end
+
+  defp authorize_recovery(%MirrorOperation{state: :processing} = operation, _options),
+    do: {:ok, operation}
+
+  defp authorize_recovery(%MirrorOperation{}, _options), do: {:error, :invalid_transition}
 
   defp append_correlation(attrs, marker) do
     case CorrelationMarker.append(attrs["body"], marker["correlation_id"]) do

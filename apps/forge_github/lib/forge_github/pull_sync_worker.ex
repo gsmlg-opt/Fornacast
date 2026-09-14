@@ -210,17 +210,26 @@ defmodule ForgeGitHub.PullSyncWorker do
       do: persist_failure(operation, now, :unsupported_operation, options)
 
   defp process_mapped(operation, now, sync, options) do
-    with {:ok, token} <- installation_token(sync, options),
+    with {:ok, authorized_operation} <- authorize_recovery(operation, options),
+         {:ok, token} <- installation_token(sync, options),
          {:ok, local} <- local_observation(sync, options) do
       case local[:unmapped_label] do
         nil ->
-          process_ready_mapped(operation, now, sync, token, local, options)
+          process_ready_mapped(authorized_operation, now, sync, token, local, options)
 
-        candidate when operation.state == :processing ->
-          materialize_mapped_local_label(operation, now, sync, token, local, candidate, options)
+        candidate when authorized_operation.state == :processing ->
+          materialize_mapped_local_label(
+            authorized_operation,
+            now,
+            sync,
+            token,
+            local,
+            candidate,
+            options
+          )
 
         _ ->
-          persist_failure(operation, now, :unsupported_resource, options)
+          persist_failure(authorized_operation, now, :unsupported_resource, options)
       end
     else
       {:error, reason} -> persist_failure(operation, now, reason, options)
@@ -937,21 +946,23 @@ defmodule ForgeGitHub.PullSyncWorker do
         # never sends this prerequisite through the original processing retry.
         try do
           with {:ok, _repository} <- pair_repository_identity(sync, token, options),
-               {:ok, _context} <- ForgeMirrors.mapped_pull_label_effect_context(marked) do
+               {:ok, _context} <- ForgeMirrors.mapped_pull_label_effect_context(marked),
+               {:ok, authorized, fresh_token} <- authorize_marked_effect(marked, sync, options) do
             result =
               with_ref_fences(git_proof, fn ->
                 with {:ok, observed} <-
                        LabelClient.create_label(
-                         token,
+                         fresh_token,
                          sync.remote_owner,
                          sync.remote_repository,
                          label.fields,
                          pair_client_options(sync, options)
                        ),
-                     {:ok, _repository} <- pair_repository_identity(sync, token, options) do
+                     {:ok, _repository} <-
+                       pair_repository_identity(sync, fresh_token, options) do
                   if canonical_provider_label(observed) == label.fields do
                     confirm_local_label(
-                      marked,
+                      authorized,
                       now,
                       sync,
                       label,
@@ -979,7 +990,7 @@ defmodule ForgeGitHub.PullSyncWorker do
               end)
 
             case result do
-              {:error, reason} -> persist_failure(marked, now, reason, options)
+              {:error, reason} -> persist_failure(authorized, now, reason, options)
               result -> result
             end
           else
@@ -1005,7 +1016,8 @@ defmodule ForgeGitHub.PullSyncWorker do
       fields: marker["proposed_snapshot"]
     }
 
-    with {:ok, token} <- installation_token(sync, options),
+    with {:ok, authorized_operation} <- authorize_recovery(operation, options),
+         {:ok, token} <- installation_token(sync, options),
          {:ok, projection} <-
            ForgePulls.sync_projection(sync.repository_id, :pull, sync.local_resource_id),
          {:ok, local} <- PullSyncProjection.from_local(projection),
@@ -1026,7 +1038,7 @@ defmodule ForgeGitHub.PullSyncWorker do
           {:ok, observed} ->
             if canonical_provider_label(observed) == label.fields do
               confirm_local_label(
-                operation,
+                authorized_operation,
                 now,
                 sync,
                 label,
@@ -1040,7 +1052,7 @@ defmodule ForgeGitHub.PullSyncWorker do
               )
             else
               local_label_conflict(
-                operation,
+                authorized_operation,
                 now,
                 sync,
                 :ambiguous_label_create,
@@ -1052,7 +1064,7 @@ defmodule ForgeGitHub.PullSyncWorker do
 
           {:error, %Error{kind: :not_found}} ->
             local_label_conflict(
-              operation,
+              authorized_operation,
               now,
               sync,
               :ambiguous_label_create,
@@ -1062,10 +1074,10 @@ defmodule ForgeGitHub.PullSyncWorker do
             )
 
           {:error, reason} ->
-            persist_failure(operation, now, reason, options)
+            persist_failure(authorized_operation, now, reason, options)
         end
       else
-        {:error, reason} -> persist_failure(operation, now, reason, options)
+        {:error, reason} -> persist_failure(authorized_operation, now, reason, options)
       end
     else
       {:conflict, kind} ->
@@ -1895,26 +1907,30 @@ defmodule ForgeGitHub.PullSyncWorker do
              callback(options, :pair_effect_context, &ForgeMirrors.mapped_pull_effect_context/1).(
                operation
              ),
-           true <- fresh.marker == marker and fresh.intent == sync.metadata_intent do
-        case marker["action"] do
-          "update_remote_pull_issue" ->
-            callback(options, :update_pull_issue, &IssueClient.update_pull_issue/6).(
-              token,
-              sync.remote_owner,
-              sync.remote_repository,
-              sync.github_number,
-              attrs,
-              request_options(sync)
-            )
+           true <- fresh.marker == marker and fresh.intent == sync.metadata_intent,
+           {:ok, authorized, fresh_token} <- authorize_marked_effect(operation, sync, options) do
+        effect_result =
+          case marker["action"] do
+            "update_remote_pull_issue" ->
+              callback(options, :update_pull_issue, &IssueClient.update_pull_issue/6).(
+                fresh_token,
+                sync.remote_owner,
+                sync.remote_repository,
+                sync.github_number,
+                attrs,
+                request_options(sync)
+              )
 
-          "set_remote_pull_draft" ->
-            callback(options, :set_draft, &PullClient.set_draft/4).(
-              token,
-              sync.github_node_id,
-              marker["proposed_draft"],
-              request_options(sync)
-            )
-        end
+            "set_remote_pull_draft" ->
+              callback(options, :set_draft, &PullClient.set_draft/4).(
+                fresh_token,
+                sync.github_node_id,
+                marker["proposed_draft"],
+                request_options(sync)
+              )
+          end
+
+        {:external_effect, effect_result, authorized, fresh_token}
       end
 
     case result do
@@ -1957,15 +1973,15 @@ defmodule ForgeGitHub.PullSyncWorker do
           options
         )
 
-      {:ok, _} ->
+      {:external_effect, {:ok, _}, authorized, fresh_token} ->
         with {:ok, remote, identity, proof} <-
-               observe_authorized(sync, token, local, now, options),
+               observe_authorized(sync, fresh_token, local, now, options),
              :ok <- normalize_precondition(precondition(sync, local, remote, identity, proof)) do
           recover_pair_effect(
-            operation,
+            authorized,
             now,
             sync,
-            token,
+            fresh_token,
             local,
             remote,
             identity,
@@ -1974,8 +1990,11 @@ defmodule ForgeGitHub.PullSyncWorker do
             options
           )
         else
-          {:error, reason} -> persist_failure(operation, now, reason, options)
+          {:error, reason} -> persist_failure(authorized, now, reason, options)
         end
+
+      {:external_effect, {:error, reason}, authorized, _fresh_token} ->
+        persist_failure(authorized, now, reason, options)
 
       {:error, reason} ->
         persist_failure(operation, now, reason, options)
@@ -2610,7 +2629,7 @@ defmodule ForgeGitHub.PullSyncWorker do
          operation,
          now,
          sync,
-         token,
+         _token,
          local,
          remote,
          provider_identity,
@@ -2634,27 +2653,33 @@ defmodule ForgeGitHub.PullSyncWorker do
              options
            ),
          {:ok, marked} <- prepare_effect(operation, now, marker, replace_effect?, options) do
-      result =
-        callback(options, :update_pull_issue, &IssueClient.update_pull_issue/6).(
-          token,
-          sync.remote_owner,
-          sync.remote_repository,
-          sync.github_number,
-          Map.take(plan.target, @issue_fields),
-          request_options(sync)
-        )
+      case authorize_marked_effect(marked, sync, options) do
+        {:ok, authorized, fresh_token} ->
+          result =
+            callback(options, :update_pull_issue, &IssueClient.update_pull_issue/6).(
+              fresh_token,
+              sync.remote_owner,
+              sync.remote_repository,
+              sync.github_number,
+              Map.take(plan.target, @issue_fields),
+              request_options(sync)
+            )
 
-      continue_after_effect(
-        result,
-        marked,
-        now,
-        sync,
-        token,
-        local,
-        marker,
-        depth,
-        options
-      )
+          continue_after_effect(
+            result,
+            authorized,
+            now,
+            sync,
+            fresh_token,
+            local,
+            marker,
+            depth,
+            options
+          )
+
+        {:error, reason} ->
+          persist_failure(marked, now, reason, options)
+      end
     else
       {:error, reason} -> persist_failure(operation, now, reason, options)
     end
@@ -2664,7 +2689,7 @@ defmodule ForgeGitHub.PullSyncWorker do
          operation,
          now,
          sync,
-         token,
+         _token,
          local,
          remote,
          provider_identity,
@@ -2688,29 +2713,56 @@ defmodule ForgeGitHub.PullSyncWorker do
              options
            ),
          {:ok, marked} <- prepare_effect(operation, now, marker, replace_effect?, options) do
-      result =
-        callback(options, :set_draft, &PullClient.set_draft/4).(
-          token,
-          remote.github_node_id,
-          plan.target["draft"],
-          request_options(sync)
-        )
+      case authorize_marked_effect(marked, sync, options) do
+        {:ok, authorized, fresh_token} ->
+          result =
+            callback(options, :set_draft, &PullClient.set_draft/4).(
+              fresh_token,
+              remote.github_node_id,
+              plan.target["draft"],
+              request_options(sync)
+            )
 
-      continue_after_effect(
-        result,
-        marked,
-        now,
-        sync,
-        token,
-        local,
-        marker,
-        depth,
-        options
-      )
+          continue_after_effect(
+            result,
+            authorized,
+            now,
+            sync,
+            fresh_token,
+            local,
+            marker,
+            depth,
+            options
+          )
+
+        {:error, reason} ->
+          persist_failure(marked, now, reason, options)
+      end
     else
       {:error, reason} -> persist_failure(operation, now, reason, options)
     end
   end
+
+  defp authorize_marked_effect(marked, sync, options) do
+    authorize = callback(options, :authorize_effect, &ForgeMirrors.authorize_external_effect/2)
+
+    with {:ok, authorized} <- authorize.(marked, marked.external_effect_marker),
+         {:ok, token} <- installation_token(sync, options) do
+      {:ok, authorized, token}
+    end
+  end
+
+  defp authorize_recovery(%MirrorOperation{state: :effect_pending} = operation, options) do
+    callback(options, :authorize_effect, &ForgeMirrors.authorize_external_effect/2).(
+      operation,
+      operation.external_effect_marker
+    )
+  end
+
+  defp authorize_recovery(%MirrorOperation{state: :processing} = operation, _options),
+    do: {:ok, operation}
+
+  defp authorize_recovery(%MirrorOperation{}, _options), do: {:error, :invalid_transition}
 
   defp continue_after_effect(
          {:ok, _response},

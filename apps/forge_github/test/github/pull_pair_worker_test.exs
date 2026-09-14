@@ -95,6 +95,67 @@ defmodule ForgeGitHub.PullPairWorkerTest do
     refute_received {:effect_marked, _}
   end
 
+  test "a post-marker authorization failure stops a paired metadata write" do
+    operation = operation(:processing)
+    parent = self()
+    local_pull_snapshot = Map.put(@base, "title", "Local")
+    local_issue = Map.put(issue_snapshot([]), "title", "Local")
+
+    local =
+      Map.merge(local_pull(local_pull_snapshot, 4), %{
+        issue_snapshot: local_issue,
+        relationship_preimage: %{label_ids: [], managed_assignee_identity_ids: []},
+        label_catalog: %{},
+        assignee_catalog: %{}
+      })
+
+    marked = %{
+      operation
+      | state: :effect_pending,
+        external_effect_marker: %{"action" => "update_remote_pull_issue"}
+    }
+
+    opts =
+      pair_options(operation, [],
+        local_observe: fn _ -> {:ok, local} end,
+        mark_pair_effect: fn ^operation, @now, pair, marker, payload ->
+          marked = %{marked | external_effect_marker: marker}
+          intent = %{payload: payload}
+          sync = context(marker) |> Map.put(:pair, pair)
+          Process.put(:pair_effect_intent, intent)
+          send(parent, :pair_effect_marked)
+          {:ok, %{operation: marked, sync: sync, intent: intent}}
+        end,
+        pair_relationship_attrs: fn _, _, _, target, _ ->
+          {:ok,
+           Map.merge(Map.take(target, ~w(title body state state_reason)), %{
+             "labels" => [],
+             "assignees" => []
+           })}
+        end,
+        pair_effect_context: fn op ->
+          {:ok, %{marker: op.external_effect_marker, intent: Process.get(:pair_effect_intent)}}
+        end,
+        authorize_effect: fn op, marker ->
+          assert op.external_effect_marker == marker
+          send(parent, :pair_effect_authorized)
+          {:error, :paused}
+        end,
+        update_pull_issue: fn _, _, _, _, _, _ ->
+          flunk("paused paired effect must not mutate GitHub")
+        end,
+        checkpoint: fn op, _, _, _, _ ->
+          send(parent, {:pair_effect_deferred, op.external_effect_marker})
+          {:ok, :deferred}
+        end
+      )
+
+    assert {:ok, :deferred} = PullSyncWorker.process_operation(operation, @now, opts)
+    assert_received :pair_effect_marked
+    assert_received :pair_effect_authorized
+    assert_received {:pair_effect_deferred, %{"action" => "update_remote_pull_issue"}}
+  end
+
   test "paired context never falls back when local relationship projection is absent" do
     operation = operation(:processing)
 
@@ -176,6 +237,10 @@ defmodule ForgeGitHub.PullPairWorkerTest do
       update_pull_issue: fn _, _, _, _, _, _ -> flunk("unexpected issue effect") end,
       set_draft: fn _, _, _, _ -> flunk("unexpected draft effect") end,
       mark_effect: mark_effect(self(), operation),
+      authorize_effect: fn marked, marker ->
+        assert marked.external_effect_marker == marker
+        {:ok, marked}
+      end,
       replace_effect: fn _, _, _, _ -> flunk("unexpected replacement effect") end,
       checkpoint: fn _, _, _, _, _ -> flunk("unexpected effect checkpoint") end,
       confirm: fn _, _, _, _, _ -> {:ok, :confirmed} end,

@@ -148,6 +148,45 @@ defmodule ForgeGitHub.ReleaseSyncWorkerTest do
     assert {:ok, :confirmed} = ReleaseSyncWorker.process_operation(operation, @now, options)
   end
 
+  test "post-marker revocation defers release recovery without a fresh token or replay" do
+    parent = self()
+    local_fields = Map.put(@base, "body", "local notes")
+
+    marker =
+      effect_marker("update_remote_release", local_fields, 41)
+      |> Map.put("expected_remote_fingerprint", fingerprint(@base))
+      |> Map.put("expected_remote_updated_at", "2026-09-14T07:30:00Z")
+
+    operation = operation(:effect_pending, marker: marker)
+
+    options =
+      options(operation,
+        context: fn ^operation ->
+          {:ok, context(tag_proof(), effect_marker: marker, local_version: 1)}
+        end,
+        local_observe: fn _ -> {:ok, local_release(local_fields, 1)} end,
+        token_fetch: fn 44, _ ->
+          send(parent, :token_fetch)
+
+          %InstallationToken{
+            token: "ephemeral",
+            expires_at: DateTime.add(@now, 3_600),
+            permissions: %{"contents" => "write", "metadata" => "read"}
+          }
+        end,
+        get_release: fn _, _, _, 41, _ -> {:ok, github_release(@base)} end,
+        authorize_effect: fn ^operation, ^marker -> {:error, :revoked} end,
+        update_release: fn _, _, _, _, _, _ -> flunk("revoked effect replayed GitHub") end,
+        defer_effect: fn ^operation, @now, retry_at, "network", "credential_unavailable" ->
+          assert DateTime.after?(retry_at, @now)
+          {:ok, :deferred}
+        end
+      )
+
+    assert {:ok, :deferred} = ReleaseSyncWorker.process_operation(operation, @now, options)
+    refute_received :token_fetch
+  end
+
   test "recovers an ambiguous create only through the exact unique tag" do
     marker = effect_marker("create_remote_release", @base, nil)
     operation = operation(:effect_pending, marker: marker, github_object_id: nil)
@@ -534,6 +573,10 @@ defmodule ForgeGitHub.ReleaseSyncWorkerTest do
       prepare_tag_proof: fn _, _, _ -> flunk("unexpected tag proof split") end,
       mark_effect: fn _, _, _ -> flunk("unexpected external effect") end,
       replace_effect: fn _, _, _, _ -> flunk("unexpected replacement effect") end,
+      authorize_effect: fn marked, marker ->
+        assert marked.external_effect_marker == marker
+        {:ok, marked}
+      end,
       create_release: fn _, _, _, _, _ -> flunk("unexpected create") end,
       update_release: fn _, _, _, _, _, _ -> flunk("unexpected update") end,
       delete_release: fn _, _, _, _, _ -> flunk("unexpected delete") end,
