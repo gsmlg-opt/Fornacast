@@ -296,6 +296,54 @@ defmodule ForgeMirrors.ReleaseSyncPersistenceTest do
     refute Map.has_key?(context, :author_user_id)
   end
 
+  test "a deferred release delete marker survives durable reclaim by a new owner", c do
+    event = release_event(c, "release.updated")
+    assert {:ok, {:materialized, [operation]}} = ForgeMirrors.materialize_outbox_event(event)
+
+    assert {:ok, [claimed]} =
+             ForgeMirrors.claim_operations("release-delete-first-owner", c.now, 60, 1, [
+               "sync.release"
+             ])
+
+    assert claimed.id == operation.id
+
+    marker = %{
+      "v" => 1,
+      "action" => "delete_remote_release",
+      "resource_kind" => "release",
+      "github_object_id" => 44_008,
+      "local_resource_id" => c.release.id
+    }
+
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(claimed, c.now, marker)
+    retry_at = DateTime.add(c.now, 1)
+
+    assert {:ok, deferred} =
+             ForgeMirrors.defer_resource_effect(
+               marked,
+               c.now,
+               retry_at,
+               "network",
+               "resource_context_unavailable"
+             )
+
+    assert deferred.state == :effect_pending
+    assert deferred.external_effect_marker == marker
+    assert is_nil(deferred.lease_owner)
+    assert is_nil(deferred.lease_expires_at)
+
+    assert {:ok, [reclaimed]} =
+             ForgeMirrors.claim_operations("release-delete-restarted-owner", retry_at, 60, 1, [
+               "sync.release"
+             ])
+
+    assert reclaimed.id == operation.id
+    assert reclaimed.state == :effect_pending
+    assert reclaimed.lease_owner == "release-delete-restarted-owner"
+    assert reclaimed.external_effect_marker == marker
+    assert reclaimed.effect_marked_at == marked.effect_marked_at
+  end
+
   test "release mirror boundaries and inventory accept 255-character multibyte tags", c do
     tag_name = String.duplicate("界", 255)
 

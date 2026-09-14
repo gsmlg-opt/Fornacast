@@ -422,6 +422,54 @@ defmodule ForgeGitHub.ReleaseSyncWorkerTest do
              ReleaseSyncWorker.process_operation(operation, @now, options)
   end
 
+  test "a timed-out delete reclaims its exact marker and confirms deletion without a second DELETE" do
+    operation = operation(:processing)
+
+    first =
+      options(operation,
+        context: fn ^operation ->
+          {:ok, context(:not_required, local_deleted: true, baseline: @base)}
+        end,
+        mark_effect: fn ^operation, @now, marker ->
+          assert marker["action"] == "delete_remote_release"
+          {:ok, %{operation | state: :effect_pending, external_effect_marker: marker}}
+        end,
+        delete_release: fn _, "acme", "widgets", 41, _ -> {:error, Error.new(:timeout)} end,
+        defer_effect: fn marked, @now, retry_at, "network", "resource_context_unavailable" ->
+          assert marked.state == :effect_pending
+          assert DateTime.after?(retry_at, @now)
+          {:ok, marked}
+        end
+      )
+
+    assert {:ok, %MirrorOperation{state: :effect_pending} = deferred} =
+             ReleaseSyncWorker.process_operation(operation, @now, first)
+
+    marker = deferred.external_effect_marker
+
+    recovered =
+      options(deferred,
+        context: fn ^deferred ->
+          {:ok,
+           context(:not_required,
+             local_deleted: true,
+             baseline: @base,
+             effect_marker: marker
+           )}
+        end,
+        get_release: fn _, "acme", "widgets", 41, _ -> {:error, Error.new(:not_found)} end,
+        delete_release: fn _, _, _, _, _ -> flunk("recovery replayed the committed DELETE") end,
+        confirm: fn ^deferred, @now, _expected, confirmation, request ->
+          assert confirmation.state == :deleted
+          assert request.action == :observe
+          assert request.expected_deleted
+          {:ok, :recovered}
+        end
+      )
+
+    assert {:ok, :recovered} = ReleaseSyncWorker.process_operation(deferred, @now, recovered)
+  end
+
   test "canonical immutable-id deletion never falls back to tag identity" do
     operation = operation(:processing, release_action: "deleted")
 
