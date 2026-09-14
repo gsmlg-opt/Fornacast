@@ -9,6 +9,44 @@ focused integration proof. PR16 and the complete acceptance matrix remain open.
 
 ## Requirement-by-requirement gates
 
+### PR16 reconciliation and operator foundations (2026-09-14)
+
+- Commit `acd3a6e` changes pull reconciliation from an unsupported-head-only
+  mapped scan into a checkpointed canonical GitHub pull inventory followed by a
+  pinned mapped-resource pass. Remote pulls omitted from webhooks now enqueue
+  ordinary `sync.pull` work, while confirmed, provider-bound pending, and
+  unsupported mappings are revisited. Mapped-only pages acquire no installation
+  token; duplicate provider IDs/numbers are rejected before durable fan-out.
+- The same commit adds a supervised, leased repository-metadata observation
+  worker. Completed installation inventory schedules idempotent
+  `reconcile.repository.metadata` work; exact immutable repository identity and
+  bounded canonical fields are fetched with an installation token. Matching
+  observations establish a shared canonical fingerprint/baseline. Differences
+  retain or refresh one open `repository_metadata_diverged` conflict without
+  overwriting local state or leaving the operation in a reclaim loop.
+- Organization owners can now filter open conflicts by repository, resource,
+  and resource type and compare database-truncated baseline/Fornacast/GitHub
+  snapshots. Git ref conflicts explicitly require an operator Git action and
+  reconciliation; no automatic Git resolution was introduced. Filter IDs are
+  organization-scoped and PostgreSQL-bigint bounded.
+- Settings expose bounded webhook inbox counts, oldest unprocessed receipt, and
+  unreconciled failed-delivery count. A reconciliation later than the failed
+  receipt clears the visible gap without deleting historical delivery evidence.
+- Combined focused verification passed **51 ForgeMirrors**, **25 ForgeGitHub**,
+  **5 ForgeImports**, and **32 FornacastWeb** tests. The changed webhook-health
+  regression passed in isolation, exact scoped formatting and diff checks
+  passed, and production compilation passed with warnings as errors. Running the
+  entire webhook inbox file in the combined mirror matrix still reproduces the
+  previously documented unrelated installation-identity fixture collision; it
+  was not modified or suppressed.
+- This is a foundation checkpoint, not PR16 or PRD completion. Repository
+  metadata still needs a trusted exact-preimage ForgeRepos apply boundary,
+  outbound marker/PATCH/recovery, local repository creation on GitHub, rename
+  collision handling, and explicit archived/internal-visibility policy. Safe
+  metadata conflict actions, the full deterministic fault matrix, integrated
+  omitted-webhook convergence, pause/resume, disconnect/revocation, and live
+  GitHub evidence also remain open.
+
 ### PR15 release synchronization foundations (2026-09-14)
 
 - Commit `c3996de` adds monotonic release sync versions, atomic local and
