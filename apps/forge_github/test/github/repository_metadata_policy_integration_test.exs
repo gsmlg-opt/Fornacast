@@ -4,17 +4,26 @@ defmodule ForgeGitHub.RepositoryMetadataPolicyIntegrationTest do
   import Ecto.Query
   import ForgeMirrors.TestSupport.MirrorFixtures
 
-  alias ForgeGitHub.{Error, InstallationToken, InventoryWorker, RepositoryMetadataSyncWorker}
+  alias ForgeGitHub.{
+    Error,
+    InstallationToken,
+    InventoryWorker,
+    ReleaseSyncWorker,
+    RepositoryMetadataSyncWorker
+  }
+
   alias ForgeGitHub.Repository, as: GitHubRepository
 
   alias ForgeMirrors.{
     MirrorConflict,
     MirrorOperation,
+    MirrorResourceState,
     MirrorWebhookDelivery,
     OrganizationMirror,
     RepositoryMirror
   }
 
+  alias ForgeReleases.Release
   alias ForgeRepos.Repository
   alias Fornacast.Repo
 
@@ -281,6 +290,286 @@ defmodule ForgeGitHub.RepositoryMetadataPolicyIntegrationTest do
            ) == 0
   end
 
+  test "full inventory repairs an intentionally omitted release deletion", c do
+    Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+    task_supervisor = start_supervised!(Task.Supervisor)
+    observed_at = DateTime.add(c.now, 10)
+
+    organization =
+      c.organization
+      |> OrganizationMirror.update_changeset(%{capabilities: %{"releases" => "enabled"}})
+      |> Repo.update!()
+
+    Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+      github_installation_id: organization.github_installation_id
+    )
+    |> Ecto.Changeset.change(permissions: %{"contents" => "write", "metadata" => "read"})
+    |> Repo.update!()
+
+    repository = Repo.get!(Repository, c.binding.repository_id)
+
+    release =
+      Repo.insert!(%Release{
+        repository_id: repository.id,
+        tag_name: "v1.0.0",
+        name: "Version 1",
+        body: "Deleted on GitHub without a webhook",
+        draft: false,
+        prerelease: false,
+        target_commitish: repository.default_branch,
+        published_at: c.now,
+        author_user_id: c.actor.id,
+        sync_version: 1
+      })
+
+    baseline = %{
+      "tag_name" => release.tag_name,
+      "name" => release.name,
+      "body" => release.body,
+      "draft" => release.draft,
+      "prerelease" => release.prerelease,
+      "target_commitish" => release.target_commitish,
+      "published_at" => DateTime.to_iso8601(release.published_at)
+    }
+
+    {:ok, fingerprint} = ForgeMirrors.resource_fingerprint(baseline)
+
+    mapping =
+      %MirrorResourceState{}
+      |> MirrorResourceState.persistence_changeset(%{
+        repository_mirror_id: c.binding.id,
+        resource_kind: :release,
+        local_resource_type: "ForgeReleases.Release",
+        local_resource_id: release.id,
+        github_object_id: 41,
+        github_node_id: "RE_41",
+        confirmed_snapshot: baseline,
+        confirmed_fingerprint: fingerprint,
+        confirmed_local_version: 1,
+        confirmed_remote_updated_at: c.now,
+        state: :confirmed
+      })
+      |> Repo.insert!()
+
+    github_repository = %GitHubRepository{
+      id: c.binding.github_repository_id,
+      node_id: c.binding.github_node_id,
+      owner_id: organization.github_account_id,
+      name: repository.slug,
+      full_name: c.binding.github_full_name,
+      owner_login: organization.github_account_login,
+      description: repository.description,
+      visibility: repository.visibility,
+      default_branch: repository.default_branch,
+      has_issues: false,
+      allow_merge_commit: true,
+      fork: false,
+      archived: false,
+      updated_at: observed_at
+    }
+
+    assert Repo.aggregate(
+             from(delivery in MirrorWebhookDelivery,
+               where: delivery.organization_mirror_id == ^organization.id
+             ),
+             :count
+           ) == 0
+
+    assert {:ok, %MirrorOperation{} = inventory} =
+             ForgeMirrors.schedule_reconciliation(c.actor, organization, observed_at)
+
+    assert {:ok, [{inventory_id, {:ok, %{operation: %{state: :completed}}}}]} =
+             InventoryWorker.run_once("omitted-release-inventory",
+               now: fn -> observed_at end,
+               task_supervisor: task_supervisor,
+               max_concurrency: 1,
+               batch_size: 1,
+               token_fetch: token_fetch(self()),
+               page_fetch: fn "metadata-policy-token", 1, _ ->
+                 {:ok, %{repositories: [github_repository], next_cursor: nil}}
+               end
+             )
+
+    assert inventory_id == inventory.id
+    marker = "inventory-operation:#{inventory.id}"
+
+    children =
+      Repo.all(
+        from operation in MirrorOperation,
+          where:
+            operation.organization_mirror_id == ^organization.id and
+              operation.id != ^inventory.id and
+              operation.kind != "finalize.organization.reconciliation" and
+              fragment("?->>'inventory_reconciliation_sweep' = ?", operation.cursor, ^marker),
+          select: operation.kind
+      )
+
+    assert Enum.sort(children) == [
+             "reconcile.repository.git",
+             "reconcile.repository.metadata",
+             "reconcile.repository.releases"
+           ]
+
+    assert {:ok, [{_finalizer_id, {:ok, %{status: :waiting}}}]} =
+             InventoryWorker.run_once("omitted-release-finalizer-waiting",
+               now: fn -> observed_at end,
+               task_supervisor: task_supervisor,
+               max_concurrency: 1,
+               batch_size: 1
+             )
+
+    assert {:ok, [git_operation]} =
+             ForgeMirrors.claim_operations(
+               "omitted-release-git",
+               observed_at,
+               60,
+               1,
+               ["reconcile.repository.git"]
+             )
+
+    assert {:ok, %{state: :completed}} =
+             ForgeMirrors.complete_operation(git_operation, observed_at)
+
+    worker_options = [
+      now: fn -> observed_at end,
+      task_supervisor: task_supervisor,
+      max_concurrency: 1,
+      batch_size: 1,
+      token_fetch: token_fetch(self()),
+      list_releases: fn "metadata-policy-token", _owner, _repository, 1, _ ->
+        {:ok, %{releases: [], next_cursor: nil}}
+      end,
+      get_release: fn "metadata-policy-token", _owner, _repository, 41, _ ->
+        {:error, Error.new(:not_found)}
+      end,
+      create_release: fn _, _, _, _, _ -> flunk("reconciliation created a remote release") end,
+      update_release: fn _, _, _, _, _, _ -> flunk("reconciliation updated a remote release") end,
+      delete_release: fn _, _, _, _, _ -> flunk("reconciliation deleted a remote release") end
+    ]
+
+    for {owner, offset} <- [
+          {"omitted-release-remote", 1},
+          {"omitted-release-mapped", 2}
+        ] do
+      assert {:ok, [{operation_id, {:ok, _result}}]} =
+               ReleaseSyncWorker.run_once(
+                 owner,
+                 Keyword.put(worker_options, :now, fn -> DateTime.add(observed_at, offset) end)
+               )
+
+      assert Repo.get!(MirrorOperation, operation_id).kind in [
+               "reconcile.repository.releases",
+               "sync.release"
+             ]
+    end
+
+    assert {:ok, [metadata_operation]} =
+             ForgeMirrors.claim_operations(
+               "omitted-release-metadata",
+               DateTime.add(observed_at, 2),
+               60,
+               1,
+               ["reconcile.repository.metadata"]
+             )
+
+    assert {:ok, %{state: :completed}} =
+             ForgeMirrors.complete_operation(metadata_operation, DateTime.add(observed_at, 2))
+
+    assert {:ok, [{child_id, {:ok, %MirrorOperation{state: :pending} = canonical_delete}}]} =
+             ReleaseSyncWorker.run_once(
+               "omitted-release-canonical-delete",
+               Keyword.put(worker_options, :now, fn -> DateTime.add(observed_at, 3) end)
+             )
+
+    assert canonical_delete.checkpoint["canonical_release_deletion"] == %{
+             "github_object_id" => 41,
+             "observed_at" => DateTime.to_iso8601(DateTime.add(observed_at, 3))
+           }
+
+    assert {:ok, [claimed_child]} =
+             ForgeMirrors.claim_operations(
+               "omitted-release-apply-delete",
+               DateTime.add(observed_at, 4),
+               60,
+               1,
+               ["sync.release"]
+             )
+
+    assert claimed_child.id == child_id
+
+    assert {:ok,
+            %{
+              baseline: ^baseline,
+              local_deleted: false,
+              local_resource_id: release_id,
+              local_version: 1,
+              tag_proof: :not_required
+            }} = ForgeMirrors.release_operation_context(claimed_child)
+
+    assert release_id == release.id
+
+    assert {:ok, %{operation: %{state: :completed}}} =
+             ReleaseSyncWorker.process_operation(
+               claimed_child,
+               DateTime.add(observed_at, 4),
+               worker_options
+             )
+
+    assert [] ==
+             Repo.all(
+               from operation in MirrorOperation,
+                 where:
+                   operation.organization_mirror_id == ^organization.id and
+                     operation.kind == "sync.release" and operation.state != :completed,
+                 select: %{
+                   id: operation.id,
+                   state: operation.state,
+                   checkpoint: operation.checkpoint,
+                   failure_class: operation.failure_class,
+                   failure_detail: operation.failure_detail
+                 }
+             )
+
+    assert Repo.get!(Release, release.id).deleted_at == DateTime.add(observed_at, 3)
+
+    assert %{state: :deleted, confirmed_snapshot: ^baseline} =
+             Repo.get!(MirrorResourceState, mapping.id)
+
+    assert Enum.all?(
+             Repo.all(
+               from operation in MirrorOperation,
+                 where:
+                   operation.organization_mirror_id == ^organization.id and
+                     operation.kind != "finalize.organization.reconciliation" and
+                     fragment(
+                       "?->>'inventory_reconciliation_sweep' = ?",
+                       operation.cursor,
+                       ^marker
+                     )
+             ),
+             &(&1.state == :completed)
+           )
+
+    finalizer_retry_at = DateTime.add(observed_at, 5)
+
+    assert {:ok, [{_finalizer_id, {:ok, %{status: :completed}}}]} =
+             InventoryWorker.run_once("omitted-release-finalizer-completed",
+               now: fn -> finalizer_retry_at end,
+               task_supervisor: task_supervisor,
+               max_concurrency: 1,
+               batch_size: 1
+             )
+
+    assert Repo.get!(OrganizationMirror, organization.id).last_reconciled_at == observed_at
+
+    assert Repo.aggregate(
+             from(delivery in MirrorWebhookDelivery,
+               where: delivery.organization_mirror_id == ^organization.id
+             ),
+             :count
+           ) == 0
+  end
+
   test "keep Fornacast recovers a committed PATCH after timeout without a second effect", c do
     repository =
       c.binding.repository_id
@@ -458,6 +747,13 @@ defmodule ForgeGitHub.RepositoryMetadataPolicyIntegrationTest do
           token: "metadata-policy-token",
           expires_at: ~U[2026-09-15 00:00:00Z],
           permissions: %{"administration" => "write"}
+        }
+
+      _installation_id, %{permissions: %{"contents" => "write", "metadata" => "read"}} ->
+        %InstallationToken{
+          token: "metadata-policy-token",
+          expires_at: ~U[2026-09-15 00:00:00Z],
+          permissions: %{"contents" => "write", "metadata" => "read"}
         }
     end
   end
