@@ -40,6 +40,15 @@ the complete acceptance matrix remain open.
   Administration token or PATCH. No inbox row exists before or after repair, and
   the real organization finalizer keeps `last_reconciled_at` behind the Git and
   metadata children before advancing it to the inventory observation time.
+- The same owner-scheduled inventory boundary now has real-worker omitted-event
+  proof for collaboration metadata. The issue/comment integration runs the
+  checkpointed remote and mapped sweeps plus every generated `sync.issue` and
+  `sync.issue_comment` child, imports a previously unknown GitHub label, applies
+  a GitHub-only title update, tombstones a comment deleted without a webhook,
+  and advances the marker finalizer only after the bounded worker drain. The
+  pull integration runs both remote/mapped pull-head phases and their two
+  canonical children, applies a GitHub-only title update, and likewise proves
+  zero inbox deliveries and a held-then-completed organization watermark.
 - The final focused gate passed **12 ForgeMirrors lifecycle tests** and **100
   ForgeGitHub worker tests**, with exact changed-file formatting, diff checks,
   and production warnings-as-errors compilation. A broader nine-file
@@ -995,7 +1004,7 @@ PR13 integration audit additionally identified these concrete remaining gates:
 | 17 | Release assets and wiki never synchronize | PR14 exposes no asset API/UI. PR15 strips provider asset payloads, retains only a bounded warning count, reports bootstrap exclusions, ignores release-asset identities and keeps wiki unsupported. Retain full PR16 reconciliation negatives and live proof. |
 | 18 | Duplicate/out-of-order webhooks neither duplicate nor regress | Inbox foundation tests exist. Extend resource-specific fixtures for issues/comments, PRs, and releases. |
 | 19 | Every operation boundary recovers after restart | Git/LFS checkpoint, lease, marker-replacement and rate-limit recovery tests pass. Metadata create/update/delete/merge boundaries and full restart matrix remain open. |
-| 20 | Full reconciliation repairs omitted deliveries | One immutable sweep now spans inventory, Git/LFS, repository metadata, issues/comments, pull heads, and releases; `last_reconciled_at` advances only after its durable finalizer proves every branch complete, and failed-delivery health remains gapped until then. A real owner-scheduled inventory -> repository-metadata worker -> finalizer integration repairs an intentionally omitted repository webhook with no outbound echo. Complete the equivalent Git/LFS, issue/comment, pull, and release worker matrix plus two-endpoint proof. |
+| 20 | Full reconciliation repairs omitted deliveries | One immutable sweep now spans inventory, Git/LFS, repository metadata, issues/comments, pull heads, and releases; `last_reconciled_at` advances only after its durable finalizer proves every branch complete, and failed-delivery health remains gapped until then. Real owner-scheduled inventory -> resource-worker -> finalizer integrations now repair intentionally omitted repository metadata, issue/comment/label, and pull deliveries with no outbound echo. Complete the equivalent Git/LFS and release worker paths plus two-endpoint proof. |
 | 21 | Pause prevents new effects but retains work | Organization finalization and repository-metadata processing/effect-pending boundaries retain work with no token/PATCH while paused, including resume and expired-lease proof. Complete the same matrix for the remaining workers, including long LFS work. |
 | 22 | Disconnect/revocation stops token use and retains local repos | Revocation after finalizer claim freezes the durable sweep without a false watermark; repository-metadata prepared effects already stop before write-token/PATCH. Verify every remaining worker, in-flight recovery path, local-repository retention, and live disconnect flow. |
 
