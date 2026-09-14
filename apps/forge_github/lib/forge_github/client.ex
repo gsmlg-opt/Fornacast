@@ -27,6 +27,7 @@ defmodule ForgeGitHub.Client do
   @max_json_collection 512
   @max_json_string_bytes 16_384
   @max_issue_metadata_string_bytes 262_144
+  @max_release_metadata_string_bytes 262_144
   # GitHub asks clients to pause on rate limits; cap a durable pause at 24 hours so a
   # malformed or hostile header cannot strand an import indefinitely.
   @retry_fallback_seconds 60
@@ -70,19 +71,40 @@ defmodule ForgeGitHub.Client do
     metadata_request(token, method, path, expected_status, opts, &pull_metadata_request_kind/2)
   end
 
-  defp metadata_request(token, method, path, expected_status, opts, classify) do
+  @doc false
+  def release_metadata_request(token, method, path, expected_status, opts) do
+    metadata_request(
+      token,
+      method,
+      path,
+      expected_status,
+      opts,
+      &release_metadata_request_kind/2,
+      :release_metadata
+    )
+  end
+
+  defp metadata_request(
+         token,
+         method,
+         path,
+         expected_status,
+         opts,
+         classify,
+         json_profile \\ :issue_metadata
+       ) do
     with {:ok, request_kind} <- classify.(method, path),
          true <- valid_issue_metadata_status?(request_kind, expected_status),
          true <- installation_gate?(opts) do
       with_request_gate(token, opts, [:json], fn ->
-        with {:ok, body} <- encode_request_body(opts, :issue_metadata),
+        with {:ok, body} <- encode_request_body(opts, json_profile),
              {:ok, response} <- perform_request(path, token, opts, method, body),
              {:ok, value} <-
                successful_response(
                  response,
                  opts,
                  expected_status,
-                 :issue_metadata
+                 json_profile
                ) do
           {:ok, value}
         else
@@ -104,6 +126,17 @@ defmodule ForgeGitHub.Client do
   @doc false
   def pull_metadata_page(token, path, opts) do
     metadata_page(token, path, opts, &pull_metadata_request_kind/2)
+  end
+
+  @doc false
+  def release_metadata_page(token, path, opts) do
+    metadata_page(
+      token,
+      path,
+      opts,
+      &release_metadata_request_kind/2,
+      :release_metadata
+    )
   end
 
   @doc false
@@ -149,14 +182,14 @@ defmodule ForgeGitHub.Client do
 
   defp valid_label_page_query?(_query), do: false
 
-  defp metadata_page(token, path, opts, classify) do
+  defp metadata_page(token, path, opts, classify, json_profile \\ :issue_metadata) do
     with {:ok, :page} <- classify.(:get, path),
          true <- installation_gate?(opts),
          {:ok, %URI{path: allowed_path}} <- URI.new(path) do
       with_request_gate(token, opts, fn ->
         with {:ok, response} <- perform_request(path, token, opts, :get, nil),
              {:ok, json} <-
-               successful_response(response, opts, 200, :issue_metadata),
+               successful_response(response, opts, 200, json_profile),
              {:ok, next_url} <- Pagination.next_url(response, [allowed_path]) do
           {:ok, %{json: json, next_url: next_url}}
         else
@@ -456,6 +489,87 @@ defmodule ForgeGitHub.Client do
   end
 
   defp pull_metadata_request_kind(_, _), do: :error
+
+  defp release_metadata_request_kind(method, path)
+       when method in [:get, :post, :patch, :delete] and is_binary(path) do
+    with {:ok,
+          %URI{
+            scheme: nil,
+            host: nil,
+            userinfo: nil,
+            fragment: nil,
+            path: parsed,
+            query: query
+          }} <- URI.new(path),
+         false <- String.contains?(parsed, "//"),
+         ["repos", owner, repository, "releases" | resource] <-
+           String.split(parsed, "/", trim: true),
+         true <- RepositoryReference.valid_owner?(owner),
+         true <- RepositoryReference.valid_repository?(repository) do
+      release_metadata_resource_kind(method, resource, query)
+    else
+      _invalid -> :error
+    end
+  rescue
+    _exception -> :error
+  end
+
+  defp release_metadata_request_kind(_method, _path), do: :error
+
+  defp release_metadata_resource_kind(:get, [], query) when is_binary(query) do
+    if valid_release_page_query?(query), do: {:ok, :page}, else: :error
+  end
+
+  defp release_metadata_resource_kind(:post, [], nil), do: {:ok, :create}
+
+  defp release_metadata_resource_kind(:get, ["tags", encoded_tag], nil) do
+    if valid_encoded_release_tag?(encoded_tag), do: {:ok, :read}, else: :error
+  end
+
+  defp release_metadata_resource_kind(method, [id], nil)
+       when method in [:get, :patch, :delete] do
+    with :ok <- validate_positive_id(id),
+         {parsed_id, ""} <- Integer.parse(id),
+         true <- id == Integer.to_string(parsed_id) do
+      {:ok,
+       case method do
+         :get -> :read
+         :patch -> :update
+         :delete -> :delete
+       end}
+    end
+  end
+
+  defp release_metadata_resource_kind(_method, _resource, _query), do: :error
+
+  defp valid_release_page_query?(query) do
+    with pairs <- Enum.to_list(URI.query_decoder(query)),
+         true <- length(pairs) == 2,
+         true <- length(pairs) == length(Enum.uniq_by(pairs, &elem(&1, 0))),
+         %{"page" => encoded_page, "per_page" => "100"} <- Map.new(pairs),
+         {page, ""} <- Integer.parse(encoded_page),
+         true <- page in 1..2_147_483_647,
+         true <- encoded_page == Integer.to_string(page) do
+      true
+    else
+      _invalid -> false
+    end
+  rescue
+    _exception -> false
+  end
+
+  defp valid_encoded_release_tag?(encoded_tag)
+       when is_binary(encoded_tag) and byte_size(encoded_tag) in 1..3_060 do
+    decoded = URI.decode(encoded_tag)
+
+    String.valid?(decoded) and decoded not in ["", ".", ".."] and byte_size(decoded) <= 1_020 and
+      :binary.match(decoded, <<0>>) == :nomatch and
+      URI.encode(decoded, &URI.char_unreserved?/1) == encoded_tag
+  rescue
+    _exception -> false
+  end
+
+  defp valid_encoded_release_tag?(_encoded_tag), do: false
 
   defp issue_metadata_request_kind(method, path)
        when method in [:get, :post, :patch, :delete] and is_binary(path) do
@@ -1094,7 +1208,10 @@ defmodule ForgeGitHub.Client do
 
   defp validate_json(values, depth, nodes, json_profile)
        when is_list(values) and length(values) <= @max_json_collection do
-    item_profile = if json_profile == :issue_metadata, do: :issue_metadata, else: :generic
+    item_profile =
+      if json_profile in [:issue_metadata, :release_metadata],
+        do: json_profile,
+        else: :generic
 
     Enum.reduce_while(values, {:ok, nodes + 1}, fn value, {:ok, count} ->
       case validate_json(value, depth + 1, count, item_profile) do
@@ -1120,9 +1237,11 @@ defmodule ForgeGitHub.Client do
   defp validate_json(_value, _depth, _nodes, _json_profile), do: {:error, :invalid_json}
 
   defp json_value_profile(:issue_metadata, "body"), do: :issue_body
+  defp json_value_profile(:release_metadata, "body"), do: :release_body
   defp json_value_profile(_json_profile, _key), do: :generic
 
   defp json_string_limit(:issue_body), do: @max_issue_metadata_string_bytes
+  defp json_string_limit(:release_body), do: @max_release_metadata_string_bytes
   defp json_string_limit(_json_profile), do: @max_json_string_bytes
 
   defp classify_response(%Req.Response{status: 401}, _opts), do: error(:invalid_credential)
