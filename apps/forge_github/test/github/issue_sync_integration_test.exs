@@ -4,9 +4,17 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
   import ForgeMirrors.TestSupport.MirrorFixtures
 
   alias Ecto.Multi
-  alias ForgeGitHub.{InstallationToken, IssueClient, IssueSyncWorker}
+  alias ForgeGitHub.{InstallationToken, InventoryWorker, IssueClient, IssueSyncWorker, Repository}
   alias ForgeIssues.Issue
-  alias ForgeMirrors.{MirrorOperation, MirrorResourceState, OutboxDispatcher}
+
+  alias ForgeMirrors.{
+    MirrorOperation,
+    MirrorResourceState,
+    MirrorWebhookDelivery,
+    OrganizationMirror,
+    OutboxDispatcher
+  }
+
   alias Fornacast.{DomainOutboxEvent, Repo}
 
   @base %{
@@ -73,6 +81,7 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
       owner_slug: organization_account.username,
       issue: issue,
       mapping: mapping,
+      identity: identity,
       stub: {__MODULE__, System.unique_integer([:positive])}
     }
   end
@@ -105,6 +114,298 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
            ) == 1
 
     assert Repo.get!(DomainOutboxEvent, event.id).state == :completed
+  end
+
+  test "full inventory repairs intentionally omitted issue and comment deliveries through real workers",
+       ctx do
+    Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+    task_supervisor = start_supervised!(Task.Supervisor)
+    observed_at = DateTime.add(DateTime.utc_now(:second), 10)
+
+    target =
+      @base
+      |> Map.put("title", "Changed on GitHub without a webhook")
+      |> Map.put("label_github_ids", [333])
+
+    label = %{
+      "id" => 333,
+      "node_id" => "LA_333",
+      "name" => "reconciled-label",
+      "color" => "aabbcc",
+      "description" => "Discovered during reconciliation"
+    }
+
+    {:ok, %{comment: comment}} =
+      Multi.new()
+      |> ForgeIssues.import_comment_multi(:comment, ctx.issue, ctx.identity, %{
+        "body" => "Removed on GitHub without a webhook",
+        "inserted_at" => @source_time,
+        "updated_at" => @source_time
+      })
+      |> Repo.transaction()
+
+    {:ok, comment_fingerprint} = ForgeMirrors.resource_fingerprint(%{"body" => comment.body})
+
+    comment_mapping =
+      %MirrorResourceState{}
+      |> MirrorResourceState.persistence_changeset(%{
+        repository_mirror_id: ctx.binding.id,
+        resource_kind: :issue_comment,
+        local_resource_type: "ForgeIssues.Comment",
+        local_resource_id: comment.id,
+        github_object_id: 900,
+        github_node_id: "IC_900",
+        github_number: 7,
+        confirmed_snapshot: %{"body" => comment.body},
+        confirmed_fingerprint: comment_fingerprint,
+        confirmed_local_version: 1,
+        confirmed_remote_updated_at: @source_time,
+        state: :confirmed
+      })
+      |> Repo.insert!()
+
+    github_repository = %Repository{
+      id: ctx.binding.github_repository_id,
+      node_id: ctx.binding.github_node_id,
+      owner_id: ctx.organization.github_account_id,
+      name: ctx.repository.slug,
+      full_name: ctx.binding.github_full_name,
+      owner_login: ctx.organization.github_account_login,
+      description: ctx.repository.description,
+      visibility: ctx.repository.visibility,
+      default_branch: ctx.repository.default_branch,
+      has_issues: true,
+      allow_merge_commit: true,
+      fork: false,
+      archived: false,
+      updated_at: observed_at
+    }
+
+    assert Repo.aggregate(
+             from(operation in MirrorOperation,
+               where: operation.organization_mirror_id == ^ctx.organization.id
+             ),
+             :count
+           ) == 0
+
+    assert Repo.aggregate(
+             from(delivery in MirrorWebhookDelivery,
+               where: delivery.organization_mirror_id == ^ctx.organization.id
+             ),
+             :count
+           ) == 0
+
+    assert {:ok, inventory} =
+             ForgeMirrors.schedule_reconciliation(ctx.owner, ctx.organization, observed_at)
+
+    assert {:ok, [{inventory_id, {:ok, %{operation: %{state: :completed}}}}]} =
+             InventoryWorker.run_once("omitted-issue-comment-inventory",
+               now: fn -> observed_at end,
+               task_supervisor: task_supervisor,
+               max_concurrency: 1,
+               batch_size: 1,
+               token_fetch: Keyword.fetch!(options(ctx), :token_fetch),
+               page_fetch: fn "integration-token", 1, _ ->
+                 {:ok, %{repositories: [github_repository], next_cursor: nil}}
+               end
+             )
+
+    assert inventory_id == inventory.id
+
+    marker = "inventory-operation:#{inventory.id}"
+
+    sweep_children =
+      Repo.all(
+        from operation in MirrorOperation,
+          where:
+            operation.organization_mirror_id == ^ctx.organization.id and
+              operation.kind != "finalize.organization.reconciliation" and
+              fragment("?->>'inventory_reconciliation_sweep' = ?", operation.cursor, ^marker),
+          select: operation.kind
+      )
+
+    assert Enum.sort(sweep_children) == [
+             "reconcile.repository.git",
+             "reconcile.repository.issue_comments",
+             "reconcile.repository.issues",
+             "reconcile.repository.metadata"
+           ]
+
+    assert Repo.get!(OrganizationMirror, ctx.organization.id).last_reconciled_at == nil
+
+    assert {:ok, [{_id, {:ok, %{status: :waiting}}}]} =
+             InventoryWorker.run_once("omitted-issue-comment-finalizer-waiting",
+               now: fn -> observed_at end,
+               task_supervisor: task_supervisor,
+               max_concurrency: 1,
+               batch_size: 1
+             )
+
+    assert {:ok, [git_operation]} =
+             ForgeMirrors.claim_operations(
+               "omitted-issue-comment-git-scaffolding",
+               observed_at,
+               60,
+               1,
+               ["reconcile.repository.git"]
+             )
+
+    assert {:ok, %{state: :completed}} =
+             ForgeMirrors.complete_operation(git_operation, observed_at)
+
+    Req.Test.stub(ctx.stub, fn conn ->
+      assert conn.method == "GET"
+
+      case conn.request_path do
+        "/repos/acme/project/issues" ->
+          Req.Test.json(conn, [Map.put(issue_json(target, observed_at), "labels", [label])])
+
+        "/repos/acme/project/issues/comments" ->
+          Req.Test.json(conn, [])
+
+        "/repos/acme/project/issues/7" ->
+          Req.Test.json(conn, Map.put(issue_json(target, observed_at), "labels", [label]))
+
+        "/repos/acme/project/issues/comments/900" ->
+          conn |> Plug.Conn.put_status(404) |> Req.Test.json(%{"message" => "Not Found"})
+
+        "/repos/acme/project" ->
+          Req.Test.json(conn, %{
+            "id" => ctx.binding.github_repository_id,
+            "node_id" => ctx.binding.github_node_id,
+            "name" => ctx.repository.slug,
+            "full_name" => ctx.binding.github_full_name,
+            "owner" => %{"id" => ctx.organization.github_account_id, "login" => "acme"},
+            "visibility" => "private",
+            "default_branch" => ctx.repository.default_branch,
+            "has_issues" => true,
+            "allow_merge_commit" => true,
+            "fork" => false,
+            "archived" => false
+          })
+
+        path ->
+          flunk("unexpected GitHub request path: #{path}")
+      end
+    end)
+
+    worker_options =
+      options(ctx) ++
+        [
+          now: fn -> observed_at end,
+          task_supervisor: task_supervisor,
+          max_concurrency: 1,
+          batch_size: 1
+        ]
+
+    for {{owner, expected_kind}, offset} <-
+          [
+            {"omitted-issue-remote", "reconcile.repository.issues"},
+            {"omitted-issue-mapped", "reconcile.repository.issues"},
+            {"omitted-comment-remote", "reconcile.repository.issue_comments"},
+            {"omitted-comment-mapped", "reconcile.repository.issue_comments"}
+          ]
+          |> Enum.with_index(1) do
+      assert {:ok, [{operation_id, {:ok, _result}}]} =
+               IssueSyncWorker.run_once(
+                 owner,
+                 Keyword.put(worker_options, :now, fn -> DateTime.add(observed_at, offset) end)
+               )
+
+      assert Repo.get!(MirrorOperation, operation_id).kind == expected_kind
+    end
+
+    assert {:ok, [metadata_operation]} =
+             ForgeMirrors.claim_operations(
+               "omitted-issue-comment-metadata-scaffolding",
+               observed_at,
+               60,
+               1,
+               ["reconcile.repository.metadata"]
+             )
+
+    assert {:ok, %{state: :completed}} =
+             ForgeMirrors.complete_operation(metadata_operation, observed_at)
+
+    assert {:drained, claimed_kinds} =
+             Enum.reduce_while(5..16, [], fn offset, claimed_kinds ->
+               case IssueSyncWorker.run_once(
+                      "omitted-issue-comment-child-#{offset}",
+                      Keyword.put(worker_options, :now, fn ->
+                        DateTime.add(observed_at, offset)
+                      end)
+                    ) do
+                 {:ok, []} ->
+                   {:halt, {:drained, claimed_kinds}}
+
+                 {:ok, [{operation_id, {:ok, _result}}]} ->
+                   kind = Repo.get!(MirrorOperation, operation_id).kind
+                   assert kind in ["sync.issue", "sync.issue_comment"]
+                   {:cont, [kind | claimed_kinds]}
+
+                 result ->
+                   flunk("unexpected issue reconciliation result: #{inspect(result)}")
+               end
+             end)
+
+    assert "sync.issue" in claimed_kinds
+    assert "sync.issue_comment" in claimed_kinds
+
+    assert %{title: "Changed on GitHub without a webhook"} = Repo.get!(Issue, ctx.issue.id)
+
+    assert [] ==
+             Repo.all(
+               from operation in MirrorOperation,
+                 where:
+                   operation.organization_mirror_id == ^ctx.organization.id and
+                     operation.kind in ["sync.issue", "sync.issue_comment"] and
+                     operation.state != :completed,
+                 select: {operation.kind, operation.state}
+             )
+
+    assert Repo.get(ForgeIssues.Comment, comment.id) == nil
+
+    assert %{state: :deleted} = Repo.get!(MirrorResourceState, comment_mapping.id)
+
+    assert %ForgeIssues.Label{name: "reconciled-label"} =
+             Repo.get_by!(ForgeIssues.Label,
+               repository_id: ctx.repository.id,
+               name: "reconciled-label"
+             )
+
+    assert Enum.all?(
+             Repo.all(
+               from operation in MirrorOperation,
+                 where:
+                   operation.organization_mirror_id == ^ctx.organization.id and
+                     operation.kind != "finalize.organization.reconciliation" and
+                     fragment(
+                       "?->>'inventory_reconciliation_sweep' = ?",
+                       operation.cursor,
+                       ^marker
+                     )
+             ),
+             &(&1.state == :completed)
+           )
+
+    finalizer_retry_at = DateTime.add(observed_at, 17)
+
+    assert {:ok, [{_id, {:ok, %{status: :completed}}}]} =
+             InventoryWorker.run_once("omitted-issue-comment-finalizer-completed",
+               now: fn -> finalizer_retry_at end,
+               task_supervisor: task_supervisor,
+               max_concurrency: 1,
+               batch_size: 1
+             )
+
+    assert Repo.get!(OrganizationMirror, ctx.organization.id).last_reconciled_at == observed_at
+
+    assert Repo.aggregate(
+             from(delivery in MirrorWebhookDelivery,
+               where: delivery.organization_mirror_id == ^ctx.organization.id
+             ),
+             :count
+           ) == 0
   end
 
   test "a real local outbox edit reaches GitHub only after its effect marker and confirms the same version",
@@ -1209,6 +1510,16 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
       end,
       get_repository: fn token, owner, repository, opts ->
         ForgeGitHub.Client.repository(token, owner, repository, transport_options(ctx, opts))
+      end,
+      list_issues: fn token, owner, repository, since, page, opts ->
+        IssueClient.list_updated_issues_page(
+          token,
+          owner,
+          repository,
+          since,
+          page,
+          transport_options(ctx, opts)
+        )
       end,
       list_comments: fn token, owner, repository, since, page, opts ->
         IssueClient.list_updated_comments_page(
