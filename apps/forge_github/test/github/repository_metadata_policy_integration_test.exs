@@ -6,6 +6,7 @@ defmodule ForgeGitHub.RepositoryMetadataPolicyIntegrationTest do
 
   alias ForgeGitHub.{
     Error,
+    GitRefWorker,
     InstallationToken,
     InventoryWorker,
     ReleaseClient,
@@ -573,6 +574,211 @@ defmodule ForgeGitHub.RepositoryMetadataPolicyIntegrationTest do
              ),
              :count
            ) == 0
+  end
+
+  test "owner reconciliation excludes wiki content and release assets", c do
+    Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+    task_supervisor = start_supervised!(Task.Supervisor)
+    observed_at = DateTime.add(c.now, 10)
+
+    organization =
+      c.organization
+      |> OrganizationMirror.update_changeset(%{capabilities: %{"releases" => "enabled"}})
+      |> Repo.update!()
+
+    Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+      github_installation_id: organization.github_installation_id
+    )
+    |> Ecto.Changeset.change(permissions: %{"contents" => "write", "metadata" => "read"})
+    |> Repo.update!()
+
+    repository = Repo.get!(Repository, c.binding.repository_id)
+
+    mapping_count_before =
+      Repo.aggregate(
+        from(mapping in MirrorResourceState,
+          where: mapping.repository_mirror_id == ^c.binding.id
+        ),
+        :count
+      )
+
+    github_repository =
+      %GitHubRepository{
+        id: c.binding.github_repository_id,
+        node_id: c.binding.github_node_id,
+        owner_id: organization.github_account_id,
+        name: repository.slug,
+        full_name: c.binding.github_full_name,
+        owner_login: organization.github_account_login,
+        description: repository.description,
+        visibility: repository.visibility,
+        default_branch: repository.default_branch,
+        has_issues: true,
+        allow_merge_commit: true,
+        fork: false,
+        archived: false,
+        updated_at: observed_at
+      }
+      |> Map.merge(%{has_wiki: true, wiki_url: "https://github.com/example/wiki"})
+
+    assert {:ok, %MirrorOperation{} = inventory} =
+             ForgeMirrors.schedule_reconciliation(c.actor, organization, observed_at)
+
+    assert {:ok, [{inventory_id, {:ok, %{operation: %{state: :completed}}}}]} =
+             InventoryWorker.run_once("unsupported-resource-inventory",
+               now: fn -> observed_at end,
+               task_supervisor: task_supervisor,
+               max_concurrency: 1,
+               batch_size: 1,
+               token_fetch: token_fetch(self()),
+               page_fetch: fn "metadata-policy-token", 1, _ ->
+                 {:ok, %{repositories: [github_repository], next_cursor: nil}}
+               end
+             )
+
+    assert inventory_id == inventory.id
+    marker = "inventory-operation:#{inventory.id}"
+
+    assert Enum.sort(
+             Repo.all(
+               from operation in MirrorOperation,
+                 where:
+                   operation.organization_mirror_id == ^organization.id and
+                     operation.id != ^inventory.id and
+                     operation.kind != "finalize.organization.reconciliation" and
+                     fragment(
+                       "?->>'inventory_reconciliation_sweep' = ?",
+                       operation.cursor,
+                       ^marker
+                     ),
+                 select: operation.kind
+             )
+           ) == [
+             "reconcile.repository.git",
+             "reconcile.repository.metadata",
+             "reconcile.repository.releases"
+           ]
+
+    assert {:ok, [git_operation]} =
+             ForgeMirrors.claim_operations(
+               "unsupported-resource-git",
+               observed_at,
+               60,
+               1,
+               ["reconcile.repository.git"]
+             )
+
+    assert {:ok, %{operation: %{state: :completed}, ref_operations: [_main_ref]}} =
+             GitRefWorker.process_operation(git_operation, observed_at,
+               repository_context: fn ^git_operation ->
+                 {:ok,
+                  %{
+                    baseline_ref_names: [],
+                    github_installation_id: organization.github_installation_id,
+                    remote_owner: organization.github_account_login,
+                    remote_repository: repository.slug,
+                    repository_generation: 1,
+                    repository_id: repository.id,
+                    repository_path: "/repositories/#{repository.id}.git",
+                    tracking_namespace: "repository-#{c.binding.id}",
+                    lfs_enabled: false
+                  }}
+               end,
+               token_fetch: token_fetch(self()),
+               fetch_refs: fn _request, "metadata-policy-token", _namespace ->
+                 {:ok,
+                  [
+                    %GitCore.Remote.ObservedRef{ref: "refs/heads/main", oid: @release_oid},
+                    %GitCore.Remote.ObservedRef{ref: "refs/wiki/Home", oid: @release_oid}
+                  ]}
+               end,
+               list_refs: fn _repository_path ->
+                 {:ok, [%{name: "refs/heads/main", target: @release_oid}]}
+               end,
+               fanout: fn ^git_operation, ref_names, ^observed_at ->
+                 assert ref_names == ["refs/heads/main"]
+                 ForgeMirrors.fanout_git_ref_reconciliation(git_operation, ref_names, observed_at)
+               end
+             )
+
+    release = %{
+      "id" => 41,
+      "node_id" => "RE_41",
+      "tag_name" => "v1.0.0",
+      "name" => "Version 1",
+      "body" => "Release notes",
+      "draft" => false,
+      "prerelease" => false,
+      "target_commitish" => repository.default_branch,
+      "published_at" => DateTime.to_iso8601(observed_at),
+      "created_at" => DateTime.to_iso8601(observed_at),
+      "updated_at" => DateTime.to_iso8601(observed_at),
+      "author" => %{"id" => 501, "node_id" => "U_501", "login" => "release-author"},
+      "asset_count" => 2,
+      "unsupported_fields" => [],
+      "assets" => [
+        %{
+          "id" => 701,
+          "name" => "artifact.tgz",
+          "browser_download_url" => "https://objects.example/701"
+        },
+        %{
+          "id" => 702,
+          "name" => "artifact.sig",
+          "browser_download_url" => "https://objects.example/702"
+        }
+      ]
+    }
+
+    assert {:ok, [{_release_operation_id, {:ok, %{operations: [release_child]}}}]} =
+             ReleaseSyncWorker.run_once("unsupported-resource-release",
+               now: fn -> DateTime.add(observed_at, 1) end,
+               task_supervisor: task_supervisor,
+               max_concurrency: 1,
+               batch_size: 1,
+               token_fetch: token_fetch(self()),
+               list_releases: fn "metadata-policy-token", _owner, _repository, 1, _ ->
+                 {:ok, %{releases: [release], next_cursor: nil}}
+               end,
+               create_release: fn _, _, _, _, _ ->
+                 flunk("reconciliation created a remote release")
+               end,
+               update_release: fn _, _, _, _, _, _ ->
+                 flunk("reconciliation updated a remote release")
+               end,
+               delete_release: fn _, _, _, _, _ ->
+                 flunk("reconciliation deleted a remote release")
+               end
+             )
+
+    assert release_child.kind == "sync.release"
+
+    assert release_child.cursor == %{
+             "github_object_id" => 41,
+             "inventory_reconciliation_sweep" => marker,
+             "remote_updated_at" => DateTime.to_iso8601(observed_at),
+             "resource_kind" => "release",
+             "sweep_id" => release_child.cursor["sweep_id"],
+             "tag_name" => "v1.0.0",
+             "trigger" => "reconcile"
+           }
+
+    assert Repo.aggregate(
+             from(mapping in MirrorResourceState,
+               where: mapping.repository_mirror_id == ^c.binding.id
+             ),
+             :count
+           ) == mapping_count_before
+
+    refute Repo.exists?(
+             from(operation in MirrorOperation,
+               where:
+                 operation.organization_mirror_id == ^organization.id and
+                   (like(operation.kind, "%wiki%") or like(operation.kind, "%asset%"))
+             )
+           )
+
+    assert release_child.cursor["resource_kind"] == "release"
   end
 
   test "duplicate and out-of-order release deliveries converge through canonical reads once", c do

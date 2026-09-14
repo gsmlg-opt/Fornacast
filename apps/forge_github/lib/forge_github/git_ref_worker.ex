@@ -1173,7 +1173,12 @@ defmodule ForgeGitHub.GitRefWorker do
         _other -> []
       end)
 
-    remote_names = Enum.map(observations, & &1.ref)
+    remote_names =
+      Enum.flat_map(observations, fn
+        %ObservedRef{ref: "refs/heads/" <> _ = ref} -> [ref]
+        %ObservedRef{ref: "refs/tags/" <> _ = ref} -> [ref]
+        _other -> []
+      end)
 
     names =
       (sync.baseline_ref_names ++ local_names ++ remote_names)
