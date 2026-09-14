@@ -78,11 +78,14 @@ the complete acceptance matrix remain open.
   persistence file encountered only the already-documented shared numeric fixture
   collisions; both affected selectors passed together in isolation. Exact changed-
   file formatting, diff checks, warnings-as-errors compilation, and two independent
-  P0/P1/P2 reviews passed. Criterion 20 now has local omitted-event evidence for
-  repository metadata, Git/LFS, issues, labels, comments, pull requests, and
-  releases; assignee-delta coverage remains before local acceptance. Criterion 11
-  still requires real clone/checkout proof from both endpoints, and criteria 21
-  and 22 still require the complete cross-worker lifecycle matrix.
+  P0/P1/P2 reviews passed. Commit `33d8c95` completes the local omitted-event
+  resource matrix by adding an unknown GitHub assignee to the real inventory
+  issue path and proving the observed immutable identity, provider-owned join,
+  and confirmed assignee-ID baseline. Its focused integration test and independent
+  P0/P1/P2 review pass. Criterion 20 is locally accepted for repository metadata,
+  Git/LFS, issues, labels, assignees, comments, pull requests, and releases.
+  Criterion 11 still requires real clone/checkout proof from both endpoints, and
+  criteria 21 and 22 still require the complete cross-worker lifecycle matrix.
 
 - Organization owners and active site administrators now have three bounded,
   durable repository-metadata conflict actions: accept the exact canonical
