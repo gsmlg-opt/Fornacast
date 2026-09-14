@@ -400,6 +400,28 @@ defmodule ForgeGitHub.ReleaseSyncWorkerTest do
     assert {:ok, :deleted} = ReleaseSyncWorker.process_operation(operation, @now, options)
   end
 
+  test "canonical deletion compares a persisted ISO publication baseline to local time" do
+    operation = operation(:processing, release_action: "deleted")
+    persisted_baseline = Map.update!(@base, "published_at", &DateTime.to_iso8601/1)
+
+    options =
+      options(operation,
+        context: fn ^operation ->
+          {:ok, context(:not_required, baseline: persisted_baseline, local_version: 3)}
+        end,
+        local_observe: fn _ -> {:ok, local_release(@base, 3)} end,
+        get_release: fn _, _, _, 41, _ -> {:error, Error.new(:not_found)} end,
+        confirm: fn ^operation, @now, _expected, confirmation, request ->
+          assert confirmation.state == :deleted
+          assert request.action == :delete
+          {:ok, :deleted}
+        end,
+        conflict: fn _, _, _, _, _, _ -> flunk("equivalent release timestamps conflicted") end
+      )
+
+    assert {:ok, :deleted} = ReleaseSyncWorker.process_operation(operation, @now, options)
+  end
+
   test "fetches exactly one bounded remote or mapped reconciliation page" do
     remote_operation = reconciliation_operation(:remote)
     mapped_operation = reconciliation_operation(:mapped)

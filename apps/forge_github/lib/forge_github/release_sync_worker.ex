@@ -325,14 +325,38 @@ defmodule ForgeGitHub.ReleaseSyncWorker do
   end
 
   defp decide_and_apply(operation, now, sync, token, local, remote, options) do
-    case release_decision(sync.baseline, local, remote) do
-      {:ok, decision} ->
-        apply_decision(operation, now, sync, token, local, remote, decision, options)
+    with {:ok, baseline} <- decision_baseline(sync.baseline) do
+      case release_decision(baseline, local, remote) do
+        {:ok, decision} ->
+          apply_decision(operation, now, sync, token, local, remote, decision, options)
 
-      {:conflict, kind} ->
-        conflict(operation, now, Atom.to_string(kind), options)
+        {:conflict, kind} ->
+          conflict(operation, now, Atom.to_string(kind), options)
+      end
+    else
+      {:error, reason} -> persist_failure(operation, now, reason, options)
     end
   end
+
+  defp decision_baseline(:missing), do: {:ok, :missing}
+
+  defp decision_baseline(%{"published_at" => nil} = baseline), do: {:ok, baseline}
+
+  defp decision_baseline(%{"published_at" => %DateTime{} = published_at} = baseline),
+    do: {:ok, Map.put(baseline, "published_at", DateTime.truncate(published_at, :second))}
+
+  defp decision_baseline(%{"published_at" => published_at} = baseline)
+       when is_binary(published_at) do
+    case DateTime.from_iso8601(published_at) do
+      {:ok, parsed, 0} ->
+        {:ok, Map.put(baseline, "published_at", DateTime.truncate(parsed, :second))}
+
+      _invalid ->
+        {:error, :invalid_projection}
+    end
+  end
+
+  defp decision_baseline(_baseline), do: {:error, :invalid_projection}
 
   defp release_decision(_baseline, :missing, :missing),
     do: {:ok, %{target: :deleted, local?: false, remote?: false}}
