@@ -4,12 +4,49 @@ Source: `docs/fornacast-github-org-sync-prd.md`, section 13 (all 22 criteria).
 
 This is a working evidence ledger, not a completion declaration. A test entrypoint
 below identifies relevant coverage; its existence alone does not prove acceptance.
-The full goal remains open. PR11 through PR15 have local implementation and
-focused integration proof. PR16 and the complete acceptance matrix remain open.
+The full goal remains open. PR11 through PR15 and bounded PR16 foundations have
+local implementation and focused integration proof. The remaining PR16 work and
+the complete acceptance matrix remain open.
 
 ## Requirement-by-requirement gates
 
 ### PR16 reconciliation and operator foundations (2026-09-14)
+
+- Organization owners and active site administrators now have three bounded,
+  durable repository-metadata conflict actions: accept the exact canonical
+  GitHub snapshot, keep the exact Fornacast snapshot and push it, or recheck
+  after an external resolution. Accept GitHub is not offered for archived or
+  `internal` observations that Fornacast cannot represent. An explicit keep
+  action may intentionally PATCH such a GitHub repository back to an
+  unarchived public/private state; automatic reconciliation still never coerces
+  or PATCHes an unrepresentable observation.
+- Every request is tied to the open conflict version and exact baseline/local/
+  remote fingerprints. The conflict remains open while work is queued or an
+  outbound effect is ambiguous and closes only after canonical confirmation.
+  Git-ref conflicts remain read-only in this UI and still require an explicit
+  Git action. Duplicate exact submissions replay one operation, while competing
+  or stale capabilities fail closed.
+- Authorization is reloaded at request time, before local application or effect
+  preparation, and again at the prepared-to-attempted boundary immediately
+  before the worker obtains Administration-write credentials or PATCHes GitHub.
+  Revocation at that boundary creates a visible permission conflict and performs
+  no write-token checkout or PATCH. Once an attempt begins, the durable marker
+  permits GET-first ambiguous-effect recovery without issuing a second intent;
+  pre-marker-format effects are conservatively treated as already attempted.
+- Resolution requests and workers share the repository-binding, organization,
+  conflict lock order. A PostgreSQL barrier regression holds the binding, waits
+  until the request backend is blocked, and proves the conflict remains
+  `FOR UPDATE NOWAIT`-acquirable before releasing the worker. Requested,
+  completed, and terminally failed audit events are distinct and transactionally
+  aligned with their durable outcomes.
+- The final action matrix passed **28 ForgeMirrors**, **18 ForgeGitHub**, **5
+  ForgeImports**, and **35 FornacastWeb** tests. It includes the three actions,
+  exact evidence drift, replay/competition, authorization revocation before
+  recording and after effect preparation, provider failure, timeout-after-
+  committed-PATCH restart recovery, worker enablement, strict parameter/CSRF
+  handling, authorization masking, action visibility, Git read-only behavior,
+  deterministic lock ordering, and legacy effect-marker recovery. Two focused
+  final reviews reported no remaining P0/P1/P2 finding.
 
 - The first-release repository-metadata representation policy is now explicit.
   Fornacast repositories have no local archived state or `internal` visibility,
@@ -61,9 +98,10 @@ focused integration proof. PR16 and the complete acceptance matrix remain open.
   production warnings-as-errors compilation passed. Two independent final
   reviews reported no remaining P0/P1/P2 finding.
 - Acceptance criterion 6 is locally accepted. Live GitHub proof remains part of
-  final acceptance. PR16 still needs explicit archived/internal-visibility
-  policy, safe operator conflict actions, and the complete reconciliation,
-  lifecycle, recovery, and two-endpoint acceptance matrices.
+  final acceptance. The archived/internal representation policy and safe
+  metadata operator actions are now covered; PR16 still needs the remaining
+  full reconciliation, lifecycle, recovery, and two-endpoint acceptance
+  matrices.
 
 - The repository-metadata foundation now performs per-field baseline/local/GitHub
   decisions for representable fields. Remote-only changes use a trusted
