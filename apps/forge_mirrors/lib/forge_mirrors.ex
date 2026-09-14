@@ -6982,6 +6982,7 @@ defmodule ForgeMirrors do
     |> Enum.sort()
     |> Enum.reduce_while({:ok, []}, fn ref_name, {:ok, operations} ->
       digest = :crypto.hash(:sha256, ref_name) |> Base.encode16(case: :lower)
+      existing = locked_git_ref_state(operation.repository_mirror_id, ref_name)
 
       attrs = %{
         organization_mirror_id: operation.organization_mirror_id,
@@ -6990,7 +6991,7 @@ defmodule ForgeMirrors do
         dedupe_key: "reconcile:#{operation.id}:#{digest}",
         cursor:
           %{
-            "initial_absence" => false,
+            "initial_absence" => is_nil(existing) or existing.state == :deleted,
             "reconciliation_operation_id" => operation.id,
             "ref_name" => ref_name,
             "trigger" => "reconcile"

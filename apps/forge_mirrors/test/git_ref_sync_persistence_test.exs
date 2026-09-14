@@ -462,6 +462,7 @@ defmodule ForgeMirrors.GitRefSyncPersistenceTest do
            ]
 
     assert Enum.all?([branch, tag], &(&1.kind == "sync.git_ref"))
+    assert Enum.all?([branch, tag], &(&1.cursor["initial_absence"] == true))
 
     assert Enum.all?(
              [branch, tag, finalizer],
