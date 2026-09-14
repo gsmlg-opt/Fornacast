@@ -305,6 +305,48 @@ defmodule ForgeRepos do
     update_api_repository(actor, repository, attrs, request_metadata, [])
   end
 
+  @doc false
+  def sync_github_repository_metadata(input), do: ForgeRepos.RepositoryMetadataSync.apply(input)
+
+  @doc false
+  def lock_repository_for_sync(repository_id)
+      when is_integer(repository_id) and repository_id > 0 do
+    if Repo.in_transaction?() do
+      case Repo.one(
+             from repository in Repository,
+               where:
+                 repository.id == ^repository_id and
+                   repository.lifecycle in [:ready, :synchronizing] and
+                   is_nil(repository.deleted_at),
+               lock: "FOR UPDATE"
+           ) do
+        %Repository{} = repository -> {:ok, repository}
+        nil -> {:error, :not_found}
+      end
+    else
+      {:error, :transaction_required}
+    end
+  end
+
+  def lock_repository_for_sync(_repository_id), do: {:error, :invalid_argument}
+
+  @doc false
+  def validate_sync_default_branch(%Repository{} = repository, branch) when is_binary(branch) do
+    changeset = Repository.api_update_changeset(repository, %{default_branch: branch})
+
+    if changeset.valid? do
+      validate_changed_default_branch(repository, branch, changeset)
+      |> case do
+        {:ok, _changeset} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:error, :invalid_default_branch}
+    end
+  end
+
+  def validate_sync_default_branch(_repository, _branch), do: {:error, :invalid_default_branch}
+
   @spec update_api_repository(User.t(), Repository.t(), map(), map(), keyword()) ::
           {:ok, Repository.t()} | {:error, api_error()}
   def update_api_repository(

@@ -106,6 +106,27 @@ defmodule ForgeMirrors.OutboxMaterializationTest do
     assert Enum.map(replayed, & &1.id) == [branch.id, tag.id]
   end
 
+  test "repository.updated materializes repository metadata reconciliation work" do
+    organization_mirror = active_organization_mirror_fixture()
+    repository_mirror = repository_mirror_fixture(organization_mirror)
+
+    event =
+      repository_event(repository_mirror, organization_mirror, event_type: "repository.updated")
+
+    assert {:ok, {:materialized, [%MirrorOperation{} = operation]}} =
+             ForgeMirrors.materialize_outbox_event(event)
+
+    assert operation.repository_mirror_id == repository_mirror.id
+    assert operation.kind == "reconcile.repository.metadata"
+
+    assert operation.cursor == %{
+             "causation_id" => nil,
+             "correlation_id" => nil,
+             "outbox_event_id" => event.event_id,
+             "trigger" => "local"
+           }
+  end
+
   test "repository.pushed rejects malformed or duplicate exact-ref evidence" do
     organization_mirror = active_organization_mirror_fixture()
     repository_mirror = repository_mirror_fixture(organization_mirror)

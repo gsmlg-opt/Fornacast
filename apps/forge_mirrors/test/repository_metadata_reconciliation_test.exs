@@ -4,6 +4,7 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliationTest do
   import ForgeMirrors.TestSupport.MirrorFixtures
 
   alias ForgeMirrors.{MirrorConflict, MirrorOperation, MirrorResourceState}
+  alias ForgeRepos.Repository
   alias Fornacast.Repo
 
   setup do
@@ -96,6 +97,234 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliationTest do
     assert %MirrorConflict{state: :open} = Repo.get!(MirrorConflict, conflict.id)
   end
 
+  test "a remote-only representable change is applied locally and confirmed", c do
+    baseline = confirm_baseline(c)
+    claimed = claim_metadata_operation(c, "metadata:inbound", "repository-metadata-inbound")
+    assert {:ok, sync} = ForgeMirrors.repository_metadata_operation_context(claimed)
+
+    remote =
+      sync
+      |> remote("#{sync.local_snapshot["name"]}-remote", DateTime.add(c.now, 1))
+      |> Map.put(:description, "changed on GitHub")
+
+    assert {:ok,
+            %{
+              action: :confirmed,
+              operation: %MirrorOperation{state: :completed},
+              baseline: updated_baseline
+            }} = ForgeMirrors.record_repository_metadata_observation(claimed, remote, c.now)
+
+    updated = Repo.get!(Repository, c.binding.repository_id)
+    assert updated.name == remote.name
+    assert updated.slug == ForgeRepos.Repository.normalize_slug(remote.name)
+    assert updated.description == "changed on GitHub"
+    assert updated.write_version == sync.local_write_version + 1
+    assert updated_baseline.id == baseline.id
+    assert updated_baseline.confirmed_local_version == updated.write_version
+    assert updated_baseline.confirmed_snapshot["name"] == remote.name
+  end
+
+  test "a local-only change persists an exact outbound effect marker", c do
+    _baseline = confirm_baseline(c)
+    repository = Repo.get!(Repository, c.binding.repository_id)
+
+    repository
+    |> Ecto.Changeset.change(description: "changed in Fornacast")
+    |> Ecto.Changeset.optimistic_lock(:write_version)
+    |> Repo.update!()
+
+    claimed = claim_metadata_operation(c, "metadata:outbound", "repository-metadata-outbound")
+    assert {:ok, sync} = ForgeMirrors.repository_metadata_operation_context(claimed)
+
+    observed_baseline =
+      sync.baseline.confirmed_snapshot
+      |> atomize_remote(sync)
+      |> Map.put(:updated_at, DateTime.add(c.now, 1))
+
+    assert {:ok,
+            %{
+              action: :update_remote,
+              operation: %MirrorOperation{state: :effect_pending} = marked,
+              target: target
+            }} =
+             ForgeMirrors.record_repository_metadata_observation(
+               claimed,
+               observed_baseline,
+               c.now
+             )
+
+    assert target["description"] == "changed in Fornacast"
+    assert marked.external_effect_marker["action"] == "update_remote_repository_metadata"
+    assert marked.external_effect_marker["target"] == target
+    assert marked.external_effect_marker["expected_remote"] == sync.baseline.confirmed_snapshot
+  end
+
+  test "an ambiguous outbound effect confirms from a canonical recovery read", c do
+    _baseline = confirm_baseline(c)
+    repository = Repo.get!(Repository, c.binding.repository_id)
+
+    repository
+    |> Ecto.Changeset.change(description: "recover me")
+    |> Ecto.Changeset.optimistic_lock(:write_version)
+    |> Repo.update!()
+
+    claimed = claim_metadata_operation(c, "metadata:recover", "repository-metadata-recover")
+    assert {:ok, sync} = ForgeMirrors.repository_metadata_operation_context(claimed)
+
+    observed_baseline =
+      sync.baseline.confirmed_snapshot
+      |> atomize_remote(sync)
+      |> Map.put(:updated_at, DateTime.add(c.now, 1))
+
+    assert {:ok, %{action: :update_remote, operation: marked, target: target}} =
+             ForgeMirrors.record_repository_metadata_observation(
+               claimed,
+               observed_baseline,
+               c.now
+             )
+
+    assert {:ok, deferred} =
+             ForgeMirrors.defer_repository_metadata_effect(
+               marked,
+               c.now,
+               DateTime.add(c.now, 1),
+               "network"
+             )
+
+    assert deferred.state == :effect_pending
+    assert deferred.lease_owner == nil
+    assert deferred.external_effect_marker == marked.external_effect_marker
+
+    assert {:ok, [reclaimed]} =
+             ForgeMirrors.claim_operations(
+               "repository-metadata-reclaimed",
+               DateTime.add(c.now, 1),
+               60,
+               1,
+               ["reconcile.repository.metadata"]
+             )
+
+    recovery_remote =
+      target
+      |> atomize_remote(sync)
+      |> Map.put(:updated_at, DateTime.add(c.now, 2))
+
+    assert {:ok, %{action: :confirmed, operation: %MirrorOperation{state: :completed}}} =
+             ForgeMirrors.record_repository_metadata_observation(
+               reclaimed,
+               recovery_remote,
+               DateTime.add(c.now, 2)
+             )
+  end
+
+  test "a newer local edit remains pending after an older outbound effect is confirmed", c do
+    _baseline = confirm_baseline(c)
+    first_local = update_description(c.binding.repository_id, "first local edit")
+
+    claimed =
+      claim_metadata_operation(c, "metadata:ordered:first", "repository-metadata-ordered-1")
+
+    assert {:ok, sync} = ForgeMirrors.repository_metadata_operation_context(claimed)
+
+    observed_baseline =
+      sync.baseline.confirmed_snapshot
+      |> atomize_remote(sync)
+      |> Map.put(:updated_at, DateTime.add(c.now, 1))
+
+    assert {:ok, %{action: :update_remote, operation: marked, target: first_target}} =
+             ForgeMirrors.record_repository_metadata_observation(
+               claimed,
+               observed_baseline,
+               c.now
+             )
+
+    second_local = update_description(c.binding.repository_id, "second local edit")
+    assert second_local.write_version == first_local.write_version + 1
+
+    confirmed_remote =
+      first_target
+      |> atomize_remote(sync)
+      |> Map.put(:updated_at, DateTime.add(c.now, 2))
+
+    assert {:ok, %{action: :confirmed, baseline: confirmed}} =
+             ForgeMirrors.record_repository_metadata_observation(
+               marked,
+               confirmed_remote,
+               DateTime.add(c.now, 2)
+             )
+
+    assert confirmed.confirmed_local_version == first_local.write_version
+    assert Repo.get!(Repository, c.binding.repository_id).description == "second local edit"
+
+    next =
+      claim_metadata_operation(c, "metadata:ordered:second", "repository-metadata-ordered-2")
+
+    assert {:ok, next_sync} = ForgeMirrors.repository_metadata_operation_context(next)
+
+    assert {:ok, %{action: :update_remote, target: next_target}} =
+             ForgeMirrors.record_repository_metadata_observation(
+               next,
+               confirmed_remote,
+               DateTime.add(c.now, 3)
+             )
+
+    assert next_target["description"] == "second local edit"
+    assert next_sync.local_write_version == second_local.write_version
+  end
+
+  test "compatible changes to different fields apply locally and mark one remote target", c do
+    _baseline = confirm_baseline(c)
+    _local = update_description(c.binding.repository_id, "local description")
+
+    claimed = claim_metadata_operation(c, "metadata:merge-fields", "repository-metadata-merge")
+    assert {:ok, sync} = ForgeMirrors.repository_metadata_operation_context(claimed)
+
+    remote =
+      sync.baseline.confirmed_snapshot
+      |> atomize_remote(sync)
+      |> Map.put(:visibility, :public)
+      |> Map.put(:updated_at, DateTime.add(c.now, 1))
+
+    assert {:ok, %{action: :update_remote, operation: marked, target: target}} =
+             ForgeMirrors.record_repository_metadata_observation(claimed, remote, c.now)
+
+    assert marked.state == :effect_pending
+    assert target["description"] == "local description"
+    assert target["visibility"] == "public"
+
+    updated = Repo.get!(Repository, c.binding.repository_id)
+    assert updated.description == "local description"
+    assert updated.visibility == :public
+  end
+
+  test "a remote rename collision becomes a namespace conflict without mutation", c do
+    _baseline = confirm_baseline(c)
+    repository = Repo.get!(Repository, c.binding.repository_id)
+
+    Repo.insert!(%Repository{
+      owner_user_id: repository.owner_user_id,
+      slug: "occupied-name",
+      name: "Occupied name",
+      visibility: :private,
+      storage_path: "/tmp/occupied-#{System.unique_integer([:positive])}.git",
+      default_branch: "main"
+    })
+
+    claimed = claim_metadata_operation(c, "metadata:collision", "repository-metadata-collision")
+    assert {:ok, sync} = ForgeMirrors.repository_metadata_operation_context(claimed)
+
+    assert {:ok, %{action: :conflict, operation: failed, conflict: conflict}} =
+             ForgeMirrors.record_repository_metadata_observation(
+               claimed,
+               remote(sync, "Occupied Name", DateTime.add(c.now, 1)),
+               c.now
+             )
+
+    assert failed.failure_class == "namespace_collision"
+    assert conflict.conflict_kind == "repository_namespace_collision"
+    assert Repo.get!(Repository, repository.id).name == repository.name
+  end
+
   test "changed evidence refreshes an open conflict and terminally completes the new operation",
        c do
     first = claim_metadata_operation(c, "metadata:refresh:first", "repository-metadata-first")
@@ -144,5 +373,39 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliationTest do
       archived: sync.local_snapshot["archived"],
       updated_at: updated_at
     }
+  end
+
+  defp confirm_baseline(c) do
+    claimed = claim_metadata_operation(c, "metadata:baseline", "repository-metadata-baseline")
+    assert {:ok, sync} = ForgeMirrors.repository_metadata_operation_context(claimed)
+
+    assert {:ok, %{action: :confirmed, baseline: baseline}} =
+             ForgeMirrors.record_repository_metadata_observation(
+               claimed,
+               remote(sync, sync.local_snapshot["name"], c.now),
+               c.now
+             )
+
+    baseline
+  end
+
+  defp atomize_remote(snapshot, sync) do
+    %{
+      id: sync.github_repository_id,
+      node_id: sync.github_node_id,
+      name: snapshot["name"],
+      description: snapshot["description"],
+      visibility: String.to_existing_atom(snapshot["visibility"]),
+      default_branch: snapshot["default_branch"],
+      archived: snapshot["archived"]
+    }
+  end
+
+  defp update_description(repository_id, description) do
+    repository_id
+    |> then(&Repo.get!(Repository, &1))
+    |> Ecto.Changeset.change(description: description)
+    |> Ecto.Changeset.optimistic_lock(:write_version)
+    |> Repo.update!()
   end
 end

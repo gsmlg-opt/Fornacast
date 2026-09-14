@@ -46,6 +46,14 @@ defmodule Fornacast.DomainOutboxTest do
     refute Repo.get_by(DomainOutboxEvent, event_id: event_id)
   end
 
+  test "record persists through an existing domain transaction" do
+    attrs = event_attrs(Ecto.UUID.generate())
+
+    assert {:ok, %DomainOutboxEvent{} = event} = DomainOutbox.record(attrs)
+    assert event.event_id == attrs.event_id
+    assert Repo.get!(DomainOutboxEvent, event.id).state == :pending
+  end
+
   test "record_multi rejects a duplicate event ID" do
     event_id = Ecto.UUID.generate()
     attrs = event_attrs(event_id)

@@ -37,7 +37,13 @@ defmodule ForgeGitHub.RepositoryMetadataProjection do
   end
 
   defp valid_optional_string?(nil, _maximum), do: true
-  defp valid_optional_string?(value, maximum), do: valid_string?(value, maximum)
+
+  defp valid_optional_string?(value, maximum) when is_binary(value) do
+    String.valid?(value) and value == String.trim(value) and byte_size(value) <= maximum and
+      not String.contains?(value, <<0>>)
+  end
+
+  defp valid_optional_string?(_, _maximum), do: false
 
   defp valid_string?(value, maximum) when is_binary(value) do
     String.valid?(value) and value == String.trim(value) and value != "" and

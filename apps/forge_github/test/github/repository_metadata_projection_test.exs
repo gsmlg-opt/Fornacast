@@ -44,6 +44,14 @@ defmodule ForgeGitHub.RepositoryMetadataProjectionTest do
     end
   end
 
+  test "accepts an empty canonical description" do
+    assert {:ok, %{description: ""}} =
+             RepositoryMetadataProjection.from_remote(
+               valid_remote()
+               |> Map.put(:description, "")
+             )
+  end
+
   test "rejects a non-UTC repository timestamp" do
     timestamp = %DateTime{
       year: 2026,

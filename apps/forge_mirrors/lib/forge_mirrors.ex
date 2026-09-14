@@ -39,6 +39,11 @@ defmodule ForgeMirrors do
     to: ForgeMirrors.RepositoryMetadataReconciliation,
     as: :record
 
+  @doc false
+  defdelegate defer_repository_metadata_effect(operation, now, next_attempt_at, failure_class),
+    to: ForgeMirrors.RepositoryMetadataReconciliation,
+    as: :defer_effect
+
   @spec observe_github_app_installation(map()) ::
           {:ok, GitHubAppInstallation.t()}
           | {:error, Ecto.Changeset.t() | :identity_mismatch | :invalid_transition}
@@ -6050,6 +6055,28 @@ defmodule ForgeMirrors do
         {:ok, operations} -> {:ok, Enum.reverse(operations)}
         {:error, reason} -> {:error, reason}
       end
+    end
+  end
+
+  defp materialize_repository_operations(
+         repository,
+         %{event_type: "repository.updated"} = event
+       ) do
+    case enqueue_operation(%{
+           organization_mirror_id: repository.organization_mirror_id,
+           repository_mirror_id: repository.id,
+           kind: "reconcile.repository.metadata",
+           dedupe_key: "outbox:#{event.event_id}:#{repository.id}",
+           cursor: %{
+             "outbox_event_id" => event.event_id,
+             "trigger" => "local",
+             "causation_id" => event.causation_id,
+             "correlation_id" => event.correlation_id
+           },
+           next_attempt_at: event.available_at
+         }) do
+      {:ok, operation} -> {:ok, [operation]}
+      {:error, reason} -> {:error, reason}
     end
   end
 

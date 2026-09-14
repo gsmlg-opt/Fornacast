@@ -63,6 +63,128 @@ defmodule ForgeGitHub.RepositoryMetadataSyncWorkerTest do
              )
   end
 
+  test "executes a marked outbound update and confirms its canonical response" do
+    operation = operation()
+    marked = %{operation | state: :effect_pending, lock_version: 2}
+    sync = sync()
+
+    target = %{
+      "name" => "forge-next",
+      "description" => "",
+      "visibility" => "private",
+      "default_branch" => "main",
+      "archived" => false
+    }
+
+    remote = %{
+      id: 9,
+      node_id: "R_9",
+      name: "forge",
+      description: nil,
+      visibility: :private,
+      default_branch: "main",
+      archived: false,
+      updated_at: @now
+    }
+
+    updated = %{remote | name: "forge-next", description: ""}
+
+    assert {:ok, :confirmed} =
+             RepositoryMetadataSyncWorker.process_operation(operation, @now,
+               context: fn ^operation -> {:ok, sync} end,
+               token_fetch: fn
+                 7, %{permissions: %{"metadata" => "read"}} -> token()
+                 7, %{permissions: %{"administration" => "write"}} -> token()
+               end,
+               repository_fetch: fn "installation-token", "acme", "forge", _ ->
+                 {:ok, remote}
+               end,
+               record: fn ^operation, ^remote, @now ->
+                 {:ok, %{action: :update_remote, operation: marked, target: target}}
+               end,
+               repository_update: fn "installation-token", "acme", "forge", attrs, _ ->
+                 assert attrs == target
+                 {:ok, updated}
+               end,
+               confirm_effect: fn ^marked, ^updated, @now -> {:ok, :confirmed} end
+             )
+  end
+
+  test "defers an ambiguous timeout without clearing the outbound marker" do
+    operation = operation()
+    marked = %{operation | state: :effect_pending, lock_version: 2}
+    remote = remote()
+
+    assert {:ok, :deferred} =
+             RepositoryMetadataSyncWorker.process_operation(operation, @now,
+               context: fn ^operation -> {:ok, sync()} end,
+               token_fetch: fn
+                 7, %{permissions: %{"metadata" => "read"}} -> token()
+                 7, %{permissions: %{"administration" => "write"}} -> token()
+               end,
+               repository_fetch: fn _, _, _, _ -> {:ok, remote} end,
+               record: fn ^operation, ^remote, @now ->
+                 {:ok, %{action: :update_remote, operation: marked, target: target()}}
+               end,
+               repository_update: fn _, _, _, _, _ ->
+                 {:error, ForgeGitHub.Error.new(:timeout)}
+               end,
+               defer_effect: fn ^marked, @now, retry_at, "network" ->
+                 assert retry_at == DateTime.add(@now, 60)
+                 {:ok, :deferred}
+               end
+             )
+  end
+
+  test "recovers a timed-out rename through the marked target path and immutable identity" do
+    operation = %{operation() | state: :effect_pending}
+    remote = %{remote() | name: "forge-next"}
+
+    sync =
+      sync()
+      |> Map.put(:effect_marker, %{
+        "action" => "update_remote_repository_metadata",
+        "target" => target()
+      })
+
+    assert {:ok, :confirmed} =
+             RepositoryMetadataSyncWorker.process_operation(operation, @now,
+               context: fn ^operation -> {:ok, sync} end,
+               token_fetch: fn 7, %{permissions: %{"metadata" => "read"}} -> token() end,
+               repository_fetch: fn "installation-token", "acme", repository, _ ->
+                 assert repository == "forge-next"
+                 {:ok, remote}
+               end,
+               record: fn ^operation, ^remote, @now -> {:ok, :confirmed} end
+             )
+  end
+
+  test "falls back to the old path when a marked rename did not commit" do
+    operation = %{operation() | state: :effect_pending}
+    remote = remote()
+
+    sync =
+      sync()
+      |> Map.put(:effect_marker, %{
+        "action" => "update_remote_repository_metadata",
+        "target" => target()
+      })
+
+    assert {:ok, :observed_old} =
+             RepositoryMetadataSyncWorker.process_operation(operation, @now,
+               context: fn ^operation -> {:ok, sync} end,
+               token_fetch: fn 7, %{permissions: %{"metadata" => "read"}} -> token() end,
+               repository_fetch: fn
+                 "installation-token", "acme", "forge-next", _ ->
+                   {:error, ForgeGitHub.Error.new(:not_found)}
+
+                 "installation-token", "acme", "forge", _ ->
+                   {:ok, remote}
+               end,
+               record: fn ^operation, ^remote, @now -> {:ok, :observed_old} end
+             )
+  end
+
   test "a revoked installation token terminally records credential_revoked" do
     operation = operation()
 
@@ -128,6 +250,37 @@ defmodule ForgeGitHub.RepositoryMetadataSyncWorkerTest do
       remote_repository: "forge",
       github_repository_id: 9,
       github_node_id: "R_9"
+    }
+  end
+
+  defp token do
+    %InstallationToken{
+      token: "installation-token",
+      expires_at: ~U[2026-09-14 06:00:00Z],
+      permissions: %{"metadata" => "read", "administration" => "write"}
+    }
+  end
+
+  defp remote do
+    %{
+      id: 9,
+      node_id: "R_9",
+      name: "forge",
+      description: nil,
+      visibility: :private,
+      default_branch: "main",
+      archived: false,
+      updated_at: @now
+    }
+  end
+
+  defp target do
+    %{
+      "name" => "forge-next",
+      "description" => "updated",
+      "visibility" => "private",
+      "default_branch" => "main",
+      "archived" => false
     }
   end
 end

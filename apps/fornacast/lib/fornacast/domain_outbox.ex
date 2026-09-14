@@ -10,6 +10,28 @@ defmodule Fornacast.DomainOutbox do
 
   @max_batch_size 100
 
+  @doc false
+  @spec record(map()) ::
+          {:ok, DomainOutboxEvent.t()} | {:error, Ecto.Changeset.t() | :transaction_required}
+  def record(attrs) when is_map(attrs) do
+    if Repo.in_transaction?() do
+      changeset = DomainOutboxEvent.record_changeset(%DomainOutboxEvent{}, attrs)
+
+      if changeset.valid? do
+        aggregate_type = Ecto.Changeset.get_field(changeset, :aggregate_type)
+        aggregate_id = Ecto.Changeset.get_field(changeset, :aggregate_id)
+        lock_aggregate(Repo, aggregate_type, aggregate_id)
+        Repo.insert(changeset, mode: :savepoint)
+      else
+        {:error, changeset}
+      end
+    else
+      {:error, :transaction_required}
+    end
+  end
+
+  def record(_attrs), do: {:error, :transaction_required}
+
   @spec record_multi(Multi.t(), Multi.name(), map() | (map() -> map())) :: Multi.t()
   def record_multi(%Multi{} = multi, key, attrs) when is_map(attrs) or is_function(attrs, 1) do
     Multi.run(multi, key, fn repo, changes ->

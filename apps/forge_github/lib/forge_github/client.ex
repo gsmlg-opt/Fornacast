@@ -84,6 +84,24 @@ defmodule ForgeGitHub.Client do
     )
   end
 
+  @doc false
+  @spec repository_metadata_request(String.t(), :patch, String.t(), 200, keyword()) ::
+          {:ok, term()} | {:error, Error.t()}
+  def repository_metadata_request(token, :patch, path, 200, opts) do
+    metadata_request(
+      token,
+      :patch,
+      path,
+      200,
+      opts,
+      &repository_metadata_request_kind/2,
+      :repository_metadata
+    )
+  end
+
+  def repository_metadata_request(_token, _method, _path, _expected_status, _opts),
+    do: error(:invalid_request)
+
   defp metadata_request(
          token,
          method,
@@ -489,6 +507,24 @@ defmodule ForgeGitHub.Client do
   end
 
   defp pull_metadata_request_kind(_, _), do: :error
+
+  defp repository_metadata_request_kind(:patch, path) when is_binary(path) do
+    with {:ok,
+          %URI{scheme: nil, host: nil, userinfo: nil, fragment: nil, path: parsed, query: nil}} <-
+           URI.new(path),
+         false <- String.contains?(parsed, "//"),
+         ["repos", owner, repository] <- String.split(parsed, "/", trim: true),
+         true <- RepositoryReference.valid_owner?(owner),
+         true <- RepositoryReference.valid_repository?(repository) do
+      {:ok, :update}
+    else
+      _invalid -> :error
+    end
+  rescue
+    _exception -> :error
+  end
+
+  defp repository_metadata_request_kind(_, _), do: :error
 
   defp release_metadata_request_kind(method, path)
        when method in [:get, :post, :patch, :delete] and is_binary(path) do

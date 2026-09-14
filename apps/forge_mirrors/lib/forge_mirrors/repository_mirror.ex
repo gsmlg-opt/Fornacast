@@ -109,6 +109,13 @@ defmodule ForgeMirrors.RepositoryMirror do
     |> validate_persistence()
   end
 
+  @doc false
+  def metadata_update_changeset(mirror, attrs) do
+    mirror
+    |> cast(attrs, [:github_full_name, :github_archived, :last_synced_at])
+    |> validate_persistence()
+  end
+
   def transition_changeset(mirror, target) when target in @states do
     mirror
     |> change(state: target)
