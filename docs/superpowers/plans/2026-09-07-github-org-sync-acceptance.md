@@ -11,6 +11,23 @@ focused integration proof. PR16 and the complete acceptance matrix remain open.
 
 ### PR16 reconciliation and operator foundations (2026-09-14)
 
+- The first-release repository-metadata representation policy is now explicit.
+  Fornacast repositories have no local archived state or `internal` visibility,
+  so identity-validated GitHub observations of those values create distinct,
+  terminal `repository_*_unrepresentable` conflicts rather than coercing
+  visibility, tombstoning local data, or issuing a metadata PATCH. The canonical
+  provider path and `github_archived` observation still advance atomically so a
+  simultaneous rename cannot strand later reconciliation.
+- When GitHub returns to a representable public/private, unarchived state, a
+  successful full metadata confirmation transactionally closes only the matching
+  representation-policy conflict with a system-attributed resolution. A real
+  leased worker integration proves rename-plus-archive observation, no
+  Administration token or PATCH, recovery through the persisted renamed path,
+  safe inbound convergence, and conflict closure. Focused verification passed
+  **5 ForgeRepos**, **29 ForgeMirrors**, and **24 ForgeGitHub** tests. This is an
+  explicit safe representation boundary, not a claim that Fornacast now exposes
+  a local archived or internal repository mode.
+
 - Policy-enabled local organization repository creation now materializes one
   durable `sync.repository.create` operation behind a shared typed auto-create
   and Git-capability gate. The worker requires installation-scoped Metadata read
