@@ -11,6 +11,43 @@ focused integration proof. PR16 and the complete acceptance matrix remain open.
 
 ### PR16 reconciliation and operator foundations (2026-09-14)
 
+- Policy-enabled local organization repository creation now materializes one
+  durable `sync.repository.create` operation behind a shared typed auto-create
+  and Git-capability gate. The worker requires installation-scoped Metadata read
+  and Administration write access, performs an exact-name GET before POST, and
+  marks expected absence plus the complete local target before the external
+  effect. It reauthorizes the owned marker, organization lifecycle, policy,
+  capability, installation, permission, immutable account, and local repository
+  immediately before every POST.
+- The GitHub client permits only `POST /orgs/:organization/repos`, the exact
+  name/optional description/public-or-private visibility payload, and HTTP 201.
+  Canonical owner ID/login, repository ID/node, name, and full name must agree
+  before binding. Timeouts keep the effect marker for GET-first recovery; a 422
+  performs one canonical GET and confirms a delayed self-create before treating
+  a mismatching repository as a visible namespace conflict. Conflicts are scoped
+  per local repository binding and cannot overwrite another contender's
+  evidence.
+- Pause releases the lease while retaining queued work and any ambiguous marker.
+  Revocation, missing permission, and policy/capability downgrade stop before
+  POST and checkpoint ambiguous recovery evidence without deleting the local
+  repository. Confirmation atomically binds immutable GitHub identity and the
+  repository metadata baseline, then orders Git reconciliation, Git finalization,
+  and the exact post-Git metadata sweep. The binding stays `discovered` until
+  that keyed metadata operation confirms, including when GitHub initially uses
+  `main` while the local default branch is different.
+- Final focused verification passed **70 ForgeMirrors** and **32 ForgeGitHub**
+  tests. This includes materialization races, policy/capability rejection,
+  pause/revocation races before POST, 403 classification, 422 self-create and
+  collision recovery, timeout/restart recovery, immutable binding/baseline
+  confirmation, per-binding conflicts, newer-local ordering, and default-branch
+  Git-then-metadata activation. Exact scoped formatting, diff checks, and
+  production warnings-as-errors compilation passed. Two independent final
+  reviews reported no remaining P0/P1/P2 finding.
+- Acceptance criterion 6 is locally accepted. Live GitHub proof remains part of
+  final acceptance. PR16 still needs explicit archived/internal-visibility
+  policy, safe operator conflict actions, and the complete reconciliation,
+  lifecycle, recovery, and two-endpoint acceptance matrices.
+
 - The repository-metadata foundation now performs per-field baseline/local/GitHub
   decisions for representable fields. Remote-only changes use a trusted
   ForgeRepos exact-preimage/owner/generation/write-version boundary; compatible
@@ -32,8 +69,8 @@ focused integration proof. PR16 and the complete acceptance matrix remain open.
   passed in isolation and the unrelated fixture-state failure was not modified.
 - This convergence slice still does not represent local archived state or GitHub
   `internal` visibility, so those inputs remain unsupported rather than being
-  overwritten. Local repository creation on GitHub and the safe operator
-  conflict actions are also still open; criterion 6 and PR16 remain incomplete.
+  overwritten. Safe operator conflict actions also remain open, and PR16 remains
+  incomplete.
 
 - Commit `acd3a6e` changes pull reconciliation from an unsupported-head-only
   mapped scan into a checkpointed canonical GitHub pull inventory followed by a
@@ -851,7 +888,7 @@ PR13 integration audit additionally identified these concrete remaining gates:
 | 3 | All enabled supported resources bootstrap to active bindings | `apps/forge_imports/test/repository_publication_test.exs` covers atomic handoff and hidden LFS bootstrap. Release metadata and complete collaboration convergence remain open. |
 | 4 | Bootstrap-time webhooks replay after baseline | Handoff and durable inbox tests exist. Re-run a complete buffered replay with Git, LFS, and metadata resources after PR12–16. |
 | 5 | GitHub-created repository imports according to policy | Inventory worker and persistence tests exist. Final gate must follow inventory through completed bootstrap, not stop at enqueue. |
-| 6 | Local organization repository is created on GitHub according to policy | Outbox/inventory foundation exists. Complete provider-side creation and ambiguous-create recovery must be proven, including policy-disabled behavior. |
+| 6 | Local organization repository is created on GitHub according to policy | Locally accepted in PR16: typed policy/capability admission, strict installation-gated create, absence marker, immediate pre-POST lifecycle fence, timeout and 422 recovery, per-binding collision evidence, immutable binding/baseline, and ordered Git-then-metadata activation are covered. Retain live GitHub proof in final acceptance. |
 | 7 | Local branch create/fast-forward reaches GitHub | Git ref worker and exact remote primitives have focused tests. Run the complete outbound Git+LFS workflow against the remote fixture. |
 | 8 | GitHub branch create/fast-forward reaches Fornacast | Inbound ref worker coverage exists. Verify the public ref changes only after required LFS availability. |
 | 9 | Safe ref deletion only from unchanged baseline | `git_ref_decision_test.exs` and worker/persistence tests cover policy and CAS. Include branch/tag deletion in final two-endpoint acceptance. |
