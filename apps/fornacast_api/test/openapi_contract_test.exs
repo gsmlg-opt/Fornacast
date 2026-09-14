@@ -2,6 +2,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
   use ExUnit.Case, async: true
 
   alias ForgeAccounts.{AccountView, Organization, User}
+  alias ForgeReleases.Release
   alias ForgeRepos.Repository
 
   @contract_root Path.expand("../priv/openapi", __DIR__)
@@ -74,12 +75,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
       ["get", "/repos/{owner}/{repo}/releases/tags/{tag}"],
       ["get", "/repos/{owner}/{repo}/releases/{release_id}"],
       ["patch", "/repos/{owner}/{repo}/releases/{release_id}"],
-      ["delete", "/repos/{owner}/{repo}/releases/{release_id}"],
-      ["get", "/repos/{owner}/{repo}/releases/{release_id}/assets"],
-      ["post", "/repos/{owner}/{repo}/releases/{release_id}/assets"],
-      ["get", "/repos/{owner}/{repo}/releases/assets/{asset_id}"],
-      ["patch", "/repos/{owner}/{repo}/releases/assets/{asset_id}"],
-      ["delete", "/repos/{owner}/{repo}/releases/assets/{asset_id}"]
+      ["delete", "/repos/{owner}/{repo}/releases/{release_id}"]
     ]
   }
 
@@ -154,9 +150,8 @@ defmodule FornacastAPI.OpenAPIContractTest do
       ~w(commit_title commit_message sha merge_method),
     "POST /repos/{owner}/{repo}/releases" =>
       ~w(tag_name target_commitish name body draft prerelease),
-    "PATCH /repos/{owner}/{repo}/releases/{release_id}" => ~w(name body draft prerelease),
-    "POST /api/uploads/repos/{owner}/{repo}/releases/{release_id}/assets" => ~w(name label),
-    "PATCH /repos/{owner}/{repo}/releases/assets/{asset_id}" => ~w(name label)
+    "PATCH /repos/{owner}/{repo}/releases/{release_id}" =>
+      ~w(tag_name target_commitish name body draft prerelease)
   }
 
   @required_mutation_fields %{
@@ -171,8 +166,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
     "POST /repos/{owner}/{repo}/issues/{issue_number}/comments" => ~w(body),
     "PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}" => ~w(body),
     "POST /repos/{owner}/{repo}/pulls" => ~w(title head base),
-    "POST /repos/{owner}/{repo}/releases" => ~w(tag_name),
-    "POST /api/uploads/repos/{owner}/{repo}/releases/{release_id}/assets" => ~w(name)
+    "POST /repos/{owner}/{repo}/releases" => ~w(tag_name)
   }
 
   @query_fields %{
@@ -185,8 +179,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
     "issues" => ~w(page per_page state labels assignee creator sort direction since),
     "issue_comments" => ~w(page per_page since),
     "pulls" => ~w(page per_page state head base sort direction),
-    "releases" => ~w(page per_page),
-    "release_assets" => ~w(page per_page)
+    "releases" => ~w(page per_page)
   }
 
   @divergences %{
@@ -202,7 +195,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
     "issues_disabled_410_operations" => @declared_issues_disabled_operations,
     "merge_method" => "merge",
     "unavailable_pull_head" => "nullable_repo_and_user_with_ref_only_label",
-    "release_assets_server" => "/api/uploads",
+    "release_assets" => "unsupported",
     "release_archives" => nil,
     "issue_pull_release_html_url" => "corresponding_public_api_url",
     "commit_pull_diff_patch_media" => "not_acceptable"
@@ -246,7 +239,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
       assert document["x-fornacast-source-commit"] == @source_commit
       assert document["x-fornacast-source-blob"] == source_blob
       assert document["x-github-api-version"] == version
-      assert document["x-fornacast-implemented-through-slice"] == "4"
+      assert document["x-fornacast-implemented-through-slice"] == "5"
       assert MapSet.subset?(@foundation_operations, operations(document))
       assert get_in(document, ["paths", "/repos/{owner}/{repo}", "get"])
       assert document["x-fornacast-delivery-slices"] == @delivery_slices
@@ -316,19 +309,20 @@ defmodule FornacastAPI.OpenAPIContractTest do
     end
   end
 
-  test "overlay owns every operation and reserves the upload server" do
+  test "overlay owns every implemented operation and keeps release assets unsupported" do
     overlay = "fornacast-overlay.json" |> contract_path() |> File.read!() |> JSON.decode!()
 
     assert overlay["source_commit"] == @source_commit
     assert overlay["versions"] == ["2022-11-28", "2026-03-10"]
     assert overlay["servers"]["rest"] == "/api/v3"
     assert overlay["servers"]["uploads"] == "/api/uploads"
-    assert overlay["implemented_through_slice"] == "4"
+    assert overlay["implemented_through_slice"] == "5"
     assert overlay["delivery_slices"] == @delivery_slices
     assert overlay["mutation_fields"] == @mutation_fields
     assert overlay["required_mutation_fields"] == @required_mutation_fields
     assert overlay["query_fields"] == @query_fields
     assert overlay["divergences"] == @divergences
+    assert overlay["divergences"]["release_assets"] == "unsupported"
 
     expected_foundation =
       @foundation_operations
@@ -338,6 +332,27 @@ defmodule FornacastAPI.OpenAPIContractTest do
 
     assert overlay["delivery_slices"]["1"] == expected_foundation
     assert Enum.sort(Map.keys(overlay["delivery_slices"])) == ~w(1 2 3 4 5)
+  end
+
+  test "release metadata operations are pinned without release asset operations" do
+    release_metadata_operations =
+      @delivery_slices
+      |> Map.fetch!("5")
+      |> Enum.map(fn [method, path] -> {method, path} end)
+      |> MapSet.new()
+
+    for {version, {filename, _source_blob}} <- @contracts do
+      document = filename |> contract_path() |> File.read!() |> JSON.decode!()
+      contract_operations = operations(document)
+
+      assert MapSet.subset?(release_metadata_operations, contract_operations), version
+
+      refute Enum.any?(contract_operations, fn {_method, path} ->
+               String.contains?(path, "/releases/assets/") or
+                 String.ends_with?(path, "/assets")
+             end),
+             version
+    end
   end
 
   test "pull responses permit redacted head identity without weakening base or label schemas" do
@@ -511,6 +526,23 @@ defmodule FornacastAPI.OpenAPIContractTest do
         200,
         FornacastAPI.Serializer.render(version, :full_repository, repository_view())
       )
+
+      rendered_release =
+        FornacastAPI.Serializer.render(version, :release, release(),
+          owner: "octocat",
+          repo: "hello-world"
+        )
+
+      for {path, method, status, body} <- [
+            {"/repos/{owner}/{repo}/releases", :get, 200, [rendered_release]},
+            {"/repos/{owner}/{repo}/releases", :post, 201, rendered_release},
+            {"/repos/{owner}/{repo}/releases/latest", :get, 200, rendered_release},
+            {"/repos/{owner}/{repo}/releases/tags/{tag}", :get, 200, rendered_release},
+            {"/repos/{owner}/{repo}/releases/{release_id}", :get, 200, rendered_release},
+            {"/repos/{owner}/{repo}/releases/{release_id}", :patch, 200, rendered_release}
+          ] do
+        assert_valid_response(document, path, method, status, body)
+      end
     end
   end
 
@@ -797,6 +829,23 @@ defmodule FornacastAPI.OpenAPIContractTest do
         push: true
       },
       size_kib: 512
+    }
+  end
+
+  defp release do
+    %Release{
+      id: 123,
+      repository_id: 99,
+      tag_name: "v1.0.0",
+      target_commitish: "trunk",
+      name: "Version 1",
+      body: "Release notes",
+      draft: false,
+      prerelease: false,
+      published_at: ~U[2026-03-10 12:00:00Z],
+      inserted_at: ~U[2026-03-10 11:00:00Z],
+      updated_at: ~U[2026-03-10 12:00:00Z],
+      author: account()
     }
   end
 

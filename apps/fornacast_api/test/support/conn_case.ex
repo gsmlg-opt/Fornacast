@@ -66,6 +66,7 @@ defmodule FornacastAPI.ConnCase do
   defp reset_tables do
     [
       "audit_events",
+      "releases",
       "issue_comments",
       "issue_assignees",
       "issue_labels",

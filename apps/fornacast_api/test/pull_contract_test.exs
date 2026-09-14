@@ -36,11 +36,11 @@ defmodule FornacastAPI.PullContractTest do
 
   test "pinned contracts own all pull routes and advance only the delivery marker" do
     overlay = openapi_json("fornacast-overlay.json")
-    assert overlay["implemented_through_slice"] == "4"
+    assert overlay["implemented_through_slice"] == "5"
 
     for version <- @versions do
       document = openapi_json("ghes-3.21-#{version}.json")
-      assert document["x-fornacast-implemented-through-slice"] == "4"
+      assert document["x-fornacast-implemented-through-slice"] == "5"
 
       for {path, methods} <- @pull_paths, method <- methods do
         assert is_map(get_in(document, ["paths", path, Atom.to_string(method)]))

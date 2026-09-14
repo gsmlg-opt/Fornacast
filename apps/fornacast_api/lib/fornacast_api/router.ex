@@ -75,6 +75,14 @@ defmodule FornacastAPI.Router do
     get "/repos/:owner/:repo/pulls/:pull_number", PullController, :show
     patch "/repos/:owner/:repo/pulls/:pull_number", PullController, :update
 
+    get "/repos/:owner/:repo/releases/latest", ReleaseController, :latest
+    get "/repos/:owner/:repo/releases/tags/:tag", ReleaseController, :by_tag
+    get "/repos/:owner/:repo/releases", ReleaseController, :index
+    post "/repos/:owner/:repo/releases", ReleaseController, :create
+    get "/repos/:owner/:repo/releases/:release_id", ReleaseController, :show
+    patch "/repos/:owner/:repo/releases/:release_id", ReleaseController, :update
+    delete "/repos/:owner/:repo/releases/:release_id", ReleaseController, :delete
+
     get "/repos/:owner/:repo/issues/:issue_number/comments", IssueCommentController, :index
     post "/repos/:owner/:repo/issues/:issue_number/comments", IssueCommentController, :create
     match :*, "/*path", FallbackController, :not_found

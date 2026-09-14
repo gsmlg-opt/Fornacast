@@ -45,6 +45,21 @@ defmodule FornacastAPI.URL do
   def pull_commits(owner, repo, number), do: pull(owner, repo, number) <> "/commits"
   def commit(owner, repo, sha), do: repository(owner, repo) <> "/commits/#{segment(sha)}"
 
+  def releases(owner, repo), do: repository(owner, repo) <> "/releases"
+  def release(owner, repo, id), do: releases(owner, repo) <> "/#{positive_id(id)}"
+  def release_assets(owner, repo, id), do: release(owner, repo, id) <> "/assets"
+
+  def release_upload_template(owner, repo, id) do
+    upload("/repos/#{segment(owner)}/#{segment(repo)}/releases/#{positive_id(id)}/assets") <>
+      "{?name,label}"
+  end
+
+  def release_by_tag(owner, repo, tag_name),
+    do: releases(owner, repo) <> "/tags/#{segment(tag_name)}"
+
+  def release_web(owner, repo, tag_name),
+    do: web("/#{segment(owner)}/#{segment(repo)}/releases/tag/#{segment(tag_name)}")
+
   def commit_statuses(owner, repo, sha),
     do: repository(owner, repo) <> "/statuses/#{segment(sha)}"
 
@@ -78,6 +93,12 @@ defmodule FornacastAPI.URL do
 
   defp segment(value) do
     raise ArgumentError, "path segment must be a string, got: #{inspect(value)}"
+  end
+
+  defp positive_id(id) when is_integer(id) and id > 0, do: Integer.to_string(id)
+
+  defp positive_id(id) do
+    raise ArgumentError, "expected a positive integer ID, got: #{inspect(id)}"
   end
 
   defp validated_base_uri! do

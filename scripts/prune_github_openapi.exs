@@ -66,12 +66,7 @@ defmodule Fornacast.OpenAPIPruner do
       {"get", "/repos/{owner}/{repo}/releases/tags/{tag}"},
       {"get", "/repos/{owner}/{repo}/releases/{release_id}"},
       {"patch", "/repos/{owner}/{repo}/releases/{release_id}"},
-      {"delete", "/repos/{owner}/{repo}/releases/{release_id}"},
-      {"get", "/repos/{owner}/{repo}/releases/{release_id}/assets"},
-      {"post", "/repos/{owner}/{repo}/releases/{release_id}/assets"},
-      {"get", "/repos/{owner}/{repo}/releases/assets/{asset_id}"},
-      {"patch", "/repos/{owner}/{repo}/releases/assets/{asset_id}"},
-      {"delete", "/repos/{owner}/{repo}/releases/assets/{asset_id}"}
+      {"delete", "/repos/{owner}/{repo}/releases/{release_id}"}
     ]
   }
 
@@ -287,7 +282,7 @@ defmodule Fornacast.OpenAPIPruner do
         "issues_disabled_410_operations" => declared_issues_disabled_operations(),
         "merge_method" => "merge",
         "unavailable_pull_head" => "nullable_repo_and_user_with_ref_only_label",
-        "release_assets_server" => "/api/uploads",
+        "release_assets" => "unsupported",
         "release_archives" => nil,
         "issue_pull_release_html_url" => "corresponding_public_api_url",
         "commit_pull_diff_patch_media" => "not_acceptable"
@@ -327,9 +322,8 @@ defmodule Fornacast.OpenAPIPruner do
         ~w(commit_title commit_message sha merge_method),
       "POST /repos/{owner}/{repo}/releases" =>
         ~w(tag_name target_commitish name body draft prerelease),
-      "PATCH /repos/{owner}/{repo}/releases/{release_id}" => ~w(name body draft prerelease),
-      "POST /api/uploads/repos/{owner}/{repo}/releases/{release_id}/assets" => ~w(name label),
-      "PATCH /repos/{owner}/{repo}/releases/assets/{asset_id}" => ~w(name label)
+      "PATCH /repos/{owner}/{repo}/releases/{release_id}" =>
+        ~w(tag_name target_commitish name body draft prerelease)
     }
   end
 
@@ -346,8 +340,7 @@ defmodule Fornacast.OpenAPIPruner do
       "POST /repos/{owner}/{repo}/issues/{issue_number}/comments" => ~w(body),
       "PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}" => ~w(body),
       "POST /repos/{owner}/{repo}/pulls" => ~w(title head base),
-      "POST /repos/{owner}/{repo}/releases" => ~w(tag_name),
-      "POST /api/uploads/repos/{owner}/{repo}/releases/{release_id}/assets" => ~w(name)
+      "POST /repos/{owner}/{repo}/releases" => ~w(tag_name)
     }
   end
 
@@ -362,8 +355,7 @@ defmodule Fornacast.OpenAPIPruner do
       "issues" => ~w(page per_page state labels assignee creator sort direction since),
       "issue_comments" => ~w(page per_page since),
       "pulls" => ~w(page per_page state head base sort direction),
-      "releases" => ~w(page per_page),
-      "release_assets" => ~w(page per_page)
+      "releases" => ~w(page per_page)
     }
   end
 end
