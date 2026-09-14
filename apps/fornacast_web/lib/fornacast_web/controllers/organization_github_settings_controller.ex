@@ -54,6 +54,25 @@ defmodule FornacastWeb.OrganizationGitHubSettingsController do
     end
   end
 
+  def resolve_repository_metadata_conflict(
+        %Plug.Conn{assigns: %{current_user: actor}} = conn,
+        params
+      ) do
+    with {:ok, organization} <- manageable_organization(actor, params),
+         {:ok, attrs} <- repository_metadata_conflict_params(params),
+         result <-
+           organization_sync(conn).resolve_repository_metadata_conflict(
+             actor,
+             organization,
+             attrs,
+             RequestMetadata.from_conn(conn)
+           ) do
+      handle_conflict_action_result(conn, organization, result)
+    else
+      {:error, reason} -> render_error(conn, reason)
+    end
+  end
+
   def install(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
     with {:ok, organization} <- manageable_organization(actor, params),
          state = installation_state(),
@@ -229,6 +248,20 @@ defmodule FornacastWeb.OrganizationGitHubSettingsController do
   end
 
   defp pull_merge_conflict_params(_params), do: {:error, :invalid_request}
+
+  defp repository_metadata_conflict_params(%{
+         "conflict_id" => conflict_id,
+         "conflict" => %{"lock_version" => lock_version, "action" => action} = attrs
+       })
+       when map_size(attrs) == 2 and
+              action in ["accept_github", "keep_fornacast", "external_recheck"] do
+    with {:ok, conflict_id} <- canonical_positive_id(conflict_id),
+         {:ok, lock_version} <- canonical_positive_id(lock_version) do
+      {:ok, %{conflict_id: conflict_id, lock_version: lock_version, action: action}}
+    end
+  end
+
+  defp repository_metadata_conflict_params(_params), do: {:error, :invalid_request}
 
   defp canonical_positive_id(value) when is_binary(value) and byte_size(value) <= 19 do
     with true <- Regex.match?(@canonical_id, value),

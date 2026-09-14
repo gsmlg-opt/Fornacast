@@ -46,6 +46,28 @@ defmodule ForgeMirrors do
     as: :defer_effect
 
   @doc false
+  defdelegate fail_repository_metadata_operation(operation, now, failure_class, failure_detail),
+    to: ForgeMirrors.RepositoryMetadataReconciliation,
+    as: :fail
+
+  @doc false
+  defdelegate authorize_repository_metadata_effect(operation, now),
+    to: ForgeMirrors.RepositoryMetadataReconciliation,
+    as: :authorize_effect
+
+  @doc "Request one durable owner-directed repository metadata conflict resolution."
+  defdelegate request_repository_metadata_conflict_resolution(
+                actor,
+                organization_id,
+                conflict,
+                action,
+                now,
+                request_metadata
+              ),
+              to: ForgeMirrors.RepositoryMetadataConflictResolution,
+              as: :request
+
+  @doc false
   def activate_repository_after_metadata(
         %MirrorOperation{kind: "reconcile.repository.metadata", state: :completed} = operation,
         %DateTime{} = now

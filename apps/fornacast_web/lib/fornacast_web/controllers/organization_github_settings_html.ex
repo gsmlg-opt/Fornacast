@@ -144,6 +144,40 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTML do
 
   def pull_merge_recheckable?(_conflict), do: false
 
+  def repository_metadata_resolvable?(conflict) when is_map(conflict) do
+    value(conflict, :resource_kind) in ["repository", :repository] and
+      value(conflict, :state) in ["open", :open] and
+      is_integer(value(conflict, :id)) and value(conflict, :id) > 0 and
+      is_integer(value(conflict, :lock_version)) and value(conflict, :lock_version) > 0
+  end
+
+  def repository_metadata_resolvable?(_conflict), do: false
+
+  def repository_metadata_actions(conflict) do
+    if repository_metadata_resolvable?(conflict) do
+      case value(conflict, :conflict_kind, value(conflict, :kind)) do
+        kind
+        when kind in [
+               "repository_archived_unrepresentable",
+               "repository_internal_visibility_unrepresentable",
+               "repository_archived_internal_unrepresentable"
+             ] ->
+          ["keep_fornacast", "external_recheck"]
+
+        _kind ->
+          ["accept_github", "keep_fornacast", "external_recheck"]
+      end
+    else
+      []
+    end
+  end
+
+  def repository_metadata_action_label("accept_github"), do: "Accept GitHub"
+  def repository_metadata_action_label("keep_fornacast"), do: "Keep Fornacast and push"
+
+  def repository_metadata_action_label("external_recheck"),
+    do: "Recheck after external resolution"
+
   def git_conflict?(conflict) when is_map(conflict),
     do: value(conflict, :resource_kind) in ["git_ref", :git_ref]
 

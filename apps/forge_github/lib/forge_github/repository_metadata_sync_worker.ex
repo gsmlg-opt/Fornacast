@@ -21,6 +21,12 @@ defmodule ForgeGitHub.RepositoryMetadataSyncWorker do
     GenServer.start_link(__MODULE__, options, name: Keyword.get(options, :name, __MODULE__))
   end
 
+  def enabled?(server \\ __MODULE__) do
+    GenServer.call(server, :enabled)
+  catch
+    :exit, _reason -> false
+  end
+
   @doc false
   def run_once(owner, options \\ [])
 
@@ -117,6 +123,29 @@ defmodule ForgeGitHub.RepositoryMetadataSyncWorker do
          now,
          options
        ) do
+    authorize_effect =
+      callback(options, :authorize_effect, &ForgeMirrors.authorize_repository_metadata_effect/2)
+
+    case authorize_effect.(operation, now) do
+      {:ok, %ForgeMirrors.MirrorOperation{} = authorized} ->
+        execute_authorized_effect(authorized, target, sync, now, options)
+
+      {:ok, %{action: :conflict} = result} ->
+        {:ok, result}
+
+      {:error, reason} ->
+        persist_effect_reason(operation, now, reason, options)
+
+      _invalid ->
+        persist_effect_reason(operation, now, :invalid_effect_marker, options)
+    end
+  rescue
+    _ -> persist_effect_reason(operation, now, :worker_crash, options)
+  end
+
+  defp execute_result(result, _sync, _now, _options), do: {:ok, result}
+
+  defp execute_authorized_effect(operation, target, sync, now, options) do
     token_fetch = callback(options, :token_fetch, &InstallationTokenBroker.fetch/2)
 
     repository_update =
@@ -141,11 +170,7 @@ defmodule ForgeGitHub.RepositoryMetadataSyncWorker do
       {:error, reason} -> persist_effect_reason(operation, now, reason, options)
       _ -> persist_effect_reason(operation, now, :credential_unavailable, options)
     end
-  rescue
-    _ -> persist_effect_reason(operation, now, :worker_crash, options)
   end
-
-  defp execute_result(result, _sync, _now, _options), do: {:ok, result}
 
   @impl true
   def init(options) do
@@ -165,6 +190,9 @@ defmodule ForgeGitHub.RepositoryMetadataSyncWorker do
     if state.enabled, do: schedule(state.interval_ms)
     {:ok, state}
   end
+
+  @impl true
+  def handle_call(:enabled, _from, state), do: {:reply, state.enabled, state}
 
   @impl true
   def handle_info(:tick, %{task_ref: nil} = state) do
@@ -286,7 +314,12 @@ defmodule ForgeGitHub.RepositoryMetadataSyncWorker do
   end
 
   defp fail(operation, now, failure_class, options) do
-    callback(options, :fail, &ForgeMirrors.fail_operation/4).(operation, now, failure_class, nil)
+    callback(options, :fail, &ForgeMirrors.fail_repository_metadata_operation/4).(
+      operation,
+      now,
+      failure_class,
+      nil
+    )
   end
 
   defp callback(options, key, default), do: Keyword.get(options, key, default)

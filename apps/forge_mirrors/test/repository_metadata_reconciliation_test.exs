@@ -315,6 +315,7 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliationTest do
 
     assert target["description"] == "changed in Fornacast"
     assert marked.external_effect_marker["action"] == "update_remote_repository_metadata"
+    assert marked.external_effect_marker["attempt_state"] == "prepared"
     assert marked.external_effect_marker["target"] == target
     assert marked.external_effect_marker["expected_remote"] == sync.baseline.confirmed_snapshot
   end
@@ -346,7 +347,7 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliationTest do
     assert target["name"] == "display-name"
   end
 
-  test "an ambiguous outbound effect confirms from a canonical recovery read", c do
+  test "a legacy ambiguous outbound effect confirms from a canonical recovery read", c do
     _baseline = confirm_baseline(c)
     repository = Repo.get!(Repository, c.binding.repository_id)
 
@@ -369,6 +370,16 @@ defmodule ForgeMirrors.RepositoryMetadataReconciliationTest do
                observed_baseline,
                c.now
              )
+
+    legacy_marker = Map.delete(marked.external_effect_marker, "attempt_state")
+
+    assert {1, _} =
+             Repo.update_all(
+               from(operation in MirrorOperation, where: operation.id == ^marked.id),
+               set: [external_effect_marker: legacy_marker]
+             )
+
+    marked = %{marked | external_effect_marker: legacy_marker}
 
     assert {:ok, deferred} =
              ForgeMirrors.defer_repository_metadata_effect(

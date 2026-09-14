@@ -102,6 +102,7 @@ defmodule ForgeGitHub.RepositoryMetadataSyncWorkerTest do
                record: fn ^operation, ^remote, @now ->
                  {:ok, %{action: :update_remote, operation: marked, target: target}}
                end,
+               authorize_effect: fn ^marked, @now -> {:ok, marked} end,
                repository_update: fn "installation-token", "acme", "forge", attrs, _ ->
                  assert attrs == target
                  {:ok, updated}
@@ -126,6 +127,7 @@ defmodule ForgeGitHub.RepositoryMetadataSyncWorkerTest do
                record: fn ^operation, ^remote, @now ->
                  {:ok, %{action: :update_remote, operation: marked, target: target()}}
                end,
+               authorize_effect: fn ^marked, @now -> {:ok, marked} end,
                repository_update: fn _, _, _, _, _ ->
                  {:error, ForgeGitHub.Error.new(:timeout)}
                end,
@@ -251,6 +253,24 @@ defmodule ForgeGitHub.RepositoryMetadataSyncWorkerTest do
 
     assert %{task_ref: nil} = :sys.get_state(pid)
     assert Process.alive?(pid)
+  end
+
+  test "reports whether its execution loop is enabled" do
+    {:ok, disabled} =
+      start_supervised(%{
+        id: :disabled_repository_metadata_worker,
+        start: {RepositoryMetadataSyncWorker, :start_link, [[enabled: false, name: nil]]}
+      })
+
+    assert RepositoryMetadataSyncWorker.enabled?(disabled) == false
+
+    {:ok, enabled} =
+      start_supervised(%{
+        id: :enabled_repository_metadata_worker,
+        start: {RepositoryMetadataSyncWorker, :start_link, [[enabled: true, name: nil]]}
+      })
+
+    assert RepositoryMetadataSyncWorker.enabled?(enabled) == true
   end
 
   defp operation do

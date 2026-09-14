@@ -31,6 +31,7 @@ defmodule ForgeImports.OrganizationSyncTest do
     assert disconnected.coverage == :none
     assert disconnected.actions.install
     refute disconnected.actions.resolve_pull_merge_conflict
+    refute disconnected.actions.resolve_repository_metadata_conflict
     assert disconnected.capabilities["lfs"] == "disabled"
     assert disconnected.capabilities["releases"] == "disabled"
 
@@ -41,6 +42,14 @@ defmodule ForgeImports.OrganizationSyncTest do
 
     assert {:error, :not_configured} =
              ForgeImports.OrganizationSync.resolve_pull_merge_conflict(
+               context.actor,
+               context.organization,
+               %{conflict_id: 1, lock_version: 1, action: "external_recheck"},
+               request_metadata()
+             )
+
+    assert {:error, :not_configured} =
+             ForgeImports.OrganizationSync.resolve_repository_metadata_conflict(
                context.actor,
                context.organization,
                %{conflict_id: 1, lock_version: 1, action: "external_recheck"},

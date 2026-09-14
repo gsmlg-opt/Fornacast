@@ -134,6 +134,33 @@
                     Recheck after external resolution
                   </.dm_btn>
                 </form>
+                <div
+                  :if={
+                    action_enabled?(@view, :resolve_repository_metadata_conflict) &&
+                      repository_metadata_resolvable?(conflict)
+                  }
+                  class="flex flex-wrap gap-2"
+                >
+                  <form
+                    :for={action <- repository_metadata_actions(conflict)}
+                    action={
+                      "/organizations/#{@organization.username}/settings/github/conflicts/#{value(conflict, :id)}/repository-metadata"
+                    }
+                    method="post"
+                  >
+                    <input type="hidden" name="_csrf_token" value={csrf_token()} />
+                    <input type="hidden" name="_method" value="patch" />
+                    <input
+                      type="hidden"
+                      name="conflict[lock_version]"
+                      value={value(conflict, :lock_version)}
+                    />
+                    <input type="hidden" name="conflict[action]" value={action} />
+                    <.dm_btn type="submit" variant="secondary" size="sm">
+                      {repository_metadata_action_label(action)}
+                    </.dm_btn>
+                  </form>
+                </div>
               </div>
             </td>
           </tr>

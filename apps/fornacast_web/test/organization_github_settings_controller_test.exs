@@ -58,6 +58,11 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
       operation_result(:resolve_pull_merge_conflict, {:ok, :accepted})
     end
 
+    def resolve_repository_metadata_conflict(actor, organization, attrs, metadata) do
+      record(:resolve_repository_metadata_conflict, [actor, organization, attrs, metadata])
+      operation_result(:resolve_repository_metadata_conflict, {:ok, :accepted})
+    end
+
     def bootstrap(actor, organization, attrs, metadata) do
       record(:bootstrap, [actor, organization, attrs, metadata])
       operation_result(:bootstrap, {:ok, :started})
@@ -135,7 +140,9 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
       {"POST", "/organizations/acme/settings/github/resume", :resume},
       {"DELETE", "/organizations/acme/settings/github", :delete},
       {"GET", "/organizations/acme/settings/github/conflicts", :conflicts},
-      {"PATCH", "/organizations/acme/settings/github/conflicts/42", :resolve_pull_merge_conflict}
+      {"PATCH", "/organizations/acme/settings/github/conflicts/42", :resolve_pull_merge_conflict},
+      {"PATCH", "/organizations/acme/settings/github/conflicts/42/repository-metadata",
+       :resolve_repository_metadata_conflict}
     ]
 
     for {method, path, action} <- routes do
@@ -475,6 +482,123 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
 
       assert_private_no_store(conn)
     end
+  end
+
+  test "owner queues each safe repository metadata resolution through the dedicated route", %{
+    owner: owner,
+    organization: organization
+  } do
+    view =
+      organization
+      |> settings_view()
+      |> put_in([:actions, :resolve_repository_metadata_conflict], true)
+      |> Map.put(:conflicts, [
+        %{
+          id: 42,
+          lock_version: 7,
+          resource: "repository 88",
+          resource_kind: "repository",
+          conflict_kind: "repository_metadata_diverged",
+          state: :open,
+          baseline: ~s({"name":"before"}),
+          local: ~s({"name":"local"}),
+          remote: ~s({"name":"remote"})
+        }
+      ])
+
+    TestOrganizationSync.result(:get_conflicts, {:ok, view})
+    action = github_settings_path(organization) <> "/conflicts/42/repository-metadata"
+    form = request_conn(owner) |> get(github_settings_path(organization) <> "/conflicts")
+
+    assert form.resp_body =~ "Accept GitHub"
+    assert form.resp_body =~ "Keep Fornacast and push"
+    assert form.resp_body =~ "Recheck after external resolution"
+    token = extract_form_csrf_token(form.resp_body, action)
+
+    accepted =
+      form
+      |> recycle_request()
+      |> with_production_csrf()
+      |> patch(action, %{
+        "_csrf_token" => token,
+        "conflict" => %{"lock_version" => "7", "action" => "accept_github"}
+      })
+
+    assert redirected_to(accepted, 303) == github_settings_path(organization) <> "/conflicts"
+
+    assert [
+             {:get_conflicts, [_actor, _organization, %{}]},
+             {:resolve_repository_metadata_conflict,
+              [%User{id: actor_id}, %Organization{id: organization_id}, attrs, metadata]}
+           ] = TestOrganizationSync.calls()
+
+    assert actor_id == owner.id
+    assert organization_id == organization.id
+    assert attrs == %{conflict_id: 42, lock_version: 7, action: "accept_github"}
+    assert metadata.user_agent == "organization-github-settings-controller-test"
+    assert_private_no_store(accepted)
+  end
+
+  test "unrepresentable repository conflicts omit accept GitHub but allow explicit keep or recheck",
+       %{owner: owner, organization: organization} do
+    view =
+      organization
+      |> settings_view()
+      |> put_in([:actions, :resolve_repository_metadata_conflict], true)
+      |> Map.put(:conflicts, [
+        %{
+          id: 43,
+          lock_version: 2,
+          resource_kind: "repository",
+          conflict_kind: "repository_archived_unrepresentable",
+          state: :open
+        }
+      ])
+
+    TestOrganizationSync.result(:get_conflicts, {:ok, view})
+    conn = request_conn(owner) |> get(github_settings_path(organization) <> "/conflicts")
+
+    refute conn.resp_body =~ "Accept GitHub"
+    assert conn.resp_body =~ "Keep Fornacast and push"
+    assert conn.resp_body =~ "Recheck after external resolution"
+  end
+
+  test "repository metadata resolution rejects forged actions and capabilities before facade access",
+       %{owner: owner, outsider: outsider, organization: organization} do
+    action = github_settings_path(organization) <> "/conflicts/42/repository-metadata"
+
+    for params <- [
+          %{},
+          %{"conflict" => "forged"},
+          %{"conflict" => %{"lock_version" => "0", "action" => "accept_github"}},
+          %{"conflict" => %{"lock_version" => "7", "action" => "force_push"}},
+          %{
+            "conflict" => %{
+              "lock_version" => "7",
+              "action" => "accept_github",
+              "extra" => "forged"
+            }
+          }
+        ] do
+      TestOrganizationSync.reset()
+      conn = request_conn(owner) |> patch(action, params)
+
+      assert html_response(conn, 422) =~ "parameters are invalid"
+      assert TestOrganizationSync.calls() == []
+      assert_private_no_store(conn)
+    end
+
+    TestOrganizationSync.reset()
+
+    conn =
+      request_conn(outsider)
+      |> patch(action, %{
+        "conflict" => %{"lock_version" => "7", "action" => "keep_fornacast"}
+      })
+
+    assert html_response(conn, 404) =~ "Organization settings not found."
+    assert TestOrganizationSync.calls() == []
+    assert_private_no_store(conn)
   end
 
   test "installation start stores an unguessable actor and organization bound correlation", %{

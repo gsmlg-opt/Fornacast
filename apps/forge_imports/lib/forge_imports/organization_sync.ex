@@ -20,7 +20,12 @@ defmodule ForgeImports.OrganizationSync do
     with {:ok, view} <- ForgeMirrors.organization_settings(actor, organization_id) do
       {:ok,
        update_in(view, [:actions], fn actions ->
-         Map.put(actions, :resolve_pull_merge_conflict, pull_merge_worker_enabled?())
+         actions
+         |> Map.put(:resolve_pull_merge_conflict, pull_merge_worker_enabled?())
+         |> Map.put(
+           :resolve_repository_metadata_conflict,
+           repository_metadata_worker_enabled?()
+         )
        end)}
     end
   end
@@ -30,7 +35,11 @@ defmodule ForgeImports.OrganizationSync do
   def get_conflicts(%User{} = actor, %Organization{id: organization_id}, filters)
       when is_map(filters) do
     with {:ok, view} <- ForgeMirrors.organization_conflicts(actor, organization_id, filters) do
-      {:ok, Map.put(view, :actions, %{resolve_pull_merge_conflict: pull_merge_worker_enabled?()})}
+      {:ok,
+       Map.put(view, :actions, %{
+         resolve_pull_merge_conflict: pull_merge_worker_enabled?(),
+         resolve_repository_metadata_conflict: repository_metadata_worker_enabled?()
+       })}
     end
   end
 
@@ -145,6 +154,39 @@ defmodule ForgeImports.OrganizationSync do
   def resolve_pull_merge_conflict(_actor, _organization, _attrs, _request_metadata),
     do: {:error, :forbidden}
 
+  def resolve_repository_metadata_conflict(
+        %User{} = actor,
+        %Organization{id: organization_id},
+        %{conflict_id: conflict_id, lock_version: lock_version, action: action},
+        request_metadata
+      )
+      when is_integer(conflict_id) and conflict_id > 0 and is_integer(lock_version) and
+             lock_version > 0 and is_binary(action) and is_map(request_metadata) do
+    with {:ok, safe_metadata} <-
+           ForgeAccounts.validate_github_request_metadata(request_metadata),
+         true <- repository_metadata_worker_enabled?() do
+      ForgeMirrors.request_repository_metadata_conflict_resolution(
+        actor,
+        organization_id,
+        %ForgeMirrors.MirrorConflict{id: conflict_id, lock_version: lock_version},
+        action,
+        DateTime.utc_now(:second),
+        safe_metadata
+      )
+    else
+      false -> {:error, :not_configured}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def resolve_repository_metadata_conflict(
+        _actor,
+        _organization,
+        _attrs,
+        _request_metadata
+      ),
+      do: {:error, :forbidden}
+
   def bootstrap(%User{} = actor, %Organization{} = organization, attrs, request_metadata)
       when is_map(attrs) do
     ForgeImports.OrganizationSync.Bootstrap.start(actor, organization, attrs, request_metadata)
@@ -249,4 +291,7 @@ defmodule ForgeImports.OrganizationSync do
 
   defp pull_merge_worker_enabled?,
     do: is_pid(Process.whereis(ForgeGitHub.PullMergeWorker))
+
+  defp repository_metadata_worker_enabled?,
+    do: ForgeGitHub.RepositoryMetadataSyncWorker.enabled?()
 end

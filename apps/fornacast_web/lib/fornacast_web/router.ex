@@ -102,6 +102,10 @@ defmodule FornacastWeb.Router do
           OrganizationGitHubSettingsController,
           :resolve_pull_merge_conflict
 
+    patch "/organizations/:organization/settings/github/conflicts/:conflict_id/repository-metadata",
+          OrganizationGitHubSettingsController,
+          :resolve_repository_metadata_conflict
+
     get "/settings/github", GitHubSettingsController, :index
     post "/settings/github", GitHubSettingsController, :create
     post "/settings/github/:identity_id/reverify", GitHubSettingsController, :reverify
