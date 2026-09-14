@@ -247,5 +247,4 @@ defmodule ForgeGitHub.PullMergeWorkerLifecycleTest do
       lease_expires_at: DateTime.add(DateTime.utc_now(:second), 1_860)
     }
   end
-
 end

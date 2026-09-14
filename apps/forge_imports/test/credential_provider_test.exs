@@ -120,19 +120,25 @@ defmodule ForgeImports.CredentialProviderTest do
     Repo.update_all(
       from(i in ForgeMirrors.GitHubAppInstallation,
         where: i.github_installation_id == ^installation_id
-      ), set: [state: :revoked])
+      ),
+      set: [state: :revoked]
+    )
 
     assert {:ok, {:error, _}} = check.()
 
     Repo.update_all(
       from(i in ForgeMirrors.GitHubAppInstallation,
         where: i.github_installation_id == ^installation_id
-      ), set: [state: :active])
+      ),
+      set: [state: :active]
+    )
 
     Repo.update_all(
       from(m in ForgeAccounts.OrganizationMember,
         where: m.organization_id == ^organization.id and m.user_id == ^context.actor.id
-      ), set: [role: :member])
+      ),
+      set: [role: :member]
+    )
 
     assert {:ok, {:error, :forbidden}} = check.()
   end
