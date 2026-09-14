@@ -5,6 +5,9 @@ defmodule ForgeReleases.Release do
 
   @fields [:tag_name, :name, :body, :draft, :prerelease, :target_commitish]
   @import_fields @fields ++ [:published_at, :inserted_at, :updated_at]
+  @sync_fields @fields ++ [:published_at, :updated_at]
+  @max_body_codepoints 65_536
+  @max_body_bytes 262_144
   @default_capabilities %{can_edit: false, can_delete: false}
 
   @type t :: %__MODULE__{}
@@ -21,6 +24,7 @@ defmodule ForgeReleases.Release do
     field :deleted_at, :utc_datetime
     field :author_user_id, :integer
     field :author_github_identity_id, :integer
+    field :sync_version, :integer, default: 1
 
     field :author, :map, virtual: true
     field :capabilities, :map, virtual: true, default: @default_capabilities
@@ -46,6 +50,7 @@ defmodule ForgeReleases.Release do
     |> normalize_publication_state()
     |> validate_author_identity()
     |> database_constraints()
+    |> optimistic_lock(:sync_version, &(&1 + 1))
   end
 
   @spec import_changeset(t(), map()) :: Ecto.Changeset.t()
@@ -58,9 +63,31 @@ defmodule ForgeReleases.Release do
     |> database_constraints()
   end
 
+  @doc false
+  @spec sync_changeset(t(), map()) :: Ecto.Changeset.t()
+  def sync_changeset(%__MODULE__{} = release, attrs) when is_map(attrs) do
+    release
+    |> cast(attrs, @sync_fields)
+    |> validate_metadata()
+    |> validate_author_identity()
+    |> validate_publication_state()
+    |> database_constraints()
+    |> optimistic_lock(:sync_version, &(&1 + 1))
+  end
+
   @spec delete_changeset(t()) :: Ecto.Changeset.t()
   def delete_changeset(%__MODULE__{} = release) do
-    change(release, deleted_at: utc_now())
+    release
+    |> change(deleted_at: utc_now())
+    |> optimistic_lock(:sync_version, &(&1 + 1))
+  end
+
+  @doc false
+  @spec sync_delete_changeset(t(), DateTime.t()) :: Ecto.Changeset.t()
+  def sync_delete_changeset(%__MODULE__{} = release, %DateTime{} = updated_at) do
+    release
+    |> change(deleted_at: updated_at, updated_at: updated_at)
+    |> optimistic_lock(:sync_version, &(&1 + 1))
   end
 
   defp validate_metadata(changeset) do
@@ -68,6 +95,8 @@ defmodule ForgeReleases.Release do
     |> validate_required([:repository_id, :tag_name, :target_commitish])
     |> validate_length(:tag_name, min: 1, max: 255)
     |> validate_length(:name, max: 255)
+    |> validate_length(:body, max: @max_body_codepoints, count: :codepoints)
+    |> validate_length(:body, max: @max_body_bytes, count: :bytes)
     |> validate_length(:target_commitish, min: 1, max: 255)
     |> reject_null_bytes([:tag_name, :name, :body, :target_commitish])
     |> validate_tag_name()
@@ -137,6 +166,7 @@ defmodule ForgeReleases.Release do
     |> unique_constraint(:tag_name, name: :releases_active_repository_tag_index)
     |> check_constraint(:author_user_id, name: :releases_author_identity_check)
     |> check_constraint(:published_at, name: :releases_publication_state_check)
+    |> check_constraint(:sync_version, name: :releases_sync_version_positive)
   end
 
   defp reject_null_bytes(changeset, fields) do

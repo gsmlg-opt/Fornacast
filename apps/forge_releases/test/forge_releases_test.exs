@@ -5,7 +5,7 @@ defmodule ForgeReleasesTest do
 
   alias ForgeReleases.Release
   alias ForgeRepos.Collaborator
-  alias Fornacast.{AuditEvent, Page, Repo}
+  alias Fornacast.{AuditEvent, DomainOutboxEvent, Page, Repo}
 
   import ForgeReleases.Fixtures
 
@@ -47,6 +47,7 @@ defmodule ForgeReleasesTest do
     assert release.author_user_id == owner.id
     assert release.target_commitish == "main"
     assert %DateTime{} = release.published_at
+    assert release.sync_version == 1
 
     assert {:ok, %Page{entries: [%Release{id: release_id}], total: 1}} =
              ForgeReleases.list(owner, owner.username, repository.slug, %{page: 1, per_page: 30})
@@ -75,6 +76,7 @@ defmodule ForgeReleasesTest do
     assert updated.name == "Version One"
     assert updated.body == "Revised"
     assert updated.prerelease
+    assert updated.sync_version == 2
     assert {:error, :not_found} = ForgeReleases.latest(owner, owner.username, repository.slug)
 
     assert :ok =
@@ -89,7 +91,36 @@ defmodule ForgeReleasesTest do
     assert {:error, :not_found} =
              ForgeReleases.get(owner, owner.username, repository.slug, release.id)
 
-    assert %Release{deleted_at: %DateTime{}} = Repo.get!(Release, release.id)
+    assert %Release{deleted_at: %DateTime{}, sync_version: 3} = Repo.get!(Release, release.id)
+
+    assert [created, changed, deleted] =
+             DomainOutboxEvent
+             |> where(
+               [event],
+               event.aggregate_type == "release" and event.aggregate_id == ^"#{release.id}"
+             )
+             |> order_by([event], asc: event.id)
+             |> Repo.all()
+
+    assert Enum.map([created, changed, deleted], & &1.event_type) == [
+             "release.created",
+             "release.updated",
+             "release.deleted"
+           ]
+
+    assert Enum.all?([created, changed, deleted], &(&1.origin == :fornacast))
+    assert Enum.map([created, changed, deleted], & &1.payload["sync_version"]) == [1, 2, 3]
+
+    assert Map.keys(deleted.payload) |> Enum.sort() ==
+             ~w(deleted release_id repository_id sync_version tag_name)
+
+    assert deleted.payload == %{
+             "repository_id" => repository.id,
+             "release_id" => release.id,
+             "tag_name" => "v1.0.0",
+             "sync_version" => 3,
+             "deleted" => true
+           }
 
     assert ["release.created", "release.updated", "release.deleted"] ==
              AuditEvent

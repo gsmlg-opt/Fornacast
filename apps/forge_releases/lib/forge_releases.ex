@@ -7,7 +7,7 @@ defmodule ForgeReleases do
 
   alias Ecto.Multi
   alias ForgeAccounts.{GitHubIdentity, User}
-  alias ForgeReleases.Release
+  alias ForgeReleases.{Release, SyncEvents}
   alias ForgeRepos.Repository
   alias Fornacast.{Audit, Page, Repo}
 
@@ -224,17 +224,30 @@ defmodule ForgeReleases do
   def delete(_actor, _owner_slug, _repository_slug, _release_id, _request_metadata),
     do: {:error, :forbidden}
 
+  defdelegate release_sync_projection(repository_id, release_id), to: ForgeReleases.Sync
+
+  defdelegate append_sync_release_observe(multi, key, expected), to: ForgeReleases.Sync
+
+  defdelegate append_sync_release_apply(multi, key, request), to: ForgeReleases.Sync
+
   @doc false
-  @spec create_multi(User.t(), Repository.t(), map(), map()) :: Multi.t()
-  def create_multi(%User{} = actor, %Repository{} = repository, attrs, request_metadata)
-      when is_map(attrs) and is_map(request_metadata) do
+  @spec create_multi(User.t(), Repository.t(), map(), map(), keyword()) :: Multi.t()
+  def create_multi(
+        %User{} = actor,
+        %Repository{} = repository,
+        attrs,
+        request_metadata,
+        options \\ []
+      )
+      when is_map(attrs) and is_map(request_metadata) and is_list(options) do
     create_multi(
       repository,
       actor,
       attrs,
       request_metadata,
       ForgeRepos.absolute_storage_path(repository),
-      GitCore.Limits.get(:ref_deadline_ms)
+      GitCore.Limits.get(:ref_deadline_ms),
+      options
     )
   end
 
@@ -242,7 +255,15 @@ defmodule ForgeReleases do
   @spec transaction(Multi.t()) :: {:ok, map()} | {:error, Multi.name(), term(), map()}
   def transaction(%Multi{} = multi), do: Repo.transaction(multi)
 
-  defp create_multi(repository, actor, attrs, request_metadata, repository_path, remaining_ms) do
+  defp create_multi(
+         repository,
+         actor,
+         attrs,
+         request_metadata,
+         repository_path,
+         remaining_ms,
+         event_options \\ []
+       ) do
     attrs = put_default(attrs, "target_commitish", repository.default_branch)
 
     Multi.new()
@@ -258,6 +279,7 @@ defmodule ForgeReleases do
     |> Multi.run(:tag, fn _repo, %{release: release} ->
       require_tag(repository_path, release.tag_name, remaining_ms)
     end)
+    |> SyncEvents.release("release.created", event_options)
     |> Audit.record_multi(
       :audit,
       actor,
@@ -288,6 +310,7 @@ defmodule ForgeReleases do
     |> Multi.run(:tag, fn _repo, %{release: release} ->
       require_tag(repository_path, release.tag_name, remaining_ms)
     end)
+    |> SyncEvents.release("release.updated")
     |> Audit.record_multi(
       :audit,
       actor,
@@ -307,6 +330,7 @@ defmodule ForgeReleases do
     |> Multi.update(:release, fn %{authorization: %{release: release}} ->
       Release.delete_changeset(release)
     end)
+    |> SyncEvents.release("release.deleted")
     |> Audit.record_multi(
       :audit,
       actor,
