@@ -9,6 +9,7 @@ defmodule ForgeMirrors do
   import Ecto.Query
 
   alias Fornacast.{DomainOutboxEvent, Repo}
+  alias ForgeRepos.Repository
 
   alias ForgeMirrors.{
     GitHubAppInstallation,
@@ -22,6 +23,9 @@ defmodule ForgeMirrors do
     RepositoryCreationPolicy,
     RepositoryMirror
   }
+
+  alias ForgeMirrors.GitHubInstallationIntent
+  alias ForgeAccounts.User
 
   @max_claim_batch 100
   @inventory_operation_kind "reconcile.organization_inventory"
@@ -4416,6 +4420,78 @@ defmodule ForgeMirrors do
   def inventory_operation_context(_operation), do: {:error, :invalid_transition}
 
   @doc false
+  def inventory_import_operation_context(%MirrorOperation{} = operation) do
+    Repo.transaction(fn ->
+      with :ok <- lock_inventory_organization(operation),
+           {:ok, persisted} <- load_owned_inventory_import_operation(operation),
+           {:ok, organization, _installation, policy} <-
+             load_inventory_scope(persisted.organization_mirror_id),
+           %RepositoryMirror{} = repository <-
+             Repo.one(
+               from mirror in RepositoryMirror,
+                 where: mirror.id == ^persisted.repository_mirror_id,
+                 lock: "FOR UPDATE"
+             ),
+           true <- repository.organization_mirror_id == organization.id,
+           true <-
+             repository.inventory_included and
+               InventoryPolicy.auto_import?(policy, true, repository.github_archived),
+           %GitHubInstallationIntent{actor_user_id: actor_id} <-
+             Repo.one(
+               from intent in GitHubInstallationIntent,
+                 where:
+                   intent.organization_mirror_id == ^organization.id and
+                     intent.github_installation_id == ^organization.github_installation_id and
+                     intent.state == :completed,
+                 order_by: [desc: intent.confirmed_at, desc: intent.id],
+                 limit: 1,
+                 lock: "FOR UPDATE"
+             ),
+           %User{} = actor <- Repo.get(User, actor_id),
+           {:ok, _organization} <-
+             ForgeAccounts.fetch_manageable_organization(actor, organization.organization_id) do
+        %{
+          operation: persisted,
+          actor: actor,
+          organization_mirror: organization,
+          repository_mirror: repository
+        }
+      else
+        false -> Repo.rollback(:invalid_transition)
+        nil -> Repo.rollback(:invalid_transition)
+        {:error, reason} -> Repo.rollback(reason)
+        _ -> Repo.rollback(:credential_unavailable)
+      end
+    end)
+    |> normalize_transaction_result()
+  rescue
+    _exception -> {:error, :lost_lease}
+  end
+
+  def inventory_import_operation_context(_operation), do: {:error, :invalid_transition}
+
+  @doc false
+  def record_inventory_import_materialization(
+        %MirrorOperation{} = operation,
+        run_id,
+        item_id,
+        now
+      )
+      when is_integer(run_id) and run_id > 0 and is_integer(item_id) and item_id > 0 and
+             is_struct(now, DateTime) do
+    cursor =
+      Map.merge(operation.cursor || %{}, %{
+        "import_run_id" => run_id,
+        "repository_item_id" => item_id
+      })
+
+    owned_transition(operation, DateTime.truncate(now, :second), [:processing], cursor: cursor)
+  end
+
+  def record_inventory_import_materialization(_operation, _run_id, _item_id, _now),
+    do: {:error, :invalid_argument}
+
+  @doc false
   @spec record_inventory_page(
           MirrorOperation.t(),
           [map()],
@@ -4764,6 +4840,64 @@ defmodule ForgeMirrors do
 
   def complete_operation(%MirrorOperation{}, %DateTime{}), do: {:error, :invalid_transition}
   def complete_operation(_operation, _now), do: {:error, :invalid_argument}
+
+  @doc false
+  def complete_inventory_import_operation(
+        %MirrorOperation{} = operation,
+        item_id,
+        %DateTime{} = now
+      )
+      when is_integer(item_id) and item_id > 0 do
+    Repo.transaction(fn ->
+      with {:ok, persisted} <- load_owned_inventory_import_operation(operation),
+           true <- persisted.cursor["repository_item_id"] == item_id,
+           %RepositoryMirror{
+             state: state,
+             bootstrap_repository_item_id: ^item_id,
+             repository_id: repository_id
+           } <-
+             Repo.one(
+               from mirror in RepositoryMirror,
+                 where: mirror.id == ^persisted.repository_mirror_id,
+                 lock: "FOR UPDATE"
+             ),
+           true <- state in [:discovered, :active],
+           %Repository{lifecycle: lifecycle} <-
+             Repo.one(
+               from repository in Repository,
+                 where: repository.id == ^repository_id,
+                 lock: "FOR UPDATE"
+             ),
+           true <- lifecycle in [:synchronizing, :ready],
+           true <-
+             Repo.exists?(
+               from child in MirrorOperation,
+                 where:
+                   child.repository_mirror_id == ^persisted.repository_mirror_id and
+                     child.kind == "reconcile.repository.bootstrap" and
+                     fragment(
+                       "?->>'bootstrap_repository_item_id' = ?",
+                       child.cursor,
+                       ^to_string(item_id)
+                     )
+             ),
+           {:ok, completed} <- complete_operation(persisted, now) do
+        completed
+      else
+        false -> :waiting
+        nil -> :waiting
+        %RepositoryMirror{} -> :waiting
+        %Repository{} -> :waiting
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> normalize_transaction_result()
+  rescue
+    _exception -> {:error, :lost_lease}
+  end
+
+  def complete_inventory_import_operation(_operation, _item_id, _now),
+    do: {:error, :invalid_argument}
 
   @spec retry_operation(
           MirrorOperation.t(),
@@ -8135,6 +8269,28 @@ defmodule ForgeMirrors do
           where:
             candidate.id == ^operation.id and candidate.kind == @inventory_operation_kind and
               is_nil(candidate.repository_mirror_id) and candidate.state == :processing and
+              candidate.lease_owner == ^operation.lease_owner and
+              candidate.lease_expires_at == ^operation.lease_expires_at and
+              candidate.lease_expires_at > fragment("timezone('UTC', clock_timestamp())") and
+              candidate.lock_version == ^operation.lock_version,
+          lock: "FOR UPDATE"
+
+      case Repo.one(query) do
+        %MirrorOperation{} = persisted -> {:ok, persisted}
+        nil -> {:error, :lost_lease}
+      end
+    else
+      {:error, :lost_lease}
+    end
+  end
+
+  defp load_owned_inventory_import_operation(%MirrorOperation{} = operation) do
+    if owned_capability?(operation) do
+      query =
+        from candidate in MirrorOperation,
+          where:
+            candidate.id == ^operation.id and candidate.kind == "bootstrap.repository_import" and
+              candidate.state == :processing and not is_nil(candidate.repository_mirror_id) and
               candidate.lease_owner == ^operation.lease_owner and
               candidate.lease_expires_at == ^operation.lease_expires_at and
               candidate.lease_expires_at > fragment("timezone('UTC', clock_timestamp())") and

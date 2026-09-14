@@ -4,6 +4,7 @@ defmodule ForgeImports.Reconciler do
   use GenServer
 
   alias ForgeImports.{Scheduler, Worker}
+  alias ForgeImports.OrganizationSync.InventoryImportWorker
 
   @default_interval_ms 30_000
   @default_batch_size 25
@@ -50,11 +51,14 @@ defmodule ForgeImports.Reconciler do
       client_options: Keyword.get(opts, :client_options, []),
       keyring: Keyword.get(opts, :keyring, Fornacast.Config.github_credential_keyring()),
       repository_worker: Keyword.get(opts, :repository_worker, ForgeImports.RepositoryWorker),
+      inventory_import_worker: Keyword.get(opts, :inventory_import_worker, InventoryImportWorker),
+      inventory_import_worker_options: Keyword.get(opts, :inventory_import_worker_options, []),
       repository_worker_options: Keyword.get(opts, :repository_worker_options, []),
       sandbox_owner: sandbox_owner(opts),
       task_supervisor: Keyword.get(opts, :task_supervisor, ForgeImports.TaskSupervisor),
       tasks: %{},
       timer: nil,
+      inventory_turn: true,
       rescan_requested: false
     }
 
@@ -70,17 +74,19 @@ defmodule ForgeImports.Reconciler do
 
   @impl true
   def handle_cast(:kick, %{enabled: true} = state) do
-    {:noreply, dispatch(%{state | rescan_requested: true})}
+    {:noreply, dispatch(%{state | inventory_turn: true, rescan_requested: true})}
   end
 
   def handle_cast(:kick, state), do: {:noreply, state}
 
   @impl true
-  def handle_info(:tick, %{enabled: true} = state), do: {:noreply, dispatch(state)}
+  def handle_info(:tick, %{enabled: true} = state),
+    do: {:noreply, dispatch(%{state | inventory_turn: true})}
+
   def handle_info(:tick, state), do: {:noreply, state}
 
   def handle_info({:scan, token}, %{enabled: true, timer: {_timer, token}} = state) do
-    {:noreply, dispatch(%{state | timer: nil})}
+    {:noreply, dispatch(%{state | timer: nil, inventory_turn: true})}
   end
 
   def handle_info({:scan, _token}, state), do: {:noreply, state}
@@ -143,7 +149,12 @@ defmodule ForgeImports.Reconciler do
       |> Enum.reject(fn item_id -> MapSet.member?(inflight, {:item, item_id}) end)
       |> Enum.map(&{:item, &1})
 
-    (discovery_work ++ item_work)
+    inventory_work =
+      if state.inventory_turn and not MapSet.member?(inflight, {:inventory, 0}),
+        do: [{:inventory, 0}],
+        else: []
+
+    (inventory_work ++ discovery_work ++ item_work)
     |> Enum.take(limit)
   end
 
@@ -157,7 +168,9 @@ defmodule ForgeImports.Reconciler do
         run_worker(kind, id, owner, state)
       end)
 
-    %{state | tasks: Map.put(state.tasks, key, task)}
+    state
+    |> Map.put(:tasks, Map.put(state.tasks, key, task))
+    |> maybe_finish_inventory_turn(kind)
   rescue
     RuntimeError -> state
   end
@@ -178,11 +191,34 @@ defmodule ForgeImports.Reconciler do
     )
   end
 
-  defp finish_task(state, key) do
-    state
-    |> Map.update!(:tasks, &Map.delete(&1, key))
-    |> dispatch()
+  defp run_worker(:inventory, _id, owner, state) do
+    options =
+      Keyword.put(
+        state.inventory_import_worker_options,
+        :discovery_options,
+        lease_seconds: state.lease_seconds,
+        client: state.client,
+        client_options: state.client_options,
+        keyring: state.keyring
+      )
+
+    apply(state.inventory_import_worker, :run_once, [owner, options])
   end
+
+  defp finish_task(state, key) do
+    state = Map.update!(state, :tasks, &Map.delete(&1, key))
+
+    state =
+      case key do
+        {:inventory, 0} -> state
+        _normal_work -> %{state | inventory_turn: true}
+      end
+
+    dispatch(state)
+  end
+
+  defp maybe_finish_inventory_turn(state, :inventory), do: %{state | inventory_turn: false}
+  defp maybe_finish_inventory_turn(state, _kind), do: state
 
   defp finalize_dispatch(%{rescan_requested: true} = state) do
     state
@@ -224,6 +260,10 @@ defmodule ForgeImports.Reconciler do
 
   defp generated_owner(:item) do
     "github-import-" <> Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+  end
+
+  defp generated_owner(:inventory) do
+    "github-inventory-import-" <> Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
   end
 
   defp find_task(tasks, reference) do

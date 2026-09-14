@@ -1088,6 +1088,19 @@ PR13 integration audit additionally identified these concrete remaining gates:
   Dedicated Git/LFS publication, scan, transport, and finalizer tests remain the
   evidence for the Git/LFS portion rather than treating an empty LFS fixture as
   a transfer proof.
+- Newly visible GitHub repositories now have a production consumer for the
+  inventory-created `bootstrap.repository_import` operation. It creates one
+  installation-token-backed repository import in the connected organization,
+  reuses its durable run/item across worker restarts, and hands publication into
+  the existing permanent binding/baseline/reconciliation pipeline. The parent
+  completes only after the exact child reconciliation is durable, releasing
+  repository FIFO before that child activates the binding. Retryable discovery
+  failures retain historical runs and create one provenance-linked successor;
+  revoked, canceled, permission, and validation failures stop instead of minting
+  another token. The combined PostgreSQL gate passes 64 scoped import worker,
+  reconciler, credential-provider, and publication tests, and production
+  compilation passes with warnings as errors. Independent Critical/Important
+  review reports no remaining finding.
 - These are local acceptance results. Live GitHub App installation and provider
   endpoint validation remain required before the complete 22-item PRD can be
   declared finished.
@@ -1098,7 +1111,7 @@ PR13 integration audit additionally identified these concrete remaining gates:
 | 2 | Permission and partial-access problems visible before bootstrap | Locally accepted in `fe1a8fd`: settings render partial selection and missing permissions, while the production bootstrap route refuses the request and creates no import run. Retain live provider-permission proof. |
 | 3 | All enabled supported resources bootstrap to active bindings | Locally accepted by composition: the App-backed acceptance imports and publishes real issue/comment/pull/release mappings and baselines; publication tests cover Git refs and LFS hold; Git/LFS persistence tests prove the finalizer activates the repository and organization only after required confirmations. Retain live GitHub bootstrap proof. |
 | 4 | Bootstrap-time webhooks replay after baseline | Locally accepted: six supported delivery families remain buffered during real App staging and become eligible only after publication handoff; a valid pull delivery is deferred by the real worker before baseline and completes into the exact bound `sync.pull` operation after the run finishes. Dedicated Git/LFS and resource webhook tests cover the other processors. Retain live delivery proof. |
-| 5 | GitHub-created repository imports according to policy | Inventory worker and persistence tests exist. Final gate must follow inventory through completed bootstrap, not stop at enqueue. |
+| 5 | GitHub-created repository imports according to policy | Locally accepted: the production inventory consumer follows policy-created work through one App-backed run/item, retryable discovery successor recovery, publication handoff, parent FIFO release, and exact child reconciliation claim while preserving the active organization binding. Retain live GitHub creation/import proof. |
 | 6 | Local organization repository is created on GitHub according to policy | Locally accepted in PR16: typed policy/capability admission, strict installation-gated create, absence marker, immediate pre-POST lifecycle fence, timeout and 422 recovery, per-binding collision evidence, immutable binding/baseline, and ordered Git-then-metadata activation are covered. Retain live GitHub proof in final acceptance. |
 | 7 | Local branch create/fast-forward reaches GitHub | Git ref worker and exact remote primitives have focused tests. Run the complete outbound Git+LFS workflow against the remote fixture. |
 | 8 | GitHub branch create/fast-forward reaches Fornacast | Inbound ref worker coverage exists. Verify the public ref changes only after required LFS availability. |

@@ -42,6 +42,7 @@ defmodule ForgeImports.ImportRun do
     :credential_key_id
   ]
   @creation_fields [
+    :mirror_operation_id,
     :predecessor_run_id,
     :source_kind,
     :github_identity_id,
@@ -113,6 +114,7 @@ defmodule ForgeImports.ImportRun do
                ]}
   schema "github_import_runs" do
     field :actor_user_id, :integer
+    field :mirror_operation_id, :integer
     field :predecessor_run_id, :integer
     field :source_kind, Ecto.Enum, values: @source_kinds
     field :github_identity_id, :integer
@@ -207,6 +209,7 @@ defmodule ForgeImports.ImportRun do
     run
     |> cast(attrs, [
       :actor_user_id,
+      :mirror_operation_id,
       :predecessor_run_id,
       :source_kind,
       :github_identity_id,
@@ -268,6 +271,7 @@ defmodule ForgeImports.ImportRun do
     |> validate_inclusion(:state, @states)
     |> validate_inclusion(:resume_state, @states)
     |> validate_positive_id(:actor_user_id)
+    |> validate_positive_id(:mirror_operation_id)
     |> validate_positive_id(:predecessor_run_id)
     |> validate_positive_id(:github_identity_id)
     |> validate_positive_id(:github_credential_id)
@@ -820,7 +824,14 @@ defmodule ForgeImports.ImportRun do
   defp map_constraints(changeset) do
     changeset
     |> foreign_key_constraint(:actor_user_id)
+    |> foreign_key_constraint(:mirror_operation_id)
+    |> unique_constraint(:mirror_operation_id,
+      name: :github_import_runs_mirror_operation_id_unique_index
+    )
     |> foreign_key_constraint(:predecessor_run_id)
+    |> unique_constraint(:predecessor_run_id,
+      name: :github_import_runs_predecessor_run_id_unique_index
+    )
     |> foreign_key_constraint(:github_identity_id)
     |> foreign_key_constraint(:github_credential_id)
     |> foreign_key_constraint(:destination_organization_id)

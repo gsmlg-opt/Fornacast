@@ -137,7 +137,7 @@ defmodule ForgeImports.DiscoveryWorker do
     with {:ok, source} <- client.repository(pat, owner, repository, client_options),
          {:ok, source} <- validate_repository(actor, source, pat),
          :ok <- exact_repository(source, owner, repository),
-         {:ok, destination} <- Destination.personal(actor) do
+         {:ok, destination} <- repository_destination(actor, capability, source.owner_login) do
       {:ok,
        %{
          source_owner_github_id: source.owner_id,
@@ -154,6 +154,15 @@ defmodule ForgeImports.DiscoveryWorker do
       {:error, reason} -> {:error, normalize_source_error(reason)}
     end
   end
+
+  defp repository_destination(
+         actor,
+         %{credential_source: :github_app, destination_organization_action: :existing} = run,
+         login
+       ),
+       do: destination_for_run(actor, run, login)
+
+  defp repository_destination(actor, _capability, _login), do: Destination.personal(actor)
 
   defp discover_organization(actor, capability, pat, client, client_options) do
     with {:ok, source} <- client.organization(pat, capability.source_owner_login, client_options),

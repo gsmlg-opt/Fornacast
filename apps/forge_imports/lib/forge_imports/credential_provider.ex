@@ -119,7 +119,14 @@ defmodule ForgeImports.CredentialProvider.GitHubApp do
   alias ForgeAccounts.{GitHubCredentialCallback, User}
   alias ForgeGitHub.{InstallationToken, InstallationTokenBroker}
   alias ForgeImports.{ImportAttempt, ImportRun, RepositoryItem}
-  alias ForgeMirrors.{GitHubAppInstallation, OrganizationMirror}
+
+  alias ForgeMirrors.{
+    GitHubAppInstallation,
+    MirrorOperation,
+    OrganizationMirror,
+    RepositoryMirror
+  }
+
   alias Fornacast.Repo
 
   defmodule CallbackError do
@@ -130,13 +137,12 @@ defmodule ForgeImports.CredentialProvider.GitHubApp do
   @doc false
   def authorize_recovery_locked(run, actor, destination_id) do
     if Repo.in_transaction?() do
-      with {:ok, selected} <- bound_mirror(run.id),
+      with {:ok, selected} <- bound_mirror(run),
            %OrganizationMirror{} = mirror <-
              Repo.one(
                from m in OrganizationMirror, where: m.id == ^selected.id, lock: "FOR UPDATE"
              ),
-           true <-
-             mirror.bootstrap_import_run_id == run.id and mirror.organization_id == destination_id,
+           true <- recovery_binding?(run, mirror, destination_id),
            :ok <- runnable_mirror(mirror),
            :ok <- authorize_binding(actor, run, mirror),
            _ <-
@@ -156,6 +162,18 @@ defmodule ForgeImports.CredentialProvider.GitHubApp do
     end
   end
 
+  defp recovery_binding?(
+         %ImportRun{source_kind: :organization, id: run_id},
+         mirror,
+         destination_id
+       ),
+       do: mirror.bootstrap_import_run_id == run_id and mirror.organization_id == destination_id
+
+  defp recovery_binding?(%ImportRun{source_kind: :repository} = run, mirror, destination_id),
+    do:
+      mirror.organization_id == destination_id and
+        mirror.github_account_id == run.source_owner_github_id
+
   @impl true
   def checkout(
         %{
@@ -169,7 +187,7 @@ defmodule ForgeImports.CredentialProvider.GitHubApp do
       when is_integer(actor_id) and is_function(callback, 2) and is_list(opts) and
              (is_struct(capability, ImportRun) or is_struct(capability, RepositoryItem)) do
     with %ImportRun{} = run <- current_run(actor_id, expected, capability),
-         {:ok, mirror} <- bound_mirror(run.id),
+         {:ok, mirror} <- bound_mirror(run),
          :ok <- runnable_mirror(mirror),
          :ok <- authorize_binding(actor, run, mirror),
          {:ok, installation} <- active_installation(mirror),
@@ -196,7 +214,8 @@ defmodule ForgeImports.CredentialProvider.GitHubApp do
           where:
             run.id == ^capability.id and run.actor_user_id == ^actor_id and
               actor.kind == :user and actor.state == :active and
-              run.credential_source == :github_app and run.source_kind == :organization and
+              run.credential_source == :github_app and
+              run.source_kind in [:organization, :repository] and
               run.state not in ^terminal_states and run.lock_version == ^capability.lock_version and
               run.lease_owner == ^capability.lease_owner and not is_nil(run.lease_expires_at) and
               run.lease_expires_at > ^now
@@ -226,7 +245,8 @@ defmodule ForgeImports.CredentialProvider.GitHubApp do
               item.selected == true and
               item.state in [:staging_git, :git_staged, :staging_metadata] and
               is_nil(item.cleanup_state) and run.actor_user_id == ^actor_id and
-              run.credential_source == :github_app and run.source_kind == :organization and
+              run.credential_source == :github_app and
+              run.source_kind in [:organization, :repository] and
               run.state == :running and actor.kind == :user and actor.state == :active and
               attempt.state == :running,
           select: run
@@ -234,7 +254,7 @@ defmodule ForgeImports.CredentialProvider.GitHubApp do
     end
   end
 
-  defp bound_mirror(run_id) do
+  defp bound_mirror(%ImportRun{source_kind: :organization, id: run_id}) do
     mirrors =
       Repo.all(
         from mirror in OrganizationMirror,
@@ -249,6 +269,29 @@ defmodule ForgeImports.CredentialProvider.GitHubApp do
       _other -> {:error, {:terminal, :binding_mismatch}}
     end
   end
+
+  defp bound_mirror(%ImportRun{source_kind: :repository, mirror_operation_id: operation_id} = run)
+       when is_integer(operation_id) do
+    case Repo.one(
+           from operation in MirrorOperation,
+             join: repository in RepositoryMirror,
+             on: repository.id == operation.repository_mirror_id,
+             join: mirror in OrganizationMirror,
+             on: mirror.id == operation.organization_mirror_id,
+             where:
+               operation.id == ^operation_id and operation.kind == "bootstrap.repository_import" and
+                 operation.state not in [:completed, :failed] and
+                 repository.github_repository_id == ^run.source_repository_github_id and
+                 mirror.github_account_id == ^run.source_owner_github_id and
+                 mirror.organization_id == ^run.destination_organization_id,
+             select: mirror
+         ) do
+      %OrganizationMirror{} = mirror -> {:ok, mirror}
+      nil -> {:error, {:terminal, :binding_mismatch}}
+    end
+  end
+
+  defp bound_mirror(_run), do: {:error, {:terminal, :binding_mismatch}}
 
   defp authorize_binding(actor, run, mirror) do
     cond do
@@ -270,6 +313,9 @@ defmodule ForgeImports.CredentialProvider.GitHubApp do
   defp runnable_mirror(%OrganizationMirror{state: state})
        when state in [:bootstrapping, :catching_up],
        do: :ok
+
+  defp runnable_mirror(%OrganizationMirror{state: state}) when state in [:active, :degraded],
+    do: :ok
 
   defp runnable_mirror(%OrganizationMirror{state: :paused}),
     do: {:error, {:retryable, :busy}}

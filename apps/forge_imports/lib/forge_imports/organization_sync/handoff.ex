@@ -4,7 +4,7 @@ defmodule ForgeImports.OrganizationSync.Handoff do
   import Ecto.Query
 
   alias Ecto.Multi
-  alias ForgeImports.ObjectMapping
+  alias ForgeImports.{ImportRun, ObjectMapping}
   alias ForgeIssues.{Comment, Issue, IssueAssignee, IssueLabel, Label}
 
   alias ForgeMirrors.{
@@ -44,9 +44,9 @@ defmodule ForgeImports.OrganizationSync.Handoff do
       nil ->
         {:ok, :not_applicable}
 
-      %OrganizationMirror{state: state} = organization_mirror
-      when state in [:bootstrapping, :catching_up] ->
-        with :ok <- validate_publication(organization_mirror, repository, item, item_id),
+      %OrganizationMirror{} = organization_mirror ->
+        with :ok <- validate_handoff_state(repo, run_id, organization_mirror),
+             :ok <- validate_publication(organization_mirror, repository, item, item_id),
              {:ok, repository} <- hold_lfs_publication(repo, organization_mirror, repository),
              {:ok, repository_mirror} <-
                bind_repository_mirror(repo, organization_mirror, repository, item, now),
@@ -72,9 +72,14 @@ defmodule ForgeImports.OrganizationSync.Handoff do
              eligible_deliveries: replay_count
            }}
         end
+    end
+  end
 
-      %OrganizationMirror{} ->
-        {:error, :bootstrap_handoff_unavailable}
+  defp validate_handoff_state(repo, run_id, %OrganizationMirror{state: state}) do
+    case repo.get(ImportRun, run_id) do
+      %ImportRun{} when state in [:bootstrapping, :catching_up] -> :ok
+      %ImportRun{source_kind: :repository} when state in [:active, :degraded] -> :ok
+      _other -> {:error, :bootstrap_handoff_unavailable}
     end
   end
 
@@ -95,6 +100,30 @@ defmodule ForgeImports.OrganizationSync.Handoff do
   end
 
   defp bootstrap_mirror(repo, run_id) do
+    case repo.get(ImportRun, run_id) do
+      %ImportRun{source_kind: :repository, mirror_operation_id: operation_id} = run
+      when is_integer(operation_id) ->
+        repo.one(
+          from mirror in OrganizationMirror,
+            join: operation in MirrorOperation,
+            on: operation.organization_mirror_id == mirror.id,
+            join: repository in RepositoryMirror,
+            on: repository.id == operation.repository_mirror_id,
+            where:
+              operation.id == ^operation_id and operation.kind == "bootstrap.repository_import" and
+                operation.state not in [:completed, :failed] and
+                repository.github_repository_id == ^run.source_repository_github_id and
+                mirror.organization_id == ^run.destination_organization_id and
+                mirror.github_account_id == ^run.source_owner_github_id,
+            lock: "FOR UPDATE"
+        )
+
+      _other ->
+        bootstrap_mirror_for_run(repo, run_id)
+    end
+  end
+
+  defp bootstrap_mirror_for_run(repo, run_id) do
     OrganizationMirror
     |> where(
       [mirror],
