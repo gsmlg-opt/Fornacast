@@ -1,9 +1,19 @@
 defmodule ForgeGitHub.WebhookProcessorTest do
   use ExUnit.Case, async: false
 
+  import ForgeMirrors.TestSupport.MirrorFixtures
+
   alias Fornacast.Repo
   alias ForgeGitHub.{AppInstallation, Error}
-  alias ForgeMirrors.{GitHubAppInstallation, MirrorWebhookDelivery}
+
+  alias ForgeMirrors.{
+    GitHubAppInstallation,
+    MirrorOperation,
+    MirrorWebhookDelivery,
+    OrganizationMirror
+  }
+
+  alias GitLFS.LFSObject
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
@@ -271,6 +281,130 @@ defmodule ForgeGitHub.WebhookProcessorTest do
     assert_received {:revoked_after_commit, ^test, :revoked}
   end
 
+  test "installation deletion stops queued effects without deleting local Git or LFS data" do
+    now = DateTime.utc_now(:second)
+
+    organization =
+      active_organization_mirror_fixture(%{
+        capabilities: %{"git" => "enabled", "lfs" => "enabled"}
+      })
+
+    installation_id = organization.github_installation_id
+
+    Repo.get_by!(GitHubAppInstallation, github_installation_id: installation_id)
+    |> Ecto.Changeset.change(permissions: %{"contents" => "write", "metadata" => "read"})
+    |> Repo.update!()
+
+    binding = repository_mirror_fixture(organization)
+    repository = Repo.get!(ForgeRepos.Repository, binding.repository_id)
+    File.mkdir_p!(Path.dirname(repository.storage_path))
+    assert {:ok, _path} = GitCore.init_bare(repository.storage_path)
+    on_exit(fn -> File.rm_rf!(repository.storage_path) end)
+
+    tree = git!(repository.storage_path, ["hash-object", "-t", "tree", "-w", "/dev/null"])
+    commit = git!(repository.storage_path, ["commit-tree", tree, "-m", "retain locally"])
+    git!(repository.storage_path, ["update-ref", "refs/heads/main", commit])
+    :ok = GitCore.invalidate_repository_cache(repository.storage_path)
+
+    payload = "retained after GitHub App deletion"
+    lfs_oid = :crypto.hash(:sha256, payload) |> Base.encode16(case: :lower)
+    on_exit(fn -> ForgeBlobs.delete(lfs_oid) end)
+
+    assert {:ok, reservation} = GitLFS.reserve_upload(repository, lfs_oid, byte_size(payload))
+
+    assert {:ok, staged, %{chunks: []}} =
+             GitLFS.stage_upload(reservation, &chunk_reader/2, %{chunks: [payload]})
+
+    assert {:ok, %LFSObject{oid_sha256: ^lfs_oid}} =
+             GitLFS.commit_synchronized_upload(staged, "refs/heads/main")
+
+    operation =
+      operation_fixture(organization, %{
+        repository_mirror_id: binding.id,
+        kind: "sync.git_ref",
+        cursor: %{
+          "initial_absence" => false,
+          "ref_name" => "refs/heads/main",
+          "trigger" => "local"
+        },
+        next_attempt_at: now
+      })
+
+    assert {:ok, [%MirrorOperation{id: operation_id} = claimed]} =
+             ForgeMirrors.claim_operations("deletion-retention", now, 60, 1, ["sync.git_ref"])
+
+    assert operation_id == operation.id
+
+    marker = %{
+      "action" => "apply_remote",
+      "expected_oid" => nil,
+      "proposed_oid" => commit,
+      "ref" => "refs/heads/main"
+    }
+
+    assert {:ok, %MirrorOperation{state: :effect_pending} = marked} =
+             ForgeMirrors.mark_external_effect(claimed, now, marker)
+
+    observed_at = DateTime.add(now, 1)
+
+    payload_json = %{
+      "action" => "deleted",
+      "installation" => %{
+        "id" => installation_id,
+        "account" => %{
+          "id" => organization.github_account_id,
+          "login" => organization.github_account_login,
+          "type" => "Organization"
+        },
+        "repository_selection" => "all",
+        "permissions" => %{"contents" => "write", "metadata" => "read"},
+        "suspended_at" => nil
+      }
+    }
+
+    assert :ok =
+             delivery("installation", "deleted", payload_json)
+             |> Map.put(:installation_id, installation_id)
+             |> ForgeGitHub.WebhookProcessor.process(
+               now: fn -> observed_at end,
+               token_revoke: fn ^installation_id ->
+                 assert Repo.get_by!(GitHubAppInstallation,
+                          github_installation_id: installation_id
+                        ).state == :revoked
+
+                 assert Repo.get!(OrganizationMirror, organization.id).state == :revoked
+
+                 assert {:ok, ^commit} =
+                          GitCore.exact_ref(repository.storage_path, "refs/heads/main")
+
+                 assert :ok = GitLFS.verify_object(repository, lfs_oid, byte_size(payload))
+                 send(self(), :token_revoked_after_local_retention)
+                 :ok
+               end
+             )
+
+    assert_received :token_revoked_after_local_retention
+    assert {:error, :revoked} = ForgeMirrors.authorize_external_effect(marked, marker)
+
+    assert %MirrorOperation{
+             state: :effect_pending,
+             external_effect_marker: ^marker
+           } = Repo.get!(MirrorOperation, operation.id)
+
+    assert {:ok, []} =
+             ForgeMirrors.claim_operations(
+               "revoked-operation",
+               DateTime.add(now, 120),
+               60,
+               1,
+               ["sync.git_ref"]
+             )
+
+    assert {:ok, _repository} = ForgeRepos.fetch_live_repository(repository.id)
+    assert {:ok, ^commit} = GitCore.exact_ref(repository.storage_path, "refs/heads/main")
+    assert :ok = GitLFS.verify_object(repository, lfs_oid, byte_size(payload))
+  end
+
   test "classifies canonical fetch failures and rejects insufficient immutable evidence" do
     retry_at = DateTime.add(DateTime.utc_now(:second), 30)
 
@@ -425,4 +559,26 @@ defmodule ForgeGitHub.WebhookProcessorTest do
       state: :active
     }
   end
+
+  defp git!(path, args) do
+    {output, status} =
+      System.cmd("git", args,
+        cd: path,
+        stderr_to_stdout: true,
+        env: [
+          {"GIT_AUTHOR_NAME", "Test"},
+          {"GIT_AUTHOR_EMAIL", "test@example.test"},
+          {"GIT_COMMITTER_NAME", "Test"},
+          {"GIT_COMMITTER_EMAIL", "test@example.test"}
+        ]
+      )
+
+    assert status == 0, output
+    String.trim(output)
+  end
+
+  defp chunk_reader(%{chunks: [chunk | rest]} = state, _options),
+    do: {:more, chunk, %{state | chunks: rest}}
+
+  defp chunk_reader(%{chunks: []} = state, _options), do: {:done, state}
 end

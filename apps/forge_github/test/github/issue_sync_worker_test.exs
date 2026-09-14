@@ -119,45 +119,47 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
            ]
   end
 
-  test "post-marker pause defers an issue write without a fresh token or provider call" do
-    parent = self()
-    operation = operation("sync.issue", :processing)
-    local = Map.put(@base, "body", "local body")
+  for reason <- [:paused, :revoked, :permission_missing] do
+    test "post-marker #{reason} defers an issue write without a fresh token or provider call" do
+      parent = self()
+      operation = operation("sync.issue", :processing)
+      local = Map.put(@base, "body", "local body")
 
-    options =
-      options(operation,
-        local_observe: fn _ -> {:ok, local_issue(local, 4)} end,
-        token_fetch: fn 44, _ ->
-          send(parent, :token_fetch)
+      options =
+        options(operation,
+          local_observe: fn _ -> {:ok, local_issue(local, 4)} end,
+          token_fetch: fn 44, _ ->
+            send(parent, :token_fetch)
 
-          %InstallationToken{
-            token: "ephemeral",
-            expires_at: DateTime.add(@now, 3_600),
-            permissions: %{"issues" => "write", "metadata" => "read"}
-          }
-        end,
-        mark_effect: fn ^operation, @now, marker ->
-          send(parent, {:effect_marked, marker})
-          {:ok, %{operation | state: :effect_pending, external_effect_marker: marker}}
-        end,
-        authorize_effect: fn marked, marker ->
-          assert marked.state == :effect_pending
-          assert marked.external_effect_marker == marker
-          {:error, :paused}
-        end,
-        update_issue: fn _, _, _, _, _, _ -> flunk("paused effect wrote GitHub") end,
-        defer_effect: fn marked, @now, retry_at, "network", "resource_context_unavailable" ->
-          assert DateTime.after?(retry_at, @now)
-          assert marked.state == :effect_pending
-          assert is_map(marked.external_effect_marker)
-          {:ok, :deferred}
-        end
-      )
+            %InstallationToken{
+              token: "ephemeral",
+              expires_at: DateTime.add(@now, 3_600),
+              permissions: %{"issues" => "write", "metadata" => "read"}
+            }
+          end,
+          mark_effect: fn ^operation, @now, marker ->
+            send(parent, {:effect_marked, marker})
+            {:ok, %{operation | state: :effect_pending, external_effect_marker: marker}}
+          end,
+          authorize_effect: fn marked, marker ->
+            assert marked.state == :effect_pending
+            assert marked.external_effect_marker == marker
+            {:error, unquote(reason)}
+          end,
+          update_issue: fn _, _, _, _, _, _ -> flunk("unauthorized effect wrote GitHub") end,
+          defer_effect: fn marked, @now, retry_at, "network", "resource_context_unavailable" ->
+            assert DateTime.after?(retry_at, @now)
+            assert marked.state == :effect_pending
+            assert is_map(marked.external_effect_marker)
+            {:ok, :deferred}
+          end
+        )
 
-    assert {:ok, :deferred} = IssueSyncWorker.process_operation(operation, @now, options)
-    assert_received :token_fetch
-    assert_received {:effect_marked, _marker}
-    refute_received :token_fetch
+      assert {:ok, :deferred} = IssueSyncWorker.process_operation(operation, @now, options)
+      assert_received :token_fetch
+      assert_received {:effect_marked, _marker}
+      refute_received :token_fetch
+    end
   end
 
   test "merges independent label and assignee additions and applies both sides" do
@@ -807,6 +809,58 @@ defmodule ForgeGitHub.IssueSyncWorkerTest do
              {:effect_marked, "create_remote_comment"},
              :comment_created
            ]
+  end
+
+  test "a post-marker revocation retains a comment effect without a second token or POST" do
+    parent = self()
+    operation = operation("sync.issue_comment", :processing)
+    snapshot = %{"body" => "local comment"}
+
+    options =
+      options(operation,
+        context: fn ^operation ->
+          {:ok,
+           comment_context(:missing,
+             github_object_id: nil,
+             github_node_id: nil,
+             confirmed_remote_updated_at: nil
+           )}
+        end,
+        local_observe: fn _ -> {:ok, local_comment(snapshot, 1)} end,
+        token_fetch: fn 44, _ ->
+          send(parent, :token_fetch)
+
+          %InstallationToken{
+            token: "ephemeral",
+            expires_at: DateTime.add(@now, 3_600),
+            permissions: %{"issues" => "write", "metadata" => "read"}
+          }
+        end,
+        mark_effect: fn ^operation, @now, marker ->
+          send(parent, {:effect_marked, marker})
+          {:ok, %{operation | state: :effect_pending, external_effect_marker: marker}}
+        end,
+        authorize_effect: fn marked, marker ->
+          assert marked.state == :effect_pending
+          assert marked.external_effect_marker == marker
+          {:error, :revoked}
+        end,
+        create_comment: fn _, _, _, _, _, _ ->
+          flunk("revoked comment effect POSTed to GitHub")
+        end,
+        defer_effect: fn marked, @now, retry_at, "network", "resource_context_unavailable" ->
+          assert DateTime.after?(retry_at, @now)
+          assert marked.state == :effect_pending
+          assert marked.external_effect_marker["action"] == "create_remote_comment"
+          {:ok, :deferred}
+        end
+      )
+
+    assert {:ok, :deferred} = IssueSyncWorker.process_operation(operation, @now, options)
+    assert_received :token_fetch
+    assert_received {:effect_marked, marker}
+    assert marker["action"] == "create_remote_comment"
+    refute_received :token_fetch
   end
 
   test "a mapped comment 404 applies a local tombstone without replaying a provider effect" do
