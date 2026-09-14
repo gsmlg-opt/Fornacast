@@ -192,7 +192,7 @@ defmodule FornacastAPI.GitHubWebhookIngressTest do
     assert duplicate_signature.status == 401
   end
 
-  test "queues pull requests without trusting a local organization binding and defers releases",
+  test "queues unbound pull request and release deliveries for safe deferral",
        %{
          conn: conn
        } do
@@ -214,15 +214,20 @@ defmodule FornacastAPI.GitHubWebhookIngressTest do
              delivery: release_guid
            ).status == 202
 
-    assert Repo.get_by!(MirrorWebhookDelivery, delivery_guid: release_guid).state ==
-             :pending_unsupported
+    release = Repo.get_by!(MirrorWebhookDelivery, delivery_guid: release_guid)
+    assert release.state == :pending
+    assert is_nil(release.organization_mirror_id)
 
-    assert {:ok, [claimed]} = ForgeMirrors.claim_webhook_deliveries("ingress-pull", 30, 10)
-    assert claimed.id == pull.id
-    assert is_nil(claimed.organization_mirror_id)
+    assert {:ok, claimed} =
+             ForgeMirrors.claim_webhook_deliveries("ingress-unbound", 30, 10, 2)
 
-    assert {:ok, deferred} = ForgeMirrors.defer_webhook_delivery(claimed, "ingress-pull")
-    assert deferred.state == :pending_unsupported
+    assert Enum.map(claimed, & &1.id) == [pull.id, release.id]
+    assert Enum.all?(claimed, &is_nil(&1.organization_mirror_id))
+
+    for delivery <- claimed do
+      assert {:ok, deferred} = ForgeMirrors.defer_webhook_delivery(delivery, "ingress-unbound")
+      assert deferred.state == :pending_unsupported
+    end
   end
 
   test "stores ignored combinations as terminal", %{conn: conn} do

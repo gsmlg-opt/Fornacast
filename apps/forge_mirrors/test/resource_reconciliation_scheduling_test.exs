@@ -479,7 +479,7 @@ defmodule ForgeMirrors.ResourceReconciliationSchedulingTest do
       |> Ecto.Changeset.change(state: state)
       |> Repo.update!()
 
-      expected_error = if state == :paused, do: :paused, else: :invalid_transition
+      expected_error = if state == :paused, do: :paused, else: :revoked
 
       assert {:error, ^expected_error} =
                ForgeMirrors.record_resource_reconciliation_page(leased, :issue, [], nil, c.now)
@@ -531,7 +531,7 @@ defmodule ForgeMirrors.ResourceReconciliationSchedulingTest do
       |> Ecto.Changeset.change(state: state)
       |> Repo.update!()
 
-      expected_error = if state == :paused, do: :paused, else: :invalid_transition
+      expected_error = if state == :paused, do: :paused, else: :revoked
 
       assert {:error, ^expected_error} =
                ForgeMirrors.finalize_git_ref_reconciliation(leased, c.now)

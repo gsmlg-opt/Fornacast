@@ -73,7 +73,7 @@ defmodule ForgeMirrors.QualityReviewTest do
 
       assert {:ok, transitioned} = result
 
-      expected_error = if transitioned.state == :paused, do: :paused, else: :invalid_transition
+      expected_error = if transitioned.state == :paused, do: :paused, else: :revoked
 
       assert {:error, ^expected_error} =
                ForgeMirrors.mark_external_effect(operation, DateTime.utc_now(:second), %{

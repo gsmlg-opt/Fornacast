@@ -398,7 +398,12 @@ defmodule ForgeMirrors.ReleaseTagProofTest do
           binding |> Ecto.Changeset.change(state: :revoked) |> Repo.update!()
       end
 
-      expected_error = if fence == :paused, do: :paused, else: :invalid_transition
+      expected_error =
+        case fence do
+          :paused -> :paused
+          :revoked -> :revoked
+          _ -> :invalid_transition
+        end
 
       assert {:error, ^expected_error} =
                ForgeMirrors.prepare_release_tag_proof(parent, "v1.0.0", c.now)
