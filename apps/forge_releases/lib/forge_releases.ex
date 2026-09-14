@@ -230,6 +230,75 @@ defmodule ForgeReleases do
 
   defdelegate append_sync_release_apply(multi, key, request), to: ForgeReleases.Sync
 
+  @import_release_keys ~w(author_github_identity_id body draft inserted_at name prerelease published_at tag_name target_commitish updated_at)a
+
+  @doc """
+  Appends a provider release import to a caller-owned transaction.
+
+  This boundary is intentionally limited to hidden repositories that are still
+  importing. It validates and inserts historical provider metadata without
+  emitting a local synchronization event; the importer owns the surrounding
+  mapping, report, and checkpoint steps.
+  """
+  @spec append_import_release(Multi.t(), Multi.name(), Repository.t(), map()) :: Multi.t()
+  def append_import_release(
+        %Multi{} = multi,
+        key,
+        %Repository{id: repository_id},
+        attrs
+      )
+      when is_integer(repository_id) and repository_id > 0 and is_map(attrs) do
+    repository_key = {__MODULE__, :import_repository, key}
+    author_key = {__MODULE__, :import_author, key}
+
+    multi
+    |> Multi.run(repository_key, fn repo, _changes ->
+      case repo.one(
+             from(repository in Repository,
+               where:
+                 repository.id == ^repository_id and repository.lifecycle == :importing and
+                   is_nil(repository.deleted_at),
+               lock: "FOR UPDATE"
+             )
+           ) do
+        %Repository{} = repository -> {:ok, repository}
+        nil -> {:error, :invalid_import_repository}
+      end
+    end)
+    |> Multi.run(author_key, fn repo, _changes ->
+      with {:ok, normalized} <- normalize_import_release_attrs(attrs),
+           %GitHubIdentity{} <-
+             repo.one(
+               from(identity in GitHubIdentity,
+                 where:
+                   identity.id == ^normalized.author_github_identity_id and
+                     identity.kind == :user,
+                 lock: "FOR KEY SHARE"
+               )
+             ) do
+        {:ok, normalized}
+      else
+        _invalid -> {:error, :invalid_import_author}
+      end
+    end)
+    |> Multi.insert(key, fn changes ->
+      repository = Map.fetch!(changes, repository_key)
+      normalized = Map.fetch!(changes, author_key)
+
+      %Release{
+        repository_id: repository.id,
+        author_github_identity_id: normalized.author_github_identity_id
+      }
+      |> Release.import_changeset(Map.delete(normalized, :author_github_identity_id))
+    end)
+  end
+
+  def append_import_release(%Multi{} = multi, _key, _repository, _attrs),
+    do:
+      Multi.run(multi, {__MODULE__, :invalid_import_release}, fn _repo, _changes ->
+        {:error, :invalid_import_release}
+      end)
+
   @doc false
   @spec create_multi(User.t(), Repository.t(), map(), map(), keyword()) :: Multi.t()
   def create_multi(
@@ -506,6 +575,21 @@ defmodule ForgeReleases do
       do: attrs,
       else: Map.put(attrs, key, value)
   end
+
+  defp normalize_import_release_attrs(attrs) do
+    if Enum.sort(Map.keys(attrs)) == Enum.sort(@import_release_keys) and
+         is_integer(attrs[:author_github_identity_id]) and
+         attrs[:author_github_identity_id] > 0 and utc_second?(attrs[:inserted_at]) and
+         utc_second?(attrs[:updated_at]) and
+         (is_nil(attrs[:published_at]) or utc_second?(attrs[:published_at])) do
+      {:ok, attrs}
+    else
+      :error
+    end
+  end
+
+  defp utc_second?(%DateTime{microsecond: {0, 0}, utc_offset: 0, std_offset: 0}), do: true
+  defp utc_second?(_value), do: false
 
   defp missing_tag,
     do: {:error, {:validation, [%{resource: "Release", field: "tag_name", code: :missing}]}}

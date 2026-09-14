@@ -329,7 +329,62 @@ defmodule ForgeGitHub.ReleaseClientTest do
     end
   end
 
-  test "rejects unsupported payload fields and non-installation gates without transport" do
+  test "accepts bounded installation and one-time import gates" do
+    read_stub = stub_name()
+
+    Req.Test.expect(read_stub, fn conn -> Req.Test.json(conn, release_json(41)) end)
+
+    assert {:ok, %{"id" => 41}} =
+             ReleaseClient.get_release(
+               "import_token",
+               "acme",
+               "widgets",
+               41,
+               client_opts(read_stub, {:one_time_run, 7})
+             )
+
+    page_stub = stub_name()
+    Req.Test.expect(page_stub, fn conn -> Req.Test.json(conn, [release_json(41)]) end)
+
+    assert {:ok, %{releases: [%{"id" => 41}], next_cursor: nil}} =
+             ReleaseClient.list_releases_page(
+               "import_token",
+               "acme",
+               "widgets",
+               nil,
+               client_opts(page_stub, {:one_time_run, 7})
+             )
+
+    assert {:error, %Error{kind: :invalid_request}} =
+             ReleaseClient.create_release(
+               "import_token",
+               "acme",
+               "widgets",
+               %{tag_name: "v1", target_commitish: "main"},
+               client_opts(stub_name(), {:one_time_run, 7})
+             )
+
+    assert {:error, %Error{kind: :invalid_request}} =
+             ReleaseClient.update_release(
+               "import_token",
+               "acme",
+               "widgets",
+               41,
+               %{name: "forbidden"},
+               client_opts(stub_name(), {:one_time_run, 7})
+             )
+
+    assert {:error, %Error{kind: :invalid_request}} =
+             ReleaseClient.delete_release(
+               "import_token",
+               "acme",
+               "widgets",
+               41,
+               client_opts(stub_name(), {:one_time_run, 7})
+             )
+  end
+
+  test "rejects unsupported payload fields and unsupported gates without transport" do
     for attrs <- [
           %{},
           %{tag_name: "v1"},

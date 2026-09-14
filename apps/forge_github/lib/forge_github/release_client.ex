@@ -141,10 +141,15 @@ defmodule ForgeGitHub.ReleaseClient do
 
   defp valid_options?(opts) when is_list(opts) do
     Keyword.keyword?(opts) and not Keyword.has_key?(opts, :json) and
-      match?(
-        {:github_installation, id} when is_integer(id) and id in 1..@max_id,
-        Keyword.get(opts, :gate_key)
-      )
+      case Keyword.get(opts, :gate_key) do
+        {kind, id}
+        when kind in [:github_installation, :one_time_run] and is_integer(id) and
+               id in 1..@max_id ->
+          true
+
+        _invalid ->
+          false
+      end
   end
 
   defp valid_options?(_opts), do: false

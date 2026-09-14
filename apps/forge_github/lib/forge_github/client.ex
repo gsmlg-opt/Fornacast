@@ -95,7 +95,7 @@ defmodule ForgeGitHub.Client do
        ) do
     with {:ok, request_kind} <- classify.(method, path),
          true <- valid_issue_metadata_status?(request_kind, expected_status),
-         true <- installation_gate?(opts) do
+         true <- metadata_gate?(opts, request_kind, json_profile) do
       with_request_gate(token, opts, [:json], fn ->
         with {:ok, body} <- encode_request_body(opts, json_profile),
              {:ok, response} <- perform_request(path, token, opts, method, body),
@@ -184,7 +184,7 @@ defmodule ForgeGitHub.Client do
 
   defp metadata_page(token, path, opts, classify, json_profile \\ :issue_metadata) do
     with {:ok, :page} <- classify.(:get, path),
-         true <- installation_gate?(opts),
+         true <- metadata_gate?(opts, :page, json_profile),
          {:ok, %URI{path: allowed_path}} <- URI.new(path) do
       with_request_gate(token, opts, fn ->
         with {:ok, response} <- perform_request(path, token, opts, :get, nil),
@@ -651,6 +651,22 @@ defmodule ForgeGitHub.Client do
   end
 
   defp installation_gate?(_opts), do: false
+
+  defp metadata_gate?(opts, kind, :release_metadata) when kind in [:read, :page],
+    do: installation_gate?(opts) or one_time_run_gate?(opts)
+
+  defp metadata_gate?(opts, _kind, _profile), do: installation_gate?(opts)
+
+  defp one_time_run_gate?(opts) when is_list(opts) do
+    Keyword.keyword?(opts) and
+      match?(
+        {:ok, {:one_time_run, id}}
+        when is_integer(id) and id in 1..9_223_372_036_854_775_807,
+        Keyword.fetch(opts, :gate_key)
+      )
+  end
+
+  defp one_time_run_gate?(_opts), do: false
 
   defp with_request_gate(pat, opts, fun) do
     with_request_gate(pat, opts, [], fun)
