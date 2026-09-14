@@ -1,17 +1,30 @@
 defmodule ForgeGitHub.PullSyncIntegrationTest do
   use ExUnit.Case, async: false
 
+  import Ecto.Query
   import ForgeMirrors.TestSupport.MirrorFixtures
 
-  alias ForgeGitHub.{Error, InstallationToken, IssueClient, PullClient, PullSyncWorker}
+  alias ForgeGitHub.{
+    Error,
+    InstallationToken,
+    InventoryWorker,
+    IssueClient,
+    PullClient,
+    PullSyncWorker
+  }
+
+  alias ForgeGitHub.Repository, as: GitHubRepository
 
   alias ForgeMirrors.{
     MirrorOperation,
     MirrorRefState,
-    MirrorResourceState
+    MirrorResourceState,
+    MirrorWebhookDelivery,
+    OrganizationMirror
   }
 
   alias ForgePulls.PullRequest
+  alias ForgeRepos.Repository
   alias Fornacast.Repo
 
   @source_time ~U[2026-09-01 00:00:00Z]
@@ -738,6 +751,194 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     assert Repo.get!(MirrorResourceState, ctx.mapping.id).state == :confirmed
     assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_local_version == 2
     assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id).confirmed_local_version == 2
+  end
+
+  test "full inventory repairs an intentionally omitted pull webhook", ctx do
+    Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+    task_supervisor = start_supervised!(Task.Supervisor)
+    now = DateTime.utc_now(:second)
+    parent = self()
+
+    assert Repo.aggregate(
+             from(delivery in MirrorWebhookDelivery,
+               where: delivery.organization_mirror_id == ^ctx.organization.id
+             ),
+             :count
+           ) == 0
+
+    assert {:ok, %MirrorOperation{} = inventory} =
+             ForgeMirrors.schedule_reconciliation(
+               organization_owner_fixture(ctx.organization),
+               ctx.organization,
+               now
+             )
+
+    repositories =
+      Enum.map([ctx.base, ctx.head], fn binding ->
+        local = Repo.get!(Repository, binding.repository_id)
+        [owner, name] = String.split(binding.github_full_name, "/", parts: 2)
+
+        %GitHubRepository{
+          id: binding.github_repository_id,
+          node_id: binding.github_node_id,
+          owner_id: ctx.organization.github_account_id,
+          name: name,
+          full_name: binding.github_full_name,
+          owner_login: owner,
+          description: local.description,
+          visibility: local.visibility,
+          default_branch: local.default_branch,
+          has_issues: true,
+          allow_merge_commit: true,
+          fork: false,
+          archived: false,
+          updated_at: now
+        }
+      end)
+
+    assert {:ok, [{inventory_id, {:ok, %{operation: %{state: :completed}}}}]} =
+             InventoryWorker.run_once("omitted-pull-inventory",
+               now: fn -> now end,
+               task_supervisor: task_supervisor,
+               max_concurrency: 1,
+               batch_size: 1,
+               token_fetch: options(ctx)[:token_fetch],
+               page_fetch: fn "integration-token", 1, _options ->
+                 {:ok, %{repositories: repositories, next_cursor: nil}}
+               end
+             )
+
+    assert inventory_id == inventory.id
+    marker = "inventory-operation:#{inventory.id}"
+    assert Repo.get!(OrganizationMirror, ctx.organization.id).last_reconciled_at == nil
+
+    inventory_children =
+      Repo.all(
+        from operation in MirrorOperation,
+          where:
+            operation.organization_mirror_id == ^ctx.organization.id and
+              operation.kind != "finalize.organization.reconciliation" and
+              fragment(
+                "?->>'inventory_reconciliation_sweep' = ?",
+                operation.cursor,
+                ^marker
+              )
+      )
+
+    assert Enum.frequencies_by(inventory_children, & &1.kind) == %{
+             "reconcile.repository.git" => 2,
+             "reconcile.repository.issue_comments" => 2,
+             "reconcile.repository.metadata" => 2,
+             "reconcile.repository.pull_heads" => 2
+           }
+
+    assert {:ok, [{_finalizer_id, {:ok, %{status: :waiting}}}]} =
+             InventoryWorker.run_once("omitted-pull-finalizer-waiting",
+               now: fn -> now end,
+               task_supervisor: task_supervisor,
+               max_concurrency: 1,
+               batch_size: 1,
+               token_fetch: fn _, _ -> flunk("finalizer must not fetch a token") end,
+               page_fetch: fn _, _, _ -> flunk("finalizer must not call GitHub") end
+             )
+
+    for kind <- [
+          "reconcile.repository.git",
+          "reconcile.repository.issue_comments",
+          "reconcile.repository.metadata"
+        ] do
+      assert {:ok, operations} =
+               ForgeMirrors.claim_operations("omitted-pull-#{kind}", now, 60, 100, [kind])
+
+      assert length(operations) == 2
+
+      for operation <- operations do
+        assert {:ok, %MirrorOperation{state: :completed}} =
+                 ForgeMirrors.complete_operation(operation, now)
+      end
+    end
+
+    changed = Map.put(ctx.baseline, "title", "Changed without a pull webhook")
+
+    worker_options =
+      options(ctx,
+        now: fn -> now end,
+        task_supervisor: task_supervisor,
+        max_concurrency: 1,
+        batch_size: 1,
+        list_pulls: fn _token, _owner, repository, 1, _request_options ->
+          send(parent, {:listed_pulls, repository})
+
+          pulls = if repository == "project", do: [pull_json(changed, now)], else: []
+          {:ok, %{pulls: pulls, next_cursor: nil}}
+        end
+      )
+
+    assert {:ok, [{_base_sweep_id, {:ok, %{operation: %{state: :pending}}}}]} =
+             PullSyncWorker.run_once("omitted-pull-base-remote", worker_options)
+
+    assert_received {:listed_pulls, "project"}
+
+    assert {:ok,
+            [{_base_sweep_id, {:ok, %{operation: %{state: :completed}, operations: [_child]}}}]} =
+             PullSyncWorker.run_once("omitted-pull-base-mapped", worker_options)
+
+    assert {:ok, [{_head_sweep_id, {:ok, %{operation: %{state: :pending}}}}]} =
+             PullSyncWorker.run_once("omitted-pull-head-remote", worker_options)
+
+    assert_received {:listed_pulls, "head"}
+
+    assert {:ok, [{_head_sweep_id, {:ok, %{operation: %{state: :completed}, operations: []}}}]} =
+             PullSyncWorker.run_once("omitted-pull-head-mapped", worker_options)
+
+    expect_observation(ctx, changed, now)
+
+    assert {:ok, [{_child_id, {:ok, %{operation: %{state: :completed}}}}]} =
+             PullSyncWorker.run_once("omitted-pull-child", worker_options)
+
+    expect_observation(ctx, changed, now)
+
+    assert {:ok, [{_mapped_child_id, {:ok, %{operation: %{state: :completed}}}}]} =
+             PullSyncWorker.run_once("omitted-pull-mapped-child", worker_options)
+
+    assert Repo.get!(ForgeIssues.Issue, ctx.issue.id).title ==
+             "Changed without a pull webhook"
+
+    assert Enum.all?(
+             Repo.all(
+               from operation in MirrorOperation,
+                 where:
+                   operation.organization_mirror_id == ^ctx.organization.id and
+                     operation.kind != "finalize.organization.reconciliation" and
+                     fragment(
+                       "?->>'inventory_reconciliation_sweep' = ?",
+                       operation.cursor,
+                       ^marker
+                     )
+             ),
+             &(&1.state == :completed)
+           )
+
+    finalizer_retry_at = DateTime.add(now, 5)
+
+    assert {:ok, [{_finalizer_id, {:ok, %{status: :completed}}}]} =
+             InventoryWorker.run_once("omitted-pull-finalizer-completed",
+               now: fn -> finalizer_retry_at end,
+               task_supervisor: task_supervisor,
+               max_concurrency: 1,
+               batch_size: 1,
+               token_fetch: fn _, _ -> flunk("finalizer must not fetch a token") end,
+               page_fetch: fn _, _, _ -> flunk("finalizer must not call GitHub") end
+             )
+
+    assert Repo.get!(OrganizationMirror, ctx.organization.id).last_reconciled_at == now
+
+    assert Repo.aggregate(
+             from(delivery in MirrorWebhookDelivery,
+               where: delivery.organization_mirror_id == ^ctx.organization.id
+             ),
+             :count
+           ) == 0
   end
 
   test "late head binding remains read-only until discovery finds the exact active head baseline",
