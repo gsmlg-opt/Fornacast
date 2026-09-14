@@ -123,6 +123,31 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
     assert Repo.get!(DomainOutboxEvent, event.id).state == :completed
   end
 
+  test "duplicate and out-of-order issue deliveries re-read canonical state without a duplicate effect",
+       ctx do
+    now = DateTime.utc_now(:second)
+    target = Map.put(@base, "title", "Canonical GitHub title")
+    newer = remote_operation(ctx, now, 700, 7, "issue-newer-delivery")
+
+    for _ <- 1..2 do
+      Req.Test.expect(ctx.stub, fn conn ->
+        assert conn.method == "GET"
+        assert conn.request_path == "/repos/acme/project/issues/7"
+        Req.Test.json(conn, issue_json(target, now))
+      end)
+    end
+
+    assert {:ok, _} = IssueSyncWorker.process_operation(newer, now, options(ctx))
+
+    older = remote_operation(ctx, now, 700, 7, "issue-older-delivery")
+    assert {:ok, _} = IssueSyncWorker.process_operation(older, now, options(ctx))
+
+    assert %{title: "Canonical GitHub title", sync_version: 2} = Repo.get!(Issue, ctx.issue.id)
+    assert_confirmed(ctx, newer, target, 2)
+    assert_confirmed(ctx, older, target, 2)
+    assert [_single_github_event] = issue_events(ctx)
+  end
+
   test "full inventory repairs intentionally omitted issue and comment deliveries through real workers",
        ctx do
     Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
@@ -1226,6 +1251,54 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
              )
   end
 
+  test "duplicate and out-of-order comment deliveries use canonical state without duplicate comments",
+       ctx do
+    now = DateTime.utc_now(:second)
+    newer = remote_comment_operation(ctx, now, "comment-newer-delivery")
+
+    for _ <- 1..2 do
+      Req.Test.expect(ctx.stub, fn conn ->
+        assert conn.method == "GET"
+        assert conn.request_path == "/repos/acme/project/issues/comments/900"
+
+        Req.Test.json(conn, %{
+          "id" => 900,
+          "node_id" => "IC_900",
+          "body" => "Canonical comment",
+          "user" => user_json(),
+          "issue_url" => "https://api.github.com/repos/acme/project/issues/7",
+          "created_at" => DateTime.to_iso8601(@source_time),
+          "updated_at" => DateTime.to_iso8601(now)
+        })
+      end)
+    end
+
+    assert {:ok, _} = IssueSyncWorker.process_operation(newer, now, options(ctx))
+
+    older = remote_comment_operation(ctx, now, "comment-older-delivery")
+    assert {:ok, _} = IssueSyncWorker.process_operation(older, now, options(ctx))
+
+    mapping =
+      Repo.get_by!(MirrorResourceState,
+        repository_mirror_id: ctx.binding.id,
+        resource_kind: :issue_comment,
+        github_object_id: 900
+      )
+
+    assert Repo.get!(ForgeIssues.Comment, mapping.local_resource_id).body == "Canonical comment"
+    assert mapping.confirmed_local_version == 1
+
+    assert 1 ==
+             Repo.aggregate(
+               from(event in DomainOutboxEvent,
+                 where:
+                   event.aggregate_type == "issue_comment" and
+                     event.aggregate_id == ^to_string(mapping.local_resource_id)
+               ),
+               :count
+             )
+  end
+
   for access <- [:confirmed, :denied, :wrong_repository, :missed_webhook] do
     @tag deletion_access: access
     test "mapped comment deletion requires repository access proof: #{access}", ctx do
@@ -1450,7 +1523,13 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
   defp enabled_comment_id(:issue), do: 900
   defp enabled_comment_id(:pull_request), do: 901
 
-  defp remote_operation(ctx, now, github_id \\ 700, number \\ 7) do
+  defp remote_operation(
+         ctx,
+         now,
+         github_id \\ 700,
+         number \\ 7,
+         delivery_guid \\ "integration-delivery"
+       ) do
     operation =
       operation_fixture(ctx.organization, %{
         repository_mirror_id: ctx.binding.id,
@@ -1461,12 +1540,31 @@ defmodule ForgeGitHub.IssueSyncIntegrationTest do
           "issue_kind" => "issue",
           "github_object_id" => github_id,
           "github_number" => number,
-          "delivery_guid" => "integration-delivery"
+          "delivery_guid" => delivery_guid
         },
         next_attempt_at: now
       })
 
     claim(operation.id, now)
+  end
+
+  defp remote_comment_operation(ctx, now, delivery_guid) do
+    operation =
+      operation_fixture(ctx.organization, %{
+        repository_mirror_id: ctx.binding.id,
+        kind: "sync.issue_comment",
+        cursor: %{
+          "trigger" => "remote",
+          "resource_kind" => "issue_comment",
+          "github_object_id" => 900,
+          "github_issue_id" => 700,
+          "github_number" => 7,
+          "delivery_guid" => delivery_guid
+        },
+        next_attempt_at: now
+      })
+
+    claim(operation.id, now, "sync.issue_comment")
   end
 
   defp issue_events(ctx),

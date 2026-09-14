@@ -25,7 +25,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
 
   alias ForgePulls.PullRequest
   alias ForgeRepos.Repository
-  alias Fornacast.Repo
+  alias Fornacast.{DomainOutboxEvent, Repo}
 
   @source_time ~U[2026-09-01 00:00:00Z]
   @base %{
@@ -1751,6 +1751,44 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     assert companion.confirmed_remote_updated_at == now
   end
 
+  test "duplicate and out-of-order pull deliveries retain canonical state without a second mutation",
+       ctx do
+    now = DateTime.utc_now(:second)
+    target = Map.put(ctx.baseline, "title", "Canonical pull title")
+    newer = remote_operation(ctx, now, "pull-newer-delivery")
+
+    for _ <- 1..2 do
+      Req.Test.expect(ctx.stub, &Req.Test.json(&1, pull_json(target, now)))
+      Req.Test.expect(ctx.stub, &Req.Test.json(&1, issue_json(target, now)))
+    end
+
+    assert {:ok, %{operation: %{state: :completed}}} =
+             PullSyncWorker.process_operation(newer, now, options(ctx))
+
+    older = remote_operation(ctx, now, "pull-older-delivery")
+
+    assert {:ok, %{operation: %{state: :completed}}} =
+             PullSyncWorker.process_operation(older, now, options(ctx))
+
+    assert %{title: "Canonical pull title", sync_version: 2} =
+             Repo.get!(ForgeIssues.Issue, ctx.issue.id)
+
+    assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_local_version == 2
+    assert Repo.get!(MirrorResourceState, ctx.issue_mapping.id).confirmed_local_version == 2
+
+    assert 1 ==
+             Repo.aggregate(
+               from(event in DomainOutboxEvent,
+                 where:
+                   event.aggregate_type == "issue" and
+                     event.aggregate_id == ^to_string(ctx.issue.id) and
+                     event.origin == :github and
+                     fragment("?->>'issue_kind' = 'pull_request'", event.payload)
+               ),
+               :count
+             )
+  end
+
   test "unknown remote labels yield one per claim on the same inbound parent", ctx do
     Repo.delete!(ctx.mapping)
     Repo.delete!(ctx.issue_mapping)
@@ -2764,7 +2802,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
     assert Repo.get!(MirrorResourceState, ctx.mapping.id).confirmed_snapshot == ctx.baseline
   end
 
-  defp remote_operation(ctx, now) do
+  defp remote_operation(ctx, now, delivery_guid \\ "pull-integration") do
     ctx.organization
     |> operation_fixture(%{
       repository_mirror_id: ctx.base.id,
@@ -2775,7 +2813,7 @@ defmodule ForgeGitHub.PullSyncIntegrationTest do
         "issue_kind" => "pull_request",
         "github_object_id" => 802,
         "github_number" => 7,
-        "delivery_guid" => "pull-integration"
+        "delivery_guid" => delivery_guid
       },
       next_attempt_at: now
     })

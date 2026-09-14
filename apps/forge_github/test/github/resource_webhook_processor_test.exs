@@ -94,6 +94,49 @@ defmodule ForgeGitHub.ResourceWebhookProcessorTest do
              )
   end
 
+  test "duplicate and out-of-order resource payloads schedule the same immutable canonical lookup" do
+    for {event, resource, expected} <- [
+          {"issues", %{"issue" => %{"id" => 42, "number" => 7}},
+           %{
+             "resource_kind" => "issue",
+             "github_object_id" => 42,
+             "github_number" => 7,
+             "issue_kind" => "issue"
+           }},
+          {"issue_comment",
+           %{"issue" => %{"id" => 42, "number" => 7}, "comment" => %{"id" => 84}},
+           %{
+             "resource_kind" => "issue_comment",
+             "github_object_id" => 84,
+             "github_number" => 7,
+             "github_issue_id" => 42,
+             "issue_kind" => "issue"
+           }},
+          {"pull_request", %{"pull_request" => %{"id" => 43, "number" => 7}},
+           %{
+             "resource_kind" => "pull",
+             "github_object_id" => 43,
+             "github_number" => 7,
+             "issue_kind" => "pull_request"
+           }},
+          {"release", %{"release" => %{"id" => 44, "tag_name" => "v1.0.0"}},
+           %{"resource_kind" => "release", "github_object_id" => 44, "tag_name" => "v1.0.0"}}
+        ] do
+      for body <- ["newer mutable payload", "older mutable payload"] do
+        delivery = delivery(event, mutable_resource(resource, body))
+
+        assert :ok =
+                 WebhookProcessor.process(delivery,
+                   resource_schedule: fn ^delivery, hints ->
+                     assert hints == expected
+                     refute Map.has_key?(hints, "body")
+                     {:ok, :scheduled}
+                   end
+                 )
+      end
+    end
+  end
+
   test "release notifications accept tags at the 255 Unicode codepoint boundary" do
     tag_name = String.duplicate("界", 255)
     delivery = delivery("release", %{"release" => %{"id" => 84, "tag_name" => tag_name}})
@@ -165,4 +208,16 @@ defmodule ForgeGitHub.ResourceWebhookProcessorTest do
       raw_payload: JSON.encode!(payload)
     }
   end
+
+  defp mutable_resource(%{"comment" => comment} = resource, body),
+    do: %{resource | "comment" => Map.put(comment, "body", body)}
+
+  defp mutable_resource(%{"issue" => issue} = resource, body),
+    do: %{resource | "issue" => Map.put(issue, "body", body)}
+
+  defp mutable_resource(%{"pull_request" => pull} = resource, body),
+    do: %{resource | "pull_request" => Map.put(pull, "body", body)}
+
+  defp mutable_resource(%{"release" => release} = resource, body),
+    do: %{resource | "release" => Map.put(release, "body", body)}
 end

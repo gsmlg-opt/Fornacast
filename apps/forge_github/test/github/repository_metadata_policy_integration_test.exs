@@ -8,6 +8,7 @@ defmodule ForgeGitHub.RepositoryMetadataPolicyIntegrationTest do
     Error,
     InstallationToken,
     InventoryWorker,
+    ReleaseClient,
     ReleaseSyncWorker,
     RepositoryMetadataSyncWorker
   }
@@ -25,7 +26,11 @@ defmodule ForgeGitHub.RepositoryMetadataPolicyIntegrationTest do
 
   alias ForgeReleases.Release
   alias ForgeRepos.Repository
-  alias Fornacast.Repo
+  alias Fornacast.{DomainOutboxEvent, Repo}
+
+  @release_oid String.duplicate("a", 40)
+
+  setup {Req.Test, :verify_on_exit!}
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
@@ -570,6 +575,92 @@ defmodule ForgeGitHub.RepositoryMetadataPolicyIntegrationTest do
            ) == 0
   end
 
+  test "duplicate and out-of-order release deliveries converge through canonical reads once", c do
+    organization =
+      c.organization
+      |> OrganizationMirror.update_changeset(%{capabilities: %{"releases" => "enabled"}})
+      |> Repo.update!()
+
+    Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+      github_installation_id: organization.github_installation_id
+    )
+    |> Ecto.Changeset.change(permissions: %{"contents" => "write", "metadata" => "read"})
+    |> Repo.update!()
+
+    repository = Repo.get!(Repository, c.binding.repository_id)
+
+    release =
+      Repo.insert!(%Release{
+        repository_id: repository.id,
+        tag_name: "v1.0.0",
+        name: "Version 1",
+        body: "Baseline release body",
+        draft: false,
+        prerelease: false,
+        target_commitish: repository.default_branch,
+        published_at: c.now,
+        author_user_id: c.actor.id,
+        sync_version: 1
+      })
+
+    baseline = release_snapshot(release)
+    {:ok, fingerprint} = ForgeMirrors.resource_fingerprint(baseline)
+
+    mapping =
+      %MirrorResourceState{}
+      |> MirrorResourceState.persistence_changeset(%{
+        repository_mirror_id: c.binding.id,
+        resource_kind: :release,
+        local_resource_type: "ForgeReleases.Release",
+        local_resource_id: release.id,
+        github_object_id: 41,
+        github_node_id: "RE_41",
+        confirmed_snapshot: baseline,
+        confirmed_fingerprint: fingerprint,
+        confirmed_local_version: 1,
+        confirmed_remote_updated_at: c.now,
+        state: :confirmed
+      })
+      |> Repo.insert!()
+
+    now = DateTime.add(c.now, 10)
+    target = %{baseline | "body" => "Canonical GitHub release body"}
+    stub = {__MODULE__, System.unique_integer([:positive])}
+    [remote_owner, remote_repository] = String.split(c.binding.github_full_name, "/", parts: 2)
+
+    Req.Test.expect(stub, 4, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/repos/#{remote_owner}/#{remote_repository}/releases/41"
+      Req.Test.json(conn, release_json(target, now, c.binding.github_full_name))
+    end)
+
+    reconcile_remote_release!(c, organization, stub, now, "release-newer-delivery")
+
+    reconcile_remote_release!(
+      c,
+      organization,
+      stub,
+      DateTime.add(now, 10),
+      "release-older-delivery"
+    )
+
+    assert %{body: "Canonical GitHub release body", sync_version: 2} =
+             Repo.get!(Release, release.id)
+
+    assert %{confirmed_local_version: 2, confirmed_snapshot: ^target, state: :confirmed} =
+             Repo.get!(MirrorResourceState, mapping.id)
+
+    assert 1 ==
+             Repo.aggregate(
+               from(event in DomainOutboxEvent,
+                 where:
+                   event.aggregate_type == "release" and
+                     event.aggregate_id == ^to_string(release.id) and event.origin == :github
+               ),
+               :count
+             )
+  end
+
   test "keep Fornacast recovers a committed PATCH after timeout without a second effect", c do
     repository =
       c.binding.repository_id
@@ -756,6 +847,119 @@ defmodule ForgeGitHub.RepositoryMetadataPolicyIntegrationTest do
           permissions: %{"contents" => "write", "metadata" => "read"}
         }
     end
+  end
+
+  defp reconcile_remote_release!(c, organization, stub, now, delivery_guid) do
+    operation =
+      operation_fixture(organization, %{
+        repository_mirror_id: c.binding.id,
+        kind: "sync.release",
+        cursor: %{
+          "trigger" => "remote",
+          "resource_kind" => "release",
+          "github_object_id" => 41,
+          "tag_name" => "v1.0.0",
+          "delivery_guid" => delivery_guid
+        },
+        next_attempt_at: now
+      })
+      |> claim_release!(now, "#{delivery_guid}-canonical", "sync.release")
+
+    options = release_options(stub)
+
+    assert {:ok, %MirrorOperation{state: :pending} = canonical} =
+             ReleaseSyncWorker.process_operation(operation, now, options)
+
+    proof_at = DateTime.add(now, 1)
+
+    canonical =
+      claim_release!(canonical, proof_at, "#{delivery_guid}-proof", "sync.release")
+
+    assert {:ok, %{tag_operation: tag, continuation: continuation}} =
+             ReleaseSyncWorker.process_operation(canonical, proof_at, options)
+
+    tag_at = DateTime.add(now, 2)
+
+    tag =
+      tag
+      |> Ecto.Changeset.change(checkpoint: %{"lfs_scan" => "complete"})
+      |> Repo.update!()
+      |> claim_release!(tag_at, "#{delivery_guid}-tag", "sync.git_ref")
+
+    assert {:ok, %{operation: %MirrorOperation{state: :completed}}} =
+             ForgeMirrors.confirm_git_ref(
+               tag,
+               "refs/tags/v1.0.0",
+               @release_oid,
+               @release_oid,
+               tag_at
+             )
+
+    continuation_at = DateTime.add(now, 3)
+
+    continuation =
+      claim_release!(
+        continuation,
+        continuation_at,
+        "#{delivery_guid}-continuation",
+        "sync.release"
+      )
+
+    assert {:ok, %{operation: %MirrorOperation{state: :completed}}} =
+             ReleaseSyncWorker.process_operation(continuation, continuation_at, options)
+  end
+
+  defp claim_release!(operation, now, owner, kind) do
+    assert {:ok, operations} = ForgeMirrors.claim_operations(owner, now, 60, 100, [kind])
+
+    Enum.find(operations, &(&1.id == operation.id)) ||
+      flunk("release operation was not claimable by #{owner}")
+  end
+
+  defp release_options(stub) do
+    [
+      token_fetch: token_fetch(self()),
+      get_release: fn token, owner, repository, id, opts ->
+        ReleaseClient.get_release(
+          token,
+          owner,
+          repository,
+          id,
+          Keyword.merge(opts,
+            plug: {Req.Test, stub},
+            resolver: fn "api.github.com" -> {:ok, [{140, 82, 114, 5}]} end
+          )
+        )
+      end
+    ]
+  end
+
+  defp release_snapshot(release) do
+    %{
+      "tag_name" => release.tag_name,
+      "name" => release.name,
+      "body" => release.body,
+      "draft" => release.draft,
+      "prerelease" => release.prerelease,
+      "target_commitish" => release.target_commitish,
+      "published_at" => DateTime.to_iso8601(release.published_at)
+    }
+  end
+
+  defp release_json(snapshot, updated_at, full_name) do
+    Map.merge(snapshot, %{
+      "id" => 41,
+      "node_id" => "RE_41",
+      "url" => "https://api.github.com/repos/#{full_name}/releases/41",
+      "created_at" => DateTime.to_iso8601(updated_at),
+      "updated_at" => DateTime.to_iso8601(updated_at),
+      "author" => %{"id" => 501, "node_id" => "U_501", "login" => "release-author"},
+      "assets" => [],
+      "assets_url" => "https://api.github.com/repos/#{full_name}/releases/41/assets",
+      "html_url" => "https://github.com/#{full_name}/releases/tag/v1.0.0",
+      "tarball_url" => "https://api.github.com/repos/#{full_name}/tarball/v1.0.0",
+      "zipball_url" => "https://api.github.com/repos/#{full_name}/zipball/v1.0.0"
+    })
   end
 
   defp remote(binding, name, archived, visibility, updated_at) do

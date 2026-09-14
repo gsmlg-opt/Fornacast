@@ -39,6 +39,71 @@ defmodule ForgeMirrors.WebhookResourceRetentionTest do
              Map.merge(hints, %{"trigger" => "remote", "delivery_guid" => delivery.delivery_guid})
   end
 
+  test "distinct duplicate and out-of-order resource deliveries retain only immutable triggers",
+       context do
+    context.organization
+    |> OrganizationMirror.update_changeset(%{
+      capabilities: %{"issues" => "enabled", "pulls" => "enabled", "releases" => "enabled"}
+    })
+    |> Repo.update!()
+
+    for {event, resource, hints, kind} <- [
+          {"issues", %{"issue" => %{"id" => 123, "number" => 7}}, issue_hints(), "sync.issue"},
+          {"issue_comment",
+           %{"issue" => %{"id" => 123, "number" => 7}, "comment" => %{"id" => 456}},
+           %{
+             "resource_kind" => "issue_comment",
+             "github_object_id" => 456,
+             "github_number" => 7,
+             "github_issue_id" => 123,
+             "issue_kind" => "issue"
+           }, "sync.issue_comment"},
+          {"pull_request", %{"pull_request" => %{"id" => 789, "number" => 7}},
+           %{
+             "resource_kind" => "pull",
+             "github_object_id" => 789,
+             "github_number" => 7,
+             "issue_kind" => "pull_request"
+           }, "sync.pull"},
+          {"release", %{"release" => %{"id" => 987, "tag_name" => "v1.0.0"}},
+           %{"resource_kind" => "release", "github_object_id" => 987, "tag_name" => "v1.0.0"},
+           "sync.release"}
+        ] do
+      newer = delivery(context, event, put_mutable_body(resource, "newer payload"))
+      older = delivery(context, event, put_mutable_body(resource, "older payload"))
+
+      assert {:ok, {:scheduled, first}} =
+               ForgeMirrors.retain_webhook_resource_trigger(newer, hints)
+
+      assert {:ok, {:scheduled, second}} =
+               ForgeMirrors.retain_webhook_resource_trigger(older, hints)
+
+      assert first.id != second.id
+      assert first.kind == kind
+      assert second.kind == kind
+
+      for operation <- [first, second] do
+        expected_cursor =
+          hints
+          |> Map.merge(%{
+            "trigger" => "remote",
+            "delivery_guid" => operation.cursor["delivery_guid"]
+          })
+          |> then(fn cursor ->
+            if kind == "sync.release",
+              do: Map.put(cursor, "release_action", "edited"),
+              else: cursor
+          end)
+
+        assert operation.cursor ==
+                 expected_cursor
+
+        refute Map.has_key?(operation.cursor, "body")
+        refute Map.has_key?(operation.cursor, "title")
+      end
+    end
+  end
+
   test "forged routes or object identities cannot borrow a persisted delivery", context do
     delivery = delivery(context, "issues", %{"issue" => %{"id" => 123, "number" => 7}})
     hints = issue_hints()
@@ -231,6 +296,18 @@ defmodule ForgeMirrors.WebhookResourceRetentionTest do
       "github_number" => 7,
       "issue_kind" => "issue"
     }
+
+  defp put_mutable_body(%{"comment" => comment} = resource, body),
+    do: %{resource | "comment" => Map.put(comment, "body", body)}
+
+  defp put_mutable_body(%{"issue" => issue} = resource, body),
+    do: %{resource | "issue" => Map.put(issue, "body", body)}
+
+  defp put_mutable_body(%{"pull_request" => pull} = resource, body),
+    do: %{resource | "pull_request" => Map.put(pull, "body", body)}
+
+  defp put_mutable_body(%{"release" => release} = resource, body),
+    do: %{resource | "release" => Map.put(release, "body", body)}
 
   defp delivery(context, event, resource) do
     payload =
