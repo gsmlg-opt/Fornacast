@@ -126,6 +126,44 @@ defmodule ForgeMirrors.PullMergeBoundary do
   @doc "Load durable marked evidence under its lease; this grants no permission to push."
   def recovery_context(operation, now), do: transaction(fn -> load_recovery(operation, now) end)
 
+  @doc "Load marked evidence only while the current organization scope permits provider access."
+  def authorized_recovery_context(operation, now) do
+    transaction(fn ->
+      with {:ok, scope} <- lock_scope(operation, now),
+           {:ok, recovery} <- load_recovery(operation, now),
+           true <- scope.repository_id == recovery.repository_id,
+           true <- scope.repository_mirror_id == recovery.repository_mirror_id,
+           true <- scope.organization_mirror_id == recovery.organization_mirror_id,
+           true <- scope.github_installation_id == recovery.github_installation_id do
+        {:ok, recovery}
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :stale_merge_identity}
+      end
+    end)
+  end
+
+  @doc "Authorize one exact marked merge effect immediately before provider use."
+  def authorize_external_effect(operation, expected_marker, now)
+      when is_map(expected_marker) do
+    transaction(fn ->
+      with {:ok, scope} <- lock_scope(operation, now),
+           {:ok, recovery} <- load_recovery(operation, now),
+           true <- recovery.operation.external_effect_marker == expected_marker,
+           true <- scope.repository_id == recovery.repository_id,
+           true <- scope.repository_mirror_id == recovery.repository_mirror_id,
+           true <- scope.organization_mirror_id == recovery.organization_mirror_id,
+           true <- scope.github_installation_id == recovery.github_installation_id do
+        {:ok, recovery.operation}
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :stale_merge_identity}
+      end
+    end)
+  end
+
+  def authorize_external_effect(_, _, _), do: {:error, :invalid_transition}
+
   @doc false
   def finalization_context(operation, now) do
     if Repo.in_transaction?() do

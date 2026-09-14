@@ -350,7 +350,8 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     assert_unfinished(c)
   end
 
-  test "LFS incomplete checkpoints before any Git push and yields the lease", c do
+  test "LFS incomplete checkpoints under the durable remote effect marker and yields the lease",
+       c do
     c.organization
     |> Changeset.change(capabilities: Map.put(c.organization.capabilities, "lfs", "enabled"))
     |> Repo.update!()
@@ -360,9 +361,132 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     assert is_binary(checkpointed.checkpoint["scan_key"])
     assert checkpointed.checkpoint["direction"] == "outbound"
     assert checkpointed.checkpoint["merge_preparation"]["merge_operation_id"] == c.intent.id
-    assert checkpointed.external_effect_marker == nil
+    assert checkpointed.external_effect_marker["phase"] == "remote_cas_pending"
     assert checkpointed.lease_owner == nil
     assert_unfinished(c)
+  end
+
+  test "LFS transfer is marked before its write credential and resumes from its checkpoint", c do
+    c.organization
+    |> Changeset.change(capabilities: Map.put(c.organization.capabilities, "lfs", "enabled"))
+    |> Repo.update!()
+
+    checkpoint = %{
+      "baseline_fingerprint" => String.duplicate("a", 43),
+      "direction" => "outbound",
+      "phase" => "transfer",
+      "requirement_cursor" => "cursor-1",
+      "scan_key" => "merge-lfs-checkpoint"
+    }
+
+    initial =
+      options(c, c.base)
+      |> Keyword.put(:token_fetch, fn _, scope ->
+        if scope.permissions["contents"] == "write" do
+          stored = Repo.get!(MirrorOperation, c.operation.id)
+          assert stored.state == :effect_pending
+          assert stored.external_effect_marker["phase"] == "remote_cas_pending"
+        end
+
+        %InstallationToken{
+          token: "credential",
+          expires_at: DateTime.add(c.now, 3600),
+          permissions: scope.permissions
+        }
+      end)
+      |> Keyword.put(:lfs_gate, fn operation, _, :outbound, _, _, _, _ ->
+        assert operation.external_effect_marker["phase"] == "remote_cas_pending"
+        {:incomplete, checkpoint}
+      end)
+
+    assert {:ok, pending} = PullMergeWorker.process_operation(c.operation, c.now, initial)
+    assert pending.external_effect_marker["phase"] == "remote_cas_pending"
+    assert pending.checkpoint["requirement_cursor"] == "cursor-1"
+
+    {:ok, [reclaimed]} =
+      ForgeMirrors.claim_operations("merge-lfs-recovery", DateTime.add(c.now, 2), 60, 1, [
+        "merge.pull"
+      ])
+
+    resumed =
+      options(c, c.base)
+      |> Keyword.put(:lfs_gate, fn operation, _, :outbound, _, _, _, _ ->
+        assert operation.checkpoint["scan_key"] == "merge-lfs-checkpoint"
+        assert operation.checkpoint["requirement_cursor"] == "cursor-1"
+        :ok
+      end)
+      |> Keyword.put(:push_remote, fn _, _, _, _ -> :ok end)
+
+    assert {:ok, deferred} =
+             PullMergeWorker.process_operation(reclaimed, DateTime.add(c.now, 2), resumed)
+
+    assert deferred.external_effect_marker["phase"] == "remote_cas_pending"
+  end
+
+  test "revocation after LFS marker and credential acquisition prevents transfer", c do
+    c.organization
+    |> Changeset.change(capabilities: Map.put(c.organization.capabilities, "lfs", "enabled"))
+    |> Repo.update!()
+
+    opts =
+      options(c, c.base)
+      |> Keyword.put(:token_fetch, fn _, scope ->
+        if scope.permissions["contents"] == "write" do
+          Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+            github_installation_id: c.organization.github_installation_id
+          )
+          |> Changeset.change(state: :revoked)
+          |> Repo.update!()
+        end
+
+        %InstallationToken{
+          token: "credential",
+          expires_at: DateTime.add(c.now, 3600),
+          permissions: scope.permissions
+        }
+      end)
+      |> Keyword.put(:lfs_gate, fn _, _, _, _, _, _, _ ->
+        flunk("LFS transfer ran after action-time revocation")
+      end)
+
+    assert {:ok, retained} = PullMergeWorker.process_operation(c.operation, c.now, opts)
+    assert retained.state == :effect_pending
+    assert retained.external_effect_marker["phase"] == "remote_cas_pending"
+    assert retained.lease_owner == nil
+  end
+
+  test "revocation as LFS finishes prevents post-transfer provider reads", c do
+    c.organization
+    |> Changeset.change(capabilities: Map.put(c.organization.capabilities, "lfs", "enabled"))
+    |> Repo.update!()
+
+    observer = options(c, c.base) |> Keyword.fetch!(:observe_ref)
+
+    opts =
+      options(c, c.base)
+      |> Keyword.put(:observe_ref, fn a, b, d, e, ref, f ->
+        if Process.get(:merge_lfs_finished),
+          do: flunk("provider ref read ran after LFS-time revocation"),
+          else: observer.(a, b, d, e, ref, f)
+      end)
+      |> Keyword.put(:lfs_gate, fn _, _, _, _, _, _, _ ->
+        Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+          github_installation_id: c.organization.github_installation_id
+        )
+        |> Changeset.change(state: :revoked)
+        |> Repo.update!()
+
+        Process.put(:merge_lfs_finished, true)
+        :ok
+      end)
+      |> Keyword.put(:push_remote, fn _, _, _, _ ->
+        flunk("Git push ran after LFS-time revocation")
+      end)
+
+    assert {:ok, retained} = PullMergeWorker.process_operation(c.operation, c.now, opts)
+    assert retained.state == :effect_pending
+    assert retained.external_effect_marker["phase"] == "remote_cas_pending"
+    assert retained.lease_owner == nil
   end
 
   test "remote head is rechecked after LFS preparation before a new push", c do
@@ -387,10 +511,11 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
           else: {:ok, observed}
       end)
 
-    assert {:error, :changed_remote_refs} =
-             PullMergeWorker.process_operation(c.operation, c.now, opts)
+    assert {:ok, deferred} = PullMergeWorker.process_operation(c.operation, c.now, opts)
+    assert deferred.state == :effect_pending
 
-    assert Repo.get!(MirrorOperation, c.operation.id).external_effect_marker == nil
+    assert Repo.get!(MirrorOperation, c.operation.id).external_effect_marker["phase"] ==
+             "remote_cas_pending"
   end
 
   test "actual push uses a token restricted to the immutable base repository", c do
@@ -441,6 +566,48 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
     assert_unfinished(c)
   end
 
+  for fence <- [:paused, :revoked] do
+    test "a marked merge #{fence} fence retains its checkpoint without credentials or remote effects",
+         c do
+      marked = mark(c)
+
+      case unquote(fence) do
+        :paused ->
+          c.organization |> Changeset.change(state: :paused) |> Repo.update!()
+
+        :revoked ->
+          Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+            github_installation_id: c.organization.github_installation_id
+          )
+          |> Changeset.change(state: :revoked)
+          |> Repo.update!()
+      end
+
+      opts =
+        options(c, c.base)
+        |> Keyword.put(:token_fetch, fn _, _ ->
+          flunk("#{unquote(fence)} marked merge fetched a fresh credential")
+        end)
+        |> Keyword.put(:lfs_gate, fn _, _, _, _, _, _, _ ->
+          flunk("#{unquote(fence)} marked merge entered LFS")
+        end)
+        |> Keyword.put(:push_remote, fn _, _, _, _ ->
+          flunk("#{unquote(fence)} marked merge pushed Git")
+        end)
+        |> Keyword.put(:update_pull_issue, fn _, _, _, _, _, _ ->
+          flunk("#{unquote(fence)} marked merge mutated provider metadata")
+        end)
+
+      assert {:ok, pending} = PullMergeWorker.process_operation(marked, c.now, opts)
+      assert pending.state == :effect_pending
+      assert pending.lease_owner == nil
+
+      retained = Repo.get!(MirrorOperation, c.operation.id)
+      assert retained.external_effect_marker == marked.external_effect_marker
+      assert_unfinished(c)
+    end
+  end
+
   test "observations use a read-only token restricted to represented repositories", c do
     opts =
       Keyword.put(options(c, c.base), :token_fetch, fn _, scope ->
@@ -476,7 +643,9 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
         {:error, :lfs_missing}
       end)
 
-    assert {:error, :lfs_missing} = PullMergeWorker.process_operation(c.operation, c.now, opts)
+    assert {:ok, deferred} = PullMergeWorker.process_operation(c.operation, c.now, opts)
+    assert deferred.state == :effect_pending
+    assert deferred.external_effect_marker["phase"] == "remote_cas_pending"
   end
 
   test "remote B recovery retries the identical recorded merge", c do
@@ -572,8 +741,11 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
         flunk("LFS entered after revoked token mint")
       end)
 
-    assert {:error, _} = PullMergeWorker.process_operation(c.operation, c.now, opts)
-    assert Repo.get!(MirrorOperation, c.operation.id).external_effect_marker == nil
+    assert {:ok, retained} = PullMergeWorker.process_operation(c.operation, c.now, opts)
+    assert retained.state == :effect_pending
+
+    assert Repo.get!(MirrorOperation, c.operation.id).external_effect_marker["phase"] ==
+             "remote_cas_pending"
   end
 
   test "LFS receives a live authority callback that rejects subsequent work after revocation",
@@ -598,8 +770,11 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
         authorize.()
       end)
 
-    assert {:error, _} = PullMergeWorker.process_operation(c.operation, c.now, opts)
-    assert Repo.get!(MirrorOperation, c.operation.id).external_effect_marker == nil
+    assert {:ok, retained} = PullMergeWorker.process_operation(c.operation, c.now, opts)
+    assert retained.state == :effect_pending
+
+    assert Repo.get!(MirrorOperation, c.operation.id).external_effect_marker["phase"] ==
+             "remote_cas_pending"
   end
 
   defp options(c, remote_base) do

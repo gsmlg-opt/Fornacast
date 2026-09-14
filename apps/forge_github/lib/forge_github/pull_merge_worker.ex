@@ -325,9 +325,10 @@ defmodule ForgeGitHub.PullMergeWorker do
 
   defp recover(operation, now, options) do
     result =
-      with {:ok, context} <- PullMergeBoundary.recovery_context(operation, now),
+      with {:ok, context} <- PullMergeBoundary.authorized_recovery_context(operation, now),
            {:ok, sync} <- execution_context(context),
            {:ok, token} <- token(sync, options),
+           {:ok, _} <- PullMergeBoundary.authorized_recovery_context(operation, now),
            {:ok, remote} <- observe(sync, :base, token, options),
            {:ok, pair} <- pair(sync, token, options) do
         cond do
@@ -1688,24 +1689,37 @@ defmodule ForgeGitHub.PullMergeWorker do
   defp push(operation, now, sync, token, options) do
     with :ok <- local_refs(sync),
          :ok <- provider_ready(sync, token, options),
-         :ok <- lfs(operation, sync, token, options) do
-      # Remote.push_refs owns its own repository fence; nesting it under
-      # with_ref_fences would deadlock its supervised transport task.
-      with :ok <- local_refs(sync),
-           :ok <- provider_ready(sync, token, options),
-           {:ok, marked} <-
-             PullMergeBoundary.mark(
-               operation,
-               now,
-               operation.external_effect_marker,
-               marker(sync.intent)
-             ) do
-        execute(marked, now, sync, token, options)
+         {:ok, marked} <-
+           PullMergeBoundary.mark(
+             operation,
+             now,
+             operation.external_effect_marker,
+             marker(sync.intent)
+           ) do
+      case lfs(marked, sync, token, options) do
+        :ok ->
+          # Remote.push_refs owns its own repository fence; nesting it under
+          # with_ref_fences would deadlock its supervised transport task.
+          with {:ok, _} <-
+                 PullMergeBoundary.authorize_external_effect(
+                   marked,
+                   marked.external_effect_marker,
+                   DateTime.utc_now(:second)
+                 ),
+               :ok <- local_refs(sync),
+               :ok <- provider_ready(sync, token, options) do
+            execute(marked, now, sync, token, options)
+          else
+            {:error, reason} -> PullMergeBoundary.defer(marked, now, next(now), reason)
+          end
+
+        {:incomplete, checkpoint} ->
+          PullMergeBoundary.checkpoint_lfs(marked, now, checkpoint)
+
+        {:error, reason} ->
+          PullMergeBoundary.defer(marked, now, next(now), reason)
       end
     else
-      {:incomplete, checkpoint} ->
-        PullMergeBoundary.checkpoint_lfs(operation, now, checkpoint)
-
       {:error, _} = error ->
         error
     end
@@ -1714,7 +1728,8 @@ defmodule ForgeGitHub.PullMergeWorker do
   defp execute(marked, now, sync, _token, options) do
     # Recheck after marking: a slow LFS scan or provider request can outlive
     # the lease or installation permission that initially admitted the claim.
-    with {:ok, push_token} <- push_token(sync, options),
+    with {:ok, _} <- PullMergeBoundary.context(marked, now),
+         {:ok, push_token} <- push_token(sync, options),
          {:ok, _} <- PullMergeBoundary.context(marked, now) do
       update = %RefUpdate{
         ref: sync.intent.base_ref,
@@ -1894,14 +1909,21 @@ defmodule ForgeGitHub.PullMergeWorker do
   defp lfs(_operation, %{lfs_enabled: false}, _token, _options), do: :ok
 
   defp lfs(operation, sync, _token, options) do
+    marker = operation.external_effect_marker
+
     authorize = fn ->
-      case PullMergeBoundary.context(operation, DateTime.utc_now(:second)) do
+      case PullMergeBoundary.authorize_external_effect(
+             operation,
+             marker,
+             DateTime.utc_now(:second)
+           ) do
         {:ok, _} -> :ok
         {:error, _} = error -> error
       end
     end
 
-    with {:ok, token} <- push_token(sync, options),
+    with :ok <- authorize.(),
+         {:ok, token} <- push_token(sync, options),
          :ok <- authorize.() do
       callback(options, :lfs_gate, &LFSSync.ensure/7).(
         operation,
