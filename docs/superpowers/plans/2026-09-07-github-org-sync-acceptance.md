@@ -4,11 +4,112 @@ Source: `docs/fornacast-github-org-sync-prd.md`, section 13 (all 22 criteria).
 
 This is a working evidence ledger, not a completion declaration. A test entrypoint
 below identifies relevant coverage; its existence alone does not prove acceptance.
-The full goal remains open. PR11 through PR13 have local implementation and
-focused integration proof. PR14–16 and the complete acceptance matrix remain
-open.
+The full goal remains open. PR11 through PR15 have local implementation and
+focused integration proof. PR16 and the complete acceptance matrix remain open.
 
 ## Requirement-by-requirement gates
+
+### PR15 release synchronization foundations (2026-09-14)
+
+- Commit `c3996de` adds monotonic release sync versions, atomic local and
+  provider-origin outbox events, exact projection/apply boundaries, GitHub
+  authorship, soft-delete tombstones and minimum-version lost-effect recovery.
+  Local/import/provider paths share the 65,536-codepoint and 262,144-byte body
+  profile. Provider create/update requests require an exact coordinator-supplied
+  two-sided tag proof; provider-owned publication timestamps must be canonical
+  UTC seconds. The final focused domain gate passed **23 tests**.
+- Commit `74d5b6c` adds the installation-gated GitHub release client and canonical
+  projection. Exact routes/statuses, confined pagination, repository/object/tag
+  identity, unique-tag recovery lookup, provider publication semantics and
+  credential-echo rejection are covered. Assets and content URLs are stripped;
+  only a bounded asset count survives for warning/reporting. The final focused
+  client/projection gate passed **18 tests**.
+- A combined **41-test** PostgreSQL gate and production warnings-as-errors
+  compilation passed. Independent reviews initially found body-profile drift,
+  absent tag/recovery contracts, noncanonical timestamps, reserved tag drift,
+  wrong-tag create confirmation and credential-echo retention; all were repaired
+  and both final re-reviews passed.
+- Commit `5fb30ff` establishes the trusted importing lifecycle boundary used by
+  GitHub App bootstrap without permitting long-lived one-time credentials or
+  emitting synchronization work before publication.
+- Commit `f9e04df` adds durable release mappings, local outbox materialization,
+  checkpointed remote and mapped reconciliation, fresh two-sided tag-proof
+  scheduling, atomic domain/mapping confirmation, provider-effect markers,
+  pause/revocation fences and activation of eligible historical release
+  deliveries. Effect recovery records the provider-applied baseline while
+  preserving a newer local projection.
+- Commit `328e912` adds the bounded release synchronization worker, immutable-ID
+  canonical reads, unique-tag-only create recovery, provider CRUD effects,
+  marker replacement before superseding writes, webhook routing and terminal
+  failure classification. Valid 255-codepoint release tags are accepted at
+  ingress while remaining bounded to 1,020 bytes.
+- Commit `17bbdfb` imports releases after pulls and before number-sequence
+  settlement, with page checkpoints, lease/cancellation fences, author mapping,
+  tag-presence enforcement, bounded asset/unsupported-field reports, capability
+  gating and atomic handoff of buffered release deliveries. Installation-backed
+  settings default Releases on only when the required permission contract is
+  available; persisted string states render correctly.
+- Final PR15 gates passed **105 ForgeImports**, **43 ForgeMirrors**, **63
+  ForgeGitHub**, and **7 FornacastWeb** tests, plus production
+  warnings-as-errors compilation and exact scoped formatting. Two independent
+  final re-reviews reported no remaining finding after repairs for lease renewal,
+  immutable node preconditions, marker supersession, Unicode tags, failure
+  classification and legacy delivery activation.
+- Broad app runs also exposed only unrelated pre-existing gates outside PR15:
+  three ForgeMirrors rollback tests reject reversing the prepared/authoritative
+  LFS scan distinction, one ForgeGitHub deadline test returned
+  `request_gate_busy` instead of timeout, and one webhook-inbox fixture collided
+  with an existing installation identity. Per the PRD scope rule these were not
+  modified or suppressed.
+- PR15 and criterion 16 are locally accepted. Live GitHub proof and the PR16
+  omitted-webhook/full-reconciliation acceptance matrix remain final gates.
+
+### PR13 webhook activation and bootstrap replay repair (2026-09-14)
+
+- Supported pull-request webhook actions now enter the processable inbox path;
+  release actions remain explicitly deferred until PR15 is complete.
+- Bootstrap handoff and terminal activation match deliveries by the authoritative
+  installation and GitHub repository identities, accept only an unbound or
+  already-matching organization association, and atomically bind the local
+  organization while promoting durable work.
+- An idempotent claim-time migration activates historical supported pull
+  deliveries only for live, included, bound repositories whose pull capability
+  is enabled. Paused and revoked mirrors and release deliveries remain fenced.
+- Paused mirrors retain pending resource operations, while operation claiming
+  and all effects remain disabled until resume. Focused regression verification
+  passed **96 tests**: ForgeMirrors **19**, ForgeGitHub **18**, ForgeImports
+  **49**, and FornacastAPI **10**. An independent re-review reported no remaining
+  finding after it caught and the implementation repaired a paused
+  issue/comment retention regression.
+- This restores the real ingress-to-worker path for PR13 local acceptance.
+  Live GitHub delivery proof and the complete 22-item acceptance matrix remain
+  final gates.
+
+### PR14 release metadata domain and local surfaces (2026-09-14)
+
+- `forge_releases` now owns repository-scoped release metadata with all FR-091
+  fields, exact local tag validation under the repository write fence,
+  transactional authorization revalidation, atomic audit records, coherent
+  draft/publication state, exclusive local/GitHub authorship, soft deletion and
+  active repository/tag uniqueness. The focused domain suite passed **12**
+  tests and an independent domain review reported no finding.
+- The repository web UI provides discoverable DuskMoon-only release list,
+  detail, create, edit and delete flows plus the canonical encoded tag route.
+  Private masking, CSRF, private/no-store responses, retained validation values,
+  sanitized Markdown, PATCH updates and absence of asset UI are covered. The
+  focused web/navigation suite passed **52** tests and final review reported no
+  finding.
+- Both supported REST versions expose GitHub-compatible release metadata
+  list/show/by-tag/latest/create/update/delete operations. Repository write
+  authority and update target existence are established before request-body
+  parsing; pagination and encoded-slash tags are covered. Pinned OpenAPI slice 5
+  contains exactly those seven operations, no asset path, and declares release
+  assets unsupported. The final API/OpenAPI suite passed **29** tests after an
+  independent review caught and repaired the stale slice-4 pull contract.
+- PR14 and FR-090 through FR-093 are locally accepted as the local foundation.
+  This does not satisfy acceptance criterion 16: PR15 must still prove two-way
+  release convergence against a fresh confirmed tag, retarget conflicts,
+  ignored assets and durable provider-effect recovery.
 
 ### PR13 connected merge acceptance and admission recovery (2026-09-14)
 
@@ -698,8 +799,8 @@ PR13 integration audit additionally identified these concrete remaining gates:
 | 13 | Issue/comment changes converge both ways | PR12 local worker, mapping, effect recovery, label materialization, signed ingress and bootstrap activation are implemented through `f45097e`; combined activation matrix: 150 passed. Real domain/lease/HTTP-stub tests cover both directions and omitted comment deletion. Complete end-to-end acceptance and restart matrix remain open. |
 | 14 | Same-repository PR metadata converges both ways | Locally accepted in PR13, including represented cross-repository synchronization, unrepresented read-only behavior and trusted late head representation. Retain live GitHub validation in final acceptance. |
 | 15 | Coordinated PR merge produces one confirmed Git result | Locally accepted through real API admission, disjoint repositories, exact provider Git CAS, lost-response worker restart, provider re-observation, one merge result and matching local/provider pull state. Retain live GitHub validation in final acceptance. |
-| 16 | Release metadata converges and stays bound to a confirmed tag | PR14–15 remain open. Existing scaffold is not proof of implementation. |
-| 17 | Release assets and wiki never synchronize | Verify explicit negative fixtures across import, inbound events, outbound events, and reconciliation when release sync is implemented. |
+| 16 | Release metadata converges and stays bound to a confirmed tag | PR14 local domain/API/web and PR15 bootstrap/incremental synchronization are locally accepted. Fresh two-sided tag proof, retarget conflicts, immutable provider identity, marker replacement and newer-local recovery are covered. Retain live GitHub proof in final acceptance. |
+| 17 | Release assets and wiki never synchronize | PR14 exposes no asset API/UI. PR15 strips provider asset payloads, retains only a bounded warning count, reports bootstrap exclusions, ignores release-asset identities and keeps wiki unsupported. Retain full PR16 reconciliation negatives and live proof. |
 | 18 | Duplicate/out-of-order webhooks neither duplicate nor regress | Inbox foundation tests exist. Extend resource-specific fixtures for issues/comments, PRs, and releases. |
 | 19 | Every operation boundary recovers after restart | Git/LFS checkpoint, lease, marker-replacement and rate-limit recovery tests pass. Metadata create/update/delete/merge boundaries and full restart matrix remain open. |
 | 20 | Full reconciliation repairs omitted deliveries | Inventory and Git/LFS reconciliation exist. Complete metadata sweeps and intentionally omitted-event acceptance in PR16. |
