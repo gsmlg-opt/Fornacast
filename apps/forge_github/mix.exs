@@ -28,6 +28,7 @@ defmodule ForgeGitHub.MixProject do
       {:forge_issues, in_umbrella: true},
       {:forge_mirrors, in_umbrella: true},
       {:forge_pulls, in_umbrella: true},
+      {:forge_releases, in_umbrella: true},
       {:forge_repos, in_umbrella: true},
       {:git_lfs, in_umbrella: true},
       {:git_core, in_umbrella: true},

@@ -23,7 +23,8 @@ defmodule ForgeGitHub.ReleaseClient do
 
   @create_fields ~w(tag_name target_commitish name body draft prerelease)
   @update_fields @create_fields
-  @canonical_fields ~w(id node_id tag_name name body draft prerelease target_commitish published_at created_at updated_at author asset_count)
+  @canonical_fields ~w(id node_id tag_name name body draft prerelease target_commitish published_at created_at updated_at author asset_count unsupported_fields)
+  @unsupported_release_fields ~w(assets_url body_html body_text discussion_url html_url make_latest mentions_count reactions tarball_url upload_url zipball_url)
 
   @spec list_releases_page(String.t(), String.t(), String.t(), nil | pos_integer(), keyword()) ::
           {:ok, %{releases: [map()], next_cursor: nil | pos_integer()}}
@@ -325,6 +326,7 @@ defmodule ForgeGitHub.ReleaseClient do
         |> Map.take(@canonical_fields)
         |> Map.put("author", author)
         |> Map.put("asset_count", asset_count)
+        |> Map.put("unsupported_fields", unsupported_release_fields(release))
 
       {:ok, canonical}
     else
@@ -359,6 +361,13 @@ defmodule ForgeGitHub.ReleaseClient do
   end
 
   defp asset_count(_assets), do: :error
+
+  defp unsupported_release_fields(release) do
+    release
+    |> Map.keys()
+    |> Enum.filter(&(&1 in @unsupported_release_fields))
+    |> Enum.sort()
+  end
 
   defp next_cursor(nil, _base, _page), do: {:ok, nil}
   defp next_cursor(_next_url, _base, @max_page), do: error(:pagination_limit)

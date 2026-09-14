@@ -69,6 +69,71 @@ defmodule ForgeGitHub.ResourceWebhookProcessorTest do
              )
   end
 
+  test "release notifications retain immutable release identity and exact tag while ignoring assets" do
+    delivery =
+      delivery("release", %{
+        "release" => %{
+          "id" => 84,
+          "tag_name" => "release/v1.0",
+          "body" => "stale",
+          "assets" => [%{"id" => 99, "name" => "never-copied"}]
+        }
+      })
+
+    assert :ok =
+             WebhookProcessor.process(delivery,
+               resource_schedule: fn ^delivery, hints ->
+                 assert hints == %{
+                          "resource_kind" => "release",
+                          "github_object_id" => 84,
+                          "tag_name" => "release/v1.0"
+                        }
+
+                 {:ok, {:scheduled, :operation}}
+               end
+             )
+  end
+
+  test "release notifications accept tags at the 255 Unicode codepoint boundary" do
+    tag_name = String.duplicate("界", 255)
+    delivery = delivery("release", %{"release" => %{"id" => 84, "tag_name" => tag_name}})
+
+    assert :ok =
+             WebhookProcessor.process(delivery,
+               resource_schedule: fn ^delivery, hints ->
+                 assert hints["tag_name"] == tag_name
+                 {:ok, {:scheduled, :operation}}
+               end
+             )
+  end
+
+  test "wiki notifications and release-asset identities never enter metadata scheduling" do
+    wiki = delivery("gollum", %{"pages" => [%{"page_name" => "Home"}]})
+
+    assert :ignore =
+             WebhookProcessor.process(wiki,
+               resource_schedule: fn _, _ -> flunk("wiki content was scheduled") end
+             )
+
+    release =
+      delivery("release", %{
+        "release" => %{
+          "id" => 84,
+          "tag_name" => "v1",
+          "assets" => [%{"id" => 99, "name" => "artifact.tgz"}]
+        }
+      })
+
+    assert :ok =
+             WebhookProcessor.process(release,
+               resource_schedule: fn _, hints ->
+                 refute Map.has_key?(hints, "assets")
+                 refute Map.has_key?(hints, "asset_ids")
+                 {:ok, :scheduled}
+               end
+             )
+  end
+
   test "malformed or confused provider identities are not scheduled" do
     for issue <- [
           %{"id" => 0, "number" => 7},

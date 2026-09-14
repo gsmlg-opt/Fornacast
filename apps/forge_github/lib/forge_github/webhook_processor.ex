@@ -83,7 +83,7 @@ defmodule ForgeGitHub.WebhookProcessor do
   end
 
   defp dispatch(%{event: event} = delivery, payload, options)
-       when event in ["issues", "issue_comment", "pull_request"] do
+       when event in ["issues", "issue_comment", "pull_request", "release"] do
     with {:ok, hints} <- resource_hints(event, payload) do
       scheduler =
         Keyword.get(options, :resource_schedule, &ForgeMirrors.retain_webhook_resource_trigger/2)
@@ -132,6 +132,23 @@ defmodule ForgeGitHub.WebhookProcessor do
          "github_number" => number,
          "github_issue_id" => issue_id,
          "issue_kind" => if(is_map(pull), do: "pull_request", else: "issue")
+       }}
+    else
+      _invalid -> {:error, :invalid_identity}
+    end
+  end
+
+  defp resource_hints("release", payload) do
+    with %{"id" => id, "tag_name" => tag_name} <- Map.get(payload, "release"),
+         true <- resource_id?(id),
+         true <- is_binary(tag_name) and byte_size(tag_name) in 1..1_020,
+         true <- String.valid?(tag_name) and String.length(tag_name) in 1..255,
+         true <- tag_name == String.trim(tag_name) do
+      {:ok,
+       %{
+         "resource_kind" => "release",
+         "github_object_id" => id,
+         "tag_name" => tag_name
        }}
     else
       _invalid -> {:error, :invalid_identity}

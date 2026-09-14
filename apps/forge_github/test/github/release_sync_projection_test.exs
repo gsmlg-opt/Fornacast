@@ -25,6 +25,7 @@ defmodule ForgeGitHub.ReleaseSyncProjectionTest do
     assert projection.remote_updated_at == ~U[2030-01-03 00:00:00Z]
     assert projection.snapshot == fields()
     assert projection.asset_count == 2
+    assert projection.unsupported_fields == ["discussion_url", "html_url"]
     assert projection.raw_author == %{"id" => 99, "node_id" => "U_99", "login" => "octocat"}
     refute Map.has_key?(projection, :assets)
     refute inspect(projection) =~ "browser_download_url"
@@ -54,6 +55,12 @@ defmodule ForgeGitHub.ReleaseSyncProjectionTest do
 
     assert {:error, :invalid_projection} =
              ReleaseSyncProjection.from_remote(%{remote_release() | "asset_count" => 513})
+
+    assert {:error, :invalid_projection} =
+             ReleaseSyncProjection.from_remote(%{
+               remote_release()
+               | "unsupported_fields" => ["html_url", "credential-leak"]
+             })
 
     assert {:error, :invalid_projection} =
              ReleaseSyncProjection.from_remote(
@@ -113,7 +120,8 @@ defmodule ForgeGitHub.ReleaseSyncProjectionTest do
       "created_at" => "2030-01-01T00:00:00Z",
       "updated_at" => "2030-01-03T00:00:00Z",
       "author" => %{"id" => 99, "node_id" => "U_99", "login" => "octocat"},
-      "asset_count" => 2
+      "asset_count" => 2,
+      "unsupported_fields" => ["discussion_url", "html_url"]
     }
   end
 end

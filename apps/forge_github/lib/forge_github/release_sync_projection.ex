@@ -38,23 +38,28 @@ defmodule ForgeGitHub.ReleaseSyncProjection do
   def from_local(_projection), do: {:error, :invalid_projection}
 
   @spec from_remote(map()) :: {:ok, map()} | {:error, :invalid_projection}
-  def from_remote(%{
-        "id" => id,
-        "node_id" => node_id,
-        "tag_name" => tag_name,
-        "name" => name,
-        "body" => body,
-        "draft" => draft,
-        "prerelease" => prerelease,
-        "target_commitish" => target_commitish,
-        "published_at" => published_at,
-        "created_at" => created_at,
-        "updated_at" => updated_at,
-        "author" => author,
-        "asset_count" => asset_count
-      }) do
+  def from_remote(
+        %{
+          "id" => id,
+          "node_id" => node_id,
+          "tag_name" => tag_name,
+          "name" => name,
+          "body" => body,
+          "draft" => draft,
+          "prerelease" => prerelease,
+          "target_commitish" => target_commitish,
+          "published_at" => published_at,
+          "created_at" => created_at,
+          "updated_at" => updated_at,
+          "author" => author,
+          "asset_count" => asset_count
+        } = remote
+      ) do
+    unsupported_fields = Map.get(remote, "unsupported_fields", [])
+
     with true <- valid_id?(id) and valid_node_id?(node_id),
          true <- is_integer(asset_count) and asset_count in 0..@max_assets,
+         true <- valid_unsupported_fields?(unsupported_fields),
          {:ok, author} <- canonical_author(author),
          {:ok, published_at} <- optional_datetime(published_at),
          {:ok, created_at} <- datetime(created_at),
@@ -79,7 +84,8 @@ defmodule ForgeGitHub.ReleaseSyncProjection do
          remote_updated_at: updated_at,
          snapshot: snapshot,
          raw_author: author,
-         asset_count: asset_count
+         asset_count: asset_count,
+         unsupported_fields: unsupported_fields
        }}
     else
       _invalid -> {:error, :invalid_projection}
@@ -146,6 +152,15 @@ defmodule ForgeGitHub.ReleaseSyncProjection do
   defp canonical_author(_author), do: {:error, :invalid_projection}
 
   defp valid_id?(id), do: is_integer(id) and id in 1..@max_id
+
+  @unsupported_release_fields ~w(assets_url body_html body_text discussion_url html_url make_latest mentions_count reactions tarball_url upload_url zipball_url)
+
+  defp valid_unsupported_fields?(fields) when is_list(fields) do
+    fields == Enum.sort(Enum.uniq(fields)) and
+      Enum.all?(fields, &(&1 in @unsupported_release_fields))
+  end
+
+  defp valid_unsupported_fields?(_fields), do: false
 
   defp valid_node_id?(value),
     do: valid_text?(value, 512, false) and value == String.trim(value)

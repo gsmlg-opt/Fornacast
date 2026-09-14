@@ -534,7 +534,8 @@ defmodule ForgeGitHub.ReleaseClientTest do
         "created_at" => "2030-01-01T00:00:00Z",
         "updated_at" => "2030-01-03T00:00:00Z",
         "author" => %{"id" => 99, "node_id" => "U_99", "login" => "octocat"},
-        "asset_count" => 0
+        "asset_count" => 0,
+        "unsupported_fields" => ~w(assets_url html_url tarball_url upload_url zipball_url)
       },
       Map.new(overrides, fn {key, value} -> {to_string(key), value} end)
     )
