@@ -211,6 +211,60 @@ defmodule ForgeMirrors.GitRefSyncPersistenceTest do
     assert {:error, :paused} = ForgeMirrors.authorize_git_lfs_effect(marked, marker)
   end
 
+  test "repository reconciliation context fences pause, revocation, suspension, and disabled Git",
+       _context do
+    now = DateTime.utc_now(:second)
+
+    for {fence, expected} <- [
+          paused: :paused,
+          revoked: :revoked,
+          suspended: :credential_unavailable,
+          disabled_git: :permission_missing
+        ] do
+      organization = active_organization_mirror_fixture()
+      repository = repository_mirror_fixture(organization)
+      context = %{organization_mirror: organization, repository_mirror: repository}
+      prepare_git_ref_authorization!(context)
+
+      operation =
+        operation(
+          context,
+          "reconcile.repository.git",
+          %{"trigger" => "remote"},
+          Ecto.UUID.generate(),
+          now
+        )
+        |> claim!(now)
+
+      case fence do
+        :paused ->
+          organization |> Ecto.Changeset.change(state: :paused) |> Repo.update!()
+
+        :revoked ->
+          organization |> Ecto.Changeset.change(state: :revoked) |> Repo.update!()
+
+        :suspended ->
+          Repo.get_by!(ForgeMirrors.GitHubAppInstallation,
+            github_installation_id: organization.github_installation_id
+          )
+          |> Ecto.Changeset.change(state: :suspended)
+          |> Repo.update!()
+
+        :disabled_git ->
+          organization
+          |> Ecto.Changeset.change(capabilities: %{"git" => "disabled"})
+          |> Repo.update!()
+      end
+
+      assert {:error, ^expected} = ForgeMirrors.git_repository_operation_context(operation)
+
+      retained = Repo.get!(MirrorOperation, operation.id)
+      assert retained.state == :processing
+      assert retained.lease_owner == operation.lease_owner
+      assert retained.lease_expires_at == operation.lease_expires_at
+    end
+  end
+
   test "Git LFS authorization rejects an ordinary exact Git effect marker", context do
     now = DateTime.utc_now(:second)
     operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)

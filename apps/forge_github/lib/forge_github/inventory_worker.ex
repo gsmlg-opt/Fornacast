@@ -209,6 +209,9 @@ defmodule ForgeGitHub.InventoryWorker do
       {:error, reason} when reason in [:busy, :timeout, :unavailable, :invalidated] ->
         retry_operation(operation, now, "network", nil, options)
 
+      {:error, :paused} ->
+        retry_operation(operation, now, "network", nil, options)
+
       {:error, :revoked} ->
         fail_operation(
           operation,
@@ -218,7 +221,8 @@ defmodule ForgeGitHub.InventoryWorker do
           options
         )
 
-      {:error, reason} when reason in [:not_configured, :invalid_scope] ->
+      {:error, reason}
+      when reason in [:credential_unavailable, :not_configured, :invalid_scope] ->
         fail_operation(
           operation,
           now,

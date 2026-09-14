@@ -661,6 +661,43 @@ defmodule ForgeGitHub.GitRefWorkerTest do
     assert_received {:fanout, ["refs/heads/main", "refs/heads/old", "refs/tags/v1.0.0"]}
   end
 
+  test "fenced Git reconciliation roots stop before token, provider, or LFS work" do
+    for kind <- ["reconcile.repository.git", "finalize.repository.git"],
+        {reason, result} <- [
+          paused: :deferred,
+          revoked: :revoked,
+          credential_unavailable: :credential_unavailable,
+          permission_missing: :permission_missing
+        ] do
+      operation = %{operation() | kind: kind}
+      retry_at = DateTime.add(@now, 60, :second)
+
+      options = [
+        repository_context: fn ^operation -> {:error, reason} end,
+        token_fetch: fn _installation_id, _scope -> flunk("#{reason} Git root fetched token") end,
+        fetch_refs: fn _, _, _ -> flunk("#{reason} Git root fetched refs") end,
+        reconcile_lfs: fn _, _, _ -> flunk("#{reason} Git finalizer scanned LFS") end,
+        finalize: fn _, _ -> flunk("#{reason} Git finalizer completed") end,
+        retry: fn ^operation, @now, ^retry_at, "network", _options ->
+          assert reason == :paused
+          {:ok, :deferred}
+        end,
+        fail: fn ^operation, @now, failure_class, _detail ->
+          assert failure_class ==
+                   if(reason in [:revoked, :credential_unavailable],
+                     do: "credential_revoked",
+                     else: "permission_missing"
+                   )
+
+          assert reason != :paused
+          {:ok, reason}
+        end
+      ]
+
+      assert {:ok, ^result} = GitRefWorker.process_operation(operation, @now, options)
+    end
+  end
+
   test "a ref baseline race rechecks finalizer supersession before retrying" do
     operation =
       %{

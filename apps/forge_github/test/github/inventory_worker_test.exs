@@ -136,6 +136,37 @@ defmodule ForgeGitHub.InventoryWorkerTest do
              InventoryWorker.run_once("inventory-test", options)
   end
 
+  test "paused and revoked inventory roots stop before token or provider page access" do
+    now = ~U[2026-09-05 03:00:00Z]
+    retry_at = DateTime.add(now, 60)
+
+    for {reason, state} <- [paused: :pending, revoked: :failed] do
+      operation = claimed_operation(now)
+
+      options =
+        worker_options(now, operation,
+          context: fn ^operation -> {:error, reason} end,
+          token_fetch: fn _installation_id, _scope ->
+            flunk("#{reason} inventory fetched token")
+          end,
+          page_fetch: fn _token, _cursor, _options ->
+            flunk("#{reason} inventory fetched page")
+          end,
+          operation_retry: fn ^operation, ^now, ^retry_at, "network" ->
+            assert reason == :paused
+            {:ok, %{operation | state: :pending}}
+          end,
+          operation_fail: fn ^operation, ^now, "credential_revoked", _detail ->
+            assert reason == :revoked
+            {:ok, %{operation | state: :failed}}
+          end
+        )
+
+      assert {:ok, [{1, {:ok, %MirrorOperation{state: ^state}}}]} =
+               InventoryWorker.run_once("inventory-test", options)
+    end
+  end
+
   test "finalizes a completed organization sweep without fetching a provider token" do
     now = ~U[2026-09-05 03:00:00Z]
 
@@ -174,6 +205,43 @@ defmodule ForgeGitHub.InventoryWorkerTest do
              InventoryWorker.run_once("inventory-test", options)
 
     assert_received :finalized
+  end
+
+  test "a paused organization finalizer defers while retaining its reconciliation watermark" do
+    now = ~U[2026-09-05 03:00:00Z]
+    watermark = DateTime.add(now, -60)
+
+    operation = %{
+      claimed_operation(now)
+      | kind: "finalize.organization.reconciliation",
+        repository_mirror_id: nil
+    }
+
+    options =
+      worker_options(now, operation,
+        context: fn _operation ->
+          flunk("finalization must not load provider inventory context")
+        end,
+        token_fetch: fn _installation_id, _scope ->
+          flunk("finalization must not request a token")
+        end,
+        page_fetch: fn _token, _cursor, _options -> flunk("finalization must not call GitHub") end,
+        finalize_reconciliation: fn ^operation, ^now ->
+          {:ok,
+           %{
+             status: :deferred,
+             operation: %{operation | state: :pending},
+             organization_mirror: %{state: :paused, last_reconciled_at: watermark}
+           }}
+        end
+      )
+
+    assert {:ok,
+            [
+              {1,
+               {:ok, %{status: :deferred, organization_mirror: %{last_reconciled_at: ^watermark}}}}
+            ]} =
+             InventoryWorker.run_once("inventory-test", options)
   end
 
   defp worker_options(now, operation, overrides) do

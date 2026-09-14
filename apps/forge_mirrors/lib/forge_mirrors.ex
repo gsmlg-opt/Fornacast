@@ -4383,7 +4383,13 @@ defmodule ForgeMirrors do
              installation_selection: :all | :selected,
              sweep_marker: String.t()
            }}
-          | {:error, :lost_lease | :invalid_transition | :invalid_policy}
+          | {:error,
+             :lost_lease
+             | :invalid_transition
+             | :invalid_policy
+             | :paused
+             | :revoked
+             | :credential_unavailable}
   def inventory_operation_context(%MirrorOperation{} = operation) do
     Repo.transaction(fn ->
       with :ok <- lock_inventory_organization(operation),
@@ -5037,7 +5043,8 @@ defmodule ForgeMirrors do
                "reconcile.repository.git",
                "finalize.repository.git"
              ]),
-           {:ok, scope} <- load_git_ref_scope(persisted) do
+           {:ok, scope} <- load_git_ref_scope(persisted),
+           true <- scope.git_enabled do
         baseline_ref_names =
           MirrorRefState
           |> where([state], state.repository_mirror_id == ^persisted.repository_mirror_id)
@@ -5050,6 +5057,7 @@ defmodule ForgeMirrors do
           tracking_namespace: "repository-#{persisted.repository_mirror_id}"
         })
       else
+        false -> Repo.rollback(:permission_missing)
         {:error, reason} -> Repo.rollback(reason)
       end
     end)
@@ -6781,7 +6789,11 @@ defmodule ForgeMirrors do
          repository_path: ForgeRepos.absolute_storage_path(repository)
        }}
     else
-      %GitHubAppInstallation{} -> {:error, :revoked}
+      %OrganizationMirror{state: :paused} -> {:error, :paused}
+      %OrganizationMirror{state: :revoked} -> {:error, :revoked}
+      %GitHubAppInstallation{state: :revoked} -> {:error, :revoked}
+      %GitHubAppInstallation{state: :suspended} -> {:error, :credential_unavailable}
+      %GitHubAppInstallation{} -> {:error, :credential_unavailable}
       false -> {:error, :permission_missing}
       _invalid -> {:error, :invalid_transition}
     end
@@ -8183,6 +8195,10 @@ defmodule ForgeMirrors do
          {:ok, inventory_policy} <- InventoryPolicy.parse(policy) do
       {:ok, organization, installation, inventory_policy}
     else
+      %OrganizationMirror{state: :paused} -> {:error, :paused}
+      %OrganizationMirror{state: :revoked} -> {:error, :revoked}
+      %GitHubAppInstallation{state: :revoked} -> {:error, :revoked}
+      %GitHubAppInstallation{state: :suspended} -> {:error, :credential_unavailable}
       {:error, :invalid_policy} = error -> error
       _invalid -> {:error, :invalid_transition}
     end

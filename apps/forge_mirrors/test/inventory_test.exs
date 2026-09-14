@@ -5,7 +5,13 @@ defmodule ForgeMirrors.InventoryTest do
   import ForgeMirrors.TestSupport.MirrorFixtures
 
   alias Fornacast.Repo
-  alias ForgeMirrors.{MirrorOperation, OrganizationMirror, RepositoryMirror}
+
+  alias ForgeMirrors.{
+    GitHubAppInstallation,
+    MirrorOperation,
+    OrganizationMirror,
+    RepositoryMirror
+  }
 
   @inventory_kind "reconcile.organization_inventory"
   @finalizer_kind "finalize.organization.reconciliation"
@@ -74,6 +80,39 @@ defmodule ForgeMirrors.InventoryTest do
              )
 
     assert Repo.get!(MirrorOperation, blocked.id).state == :pending
+  end
+
+  test "inventory context returns typed lifecycle fences after claim", context do
+    for {fence, expected} <- [
+          paused: :paused,
+          revoked: :revoked,
+          suspended: :credential_unavailable
+        ] do
+      organization = active_inventory_mirror(context.now)
+      operation = inventory_operation(organization, context.now, "claimed-#{fence}")
+      claimed = claim_inventory!(operation, context.now)
+
+      case fence do
+        state when state in [:paused, :revoked] ->
+          organization
+          |> Ecto.Changeset.change(state: state)
+          |> Repo.update!()
+
+        :suspended ->
+          Repo.get_by!(GitHubAppInstallation,
+            github_installation_id: organization.github_installation_id
+          )
+          |> Ecto.Changeset.change(state: :suspended)
+          |> Repo.update!()
+      end
+
+      assert {:error, ^expected} = ForgeMirrors.inventory_operation_context(claimed)
+
+      assert %MirrorOperation{state: :processing, lease_owner: lease_owner} =
+               Repo.get!(MirrorOperation, operation.id)
+
+      assert lease_owner == claimed.lease_owner
+    end
   end
 
   test "page commit upserts immutable identities and checkpoints without changing enqueue cursor",

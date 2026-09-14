@@ -187,6 +187,52 @@ defmodule ForgeGitHub.ReleaseSyncWorkerTest do
     refute_received :token_fetch
   end
 
+  test "post-marker pause defers a release update without a fresh token or replay" do
+    parent = self()
+    proof = tag_proof()
+    operation = operation(:processing, checkpoint: canonical_checkpoint())
+    local_fields = Map.put(@base, "body", "local notes")
+
+    options =
+      options(operation,
+        context: fn ^operation ->
+          {:ok, context(proof, baseline: @base, local_version: 4)}
+        end,
+        local_observe: fn _ -> {:ok, local_release(local_fields, 4)} end,
+        get_release: fn _, _, _, 41, _ -> {:ok, github_release(@base)} end,
+        token_fetch: fn 44, _ ->
+          send(parent, :token_fetch)
+
+          %InstallationToken{
+            token: "ephemeral",
+            expires_at: DateTime.add(@now, 3_600),
+            permissions: %{"contents" => "write", "metadata" => "read"}
+          }
+        end,
+        mark_effect: fn ^operation, @now, marker ->
+          send(parent, {:effect_marked, marker})
+          {:ok, %{operation | state: :effect_pending, external_effect_marker: marker}}
+        end,
+        authorize_effect: fn marked, marker ->
+          assert marked.state == :effect_pending
+          assert marked.external_effect_marker == marker
+          {:error, :paused}
+        end,
+        update_release: fn _, _, _, _, _, _ -> flunk("paused release update replayed GitHub") end,
+        defer_effect: fn marked, @now, retry_at, "network", "resource_context_unavailable" ->
+          assert marked.state == :effect_pending
+          assert %{"action" => "update_remote_release"} = marked.external_effect_marker
+          assert DateTime.after?(retry_at, @now)
+          {:ok, :deferred}
+        end
+      )
+
+    assert {:ok, :deferred} = ReleaseSyncWorker.process_operation(operation, @now, options)
+    assert_received :token_fetch
+    assert_received {:effect_marked, %{"action" => "update_remote_release"}}
+    refute_received :token_fetch
+  end
+
   test "recovers an ambiguous create only through the exact unique tag" do
     marker = effect_marker("create_remote_release", @base, nil)
     operation = operation(:effect_pending, marker: marker, github_object_id: nil)

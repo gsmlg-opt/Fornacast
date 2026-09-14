@@ -1095,6 +1095,17 @@ defmodule ForgeGitHub.GitRefWorker do
           "GitHub contents write permission unavailable"
         )
 
+      reason == :paused ->
+        retry_at = DateTime.add(now, 60, :second)
+
+        callback(options, :retry, &ForgeMirrors.retry_operation/5).(
+          operation,
+          now,
+          retry_at,
+          "network",
+          retry_options
+        )
+
       true ->
         retry_at = DateTime.add(now, 60, :second)
 
