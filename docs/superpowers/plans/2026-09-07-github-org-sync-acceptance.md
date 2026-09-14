@@ -11,6 +11,30 @@ focused integration proof. PR16 and the complete acceptance matrix remain open.
 
 ### PR16 reconciliation and operator foundations (2026-09-14)
 
+- The repository-metadata foundation now performs per-field baseline/local/GitHub
+  decisions for representable fields. Remote-only changes use a trusted
+  ForgeRepos exact-preimage/owner/generation/write-version boundary; compatible
+  changes to different fields merge; local-only changes persist an immutable
+  outbound marker before an installation-gated PATCH. Canonical responses
+  confirm the baseline, and ambiguous timeouts retain the marker for a read
+  before any retry. Rename recovery probes the marked target and prior path but
+  accepts only the bound immutable GitHub ID/node. Namespace collisions and
+  incompatible edits remain explicit conflicts. GitHub-origin repository
+  updates emit an atomic provider-neutral outbox event that the mirror ignores,
+  preventing echo.
+- Focused verification for this convergence slice passed **5 ForgeRepos**, **23
+  ForgeMirrors**, and **17 ForgeGitHub** tests, plus the new direct transactional
+  DomainOutbox regression. The tests include remote/local/compatible concurrent
+  edits, rename collision, timeout after remote commit, timeout after rename,
+  uncommitted rename fallback, and a newer local edit ordered behind an older
+  durable effect. The full DomainOutbox test file also encountered a pre-existing
+  committed stale test event in the shared test database; its changed regression
+  passed in isolation and the unrelated fixture-state failure was not modified.
+- This convergence slice still does not represent local archived state or GitHub
+  `internal` visibility, so those inputs remain unsupported rather than being
+  overwritten. Local repository creation on GitHub and the safe operator
+  conflict actions are also still open; criterion 6 and PR16 remain incomplete.
+
 - Commit `acd3a6e` changes pull reconciliation from an unsupported-head-only
   mapped scan into a checkpointed canonical GitHub pull inventory followed by a
   pinned mapped-resource pass. Remote pulls omitted from webhooks now enqueue
