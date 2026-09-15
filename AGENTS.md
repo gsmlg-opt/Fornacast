@@ -191,6 +191,12 @@ If a needed UI capability is missing from DuskMoon packages, open a GitHub issue
 **Change hygiene**
 
 - Match existing module style, return shapes, and test placement.
+- Keep [`README.md`](./README.md), [`docs/deployment.md`](./docs/deployment.md),
+  `docker-compose.yml`, `.env.example`, and `config/runtime.exs` aligned when
+  deployment or database behavior changes. Document PostgreSQL as the
+  authoritative domain database separately from Concord's embedded config and
+  LocalCAS metadata, and keep the paired PostgreSQL dump plus `fornacast-data`
+  filesystem backup boundary explicit.
 - Run `devenv shell -- mix format --check-formatted` and the relevant focused
   PostgreSQL tests before considering work done. For database-backed commands,
   use the devenv Unix socket and `PGPORT=55432`; do not fall back to a domain
@@ -201,6 +207,7 @@ If a needed UI capability is missing from DuskMoon packages, open a GitHub issue
 ## Related Docs
 
 - Operator / deploy: [`README.md`](./README.md)
+- Deployment, upgrade, backup, and restore: [`docs/deployment.md`](./docs/deployment.md)
 - UI library rules: [`CLAUDE.md`](./CLAUDE.md)
 - Design specs & plans: [`docs/superpowers/`](./docs/superpowers/)
 

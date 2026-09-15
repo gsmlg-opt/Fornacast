@@ -145,6 +145,12 @@ devenv shell -- mix fornacast.admin.create \
 
 ## Docker Compose
 
+For deployment, upgrades, backup, and restore procedures, see the
+[`docs/deployment.md`](docs/deployment.md) deployment guide. Compose stores the
+PostgreSQL domain database in `postgres-data`; `fornacast-data` holds bare Git
+repositories, SSH state, Concord configuration/LocalCAS metadata, and release
+assets.
+
 Create an environment file:
 
 ```sh
@@ -165,6 +171,9 @@ the app health check before accepting traffic. The public ports are `4000` for
 HTTP and `2222` for SSH. Application ports `4890` and `4891` remain unpublished.
 
 ### Deploy a prebuilt release image
+
+Before replacing an existing image, read the [deployment guide](docs/deployment.md)
+for the PostgreSQL-first upgrade boundary and required paired backups.
 
 The published image is compiled for the supported PostgreSQL 17 domain
 database. Its runtime adapter must match the compiled PostgreSQL adapter.
