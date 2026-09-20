@@ -4,7 +4,7 @@ defmodule FornacastUmbrella.MixProject do
   def project do
     [
       apps_path: "apps",
-      version: "0.3.1",
+      version: "0.4.0",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       releases: releases(),
