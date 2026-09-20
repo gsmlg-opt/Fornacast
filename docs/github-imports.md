@@ -72,6 +72,7 @@ Each selected repository is an independent durable item processed by bounded wor
 | ----- | ------- |
 | Git staging | Bare mirror into a private importing shadow |
 | Metadata staging | Issues, comments, labels, assignees, representable pull requests |
+| LFS staging | Download and verify objects reachable from all imported branches and tags |
 | Publication | Atomic swap from hidden shadow to visible repository |
 
 Workers persist checkpoints and resume from durable evidence after restarts. The reconciler
@@ -113,7 +114,7 @@ the storage parent private and mount the volume exclusively to one node at a tim
 
 **Imported when representable today**
 
-- Git branches and tags (bare mirror)
+- Git branches and tags (bare mirror), including their reachable Git LFS objects
 - Repository settings needed for publication (visibility, default branch, merge settings)
 - Issues, comments, labels, assignees
 - Pull requests that map to the current ForgeIssues/ForgePulls model, including same-repo PRs
@@ -122,10 +123,35 @@ the storage parent private and mount the volume exclusively to one node at a tim
 
 - GitHub releases and release assets (no published release domain yet)
 - Cross-repository pull requests that cannot be represented locally
-- Git LFS objects, wiki repos, submodule recursion, GitHub-only refs
+- Wiki repos, submodule recursion, GitHub-only refs
 - Organization membership, teams, invitations, and GitHub permission grants
 
 Unsupported categories appear in the final report; they are not silently dropped.
+
+## Git LFS
+
+One-time imports download LFS objects referenced anywhere in the history reachable
+from imported branches and tags, including annotated tags. Objects are streamed
+into local storage and checked against their SHA-256 identifier and declared size
+before the repository can be published. Empty repositories and repositories
+without LFS pointers require no LFS downloads.
+
+LFS uses the import's saved or one-time PAT. The selected credential must also be
+able to read the repository's LFS objects. GitHub App-backed organization mirrors
+retain their existing bootstrap handoff: an LFS-enabled repository stays in the
+synchronizing lifecycle until the mirror workers make its objects available and
+confirm its refs. Existing mirror capability settings remain in effect.
+
+Scans and transfers keep durable progress across worker restarts. Missing objects,
+size/hash mismatches, and authentication failures prevent successful publication;
+they are not downgraded to an unsupported-feature warning. Use the existing
+credential replacement and retry controls after resolving the reported failure.
+Completed historical imports are not automatically repaired; re-import them to
+fetch LFS objects that an older version skipped.
+
+For LFS-enabled ongoing synchronization, inbound objects are downloaded and
+verified before confirming local refs; outbound objects are uploaded and verified
+before pushing refs to GitHub. LFS locking is not supported.
 
 ## Conflict and replacement semantics
 

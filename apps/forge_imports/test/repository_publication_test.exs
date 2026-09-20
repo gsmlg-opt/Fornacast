@@ -55,6 +55,25 @@ defmodule ForgeImports.RepositoryPublicationTest do
     %{actor: actor, identity: identity}
   end
 
+  test "legacy publishable item without LFS completion is routed back to staging", context do
+    fixture = ready_publication_fixture(context, slug: "legacy-lfs-proof")
+    checkpoint = Map.delete(fixture.item.checkpoint, "lfs_import")
+
+    assert {1, _} =
+             Repo.update_all(
+               from(item in RepositoryItem, where: item.id == ^fixture.item.id),
+               set: [checkpoint: checkpoint]
+             )
+
+    legacy = Repo.get!(RepositoryItem, fixture.item.id)
+    refute Map.has_key?(legacy.checkpoint, "lfs_import")
+
+    assert {:ok, :git_staged} = RepositoryPublisher.durable_proof_state(legacy)
+    assert {:ok, recovered} = ForgeImports.Recovery.reconcile(legacy, now: @now)
+    assert recovered.state == :staging_metadata
+    assert Repo.get!(Repository, fixture.shadow.id).lifecycle == :importing
+  end
+
   test "legacy pull issue IDs cannot publish through terminal metadata checkpoints", context do
     fixture = ready_publication_fixture(context)
     assert {:ok, :ready_to_publish} = RepositoryPublisher.durable_proof_state(fixture.item)
@@ -116,7 +135,7 @@ defmodule ForgeImports.RepositoryPublicationTest do
 
     assert Repo.get!(Repository, fixture.shadow.id).lifecycle == :importing
 
-    assert {:ok, %RepositoryItem{state: :git_staged}} =
+    assert {:ok, %RepositoryItem{state: :staging_metadata}} =
              ForgeImports.Worker.run(fixture.item.id, "identity-routing",
                repository_worker: __MODULE__.MetadataRecoveryObserver
              )
@@ -311,12 +330,9 @@ defmodule ForgeImports.RepositoryPublicationTest do
     fixture =
       ready_publication_fixture(context,
         owner: organization,
-        slug: "pull-replay-repository"
+        slug: "pull-replay-repository",
+        source_kind: :organization
       )
-
-    shadow_path = ForgeRepos.absolute_storage_path(fixture.shadow)
-    File.mkdir_p!(Path.dirname(shadow_path))
-    assert {:ok, ^shadow_path} = GitCore.init_bare(shadow_path)
 
     installation_id = 8_350_000_000 + System.unique_integer([:positive])
 
@@ -361,6 +377,8 @@ defmodule ForgeImports.RepositoryPublicationTest do
         github_full_name: fixture.item.source_full_name
       })
       |> unwrap!()
+
+    mark_lfs_mirror_handoff!(fixture)
 
     pull_id = 8_360_000_000 + System.unique_integer([:positive])
     delivery_guid = Ecto.UUID.generate()
@@ -456,12 +474,11 @@ defmodule ForgeImports.RepositoryPublicationTest do
     fixture =
       ready_publication_fixture(context,
         owner: organization,
-        slug: "mirrored-repository"
+        slug: "mirrored-repository",
+        source_kind: :organization
       )
 
     shadow_path = ForgeRepos.absolute_storage_path(fixture.shadow)
-    File.mkdir_p!(Path.dirname(shadow_path))
-    assert {:ok, ^shadow_path} = GitCore.init_bare(shadow_path)
     %{base: base_oid} = create_merge_graph!(shadow_path)
     update_ref!(shadow_path, base_oid, "refs/tags/v1.0.0")
 
@@ -584,6 +601,8 @@ defmodule ForgeImports.RepositoryPublicationTest do
         github_full_name: fixture.item.source_full_name
       })
       |> unwrap!()
+
+    mark_lfs_mirror_handoff!(fixture)
 
     {:ok, delivery, :enqueued} =
       ForgeMirrors.enqueue_webhook_delivery(
@@ -2125,7 +2144,7 @@ defmodule ForgeImports.RepositoryPublicationTest do
 
   defp ready_publication_fixture(context, opts \\ []) do
     owner = Keyword.get(opts, :owner, context.actor)
-    run = running_run_fixture(context.actor, context.identity, owner)
+    run = running_run_fixture(context.actor, context.identity, owner, opts)
     action = Keyword.get(opts, :action, :create)
     target = Keyword.get(opts, :target)
     slug = Keyword.get(opts, :slug, "demo")
@@ -2175,6 +2194,9 @@ defmodule ForgeImports.RepositoryPublicationTest do
       |> Repo.transaction()
 
     staged_path = ForgeRepos.absolute_storage_path(shadow)
+    File.mkdir_p!(Path.dirname(staged_path))
+    assert {:ok, ^staged_path} = GitCore.init_bare(staged_path)
+    File.chmod!(staged_path, 0o700)
 
     assert {1, _rows} =
              Repo.update_all(
@@ -2192,10 +2214,14 @@ defmodule ForgeImports.RepositoryPublicationTest do
                    "submodules_detected" => false,
                    "scan_truncated" => false
                  },
-                 checkpoint: %{
-                   "git_staged" => true,
-                   "unsupported_scan" => "complete"
-                 }
+                 checkpoint:
+                   Map.merge(
+                     %{
+                       "git_staged" => true,
+                       "unsupported_scan" => "complete"
+                     },
+                     lfs_completion_checkpoint!(shadow, item)
+                   )
                ]
              )
 
@@ -2205,17 +2231,62 @@ defmodule ForgeImports.RepositoryPublicationTest do
     %{run: run, item: item, attempt: attempt, shadow: shadow, target: target}
   end
 
-  defp running_run_fixture(actor, identity, owner) do
+  defp lfs_completion_checkpoint!(shadow, item) do
+    {:ok, refs} = GitCore.list_refs(ForgeRepos.absolute_storage_path(shadow))
+
+    baselines =
+      refs
+      |> Enum.filter(&(&1.kind in [:branch, :tag]))
+      |> Enum.map(&%{ref_name: &1.name, ref_kind: &1.kind, oid: &1.target})
+
+    {:ok, scan} =
+      GitLFS.PointerScanner.begin_scan(
+        shadow,
+        "publication-fixture:#{item.id}",
+        baselines
+      )
+
+    {:ok, published} = GitLFS.PointerScanner.publish_scan(scan)
+
+    %{
+      "lfs_import" => %{
+        "status" => "complete",
+        "repository_generation" => shadow.generation,
+        "scan_id" => published.id,
+        "scan_key" => published.scan_key,
+        "baseline_fingerprint" => published.baseline_fingerprint,
+        "object_cursor" => nil
+      }
+    }
+  end
+
+  defp mark_lfs_mirror_handoff!(fixture) do
+    checkpoint =
+      Map.put(fixture.item.checkpoint, "lfs_import", %{
+        "status" => "mirror_handoff",
+        "repository_generation" => fixture.shadow.generation
+      })
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(item in RepositoryItem, where: item.id == ^fixture.item.id),
+               set: [checkpoint: checkpoint]
+             )
+  end
+
+  defp running_run_fixture(actor, identity, owner, opts) do
+    source_kind = Keyword.get(opts, :source_kind, :repository)
+
     run =
       %{
         actor_user_id: actor.id,
-        source_kind: :repository,
+        source_kind: source_kind,
         github_identity_id: identity.id,
         credential_source: :one_time,
         source_owner_github_id: 8_950_000_001,
         source_owner_login: "acme",
-        source_repository_github_id: 9_950_000_001,
-        source_repository_full_name: "acme/demo",
+        source_repository_github_id: if(source_kind == :repository, do: 9_950_000_001),
+        source_repository_full_name: if(source_kind == :repository, do: "acme/demo"),
         destination_organization_action: :existing,
         destination_organization_slug: owner.username,
         destination_organization_id: if(owner.id == actor.id, do: nil, else: owner.id),

@@ -144,7 +144,7 @@ defmodule ForgeGitHub.ReleaseClient do
     Keyword.keyword?(opts) and not Keyword.has_key?(opts, :json) and
       case Keyword.get(opts, :gate_key) do
         {kind, id}
-        when kind in [:github_installation, :one_time_run] and is_integer(id) and
+        when kind in [:github_installation, :one_time_run, :saved_credential] and is_integer(id) and
                id in 1..@max_id ->
           true
 

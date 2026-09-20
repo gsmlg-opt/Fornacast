@@ -32,6 +32,9 @@ defmodule ForgeImports.Recovery do
       item.state == :git_staged and get_in(item.checkpoint, ["git_staged"]) == true ->
         {:ok, :git_staged}
 
+      item.state == :ready_to_publish and match?({:ok, :git_staged}, proof) ->
+        {:ok, :staging_metadata}
+
       match?({:ok, :ready_to_publish}, proof) ->
         {:ok, :ready_to_publish}
 

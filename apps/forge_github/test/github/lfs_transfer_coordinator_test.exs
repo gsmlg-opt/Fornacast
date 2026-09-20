@@ -6,6 +6,79 @@ defmodule ForgeGitHub.LFS.TransferCoordinatorTest do
   alias ForgeRepos.Repository
   alias GitLFS.PointerScanner.Scan
 
+  test "import credential gates are preserved for LFS Batch requests" do
+    for gate_key <- [{:saved_credential, 21}, {:one_time_run, 34}] do
+      [requirement | _] = requirements()
+
+      callbacks =
+        callbacks(
+          list_requirements: fn _, _ ->
+            {:ok, %{objects: [requirement], next_cursor: nil}}
+          end,
+          batch: fn "import-token", "octocat", "repo", :download, objects, options ->
+            assert options[:gate_key] == gate_key
+            {:ok, Enum.map(objects, &remote_download/1)}
+          end,
+          verify_local: fn _, _, _ -> :ok end
+        )
+
+      assert {:ok, nil} =
+               TransferCoordinator.process_page(
+                 repository(),
+                 scan(),
+                 :inbound,
+                 "import-token",
+                 "octocat",
+                 "repo",
+                 nil,
+                 gate_key: gate_key,
+                 callbacks: callbacks
+               )
+    end
+  end
+
+  test "unrelated and invalid credential gates fail before scan or provider access" do
+    parent = self()
+
+    callbacks =
+      callbacks(
+        list_requirements: fn _, _ ->
+          send(parent, :unexpected_scan)
+          {:ok, %{objects: [], next_cursor: nil}}
+        end,
+        batch: fn _, _, _, _, _, _ ->
+          send(parent, :unexpected_batch)
+          {:error, Error.new(:invalid_request)}
+        end
+      )
+
+    for gate_key <- [
+          {:import_setup, 1},
+          {:account_setup, 1},
+          {:github_app, 1},
+          {:saved_credential, 0},
+          {:one_time_run, -1},
+          {:github_installation, "1"},
+          {:saved_credential, 9_223_372_036_854_775_808}
+        ] do
+      assert {:error, %Error{kind: :invalid_request}} =
+               TransferCoordinator.process_page(
+                 repository(),
+                 scan(),
+                 :inbound,
+                 "import-token",
+                 "octocat",
+                 "repo",
+                 nil,
+                 gate_key: gate_key,
+                 callbacks: callbacks
+               )
+    end
+
+    refute_received :unexpected_scan
+    refute_received :unexpected_batch
+  end
+
   test "inbound proves the remote page before directly staging each missing local object" do
     parent = self()
     [ready, missing] = requirements()

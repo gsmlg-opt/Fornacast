@@ -26,19 +26,23 @@ Implemented first-release paths:
 - Filesystem-backed bare Git storage.
 - Erlang/OTP Git-over-SSH daemon and Git-over-HTTP smart protocol.
 - `git ls-remote`, `git clone`, `git fetch`, and basic `git push`.
+- Git LFS Batch/Basic upload, download and verification, with HTTP credentials or SSH authentication.
 - Initial branch push, fast-forward branch update, new branch push, tag creation, and force-push rejection.
 - Repository overview, README rendering, source tree, file view, raw file, commits, commit detail, diffs, branches, tags, and in-repo search.
 - `/health` endpoint and automatic boot migrations.
 - A separate GitHub-compatible REST listener (`/api/v3`), started with the web application.
 - Read-only GraphQL (`/api/graphql`) and public discovery (`/.well-known/fornacast`) on the API listener.
 
-Out of scope for this release: CI, packages, LFS, permanent mirrors, and forks.
+Out of scope for this release: CI, packages, and forks.
 The GitHub importer remains a one-time bootstrap path.
+GitHub imports include LFS objects reachable from imported branches and tags;
+LFS-enabled GitHub mirrors transfer objects before confirming synchronized refs.
+See [GitHub import and LFS recovery](docs/github-imports.md#git-lfs).
 
-## Roadmap
+## GitHub synchronization
 
-Two-way GitHub organization mirroring is planned after v0.2.2. The permanent
-mirror domain will be separate from the bootstrap importer. GitHub wiki
+Two-way GitHub organization mirroring uses a permanent mirror domain separate
+from the one-time bootstrap importer. GitHub wiki
 repositories and release asset binaries remain excluded from synchronization.
 
 ## Architecture

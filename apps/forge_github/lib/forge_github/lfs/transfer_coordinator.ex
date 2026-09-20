@@ -14,14 +14,14 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
 
   @type direction :: :inbound | :outbound | :converge
   @type option ::
-          {:gate_key, {:github_installation, pos_integer()}}
+          {:gate_key, {:github_installation | :saved_credential | :one_time_run, pos_integer()}}
           | {:authorize, (-> :ok | {:error, term()})}
 
   @doc """
   Synchronizes one completed pointer-scan page without advancing its cursor on failure.
 
-  Requires `gate_key: {:github_installation, installation_id}` so every Batch request is
-  serialized with other requests made using the same installation credential.
+  Requires a GitHub installation, saved credential, or one-time import run `gate_key`
+  so every Batch request is serialized with other requests using that credential identity.
   Trusted callers may supply a runtime `authorize` callback returning `:ok` or an error.
   It is checked before every new provider request; it does not abort an in-flight request.
   """
@@ -708,9 +708,9 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
     end
   end
 
-  defp valid_gate_key?({:github_installation, installation_id})
-       when is_integer(installation_id) and installation_id > 0 and
-              installation_id <= @maximum_object_size,
+  defp valid_gate_key?({kind, id})
+       when kind in [:github_installation, :saved_credential, :one_time_run] and
+              is_integer(id) and id > 0 and id <= @maximum_object_size,
        do: true
 
   defp valid_gate_key?(_gate_key), do: false

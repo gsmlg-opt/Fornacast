@@ -564,7 +564,7 @@ defmodule ForgeImports.RepositoryWorkerTest do
   end
 
   @tag :tmp_dir
-  test "bounded default-tree scan records LFS and submodule warnings idempotently", context do
+  test "bounded default-tree scan records only remaining unsupported warnings", context do
     source = repository_with_unsupported_git!(context.tmp_dir)
     staging_root = Path.join(context.tmp_dir, "staging")
     original_root = Application.fetch_env!(:fornacast, :repo_storage_root)
@@ -574,7 +574,7 @@ defmodule ForgeImports.RepositoryWorkerTest do
     assert {:ok,
             %RepositoryItem{
               state: :git_staged,
-              warning_count: 2,
+              warning_count: 1,
               source_git: %{
                 "lfs_detected" => true,
                 "submodules_detected" => true,
@@ -589,27 +589,374 @@ defmodule ForgeImports.RepositoryWorkerTest do
                remote_options: [source: source]
              )
 
-    assert ["unsupported_git_lfs", "unsupported_submodules"] =
+    assert ["unsupported_submodules"] =
              ReportEntry
              |> where([report], report.repository_item_id == ^context.item.id)
              |> order_by([report], asc: report.classification)
              |> Repo.all()
              |> Enum.map(& &1.classification)
 
-    assert %ImportRun{warning_count: 2} = Repo.get!(ImportRun, context.run.id)
+    assert %ImportRun{warning_count: 1} = Repo.get!(ImportRun, context.run.id)
 
-    assert {:ok, %RepositoryItem{state: :ready_to_publish}} =
+    assert Repo.aggregate(ReportEntry, :count) == 1
+  end
+
+  @tag :tmp_dir
+  test "imports LFS bytes reachable only from history another branch and an annotated tag",
+       context do
+    payloads = stage_lfs_fixture!(context)
+
+    callbacks = lfs_callbacks(context, payloads)
+
+    assert {:ok, %RepositoryItem{state: :ready_to_publish} = completed} =
+             finish_lfs_worker(context.item.id, callbacks)
+
+    assert completed.checkpoint["lfs_import"]["status"] == "complete"
+    assert ForgeImports.GitHub.LFSImporter.complete?(completed)
+    {:ok, repository} = ForgeRepos.fetch_importing_repository(completed.hidden_repository_id)
+
+    for {oid, payload} <- payloads do
+      assert :ok = GitLFS.verify_object(repository, oid, byte_size(payload))
+    end
+
+    assert {:ok, %{repository: published}} =
+             ForgeImports.publish_repository(context.actor, completed.id, %{})
+
+    assert published.lifecycle == :ready
+
+    for {oid, payload} <- payloads do
+      assert {:ok, source, _} = GitLFS.open_object(published, oid, byte_size(payload), :all)
+      assert {:ok, ^payload, source} = GitLFS.read(source, byte_size(payload))
+      assert :ok = GitLFS.close(source)
+    end
+
+    refute Repo.exists?(
+             from report in ReportEntry,
+               where:
+                 report.repository_item_id == ^context.item.id and
+                   report.classification == "unsupported_git_lfs"
+           )
+  end
+
+  test "credential rejection after metadata transition pauses the current lease", context do
+    assert {:ok, %RepositoryItem{state: :git_staged}} =
              RepositoryWorker.stage(context.item.id,
-               owner: "unsupported-scan-replay",
-               lease_seconds: 60,
+               owner: "metadata-credential-git",
                keyring: @keyring,
-               remote: __MODULE__.UnexpectedRemote,
-               remote_options: [test_pid: self()],
-               client_options: empty_metadata_client_options()
+               remote: __MODULE__.SuccessfulRemote,
+               remote_options: [test_pid: self()]
              )
 
-    assert Repo.aggregate(ReportEntry, :count) == 2
-    refute_receive {:unexpected_remote, _operation}
+    stub = {__MODULE__, :metadata_credential_rejected}
+    Req.Test.stub(stub, fn conn -> Plug.Conn.send_resp(conn, 401, "{}") end)
+
+    assert {:error, :awaiting_credential} =
+             RepositoryWorker.stage(context.item.id,
+               owner: "metadata-credential-stage",
+               keyring: @keyring,
+               client_options: [
+                 plug: {Req.Test, stub},
+                 resolver: fn "api.github.com" -> {:ok, [{140, 82, 114, 5}]} end
+               ]
+             )
+
+    assert %RepositoryItem{state: :awaiting_credential, lease_owner: nil} =
+             Repo.get!(RepositoryItem, context.item.id)
+  end
+
+  @tag :tmp_dir
+  test "LFS transfer renews its lease and persists with the refreshed version", context do
+    payloads = stage_lfs_fixture!(context)
+    callbacks = lfs_callbacks(context, payloads)
+    parent = self()
+
+    callbacks =
+      Map.put(callbacks, :batch, fn token, owner, repo, operation, objects, options ->
+        item = Repo.get!(RepositoryItem, context.item.id)
+
+        Repo.update_all(from(i in RepositoryItem, where: i.id == ^item.id),
+          set: [lease_expires_at: DateTime.add(DateTime.utc_now(:second), 20, :second)]
+        )
+
+        result = callbacks.batch.(token, owner, repo, operation, objects, options)
+
+        send(
+          parent,
+          {:lfs_renewed, Repo.get!(RepositoryItem, item.id).lock_version > item.lock_version}
+        )
+
+        result
+      end)
+
+    assert {:ok, %RepositoryItem{state: :ready_to_publish}} =
+             finish_lfs_worker(context.item.id, callbacks)
+
+    assert_receive {:lfs_renewed, true}
+  end
+
+  @tag :tmp_dir
+  test "LFS pages resume at the durable cursor after worker interruption", context do
+    work = Path.join(context.tmp_dir, "paged-lfs-work")
+    File.mkdir!(work)
+    git!(["init", "--initial-branch=main"], work)
+    git!(["config", "user.name", "Fornacast Test"], work)
+    git!(["config", "user.email", "fornacast@example.test"], work)
+
+    payloads =
+      Map.new(1..101, fn index ->
+        payload = "#{context.tmp_dir}:#{index}:#{Ecto.UUID.generate()}"
+        File.write!(Path.join(work, "asset-#{index}.bin"), lfs_pointer(payload))
+        {lfs_oid(payload), payload}
+      end)
+
+    git!(["add", "."], work)
+    git!(["commit", "-m", "paged LFS pointers"], work)
+    stage_lfs_source!(context, work)
+    callbacks = lfs_callbacks(context, payloads)
+    [last_oid | _] = payloads |> Map.keys() |> Enum.sort(:desc)
+    parent = self()
+
+    failing =
+      Map.put(callbacks, :batch, fn token, owner, repo, operation, objects, options ->
+        send(parent, {:lfs_page_size, length(objects)})
+
+        if length(objects) == 1 do
+          {:error, ForgeGitHub.Error.new(:transport)}
+        else
+          callbacks.batch.(token, owner, repo, operation, objects, options)
+        end
+      end)
+
+    assert {:error, :transport} = finish_lfs_worker(context.item.id, failing)
+    assert_receive {:lfs_page_size, 100}
+    assert_receive {:lfs_page_size, 1}
+    pending = Repo.get!(RepositoryItem, context.item.id)
+    cursor = pending.checkpoint["lfs_import"]["object_cursor"]
+    assert is_binary(cursor) and cursor < last_oid
+    make_item_due!(pending.id)
+
+    resumed =
+      Map.put(callbacks, :batch, fn token, owner, repo, operation, objects, options ->
+        assert [%{oid: ^last_oid}] = objects
+        callbacks.batch.(token, owner, repo, operation, objects, options)
+      end)
+
+    assert {:ok, %RepositoryItem{state: :ready_to_publish}} =
+             finish_lfs_worker(pending.id, resumed)
+
+    refute_receive {:unexpected_remote, _}
+  end
+
+  for empty <- [true, false] do
+    @tag :tmp_dir
+    @tag empty_repository: empty
+    test "repository with empty=#{empty} and no LFS pointers needs no LFS request", context do
+      source = Path.join(context.tmp_dir, "plain-source")
+      File.mkdir!(source)
+      git!(["init", "--initial-branch=main"], source)
+
+      unless context.empty_repository do
+        git!(["config", "user.name", "Fornacast Test"], source)
+        git!(["config", "user.email", "fornacast@example.test"], source)
+        File.write!(Path.join(source, "readme"), "ordinary content")
+        git!(["add", "."], source)
+        git!(["commit", "-m", "ordinary file"], source)
+      end
+
+      stage_lfs_source!(context, source)
+      parent = self()
+
+      callbacks =
+        lfs_callbacks(context, %{}, %{
+          batch: fn _, _, _, _, _, _ -> send(parent, :unexpected_lfs_request) end
+        })
+
+      assert {:ok, %RepositoryItem{state: :ready_to_publish}} =
+               finish_lfs_worker(context.item.id, callbacks)
+
+      refute_receive :unexpected_lfs_request
+    end
+  end
+
+  @tag :tmp_dir
+  test "saved credentials import LFS using their own request gate", context do
+    {run, item, _credential} = saved_run_fixture(context.actor, context.identity)
+    context = %{context | run: run, item: item}
+    payloads = stage_lfs_fixture!(context)
+
+    assert {:ok, %RepositoryItem{state: :ready_to_publish}} =
+             finish_lfs_worker(item.id, lfs_callbacks(context, payloads))
+  end
+
+  for failure <- [:object_missing, :integrity_mismatch, :primary_rate_limit] do
+    @tag :tmp_dir
+    @tag lfs_failure: failure
+    test "LFS #{failure} prevents publication and resumes without cloning", context do
+      failure = context.lfs_failure
+      payloads = stage_lfs_fixture!(context)
+      retry_at = DateTime.add(DateTime.utc_now(:second), 300, :second)
+      callbacks = lfs_callbacks(context, payloads)
+
+      failing =
+        if failure == :integrity_mismatch do
+          lfs_callbacks(
+            context,
+            Map.new(payloads, fn {oid, bytes} ->
+              {oid, :binary.copy("x", byte_size(bytes))}
+            end)
+          )
+        else
+          Map.put(callbacks, :batch, fn _, _, _, _, _, _ ->
+            {:error, ForgeGitHub.Error.new(failure, retry_at)}
+          end)
+        end
+
+      assert {:error, ^failure} = finish_lfs_worker(context.item.id, failing)
+      pending = Repo.get!(RepositoryItem, context.item.id)
+      assert pending.state == :staging_metadata
+      assert pending.lease_owner == nil
+      assert pending.failure_kind == Atom.to_string(failure)
+      refute ForgeImports.GitHub.LFSImporter.complete?(pending)
+      assert {:error, _} = ForgeImports.publish_repository(context.actor, pending.id, %{})
+      if failure != :integrity_mismatch, do: assert(pending.next_attempt_at == retry_at)
+      scan_id = pending.checkpoint["lfs_import"]["scan_id"]
+      make_item_due!(pending.id)
+
+      assert {:ok, %RepositoryItem{state: :ready_to_publish} = completed} =
+               finish_lfs_worker(pending.id, callbacks)
+
+      assert completed.checkpoint["lfs_import"]["scan_id"] == scan_id
+      refute_receive {:unexpected_remote, _}
+    end
+  end
+
+  @tag :tmp_dir
+  test "revoked saved credential before LFS checkout preserves the scan for renewal", context do
+    {run, item, credential} = saved_run_fixture(context.actor, context.identity)
+    context = %{context | run: run, item: item}
+    payloads = stage_lfs_fixture!(context)
+    parent = self()
+
+    callbacks =
+      lfs_callbacks(context, payloads, %{
+        batch: fn _, _, _, _, _, _ -> send(parent, :unexpected_lfs_batch) end
+      })
+
+    list_requirements = fn scan, options ->
+      Repo.update_all(from(c in GitHubCredential, where: c.id == ^credential.id),
+        set: [status: :invalid]
+      )
+
+      GitLFS.PointerScanner.list_requirements(scan, options)
+    end
+
+    assert {:error, :awaiting_credential} =
+             finish_lfs_worker(item.id, callbacks, list_requirements: list_requirements)
+
+    current = Repo.get!(RepositoryItem, item.id)
+    assert current.state == :awaiting_credential
+    assert current.resume_state == :staging_metadata
+    assert current.lease_owner == nil
+    assert is_integer(current.checkpoint["lfs_import"]["scan_id"])
+    assert current.checkpoint["git_staged"] == true
+    assert Repo.get!(ImportRun, run.id).state == :awaiting_credential
+    refute ForgeImports.GitHub.LFSImporter.complete?(current)
+    refute_receive :unexpected_lfs_batch
+  end
+
+  @tag :tmp_dir
+  test "invalid LFS credentials pause import without publishing", context do
+    payloads = stage_lfs_fixture!(context)
+
+    callbacks =
+      lfs_callbacks(context, payloads, %{
+        batch: fn _, _, _, _, _, _ ->
+          {:error, ForgeGitHub.Error.new(:invalid_credential)}
+        end
+      })
+
+    assert {:error, :awaiting_credential} = finish_lfs_worker(context.item.id, callbacks)
+    assert %ImportRun{state: :awaiting_credential} = Repo.get!(ImportRun, context.run.id)
+    item = Repo.get!(RepositoryItem, context.item.id)
+    assert item.state == :awaiting_credential
+    assert item.resume_state == :staging_metadata
+    refute ForgeImports.GitHub.LFSImporter.complete?(item)
+  end
+
+  @tag :tmp_dir
+  test "expired LFS actions refresh their batch before completing", context do
+    payloads = stage_lfs_fixture!(context)
+    callbacks = lfs_callbacks(context, payloads)
+    parent = self()
+
+    callbacks =
+      Map.put(callbacks, :batch, fn token, owner, repo, operation, objects, options ->
+        send(parent, :lfs_batch)
+
+        if Process.get(:lfs_expired_once) do
+          callbacks.batch.(token, owner, repo, operation, objects, options)
+        else
+          Process.put(:lfs_expired_once, true)
+          {:error, ForgeGitHub.Error.new(:action_expired)}
+        end
+      end)
+
+    assert {:ok, %RepositoryItem{state: :ready_to_publish}} =
+             finish_lfs_worker(context.item.id, callbacks)
+
+    assert_receive :lfs_batch
+    assert_receive :lfs_batch
+  end
+
+  for interruption <- [:cancellation, :run_cancellation, :lease_loss] do
+    @tag :tmp_dir
+    @tag lfs_interruption: interruption
+    test "LFS #{interruption} stops transfer without publication", context do
+      interruption = context.lfs_interruption
+      payloads = stage_lfs_fixture!(context)
+      callbacks = lfs_callbacks(context, payloads)
+      parent = self()
+
+      callbacks =
+        Map.put(callbacks, :batch, fn token, owner, repo, operation, objects, options ->
+          result = callbacks.batch.(token, owner, repo, operation, objects, options)
+
+          if interruption == :cancellation do
+            assert {:ok, _} =
+                     ForgeImports.Cancellation.request(
+                       context.actor,
+                       Repo.get!(ImportRun, context.run.id),
+                       %{}
+                     )
+          else
+            if interruption == :run_cancellation do
+              Repo.update_all(from(r in ImportRun, where: r.id == ^context.run.id),
+                set: [state: :cancel_requested]
+              )
+            else
+              Repo.update_all(from(i in RepositoryItem, where: i.id == ^context.item.id),
+                set: [lease_owner: "replacement-owner"]
+              )
+            end
+          end
+
+          send(parent, :interrupted)
+          result
+        end)
+
+      expected_error = if interruption == :run_cancellation, do: :cancelled, else: :lost_lease
+      assert {:error, ^expected_error} = finish_lfs_worker(context.item.id, callbacks)
+      assert_receive :interrupted
+      item = Repo.get!(RepositoryItem, context.item.id)
+      refute ForgeImports.GitHub.LFSImporter.complete?(item)
+      assert {:error, _} = ForgeImports.publish_repository(context.actor, item.id, %{})
+      if interruption == :lease_loss, do: assert(item.lease_owner == "replacement-owner")
+      {:ok, repository} = ForgeRepos.fetch_importing_repository(item.hidden_repository_id)
+
+      for {oid, payload} <- payloads do
+        refute GitLFS.verify_object(repository, oid, byte_size(payload)) == :ok
+      end
+    end
   end
 
   @tag :tmp_dir
@@ -2535,6 +2882,8 @@ defmodule ForgeImports.RepositoryWorkerTest do
 
       send(Keyword.fetch!(opts, :test_pid), {:mirror, request})
 
+      {:ok, _path} = GitCore.init_bare(request.destination)
+
       {:ok,
        %GitCore.Remote.Result{
          path: request.destination,
@@ -2615,6 +2964,8 @@ defmodule ForgeImports.RepositoryWorkerTest do
     def mirror(%{repository: "later"} = request, pat, opts) do
       if pat != "github_pat_repository_worker_secret", do: raise("wrong credential")
       send(Keyword.fetch!(opts, :test_pid), {:later_success, request.repository})
+
+      {:ok, _path} = GitCore.init_bare(request.destination)
 
       {:ok,
        %GitCore.Remote.Result{
@@ -2911,6 +3262,8 @@ defmodule ForgeImports.RepositoryWorkerTest do
       end
 
       Agent.update(state, &%{&1 | active: &1.active - 1})
+
+      {:ok, _path} = GitCore.init_bare(request.destination)
 
       {:ok,
        %GitCore.Remote.Result{
@@ -3295,6 +3648,143 @@ defmodule ForgeImports.RepositoryWorkerTest do
     bare
   end
 
+  defp stage_lfs_fixture!(context) do
+    {source, payloads} = repository_with_complete_lfs_history!(context.tmp_dir)
+    stage_lfs_source!(context, source)
+    payloads
+  end
+
+  defp stage_lfs_source!(context, source) do
+    staging_root = Path.join(context.tmp_dir, "lfs-import-staging")
+    original_root = Application.fetch_env!(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, staging_root)
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    assert {:ok, %RepositoryItem{state: :git_staged}} =
+             RepositoryWorker.stage(context.item.id,
+               owner: "lfs-git-stage",
+               lease_seconds: 60,
+               keyring: @keyring,
+               remote: __MODULE__.LocalMirrorRemote,
+               remote_options: [source: source]
+             )
+  end
+
+  defp finish_lfs_worker(item_id, callbacks, lfs_options \\ []) do
+    Enum.reduce_while(1..300, nil, fn turn, _ ->
+      result =
+        RepositoryWorker.stage(item_id,
+          owner: "lfs-stage-#{turn}",
+          lease_seconds: 60,
+          keyring: @keyring,
+          remote: __MODULE__.UnexpectedRemote,
+          remote_options: [test_pid: self()],
+          client_options: empty_metadata_client_options(),
+          lfs_transfer_options: [callbacks: callbacks],
+          lfs_options: lfs_options
+        )
+
+      case result do
+        {:ok, %RepositoryItem{state: :ready_to_publish}} -> {:halt, result}
+        {:ok, %RepositoryItem{state: :staging_metadata}} -> {:cont, result}
+        _ -> {:halt, result}
+      end
+    end)
+  end
+
+  defp lfs_callbacks(context, payloads, overrides \\ %{}) do
+    gate_key =
+      if context.run.credential_source == :saved,
+        do: {:saved_credential, context.run.github_credential_id},
+        else: {:one_time_run, context.run.id}
+
+    Map.merge(
+      %{
+        batch: fn token, "acme", "demo", :download, objects, options ->
+          assert token == @pat
+          assert options[:gate_key] == gate_key
+          assert :ok = options[:authorize].()
+
+          {:ok,
+           Enum.map(objects, fn object ->
+             %ForgeGitHub.LFS.Object{
+               oid: object.oid,
+               size: object.size,
+               authenticated: true,
+               actions: %{
+                 download:
+                   ForgeGitHub.LFS.Action.new!(
+                     :download,
+                     "https://objects.example.test/#{object.oid}",
+                     %{},
+                     nil
+                   )
+               },
+               error: nil
+             }
+           end)}
+        end,
+        consume_download: fn _action, object, consumer, _options ->
+          payload = Map.fetch!(payloads, object.oid)
+
+          case consumer.(&lfs_chunk_reader/2, [payload]) do
+            {:ok, staged, []} -> {:ok, staged}
+            {:error, _reason, _state} -> {:error, ForgeGitHub.Error.new(:integrity_mismatch)}
+          end
+        end
+      },
+      overrides
+    )
+  end
+
+  defp repository_with_complete_lfs_history!(tmp_dir) do
+    work = Path.join(tmp_dir, "complete-lfs-work")
+    bare = Path.join(tmp_dir, "complete-lfs-source.git")
+    File.mkdir!(work)
+    git!(["init", "--initial-branch=main"], work)
+    git!(["config", "user.name", "Fornacast Test"], work)
+    git!(["config", "user.email", "fornacast@example.test"], work)
+
+    suffix = Ecto.UUID.generate()
+    payloads = ["history-#{suffix}", "branch-#{suffix}", "tag-#{suffix}"]
+    [history, branch, tag] = payloads
+    File.write!(Path.join(work, "asset.bin"), lfs_pointer(history))
+    git!(["add", "asset.bin"], work)
+    git!(["commit", "-m", "historical pointer"], work)
+    File.write!(Path.join(work, "asset.bin"), "ordinary current bytes")
+    git!(["add", "asset.bin"], work)
+    git!(["commit", "-m", "replace pointer on main"], work)
+
+    git!(["checkout", "-b", "feature"], work)
+    File.write!(Path.join(work, "branch.bin"), lfs_pointer(branch))
+    git!(["add", "branch.bin"], work)
+    git!(["commit", "-m", "branch pointer"], work)
+    git!(["checkout", "main"], work)
+
+    git!(["checkout", "--orphan", "tag-source"], work)
+    git!(["rm", "-rf", "."], work)
+    File.write!(Path.join(work, "tag.bin"), lfs_pointer(tag))
+    git!(["add", "tag.bin"], work)
+    git!(["commit", "-m", "tag pointer"], work)
+    git!(["tag", "-a", "v-lfs", "-m", "annotated LFS tag"], work)
+    git!(["checkout", "main"], work)
+    git!(["branch", "-D", "tag-source"], work)
+    git!(["clone", "--mirror", work, bare], tmp_dir)
+
+    {bare, Map.new(payloads, &{lfs_oid(&1), &1})}
+  end
+
+  defp lfs_pointer(payload) do
+    "version https://git-lfs.github.com/spec/v1\n" <>
+      "oid sha256:#{lfs_oid(payload)}\nsize #{byte_size(payload)}\n"
+  end
+
+  defp lfs_oid(payload),
+    do: :crypto.hash(:sha256, payload) |> Base.encode16(case: :lower)
+
+  defp lfs_chunk_reader([chunk | rest], _options), do: {:ok, chunk, rest}
+  defp lfs_chunk_reader([], _options), do: {:done, []}
+
   defp write_blocking_remote_git!(tmp_dir) do
     git = Path.join(tmp_dir, "blocking-remote-git")
     real_git = System.find_executable("git") || raise "git is required"
@@ -3375,7 +3865,8 @@ defmodule ForgeImports.RepositoryWorkerTest do
 
     Req.Test.stub(stub, fn conn ->
       if String.ends_with?(conn.request_path, "/labels") or
-           String.ends_with?(conn.request_path, "/issues") do
+           String.ends_with?(conn.request_path, "/issues") or
+           String.ends_with?(conn.request_path, "/releases") do
         Req.Test.json(conn, [])
       else
         Plug.Conn.send_resp(conn, 404, "{}")

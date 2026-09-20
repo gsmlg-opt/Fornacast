@@ -23,6 +23,47 @@ defmodule GitLFS.StorageTest do
     %{owner: owner, repository: repository}
   end
 
+  test "import staging stores verified bytes while public LFS authorization remains denied", %{
+    repository: repository,
+    owner: owner
+  } do
+    repository =
+      repository
+      |> Ecto.Changeset.change(lifecycle: :importing)
+      |> Repo.update!()
+
+    payload = "private import LFS bytes"
+    oid = digest(payload)
+    on_exit(fn -> ForgeBlobs.delete(oid) end)
+
+    assert {:ok, reservation} = GitLFS.reserve_upload(repository, oid, byte_size(payload))
+
+    assert {:ok, staged, _} =
+             GitLFS.stage_upload(reservation, &chunk_reader/2, %{chunks: [payload]})
+
+    assert {:ok, _} = GitLFS.commit_synchronized_upload(staged, "refs/heads/main")
+    assert :ok = GitLFS.verify_object(repository, oid, byte_size(payload))
+
+    for operation <- ["download", "upload"] do
+      assert {:error, :not_found} =
+               GitLFS.batch(
+                 repository,
+                 GitLFS.Principal.password(owner),
+                 %{
+                   "operation" => operation,
+                   "objects" => [%{"oid" => oid, "size" => byte_size(payload)}]
+                 },
+                 "https://forge.example.test"
+               )
+    end
+
+    refute Fornacast.Access.allowed?(owner, :repository_read, repository)
+    refute Fornacast.Access.allowed?(owner, :repository_write, repository)
+
+    stale = %{repository | generation: repository.generation + 1}
+    assert {:error, :not_found} = GitLFS.reserve_upload(stale, oid, byte_size(payload))
+  end
+
   test "stages, commits, verifies, and range-reads a SHA-256 object", %{repository: repository} do
     payload = "large binary payload"
     oid = digest(payload)

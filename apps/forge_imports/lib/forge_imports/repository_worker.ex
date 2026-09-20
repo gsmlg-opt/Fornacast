@@ -19,6 +19,8 @@ defmodule ForgeImports.RepositoryWorker do
   }
 
   alias ForgeGitHub.{Client, InstallationTokenBroker, InstallationTokenScope}
+  alias ForgeGitHub.LFS.TransferCoordinator
+  alias ForgeImports.GitHub.LFSImporter
   alias ForgeImports.GitHub.MetadataImporter
   alias ForgeRepos.Repository
   alias Fornacast.{Audit, AuditEvent, OperationLease, Repo}
@@ -191,18 +193,111 @@ defmodule ForgeImports.RepositoryWorker do
              &metadata_checkout(actor, run, item, &1, options),
              metadata_importer_options(item, options)
            ),
-         {:ok, %{item: current}} <- current_context(item.id, item.lease_owner),
-         {:ok, updated} <- persist_ready_to_publish(current) do
-      {:ok, updated}
+         {:ok, %{run: current_run, item: current}} <- current_context(item.id, item.lease_owner),
+         {:ok, lfs_result} <- stage_lfs(current, current_run, options),
+         {:ok, %{item: refreshed}} <- current_context(item.id, item.lease_owner) do
+      persist_lfs_result(refreshed, lfs_result)
     else
-      {:ok, :identity_recovered} -> persist_metadata_progress(capability)
-      true -> persist_cancellation(capability)
-      {:error, :cancelled} -> persist_cancellation(capability)
-      {:error, reason} -> release_with_error(capability, reason)
+      {:ok, :identity_recovered} ->
+        persist_metadata_progress(capability)
+
+      true ->
+        persist_cancellation(capability)
+
+      {:error, :cancelled} ->
+        persist_cancellation(capability)
+
+      {:error, %ForgeGitHub.Error{kind: kind}}
+      when kind in [:invalid_credential, :forbidden, :not_found] ->
+        pause_for_credential(capability, kind)
+
+      {:error, %ForgeGitHub.Error{} = error} ->
+        release_with_provider_error(capability, error)
+
+      {:error, reason}
+      when reason in [
+             :invalid_credential,
+             :credential_changed,
+             :credential_service_unavailable,
+             :not_found,
+             :forbidden
+           ] ->
+        pause_for_credential(capability, reason)
+
+      {:error, reason} ->
+        release_with_error(capability, reason)
     end
   rescue
     _error in [Turso.Error, DBConnection.ConnectionError] ->
       release_with_error(capability, :persistence_unavailable)
+  end
+
+  defp stage_lfs(item, run, options) do
+    transfer = fn repository, scan, cursor ->
+      lfs_transfer_checkout(item, repository, scan, cursor, options)
+    end
+
+    authorize = fn -> authorize_lfs(item.id, item.lease_owner, options.lease_seconds) end
+
+    case LFSImporter.advance(item, run, transfer, authorize, options.lfs_options) do
+      {:complete, checkpoint} -> {:ok, {:complete, checkpoint}}
+      {:incomplete, checkpoint} -> {:ok, {:incomplete, checkpoint}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp persist_lfs_result(item, {:complete, checkpoint}),
+    do: persist_ready_to_publish(item, checkpoint)
+
+  defp persist_lfs_result(item, {:incomplete, checkpoint}),
+    do: persist_lfs_progress(item, checkpoint)
+
+  defp lfs_transfer_checkout(item, repository, scan, cursor, options) do
+    reference = make_ref()
+    parent = self()
+    [remote_owner, remote_repository] = String.split(item.source_full_name, "/", parts: 2)
+
+    checkout =
+      with {:ok, %{actor: actor, run: run, item: current}} <-
+             current_context(item.id, item.lease_owner) do
+        CredentialProvider.checkout(
+          %{actor: actor, run: run, capability: current},
+          fn credential, metadata ->
+            result =
+              TransferCoordinator.process_page(
+                repository,
+                scan,
+                :inbound,
+                credential,
+                remote_owner,
+                remote_repository,
+                cursor,
+                Keyword.merge(options.lfs_transfer_options,
+                  gate_key: metadata.gate_key,
+                  authorize: fn ->
+                    authorize_lfs(item.id, item.lease_owner, options.lease_seconds)
+                  end
+                )
+              )
+
+            send(parent, {reference, result})
+            credential_callback_result(result)
+          end,
+          credential_options(options)
+        )
+      end
+
+    receive_metadata_result(checkout, reference)
+  end
+
+  defp authorize_lfs(item_id, owner, lease_seconds) do
+    with {:ok, _context} <- current_context(item_id, owner),
+         :ok <- heartbeat(item_id, owner, lease_seconds) do
+      :ok
+    else
+      {:error, reason} -> {:error, reason}
+      :error -> {:error, :lost_lease}
+    end
   end
 
   defp metadata_checkout(_actor, _run, item, callback, options) do
@@ -278,7 +373,7 @@ defmodule ForgeImports.RepositoryWorker do
     end
   end
 
-  defp persist_ready_to_publish(item) do
+  defp persist_ready_to_publish(item, checkpoint) do
     now = DateTime.utc_now(:second)
 
     query =
@@ -295,12 +390,41 @@ defmodule ForgeImports.RepositoryWorker do
              lease_expires_at: nil,
              next_attempt_at: nil,
              wait_reason: nil,
+             checkpoint: checkpoint,
              updated_at: now
            ],
            inc: [lock_version: 1]
          ) do
       {1, _rows} -> {:ok, Repo.get!(RepositoryItem, item.id)}
       {0, _rows} -> {:error, :lost_lease}
+    end
+  end
+
+  defp persist_lfs_progress(item, checkpoint) do
+    now = DateTime.utc_now(:second)
+
+    query =
+      from candidate in RepositoryItem,
+        where:
+          candidate.id == ^item.id and candidate.lock_version == ^item.lock_version and
+            candidate.lease_owner == ^item.lease_owner and candidate.lease_expires_at > ^now and
+            candidate.state == :staging_metadata and is_nil(candidate.cleanup_state)
+
+    case Repo.update_all(query,
+           set: [
+             checkpoint: checkpoint,
+             lease_owner: nil,
+             lease_expires_at: nil,
+             next_attempt_at: now,
+             wait_reason: nil,
+             failure_kind: nil,
+             failure_detail: nil,
+             updated_at: now
+           ],
+           inc: [lock_version: 1]
+         ) do
+      {1, _} -> {:ok, Repo.get!(RepositoryItem, item.id)}
+      {0, _} -> {:error, :lost_lease}
     end
   end
 
@@ -1014,6 +1138,9 @@ defmodule ForgeImports.RepositoryWorker do
   defp credential_callback_result({:error, :invalid_credential}),
     do: {:error, :invalid_credential}
 
+  defp credential_callback_result({:error, %ForgeGitHub.Error{kind: :invalid_credential}}),
+    do: {:error, :invalid_credential}
+
   defp credential_callback_result(_result), do: :ok
 
   defp normalize_app_credential_result(
@@ -1268,7 +1395,6 @@ defmodule ForgeImports.RepositoryWorker do
 
   defp scan_warnings(scan) do
     []
-    |> maybe_warning(scan.lfs?, "unsupported_git_lfs")
     |> maybe_warning(scan.submodules?, "unsupported_submodules")
     |> maybe_warning(scan.truncated?, "unsupported_scan_truncated")
     |> Enum.reverse()
@@ -1277,7 +1403,6 @@ defmodule ForgeImports.RepositoryWorker do
   defp maybe_warning(warnings, true, classification), do: [classification | warnings]
   defp maybe_warning(warnings, false, _classification), do: warnings
 
-  defp warning_summary("unsupported_git_lfs"), do: "Git LFS objects are not imported"
   defp warning_summary("unsupported_submodules"), do: "Git submodules are not imported"
 
   defp warning_summary("unsupported_scan_truncated"),
@@ -1462,7 +1587,9 @@ defmodule ForgeImports.RepositoryWorker do
     RepositoryItem
     |> where(
       [item],
-      item.id == ^item_id and item.lease_owner == ^owner and item.state == :staging_git
+      item.id == ^item_id and item.lease_owner == ^owner and
+        item.state in [:staging_git, :git_staged, :staging_metadata] and
+        is_nil(item.cleanup_state)
     )
     |> maybe_lock()
     |> Repo.one()
@@ -1508,9 +1635,9 @@ defmodule ForgeImports.RepositoryWorker do
     |> where(
       [item],
       item.id == ^capability.id and item.import_run_id == ^capability.import_run_id and
-        item.lock_version == ^capability.lock_version and
         item.lease_owner == ^capability.lease_owner and
-        item.state in [:staging_git, :git_staged, :staging_metadata]
+        item.state in [:staging_git, :git_staged, :staging_metadata] and
+        is_nil(item.cleanup_state)
     )
     |> maybe_lock()
     |> Repo.one()
@@ -1734,6 +1861,14 @@ defmodule ForgeImports.RepositoryWorker do
     end
   end
 
+  defp release_with_provider_error(capability, %ForgeGitHub.Error{} = error) do
+    case persist_retry_backoff(capability, error.kind, error.retry_at) do
+      :ok -> {:error, error.kind}
+      {:error, :lost_lease} -> {:error, :lost_lease}
+      {:error, :persistence_unavailable} -> {:error, :persistence_unavailable}
+    end
+  end
+
   defp release_owned_capability(capability) do
     case Repo.get_by(RepositoryItem, id: capability.id, lease_owner: capability.lease_owner) do
       %RepositoryItem{} = current -> OperationLease.release(RepositoryItem, current)
@@ -1743,16 +1878,17 @@ defmodule ForgeImports.RepositoryWorker do
     _error in [Turso.Error, DBConnection.ConnectionError] -> {:error, :lost_lease}
   end
 
-  defp persist_retry_backoff(capability, classification) do
+  defp persist_retry_backoff(capability, classification, retry_at \\ nil) do
     transaction = fn ->
       Repo.transaction(fn ->
         with %ImportRun{} = run <- locked_run(capability.import_run_id),
              %RepositoryItem{} = item <- locked_error_item(capability),
              now <- DateTime.utc_now(:second),
              true <- live_lease?(item, now),
+             next_attempt_at <- provider_retry_at(retry_at, now),
              {:ok, _released} <-
                OperationLease.update_owned(RepositoryItem, item,
-                 next_attempt_at: DateTime.add(now, @retry_backoff_seconds, :second),
+                 next_attempt_at: next_attempt_at,
                  failure_kind: Atom.to_string(classification),
                  failure_detail: nil
                ),
@@ -1776,6 +1912,14 @@ defmodule ForgeImports.RepositoryWorker do
     _error in [Turso.Error, DBConnection.ConnectionError] ->
       {:error, :persistence_unavailable}
   end
+
+  defp provider_retry_at(%DateTime{} = retry_at, now) do
+    retry_at = DateTime.truncate(retry_at, :second)
+    if DateTime.compare(retry_at, now) == :gt, do: retry_at, else: now
+  end
+
+  defp provider_retry_at(_retry_at, now),
+    do: DateTime.add(now, @retry_backoff_seconds, :second)
 
   defp bump_run_after_retry(%ImportRun{state: state}, _now)
        when state in [:completed, :completed_with_warnings, :canceled, :failed],
@@ -1837,7 +1981,7 @@ defmodule ForgeImports.RepositoryWorker do
     allowed =
       if @allow_test_options,
         do:
-          ~w(owner lease_seconds keyring remote remote_options scan_options persistence_hook client client_options token_broker token_scope)a,
+          ~w(owner lease_seconds keyring remote remote_options scan_options lfs_options lfs_transfer_options persistence_hook client client_options token_broker token_scope)a,
         else: ~w(owner lease_seconds)a
 
     cond do
@@ -1861,6 +2005,8 @@ defmodule ForgeImports.RepositoryWorker do
     remote = Keyword.get(opts, :remote, Remote)
     remote_options = Keyword.get(opts, :remote_options, [])
     scan_options = Keyword.get(opts, :scan_options, [])
+    lfs_options = Keyword.get(opts, :lfs_options, [])
+    lfs_transfer_options = Keyword.get(opts, :lfs_transfer_options, [])
     persistence_hook = Keyword.get(opts, :persistence_hook)
     keyring = Keyword.get(opts, :keyring, Fornacast.Config.github_credential_keyring())
     client = Keyword.get(opts, :client, Client)
@@ -1874,6 +2020,9 @@ defmodule ForgeImports.RepositoryWorker do
          function_exported?(remote, :refresh, 3) and
          function_exported?(remote, :cleanup_evidence, 1) and Keyword.keyword?(remote_options) and
          Keyword.keyword?(scan_options) and
+         Keyword.keyword?(lfs_options) and
+         Keyword.keyword?(lfs_transfer_options) and
+         Keyword.keys(lfs_transfer_options) -- [:callbacks] == [] and
          (is_nil(persistence_hook) or is_function(persistence_hook, 0)) and
          not Keyword.has_key?(remote_options, :cancel?) and
          not Keyword.has_key?(remote_options, :heartbeat) and
@@ -1887,6 +2036,8 @@ defmodule ForgeImports.RepositoryWorker do
          remote: remote,
          remote_options: remote_options,
          scan_options: scan_options,
+         lfs_options: lfs_options,
+         lfs_transfer_options: lfs_transfer_options,
          persistence_hook: persistence_hook,
          keyring: keyring,
          client: client,
@@ -1960,6 +2111,14 @@ defmodule ForgeImports.RepositoryWorker do
               :ambiguous_staging,
               :unsafe_cleanup_state,
               :invalid_remote_result,
+              :object_missing,
+              :integrity_mismatch,
+              :action_expired,
+              :invalid_lfs_response,
+              :unsafe_action_url,
+              :unsafe_redirect,
+              :local_storage,
+              :request_gate_busy,
               :persistence_unavailable
             ],
        do: reason

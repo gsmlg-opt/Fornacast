@@ -329,7 +329,7 @@ defmodule ForgeGitHub.ReleaseClientTest do
     end
   end
 
-  test "accepts bounded installation and one-time import gates" do
+  test "accepts bounded installation, one-time import, and saved credential read gates" do
     read_stub = stub_name()
 
     Req.Test.expect(read_stub, fn conn -> Req.Test.json(conn, release_json(41)) end)
@@ -353,6 +353,18 @@ defmodule ForgeGitHub.ReleaseClientTest do
                "widgets",
                nil,
                client_opts(page_stub, {:one_time_run, 7})
+             )
+
+    saved_stub = stub_name()
+    Req.Test.expect(saved_stub, fn conn -> Req.Test.json(conn, release_json(41)) end)
+
+    assert {:ok, %{"id" => 41}} =
+             ReleaseClient.get_release(
+               "saved_token",
+               "acme",
+               "widgets",
+               41,
+               client_opts(saved_stub, {:saved_credential, 8})
              )
 
     assert {:error, %Error{kind: :invalid_request}} =
@@ -414,7 +426,7 @@ defmodule ForgeGitHub.ReleaseClientTest do
                client_opts(stub_name())
              )
 
-    for gate_key <- [nil, {:saved_credential, 1}, {:github_app, 1}, {:github_installation, 0}] do
+    for gate_key <- [nil, {:github_app, 1}, {:github_installation, 0}, {:saved_credential, 0}] do
       assert {:error, %Error{kind: :invalid_request}} =
                ReleaseClient.get_release(
                  "installation_token",

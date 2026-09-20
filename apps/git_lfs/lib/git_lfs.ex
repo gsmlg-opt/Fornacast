@@ -321,11 +321,14 @@ defmodule GitLFS do
   end
 
   defp live_repository(repository_id, generation) do
+    # Internal import workers stage bytes before publication. Public transfers
+    # still require a ready repository through TransferToken and Fornacast.Access.
     Repository
     |> where(
       [repository],
       repository.id == ^repository_id and repository.generation == ^generation and
-        repository.lifecycle in [:ready, :synchronizing] and is_nil(repository.deleted_at)
+        repository.lifecycle in [:ready, :synchronizing, :importing] and
+        is_nil(repository.deleted_at)
     )
     |> Repo.one()
   end

@@ -697,7 +697,8 @@ defmodule GitLFS.PointerScanner do
     |> where(
       [repository],
       repository.id == ^id and repository.generation == ^generation and
-        repository.lifecycle in [:ready, :synchronizing] and is_nil(repository.deleted_at)
+        repository.lifecycle in [:ready, :synchronizing, :importing] and
+        is_nil(repository.deleted_at)
     )
     |> lock("FOR UPDATE")
     |> Repo.one()
@@ -715,7 +716,8 @@ defmodule GitLFS.PointerScanner do
     |> where(
       [repository],
       repository.id == ^repository_id and repository.generation == ^generation and
-        repository.lifecycle in [:ready, :synchronizing] and is_nil(repository.deleted_at)
+        repository.lifecycle in [:ready, :synchronizing, :importing] and
+        is_nil(repository.deleted_at)
     )
     |> lock("FOR UPDATE")
     |> Repo.one()
@@ -731,7 +733,8 @@ defmodule GitLFS.PointerScanner do
     |> where(
       [repository],
       repository.id == ^id and repository.generation == ^generation and
-        repository.lifecycle in [:ready, :synchronizing] and is_nil(repository.deleted_at)
+        repository.lifecycle in [:ready, :synchronizing, :importing] and
+        is_nil(repository.deleted_at)
     )
     |> Repo.one()
     |> case do

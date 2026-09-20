@@ -4,6 +4,10 @@
 
 **Status:** Approved
 
+**2026-09-20 LFS extension:** The historical exclusion of LFS object bytes below
+is superseded by the approved [GitHub import LFS design](2026-09-20-github-import-lfs-design.md).
+New one-time imports must stage and verify reachable LFS objects before publication.
+
 ## Goal
 
 Add a web-managed, one-time migration workflow from GitHub.com into Fornacast.

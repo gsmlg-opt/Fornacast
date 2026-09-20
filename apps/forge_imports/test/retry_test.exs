@@ -494,14 +494,21 @@ defmodule ForgeImports.RetryTest do
       |> Repo.transaction()
 
     staged_path = ForgeRepos.absolute_storage_path(shadow)
+    File.mkdir_p!(Path.dirname(staged_path))
+    assert {:ok, ^staged_path} = GitCore.init_bare(staged_path)
+    File.chmod!(staged_path, 0o700)
 
-    checkpoint = %{"git_staged" => true, "unsupported_scan" => "complete"}
+    checkpoint =
+      Map.merge(
+        %{"git_staged" => true, "unsupported_scan" => "complete"},
+        lfs_completion_checkpoint!(shadow, item)
+      )
 
     source_git = %{
-      "empty" => false,
+      "empty" => true,
       "default_branch" => "main",
-      "refs" => 2,
-      "bytes" => 128,
+      "refs" => 0,
+      "bytes" => 0,
       "lfs_detected" => false,
       "submodules_detected" => false,
       "scan_truncated" => false
@@ -549,6 +556,28 @@ defmodule ForgeImports.RetryTest do
     end
 
     item
+  end
+
+  defp lfs_completion_checkpoint!(shadow, item) do
+    {:ok, scan} =
+      GitLFS.PointerScanner.begin_scan(
+        shadow,
+        "retry-fixture:#{item.id}",
+        []
+      )
+
+    {:ok, published} = GitLFS.PointerScanner.publish_scan(scan)
+
+    %{
+      "lfs_import" => %{
+        "status" => "complete",
+        "repository_generation" => shadow.generation,
+        "scan_id" => published.id,
+        "scan_key" => published.scan_key,
+        "baseline_fingerprint" => published.baseline_fingerprint,
+        "object_cursor" => nil
+      }
+    }
   end
 
   defp saved_source(credential, identity) do

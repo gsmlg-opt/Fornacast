@@ -31,6 +31,7 @@ defmodule ForgeImports.MixProject do
       {:forge_releases, in_umbrella: true},
       {:forge_repos, in_umbrella: true},
       {:git_core, in_umbrella: true},
+      {:git_lfs, in_umbrella: true},
       {:ecto, "~> 3.14"},
       {:req, "~> 0.7"}
     ]

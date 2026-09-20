@@ -720,7 +720,7 @@ defmodule ForgeGitHub.Client do
   defp installation_gate?(_opts), do: false
 
   defp metadata_gate?(opts, kind, :release_metadata) when kind in [:read, :page],
-    do: installation_gate?(opts) or one_time_run_gate?(opts)
+    do: installation_gate?(opts) or one_time_run_gate?(opts) or saved_credential_gate?(opts)
 
   defp metadata_gate?(opts, _kind, _profile), do: installation_gate?(opts)
 
@@ -734,6 +734,17 @@ defmodule ForgeGitHub.Client do
   end
 
   defp one_time_run_gate?(_opts), do: false
+
+  defp saved_credential_gate?(opts) when is_list(opts) do
+    Keyword.keyword?(opts) and
+      match?(
+        {:ok, {:saved_credential, id}}
+        when is_integer(id) and id in 1..9_223_372_036_854_775_807,
+        Keyword.fetch(opts, :gate_key)
+      )
+  end
+
+  defp saved_credential_gate?(_opts), do: false
 
   defp with_request_gate(pat, opts, fun) do
     with_request_gate(pat, opts, [], fun)

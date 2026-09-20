@@ -867,7 +867,7 @@ defmodule ForgeImports.RepositoryPublisher do
         {:ok, :queued}
 
       hidden? and staged? and valid_git_proof?(item) ->
-        if terminal_metadata?(item.id) and
+        if ForgeImports.GitHub.LFSImporter.complete?(item) and terminal_metadata?(item.id) and
              ForgeImports.GitHub.MetadataImporter.validate_pull_issue_identities(item) == :ok,
            do: {:ok, :ready_to_publish},
            else: {:ok, :git_staged}

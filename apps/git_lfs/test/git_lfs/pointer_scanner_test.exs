@@ -28,6 +28,25 @@ defmodule GitLFS.PointerScannerTest do
     %{repository: repository}
   end
 
+  test "hidden import scans can finish without making the repository public", %{
+    repository: repository
+  } do
+    repository =
+      repository
+      |> Ecto.Changeset.change(lifecycle: :importing)
+      |> Repo.update!()
+
+    assert {:ok, %Scan{state: :complete} = scan} =
+             PointerScanner.begin_scan(repository, "import-empty", [])
+
+    assert {:ok, %Scan{state: :complete}} = PointerScanner.resume_scan(repository, "import-empty")
+    assert {:ok, %Scan{state: :published}} = PointerScanner.publish_scan(scan)
+    assert Repo.get!(ForgeRepos.Repository, repository.id).lifecycle == :importing
+
+    stale = %{repository | generation: repository.generation + 1}
+    assert {:error, :stale_repository} = PointerScanner.begin_scan(stale, "stale-import", [])
+  end
+
   test "seeds branch and tag targets and reclaims an expired bounded lease", %{
     repository: repository
   } do
