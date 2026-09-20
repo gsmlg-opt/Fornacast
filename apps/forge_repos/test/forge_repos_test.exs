@@ -13,29 +13,39 @@ defmodule ForgeReposTest do
 
   test "repository slugs are normalized and validated" do
     assert Repository.normalize_slug("Demo Repo.git") == "demo-repo"
-    assert Repository.canonical_slug?("demo")
-    assert Repository.canonical_slug?(String.duplicate("a", 63))
+    assert Repository.normalize_slug(".GitHub") == ".github"
+
+    for canonical <- [
+          "demo",
+          ".github",
+          "-leading",
+          "_leading",
+          "trailing-",
+          "trailing_",
+          "trailing.",
+          String.duplicate("a", 100)
+        ] do
+      assert Repository.canonical_slug?(canonical)
+    end
 
     for noncanonical <- [
           "Demo",
-          "demo-",
           "demo.git",
-          "demo.",
           ".",
           "..",
-          String.duplicate("a", 64)
+          String.duplicate("a", 101)
         ] do
       refute Repository.canonical_slug?(noncanonical)
     end
 
     changeset =
       Repository.create_changeset(
-        %Repository{owner_user_id: 1, storage_path: "@hashed/aa/bb/demo.git"},
-        %{name: "Demo", slug: "Demo Repo", visibility: :private, default_branch: "main"}
+        %Repository{owner_user_id: 1, storage_path: "@hashed/aa/bb/github.git"},
+        %{name: ".github", slug: ".github", visibility: :private, default_branch: "main"}
       )
 
     assert changeset.valid?
-    assert Ecto.Changeset.get_change(changeset, :slug) == "demo-repo"
+    assert Ecto.Changeset.get_change(changeset, :slug) == ".github"
   end
 
   test "repository changesets reject NUL in every stored API string field" do

@@ -1025,7 +1025,7 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
              put_in(
                attempt_attrs,
                [:decision, "slug"],
-               String.duplicate("a", 63)
+               String.duplicate("a", 100)
              )
            ).valid?
 
@@ -1067,8 +1067,7 @@ defmodule ForgeImports.ImportPersistenceHardeningTest do
           Map.put(valid_replace_decision, "slug", "."),
           Map.put(valid_replace_decision, "slug", ".."),
           Map.put(valid_replace_decision, "slug", "demo.git"),
-          Map.put(valid_replace_decision, "slug", "demo."),
-          Map.put(valid_replace_decision, "slug", String.duplicate("a", 64)),
+          Map.put(valid_replace_decision, "slug", String.duplicate("a", 101)),
           Map.put(valid_replace_decision, "replacement_updated_at", "not-a-time"),
           Map.put(valid_replace_decision, "replacement_write_version", -1),
           Map.put(valid_replace_decision, "replacement_last_pushed_at", "not-a-time"),

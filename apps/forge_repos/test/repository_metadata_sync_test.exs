@@ -55,6 +55,13 @@ defmodule ForgeRepos.RepositoryMetadataSyncTest do
              )
   end
 
+  test "accepts a GitHub-compatible leading-dot remote repository name", c do
+    input = put_in(sync_input(c.repository), [:remote, :name], ".github")
+
+    assert {:ok, %{name: ".github", slug: ".github"}} =
+             ForgeRepos.sync_github_repository_metadata(input)
+  end
+
   test "rejects a changed expected preimage without mutation or outbox event", c do
     input = put_in(sync_input(c.repository), [:expected, :name], "Changed locally")
 

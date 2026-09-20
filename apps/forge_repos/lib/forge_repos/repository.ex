@@ -5,7 +5,7 @@ defmodule ForgeRepos.Repository do
 
   @visibilities [:private, :public]
   @lifecycles [:importing, :synchronizing, :ready, :tombstoned]
-  @slug_regex ~r/^[a-z0-9][a-z0-9._-]{0,62}$/
+  @slug_regex ~r/^[a-z0-9._-]{1,100}$/
   @api_fields [
     :slug,
     :name,
@@ -273,7 +273,6 @@ defmodule ForgeRepos.Repository do
     |> String.downcase()
     |> String.replace_suffix(".git", "")
     |> String.replace(~r/[^a-z0-9._-]+/, "-")
-    |> String.trim("-")
   end
 
   def normalize_slug(_), do: ""
@@ -281,7 +280,7 @@ defmodule ForgeRepos.Repository do
   def canonical_slug?(slug) when is_binary(slug) do
     String.valid?(slug) and slug == normalize_slug(slug) and Regex.match?(@slug_regex, slug) and
       slug not in [".", ".."] and
-      not String.ends_with?(slug, ".") and not String.ends_with?(slug, ".git")
+      not String.ends_with?(slug, ".git")
   end
 
   def canonical_slug?(_slug), do: false
@@ -292,7 +291,6 @@ defmodule ForgeRepos.Repository do
     |> validate_change(:slug, fn :slug, slug ->
       cond do
         slug in [".", ".."] -> [slug: "is reserved"]
-        String.ends_with?(slug, ".") -> [slug: "must not end with a dot"]
         String.ends_with?(slug, ".git") -> [slug: "must not end with .git"]
         true -> []
       end

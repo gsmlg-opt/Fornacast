@@ -172,7 +172,7 @@ defmodule ForgeImports.ImportAttempt do
     do: Map.keys(decision) |> Enum.sort() == Enum.sort(expected)
 
   defp valid_slug?(slug) do
-    ForgeImports.SafeValue.github_source_text?(slug, 63, required?: true) and
+    ForgeImports.SafeValue.github_source_text?(slug, 100, required?: true) and
       Repository.canonical_slug?(slug)
   end
 

@@ -628,6 +628,26 @@ defmodule FornacastAPI.RepositoriesTest do
     end
   end
 
+  test "personal creation and lookup accept a GitHub-compatible leading-dot name", %{
+    alice: alice
+  } do
+    {_api_key, secret} = pat(alice, ["public_repo"])
+
+    created =
+      api_conn(secret: secret, version: "2026-03-10")
+      |> post_json("/api/v3/user/repos", %{"name" => ".github", "auto_init" => false})
+
+    body = json_response(created, 201)
+    assert body["name"] == ".github"
+    assert body["full_name"] == "alice/.github"
+    assert body["html_url"] == "http://localhost:4890/alice/.github"
+    assert body["clone_url"] == "http://localhost:4890/alice/.github.git"
+    assert body["ssh_url"] =~ "alice/.github.git"
+
+    shown = api_conn(version: "2026-03-10") |> get("/api/v3/repos/alice/.github")
+    assert json_response(shown, 200)["id"] == body["id"]
+  end
+
   test "private and organization creation require exact scopes and namespace permission before body admission",
        %{alice: alice} do
     organization = organization(alice, "acme")

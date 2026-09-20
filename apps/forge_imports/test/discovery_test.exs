@@ -851,6 +851,40 @@ defmodule ForgeImports.DiscoveryTest do
     assert normalized.wait_reason == "repository_slug_normalized"
   end
 
+  test "repository discovery preserves a GitHub-compatible leading-dot destination slug", %{
+    actor: actor
+  } do
+    account = saved_account_fixture(actor)
+
+    assert {:ok, %RunView{repositories: [item]}} =
+             ForgeImports.create_repository_discovery(
+               actor,
+               %{
+                 source: "duskmoon-dev/.github",
+                 credential_source: :saved,
+                 github_identity_id: account.identity_id
+               },
+               request_metadata(),
+               dispatch: :inline,
+               client: __MODULE__.RepositoryClient,
+               client_options: [
+                 repository:
+                   repository_fixture(
+                     id: 91_010,
+                     owner_id: 81_010,
+                     owner_login: "duskmoon-dev",
+                     name: ".github",
+                     full_name: "duskmoon-dev/.github",
+                     html_url: "https://github.com/duskmoon-dev/.github"
+                   )
+               ]
+             )
+
+    assert item.destination_slug == ".github"
+    assert item.state == :queued
+    assert item.wait_reason == nil
+  end
+
   test "actor-scoped reads and plan updates mask foreign and disabled users", %{actor: actor} do
     account = saved_account_fixture(actor)
 
