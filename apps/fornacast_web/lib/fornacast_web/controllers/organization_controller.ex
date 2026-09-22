@@ -59,7 +59,14 @@ defmodule FornacastWeb.OrganizationController do
            per_page: 100
          ) do
       {:ok, %Fornacast.Page{entries: repository_views}} ->
-        render_namespace(conn, owner, repository_views)
+        can_manage_organization =
+          match?(%Organization{}, account) and
+            match?(
+              {:ok, _},
+              ForgeAccounts.fetch_manageable_organization(current_user, account.id)
+            )
+
+        render_namespace(conn, owner, repository_views, can_manage_organization)
 
       {:error, _masked} ->
         render_namespace_not_found(conn)
@@ -81,10 +88,11 @@ defmodule FornacastWeb.OrganizationController do
     )
   end
 
-  defp render_namespace(conn, owner, repository_views) do
+  defp render_namespace(conn, owner, repository_views, can_manage_organization) do
     rendered =
       OrganizationHTML.show(%{
         owner: owner,
+        can_manage_organization: can_manage_organization,
         description: namespace_description(owner),
         repository_views: repository_views,
         __changed__: nil

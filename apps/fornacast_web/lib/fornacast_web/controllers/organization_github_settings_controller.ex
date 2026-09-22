@@ -1,7 +1,11 @@
 defmodule FornacastWeb.OrganizationGitHubSettingsController do
   use FornacastWeb, :controller
 
-  alias FornacastWeb.{OrganizationGitHubSettingsHTML, RequestMetadata}
+  alias FornacastWeb.{
+    OrganizationGitHubSettingsHTML,
+    OrganizationSettingsComponents,
+    RequestMetadata
+  }
 
   @callback_session_key :github_organization_installation
   @canonical_id ~r/\A[1-9][0-9]*\z/
@@ -12,29 +16,42 @@ defmodule FornacastWeb.OrganizationGitHubSettingsController do
   def index(conn, params), do: render_settings(conn, params, :index)
 
   def conflicts(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
-    with {:ok, organization} <- manageable_organization(actor, params),
-         {:ok, %{} = view} <-
-           organization_sync(conn).get_conflicts(
-             actor,
-             organization,
-             Map.take(params, ["repository", "resource", "type"])
-           ),
-         {:ok, view} <- OrganizationGitHubSettingsHTML.normalize_view(organization, view) do
-      rendered =
-        OrganizationGitHubSettingsHTML.conflicts(%{
-          organization: organization,
-          view: view,
-          __changed__: nil
-        })
+    case manageable_organization(actor, params) do
+      {:ok, organization} ->
+        case organization_sync(conn).get_conflicts(
+               actor,
+               organization,
+               Map.take(params, ["repository", "resource", "type"])
+             ) do
+          {:ok, %{} = view} ->
+            case OrganizationGitHubSettingsHTML.normalize_view(organization, view) do
+              {:ok, view} ->
+                rendered =
+                  OrganizationGitHubSettingsHTML.conflicts(%{
+                    organization: organization,
+                    view: view,
+                    __changed__: nil
+                  })
 
-      page(
-        conn,
-        "#{organization.display_name || organization.username} GitHub settings",
-        rendered |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary()
-      )
-    else
-      {:error, reason} -> render_error(conn, reason)
-      _unexpected -> render_error(conn, :unavailable)
+                page(
+                  conn,
+                  "#{organization.display_name || organization.username} GitHub settings",
+                  rendered |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary()
+                )
+
+              {:error, reason} ->
+                render_authorized_error(conn, organization, reason)
+            end
+
+          {:error, reason} ->
+            render_authorized_error(conn, organization, reason)
+
+          _unexpected ->
+            render_authorized_error(conn, organization, :unavailable)
+        end
+
+      {:error, reason} ->
+        render_error(conn, reason)
     end
   end
 
@@ -163,22 +180,36 @@ defmodule FornacastWeb.OrganizationGitHubSettingsController do
          params,
          template
        ) do
-    with {:ok, organization} <- manageable_organization(actor, params),
-         {:ok, %{} = view} <- organization_sync(conn).get_settings(actor, organization),
-         {:ok, view} <- OrganizationGitHubSettingsHTML.normalize_view(organization, view) do
-      rendered =
-        apply(OrganizationGitHubSettingsHTML, template, [
-          %{organization: organization, view: view, __changed__: nil}
-        ])
+    case manageable_organization(actor, params) do
+      {:ok, organization} ->
+        case organization_sync(conn).get_settings(actor, organization) do
+          {:ok, %{} = view} ->
+            case OrganizationGitHubSettingsHTML.normalize_view(organization, view) do
+              {:ok, view} ->
+                rendered =
+                  apply(OrganizationGitHubSettingsHTML, template, [
+                    %{organization: organization, view: view, __changed__: nil}
+                  ])
 
-      page(
-        conn,
-        "#{organization.display_name || organization.username} GitHub settings",
-        rendered |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary()
-      )
-    else
-      {:error, reason} -> render_error(conn, reason)
-      _unexpected -> render_error(conn, :unavailable)
+                page(
+                  conn,
+                  "#{organization.display_name || organization.username} GitHub settings",
+                  rendered |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary()
+                )
+
+              {:error, reason} ->
+                render_authorized_error(conn, organization, reason)
+            end
+
+          {:error, reason} ->
+            render_authorized_error(conn, organization, reason)
+
+          _unexpected ->
+            render_authorized_error(conn, organization, :unavailable)
+        end
+
+      {:error, reason} ->
+        render_error(conn, reason)
     end
   end
 
@@ -361,6 +392,69 @@ defmodule FornacastWeb.OrganizationGitHubSettingsController do
     do: "/organizations/#{organization.username}/settings/github"
 
   defp conflicts_path(organization), do: settings_path(organization) <> "/conflicts"
+
+  defp render_authorized_error(conn, _organization, :invalid_callback),
+    do: render_error(conn, :invalid_callback)
+
+  defp render_authorized_error(conn, _organization, reason)
+       when reason in [:not_found, :forbidden],
+       do: render_error(conn, reason)
+
+  defp render_authorized_error(conn, organization, :invalid_request),
+    do:
+      render_layout_error(
+        conn,
+        organization,
+        :unprocessable_entity,
+        "GitHub organization settings parameters are invalid."
+      )
+
+  defp render_authorized_error(conn, organization, reason)
+       when reason in [:busy, :leased, :stale, :conflict],
+       do:
+         render_layout_error(
+           conn,
+           organization,
+           :conflict,
+           "GitHub organization sync changed or is busy. Refresh and try again."
+         )
+
+  defp render_authorized_error(conn, organization, :missing_permissions),
+    do:
+      render_layout_error(
+        conn,
+        organization,
+        :unprocessable_entity,
+        "GitHub App permissions are insufficient for the requested capabilities."
+      )
+
+  defp render_authorized_error(conn, organization, _reason),
+    do:
+      render_layout_error(
+        conn,
+        organization,
+        :service_unavailable,
+        "GitHub organization sync is temporarily unavailable."
+      )
+
+  defp render_layout_error(conn, organization, status, message) do
+    rendered =
+      OrganizationSettingsComponents.organization_settings_layout(%{
+        organization: organization,
+        active: :github,
+        inner_block: [
+          %{inner_block: fn _changed, _argument -> Phoenix.HTML.raw(error_panel(message)) end}
+        ],
+        __changed__: nil
+      })
+
+    conn
+    |> put_status(status)
+    |> page(
+      "#{organization.display_name || organization.username} GitHub settings",
+      rendered |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary()
+    )
+  end
 
   defp render_error(conn, :invalid_callback) do
     conn

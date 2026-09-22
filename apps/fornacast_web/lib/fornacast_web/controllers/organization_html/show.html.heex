@@ -1,4 +1,13 @@
-<p class="muted">{@description}</p>
+<div class="flex flex-wrap items-center justify-between gap-4">
+  <p class="muted">{@description}</p>
+  <.dm_link
+    :if={@can_manage_organization}
+    href={"/organizations/#{@owner.username}/settings"}
+    class="btn btn-outline"
+  >
+    Settings
+  </.dm_link>
+</div>
 <table class="data-table">
   <thead>
     <tr>

@@ -134,6 +134,35 @@ defmodule FornacastWeb.OrganizationControllerTest do
     assert_private_no_store(viewer_conn)
   end
 
+  test "organization settings entry follows canonical management access", %{
+    owner: owner,
+    viewer: member
+  } do
+    {:ok, organization} =
+      ForgeAccounts.create_organization(owner, %{
+        username: "settings-#{Base.encode16(:crypto.strong_rand_bytes(5), case: :lower)}",
+        display_name: "Settings organization"
+      })
+
+    {:ok, _} = ForgeAccounts.add_organization_member(organization, member)
+    outsider = user_fixture("outsider")
+    admin = user_fixture("admin") |> Ecto.Changeset.change(role: :admin) |> Repo.update!()
+    link = ~s(href="/organizations/#{organization.username}/settings")
+
+    for actor <- [owner, admin] do
+      assert request_conn(actor) |> get("/#{organization.username}") |> html_response(200) =~ link
+    end
+
+    for actor <- [member, outsider] do
+      refute request_conn(actor) |> get("/#{organization.username}") |> html_response(200) =~ link
+    end
+
+    assert build_conn() |> get("/#{organization.username}") |> redirected_to() == "/login"
+
+    refute request_conn(owner) |> get("/#{owner.username}") |> html_response(200) =~
+             ~s(href="/organizations/#{owner.username}/settings")
+  end
+
   defp request_conn(user) do
     build_conn()
     |> Plug.Test.init_test_session(user_id: user.id)

@@ -57,6 +57,7 @@ defmodule FornacastWeb.Router do
     pipe_through [:private_no_store, :browser, :authenticated]
 
     get "/organizations/:organization/settings", OrganizationSettingsController, :index
+    patch "/organizations/:organization_slug/settings", OrganizationSettingsController, :update
 
     get "/organizations/:organization/settings/github",
         OrganizationGitHubSettingsController,

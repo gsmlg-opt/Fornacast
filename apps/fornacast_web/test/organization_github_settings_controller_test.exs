@@ -154,12 +154,10 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
              Phoenix.Router.route_info(FornacastWeb.Router, "GET", "/acme", "localhost")
   end
 
-  test "organization owner opens canonical organization settings through one facade call", %{
+  test "organization owner opens canonical organization settings without a facade call", %{
     owner: owner,
     organization: organization
   } do
-    TestOrganizationSync.result(:get_settings, {:ok, settings_view(organization)})
-
     conn = request_conn(owner) |> get("/organizations/#{organization.username}/settings")
     html = html_response(conn, 200)
 
@@ -168,11 +166,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
     assert html =~ ~s(href="/organizations/#{organization.username}/settings/github")
     assert_private_no_store(conn)
 
-    assert [{:get_settings, [%User{id: actor_id}, %Organization{id: organization_id}]}] =
-             TestOrganizationSync.calls()
-
-    assert actor_id == owner.id
-    assert organization_id == organization.id
+    assert TestOrganizationSync.calls() == []
   end
 
   test "owner and site admin open GitHub settings through canonical organization authorization",
@@ -828,6 +822,49 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
 
       assert html =~ message
       refute html =~ inspect(reason)
+      assert [{:get_settings, [_actor, _organization]}] = TestOrganizationSync.calls()
+      assert_private_no_store(conn)
+    end
+  end
+
+  test "authorized unavailable GitHub settings retains the organization settings navigation", %{
+    owner: owner,
+    organization: organization
+  } do
+    TestOrganizationSync.result(:get_settings, {:error, :provider_unavailable})
+
+    conn = request_conn(owner) |> get(github_settings_path(organization))
+    html = html_response(conn, 503)
+
+    assert html =~ "temporarily unavailable"
+    assert html =~ "data-organization-settings-layout"
+    assert html =~ "Acme Engineering"
+    assert html =~ "@#{organization.username}"
+    assert html =~ ~s(href="/organizations/#{organization.username}/settings")
+
+    assert html =~
+             ~r/href="\/organizations\/[^\"]+\/settings\/github"[^>]*aria-current="page"/
+
+    assert [{:get_settings, [_actor, _organization]}] = TestOrganizationSync.calls()
+    assert_private_no_store(conn)
+  end
+
+  test "masked GitHub settings facade failures do not render organization details", %{
+    owner: owner,
+    organization: organization
+  } do
+    for reason <- [:forbidden, :not_found] do
+      TestOrganizationSync.reset()
+      TestOrganizationSync.result(:get_settings, {:error, reason})
+
+      conn = request_conn(owner) |> get(github_settings_path(organization))
+      html = html_response(conn, 404)
+      [main] = Regex.run(~r/<main\b[^>]*>(.*)<\/main>/s, html, capture: :all_but_first)
+
+      assert main =~ "Organization settings not found."
+      refute main =~ "data-organization-settings-layout"
+      refute main =~ "Acme Engineering"
+      refute main =~ "@#{organization.username}"
       assert [{:get_settings, [_actor, _organization]}] = TestOrganizationSync.calls()
       assert_private_no_store(conn)
     end

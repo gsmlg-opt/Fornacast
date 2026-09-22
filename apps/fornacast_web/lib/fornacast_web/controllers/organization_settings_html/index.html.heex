@@ -1,30 +1,63 @@
-<section
-  class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6"
-  data-organization-settings={@organization.id}
->
-  <header class="grid gap-2">
-    <p class="text-xs text-on-surface-variant">Organization administration</p>
-    <h2 class="text-2xl font-semibold">Organization settings</h2>
-    <p class="text-sm text-on-surface-variant">
-      Manage integrations and synchronization for {@organization.display_name ||
-        @organization.username}.
-    </p>
-  </header>
-
-  <.dm_card id="organization-github-settings" variant="bordered" shadow="sm" padding="lg">
-    <:title><span class="text-lg font-semibold">GitHub organization sync</span></:title>
-    <div class="grid gap-4">
+<.organization_settings_layout organization={@organization} active={:general}>
+  <section
+    class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6"
+    data-organization-settings={@organization.id}
+  >
+    <header class="grid gap-2">
+      <p class="text-xs text-on-surface-variant">Organization administration</p>
+      <h2 class="text-2xl font-semibold">General</h2>
       <p class="text-sm text-on-surface-variant">
-        Status: <span class="font-semibold">{sync_status(@view)}</span>
+        Manage this organization&apos;s public profile.
       </p>
-      <div>
-        <.dm_link
-          href={"/organizations/#{@organization.username}/settings/github"}
-          class="btn btn-primary"
-        >
-          Open GitHub settings
-        </.dm_link>
+    </header>
+
+    <.dm_alert :if={@flash} variant="success" role="status">
+      {@flash}
+    </.dm_alert>
+
+    <form
+      action={"/organizations/#{@organization.username}/settings"}
+      method="post"
+      class="grid gap-4"
+    >
+      <input type="hidden" name="_csrf_token" value={csrf_token()} />
+      <input type="hidden" name="_method" value="patch" />
+
+      <.dm_input
+        id="organization-name"
+        name="organization[name]"
+        label="Display name"
+        value={form_value(@form, "name")}
+        errors={profile_field_errors(@errors, "name")}
+        maxlength={120}
+        autofocus={focus_field(@errors) == "name"}
+      />
+
+      <.dm_textarea
+        id="organization-description"
+        name="organization[description]"
+        label="Description"
+        value={form_value(@form, "description")}
+        errors={profile_field_errors(@errors, "description")}
+        maxlength={500}
+        rows={5}
+        autofocus={focus_field(@errors) == "description"}
+      />
+
+      <div class="grid gap-1 text-sm text-on-surface-variant">
+        <span>Organization slug:
+        <strong class="text-on-surface">@{@organization.username}</strong></span>
+        <span>
+          Organization URL:
+          <.dm_link href={"/#{@organization.username}"} class="text-primary">
+            /{@organization.username}
+          </.dm_link>
+        </span>
       </div>
-    </div>
-  </.dm_card>
-</section>
+
+      <div>
+        <.dm_btn type="submit" variant="primary">Save changes</.dm_btn>
+      </div>
+    </form>
+  </section>
+</.organization_settings_layout>

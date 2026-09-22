@@ -3,6 +3,8 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTML do
 
   use FornacastWeb, :html
 
+  alias FornacastWeb.OrganizationSettingsComponents
+
   @max_repositories 100
   @max_operations 50
   @max_conflicts 50
