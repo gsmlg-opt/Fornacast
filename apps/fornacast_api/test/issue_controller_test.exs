@@ -885,6 +885,7 @@ defmodule FornacastAPI.IssueControllerTest do
     {_key, secret} = pat(alice, ["public_repo"])
     issue = issue(repository, alice, 1, :issue)
     pull = issue(repository, alice, 2, :pull_request)
+
     Repo.insert!(%PullRequest{
       issue_id: pull.id,
       repository_id: repository.id,
@@ -896,6 +897,7 @@ defmodule FornacastAPI.IssueControllerTest do
       mergeable: true,
       mergeable_state: :mergeable
     })
+
     comment = comment(issue, alice)
 
     for version <- @versions do

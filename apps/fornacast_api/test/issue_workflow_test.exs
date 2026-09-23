@@ -261,6 +261,7 @@ defmodule FornacastAPI.IssueWorkflowTest do
     {_key, secret} = pat(owner, ["public_repo"])
     ordinary = issue(repository, owner, 1, :issue)
     pull = issue(repository, owner, 2, :pull_request)
+
     Repo.insert!(%PullRequest{
       issue_id: pull.id,
       repository_id: repository.id,
