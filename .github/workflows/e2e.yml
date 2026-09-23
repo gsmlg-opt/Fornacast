@@ -58,7 +58,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Resolve published release version
         if: github.event_name == 'workflow_dispatch'
@@ -87,7 +87,7 @@ jobs:
 
       - name: Cache release dependencies
         if: github.event_name == 'pull_request'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             deps
@@ -471,7 +471,7 @@ jobs:
 
       - name: Upload release logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fornacast-e2e-logs
           path: |

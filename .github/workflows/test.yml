@@ -50,7 +50,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: |
@@ -67,7 +67,7 @@ jobs:
           otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache test dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             deps

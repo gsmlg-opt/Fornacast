@@ -34,7 +34,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.git_ref }}
           fetch-depth: 0
@@ -72,7 +72,7 @@ jobs:
           otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache release dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             deps
@@ -124,7 +124,7 @@ jobs:
           tar -C "$RUNNER_TEMP" -czf "artifacts/fornacast-${VERSION}-linux-x86_64.tar.gz" fornacast
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Commit release version
         env:
@@ -175,7 +175,7 @@ jobs:
 
       - name: Build and publish Docker image
         id: docker
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
