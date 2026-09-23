@@ -247,7 +247,7 @@ defmodule ForgeImports.OrganizationSync do
          {:ok, %OrganizationMirror{} = mirror} <- active_mirror(organization_id),
          {:ok, revoked} <- ForgeMirrors.transition_organization_mirror(actor, mirror, :revoked) do
       if is_integer(revoked.github_installation_id),
-        do: InstallationTokenBroker.revoke(revoked.github_installation_id)
+        do: InstallationTokenBroker.invalidate_unauthorized(revoked.github_installation_id)
 
       {:ok, revoked}
     end

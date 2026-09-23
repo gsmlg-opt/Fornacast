@@ -15,8 +15,6 @@ defmodule ForgeMirrors.InstallationIntents do
   alias Fornacast.Repo
 
   @max_intent_seconds 900
-  @proof_scan_limit 20
-
   def begin(actor, organization_id, state_digest, now, expires_at) do
     with {:ok, actor, organization} <- authorize(actor, organization_id),
          :ok <- validate_digest(state_digest),
@@ -114,13 +112,11 @@ defmodule ForgeMirrors.InstallationIntents do
                intent
                |> GitHubInstallationIntent.callback_changeset(installation_id, setup_action, now)
                |> Repo.update() do
-          case linked_proof_sender(callback_intent) do
-            nil ->
-              %{status: :pending_webhook, intent: callback_intent, mirror: lock_mirror(intent)}
-
-            sender_id ->
-              complete_intent(callback_intent, sender_id, now)
-          end
+          # The setup callback records provider provenance only.  A historical
+          # installation.created delivery is never current authorization for a
+          # new binding; completion must go through the live authorization
+          # boundary below.
+          %{status: :pending_webhook, intent: callback_intent, mirror: lock_mirror(intent)}
         else
           nil -> Repo.rollback(:invalid_installation)
           {:error, reason} -> Repo.rollback(reason)
@@ -141,27 +137,31 @@ defmodule ForgeMirrors.InstallationIntents do
   end
 
   defp complete_intent(intent, sender_github_user_id, now) do
-    actor = Repo.get(User, intent.actor_user_id)
-
-    if linked_sender?(actor, sender_github_user_id) do
-      installation = active_organization_installation(intent.github_installation_id)
-      mirror = lock_mirror(intent)
-
-      with %GitHubAppInstallation{} = installation <- installation,
-           %OrganizationMirror{state: :pending_installation} = mirror <- mirror,
-           true <- is_nil(mirror.github_installation_id) and is_nil(mirror.github_account_id),
-           {:ok, ready} <- bind_mirror(mirror, installation, now),
-           {:ok, completed} <-
-             intent
-             |> GitHubInstallationIntent.complete_changeset(now)
-             |> Repo.update() do
-        associate_buffered_deliveries(ready, installation.github_installation_id)
-        %{status: :ready, intent: completed, mirror: ready}
-      else
-        _invalid -> Repo.rollback(:installation_binding_conflict)
-      end
+    # Reload the actor and organization inside the same transaction that locks
+    # the intent and mirror.  The actor supplied when the intent began may have
+    # been demoted or removed from the organization meanwhile.
+    with %User{} = actor <- Repo.get(User, intent.actor_user_id),
+         {:ok, organization} <-
+           ForgeAccounts.fetch_manageable_organization(actor, intent.organization_id),
+         true <- organization.id == intent.organization_id,
+         true <- linked_sender?(actor, sender_github_user_id),
+         %GitHubAppInstallation{} = installation <-
+           active_organization_installation(intent.github_installation_id),
+         %OrganizationMirror{state: :pending_installation} = mirror <- lock_mirror(intent),
+         true <- is_nil(mirror.github_installation_id) and is_nil(mirror.github_account_id),
+         {:ok, ready} <- bind_mirror(mirror, installation, now),
+         {:ok, completed} <-
+           intent
+           |> GitHubInstallationIntent.complete_changeset(now)
+           |> Repo.update() do
+      associate_buffered_deliveries(ready, installation.github_installation_id)
+      %{status: :ready, intent: completed, mirror: ready}
     else
-      :unclaimed
+      {:error, :forbidden} -> :unclaimed
+      {:error, :not_found} -> :unclaimed
+      false -> :unclaimed
+      nil -> :unclaimed
+      _invalid -> Repo.rollback(:installation_binding_conflict)
     end
   end
 
@@ -195,50 +195,11 @@ defmodule ForgeMirrors.InstallationIntents do
     :ok
   end
 
-  defp linked_proof_sender(intent) do
-    actor = Repo.get(User, intent.actor_user_id)
-    linked = linked_github_identities(actor) |> MapSet.new(& &1.github_user_id)
-
-    MirrorWebhookDelivery
-    |> where(
-      [delivery],
-      delivery.installation_id == ^intent.github_installation_id and
-        delivery.event == "installation" and delivery.action == "created"
-    )
-    |> order_by([delivery], desc: delivery.received_at, desc: delivery.id)
-    |> limit(@proof_scan_limit)
-    |> Repo.all()
-    |> Enum.find_value(fn delivery ->
-      case proof_sender(delivery) do
-        sender_id when is_integer(sender_id) ->
-          if MapSet.member?(linked, sender_id), do: sender_id
-
-        _invalid ->
-          nil
-      end
-    end)
-  end
-
-  defp proof_sender(%MirrorWebhookDelivery{raw_payload: raw, installation_id: installation_id}) do
-    with {:ok, payload} when is_map(payload) <- JSON.decode(raw),
-         ^installation_id <- get_in(payload, ["installation", "id"]),
-         sender_id when is_integer(sender_id) and sender_id > 0 <-
-           get_in(payload, ["sender", "id"]) do
-      sender_id
-    else
-      _invalid -> nil
-    end
-  rescue
-    _exception -> nil
-  end
-
   defp linked_sender?(%User{} = actor, sender_github_user_id) do
     Enum.any?(linked_github_identities(actor), fn identity ->
       identity.github_user_id == sender_github_user_id
     end)
   end
-
-  defp linked_sender?(_actor, _sender_github_user_id), do: false
 
   defp linked_github_identities(%User{} = actor) do
     actor
@@ -248,8 +209,6 @@ defmodule ForgeMirrors.InstallationIntents do
       _identity -> false
     end)
   end
-
-  defp linked_github_identities(_actor), do: []
 
   defp active_organization_installation(installation_id) do
     Repo.get_by(GitHubAppInstallation,

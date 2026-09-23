@@ -45,6 +45,25 @@ Two-way GitHub organization mirroring uses a permanent mirror domain separate
 from the one-time bootstrap importer. GitHub wiki
 repositories and release asset binaries remain excluded from synchronization.
 
+Connections require a configured GitHub App with installation access for the
+target organization and an authenticated, linked GitHub user who currently
+owns that organization. Installation accessibility and organization-management
+authority are checked separately; repository permissions or a historical
+`installation.created` webhook do not authorize a new binding. The setup
+callback and webhook may arrive in either order, but binding rechecks the
+local organization owner/admin permission in its transaction.
+
+Disconnecting locally revokes the Fornacast mirror and fences its pending work,
+while retaining repositories, Git/LFS data, and recovery evidence. It only
+invalidates cached installation credentials, so a fresh authorized reconnect
+to an active installation can obtain a new token without restarting. A
+provider installation deletion is a separate terminal revocation and cannot
+be undone by reconnecting or by an old webhook.
+
+Live GitHub installation and OAuth acceptance remains an operator gate. Verify
+the App's configured user-authorization permissions, installation status, and
+organization-owner access against GitHub before enabling production mirroring.
+
 ## Architecture
 
 Fornacast is an Elixir **umbrella** released as a single OTP release named `fornacast`:

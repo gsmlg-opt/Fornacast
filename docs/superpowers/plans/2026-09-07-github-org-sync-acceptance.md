@@ -10,6 +10,21 @@ acceptance matrix, including a synchronized clone/checkout from GitHub.
 
 ## Requirement-by-requirement gates
 
+### Security and lifecycle follow-up (2026-09-23)
+
+- Historical `installation.created` deliveries no longer complete a setup
+  callback. They remain buffered provenance only; completion still requires the
+  live webhook path and reloaded local authorization.
+- Installation completion now reloads the actor and checks current
+  organization-management authority while the intent and mirror are locked.
+  Permission loss therefore leaves the intent unclaimed and performs no
+  bootstrap scheduling.
+- Local disconnect now invalidates installation-token cache state without
+  terminally adding the installation to the broker's provider-revoked set.
+  Provider deletion continues to use durable revocation and terminal broker
+  fencing. Focused acceptance and broker suites passed locally; live GitHub
+  user-authorization and reconnect acceptance remain unverified.
+
 ### PR16 reconciliation and operator foundations (2026-09-14)
 
 - Commit `ed6b551` makes `last_reconciled_at` a proof of the complete durable
