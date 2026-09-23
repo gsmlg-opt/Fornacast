@@ -4,6 +4,7 @@ defmodule FornacastAPI.IssueWorkflowTest do
   import Ecto.Query
 
   alias ForgeIssues.{Comment, Issue, IssueAssignee, IssueLabel, Label}
+  alias ForgePulls.PullRequest
   alias ForgeRepos.{Collaborator, Repository}
   alias Fornacast.{AuditEvent, Repo}
 
@@ -260,6 +261,17 @@ defmodule FornacastAPI.IssueWorkflowTest do
     {_key, secret} = pat(owner, ["public_repo"])
     ordinary = issue(repository, owner, 1, :issue)
     pull = issue(repository, owner, 2, :pull_request)
+    Repo.insert!(%PullRequest{
+      issue_id: pull.id,
+      repository_id: repository.id,
+      head_repository_id: repository.id,
+      head_ref: "refs/heads/feature/disabled",
+      base_ref: "refs/heads/main",
+      head_sha: String.duplicate("1", 40),
+      base_sha: String.duplicate("2", 40),
+      mergeable: true,
+      mergeable_state: :mergeable
+    })
 
     ordinary_comment =
       Repo.insert!(%Comment{issue_id: ordinary.id, author_user_id: owner.id, body: "blocked"})

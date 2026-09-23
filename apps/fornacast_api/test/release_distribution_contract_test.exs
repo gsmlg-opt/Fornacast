@@ -108,7 +108,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     workflow = File.read!(@workflow)
 
     refute workflow =~ "packages: write"
-    assert workflow =~ "uses: docker/setup-buildx-action@v3"
+    assert workflow =~ "uses: docker/setup-buildx-action@v4"
     refute workflow =~ "Resolve GHCR username"
     refute workflow =~ "gh api user"
 

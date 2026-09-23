@@ -6,6 +6,7 @@ defmodule FornacastAPI.IssueControllerTest do
   alias ForgeAccounts.User
   alias Fornacast.AuditEvent
   alias ForgeRepos.Repository
+  alias ForgePulls.PullRequest
   alias ForgeIssues.{Comment, Issue, IssueAssignee, IssueLabel, Label}
 
   @user_agent "fornacast-issue-api-test/1.0"
@@ -884,6 +885,17 @@ defmodule FornacastAPI.IssueControllerTest do
     {_key, secret} = pat(alice, ["public_repo"])
     issue = issue(repository, alice, 1, :issue)
     pull = issue(repository, alice, 2, :pull_request)
+    Repo.insert!(%PullRequest{
+      issue_id: pull.id,
+      repository_id: repository.id,
+      head_repository_id: repository.id,
+      head_ref: "refs/heads/feature/disabled",
+      base_ref: "refs/heads/main",
+      head_sha: String.duplicate("1", 40),
+      base_sha: String.duplicate("2", 40),
+      mergeable: true,
+      mergeable_state: :mergeable
+    })
     comment = comment(issue, alice)
 
     for version <- @versions do
