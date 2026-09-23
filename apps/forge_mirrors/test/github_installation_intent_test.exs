@@ -1,9 +1,10 @@
 defmodule ForgeMirrors.GitHubInstallationIntentTest do
   use ExUnit.Case, async: false
 
+  import Ecto.Query
   import ForgeMirrors.TestSupport.MirrorFixtures
 
-  alias ForgeAccounts.GitHubIdentity
+  alias ForgeAccounts.{GitHubIdentity, OrganizationMember}
   alias ForgeMirrors.{GitHubAppInstallation, OrganizationMirror}
   alias Fornacast.Repo
 
@@ -91,7 +92,7 @@ defmodule ForgeMirrors.GitHubInstallationIntentTest do
     refute settings.actions.bootstrap
   end
 
-  test "a durable signed webhook received before callback completes the intent during callback",
+  test "a historical signed webhook received before callback cannot authorize the callback",
        context do
     digest = :crypto.hash(:sha256, "webhook-first-state")
 
@@ -108,7 +109,7 @@ defmodule ForgeMirrors.GitHubInstallationIntentTest do
     observe_installation(installation_id, context.organization_id)
     enqueue_created_delivery(installation_id, context.github_user_id)
 
-    assert {:ok, %{status: :ready, mirror: ready}} =
+    assert {:ok, %{status: :pending_webhook, mirror: pending_after_callback}} =
              ForgeMirrors.record_github_installation_callback(
                context.actor,
                context.organization_id,
@@ -118,9 +119,58 @@ defmodule ForgeMirrors.GitHubInstallationIntentTest do
                DateTime.add(@now, 1)
              )
 
-    assert pending.id == ready.id
-    assert ready.state == :ready_to_bootstrap
-    assert ready.github_installation_id == installation_id
+    assert pending.id == pending_after_callback.id
+    assert pending_after_callback.state == :pending_installation
+    assert pending_after_callback.github_installation_id == nil
+  end
+
+  test "completion rechecks current local organization-management permission", context do
+    digest = :crypto.hash(:sha256, "permission-recheck-state")
+
+    assert {:ok, _result} =
+             ForgeMirrors.begin_github_installation(
+               context.actor,
+               context.organization_id,
+               digest,
+               @now,
+               DateTime.add(@now, 600)
+             )
+
+    installation_id = 8_000_000 + System.unique_integer([:positive, :monotonic])
+    observe_installation(installation_id, context.organization_id)
+
+    assert {:ok, %{status: :pending_webhook}} =
+             ForgeMirrors.record_github_installation_callback(
+               context.actor,
+               context.organization_id,
+               digest,
+               installation_id,
+               :install,
+               DateTime.add(@now, 1)
+             )
+
+    {1, nil} =
+      Repo.update_all(
+        from(member in OrganizationMember,
+          where:
+            member.organization_id == ^context.organization_id and
+              member.user_id == ^context.actor.id
+        ),
+        set: [role: :member]
+      )
+
+    assert {:ok, :unclaimed} =
+             ForgeMirrors.confirm_github_installation_webhook(
+               installation_id,
+               context.github_user_id,
+               DateTime.add(@now, 2)
+             )
+
+    assert {:ok, %OrganizationMirror{state: :pending_installation}} =
+             ForgeMirrors.get_organization_mirror_for_organization(
+               context.organization_id,
+               "github"
+             )
   end
 
   test "state digests are actor and organization bound, one time, and expire", context do
