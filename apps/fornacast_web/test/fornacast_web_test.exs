@@ -950,10 +950,10 @@ defmodule FornacastWebTest do
       })
 
     invalid_body = html_response(invalid_repo, 422)
-    assert invalid_body =~ ~s(<option value="acme" selected>)
+    assert invalid_body =~ ~r/<option[^>]*value="acme"[^>]*selected/
     assert invalid_body =~ ~s(name="repository[slug]" value="draft")
     assert invalid_body =~ ~s(>keep these values</textarea>)
-    assert invalid_body =~ ~s(<option value="public" selected>)
+    assert invalid_body =~ ~r/<option[^>]*value="public"[^>]*selected/
 
     created_repo =
       created_org
