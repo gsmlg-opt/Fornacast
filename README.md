@@ -60,9 +60,9 @@ to an active installation can obtain a new token without restarting. A
 provider installation deletion is a separate terminal revocation and cannot
 be undone by reconnecting or by an old webhook.
 
-Live GitHub installation and OAuth acceptance remains an operator gate. Verify
-the App's configured user-authorization permissions, installation status, and
-organization-owner access against GitHub before enabling production mirroring.
+Live GitHub installation acceptance remains an operator gate. Verify the App's
+installation status and organization-owner access against GitHub before
+enabling production mirroring.
 
 ## Architecture
 

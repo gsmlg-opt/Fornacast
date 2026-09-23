@@ -23,7 +23,7 @@ acceptance matrix, including a synchronized clone/checkout from GitHub.
   terminally adding the installation to the broker's provider-revoked set.
   Provider deletion continues to use durable revocation and terminal broker
   fencing. Focused acceptance and broker suites passed locally; live GitHub
-  user-authorization and reconnect acceptance remain unverified.
+  installation and reconnect acceptance remain unverified.
 
 ### PR16 reconciliation and operator foundations (2026-09-14)
 
