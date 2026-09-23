@@ -116,7 +116,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
              ~r/- name: Log in to GHCR\s+uses: docker\/login-action@v3\s+with:\s+registry: ghcr.io\s+username: \$\{\{ github\.actor \}\}\s+password: \$\{\{ secrets\.GHCR_TOKEN \}\}/
 
     assert workflow =~
-             ~r/- name: Build and publish Docker image.*?uses: docker\/build-push-action@v6.*?context: \.\s+file: \.\/Dockerfile\s+push: true\s+tags: \|\s+ghcr\.io\/gsmlg-dev\/fornacast:latest\s+ghcr\.io\/gsmlg-dev\/fornacast:\$\{\{ steps\.version\.outputs\.version \}\}/s
+             ~r/- name: Build and publish Docker image.*?uses: docker\/build-push-action@v7.*?context: \.\s+file: \.\/Dockerfile\s+push: true\s+tags: \|\s+ghcr\.io\/gsmlg-dev\/fornacast:latest\s+ghcr\.io\/gsmlg-dev\/fornacast:\$\{\{ steps\.version\.outputs\.version \}\}/s
 
     assert workflow =~
              ~r/- name: Build and publish Docker image.*?build-args: \|\s+FORNACAST_DATABASE_ADAPTER=postgres/s
