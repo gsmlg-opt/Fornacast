@@ -26,8 +26,8 @@ defmodule GitCore.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:erlexec, "~> 2.3.4"},
-      {:rustler, "~> 0.38.0"}
+      {:erlexec, "~> 2.5"},
+      {:rustler, "~> 0.38"}
     ]
   end
 end
