@@ -265,6 +265,38 @@ defmodule ForgeAccounts do
 
   def get_public_user(_username), do: {:error, :not_found}
 
+  @doc "Lists active organization owners and their safe saved GitHub account views."
+  def organization_github_owners(actor, organization_id) do
+    with {:ok, _organization} <- fetch_manageable_organization(actor, organization_id) do
+      owners =
+        Repo.all(
+          from u in User,
+            join: m in OrganizationMember,
+            on: m.user_id == u.id,
+            where:
+              m.organization_id == ^organization_id and m.role == :owner and
+                u.state == :active and u.kind == :user,
+            order_by: u.id
+        )
+
+      {:ok,
+       Enum.map(owners, fn owner ->
+         {:ok, accounts} = list_github_accounts(owner)
+         %{id: owner.id, username: owner.username, accounts: accounts}
+       end)}
+    end
+  end
+
+  @doc false
+  def organization_github_owner(actor, organization_id, owner_id) do
+    with {:ok, owners} <- organization_github_owners(actor, organization_id),
+         true <- Enum.any?(owners, &(&1.id == owner_id)) do
+      {:ok, Repo.get!(User, owner_id)}
+    else
+      _ -> {:error, :forbidden}
+    end
+  end
+
   def get_organization(id), do: Repo.get_by(Organization, id: id, kind: :organization)
 
   @doc """

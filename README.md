@@ -41,6 +41,20 @@ See [GitHub import and LFS recovery](docs/github-imports.md#git-lfs).
 
 ## GitHub synchronization
 
+The organization GitHub tab (`/organizations/:organization/settings/github`)
+configures personal-use PAT synchronization. Select an active organization owner's
+saved PAT, the source GitHub organization, and all or selected repositories in
+its repository subpage. Refreshing the list only reads GitHub. The enable/disable
+setting currently records intent: **PAT synchronization execution is not yet
+implemented**. The first planned direction is GitHub → Fornacast, with outbound
+synchronization to follow. PAT values remain in the existing encrypted credential
+store; configuration stores references only. Changing the source or credential
+clears the cached inventory and repository selection.
+
+The existing GitHub App mirror remains available under the advanced App settings
+link (`/organizations/:organization/settings/github/app`), independently of PAT
+configuration. The following requirements apply to that App implementation.
+
 Two-way GitHub organization mirroring uses a permanent mirror domain separate
 from the one-time bootstrap importer. GitHub wiki
 repositories and release asset binaries remain excluded from synchronization.

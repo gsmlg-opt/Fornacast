@@ -1,0 +1,98 @@
+<OrganizationSettingsComponents.organization_settings_layout
+  organization={@organization}
+  active={:github}
+>
+  <section class="grid gap-4" data-pat-repositories>
+    <header class="grid gap-2">
+      <.dm_link href={base(@organization)} class="text-primary">Back to GitHub configuration</.dm_link>
+      <h2 class="text-2xl font-semibold">Synchronized repositories</h2>
+      <p class="text-on-surface-variant">
+        Choose repositories for {@view.config.github_organization}. Selection is saved for future GitHub → Fornacast synchronization.
+      </p>
+    </header>
+    <.dm_alert :if={@error} id="pat-repositories-error" variant="error" role="alert">
+      {@error}
+    </.dm_alert>
+    <.dm_alert :if={@flash} id="pat-repositories-saved" variant="success" role="status">
+      {@flash}
+    </.dm_alert>
+    <.dm_card id="pat-repositories-list" variant="bordered" padding="lg">
+      <:title>Repository selection</:title>
+      <p class="text-sm text-on-surface-variant">
+        Only repositories visible to the selected owner’s PAT can be listed. Refreshing reads GitHub; it does not import repositories.
+      </p>
+      <form
+        :if={@view.config.id}
+        action={base(@organization) <> "/repositories/refresh"}
+        method="post"
+        class="my-4"
+      >
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <input type="hidden" name="pat_sync[lock_version]" value={@view.config.lock_version} />
+        <button type="submit" class="btn btn-secondary">Refresh from GitHub</button>
+      </form>
+      <p :if={!@view.config.id}>
+        Save an owner PAT and GitHub organization in configuration first.
+      </p>
+      <form
+        :if={@view.config.id}
+        action={base(@organization) <> "/repositories"}
+        method="post"
+        class="grid gap-4"
+      >
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <input type="hidden" name="_method" value="patch" />
+        <input type="hidden" name="pat_sync[lock_version]" value={@view.config.lock_version} />
+        <input type="hidden" name="pat_sync[selected_repository_ids][]" value="" />
+        <label class="grid gap-1" for="pat-repository-selection">
+          <span>Synchronization scope</span>
+          <select
+            class="select"
+            id="pat-repository-selection"
+            name="pat_sync[repository_selection]"
+          >
+            <option value="all" selected={@view.config.repository_selection == "all"}>
+              All PAT-visible repositories
+            </option>
+            <option value="selected" selected={@view.config.repository_selection == "selected"}>
+              Selected repositories only
+            </option>
+          </select>
+        </label>
+        <p :if={repository_rows(@view) == []}>
+          No repositories listed. Refresh from GitHub to choose individual repositories.
+        </p>
+        <div :if={repository_rows(@view) != []} class="overflow-x-auto">
+          <table class="table" aria-label="PAT-visible GitHub repositories">
+            <thead>
+              <tr>
+                <th>Select</th><th>Repository</th><th>Visibility</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr :for={repo <- repository_rows(@view)}>
+                <td>
+                  <input
+                    type="checkbox"
+                    class="checkbox"
+                    name="pat_sync[selected_repository_ids][]"
+                    value={repo["id"]}
+                    checked={selected?(@view.config, repo["id"])}
+                    aria-label={"Synchronize " <> repo["full_name"]}
+                  />
+                </td>
+                <th scope="row">{repo["full_name"]}</th><td>{repo["visibility"]}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="text-sm text-on-surface-variant">
+          Choose “Selected repositories only” to apply the checkboxes. Unselected repositories are retained locally.
+        </p>
+        <div>
+          <button type="submit" class="btn btn-primary">Save repository selection</button>
+        </div>
+      </form>
+    </.dm_card>
+  </section>
+</OrganizationSettingsComponents.organization_settings_layout>

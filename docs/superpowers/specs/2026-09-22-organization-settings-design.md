@@ -155,3 +155,26 @@ Implementation is complete when this checklist and the companion plan's scoped
 checks pass. Stop there. Commit, push, release, deployment, and follow-up features
 require their own authorization. After implementation, record the feature in
 agent-note with `project: fornacast` under the repository's note workflow.
+
+
+## 2026-09-24: Personal-use PAT configuration
+
+The owner-approved next slice makes PAT configuration the canonical GitHub tab.
+The credential must belong to a current active organization owner; site admins
+may manage the configuration but cannot substitute a non-owner's PAT. When there
+are multiple owners or saved accounts, select them explicitly. Existing account
+settings remain responsible for storing and rotating encrypted PATs.
+
+Persist enablement intent, owner/account references, source organization, inbound
+direction, repository selection and a bounded inventory in a separate PostgreSQL
+configuration table. Use version checks to reject stale saves and source changes
+during inventory discovery. Changing the source clears inventory and selection.
+The repository subpage can read GitHub inventory via the owner PAT and save scope.
+No importer, scheduler, outbound writer or App mirror is activated by these forms.
+The UI must explicitly state that synchronization execution is pending.
+
+GitHub → Fornacast execution is the next phase; Fornacast → GitHub comes afterward.
+Retain the App mirror implementation at the advanced `/settings/github/app` page
+and preserve its mutation, callback and conflict routes. The canonical GitHub tab
+now uses PAT configuration; the earlier App-only product decision does not apply
+to this personal-use configuration slice.

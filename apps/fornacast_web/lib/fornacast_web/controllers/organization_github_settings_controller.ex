@@ -234,7 +234,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsController do
   defp handle_action_result(conn, organization, {:ok, _result}) do
     conn
     |> put_status(:see_other)
-    |> redirect(to: settings_path(organization))
+    |> redirect(to: settings_path(organization) <> "/app")
   end
 
   defp handle_action_result(conn, _organization, {:error, reason}),

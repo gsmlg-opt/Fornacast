@@ -1,0 +1,146 @@
+<OrganizationSettingsComponents.organization_settings_layout
+  organization={@organization}
+  active={:github}
+>
+  <section class="grid gap-4" data-organization-pat-settings>
+    <header class="grid gap-2">
+      <h2 class="text-2xl font-semibold">GitHub synchronization</h2>
+      <p class="text-on-surface-variant">
+        Configure organization synchronization with an owner’s saved personal access token (PAT).
+      </p>
+    </header>
+    <.dm_alert :if={@error} id="pat-settings-error" variant="error" role="alert">
+      {@error}
+    </.dm_alert>
+    <.dm_alert :if={@flash} id="pat-settings-saved" variant="success" role="status">
+      {@flash}
+    </.dm_alert>
+    <.dm_alert id="pat-configuration-only" variant="info" outlined>
+      GitHub → Fornacast synchronization uses the saved owner PAT. You can run it manually and pause it at any time.
+    </.dm_alert>
+    <.dm_card id="pat-sync-config" variant="bordered" padding="lg">
+      <:title>GitHub mirror configuration</:title>
+      <form
+        action={base(@organization) <> "/pat"}
+        method="post"
+        class="grid gap-4"
+        id="pat-sync-form"
+      >
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <input type="hidden" name="_method" value="patch" />
+        <input type="hidden" name="pat_sync[lock_version]" value={@view.config.lock_version} />
+        <label class="flex items-center gap-2">
+          <input type="hidden" name="pat_sync[enabled]" value="false" />
+          <input
+            class="checkbox"
+            type="checkbox"
+            name="pat_sync[enabled]"
+            value="true"
+            checked={@view.config.enabled}
+          /> Enable GitHub mirror configuration
+        </label>
+        <label class="grid gap-1" for="pat-source-org">
+          <span>GitHub organization</span>
+          <input
+            class="input"
+            id="pat-source-org"
+            name="pat_sync[github_organization]"
+            value={@view.config.github_organization}
+            required
+            maxlength="39"
+          />
+        </label>
+        <label class="grid gap-1" for="pat-owner">
+          <span>Credential owner</span>
+          <select class="select" id="pat-owner" name="pat_sync[owner_user_id]">
+            <option value="">Choose organization owner</option>
+            <option
+              :for={owner <- @view.owners}
+              value={owner.id}
+              selected={owner.id == @view.config.owner_user_id}
+            >
+              @{owner.username}
+            </option>
+          </select>
+        </label>
+        <label class="grid gap-1" for="pat-account">
+          <span>Owner’s saved GitHub PAT</span>
+          <select class="select" id="pat-account" name="pat_sync[github_identity_id]">
+            <option value="">Choose saved PAT</option>
+            <option
+              :for={{owner, account} <- accounts(@view)}
+              value={account.identity_id}
+              selected={account.identity_id == @view.config.github_identity_id}
+            >
+              @{owner.username} / GitHub @{account.login} — {credential_status(account)}
+            </option>
+          </select>
+        </label>
+        <p class="text-sm text-on-surface-variant">
+          {credential_status(@view.credential)}. Token values are never displayed.
+        </p>
+        <.dm_link href="/settings/github" class="text-primary">Manage your saved GitHub PATs</.dm_link>
+        <div class="grid gap-1">
+          <span class="font-semibold">Planned synchronization direction</span>
+          <p>GitHub → Fornacast</p>
+          <p class="text-sm text-on-surface-variant">
+            Fornacast → GitHub will be added in a later phase.
+          </p>
+        </div>
+        <div><button class="btn btn-primary" type="submit">Save configuration</button></div>
+      </form>
+      <form action={base(@organization) <> "/pat/check"} method="post" class="mt-3">
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <button class="btn btn-secondary" type="submit">Check configuration</button>
+      </form>
+      <.dm_alert :if={@check_result} id="pat-check-result" variant="success" role="status">
+        Check completed: owner <strong>{@check_result.owner}</strong>, GitHub organization <strong>{@check_result.github_organization}</strong>, PAT status <strong>{@check_result.credential_status}</strong>, visible repositories <strong>{@check_result.repository_count}</strong>, checked at {@check_result.checked_at}.
+      </.dm_alert>
+      <div class="mt-4 flex gap-2">
+        <form action={base(@organization) <> "/sync"} method="post">
+          <input type="hidden" name="_csrf_token" value={csrf_token()} />
+          <input type="hidden" name="pat_sync[lock_version]" value={@view.config.lock_version} />
+          <button
+            class="btn btn-secondary"
+            type="submit"
+            disabled={!@view.config.enabled or @view.config.paused}
+          >Sync now</button>
+        </form>
+        <form
+          action={base(@organization) <> "/pat" <> if(@view.config.paused, do: "/resume", else: "/pause")}
+          method="post"
+        >
+          <input type="hidden" name="_csrf_token" value={csrf_token()} />
+          <button class="btn btn-ghost" type="submit">{if @view.config.paused,
+            do: "Resume synchronization",
+            else: "Pause synchronization"}</button>
+        </form>
+      </div>
+      <p class="mt-2 text-sm text-on-surface-variant">
+        Status: {if @view.config.paused,
+          do: "Paused",
+          else:
+            if(@view.config.last_sync_status,
+              do: @view.config.last_sync_status,
+              else: "Never synchronized"
+            )}
+      </p>
+    </.dm_card>
+    <.dm_card id="pat-repository-scope" variant="bordered" padding="lg">
+      <:title>Repository scope</:title>
+      <p>
+        {if @view.config.repository_selection == "all",
+          do: "All PAT-visible organization repositories",
+          else: "Selected repositories only"}
+      </p>
+      <.dm_link href={base(@organization) <> "/repositories"} class="text-primary">Manage synchronized repositories</.dm_link>
+    </.dm_card>
+    <details class="rounded-lg border border-outline-variant p-4">
+      <summary>GitHub App mirror (advanced)</summary>
+      <p class="text-sm text-on-surface-variant my-2">
+        The existing GitHub App integration is managed separately from PAT configuration.
+      </p>
+      <.dm_link href={base(@organization) <> "/app"} class="text-primary">Open GitHub App settings</.dm_link>
+    </details>
+  </section>
+</OrganizationSettingsComponents.organization_settings_layout>

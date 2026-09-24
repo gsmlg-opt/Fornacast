@@ -162,7 +162,7 @@ defmodule FornacastWeb.OrganizationGitHubInstallationAcceptanceTest do
     assert html =~ "Ready to bootstrap"
 
     settings_conn =
-      started |> recycle_request() |> get(github_settings_path(context.organization))
+      started |> recycle_request() |> get(github_settings_path(context.organization) <> "/app")
 
     settings_html = html_response(settings_conn, 200)
 

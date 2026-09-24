@@ -59,7 +59,41 @@ defmodule FornacastWeb.Router do
     get "/organizations/:organization/settings", OrganizationSettingsController, :index
     patch "/organizations/:organization_slug/settings", OrganizationSettingsController, :update
 
-    get "/organizations/:organization/settings/github",
+    get "/organizations/:organization/settings/github", OrganizationPATSettingsController, :index
+
+    patch "/organizations/:organization/settings/github/pat",
+          OrganizationPATSettingsController,
+          :save
+
+    post "/organizations/:organization/settings/github/pat/check",
+         OrganizationPATSettingsController,
+         :check
+
+    get "/organizations/:organization/settings/github/repositories",
+        OrganizationPATSettingsController,
+        :repositories
+
+    patch "/organizations/:organization/settings/github/repositories",
+          OrganizationPATSettingsController,
+          :selection
+
+    post "/organizations/:organization/settings/github/repositories/refresh",
+         OrganizationPATSettingsController,
+         :refresh
+
+    post "/organizations/:organization/settings/github/sync",
+         OrganizationPATSettingsController,
+         :sync_now
+
+    post "/organizations/:organization/settings/github/pat/pause",
+         OrganizationPATSettingsController,
+         :pause
+
+    post "/organizations/:organization/settings/github/pat/resume",
+         OrganizationPATSettingsController,
+         :resume
+
+    get "/organizations/:organization/settings/github/app",
         OrganizationGitHubSettingsController,
         :index
 
