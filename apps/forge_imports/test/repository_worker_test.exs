@@ -638,6 +638,38 @@ defmodule ForgeImports.RepositoryWorkerTest do
            )
   end
 
+  @tag :tmp_dir
+  test "permanent LFS repository corruption terminates the attempt and run", context do
+    payloads = stage_lfs_fixture!(context)
+    callbacks = lfs_callbacks(context, payloads)
+
+    assert {:ok, %RepositoryItem{state: :failed} = failed} =
+             finish_lfs_worker(context.item.id, callbacks,
+               expand_object: fn _path, _oid, _kind, _offset, _limit ->
+                 {:error,
+                  %GitCore.Error{
+                    kind: :corrupt_repository,
+                    operation: :expand_lfs_scan_object,
+                    detail: "invalid packed object"
+                  }}
+               end
+             )
+
+    assert failed.failure_kind == "corrupt_repository"
+    assert failed.failure_count == 1
+    assert failed.next_attempt_at == nil
+    assert failed.lease_owner == nil
+
+    assert %ImportAttempt{state: :failed, failure_kind: "corrupt_repository"} =
+             Repo.get_by!(ImportAttempt,
+               repository_item_id: failed.id,
+               attempt_number: failed.attempt_count
+             )
+
+    assert {:ok, %ImportRun{state: :failed}} =
+             ForgeImports.RunAggregator.finish_if_terminal(context.run.id)
+  end
+
   test "credential rejection after metadata transition pauses the current lease", context do
     assert {:ok, %RepositoryItem{state: :git_staged}} =
              RepositoryWorker.stage(context.item.id,

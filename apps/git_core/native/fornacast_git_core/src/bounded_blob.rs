@@ -337,11 +337,11 @@ impl DecodeWorkBudget {
             .map_err(|_| Error::corrupt("caller limit does not fit the decode work counter"))?;
         let limits = DecodeWorkLimits {
             // Tiny instructions are the cheapest possible valid delta commands. Requiring
-            // sixteen requested bytes per command, with a small baseline, keeps normal Git
+            // sixteen requested bytes per command, with a bounded baseline, keeps normal Git
             // deltas valid while bounding adversarial one-byte COPY programs.
             delta_instructions: scaled_work_limit(
                 caller_limit,
-                128,
+                256,
                 1,
                 16,
                 MAX_DELTA_INSTRUCTIONS,
@@ -353,7 +353,7 @@ impl DecodeWorkBudget {
             // ordinary repositories usable without permitting an unbounded pack walk.
             index_entries_scanned: scaled_work_limit(
                 caller_limit,
-                65_536,
+                262_144,
                 1,
                 16,
                 MAX_INDEX_ENTRIES_SCANNED,
@@ -3218,7 +3218,7 @@ mod tests {
 
     #[test]
     fn prefix_blob_repeated_high_offset_copies_stop_at_the_cumulative_work_budget() {
-        let fixture = repeated_high_offset_copy_fixture(256);
+        let fixture = repeated_high_offset_copy_fixture(512);
         let repo = gix::open(&fixture.repo_path).expect("open fixture repository");
 
         let error = read_prefix(&repo, fixture.oid, fixture.original.len())
@@ -3227,8 +3227,34 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::CorruptRepository);
         assert_eq!(
             error.to_string(),
-            "decode work budget exhausted: delta instructions 145 exceed limit 144"
+            "decode work budget exhausted: delta instructions 289 exceed limit 288"
         );
+    }
+
+    #[test]
+    fn decode_work_limits_remain_hard_capped() {
+        let budget = DecodeWorkBudget::new(100_000_000).expect("work budget");
+
+        assert_eq!(
+            budget.limits.delta_instructions,
+            super::MAX_DELTA_INSTRUCTIONS
+        );
+        assert_eq!(
+            budget.limits.index_entries_scanned,
+            super::MAX_INDEX_ENTRIES_SCANNED
+        );
+    }
+
+    #[test]
+    fn prefix_blob_accepts_compact_real_world_delta_instruction_count() {
+        let fixture = compact_real_world_delta_fixture();
+        let repo = gix::open(&fixture.repo_path).expect("open fixture repository");
+
+        let prefix = read_prefix(&repo, fixture.oid, fixture.original.len())
+            .expect("a compact valid delta must fit the bounded decode budget");
+
+        assert_eq!(prefix.data, fixture.original);
+        assert_eq!(prefix.allocations.delta_instructions, 167);
     }
 
     #[test]
@@ -3258,6 +3284,18 @@ mod tests {
             counts[0], counts[1],
             "repeated COPY content reads must not reopen or rescan the pack index"
         );
+    }
+
+    #[test]
+    fn prefix_blob_accepts_large_valid_pack_index() {
+        let fixture = large_pack_index_fixture(20_000);
+        let repo = gix::open(&fixture.repo_path).expect("open fixture repository");
+
+        let prefix = read_prefix(&repo, fixture.oid, fixture.original.len())
+            .expect("a valid pack index must fit the bounded decode budget");
+
+        assert_eq!(prefix.data, fixture.original);
+        assert!(prefix.allocations.index_entries_scanned > 65_537);
     }
 
     #[test]
@@ -4111,6 +4149,128 @@ mod tests {
             evidence,
             storage: StorageForm::PackedRefDelta,
         }
+    }
+
+    fn compact_real_world_delta_fixture() -> Fixture {
+        let temp = TempDirectory::new("compact-real-world-delta");
+        let repo_path = temp.0.join("compact-real-world-delta.git");
+        git(
+            &[
+                "init",
+                "--bare",
+                "--object-format=sha1",
+                path_str(&repo_path),
+            ],
+            None,
+        );
+
+        let base: Vec<u8> = (0..4096).map(|index| (index % 251) as u8).collect();
+        let mut original = vec![*base.last().expect("non-empty base"); 166];
+        original.extend_from_slice(&base[3654..]);
+        assert_eq!(original.len(), 608);
+
+        let base_oid = git(&["hash-object", "--stdin"], Some(&base));
+        let result_oid = git(&["hash-object", "--stdin"], Some(&original));
+        let mut delta = encode_delta_varint(base.len() as u64);
+        delta.extend(encode_delta_varint(original.len() as u64));
+        for _ in 0..166 {
+            delta.extend([0x93, 0xff, 0x0f, 0x01]);
+        }
+        delta.extend([0xb3, 0x46, 0x0e, 0xba, 0x01]);
+
+        let mut pack = b"PACK".to_vec();
+        pack.extend(2_u32.to_be_bytes());
+        pack.extend(2_u32.to_be_bytes());
+        pack.extend(encode_pack_entry_header(3, base.len()));
+        pack.extend(zlib(&base));
+        pack.extend(encode_pack_entry_header(7, delta.len()));
+        pack.extend(parse_oid(&base_oid).as_slice());
+        pack.extend(zlib(&delta));
+
+        let mut hasher = gix_hash::hasher(gix_hash::Kind::Sha1);
+        hasher.update(&pack);
+        let pack_id = hasher.try_finalize().expect("hash synthetic pack");
+        pack.extend(pack_id.as_slice());
+
+        let pack_path = repo_path
+            .join("objects/pack")
+            .join(format!("pack-{pack_id}.pack"));
+        std::fs::write(&pack_path, pack).expect("write synthetic pack");
+        git(&["index-pack", path_str(&pack_path)], None);
+
+        let verify = verify_pack(&repo_path);
+        let evidence = verify_line(&verify, &result_oid);
+        assert!(
+            evidence.split_whitespace().count() >= 7,
+            "expected a verified delta entry: {evidence}"
+        );
+
+        Fixture {
+            _temp: temp,
+            repo_path,
+            oid: parse_oid(&result_oid),
+            original,
+            evidence,
+            storage: StorageForm::PackedRefDelta,
+        }
+    }
+
+    fn large_pack_index_fixture(object_count: usize) -> Fixture {
+        let temp = TempDirectory::new("large-pack-index");
+        let repo_path = temp.0.join("large-pack-index.git");
+        git(
+            &[
+                "init",
+                "--bare",
+                "--object-format=sha1",
+                path_str(&repo_path),
+            ],
+            None,
+        );
+
+        let mut pack = b"PACK".to_vec();
+        pack.extend(2_u32.to_be_bytes());
+        pack.extend(
+            u32::try_from(object_count)
+                .expect("fixture object count")
+                .to_be_bytes(),
+        );
+        let mut target = None;
+
+        for index in 0..object_count {
+            let body = format!("synthetic packed blob {index:05}").into_bytes();
+            pack.extend(encode_pack_entry_header(3, body.len()));
+            pack.extend(zlib(&body));
+            target = Some((blob_oid(&body), body));
+        }
+
+        let mut hasher = gix_hash::hasher(gix_hash::Kind::Sha1);
+        hasher.update(&pack);
+        let pack_id = hasher.try_finalize().expect("hash synthetic pack");
+        pack.extend(pack_id.as_slice());
+
+        let pack_path = repo_path
+            .join("objects/pack")
+            .join(format!("pack-{pack_id}.pack"));
+        std::fs::write(&pack_path, pack).expect("write synthetic pack");
+        git(&["index-pack", path_str(&pack_path)], None);
+
+        let (oid, original) = target.expect("non-empty fixture");
+        Fixture {
+            _temp: temp,
+            repo_path,
+            oid,
+            original,
+            evidence: format!("synthetic pack with {object_count} blobs"),
+            storage: StorageForm::PackedBase,
+        }
+    }
+
+    fn blob_oid(body: &[u8]) -> gix_hash::ObjectId {
+        let mut hasher = gix_hash::hasher(gix_hash::Kind::Sha1);
+        hasher.update(format!("blob {}\0", body.len()).as_bytes());
+        hasher.update(body);
+        hasher.try_finalize().expect("hash synthetic blob")
     }
 
     fn encode_delta_varint(mut value: u64) -> Vec<u8> {

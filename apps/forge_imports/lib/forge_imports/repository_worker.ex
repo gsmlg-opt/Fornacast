@@ -214,6 +214,9 @@ defmodule ForgeImports.RepositoryWorker do
       {:error, %ForgeGitHub.Error{} = error} ->
         release_with_provider_error(capability, error)
 
+      {:error, %GitCore.Error{kind: :corrupt_repository}} ->
+        persist_corrupt_repository_failure(capability)
+
       {:error, reason}
       when reason in [
              :invalid_credential,
@@ -1867,6 +1870,51 @@ defmodule ForgeImports.RepositoryWorker do
       {:error, :lost_lease} -> {:error, :lost_lease}
       {:error, :persistence_unavailable} -> {:error, :persistence_unavailable}
     end
+  end
+
+  defp persist_corrupt_repository_failure(capability) do
+    transaction = fn ->
+      Repo.transaction(fn ->
+        with %ImportRun{state: :running} = run <- locked_run(capability.import_run_id),
+             %RepositoryItem{} = item <- locked_error_item(capability),
+             %ImportAttempt{state: :running} = attempt <- current_attempt(item),
+             now <- DateTime.utc_now(:second),
+             true <- live_lease?(item, now),
+             {:ok, _attempt} <-
+               attempt
+               |> ImportAttempt.transition_changeset(:failed, %{
+                 terminal_at: now,
+                 failure_kind: "corrupt_repository"
+               })
+               |> Repo.update(),
+             {:ok, failed} <-
+               OperationLease.update_owned(RepositoryItem, item,
+                 state: :failed,
+                 wait_reason: nil,
+                 next_attempt_at: nil,
+                 failure_kind: "corrupt_repository",
+                 failure_detail: nil,
+                 failure_count: item.failure_count + 1
+               ),
+             :ok <- bump_run_after_retry(run, now) do
+          failed
+        else
+          nil -> Repo.rollback(:lost_lease)
+          false -> Repo.rollback(:lost_lease)
+          {:error, :lost_lease} -> Repo.rollback(:lost_lease)
+          _failure -> Repo.rollback(:persistence_unavailable)
+        end
+      end)
+    end
+
+    case Persistence.with_retry(transaction) do
+      {:ok, %RepositoryItem{} = item} -> {:ok, item}
+      {:error, :lost_lease} -> {:error, :lost_lease}
+      {:error, _reason} -> {:error, :persistence_unavailable}
+    end
+  rescue
+    _error in [Turso.Error, DBConnection.ConnectionError] ->
+      {:error, :persistence_unavailable}
   end
 
   defp release_owned_capability(capability) do
