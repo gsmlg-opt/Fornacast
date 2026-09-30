@@ -1,5 +1,5 @@
 defmodule ForgeMirrors.PatConfiguration do
-  @moduledoc "Saved PAT synchronization intent. No scheduler consumes this configuration yet."
+  @moduledoc "Saved PAT configuration for organization import and synchronization."
   use Ecto.Schema
   import Ecto.Changeset
 

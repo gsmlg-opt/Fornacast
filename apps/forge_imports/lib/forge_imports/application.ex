@@ -12,7 +12,8 @@ defmodule ForgeImports.Application do
 
     children = [
       {ForgeImports.RecoverySupervisor,
-       enabled: recovery_enabled, cleanup_enabled: cleanup_enabled}
+       enabled: recovery_enabled, cleanup_enabled: cleanup_enabled},
+      {ForgeImports.PatSyncScheduler, enabled: recovery_enabled}
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: ForgeImports.Supervisor)

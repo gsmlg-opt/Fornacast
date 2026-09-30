@@ -56,25 +56,24 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
                    false <- config.paused,
                    true <- config.enabled,
                    {:ok, _} <- PatSettings.mark_sync(actor, organization.id, "running", metadata),
-                   result <-
-                     ForgeImports.OrganizationPatSettings.refresh(
+                   {:ok, run} <-
+                     ForgeImports.OrganizationPatSettings.sync(
                        actor,
                        organization.id,
                        attrs["lock_version"],
                        metadata
-                     ),
-                   {:ok, _} <-
-                     PatSettings.mark_sync(
-                       actor,
-                       organization.id,
-                       if(result == :ok, do: "succeeded", else: "failed"),
-                       metadata
                      ) do
-                result
+                {:ok, run}
               else
-                true -> {:error, :paused}
-                false -> {:error, :not_enabled}
-                {:error, reason} -> {:error, reason}
+                true ->
+                  {:error, :paused}
+
+                false ->
+                  {:error, :not_enabled}
+
+                {:error, reason} ->
+                  _ = PatSettings.mark_sync(actor, organization.id, "failed", metadata)
+                  {:error, reason}
               end
 
             :check ->
@@ -128,7 +127,7 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
     message =
       case action do
         :refresh -> "Repository list refreshed."
-        :sync_now -> "Synchronization completed."
+        :sync_now -> "Synchronization queued."
         :pause -> "Synchronization paused."
         :resume -> "Synchronization resumed."
         _ -> "PAT synchronization configuration saved."

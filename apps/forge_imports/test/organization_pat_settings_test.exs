@@ -11,6 +11,13 @@ defmodule ForgeImports.OrganizationPatSettingsTest do
     end
   end
 
+  defmodule Imports do
+    def create_organization_discovery(actor, attrs, metadata, opts) do
+      send(self(), {:pat_sync, actor.id, attrs, metadata, opts})
+      {:ok, %{id: 99, state: :discovering}}
+    end
+  end
+
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
     n = System.unique_integer([:positive, :monotonic])
@@ -75,5 +82,20 @@ defmodule ForgeImports.OrganizationPatSettingsTest do
 
     assert row == %{"id" => 42, "full_name" => "source-org/repo", "visibility" => "private"}
     assert Repo.aggregate(ForgeMirrors.MirrorOperation, :count) == 0
+  end
+
+  test "sync starts a saved-PAT organization import for the existing destination", c do
+    assert {:ok, %{id: 99, state: :discovering}} =
+             OrganizationPatSettings.sync(c.owner, c.org.id, c.version, %{"request" => "test"},
+               imports: Imports,
+               dispatch: :async
+             )
+
+    assert_receive {:pat_sync, actor_id, attrs, %{"request" => "test"}, dispatch: :async}
+    assert actor_id == c.owner.id
+    assert attrs.organization == "source-org"
+    assert attrs.credential_source == :saved
+    assert attrs.github_identity_id > 0
+    assert attrs.destination_organization == %{action: :existing, id: c.org.id}
   end
 end

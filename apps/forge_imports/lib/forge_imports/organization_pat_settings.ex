@@ -1,5 +1,8 @@
 defmodule ForgeImports.OrganizationPatSettings do
-  @moduledoc "Read-only GitHub inventory discovery for future PAT synchronization."
+  @moduledoc "GitHub organization inventory and PAT-backed synchronization entrypoints."
+  import Ecto.Query
+
+  alias ForgeImports.ImportRun
   alias ForgeMirrors.PatSettings
 
   def refresh(actor, organization_id, version, metadata, opts \\ []) do
@@ -41,6 +44,35 @@ defmodule ForgeImports.OrganizationPatSettings do
           _ -> {:error, :unavailable}
         end
       end)
+    else
+      false -> {:error, :stale}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc "Starts or reuses the durable organization import for the saved PAT."
+  def sync(actor, organization_id, version, metadata, opts \\ []) do
+    imports = Keyword.get(opts, :imports, ForgeImports)
+    dispatch = Keyword.get(opts, :dispatch, :async)
+    import_opts = if Mix.env() == :test, do: [dispatch: dispatch], else: []
+
+    with {:ok, %{config: config}} <- PatSettings.view(actor, organization_id),
+         true <- config.id != nil and to_string(config.lock_version) == version,
+         false <- config.paused,
+         true <- config.enabled,
+         {:ok, owner} <-
+           ForgeAccounts.organization_github_owner(actor, organization_id, config.owner_user_id),
+         {:ok, run} <-
+           start_or_reuse(
+             actor,
+             organization_id,
+             config,
+             owner,
+             metadata,
+             imports,
+             import_opts
+           ) do
+      {:ok, run}
     else
       false -> {:error, :stale}
       {:error, reason} -> {:error, reason}
@@ -100,6 +132,46 @@ defmodule ForgeImports.OrganizationPatSettings do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp start_or_reuse(actor, organization_id, config, owner, metadata, imports, import_opts) do
+    case existing_run(actor, organization_id, config.github_organization) do
+      {:ok, _run} = result ->
+        result
+
+      nil ->
+        imports.create_organization_discovery(
+          owner,
+          %{
+            organization: config.github_organization,
+            credential_source: :saved,
+            github_identity_id: config.github_identity_id,
+            destination_organization: %{action: :existing, id: organization_id}
+          },
+          metadata,
+          import_opts
+        )
+    end
+  end
+
+  defp existing_run(actor, organization_id, source_login) do
+    actor_id = actor.id
+
+    query =
+      from run in ImportRun,
+        where:
+          run.actor_user_id == ^actor_id and
+            run.destination_organization_id == ^organization_id and
+            run.source_kind == :organization and
+            run.source_owner_login == ^source_login and
+            run.state not in ^ImportRun.terminal_states(),
+        order_by: [desc: run.id],
+        limit: 1
+
+    case Fornacast.Repo.one(query) do
+      %ImportRun{} = run -> ForgeImports.get_run(actor, run.id)
+      nil -> nil
     end
   end
 end
