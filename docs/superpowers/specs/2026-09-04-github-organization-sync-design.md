@@ -35,8 +35,10 @@ Fornacast shall not synchronize GitHub wiki repositories, Actions, checks, Proje
 3. **No silent last-write-wins behavior.**
    Compatible changes converge automatically. Incompatible concurrent changes become explicit conflicts.
 
-4. **GitHub App installations are required for organization sync.**
-   User PATs remain available for manual one-time imports, but a permanent organization mirror uses a GitHub App installation and short-lived installation tokens.
+4. **PAT is the current organization sync credential.**
+   A verified saved PAT supports one-time organization import and recurring
+   synchronization. GitHub App installation tokens are a future replacement
+   path and are not a prerequisite for the current release.
 
 5. **Webhooks reduce latency; reconciliation provides correctness.**
    Every supported webhook is durably enqueued. Periodic inventory, Git-ref, and metadata reconciliation repairs missed, delayed, or out-of-order deliveries.
@@ -61,11 +63,14 @@ Users need Fornacast to remain a usable local forge while GitHub continues to be
 
 ### G1 — Organization connection
 
-An organization owner can connect a local Fornacast organization to a GitHub organization through a GitHub App installation.
+An organization owner can connect a local Fornacast organization to a GitHub
+organization with a verified saved PAT. A GitHub App connection is a later
+replacement path.
 
 ### G2 — Bootstrap
 
-The initial run imports every repository visible to the installation, subject to explicit selection policy, and establishes permanent repository bindings.
+The initial PAT run imports every repository visible to the token, subject to
+explicit selection policy, and establishes durable repository bindings.
 
 ### G3 — Incremental repository synchronization
 
@@ -149,7 +154,7 @@ Authorization must use the existing organization ownership/administration domain
 
 | Domain | GitHub → Fornacast | Fornacast → GitHub | First-release notes |
 |---|---|---|---|
-| Organization connection | Yes | N/A | One GitHub App installation per local organization |
+| Organization connection | Yes | N/A | One verified saved PAT per local organization; App replacement is future |
 | Repository inventory | Yes | Yes | New local repositories create GitHub repositories when enabled |
 | Repository metadata | Yes | Yes | Name, description, visibility, default branch, archived state |
 | Git branches | Yes | Yes | Create, fast-forward, exact-baseline delete |
@@ -167,11 +172,15 @@ Authorization must use the existing organization ownership/administration domain
 
 ## 9. Functional requirements
 
-### 9.1 GitHub App configuration
+### 9.1 Current PAT configuration and future GitHub App
 
 #### FR-001 Operator configuration
 
-The Fornacast instance shall accept GitHub App configuration through deployment secrets:
+The current release shall accept organization PAT configuration through the
+authenticated settings UI. PAT values remain in the encrypted credential store;
+the organization sync configuration stores only credential references.
+
+The future GitHub App replacement shall accept configuration through deployment secrets:
 
 - App ID;
 - App private key or mounted private-key path;
@@ -237,7 +246,7 @@ The page shall show:
 
 The owner can configure:
 
-- synchronize all installation-visible repositories or selected repositories;
+- synchronize all PAT-visible repositories or selected repositories;
 - automatically import newly visible GitHub repositories;
 - automatically create GitHub repositories for new local repositories;
 - enabled capability set;
@@ -814,8 +823,8 @@ Expose telemetry and health data for:
 
 The feature is complete when all of the following pass:
 
-1. An organization owner can install/connect a GitHub App and bind the correct GitHub organization.
-2. Missing permissions and partial repository access are visible before bootstrap.
+1. An organization owner can save a verified PAT and bind the correct GitHub organization.
+2. Invalid PAT access and partial repository access are visible before bootstrap.
 3. Bootstrap imports all enabled, supported resources and ends with active permanent bindings.
 4. Webhooks received during bootstrap are replayed after the baseline is established.
 5. A GitHub-created repository is imported according to policy.
@@ -843,7 +852,8 @@ The feature is complete when all of the following pass:
 
 - `forge_github`;
 - `forge_mirrors`;
-- GitHub App installation;
+- saved PAT organization import/synchronization;
+- GitHub App installation as a future replacement;
 - organization settings;
 - durable webhook inbox;
 - generic domain outbox;

@@ -26,7 +26,8 @@ Reusable foundations:
 
 Missing foundations:
 
-- GitHub App installation authentication;
+- saved PAT authentication for the current organization import/sync path;
+- GitHub App installation authentication as a future replacement path;
 - organization-scoped sync settings;
 - permanent organization/repository bindings;
 - webhook ingress/inbox;
@@ -350,7 +351,8 @@ Use bounded tasks, durable leases, and no process per repository.
 
 ### Objective
 
-Replace PAT assumptions for permanent organization connections.
+Add the future GitHub App credential path without making it a prerequisite for
+the current saved-PAT organization import/synchronization flow.
 
 ### Configuration
 

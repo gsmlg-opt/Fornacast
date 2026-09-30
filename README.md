@@ -34,7 +34,8 @@ Implemented first-release paths:
 - Read-only GraphQL (`/api/graphql`) and public discovery (`/.well-known/fornacast`) on the API listener.
 
 Out of scope for this release: CI, packages, and forks.
-The GitHub importer remains a one-time bootstrap path.
+The GitHub importer remains the bootstrap engine used by one-time imports and
+the current PAT organization synchronization path.
 GitHub imports include LFS objects reachable from imported branches and tags;
 LFS-enabled GitHub mirrors transfer objects before confirming synchronized refs.
 See [GitHub import and LFS recovery](docs/github-imports.md#git-lfs).
@@ -44,28 +45,25 @@ See [GitHub import and LFS recovery](docs/github-imports.md#git-lfs).
 The organization GitHub tab (`/organizations/:organization/settings/github`)
 configures personal-use PAT synchronization. Select an active organization owner's
 saved PAT, the source GitHub organization, and all or selected repositories in
-its repository subpage. Refreshing the list only reads GitHub. The enable/disable
-setting currently records intent: **PAT synchronization execution is not yet
-implemented**. The first planned direction is GitHub → Fornacast, with outbound
-synchronization to follow. PAT values remain in the existing encrypted credential
-store; configuration stores references only. Changing the source or credential
-clears the cached inventory and repository selection.
+its repository subpage. Refreshing the list only reads GitHub. `Sync now` and
+interval mode start a durable PAT-backed organization import/synchronization run
+that discovers visible repositories and uses the existing recovery pipeline.
+PAT values remain in the existing encrypted credential store; configuration
+stores references only. Changing the source or credential clears the cached
+inventory and repository selection.
 
-The existing GitHub App mirror remains available under the advanced App settings
-link (`/organizations/:organization/settings/github/app`), independently of PAT
-configuration. The following requirements apply to that App implementation.
+GitHub App organization synchronization is a future replacement for this PAT
+path. The App settings and mirror domain are retained as preparatory plumbing;
+an App installation is not required for the current PAT import or sync flow.
 
-Two-way GitHub organization mirroring uses a permanent mirror domain separate
-from the one-time bootstrap importer. GitHub wiki
+The future two-way GitHub organization mirror uses a permanent mirror domain
+separate from the one-time bootstrap importer. GitHub wiki
 repositories and release asset binaries remain excluded from synchronization.
 
-Connections require a configured GitHub App with installation access for the
-target organization and an authenticated, linked GitHub user who currently
-owns that organization. Installation accessibility and organization-management
-authority are checked separately; repository permissions or a historical
-`installation.created` webhook do not authorize a new binding. The setup
-callback and webhook may arrive in either order, but binding rechecks the
-local organization owner/admin permission in its transaction.
+The current PAT flow requires a saved, verified PAT belonging to an active local
+organization owner and access to the configured GitHub organization. GitHub App
+installation accessibility and webhook binding are future requirements for the
+replacement App flow, not prerequisites for PAT synchronization.
 
 Disconnecting locally revokes the Fornacast mirror and fences its pending work,
 while retaining repositories, Git/LFS data, and recovery evidence. It only
