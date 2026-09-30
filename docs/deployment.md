@@ -59,6 +59,23 @@ the legacy-data preflight and automatic PostgreSQL migrations before starting
 its supervised services. Readiness succeeds only after both internal health
 endpoints are ready; nginx waits for that readiness check.
 
+The packaged release also exposes the migration command explicitly. Use it when
+an operator needs to apply migrations before starting the application:
+
+```sh
+docker compose run --rm app migrate
+```
+
+For a standalone release tarball, run the same command after exporting the
+PostgreSQL connection environment:
+
+```sh
+/opt/fornacast/bin/fornacast migrate
+```
+
+The command applies all pending migrations and exits without starting the
+supervision tree. It does not accept additional arguments.
+
 Complete `/setup` from the local host or through an SSH tunnel before opening
 public port `4000`. Publish only nginx on `4000` and SSH on `2222`; ports `4890`
 and `4891` are internal.
