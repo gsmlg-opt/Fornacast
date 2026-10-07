@@ -847,8 +847,97 @@ defmodule ForgeImports.DiscoveryTest do
              )
 
     assert normalized.destination_slug == "camelcase"
-    assert normalized.state == :awaiting_resolution
-    assert normalized.wait_reason == "repository_slug_normalized"
+    assert normalized.source_name == "CamelCase"
+    assert normalized.state == :queued
+    assert normalized.wait_reason == nil
+  end
+
+  test "repository discovery preserves Samgita casing without a normalization conflict", %{
+    actor: actor
+  } do
+    assert {:ok, %RunView{repositories: [item]}} =
+             ForgeImports.create_repository_discovery(
+               actor,
+               %{source: "octocat/Samgita", credential_source: :one_time, pat: @pat},
+               request_metadata(),
+               dispatch: :inline,
+               client: __MODULE__.RepositoryClient,
+               client_options: [repository: repository_fixture(name: "Samgita")]
+             )
+
+    assert item.source_name == "Samgita"
+    assert item.destination_slug == "samgita"
+    assert item.state == :queued
+    assert item.wait_reason == nil
+  end
+
+  test "organization destination updates accept casing while retaining actual collisions", %{
+    actor: actor
+  } do
+    repositories = [
+      repository_fixture(id: 92_011, owner_id: 82_001, owner_login: "github", name: "Samgita"),
+      repository_fixture(id: 92_012, owner_id: 82_001, owner_login: "github", name: "Demo"),
+      repository_fixture(id: 92_013, owner_id: 82_001, owner_login: "github", name: "demo"),
+      repository_fixture(id: 92_014, owner_id: 82_001, owner_login: "github", name: "Existing")
+    ]
+
+    assert {:ok, %RunView{} = view} =
+             ForgeImports.create_organization_discovery(
+               actor,
+               %{
+                 organization: "github",
+                 credential_source: :one_time,
+                 pat: @pat,
+                 destination_organization: %{action: :new, slug: "imports"}
+               },
+               request_metadata(),
+               dispatch: :inline,
+               client: __MODULE__.OrganizationClient,
+               client_options: [repositories: repositories]
+             )
+
+    {:ok, organization} = organization_fixture(actor, "case-destination")
+
+    {:ok, _existing} =
+      ForgeRepos.create_repository(organization, %{
+        slug: "existing",
+        name: "Existing"
+      })
+
+    assert {:ok, %RunView{repositories: items}} =
+             ForgeImports.update_organization_destination(actor, view.id, %{
+               action: :existing,
+               id: organization.id
+             })
+
+    assert [samgita, upper_duplicate, lower_duplicate, existing] = items
+    assert samgita.source_name == "Samgita"
+    assert samgita.destination_slug == "samgita"
+    assert samgita.state == :queued
+    assert samgita.wait_reason == nil
+
+    for duplicate <- [upper_duplicate, lower_duplicate] do
+      assert duplicate.destination_slug == "demo"
+      assert duplicate.state == :awaiting_resolution
+      assert duplicate.wait_reason == "normalized_slug_collision"
+    end
+
+    assert existing.destination_slug == "existing"
+    assert existing.state == :awaiting_resolution
+    assert existing.wait_reason == "repository_conflict"
+  end
+
+  test "destination planning still requires resolution for destructive name normalization" do
+    destination = %{status: :clean, owner_id: nil}
+    repository = repository_fixture(name: "Demo.git")
+
+    assert [%{attrs: item}] =
+             ForgeImports.Destination.repository_plans([repository], destination, @now)
+
+    assert item.source_name == "Demo.git"
+    assert item.destination_slug == "demo"
+    assert item.state == :awaiting_resolution
+    assert item.wait_reason == "repository_slug_normalized"
   end
 
   test "repository discovery preserves a GitHub-compatible leading-dot destination slug", %{

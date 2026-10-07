@@ -252,6 +252,20 @@ defmodule ForgeImports.RepositoryPublicationTest do
              )
   end
 
+  test "publication preserves source name casing with a canonical destination slug", context do
+    fixture = ready_publication_fixture(context, slug: "samgita", source_name: "Samgita")
+
+    assert {:ok, %{repository: published}} =
+             ForgeImports.publish_repository(
+               context.actor,
+               fixture.item.id,
+               request_metadata("case-preserving-create")
+             )
+
+    assert published.name == "Samgita"
+    assert published.slug == "samgita"
+  end
+
   test "publishes create with canonical settings, durable evidence, audit, and read-only replay",
        context do
     fixture = ready_publication_fixture(context)
@@ -2154,7 +2168,7 @@ defmodule ForgeImports.RepositoryPublicationTest do
         import_run_id: run.id,
         github_repository_id: 9_950_000_000 + System.unique_integer([:positive]),
         source_full_name: "acme/#{slug}",
-        source_name: "Demo source",
+        source_name: Keyword.get(opts, :source_name, "Demo source"),
         source_metadata: %{
           "default_branch" => "trunk",
           "visibility" => "public",

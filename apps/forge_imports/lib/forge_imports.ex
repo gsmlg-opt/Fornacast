@@ -842,7 +842,7 @@ defmodule ForgeImports do
           slug
         )
 
-      item.source_name != slug ->
+      String.downcase(item.source_name) != slug ->
         destination_item_attrs(
           item,
           destination,

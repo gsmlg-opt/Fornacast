@@ -203,7 +203,7 @@ defmodule ForgeImports.Destination do
       repository: repository,
       slug: if(Repository.canonical_slug?(slug), do: slug),
       normalized_slug: slug,
-      normalized?: repository.name != slug
+      normalized?: String.downcase(repository.name) != slug
     }
   end
 

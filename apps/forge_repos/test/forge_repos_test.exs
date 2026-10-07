@@ -273,9 +273,45 @@ defmodule ForgeReposTest do
 
   test "git path parser accepts only friendly owner/repo git paths" do
     assert ForgeRepos.parse_git_path("alice/demo.git") == {:ok, "alice", "demo"}
+    assert ForgeRepos.parse_git_path("Alice/Demo.git") == {:ok, "Alice", "Demo"}
     assert ForgeRepos.parse_git_path("/alice/demo.git") == {:error, :invalid_path}
     assert ForgeRepos.parse_git_path("alice/../../demo.git") == {:error, :invalid_path}
     assert ForgeRepos.parse_git_path("alice/demo.git; rm -rf /") == {:error, :invalid_path}
+    assert ForgeRepos.parse_git_path("alice/Demo Repo.git") == {:error, :invalid_path}
+  end
+
+  test "repository names preserve casing with case-insensitive lookup and uniqueness" do
+    owner = user_fixture("alice")
+
+    assert {:ok, repository} =
+             ForgeRepos.create_api_repository(
+               owner,
+               owner,
+               %{"name" => "Samgita"},
+               request_metadata("mixed-case-create")
+             )
+
+    assert repository.name == "Samgita"
+    assert repository.slug == "samgita"
+    assert ForgeRepos.get_repository("ALICE", "SAMGITA").id == repository.id
+
+    assert {:ok, authorized} =
+             ForgeRepos.fetch_authorized_repository(owner, "Alice", "SAMGITA", :repository_read)
+
+    assert authorized.id == repository.id
+    assert {:ok, resolved} = ForgeRepos.resolve_git_path("Alice/Samgita.git")
+    assert resolved.id == repository.id
+
+    assert_validation_error(
+      ForgeRepos.create_api_repository(
+        owner,
+        owner,
+        %{"name" => "samgita"},
+        request_metadata("mixed-case-duplicate")
+      ),
+      "name",
+      :already_exists
+    )
   end
 
   test "HTTP clone URLs preserve the owner and repository path without credentials" do

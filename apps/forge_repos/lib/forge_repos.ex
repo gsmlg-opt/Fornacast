@@ -3027,6 +3027,6 @@ defmodule ForgeRepos do
   end
 
   defp valid_git_path_segment?(segment) do
-    segment == Repository.normalize_slug(segment) and segment != ""
+    String.downcase(segment) == Repository.normalize_slug(segment) and segment != ""
   end
 end

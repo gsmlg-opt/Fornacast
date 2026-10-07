@@ -22,6 +22,11 @@ Fornacast continues to lowercase repository slugs and remove a supplied `.git`
 suffix. Invalid character runs continue to normalize to `-`. Hyphens are no
 longer stripped from the beginning or end because GitHub permits them.
 
+Repository display names preserve their original casing, such as `Samgita`.
+Lookups, uniqueness, and Git paths are case-insensitive through the lowercase
+slug. GitHub imports do not require conflict resolution for case-only changes;
+actual duplicate destinations and destructive name normalization still do.
+
 ## Integration
 
 `ForgeRepos.Repository` remains the authoritative local validator. All normal,
@@ -42,6 +47,10 @@ Regression coverage will prove:
 - leading and trailing hyphens follow GitHub's documented character rule;
 - 100 characters are accepted and 101 are rejected;
 - GitHub import discovery selects `.github` without a rename conflict;
+- mixed-case names import without a case-only conflict and retain their casing
+  at publication, including after an organization destination change;
+- mixed-case Git paths resolve the same repository, while case-only duplicate
+  names remain conflicts;
 - GitHub metadata synchronization can rename a local repository to `.github`;
 - persisted import decisions accept the 100-character boundary;
 - trailing dots are accepted, while the reserved `.` and `..` values and the
