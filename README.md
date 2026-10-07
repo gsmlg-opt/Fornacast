@@ -40,6 +40,11 @@ GitHub imports include LFS objects reachable from imported branches and tags;
 LFS-enabled GitHub mirrors transfer objects before confirming synchronized refs.
 See [GitHub import and LFS recovery](docs/github-imports.md#git-lfs).
 
+One-time imports also retain release metadata and stream release assets into the
+shared LocalCAS blob store. Local release APIs expose asset upload, metadata,
+ranged download and logical deletion, source archives, and generated release notes.
+See [release asset recovery](docs/github-imports.md#release-assets).
+
 ## GitHub synchronization
 
 The organization GitHub tab (`/organizations/:organization/settings/github`)
@@ -293,6 +298,8 @@ curl -H 'User-Agent: fornacast-example/1.0' \
 ```
 
 Classic scopes are `repo` for private-repository access, `public_repo` for public-repository writes, `read:org` for organization reads, and `write:org` for organization mutations. Scopes do not override domain authorization: the authenticated user must also have the required repository or organization role. Legacy API tokens are accepted only during the documented migration window and remain read-only.
+
+Standalone development returns API and upload URLs on the API listener (default port 4891) and web links on the web listener (default port 4890). Setting FORNACAST_BASE_URL keeps all published URLs on that configured origin.
 
 Published upload URLs use `/api/uploads` on the same origin as `/api/v3`. Do not publish the internal port `4891` as a separate production origin.
 

@@ -66,7 +66,15 @@ defmodule Fornacast.OpenAPIPruner do
       {"get", "/repos/{owner}/{repo}/releases/tags/{tag}"},
       {"get", "/repos/{owner}/{repo}/releases/{release_id}"},
       {"patch", "/repos/{owner}/{repo}/releases/{release_id}"},
-      {"delete", "/repos/{owner}/{repo}/releases/{release_id}"}
+      {"delete", "/repos/{owner}/{repo}/releases/{release_id}"},
+      {"get", "/repos/{owner}/{repo}/releases/{release_id}/assets"},
+      {"post", "/repos/{owner}/{repo}/releases/{release_id}/assets"},
+      {"get", "/repos/{owner}/{repo}/releases/assets/{asset_id}"},
+      {"patch", "/repos/{owner}/{repo}/releases/assets/{asset_id}"},
+      {"delete", "/repos/{owner}/{repo}/releases/assets/{asset_id}"},
+      {"post", "/repos/{owner}/{repo}/releases/generate-notes"},
+      {"get", "/repos/{owner}/{repo}/releases/assets/{asset_id}/download"},
+      {"get", "/repos/{owner}/{repo}/releases/{release_id}/archives/{format}"}
     ]
   }
 
@@ -154,7 +162,7 @@ defmodule Fornacast.OpenAPIPruner do
       |> Enum.reject(fn {_method, path} -> path == "/versions" end)
       |> Enum.group_by(&elem(&1, 1), &elem(&1, 0))
       |> Map.new(fn {path, methods} ->
-        path_item = Map.fetch!(document["paths"], path)
+        path_item = document["paths"][path] || local_release_path(path)
         preserved = Map.take(path_item, ["parameters", "servers", "summary", "description"])
 
         operations =
@@ -223,7 +231,67 @@ defmodule Fornacast.OpenAPIPruner do
     end)
   end
 
+  defp prune_operation(operation, "/repos/{owner}/{repo}/releases/{release_id}/assets", "post"),
+    do: Map.put(operation, "servers", [%{"url" => "/api/uploads"}])
+
+  defp prune_operation(operation, path, method)
+       when path in [
+              "/repos/{owner}/{repo}/releases",
+              "/repos/{owner}/{repo}/releases/{release_id}",
+              "/repos/{owner}/{repo}/releases/latest",
+              "/repos/{owner}/{repo}/releases/tags/{tag}"
+            ] and
+              method in ["get", "post", "patch"] do
+    status = if method == "post", do: "201", else: "200"
+    keys = ["responses", status, "content", "application/json", "schema"]
+
+    keys =
+      if method == "get" and String.ends_with?(path, "/releases"),
+        do: keys ++ ["items"],
+        else: keys
+
+    update_in(
+      operation,
+      keys ++ ["properties"],
+      &Map.put(&1, "discussion_url", %{"type" => "string", "format" => "uri", "nullable" => true})
+    )
+  end
+
   defp prune_operation(operation, _path, _method), do: operation
+
+  defp local_release_path(path) do
+    archive? = String.contains?(path, "/archives/")
+    names = if archive?, do: ~w(owner repo release_id format), else: ~w(owner repo asset_id)
+
+    parameters =
+      Enum.map(names, fn name ->
+        schema =
+          if name == "format",
+            do: %{"type" => "string", "enum" => ["tar", "zip"]},
+            else: %{"type" => "string"}
+
+        %{"name" => name, "in" => "path", "required" => true, "schema" => schema}
+      end)
+
+    %{
+      "get" => %{
+        "operationId" =>
+          if(archive?, do: "fornacast/release-archive", else: "fornacast/release-asset-download"),
+        "x-fornacast-local" => true,
+        "parameters" => parameters,
+        "responses" => %{
+          "200" => %{
+            "description" => "Authorized local binary",
+            "content" => %{
+              "application/octet-stream" => %{
+                "schema" => %{"type" => "string", "format" => "binary"}
+              }
+            }
+          }
+        }
+      }
+    }
+  end
 
   defp put_issues_disabled_response(operation, path, method, response) do
     if {method, path} in @issues_disabled_operations do
@@ -282,8 +350,8 @@ defmodule Fornacast.OpenAPIPruner do
         "issues_disabled_410_operations" => declared_issues_disabled_operations(),
         "merge_method" => "merge",
         "unavailable_pull_head" => "nullable_repo_and_user_with_ref_only_label",
-        "release_assets" => "unsupported",
-        "release_archives" => nil,
+        "release_assets" => "local_cas",
+        "release_archives" => "authorized_local_git",
         "issue_pull_release_html_url" => "corresponding_public_api_url",
         "commit_pull_diff_patch_media" => "not_acceptable"
       }
@@ -321,9 +389,12 @@ defmodule Fornacast.OpenAPIPruner do
       "PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge" =>
         ~w(commit_title commit_message sha merge_method),
       "POST /repos/{owner}/{repo}/releases" =>
-        ~w(tag_name target_commitish name body draft prerelease),
+        ~w(tag_name target_commitish name body draft prerelease make_latest generate_release_notes),
       "PATCH /repos/{owner}/{repo}/releases/{release_id}" =>
-        ~w(tag_name target_commitish name body draft prerelease)
+        ~w(tag_name target_commitish name body draft prerelease make_latest),
+      "POST /repos/{owner}/{repo}/releases/generate-notes" =>
+        ~w(tag_name target_commitish previous_tag_name),
+      "PATCH /repos/{owner}/{repo}/releases/assets/{asset_id}" => ~w(name label)
     }
   end
 
@@ -340,7 +411,8 @@ defmodule Fornacast.OpenAPIPruner do
       "POST /repos/{owner}/{repo}/issues/{issue_number}/comments" => ~w(body),
       "PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}" => ~w(body),
       "POST /repos/{owner}/{repo}/pulls" => ~w(title head base),
-      "POST /repos/{owner}/{repo}/releases" => ~w(tag_name)
+      "POST /repos/{owner}/{repo}/releases" => ~w(tag_name),
+      "POST /repos/{owner}/{repo}/releases/generate-notes" => ~w(tag_name)
     }
   end
 
@@ -355,7 +427,9 @@ defmodule Fornacast.OpenAPIPruner do
       "issues" => ~w(page per_page state labels assignee creator sort direction since),
       "issue_comments" => ~w(page per_page since),
       "pulls" => ~w(page per_page state head base sort direction),
-      "releases" => ~w(page per_page)
+      "releases" => ~w(page per_page),
+      "release_assets" => ~w(page per_page),
+      "release_asset_upload" => ~w(name label)
     }
   end
 end

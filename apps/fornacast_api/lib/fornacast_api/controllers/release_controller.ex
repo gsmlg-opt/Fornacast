@@ -85,6 +85,22 @@ defmodule FornacastAPI.ReleaseController do
     )
   end
 
+  def generate_notes(conn, %{"owner" => owner, "repo" => repo}) do
+    with {:ok, %{actor: actor} = authentication} <- require_auth(conn),
+         {:ok, repository} <- authorized_repository(actor, owner, repo),
+         {:ok, accepted_scopes} <-
+           authorize_scope(authentication, :repository_mutation, repository.visibility),
+         {:ok, _} <- ForgeRepos.fetch_authorized_repository(actor, owner, repo, :repository_write),
+         {:ok, body, conn} <- read_authorized_body(conn, accepted_scopes),
+         {:ok, attrs} <- RequestValidator.validate(conn.assigns.api_version, :release_notes, body),
+         {:ok, notes} <- ForgeReleases.generate_notes(actor, owner, repo, attrs) do
+      Response.json(conn, 200, notes, accepted_scopes: accepted_scopes)
+    else
+      {:error, %Error{} = error, _reason, conn} -> Response.error(conn, error)
+      {:error, reason} -> render_error(conn, reason, @create_url)
+    end
+  end
+
   def update(conn, %{"owner" => owner, "repo" => repo, "release_id" => release_id}) do
     mutate(
       conn,

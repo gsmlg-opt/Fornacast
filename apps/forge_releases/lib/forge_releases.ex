@@ -129,16 +129,7 @@ defmodule ForgeReleases do
              repository_slug,
              :repository_read
            ),
-         %Release{} = release <-
-           Repo.one(
-             from(release in Release,
-               where:
-                 release.repository_id == ^repository.id and is_nil(release.deleted_at) and
-                   release.draft == false and release.prerelease == false,
-               order_by: [desc: release.published_at, desc: release.id],
-               limit: 1
-             )
-           ) do
+         %Release{} = release <- latest_release(repository.id) do
       {:ok, decorate_release(release, actor, repository)}
     else
       nil -> {:error, :not_found}
@@ -224,6 +215,130 @@ defmodule ForgeReleases do
   def delete(_actor, _owner_slug, _repository_slug, _release_id, _request_metadata),
     do: {:error, :forbidden}
 
+  defdelegate list_assets(actor, owner, repo, release_id, filters),
+    to: ForgeReleases.Assets,
+    as: :list
+
+  defdelegate get_asset(actor, owner, repo, asset_id), to: ForgeReleases.Assets, as: :get
+
+  defdelegate upload_asset(actor, owner, repo, release_id, attrs, reader, state, options \\ []),
+    to: ForgeReleases.Assets,
+    as: :upload
+
+  defdelegate import_asset(repository, release_id, attrs, reader, state, options),
+    to: ForgeReleases.Assets
+
+  defdelegate resume_import_asset(repository, release_id, attrs, options),
+    to: ForgeReleases.Assets
+
+  defdelegate update_asset(actor, owner, repo, asset_id, attrs, metadata),
+    to: ForgeReleases.Assets,
+    as: :update
+
+  defdelegate delete_asset(actor, owner, repo, asset_id, metadata),
+    to: ForgeReleases.Assets,
+    as: :delete
+
+  defdelegate open_asset(actor, owner, repo, asset_id, range \\ :all),
+    to: ForgeReleases.Assets,
+    as: :open
+
+  defdelegate read_asset_chunk(source, bytes), to: ForgeReleases.AssetStorage, as: :read
+  defdelegate close_asset(source), to: ForgeReleases.AssetStorage, as: :close
+  defdelegate complete_asset_download(asset_id), to: ForgeReleases.Assets, as: :complete_download
+
+  def generate_notes(actor, owner, repo, attrs) do
+    with {:ok, repository} <-
+           ForgeRepos.fetch_authorized_repository(actor, owner, repo, :repository_write),
+         tag when is_binary(tag) and byte_size(tag) in 1..255 <- attr(attrs, "tag_name") do
+      ForgeReleases.Notes.generate(
+        repository,
+        tag,
+        attr(attrs, "previous_tag_name"),
+        attr(attrs, "target_commitish")
+      )
+    else
+      {:error, _} = error -> error
+      _ -> invalid("tag_name")
+    end
+  end
+
+  defp prepare_notes(repository, attrs) do
+    case attr(attrs, "generate_release_notes") do
+      true ->
+        with {:ok, notes} <-
+               ForgeReleases.Notes.generate(
+                 repository,
+                 attr(attrs, "tag_name"),
+                 nil,
+                 attr(attrs, "target_commitish")
+               ) do
+          body =
+            case attr(attrs, "body") do
+              nil -> notes.body
+              "" -> notes.body
+              existing -> existing <> "\n\n" <> notes.body
+            end
+
+          {:ok,
+           attrs
+           |> Map.new(fn {k, v} -> {to_string(k), v} end)
+           |> Map.put("body", body)
+           |> put_default("name", notes.name)}
+        end
+
+      value when value in [nil, false] ->
+        {:ok, attrs}
+
+      _ ->
+        invalid("generate_release_notes")
+    end
+  end
+
+  defp select_latest(repo, %{release: release}) do
+    if release.make_latest == "true" and not release.draft and not release.prerelease do
+      repo.update_all(
+        from(r in Release,
+          where:
+            r.repository_id == ^release.repository_id and r.id != ^release.id and
+              r.make_latest == "true"
+        ),
+        set: [make_latest: "legacy"]
+      )
+    end
+
+    {:ok, release.id}
+  end
+
+  defp latest_release(repository_id) do
+    releases =
+      Repo.all(
+        from r in Release,
+          where:
+            r.repository_id == ^repository_id and is_nil(r.deleted_at) and
+              not r.draft and not r.prerelease and r.make_latest != "false",
+          order_by: [desc: r.updated_at, desc: r.id]
+      )
+
+    Enum.find(releases, &(&1.make_latest == "true")) ||
+      Enum.reduce(releases, nil, fn release, current ->
+        cond do
+          is_nil(current) -> release
+          higher_version?(release.tag_name, current.tag_name) -> release
+          true -> current
+        end
+      end)
+  end
+
+  defp higher_version?(tag, current_tag) do
+    with {:ok, version} <- Version.parse(String.trim_leading(tag, "v")),
+         {:ok, current} <- Version.parse(String.trim_leading(current_tag, "v")) do
+      Version.compare(version, current) == :gt
+    else
+      _ -> false
+    end
+  end
+
   defdelegate release_sync_projection(repository_id, release_id), to: ForgeReleases.Sync
 
   defdelegate append_sync_release_observe(multi, key, expected), to: ForgeReleases.Sync
@@ -231,6 +346,7 @@ defmodule ForgeReleases do
   defdelegate append_sync_release_apply(multi, key, request), to: ForgeReleases.Sync
 
   @import_release_keys ~w(author_github_identity_id body draft inserted_at name prerelease published_at tag_name target_commitish updated_at)a
+  @optional_import_release_keys ~w(immutable source_metadata make_latest)a
 
   @doc """
   Appends a provider release import to a caller-owned transaction.
@@ -333,18 +449,28 @@ defmodule ForgeReleases do
          remaining_ms,
          event_options \\ []
        ) do
-    attrs = put_default(attrs, "target_commitish", repository.default_branch)
+    attrs =
+      attrs
+      |> put_default("target_commitish", repository.default_branch)
+      |> put_default("make_latest", "true")
 
     Multi.new()
     |> Multi.run(:authorization, fn repo, _changes ->
       authorize_mutation(repo, actor.id, repository.id)
     end)
-    |> Multi.insert(:release, fn %{authorization: %{actor: current_actor}} ->
+    |> Multi.run(:notes, fn _repo, _changes ->
+      prepare_notes(repository, attrs)
+    end)
+    |> Multi.insert(:release, fn %{
+                                   authorization: %{actor: current_actor},
+                                   notes: normalized_attrs
+                                 } ->
       Release.create_changeset(
         %Release{repository_id: repository.id, author_user_id: current_actor.id},
-        attrs
+        normalized_attrs
       )
     end)
+    |> Multi.run(:latest_selection, &select_latest/2)
     |> Multi.run(:tag, fn _repo, %{release: release} ->
       require_tag(repository_path, release.tag_name, remaining_ms)
     end)
@@ -376,6 +502,7 @@ defmodule ForgeReleases do
     |> Multi.update(:release, fn %{authorization: %{release: release}} ->
       Release.update_changeset(release, attrs)
     end)
+    |> Multi.run(:latest_selection, &select_latest/2)
     |> Multi.run(:tag, fn _repo, %{release: release} ->
       require_tag(repository_path, release.tag_name, remaining_ms)
     end)
@@ -398,6 +525,9 @@ defmodule ForgeReleases do
     end)
     |> Multi.update(:release, fn %{authorization: %{release: release}} ->
       Release.delete_changeset(release)
+    end)
+    |> Multi.run(:assets_deleted, fn repo, %{release: release} ->
+      {:ok, ForgeReleases.Assets.delete_release_assets(repo, release.id)}
     end)
     |> SyncEvents.release("release.deleted")
     |> Audit.record_multi(
@@ -433,7 +563,9 @@ defmodule ForgeReleases do
                lock: "FOR UPDATE"
              )
            ) do
-      {:ok, Map.put(authorization, :release, release)}
+      if release.immutable and not release.draft,
+        do: invalid("immutable"),
+        else: {:ok, Map.put(authorization, :release, release)}
     else
       nil -> {:error, :not_found}
       {:error, _reason} = error -> error
@@ -502,7 +634,16 @@ defmodule ForgeReleases do
   defp decorate_release(%Release{} = release, actor, repository) do
     writable = Fornacast.Access.allowed?(actor, :repository_write, repository)
     author = release_author(release, actor)
-    %{release | author: author, capabilities: %{can_edit: writable, can_delete: writable}}
+
+    %{
+      release
+      | author: author,
+        assets: ForgeReleases.Assets.for_release(release.id),
+        capabilities: %{
+          can_edit: writable and not (release.immutable and not release.draft),
+          can_delete: writable and not (release.immutable and not release.draft)
+        }
+    }
   end
 
   defp release_author(%Release{author_user_id: user_id}, %User{id: user_id} = actor), do: actor
@@ -526,6 +667,9 @@ defmodule ForgeReleases do
   end
 
   defp map_mutation_result({:error, :authorization, reason, _changes}, _key, _actor),
+    do: {:error, reason}
+
+  defp map_mutation_result({:error, :notes, reason, _changes}, _key, _actor),
     do: {:error, reason}
 
   defp map_mutation_result({:error, :tag, reason, _changes}, _key, _actor),
@@ -568,7 +712,21 @@ defmodule ForgeReleases do
       else: invalid("page")
   end
 
-  defp attr(attrs, key), do: Map.get(attrs, key, Map.get(attrs, String.to_existing_atom(key)))
+  defp attr(attrs, key) do
+    case Map.fetch(attrs, key) do
+      {:ok, value} ->
+        value
+
+      :error ->
+        Enum.find_value(attrs, fn {candidate, value} ->
+          if to_string(candidate) == key, do: {value}
+        end)
+        |> unwrap_attr()
+    end
+  end
+
+  defp unwrap_attr({value}), do: value
+  defp unwrap_attr(nil), do: nil
 
   defp put_default(attrs, key, value) do
     if Map.has_key?(attrs, key) or Map.has_key?(attrs, String.to_existing_atom(key)),
@@ -577,7 +735,8 @@ defmodule ForgeReleases do
   end
 
   defp normalize_import_release_attrs(attrs) do
-    if Enum.sort(Map.keys(attrs)) == Enum.sort(@import_release_keys) and
+    if Map.keys(attrs) -- (@import_release_keys ++ @optional_import_release_keys) == [] and
+         @import_release_keys -- Map.keys(attrs) == [] and
          is_integer(attrs[:author_github_identity_id]) and
          attrs[:author_github_identity_id] > 0 and utc_second?(attrs[:inserted_at]) and
          utc_second?(attrs[:updated_at]) and

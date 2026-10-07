@@ -51,5 +51,32 @@
     <article class="prose max-w-none bg-surface-container text-on-surface rounded-lg border border-outline-variant p-4">
       {markdown(@result.content.release.body)}
     </article>
+
+    <section
+      class="grid gap-3 bg-surface-container text-on-surface rounded-lg border border-outline-variant p-4"
+      data-release-assets
+    >
+      <h3 class="font-semibold">Release assets</h3>
+      <ul class="grid gap-3" role="list">
+        <li
+          :for={asset <- assets(@result.content.release)}
+          class="flex flex-wrap items-center justify-between gap-2"
+          data-release-asset
+        >
+          <div class="min-w-0">
+            <.dm_link href={asset_path(@result.chrome, asset.id)}>{asset.name}</.dm_link>
+            <p :if={asset.label} class="text-sm text-on-surface-variant">{asset.label}</p>
+            <p class="text-xs text-on-surface-variant">
+              {asset.size} bytes · {asset.download_count + asset.source_download_count} downloads
+            </p>
+          </div>
+          <code class="max-w-full break-all text-xs text-on-surface-variant">sha256:{asset.sha256_digest}</code>
+        </li>
+      </ul>
+      <div class="flex flex-wrap gap-3">
+        <.dm_link href={archive_path(@result.chrome, @result.content.release.id, "zip")}>Source code (zip)</.dm_link>
+        <.dm_link href={archive_path(@result.chrome, @result.content.release.id, "tar")}>Source code (tar)</.dm_link>
+      </div>
+    </section>
   </section>
 </RepositoryHTML.repository_frame>

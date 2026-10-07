@@ -919,53 +919,18 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
     assert Enum.map(mappings, & &1.github_object_id) == [41, 42, 43]
     assert Enum.all?(mappings, &(&1.local_resource_type == "ForgeReleases.Release"))
 
-    warning =
-      Repo.get_by!(ReportEntry,
-        repository_item_id: item.id,
-        classification: "unsupported_release_assets",
-        source_object_id: 41
-      )
+    refute Repo.get_by(ReportEntry,
+             repository_item_id: item.id,
+             classification: "unsupported_release_assets"
+           )
 
-    assert warning.outcome == :warning
-    assert warning.metadata == %{"category" => "release_assets", "count" => 2, "github_id" => 41}
+    refute Repo.get_by(ReportEntry,
+             repository_item_id: item.id,
+             classification: "unsupported_release_fields",
+             source_object_id: 41
+           )
 
-    assert Repo.aggregate(
-             from(report in ReportEntry,
-               where:
-                 report.repository_item_id == ^item.id and
-                   report.classification == "unsupported_release_assets"
-             ),
-             :count,
-             :id
-           ) == 1
-
-    unsupported_fields =
-      Repo.get_by!(ReportEntry,
-        repository_item_id: item.id,
-        classification: "unsupported_release_fields",
-        source_object_id: 41
-      )
-
-    assert unsupported_fields.metadata == %{
-             "category" => "release_fields",
-             "field" => "html_url,upload_url",
-             "github_id" => 41
-           }
-
-    assert unsupported_fields.source_count == 2
-
-    assert Repo.aggregate(
-             from(report in ReportEntry,
-               where:
-                 report.repository_item_id == ^item.id and
-                   report.classification == "unsupported_release_fields" and
-                   report.source_object_id == 41
-             ),
-             :count,
-             :id
-           ) == 1
-
-    persisted = inspect({releases, mappings, warning})
+    persisted = inspect({releases, mappings})
     refute persisted =~ "browser_download_url"
     refute persisted =~ "upload_url"
     refute persisted =~ "asset-sentinel"
@@ -1298,7 +1263,525 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
              ),
              :count,
              :id
+           ) == 0
+  end
+
+  test "release asset fences lock the actor before the import run and item", %{run: run} do
+    {item, repository, _stub, _head, _base} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    reference = make_ref()
+    handler = {__MODULE__, reference}
+    prefix = Repo.config()[:telemetry_prefix] || [:fornacast, :repo]
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        prefix ++ [:query],
+        fn _event, _measurements, metadata, {caller, reference} ->
+          if self() == caller and is_binary(metadata.query) and
+               String.contains?(metadata.query, "FOR UPDATE") do
+            case Regex.run(~r/FROM "([^"]+)"/, metadata.query) do
+              [_, table] -> send(caller, {reference, :locked_table, table})
+              _ -> :ok
+            end
+          end
+        end,
+        {self(), reference}
+      )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+    fence = ForgeImports.GitHub.ReleaseAssets.initial_fence(item, repository)
+    assert {:ok, :ok} = Repo.transaction(fn -> fence.(Repo) end)
+
+    locked =
+      Enum.map(1..3, fn _ ->
+        receive do
+          {^reference, :locked_table, table} -> table
+        after
+          1_000 -> flunk("missing row-lock telemetry")
+        end
+      end)
+
+    assert locked == ["users", "github_import_runs", "github_import_repository_items"]
+  end
+
+  test "release asset gate contention preserves incomplete progress without a permanent failure",
+       %{run: run} do
+    {item, _repository, stub, head_sha, _} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    git!(item.staged_storage_path, ["update-ref", "refs/tags/v1", head_sha])
+
+    stub_client!(stub,
+      labels: [],
+      issues: [],
+      comments: %{},
+      releases: [[release_payload(87, tag_name: "v1", asset_count: 1)]]
+    )
+
+    options = importer_opts(stub, item) |> Keyword.put(:asset_client, __MODULE__.BusyAssetClient)
+    assert :ok = MetadataImporter.stage_phase(item, :releases, options)
+
+    assert {:error, :request_gate_busy} =
+             MetadataImporter.stage_phase(item, :release_assets_v1, options)
+
+    refute terminal?(item.id, "release_assets_v1")
+
+    refute Repo.get_by(ReportEntry,
+             repository_item_id: item.id,
+             classification: "release_asset_transfer_failed"
+           )
+
+    refute Repo.get_by(ObjectMapping, repository_item_id: item.id, object_kind: "release_asset")
+
+    assert :ok =
+             MetadataImporter.stage_phase(
+               item,
+               :release_assets_v1,
+               Keyword.put(options, :asset_client, __MODULE__.AssetClient)
+             )
+
+    assert terminal?(item.id, "release_assets_v1")
+  end
+
+  test "release asset phase publishes stored binaries and replays without downloading", %{
+    run: run
+  } do
+    {item, repository, stub, head_sha, _} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    git!(item.staged_storage_path, ["update-ref", "refs/tags/v1", head_sha])
+
+    stub_client!(stub,
+      labels: [],
+      issues: [],
+      comments: %{},
+      releases: [[release_payload(81, tag_name: "v1", asset_count: 1)]]
+    )
+
+    options = importer_opts(stub, item) |> Keyword.put(:asset_client, __MODULE__.AssetClient)
+
+    assert :ok = MetadataImporter.stage_phase(item, :releases, options)
+    legacy_asset_warning!(item, 81)
+    assert :ok = MetadataImporter.stage_phase(item, :release_assets_v1, options)
+    assert_receive :asset_download
+
+    mapping =
+      Repo.get_by!(ObjectMapping,
+        repository_item_id: item.id,
+        object_kind: "release_asset",
+        github_object_id: 501
+      )
+
+    asset = Repo.get!(ForgeReleases.Asset, mapping.local_resource_id)
+    assert asset.name == "package.tar.gz"
+    assert asset.label == nil
+    assert asset.size == 7
+    assert {:ok, source} = ForgeReleases.AssetStorage.open(asset.storage_key, 7, :all)
+    assert {:ok, "payload", source} = ForgeReleases.AssetStorage.read(source, 64)
+    assert :ok = ForgeReleases.AssetStorage.close(source)
+    assert terminal?(item.id, "release_assets_v1")
+
+    assert Repo.get_by(ReportEntry,
+             repository_item_id: item.id,
+             classification: "unsupported_release_assets"
+           ) == nil
+
+    assert Repo.get_by!(ReportEntry,
+             repository_item_id: item.id,
+             classification: "release_assets_imported"
+           ).outcome == :imported
+
+    assert :ok = MetadataImporter.stage_phase(item, :release_assets_v1, options)
+    refute_receive :asset_download
+
+    assert Repo.aggregate(
+             from(mapping in ObjectMapping,
+               where:
+                 mapping.hidden_repository_id == ^repository.id and
+                   mapping.object_kind == "release_asset"
+             ),
+             :count
            ) == 1
+  end
+
+  test "release asset phase keeps incomplete transfers resumable and refuses lost leases", %{
+    run: run
+  } do
+    {item, _repository, stub, head_sha, _} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    git!(item.staged_storage_path, ["update-ref", "refs/tags/v1", head_sha])
+
+    stub_client!(stub,
+      labels: [],
+      issues: [],
+      comments: %{},
+      releases: [[release_payload(82, tag_name: "v1", asset_count: 1)]]
+    )
+
+    options =
+      importer_opts(stub, item) |> Keyword.put(:asset_client, __MODULE__.FailedAssetClient)
+
+    assert :ok = MetadataImporter.stage_phase(item, :releases, options)
+    legacy_asset_warning!(item, 82)
+
+    assert {:error, :integrity_mismatch} =
+             MetadataImporter.stage_phase(item, :release_assets_v1, options)
+
+    refute terminal?(item.id, "release_assets_v1")
+    refute Repo.get_by(ObjectMapping, repository_item_id: item.id, object_kind: "release_asset")
+
+    assert Repo.get_by!(ReportEntry,
+             repository_item_id: item.id,
+             classification: "unsupported_release_assets"
+           ).outcome == :warning
+
+    assert {:error, :lost_lease} =
+             MetadataImporter.stage_phase(
+               item,
+               :release_assets_v1,
+               Keyword.put(options, :heartbeat, fn -> {:error, :lost_lease} end)
+             )
+
+    assert :ok =
+             MetadataImporter.stage_phase(
+               item,
+               :release_assets_v1,
+               Keyword.put(options, :asset_client, __MODULE__.AssetClient)
+             )
+
+    assert terminal?(item.id, "release_assets_v1")
+
+    assert Repo.get_by(ReportEntry,
+             repository_item_id: item.id,
+             classification: "release_asset_transfer_failed"
+           ) == nil
+
+    assert Repo.get_by!(ReportEntry,
+             repository_item_id: item.id,
+             classification: "release_assets_recovered"
+           ).outcome == :imported
+  end
+
+  test "release asset phase recovers committed bytes after fenced SQL publication fails", %{
+    run: run
+  } do
+    {item, repository, stub, head_sha, _} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    git!(item.staged_storage_path, ["update-ref", "refs/tags/v1", head_sha])
+
+    stub_client!(stub,
+      labels: [],
+      issues: [],
+      comments: %{},
+      releases: [[release_payload(83, tag_name: "v1", asset_count: 1)]]
+    )
+
+    options = importer_opts(stub, item) |> Keyword.put(:asset_client, __MODULE__.AssetClient)
+    assert :ok = MetadataImporter.stage_phase(item, :releases, options)
+
+    interrupted =
+      Keyword.put(options, :asset_options,
+        test_after_commit: fn ->
+          Repo.update_all(from(current in RepositoryItem, where: current.id == ^item.id),
+            set: [state: :failed]
+          )
+
+          :ok
+        end
+      )
+
+    assert {:error, :lost_lease} =
+             MetadataImporter.stage_phase(item, :release_assets_v1, interrupted)
+
+    assert_receive :asset_download
+    operation = Repo.get_by!(ForgeReleases.AssetOperation, repository_id: repository.id)
+    assert operation.state == :staged
+    assert {:ok, source} = ForgeReleases.AssetStorage.open(operation.storage_key, 7, :all)
+    assert {:ok, "payload", source} = ForgeReleases.AssetStorage.read(source, 64)
+    assert :ok = ForgeReleases.AssetStorage.close(source)
+    refute terminal?(item.id, "release_assets_v1")
+    refute Repo.get_by(ObjectMapping, repository_item_id: item.id, object_kind: "release_asset")
+
+    Repo.update_all(from(current in RepositoryItem, where: current.id == ^item.id),
+      set: [state: item.state]
+    )
+
+    assert :ok = MetadataImporter.stage_phase(item, :release_assets_v1, options)
+    refute_receive :asset_download
+    assert Repo.get!(ForgeReleases.AssetOperation, operation.id).state == :completed
+    assert Repo.get_by!(ObjectMapping, repository_item_id: item.id, object_kind: "release_asset")
+    assert terminal?(item.id, "release_assets_v1")
+  end
+
+  test "release asset phase refuses lease loss during a streamed reader", %{run: run} do
+    {item, _repository, stub, head_sha, _} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    git!(item.staged_storage_path, ["update-ref", "refs/tags/v1", head_sha])
+
+    stub_client!(stub,
+      labels: [],
+      issues: [],
+      comments: %{},
+      releases: [[release_payload(84, tag_name: "v1", asset_count: 1)]]
+    )
+
+    options =
+      importer_opts(stub, item) |> Keyword.put(:asset_client, __MODULE__.LeaseLostAssetClient)
+
+    assert :ok = MetadataImporter.stage_phase(item, :releases, options)
+
+    asset_options =
+      Keyword.update!(options, :client_options, &Keyword.put(&1, :test_item_id, item.id))
+
+    assert {:error, :lost_lease} =
+             MetadataImporter.stage_phase(item, :release_assets_v1, asset_options)
+
+    assert_receive :asset_reader_started
+    refute terminal?(item.id, "release_assets_v1")
+    refute Repo.get_by(ObjectMapping, repository_item_id: item.id, object_kind: "release_asset")
+
+    refute Repo.get_by(ReportEntry,
+             repository_item_id: item.id,
+             classification: "release_asset_transfer_failed"
+           )
+  end
+
+  test "release asset phase retains legacy warning when provider inventory shrinks", %{run: run} do
+    {item, _repository, stub, head_sha, _} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    git!(item.staged_storage_path, ["update-ref", "refs/tags/v1", head_sha])
+
+    stub_client!(stub,
+      labels: [],
+      issues: [],
+      comments: %{},
+      releases: [[release_payload(86, tag_name: "v1", asset_count: 2)]]
+    )
+
+    options = importer_opts(stub, item) |> Keyword.put(:asset_client, __MODULE__.AssetClient)
+    assert :ok = MetadataImporter.stage_phase(item, :releases, options)
+    legacy_asset_warning!(item, 86)
+
+    assert {:error, :release_asset_inventory_changed} =
+             MetadataImporter.stage_phase(item, :release_assets_v1, options)
+
+    refute terminal?(item.id, "release_assets_v1")
+
+    assert Repo.get_by!(ReportEntry,
+             repository_item_id: item.id,
+             classification: "unsupported_release_assets"
+           ).outcome == :warning
+
+    failure =
+      Repo.get_by!(ReportEntry,
+        repository_item_id: item.id,
+        classification: "release_asset_transfer_failed"
+      )
+
+    assert failure.metadata["code"] == "release_asset_inventory_changed"
+
+    assert {:error, :invalid_release_asset_inventory} =
+             MetadataImporter.stage_phase(
+               item,
+               :release_assets_v1,
+               Keyword.put(options, :asset_client, __MODULE__.DuplicateAssetClient)
+             )
+
+    refute terminal?(item.id, "release_assets_v1")
+  end
+
+  test "GitHub App mirror releases retain the asset exclusion without downloading", %{
+    actor: actor
+  } do
+    suffix = System.unique_integer([:positive])
+
+    {:ok, organization} =
+      ForgeAccounts.create_organization(actor, %{
+        username: "asset-app-org-#{suffix}",
+        display_name: "Asset App Org #{suffix}"
+      })
+
+    {:ok, run} =
+      Persistence.insert_run(%{
+        actor_user_id: actor.id,
+        source_kind: :organization,
+        github_identity_id: nil,
+        credential_source: :github_app,
+        github_credential_id: nil,
+        source_owner_github_id: 8_950_000_001,
+        source_owner_login: "octocat",
+        destination_organization_action: :existing,
+        destination_organization_slug: organization.username,
+        destination_organization_id: organization.id,
+        destination_organization_status: :clean,
+        state: :running,
+        request_metadata: %{}
+      })
+
+    {item, _repository, stub, head_sha, _} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    mirror =
+      ForgeMirrors.TestSupport.MirrorFixtures.ready_organization_mirror_fixture(%{
+        organization_id: organization.id,
+        github_installation_id: System.system_time(:microsecond),
+        github_account_id: run.source_owner_github_id,
+        github_account_login: run.source_owner_login,
+        bootstrap_import_run_id: run.id,
+        capabilities: %{"git" => "enabled", "releases" => "enabled"}
+      })
+
+    {:ok, mirror} = ForgeMirrors.transition_organization_mirror(actor, mirror, :bootstrapping)
+
+    ForgeMirrors.TestSupport.MirrorFixtures.repository_mirror_fixture(mirror, %{
+      github_repository_id: item.github_repository_id,
+      github_node_id: "R_asset_excluded",
+      github_full_name: item.source_full_name
+    })
+
+    git!(item.staged_storage_path, ["update-ref", "refs/tags/v1", head_sha])
+
+    stub_client!(stub,
+      labels: [],
+      issues: [],
+      comments: %{},
+      releases: [[release_payload(85, tag_name: "v1", asset_count: 1)]]
+    )
+
+    options = importer_opts(stub, item) |> Keyword.put(:asset_client, __MODULE__.AssetClient)
+    assert :ok = MetadataImporter.stage_phase(item, :releases, options)
+    assert :ok = MetadataImporter.stage_phase(item, :release_assets_v1, options)
+    assert terminal?(item.id, "release_assets_v1")
+
+    assert Repo.get_by!(ReportEntry,
+             repository_item_id: item.id,
+             source_object_id: 85,
+             classification: "unsupported_release_assets"
+           ).outcome == :warning
+
+    refute Repo.get_by(ObjectMapping, repository_item_id: item.id, object_kind: "release_asset")
+    refute_receive :asset_download
+  end
+
+  defp legacy_asset_warning!(item, release_id) do
+    %ReportEntry{}
+    |> ReportEntry.create_changeset(%{
+      import_run_id: item.import_run_id,
+      repository_item_id: item.id,
+      idempotency_key: "legacy-release-assets-#{item.id}-#{release_id}",
+      scope: :object,
+      object_kind: "release",
+      source_object_id: release_id,
+      outcome: :warning,
+      classification: "unsupported_release_assets",
+      summary: "Release asset binaries were excluded",
+      metadata: %{"category" => "release_assets", "count" => 1},
+      source_count: 1
+    })
+    |> Repo.insert!()
+  end
+
+  defmodule AssetClient do
+    def list_assets_page(_token, _owner, _repository, _release_id, _cursor, _options) do
+      {:ok,
+       %{
+         assets: [
+           %{
+             "id" => 501,
+             "node_id" => "RA_501",
+             "name" => "package.tar.gz",
+             "label" => nil,
+             "content_type" => "application/gzip",
+             "state" => "uploaded",
+             "size" => 7,
+             "digest" => nil,
+             "download_count" => 4,
+             "created_at" => "2026-08-26T01:00:00Z",
+             "updated_at" => "2026-08-28T01:00:00Z",
+             "uploader" => %{"id" => 90_081, "node_id" => "U_81", "login" => "user-81"}
+           }
+         ],
+         next_cursor: nil
+       }}
+    end
+
+    def download(_token, _owner, _repository, _asset, consumer, _options) do
+      send(self(), :asset_download)
+
+      reader = fn
+        [chunk | rest], options ->
+          assert Keyword.keys(options) -- [:length, :read_timeout] == []
+          {:ok, chunk, rest}
+
+        [], options ->
+          assert Keyword.keys(options) -- [:length, :read_timeout] == []
+          {:eof, []}
+      end
+
+      case consumer.(reader, ["pay", "load"]) do
+        {:ok, asset, []} -> {:ok, asset}
+        {:error, reason, _} -> {:error, reason}
+      end
+    end
+  end
+
+  defmodule LeaseLostAssetClient do
+    defdelegate list_assets_page(token, owner, repository, release, cursor, options),
+      to: AssetClient
+
+    def download(_, _, _, _, consumer, options) do
+      item_id = Keyword.fetch!(options, :test_item_id)
+
+      reader = fn
+        [chunk | rest], _ ->
+          send(self(), :asset_reader_started)
+
+          Repo.update_all(from(item in RepositoryItem, where: item.id == ^item_id),
+            set: [state: :failed]
+          )
+
+          {:ok, chunk, rest}
+
+        [], _ ->
+          {:eof, []}
+      end
+
+      case consumer.(reader, ["pay", "load"]) do
+        {:ok, asset, []} -> {:ok, asset}
+        {:error, reason, _} -> {:error, reason}
+      end
+    end
+  end
+
+  defmodule DuplicateAssetClient do
+    def list_assets_page(token, owner, repository, release, cursor, options) do
+      {:ok, %{assets: [asset]} = page} =
+        AssetClient.list_assets_page(token, owner, repository, release, cursor, options)
+
+      {:ok, %{page | assets: [asset, asset]}}
+    end
+
+    defdelegate download(token, owner, repository, asset, consumer, options), to: AssetClient
+  end
+
+  defmodule BusyAssetClient do
+    defdelegate list_assets_page(token, owner, repository, release, cursor, options),
+      to: AssetClient
+
+    def download(_, _, _, _, _, _), do: {:error, %ForgeGitHub.Error{kind: :request_gate_busy}}
+  end
+
+  defmodule FailedAssetClient do
+    defdelegate list_assets_page(token, owner, repository, release, cursor, options),
+      to: AssetClient
+
+    def download(_, _, _, _, _, _), do: {:error, :integrity_mismatch}
   end
 
   defp stage(item, stub, opts \\ []) do

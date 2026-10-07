@@ -3,8 +3,9 @@ defmodule ForgeReleases.Release do
 
   import Ecto.Changeset
 
-  @fields [:tag_name, :name, :body, :draft, :prerelease, :target_commitish]
-  @import_fields @fields ++ [:published_at, :inserted_at, :updated_at]
+  @fields [:tag_name, :name, :body, :draft, :prerelease, :target_commitish, :make_latest]
+  @import_fields @fields ++
+                   [:published_at, :inserted_at, :updated_at, :immutable, :source_metadata]
   @sync_fields @fields ++ [:published_at, :updated_at]
   @max_body_codepoints 65_536
   @max_body_bytes 262_144
@@ -25,6 +26,10 @@ defmodule ForgeReleases.Release do
     field :author_user_id, :integer
     field :author_github_identity_id, :integer
     field :sync_version, :integer, default: 1
+    field :immutable, :boolean, default: false
+    field :make_latest, :string, default: "legacy"
+    field :source_metadata, :map, default: %{}
+    field :assets, {:array, :map}, virtual: true, default: []
 
     field :author, :map, virtual: true
     field :capabilities, :map, virtual: true, default: @default_capabilities
@@ -48,6 +53,7 @@ defmodule ForgeReleases.Release do
     |> cast(attrs, @fields)
     |> validate_metadata()
     |> normalize_publication_state()
+    |> clear_historical_body()
     |> validate_author_identity()
     |> database_constraints()
     |> optimistic_lock(:sync_version, &(&1 + 1))
@@ -58,6 +64,7 @@ defmodule ForgeReleases.Release do
     release
     |> cast(attrs, @import_fields)
     |> validate_metadata()
+    |> validate_source_metadata()
     |> validate_author_identity()
     |> validate_publication_state()
     |> database_constraints()
@@ -98,9 +105,75 @@ defmodule ForgeReleases.Release do
     |> validate_length(:body, max: @max_body_codepoints, count: :codepoints)
     |> validate_length(:body, max: @max_body_bytes, count: :bytes)
     |> validate_length(:target_commitish, min: 1, max: 255)
+    |> validate_inclusion(:make_latest, ["true", "false", "legacy"])
     |> reject_null_bytes([:tag_name, :name, :body, :target_commitish])
     |> validate_tag_name()
   end
+
+  defp clear_historical_body(changeset) do
+    if changed?(changeset, :body) do
+      put_change(
+        changeset,
+        :source_metadata,
+        Map.drop(get_field(changeset, :source_metadata), [
+          "body_html",
+          "body_text",
+          "mentions_count"
+        ])
+      )
+    else
+      changeset
+    end
+  end
+
+  defp validate_source_metadata(changeset) do
+    validate_change(changeset, :source_metadata, fn :source_metadata, metadata ->
+      if valid_source_metadata?(metadata), do: [], else: [source_metadata: "is invalid"]
+    end)
+  end
+
+  def valid_source_metadata?(metadata) when is_map(metadata) do
+    allowed = ~w(body_html body_text mentions_count reactions discussion_url)
+
+    Enum.all?(metadata, fn
+      {key, value} when key in ["body_html", "body_text"] ->
+        is_nil(value) or
+          (is_binary(value) and String.valid?(value) and byte_size(value) <= 1_048_576)
+
+      {"mentions_count", value} ->
+        is_integer(value) and value >= 0
+
+      {"discussion_url", nil} ->
+        true
+
+      {"discussion_url", value} when is_binary(value) ->
+        uri = URI.parse(value)
+
+        uri.scheme == "https" and uri.host == "github.com" and is_nil(uri.userinfo) and
+          is_binary(uri.path) and String.contains?(uri.path, "/discussions/")
+
+      {"reactions", values} when is_map(values) ->
+        keys = ~w(url total_count +1 -1 laugh hooray confused heart rocket eyes)
+
+        Enum.sort(Map.keys(values)) == Enum.sort(keys) and
+          Enum.all?(values, fn
+            {"url", value} when is_binary(value) and byte_size(value) <= 2_048 ->
+              uri = URI.parse(value)
+
+              uri.scheme == "https" and uri.host == "api.github.com" and is_nil(uri.userinfo) and
+                is_binary(uri.path) and
+                Regex.match?(~r{\A/repos/[^/]+/[^/]+/releases/[1-9][0-9]*/reactions\z}, uri.path)
+
+            {key, value} ->
+              key in keys and is_integer(value) and value in 0..9_223_372_036_854_775_807
+          end)
+
+      _ ->
+        false
+    end) and Enum.all?(Map.keys(metadata), &(&1 in allowed))
+  end
+
+  def valid_source_metadata?(_), do: false
 
   defp validate_tag_name(changeset) do
     validate_change(changeset, :tag_name, fn :tag_name, tag_name ->

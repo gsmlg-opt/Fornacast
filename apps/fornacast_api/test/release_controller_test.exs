@@ -239,7 +239,7 @@ defmodule FornacastAPI.ReleaseControllerTest do
 
       unsupported =
         api_conn(secret, version)
-        |> post_json(base, %{"tag_name" => "missing", "generate_release_notes" => true})
+        |> post_json(base, %{"tag_name" => "missing", "generate_release_notes" => "yes"})
 
       assert [%{"field" => "generate_release_notes"}] =
                json_response(unsupported, 422)["errors"]
@@ -254,6 +254,200 @@ defmodule FornacastAPI.ReleaseControllerTest do
         conn = request(api_conn(secret, version), method, path, nil)
         assert json_response(conn, 404)["message"] == "Not Found"
       end
+    end
+  end
+
+  test "release assets upload, serialize, download ranges, rename and delete in both versions" do
+    for version <- @versions do
+      alice = user("asset-api-#{String.replace(version, "-", "")}")
+      repository = repository(alice, "assets")
+      put_tag(repository, "v1")
+      {_key, secret} = pat(alice, ["public_repo"])
+      base = "/api/v3/repos/#{alice.username}/assets/releases"
+
+      release_id =
+        json_response(post_json(api_conn(secret, version), base, %{"tag_name" => "v1"}), 201)[
+          "id"
+        ]
+
+      bytes = <<0, 255, 1, 2, 3, 4, 5>>
+
+      upload_path =
+        "/api/uploads/repos/#{alice.username}/assets/releases/#{release_id}/assets?name=archive.bin"
+
+      uploaded =
+        api_conn(secret, version)
+        |> put_req_header("content-type", "application/octet-stream")
+        |> post(upload_path, bytes)
+
+      asset = json_response(uploaded, 201)
+      assert asset["label"] == nil
+      assert asset["size"] == byte_size(bytes)
+
+      assert asset["digest"] ==
+               "sha256:" <> Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+
+      assert asset["uploader"]["login"] == alice.username
+      asset_path = "#{base}/assets/#{asset["id"]}"
+
+      assert [listed] =
+               json_response(get(api_conn(nil, version), "#{base}/#{release_id}/assets"), 200)
+
+      assert listed["id"] == asset["id"]
+
+      assert [embedded] =
+               json_response(get(api_conn(nil, version), "#{base}/#{release_id}"), 200)["assets"]
+
+      assert embedded["id"] == asset["id"]
+
+      downloaded =
+        api_conn(nil, version)
+        |> put_req_header("accept", "application/octet-stream")
+        |> get(asset_path)
+
+      assert response(downloaded, 200) == bytes
+      direct = get(api_conn(nil, version), URI.parse(asset["browser_download_url"]).path)
+      assert response(direct, 200) == bytes
+      assert get_resp_header(downloaded, "x-content-type-options") == ["nosniff"]
+
+      ranged =
+        api_conn(nil, version)
+        |> put_req_header("accept", "application/octet-stream")
+        |> put_req_header("range", "bytes=1-3")
+        |> get(asset_path)
+
+      assert response(ranged, 206) == <<255, 1, 2>>
+      assert get_resp_header(ranged, "content-range") == ["bytes 1-3/7"]
+
+      invalid =
+        api_conn(nil, version)
+        |> put_req_header("accept", "application/octet-stream")
+        |> put_req_header("range", "bytes=99-")
+        |> get(asset_path)
+
+      assert response(invalid, 416) == ""
+      assert json_response(get(api_conn(nil, version), asset_path), 200)["download_count"] == 3
+
+      renamed =
+        patch_json(api_conn(secret, version), asset_path, %{
+          "name" => "renamed.bin",
+          "label" => "Binary"
+        })
+
+      assert json_response(renamed, 200)["name"] == "renamed.bin"
+      assert response(delete(api_conn(secret, version), asset_path), 204) == ""
+      assert json_response(get(api_conn(nil, version), asset_path), 404)["message"] == "Not Found"
+    end
+  end
+
+  test "private and draft assets are masked and mutation authorization precedes body reads" do
+    alice = user("private-assets")
+    bob = user("asset-outsider")
+    repository = repository(alice, "private", visibility: :private)
+    put_tag(repository, "v1")
+    {_key, secret} = pat(alice, ["repo"])
+    {_key, outsider} = pat(bob, ["repo"])
+    base = "/api/v3/repos/#{alice.username}/private/releases"
+
+    release_id =
+      json_response(
+        post_json(api_conn(secret, "2022-11-28"), base, %{"tag_name" => "v1", "draft" => true}),
+        201
+      )["id"]
+
+    upload =
+      "/api/uploads/repos/#{alice.username}/private/releases/#{release_id}/assets?name=private.bin"
+
+    asset =
+      api_conn(secret, "2022-11-28")
+      |> put_req_header("content-type", "application/octet-stream")
+      |> post(upload, "private")
+      |> json_response(201)
+
+    path = "#{base}/assets/#{asset["id"]}"
+
+    for actor_secret <- [nil, outsider] do
+      assert json_response(get(api_conn(actor_secret, "2022-11-28"), path), 404)["message"] ==
+               "Not Found"
+
+      hidden = request(api_conn(actor_secret, "2022-11-28"), :patch, path, "{")
+      assert json_response(hidden, if(actor_secret, do: 404, else: 401))["message"]
+      assert adapter_request_body(hidden) == "{"
+    end
+
+    assert response(
+             api_conn(secret, "2022-11-28")
+             |> put_req_header("accept", "application/octet-stream")
+             |> get(path),
+             200
+           ) == "private"
+
+    public = repository(alice, "public-draft")
+    put_tag(public, "v1")
+    public_base = "/api/v3/repos/#{alice.username}/public-draft/releases"
+
+    draft_id =
+      json_response(
+        post_json(api_conn(secret, "2022-11-28"), public_base, %{
+          "tag_name" => "v1",
+          "draft" => true
+        }),
+        201
+      )["id"]
+
+    public_upload =
+      "/api/uploads/repos/#{alice.username}/public-draft/releases/#{draft_id}/assets?name=draft.bin"
+
+    draft_asset =
+      api_conn(secret, "2022-11-28")
+      |> put_req_header("content-type", "application/octet-stream")
+      |> post(public_upload, "draft")
+      |> json_response(201)
+
+    assert json_response(
+             get(api_conn(nil, "2022-11-28"), "#{public_base}/assets/#{draft_asset["id"]}"),
+             404
+           )["message"] == "Not Found"
+
+    assert json_response(
+             get(api_conn(nil, "2022-11-28"), "#{public_base}/#{draft_id}/archives/zip"),
+             404
+           )["message"] == "Not Found"
+  end
+
+  test "source archives come from local Git and notes generation uses commit history" do
+    alice = user("archive-api")
+    repository = repository(alice, "archives")
+    put_tag(repository, "v1")
+    {_key, secret} = pat(alice, ["public_repo"])
+    base = "/api/v3/repos/#{alice.username}/archives/releases"
+
+    release =
+      post_json(api_conn(secret, "2022-11-28"), base, %{"tag_name" => "v1"}) |> json_response(201)
+
+    for format <- ["tar", "zip"] do
+      archive = get(api_conn(nil, "2022-11-28"), "#{base}/#{release["id"]}/archives/#{format}")
+      bytes = response(archive, 200)
+      assert byte_size(bytes) > 0
+      if format == "zip", do: assert(binary_part(bytes, 0, 2) == "PK")
+    end
+
+    notes =
+      post_json(api_conn(secret, "2022-11-28"), "#{base}/generate-notes", %{"tag_name" => "v1"})
+      |> json_response(200)
+
+    assert notes["name"] == "v1"
+    assert notes["body"] =~ "release v1"
+    old_max = Application.get_env(:forge_releases, :archive_max_bytes)
+    Application.put_env(:forge_releases, :archive_max_bytes, 1)
+
+    try do
+      too_large = get(api_conn(nil, "2022-11-28"), "#{base}/#{release["id"]}/archives/tar")
+      assert json_response(too_large, 413)["message"] == "Payload Too Large"
+    after
+      if old_max,
+        do: Application.put_env(:forge_releases, :archive_max_bytes, old_max),
+        else: Application.delete_env(:forge_releases, :archive_max_bytes)
     end
   end
 

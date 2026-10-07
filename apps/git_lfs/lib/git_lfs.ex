@@ -150,6 +150,12 @@ defmodule GitLFS do
     do: {:error, :invalid_request}
 
   defp commit_staged_upload(reservation, staged_ref, first_seen_ref) do
+    ForgeBlobs.with_digest_lock(reservation.oid, fn ->
+      commit_staged_upload_locked(reservation, staged_ref, first_seen_ref)
+    end)
+  end
+
+  defp commit_staged_upload_locked(reservation, staged_ref, first_seen_ref) do
     with :ok <- validate_reservation(reservation),
          {:ok, repository} <- reservation_repository(reservation),
          {:ok, %{sha256_digest: oid, storage_key: storage_key, size: size}} <-
@@ -168,6 +174,15 @@ defmodule GitLFS do
   @spec ensure_synchronized_object(Repository.t(), String.t(), non_neg_integer(), String.t()) ::
           :ok | {:error, atom()}
   def ensure_synchronized_object(%Repository{} = repository, oid, size, first_seen_ref) do
+    ForgeBlobs.with_digest_lock(oid, fn ->
+      ensure_synchronized_object_locked(repository, oid, size, first_seen_ref)
+    end)
+  end
+
+  def ensure_synchronized_object(_repository, _oid, _size, _first_seen_ref),
+    do: {:error, :invalid_request}
+
+  defp ensure_synchronized_object_locked(repository, oid, size, first_seen_ref) do
     with :ok <- validate_object(oid, size),
          true <- standard_ref?(first_seen_ref),
          {:ok, repository} <- current_repository(repository),
@@ -181,9 +196,6 @@ defmodule GitLFS do
       {:error, reason} -> {:error, reason}
     end
   end
-
-  def ensure_synchronized_object(_repository, _oid, _size, _first_seen_ref),
-    do: {:error, :invalid_request}
 
   @spec verify_object(Repository.t(), String.t(), non_neg_integer()) ::
           :ok | {:error, atom()}

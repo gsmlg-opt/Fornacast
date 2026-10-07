@@ -587,6 +587,11 @@ defmodule ForgeGitHub.Client do
     if valid_release_page_query?(query), do: {:ok, :page}, else: :error
   end
 
+  defp release_metadata_resource_kind(:get, [id, "assets"], query) when is_binary(query) do
+    if validate_positive_id(id) == :ok and id == Integer.to_string(String.to_integer(id)) and
+         valid_release_page_query?(query), do: {:ok, :page}, else: :error
+  end
+
   defp release_metadata_resource_kind(:post, [], nil), do: {:ok, :create}
 
   defp release_metadata_resource_kind(:get, ["tags", encoded_tag], nil) do

@@ -74,8 +74,9 @@ defmodule FornacastAPI.Validators.V2026_03_10 do
   def validate(operation, body) when operation in [:pull_create, :pull_update, :pull_merge],
     do: Pull.validate(operation, body)
 
-  def validate(operation, body) when operation in [:release_create, :release_update],
-    do: Release.validate(operation, body)
+  def validate(operation, body)
+      when operation in [:release_create, :release_update, :release_notes],
+      do: Release.validate(operation, body)
 
   def validate(operation, body) when is_atom(operation) and is_map(body) do
     %{resource: resource, required: required, fields: fields} =

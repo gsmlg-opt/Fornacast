@@ -31,6 +31,23 @@ defmodule FornacastAPI.ReleaseContractTest do
     end
   end
 
+  test "both API versions accept implemented notes and latest inputs" do
+    for version <- @versions do
+      for latest <- ["true", "false", "legacy"] do
+        attrs = %{"tag_name" => "v1", "make_latest" => latest, "generate_release_notes" => true}
+        assert {:ok, ^attrs} = RequestValidator.validate(version, :release_create, attrs)
+      end
+
+      attrs = %{"tag_name" => "v1", "previous_tag_name" => "v0", "target_commitish" => "main"}
+      assert {:ok, ^attrs} = RequestValidator.validate(version, :release_notes, attrs)
+
+      assert {:error, _} =
+               RequestValidator.validate(version, :release_update, %{
+                 "generate_release_notes" => true
+               })
+    end
+  end
+
   test "release validation rejects malformed and unsupported asset behavior" do
     invalid = [
       {:release_create, %{}, "tag_name", :missing_field},
@@ -40,10 +57,9 @@ defmodule FornacastAPI.ReleaseContractTest do
       {:release_update, %{"name" => 1}, "name", :invalid},
       {:release_update, %{"body" => 1}, "body", :invalid},
       {:release_update, %{"asset" => %{}}, "asset", :unprocessable},
-      {:release_create, %{"tag_name" => "v1", "generate_release_notes" => true},
-       "generate_release_notes", :unprocessable},
-      {:release_create, %{"tag_name" => "v1", "make_latest" => true}, "make_latest",
-       :unprocessable}
+      {:release_create, %{"tag_name" => "v1", "generate_release_notes" => "true"},
+       "generate_release_notes", :invalid},
+      {:release_create, %{"tag_name" => "v1", "make_latest" => true}, "make_latest", :invalid}
     ]
 
     for version <- @versions, {operation, body, field, code} <- invalid do
@@ -89,8 +105,16 @@ defmodule FornacastAPI.ReleaseContractTest do
       assert rendered.author.login == "alice"
       assert rendered.assets == []
       assert rendered.immutable == false
-      assert rendered.tarball_url == nil
-      assert rendered.zipball_url == nil
+
+      assert rendered.tarball_url ==
+               "https://forge.test/api/v3/repos/alice/demo/releases/11/archives/tar"
+
+      assert rendered.zipball_url ==
+               "https://forge.test/api/v3/repos/alice/demo/releases/11/archives/zip"
+
+      assert rendered.updated_at == "2026-09-05T08:00:00Z"
+      assert rendered.body_html =~ "Notes"
+      assert rendered.body_text == "Notes"
       assert rendered.url == "https://forge.test/api/v3/repos/alice/demo/releases/11"
       assert rendered.html_url == "https://forge.test/alice/demo/releases/tag/v1.0.0"
     end

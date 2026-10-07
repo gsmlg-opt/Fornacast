@@ -45,7 +45,7 @@ defmodule FornacastWeb.ReleaseHTMLTest do
              "/alice/demo/releases"
   end
 
-  test "detail renders supported metadata, sanitized markdown, and no assets" do
+  test "detail renders metadata, sanitized markdown, and local source archive links" do
     html =
       :release
       |> result(%{release: release()})
@@ -58,7 +58,28 @@ defmodule FornacastWeb.ReleaseHTMLTest do
     assert html =~ "Edit release"
     assert html =~ "Delete release"
     refute html =~ "Upload asset"
-    refute html =~ "Release assets"
+    assert html =~ "Release assets"
+    assert html =~ "/alice/demo/releases/4/archives/zip"
+    assert html =~ "/alice/demo/releases/4/archives/tar"
+  end
+
+  test "detail links local assets with escaped names and digest evidence" do
+    asset = %{
+      id: 9,
+      name: "binary<name>.zip",
+      label: nil,
+      size: 321,
+      download_count: 2,
+      source_download_count: 4,
+      sha256_digest: String.duplicate("a", 64)
+    }
+
+    html = :release |> result(%{release: %{release() | assets: [asset]}}) |> render(:show)
+    assert html =~ "/alice/demo/releases/assets/9/download"
+    assert html =~ "binary&lt;name&gt;.zip"
+    assert html =~ "321 bytes"
+    assert html =~ "6 downloads"
+    assert html =~ "sha256:"
   end
 
   test "new and edit forms use DuskMoon fields for every supported mutation field" do
@@ -81,6 +102,8 @@ defmodule FornacastWeb.ReleaseHTMLTest do
       assert html =~ ~s(name="release[target_commitish]")
       assert html =~ ~s(name="release[draft]")
       assert html =~ ~s(name="release[prerelease]")
+      assert html =~ ~s(name="release[make_latest]")
+      if template == :new, do: assert(html =~ ~s(name="release[generate_release_notes]"))
       assert html =~ "Name is invalid"
       assert html =~ ~s(name="_csrf_token")
     end

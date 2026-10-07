@@ -11,15 +11,67 @@ defmodule FornacastAPI.Plugs.MediaType do
 
   def call(conn, _opts) do
     cond do
-      not acceptable?(conn) ->
+      not acceptable?(conn) and not binary_acceptable?(conn) ->
         reject(conn, 406, "Not Acceptable")
 
-      body_bearing?(conn) and not supported_content_type?(conn) ->
+      body_bearing?(conn) and not supported_content_type?(conn) and not asset_upload?(conn) ->
         reject(conn, 415, "Unsupported Media Type")
 
       true ->
         conn
     end
+  end
+
+  def binary_asset_request?(conn) do
+    ranges = parse_ranges(get_req_header(conn, "accept"))
+
+    Enum.any?(ranges, &(&1.media_type == "application/octet-stream" and &1.quality > 0.0)) and
+      effective_quality("application/octet-stream", ranges) >=
+        Enum.max(Enum.map(@supported_media_types, &effective_quality(&1, ranges)))
+  end
+
+  defp asset_upload?(conn) do
+    conn.method == "POST" and
+      Regex.match?(
+        ~r/\A\/api\/uploads\/repos\/[^\/]+\/[^\/]+\/releases\/[0-9]+\/assets\z/,
+        conn.request_path
+      ) and
+      case get_req_header(conn, "content-type") do
+        [value] ->
+          byte_size(value) <= 255 and
+            Regex.match?(
+              ~r/\A[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+(?:;[^\r\n]*)?\z/,
+              value
+            )
+
+        _ ->
+          false
+      end
+  end
+
+  defp binary_acceptable?(conn) do
+    media_types =
+      case Regex.run(
+             ~r/\A\/api\/v3\/repos\/[^\/]+\/[^\/]+\/releases\/(assets\/[0-9]+(?:\/download)?|[0-9]+\/archives\/(?:tar|zip))\z/,
+             conn.request_path
+           ) do
+        [_, "assets/" <> _] ->
+          ["application/octet-stream"]
+
+        [_, resource] ->
+          archive_type =
+            if String.ends_with?(resource, "/zip"),
+              do: "application/zip",
+              else: "application/x-tar"
+
+          ["application/octet-stream", archive_type]
+
+        _ ->
+          []
+      end
+
+    ranges = parse_ranges(get_req_header(conn, "accept"))
+    conn.method == "GET" and Enum.any?(media_types, &(effective_quality(&1, ranges) > 0.0))
   end
 
   defp acceptable?(conn) do

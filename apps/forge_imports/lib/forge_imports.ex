@@ -39,6 +39,9 @@ defmodule ForgeImports do
 
   def provider, do: :github
 
+  def backfill_release_assets(actor, item_id, identity_id, request_metadata, opts \\ []),
+    do: ForgeImports.ReleaseAssetBackfill.run(actor, item_id, identity_id, request_metadata, opts)
+
   def create_repository_discovery(actor, attrs, request_metadata, opts \\ []),
     do: ForgeImports.Discovery.create_repository(actor, attrs, request_metadata, opts)
 

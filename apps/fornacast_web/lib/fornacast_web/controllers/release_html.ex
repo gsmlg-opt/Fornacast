@@ -21,6 +21,13 @@ defmodule FornacastWeb.ReleaseHTML do
   def release_tag_path(chrome, tag),
     do: releases_path(chrome) <> "/tag/" <> encode_segment(tag)
 
+  def assets(release), do: Map.get(release, :assets) || []
+
+  def asset_path(chrome, id), do: releases_path(chrome) <> "/assets/#{id}/download"
+
+  def archive_path(chrome, release_id, format),
+    do: release_path(chrome, release_id) <> "/archives/" <> format
+
   def pagination_base(result), do: releases_path(result.chrome)
 
   def release_name(%{name: name, tag_name: tag}) when name in [nil, ""], do: tag
@@ -139,6 +146,25 @@ defmodule FornacastWeb.ReleaseHTML do
             errors={field_errors(@result.content.errors, "Release", "prerelease")}
           />
         </div>
+
+        <.dm_select
+          id="release-make-latest"
+          name="release[make_latest]"
+          label="Latest release"
+          value={form_value(@result.content.values, "make_latest", "legacy")}
+          options={[
+            {"Choose by version", "legacy"},
+            {"Make latest", "true"},
+            {"Do not make latest", "false"}
+          ]}
+        />
+        <.dm_checkbox
+          :if={@mode == :new}
+          id="release-generate-notes"
+          name="release[generate_release_notes]"
+          label="Generate release notes from commits"
+          checked={checked?(@result.content.values, "generate_release_notes")}
+        />
 
         <div class="flex flex-wrap gap-3">
           <.dm_btn type="submit" variant="primary">{@submit}</.dm_btn>

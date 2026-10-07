@@ -28,7 +28,15 @@ defmodule ForgeImports.GitHub.MetadataImporter do
   alias Fornacast.Repo
   alias GitCore
 
-  @phases [:labels, :issues, :comments, :pull_requests, :releases, :number_sequence]
+  @phases [
+    :labels,
+    :issues,
+    :comments,
+    :pull_requests,
+    :releases,
+    :release_assets_v1,
+    :number_sequence
+  ]
   @terminal_page_key "__terminal_v1__"
 
   @type credential_metadata :: %{
@@ -326,6 +334,34 @@ defmodule ForgeImports.GitHub.MetadataImporter do
   defp do_stage_phase(item, :comments, opts), do: import_comments(item, opts)
   defp do_stage_phase(item, :pull_requests, opts), do: import_pulls(item, opts)
   defp do_stage_phase(item, :releases, opts), do: import_releases(item, opts)
+
+  defp do_stage_phase(item, :release_assets_v1, opts) do
+    case Repo.get(ImportRun, item.import_run_id) do
+      %ImportRun{credential_source: :github_app} ->
+        commit_phase_terminal(item, "release_assets_v1")
+
+      %ImportRun{mirror_operation_id: id} when not is_nil(id) ->
+        commit_phase_terminal(item, "release_assets_v1")
+
+      %ImportRun{} ->
+        with {:ok, repository} <- hidden_repository(item) do
+          ForgeImports.GitHub.ReleaseAssets.stage(
+            item,
+            repository,
+            Keyword.fetch!(opts, :credential_checkout),
+            Keyword.put(
+              opts,
+              :asset_fence,
+              ForgeImports.GitHub.ReleaseAssets.initial_fence(item, repository)
+            )
+          )
+        end
+
+      _ ->
+        {:error, :stale_item}
+    end
+  end
+
   defp do_stage_phase(item, :number_sequence, opts), do: finalize_sequence(item, opts)
 
   defp import_labels(item, opts) do
@@ -760,7 +796,8 @@ defmodule ForgeImports.GitHub.MetadataImporter do
           "v" => 1,
           "github_node_id" => projection.github_node_id,
           "remote_created_at" => DateTime.to_iso8601(projection.remote_created_at),
-          "remote_updated_at" => DateTime.to_iso8601(projection.remote_updated_at)
+          "remote_updated_at" => DateTime.to_iso8601(projection.remote_updated_at),
+          "asset_count" => projection.asset_count
         }
       })
     end)
@@ -781,13 +818,28 @@ defmodule ForgeImports.GitHub.MetadataImporter do
       published_at: fields["published_at"],
       tag_name: fields["tag_name"],
       target_commitish: fields["target_commitish"],
-      updated_at: projection.remote_updated_at
+      updated_at: projection.remote_updated_at,
+      immutable: Map.get(projection, :immutable, false),
+      source_metadata: Map.get(projection, :source_metadata, %{})
     }
   end
 
   defp maybe_report_release_assets(multi, _item, %{asset_count: 0}), do: multi
 
   defp maybe_report_release_assets(multi, item, projection) do
+    case Repo.get(ImportRun, item.import_run_id) do
+      %ImportRun{credential_source: :github_app} ->
+        report_excluded_release_assets(multi, item, projection)
+
+      %ImportRun{mirror_operation_id: id} when not is_nil(id) ->
+        report_excluded_release_assets(multi, item, projection)
+
+      _ ->
+        multi
+    end
+  end
+
+  defp report_excluded_release_assets(multi, item, projection) do
     Multi.insert(
       multi,
       {:release_assets, projection.github_object_id},

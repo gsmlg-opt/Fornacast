@@ -75,6 +75,22 @@ defmodule FornacastAPI.Router do
     get "/repos/:owner/:repo/pulls/:pull_number", PullController, :show
     patch "/repos/:owner/:repo/pulls/:pull_number", PullController, :update
 
+    get "/repos/:owner/:repo/releases/:release_id/assets", ReleaseAssetController, :index
+
+    get "/repos/:owner/:repo/releases/assets/:asset_id/download",
+        ReleaseAssetController,
+        :download
+
+    get "/repos/:owner/:repo/releases/assets/:asset_id", ReleaseAssetController, :show
+    patch "/repos/:owner/:repo/releases/assets/:asset_id", ReleaseAssetController, :update
+    delete "/repos/:owner/:repo/releases/assets/:asset_id", ReleaseAssetController, :delete
+
+    get "/repos/:owner/:repo/releases/:release_id/archives/:format",
+        ReleaseAssetController,
+        :archive
+
+    post "/repos/:owner/:repo/releases/generate-notes", ReleaseController, :generate_notes
+
     get "/repos/:owner/:repo/releases/latest", ReleaseController, :latest
     get "/repos/:owner/:repo/releases/tags/:tag", ReleaseController, :by_tag
     get "/repos/:owner/:repo/releases", ReleaseController, :index
@@ -90,6 +106,8 @@ defmodule FornacastAPI.Router do
 
   scope "/api/uploads", FornacastAPI do
     pipe_through :api_context
+
+    post "/repos/:owner/:repo/releases/:release_id/assets", ReleaseAssetController, :create
 
     match :*, "/*path", FallbackController, :not_found
   end

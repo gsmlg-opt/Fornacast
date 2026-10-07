@@ -28,6 +28,11 @@ remain excluded from synchronization. CI, packages, LFS, mirrors, and forks
 remain outside the current release scope. Force-push and branch/tag deletion
 are rejected by write-side policy.
 
+One-time imports include release asset binaries through shared ForgeBlobs LocalCAS;
+the release-binary exclusion above applies to organization mirroring. PostgreSQL
+owns asset metadata and recovery operations; never delete a shared digest directly
+when an asset is removed.
+
 ## 2. Quick Start / Local Environment
 
 **Prerequisites:** Elixir 1.20 + OTP 29, Rust ≥ 1.96, Git, OpenSSH client. Use [devenv](./devenv.nix) for the pinned toolchain and managed PostgreSQL 17 service, or provide an equivalent PostgreSQL installation.

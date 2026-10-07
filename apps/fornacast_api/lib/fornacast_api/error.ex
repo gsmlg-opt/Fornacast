@@ -51,6 +51,11 @@ defmodule FornacastAPI.Error do
   def from_domain(reason, url) when reason in [:head_changed, :ref_conflict],
     do: new(409, "Conflict", url)
 
+  def from_domain(:entity_too_large, url), do: new(413, "Payload Too Large", url)
+  def from_domain(:immutable, url), do: new(422, "Release is immutable", url)
+  def from_domain(:unavailable, url), do: new(503, "Service unavailable", url)
+  def from_domain(:integrity_mismatch, url), do: new(422, "Asset integrity mismatch", url)
+
   def from_domain(:git_initializer_unavailable, url), do: new(503, "Service unavailable", url)
   def from_domain({:conflict, _safe_reason}, url), do: new(409, "Conflict", url)
 

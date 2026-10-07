@@ -10,7 +10,7 @@ defmodule FornacastWeb.ReleaseController do
   }
 
   @authenticated_actions [:new, :create, :edit, :update, :delete]
-  @release_fields ~w(tag_name name body target_commitish draft prerelease)
+  @release_fields ~w(tag_name name body target_commitish draft prerelease make_latest generate_release_notes)
 
   plug :redirect_unauthenticated_with_return when action in @authenticated_actions
   plug FornacastWeb.Plugs.RequireUser when action in @authenticated_actions
@@ -209,7 +209,9 @@ defmodule FornacastWeb.ReleaseController do
   defp release_attrs(%{"release" => attrs}) when is_map(attrs) do
     attrs = Map.take(attrs, @release_fields)
 
-    Enum.reduce_while(["draft", "prerelease"], {:ok, attrs}, fn field, {:ok, normalized} ->
+    Enum.reduce_while(["draft", "prerelease", "generate_release_notes"], {:ok, attrs}, fn field,
+                                                                                          {:ok,
+                                                                                           normalized} ->
       case Map.fetch(normalized, field) do
         {:ok, value} ->
           case boolean(value) do

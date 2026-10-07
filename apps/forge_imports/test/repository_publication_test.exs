@@ -39,7 +39,7 @@ defmodule ForgeImports.RepositoryPublicationTest do
   @now ~U[2026-08-28 01:00:00Z]
   @pat "github_pat_publication_test_secret"
   @keyring %{active: "test-v1", keys: %{"test-v1" => :binary.copy(<<9>>, 32)}}
-  @terminal_resources ~w(labels issues comments pull_requests releases number_sequence)
+  @terminal_resources ~w(labels issues comments pull_requests releases release_assets_v1 number_sequence)
 
   setup do
     if postgres?() do
@@ -264,6 +264,158 @@ defmodule ForgeImports.RepositoryPublicationTest do
 
     assert published.name == "Samgita"
     assert published.slug == "samgita"
+  end
+
+  test "explicit asset backfill preserves completed state and uses an actor-owned saved credential",
+       context do
+    fixture = ready_publication_fixture(context, slug: "backfill-assets")
+
+    release_attrs = %{
+      author_github_identity_id: context.identity.id,
+      body: "Release notes",
+      draft: false,
+      inserted_at: @now,
+      updated_at: @now,
+      published_at: @now,
+      name: "Release",
+      prerelease: false,
+      tag_name: "v1",
+      target_commitish: "trunk",
+      immutable: true,
+      source_metadata: %{}
+    }
+
+    assert {:ok, %{release: release}} =
+             Multi.new()
+             |> ForgeReleases.append_import_release(:release, fixture.shadow, release_attrs)
+             |> Repo.transaction()
+
+    %ObjectMapping{}
+    |> ObjectMapping.create_changeset(%{
+      repository_item_id: fixture.item.id,
+      hidden_repository_id: fixture.shadow.id,
+      github_repository_id: fixture.item.github_repository_id,
+      object_kind: "release",
+      github_object_id: 81,
+      local_resource_type: "ForgeReleases.Release",
+      local_resource_id: release.id,
+      source_evidence: %{"v" => 1, "asset_count" => 1}
+    })
+    |> Repo.insert!()
+
+    assert {:ok, %{repository: published}} =
+             ForgeImports.publish_repository(
+               context.actor,
+               fixture.item.id,
+               request_metadata("backfill-publish")
+             )
+
+    github_user_id = 800_000 + System.unique_integer([:positive])
+    login = "backfill-#{github_user_id}"
+
+    assert {:ok, account} =
+             ForgeAccounts.save_github_account(
+               context.actor,
+               %{
+                 github_user_id: github_user_id,
+                 login: login,
+                 avatar_url: nil,
+                 profile_url: "https://github.com/#{login}"
+               },
+               "backfill-saved-pat",
+               request_metadata("backfill-credential")
+             )
+
+    item_before = Repo.get!(RepositoryItem, fixture.item.id)
+    run_before = Repo.get!(ImportRun, fixture.run.id)
+
+    assert :ok =
+             ForgeImports.backfill_release_assets(
+               context.actor,
+               fixture.item.id,
+               account.identity_id,
+               request_metadata("explicit-backfill"),
+               asset_client: __MODULE__.BackfillAssetClient
+             )
+
+    assert_receive :backfill_download
+
+    asset_mapping =
+      Repo.get_by!(ObjectMapping,
+        repository_item_id: fixture.item.id,
+        object_kind: "release_asset"
+      )
+
+    asset = Repo.get!(ForgeReleases.Asset, asset_mapping.local_resource_id)
+    assert asset.repository_id == published.id
+    assert asset.state == :uploaded
+    assert asset.label == nil
+    assert Repo.get!(RepositoryItem, fixture.item.id).state == item_before.state
+    assert Repo.get!(ImportRun, fixture.run.id).state == run_before.state
+    assert Repo.get!(RepositoryItem, fixture.item.id).lease_owner == nil
+
+    assert :ok =
+             ForgeImports.backfill_release_assets(
+               context.actor,
+               fixture.item.id,
+               account.identity_id,
+               request_metadata("backfill-replay"),
+               asset_client: __MODULE__.BackfillAssetClient
+             )
+
+    refute_receive :backfill_download
+
+    foreign = user_fixture("foreign-backfill")
+
+    assert {:error, _} =
+             ForgeImports.backfill_release_assets(
+               foreign,
+               fixture.item.id,
+               account.identity_id,
+               request_metadata("forbidden-backfill"),
+               asset_client: __MODULE__.BackfillAssetClient
+             )
+
+    refute_receive :backfill_download
+  end
+
+  defmodule BackfillAssetClient do
+    def list_assets_page(_token, _owner, _repository, _release, _cursor, _options) do
+      {:ok,
+       %{
+         assets: [
+           %{
+             "id" => 601,
+             "node_id" => "RA_601",
+             "name" => "package.tar.gz",
+             "label" => nil,
+             "content_type" => "application/gzip",
+             "state" => "uploaded",
+             "size" => 7,
+             "digest" => nil,
+             "download_count" => 4,
+             "created_at" => "2026-08-26T01:00:00Z",
+             "updated_at" => "2026-08-28T01:00:00Z",
+             "uploader" => %{"id" => 900_601, "node_id" => "U_601", "login" => "uploader-601"}
+           }
+         ],
+         next_cursor: nil
+       }}
+    end
+
+    def download(_token, _owner, _repository, _asset, consumer, _options) do
+      send(self(), :backfill_download)
+
+      reader = fn
+        [chunk | rest], _ -> {:ok, chunk, rest}
+        [], _ -> {:eof, []}
+      end
+
+      case consumer.(reader, ["payload"]) do
+        {:ok, asset, []} -> {:ok, asset}
+        {:error, reason, _} -> {:error, reason}
+      end
+    end
   end
 
   test "publishes create with canonical settings, durable evidence, audit, and read-only replay",

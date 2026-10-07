@@ -19,6 +19,7 @@ defmodule ForgeReleases.ReleaseModeRecoveryProbe do
     :ok = load_database_independent_storage_apps!()
     {:ok, _started} = Application.ensure_all_started(:ex_storage_service, storage_mode)
     :ok = Application.start(:forge_blobs, blob_mode)
+    {:ok, _} = Application.ensure_all_started(:mdex)
     :ok = Application.start(:forge_releases, host_mode)
 
     assert!(Process.whereis(Fornacast.Repo) == nil, :database_started)
@@ -93,7 +94,14 @@ defmodule ForgeReleases.ReleaseModeRecoveryProbe do
       spec =
         application
         |> Application.spec()
-        |> Keyword.update!(:applications, &List.delete(&1, :fornacast))
+        |> Keyword.update!(:applications, fn dependencies ->
+          # This probe exercises only the storage supervisor. Domain dependency
+          # ordering is verified by ApplicationTest, and must not boot a DB here.
+          Enum.reject(
+            dependencies,
+            &(&1 in [:fornacast, :forge_accounts, :forge_repos, :git_core])
+          )
+        end)
         |> Keyword.reject(fn {_key, value} -> value == :undefined end)
 
       :ok = Application.unload(application)

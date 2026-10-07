@@ -47,6 +47,12 @@ defmodule FornacastAPI.URL do
 
   def releases(owner, repo), do: repository(owner, repo) <> "/releases"
   def release(owner, repo, id), do: releases(owner, repo) <> "/#{positive_id(id)}"
+
+  def release_archive(owner, repo, id, format),
+    do: release(owner, repo, id) <> "/archives/" <> format
+
+  def release_asset(owner, repo, id), do: releases(owner, repo) <> "/assets/" <> positive_id(id)
+
   def release_assets(owner, repo, id), do: release(owner, repo, id) <> "/assets"
 
   def release_upload_template(owner, repo, id) do
@@ -66,9 +72,9 @@ defmodule FornacastAPI.URL do
   def issue_reactions(owner, repo, number), do: issue(owner, repo, number) <> "/reactions"
   def issue_comment_reactions(owner, repo, id), do: issue_comment(owner, repo, id) <> "/reactions"
 
-  defp absolute(path) when is_binary(path) do
+  defp absolute(path, base_url \\ api_base_url()) when is_binary(path) do
     if String.starts_with?(path, "/") do
-      base = validated_base_uri!()
+      base = validated_base_uri!(base_url)
 
       %{base | path: path, query: nil, fragment: nil, userinfo: nil}
       |> URI.to_string()
@@ -79,7 +85,8 @@ defmodule FornacastAPI.URL do
 
   defp join(prefix, path) when is_binary(path) and is_binary(prefix) do
     if String.starts_with?(path, "/") do
-      absolute(prefix <> path)
+      base_url = if prefix == "", do: Fornacast.Config.base_url(), else: api_base_url()
+      absolute(prefix <> path, base_url)
     else
       raise ArgumentError, "path must be a string beginning with /, got: #{inspect(path)}"
     end
@@ -101,9 +108,10 @@ defmodule FornacastAPI.URL do
     raise ArgumentError, "expected a positive integer ID, got: #{inspect(id)}"
   end
 
-  defp validated_base_uri! do
-    base_url = Fornacast.Config.base_url()
+  defp api_base_url,
+    do: Application.get_env(:fornacast_api, :base_url, Fornacast.Config.base_url())
 
+  defp validated_base_uri!(base_url) do
     with true <- is_binary(base_url),
          false <- ascii_control?(base_url),
          {:ok, %URI{} = uri} <- URI.new(base_url),

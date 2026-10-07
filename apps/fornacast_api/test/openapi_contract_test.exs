@@ -75,7 +75,15 @@ defmodule FornacastAPI.OpenAPIContractTest do
       ["get", "/repos/{owner}/{repo}/releases/tags/{tag}"],
       ["get", "/repos/{owner}/{repo}/releases/{release_id}"],
       ["patch", "/repos/{owner}/{repo}/releases/{release_id}"],
-      ["delete", "/repos/{owner}/{repo}/releases/{release_id}"]
+      ["delete", "/repos/{owner}/{repo}/releases/{release_id}"],
+      ["get", "/repos/{owner}/{repo}/releases/{release_id}/assets"],
+      ["post", "/repos/{owner}/{repo}/releases/{release_id}/assets"],
+      ["get", "/repos/{owner}/{repo}/releases/assets/{asset_id}"],
+      ["patch", "/repos/{owner}/{repo}/releases/assets/{asset_id}"],
+      ["delete", "/repos/{owner}/{repo}/releases/assets/{asset_id}"],
+      ["post", "/repos/{owner}/{repo}/releases/generate-notes"],
+      ["get", "/repos/{owner}/{repo}/releases/assets/{asset_id}/download"],
+      ["get", "/repos/{owner}/{repo}/releases/{release_id}/archives/{format}"]
     ]
   }
 
@@ -149,9 +157,12 @@ defmodule FornacastAPI.OpenAPIContractTest do
     "PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge" =>
       ~w(commit_title commit_message sha merge_method),
     "POST /repos/{owner}/{repo}/releases" =>
-      ~w(tag_name target_commitish name body draft prerelease),
+      ~w(tag_name target_commitish name body draft prerelease make_latest generate_release_notes),
     "PATCH /repos/{owner}/{repo}/releases/{release_id}" =>
-      ~w(tag_name target_commitish name body draft prerelease)
+      ~w(tag_name target_commitish name body draft prerelease make_latest),
+    "POST /repos/{owner}/{repo}/releases/generate-notes" =>
+      ~w(tag_name target_commitish previous_tag_name),
+    "PATCH /repos/{owner}/{repo}/releases/assets/{asset_id}" => ~w(name label)
   }
 
   @required_mutation_fields %{
@@ -166,7 +177,8 @@ defmodule FornacastAPI.OpenAPIContractTest do
     "POST /repos/{owner}/{repo}/issues/{issue_number}/comments" => ~w(body),
     "PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}" => ~w(body),
     "POST /repos/{owner}/{repo}/pulls" => ~w(title head base),
-    "POST /repos/{owner}/{repo}/releases" => ~w(tag_name)
+    "POST /repos/{owner}/{repo}/releases" => ~w(tag_name),
+    "POST /repos/{owner}/{repo}/releases/generate-notes" => ~w(tag_name)
   }
 
   @query_fields %{
@@ -179,7 +191,9 @@ defmodule FornacastAPI.OpenAPIContractTest do
     "issues" => ~w(page per_page state labels assignee creator sort direction since),
     "issue_comments" => ~w(page per_page since),
     "pulls" => ~w(page per_page state head base sort direction),
-    "releases" => ~w(page per_page)
+    "releases" => ~w(page per_page),
+    "release_assets" => ~w(page per_page),
+    "release_asset_upload" => ~w(name label)
   }
 
   @divergences %{
@@ -195,8 +209,8 @@ defmodule FornacastAPI.OpenAPIContractTest do
     "issues_disabled_410_operations" => @declared_issues_disabled_operations,
     "merge_method" => "merge",
     "unavailable_pull_head" => "nullable_repo_and_user_with_ref_only_label",
-    "release_assets" => "unsupported",
-    "release_archives" => nil,
+    "release_assets" => "local_cas",
+    "release_archives" => "authorized_local_git",
     "issue_pull_release_html_url" => "corresponding_public_api_url",
     "commit_pull_diff_patch_media" => "not_acceptable"
   }
@@ -309,7 +323,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
     end
   end
 
-  test "overlay owns every implemented operation and keeps release assets unsupported" do
+  test "overlay owns every implemented operation and documents local release assets" do
     overlay = "fornacast-overlay.json" |> contract_path() |> File.read!() |> JSON.decode!()
 
     assert overlay["source_commit"] == @source_commit
@@ -322,7 +336,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
     assert overlay["required_mutation_fields"] == @required_mutation_fields
     assert overlay["query_fields"] == @query_fields
     assert overlay["divergences"] == @divergences
-    assert overlay["divergences"]["release_assets"] == "unsupported"
+    assert overlay["divergences"]["release_assets"] == "local_cas"
 
     expected_foundation =
       @foundation_operations
@@ -334,7 +348,7 @@ defmodule FornacastAPI.OpenAPIContractTest do
     assert Enum.sort(Map.keys(overlay["delivery_slices"])) == ~w(1 2 3 4 5)
   end
 
-  test "release metadata operations are pinned without release asset operations" do
+  test "release metadata and asset operations are pinned with authorized local downloads" do
     release_metadata_operations =
       @delivery_slices
       |> Map.fetch!("5")
@@ -347,11 +361,22 @@ defmodule FornacastAPI.OpenAPIContractTest do
 
       assert MapSet.subset?(release_metadata_operations, contract_operations), version
 
-      refute Enum.any?(contract_operations, fn {_method, path} ->
-               String.contains?(path, "/releases/assets/") or
-                 String.ends_with?(path, "/assets")
-             end),
-             version
+      assert MapSet.member?(
+               contract_operations,
+               {"get", "/repos/{owner}/{repo}/releases/assets/{asset_id}"}
+             )
+
+      assert MapSet.member?(
+               contract_operations,
+               {"post", "/repos/{owner}/{repo}/releases/{release_id}/assets"}
+             )
+
+      assert get_in(document, [
+               "paths",
+               "/repos/{owner}/{repo}/releases/{release_id}/assets",
+               "post",
+               "servers"
+             ]) == [%{"url" => "/api/uploads"}]
     end
   end
 

@@ -48,6 +48,19 @@ defmodule ForgeBlobs do
   @spec ready?() :: boolean()
   def ready?, do: Manager.ready?()
 
+  @doc "Serializes CAS attachment, open and reclamation on the supported single-node volume."
+  def with_digest_lock(digest, fun) when is_binary(digest) and is_function(fun, 0) do
+    with_digest_lock(digest, self(), fun)
+  end
+
+  @doc false
+  def with_digest_lock(digest, requester, fun)
+      when is_binary(digest) and is_pid(requester) and is_function(fun, 0) do
+    # Storage tasks join their coordinator's lock as another holder. The lock
+    # survives coordinator death until every filesystem actor has emitted DOWN.
+    :global.trans({{__MODULE__, :digest, digest}, requester}, fun, [node()])
+  end
+
   @doc """
   Streams a caller-owned source into one staging directory.
 

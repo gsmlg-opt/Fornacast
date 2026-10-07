@@ -118,15 +118,52 @@ the storage parent private and mount the volume exclusively to one node at a tim
 - Repository settings needed for publication (visibility, default branch, merge settings)
 - Issues, comments, labels, assignees
 - Pull requests that map to the current ForgeIssues/ForgePulls model, including same-repo PRs
+- Release metadata and release asset binaries in one-time imports
 
 **Reported but not imported**
 
-- GitHub releases and release assets (no published release domain yet)
 - Cross-repository pull requests that cannot be represented locally
 - Wiki repos, submodule recursion, GitHub-only refs
 - Organization membership, teams, invitations, and GitHub permission grants
 
 Unsupported categories appear in the final report; they are not silently dropped.
+
+## Release assets
+
+One-time imports preserve release timestamps, immutable state, historical body
+projections and validated reaction/mention aggregates. Provider IDs remain source
+mappings; public release and asset IDs and download URLs belong to Fornacast.
+Historical reaction URLs remain GitHub references; importing aggregates does not
+create local reactions.
+
+Asset binaries stream into shared LocalCAS. PostgreSQL owns asset metadata and
+upload operations. A separately versioned asset checkpoint prevents repository
+publication until required assets are complete. Failures keep that phase incomplete
+and appear in the report. Retry resumes journaled bytes and mappings.
+
+Previously completed imports require explicit backfill with the current actor and
+a saved credential:
+
+```elixir
+ForgeImports.backfill_release_assets(actor, item_id, github_identity_id, request_metadata)
+```
+
+Backfill preserves the completed run and repository lifecycle and checks current
+generation and authorization. Boot and migrations never trigger historical GitHub
+downloads. Organization mirrors retain the release-binary exclusion.
+
+Upload local assets with a raw body and its Content-Type to
+`/api/v3/repos/:owner/:repo/releases/:id/assets?name=...`. Metadata, PATCH/DELETE and
+range downloads use `/releases/assets/:asset_id`; `Accept: application/octet-stream`
+selects bytes. The release page provides authorized asset and source archive links.
+Private/draft visibility is inherited from the release. Published immutable
+releases reject metadata and asset changes.
+
+Deletion hides metadata immediately. Maintenance reclaims unreferenced bytes after
+the configured grace, checking other assets, unfinished operations and LFS inventory.
+The supported deployment remains one BEAM with exclusive storage and
+stop-before-start upgrades. Back up PostgreSQL and the complete filesystem volume
+together in a quiesced window.
 
 ## Git LFS
 

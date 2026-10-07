@@ -391,7 +391,8 @@ defmodule ForgeImports.RunViewConsistencyTest do
     })
     |> Repo.insert!()
 
-    for resource <- ~w(labels issues comments pull_requests releases number_sequence) do
+    for resource <-
+          ~w(labels issues comments pull_requests releases release_assets_v1 number_sequence) do
       %PageCheckpoint{}
       |> PageCheckpoint.create_changeset(%{
         repository_item_id: item.id,

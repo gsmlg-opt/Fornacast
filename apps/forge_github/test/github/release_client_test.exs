@@ -89,6 +89,66 @@ defmodule ForgeGitHub.ReleaseClientTest do
              )
   end
 
+  test "preserves immutable releases and validated historical presentation fields" do
+    metadata = %{
+      "body_html" => "<p>Release notes</p>",
+      "body_text" => "Release notes",
+      "mentions_count" => 2,
+      "reactions" => %{
+        "url" => "https://api.github.com/repos/acme/widgets/releases/41/reactions",
+        "total_count" => 3,
+        "+1" => 3,
+        "-1" => 0,
+        "laugh" => 0,
+        "hooray" => 0,
+        "confused" => 0,
+        "heart" => 0,
+        "rocket" => 0,
+        "eyes" => 0
+      },
+      "discussion_url" => "https://github.com/acme/widgets/discussions/4"
+    }
+
+    stub = stub_name()
+    payload = release_json(41) |> Map.merge(metadata) |> Map.put("immutable", true)
+    Req.Test.expect(stub, &Req.Test.json(&1, payload))
+
+    assert {:ok, release} =
+             ReleaseClient.get_release(
+               "installation_token",
+               "acme",
+               "widgets",
+               41,
+               client_opts(stub)
+             )
+
+    assert release["immutable"] == true
+    assert release["source_metadata"] == metadata
+    assert release["unsupported_fields"] == []
+  end
+
+  test "rejects invalid historical aggregate fields and credential echoes" do
+    for fields <- [
+          %{"mentions_count" => -1},
+          %{"reactions" => %{"total_count" => -1}},
+          %{"immutable" => "true"},
+          %{"discussion_url" => "http://localhost/private"},
+          %{"body_text" => "installation_token"}
+        ] do
+      stub = stub_name()
+      Req.Test.expect(stub, &Req.Test.json(&1, Map.merge(release_json(41), fields)))
+
+      assert {:error, %Error{kind: :invalid_response}} =
+               ReleaseClient.get_release(
+                 "installation_token",
+                 "acme",
+                 "widgets",
+                 41,
+                 client_opts(stub)
+               )
+    end
+  end
+
   test "creates and updates only supported bounded release fields" do
     body = String.duplicate("🙂", 65_536)
     create_stub = stub_name()
@@ -547,7 +607,9 @@ defmodule ForgeGitHub.ReleaseClientTest do
         "updated_at" => "2030-01-03T00:00:00Z",
         "author" => %{"id" => 99, "node_id" => "U_99", "login" => "octocat"},
         "asset_count" => 0,
-        "unsupported_fields" => ~w(assets_url html_url tarball_url upload_url zipball_url)
+        "unsupported_fields" => [],
+        "immutable" => false,
+        "source_metadata" => %{}
       },
       Map.new(overrides, fn {key, value} -> {to_string(key), value} end)
     )

@@ -8,6 +8,9 @@ defmodule ForgeGitHub.LFS.Transport do
   @maximum_request_bytes 2_000_000
   @maximum_header_bytes 65_536
   @stream_chunk_bytes 64 * 1_024
+  # Mint can deliver several TLS frames in one recv. Assets retain a bounded
+  # receive window while each reader call still returns at most 64 KiB.
+  @asset_stream_window_bytes 1_048_576
   @maximum_object_size 9_223_372_036_854_775_807
   @allowed_methods [:get, :post, :put]
   @blocked_headers ~w(connection content-length host keep-alive proxy-authenticate
@@ -39,6 +42,7 @@ defmodule ForgeGitHub.LFS.Transport do
           | {:download, function(), term(), non_neg_integer()}
           | {:upload, function(), term(), non_neg_integer()}
           | {:consume_download, function(), non_neg_integer(), String.t()}
+          | {:consume_asset_download, function(), non_neg_integer(), String.t() | nil}
 
   @spec request(atom(), String.t(), [{String.t(), String.t()}], body(), keyword()) ::
           {:ok, response()}
@@ -46,7 +50,17 @@ defmodule ForgeGitHub.LFS.Transport do
           | {:error, Error.t()}
           | {:error, Error.t(), term()}
   def request(method, url, headers, body, opts \\ []) do
-    deadline = monotonic_ms() + request_timeout(opts)
+    timeout =
+      case {body, Keyword.get(opts, :request_timeout)} do
+        {{:consume_asset_download, _, _, _}, timeout}
+        when is_integer(timeout) and timeout in 1..300_000 ->
+          timeout
+
+        _ ->
+          request_timeout(opts)
+      end
+
+    deadline = monotonic_ms() + timeout
 
     with true <- method in @allowed_methods,
          {:ok, uri} <- validate_url(url),
@@ -183,7 +197,8 @@ defmodule ForgeGitHub.LFS.Transport do
             {:error, %Error{kind: deadline_or(deadline, :send)}, state}
         end
 
-      {:consume_download, consumer, expected_size, expected_oid} ->
+      {mode, consumer, expected_size, expected_oid}
+      when mode in [:consume_download, :consume_asset_download] ->
         case api.request(connection, "GET", target, wire_headers, nil) do
           {:ok, connection, reference} ->
             source = %DownloadSource{
@@ -193,10 +208,15 @@ defmodule ForgeGitHub.LFS.Transport do
               deadline: deadline,
               expected_size: expected_size,
               expected_oid: expected_oid,
+              buffer_limit:
+                if(mode == :consume_asset_download,
+                  do: @asset_stream_window_bytes,
+                  else: @stream_chunk_bytes
+                ),
               hash: :crypto.hash_init(:sha256)
             }
 
-            consume_download(consumer, source)
+            consume_download(consumer, source, mode)
 
           _error ->
             {:error, %Error{kind: deadline_or(deadline, :send)}}
@@ -298,13 +318,18 @@ defmodule ForgeGitHub.LFS.Transport do
     _kind, _reason -> {:error, :source, state}
   end
 
-  defp consume_download(consumer, source) do
+  defp consume_download(consumer, source, mode) do
     case safe_consume(consumer, source) do
       {:ok, value, %DownloadSource{} = final_source} ->
         finish_consumed_download(final_source, {:ok, value})
 
       {:error, reason, %DownloadSource{} = final_source} ->
-        finish_consumed_download(final_source, {:error, reason})
+        if mode == :consume_asset_download and is_nil(final_source.error) and
+             not final_source.completed do
+          {:ok, download_source_response(final_source), {:error, reason}}
+        else
+          finish_consumed_download(final_source, {:error, reason})
+        end
 
       _invalid ->
         {:error, %Error{kind: :sink}}
@@ -433,7 +458,7 @@ defmodule ForgeGitHub.LFS.Transport do
     total = source.received + buffered
 
     cond do
-      buffered > @stream_chunk_bytes -> {:error, :response_too_large, source}
+      buffered > source.buffer_limit -> {:error, :response_too_large, source}
       total > source.expected_size -> {:error, :integrity_mismatch, source}
       true -> {:ok, %{source | pending: source.pending <> data}}
     end
@@ -486,7 +511,8 @@ defmodule ForgeGitHub.LFS.Transport do
       validate_content_encoding(response) != :ok ->
         {:error, :integrity_mismatch, %{source | error: :integrity_mismatch}}
 
-      not Plug.Crypto.secure_compare(digest, source.expected_oid) ->
+      not is_nil(source.expected_oid) and
+          not Plug.Crypto.secure_compare(digest, source.expected_oid) ->
         {:error, :integrity_mismatch, %{source | error: :integrity_mismatch}}
 
       true ->
@@ -838,6 +864,12 @@ defmodule ForgeGitHub.LFS.Transport do
               expected in 0..@maximum_object_size and is_binary(oid) and byte_size(oid) == 64,
        do: {:ok, {:consume_download, consumer, expected, oid}}
 
+  defp validate_body(:get, {:consume_asset_download, consumer, expected, oid})
+       when is_function(consumer, 2) and is_integer(expected) and
+              expected in 0..@maximum_object_size and
+              (is_nil(oid) or (is_binary(oid) and byte_size(oid) == 64)),
+       do: {:ok, {:consume_asset_download, consumer, expected, oid}}
+
   defp validate_body(:put, {:upload, reader, state, expected})
        when is_function(reader, 2) and is_integer(expected) and
               expected in 0..@maximum_object_size,
@@ -861,8 +893,9 @@ defmodule ForgeGitHub.LFS.Transport do
   defp request_headers(headers, host, {:download, _writer, _state, _expected}),
     do: [{"host", host} | headers]
 
-  defp request_headers(headers, host, {:consume_download, _consumer, _expected, _oid}),
-    do: [{"host", host} | headers]
+  defp request_headers(headers, host, {mode, _consumer, _expected, _oid})
+       when mode in [:consume_download, :consume_asset_download],
+       do: [{"host", host} | headers]
 
   defp request_headers(headers, host, {:upload, _reader, _state, expected}),
     do: [{"host", host}, {"content-length", Integer.to_string(expected)} | headers]

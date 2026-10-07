@@ -193,6 +193,45 @@ defmodule FornacastAPI.SerializationTest do
       assert URL.web("/octocat/hello") == "https://forge.test/octocat/hello"
     end
 
+    test "development API URLs can use the separate listener while web URLs retain their origin" do
+      previous = Application.get_env(:fornacast_api, :base_url)
+
+      on_exit(fn ->
+        if previous,
+          do: Application.put_env(:fornacast_api, :base_url, previous),
+          else: Application.delete_env(:fornacast_api, :base_url)
+      end)
+
+      Application.put_env(:fornacast_api, :base_url, "http://localhost:4891")
+
+      assert URL.release("owner", "repo", 1) ==
+               "http://localhost:4891/api/v3/repos/owner/repo/releases/1"
+
+      assert URL.release_upload_template("owner", "repo", 1) ==
+               "http://localhost:4891/api/uploads/repos/owner/repo/releases/1/assets{?name,label}"
+
+      assert URL.api_v3() == "http://localhost:4891/api/v3"
+      assert URL.graphql() == "http://localhost:4891/api/graphql"
+      assert URL.uploads() == "http://localhost:4891/api/uploads"
+
+      assert URL.release_web("owner", "repo", "v1") ==
+               "https://forge.test/owner/repo/releases/tag/v1"
+    end
+
+    test "rejects unsafe configured API origins" do
+      previous = Application.get_env(:fornacast_api, :base_url)
+
+      on_exit(fn ->
+        if previous,
+          do: Application.put_env(:fornacast_api, :base_url, previous),
+          else: Application.delete_env(:fornacast_api, :base_url)
+      end)
+
+      Application.put_env(:fornacast_api, :base_url, "https://forge.test\r\nx-injected: true")
+      assert_raise ArgumentError, fn -> URL.release("owner", "repo", 1) end
+      assert URL.web("/about") == "https://forge.test/about"
+    end
+
     test "clears base credentials, path, query, and fragment" do
       Application.put_env(
         :fornacast,

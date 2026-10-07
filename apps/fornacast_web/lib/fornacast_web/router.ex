@@ -216,6 +216,8 @@ defmodule FornacastWeb.Router do
     patch "/:owner/:repo/pulls/:number/state", PullRequestController, :state
     post "/:owner/:repo/pulls/:number/merge", PullRequestController, :merge
     get "/:owner/:repo/pulls/:number", PullRequestController, :show
+    get "/:owner/:repo/releases/assets/:asset_id/download", ReleaseAssetController, :download
+    get "/:owner/:repo/releases/:release_id/archives/:format", ReleaseAssetController, :archive
     get "/:owner/:repo/releases", ReleaseController, :index
     get "/:owner/:repo/releases/new", ReleaseController, :new
     post "/:owner/:repo/releases", ReleaseController, :create

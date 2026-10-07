@@ -24,7 +24,7 @@ defmodule ForgeGitHub.ReleaseClient do
   @create_fields ~w(tag_name target_commitish name body draft prerelease)
   @update_fields @create_fields
   @canonical_fields ~w(id node_id tag_name name body draft prerelease target_commitish published_at created_at updated_at author asset_count unsupported_fields)
-  @unsupported_release_fields ~w(assets_url body_html body_text discussion_url html_url make_latest mentions_count reactions tarball_url upload_url zipball_url)
+  @unsupported_release_fields ~w(make_latest)
 
   @spec list_releases_page(String.t(), String.t(), String.t(), nil | pos_integer(), keyword()) ::
           {:ok, %{releases: [map()], next_cursor: nil | pos_integer()}}
@@ -320,12 +320,16 @@ defmodule ForgeGitHub.ReleaseClient do
              token
            ),
          {:ok, author} <- canonical_author(author, token),
-         {:ok, asset_count} <- asset_count(assets) do
+         {:ok, asset_count} <- asset_count(assets),
+         {:ok, immutable, source_metadata} <-
+           ForgeGitHub.ReleaseMetadata.from_remote(release, token) do
       canonical =
         release
         |> Map.take(@canonical_fields)
         |> Map.put("author", author)
         |> Map.put("asset_count", asset_count)
+        |> Map.put("immutable", immutable)
+        |> Map.put("source_metadata", source_metadata)
         |> Map.put("unsupported_fields", unsupported_release_fields(release))
 
       {:ok, canonical}

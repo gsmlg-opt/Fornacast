@@ -61,6 +61,8 @@ defmodule ForgeGitHub.ReleaseSyncProjection do
          true <- is_integer(asset_count) and asset_count in 0..@max_assets,
          true <- valid_unsupported_fields?(unsupported_fields),
          {:ok, author} <- canonical_author(author),
+         true <- is_boolean(Map.get(remote, "immutable", false)),
+         :ok <- ForgeGitHub.ReleaseMetadata.validate(Map.get(remote, "source_metadata", %{})),
          {:ok, published_at} <- optional_datetime(published_at),
          {:ok, created_at} <- datetime(created_at),
          {:ok, updated_at} <- datetime(updated_at),
@@ -85,7 +87,9 @@ defmodule ForgeGitHub.ReleaseSyncProjection do
          snapshot: snapshot,
          raw_author: author,
          asset_count: asset_count,
-         unsupported_fields: unsupported_fields
+         unsupported_fields: unsupported_fields,
+         immutable: Map.get(remote, "immutable", false),
+         source_metadata: Map.get(remote, "source_metadata", %{})
        }}
     else
       _invalid -> {:error, :invalid_projection}

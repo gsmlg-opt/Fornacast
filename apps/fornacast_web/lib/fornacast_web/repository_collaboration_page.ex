@@ -251,7 +251,8 @@ defmodule FornacastWeb.RepositoryCollaborationPage do
       "body" => release.body,
       "target_commitish" => release.target_commitish,
       "draft" => release.draft,
-      "prerelease" => release.prerelease
+      "prerelease" => release.prerelease,
+      "make_latest" => release.make_latest
     }
   end
 
