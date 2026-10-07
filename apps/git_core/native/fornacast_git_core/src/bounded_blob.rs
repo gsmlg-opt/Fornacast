@@ -799,6 +799,10 @@ enum CompressedSource<'a> {
         bytes: &'a [u8],
         position: usize,
     },
+    Packed {
+        opened: OpenedPack,
+        position: usize,
+    },
     File {
         file: File,
         buffer: Vec<u8>,
@@ -817,31 +821,10 @@ impl CompressedSource<'_> {
     ) -> DecodeResult<(gix_features::zlib::Status, usize, usize, bool)> {
         match self {
             CompressedSource::Slice { bytes, position } => {
-                let remaining = &bytes[*position..];
-                let input_len = budget.compressed_chunk(remaining.len())?;
-                let input = &remaining[..input_len];
-                let eof = remaining.is_empty();
-                let before_in = inflate.total_in();
-                let before_out = inflate.total_out();
-                let status = inflate
-                    .decompress(
-                        input,
-                        output,
-                        if eof {
-                            gix_features::zlib::FlushDecompress::Finish
-                        } else {
-                            gix_features::zlib::FlushDecompress::None
-                        },
-                    )
-                    .map_err(|error| Error::corrupt(format!("inflate pack entry: {error}")))?;
-                let consumed = (inflate.total_in() - before_in) as usize;
-                let written = (inflate.total_out() - before_out) as usize;
-                budget.charge_compressed_input(consumed as u64)?;
-                budget.charge_inflated_output(written as u64)?;
-                *position = position
-                    .checked_add(consumed)
-                    .ok_or_else(|| Error::corrupt("compressed input position overflow"))?;
-                Ok((status, consumed, written, eof))
+                Self::decompress_slice(bytes, position, inflate, output, budget)
+            }
+            CompressedSource::Packed { opened, position } => {
+                Self::decompress_slice(opened.compressed()?, position, inflate, output, budget)
             }
             CompressedSource::File {
                 file,
@@ -886,9 +869,46 @@ impl CompressedSource<'_> {
         }
     }
 
+    fn decompress_slice(
+        bytes: &[u8],
+        position: &mut usize,
+        inflate: &mut gix_features::zlib::Decompress,
+        output: &mut [u8],
+        budget: &DecodeWorkBudget,
+    ) -> DecodeResult<(gix_features::zlib::Status, usize, usize, bool)> {
+        let remaining = &bytes[*position..];
+        let input_len = budget.compressed_chunk(remaining.len())?;
+        let input = &remaining[..input_len];
+        let eof = remaining.is_empty();
+        let before_in = inflate.total_in();
+        let before_out = inflate.total_out();
+        let status = inflate
+            .decompress(
+                input,
+                output,
+                if eof {
+                    gix_features::zlib::FlushDecompress::Finish
+                } else {
+                    gix_features::zlib::FlushDecompress::None
+                },
+            )
+            .map_err(|error| Error::corrupt(format!("inflate pack entry: {error}")))?;
+        let consumed = (inflate.total_in() - before_in) as usize;
+        let written = (inflate.total_out() - before_out) as usize;
+        budget.charge_compressed_input(consumed as u64)?;
+        budget.charge_inflated_output(written as u64)?;
+        *position = position
+            .checked_add(consumed)
+            .ok_or_else(|| Error::corrupt("compressed input position overflow"))?;
+        Ok((status, consumed, written, eof))
+    }
+
     fn is_exactly_exhausted(&mut self, budget: &DecodeWorkBudget) -> DecodeResult<bool> {
         match self {
             CompressedSource::Slice { bytes, position } => Ok(*position == bytes.len()),
+            CompressedSource::Packed { opened, position } => {
+                Ok(*position == opened.compressed()?.len())
+            }
             CompressedSource::File {
                 file,
                 buffer,
@@ -1019,6 +1039,27 @@ struct InflatedStream<'a> {
 }
 
 impl<'a> InflatedStream<'a> {
+    fn from_pack(
+        opened: OpenedPack,
+        tracker: &mut AllocationTracker,
+        role: BufferRole,
+    ) -> DecodeResult<Self> {
+        opened.compressed()?;
+        let declared_size = opened.entry.decompressed_size;
+        Ok(Self {
+            source: CompressedSource::Packed {
+                opened,
+                position: 0,
+            },
+            inflate: gix_features::zlib::Decompress::new(),
+            output: tracker.stream_buffer(role)?,
+            output_position: 0,
+            output_length: 0,
+            declared_size: Some(declared_size),
+            ended: false,
+        })
+    }
+
     fn from_slice(
         bytes: &'a [u8],
         declared_size: u64,
@@ -2145,78 +2186,81 @@ fn probe_source(
     pack_entries: &mut Vec<VerifiedPackEntry>,
     budget: &DecodeWorkBudget,
 ) -> DecodeResult<ObjectMetadata> {
-    enter_source(source, stack)?;
-    let result = match source {
-        ObjectSource::Loose { object_db, id } => {
-            let path = loose_object_path_at(object_db, *id);
-            budget.charge_source_open(1)?;
-            let file = File::open(&path).map_err(|error| {
-                Error::storage(format!("open loose object {}: {error}", path.display()))
-            })?;
-            let mut stream = InflatedStream::from_file(file, tracker, BufferRole::Metadata)?;
-            read_loose_header(&mut stream, budget)
-        }
-        ObjectSource::Packed { .. } => {
-            let opened = open_packed(repo, source, budget)?;
-            let entry_end = opened.entry_end;
-            let packed_result = if let Some(kind) = opened.entry.header.as_kind() {
-                Ok(ObjectMetadata {
-                    kind,
-                    size: opened.entry.decompressed_size,
-                })
-            } else {
+    // Keep the bounded chain on the heap: BEAM scheduler stacks are much smaller
+    // than Rust test-thread stacks, even for ordinary valid packed delta chains.
+    let mut pending = Vec::new();
+    let mut current = source.clone();
+    let mut metadata = loop {
+        enter_source(&current, stack)?;
+        match &current {
+            ObjectSource::Loose { object_db, id } => {
+                let path = loose_object_path_at(object_db, *id);
+                budget.charge_source_open(1)?;
+                let file = File::open(&path).map_err(|error| {
+                    Error::storage(format!("open loose object {}: {error}", path.display()))
+                })?;
+                let mut stream = InflatedStream::from_file(file, tracker, BufferRole::Metadata)?;
+                break pop_result(stack, read_loose_header(&mut stream, budget))?;
+            }
+            ObjectSource::Packed { .. } => {
+                let opened = open_packed(repo, &current, budget)?;
+                if let Some(kind) = opened.entry.header.as_kind() {
+                    let metadata = ObjectMetadata {
+                        kind,
+                        size: opened.entry.decompressed_size,
+                    };
+                    pack_entries.push(VerifiedPackEntry {
+                        source: current,
+                        entry_end: opened.entry_end,
+                    });
+                    break pop_result::<_, Error>(stack, Ok(metadata))?;
+                }
                 let ref_base_id = match opened.entry.header {
                     gix_pack::data::entry::Header::RefDelta { base_id } => Some(base_id),
                     _ => None,
                 };
-                let base = resolve_delta_base(repo, source, &opened, budget)?;
-                let base_metadata = probe_source(
-                    repo,
-                    &base,
-                    tracker,
-                    stack,
-                    delta_bases,
-                    pack_entries,
-                    budget,
-                )?;
-                let compressed = opened.compressed()?;
-                let mut stream = InflatedStream::from_slice(
-                    compressed,
-                    opened.entry.decompressed_size,
-                    tracker,
-                    BufferRole::Metadata,
-                )?;
-                let (declared_base_size, result_size) = read_delta_header(&mut stream, budget)?;
-                if declared_base_size != base_metadata.size {
-                    return pop_result(
-                        stack,
-                        Err(Error::corrupt(format!(
-                            "delta declares base size {declared_base_size}, resolved base has size {}",
-                            base_metadata.size
-                        ))),
-                    );
-                }
-                delta_bases.push(VerifiedDeltaBase {
-                    delta: source.clone(),
-                    base,
-                    metadata: base_metadata,
-                    ref_base_id,
-                });
-                Ok(ObjectMetadata {
-                    kind: base_metadata.kind,
-                    size: result_size,
-                })
-            };
-            if packed_result.is_ok() {
-                pack_entries.push(VerifiedPackEntry {
-                    source: source.clone(),
-                    entry_end,
-                });
+                let base = resolve_delta_base(repo, &current, &opened, budget)?;
+                pending.push((current, base.clone(), ref_base_id, opened));
+                current = base;
             }
-            packed_result
         }
     };
-    pop_result(stack, result)
+    while let Some((source, base, ref_base_id, opened)) = pending.pop() {
+        let mut stream = InflatedStream::from_slice(
+            opened.compressed()?,
+            opened.entry.decompressed_size,
+            tracker,
+            BufferRole::Metadata,
+        )?;
+        let (declared_base_size, result_size) = read_delta_header(&mut stream, budget)?;
+        if declared_base_size != metadata.size {
+            return pop_result(
+                stack,
+                Err(Error::corrupt(format!(
+                    "delta declares base size {declared_base_size}, resolved base has size {}",
+                    metadata.size,
+                ))),
+            );
+        }
+        delta_bases.push(VerifiedDeltaBase {
+            delta: source.clone(),
+            base,
+            metadata,
+            ref_base_id,
+        });
+        pack_entries.push(VerifiedPackEntry {
+            source,
+            entry_end: opened.entry_end,
+        });
+        metadata = pop_result::<_, Error>(
+            stack,
+            Ok(ObjectMetadata {
+                kind: metadata.kind,
+                size: result_size,
+            }),
+        )?;
+    }
+    Ok(metadata)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2238,6 +2282,29 @@ fn append_source_range(
     )
 }
 
+enum DecodeTask {
+    Source {
+        source: ObjectSource,
+        expected: ObjectMetadata,
+        start: u64,
+        length: usize,
+    },
+    Delta(DeltaFrame),
+    Finish {
+        output_start: u64,
+        length: usize,
+    },
+}
+
+struct DeltaFrame {
+    stream: InflatedStream<'static>,
+    base: ObjectSource,
+    base_metadata: ObjectMetadata,
+    requested: Range<u64>,
+    result_size: u64,
+    result_position: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn append_source_range_to_sink<S>(
     repo: &gix::Repository,
@@ -2254,205 +2321,239 @@ fn append_source_range_to_sink<S>(
 where
     S: DecodeSink + ?Sized,
 {
-    let end = start
-        .checked_add(length as u64)
-        .ok_or_else(|| Error::corrupt("requested object range overflow"))?;
-    if end > expected.size {
-        return Err(Error::corrupt(format!(
-            "requested object range {start}..{end} exceeds size {}",
-            expected.size
-        )));
-    }
-
-    enter_source(source, stack)?;
-    let output_start = output.position();
-    let role = if stack.len() == 1 {
-        BufferRole::DecodedObject
-    } else {
-        BufferRole::DecodedBase
-    };
-    let result = match source {
-        ObjectSource::Loose { object_db, id } => {
-            let path = loose_object_path_at(object_db, *id);
-            budget.charge_source_open(1)?;
-            let file = File::open(&path).map_err(|error| {
-                Error::storage(format!("open loose object {}: {error}", path.display()))
-            })?;
-            let mut stream = InflatedStream::from_file(file, tracker, role)?;
-            let actual = read_loose_header(&mut stream, budget)?;
-            ensure_metadata(expected, actual)?;
-            stream.skip_exact(start, budget)?;
-            stream.append_exact(length as u64, output, budget)?;
-            if end == expected.size {
-                stream.finish_exact(budget)?;
-            }
-            Ok(())
-        }
-        ObjectSource::Packed { .. } => {
-            let opened = open_guarded_packed(repo, source, guarded, budget)?;
-            if let Some(kind) = opened.entry.header.as_kind() {
-                let actual = ObjectMetadata {
-                    kind,
-                    size: opened.entry.decompressed_size,
-                };
-                ensure_metadata(expected, actual)?;
-                let compressed = opened.compressed()?;
-                let mut stream = InflatedStream::from_slice(
-                    compressed,
-                    opened.entry.decompressed_size,
-                    tracker,
-                    role,
-                )?;
-                stream.skip_exact(start, budget)?;
-                stream.append_exact(length as u64, output, budget)?;
-                if end == expected.size {
-                    stream.finish_exact(budget)?;
-                }
-                Ok(())
-            } else {
-                append_delta_range(
-                    repo, source, &opened, expected, start, end, output, tracker, stack, guarded,
-                    budget,
-                )
-            }
-        }
-    };
-
-    let result = result.and_then(|()| {
-        let appended = output
-            .position()
-            .checked_sub(output_start)
-            .ok_or_else(|| Error::corrupt("decoder output position moved backwards"))?;
-        if appended != length as u64 {
-            Err(Error::corrupt(format!(
-                "decoder appended {appended} bytes for a {length}-byte request"
-            )))
-        } else {
-            Ok(())
-        }
-    });
-    pop_result(stack, result)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_delta_range<S>(
-    repo: &gix::Repository,
-    source: &ObjectSource,
-    opened: &OpenedPack,
-    expected: ObjectMetadata,
-    start: u64,
-    end: u64,
-    output: &mut S,
-    tracker: &mut AllocationTracker,
-    stack: &mut Vec<ObjectSource>,
-    guarded: &GuardedMetadata,
-    budget: &DecodeWorkBudget,
-) -> DecodeResult<()>
-where
-    S: DecodeSink + ?Sized,
-{
-    let verified_base = guarded.delta_base(source)?;
-    let base = &verified_base.base;
-    let base_metadata = verified_base.metadata;
-    let compressed = opened.compressed()?;
-    let mut stream = InflatedStream::from_slice(
-        compressed,
-        opened.entry.decompressed_size,
-        tracker,
-        BufferRole::Delta,
-    )?;
-    let (declared_base_size, result_size) = read_delta_header(&mut stream, budget)?;
-    if declared_base_size != base_metadata.size {
-        return Err(Error::corrupt(format!(
-            "delta declares base size {declared_base_size}, resolved base has size {}",
-            base_metadata.size
-        )));
-    }
-    ensure_metadata(
+    let mut tasks = vec![DecodeTask::Source {
+        source: source.clone(),
         expected,
-        ObjectMetadata {
-            kind: base_metadata.kind,
-            size: result_size,
-        },
-    )?;
-
-    let requested = start..end;
-    let mut result_position = 0_u64;
-    while result_position < end {
-        budget.charge_delta_instruction()?;
-        let opcode = stream.read_required_byte(budget)?;
-        let instruction =
-            decode_delta_instruction(opcode, &mut || stream.read_required_byte(budget))?;
-        let instruction_size = match instruction {
-            DeltaInstruction::Insert { size } | DeltaInstruction::Copy { size, .. } => size,
-        };
-        let instruction_end = result_position
-            .checked_add(instruction_size)
-            .ok_or_else(|| Error::corrupt("delta result position overflow"))?;
-        if instruction_end > result_size {
-            return Err(Error::corrupt(format!(
-                "delta command ends at {instruction_end}, beyond result size {result_size}"
-            )));
-        }
-
-        match &instruction {
-            DeltaInstruction::Insert { size } => {
-                if instruction_end <= start {
-                    stream.skip_exact(*size, budget)?;
-                } else {
-                    let overlap_start = result_position.max(start);
-                    let overlap_end = instruction_end.min(end);
-                    stream.skip_exact(overlap_start - result_position, budget)?;
-                    stream.append_exact(overlap_end - overlap_start, output, budget)?;
-                }
-            }
-            DeltaInstruction::Copy { offset, size } => {
-                let base_end = offset
-                    .checked_add(*size)
-                    .ok_or_else(|| Error::corrupt("delta base copy range overflow"))?;
-                if base_end > base_metadata.size {
+        start,
+        length,
+    }];
+    // Each COPY suspends one inflater on this bounded heap stack, rather than
+    // retaining two large Rust call frames on the scheduler's native stack.
+    while let Some(task) = tasks.pop() {
+        match task {
+            DecodeTask::Source {
+                source,
+                expected,
+                start,
+                length,
+            } => {
+                let end = start
+                    .checked_add(length as u64)
+                    .ok_or_else(|| Error::corrupt("requested object range overflow"))?;
+                if end > expected.size {
                     return Err(Error::corrupt(format!(
-                        "delta copy range {offset}..{base_end} exceeds base size {}",
-                        base_metadata.size
+                        "requested object range {start}..{end} exceeds size {}",
+                        expected.size
                     )));
                 }
-                if let Some(base_range) =
-                    overlapping_base_range(&instruction, result_position, requested.clone())?
-                {
-                    let length = usize::try_from(base_range.end - base_range.start)
-                        .map_err(|_| Error::corrupt("delta copy length does not fit usize"))?;
-                    append_source_range_to_sink(
-                        repo,
-                        base,
-                        base_metadata,
-                        base_range.start,
-                        length,
-                        output,
-                        tracker,
-                        stack,
-                        guarded,
-                        budget,
-                    )?;
+                enter_source(&source, stack)?;
+                tasks.push(DecodeTask::Finish {
+                    output_start: output.position(),
+                    length,
+                });
+                let role = if stack.len() == 1 {
+                    BufferRole::DecodedObject
+                } else {
+                    BufferRole::DecodedBase
+                };
+                match &source {
+                    ObjectSource::Loose { object_db, id } => {
+                        let path = loose_object_path_at(object_db, *id);
+                        budget.charge_source_open(1)?;
+                        let file = File::open(&path).map_err(|error| {
+                            Error::storage(format!("open loose object {}: {error}", path.display()))
+                        })?;
+                        let mut stream = InflatedStream::from_file(file, tracker, role)?;
+                        let actual = read_loose_header(&mut stream, budget)?;
+                        ensure_metadata(expected, actual)?;
+                        stream.skip_exact(start, budget)?;
+                        stream.append_exact(length as u64, output, budget)?;
+                        if end == expected.size {
+                            stream.finish_exact(budget)?;
+                        }
+                    }
+                    ObjectSource::Packed { .. } => {
+                        let opened = open_guarded_packed(repo, &source, guarded, budget)?;
+                        if let Some(kind) = opened.entry.header.as_kind() {
+                            ensure_metadata(
+                                expected,
+                                ObjectMetadata {
+                                    kind,
+                                    size: opened.entry.decompressed_size,
+                                },
+                            )?;
+                            let mut stream = InflatedStream::from_pack(opened, tracker, role)?;
+                            stream.skip_exact(start, budget)?;
+                            stream.append_exact(length as u64, output, budget)?;
+                            if end == expected.size {
+                                stream.finish_exact(budget)?;
+                            }
+                        } else {
+                            tasks.push(DecodeTask::Delta(DeltaFrame::new(
+                                &source,
+                                opened,
+                                expected,
+                                start..end,
+                                tracker,
+                                guarded,
+                                budget,
+                            )?));
+                        }
+                    }
                 }
             }
+            DecodeTask::Delta(mut frame) => {
+                if let Some((start, length)) = frame.advance(output, budget)? {
+                    let source = frame.base.clone();
+                    let expected = frame.base_metadata;
+                    tasks.push(DecodeTask::Delta(frame));
+                    tasks.push(DecodeTask::Source {
+                        source,
+                        expected,
+                        start,
+                        length,
+                    });
+                }
+            }
+            DecodeTask::Finish {
+                output_start,
+                length,
+            } => {
+                let appended = output
+                    .position()
+                    .checked_sub(output_start)
+                    .ok_or_else(|| Error::corrupt("decoder output position moved backwards"))?;
+                let result = if appended != length as u64 {
+                    Err(Error::corrupt(format!(
+                        "decoder appended {appended} bytes for a {length}-byte request"
+                    )))
+                } else {
+                    Ok(())
+                };
+                pop_result(stack, result)?;
+            }
         }
-        result_position = instruction_end;
-    }
-
-    if stream.is_ended() && result_position < result_size {
-        return Err(Error::corrupt(format!(
-            "delta stream reached StreamEnd at result offset {result_position}, expected {result_size}"
-        )));
-    }
-    if end == result_size {
-        if result_position != result_size {
-            return Err(Error::corrupt(format!(
-                "delta result ended at {result_position}, expected {result_size}"
-            )));
-        }
-        stream.finish_exact(budget)?;
     }
     Ok(())
+}
+
+impl DeltaFrame {
+    fn new(
+        source: &ObjectSource,
+        opened: OpenedPack,
+        expected: ObjectMetadata,
+        requested: Range<u64>,
+        tracker: &mut AllocationTracker,
+        guarded: &GuardedMetadata,
+        budget: &DecodeWorkBudget,
+    ) -> DecodeResult<Self> {
+        let verified_base = guarded.delta_base(source)?;
+        let base_metadata = verified_base.metadata;
+        let mut stream = InflatedStream::from_pack(opened, tracker, BufferRole::Delta)?;
+        let (declared_base_size, result_size) = read_delta_header(&mut stream, budget)?;
+        if declared_base_size != base_metadata.size {
+            return Err(Error::corrupt(format!(
+                "delta declares base size {declared_base_size}, resolved base has size {}",
+                base_metadata.size
+            )));
+        }
+        ensure_metadata(
+            expected,
+            ObjectMetadata {
+                kind: base_metadata.kind,
+                size: result_size,
+            },
+        )?;
+        Ok(Self {
+            stream,
+            base: verified_base.base.clone(),
+            base_metadata,
+            requested,
+            result_size,
+            result_position: 0,
+        })
+    }
+
+    fn advance<S: DecodeSink + ?Sized>(
+        &mut self,
+        output: &mut S,
+        budget: &DecodeWorkBudget,
+    ) -> DecodeResult<Option<(u64, usize)>> {
+        while self.result_position < self.requested.end {
+            budget.charge_delta_instruction()?;
+            let opcode = self.stream.read_required_byte(budget)?;
+            let instruction =
+                decode_delta_instruction(opcode, &mut || self.stream.read_required_byte(budget))?;
+            let instruction_size = match instruction {
+                DeltaInstruction::Insert { size } | DeltaInstruction::Copy { size, .. } => size,
+            };
+            let instruction_end = self
+                .result_position
+                .checked_add(instruction_size)
+                .ok_or_else(|| Error::corrupt("delta result position overflow"))?;
+            if instruction_end > self.result_size {
+                return Err(Error::corrupt(format!(
+                    "delta command ends at {instruction_end}, beyond result size {}",
+                    self.result_size
+                )));
+            }
+            let mut child = None;
+            match &instruction {
+                DeltaInstruction::Insert { size } => {
+                    if instruction_end <= self.requested.start {
+                        self.stream.skip_exact(*size, budget)?;
+                    } else {
+                        let overlap_start = self.result_position.max(self.requested.start);
+                        let overlap_end = instruction_end.min(self.requested.end);
+                        self.stream
+                            .skip_exact(overlap_start - self.result_position, budget)?;
+                        self.stream
+                            .append_exact(overlap_end - overlap_start, output, budget)?;
+                    }
+                }
+                DeltaInstruction::Copy { offset, size } => {
+                    let base_end = offset
+                        .checked_add(*size)
+                        .ok_or_else(|| Error::corrupt("delta base copy range overflow"))?;
+                    if base_end > self.base_metadata.size {
+                        return Err(Error::corrupt(format!(
+                            "delta copy range {offset}..{base_end} exceeds base size {}",
+                            self.base_metadata.size
+                        )));
+                    }
+                    if let Some(base_range) = overlapping_base_range(
+                        &instruction,
+                        self.result_position,
+                        self.requested.clone(),
+                    )? {
+                        let length = usize::try_from(base_range.end - base_range.start)
+                            .map_err(|_| Error::corrupt("delta copy length does not fit usize"))?;
+                        child = Some((base_range.start, length));
+                    }
+                }
+            }
+            self.result_position = instruction_end;
+            if child.is_some() {
+                return Ok(child);
+            }
+        }
+        if self.stream.is_ended() && self.result_position < self.result_size {
+            return Err(Error::corrupt(format!(
+                "delta stream reached StreamEnd at result offset {}, expected {}",
+                self.result_position, self.result_size
+            )));
+        }
+        if self.requested.end == self.result_size {
+            if self.result_position != self.result_size {
+                return Err(Error::corrupt(format!(
+                    "delta result ended at {}, expected {}",
+                    self.result_position, self.result_size
+                )));
+            }
+            self.stream.finish_exact(budget)?;
+        }
+        Ok(None)
+    }
 }
 
 fn resolve_delta_base(
@@ -3520,6 +3621,38 @@ mod tests {
     }
 
     #[test]
+    fn deep_delta_prefix_and_verified_visitor_fit_scheduler_sized_stack() {
+        let fixture = deep_delta_fixture();
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let repo = gix::open(&fixture.repo_path).expect("open deep delta fixture");
+                let prefix = read_object_prefix(&repo, fixture.oid, 1).expect("deep delta prefix");
+                assert_eq!(prefix.data, fixture.original[..1]);
+                assert_eq!(prefix.size, fixture.original.len() as u64);
+                let mut bytes = Vec::new();
+                let outcome = visit_verified_blob(
+                    &repo,
+                    fixture.oid,
+                    fixture.original.len() as u64,
+                    || false,
+                    &mut |chunk: &[u8]| bytes.extend_from_slice(chunk),
+                )
+                .expect("deep delta verified visitor");
+                assert_eq!(
+                    outcome,
+                    VisitOutcome::Complete {
+                        size: fixture.original.len() as u64
+                    }
+                );
+                assert_eq!(bytes, fixture.original);
+            })
+            .expect("spawn scheduler-sized stack")
+            .join()
+            .expect("decoder must not overflow its native stack");
+    }
+
+    #[test]
     fn prefix_blob_local_cycle_guard_runs_before_public_header_traversal() {
         let source = ObjectSource::Packed {
             index_path: PathBuf::from("fixture.idx"),
@@ -4084,6 +4217,57 @@ mod tests {
             _temp: temp,
             repo_path,
             oid: parse_oid(&oid_text),
+            original,
+            evidence,
+            storage: StorageForm::PackedRefDelta,
+        }
+    }
+
+    fn deep_delta_fixture() -> Fixture {
+        let temp = TempDirectory::new("deep-delta");
+        let repo_path = temp.0.join("deep-delta.git");
+        git(
+            &[
+                "init",
+                "--bare",
+                "--object-format=sha1",
+                path_str(&repo_path),
+            ],
+            None,
+        );
+        let mut original = vec![b'b'; 64];
+        let mut oid = blob_oid(&original);
+        let mut pack = b"PACK".to_vec();
+        pack.extend(2_u32.to_be_bytes());
+        pack.extend((MAX_CHAIN_DEPTH as u32).to_be_bytes());
+        pack.extend(encode_pack_entry_header(3, original.len()));
+        pack.extend(zlib(&original));
+        for index in 1..MAX_CHAIN_DEPTH {
+            let mut delta = encode_delta_varint(original.len() as u64);
+            delta.extend(encode_delta_varint(original.len() as u64 + 1));
+            // COPY the complete previous object, then INSERT one distinguishing byte.
+            delta.extend([0x90, original.len() as u8, 1, index as u8]);
+            pack.extend(encode_pack_entry_header(7, delta.len()));
+            pack.extend(oid.as_slice());
+            pack.extend(zlib(&delta));
+            original.push(index as u8);
+            oid = blob_oid(&original);
+        }
+        let mut hasher = gix_hash::hasher(gix_hash::Kind::Sha1);
+        hasher.update(&pack);
+        let pack_id = hasher.try_finalize().expect("hash deep delta pack");
+        pack.extend(pack_id.as_slice());
+        let pack_path = repo_path
+            .join("objects/pack")
+            .join(format!("pack-{pack_id}.pack"));
+        std::fs::write(&pack_path, pack).expect("write deep delta pack");
+        git(&["index-pack", path_str(&pack_path)], None);
+        let evidence = verify_line(&verify_pack(&repo_path), &oid.to_string());
+        assert_eq!(evidence.split_whitespace().nth(5), Some("63"));
+        Fixture {
+            _temp: temp,
+            repo_path,
+            oid,
             original,
             evidence,
             storage: StorageForm::PackedRefDelta,
