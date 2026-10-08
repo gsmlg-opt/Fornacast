@@ -33,3 +33,5 @@ config :fornacast_api, FornacastAPI.Endpoint,
   server: true
 
 config :phoenix, :stacktrace_depth, 20
+
+config :logger, level: :info
