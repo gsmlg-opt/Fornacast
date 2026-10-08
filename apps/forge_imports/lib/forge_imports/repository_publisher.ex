@@ -261,6 +261,7 @@ defmodule ForgeImports.RepositoryPublisher do
              :ok <- after_admission_locks(),
              now <- DateTime.utc_now(:second),
              :ok <- validate_fresh_run(run, now),
+             :ok <- ForgeImports.PatSyncWorker.import_authorized?(run.id, lock: true),
              :ok <- validate_publication_gate(actor, run, item, attempt, now),
              {:ok, intent} <- publication_intent(item, attempt, safe_metadata),
              {:ok, claimed} <- persist_intent(item, intent, now) do
@@ -448,12 +449,14 @@ defmodule ForgeImports.RepositoryPublisher do
 
     case item do
       %RepositoryItem{} = item ->
-        case {Persistence.ensure_adoption_safe_locked(repo, item),
-              ForgeImports.GitHub.MetadataImporter.validate_pull_issue_identities(item)} do
-          {:ok, :ok} -> {:ok, item.id}
-          {:ok, {:error, _}} -> {:error, :metadata_not_ready}
-          {{:error, :cleanup_conflict}, _} -> {:error, :destination_changed}
-          {{:error, :persistence_unavailable}, _} -> {:error, :persistence_unavailable}
+        with :ok <- ForgeImports.PatSyncWorker.import_authorized?(capability.run_id, lock: true) do
+          case {Persistence.ensure_adoption_safe_locked(repo, item),
+                ForgeImports.GitHub.MetadataImporter.validate_pull_issue_identities(item)} do
+            {:ok, :ok} -> {:ok, item.id}
+            {:ok, {:error, _}} -> {:error, :metadata_not_ready}
+            {{:error, :cleanup_conflict}, _} -> {:error, :destination_changed}
+            {{:error, :persistence_unavailable}, _} -> {:error, :persistence_unavailable}
+          end
         end
 
       nil ->

@@ -216,12 +216,12 @@ defmodule ForgeImports.GitHub.MetadataImporter do
             lock: "FOR UPDATE"
         )
 
-      unless candidate, do: Repo.rollback(:pull_issue_identity_mismatch)
-
-      case ForgeGitHub.User.id(candidate.metadata["github_id"]) do
-        {:ok, ^issue_id} -> :ok
-        {:ok, _contradictory_id} -> Repo.rollback(:pull_issue_identity_mismatch)
-        :error -> :ok
+      if candidate do
+        case ForgeGitHub.User.id(candidate.metadata["github_id"]) do
+          {:ok, ^issue_id} -> :ok
+          {:ok, _contradictory_id} -> Repo.rollback(:pull_issue_identity_mismatch)
+          :error -> :ok
+        end
       end
 
       local_issue =
@@ -287,15 +287,27 @@ defmodule ForgeImports.GitHub.MetadataImporter do
         identity |> Ecto.Changeset.change(github_object_id: issue_id) |> Repo.update!()
       else
         # Candidate-only recovery is safe only before any local PR for this number exists.
+        unless candidate, do: Repo.rollback(:pull_issue_identity_mismatch)
+
         if Repo.exists?(
              from i in Issue, where: i.repository_id == ^repository.id and i.number == ^number
            ),
            do: Repo.rollback(:pull_issue_identity_mismatch)
       end
 
-      candidate
-      |> Ecto.Changeset.change(metadata: Map.put(candidate.metadata, "github_id", issue_id))
-      |> Repo.update!()
+      if candidate do
+        candidate
+        |> Ecto.Changeset.change(metadata: Map.put(candidate.metadata, "github_id", issue_id))
+        |> Repo.update!()
+      else
+        # Older retry adoption retained mappings but omitted candidate reports.
+        # Rebuild evidence only after authenticated refetch and local mapping checks.
+        Repo.insert(pull_candidate_changeset(current, number, issue_id))
+        |> case do
+          {:ok, _candidate} -> :ok
+          {:error, _changeset} -> Repo.rollback(:pull_issue_identity_mismatch)
+        end
+      end
 
       pending_evidence? =
         Repo.exists?(
@@ -1526,7 +1538,7 @@ defmodule ForgeImports.GitHub.MetadataImporter do
                end)
                |> Repo.transaction() do
             {:ok, _} -> {:cont, :ok}
-            {:error, _, _, _} -> {:cont, :ok}
+            {:error, _step, reason, _changes} -> {:halt, {:error, reason}}
           end
 
         {:error, _} ->
@@ -1806,22 +1818,26 @@ defmodule ForgeImports.GitHub.MetadataImporter do
     Multi.insert(
       multi,
       {:pull_candidate, number},
-      ReportEntry.create_changeset(%ReportEntry{}, %{
-        import_run_id: item.import_run_id,
-        repository_item_id: item.id,
-        idempotency_key: "pull-candidate-#{item.id}-#{number}",
-        scope: :object,
-        object_kind: "pull_request",
-        source_object_id: number,
-        outcome: :skipped,
-        classification: "pull_candidate",
-        summary: "Pull request deferred to pull phase",
-        metadata: %{"count" => number, "github_id" => issue_id},
-        source_count: 0
-      }),
+      pull_candidate_changeset(item, number, issue_id),
       on_conflict: :nothing,
       conflict_target: [:import_run_id, :idempotency_key]
     )
+  end
+
+  defp pull_candidate_changeset(item, number, issue_id) do
+    ReportEntry.create_changeset(%ReportEntry{}, %{
+      import_run_id: item.import_run_id,
+      repository_item_id: item.id,
+      idempotency_key: "pull-candidate-#{item.id}-#{number}",
+      scope: :object,
+      object_kind: "pull_request",
+      source_object_id: number,
+      outcome: :skipped,
+      classification: "pull_candidate",
+      summary: "Pull request deferred to pull phase",
+      metadata: %{"count" => number, "github_id" => issue_id},
+      source_count: 0
+    })
   end
 
   defp candidate_issue_id(item, number) do

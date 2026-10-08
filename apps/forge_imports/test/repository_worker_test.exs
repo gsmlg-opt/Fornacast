@@ -639,6 +639,37 @@ defmodule ForgeImports.RepositoryWorkerTest do
   end
 
   @tag :tmp_dir
+  test "LFS scan work limits preserve a retryable attempt rather than report corruption",
+       context do
+    payloads = stage_lfs_fixture!(context)
+    callbacks = lfs_callbacks(context, payloads)
+
+    assert {:error, :scan_work_limit} =
+             finish_lfs_worker(context.item.id, callbacks,
+               expand_object: fn _path, _oid, _kind, _offset, _limit ->
+                 {:error,
+                  %GitCore.Error{
+                    kind: :scan_work_limit,
+                    operation: :expand_lfs_scan_object,
+                    detail: "decode work budget exhausted"
+                  }}
+               end
+             )
+
+    item = Repo.get!(RepositoryItem, context.item.id)
+    assert item.state == :staging_metadata
+    assert item.failure_kind == "scan_work_limit"
+    assert item.failure_count == 0
+    assert item.next_attempt_at
+    assert item.lease_owner == nil
+
+    assert Repo.get_by!(ImportAttempt,
+             repository_item_id: item.id,
+             attempt_number: item.attempt_count
+           ).state == :running
+  end
+
+  @tag :tmp_dir
   test "permanent LFS repository corruption terminates the attempt and run", context do
     payloads = stage_lfs_fixture!(context)
     callbacks = lfs_callbacks(context, payloads)
@@ -694,6 +725,49 @@ defmodule ForgeImports.RepositoryWorkerTest do
 
     assert %RepositoryItem{state: :awaiting_credential, lease_owner: nil} =
              Repo.get!(RepositoryItem, context.item.id)
+  end
+
+  @tag :tmp_dir
+  test "one LFS authorization checkpoint reads its current context only once", context do
+    payloads = stage_lfs_fixture!(context)
+    callbacks = lfs_callbacks(context, payloads)
+    parent = self()
+
+    callbacks =
+      Map.put(callbacks, :batch, fn token, owner, repo, operation, objects, options ->
+        reference = make_ref()
+        handler = {__MODULE__, reference}
+        caller = self()
+        prefix = Repo.config()[:telemetry_prefix] || [:fornacast, :repo]
+
+        :ok =
+          :telemetry.attach(
+            handler,
+            prefix ++ [:query],
+            fn _, _, metadata, _ ->
+              if self() == caller and
+                   String.contains?(metadata.query, "FROM \"github_import_repository_items\"") and
+                   String.contains?(metadata.query, "INNER JOIN \"github_import_runs\"") do
+                send(caller, {reference, :context_read})
+              end
+            end,
+            nil
+          )
+
+        try do
+          assert :ok = options[:authorize].()
+          send(parent, {:context_reads, count_context_reads(reference)})
+        after
+          :telemetry.detach(handler)
+        end
+
+        callbacks.batch.(token, owner, repo, operation, objects, options)
+      end)
+
+    assert {:ok, %RepositoryItem{state: :ready_to_publish}} =
+             finish_lfs_worker(context.item.id, callbacks)
+
+    assert_receive {:context_reads, 1}
   end
 
   @tag :tmp_dir
@@ -3700,6 +3774,14 @@ defmodule ForgeImports.RepositoryWorkerTest do
                remote: __MODULE__.LocalMirrorRemote,
                remote_options: [source: source]
              )
+  end
+
+  defp count_context_reads(reference) do
+    receive do
+      {^reference, :context_read} -> 1 + count_context_reads(reference)
+    after
+      0 -> 0
+    end
   end
 
   defp finish_lfs_worker(item_id, callbacks, lfs_options \\ []) do

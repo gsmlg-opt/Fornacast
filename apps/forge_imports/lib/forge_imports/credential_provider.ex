@@ -35,7 +35,8 @@ defmodule ForgeImports.CredentialProvider do
       )
 
       with true <- not is_nil(actor) and not is_nil(owner),
-           :ok <- recovery_destination(actor, owner) do
+           :ok <- recovery_destination(actor, owner),
+           :ok <- ForgeImports.PatSyncWorker.import_authorized?(run.id, lock: true) do
         if run.credential_source == :github_app,
           do: GitHubApp.authorize_recovery_locked(run, actor, owner.id),
           else: :ok
@@ -504,7 +505,8 @@ defmodule ForgeImports.CredentialProvider.SavedPAT do
     reference = make_ref()
     parent = self()
 
-    with %GitHubIdentity{kind: :user, login: login, local_user_id: ^actor_id} <-
+    with :ok <- ForgeImports.PatSyncWorker.import_authorized?(run.id),
+         %GitHubIdentity{kind: :user, login: login, local_user_id: ^actor_id} <-
            Repo.get(GitHubIdentity, run.github_identity_id) do
       metadata = %{
         git_login: login,
@@ -533,6 +535,7 @@ defmodule ForgeImports.CredentialProvider.SavedPAT do
       normalize_checkout(checkout, reference)
     else
       nil -> {:error, :not_found}
+      {:error, reason} -> {:error, reason}
     end
   end
 

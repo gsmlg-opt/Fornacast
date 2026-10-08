@@ -52,29 +52,12 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
               )
 
             :sync_now ->
-              with {:ok, %{config: config}} <- PatSettings.view(actor, organization.id),
-                   false <- config.paused,
-                   true <- config.enabled,
-                   {:ok, _} <- PatSettings.mark_sync(actor, organization.id, "running", metadata),
-                   {:ok, run} <-
-                     ForgeImports.OrganizationPatSettings.sync(
-                       actor,
-                       organization.id,
-                       attrs["lock_version"],
-                       metadata
-                     ) do
-                {:ok, run}
-              else
-                true ->
-                  {:error, :paused}
-
-                false ->
-                  {:error, :not_enabled}
-
-                {:error, reason} ->
-                  _ = PatSettings.mark_sync(actor, organization.id, "failed", metadata)
-                  {:error, reason}
-              end
+              ForgeImports.OrganizationPatSettings.sync(
+                actor,
+                organization.id,
+                attrs["lock_version"],
+                metadata
+              )
 
             :check ->
               ForgeImports.OrganizationPatSettings.check(actor, organization.id)
@@ -113,7 +96,10 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
             organization,
             view,
             template,
-            if(action == :check, do: check_error_message(reason), else: error_message(reason))
+            if(action == :check,
+              do: check_error_message(reason),
+              else: error_message(reason, action)
+            )
           )
       end
     else
@@ -127,7 +113,7 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
     message =
       case action do
         :refresh -> "Repository list refreshed."
-        :sync_now -> "Synchronization queued."
+        :sync_now -> "Synchronization of all PAT-visible organization repositories queued."
         :pause -> "Synchronization paused."
         :resume -> "Synchronization resumed."
         _ -> "PAT synchronization configuration saved."
@@ -213,9 +199,20 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
   defp error_message(:unavailable),
     do: "The PAT or GitHub check service is unavailable. Verify the saved PAT and try again."
 
-  defp error_message(_),
+  defp error_message(reason) when reason in [:repository_sync_failed, :import_failed],
     do:
-      "Could not refresh the repository list. Check the owner’s PAT and GitHub access, then try again."
+      "Could not synchronize repositories. Check the saved PAT and GitHub access, then try again."
+
+  defp error_message(_), do: nil
+
+  defp error_message(reason, action) do
+    error_message(reason) ||
+      if action == :sync_now do
+        "Could not start synchronization. Check the owner’s PAT and GitHub access, then try again."
+      else
+        "Could not refresh the repository list. Check the owner’s PAT and GitHub access, then try again."
+      end
+  end
 
   defp check_error_message(reason) when is_atom(reason),
     do: "Configuration check failed (#{reason})."

@@ -7,7 +7,7 @@
       <.dm_link href={base(@organization)} class="text-primary">Back to GitHub configuration</.dm_link>
       <h2 class="text-2xl font-semibold">Synchronized repositories</h2>
       <p class="text-on-surface-variant">
-        Choose repositories for {@view.config.github_organization}. Selection is saved for future GitHub → Fornacast synchronization.
+        Manage repository selection for {@view.config.github_organization} and start GitHub → Fornacast synchronization.
       </p>
     </header>
     <.dm_alert :if={@error} id="pat-repositories-error" variant="error" role="alert">
@@ -16,6 +16,27 @@
     <.dm_alert :if={@flash} id="pat-repositories-saved" variant="success" role="status">
       {@flash}
     </.dm_alert>
+    <.dm_card id="pat-repositories-sync" variant="bordered" padding="lg">
+      <:title>Synchronize organization</:title>
+      <p class="text-sm text-on-surface-variant">
+        Sync now immediately starts background synchronization of all PAT-visible repositories in the GitHub organization, regardless of the saved repository selection.
+      </p>
+      <form action={base(@organization) <> "/sync"} method="post" class="mt-4">
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <input type="hidden" name="pat_sync[lock_version]" value={@view.config.lock_version} />
+        <button
+          class="btn btn-primary"
+          type="submit"
+          disabled={!@view.config.enabled or @view.config.paused}
+        >Sync now</button>
+      </form>
+      <p class="mt-2 text-sm text-on-surface-variant">
+        Status: {if @view.config.paused,
+          do: "Paused",
+          else: @view.config.last_sync_status || "Never synchronized"}
+      </p>
+      <.sync_report summary={@view.config.last_sync_summary} />
+    </.dm_card>
     <.dm_card id="pat-repositories-list" variant="bordered" padding="lg">
       <:title>Repository selection</:title>
       <p class="text-sm text-on-surface-variant">
@@ -45,7 +66,7 @@
         <input type="hidden" name="pat_sync[lock_version]" value={@view.config.lock_version} />
         <input type="hidden" name="pat_sync[selected_repository_ids][]" value="" />
         <label class="grid gap-1" for="pat-repository-selection">
-          <span>Synchronization scope</span>
+          <span>Saved synchronization scope</span>
           <select
             class="select"
             id="pat-repository-selection"
@@ -87,12 +108,15 @@
           </table>
         </div>
         <p class="text-sm text-on-surface-variant">
-          Choose “Selected repositories only” to apply the checkboxes. Unselected repositories are retained locally.
+          Choose “Selected repositories only” to save the checkboxes. Sync now always includes all PAT-visible organization repositories. Unselected repositories are retained locally.
         </p>
         <div>
           <button type="submit" class="btn btn-primary">Save repository selection</button>
         </div>
       </form>
+      <p class="mt-4 text-sm text-on-surface-variant">
+        Saving repository selection does not synchronize repository contents.
+      </p>
     </.dm_card>
   </section>
 </OrganizationSettingsComponents.organization_settings_layout>

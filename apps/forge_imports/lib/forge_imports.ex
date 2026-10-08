@@ -421,6 +421,25 @@ defmodule ForgeImports do
   def retry_import(_actor, _run_id, _credential_source, _request_metadata, _opts),
     do: {:error, :not_found}
 
+  @doc "Atomically fences unpublished work and retries it while retaining proven staging."
+  def restart_import(actor, run_id, credential_source, request_metadata, opts \\ [])
+
+  def restart_import(%User{} = actor, run_id, credential_source, request_metadata, opts)
+      when is_integer(run_id) and run_id > 0 and is_map(request_metadata) and is_list(opts) do
+    with {:ok, active_actor} <- active_actor(actor),
+         %ImportRun{} = predecessor <- actor_run(active_actor.id, run_id),
+         {:ok, successor} <-
+           Retry.restart(active_actor, predecessor, credential_source, request_metadata, opts) do
+      get_run(active_actor, successor.id)
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :not_found}
+    end
+  end
+
+  def restart_import(_actor, _run_id, _credential_source, _request_metadata, _opts),
+    do: {:error, :not_found}
+
   defp mutate_item(actor, expected_run, expected_item, callback) do
     transact(fn ->
       with {:ok, active_actor} <- active_actor(actor, lock?: true),

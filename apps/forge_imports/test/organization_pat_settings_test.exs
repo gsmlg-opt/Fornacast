@@ -11,13 +11,6 @@ defmodule ForgeImports.OrganizationPatSettingsTest do
     end
   end
 
-  defmodule Imports do
-    def create_organization_discovery(actor, attrs, metadata, opts) do
-      send(self(), {:pat_sync, actor.id, attrs, metadata, opts})
-      {:ok, %{id: 99, state: :discovering}}
-    end
-  end
-
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
     n = System.unique_integer([:positive, :monotonic])
@@ -84,18 +77,85 @@ defmodule ForgeImports.OrganizationPatSettingsTest do
     assert Repo.aggregate(ForgeMirrors.MirrorOperation, :count) == 0
   end
 
-  test "sync starts a saved-PAT organization import for the existing destination", c do
-    assert {:ok, %{id: 99, state: :discovering}} =
-             OrganizationPatSettings.sync(c.owner, c.org.id, c.version, %{"request" => "test"},
-               imports: Imports,
-               dispatch: :async
+  test "sync admits a durable all-repository job and reuses it on repeated clicks", c do
+    assert {:ok, job} =
+             OrganizationPatSettings.sync(c.owner, c.org.id, c.version, %{}, dispatch: :manual)
+
+    assert %{organization_id: organization_id, state: "queued", import_run_id: nil} = job
+    assert organization_id == c.org.id
+
+    assert {:ok, same} =
+             OrganizationPatSettings.sync(c.owner, c.org.id, c.version, %{}, dispatch: :manual)
+
+    assert same.id == job.id
+    assert {:ok, %{config: %{last_sync_status: "running"}}} = PatSettings.view(c.owner, c.org.id)
+  end
+
+  test "a source change admits a new job immediately and fences the old source", c do
+    assert {:ok, old} =
+             OrganizationPatSettings.sync(c.owner, c.org.id, c.version, %{}, dispatch: :manual)
+
+    assert {:ok, config} =
+             PatSettings.save(
+               c.owner,
+               c.org.id,
+               %{"github_organization" => "another-source", "lock_version" => c.version},
+               %{}
              )
 
-    assert_receive {:pat_sync, actor_id, attrs, %{"request" => "test"}, dispatch: :async}
-    assert actor_id == c.owner.id
-    assert attrs.organization == "source-org"
-    assert attrs.credential_source == :saved
-    assert attrs.github_identity_id > 0
-    assert attrs.destination_organization == %{action: :existing, id: c.org.id}
+    assert {:ok, new} =
+             OrganizationPatSettings.sync(c.owner, c.org.id, to_string(config.lock_version), %{},
+               dispatch: :manual
+             )
+
+    assert new.id != old.id
+    assert new.github_organization == "another-source"
+
+    assert %{state: "failed", error: "configuration_changed", lease_owner: nil} =
+             Repo.get!(ForgeImports.PatSyncRun, old.id)
+  end
+
+  test "disabled and paused sync requests do not create import tasks", c do
+    assert {:ok, _} = PatSettings.set_paused(c.owner, c.org.id, true, %{})
+
+    assert {:error, :paused} =
+             OrganizationPatSettings.sync(c.owner, c.org.id, c.version, %{}, dispatch: :manual)
+  end
+
+  test "a queued synchronization continues without another click and records discovery failures",
+       c do
+    assert {:ok, job} =
+             OrganizationPatSettings.sync(c.owner, c.org.id, c.version, %{}, dispatch: :manual)
+
+    assert {:error, :not_found} =
+             apply(ForgeImports.PatSyncWorker, :perform, [
+               job.id,
+               [create_discovery: fn _owner, _attrs, _metadata -> {:error, :not_found} end]
+             ])
+
+    assert %{state: "failed", finished_at: finished_at} =
+             Fornacast.Repo.get!(ForgeImports.PatSyncRun, job.id)
+
+    refute is_nil(finished_at)
+    assert {:ok, %{config: %{last_sync_status: "failed"}}} = PatSettings.view(c.owner, c.org.id)
+  end
+
+  test "a source change fences already queued synchronization before provider access", c do
+    assert {:ok, job} =
+             OrganizationPatSettings.sync(c.owner, c.org.id, c.version, %{}, dispatch: :manual)
+
+    assert {:ok, _} =
+             PatSettings.save(
+               c.owner,
+               c.org.id,
+               %{"github_organization" => "another-source", "lock_version" => c.version},
+               %{}
+             )
+
+    assert {:error, :configuration_changed} =
+             apply(ForgeImports.PatSyncWorker, :perform, [
+               job.id,
+               [create_discovery: fn _, _, _ -> flunk("provider must not be called") end]
+             ])
   end
 end

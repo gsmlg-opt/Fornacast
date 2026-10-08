@@ -7,9 +7,11 @@ defmodule ForgeImports.Retry do
 
   alias ForgeImports.{
     ImportRun,
+    ImportAttempt,
     ObjectMapping,
     PageCheckpoint,
     Persistence,
+    ReportEntry,
     RepositoryItem,
     RepositoryPublisher,
     Telemetry
@@ -20,6 +22,135 @@ defmodule ForgeImports.Retry do
 
   @retryable_run_states [:failed, :canceled, :completed_with_warnings]
   @retryable_item_states [:failed, :canceled]
+
+  def restart(actor, predecessor, credential_source, request_metadata, opts \\ []) do
+    Persistence.with_retry(fn ->
+      Repo.transaction(fn ->
+        with {:ok, active_actor} <- active_actor(actor),
+             %ImportRun{} = current <- locked_predecessor(active_actor.id, predecessor.id),
+             true <- current.state in [:running, :awaiting_credential, :cancel_requested],
+             items <-
+               Repo.all(
+                 from i in RepositoryItem,
+                   where: i.import_run_id == ^current.id and i.selected == true,
+                   order_by: i.id,
+                   lock: "FOR UPDATE"
+               ),
+             :ok <- restart_safe(items),
+             :ok <- release_run_lease(current),
+             {:ok, canceled} <-
+               request_restart_cancel(
+                 active_actor,
+                 Repo.get!(ImportRun, current.id),
+                 request_metadata,
+                 opts
+               ),
+             :ok <- settle_restart_items(items),
+             {:ok, terminal} <-
+               canceled
+               |> ImportRun.transition_changeset(:canceled, %{
+                 terminal_at: DateTime.utc_now(:second)
+               })
+               |> Repo.update(),
+             {:ok, successor} <-
+               create_successor(active_actor, terminal, credential_source, request_metadata, opts) do
+          successor
+        else
+          nil -> Repo.rollback(:not_found)
+          false -> Repo.rollback(:invalid_predecessor)
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+    end)
+  end
+
+  defp restart_safe(items) do
+    Enum.reduce_while(items, :ok, fn item, :ok ->
+      cond do
+        item.state == :publishing ->
+          {:halt, {:error, :busy}}
+
+        item.state in [:published, :completed, :skipped] ->
+          {:cont, :ok}
+
+        item.publication_evidence != %{} ->
+          {:halt, {:error, :invalid_predecessor}}
+
+        item.state == :staging_git ->
+          {:halt, {:error, :busy}}
+
+        not is_nil(item.cleanup_state) ->
+          {:halt, {:error, :cleanup_conflict}}
+
+        true ->
+          with :ok <- Persistence.ensure_adoption_safe_locked(Repo, item),
+               {:ok, phase} <- RepositoryPublisher.durable_proof_state(item),
+               true <- phase in [:queued, :git_staged, :ready_to_publish],
+               true <- phase != :queued or is_nil(item.lease_owner) do
+            {:cont, :ok}
+          else
+            false -> {:halt, {:error, :busy}}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+      end
+    end)
+  end
+
+  defp release_run_lease(%ImportRun{lease_owner: nil}), do: :ok
+  defp release_run_lease(run), do: Fornacast.OperationLease.release(ImportRun, run)
+
+  defp request_restart_cancel(
+         _actor,
+         %ImportRun{state: :cancel_requested} = run,
+         _metadata,
+         _opts
+       ),
+       do: {:ok, run}
+
+  defp request_restart_cancel(actor, run, metadata, opts),
+    do: ForgeImports.Cancellation.request(actor, run, metadata, opts)
+
+  defp settle_restart_items(items) do
+    Enum.reduce_while(items, :ok, fn previous, :ok ->
+      item = Repo.get!(RepositoryItem, previous.id)
+
+      if item.state == :cancel_requested do
+        with {:ok, _} <-
+               item
+               |> RepositoryItem.transition_changeset(:canceled, %{
+                 wait_reason: nil,
+                 next_attempt_at: nil
+               })
+               |> Repo.update(),
+             :ok <- settle_restart_attempt(item) do
+          {:cont, :ok}
+        else
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      else
+        {:cont, :ok}
+      end
+    end)
+  end
+
+  defp settle_restart_attempt(item) do
+    case Repo.one(
+           from a in ImportAttempt,
+             where:
+               a.repository_item_id == ^item.id and a.attempt_number == ^item.attempt_count and
+                 a.state == :running,
+             lock: "FOR UPDATE"
+         ) do
+      nil ->
+        :ok
+
+      attempt ->
+        case attempt |> ImportAttempt.transition_changeset(:canceled) |> Repo.update() do
+          {:ok, _} -> :ok
+          {:error, _} -> {:error, :persistence_unavailable}
+        end
+    end
+  end
 
   @spec create_successor(User.t(), ImportRun.t(), term(), map(), keyword()) ::
           {:ok, ImportRun.t()} | {:error, atom()}
@@ -114,17 +245,59 @@ defmodule ForgeImports.Retry do
   defp adopt_proven_staging(repo, predecessor_item, successor_item, phase) do
     shadow_id = predecessor_item.hidden_repository_id
 
-    with %Repository{} = shadow <- repo.get(Repository, shadow_id),
+    with true <-
+           predecessor_item.github_repository_id == successor_item.github_repository_id and
+             predecessor_item.source_full_name == successor_item.source_full_name and
+             predecessor_item.destination_owner_id == successor_item.destination_owner_id,
+         %Repository{} = shadow <- repo.get(Repository, shadow_id),
          {:ok, shadow} <- adopt_shadow(repo, shadow, successor_item.id),
          {:ok, updated_item} <-
            attach_staging(repo, predecessor_item, successor_item, shadow, phase),
          :ok <- relink_mappings(repo, predecessor_item.id, updated_item.id),
-         :ok <- relink_checkpoints(repo, predecessor_item.id, updated_item.id) do
+         :ok <- relink_checkpoints(repo, predecessor_item.id, updated_item.id),
+         :ok <- copy_pull_candidates(repo, predecessor_item, updated_item) do
       {:ok, updated_item}
     else
       nil -> {:error, :invalid_predecessor}
+      false -> {:error, :invalid_predecessor}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp copy_pull_candidates(repo, predecessor, successor) do
+    repo.all(
+      from entry in ReportEntry,
+        where:
+          entry.import_run_id == ^predecessor.import_run_id and
+            entry.repository_item_id == ^predecessor.id and
+            entry.classification == "pull_candidate",
+        order_by: entry.id,
+        lock: "FOR UPDATE"
+    )
+    |> Enum.reduce_while(:ok, fn entry, :ok ->
+      attrs =
+        entry
+        |> Map.take([
+          :scope,
+          :object_kind,
+          :source_object_id,
+          :outcome,
+          :classification,
+          :summary,
+          :metadata,
+          :source_count
+        ])
+        |> Map.merge(%{
+          import_run_id: successor.import_run_id,
+          repository_item_id: successor.id,
+          idempotency_key: "pull-candidate-#{successor.id}-#{entry.source_object_id}"
+        })
+
+      case repo.insert(ReportEntry.create_changeset(%ReportEntry{}, attrs)) do
+        {:ok, _entry} -> {:cont, :ok}
+        {:error, _changeset} -> {:halt, {:error, :invalid_predecessor}}
+      end
+    end)
   end
 
   defp adopt_shadow(repo, %Repository{} = shadow, successor_item_id) do
@@ -464,7 +637,8 @@ defmodule ForgeImports.Retry do
   defp active_actor(%User{id: actor_id}) do
     case Repo.one(
            from user in User,
-             where: user.id == ^actor_id and user.kind == :user and user.state == :active
+             where: user.id == ^actor_id and user.kind == :user and user.state == :active,
+             lock: "FOR UPDATE"
          ) do
       %User{} = active -> {:ok, active}
       nil -> {:error, :forbidden}

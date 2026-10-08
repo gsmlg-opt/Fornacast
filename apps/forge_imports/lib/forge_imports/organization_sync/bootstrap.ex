@@ -58,7 +58,7 @@ defmodule ForgeImports.OrganizationSync.Bootstrap do
       )
 
     case mirrors do
-      [] -> :ok
+      [] -> ForgeImports.PatSyncWorker.import_authorized?(run_id)
       [%OrganizationMirror{state: state}] when state in [:bootstrapping, :catching_up] -> :ok
       [%OrganizationMirror{state: :paused}] -> {:error, :paused}
       [%OrganizationMirror{state: :revoked}] -> {:error, :revoked}

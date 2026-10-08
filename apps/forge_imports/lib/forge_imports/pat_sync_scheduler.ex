@@ -5,7 +5,7 @@ defmodule ForgeImports.PatSyncScheduler do
   import Ecto.Query
 
   alias ForgeAccounts.{User, Organization}
-  alias ForgeMirrors.{PatConfiguration, PatSettings}
+  alias ForgeMirrors.PatConfiguration
   alias ForgeImports.OrganizationPatSettings
   alias Fornacast.Repo
 
@@ -60,26 +60,14 @@ defmodule ForgeImports.PatSyncScheduler do
       with %Organization{} = _organization <- Repo.get(Organization, config.organization_id),
            %User{} = owner <- Repo.get(User, config.owner_user_id),
            {:ok, _} <-
-             PatSettings.mark_sync(owner, config.organization_id, "running", %{
-               "source" => "pat_scheduler"
-             }),
-           {:ok, _} <-
              OrganizationPatSettings.sync(
                owner,
                config.organization_id,
                to_string(config.lock_version),
-               %{"source" => "pat_scheduler"}
+               %{"operation_id" => "pat-scheduler-#{config.id}"}
              ) do
         :ok
       else
-        %User{} = owner ->
-          _ =
-            PatSettings.mark_sync(owner, config.organization_id, "failed", %{
-              "source" => "pat_scheduler"
-            })
-
-          :error
-
         _ ->
           :error
       end

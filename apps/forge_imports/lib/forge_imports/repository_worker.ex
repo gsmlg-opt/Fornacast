@@ -217,6 +217,9 @@ defmodule ForgeImports.RepositoryWorker do
       {:error, %GitCore.Error{kind: :corrupt_repository}} ->
         persist_corrupt_repository_failure(capability)
 
+      {:error, %GitCore.Error{kind: :scan_work_limit}} ->
+        release_with_error(capability, :scan_work_limit)
+
       {:error, reason}
       when reason in [
              :invalid_credential,
@@ -294,8 +297,8 @@ defmodule ForgeImports.RepositoryWorker do
   end
 
   defp authorize_lfs(item_id, owner, lease_seconds) do
-    with {:ok, _context} <- current_context(item_id, owner),
-         :ok <- heartbeat(item_id, owner, lease_seconds) do
+    with {:ok, %{item: item}} <- current_context(item_id, owner),
+         :ok <- renew_current_lease(item, lease_seconds) do
       :ok
     else
       {:error, reason} -> {:error, reason}
@@ -1697,9 +1700,14 @@ defmodule ForgeImports.RepositoryWorker do
                  actor.state == :active and attempt.state == :running,
              select: %{actor: actor, run: run, item: item}
          ) do
-      %{run: %ImportRun{state: :running}, item: %RepositoryItem{}} = context -> {:ok, context}
-      %{run: %ImportRun{state: :cancel_requested}} -> {:error, :cancelled}
-      nil -> {:error, :lost_lease}
+      %{run: %ImportRun{state: :running} = run, item: %RepositoryItem{}} = context ->
+        with :ok <- ForgeImports.PatSyncWorker.import_authorized?(run.id), do: {:ok, context}
+
+      %{run: %ImportRun{state: :cancel_requested}} ->
+        {:error, :cancelled}
+
+      nil ->
+        {:error, :lost_lease}
     end
   end
 
@@ -1815,24 +1823,27 @@ defmodule ForgeImports.RepositoryWorker do
   end
 
   defp heartbeat(item_id, owner, lease_seconds) do
-    now = DateTime.utc_now(:second)
-
     with {:ok, %{item: item}} <- current_context(item_id, owner) do
-      remaining = DateTime.diff(item.lease_expires_at, now, :second)
-
-      if remaining <= div(lease_seconds, 2) do
-        case OperationLease.renew_owned(RepositoryItem, item,
-               now: now,
-               lease_seconds: lease_seconds
-             ) do
-          {:ok, _renewed} -> :ok
-          {:error, _reason} -> :error
-        end
-      else
-        :ok
-      end
+      renew_current_lease(item, lease_seconds)
     else
       {:error, _reason} -> :error
+    end
+  end
+
+  defp renew_current_lease(%RepositoryItem{} = item, lease_seconds) do
+    now = DateTime.utc_now(:second)
+    remaining = DateTime.diff(item.lease_expires_at, now, :second)
+
+    if remaining <= div(lease_seconds, 2) do
+      case OperationLease.renew_owned(RepositoryItem, item,
+             now: now,
+             lease_seconds: lease_seconds
+           ) do
+        {:ok, _renewed} -> :ok
+        {:error, _reason} -> :error
+      end
+    else
+      :ok
     end
   end
 
@@ -2167,6 +2178,8 @@ defmodule ForgeImports.RepositoryWorker do
               :unsafe_redirect,
               :local_storage,
               :request_gate_busy,
+              :scan_work_limit,
+              :label_normalization_conflict,
               :persistence_unavailable
             ],
        do: reason

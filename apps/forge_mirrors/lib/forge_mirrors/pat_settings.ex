@@ -59,7 +59,10 @@ defmodule ForgeMirrors.PatSettings do
                   inventory: %{},
                   inventory_refreshed_at: nil,
                   selected_repository_ids: [],
-                  repository_selection: "all"
+                  repository_selection: "all",
+                  last_sync_at: nil,
+                  last_sync_status: nil,
+                  last_sync_summary: %{}
                 )
               else
                 changeset
@@ -77,7 +80,12 @@ defmodule ForgeMirrors.PatSettings do
       when status in ["running", "succeeded", "failed"] do
     with {:ok, safe_metadata} <- ForgeAccounts.validate_github_request_metadata(metadata),
          {:ok, %{config: config}} <- view(actor, organization_id) do
-      changes = change(config, last_sync_at: DateTime.utc_now(:second), last_sync_status: status)
+      changes =
+        change(config,
+          last_sync_at: DateTime.utc_now(:second),
+          last_sync_status: status,
+          last_sync_summary: if(status == "running", do: %{}, else: config.last_sync_summary)
+        )
 
       with {:ok, saved} <- Repo.update(changes),
            {:ok, _audit} <-
@@ -91,6 +99,55 @@ defmodule ForgeMirrors.PatSettings do
              ) do
         {:ok, saved}
       end
+    end
+  end
+
+  @doc false
+  def record_sync_summary(job_id, summary) when is_integer(job_id) and is_map(summary) do
+    # Settling an admitted job must remain possible after its owner loses access.
+    # Use the persisted source snapshot, never a caller-supplied configuration.
+    job =
+      Repo.one(
+        from j in "organization_pat_sync_runs",
+          where: j.id == ^job_id,
+          select:
+            map(j, [
+              :id,
+              :configuration_id,
+              :organization_id,
+              :owner_user_id,
+              :github_identity_id,
+              :github_organization,
+              :state
+            ])
+      )
+
+    case job do
+      nil ->
+        {:error, :not_found}
+
+      job ->
+        {count, _} =
+          Repo.update_all(
+            from(c in PatConfiguration,
+              as: :configuration,
+              where:
+                c.id == ^job.configuration_id and c.organization_id == ^job.organization_id and
+                  c.owner_user_id == ^job.owner_user_id and
+                  c.github_identity_id == ^job.github_identity_id and
+                  c.github_organization == ^job.github_organization and
+                  not exists(
+                    from newer in "organization_pat_sync_runs",
+                      where:
+                        newer.configuration_id == parent_as(:configuration).id and
+                          newer.id > ^job.id,
+                      select: newer.id
+                  )
+            ),
+            set: [last_sync_summary: summary, last_sync_status: job.state]
+          )
+
+        if count == 1, do: :ok, else: {:error, :configuration_changed}
     end
   end
 

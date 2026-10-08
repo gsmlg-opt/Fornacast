@@ -81,6 +81,17 @@ defmodule ForgeImports.CleanupOperation do
   def terminal_states, do: @terminal_states
   def kinds, do: @kinds
 
+  @doc false
+  def valid_completed_quarantine?(
+        %__MODULE__{
+          kind: :remote_quarantine,
+          state: :cleanup_complete
+        } = operation
+      ),
+      do: operation |> change() |> validate_contract(:persisted_storage_root) |> Map.get(:valid?)
+
+  def valid_completed_quarantine?(_operation), do: false
+
   def deterministic_operation_id(kind, repository_id, item_id, source_lock_version)
       when kind in @kinds and is_integer(repository_id) and repository_id > 0 and
              is_integer(item_id) and item_id > 0 and is_integer(source_lock_version) and

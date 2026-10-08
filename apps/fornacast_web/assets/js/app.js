@@ -3,6 +3,7 @@ import "phoenix_duskmoon";
 import { registerAll } from "@duskmoon-dev/elements";
 import { registerAllArts } from "@duskmoon-dev/art-elements";
 import { initImportStatusPolling } from "./import_status.js";
+import { initPatSyncStatusPolling } from "./pat_sync_status.js";
 
 registerAll();
 registerAllArts();
@@ -140,6 +141,7 @@ if (document.readyState === "loading") {
       initAppbarMenus();
       initRepositoryClonePopoverFocus();
       initImportStatusPolling();
+      initPatSyncStatusPolling();
     },
     { once: true },
   );
@@ -148,4 +150,5 @@ if (document.readyState === "loading") {
   initAppbarMenus();
   initRepositoryClonePopoverFocus();
   initImportStatusPolling();
+  initPatSyncStatusPolling();
 }

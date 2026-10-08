@@ -288,14 +288,26 @@ defmodule ForgeAccounts do
   end
 
   @doc false
-  def organization_github_owner(actor, organization_id, owner_id) do
-    with {:ok, owners} <- organization_github_owners(actor, organization_id),
-         true <- Enum.any?(owners, &(&1.id == owner_id)) do
-      {:ok, Repo.get!(User, owner_id)}
+  def organization_github_owner(actor, organization_id, owner_id)
+      when is_integer(owner_id) and owner_id > 0 and owner_id <= 9_223_372_036_854_775_807 do
+    with {:ok, _organization} <- fetch_manageable_organization(actor, organization_id),
+         %User{} = owner <-
+           Repo.one(
+             from u in User,
+               join: m in OrganizationMember,
+               on: m.user_id == u.id,
+               where:
+                 u.id == ^owner_id and m.organization_id == ^organization_id and
+                   m.role == :owner and u.state == :active and u.kind == :user
+           ) do
+      {:ok, owner}
     else
       _ -> {:error, :forbidden}
     end
   end
+
+  def organization_github_owner(_actor, _organization_id, _owner_id),
+    do: {:error, :forbidden}
 
   def get_organization(id), do: Repo.get_by(Organization, id: id, kind: :organization)
 

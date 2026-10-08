@@ -70,8 +70,8 @@ defmodule ForgeImports.Persistence do
       [item.hidden_repository_id, item.replacement_repository_id]
       |> Enum.filter(&(is_integer(&1) and &1 > 0))
 
-    cleanup? =
-      repo.exists?(
+    cleanups =
+      repo.all(
         from cleanup in CleanupOperation,
           where:
             cleanup.repository_item_id == ^item.id or cleanup.repository_id in ^repository_ids
@@ -85,7 +85,7 @@ defmodule ForgeImports.Persistence do
               repository.id in ^repository_ids and not is_nil(repository.storage_reclaimed_at)
         )
 
-    if cleanup? or reclaimed? do
+    if reclaimed? or Enum.any?(cleanups, &(not harmless_quarantine_history?(repo, item, &1))) do
       {:error, :cleanup_conflict}
     else
       :ok = after_adoption_safety()
@@ -93,6 +93,39 @@ defmodule ForgeImports.Persistence do
     end
   rescue
     _error -> {:error, :persistence_unavailable}
+  end
+
+  defp harmless_quarantine_history?(repo, item, operation) do
+    evidence = operation.evidence
+
+    with true <- is_nil(item.cleanup_state),
+         true <- CleanupOperation.valid_completed_quarantine?(operation),
+         true <- operation.repository_id == item.hidden_repository_id,
+         %Repository{} = repository <- repo.get(Repository, item.hidden_repository_id),
+         true <- evidence["repository_generation"] == repository.generation,
+         true <- evidence["repository_storage_path"] == repository.storage_path,
+         true <- evidence["storage_root"] == Fornacast.Config.repo_storage_root(),
+         true <- evidence["requested_path"] == item.staged_storage_path,
+         true <- evidence["quarantine_path"] != item.staged_storage_path,
+         %RepositoryItem{} = source <- repo.get(RepositoryItem, operation.repository_item_id),
+         true <- source.hidden_repository_id == item.hidden_repository_id,
+         true <- DateTime.compare(operation.completed_at, item.updated_at) in [:lt, :eq],
+         true <- source.id != item.id or operation.source_lock_version < item.lock_version,
+         {:ok, phase} <- ForgeImports.RepositoryPublisher.durable_proof_state(item),
+         true <- phase in [:git_staged, :ready_to_publish],
+         {:ok, {:missing, root}} <-
+           GitCore.contained_tree_identity(
+             evidence["storage_root"],
+             String.split(evidence["relative_path"], "/"),
+             1_000
+           ) do
+      expected_root =
+        evidence["root_identity"] || get_in(evidence, ["anchored_absence", "root_identity"])
+
+      Map.new(root, fn {key, value} -> {to_string(key), value} end) == expected_root
+    else
+      _unsafe -> false
+    end
   end
 
   @doc false

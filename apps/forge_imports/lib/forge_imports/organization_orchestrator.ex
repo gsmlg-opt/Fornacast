@@ -121,22 +121,14 @@ defmodule ForgeImports.OrganizationOrchestrator do
   defp freeze_and_activate_transaction(actor, run_id, request_metadata, options) do
     with_actor_run(actor, run_id, fn active_actor, run, now ->
       with :ok <- startable_run(active_actor, run, now),
-           items <- run_items(run.id),
+           {:ok, items} <- restartable_items(run, run_items(run.id), now),
            {:ok, selected_items} <- exact_selected_items(run, items, now),
            :ok <- prelock_replacement_targets(selected_items),
            {:ok, frozen_plans} <- freeze_plans(active_actor, run, selected_items),
            :ok <- unique_final_slugs(frozen_plans),
            {:ok, frozen_items} <- persist_frozen_plans(frozen_plans, now),
            skip_count <- Enum.count(frozen_plans, &(&1.action == :skip)),
-           {:ok, ready} <-
-             Persistence.update_without_lease(
-               run,
-               [:awaiting_resolution],
-               ImportRun.transition_changeset(run, :ready, %{
-                 skipped_count: run.skipped_count + skip_count
-               }),
-               now
-             ),
+           {:ok, ready} <- prepare_ready_run(run, skip_count, now),
            {:ok, running} <-
              Persistence.update_without_lease(
                ready,
@@ -158,6 +150,57 @@ defmodule ForgeImports.OrganizationOrchestrator do
       end
     end)
   end
+
+  defp prepare_ready_run(%ImportRun{state: :ready} = run, 0, _now), do: {:ok, run}
+
+  defp prepare_ready_run(run, skip_count, now) do
+    Persistence.update_without_lease(
+      run,
+      [:awaiting_resolution],
+      ImportRun.transition_changeset(run, :ready, %{skipped_count: run.skipped_count + skip_count}),
+      now
+    )
+  end
+
+  defp restartable_items(%ImportRun{state: :ready, predecessor_run_id: predecessor}, items, now)
+       when is_integer(predecessor) do
+    Enum.reduce_while(items, {:ok, []}, fn item, {:ok, prepared} ->
+      cond do
+        active_lease?(item, now) ->
+          {:halt, {:error, :busy}}
+
+        item.attempt_count != 0 ->
+          {:halt, {:error, :stale}}
+
+        item.state == :queued ->
+          {:cont, {:ok, [item | prepared]}}
+
+        item.state in [:git_staged, :ready_to_publish] ->
+          with {:ok, phase} <- RepositoryPublisher.durable_proof_state(item),
+               true <- phase == item.state,
+               {:ok, queued} <-
+                 Persistence.update_without_lease(
+                   item,
+                   [item.state],
+                   RepositoryItem.recovery_changeset(item, :queued),
+                   now
+                 ) do
+            {:cont, {:ok, [queued | prepared]}}
+          else
+            _ -> {:halt, {:error, :stale}}
+          end
+
+        true ->
+          {:halt, {:error, :stale}}
+      end
+    end)
+    |> case do
+      {:ok, prepared} -> {:ok, Enum.reverse(prepared)}
+      error -> error
+    end
+  end
+
+  defp restartable_items(_run, items, _now), do: {:ok, items}
 
   defp activate_destination(repo, actor, run, frozen_items, request_metadata) do
     case run.destination_organization_action do
@@ -332,6 +375,20 @@ defmodule ForgeImports.OrganizationOrchestrator do
          %ImportRun{state: :awaiting_resolution, source_kind: :organization} = run,
          now
        ) do
+    cond do
+      active_lease?(run, now) -> {:error, :busy}
+      run.destination_organization_status != :clean -> {:error, :stale}
+      true -> validate_run_destination(actor, run)
+    end
+  end
+
+  defp startable_run(
+         actor,
+         %ImportRun{state: :ready, predecessor_run_id: predecessor, source_kind: :organization} =
+           run,
+         now
+       )
+       when is_integer(predecessor) do
     cond do
       active_lease?(run, now) -> {:error, :busy}
       run.destination_organization_status != :clean -> {:error, :stale}

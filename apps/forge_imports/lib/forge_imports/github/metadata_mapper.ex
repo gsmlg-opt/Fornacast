@@ -14,7 +14,7 @@ defmodule ForgeImports.GitHub.MetadataMapper do
          github_id: github_id,
          name: name,
          color: color,
-         description: description
+         description: if(description == "", do: nil, else: description)
        }}
     else
       _ -> {:error, :invalid_label}

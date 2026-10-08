@@ -43,6 +43,61 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
     %{actor: actor, identity: identity, run: run}
   end
 
+  test "attaches labels with empty descriptions without rolling back issue pages", %{run: run} do
+    {item, repository, _stub, _head, _base} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    labels =
+      Enum.map(1..2, fn id ->
+        fixture!("labels_page.json")
+        |> hd()
+        |> Map.merge(%{"id" => id, "name" => "label-#{id}", "description" => ""})
+      end)
+
+    issue = fixture!("issues_page.json") |> hd() |> Map.put("labels", labels)
+    stub = stub_client!(labels: labels, issues: [issue], comments: %{})
+
+    assert :ok = MetadataImporter.stage_phase(item, :labels, importer_opts(stub, item))
+    assert :ok = MetadataImporter.stage_phase(item, :issues, importer_opts(stub, item))
+    assert terminal?(item.id, "issues")
+    imported = Repo.get_by!(Issue, repository_id: repository.id, number: issue["number"])
+
+    assert Repo.aggregate(
+             from(relation in ForgeIssues.IssueLabel, where: relation.issue_id == ^imported.id),
+             :count
+           ) == 2
+  end
+
+  test "label conflicts stop issue pages without querying an aborted transaction", %{run: run} do
+    {item, repository, _stub, _head, _base} =
+      git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    labels =
+      Enum.map(1..2, fn id ->
+        fixture!("labels_page.json") |> hd() |> Map.merge(%{"id" => id, "name" => "label-#{id}"})
+      end)
+
+    [first | rest] = labels
+
+    issue =
+      fixture!("issues_page.json")
+      |> hd()
+      |> Map.put("labels", [Map.put(first, "color", "ffffff") | rest])
+
+    stub = stub_client!(labels: labels, issues: [issue], comments: %{})
+
+    assert :ok = MetadataImporter.stage_phase(item, :labels, importer_opts(stub, item))
+
+    assert {:error, :label_normalization_conflict} =
+             MetadataImporter.stage_phase(item, :issues, importer_opts(stub, item))
+
+    refute terminal?(item.id, "issues")
+
+    refute Repo.exists?(
+             from(candidate in Issue, where: candidate.repository_id == ^repository.id)
+           )
+  end
+
   test "imports labels, issues, comments, assignees, and a same-repo pull with terminal checkpoints",
        %{run: run} do
     {item, repository, _stub, head_sha, base_sha} =
@@ -409,6 +464,116 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
 
     assert Repo.get!(ReportEntry, candidate.id).metadata["github_id"] == issue["id"]
     assert Repo.get!(ReportEntry, second.id).metadata == %{"count" => 8}
+  end
+
+  test "authenticated recovery restores missing adopted pull evidence only for matching local mappings",
+       %{run: run} do
+    {item, _, _, head, base} = git_staged_fixture(run, full_name: "octocat/Hello-World")
+
+    issue =
+      hd(fixture!("issues_page.json"))
+      |> Map.put("pull_request", %{
+        "url" => "https://api.github.com/repos/octocat/Hello-World/pulls/7"
+      })
+
+    pull = align_pull_payload(fixture!("pull_same_repo.json"), head, base)
+    stub = stub_client!(labels: [], issues: [issue], comments: %{}, pull: pull)
+    assert :ok = stage(item, stub, phases: [:issues])
+
+    candidate =
+      Repo.get_by!(ReportEntry, repository_item_id: item.id, classification: "pull_candidate")
+
+    Repo.delete!(candidate)
+    recovery_stub!(stub, item, issue, pull, :ok)
+
+    assert {:error, :pull_issue_identity_mismatch} =
+             MetadataImporter.revalidate_pull_issue_identity(item, 7, importer_opts(stub, item))
+
+    refute Repo.get_by(ReportEntry, repository_item_id: item.id, classification: "pull_candidate")
+
+    Repo.insert!(Ecto.Changeset.change(%{candidate | id: nil}))
+    stub_client!(stub, labels: [], issues: [issue], comments: %{}, pull: pull)
+    assert :ok = stage(item, stub, phases: [:pull_requests])
+
+    candidate =
+      Repo.get_by!(ReportEntry, repository_item_id: item.id, classification: "pull_candidate")
+
+    Repo.delete!(candidate)
+
+    mappings =
+      Repo.all(from m in ObjectMapping, where: m.repository_item_id == ^item.id, order_by: m.id)
+
+    for response <- [:denied, :wrong_repository, :wrong_pull, :wrong_signpost] do
+      recovery_stub!(stub, item, issue, pull, response)
+
+      assert {:error, _} =
+               MetadataImporter.revalidate_pull_issue_identity(item, 7, importer_opts(stub, item))
+
+      refute Repo.get_by(ReportEntry,
+               repository_item_id: item.id,
+               classification: "pull_candidate"
+             )
+
+      assert Repo.all(
+               from m in ObjectMapping, where: m.repository_item_id == ^item.id, order_by: m.id
+             ) == mappings
+    end
+
+    recovery_stub!(stub, item, issue, pull, :ok)
+
+    identity_mapping = Enum.find(mappings, &(&1.object_kind == "issue"))
+
+    identity_mapping
+    |> Ecto.Changeset.change(github_repository_id: item.github_repository_id + 1)
+    |> Repo.update!()
+
+    assert {:error, :pull_issue_identity_mismatch} =
+             MetadataImporter.revalidate_pull_issue_identity(item, 7, importer_opts(stub, item))
+
+    refute Repo.get_by(ReportEntry, repository_item_id: item.id, classification: "pull_candidate")
+
+    Repo.get!(ObjectMapping, identity_mapping.id)
+    |> Ecto.Changeset.change(github_repository_id: item.github_repository_id)
+    |> Repo.update!()
+
+    for {field, value} <- [state: :canceled, lease_owner: "different-worker"] do
+      current = Repo.get!(RepositoryItem, item.id)
+      current |> Ecto.Changeset.change([{field, value}]) |> Repo.update!()
+
+      assert {:error, :stale_item} =
+               MetadataImporter.revalidate_pull_issue_identity(item, 7, importer_opts(stub, item))
+
+      refute Repo.get_by(ReportEntry,
+               repository_item_id: item.id,
+               classification: "pull_candidate"
+             )
+
+      Repo.get!(RepositoryItem, item.id)
+      |> Ecto.Changeset.change([{field, Map.fetch!(current, field)}])
+      |> Repo.update!()
+    end
+
+    mappings =
+      Repo.all(from m in ObjectMapping, where: m.repository_item_id == ^item.id, order_by: m.id)
+
+    assert :ok =
+             MetadataImporter.revalidate_pull_issue_identity(item, 7, importer_opts(stub, item))
+
+    recovered =
+      Repo.get_by!(ReportEntry, repository_item_id: item.id, classification: "pull_candidate")
+
+    assert recovered.import_run_id == run.id
+    assert recovered.metadata == %{"count" => 7, "github_id" => issue["id"]}
+    assert MetadataImporter.validate_pull_issue_identities(item) == :ok
+
+    assert Repo.all(
+             from m in ObjectMapping, where: m.repository_item_id == ^item.id, order_by: m.id
+           ) == mappings
+
+    assert :ok =
+             MetadataImporter.revalidate_pull_issue_identity(item, 7, importer_opts(stub, item))
+
+    assert Repo.get!(ReportEntry, recovered.id) == recovered
   end
 
   defp recovery_stub!(stub, item, issue, pull, response) do

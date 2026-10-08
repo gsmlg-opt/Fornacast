@@ -14,6 +14,7 @@ defmodule ForgeMirrors.PatConfiguration do
     field :interval_minutes, :integer, default: 360
     field :last_sync_at, :utc_datetime
     field :last_sync_status, :string
+    field :last_sync_summary, :map, default: %{}
     field :direction, :string, default: "github_to_fornacast"
     field :repository_selection, :string, default: "all"
     field :selected_repository_ids, {:array, :integer}, default: []

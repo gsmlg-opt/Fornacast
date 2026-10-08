@@ -49,10 +49,23 @@ See [release asset recovery](docs/github-imports.md#release-assets).
 
 The organization GitHub tab (`/organizations/:organization/settings/github`)
 configures personal-use PAT synchronization. Select an active organization owner's
-saved PAT, the source GitHub organization, and all or selected repositories in
-its repository subpage. Refreshing the list only reads GitHub. `Sync now` and
-interval mode start a durable PAT-backed organization import/synchronization run
-that discovers visible repositories and uses the existing recovery pipeline.
+saved PAT and source GitHub organization. `Sync now` immediately queues a
+recoverable background run for **all PAT-visible repositories in that GitHub
+organization**, regardless of the saved repository selection. Refreshing the
+list only reads GitHub; saving configuration or repository selection does not
+synchronize repository contents. Interval mode uses the same durable PAT-backed
+organization synchronization pipeline. Both settings pages show progress totals
+and individual repository outcomes; reload the page to see updated results.
+
+New repositories use the existing import pipeline, including Git history, LFS,
+repository metadata, and supported issues, pull requests, releases and release
+assets. Existing repositories refresh Git branches, tags and their reachable
+LFS objects; their issues, pull requests, releases and assets are not refreshed
+by this action. Existing repositories must have a verified import binding to
+the immutable GitHub repository ID. Name collisions, divergent branches and
+changed tags are reported as failures while other repositories continue.
+Local branches and tags are retained when GitHub deletes them.
+
 PAT values remain in the existing encrypted credential store; configuration
 stores references only. Changing the source or credential clears the cached
 inventory and repository selection.
@@ -60,6 +73,17 @@ inventory and repository selection.
 GitHub App organization synchronization is a future replacement for this PAT
 path. The App settings and mirror domain are retained as preparatory plumbing;
 an App installation is not required for the current PAT import or sync flow.
+
+GitHub REST responses are limited to 200 MiB (209,715,200 bytes), including release
+metadata pages. Outgoing JSON mutation requests retain their 2,000,000-byte limit.
+Synchronization reports show provider wait reasons and Git scan limits; a scan work
+limit is retryable and is not reported as Git object corruption.
+While synchronization runs, the report refreshes automatically and shows committed
+metadata checkpoints, downloaded release assets, and checked LFS objects. Long
+release downloads share the PAT request gate, so other repositories can wait while
+these counters advance. Retrying a failed synchronization adopts proven staged
+Git data and checkpoints through a successor import instead of resetting terminal
+attempts or rediscovering conflicting repository names.
 
 The future two-way GitHub organization mirror uses a permanent mirror domain
 separate from the one-time bootstrap importer. GitHub wiki

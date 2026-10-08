@@ -1,7 +1,7 @@
 defmodule ForgeAccounts.OrganizationManagementAuthorizationTest do
   use ExUnit.Case, async: false
 
-  alias ForgeAccounts.{Organization, User}
+  alias ForgeAccounts.{Organization, OrganizationMember, User}
   alias Fornacast.Repo
 
   setup do
@@ -21,6 +21,123 @@ defmodule ForgeAccounts.OrganizationManagementAuthorizationTest do
     assert {:ok, _membership} = ForgeAccounts.add_organization_member(organization, member)
 
     %{owner: owner, admin: admin, member: member, outsider: outsider, organization: organization}
+  end
+
+  test "selected GitHub owner authorization avoids enumerating owner account views", context do
+    other_owner = user_fixture("other-owner")
+
+    assert {:ok, _} =
+             ForgeAccounts.add_organization_member(context.organization, other_owner, :owner)
+
+    {result, queries} =
+      collect_queries(fn ->
+        ForgeAccounts.organization_github_owner(
+          context.owner,
+          context.organization.id,
+          context.owner.id
+        )
+      end)
+
+    assert {:ok, selected} = result
+    assert selected.id == context.owner.id
+    assert length(queries) == 4
+    refute Enum.any?(queries, &String.contains?(&1, "github_"))
+  end
+
+  test "site administrators still must select an active organization owner", context do
+    assert {:ok, selected} =
+             ForgeAccounts.organization_github_owner(
+               context.admin,
+               context.organization.id,
+               context.owner.id
+             )
+
+    assert selected.id == context.owner.id
+
+    for owner_id <- [
+          context.admin.id,
+          context.member.id,
+          context.outsider.id,
+          context.organization.id
+        ] do
+      assert {:error, :forbidden} =
+               ForgeAccounts.organization_github_owner(
+                 context.admin,
+                 context.organization.id,
+                 owner_id
+               )
+    end
+
+    membership =
+      Repo.get_by!(OrganizationMember,
+        organization_id: context.organization.id,
+        user_id: context.owner.id
+      )
+
+    Repo.update!(Ecto.Changeset.change(membership, role: :member))
+
+    assert {:error, :forbidden} =
+             ForgeAccounts.organization_github_owner(
+               context.admin,
+               context.organization.id,
+               context.owner.id
+             )
+  end
+
+  test "selected-owner authorization reloads actor owner and organization authority", context do
+    assert {:error, :forbidden} =
+             ForgeAccounts.organization_github_owner(
+               %{context.member | role: :admin},
+               context.organization.id,
+               context.owner.id
+             )
+
+    Repo.update!(User.state_changeset(context.owner, %{state: :disabled}))
+
+    assert {:error, :forbidden} =
+             ForgeAccounts.organization_github_owner(
+               context.admin,
+               context.organization.id,
+               context.owner.id
+             )
+
+    Repo.update!(User.state_changeset(context.owner, %{state: :active}))
+    Repo.update!(User.state_changeset(context.admin, %{state: :disabled}))
+
+    assert {:error, :forbidden} =
+             ForgeAccounts.organization_github_owner(
+               context.admin,
+               context.organization.id,
+               context.owner.id
+             )
+
+    Repo.update!(User.state_changeset(context.admin, %{state: :active}))
+    Repo.update!(Organization.changeset(context.organization, %{state: :disabled}))
+
+    assert {:error, :forbidden} =
+             ForgeAccounts.organization_github_owner(
+               context.admin,
+               context.organization.id,
+               context.owner.id
+             )
+  end
+
+  test "invalid selected owner IDs preserve forbidden results", context do
+    for owner_id <- [nil, false, "#{context.owner.id}", 0, -1, 1.0, 9_223_372_036_854_775_808] do
+      assert {:error, :forbidden} =
+               ForgeAccounts.organization_github_owner(
+                 context.admin,
+                 context.organization.id,
+                 owner_id
+               )
+    end
+
+    assert {:error, :forbidden} =
+             ForgeAccounts.organization_github_owner(
+               context.admin,
+               2_147_483_647,
+               context.owner.id
+             )
   end
 
   test "active owner and site admin receive the canonical manageable organization", context do
@@ -149,6 +266,38 @@ defmodule ForgeAccounts.OrganizationManagementAuthorizationTest do
 
     assert {:error, :not_found} =
              ForgeAccounts.fetch_manageable_organization(context.admin, disabled.id)
+  end
+
+  defp collect_queries(fun) do
+    reference = make_ref()
+    handler = {__MODULE__, reference}
+    caller = self()
+    prefix = Repo.config()[:telemetry_prefix] || [:fornacast, :repo]
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        prefix ++ [:query],
+        fn _, _, metadata, _ ->
+          if self() == caller, do: send(caller, {reference, metadata.query})
+        end,
+        nil
+      )
+
+    try do
+      result = fun.()
+      {result, receive_queries(reference)}
+    after
+      :telemetry.detach(handler)
+    end
+  end
+
+  defp receive_queries(reference) do
+    receive do
+      {^reference, query} -> [query | receive_queries(reference)]
+    after
+      0 -> []
+    end
   end
 
   defp user_fixture(prefix, role \\ :user) do

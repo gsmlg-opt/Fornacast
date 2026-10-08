@@ -10,9 +10,11 @@ defmodule ForgeImports.RetryTest do
   alias ForgeImports.{
     ImportAttempt,
     ImportRun,
+    CleanupOperation,
     ObjectMapping,
     PageCheckpoint,
     Persistence,
+    ReportEntry,
     RepositoryItem
   }
 
@@ -200,6 +202,176 @@ defmodule ForgeImports.RetryTest do
     assert Repo.get!(RepositoryItem, item.id).hidden_repository_id == item.hidden_repository_id
   end
 
+  test "retry preserves pull candidate evidence under the successor without changing history", %{
+    actor: actor,
+    identity: identity,
+    credential: credential
+  } do
+    predecessor = terminal_org_run!(actor, identity, :failed)
+    item = staged_item!(predecessor, actor, slug: "pull-evidence-retry")
+    other = org_item!(predecessor, actor, 9_100_000_090, "other-evidence", selected: false)
+
+    candidates =
+      for owner <- [item, other] do
+        %ReportEntry{}
+        |> ReportEntry.create_changeset(%{
+          import_run_id: predecessor.id,
+          repository_item_id: owner.id,
+          idempotency_key: "pull-candidate-#{owner.id}-7",
+          scope: :object,
+          object_kind: "pull_request",
+          source_object_id: 7,
+          outcome: :skipped,
+          classification: "pull_candidate",
+          summary: "Pull request deferred to pull phase",
+          metadata: %{"count" => 7, "github_id" => 101},
+          source_count: 0
+        })
+        |> Repo.insert!()
+      end
+
+    assert {:ok, successor} =
+             ForgeImports.retry_import(
+               actor,
+               predecessor.id,
+               saved_source(credential, identity),
+               request_metadata("pull-evidence-retry")
+             )
+
+    assert [adopted] = successor.repositories
+
+    candidate =
+      Repo.get_by!(ReportEntry,
+        import_run_id: successor.id,
+        repository_item_id: adopted.id,
+        classification: "pull_candidate"
+      )
+
+    assert candidate.idempotency_key == "pull-candidate-#{adopted.id}-7"
+    assert candidate.metadata == %{"count" => 7, "github_id" => 101}
+    assert candidate.source_object_id == 7
+    assert Enum.map(candidates, &Repo.get!(ReportEntry, &1.id)) == candidates
+
+    assert Repo.aggregate(from(r in ReportEntry, where: r.import_run_id == ^successor.id), :count) ==
+             1
+  end
+
+  @tag :tmp_dir
+  test "retry retains new Git staging after completed remote quarantine cleanup", %{
+    actor: actor,
+    identity: identity,
+    credential: credential,
+    tmp_dir: tmp_dir
+  } do
+    isolate_storage_root!(tmp_dir)
+
+    for effect <- [:removed, :missing] do
+      predecessor = terminal_org_run!(actor, identity, :failed)
+      item = staged_item!(predecessor, actor, slug: "recloned-#{effect}")
+      earlier_cleanup = completed_quarantine!(item, :removed)
+      item = Repo.get!(RepositoryItem, item.id)
+      cleanup = completed_quarantine!(item, effect)
+      item = Repo.get!(RepositoryItem, item.id)
+
+      assert {:ok, successor} =
+               ForgeImports.retry_import(
+                 actor,
+                 predecessor.id,
+                 saved_source(credential, identity),
+                 request_metadata("recloned-#{effect}")
+               )
+
+      assert [summary] = successor.repositories
+      adopted = Repo.get!(RepositoryItem, summary.id)
+      assert adopted.hidden_repository_id == item.hidden_repository_id
+      assert adopted.checkpoint == item.checkpoint
+      assert Repo.get!(CleanupOperation, earlier_cleanup.id).state == :cleanup_complete
+      assert Repo.get!(CleanupOperation, cleanup.id).state == :cleanup_complete
+      assert File.dir?(item.staged_storage_path)
+      assert :ok = Persistence.ensure_adoption_safe_locked(Repo, adopted)
+    end
+  end
+
+  @tag :tmp_dir
+  test "completed quarantine history still fences an occupied quarantine slot", %{
+    actor: actor,
+    identity: identity,
+    credential: credential,
+    tmp_dir: tmp_dir
+  } do
+    isolate_storage_root!(tmp_dir)
+    predecessor = terminal_org_run!(actor, identity, :failed)
+    item = staged_item!(predecessor, actor, slug: "occupied-quarantine")
+    cleanup = completed_quarantine!(item, :removed)
+    File.mkdir!(cleanup.evidence["quarantine_path"])
+    File.chmod!(cleanup.evidence["quarantine_path"], 0o700)
+
+    assert {:error, :cleanup_conflict} =
+             ForgeImports.retry_import(
+               actor,
+               predecessor.id,
+               saved_source(credential, identity),
+               request_metadata("occupied-quarantine")
+             )
+
+    refute Repo.exists?(from r in ImportRun, where: r.predecessor_run_id == ^predecessor.id)
+    assert File.dir?(item.staged_storage_path)
+  end
+
+  @tag :tmp_dir
+  test "cleanup adoption exception rejects unsafe cleanup states and reclaimed staging", %{
+    actor: actor,
+    identity: identity,
+    tmp_dir: tmp_dir
+  } do
+    isolate_storage_root!(tmp_dir)
+    predecessor = terminal_org_run!(actor, identity, :failed)
+    item = staged_item!(predecessor, actor, slug: "quarantine-fences")
+    cleanup = completed_quarantine!(item, :missing)
+    item = Repo.get!(RepositoryItem, item.id)
+
+    for overrides <- [
+          [state: :cleanup_pending, completed_at: nil, next_attempt_at: @now],
+          [state: :cleanup_blocked, completed_at: nil, last_error: "identity_mismatch"]
+        ] do
+      Repo.update_all(
+        from(o in CleanupOperation, where: o.id == ^cleanup.id),
+        set: overrides
+      )
+
+      assert {:error, :cleanup_conflict} = Persistence.ensure_adoption_safe_locked(Repo, item)
+
+      Repo.update_all(
+        from(o in CleanupOperation, where: o.id == ^cleanup.id),
+        set: [
+          state: cleanup.state,
+          kind: cleanup.kind,
+          source_lock_version: cleanup.source_lock_version,
+          evidence: cleanup.evidence,
+          completed_at: cleanup.completed_at,
+          next_attempt_at: cleanup.next_attempt_at,
+          last_error: cleanup.last_error
+        ]
+      )
+    end
+
+    for kind <- [:unpublished_shadow, :replacement_tombstone] do
+      refute CleanupOperation.valid_completed_quarantine?(%{cleanup | kind: kind})
+    end
+
+    unstaged = %{item | checkpoint: %{}}
+    assert {:error, :cleanup_conflict} = Persistence.ensure_adoption_safe_locked(Repo, unstaged)
+    in_cleanup = %{item | cleanup_state: "cleanup_pending"}
+    assert {:error, :cleanup_conflict} = Persistence.ensure_adoption_safe_locked(Repo, in_cleanup)
+
+    Repo.update_all(
+      from(r in Repository, where: r.id == ^item.hidden_repository_id),
+      set: [storage_reclaimed_at: @now]
+    )
+
+    assert {:error, :cleanup_conflict} = Persistence.ensure_adoption_safe_locked(Repo, item)
+  end
+
   test "retry rejects corrupt staging evidence", %{
     actor: actor,
     identity: identity,
@@ -276,6 +448,52 @@ defmodule ForgeImports.RetryTest do
                saved_source(credential, identity),
                request_metadata("with-credential")
              )
+  end
+
+  test "restart observes a concurrent actor deactivation before acquiring run locks" do
+    actor = Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, &user_fixture/0)
+    parent = self()
+    reference = make_ref()
+
+    on_exit(fn ->
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+        Repo.delete!(Repo.get!(User, actor.id))
+      end)
+    end)
+
+    deactivation =
+      Task.async(fn ->
+        Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+          Repo.transaction(fn ->
+            Repo.update!(Ecto.Changeset.change(actor, state: :disabled))
+            send(parent, {reference, :deactivation_pending})
+
+            receive do
+              {^reference, :commit} -> :ok
+            after
+              5_000 -> Repo.rollback(:timeout)
+            end
+          end)
+        end)
+      end)
+
+    assert_receive {^reference, :deactivation_pending}
+
+    restart =
+      Task.async(fn ->
+        Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+          ForgeImports.Retry.restart(actor, %ImportRun{id: -1}, nil, %{})
+        end)
+      end)
+
+    try do
+      assert Task.yield(restart, 100) == nil
+    after
+      send(deactivation.pid, {reference, :commit})
+      assert {:ok, :ok} = Task.await(deactivation, 5_000)
+    end
+
+    assert {:error, :forbidden} = Task.await(restart, 5_000)
   end
 
   test "concurrent retry calls allow only one successor", %{
@@ -556,6 +774,100 @@ defmodule ForgeImports.RetryTest do
     end
 
     item
+  end
+
+  defp isolate_storage_root!(tmp_dir) do
+    previous = Application.get_env(:fornacast, :repo_storage_root)
+    root = Path.join(tmp_dir, "repos")
+    File.mkdir_p!(root)
+    File.chmod!(root, 0o700)
+    Application.put_env(:fornacast, :repo_storage_root, root)
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, previous) end)
+  end
+
+  defp completed_quarantine!(item, effect) do
+    repository = Repo.get!(Repository, item.hidden_repository_id)
+    root = Fornacast.Config.repo_storage_root()
+    target = GitCore.Remote.cleanup_slot_path(item.staged_storage_path)
+    relative = Path.relative_to(target, root)
+    segments = String.split(relative, "/")
+    File.mkdir!(target)
+    File.chmod!(target, 0o700)
+    assert {:ok, {:present, proof}} = GitCore.contained_tree_identity(root, segments, 1_000)
+    stringify = fn identity -> Map.new(identity, fn {k, v} -> {to_string(k), v} end) end
+
+    evidence =
+      %{
+        "version" => 1,
+        "kind" => "remote_quarantine",
+        "storage_root" => root,
+        "relative_path" => relative,
+        "repository_id" => repository.id,
+        "repository_generation" => repository.generation,
+        "repository_storage_path" => repository.storage_path,
+        "item_id" => item.id,
+        "item_lock_version" => item.lock_version,
+        "requested_path" => item.staged_storage_path,
+        "quarantine_path" => target,
+        "remote_failure_kind" => "remote_clone_failed"
+      }
+      |> Map.merge(stringify.(proof.target))
+
+    operation =
+      %CleanupOperation{}
+      |> CleanupOperation.create_changeset(%{
+        repository_id: repository.id,
+        repository_item_id: item.id,
+        source_lock_version: item.lock_version,
+        kind: :remote_quarantine,
+        operation_id:
+          CleanupOperation.deterministic_operation_id(
+            :remote_quarantine,
+            repository.id,
+            item.id,
+            item.lock_version
+          ),
+        evidence: evidence,
+        eligible_at: @now,
+        next_attempt_at: @now
+      })
+      |> Repo.insert!()
+
+    File.rmdir!(target)
+
+    evidence =
+      case effect do
+        :removed ->
+          evidence
+          |> Map.put("root_identity", stringify.(proof.root))
+          |> Map.put("anchored_identity", stringify.(proof.target))
+
+        :missing ->
+          Map.put(evidence, "anchored_absence", %{
+            "version" => 1,
+            "observed_at" => DateTime.to_iso8601(@now),
+            "root_identity" => stringify.(proof.root)
+          })
+      end
+
+    complete =
+      operation
+      |> CleanupOperation.lease_update_changeset(
+        state: :cleanup_complete,
+        evidence: evidence,
+        next_attempt_at: nil,
+        effect_started_at: @now,
+        effect_finished_at: @now,
+        completed_at: @now
+      )
+      |> Repo.update!()
+
+    Repo.update_all(
+      from(i in RepositoryItem, where: i.id == ^item.id),
+      inc: [lock_version: 2]
+    )
+
+    complete
   end
 
   defp lfs_completion_checkpoint!(shadow, item) do

@@ -1329,6 +1329,45 @@ defmodule ForgeRepos do
              generation > 0 and is_integer(actor_id) and actor_id > 0 and is_binary(request_id) and
              byte_size(request_id) in 1..255 and is_list(commands) and commands != [] and
              is_integer(absolute_deadline) do
+    prepare_git_operations(
+      repository,
+      actor_id,
+      request_id,
+      commands,
+      absolute_deadline,
+      :receive_pack
+    )
+  end
+
+  def prepare_receive_pack_operations(_, _, _, _, _), do: {:error, :invalid}
+
+  @doc "Prepares recovery evidence for inbound branch/tag writes without emitting a local push event."
+  @spec prepare_inbound_git_operations(User.t(), Repository.t(), String.t(), [tuple()], integer()) ::
+          {:ok, [GitWriteOperation.t()]} | {:error, atom()}
+  def prepare_inbound_git_operations(
+        %User{id: actor_id, kind: :user, state: :active},
+        %Repository{id: repository_id, generation: generation} = repository,
+        request_id,
+        commands,
+        absolute_deadline
+      )
+      when is_integer(repository_id) and repository_id > 0 and is_integer(generation) and
+             generation > 0 and is_integer(actor_id) and actor_id > 0 and is_binary(request_id) and
+             byte_size(request_id) in 1..255 and is_list(commands) and commands != [] and
+             is_integer(absolute_deadline) do
+    prepare_git_operations(
+      repository,
+      actor_id,
+      request_id,
+      commands,
+      absolute_deadline,
+      :inbound
+    )
+  end
+
+  def prepare_inbound_git_operations(_, _, _, _, _), do: {:error, :invalid}
+
+  defp prepare_git_operations(repository, actor_id, request_id, commands, absolute_deadline, kind) do
     with :ok <- validate_receive_pack_command_count(commands),
          :ok <- receive_pack_deadline(absolute_deadline),
          {:ok, operation_attrs} <-
@@ -1337,7 +1376,8 @@ defmodule ForgeRepos do
              actor_id,
              request_id,
              commands,
-             absolute_deadline
+             absolute_deadline,
+             kind
            ) do
       multi =
         Multi.new()
@@ -1362,15 +1402,6 @@ defmodule ForgeRepos do
       end
     end
   end
-
-  def prepare_receive_pack_operations(
-        _actor,
-        _repository,
-        _request_id,
-        _commands,
-        _absolute_deadline
-      ),
-      do: {:error, :invalid}
 
   @spec receive_pack_operation_statuses([GitWriteOperation.t()]) ::
           {:ok, [{String.t(), String.t(), nil | String.t()}]} | {:error, :unavailable}
@@ -1455,7 +1486,8 @@ defmodule ForgeRepos do
          actor_id,
          request_id,
          commands,
-         absolute_deadline
+         absolute_deadline,
+         kind
        ) do
     commands
     |> Enum.reduce_while({:ok, [], MapSet.new()}, fn
@@ -1470,7 +1502,7 @@ defmodule ForgeRepos do
                 repository_id: repository.id,
                 actor_user_id: actor_id,
                 request_id: request_id,
-                kind: :receive_pack,
+                kind: inbound_operation_kind(kind, old_oid),
                 state: :prepared,
                 target_ref: target_ref,
                 expected_oid: normalize_receive_pack_expected_oid(old_oid),
@@ -1506,6 +1538,10 @@ defmodule ForgeRepos do
 
   defp normalize_receive_pack_expected_oid(@zero_oid), do: nil
   defp normalize_receive_pack_expected_oid(oid), do: String.downcase(oid)
+
+  defp inbound_operation_kind(:receive_pack, _old_oid), do: :receive_pack
+  defp inbound_operation_kind(:inbound, @zero_oid), do: :ref_create
+  defp inbound_operation_kind(:inbound, _old_oid), do: :ref_update
 
   defp fetch_receive_pack_repository(repo, repository) do
     query =

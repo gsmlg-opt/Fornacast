@@ -13,6 +13,8 @@ defmodule ForgeImports.Application do
     children = [
       {ForgeImports.RecoverySupervisor,
        enabled: recovery_enabled, cleanup_enabled: cleanup_enabled},
+      {Task.Supervisor, name: ForgeImports.PatSyncTaskSupervisor},
+      {ForgeImports.PatSyncWorker, enabled: recovery_enabled},
       {ForgeImports.PatSyncScheduler, enabled: recovery_enabled}
     ]
 
