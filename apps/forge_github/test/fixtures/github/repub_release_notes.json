@@ -1,0 +1,10 @@
+[
+  {
+    "tag_name": "v1.1.0",
+    "body": "## Changes\n\n- **Docker**: Configure volume mount at /data for persistent storage\n  - SQLite metadata: /data/metadata/repub.db\n  - Package archives: /data/packages/\n- **Documentation**: Add Docker standalone quickstart (zero external dependencies)\n  - Run with: `docker run -d -p 8080:8080 -v repub_data:/data ghcr.io/gsmlg-dev/repub:latest`\n\n## Features\n\n- Self-hosted Dart/Flutter package registry (Pub Spec v2)\n- Bearer token authentication with scoped tokens\n- Flexible storage: Local files or S3-compatible (MinIO, AWS S3)\n- Flexible database: SQLite (default) or PostgreSQL\n- Zero external dependencies in default Docker configuration"
+  },
+  {
+    "tag_name": "v1.0.0",
+    "body": "## repub v1.0.0\n\nInitial release of repub - a self-hosted Dart/Flutter package registry implementing the Pub Repository Spec v2.\n\n### Features\n\n- **Full Pub API compatibility** - Works with `dart pub` and `flutter pub` commands\n- **PostgreSQL metadata storage** - Reliable package and version tracking\n- **S3-compatible blob storage** - Works with MinIO, AWS S3, or any S3-compatible service\n- **Bearer token authentication** - Scoped tokens for publish and read access\n- **Docker support** - Ready-to-use container image\n\n### Packages\n\n| Package | Description |\n|---------|-------------|\n| `repub_model` | Shared configuration and data models |\n| `repub_auth` | Token authentication and authorization |\n| `repub_storage` | PostgreSQL metadata and S3 blob storage |\n| `repub_migrate` | Database schema migrations |\n| `repub_server` | HTTP server implementing Pub API |\n| `repub_cli` | CLI for database migrations and token management |\n\n### Docker Image\n\n```bash\ndocker pull ghcr.io/gsmlg-dev/repub:1.0.0\n```\n\n### Quick Start\n\nSee the [README](https://github.com/gsmlg-opt/repub#readme) for setup instructions."
+  }
+]

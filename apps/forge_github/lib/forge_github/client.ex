@@ -1,5 +1,12 @@
 defmodule ForgeGitHub.Client do
-  @moduledoc "A fixed-host, bounded client for GitHub REST resources."
+  @moduledoc """
+  A fixed-host, bounded client for GitHub REST resources.
+
+  REST responses are capped at 200 MiB. JSON mutation request bodies retain their
+  2,000,000-byte cap, independently of the response limit. Issue, comment, and
+  pull-request GETs use the same bounded metadata body profile for every
+  credential type.
+  """
 
   alias ForgeGitHub.{
     Error,
@@ -19,7 +26,8 @@ defmodule ForgeGitHub.Client do
   @user_agent "Fornacast/0.2.0"
   @request_timeout 20_000
   @request_gate_acquire_timeout 2_000
-  @max_body_bytes 2_000_000
+  @max_request_body_bytes 2_000_000
+  @max_response_body_bytes 200 * 1024 * 1024
   @allowed_methods [:get, :post, :patch, :put, :delete]
   @max_pages 100
   @max_json_depth 16
@@ -397,7 +405,7 @@ defmodule ForgeGitHub.Client do
           [paths.issues],
           1,
           [],
-          if(installation_gate?(opts), do: :issue_metadata, else: :generic)
+          :issue_metadata
         )
       end)
     else
@@ -421,7 +429,7 @@ defmodule ForgeGitHub.Client do
           ["#{paths.comments}/#{issue_number}/comments"],
           1,
           [],
-          if(installation_gate?(opts), do: :issue_metadata, else: :generic)
+          :issue_metadata
         )
       end)
     else
@@ -445,7 +453,7 @@ defmodule ForgeGitHub.Client do
           pat,
           opts,
           &json_object/1,
-          if(installation_gate?(opts), do: :issue_metadata, else: :generic)
+          :issue_metadata
         )
       end)
     else
@@ -469,7 +477,7 @@ defmodule ForgeGitHub.Client do
           pat,
           opts,
           &json_object/1,
-          if(installation_gate?(opts), do: :issue_metadata, else: :generic)
+          :issue_metadata
         )
       end)
     else
@@ -1164,7 +1172,7 @@ defmodule ForgeGitHub.Client do
 
   defp validate_wire_response(%Req.Response{body: body} = response) when is_binary(body) do
     cond do
-      byte_size(body) > @max_body_bytes ->
+      byte_size(body) > @max_response_body_bytes ->
         error(:response_too_large)
 
       oversized_content_length?(response) ->
@@ -1184,7 +1192,7 @@ defmodule ForgeGitHub.Client do
     case Req.Response.get_header(response, "content-length") do
       [value] ->
         match?(
-          {:ok, length} when length > @max_body_bytes,
+          {:ok, length} when length > @max_response_body_bytes,
           parse_decimal(value, 10, 9_999_999_999)
         )
 
@@ -1211,7 +1219,7 @@ defmodule ForgeGitHub.Client do
       {:ok, value} ->
         with {:ok, _nodes} <- validate_json(value, 0, 0, json_profile),
              {:ok, body} <- encode_json(value) do
-          if byte_size(body) <= @max_body_bytes,
+          if byte_size(body) <= @max_request_body_bytes,
             do: {:ok, body},
             else: error(:request_too_large)
         else

@@ -299,6 +299,7 @@ defmodule ForgeGitHub.ReleaseClient do
          :ok <- validate_tag_name(tag_name),
          :ok <- validate_optional_name(name),
          :ok <- validate_body(body),
+         true <- safe_release_body?(body, token),
          :ok <- validate_boolean(draft),
          :ok <- validate_boolean(prerelease),
          :ok <- validate_required_name(target_commitish),
@@ -311,7 +312,6 @@ defmodule ForgeGitHub.ReleaseClient do
                node_id,
                tag_name,
                name,
-               body,
                target_commitish,
                published_at,
                created_at,
@@ -481,6 +481,20 @@ defmodule ForgeGitHub.ReleaseClient do
 
   defp validate_retained_strings(values, token) when is_list(values) and is_binary(token) do
     if Enum.all?(values, &safe_provider_string?(&1, token)), do: :ok, else: :error
+  end
+
+  defp safe_release_body?(nil, _token), do: true
+
+  defp safe_release_body?(value, token) when is_binary(value) and is_binary(token) do
+    # Release notes can describe Bearer token authentication. Permit that prose
+    # only during validation; retain the original notes and reject credential
+    # echoes before removing the descriptive prefix.
+    not String.contains?(value, token) and
+      not (byte_size(value) >= 8 and String.contains?(token, value)) and
+      safe_provider_string?(
+        String.replace(value, ~r/\bbearer (?=tokens?\b|authentication\b)/i, ""),
+        token
+      )
   end
 
   defp safe_provider_string?(nil, _token), do: true

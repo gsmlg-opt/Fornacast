@@ -422,16 +422,50 @@ defmodule ForgeGitHub.ClientTest do
     refute_receive :caller_death_resolver_finished_late, 100
   end
 
-  test "halts a response whose body exceeds the fixed bound" do
+  test "accepts a releases page larger than the former 2 MB response cap" do
     stub = stub_name()
-    oversized = String.duplicate("x", 2_100_000)
+
+    releases =
+      for id <- 1..100 do
+        %{"id" => id, "tag_name" => "v#{id}", "body" => String.duplicate("x", 30_000)}
+      end
+
+    body = JSON.encode!(releases)
+    assert byte_size(body) > 2_000_000
 
     Req.Test.expect(stub, fn conn ->
-      Plug.Conn.send_resp(conn, 200, JSON.encode!(Map.put(user_json(), "name", oversized)))
+      assert conn.request_path == "/repos/octocat/hello-world/releases"
+      assert conn.query_string == "per_page=100&page=1"
+      Plug.Conn.send_resp(conn, 200, body)
     end)
 
-    assert {:error, %Error{kind: :response_too_large}} =
-             Client.authenticated_user("github_pat_test", client_opts(stub))
+    assert {:ok, %{json: releases_result, next_url: nil}} =
+             Client.release_metadata_page(
+               "github_pat_test",
+               "/repos/octocat/hello-world/releases?per_page=100&page=1",
+               client_opts(stub)
+             )
+
+    assert releases_result == releases
+  end
+
+  test "accepts the 200 MiB content length boundary and rejects one byte more" do
+    for {length, expected} <- [{209_715_200, :ok}, {209_715_201, :response_too_large}] do
+      stub = stub_name()
+
+      Req.Test.expect(stub, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("content-length", Integer.to_string(length))
+        |> Req.Test.json(user_json())
+      end)
+
+      result = Client.authenticated_user("github_pat_test", client_opts(stub))
+
+      case expected do
+        :ok -> assert {:ok, %User{login: "octocat"}} = result
+        :response_too_large -> assert {:error, %Error{kind: :response_too_large}} = result
+      end
+    end
   end
 
   test "rejects any non-identity content encoding" do
@@ -1059,10 +1093,18 @@ defmodule ForgeGitHub.ClientTest do
              Client.pull_graphql_request("token", %{}, opts)
   end
 
-  test "App bootstrap retains bounded long issue and comment bodies across pages" do
+  test "App and PAT imports retain bounded long issue and comment bodies across pages" do
     body = String.duplicate("界", 20_000)
 
-    for kind <- [:issue, :comment] do
+    for kind <- [:issue, :comment],
+        gate <- [
+          :github_installation,
+          :saved_credential,
+          :one_time_run,
+          :import_setup,
+          :account_setup,
+          :github_app
+        ] do
       stub = stub_name()
 
       Req.Test.expect(stub, 2, fn conn ->
@@ -1084,7 +1126,7 @@ defmodule ForgeGitHub.ClientTest do
         Keyword.put(
           client_opts(stub),
           :gate_key,
-          {:github_installation, System.unique_integer([:positive])}
+          {gate, System.unique_integer([:positive])}
         )
 
       result =
@@ -1097,12 +1139,20 @@ defmodule ForgeGitHub.ClientTest do
     end
   end
 
-  test "App bootstrap keeps unrelated strings bounded and PAT body limits unchanged" do
-    for {key, gate} <- [{"title", :github_installation}, {"body", :one_time_run}] do
+  test "App and PAT imports keep unrelated strings and oversized bodies bounded" do
+    for gate <- [
+          :github_installation,
+          :saved_credential,
+          :one_time_run,
+          :import_setup,
+          :account_setup,
+          :github_app
+        ],
+        {key, size} <- [{"title", 20_000}, {"body", 262_145}] do
       stub = stub_name()
 
       Req.Test.expect(stub, fn conn ->
-        Req.Test.json(conn, [%{key => String.duplicate("a", 20_000)}])
+        Req.Test.json(conn, [%{key => String.duplicate("a", size)}])
       end)
 
       assert {:error, %Error{kind: :invalid_response}} =
@@ -1142,10 +1192,18 @@ defmodule ForgeGitHub.ClientTest do
     assert_received {:request, "/repos/octocat/Hello-World/issues/7/comments", "per_page=100"}
   end
 
-  test "paired App bootstrap GETs retain bounded multibyte pull and issue bodies" do
+  test "paired App and PAT import GETs retain bounded multibyte pull and issue bodies" do
     body = String.duplicate("😀", 65_536)
 
-    for endpoint <- [:pull_request, :repository_issue] do
+    for endpoint <- [:pull_request, :repository_issue],
+        gate <- [
+          :github_installation,
+          :saved_credential,
+          :one_time_run,
+          :import_setup,
+          :account_setup,
+          :github_app
+        ] do
       stub = stub_name()
       Req.Test.expect(stub, fn conn -> Req.Test.json(conn, %{"body" => body}) end)
 
@@ -1155,19 +1213,24 @@ defmodule ForgeGitHub.ClientTest do
                  "octocat",
                  "Hello-World",
                  7,
-                 client_opts(stub, 1,
-                   gate_key: {:github_installation, System.unique_integer([:positive])}
-                 )
+                 client_opts(stub, 1, gate_key: {gate, System.unique_integer([:positive])})
                ])
     end
   end
 
-  test "paired bootstrap GET body allowance does not widen PAT or unrelated JSON fields" do
+  test "paired import GETs keep unrelated fields and oversized bodies bounded" do
     for endpoint <- [:pull_request, :repository_issue],
-        {key, value, gate} <- [
-          {"body", String.duplicate("a", 16_385), :one_time_run},
-          {"title", String.duplicate("a", 16_385), :github_installation},
-          {"body", String.duplicate("a", 262_145), :github_installation}
+        gate <- [
+          :github_installation,
+          :saved_credential,
+          :one_time_run,
+          :import_setup,
+          :account_setup,
+          :github_app
+        ],
+        {key, value} <- [
+          {"title", String.duplicate("a", 16_385)},
+          {"body", String.duplicate("a", 262_145)}
         ] do
       stub = stub_name()
       Req.Test.expect(stub, fn conn -> Req.Test.json(conn, %{key => value}) end)
@@ -1359,8 +1422,8 @@ defmodule ForgeGitHub.ClientTest do
       {:ok, state,
        [
          {:status, state.ref, 200},
-         {:headers, state.ref, [{"content-type", "application/json"}]},
-         {:data, state.ref, String.duplicate("x", 2_000_001)},
+         {:headers, state.ref,
+          [{"content-type", "application/json"}, {"content-length", "209715201"}]},
          {:done, state.ref}
        ]}
     end

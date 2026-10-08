@@ -7,7 +7,8 @@ defmodule ForgeGitHub.Transport do
   @port 443
   @connect_timeout 5_000
   @total_timeout 20_000
-  @max_body_bytes 2_000_000
+  @max_request_body_bytes 2_000_000
+  @max_response_body_bytes 200 * 1024 * 1024
   @max_header_bytes 65_536
   @allowed_methods [:get, :post, :patch, :put, :delete]
 
@@ -282,17 +283,22 @@ defmodule ForgeGitHub.Transport do
       {:headers, ^reference, headers}, {:cont, state} when is_list(headers) ->
         header_size = state.header_size + header_bytes(headers)
 
-        if header_size <= @max_header_bytes do
-          {:cont,
-           {:cont, %{state | headers: [headers | state.headers], header_size: header_size}}}
-        else
-          {:halt, {:error, :receive}}
+        cond do
+          header_size > @max_header_bytes ->
+            {:halt, {:error, :receive}}
+
+          oversized_content_length?(headers) ->
+            {:halt, {:error, :response_too_large}}
+
+          true ->
+            {:cont,
+             {:cont, %{state | headers: [headers | state.headers], header_size: header_size}}}
         end
 
       {:data, ^reference, data}, {:cont, state} when is_binary(data) ->
         size = state.size + byte_size(data)
 
-        if size > @max_body_bytes do
+        if size > @max_response_body_bytes do
           {:halt, {:error, :response_too_large}}
         else
           {:cont, {:cont, %{state | size: size, chunks: [data | state.chunks]}}}
@@ -349,7 +355,7 @@ defmodule ForgeGitHub.Transport do
   defp validate_request(_request), do: :error
 
   defp valid_body?(nil), do: true
-  defp valid_body?(body) when is_binary(body), do: byte_size(body) <= @max_body_bytes
+  defp valid_body?(body) when is_binary(body), do: byte_size(body) <= @max_request_body_bytes
   defp valid_body?(_body), do: false
 
   defp method_name(:get), do: "GET"
@@ -416,6 +422,17 @@ defmodule ForgeGitHub.Transport do
 
       _invalid, _total ->
         @max_header_bytes + 1
+    end)
+  end
+
+  defp oversized_content_length?(headers) do
+    Enum.any?(headers, fn
+      {"content-length", value} when is_binary(value) and byte_size(value) in 1..10 ->
+        String.match?(value, ~r/\A[0-9]+\z/) and
+          String.to_integer(value) > @max_response_body_bytes
+
+      _other ->
+        false
     end)
   end
 

@@ -551,7 +551,8 @@ defmodule ForgeGitHub.LFS do
           |> String.trim()
           |> String.downcase()
 
-        media_type == @lfs_media_type
+        # GitHub's Batch endpoint also returns ordinary JSON for valid LFS actions.
+        media_type in [@lfs_media_type, "application/json"]
 
       _missing ->
         false

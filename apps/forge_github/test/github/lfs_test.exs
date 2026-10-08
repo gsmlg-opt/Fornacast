@@ -6,6 +6,66 @@ defmodule ForgeGitHub.LFSTest do
 
   @oid String.duplicate("a", 64)
 
+  test "accepts GitHub Batch application/json responses while validating the payload" do
+    payload = %{
+      "objects" => [
+        %{
+          "oid" => @oid,
+          "size" => 3,
+          "actions" => %{
+            "download" => %{
+              "href" => "https://github-cloud.githubusercontent.com/download",
+              "expires_in" => 3600
+            }
+          }
+        }
+      ]
+    }
+
+    response = %{
+      status: 200,
+      headers: [{"content-type", "application/json; charset=utf-8"}],
+      body: Jason.encode!(payload)
+    }
+
+    assert {:ok, [%Object{oid: @oid, size: 3}]} =
+             LFS.batch(
+               "token",
+               "octocat",
+               "repo",
+               :download,
+               [%{oid: @oid, size: 3}],
+               test_options(response)
+             )
+
+    invalid = %{
+      response
+      | body: Jason.encode!(put_in(payload, ["objects", Access.at(0), "size"], 4))
+    }
+
+    assert {:error, %Error{kind: :invalid_lfs_response}} =
+             LFS.batch(
+               "token",
+               "octocat",
+               "repo",
+               :download,
+               [%{oid: @oid, size: 3}],
+               test_options(invalid)
+             )
+
+    for content_type <- ["text/html", "application/jsonp", "application/octet-stream"] do
+      assert {:error, %Error{kind: :invalid_lfs_response}} =
+               LFS.batch(
+                 "token",
+                 "octocat",
+                 "repo",
+                 :download,
+                 [%{oid: @oid, size: 3}],
+                 test_options(%{response | headers: [{"content-type", content_type}]})
+               )
+    end
+  end
+
   test "Batch rechecks authority after waiting for its installation gate" do
     parent = self()
     gate_key = {:github_installation, System.unique_integer([:positive])}

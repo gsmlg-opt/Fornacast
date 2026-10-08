@@ -121,7 +121,8 @@ defmodule ForgeGitHub.LFS.TransferCoordinatorTest do
           {:ok, staged, :source} = consumer.(:reader, :source)
           {:ok, staged}
         end,
-        stage_upload: fn reservation, :reader, :source ->
+        stage_upload: fn reservation, staging_reader, :source ->
+          assert is_function(staging_reader, 2)
           send(parent, {:stage, reservation})
           {:ok, {:staged, reservation}, :source}
         end,
@@ -158,6 +159,83 @@ defmodule ForgeGitHub.LFS.TransferCoordinatorTest do
     assert_received {:download, ^missing_oid}
     assert_received {:stage, {:reservation, ^missing_oid}}
     assert_received {:commit, {:staged, {:reservation, ^missing_oid}}, "refs/tags/v1.0.0"}
+  end
+
+  @tag :tmp_dir
+  test "inbound adapts download chunks and EOF to the CAS staging reader", %{tmp_dir: tmp_dir} do
+    for {chunks, index} <-
+          Enum.with_index([["pay", "load"], [], [String.duplicate("a", 70_000), "tail"]]) do
+      payload = Enum.join(chunks)
+      oid = :crypto.hash(:sha256, payload) |> Base.encode16(case: :lower)
+      requirement = %{oid: oid, size: byte_size(payload), first_seen_ref: "refs/heads/main"}
+      committed = make_ref()
+
+      reader = fn state, options ->
+        if Keyword.keys(options) -- [:length, :read_timeout] != [] do
+          {:error, :invalid_source, state}
+        else
+          case state do
+            [chunk | rest] -> {:ok, chunk, rest}
+            [] -> {:eof, []}
+          end
+        end
+      end
+
+      callbacks =
+        callbacks(
+          list_requirements: fn _, _ -> {:ok, %{objects: [requirement], next_cursor: nil}} end,
+          batch: fn _, _, _, :download, objects, _ ->
+            {:ok, Enum.map(objects, &remote_download/1)}
+          end,
+          verify_local: fn _, _, _ ->
+            if Process.get(committed), do: :ok, else: {:error, :not_found}
+          end,
+          ensure_local: fn _, _, _, _ -> {:error, :not_found} end,
+          with_upload_lock: fn _, _, fun -> fun.() end,
+          reserve_upload: fn _, _, _ -> {:ok, :reservation} end,
+          recover_upload: fn _ -> {:error, :not_found} end,
+          consume_download: fn _, _, consumer, _ ->
+            case consumer.(reader, chunks) do
+              {:ok, staged, []} -> {:ok, staged}
+              {:error, reason, _} -> {:error, Error.new(:sink), reason}
+            end
+          end,
+          stage_upload: fn :reservation, adapted_reader, state ->
+            ExStorageService.BlobStore.LocalCAS.stage_from_reader(
+              fn source ->
+                adapted_reader.(source,
+                  length: 1_048_576,
+                  read_length: 65_536,
+                  read_timeout: 1_000
+                )
+              end,
+              state,
+              tmp_dir: Path.join(tmp_dir, Integer.to_string(index)),
+              max_size: max(byte_size(payload), 1)
+            )
+          end,
+          commit_download: fn staged, "refs/heads/main" ->
+            assert File.read!(staged.path) == payload
+            assert staged.hash == oid
+            assert staged.size == byte_size(payload)
+            Process.put(committed, true)
+            {:ok, :object}
+          end
+        )
+
+      assert {:ok, nil} =
+               TransferCoordinator.process_page(
+                 repository(),
+                 scan(),
+                 :inbound,
+                 "installation-token",
+                 "octocat",
+                 "repo",
+                 nil,
+                 gate_key: {:github_installation, 77},
+                 callbacks: callbacks
+               )
+    end
   end
 
   test "inbound remote absence and local corruption stop publication work" do
@@ -328,7 +406,8 @@ defmodule ForgeGitHub.LFS.TransferCoordinatorTest do
           {:ok, staged, :source} = consumer.(:reader, :source)
           {:ok, staged}
         end,
-        stage_upload: fn reservation, :reader, :source ->
+        stage_upload: fn reservation, staging_reader, :source ->
+          assert is_function(staging_reader, 2)
           {:ok, {:staged, reservation}, :source}
         end,
         commit_download: fn _staged, _ref -> {:ok, :object} end
@@ -367,7 +446,8 @@ defmodule ForgeGitHub.LFS.TransferCoordinatorTest do
             {:ok, staged}
           end
         end,
-        stage_upload: fn reservation, :reader, :source ->
+        stage_upload: fn reservation, staging_reader, :source ->
+          assert is_function(staging_reader, 2)
           {:ok, {:staged, reservation}, :source}
         end,
         commit_download: fn _staged, _ref -> {:ok, :object} end

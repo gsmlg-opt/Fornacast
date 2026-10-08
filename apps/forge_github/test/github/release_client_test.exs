@@ -498,6 +498,48 @@ defmodule ForgeGitHub.ReleaseClientTest do
     end
   end
 
+  test "imports historical release notes describing Bearer token authentication" do
+    notes =
+      Path.join(__DIR__, "../fixtures/github/repub_release_notes.json")
+      |> File.read!()
+      |> JSON.decode!()
+
+    for note <- notes do
+      stub = stub_name()
+      release = release_json(41, tag_name: note["tag_name"], body: note["body"])
+      Req.Test.expect(stub, &Req.Test.json(&1, [release]))
+
+      assert {:ok, %{releases: [imported], next_cursor: nil}} =
+               ReleaseClient.list_releases_page(
+                 "installation_token",
+                 "acme",
+                 "widgets",
+                 nil,
+                 client_opts(stub, {:saved_credential, 8})
+               )
+
+      assert imported["body"] == note["body"]
+    end
+  end
+
+  test "release body prose allowance keeps actual credentials and token patterns blocked" do
+    token = "installation_token"
+
+    for body <- [
+          "Bearer #{token}",
+          "Bearer token authentication: #{token}",
+          "Bearer ghp_other_credential",
+          "Bearer github_pat_other_credential",
+          "Bearer opaque_other_credential"
+        ] do
+      stub = stub_name()
+      Req.Test.expect(stub, &Req.Test.json(&1, release_json(41, body: body)))
+
+      assert {:error, %Error{kind: :invalid_response}} =
+               ReleaseClient.get_release(token, "acme", "widgets", 41, client_opts(stub))
+    end
+  end
+
   test "rejects credential echoes in every retained provider-controlled string" do
     for field <- [
           "node_id",

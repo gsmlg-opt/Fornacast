@@ -80,10 +80,27 @@ defmodule ForgeGitHub.TransportTest do
     refute inspect(error) =~ "github_pat_transport_secret"
   end
 
-  test "stops at the hard raw body cap and closes the connection" do
+  test "accepts a response larger than the former 2 MB cap" do
+    request = request({140, 82, 114, 5}, __MODULE__.LargeResponseMint)
+
+    assert {^request, %Req.Response{status: 200, body: body}} = Transport.run(request)
+    assert byte_size(body) == 2_000_001
+    assert_receive :closed
+  end
+
+  test "rejects content length above 200 MiB before receiving the body" do
+    request = request({140, 82, 114, 5}, __MODULE__.OversizedHeaderMint)
+
+    assert {^request, %Transport.Error{kind: :response_too_large}} = Transport.run(request)
+    refute_receive :body_received
+    assert_receive :closed
+  end
+
+  test "counts streamed bytes through exactly 200 MiB and rejects one byte more" do
     request = request({140, 82, 114, 5}, __MODULE__.OversizedMint)
 
     assert {^request, %Transport.Error{kind: :response_too_large}} = Transport.run(request)
+    assert_receive :response_cap_reached
     assert_receive :closed
   end
 
@@ -271,7 +288,7 @@ defmodule ForgeGitHub.TransportTest do
     end
   end
 
-  defmodule OversizedMint do
+  defmodule LargeResponseMint do
     defdelegate connect(scheme, address, port, options),
       to: ForgeGitHub.TransportTest.SuccessMint
 
@@ -284,10 +301,58 @@ defmodule ForgeGitHub.TransportTest do
       {:ok, state,
        [
          {:status, state.ref, 200},
-         {:headers, state.ref, []},
+         {:headers, state.ref, [{"content-length", "2000001"}]},
          {:data, state.ref, String.duplicate("x", 2_000_001)},
          {:done, state.ref}
        ]}
+    end
+  end
+
+  defmodule OversizedHeaderMint do
+    defdelegate connect(scheme, address, port, options),
+      to: ForgeGitHub.TransportTest.SuccessMint
+
+    defdelegate request(state, method, path, headers, body),
+      to: ForgeGitHub.TransportTest.SuccessMint
+
+    defdelegate close(state), to: ForgeGitHub.TransportTest.SuccessMint
+
+    def recv(%{headers_received: true} = state, 0, _timeout) do
+      send(state.owner, :body_received)
+      {:ok, state, [{:done, state.ref}]}
+    end
+
+    def recv(state, 0, _timeout) do
+      {:ok, Map.put(state, :headers_received, true),
+       [
+         {:status, state.ref, 200},
+         {:headers, state.ref, [{"content-length", "209715201"}]}
+       ]}
+    end
+  end
+
+  defmodule OversizedMint do
+    defdelegate connect(scheme, address, port, options),
+      to: ForgeGitHub.TransportTest.SuccessMint
+
+    defdelegate request(state, method, path, headers, body),
+      to: ForgeGitHub.TransportTest.SuccessMint
+
+    defdelegate close(state), to: ForgeGitHub.TransportTest.SuccessMint
+
+    def recv(%{cap_reached: true} = state, 0, _timeout) do
+      send(state.owner, :response_cap_reached)
+      {:ok, state, [{:data, state.ref, "x"}, {:done, state.ref}]}
+    end
+
+    def recv(state, 0, _timeout) do
+      # Reuse one binary across the entire 200 MiB stream; do not allocate a
+      # 200 MiB test payload. A dishonest content length must not bypass counting.
+      chunk = String.duplicate("x", 1024 * 1024)
+      chunks = List.duplicate({:data, state.ref, chunk}, 200)
+
+      {:ok, Map.put(state, :cap_reached, true),
+       [{:status, state.ref, 200}, {:headers, state.ref, [{"content-length", "1"}]}] ++ chunks}
     end
   end
 

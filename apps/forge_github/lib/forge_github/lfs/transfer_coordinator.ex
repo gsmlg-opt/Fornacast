@@ -426,7 +426,17 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
   end
 
   defp stream_download(reservation, requirement, action, callbacks) do
-    consumer = fn reader, source -> callbacks.stage_upload.(reservation, reader, source) end
+    consumer = fn reader, source ->
+      staging_reader = fn state, options ->
+        case reader.(state, Keyword.take(options, [:length, :read_timeout])) do
+          {:ok, chunk, next} -> {:more, chunk, next}
+          {:eof, next} -> {:ok, "", next}
+          {:error, reason, next} -> {:error, reason, next}
+        end
+      end
+
+      callbacks.stage_upload.(reservation, staging_reader, source)
+    end
 
     case guarded_call(callbacks, :consume_download, [action, requirement, consumer, []]) do
       {:ok, staged} ->
