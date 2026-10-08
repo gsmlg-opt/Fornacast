@@ -474,6 +474,8 @@ defmodule GitCore do
   A non-nil offset is re-enqueued for the same object before that work item is acknowledged.
   Tree offsets are raw object-body byte offsets, so resuming never skips or rescans repository-wide
   history. Blob candidates contain the complete body only when it is at most 1024 bytes.
+  The persisted legacy `:tag_or_commit` hint represents a tag-ref root and accepts all legal
+  Git tag targets (commit, tree, blob or annotated tag). Branch roots remain strictly `:commit`.
   """
   @spec expand_lfs_scan_object(
           Path.t(),
@@ -1695,6 +1697,7 @@ defmodule GitCore do
   defp native_error_kind("tree_entry_limit"), do: :tree_entry_limit
   defp native_error_kind("diff_file_limit"), do: :diff_file_limit
   defp native_error_kind("scan_byte_limit"), do: :scan_byte_limit
+  defp native_error_kind("scan_work_limit"), do: :scan_work_limit
   defp native_error_kind("changed_path_limit"), do: :changed_path_limit
   defp native_error_kind("merge_conflict"), do: :merge_conflict
   defp native_error_kind("merge_byte_limit"), do: :merge_byte_limit

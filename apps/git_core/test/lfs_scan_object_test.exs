@@ -80,6 +80,45 @@ defmodule GitCore.LFSScanObjectTest do
              GitCore.expand_lfs_scan_object(repo_path, "not-an-oid", :commit, 0, 1)
   end
 
+  test "lightweight and annotated tags can reach tree and blob LFS pointers", %{tmp_dir: tmp_dir} do
+    repo_path = Path.join(tmp_dir, "tag-objects.git")
+    work_path = Path.join(tmp_dir, "tag-objects-work")
+    data = pointer("c", 33)
+    git!(["init", "--bare", repo_path])
+    git!(["init", work_path])
+    File.write!(Path.join(work_path, "asset.lfs"), data)
+    git!(["-C", work_path, "add", "."])
+    git!(["-C", work_path, "commit", "-m", "pointer"])
+    tree = git!(["-C", work_path, "rev-parse", "HEAD^{tree}"])
+    blob = git!(["-C", work_path, "rev-parse", "HEAD:asset.lfs"])
+
+    for {kind, oid} <- [{"tree", tree}, {"blob", blob}] do
+      git!(["-C", work_path, "tag", "light-#{kind}", oid])
+      git!(["-C", work_path, "tag", "-a", "annotated-#{kind}", oid, "-m", kind])
+    end
+
+    git!(["-C", work_path, "tag", "-a", "nested-blob", "annotated-blob", "-m", "nested"])
+    git!(["-C", work_path, "push", repo_path, "HEAD:refs/heads/main", "--tags"])
+
+    baselines =
+      for name <- ["light-tree", "light-blob", "annotated-tree", "annotated-blob", "nested-blob"] do
+        %{
+          ref_name: "refs/tags/#{name}",
+          oid: git!(["-C", work_path, "rev-parse", "refs/tags/#{name}"]),
+          kind_hint: :tag_or_commit
+        }
+      end
+
+    candidates = drain_queue(repo_path, baselines, 1)
+
+    for baseline <- baselines do
+      assert candidate_bodies(candidates, baseline.ref_name) == MapSet.new([data])
+    end
+
+    assert {:error, %GitCore.Error{kind: :corrupt_repository}} =
+             GitCore.expand_lfs_scan_object(repo_path, tree, :commit, 0, 1)
+  end
+
   defp drain_queue(repo_path, baselines, limit) do
     queue =
       Enum.map(baselines, fn baseline ->

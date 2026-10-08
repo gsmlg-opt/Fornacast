@@ -55,7 +55,7 @@ pub(crate) fn expand_lfs_scan_object_impl(
     match object.kind {
         gix_object::Kind::Commit => expand_commit(&object.data, oid, offset, limit),
         gix_object::Kind::Tree => expand_tree(&object.data, oid, offset, limit),
-        gix_object::Kind::Tag => expand_tag(&object.data, oid, kind_hint, offset),
+        gix_object::Kind::Tag => expand_tag(&object.data, oid, offset),
         gix_object::Kind::Blob => unreachable!("blobs are expanded without a complete decode"),
     }
 }
@@ -208,7 +208,6 @@ fn expand_tree(
 fn expand_tag(
     data: &[u8],
     oid: gix_hash::ObjectId,
-    kind_hint: &str,
     offset: u64,
 ) -> Result<NativeLfsExpansion, NativeError> {
     require_zero_offset(offset, "tag")?;
@@ -216,26 +215,7 @@ fn expand_tag(
         .map_err(|decode_error| error("corrupt_repository", decode_error))?;
     let target = tag.target();
     let target_kind = tag.target_kind;
-    if matches!(kind_hint, "tag_or_commit" | "tag")
-        && !matches!(
-            target_kind,
-            gix_object::Kind::Tag | gix_object::Kind::Commit
-        )
-    {
-        return Err(error(
-            "target_not_commit",
-            "annotated tag baseline does not resolve toward a commit",
-        ));
-    }
-    let child_hint = if matches!(kind_hint, "tag_or_commit" | "tag") {
-        match target_kind {
-            gix_object::Kind::Commit => "commit",
-            gix_object::Kind::Tag => "tag_or_commit",
-            _ => unreachable!("root tag targets were restricted to tags and commits"),
-        }
-    } else {
-        object_kind_name(target_kind)
-    };
+    let child_hint = object_kind_name(target_kind);
     Ok((
         "tag".to_string(),
         vec![(target.to_string(), child_hint.to_string())],
@@ -264,19 +244,15 @@ fn validate_actual_kind(
         "tree" => actual == gix_object::Kind::Tree,
         "blob" => actual == gix_object::Kind::Blob,
         "tag" => actual == gix_object::Kind::Tag,
-        "tag_or_commit" => matches!(actual, gix_object::Kind::Tag | gix_object::Kind::Commit),
+        // The persisted legacy hint identifies a tag-ref root, which may be any Git object.
+        "tag_or_commit" => true,
         _ => false,
     };
     if accepted {
         Ok(())
     } else {
-        let kind = if hint == "tag_or_commit" {
-            "target_not_commit"
-        } else {
-            "corrupt_repository"
-        };
         Err(error(
-            kind,
+            "corrupt_repository",
             format!(
                 "object {oid} is {}, expected {hint}",
                 object_kind_name(actual)
@@ -350,6 +326,7 @@ fn blob_error(blob_error: bounded_blob::Error) -> NativeError {
     let kind = match blob_error.kind() {
         bounded_blob::ErrorKind::StorageUnavailable => "storage_unavailable",
         bounded_blob::ErrorKind::CorruptRepository => "corrupt_repository",
+        bounded_blob::ErrorKind::WorkLimit => "scan_work_limit",
         bounded_blob::ErrorKind::Stopped => "scan_timeout",
     };
     error(kind, blob_error)

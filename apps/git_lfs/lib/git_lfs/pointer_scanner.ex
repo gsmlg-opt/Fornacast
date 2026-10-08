@@ -14,6 +14,7 @@ defmodule GitLFS.PointerScanner do
   alias GitLFS.{LFSObject, Pointer, RepositoryObject}
 
   alias GitLFS.PointerScanner.{
+    ExpansionPage,
     Reachability,
     Scan,
     ScanRef,
@@ -150,6 +151,51 @@ defmodule GitLFS.PointerScanner do
 
   def claim_work(_scan, _owner, _options), do: {:error, :invalid_request}
 
+  @doc "Reads a bounded expansion from this scan's frozen repository generation."
+  def cached_expansion(%Scan{} = scan, %WorkItem{} = work)
+      when work.scan_id == scan.id and is_integer(work.tree_offset) and work.tree_offset >= 0 do
+    version = ExpansionPage.format_version()
+
+    transaction(fn ->
+      result =
+        Repo.one(
+          from current in Scan,
+            join: repository in Repository,
+            on: repository.id == current.repository_id,
+            left_join: page in ExpansionPage,
+            on:
+              page.scan_id == current.id and page.object_oid == ^work.object_oid and
+                page.tree_offset == ^work.tree_offset and page.batch_limit == current.batch_limit and
+                page.format_version == ^version,
+            where:
+              current.id == ^scan.id and current.repository_id == ^scan.repository_id and
+                current.repository_generation == ^scan.repository_generation and
+                current.scan_key == ^scan.scan_key and
+                current.baseline_fingerprint == ^scan.baseline_fingerprint and
+                current.batch_limit == ^scan.batch_limit and
+                repository.generation == current.repository_generation and
+                repository.lifecycle in [:ready, :synchronizing, :importing] and
+                is_nil(repository.deleted_at),
+            select: %{page: page}
+        )
+
+      case result do
+        %{page: nil} ->
+          nil
+
+        %{page: page} ->
+          normalized = expansion_from_page!(page)
+          validate_resolved_kind!(work.object_kind, normalized.object_kind)
+          normalized
+
+        nil ->
+          Repo.rollback(:stale_scan)
+      end
+    end)
+  end
+
+  def cached_expansion(_scan, _work), do: {:error, :invalid_request}
+
   @doc "Atomically records one replay-safe bounded GitCore expansion."
   @spec record_expansion(WorkItem.t(), String.t(), expansion()) ::
           {:ok, %{work_item: WorkItem.t(), scan: Scan.t()}}
@@ -169,6 +215,8 @@ defmodule GitLFS.PointerScanner do
           authorize_expansion!(work, capability, owner)
           validate_resolved_kind!(work.object_kind, normalized.object_kind)
           scan_ref = scan_ref!(scan.id, work.ref_name)
+
+          persist_expansion_page!(scan, work, normalized, fingerprint)
 
           persist_candidate!(scan, scan_ref, normalized.object_kind, normalized.candidate)
           enqueue_children!(scan, work.ref_name, normalized.children)
@@ -377,6 +425,7 @@ defmodule GitLFS.PointerScanner do
   end
 
   defp initial_kind(:branch), do: :commit
+  # Persisted legacy hint for any legal Git tag target, including trees and blobs.
   defp initial_kind(:tag), do: :tag_or_commit
 
   defp normalize_baselines(baselines) do
@@ -514,6 +563,75 @@ defmodule GitLFS.PointerScanner do
     |> Base.encode16(case: :lower)
   end
 
+  defp persist_expansion_page!(scan, work, normalized, fingerprint) do
+    key = [
+      scan_id: scan.id,
+      object_oid: work.object_oid,
+      tree_offset: work.tree_offset,
+      batch_limit: scan.batch_limit,
+      format_version: ExpansionPage.format_version()
+    ]
+
+    case Repo.get_by(ExpansionPage, key) do
+      nil ->
+        attrs =
+          Map.new(key)
+          |> Map.merge(%{
+            object_kind: normalized.object_kind,
+            children:
+              Enum.map(
+                normalized.children,
+                &%{"oid" => &1.oid, "kind" => Atom.to_string(&1.kind)}
+              ),
+            candidate_data: normalized.candidate && normalized.candidate.data,
+            candidate_size: normalized.candidate && normalized.candidate.blob_size,
+            next_offset: normalized.next_offset,
+            result_fingerprint: fingerprint
+          })
+
+        %ExpansionPage{} |> ExpansionPage.changeset(attrs) |> insert!()
+
+      page ->
+        unless page.result_fingerprint == fingerprint and expansion_from_page!(page) == normalized,
+          do: Repo.rollback(:expansion_conflict)
+    end
+  end
+
+  defp expansion_from_page!(page) do
+    children =
+      Enum.map(page.children, fn
+        %{"oid" => oid, "kind" => kind}
+        when kind in ["commit", "tree", "blob", "tag", "tag_or_commit"] ->
+          %{oid: oid, kind: String.to_existing_atom(kind)}
+
+        _ ->
+          Repo.rollback(:invalid_expansion)
+      end)
+
+    candidate =
+      case {page.candidate_data, page.candidate_size} do
+        {nil, nil} -> nil
+        {data, size} -> %{data: data, blob_size: size}
+      end
+
+    normalized =
+      normalize_expansion!(
+        %{
+          object_kind: page.object_kind,
+          children: children,
+          candidate: candidate,
+          next_offset: page.next_offset
+        },
+        page.tree_offset,
+        page.batch_limit
+      )
+
+    unless result_fingerprint(normalized) == page.result_fingerprint,
+      do: Repo.rollback(:expansion_conflict)
+
+    normalized
+  end
+
   defp replay?(work, capability, owner, fingerprint) do
     work.last_expanded_offset == capability.tree_offset and
       work.last_result_fingerprint == fingerprint and work.last_owner == owner
@@ -536,7 +654,9 @@ defmodule GitLFS.PointerScanner do
   end
 
   defp validate_resolved_kind!(hint, actual) do
-    valid? = hint == actual or (hint == :tag_or_commit and actual in [:tag, :commit])
+    valid? =
+      hint == actual or (hint == :tag_or_commit and actual in [:tag, :commit, :tree, :blob])
+
     unless valid?, do: Repo.rollback(:object_kind_mismatch)
   end
 
@@ -584,33 +704,73 @@ defmodule GitLFS.PointerScanner do
     end
   end
 
-  defp enqueue_children!(scan, ref_name, children) do
-    Enum.each(children, fn child ->
-      case Repo.get_by(WorkItem,
-             scan_id: scan.id,
-             ref_name: ref_name,
-             object_oid: child.oid
-           ) do
-        nil ->
-          %WorkItem{}
-          |> WorkItem.creation_changeset(%{
-            scan_id: scan.id,
-            ref_name: ref_name,
-            object_oid: child.oid,
-            object_kind: child.kind
-          })
-          |> insert!()
+  defp enqueue_children!(_scan, _ref_name, []), do: :ok
 
-        %WorkItem{object_kind: existing_kind} ->
-          unless compatible_hints?(existing_kind, child.kind),
-            do: Repo.rollback(:inconsistent_child_kind)
-      end
-    end)
+  defp enqueue_children!(scan, ref_name, children) do
+    oids = Enum.map(children, & &1.oid)
+
+    existing =
+      WorkItem
+      |> where(
+        [work],
+        work.scan_id == ^scan.id and work.ref_name == ^ref_name and work.object_oid in ^oids
+      )
+      |> select([work], {work.object_oid, work.object_kind})
+      |> Repo.all()
+      |> Map.new()
+
+    now = DateTime.utc_now(:second)
+
+    rows =
+      Enum.flat_map(children, fn child ->
+        case Map.fetch(existing, child.oid) do
+          {:ok, kind} ->
+            unless compatible_hints?(kind, child.kind),
+              do: Repo.rollback(:inconsistent_child_kind)
+
+            []
+
+          :error ->
+            changeset =
+              WorkItem.creation_changeset(%WorkItem{}, %{
+                scan_id: scan.id,
+                ref_name: ref_name,
+                object_oid: child.oid,
+                object_kind: child.kind
+              })
+
+            unless changeset.valid?, do: Repo.rollback({:validation, changeset})
+
+            row =
+              changeset
+              |> Changeset.apply_changes()
+              |> Map.from_struct()
+              |> Map.take([
+                :scan_id,
+                :ref_name,
+                :object_oid,
+                :object_kind,
+                :state,
+                :tree_offset,
+                :attempt_count
+              ])
+              |> Map.merge(%{inserted_at: now, updated_at: now})
+
+            [row]
+        end
+      end)
+
+    if rows != [], do: Repo.insert_all(WorkItem, rows)
   end
 
   defp compatible_hints?(kind, kind), do: true
-  defp compatible_hints?(:tag_or_commit, kind) when kind in [:tag, :commit], do: true
-  defp compatible_hints?(kind, :tag_or_commit) when kind in [:tag, :commit], do: true
+
+  defp compatible_hints?(:tag_or_commit, kind) when kind in [:tag, :commit, :tree, :blob],
+    do: true
+
+  defp compatible_hints?(kind, :tag_or_commit) when kind in [:tag, :commit, :tree, :blob],
+    do: true
+
   defp compatible_hints?(_existing, _new), do: false
 
   defp maybe_complete_scan!(scan) do

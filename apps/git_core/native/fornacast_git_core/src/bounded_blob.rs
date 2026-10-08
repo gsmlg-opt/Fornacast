@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::Read;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use gix_object::bstr::ByteSlice;
 
@@ -34,6 +35,7 @@ const BLOB_METADATA_WORK_LIMIT: usize = 100_000_000;
 pub(crate) enum ErrorKind {
     StorageUnavailable,
     CorruptRepository,
+    WorkLimit,
     Stopped,
 }
 
@@ -54,6 +56,13 @@ impl Error {
     fn storage(detail: impl std::fmt::Display) -> Self {
         Self {
             kind: ErrorKind::StorageUnavailable,
+            detail: detail.to_string(),
+        }
+    }
+
+    fn work_limit(detail: impl std::fmt::Display) -> Self {
+        Self {
+            kind: ErrorKind::WorkLimit,
             detail: detail.to_string(),
         }
     }
@@ -290,6 +299,7 @@ struct DecodeWorkBudget {
     inflated_output_bytes: Cell<u64>,
     skipped_output_bytes: Cell<u64>,
     discovery_bytes: Cell<u64>,
+    pack_indexes: RefCell<Vec<Rc<gix_pack::index::File>>>,
     stop: Option<RefCell<Box<dyn FnMut() -> bool>>>,
 }
 
@@ -336,28 +346,13 @@ impl DecodeWorkBudget {
         let caller_limit = u64::try_from(caller_limit)
             .map_err(|_| Error::corrupt("caller limit does not fit the decode work counter"))?;
         let limits = DecodeWorkLimits {
-            // Tiny instructions are the cheapest possible valid delta commands. Requiring
-            // sixteen requested bytes per command, with a bounded baseline, keeps normal Git
-            // deltas valid while bounding adversarial one-byte COPY programs.
-            delta_instructions: scaled_work_limit(
-                caller_limit,
-                256,
-                1,
-                16,
-                MAX_DELTA_INSTRUCTIONS,
-            )?,
+            // A one-byte prefix can traverse the same delta chain and pack index as a
+            // complete read. Bound this work independently of retained output bytes.
+            delta_instructions: MAX_DELTA_INSTRUCTIONS,
             // Source opens remain bounded independently because a COPY can otherwise reopen
             // and reinflate the same base even when its output overlaps by only one byte.
-            source_opens: scaled_work_limit(caller_limit, 512, 1, 4 * 1024, MAX_SOURCE_OPENS)?,
-            // Linear directory/index scans are charged per entry. The larger baseline keeps
-            // ordinary repositories usable without permitting an unbounded pack walk.
-            index_entries_scanned: scaled_work_limit(
-                caller_limit,
-                262_144,
-                1,
-                16,
-                MAX_INDEX_ENTRIES_SCANNED,
-            )?,
+            source_opens: MAX_SOURCE_OPENS,
+            index_entries_scanned: MAX_INDEX_ENTRIES_SCANNED,
             compressed_input_bytes: scaled_work_limit(
                 caller_limit,
                 16 * MIB,
@@ -390,6 +385,7 @@ impl DecodeWorkBudget {
             inflated_output_bytes: Cell::new(0),
             skipped_output_bytes: Cell::new(0),
             discovery_bytes: Cell::new(0),
+            pack_indexes: RefCell::new(Vec::new()),
             stop: stop.map(RefCell::new),
         })
     }
@@ -488,10 +484,10 @@ impl DecodeWorkBudget {
         let next = counter
             .get()
             .checked_add(count)
-            .ok_or_else(|| Error::corrupt(format!("decode work counter overflow: {label}")))?;
+            .ok_or_else(|| Error::work_limit(format!("decode work counter overflow: {label}")))?;
         counter.set(next);
         if next > limit {
-            return Err(Error::corrupt(format!(
+            return Err(Error::work_limit(format!(
                 "decode work budget exhausted: {label} {next} exceed limit {limit}"
             )));
         }
@@ -768,7 +764,7 @@ impl GuardedMetadata {
 
 struct OpenedPack {
     pack: gix_pack::data::File,
-    index: Option<gix_pack::index::File>,
+    index: Option<Rc<gix_pack::index::File>>,
     entry: gix_pack::data::Entry,
     entry_end: gix_pack::data::Offset,
 }
@@ -789,7 +785,7 @@ impl OpenedPack {
 
     fn index(&self) -> DecodeResult<&gix_pack::index::File> {
         self.index
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| Error::corrupt("guarded pack reopen has no index"))
     }
 }
@@ -2012,7 +2008,16 @@ fn open_pack_index(
     repo: &gix::Repository,
     index_path: &Path,
     budget: &DecodeWorkBudget,
-) -> DecodeResult<gix_pack::index::File> {
+) -> DecodeResult<Rc<gix_pack::index::File>> {
+    budget.check_stop()?;
+    if let Some(index) = budget
+        .pack_indexes
+        .borrow()
+        .iter()
+        .find(|index| index.path() == index_path)
+    {
+        return Ok(Rc::clone(index));
+    }
     budget.charge_source_open(1)?;
     let index_bytes = std::fs::metadata(index_path)
         .map_err(|error| {
@@ -2057,6 +2062,11 @@ fn open_pack_index(
             index.num_objects()
         )));
     }
+    // Index files are immutable for the duration of a decode. Share the validated
+    // mapping across delta-chain probes instead of charging and validating it anew.
+    // Distinct mappings remain bounded by the charged index/source-open budgets.
+    let index = Rc::new(index);
+    budget.pack_indexes.borrow_mut().push(Rc::clone(&index));
     Ok(index)
 }
 
@@ -2127,7 +2137,7 @@ fn open_guarded_packed(
 fn opened_pack_from_parts(
     source: &ObjectSource,
     pack: gix_pack::data::File,
-    index: Option<gix_pack::index::File>,
+    index: Option<Rc<gix_pack::index::File>>,
     entry_end: gix_pack::data::Offset,
 ) -> DecodeResult<OpenedPack> {
     let ObjectSource::Packed { pack_offset, .. } = source else {
@@ -2711,7 +2721,7 @@ fn loose_object_path_at(object_db: &Path, id: gix_hash::ObjectId) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -3318,23 +3328,81 @@ mod tests {
     }
 
     #[test]
-    fn prefix_blob_repeated_high_offset_copies_stop_at_the_cumulative_work_budget() {
+    fn small_valid_delta_is_not_rejected_by_its_output_size() {
         let fixture = repeated_high_offset_copy_fixture(512);
+        let repo = gix::open(&fixture.repo_path).expect("open fixture repository");
+
+        let prefix = read_prefix(&repo, fixture.oid, fixture.original.len())
+            .expect("valid small delta fits the independent work budget");
+
+        assert_eq!(prefix.data, fixture.original);
+        assert_eq!(prefix.allocations.delta_instructions, 512);
+
+        let expansion = crate::lfs_candidates::expand_lfs_scan_object_impl(
+            path_str(&fixture.repo_path),
+            &fixture.oid.to_string(),
+            "blob",
+            0,
+            100,
+        )
+        .expect("LFS metadata and complete pointer-candidate reads use the same work policy");
+        assert_eq!(expansion.2, Some((fixture.original, 512)));
+    }
+
+    #[test]
+    fn tiny_prefix_can_validate_a_large_pack_index() {
+        let fixture = large_pack_index_fixture(150_000);
+        let repo = gix::open(&fixture.repo_path).expect("open fixture repository");
+
+        let prefix = read_object_prefix(&repo, fixture.oid, 1)
+            .expect("metadata probing has its own index-validation budget");
+
+        assert_eq!(prefix.data, fixture.original[..1]);
+        assert!(prefix.allocations.index_entries_scanned > 262_145);
+        assert!(prefix.allocations.max_decoded_object_buffer <= 1);
+    }
+
+    #[test]
+    fn exhausted_work_budget_is_a_resource_limit_not_corruption() {
+        let budget = DecodeWorkBudget::new(1).expect("work budget");
+        let error = budget
+            .charge_index_entries(super::MAX_INDEX_ENTRIES_SCANNED + 1)
+            .expect_err("finite work budget must stop excessive scanning");
+
+        let native_error = super::super::bounded_blob_native_error(error);
+        assert_eq!(native_error.0, "scan_work_limit");
+    }
+
+    #[test]
+    fn prefix_blob_repeated_high_offset_copies_stop_at_the_cumulative_work_budget() {
+        let fixture = repeated_high_offset_copy_fixture(8192);
         let repo = gix::open(&fixture.repo_path).expect("open fixture repository");
 
         let error = read_prefix(&repo, fixture.oid, fixture.original.len())
             .expect_err("repeated high-offset copies must exhaust bounded decode work");
 
-        assert_eq!(error.kind(), ErrorKind::CorruptRepository);
-        assert_eq!(
-            error.to_string(),
-            "decode work budget exhausted: delta instructions 289 exceed limit 288"
+        assert_eq!(error.kind(), ErrorKind::WorkLimit);
+        assert!(
+            error
+                .to_string()
+                .contains("decode work budget exhausted: source opens")
         );
     }
 
     #[test]
     fn decode_work_limits_remain_hard_capped() {
         let budget = DecodeWorkBudget::new(100_000_000).expect("work budget");
+        let tiny_budget = DecodeWorkBudget::new(1).expect("tiny-prefix work budget");
+
+        assert_eq!(
+            tiny_budget.limits.delta_instructions,
+            budget.limits.delta_instructions
+        );
+        assert_eq!(tiny_budget.limits.source_opens, budget.limits.source_opens);
+        assert_eq!(
+            tiny_budget.limits.index_entries_scanned,
+            budget.limits.index_entries_scanned
+        );
 
         assert_eq!(
             budget.limits.delta_instructions,
@@ -3375,9 +3443,10 @@ mod tests {
             let conservative_validation_charge = index_bytes.div_ceil(24);
 
             assert!(
-                prefix.allocations.index_entries_scanned >= conservative_validation_charge * 3,
-                "every locate and preflight index validation must be charged"
+                prefix.allocations.index_entries_scanned >= conservative_validation_charge,
+                "the shared index validation must be charged"
             );
+            assert!(prefix.allocations.index_entries_scanned < conservative_validation_charge * 2);
             prefix.allocations.index_entries_scanned
         });
 
@@ -3396,7 +3465,8 @@ mod tests {
             .expect("a valid pack index must fit the bounded decode budget");
 
         assert_eq!(prefix.data, fixture.original);
-        assert!(prefix.allocations.index_entries_scanned > 65_537);
+        assert!(prefix.allocations.index_entries_scanned > 20_000);
+        assert!(prefix.allocations.index_entries_scanned < 65_537);
     }
 
     #[test]
@@ -3584,7 +3654,7 @@ mod tests {
         let error = parse_alternate_paths(b"relative-object-database\n", &budget)
             .expect_err("the path budget must be charged before parsing the first path");
 
-        assert_eq!(error.kind(), ErrorKind::CorruptRepository);
+        assert_eq!(error.kind(), ErrorKind::WorkLimit);
         assert_eq!(
             error.to_string(),
             "decode work budget exhausted: source opens 1 exceed limit 0"
@@ -4634,6 +4704,7 @@ mod tests {
             inflated_output_bytes: Cell::new(0),
             skipped_output_bytes: Cell::new(0),
             discovery_bytes: Cell::new(0),
+            pack_indexes: RefCell::new(Vec::new()),
             stop: None,
         }
     }

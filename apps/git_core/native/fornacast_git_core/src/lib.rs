@@ -826,6 +826,7 @@ fn bounded_blob_native_error(error: bounded_blob::Error) -> NativeError {
     let kind = match error.kind() {
         bounded_blob::ErrorKind::StorageUnavailable => "storage_unavailable",
         bounded_blob::ErrorKind::CorruptRepository => "corrupt_repository",
+        bounded_blob::ErrorKind::WorkLimit => "scan_work_limit",
         bounded_blob::ErrorKind::Stopped => "scan_timeout",
     };
     native_error(kind, error)
@@ -9085,7 +9086,7 @@ mod tests {
         );
         let outer = expand_lfs_scan_object_impl(fixture.path(), &outer_tag, "tag_or_commit", 0, 1)
             .expect("outer annotated tag expansion");
-        assert_eq!(outer.1, vec![(tag.clone(), "tag_or_commit".to_string())]);
+        assert_eq!(outer.1, vec![(tag.clone(), "tag".to_string())]);
 
         let expanded = expand_lfs_scan_object_impl(fixture.path(), &tag, "tag_or_commit", 0, 1)
             .expect("annotated tag expansion");
