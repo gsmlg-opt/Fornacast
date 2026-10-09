@@ -37,7 +37,8 @@ jobs:
     runs-on: ubuntu-24.04
     services:
       postgres:
-        image: postgres:17
+        # Official Docker image mirror avoids unauthenticated Docker Hub pull limits.
+        image: public.ecr.aws/docker/library/postgres:17
         env:
           POSTGRES_DB: fornacast_e2e
           POSTGRES_USER: fornacast
