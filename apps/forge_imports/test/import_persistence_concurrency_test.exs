@@ -626,6 +626,9 @@ defmodule ForgeImports.ImportPersistenceConcurrencyTest do
 
   defp reset_database! do
     for table <- [
+          "mirror_pull_metadata_intents",
+          "mirror_pull_creation_intents",
+          "organization_pat_configurations",
           "github_import_repository_cleanups",
           "github_import_report_entries",
           "github_import_page_checkpoints",
@@ -633,11 +636,12 @@ defmodule ForgeImports.ImportPersistenceConcurrencyTest do
           "github_import_attempts",
           "github_import_repository_items",
           "github_import_runs",
+          "organization_mirrors",
           "github_credentials",
-          "github_identities",
           "audit_events",
           "repository_collaborators",
           "repositories",
+          "github_identities",
           "organization_members",
           "api_keys",
           "ssh_keys",
