@@ -26,7 +26,8 @@ defmodule ForgeBlobs.MixProject do
     [
       {:fornacast, in_umbrella: true},
       # TODO(upstream): gsmlg-opt/ex_storage_service#17
-      {:ex_storage_service, "== 0.6.4"}
+      # TODO(upstream): gsmlg-opt/ex_storage_service#18 - support HTTP family 0.18.
+      {:ex_storage_service, "== 0.6.5"}
     ]
   end
 end
