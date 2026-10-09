@@ -176,8 +176,16 @@ defmodule ForgeGitHub.PullCreateIntegrationTest do
            )
 
     assert Enum.all?(mappings, &(&1.confirmed_snapshot["body"] == c.issue.body))
-    assert Repo.aggregate(ForgeIssues.Issue, :count) == 1
-    assert Repo.aggregate(ForgePulls.PullRequest, :count) == 1
+
+    assert Repo.aggregate(
+             from(i in ForgeIssues.Issue, where: i.repository_id == ^c.pull.repository_id),
+             :count
+           ) == 1
+
+    assert Repo.aggregate(
+             from(p in ForgePulls.PullRequest, where: p.repository_id == ^c.pull.repository_id),
+             :count
+           ) == 1
   end
 
   test "missing assignee nodes seed across claims without another POST or metadata PATCH", c do

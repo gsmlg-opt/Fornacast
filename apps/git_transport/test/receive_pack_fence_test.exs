@@ -22,6 +22,19 @@ defmodule GitTransport.ReceivePackFenceTest.BlockedRecovery do
     do: {:error, :unavailable}
 end
 
+defmodule GitTransport.ReceivePackFenceTest.DeadlineReconciler do
+  @behaviour ForgeRepos.RepositoryWriteReconcilers
+
+  @impl true
+  def cleanup_safety_locked(_repository, _now), do: :safe
+
+  @impl true
+  def reconcile_repository_locked(_repository, _path, deadline) do
+    send(self(), {:write_deadline, deadline})
+    :ok
+  end
+end
+
 defmodule GitTransport.ReceivePackFenceTest do
   use ExUnit.Case, async: false
 
@@ -534,39 +547,49 @@ defmodule GitTransport.ReceivePackFenceTest do
         end)
       end)
 
-    assert_receive {:native_effect_complete, worker}
+    assert_receive {:native_effect_complete, worker}, 5_000
     on_exit(fn -> send(worker, :finish_native) end)
 
-    assert %GitWriteOperation{state: :prepared} =
-             Repo.get_by!(GitWriteOperation, request_id: request_id)
+    try do
+      assert %GitWriteOperation{state: :prepared} =
+               Repo.get_by!(GitWriteOperation, request_id: request_id)
 
-    assert is_nil(Repo.get!(Repository, repository.id).last_pushed_at)
+      assert is_nil(Repo.get!(Repository, repository.id).last_pushed_at)
 
-    publication =
-      Task.async(fn ->
-        ForgeRepos.with_import_publication_fence(repository, :receive_pack, fn _path,
-                                                                               _remaining ->
-          operation = Repo.get_by!(GitWriteOperation, request_id: request_id)
-          persisted_repository = Repo.get!(Repository, repository.id)
-          send(test_pid, {:publication_entered, operation, persisted_repository, self()})
+      publication =
+        Task.async(fn ->
+          ForgeRepos.with_import_publication_fence(repository, :receive_pack, fn _path,
+                                                                                 _remaining ->
+            operation = Repo.get_by!(GitWriteOperation, request_id: request_id)
+            persisted_repository = Repo.get!(Repository, repository.id)
+            send(test_pid, {:publication_entered, operation, persisted_repository, self()})
 
-          receive do
-            :finish_publication -> :published
-          end
+            receive do
+              :finish_publication -> :published
+            end
+          end)
         end)
-      end)
 
-    wait_for_waiters(1)
-    refute_receive {:publication_entered, _operation, _repository, _pid}
-    send(worker, :finish_native)
+      try do
+        wait_for_waiters(1)
+        refute_receive {:publication_entered, _operation, _repository, _pid}
+        send(worker, :finish_native)
 
-    assert {:ok, _response, [{"refs/heads/main", "ok", nil}]} = Task.await(response)
+        assert {:ok, _response, [{"refs/heads/main", "ok", nil}]} = Task.await(response)
 
-    assert_receive {:publication_entered, %GitWriteOperation{state: :bookkeeping_complete},
-                    %Repository{last_pushed_at: %DateTime{}}, publication_pid}
+        assert_receive {:publication_entered, %GitWriteOperation{state: :bookkeeping_complete},
+                        %Repository{last_pushed_at: %DateTime{}}, publication_pid},
+                       5_000
 
-    send(publication_pid, :finish_publication)
-    assert :published = Task.await(publication)
+        send(publication_pid, :finish_publication)
+        assert :published = Task.await(publication)
+      after
+        finish_native_worker(worker, :finish_native)
+        finish_native_worker(publication.pid, :finish_publication)
+      end
+    after
+      finish_native_worker(worker, :finish_native)
+    end
   end
 
   @tag :tmp_dir
@@ -761,22 +784,26 @@ defmodule GitTransport.ReceivePackFenceTest do
         end
       end)
 
-    assert_receive {:native_entered, :first, first_worker}
+    assert_receive {:native_entered, :first, first_worker}, 5_000
     on_exit(fn -> send(first_worker, :release) end)
 
-    second =
-      response_task(repository, fn _path, _pack, _commands ->
-        send(parent, {:native_entered, :second})
-        {:ok, [{"refs/heads/main", "ok", nil}]}
-      end)
+    try do
+      second =
+        response_task(repository, fn _path, _pack, _commands ->
+          send(parent, {:native_entered, :second})
+          {:ok, [{"refs/heads/main", "ok", nil}]}
+        end)
 
-    wait_for_waiters(1)
-    refute_receive {:native_entered, :second}
-    send(first_worker, :release)
-    assert_receive {:native_entered, :second}
-
-    assert {:ok, _response, _statuses} = Task.await(first)
-    assert {:ok, _response, _statuses} = Task.await(second)
+      wait_for_waiters(1)
+      refute_receive {:native_entered, :second}
+      send(first_worker, :release)
+      assert {:ok, _response, _statuses} = Task.await(first)
+      assert {:ok, _response, _statuses} = Task.await(second)
+      assert_receive {:native_entered, :second}
+    after
+      finish_native_worker(first_worker, :release)
+      wait_for_persisted_workers(0, 2_000)
+    end
   end
 
   @tag :tmp_dir
@@ -850,47 +877,66 @@ defmodule GitTransport.ReceivePackFenceTest do
 
     limits =
       Application.get_env(:git_core, :limits, [])
-      |> Keyword.put(:content_deadline_ms, 25)
+      |> Keyword.put(:content_deadline_ms, 5_000)
 
     Application.put_env(:git_core, :limits, limits)
     on_exit(fn -> restore_env(:git_core, :limits, original_limits) end)
+
+    Application.put_env(:forge_repos, :repository_write_reconcilers, [
+      {10, :deadline_test, __MODULE__.DeadlineReconciler}
+    ])
+
     parent = self()
 
     first =
       response_task(repository, fn _path, _pack, _commands ->
-        send(parent, {:native_entered, :long, self()})
+        receive do
+          {:write_deadline, deadline} ->
+            send(parent, {:native_entered, :long, self(), deadline})
+        end
 
         receive do
           :release -> {:ok, [{"refs/heads/main", "ok", nil}]}
         end
       end)
 
-    assert_receive {:native_entered, :long, first_worker}
+    assert_receive {:native_entered, :long, first_worker, deadline}, 5_000
     on_exit(fn -> send(first_worker, :release) end)
-    Process.sleep(30)
 
-    second =
-      response_task(repository, fn _path, _pack, _commands ->
-        send(parent, {:native_entered, :timed_out_waiter})
-        {:ok, []}
-      end)
+    try do
+      timer = make_ref()
+      remaining = max(deadline - System.monotonic_time(:millisecond) + 1, 0)
+      Process.send_after(self(), {:writer_deadline_elapsed, timer}, remaining)
+      assert_receive {:writer_deadline_elapsed, ^timer}, 5_000
+      assert System.monotonic_time(:millisecond) > deadline
 
-    assert {:ok, response, [{"refs/heads/main", "ng", "Git receive-pack unavailable"}]} =
-             Task.await(second)
+      Application.put_env(:git_core, :limits, Keyword.put(limits, :content_deadline_ms, 25))
 
-    assert response =~ "ng refs/heads/main Git receive-pack unavailable"
-    refute_receive {:native_entered, :timed_out_waiter}
-    assert Task.yield(first, 0) == nil
+      second =
+        response_task(repository, fn _path, _pack, _commands ->
+          send(parent, {:native_entered, :timed_out_waiter})
+          {:ok, []}
+        end)
 
-    send(first_worker, :release)
+      assert {:ok, response, [{"refs/heads/main", "ng", "Git receive-pack unavailable"}]} =
+               Task.await(second)
 
-    assert {:ok, response, [{"refs/heads/main", "ng", "Git receive-pack unavailable"}]} =
-             Task.await(first)
+      assert response =~ "ng refs/heads/main Git receive-pack unavailable"
+      refute_receive {:native_entered, :timed_out_waiter}
+      assert Task.yield(first, 0) == nil
 
-    assert response =~ "ng refs/heads/main Git receive-pack unavailable"
-    assert [%GitWriteOperation{state: :prepared}] = Repo.all(GitWriteOperation)
+      send(first_worker, :release)
 
-    restore_env(:git_core, :limits, original_limits)
+      assert {:ok, response, [{"refs/heads/main", "ng", "Git receive-pack unavailable"}]} =
+               Task.await(first)
+
+      assert response =~ "ng refs/heads/main Git receive-pack unavailable"
+      assert [%GitWriteOperation{state: :prepared}] = Repo.all(GitWriteOperation)
+    after
+      finish_native_worker(first_worker, :release)
+      restore_env(:git_core, :limits, original_limits)
+    end
+
     assert :ok = ForgeRepos.GitWriteRecovery.reconcile_repository(repository)
     commands = successful_commands(repository)
 
@@ -934,34 +980,40 @@ defmodule GitTransport.ReceivePackFenceTest do
       end)
 
     caller_monitor = Process.monitor(caller)
-    wait_for_file(entered_path)
-    Process.exit(caller, :kill)
-    assert_receive {:DOWN, ^caller_monitor, :process, ^caller, :killed}, 500
 
-    other_repository = repository_fixture(owner, "other")
+    try do
+      wait_for_file(entered_path)
+      Process.exit(caller, :kill)
+      assert_receive {:DOWN, ^caller_monitor, :process, ^caller, :killed}, 500
 
-    assert {:ok, _response, _statuses} =
-             response_task(other_repository, fn _path, _pack, _commands ->
-               send(parent, :other_repository_entered)
-               {:ok, [{"refs/heads/main", "ok", nil}]}
-             end)
-             |> Task.await()
+      other_repository = repository_fixture(owner, "other")
 
-    assert_receive :other_repository_entered
+      assert {:ok, _response, _statuses} =
+               response_task(other_repository, fn _path, _pack, _commands ->
+                 send(parent, :other_repository_entered)
+                 {:ok, [{"refs/heads/main", "ok", nil}]}
+               end)
+               |> Task.await()
 
-    second =
-      response_task(repository, fn _path, _pack, _commands ->
-        send(parent, :second_native_entered)
-        {:ok, [{"refs/heads/main", "ok", nil}]}
-      end)
+      assert_receive :other_repository_entered
 
-    wait_for_waiters(1)
-    refute_receive :second_native_entered
-    File.write!(release_path, "release")
-    assert_receive :second_native_entered
-    assert {:ok, _response, _statuses} = Task.await(second)
-    refute_receive {:first_response, _result}
-    wait_for_workers(0)
+      second =
+        response_task(repository, fn _path, _pack, _commands ->
+          send(parent, :second_native_entered)
+          {:ok, [{"refs/heads/main", "ok", nil}]}
+        end)
+
+      wait_for_waiters(1)
+      refute_receive :second_native_entered
+      File.write!(release_path, "release")
+      assert_receive :second_native_entered, 5_000
+      assert {:ok, _response, _statuses} = Task.await(second)
+      refute_receive {:first_response, _result}
+      wait_for_workers(0)
+    after
+      File.write!(release_path, "release")
+      wait_for_persisted_workers(0, 2_000)
+    end
   end
 
   @tag :tmp_dir
@@ -981,58 +1033,63 @@ defmodule GitTransport.ReceivePackFenceTest do
         {:ok, [{"refs/heads/main", "ok", nil}]}
       end)
 
-    wait_for_file(entered_path)
-    original_manager = Process.whereis(GitTransport.ReceivePackWorkerManager)
-    manager_monitor = Process.monitor(original_manager)
-    Process.exit(original_manager, :kill)
-    assert_receive {:DOWN, ^manager_monitor, :process, ^original_manager, :killed}
-    wait_for_worker_manager_restart(original_manager)
-    assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 1
-    assert GitTransport.ReceivePackWorkerManager.persisted_worker_count() == 1
+    try do
+      wait_for_file(entered_path)
+      original_manager = Process.whereis(GitTransport.ReceivePackWorkerManager)
+      manager_monitor = Process.monitor(original_manager)
+      Process.exit(original_manager, :kill)
+      assert_receive {:DOWN, ^manager_monitor, :process, ^original_manager, :killed}
+      wait_for_worker_manager_restart(original_manager)
+      assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 1
+      assert GitTransport.ReceivePackWorkerManager.persisted_worker_count() == 1
 
-    original_supervisor = Process.whereis(GitTransport.ReceivePackWorkerSupervisor)
-    supervisor_monitor = Process.monitor(original_supervisor)
-    Process.exit(original_supervisor, :kill)
-    assert_receive {:DOWN, ^supervisor_monitor, :process, ^original_supervisor, :killed}
-    wait_for_worker_supervisor_restart(original_supervisor)
-    assert Task.yield(first, 0) == nil
-    assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 1
+      original_supervisor = Process.whereis(GitTransport.ReceivePackWorkerSupervisor)
+      supervisor_monitor = Process.monitor(original_supervisor)
+      Process.exit(original_supervisor, :kill)
+      assert_receive {:DOWN, ^supervisor_monitor, :process, ^original_supervisor, :killed}
+      wait_for_worker_supervisor_restart(original_supervisor)
+      assert Task.yield(first, 0) == nil
+      assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 1
 
-    restarted_supervisor = Process.whereis(GitTransport.ReceivePackWorkerSupervisor)
-    restarted_monitor = Process.monitor(restarted_supervisor)
-    Process.exit(restarted_supervisor, :kill)
+      restarted_supervisor = Process.whereis(GitTransport.ReceivePackWorkerSupervisor)
+      restarted_monitor = Process.monitor(restarted_supervisor)
+      Process.exit(restarted_supervisor, :kill)
 
-    assert_receive {:DOWN, ^restarted_monitor, :process, ^restarted_supervisor, :killed}
-    wait_for_worker_supervisor_restart(restarted_supervisor)
-    assert Task.yield(first, 0) == nil
-    assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 1
+      assert_receive {:DOWN, ^restarted_monitor, :process, ^restarted_supervisor, :killed}
+      wait_for_worker_supervisor_restart(restarted_supervisor)
+      assert Task.yield(first, 0) == nil
+      assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 1
 
-    other_repository = repository_fixture(owner, "supervisor-crash-other")
+      other_repository = repository_fixture(owner, "supervisor-crash-other")
 
-    assert {:ok, _response, _statuses} =
-             response_task(other_repository, fn _path, _pack, _commands ->
-               send(parent, :supervisor_crash_other_entered)
-               {:ok, [{"refs/heads/main", "ok", nil}]}
-             end)
-             |> Task.await()
+      assert {:ok, _response, _statuses} =
+               response_task(other_repository, fn _path, _pack, _commands ->
+                 send(parent, :supervisor_crash_other_entered)
+                 {:ok, [{"refs/heads/main", "ok", nil}]}
+               end)
+               |> Task.await()
 
-    assert_receive :supervisor_crash_other_entered
+      assert_receive :supervisor_crash_other_entered
 
-    second =
-      response_task(repository, fn _path, _pack, _commands ->
-        send(parent, :supervisor_crash_same_entered)
-        {:ok, [{"refs/heads/main", "ok", nil}]}
-      end)
+      second =
+        response_task(repository, fn _path, _pack, _commands ->
+          send(parent, :supervisor_crash_same_entered)
+          {:ok, [{"refs/heads/main", "ok", nil}]}
+        end)
 
-    wait_for_waiters(1)
-    refute_receive :supervisor_crash_same_entered
-    File.write!(release_path, "release")
-    assert {:ok, _response, _statuses} = Task.await(first)
-    assert_receive :supervisor_crash_same_entered
-    assert {:ok, _response, _statuses} = Task.await(second)
-    wait_for_workers(0)
-    assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 0
-    assert GitTransport.ReceivePackWorkerManager.persisted_worker_count() == 0
+      wait_for_waiters(1)
+      refute_receive :supervisor_crash_same_entered
+      File.write!(release_path, "release")
+      assert {:ok, _response, _statuses} = Task.await(first)
+      assert_receive :supervisor_crash_same_entered, 5_000
+      assert {:ok, _response, _statuses} = Task.await(second)
+      wait_for_workers(0)
+      assert GitTransport.ReceivePackWorkerManager.tracked_worker_count() == 0
+      assert GitTransport.ReceivePackWorkerManager.persisted_worker_count() == 0
+    after
+      File.write!(release_path, "release")
+      wait_for_persisted_workers(0, 2_000)
+    end
   end
 
   @tag :tmp_dir
@@ -1524,6 +1581,13 @@ defmodule GitTransport.ReceivePackFenceTest do
 
   defp write_deadline do
     System.monotonic_time(:millisecond) + 10_000
+  end
+
+  defp finish_native_worker(worker, message) do
+    monitor = Process.monitor(worker)
+    send(worker, message)
+
+    assert_receive {:DOWN, ^monitor, :process, ^worker, _reason}, 5_000
   end
 
   defp wait_for_waiters(expected, attempts \\ 100)

@@ -259,15 +259,19 @@ defmodule GitTransportTest do
         :owner_death ->
           parent = self()
 
-          owner =
-            spawn(fn ->
+          {owner, monitor} =
+            spawn_monitor(fn ->
               {:ok, _handle} = ForgeRepos.open_repository_read(repository, deadline)
               send(parent, {:channel_owner_acquired, self()})
               Process.sleep(:infinity)
             end)
 
-          assert_receive {:channel_owner_acquired, ^owner}
-          Process.exit(owner, :kill)
+          try do
+            assert_receive {:channel_owner_acquired, ^owner}, 1_000
+          after
+            Process.exit(owner, :kill)
+            assert_receive {:DOWN, ^monitor, :process, ^owner, _reason}, 1_000
+          end
 
         path ->
           assert {:ok, handle} = ForgeRepos.open_repository_read(repository, deadline)

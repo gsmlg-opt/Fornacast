@@ -96,14 +96,14 @@ defmodule ForgeGitHub.InstallationTokenBrokerTest do
       )
 
     caller = Task.async(fn -> InstallationTokenBroker.fetch(broker, 44) end)
-    assert_receive {:fetch_started, 1, stale_fetch_task}
+    assert_receive {:fetch_started, 1, stale_fetch_task}, 1_000
     stale_monitor = Process.monitor(stale_fetch_task)
     assert :ok = InstallationTokenBroker.invalidate(broker, 44)
     assert {:error, :invalidated} = Task.await(caller)
-    assert_receive {:DOWN, ^stale_monitor, :process, ^stale_fetch_task, _reason}
+    assert_receive {:DOWN, ^stale_monitor, :process, ^stale_fetch_task, _reason}, 1_000
 
     fresh = Task.async(fn -> InstallationTokenBroker.fetch(broker, 44) end)
-    assert_receive {:fetch_started, 2, fresh_fetch_task}
+    assert_receive {:fetch_started, 2, fresh_fetch_task}, 1_000
     send(fresh_fetch_task, :release)
     assert %InstallationToken{token: "generation-2"} = Task.await(fresh)
 
@@ -210,17 +210,23 @@ defmodule ForgeGitHub.InstallationTokenBrokerTest do
         end
       )
 
-    caller = spawn(fn -> InstallationTokenBroker.fetch(broker, 44) end)
-    assert_receive {:dead_caller_fetch, fetch_task}
-    fetch_monitor = Process.monitor(fetch_task)
-    Process.exit(caller, :kill)
-    assert_receive {:DOWN, ^fetch_monitor, :process, ^fetch_task, _reason}, 1_000
+    {caller, caller_monitor} = spawn_monitor(fn -> InstallationTokenBroker.fetch(broker, 44) end)
 
-    replacement = Task.async(fn -> InstallationTokenBroker.fetch(broker, 44) end)
-    assert_receive {:dead_caller_fetch, replacement_fetch}
-    assert :ok = InstallationTokenBroker.invalidate(broker, 44)
-    assert {:error, :invalidated} = Task.await(replacement)
-    refute Process.alive?(replacement_fetch)
+    try do
+      assert_receive {:dead_caller_fetch, fetch_task}, 1_000
+      fetch_monitor = Process.monitor(fetch_task)
+      Process.exit(caller, :kill)
+      assert_receive {:DOWN, ^fetch_monitor, :process, ^fetch_task, _reason}, 1_000
+
+      replacement = Task.async(fn -> InstallationTokenBroker.fetch(broker, 44) end)
+      assert_receive {:dead_caller_fetch, replacement_fetch}, 1_000
+      assert :ok = InstallationTokenBroker.invalidate(broker, 44)
+      assert {:error, :invalidated} = Task.await(replacement)
+      refute Process.alive?(replacement_fetch)
+    after
+      Process.exit(caller, :kill)
+      assert_receive {:DOWN, ^caller_monitor, :process, ^caller, _reason}, 1_000
+    end
   end
 
   test "waiters expire before the public call timeout and release the task" do
