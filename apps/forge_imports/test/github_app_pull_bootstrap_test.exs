@@ -406,7 +406,48 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
     assert release_state.confirmed_remote_updated_at == nil
     assert release_state.confirmed_fingerprint == nil
     assert release_state.confirmed_snapshot == nil
-    assert Repo.get_by!(ObjectMapping, repository_item_id: item.id, object_kind: "release")
+
+    release_mapping =
+      Repo.get_by!(ObjectMapping, repository_item_id: item.id, object_kind: "release")
+
+    assert release_mapping.source_evidence["asset_count"] == 0
+
+    for evidence <- [
+          Map.delete(release_mapping.source_evidence, "asset_count"),
+          Map.put(release_mapping.source_evidence, "asset_count", 512)
+        ] do
+      assert {:error, :test_rollback, :test_rollback, %{bootstrap_handoff: handoff}} =
+               handoff_with_release_evidence(
+                 run,
+                 ready,
+                 published,
+                 release_mapping,
+                 evidence,
+                 now
+               )
+
+      assert handoff.promoted_resources > 0
+    end
+
+    invalid_evidence =
+      Enum.map([-1, 513, "0", nil], fn count ->
+        Map.put(release_mapping.source_evidence, "asset_count", count)
+      end) ++ [Map.put(release_mapping.source_evidence, "unexpected", true)]
+
+    for evidence <- invalid_evidence do
+      assert {:error, :bootstrap_handoff, :release_baseline_requires_refetch, _changes} =
+               handoff_with_release_evidence(
+                 run,
+                 ready,
+                 published,
+                 release_mapping,
+                 evidence,
+                 now
+               )
+    end
+
+    assert Repo.get!(ObjectMapping, release_mapping.id).source_evidence ==
+             release_mapping.source_evidence
 
     assert %{state: :pending, organization_mirror_id: organization_mirror_id} =
              Repo.get!(ForgeMirrors.MirrorWebhookDelivery, buffered_pull.id)
@@ -544,6 +585,16 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
            )
 
     refute Repo.get_by(Release, repository_id: shadow.id)
+  end
+
+  defp handoff_with_release_evidence(run, item, repository, mapping, evidence, now) do
+    Multi.new()
+    |> Multi.update(:release_evidence, Changeset.change(mapping, source_evidence: evidence))
+    |> Multi.put(:repository, %{repository: repository})
+    |> Multi.put(:item, item)
+    |> ForgeImports.OrganizationSync.Handoff.append(:bootstrap_handoff, run.id, item.id, now)
+    |> Multi.run(:test_rollback, fn _repo, _changes -> {:error, :test_rollback} end)
+    |> Repo.transaction()
   end
 
   defp staged_item(run, organization, now) do
