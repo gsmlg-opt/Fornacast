@@ -56,19 +56,25 @@ defmodule ForgeGitHub.ClientGraphQLDeadlineTest do
     holder =
       Task.async(fn ->
         RequestGate.run(gate_key, fn ->
+          owner_monitor = Process.monitor(parent)
           send(parent, :gate_held)
 
           receive do
             :release_gate -> :ok
+            {:DOWN, ^owner_monitor, :process, ^parent, _reason} -> :ok
           end
+
+          Process.demonitor(owner_monitor, [:flush])
+          :ok
         end)
       end)
 
-    assert_receive :gate_held
-    deadline = System.monotonic_time(:millisecond) + 2_300
-
     caller =
       Task.async(fn ->
+        receive do: (:start_caller -> :ok)
+        deadline = System.monotonic_time(:millisecond) + 3_000
+        send(parent, {:caller_deadline, deadline})
+
         Client.pull_graphql_request(
           "token",
           %{"query" => "query { viewer { id } }"},
@@ -76,24 +82,48 @@ defmodule ForgeGitHub.ClientGraphQLDeadlineTest do
             gate_key: gate_key,
             deadline_monotonic_ms: deadline,
             resolver: fn "api.github.com" ->
-              send(parent, {:delayed_resolver_started, self()})
-              Process.sleep(1_700)
-              send(parent, :delayed_resolver_finished)
+              send(parent, :resolver_called)
               {:ok, [{140, 82, 114, 5}]}
             end
           )
         )
       end)
 
-    Process.sleep(900)
-    send(holder.pid, :release_gate)
-    assert :ok = Task.await(holder)
+    try do
+      assert_receive :gate_held, 5_000
+      :erlang.trace(caller.pid, true, [:procs, :send, :set_on_spawn])
+      send(caller.pid, :start_caller)
 
-    assert {:error, %Error{kind: :timeout}} = Task.await(caller, 4_000)
-    assert_receive {:delayed_resolver_started, resolver_pid}
-    resolver_monitor = Process.monitor(resolver_pid)
-    assert_receive {:DOWN, ^resolver_monitor, :process, ^resolver_pid, _reason}, 500
-    refute_receive :delayed_resolver_finished
+      assert_receive {:caller_deadline, deadline}, 5_000
+      caller_pid = caller.pid
+      assert_receive {:trace, ^caller_pid, :spawn, lock_worker, _mfa}, 5_000
+      assert_receive {:trace, ^caller_pid, :spawn, watchdog, _mfa}, 5_000
+      :erlang.suspend_process(caller_pid)
+
+      send(holder.pid, :release_gate)
+      assert :ok = Task.await(holder)
+
+      assert_receive {:trace, ^lock_worker, :send, {_reference, :acquired, ^lock_worker},
+                      ^caller_pid},
+                     5_000
+
+      for pid <- [caller_pid, lock_worker, watchdog], do: :erlang.trace(pid, false, [:all])
+
+      # Keep the acquisition acknowledgement queued until the original budget is exhausted.
+      timer = make_ref()
+      Process.send_after(self(), timer, max(deadline - System.monotonic_time(:millisecond), 0))
+      assert_receive ^timer, 5_000
+      assert System.monotonic_time(:millisecond) >= deadline
+      :erlang.resume_process(caller_pid)
+
+      assert {:error, %Error{kind: :timeout}} = Task.await(caller, 5_000)
+      refute_receive :resolver_called
+    after
+      resume_if_suspended(caller.pid)
+      Task.shutdown(caller, :brutal_kill)
+      send(holder.pid, :release_gate)
+      Task.shutdown(holder, 5_000)
+    end
   end
 
   test "too-short, malformed, duplicate, and non-GraphQL deadline options fail before HTTP" do
@@ -145,6 +175,12 @@ defmodule ForgeGitHub.ClientGraphQLDeadlineTest do
   end
 
   defp stub_name, do: {__MODULE__, System.unique_integer([:positive])}
+
+  defp resume_if_suspended(pid) do
+    if Process.info(pid, :status) == {:status, :suspended}, do: :erlang.resume_process(pid)
+  catch
+    :error, :badarg -> :ok
+  end
 
   defmodule DeadlineMint do
     def connect(:https, address, 443, options) do

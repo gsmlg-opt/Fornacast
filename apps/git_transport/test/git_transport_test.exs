@@ -989,9 +989,13 @@ defmodule GitTransportTest do
     dirty_clone_path = Path.join(tmp_dir, "dirty-clone")
     dirty_entered = Path.join(tmp_dir, "ssh-dirty-entered")
     dirty_release = Path.join(tmp_dir, "ssh-dirty-release")
+    pack_started = make_ref()
+    parent = self()
 
     GitTransport.UploadPack.with_test_global_pack_objects(
       fn path, wants ->
+        send(parent, {pack_started, :pack_started})
+
         {:ok, {}} =
           GitTransport.TestDirtyIoNative.test_dirty_io_wait(dirty_entered, dirty_release)
 
@@ -1025,19 +1029,39 @@ defmodule GitTransportTest do
             )
           end)
 
-        wait_for_file!(dirty_entered)
+        clone_ref = clone.ref
 
-        cleanup =
-          Task.async(fn ->
-            deadline = System.monotonic_time(:millisecond) + 2_000
-            GitCore.RepositoryReadLimiter.acquire_cleanup(repo.id, deadline)
-          end)
+        try do
+          receive do
+            {^pack_started, :pack_started} ->
+              :ok
 
-        assert Task.yield(cleanup, 30) == nil
-        File.touch!(dirty_release)
-        assert {_output, 0} = Task.await(clone)
-        assert {:ok, cleanup_lease} = Task.await(cleanup)
-        assert :ok = GitCore.RepositoryReadLimiter.release(cleanup_lease)
+            {^clone_ref, {output, status}} ->
+              flunk("SSH clone exited before pack generation (#{status}):\n#{output}")
+          after
+            5_000 -> flunk("SSH clone did not reach pack generation")
+          end
+
+          wait_for_file!(dirty_entered)
+
+          cleanup =
+            Task.async(fn ->
+              deadline = System.monotonic_time(:millisecond) + 2_000
+              GitCore.RepositoryReadLimiter.acquire_cleanup(repo.id, deadline)
+            end)
+
+          assert Task.yield(cleanup, 30) == nil
+          File.touch!(dirty_release)
+          assert {_output, 0} = Task.await(clone)
+          assert {:ok, cleanup_lease} = Task.await(cleanup)
+          assert :ok = GitCore.RepositoryReadLimiter.release(cleanup_lease)
+        after
+          File.touch!(dirty_release)
+
+          if Process.alive?(clone.pid) do
+            Task.yield(clone, 5_000) || Task.shutdown(clone, :brutal_kill)
+          end
+        end
       end
     )
 
