@@ -532,10 +532,8 @@ defmodule GitTransport.ReceivePackFenceTest do
     native = fn ^path, "PACK", ^commands ->
       update_ref(path, proposed_oid, "refs/heads/main")
       send(test_pid, {:native_effect_complete, self()})
-
-      receive do
-        :finish_native -> {:ok, [{"refs/heads/main", "ok", nil}]}
-      end
+      await_native_release(test_pid, :finish_native)
+      {:ok, [{"refs/heads/main", "ok", nil}]}
     end
 
     request_id = "fenced-bookkeeping"
@@ -778,10 +776,8 @@ defmodule GitTransport.ReceivePackFenceTest do
     first =
       response_task(repository, fn _path, _pack, _commands ->
         send(parent, {:native_entered, :first, self()})
-
-        receive do
-          :release -> {:ok, [{"refs/heads/main", "ok", nil}]}
-        end
+        await_native_release(parent, :release)
+        {:ok, [{"refs/heads/main", "ok", nil}]}
       end)
 
     assert_receive {:native_entered, :first, first_worker}, 5_000
@@ -895,9 +891,8 @@ defmodule GitTransport.ReceivePackFenceTest do
             send(parent, {:native_entered, :long, self(), deadline})
         end
 
-        receive do
-          :release -> {:ok, [{"refs/heads/main", "ok", nil}]}
-        end
+        await_native_release(parent, :release)
+        {:ok, [{"refs/heads/main", "ok", nil}]}
       end)
 
     assert_receive {:native_entered, :long, first_worker, deadline}, 5_000
@@ -1588,6 +1583,19 @@ defmodule GitTransport.ReceivePackFenceTest do
     send(worker, message)
 
     assert_receive {:DOWN, ^monitor, :process, ^worker, _reason}, 5_000
+  end
+
+  defp await_native_release(owner, message) do
+    monitor = Process.monitor(owner)
+
+    try do
+      receive do
+        ^message -> :ok
+        {:DOWN, ^monitor, :process, ^owner, _reason} -> :ok
+      end
+    after
+      Process.demonitor(monitor, [:flush])
+    end
   end
 
   defp wait_for_waiters(expected, attempts \\ 100)
