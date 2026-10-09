@@ -26,11 +26,30 @@ defmodule ForgeImports.RepositoryWorkerTest do
   @pat "github_pat_repository_worker_secret"
   @keyring %{active: "test-v1", keys: %{"test-v1" => :binary.copy(<<7>>, 32)}}
 
-  setup do
+  setup context do
     if postgres?() do
-      :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
-      Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
-      ForgeImports.RecoveryTestHelper.mark_sandbox_owner!()
+      if context[:independent_connections] do
+        owner_key = {ForgeImports.Reconciler, :sandbox_owner}
+        original_owner = :persistent_term.get(owner_key, nil)
+        :ok = Ecto.Adapters.SQL.Sandbox.mode(Repo, :auto)
+        :persistent_term.put(owner_key, nil)
+
+        on_exit(fn ->
+          try do
+            reset_database!()
+          after
+            :ok = Ecto.Adapters.SQL.Sandbox.mode(Repo, :manual)
+            :persistent_term.put(owner_key, original_owner)
+          end
+        end)
+
+        reset_database!()
+      else
+        :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+        Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+        ForgeImports.RecoveryTestHelper.mark_sandbox_owner!()
+        reset_database!()
+      end
     else
       reset_database!()
       on_exit(&reset_database!/0)
@@ -1656,6 +1675,7 @@ defmodule ForgeImports.RepositoryWorkerTest do
   end
 
   @tag :tmp_dir
+  @tag independent_connections: true
   test "RecoverySupervisor death kills Remote descendants and restart records quarantine",
        context do
     fake = write_blocking_remote_git!(context.tmp_dir)
@@ -4030,6 +4050,9 @@ defmodule ForgeImports.RepositoryWorkerTest do
 
   defp reset_database! do
     for table <- [
+          "mirror_pull_metadata_intents",
+          "mirror_pull_creation_intents",
+          "organization_pat_configurations",
           "github_import_repository_cleanups",
           "github_import_report_entries",
           "github_import_page_checkpoints",
@@ -4037,11 +4060,12 @@ defmodule ForgeImports.RepositoryWorkerTest do
           "github_import_attempts",
           "github_import_repository_items",
           "github_import_runs",
+          "organization_mirrors",
           "github_credentials",
-          "github_identities",
           "audit_events",
           "repository_collaborators",
           "repositories",
+          "github_identities",
           "organization_members",
           "api_keys",
           "ssh_keys",

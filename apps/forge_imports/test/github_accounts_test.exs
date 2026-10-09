@@ -33,6 +33,8 @@ defmodule ForgeImports.GitHubAccountsTest do
   setup do
     if postgres?() do
       :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+      # Committed concurrency fixtures can leave audits outside this sandbox.
+      Repo.delete_all(AuditEvent)
     else
       reset_database!()
       on_exit(&reset_database!/0)
