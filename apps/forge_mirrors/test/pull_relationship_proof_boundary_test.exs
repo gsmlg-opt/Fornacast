@@ -87,6 +87,7 @@ defmodule ForgeMirrors.PullRelationshipProofBoundaryTest do
         aggregate_id: to_string(issue.id),
         event_type: "issue.created",
         origin: :fornacast,
+        available_at: now,
         payload: %{
           "repository_id" => base.repository_id,
           "issue_id" => issue.id,
@@ -102,7 +103,7 @@ defmodule ForgeMirrors.PullRelationshipProofBoundaryTest do
     {:ok, claimed} =
       ForgeMirrors.claim_operations("relationship-proof", now, 120, 100, ["sync.pull"])
 
-    operation = Enum.find(claimed, &(&1.id == queued.id))
+    [operation] = Enum.filter(claimed, &(&1.id == queued.id))
     {:ok, unmarked} = ForgeMirrors.outbound_pull_creation_context(operation)
 
     expected =
