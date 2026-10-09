@@ -36,10 +36,12 @@ defmodule FornacastAPI.DatabaseWorkflowContractTest do
     refute unit_job =~ "strategy:"
     refute workflow =~ "matrix."
     refute workflow =~ "turso"
-    assert length(:binary.matches(workflow, "image: postgres:17")) == 1
+
+    assert length(:binary.matches(workflow, "image: public.ecr.aws/docker/library/postgres:17")) ==
+             1
 
     assert unit_job =~
-             ~r/services:\s*\n\s+postgres:\s*\n\s+image: postgres:17\s*\n\s+env:\s*\n\s+POSTGRES_DB: fornacast_test\s*\n\s+POSTGRES_USER: postgres\s*\n\s+POSTGRES_PASSWORD: postgres/s
+             ~r/services:\s*\n\s+postgres:\s*\n\s+image: public\.ecr\.aws\/docker\/library\/postgres:17\s*\n\s+env:\s*\n\s+POSTGRES_DB: fornacast_test\s*\n\s+POSTGRES_USER: postgres\s*\n\s+POSTGRES_PASSWORD: postgres/s
 
     assert unit_job =~ ~r/ports:\s*\n\s*- 5432:5432/
     assert unit_job =~ "pg_isready -U postgres -d fornacast_test"

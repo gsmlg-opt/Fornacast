@@ -278,7 +278,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     refute workflow =~ "FORNACAST_DATABASE_PATH"
 
     assert workflow =~
-             ~r/release-smoke:\s*\n\s+name: Release Smoke\s*\n\s+runs-on: ubuntu-24\.04\s*\n\s+services:\s*\n\s+postgres:\s*\n\s+image: postgres:17\s*\n\s+env:\s*\n\s+POSTGRES_DB: fornacast_e2e\s*\n\s+POSTGRES_USER: fornacast\s*\n\s+POSTGRES_PASSWORD: fornacast_e2e_password\s*\n\s+ports:\s*\n\s+- 5432:5432\s*\n\s+options: >-\s*\n\s+--health-cmd "pg_isready -U fornacast -d fornacast_e2e"\s*\n\s+--health-interval 5s\s*\n\s+--health-timeout 5s\s*\n\s+--health-retries 20/s
+             ~r/release-smoke:\s*\n\s+name: Release Smoke\s*\n\s+runs-on: ubuntu-24\.04\s*\n\s+services:\s*\n\s+postgres:\s*\n\s+image: public\.ecr\.aws\/docker\/library\/postgres:17\s*\n\s+env:\s*\n\s+POSTGRES_DB: fornacast_e2e\s*\n\s+POSTGRES_USER: fornacast\s*\n\s+POSTGRES_PASSWORD: fornacast_e2e_password\s*\n\s+ports:\s*\n\s+- 5432:5432\s*\n\s+options: >-\s*\n\s+--health-cmd "pg_isready -U fornacast -d fornacast_e2e"\s*\n\s+--health-interval 5s\s*\n\s+--health-timeout 5s\s*\n\s+--health-retries 20/s
 
     assert workflow =~ "POSTGRES_HOST: 127.0.0.1"
     assert workflow =~ ~r/POSTGRES_PORT: ["']5432["']/
