@@ -67,7 +67,11 @@ defmodule ForgeImports.OrganizationOrchestrationTest do
                user_id: actor_id,
                role: :owner
              }
-           ] = Repo.all(OrganizationMember)
+           ] =
+             Repo.all(
+               from membership in OrganizationMember,
+                 where: membership.organization_id == ^activated.destination_organization.id
+             )
 
     assert {organization_id, actor_id} ==
              {activated.destination_organization.id, actor.id}

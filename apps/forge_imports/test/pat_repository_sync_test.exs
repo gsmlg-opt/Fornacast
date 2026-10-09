@@ -82,6 +82,7 @@ defmodule ForgeImports.PatRepositorySyncTest do
   end
 
   test "updates branches and tags using PAT without a GitHub App installation", c do
+    installation_count = Repo.aggregate(ForgeMirrors.GitHubAppInstallation, :count)
     target = commit!(c.source, "upstream update", "README.md", "updated\n")
     git!(c.source, ["branch", "feature"])
     git!(c.source, ["tag", "v1"])
@@ -99,7 +100,7 @@ defmodule ForgeImports.PatRepositorySyncTest do
     assert %Repository{write_version: 3, last_pushed_at: %DateTime{}} =
              Repo.get!(Repository, c.repository.id)
 
-    assert Repo.aggregate(ForgeMirrors.GitHubAppInstallation, :count) == 0
+    assert Repo.aggregate(ForgeMirrors.GitHubAppInstallation, :count) == installation_count
 
     assert :ok = sync(c)
     assert %Repository{write_version: 3} = Repo.get!(Repository, c.repository.id)
@@ -334,7 +335,7 @@ defmodule ForgeImports.PatRepositorySyncTest do
 
           reader = fn
             [data], _ -> {:ok, data, []}
-            [], _ -> {:done, []}
+            [], _ -> {:eof, []}
           end
 
           {:ok, staged, []} = consumer.(reader, [payload])

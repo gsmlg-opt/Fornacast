@@ -4,6 +4,7 @@ defmodule ForgeImports.RunViewConsistencyTest do
   import Ecto.Query
 
   alias Ecto.Multi
+  alias ForgeImports.TestSupport.LFSImportFixture
 
   alias ForgeImports.{
     DiscoveryWorker,
@@ -342,6 +343,11 @@ defmodule ForgeImports.RunViewConsistencyTest do
       })
       |> Repo.transaction()
 
+    staged_path = ForgeRepos.absolute_storage_path(shadow)
+    File.mkdir_p!(Path.dirname(staged_path))
+    assert {:ok, ^staged_path} = GitCore.init_bare(staged_path)
+    on_exit(fn -> File.rm_rf!(staged_path) end)
+
     assert {1, _rows} =
              Repo.update_all(
                from(candidate in RepositoryItem, where: candidate.id == ^item.id),
@@ -351,10 +357,10 @@ defmodule ForgeImports.RunViewConsistencyTest do
                  staged_storage_path: ForgeRepos.absolute_storage_path(shadow),
                  checkpoint: %{"git_staged" => true, "unsupported_scan" => "complete"},
                  source_git: %{
-                   "empty" => false,
+                   "empty" => true,
                    "default_branch" => "main",
-                   "refs" => 1,
-                   "bytes" => 1,
+                   "refs" => 0,
+                   "bytes" => 0,
                    "lfs_detected" => false,
                    "submodules_detected" => false,
                    "scan_truncated" => false
@@ -362,7 +368,7 @@ defmodule ForgeImports.RunViewConsistencyTest do
                ]
              )
 
-    item = Repo.get!(RepositoryItem, item.id)
+    item = Repo.get!(RepositoryItem, item.id) |> LFSImportFixture.complete!(run)
 
     decision =
       if target do

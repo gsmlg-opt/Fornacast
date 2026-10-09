@@ -3897,7 +3897,7 @@ defmodule ForgeImports.RepositoryWorkerTest do
     do: :crypto.hash(:sha256, payload) |> Base.encode16(case: :lower)
 
   defp lfs_chunk_reader([chunk | rest], _options), do: {:ok, chunk, rest}
-  defp lfs_chunk_reader([], _options), do: {:done, []}
+  defp lfs_chunk_reader([], _options), do: {:eof, []}
 
   defp write_blocking_remote_git!(tmp_dir) do
     git = Path.join(tmp_dir, "blocking-remote-git")

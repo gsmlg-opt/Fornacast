@@ -175,16 +175,17 @@ defmodule ForgeGitHub.InstallationTokenBrokerTest do
         end
       )
 
-    callers =
-      for _ <- 1..201 do
-        Task.async(fn ->
-          result = InstallationTokenBroker.fetch(broker, 44)
-          send(parent, {:bounded_result, result})
-          result
-        end)
-      end
+    fetch = fn ->
+      result = InstallationTokenBroker.fetch(broker, 44)
+      send(parent, {:bounded_result, result})
+      result
+    end
 
-    assert_receive {:bounded_fetch, fetch_task}
+    first = Task.async(fetch)
+    assert_receive {:bounded_fetch, fetch_task}, 1_000
+    remaining = for _ <- 1..200, do: Task.async(fetch)
+    callers = [first | remaining]
+
     assert_receive {:bounded_result, {:error, :busy}}, 2_000
     refute_receive {:bounded_result, _other}, 100
 

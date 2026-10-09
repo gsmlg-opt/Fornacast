@@ -5,7 +5,7 @@ defmodule ForgeImports.GitHubImportE2ETest do
 
   alias ForgeAccounts.{GitHubCredential, Organization, User}
   alias ForgeImports.GitHub.MetadataImporter
-  alias ForgeImports.TestSupport.{FakeGitHub, GitRemoteFixture, ImportReset}
+  alias ForgeImports.TestSupport.{FakeGitHub, GitRemoteFixture, ImportReset, LFSImportFixture}
 
   alias ForgeImports.{
     ImportAttempt,
@@ -411,6 +411,7 @@ defmodule ForgeImports.GitHubImportE2ETest do
   end
 
   defp stage_metadata_and_publish(actor, item, opts) do
+    item = LFSImportFixture.complete!(item, Repo.get!(ImportRun, item.import_run_id))
     owner = Keyword.fetch!(opts, :owner)
     repo_name = Keyword.fetch!(opts, :repo)
     destination_slug = Keyword.get(opts, :destination_slug, item.destination_slug)

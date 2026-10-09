@@ -68,11 +68,11 @@ defmodule ForgeGitHub.PullSyncWorkerLifecycleTest do
                   ["sync.pull", "reconcile.repository.pull_heads"] ->
           {:ok, operations}
         end,
-        reconcile_pull_heads: fn operation, %DateTime{} ->
-          send(parent, {:pull_operation_started, operation.id, self()})
+        resource_inventory: fn id, :pull, nil, 100 ->
+          send(parent, {:pull_operation_started, id, self()})
 
           receive do
-            :release -> {:ok, operation.id}
+            :release -> {:ok, %{observations: [], next_cursor: nil}}
           end
         end
       )
@@ -112,11 +112,11 @@ defmodule ForgeGitHub.PullSyncWorkerLifecycleTest do
                   ["sync.pull", "reconcile.repository.pull_heads"] ->
           {:ok, operations}
         end,
-        reconcile_pull_heads: fn operation, %DateTime{} ->
-          send(parent, {:maximum_pull_operation_started, operation.id, self()})
+        resource_inventory: fn id, :pull, nil, 100 ->
+          send(parent, {:maximum_pull_operation_started, id, self()})
 
           receive do
-            :release -> {:ok, operation.id}
+            :release -> {:ok, %{observations: [], next_cursor: nil}}
           end
         end
       )
@@ -154,6 +154,10 @@ defmodule ForgeGitHub.PullSyncWorkerLifecycleTest do
           interval_ms: 10,
           task_supervisor: task_supervisor,
           loop_task_supervisor: loop_task_supervisor,
+          reconciliation_context: fn operation ->
+            {:ok, %{phase: :mapped, repository_mirror_id: operation.id, mapping_cursor: nil}}
+          end,
+          record_page: fn operation, :pull, [], nil, %DateTime{} -> {:ok, operation.id} end,
           claim: fn "pull-lifecycle-test",
                     %DateTime{},
                     60,
