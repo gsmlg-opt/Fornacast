@@ -37,7 +37,7 @@ defmodule FornacastAPI.MixProject do
       {:forge_github, in_umbrella: true},
       {:forge_mirrors, in_umbrella: true},
       {:git_core, in_umbrella: true},
-      {:phoenix, "~> 1.8"},
+      {:phoenix, "~> 1.8.15"},
       {:bandit, "~> 1.12"},
       {:absinthe, "~> 1.7"},
       {:absinthe_plug, "~> 1.5"},

@@ -33,9 +33,9 @@ defmodule ForgeGitHub.MixProject do
       {:git_lfs, in_umbrella: true},
       {:git_core, in_umbrella: true},
       {:ecto, "~> 3.14"},
-      {:mint, "~> 1.9"},
+      {:mint, "~> 1.11"},
       {:plug, "~> 1.19"},
-      {:req, "~> 0.7"},
+      {:req, "~> 0.7.5"},
       {:telemetry, "~> 1.0"}
     ]
   end

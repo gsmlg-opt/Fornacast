@@ -37,14 +37,14 @@ defmodule FornacastWeb.MixProject do
       {:git_core, in_umbrella: true},
       {:git_lfs, in_umbrella: true},
       {:git_transport, in_umbrella: true},
-      {:phoenix, "~> 1.8"},
-      {:phoenix_duskmoon, "~> 9.8"},
-      {:duskmoon_bundler_runtime, "~> 9.8"},
-      {:duskmoon_bundler, "~> 9.8", runtime: Mix.env() == :dev},
+      {:phoenix, "~> 1.8.15"},
+      {:phoenix_duskmoon, "~> 9.16.7"},
+      {:duskmoon_bundler_runtime, "~> 9.16.1"},
+      {:duskmoon_bundler, "~> 9.16.1", runtime: Mix.env() == :dev},
       {:phoenix_ecto, "~> 4.7"},
       {:phoenix_html, "~> 4.3"},
       {:bandit, "~> 1.12"},
-      {:mdex, "~> 0.13.2"}
+      {:mdex, "~> 0.14.2"}
     ]
   end
 end

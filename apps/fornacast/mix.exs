@@ -32,7 +32,7 @@ defmodule Fornacast.MixProject do
       # TODO(upstream): gsmlg-dev/concord#76
       {:concord, "~> 3.0"},
       {:postgrex, "~> 0.22.2"},
-      {:phoenix_pubsub, "~> 2.2"}
+      {:phoenix_pubsub, "~> 2.4.1"}
     ]
   end
 end

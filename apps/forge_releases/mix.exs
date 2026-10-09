@@ -30,7 +30,7 @@ defmodule ForgeReleases.MixProject do
       {:forge_repos, in_umbrella: true},
       {:git_core, in_umbrella: true},
       {:ecto, "~> 3.14"},
-      {:mdex, "~> 0.13.2"}
+      {:mdex, "~> 0.14.2"}
     ]
   end
 end

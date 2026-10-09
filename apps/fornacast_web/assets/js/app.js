@@ -1,5 +1,6 @@
 import "phoenix_duskmoon";
 // TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#104
+// TODO(upstream): duskmoon-dev/duskmoon-elements#83
 import { registerAll } from "@duskmoon-dev/elements";
 import { registerAllArts } from "@duskmoon-dev/art-elements";
 import { initImportStatusPolling } from "./import_status.js";

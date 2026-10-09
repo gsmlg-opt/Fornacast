@@ -327,6 +327,7 @@ config :phoenix, :filter_parameters, {:keep, []}
 
 fornacast_web_path = Path.expand("../apps/fornacast_web", __DIR__)
 
+# TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#175 - update when the split-chunk export fix is released.
 config :duskmoon_bundler, :fornacast_web,
   entry: Path.join(fornacast_web_path, "assets/js/app.js"),
   outdir: Path.join(fornacast_web_path, "priv/static/assets"),

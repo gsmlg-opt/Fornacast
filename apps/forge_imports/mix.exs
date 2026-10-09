@@ -33,7 +33,7 @@ defmodule ForgeImports.MixProject do
       {:git_core, in_umbrella: true},
       {:git_lfs, in_umbrella: true},
       {:ecto, "~> 3.14"},
-      {:req, "~> 0.7"}
+      {:req, "~> 0.7.5"}
     ]
   end
 
