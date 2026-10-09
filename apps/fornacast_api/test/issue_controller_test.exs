@@ -522,6 +522,10 @@ defmodule FornacastAPI.IssueControllerTest do
     comment(second, alice)
     second_comment = comment(second, alice)
 
+    Repo.update_all(from(row in Comment, where: row.issue_id == ^second.id),
+      set: [inserted_at: now, updated_at: now]
+    )
+
     for version <- @versions do
       query =
         URI.encode_query(%{
@@ -555,7 +559,7 @@ defmodule FornacastAPI.IssueControllerTest do
       comments =
         api_conn(nil, version)
         |> get(
-          "/api/v3/repos/alice/filters/issues/2/comments?since=#{URI.encode_www_form(DateTime.to_iso8601(second_comment.updated_at))}&page=2&per_page=1"
+          "/api/v3/repos/alice/filters/issues/2/comments?since=#{URI.encode_www_form(DateTime.to_iso8601(now))}&page=2&per_page=1"
         )
 
       assert [comment_body] = json_response(comments, 200)

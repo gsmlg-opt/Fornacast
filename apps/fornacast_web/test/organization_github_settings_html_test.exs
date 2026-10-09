@@ -26,7 +26,8 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTMLTest do
     assert html =~ ~s(action="/organizations/acme/settings/github/install" method="post")
     assert html =~ "Install GitHub App"
     assert length(Regex.scan(~r/<button\b[^>]*class="[^"]*btn-primary/, html)) == 1
-    assert length(Regex.scan(~r/<el-dm-card\b/, html)) >= 4
+    document = LazyHTML.from_fragment(html)
+    assert Enum.count(LazyHTML.query(document, "article.card")) >= 4
     refute html =~ "daisy"
     refute html =~ ~r/(?:bg|text|border)-(?:red|blue|green|gray|slate|zinc)-\d+/
   end

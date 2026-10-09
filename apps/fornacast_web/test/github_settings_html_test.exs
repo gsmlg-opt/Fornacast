@@ -15,7 +15,8 @@ defmodule FornacastWeb.GitHubSettingsHTMLTest do
 
     assert html =~ "data-github-settings"
     assert html =~ "bg-surface-container-low"
-    assert length(Regex.scan(~r/<el-dm-card\b/, html)) == 3
+    document = LazyHTML.from_fragment(html)
+    assert Enum.count(LazyHTML.query(document, "article.card")) == 3
     assert html =~ "Github:octocat"
     assert html =~ "Github:hubot"
     refute html =~ "https://avatars.githubusercontent.com/u/90041"
@@ -29,7 +30,7 @@ defmodule FornacastWeb.GitHubSettingsHTMLTest do
     assert length(Regex.scan(~r/<h3\b[^>]*id="github-account-\d+-heading"/, html)) == 2
     assert length(Regex.scan(~r/<button\b[^>]*class="[^"]*btn-primary/, html)) == 1
     assert html =~ ~s(<ul class="grid gap-4" data-github-account-list role="list">)
-    assert length(Regex.scan(~r/<article\b/, html)) == 2
+    assert Enum.count(LazyHTML.query(document, "article[aria-labelledby]")) == 2
     assert length(Regex.scan(~r/<time\b[^>]*datetime="2026-08-26T08:0[01]:00Z"/, html)) == 4
     refute html =~ ~r/\bgap-(?:1|3|6)\b/
     refute html =~ ~r/(?:bg|text|border)-(?:red|blue|green|gray|slate|zinc)-\d+/

@@ -37,8 +37,10 @@ defmodule FornacastWeb.ImportHTMLTest do
 
     assert repository =~ "data-repository-import"
     assert organization =~ "data-organization-import"
-    assert length(Regex.scan(~r/<el-dm-card\b/, repository)) >= 1
-    assert length(Regex.scan(~r/<el-dm-card\b/, organization)) >= 1
+    repository_document = LazyHTML.from_fragment(repository)
+    organization_document = LazyHTML.from_fragment(organization)
+    assert Enum.count(LazyHTML.query(repository_document, "article.card")) >= 1
+    assert Enum.count(LazyHTML.query(organization_document, "article.card")) >= 1
     assert repository =~ ~s(action="/repos/import/discover" method="post")
     assert organization =~ ~s(action="/organizations/import/discover" method="post")
     assert repository =~ ~s(name="import[source]")
