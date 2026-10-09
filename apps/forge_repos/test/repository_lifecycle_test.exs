@@ -570,6 +570,73 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
   end
 
   @tag :tmp_dir
+  test "PostgreSQL historical fixtures restore the full schema after success and failure",
+       context do
+    if postgres?() do
+      migration_repo = start_migration_repo!(context)
+      applied_versions = Enum.sort(Ecto.Migrator.migrated_versions(migration_repo))
+
+      assert migration_applied?(migration_repo, @cleanup_selector_version)
+
+      assert table_column_exists?(
+               migration_repo,
+               "organization_pat_configurations",
+               "last_sync_summary"
+             )
+
+      for outcome <- [:success, :failure] do
+        body = fn ->
+          assert [@cleanup_selector_version] =
+                   migrate_down(migration_repo, @cleanup_selector_version)
+
+          refute migration_applied?(migration_repo, @cleanup_selector_version)
+
+          refute table_column_exists?(
+                   migration_repo,
+                   "organization_pat_configurations",
+                   "last_sync_summary"
+                 )
+
+          for version <- [
+                @cleanup_recovery_version,
+                @staged_path_version,
+                @write_version,
+                @version
+              ] do
+            assert [^version] = migrate_down(migration_repo, version)
+          end
+
+          if outcome == :failure, do: raise("historical fixture body failure")
+          :historical_schema
+        end
+
+        cleanup = fn ->
+          assert migration_applied?(migration_repo, @cleanup_selector_version)
+
+          assert table_column_exists?(
+                   migration_repo,
+                   "organization_pat_configurations",
+                   "last_sync_summary"
+                 )
+
+          send(self(), {:historical_fixture_cleanup, outcome})
+        end
+
+        if outcome == :failure do
+          assert_raise RuntimeError, "historical fixture body failure", fn ->
+            with_complete_restore(migration_repo, body, cleanup)
+          end
+        else
+          assert :historical_schema = with_complete_restore(migration_repo, body, cleanup)
+        end
+
+        assert Enum.sort(Ecto.Migrator.migrated_versions(migration_repo)) == applied_versions
+        assert_received {:historical_fixture_cleanup, ^outcome}
+      end
+    end
+  end
+
+  @tag :tmp_dir
   test "00400 upgrades an existing repository and preserves repository index contracts",
        context do
     migration_repo = start_migration_repo!(context)
@@ -1296,8 +1363,11 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
   defp migrate_up(repo, version),
     do: Ecto.Migrator.run(repo, @migrations_path, :up, to: version, log: false)
 
-  defp migrate_down(repo, version),
-    do: Ecto.Migrator.run(repo, @migrations_path, :down, to: version, log: false)
+  defp migrate_down(repo, version) do
+    # Prepare the historical schema before rolling back the requested migration itself.
+    Ecto.Migrator.run(repo, @migrations_path, :down, to_exclusive: version, log: false)
+    Ecto.Migrator.run(repo, @migrations_path, :down, to: version, log: false)
+  end
 
   defp ensure_up!(repo, version) do
     unless migration_applied?(repo, version), do: migrate_up(repo, version)
@@ -1305,12 +1375,10 @@ defmodule ForgeRepos.RepositoryLifecycleMigrationTest do
 
   defp with_complete_restore(repo, body, cleanup \\ fn -> :ok end) do
     if postgres?() do
+      applied_versions = Enum.sort(Ecto.Migrator.migrated_versions(repo))
+
       MigrationTestSupport.with_restore(body, fn ->
-        ensure_up!(repo, @version)
-        ensure_up!(repo, @write_version)
-        ensure_up!(repo, @staged_path_version)
-        ensure_up!(repo, @cleanup_recovery_version)
-        ensure_up!(repo, @cleanup_selector_version)
+        Enum.each(applied_versions, &ensure_up!(repo, &1))
         cleanup.()
       end)
     else
