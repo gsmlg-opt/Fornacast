@@ -1,4 +1,4 @@
-<RepositoryHTML.repository_frame result={@result} active={:pulls}>
+<.fc_repository_frame view={RepositoryView.frame(@result, :pulls)}>
   <section class="grid min-w-0 gap-3 p-4" data-pull-conversation>
     <header class="grid gap-3 rounded-lg bg-surface-container p-4 text-on-surface">
       <div class="flex flex-wrap items-start justify-between gap-3">
@@ -23,7 +23,7 @@
                 is_nil(@result.content.pull.merged_at)
             }
             action={
-              RepositoryHTML.pull_state_path(@result.chrome, @result.content.pull.issue.number)
+              RepositoryPaths.pull_state_path(@result.chrome, @result.content.pull.issue.number)
             }
             method="post"
           >
@@ -82,7 +82,7 @@
           <form
             :if={comment.capabilities.can_edit}
             action={
-              RepositoryHTML.issue_comment_path(
+              RepositoryPaths.issue_comment_path(
                 @result.chrome,
                 @result.content.pull.issue.number,
                 comment.id
@@ -130,7 +130,7 @@
           <form
             :if={comment.capabilities.can_delete}
             action={
-              RepositoryHTML.issue_comment_path(
+              RepositoryPaths.issue_comment_path(
                 @result.chrome,
                 @result.content.pull.issue.number,
                 comment.id
@@ -149,7 +149,7 @@
     <form
       :if={Map.get(@result.content.pull.capabilities, :can_comment, false)}
       action={
-        RepositoryHTML.issue_comments_path(@result.chrome, @result.content.pull.issue.number)
+        RepositoryPaths.issue_comments_path(@result.chrome, @result.content.pull.issue.number)
       }
       method="post"
       class="grid gap-3 rounded-lg bg-surface-container p-4 text-on-surface"
@@ -210,7 +210,9 @@
             is_nil(@result.content.pull.merged_at) and
             @result.content.pull.issue.state == :open
         }
-        action={RepositoryHTML.pull_merge_path(@result.chrome, @result.content.pull.issue.number)}
+        action={
+          RepositoryPaths.pull_merge_path(@result.chrome, @result.content.pull.issue.number)
+        }
         method="post"
       >
         <input type="hidden" name="_csrf_token" value={csrf_token()} />
@@ -219,4 +221,4 @@
       </form>
     </section>
   </section>
-</RepositoryHTML.repository_frame>
+</.fc_repository_frame>

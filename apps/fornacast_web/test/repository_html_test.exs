@@ -141,12 +141,51 @@ defmodule FornacastWeb.RepositoryHTMLTest do
 
   alias ForgeAccounts.User
   alias ForgeRepos.Repository
-  alias FornacastWeb.{HTML, RepositoryHTML, RepositoryPage}
+  alias FornacastWeb.{HTML, RepositoryHTML, RepositoryPage, RepositoryPaths, RepositoryView}
+
+  test "repository header links organization and personal owners to their namespace pages" do
+    for {username, kind} <- [{"gsmlg-opt", :organization}, {"alice", :user}] do
+      result = put_in(code_result().chrome.owner, %{owner() | username: username, kind: kind})
+
+      html =
+        render_component(&FornacastComponent.RepositoryLayout.fc_repository_header/1,
+          header: RepositoryView.frame(result, :code).header
+        )
+
+      assert html =~ ~r/<a\b[^>]*href="\/#{username}"[^>]*>\s*#{username}\s*<\/a>/
+      refute html =~ ~r/<a\b[^>]*href="\/#{username}"[^>]*>[^<]*\//
+    end
+  end
+
+  test "repository title uses canonical root independently of selected ref and page kind" do
+    for kind <- [:code, :tree, :blob, :commit, :search, :issues, :pulls, :releases] do
+      result = %{code_result() | kind: kind}
+      result = put_in(result.chrome.repository.name, "Demo Project")
+      view = RepositoryView.frame(result, :code)
+
+      html =
+        render_component(&FornacastComponent.RepositoryLayout.fc_repository_header/1,
+          header: view.header
+        )
+
+      document = LazyHTML.from_document(html)
+
+      assert LazyHTML.attribute(LazyHTML.query(document, "h1 a"), "href") == [
+               "/alice",
+               "/alice/demo"
+             ]
+
+      assert LazyHTML.text(LazyHTML.query(document, "h1 > a")) == "Demo Project"
+      assert hd(view.navigation).href == "/alice/demo?ref=refs%2Fheads%2Ffeature%2Fforge"
+      assert view.header.name_href == "/alice/demo"
+    end
+  end
 
   test "code surface renders repository identity, selected full ref, exact counts, and only approved navigation" do
     html = render_result(code_result())
 
-    assert html =~ "alice/demo"
+    identity = html |> LazyHTML.from_document() |> LazyHTML.query("#repository-identity h1")
+    assert identity |> LazyHTML.text() |> String.replace(~r/\s/, "") == "alice/demo"
     assert html =~ "public"
     assert html =~ "feature/forge"
     assert html =~ "Default branch: trunk"
@@ -314,7 +353,7 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     selected = code_result()
     oid = selected.content.commit_summary.latest.oid
 
-    assert RepositoryHTML.commit_path(selected.chrome, oid) ==
+    assert RepositoryPaths.commit_path(selected.chrome, oid) ==
              "/alice/demo/commit/#{oid}?ref=refs%2Fheads%2Ffeature%2Fforge"
 
     code = render_result(selected)
@@ -330,7 +369,7 @@ defmodule FornacastWeb.RepositoryHTMLTest do
       |> put_in([Access.key(:chrome), Access.key(:snapshot)], nil)
       |> put_in([Access.key(:content), Access.key(:ref_context)], nil)
 
-    assert RepositoryHTML.commit_path(without_context.chrome, oid) ==
+    assert RepositoryPaths.commit_path(without_context.chrome, oid) ==
              "/alice/demo/commit/#{oid}"
 
     commit = render_result(without_context)
@@ -381,7 +420,7 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     refute text_html =~ "<script>"
     assert text_html =~ "This file is truncated."
     assert text_html =~ "href=\"/alice/demo/raw/refs/heads/feature/forge/unsafe.ex"
-    assert text_html =~ "data-copy-value=\"&lt;script&gt;alert(1)&lt;/script&gt;\""
+    assert text_html =~ "data-fc-copy-value=\"&lt;script&gt;alert(1)&lt;/script&gt;\""
 
     binary_html =
       blob_result(%GitCore.Blob{
@@ -403,7 +442,7 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     [binary_viewer] =
       Regex.run(~r/<section\s+id="repository-blob".*?<\/section>/s, binary_html)
 
-    refute binary_viewer =~ "data-copy-value"
+    refute binary_viewer =~ "data-fc-copy-value"
 
     non_utf8_html =
       blob_result(%GitCore.Blob{
@@ -424,7 +463,7 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     [non_utf8_viewer] =
       Regex.run(~r/<section\s+id="repository-blob".*?<\/section>/s, non_utf8_html)
 
-    refute non_utf8_viewer =~ "data-copy-value"
+    refute non_utf8_viewer =~ "data-fc-copy-value"
   end
 
   test "empty and missing-default states stay explicit and never invent repository content" do
@@ -605,7 +644,7 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     refute html =~ "git push -u origin main"
     assert html =~ "role=\"status\""
     assert html =~ "aria-live=\"polite\""
-    assert html =~ "data-copy-status"
+    assert html =~ "data-fc-copy-status"
   end
 
   test "repository shell accepts safe iodata and keeps anonymous and authenticated chrome distinct" do
@@ -672,11 +711,17 @@ defmodule FornacastWeb.RepositoryHTMLTest do
 
   test "released server-side navigation components replace local workarounds" do
     source =
-      File.read!(Path.expand("../lib/fornacast_web/controllers/repository_html.ex", __DIR__))
+      File.read!(
+        Path.expand(
+          "../../fornacast_component/lib/fornacast_component/repository_layout.ex",
+          __DIR__
+        )
+      )
 
     lock = File.read!(Path.expand("../../../mix.lock", __DIR__))
 
-    assert lock =~ ~r/"phoenix_duskmoon".*"9\.12\.2"/
+    [_, version] = Regex.run(~r/"phoenix_duskmoon": \{:hex, :phoenix_duskmoon, "([^"]+)"/, lock)
+    assert Version.match?(version, ">= 9.12.2 and < 10.0.0")
     assert source =~ "<.dm_breadcrumb"
     assert source =~ "<.dm_pagination"
     refute source =~ "WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#82"
@@ -781,31 +826,33 @@ defmodule FornacastWeb.RepositoryHTMLTest do
 
     for {active, label} <- [releases: "Releases", issues: "Issues", pulls: "Pull Requests"] do
       html =
-        render_component(&RepositoryHTML.repository_navigation/1, result: result, active: active)
+        render_component(&FornacastComponent.RepositoryLayout.fc_repository_navigation/1,
+          items: RepositoryView.frame(result, active).navigation
+        )
 
       assert active_navigation_label(html) == label
     end
 
-    assert RepositoryHTML.releases_path(result.chrome) == "/alice/demo/releases"
-    assert RepositoryHTML.issues_path(result.chrome) == "/alice/demo/issues"
-    assert RepositoryHTML.new_issue_path(result.chrome) == "/alice/demo/issues/new"
-    assert RepositoryHTML.issue_path(result.chrome, 17) == "/alice/demo/issues/17"
-    assert RepositoryHTML.edit_issue_path(result.chrome, 17) == "/alice/demo/issues/17/edit"
+    assert RepositoryPaths.releases_path(result.chrome) == "/alice/demo/releases"
+    assert RepositoryPaths.issues_path(result.chrome) == "/alice/demo/issues"
+    assert RepositoryPaths.new_issue_path(result.chrome) == "/alice/demo/issues/new"
+    assert RepositoryPaths.issue_path(result.chrome, 17) == "/alice/demo/issues/17"
+    assert RepositoryPaths.edit_issue_path(result.chrome, 17) == "/alice/demo/issues/17/edit"
 
-    assert RepositoryHTML.issue_comments_path(result.chrome, 17) ==
+    assert RepositoryPaths.issue_comments_path(result.chrome, 17) ==
              "/alice/demo/issues/17/comments"
 
-    assert RepositoryHTML.issue_comment_path(result.chrome, 17, 31) ==
+    assert RepositoryPaths.issue_comment_path(result.chrome, 17, 31) ==
              "/alice/demo/issues/17/comments/31"
 
-    assert RepositoryHTML.issue_state_path(result.chrome, 17) == "/alice/demo/issues/17/state"
-    assert RepositoryHTML.pulls_path(result.chrome) == "/alice/demo/pulls"
-    assert RepositoryHTML.new_pull_path(result.chrome) == "/alice/demo/pulls/new"
-    assert RepositoryHTML.pull_path(result.chrome, 23) == "/alice/demo/pulls/23"
-    assert RepositoryHTML.pull_commits_path(result.chrome, 23) == "/alice/demo/pulls/23/commits"
-    assert RepositoryHTML.pull_files_path(result.chrome, 23) == "/alice/demo/pulls/23/files"
-    assert RepositoryHTML.pull_state_path(result.chrome, 23) == "/alice/demo/pulls/23/state"
-    assert RepositoryHTML.pull_merge_path(result.chrome, 23) == "/alice/demo/pulls/23/merge"
+    assert RepositoryPaths.issue_state_path(result.chrome, 17) == "/alice/demo/issues/17/state"
+    assert RepositoryPaths.pulls_path(result.chrome) == "/alice/demo/pulls"
+    assert RepositoryPaths.new_pull_path(result.chrome) == "/alice/demo/pulls/new"
+    assert RepositoryPaths.pull_path(result.chrome, 23) == "/alice/demo/pulls/23"
+    assert RepositoryPaths.pull_commits_path(result.chrome, 23) == "/alice/demo/pulls/23/commits"
+    assert RepositoryPaths.pull_files_path(result.chrome, 23) == "/alice/demo/pulls/23/files"
+    assert RepositoryPaths.pull_state_path(result.chrome, 23) == "/alice/demo/pulls/23/state"
+    assert RepositoryPaths.pull_merge_path(result.chrome, 23) == "/alice/demo/pulls/23/merge"
   end
 
   test "collaboration page kinds omit repository ref controls" do
@@ -813,9 +860,9 @@ defmodule FornacastWeb.RepositoryHTMLTest do
       result = %{code_result() | kind: kind, content: %{}}
 
       html =
-        render_component(&RepositoryHTML.repository_frame/1,
-          result: result,
-          active: if(kind in [:issues, :issue], do: :issues, else: :pulls),
+        render_component(&FornacastComponent.RepositoryLayout.fc_repository_frame/1,
+          view:
+            RepositoryView.frame(result, if(kind in [:issues, :issue], do: :issues, else: :pulls)),
           inner_block: [%{inner_block: fn _changed, _argument -> "content" end}]
         )
 
@@ -963,7 +1010,7 @@ defmodule FornacastWeb.RepositoryHTMLTest do
       data-readme
       data-repository-sidebar
       data-clone-popover
-      data-copy-status
+      data-fc-copy-status
     ) do
       assert code =~ marker
     end

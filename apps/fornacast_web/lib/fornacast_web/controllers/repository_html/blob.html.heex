@@ -1,8 +1,8 @@
-<.repository_frame result={@result} active={:code}>
+<.fc_repository_frame view={RepositoryView.frame(@result, :code)}>
   <section class="repository-blob-page min-w-0" data-blob-page>
-    <.server_breadcrumbs result={@result} path={@result.content.path} />
+    <.fc_server_breadcrumbs crumbs={breadcrumb_items(@result.chrome, @result.content.path)} />
     <div class="repository-blob-wrap" data-blob-viewer>
-      <.dm_git_blob_viewer
+      <.fc_git_blob_viewer
         id="repository-blob"
         class="repository-component repository-blob"
         filename={@result.content.path}
@@ -16,4 +16,4 @@
       />
     </div>
   </section>
-</.repository_frame>
+</.fc_repository_frame>

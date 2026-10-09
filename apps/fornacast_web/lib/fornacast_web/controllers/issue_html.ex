@@ -2,6 +2,8 @@ defmodule FornacastWeb.IssueHTML do
   @moduledoc false
 
   use FornacastWeb, :html
+  use FornacastComponent
+  alias FornacastWeb.{RepositoryPaths, RepositoryView}
 
   alias FornacastWeb.{CollaborationMarkdown, RepositoryHTML}
 
@@ -25,7 +27,7 @@ defmodule FornacastWeb.IssueHTML do
       |> Enum.map(fn {key, value} -> {key, to_string(value)} end)
       |> URI.encode_query()
 
-    base = RepositoryHTML.issues_path(result.chrome)
+    base = RepositoryPaths.issues_path(result.chrome)
     if query == "", do: base, else: base <> "?" <> query
   end
 

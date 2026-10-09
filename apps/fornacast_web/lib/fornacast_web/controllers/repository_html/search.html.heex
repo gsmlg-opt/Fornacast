@@ -1,4 +1,4 @@
-<.repository_frame result={@result} active={:code}>
+<.fc_repository_frame view={RepositoryView.frame(@result, :code)}>
   <section class="repository-search-page min-w-0" data-search-page>
     <header class="repository-collection-heading">
       <div>
@@ -40,14 +40,14 @@
       <button type="submit" class="btn btn-primary">Search</button>
     </form>
 
-    <.optional_panel
+    <.fc_optional_panel
       :if={validation_message(@result.content.validation_error)}
       title="Search request"
       message={validation_message(@result.content.validation_error)}
       kind="warning"
     />
 
-    <.optional_panel
+    <.fc_optional_panel
       :if={
         is_nil(@result.content.validation_error) and @result.content.query == "" and
           is_nil(@result.content.results)
@@ -94,7 +94,7 @@
         </.dm_table>
       </div>
 
-      <.optional_panel
+      <.fc_optional_panel
         :if={@result.content.results.results == []}
         title="No results"
         message="No results found."
@@ -102,4 +102,4 @@
       />
     <% end %>
   </section>
-</.repository_frame>
+</.fc_repository_frame>

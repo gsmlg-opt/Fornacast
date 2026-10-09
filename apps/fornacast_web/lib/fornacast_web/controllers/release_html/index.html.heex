@@ -1,4 +1,4 @@
-<RepositoryHTML.repository_frame result={@result} active={:releases}>
+<.fc_repository_frame view={RepositoryView.frame(@result, :releases)}>
   <section class="grid min-w-0 gap-3 p-4" data-releases-page>
     <header class="flex flex-wrap items-center justify-between gap-3 bg-surface-container text-on-surface rounded-lg p-4">
       <div>
@@ -42,17 +42,17 @@
       </li>
     </ul>
 
-    <RepositoryHTML.optional_panel
+    <.fc_optional_panel
       :if={@result.content.releases.entries == []}
       title="No releases"
       message="No releases have been published for this repository."
       kind="empty"
     />
 
-    <RepositoryHTML.server_pagination
+    <.fc_server_pagination
       page={@result.content.releases.page}
       total_pages={total_pages(@result.content.releases)}
-      base_href={pagination_base(@result)}
+      page_url={RepositoryPaths.page_href(pagination_base(@result), "{page}")}
     />
   </section>
-</RepositoryHTML.repository_frame>
+</.fc_repository_frame>

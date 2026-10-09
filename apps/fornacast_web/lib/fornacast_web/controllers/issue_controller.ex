@@ -5,7 +5,7 @@ defmodule FornacastWeb.IssueController do
     IssueHTML,
     PullRequestHTML,
     RepositoryCollaborationPage,
-    RepositoryHTML,
+    RepositoryPaths,
     RepositoryPage,
     RepositoryWeb,
     RequestMetadata
@@ -64,7 +64,7 @@ defmodule FornacastWeb.IssueController do
              []
            ) do
       case result.content.issue.kind do
-        :pull_request -> private_redirect(conn, RepositoryHTML.pull_path(result.chrome, number))
+        :pull_request -> private_redirect(conn, RepositoryPaths.pull_path(result.chrome, number))
         :issue -> RepositoryWeb.render(conn, result, html_module(conn), :show)
       end
     else
@@ -122,7 +122,7 @@ defmodule FornacastWeb.IssueController do
              []
            ) do
       case result.content.issue.kind do
-        :pull_request -> private_redirect(conn, RepositoryHTML.pull_path(result.chrome, number))
+        :pull_request -> private_redirect(conn, RepositoryPaths.pull_path(result.chrome, number))
         :issue -> render_edit(conn, context, result, issue_values(result.content.issue), [])
       end
     else
@@ -532,11 +532,11 @@ defmodule FornacastWeb.IssueController do
   defp comment_parent(_comment, _number), do: {:error, :not_found}
 
   defp redirect_to_issue(conn, context, %{kind: :pull_request, number: number}) do
-    private_redirect(conn, RepositoryHTML.pull_path(path_chrome(context), number))
+    private_redirect(conn, RepositoryPaths.pull_path(path_chrome(context), number))
   end
 
   defp redirect_to_issue(conn, context, %{number: number}) do
-    private_redirect(conn, RepositoryHTML.issue_path(path_chrome(context), number))
+    private_redirect(conn, RepositoryPaths.issue_path(path_chrome(context), number))
   end
 
   defp path_chrome(context) do

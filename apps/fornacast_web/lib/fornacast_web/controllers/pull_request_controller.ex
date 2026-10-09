@@ -4,7 +4,7 @@ defmodule FornacastWeb.PullRequestController do
   alias FornacastWeb.{
     PullRequestHTML,
     RepositoryCollaborationPage,
-    RepositoryHTML,
+    RepositoryPaths,
     RepositoryPage,
     RepositoryWeb,
     RequestMetadata
@@ -83,7 +83,7 @@ defmodule FornacastWeb.PullRequestController do
            ) do
       conn
       |> put_private_cache_headers()
-      |> redirect(to: RepositoryHTML.pull_path(path_chrome(context), pull.issue.number))
+      |> redirect(to: RepositoryPaths.pull_path(path_chrome(context), pull.issue.number))
     else
       {:error, {:validation, errors}} ->
         render_create_error(conn, owner_slug, repository_slug, params, errors)
@@ -153,7 +153,7 @@ defmodule FornacastWeb.PullRequestController do
              attrs,
              RequestMetadata.from_conn(conn)
            ) do
-      private_redirect(conn, RepositoryHTML.pull_path(path_chrome(context), number))
+      private_redirect(conn, RepositoryPaths.pull_path(path_chrome(context), number))
     else
       {:error, :invalid_integer} -> RepositoryWeb.error(conn, nil, :not_found)
       {:error, reason} -> RepositoryWeb.error(conn, nil, reason)
@@ -176,7 +176,7 @@ defmodule FornacastWeb.PullRequestController do
              attrs,
              RequestMetadata.from_conn(conn)
            ) do
-      private_redirect(conn, RepositoryHTML.pull_path(path_chrome(context), number))
+      private_redirect(conn, RepositoryPaths.pull_path(path_chrome(context), number))
     else
       {:error, :invalid_integer} -> RepositoryWeb.error(conn, nil, :not_found)
       {:error, reason} -> RepositoryWeb.error(conn, nil, reason)

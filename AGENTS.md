@@ -15,6 +15,7 @@ Fornacast is a small self-hosted Git forge. First-release scope is intentionally
 - `forge_github` owns GitHub provider authentication, transport, and webhook primitives.
 - `forge_mirrors` owns provider-neutral organization/repository mirror policy and durable state.
 - Domain apps will emit through `Fornacast.DomainOutbox`; they must never call `ForgeMirrors` directly.
+- `fornacast_component` owns project Git renderers and shared repository layout as a pure presentation library. Web owns typed projection/routes; the component app depends only on Phoenix/DuskMoon foundations.
 - Presentation is split: Phoenix web (`fornacast_web`) and a separate Bandit REST listener (`fornacast_api`).
 - Git I/O: Rust NIF over gitoxide (`git_core`) + Erlang/OTP SSH daemon (`git_transport`).
 - **PostgreSQL 17 is the supported/default domain database** for development,
@@ -149,7 +150,7 @@ Fornacast/
 - Keep authorization at the domain boundary (`Fornacast.Access` / `fetch_authorized_repository`). Do not invent ad-hoc permission checks in controllers.
 - Domain functions typically return `{:ok, t}` / `{:error, atom | {:validation, _} | ...}` tuples. Map API errors through `FornacastAPI.Error.from_domain/2`.
 - Record sensitive mutations with `Fornacast.Audit` / `record_multi` when following existing patterns.
-- Web UI: **phoenix_duskmoon** only. Controllers use `use FornacastWeb, :html` / `:controller`, which pulls in `PhoenixDuskmoon.Component` and `ArtComponent`.
+- Web UI: **phoenix_duskmoon** foundation controls and **fornacast_component** project compositions only. Controllers use `use FornacastWeb, :html` / `:controller`, which pulls in `PhoenixDuskmoon.Component` and `ArtComponent`.
 - Tailwind plugin must be `@duskmoon-dev/core/plugin`. Themes already imported: `sunshine` / `moonlight`.
 - Assets are built with **duskmoon_bundler** (`mix assets.build` / `mix assets.deploy`), not a hand-rolled Vite/webpack setup.
 - API clients require non-empty `User-Agent`. Supported `X-GitHub-Api-Version` values: `2022-11-28` (default) and `2026-03-10`. Keep versioned serializers/validators in sync when changing response shapes.

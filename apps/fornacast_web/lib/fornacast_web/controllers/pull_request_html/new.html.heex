@@ -1,4 +1,4 @@
-<RepositoryHTML.repository_frame result={@result} active={:pulls}>
+<.fc_repository_frame view={RepositoryView.frame(@result, :pulls)}>
   <section class="grid min-w-0 gap-3 p-4" data-pull-form>
     <header class="bg-surface-container text-on-surface rounded-lg p-4">
       <p class="text-xs text-on-surface-variant">Repository pull requests</p>
@@ -6,7 +6,7 @@
     </header>
 
     <form
-      action={RepositoryHTML.pulls_path(@result.chrome)}
+      action={RepositoryPaths.pulls_path(@result.chrome)}
       method="post"
       class="grid gap-3 bg-surface-container text-on-surface rounded-lg p-4"
     >
@@ -89,8 +89,8 @@
 
       <div class="flex gap-3">
         <.dm_btn type="submit" variant="primary">Create pull request</.dm_btn>
-        <.dm_link href={RepositoryHTML.pulls_path(@result.chrome)}>Cancel</.dm_link>
+        <.dm_link href={RepositoryPaths.pulls_path(@result.chrome)}>Cancel</.dm_link>
       </div>
     </form>
   </section>
-</RepositoryHTML.repository_frame>
+</.fc_repository_frame>

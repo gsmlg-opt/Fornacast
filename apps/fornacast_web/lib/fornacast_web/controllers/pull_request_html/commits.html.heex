@@ -1,4 +1,4 @@
-<RepositoryHTML.repository_frame result={@result} active={:pulls}>
+<.fc_repository_frame view={RepositoryView.frame(@result, :pulls)}>
   <section class="grid min-w-0 gap-3 p-4" data-pull-commits>
     <header class="grid gap-3 rounded-lg bg-surface-container p-4 text-on-surface">
       <h2 class="text-lg font-semibold">Commits</h2>
@@ -23,12 +23,15 @@
       </.dm_table>
     </div>
 
-    <RepositoryHTML.server_pagination
+    <.fc_server_pagination
       page={@result.content.commits.page}
       total_pages={total_pages(@result.content.commits)}
-      base_href={
-        RepositoryHTML.pull_commits_path(@result.chrome, @result.content.pull.issue.number)
+      page_url={
+        RepositoryPaths.page_href(
+          RepositoryPaths.pull_commits_path(@result.chrome, @result.content.pull.issue.number),
+          "{page}"
+        )
       }
     />
   </section>
-</RepositoryHTML.repository_frame>
+</.fc_repository_frame>

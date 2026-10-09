@@ -27,6 +27,7 @@ defmodule FornacastWeb.MixProject do
   defp deps do
     [
       {:fornacast, in_umbrella: true},
+      {:fornacast_component, in_umbrella: true},
       {:forge_accounts, in_umbrella: true},
       {:forge_github, in_umbrella: true},
       {:forge_imports, in_umbrella: true},

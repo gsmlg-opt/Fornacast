@@ -7,6 +7,7 @@
     "@duskmoon-dev/css-art": "1.20.3",
     "@duskmoon-dev/elements": "1.9.0",
     "marked": "18.1.0",
-    "tailwindcss": "4.3.3"
+    "tailwindcss": "4.3.3",
+    "fornacast-component": "*"
   }
 }

@@ -1,4 +1,4 @@
-<RepositoryHTML.repository_frame result={@result} active={:issues}>
+<.fc_repository_frame view={RepositoryView.frame(@result, :issues)}>
   <section class="grid min-w-0 gap-3 p-4" data-issue-form>
     <header class="bg-surface-container text-on-surface rounded-lg p-4">
       <p class="text-xs text-on-surface-variant">Repository issues</p>
@@ -6,7 +6,7 @@
     </header>
 
     <form
-      action={RepositoryHTML.issues_path(@result.chrome)}
+      action={RepositoryPaths.issues_path(@result.chrome)}
       method="post"
       class="grid gap-3 bg-surface-container text-on-surface rounded-lg p-4"
     >
@@ -83,8 +83,8 @@
 
       <div class="flex gap-3">
         <.dm_btn type="submit" variant="primary">Create issue</.dm_btn>
-        <.dm_link href={RepositoryHTML.issues_path(@result.chrome)}>Cancel</.dm_link>
+        <.dm_link href={RepositoryPaths.issues_path(@result.chrome)}>Cancel</.dm_link>
       </div>
     </form>
   </section>
-</RepositoryHTML.repository_frame>
+</.fc_repository_frame>

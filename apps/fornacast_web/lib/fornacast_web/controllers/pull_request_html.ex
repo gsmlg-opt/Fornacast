@@ -2,6 +2,8 @@ defmodule FornacastWeb.PullRequestHTML do
   @moduledoc false
 
   use FornacastWeb, :html
+  use FornacastComponent
+  alias FornacastWeb.{RepositoryPaths, RepositoryView}
 
   alias FornacastWeb.{CollaborationMarkdown, RepositoryHTML}
 
@@ -24,7 +26,7 @@ defmodule FornacastWeb.PullRequestHTML do
       |> Enum.map(fn {key, value} -> {key, query_value(value)} end)
       |> URI.encode_query()
 
-    base = RepositoryHTML.pulls_path(result.chrome)
+    base = RepositoryPaths.pulls_path(result.chrome)
     if query == "", do: base, else: base <> "?" <> query
   end
 
@@ -66,19 +68,19 @@ defmodule FornacastWeb.PullRequestHTML do
     ~H"""
     <nav class="flex flex-wrap gap-2" aria-label="Pull request navigation" data-pull-navigation>
       <.dm_link
-        href={RepositoryHTML.pull_path(@result.chrome, @result.content.pull.issue.number)}
+        href={RepositoryPaths.pull_path(@result.chrome, @result.content.pull.issue.number)}
         aria-current={if @active == :conversation, do: "page"}
       >
         Conversation
       </.dm_link>
       <.dm_link
-        href={RepositoryHTML.pull_commits_path(@result.chrome, @result.content.pull.issue.number)}
+        href={RepositoryPaths.pull_commits_path(@result.chrome, @result.content.pull.issue.number)}
         aria-current={if @active == :commits, do: "page"}
       >
         Commits
       </.dm_link>
       <.dm_link
-        href={RepositoryHTML.pull_files_path(@result.chrome, @result.content.pull.issue.number)}
+        href={RepositoryPaths.pull_files_path(@result.chrome, @result.content.pull.issue.number)}
         aria-current={if @active == :files, do: "page"}
       >
         Files changed

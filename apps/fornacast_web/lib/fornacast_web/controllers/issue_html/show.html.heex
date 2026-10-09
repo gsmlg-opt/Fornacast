@@ -1,4 +1,4 @@
-<RepositoryHTML.repository_frame result={@result} active={:issues}>
+<.fc_repository_frame view={RepositoryView.frame(@result, :issues)}>
   <section class="grid min-w-0 gap-3 p-4" data-issue-conversation>
     <header class="bg-surface-container text-on-surface rounded-lg p-4">
       <div class="flex flex-wrap items-start justify-between gap-3">
@@ -17,13 +17,15 @@
           </.dm_badge>
           <.dm_link
             :if={@result.content.issue.capabilities.can_edit}
-            href={RepositoryHTML.edit_issue_path(@result.chrome, @result.content.issue.number)}
+            href={RepositoryPaths.edit_issue_path(@result.chrome, @result.content.issue.number)}
           >
             Edit
           </.dm_link>
           <form
             :if={@result.content.issue.capabilities.can_close}
-            action={RepositoryHTML.issue_state_path(@result.chrome, @result.content.issue.number)}
+            action={
+              RepositoryPaths.issue_state_path(@result.chrome, @result.content.issue.number)
+            }
             method="post"
           >
             <input type="hidden" name="_csrf_token" value={csrf_token()} />
@@ -87,7 +89,7 @@
           <form
             :if={comment.capabilities.can_edit}
             action={
-              RepositoryHTML.issue_comment_path(
+              RepositoryPaths.issue_comment_path(
                 @result.chrome,
                 @result.content.issue.number,
                 comment.id
@@ -135,7 +137,7 @@
           <form
             :if={comment.capabilities.can_delete}
             action={
-              RepositoryHTML.issue_comment_path(
+              RepositoryPaths.issue_comment_path(
                 @result.chrome,
                 @result.content.issue.number,
                 comment.id
@@ -151,7 +153,7 @@
       </li>
     </ol>
 
-    <RepositoryHTML.optional_panel
+    <.fc_optional_panel
       :if={@result.content.comments.entries == []}
       title="No comments"
       message="No comments yet."
@@ -160,7 +162,7 @@
 
     <form
       :if={@result.content.issue.capabilities.can_comment}
-      action={RepositoryHTML.issue_comments_path(@result.chrome, @result.content.issue.number)}
+      action={RepositoryPaths.issue_comments_path(@result.chrome, @result.content.issue.number)}
       method="post"
       class="grid gap-3 bg-surface-container text-on-surface rounded-lg p-4"
       data-issue-comment-form
@@ -184,4 +186,4 @@
       <.dm_btn type="submit" variant="primary">Add comment</.dm_btn>
     </form>
   </section>
-</RepositoryHTML.repository_frame>
+</.fc_repository_frame>

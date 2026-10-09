@@ -1,4 +1,4 @@
-<.repository_frame result={@result} active={:code}>
+<.fc_repository_frame view={RepositoryView.frame(@result, :code)}>
   <%= if @result.kind == :code do %>
     <div class="repository-code-layout" data-repository-grid>
       <div class="repository-code-main min-w-0">
@@ -18,7 +18,10 @@
           </.dm_link>
         </section>
 
-        <.ref_controls result={@result} />
+        <.fc_ref_controls
+          toolbar={RepositoryView.frame(@result, :code).toolbar}
+          clone={RepositoryView.frame(@result, :code).clone}
+        />
 
         <section
           :if={@result.content.commit_summary.latest}
@@ -46,7 +49,7 @@
         </section>
 
         <div id="repository-files" class="repository-file-tree-wrap" data-file-tree>
-          <.dm_git_file_tree
+          <.fc_git_file_tree
             id="repository-file-tree"
             class="repository-component repository-file-tree"
             label="Repository files"
@@ -60,11 +63,11 @@
               href={row.href}
               aria_label={row.aria_label}
             />
-          </.dm_git_file_tree>
-          <.server_pagination
+          </.fc_git_file_tree>
+          <.fc_server_pagination
             page={@result.content.tree.page}
             total_pages={@result.content.tree.total_pages}
-            base_href={source_path(@result.chrome)}
+            page_url={RepositoryPaths.page_href(source_path(@result.chrome), "{page}")}
           />
         </div>
 
@@ -83,7 +86,7 @@
           </div>
         </section>
 
-        <.optional_panel
+        <.fc_optional_panel
           :if={match?({:unavailable, _}, @result.content.readme)}
           title="README"
           message="README temporarily unavailable"
@@ -202,12 +205,12 @@
 
   <%= if @result.kind == :empty do %>
     <section class="repository-empty-layout" data-empty-repository>
-      <.optional_panel
+      <.fc_optional_panel
         title="Empty repository"
         message="This repository does not have any branches or tags yet."
         kind="empty"
       />
-      <.dm_git_clone_box
+      <.fc_git_clone_box
         id="repository-empty-setup"
         title={if @result.content.write_access, do: "Push the first branch", else: "Clone URL"}
         class="repository-component repository-empty-setup"
@@ -220,11 +223,11 @@
           value={@result.chrome.clone.ssh_url}
         />
         <:command
-          :for={{label, value} <- clone_commands(@result)}
+          :for={{label, value} <- RepositoryView.frame(@result, :code).clone.commands}
           label={label}
           value={value}
         />
-      </.dm_git_clone_box>
+      </.fc_git_clone_box>
       <section class="repository-component repository-sidebar-panel" data-repository-size>
         <h2>Repository size</h2>
         <p>
@@ -241,7 +244,7 @@
 
   <%= if @result.kind == :missing_default do %>
     <section class="repository-missing-default" data-missing-default>
-      <.optional_panel
+      <.fc_optional_panel
         title="Configured default ref is unavailable"
         message={"Fornacast is configured to use #{@result.content.configured_ref}, but that ref does not exist."}
         kind="warning"
@@ -259,4 +262,4 @@
       </section>
     </section>
   <% end %>
-</.repository_frame>
+</.fc_repository_frame>

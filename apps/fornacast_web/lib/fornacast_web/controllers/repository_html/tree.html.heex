@@ -1,8 +1,8 @@
-<.repository_frame result={@result} active={:code}>
+<.fc_repository_frame view={RepositoryView.frame(@result, :code)}>
   <section class="repository-tree-page min-w-0" data-tree-page>
-    <.server_breadcrumbs result={@result} path={@result.content.path} />
+    <.fc_server_breadcrumbs crumbs={breadcrumb_items(@result.chrome, @result.content.path)} />
     <div class="repository-file-tree-wrap" data-file-tree>
-      <.dm_git_file_tree
+      <.fc_git_file_tree
         id="repository-file-tree"
         class="repository-component repository-file-tree"
         label={"Files in #{@result.content.path}"}
@@ -16,12 +16,14 @@
           href={row.href}
           aria_label={row.aria_label}
         />
-      </.dm_git_file_tree>
+      </.fc_git_file_tree>
     </div>
-    <.server_pagination
+    <.fc_server_pagination
       page={@result.content.tree.page}
       total_pages={@result.content.tree.total_pages}
-      base_href={source_path(@result.chrome, @result.content.path)}
+      page_url={
+        RepositoryPaths.page_href(source_path(@result.chrome, @result.content.path), "{page}")
+      }
     />
   </section>
-</.repository_frame>
+</.fc_repository_frame>

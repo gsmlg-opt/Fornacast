@@ -6,6 +6,7 @@
     "{config,test}/**/*.{ex,exs,heex}",
     "apps/*/{mix,.formatter}.exs",
     "apps/*/{config,lib,test}/**/*.{ex,exs,heex}",
-    "apps/fornacast_web/assets/**/*.{js,ts,jsx,tsx}"
+    "apps/fornacast_web/assets/**/*.{js,ts,jsx,tsx}",
+    "apps/fornacast_component/{assets,test}/**/*.{js,ts}"
   ]
 ]

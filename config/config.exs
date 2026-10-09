@@ -325,6 +325,7 @@ config :phoenix, :json_library, JSON
 
 config :phoenix, :filter_parameters, {:keep, []}
 
+fornacast_component_path = Path.expand("../apps/fornacast_component", __DIR__)
 fornacast_web_path = Path.expand("../apps/fornacast_web", __DIR__)
 
 # TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#175 - update when the split-chunk export fix is released.
@@ -343,12 +344,15 @@ config :duskmoon_bundler, :fornacast_web,
   tailwind: [
     css: Path.join(fornacast_web_path, "assets/css/app.css"),
     sources: [
+      %{base: Path.join(fornacast_component_path, "lib"), pattern: "**/*.{ex,heex,eex}"},
       %{base: Path.join(fornacast_web_path, "lib"), pattern: "**/*.{ex,heex,eex}"},
       %{base: Path.join(fornacast_web_path, "assets"), pattern: "**/*.{js,ts,jsx,tsx}"}
     ]
   ],
+  # TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#180 - verify nested package exports when changing the dependency graph.
   server: [
     watch_dirs: [
+      Path.join(fornacast_component_path, "lib"),
       Path.join(fornacast_web_path, "lib"),
       Path.join(fornacast_web_path, "assets")
     ]

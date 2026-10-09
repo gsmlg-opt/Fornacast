@@ -2,6 +2,8 @@ defmodule FornacastWeb.ReleaseHTML do
   @moduledoc false
 
   use FornacastWeb, :html
+  use FornacastComponent
+  alias FornacastWeb.{RepositoryPaths, RepositoryView}
 
   alias FornacastWeb.{CollaborationMarkdown, RepositoryHTML}
 
@@ -13,7 +15,7 @@ defmodule FornacastWeb.ReleaseHTML do
   def format_time(value), do: RepositoryHTML.format_time(value)
   def csrf_token, do: Plug.CSRFProtection.get_csrf_token()
 
-  defdelegate releases_path(chrome), to: RepositoryHTML
+  defdelegate releases_path(chrome), to: RepositoryPaths
   def new_release_path(chrome), do: releases_path(chrome) <> "/new"
   def release_path(chrome, id), do: releases_path(chrome) <> "/" <> encode_segment(id)
   def edit_release_path(chrome, id), do: release_path(chrome, id) <> "/edit"

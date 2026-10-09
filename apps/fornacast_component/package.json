@@ -1,0 +1,11 @@
+{
+  "name": "fornacast-component",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./clipboard": "./assets/js/clipboard.js"
+  },
+  "scripts": {
+    "test": "node --test test/js/clipboard.test.js"
+  }
+}

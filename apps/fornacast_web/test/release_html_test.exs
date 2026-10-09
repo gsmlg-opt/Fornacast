@@ -5,7 +5,7 @@ defmodule FornacastWeb.ReleaseHTMLTest do
   alias ForgeReleases.Release
   alias ForgeRepos.Repository
   alias Fornacast.Page
-  alias FornacastWeb.{ReleaseHTML, RepositoryHTML, RepositoryPage}
+  alias FornacastWeb.{ReleaseHTML, RepositoryPaths, RepositoryPage}
 
   test "index is a dense DuskMoon release list with one primary action" do
     release = release()
@@ -41,7 +41,7 @@ defmodule FornacastWeb.ReleaseHTMLTest do
   end
 
   test "repository release path is canonical" do
-    assert :releases |> result(%{}) |> then(&RepositoryHTML.releases_path(&1.chrome)) ==
+    assert :releases |> result(%{}) |> then(&RepositoryPaths.releases_path(&1.chrome)) ==
              "/alice/demo/releases"
   end
 
