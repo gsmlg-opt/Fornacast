@@ -263,12 +263,13 @@ defmodule ForgeReleases do
     end
   end
 
-  defp prepare_notes(repository, attrs) do
+  defp prepare_notes(repository, attrs, repository_path) do
     case attr(attrs, "generate_release_notes") do
       true ->
         with {:ok, notes} <-
-               ForgeReleases.Notes.generate(
+               ForgeReleases.Notes.generate_from_path(
                  repository,
+                 repository_path,
                  attr(attrs, "tag_name"),
                  nil,
                  attr(attrs, "target_commitish")
@@ -416,12 +417,22 @@ defmodule ForgeReleases do
       end)
 
   @doc false
-  @spec create_multi(User.t(), Repository.t(), map(), map(), keyword()) :: Multi.t()
-  def create_multi(
+  @spec create_fenced_multi(
+          User.t(),
+          Repository.t(),
+          map(),
+          map(),
+          Path.t(),
+          non_neg_integer(),
+          keyword()
+        ) :: Multi.t()
+  def create_fenced_multi(
         %User{} = actor,
         %Repository{} = repository,
         attrs,
         request_metadata,
+        repository_path,
+        remaining_ms,
         options \\ []
       )
       when is_map(attrs) and is_map(request_metadata) and is_list(options) do
@@ -430,8 +441,8 @@ defmodule ForgeReleases do
       actor,
       attrs,
       request_metadata,
-      ForgeRepos.absolute_storage_path(repository),
-      GitCore.Limits.get(:ref_deadline_ms),
+      repository_path,
+      remaining_ms,
       options
     )
   end
@@ -459,7 +470,7 @@ defmodule ForgeReleases do
       authorize_mutation(repo, actor.id, repository.id)
     end)
     |> Multi.run(:notes, fn _repo, _changes ->
-      prepare_notes(repository, attrs)
+      prepare_notes(repository, attrs, repository_path)
     end)
     |> Multi.insert(:release, fn %{
                                    authorization: %{actor: current_actor},

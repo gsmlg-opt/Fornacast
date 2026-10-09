@@ -272,17 +272,22 @@ defmodule ForgeReleasesTest do
     writer = user_fixture("release-stale-writer-#{System.unique_integer([:positive])}")
     collaborator = grant(repository, writer, :write)
 
-    multi =
-      ForgeReleases.create_multi(
-        writer,
-        repository,
-        %{"tag_name" => "v1.0.0", "name" => "Stale writer"},
-        request_metadata("stale")
-      )
+    assert {:error, :authorization, :forbidden, %{}} =
+             ForgeRepos.with_write_fence(repository, :tag, fn path, remaining ->
+               multi =
+                 ForgeReleases.create_fenced_multi(
+                   writer,
+                   repository,
+                   %{"tag_name" => "v1.0.0", "name" => "Stale writer"},
+                   request_metadata("stale"),
+                   path,
+                   remaining
+                 )
 
-    Repo.delete!(collaborator)
+               Repo.delete!(collaborator)
+               ForgeReleases.transaction(multi)
+             end)
 
-    assert {:error, :authorization, :forbidden, %{}} = ForgeReleases.transaction(multi)
     assert Repo.aggregate(Release, :count, :id) == 0
     assert Repo.aggregate(AuditEvent, :count, :id) == 0
   end

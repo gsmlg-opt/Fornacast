@@ -5110,6 +5110,7 @@ defmodule ForgeMirrors do
       end
     end)
     |> normalize_transaction_result()
+    |> with_permitted_repository_path()
   rescue
     _exception -> {:error, :lost_lease}
   end
@@ -5196,6 +5197,7 @@ defmodule ForgeMirrors do
       end
     end)
     |> normalize_transaction_result()
+    |> with_permitted_repository_path()
   rescue
     _exception -> {:error, :lost_lease}
   end
@@ -6897,7 +6899,7 @@ defmodule ForgeMirrors do
             id: repository_id,
             owner_user_id: owner_id,
             generation: repository_generation
-          } = repository} <-
+          }} <-
            ForgeRepos.fetch_live_repository(repository_id),
          true <- owner_id == organization_mirror.organization_id,
          [remote_owner, remote_repository] <- String.split(github_full_name || "", "/"),
@@ -6919,8 +6921,7 @@ defmodule ForgeMirrors do
          remote_owner: remote_owner,
          remote_repository: remote_repository,
          repository_id: repository_id,
-         repository_generation: repository_generation,
-         repository_path: ForgeRepos.absolute_storage_path(repository)
+         repository_generation: repository_generation
        }}
     else
       %OrganizationMirror{state: :paused} -> {:error, :paused}
@@ -6932,6 +6933,22 @@ defmodule ForgeMirrors do
       _invalid -> {:error, :invalid_transition}
     end
   end
+
+  defp with_permitted_repository_path({:ok, scope}) do
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:ref_deadline_ms)
+
+    with {:ok, repository} <- ForgeRepos.fetch_live_repository(scope.repository_id),
+         true <- repository.generation == scope.repository_generation do
+      ForgeRepos.with_repository_read(repository, deadline, fn handle ->
+        {:ok, Map.put(scope, :repository_path, ForgeRepos.repository_read_path(handle))}
+      end)
+    else
+      false -> {:error, :stale_repository}
+      error -> error
+    end
+  end
+
+  defp with_permitted_repository_path(error), do: error
 
   defp git_ref_baseline(operation, ref_name) do
     case locked_git_ref_state(operation.repository_mirror_id, ref_name) do

@@ -41,7 +41,7 @@ defmodule ForgeGitHub.LFSSync do
              (is_nil(target_oid) or is_binary(target_oid)) and is_binary(token) and
              is_list(options) do
     with :ok <- validate_inputs(operation, sync, target_oid, token),
-         {:ok, callbacks} <- callbacks(options),
+         {:ok, callbacks} <- callbacks(options, sync),
          :ok <- authorize(callbacks),
          {:ok, %Repository{} = repository} <- callbacks.fetch_repository.(sync.repository_id),
          true <- repository.generation == sync.repository_generation,
@@ -393,7 +393,7 @@ defmodule ForgeGitHub.LFSSync do
        else: {:error, :invalid_argument}
   end
 
-  defp callbacks(options) do
+  defp callbacks(options, sync) do
     allowed = [
       :authorize,
       :begin_scan,
@@ -415,10 +415,18 @@ defmodule ForgeGitHub.LFSSync do
          authorize: Keyword.fetch(options, :authorize),
          begin_scan: callback(options, :begin_scan, &PointerScanner.begin_scan/4),
          claim_work: callback(options, :claim_work, &PointerScanner.claim_work/3),
-         expand_object: callback(options, :expand_object, &GitCore.expand_lfs_scan_object/5),
+         expand_object:
+           callback(options, :expand_object, fn _path, oid, kind, offset, limit ->
+             with_repository_read(sync, fn path ->
+               GitCore.expand_lfs_scan_object(path, oid, kind, offset, limit)
+             end)
+           end),
          fetch_repository:
            callback(options, :fetch_repository, &ForgeRepos.fetch_live_repository/1),
-         list_refs: callback(options, :list_refs, &GitCore.list_refs/1),
+         list_refs:
+           callback(options, :list_refs, fn _path ->
+             with_repository_read(sync, &GitCore.list_refs/1)
+           end),
          # The prospective ref has not passed CAS yet. Retain old mappings across crashes
          # and concurrent ref writes; only fenced reachability reconciliation may prune.
          publish_scan: callback(options, :publish_scan, &PointerScanner.prepare_scan/1),
@@ -429,6 +437,20 @@ defmodule ForgeGitHub.LFSSync do
        }}
     else
       {:error, :invalid_argument}
+    end
+  end
+
+  defp with_repository_read(sync, callback) do
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:ref_deadline_ms)
+
+    with {:ok, repository} <- ForgeRepos.fetch_live_repository(sync.repository_id),
+         true <- repository.generation == sync.repository_generation do
+      ForgeRepos.with_repository_read(repository, deadline, fn handle ->
+        callback.(ForgeRepos.repository_read_path(handle))
+      end)
+    else
+      false -> {:error, :stale_repository}
+      error -> error
     end
   end
 

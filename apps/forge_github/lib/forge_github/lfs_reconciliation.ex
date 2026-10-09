@@ -10,7 +10,7 @@ defmodule ForgeGitHub.LFSReconciliation do
     if @test_callbacks or options == [] do
       with {:ok, repository} <- ForgeRepos.fetch_live_repository(sync.repository_id),
            true <- repository.generation == sync.repository_generation,
-           {:ok, baselines} <- baselines(sync.repository_path),
+           {:ok, baselines} <- read_baselines(sync),
            :ok <- confirmed_baselines(baselines, sync),
            fingerprint <- fingerprint(baselines),
            checkpoint <- matching_checkpoint(operation.checkpoint, fingerprint),
@@ -47,7 +47,7 @@ defmodule ForgeGitHub.LFSReconciliation do
     owner = "lfs-reconcile:#{operation.id}:#{operation.attempt_count}"
 
     with {:ok, work} <- PointerScanner.claim_work(scan, owner, limit: 1, lease_seconds: 300),
-         :ok <- expand(work, owner, sync.repository_path, scan.batch_limit) do
+         :ok <- expand(work, owner, sync, scan.batch_limit) do
       {:incomplete, checkpoint(scan.scan_key, fingerprint, nil)}
     end
   end
@@ -79,15 +79,17 @@ defmodule ForgeGitHub.LFSReconciliation do
 
   defp expand([], _owner, _path, _limit), do: :ok
 
-  defp expand([work], owner, path, limit) do
+  defp expand([work], owner, sync, limit) do
     with {:ok, expansion} <-
-           GitCore.expand_lfs_scan_object(
-             path,
-             work.object_oid,
-             work.object_kind,
-             work.tree_offset,
-             limit
-           ),
+           with_repository_read(sync, fn path ->
+             GitCore.expand_lfs_scan_object(
+               path,
+               work.object_oid,
+               work.object_kind,
+               work.tree_offset,
+               limit
+             )
+           end),
          {:ok, _result} <- PointerScanner.record_expansion(work, owner, expansion),
          do: :ok
   end
@@ -104,16 +106,16 @@ defmodule ForgeGitHub.LFSReconciliation do
 
   defp publish(operation, sync, scan, fingerprint, finalize, options) do
     Keyword.get(options, :before_publish, fn -> :ok end).()
-    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:ref_deadline_ms)
+    context = Keyword.get(options, :context, &ForgeMirrors.git_repository_operation_context/1)
 
-    with {:ok, lease} <- GitCore.RepositoryWriteLimiter.acquire(sync.repository_id, deadline) do
-      try do
-        context = Keyword.get(options, :context, &ForgeMirrors.git_repository_operation_context/1)
-
-        with {:ok, current} <- baselines(sync.repository_path),
+    with {:ok, fresh_sync} <- context.(operation),
+         true <- fresh_sync.repository_generation == sync.repository_generation,
+         {:ok, repository} <- ForgeRepos.fetch_live_repository(sync.repository_id),
+         true <- repository.generation == sync.repository_generation do
+      ForgeRepos.with_write_fence(repository, :ref, fn path, _remaining ->
+        with {:ok, refs} <- GitCore.list_refs(path),
+             current <- baselines(refs),
              true <- fingerprint(current) == fingerprint,
-             {:ok, fresh_sync} <- context.(operation),
-             true <- fresh_sync.repository_generation == sync.repository_generation,
              :ok <- confirmed_baselines(current, fresh_sync) do
           Repo.transaction(fn ->
             with {:ok, _published} <- PointerScanner.publish_scan(scan) do
@@ -134,27 +136,45 @@ defmodule ForgeGitHub.LFSReconciliation do
           false -> restart(scan, fingerprint)
           {:error, reason} -> {:error, reason}
         end
-      after
-        :ok = GitCore.RepositoryWriteLimiter.release(lease)
-      end
+      end)
+    else
+      false -> {:error, :stale_repository}
+      {:error, reason} -> {:error, reason}
     end
   end
 
-  defp baselines(path) do
-    with {:ok, refs} <- GitCore.list_refs(path) do
-      {:ok,
-       refs
-       |> Enum.flat_map(fn
-         %{name: "refs/heads/" <> _ = name, target: oid} ->
-           [%{ref_name: name, ref_kind: :branch, oid: oid}]
+  defp read_baselines(sync) do
+    with_repository_read(sync, fn path ->
+      with {:ok, refs} <- GitCore.list_refs(path), do: {:ok, baselines(refs)}
+    end)
+  end
 
-         %{name: "refs/tags/" <> _ = name, target: oid} ->
-           [%{ref_name: name, ref_kind: :tag, oid: oid}]
+  defp baselines(refs) do
+    refs
+    |> Enum.flat_map(fn
+      %{name: "refs/heads/" <> _ = name, target: oid} ->
+        [%{ref_name: name, ref_kind: :branch, oid: oid}]
 
-         _other ->
-           []
-       end)
-       |> Enum.sort_by(& &1.ref_name)}
+      %{name: "refs/tags/" <> _ = name, target: oid} ->
+        [%{ref_name: name, ref_kind: :tag, oid: oid}]
+
+      _other ->
+        []
+    end)
+    |> Enum.sort_by(& &1.ref_name)
+  end
+
+  defp with_repository_read(sync, callback) do
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:ref_deadline_ms)
+
+    with {:ok, repository} <- ForgeRepos.fetch_live_repository(sync.repository_id),
+         true <- repository.generation == sync.repository_generation do
+      ForgeRepos.with_repository_read(repository, deadline, fn handle ->
+        callback.(ForgeRepos.repository_read_path(handle))
+      end)
+    else
+      false -> {:error, :stale_repository}
+      error -> error
     end
   end
 

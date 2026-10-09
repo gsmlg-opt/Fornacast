@@ -157,7 +157,9 @@ defmodule ForgeGitHub.GitRefWorker do
          request <- sync_request(sync),
          {:ok, observations} <- fetch_remote_refs(request, token, sync, options),
          {:ok, local_refs} <-
-           callback(options, :list_refs, &GitCore.list_refs/1).(sync.repository_path),
+           callback(options, :list_refs, fn _path ->
+             with_repository_read(sync, &GitCore.list_refs/1)
+           end).(sync.repository_path),
          {:ok, ref_names} <- reconciliation_ref_names(sync, local_refs, observations) do
       callback(options, :fanout, &ForgeMirrors.fanout_git_ref_reconciliation/3).(
         operation,
@@ -350,11 +352,16 @@ defmodule ForgeGitHub.GitRefWorker do
   end
 
   defp read_local_ref(sync, options) do
-    callback(options, :exact_ref, &GitCore.exact_ref/2).(sync.repository_path, sync.ref_name)
+    callback(options, :exact_ref, fn _path, ref ->
+      with_repository_read(sync, &GitCore.exact_ref(&1, ref))
+    end).(sync.repository_path, sync.ref_name)
   end
 
   defp decide(sync, local_oid, remote_oid, options) do
-    ancestor = callback(options, :ancestor?, &GitCore.is_ancestor/3)
+    ancestor =
+      callback(options, :ancestor?, fn _path, left, right ->
+        with_repository_read(sync, &GitCore.is_ancestor(&1, left, right))
+      end)
 
     GitRefDecision.decide(sync.ref_kind, sync.baseline, local_oid, remote_oid, fn left, right ->
       ancestor.(sync.repository_path, left, right)
@@ -954,6 +961,20 @@ defmodule ForgeGitHub.GitRefWorker do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp with_repository_read(sync, callback) do
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:ref_deadline_ms)
+
+    with {:ok, repository} <- ForgeRepos.fetch_live_repository(sync.repository_id),
+         true <- repository.generation == sync.repository_generation do
+      ForgeRepos.with_repository_read(repository, deadline, fn handle ->
+        callback.(ForgeRepos.repository_read_path(handle))
+      end)
+    else
+      false -> {:error, :stale_repository}
+      error -> error
     end
   end
 

@@ -1777,6 +1777,7 @@ defmodule ForgeGitHub.PullMergeWorker do
              context.expected.pull_eligibility_proof["head"]["repository_mirror_id"]
            ),
          {:ok, repository} <- ForgeRepos.fetch_live_repository(context.repository_id),
+         {:ok, repository_path} <- permitted_repository_path(repository),
          organization when not is_nil(organization) <-
            Repo.get(OrganizationMirror, context.organization_mirror_id),
          {:ok, base_route} <- route(base),
@@ -1784,7 +1785,7 @@ defmodule ForgeGitHub.PullMergeWorker do
       {:ok,
        Map.merge(context, %{
          routing: %{base: base_route, head: head_route},
-         repository_path: ForgeRepos.absolute_storage_path(repository),
+         repository_path: repository_path,
          repository_generation: repository.generation,
          remote_owner: base_route.owner,
          remote_repository: base_route.repository,
@@ -1807,6 +1808,14 @@ defmodule ForgeGitHub.PullMergeWorker do
     else
       _ -> {:error, :stale_merge_identity}
     end
+  end
+
+  defp permitted_repository_path(repository) do
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:ref_deadline_ms)
+
+    ForgeRepos.with_repository_read(repository, deadline, fn handle ->
+      {:ok, ForgeRepos.repository_read_path(handle)}
+    end)
   end
 
   defp route(binding) do
