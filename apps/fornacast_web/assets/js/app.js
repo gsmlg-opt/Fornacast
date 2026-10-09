@@ -2,6 +2,7 @@ import "phoenix_duskmoon";
 import { installClipboardBehavior } from "fornacast-component/clipboard";
 // TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#104
 // TODO(upstream): duskmoon-dev/duskmoon-elements#83
+// TODO(upstream): duskmoon-dev/duskmoon-elements#85 - update transitive KaTeX when fixed upstream.
 import { registerAll } from "@duskmoon-dev/elements";
 import { registerAllArts } from "@duskmoon-dev/art-elements";
 import { initImportStatusPolling } from "./import_status.js";
