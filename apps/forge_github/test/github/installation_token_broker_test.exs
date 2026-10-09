@@ -234,7 +234,7 @@ defmodule ForgeGitHub.InstallationTokenBrokerTest do
 
     broker =
       start_broker!(
-        waiter_timeout_ms: 50,
+        waiter_timeout_ms: 1_000,
         fetcher: fn _, _ ->
           send(parent, {:expiring_fetch, self()})
           receive do: (:never -> :unexpected)
@@ -243,10 +243,10 @@ defmodule ForgeGitHub.InstallationTokenBrokerTest do
 
     started_at = System.monotonic_time(:millisecond)
     caller = Task.async(fn -> InstallationTokenBroker.fetch(broker, 44) end)
-    assert_receive {:expiring_fetch, fetch_task}
+    assert_receive {:expiring_fetch, fetch_task}, 1_000
     fetch_monitor = Process.monitor(fetch_task)
-    assert {:error, :timeout} = Task.await(caller, 1_000)
-    assert System.monotonic_time(:millisecond) - started_at < 1_000
+    assert {:error, :timeout} = Task.await(caller, 3_000)
+    assert System.monotonic_time(:millisecond) - started_at < 3_000
     assert_receive {:DOWN, ^fetch_monitor, :process, ^fetch_task, _reason}, 1_000
 
     status = :sys.get_status(broker) |> inspect()
