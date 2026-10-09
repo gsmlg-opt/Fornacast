@@ -33,6 +33,10 @@ jobs:
       POSTGRES_TEST_DB: fornacast_test
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
+      GIT_AUTHOR_NAME: Fornacast Test
+      GIT_AUTHOR_EMAIL: test@example.com
+      GIT_COMMITTER_NAME: Fornacast Test
+      GIT_COMMITTER_EMAIL: test@example.com
     services:
       postgres:
         image: postgres:17

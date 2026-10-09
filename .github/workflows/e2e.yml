@@ -120,6 +120,7 @@ jobs:
 
       - name: Install frontend dependencies
         if: github.event_name == 'pull_request'
+        # TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#185
         run: mix npm.ci
 
       - name: Build static assets
