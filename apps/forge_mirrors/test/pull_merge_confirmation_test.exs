@@ -1,5 +1,6 @@
 defmodule ForgeMirrors.PullMergeConfirmationTest do
   use ExUnit.Case, async: false
+  import Ecto.Query
   import ForgeMirrors.TestSupport.MirrorFixtures
   alias Ecto.{Changeset, Multi}
   alias ForgeMirrors.{MirrorRefState, MirrorResourceState, PullEligibility, PullMergeBoundary}
@@ -604,7 +605,10 @@ defmodule ForgeMirrors.PullMergeConfirmationTest do
                Map.put(changed, :classification, :concurrent_edit)
              )
 
-    refute Repo.exists?(ForgeMirrors.MirrorConflict)
+    refute Repo.exists?(
+             from conflict in ForgeMirrors.MirrorConflict,
+               where: conflict.organization_mirror_id == ^c.organization.id
+           )
 
     assert Repo.get!(ForgeMirrors.MirrorOperation, operation.id).lease_owner ==
              operation.lease_owner
@@ -642,7 +646,10 @@ defmodule ForgeMirrors.PullMergeConfirmationTest do
                remote
              )
 
-    refute Repo.exists?(ForgeMirrors.MirrorConflict)
+    refute Repo.exists?(
+             from conflict in ForgeMirrors.MirrorConflict,
+               where: conflict.organization_mirror_id == ^c.organization.id
+           )
 
     assert Repo.get!(ForgeMirrors.MirrorOperation, operation.id).external_effect_marker ==
              operation.external_effect_marker

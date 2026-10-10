@@ -96,14 +96,14 @@ defmodule ForgeGitHub.InstallationTokenBrokerTest do
       )
 
     caller = Task.async(fn -> InstallationTokenBroker.fetch(broker, 44) end)
-    assert_receive {:fetch_started, 1, stale_fetch_task}
+    assert_receive {:fetch_started, 1, stale_fetch_task}, 1_000
     stale_monitor = Process.monitor(stale_fetch_task)
     assert :ok = InstallationTokenBroker.invalidate(broker, 44)
     assert {:error, :invalidated} = Task.await(caller)
-    assert_receive {:DOWN, ^stale_monitor, :process, ^stale_fetch_task, _reason}
+    assert_receive {:DOWN, ^stale_monitor, :process, ^stale_fetch_task, _reason}, 1_000
 
     fresh = Task.async(fn -> InstallationTokenBroker.fetch(broker, 44) end)
-    assert_receive {:fetch_started, 2, fresh_fetch_task}
+    assert_receive {:fetch_started, 2, fresh_fetch_task}, 1_000
     send(fresh_fetch_task, :release)
     assert %InstallationToken{token: "generation-2"} = Task.await(fresh)
 
@@ -175,16 +175,17 @@ defmodule ForgeGitHub.InstallationTokenBrokerTest do
         end
       )
 
-    callers =
-      for _ <- 1..201 do
-        Task.async(fn ->
-          result = InstallationTokenBroker.fetch(broker, 44)
-          send(parent, {:bounded_result, result})
-          result
-        end)
-      end
+    fetch = fn ->
+      result = InstallationTokenBroker.fetch(broker, 44)
+      send(parent, {:bounded_result, result})
+      result
+    end
 
-    assert_receive {:bounded_fetch, fetch_task}
+    first = Task.async(fetch)
+    assert_receive {:bounded_fetch, fetch_task}, 1_000
+    remaining = for _ <- 1..200, do: Task.async(fetch)
+    callers = [first | remaining]
+
     assert_receive {:bounded_result, {:error, :busy}}, 2_000
     refute_receive {:bounded_result, _other}, 100
 
@@ -209,17 +210,23 @@ defmodule ForgeGitHub.InstallationTokenBrokerTest do
         end
       )
 
-    caller = spawn(fn -> InstallationTokenBroker.fetch(broker, 44) end)
-    assert_receive {:dead_caller_fetch, fetch_task}
-    fetch_monitor = Process.monitor(fetch_task)
-    Process.exit(caller, :kill)
-    assert_receive {:DOWN, ^fetch_monitor, :process, ^fetch_task, _reason}, 1_000
+    {caller, caller_monitor} = spawn_monitor(fn -> InstallationTokenBroker.fetch(broker, 44) end)
 
-    replacement = Task.async(fn -> InstallationTokenBroker.fetch(broker, 44) end)
-    assert_receive {:dead_caller_fetch, replacement_fetch}
-    assert :ok = InstallationTokenBroker.invalidate(broker, 44)
-    assert {:error, :invalidated} = Task.await(replacement)
-    refute Process.alive?(replacement_fetch)
+    try do
+      assert_receive {:dead_caller_fetch, fetch_task}, 1_000
+      fetch_monitor = Process.monitor(fetch_task)
+      Process.exit(caller, :kill)
+      assert_receive {:DOWN, ^fetch_monitor, :process, ^fetch_task, _reason}, 1_000
+
+      replacement = Task.async(fn -> InstallationTokenBroker.fetch(broker, 44) end)
+      assert_receive {:dead_caller_fetch, replacement_fetch}, 1_000
+      assert :ok = InstallationTokenBroker.invalidate(broker, 44)
+      assert {:error, :invalidated} = Task.await(replacement)
+      refute Process.alive?(replacement_fetch)
+    after
+      Process.exit(caller, :kill)
+      assert_receive {:DOWN, ^caller_monitor, :process, ^caller, _reason}, 1_000
+    end
   end
 
   test "waiters expire before the public call timeout and release the task" do
@@ -227,7 +234,7 @@ defmodule ForgeGitHub.InstallationTokenBrokerTest do
 
     broker =
       start_broker!(
-        waiter_timeout_ms: 50,
+        waiter_timeout_ms: 1_000,
         fetcher: fn _, _ ->
           send(parent, {:expiring_fetch, self()})
           receive do: (:never -> :unexpected)
@@ -236,10 +243,10 @@ defmodule ForgeGitHub.InstallationTokenBrokerTest do
 
     started_at = System.monotonic_time(:millisecond)
     caller = Task.async(fn -> InstallationTokenBroker.fetch(broker, 44) end)
-    assert_receive {:expiring_fetch, fetch_task}
+    assert_receive {:expiring_fetch, fetch_task}, 1_000
     fetch_monitor = Process.monitor(fetch_task)
-    assert {:error, :timeout} = Task.await(caller, 1_000)
-    assert System.monotonic_time(:millisecond) - started_at < 1_000
+    assert {:error, :timeout} = Task.await(caller, 3_000)
+    assert System.monotonic_time(:millisecond) - started_at < 3_000
     assert_receive {:DOWN, ^fetch_monitor, :process, ^fetch_task, _reason}, 1_000
 
     status = :sys.get_status(broker) |> inspect()

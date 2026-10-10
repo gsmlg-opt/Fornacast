@@ -10,12 +10,55 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
     repository_analysis repository_disk_usage resolve_snapshot search_tree tags
   )a)
   @duplicate_classifications %{
+    {"apps/forge_pulls/lib/forge_pulls/coordinated_merge_finalization.ex", :validate_refs,
+     :exact_ref} => 2,
     {"apps/git_transport/lib/git_transport/upload_pack.ex", :pack_objects, :pack_objects} => 2,
     {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :load_context, :ref_summary} => 2,
     {"apps/fornacast_web/lib/fornacast_web/repository_page.ex", :optional_chrome_snapshot,
      :resolve_snapshot} => 2
   }
   @git_core_classification %{
+    # Mirror observations reload the live generation under read permits; publication
+    # and pull/import ref proofs hold domain writer fences. Import observations
+    # belong to the operation's hidden staged repository until publication.
+    {"apps/forge_github/lib/forge_github/git_ref_worker.ex", :process_operation, :list_refs} =>
+      :read_handle,
+    {"apps/forge_github/lib/forge_github/git_ref_worker.ex", :read_local_ref, :exact_ref} =>
+      :read_handle,
+    {"apps/forge_github/lib/forge_github/lfs_sync.ex", :callbacks, :list_refs} => :read_handle,
+    {"apps/forge_github/lib/forge_github/lfs_reconciliation.ex", :read_baselines, :list_refs} =>
+      :read_handle,
+    {"apps/forge_github/lib/forge_github/lfs_reconciliation.ex", :publish, :list_refs} =>
+      :writer_fence,
+    {"apps/forge_github/lib/forge_github/pull_sync_worker.ex", :verify_required_ref, :exact_ref} =>
+      :writer_fence,
+    {"apps/forge_pulls/lib/forge_pulls/coordinated_merge_finalization.ex", :validate_refs,
+     :exact_ref} => :writer_fence,
+    {"apps/forge_pulls/lib/forge_pulls/coordinated_merge_finalization.ex", :advance_ref,
+     :exact_ref} => :writer_fence,
+    {"apps/forge_releases/lib/forge_releases.ex", :require_tag, :exact_ref} => :writer_fence,
+    {"apps/forge_imports/lib/forge_imports/github/lfs_importer.ex", :callbacks, :list_refs} =>
+      :import_lease,
+    {"apps/forge_imports/lib/forge_imports/github/lfs_importer.ex", :completion_valid?,
+     :list_refs} => :import_lease,
+    {"apps/forge_imports/lib/forge_imports/github/metadata_importer.ex", :staged_refs, :list_refs} =>
+      :import_lease,
+    {"apps/forge_imports/lib/forge_imports/github/metadata_importer.ex", :staged_tag_refs,
+     :list_refs} => :import_lease,
+    {"apps/forge_imports/lib/forge_imports/github/pull_head_binding.ex", :with_observation,
+     :exact_ref} => :writer_fence,
+    {"apps/forge_imports/lib/forge_imports/organization_sync/handoff.ex", :seed_refs, :list_refs} =>
+      :import_lease,
+    {"apps/forge_imports/lib/forge_imports/pat_repository_sync.ex", :current_refs, :exact_ref} =>
+      :writer_fence,
+    {"apps/forge_imports/lib/forge_imports/pat_repository_sync.ex", :plan_batch, :exact_ref} =>
+      :writer_fence,
+    {"apps/forge_imports/lib/forge_imports/persistence.ex", :harmless_quarantine_history?,
+     :contained_tree_identity} => :import_lease,
+    # Remote sync validates its destination while holding its existing path-key
+    # writer permit. This classification does not imply a domain cleanup permit.
+    {"apps/git_core/lib/git_core/remote.ex", :validate_sync_destination, :is_bare_repository?} =>
+      :writer_fence,
     {"apps/forge_pulls/lib/forge_pulls.ex", :branch_option_pages, :ref_page} => :read_handle,
     {"apps/forge_pulls/lib/forge_pulls.ex", :list_commits, :commit_range_page} => :read_handle,
     {"apps/forge_pulls/lib/forge_pulls.ex", :changed_files, :diff_between} => :read_handle,

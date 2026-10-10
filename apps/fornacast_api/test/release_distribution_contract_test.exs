@@ -278,7 +278,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     refute workflow =~ "FORNACAST_DATABASE_PATH"
 
     assert workflow =~
-             ~r/release-smoke:\s*\n\s+name: Release Smoke\s*\n\s+runs-on: ubuntu-24\.04\s*\n\s+services:\s*\n\s+postgres:\s*\n\s+image: postgres:17\s*\n\s+env:\s*\n\s+POSTGRES_DB: fornacast_e2e\s*\n\s+POSTGRES_USER: fornacast\s*\n\s+POSTGRES_PASSWORD: fornacast_e2e_password\s*\n\s+ports:\s*\n\s+- 5432:5432\s*\n\s+options: >-\s*\n\s+--health-cmd "pg_isready -U fornacast -d fornacast_e2e"\s*\n\s+--health-interval 5s\s*\n\s+--health-timeout 5s\s*\n\s+--health-retries 20/s
+             ~r/release-smoke:\s*\n\s+name: Release Smoke\s*\n\s+runs-on: ubuntu-24\.04\s*\n\s+services:\s*\n\s+postgres:\s*\n\s+image: public\.ecr\.aws\/docker\/library\/postgres:17\s*\n\s+env:\s*\n\s+POSTGRES_DB: fornacast_e2e\s*\n\s+POSTGRES_USER: fornacast\s*\n\s+POSTGRES_PASSWORD: fornacast_e2e_password\s*\n\s+ports:\s*\n\s+- 5432:5432\s*\n\s+options: >-\s*\n\s+--health-cmd "pg_isready -U fornacast -d fornacast_e2e"\s*\n\s+--health-interval 5s\s*\n\s+--health-timeout 5s\s*\n\s+--health-retries 20/s
 
     assert workflow =~ "POSTGRES_HOST: 127.0.0.1"
     assert workflow =~ ~r/POSTGRES_PORT: ["']5432["']/
@@ -1019,7 +1019,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert runtime_stage =~ "LANG=C.UTF-8"
     assert "coreutils" in String.split(runtime_packages)
     assert File.read!(@releases_mix) =~ ~s({:forge_blobs, in_umbrella: true})
-    assert File.read!(@blobs_mix) =~ ~s({:ex_storage_service, "== 0.6.4"})
+    assert File.read!(@blobs_mix) =~ ~s({:ex_storage_service, "== 0.6.5"})
     assert dockerfile =~ "scripts/release_asset_storage_smoke.sh"
     refute dockerfile =~ "COPY scripts scripts"
     assert dockerfile =~ "RELEASE_DISTRIBUTION=name"
@@ -1043,7 +1043,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert readme =~ "Erlang distribution and EPMD are bound to loopback"
     refute dockerfile =~ "EXPOSE 9000"
     refute compose =~ ~r/^\s+- ["']?9000/m
-    assert e2e =~ "ex_storage_service-0.6.4"
+    assert e2e =~ "ex_storage_service-0.6.5"
     assert e2e =~ "release_asset_storage_smoke.sh release/fornacast write"
     assert e2e =~ "release_asset_storage_smoke.sh release/fornacast verify"
     assert e2e =~ ~s(echo "ELIXIR_ERL_OPTIONS=-kernel inet_dist_use_interface {127,0,0,1}")

@@ -15,6 +15,23 @@ defmodule ForgeGitHub.PullCreateIntegrationTest do
         capabilities: %{"git" => "enabled", "pulls" => "enabled"}
       })
 
+    {:ok, _installation} =
+      ForgeMirrors.observe_github_app_installation(%{
+        github_installation_id: org.github_installation_id,
+        github_account_id: org.github_account_id,
+        github_account_login: org.github_account_login,
+        account_type: :organization,
+        repository_selection: :all,
+        permissions: %{
+          "metadata" => "read",
+          "contents" => "read",
+          "pull_requests" => "write",
+          "issues" => "write"
+        },
+        state: :active,
+        last_verified_at: DateTime.utc_now()
+      })
+
     base =
       repository_mirror_fixture(org, %{
         github_full_name: "acme/base",
@@ -159,8 +176,16 @@ defmodule ForgeGitHub.PullCreateIntegrationTest do
            )
 
     assert Enum.all?(mappings, &(&1.confirmed_snapshot["body"] == c.issue.body))
-    assert Repo.aggregate(ForgeIssues.Issue, :count) == 1
-    assert Repo.aggregate(ForgePulls.PullRequest, :count) == 1
+
+    assert Repo.aggregate(
+             from(i in ForgeIssues.Issue, where: i.repository_id == ^c.pull.repository_id),
+             :count
+           ) == 1
+
+    assert Repo.aggregate(
+             from(p in ForgePulls.PullRequest, where: p.repository_id == ^c.pull.repository_id),
+             :count
+           ) == 1
   end
 
   test "missing assignee nodes seed across claims without another POST or metadata PATCH", c do

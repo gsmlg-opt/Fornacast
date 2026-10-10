@@ -711,8 +711,18 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
     assert :ok = stage(item, stub, phases: [:pull_requests])
   end
 
+  @tag :tmp_dir
   test "represented bootstrap heads require active confirmed live refs and reject stale absence",
-       %{run: run, actor: actor} do
+       %{run: run, actor: actor, tmp_dir: tmp_dir} do
+    original_root = Application.get_env(:fornacast, :repo_storage_root)
+    root = Path.join(tmp_dir, "repos")
+    Application.put_env(:fornacast, :repo_storage_root, root)
+
+    on_exit(fn ->
+      Application.put_env(:fornacast, :repo_storage_root, original_root)
+      File.rm_rf!(root)
+    end)
+
     {item, shadow, _, _, base_sha} = git_staged_fixture(run, full_name: "octocat/Hello-World")
 
     {:ok, organization} =

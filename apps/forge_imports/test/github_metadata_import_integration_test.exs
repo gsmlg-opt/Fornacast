@@ -5,6 +5,7 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
 
   alias Ecto.Multi
   alias ForgeImports.GitHub.MetadataImporter
+  alias ForgeImports.TestSupport.LFSImportFixture
   alias ForgeImports.{ImportAttempt, ObjectMapping, Persistence, ReportEntry, RepositoryItem}
   alias ForgeIssues.{Issue, NumberSequence}
   alias ForgeMirrors.{MirrorResourceState, RepositoryMirror}
@@ -484,7 +485,7 @@ defmodule ForgeImports.GitHubMetadataImportIntegrationTest do
                ]
              )
 
-    item = Repo.get!(RepositoryItem, item.id)
+    item = Repo.get!(RepositoryItem, item.id) |> LFSImportFixture.complete!(run)
     stub = stub_name()
     {item, shadow, stub, head_sha, base_sha}
   end

@@ -61,6 +61,8 @@ defmodule ForgeImports.OrganizationPatSettingsTest do
   end
 
   test "read-only discovery persists safe rows, not a sync operation", c do
+    operation_count = Repo.aggregate(ForgeMirrors.MirrorOperation, :count)
+
     Process.put(
       {Client, :result},
       {:ok,
@@ -74,7 +76,7 @@ defmodule ForgeImports.OrganizationPatSettingsTest do
              PatSettings.view(c.owner, c.org.id)
 
     assert row == %{"id" => 42, "full_name" => "source-org/repo", "visibility" => "private"}
-    assert Repo.aggregate(ForgeMirrors.MirrorOperation, :count) == 0
+    assert Repo.aggregate(ForgeMirrors.MirrorOperation, :count) == operation_count
   end
 
   test "sync admits a durable all-repository job and reuses it on repeated clicks", c do

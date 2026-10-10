@@ -714,7 +714,12 @@ defmodule ForgeImports.OrganizationSync.Handoff do
   @release_evidence_keys ~w(github_node_id remote_created_at remote_updated_at v)
 
   defp release_evidence(evidence) when is_map(evidence) do
-    with true <- Enum.sort(Map.keys(evidence)) == @release_evidence_keys,
+    # Earlier v1 mappings predate the importer's asset_count evidence.
+    with true <-
+           Enum.sort(Map.keys(Map.delete(evidence, "asset_count"))) == @release_evidence_keys,
+         true <-
+           not Map.has_key?(evidence, "asset_count") or
+             (is_integer(evidence["asset_count"]) and evidence["asset_count"] in 0..512),
          1 <- evidence["v"],
          true <- valid_identity_text?(evidence["github_node_id"]),
          {:ok, _} <- evidence_datetime(evidence["remote_created_at"]),

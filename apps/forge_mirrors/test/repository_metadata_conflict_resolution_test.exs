@@ -6,7 +6,15 @@ defmodule ForgeMirrors.RepositoryMetadataConflictResolutionTest do
 
   alias ForgeAccounts.User
 
-  alias ForgeMirrors.{MirrorConflict, MirrorOperation, MirrorResourceState, RepositoryMirror}
+  alias ForgeMirrors.{
+    GitHubAppInstallation,
+    MirrorConflict,
+    MirrorOperation,
+    MirrorResourceState,
+    OrganizationMirror,
+    RepositoryMirror
+  }
+
   alias ForgeRepos.Repository
   alias Fornacast.{AuditEvent, Repo}
 
@@ -29,11 +37,12 @@ defmodule ForgeMirrors.RepositoryMetadataConflictResolutionTest do
         github_full_name: "example/repo-#{suffix}"
       })
 
+    actor = organization_owner_fixture(organization)
+
     if context[:committed] do
-      on_exit(fn -> cleanup_committed_operations(organization.id) end)
+      on_exit(fn -> cleanup_committed_fixture(organization, binding, actor) end)
     end
 
-    actor = organization_owner_fixture(organization)
     now = DateTime.utc_now(:second)
 
     %{organization: organization, binding: binding, actor: actor, now: now}
@@ -469,19 +478,8 @@ defmodule ForgeMirrors.RepositoryMetadataConflictResolutionTest do
 
     assert {:ok, :locked} = Task.await(worker, 5_000)
 
-    assert {:ok, %{operation: %MirrorOperation{state: :pending} = requested}} =
+    assert {:ok, %{operation: %MirrorOperation{state: :pending}}} =
              Task.await(requester, 5_000)
-
-    Repo.update_all(
-      from(operation in MirrorOperation, where: operation.id == ^requested.id),
-      set: [
-        state: :failed,
-        failure_class: "local_validation",
-        failure_disposition: :terminal,
-        failure_detail: "concurrency regression cleanup",
-        updated_at: c.now
-      ]
-    )
   end
 
   defp request(c, conflict, action) do
@@ -586,33 +584,30 @@ defmodule ForgeMirrors.RepositoryMetadataConflictResolutionTest do
     end
   end
 
-  defp cleanup_committed_operations(organization_mirror_id) do
+  defp cleanup_committed_fixture(organization, binding, actor) do
     Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
-      Repo.update_all(
-        from(operation in MirrorOperation,
-          where:
-            operation.organization_mirror_id == ^organization_mirror_id and
-              operation.state in [:pending, :processing, :effect_pending]
-        ),
-        set: [
-          state: :failed,
-          lease_owner: nil,
-          lease_expires_at: nil,
-          external_effect_marker: nil,
-          effect_marked_at: nil,
-          failure_class: "local_validation",
-          failure_disposition: :terminal,
-          failure_detail: "concurrency regression cleanup",
-          updated_at: DateTime.utc_now(:second)
-        ]
-      )
+      {:ok, _} =
+        Repo.transaction(fn ->
+          Repo.delete_all(from(event in AuditEvent, where: event.actor_user_id == ^actor.id))
 
-      Repo.update_all(
-        from(organization in ForgeMirrors.OrganizationMirror,
-          where: organization.id == ^organization_mirror_id
-        ),
-        set: [state: :revoked, updated_at: DateTime.utc_now(:second)]
-      )
+          Repo.delete_all(
+            from(mirror in OrganizationMirror, where: mirror.id == ^organization.id)
+          )
+
+          Repo.delete_all(
+            from(repository in Repository, where: repository.id == ^binding.repository_id)
+          )
+
+          Repo.delete_all(
+            from(installation in GitHubAppInstallation,
+              where: installation.github_installation_id == ^organization.github_installation_id
+            )
+          )
+
+          Repo.delete_all(
+            from(user in User, where: user.id in ^[organization.organization_id, actor.id])
+          )
+        end)
     end)
   end
 end

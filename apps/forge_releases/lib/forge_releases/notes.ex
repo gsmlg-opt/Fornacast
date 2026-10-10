@@ -4,7 +4,21 @@ defmodule ForgeReleases.Notes do
   alias ForgeReleases.Archives
 
   def generate(repository, tag_name, previous_tag \\ nil, target_commitish \\ nil) do
-    path = ForgeRepos.absolute_storage_path(repository)
+    deadline = System.monotonic_time(:millisecond) + GitCore.Limits.get(:content_deadline_ms)
+
+    ForgeRepos.with_repository_read(repository, deadline, fn handle ->
+      generate_from_path(
+        ForgeRepos.repository_read_repository(handle),
+        ForgeRepos.repository_read_path(handle),
+        tag_name,
+        previous_tag,
+        target_commitish
+      )
+    end)
+  end
+
+  @doc false
+  def generate_from_path(repository, path, tag_name, previous_tag, target_commitish) do
     target = target_commitish || repository.default_branch
 
     with {:ok, oid} <- release_target(path, tag_name, target),

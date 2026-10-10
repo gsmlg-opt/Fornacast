@@ -8,8 +8,13 @@ defmodule ForgeGitHub.LFSSyncPersistenceTest do
 
   @moduletag :tmp_dir
 
-  test "101-object scan replay checks page one again after publication", %{tmp_dir: path} do
+  test "101-object scan replay checks page one again after publication", %{tmp_dir: tmp_root} do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+    previous_root = Application.fetch_env!(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, Path.join(tmp_root, "repositories"))
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, previous_root) end)
+    path = Path.join(tmp_root, "source")
+    File.mkdir_p!(path)
     suffix = System.unique_integer([:positive])
 
     assert {:ok, owner} =
@@ -52,7 +57,8 @@ defmodule ForgeGitHub.LFSSyncPersistenceTest do
     git!(path, ["commit", "-m", "101 pointers"])
     git!(path, ["branch", "-M", "main"])
     target = git!(path, ["rev-parse", "HEAD"])
-    bare_path = Path.join(path, "mirror.git")
+    bare_path = ForgeRepos.absolute_storage_path(repository)
+    File.rm_rf!(bare_path)
     git!(path, ["clone", "--bare", path, bare_path])
 
     sync = %{

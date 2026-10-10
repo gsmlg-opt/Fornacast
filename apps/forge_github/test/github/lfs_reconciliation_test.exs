@@ -21,7 +21,7 @@ defmodule ForgeGitHub.LFSReconciliationTest do
 
   @moduletag :tmp_dir
 
-  setup %{tmp_dir: path} do
+  setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
     suffix = System.unique_integer([:positive])
 
@@ -33,7 +33,9 @@ defmodule ForgeGitHub.LFSReconciliationTest do
       })
 
     {:ok, repository} = ForgeRepos.create_repository(owner, %{name: "Sweep", slug: "sweep"})
+    path = ForgeRepos.absolute_storage_path(repository)
     git!(path, ["init", "--bare"])
+    on_exit(fn -> File.rm_rf!(path) end)
     oid = :crypto.hash(:sha256, "unreachable-#{suffix}") |> Base.encode16(case: :lower)
     now = DateTime.utc_now(:second)
 
@@ -73,6 +75,91 @@ defmodule ForgeGitHub.LFSReconciliationTest do
              LFSReconciliation.run(context.operation, context.sync, callback,
                context: fn _ -> {:ok, context.sync} end
              )
+  end
+
+  test "active cleanup blocks baseline observation until its permit is released", context do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+
+    assert {:ok, cleanup} =
+             GitCore.RepositoryReadLimiter.acquire_cleanup(context.repository.id, deadline)
+
+    task =
+      Task.async(fn ->
+        receive do
+          :start ->
+            LFSReconciliation.run(context.operation, context.sync, fn -> :finalized end,
+              context: fn _ -> {:ok, context.sync} end
+            )
+        end
+      end)
+
+    :ok = Ecto.Adapters.SQL.Sandbox.allow(Repo, self(), task.pid)
+    send(task.pid, :start)
+
+    try do
+      wait_for_read_waiter(context.repository.id, task.pid)
+      assert Task.yield(task, 0) == nil
+      assert Repo.get!(RepositoryObject, context.mapping.id).reachable
+    after
+      :ok = GitCore.RepositoryReadLimiter.release(cleanup)
+    end
+
+    assert Task.await(task, 5_000) == :finalized
+    refute Repo.get!(RepositoryObject, context.mapping.id).reachable
+  end
+
+  test "mirror path context rechecks generation after waiting for cleanup" do
+    now = DateTime.utc_now(:second)
+    mirror = lfs_mirror_context!()
+
+    operation =
+      enqueue_operation!(mirror, "finalize.repository.git", %{}) |> claim!(now, "path-context")
+
+    deadline = System.monotonic_time(:millisecond) + 5_000
+
+    assert {:ok, cleanup} =
+             GitCore.RepositoryReadLimiter.acquire_cleanup(mirror.repository.id, deadline)
+
+    task =
+      Task.async(fn ->
+        receive do
+          :start -> ForgeMirrors.git_repository_operation_context(operation)
+        end
+      end)
+
+    :ok = Ecto.Adapters.SQL.Sandbox.allow(Repo, self(), task.pid)
+    send(task.pid, :start)
+
+    try do
+      wait_for_read_waiter(mirror.repository.id, task.pid)
+
+      from(repository in ForgeRepos.Repository, where: repository.id == ^mirror.repository.id)
+      |> Repo.update_all(inc: [generation: 1])
+    after
+      :ok = GitCore.RepositoryReadLimiter.release(cleanup)
+    end
+
+    assert Task.await(task, 5_000) == {:error, :not_found}
+  end
+
+  test "observations and publication use the live repository path", context do
+    sync = %{context.sync | repository_path: "/nonexistent/stale-lfs-path.git"}
+
+    assert :finalized =
+             LFSReconciliation.run(context.operation, sync, fn -> :finalized end,
+               context: fn _ -> {:ok, sync} end
+             )
+  end
+
+  test "a stale repository generation cannot begin an authoritative sweep", context do
+    sync = %{context.sync | repository_generation: context.repository.generation + 1}
+
+    assert {:error, :stale_repository} =
+             LFSReconciliation.run(context.operation, sync, fn ->
+               flunk("stale sweep finalized")
+             end)
+
+    assert Repo.get!(RepositoryObject, context.mapping.id).reachable
   end
 
   test "ref changes before publication retain old reachability and restart the scan", context do
@@ -569,6 +656,27 @@ defmodule ForgeGitHub.LFSReconciliationTest do
            ) == 0
   end
 
+  defp wait_for_read_waiter(repository_id, owner, attempts \\ 100)
+
+  defp wait_for_read_waiter(repository_id, owner, attempts) when attempts > 0 do
+    queued? =
+      GitCore.RepositoryReadLimiter
+      |> :sys.get_state()
+      |> Map.fetch!(:waiters)
+      |> Map.values()
+      |> Enum.any?(&(&1.repository_id == repository_id and &1.owner == owner))
+
+    if queued? do
+      :ok
+    else
+      Process.sleep(5)
+      wait_for_read_waiter(repository_id, owner, attempts - 1)
+    end
+  end
+
+  defp wait_for_read_waiter(_repository_id, _owner, 0),
+    do: flunk("LFS baseline observation did not wait for the cleanup permit")
+
   defp resume(_operation, _sync, 0), do: flunk("scan failed to finish within bounded attempts")
 
   defp resume(operation, sync, remaining) do
@@ -709,9 +817,9 @@ defmodule ForgeGitHub.LFSReconciliationTest do
   end
 
   defp chunk_reader(%{chunks: [chunk | rest]} = state, _options),
-    do: {:more, chunk, %{state | chunks: rest}}
+    do: {:ok, chunk, %{state | chunks: rest}}
 
-  defp chunk_reader(%{chunks: []} = state, _options), do: {:done, state}
+  defp chunk_reader(%{chunks: []} = state, _options), do: {:eof, state}
 
   defp write_object!(repository_path, type, body) do
     object_path =

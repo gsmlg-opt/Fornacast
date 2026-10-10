@@ -62,10 +62,15 @@ defmodule ForgeMirrors.InventoryTest do
     assert Repo.get!(MirrorOperation, ordinary.id).state == :pending
     Repo.delete!(ordinary)
 
-    assert {:ok, _suspended} =
+    installation =
+      Repo.get_by!(GitHubAppInstallation,
+        github_installation_id: context.organization_mirror.github_installation_id
+      )
+
+    assert {:ok, %GitHubAppInstallation{state: :suspended}} =
              ForgeMirrors.suspend_github_app_installation(
                context.organization_mirror.github_installation_id,
-               DateTime.add(context.now, 1)
+               DateTime.add(installation.last_verified_at, 1)
              )
 
     blocked = inventory_operation(context.organization_mirror, context.now, "suspended")

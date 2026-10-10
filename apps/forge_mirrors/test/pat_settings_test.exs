@@ -40,6 +40,7 @@ defmodule ForgeMirrors.PatSettingsTest do
   end
 
   test "saves configuration without creating an active mirror or executing sync", c do
+    mirror_count = Repo.aggregate(ForgeMirrors.OrganizationMirror, :count)
     assert {:ok, saved} = PatSettings.save(c.owner, c.org.id, c.attrs, %{})
     assert saved.enabled
     assert saved.direction == "github_to_fornacast"
@@ -48,7 +49,7 @@ defmodule ForgeMirrors.PatSettingsTest do
              PatSettings.view(c.owner, c.org.id)
 
     assert id == saved.id
-    assert Repo.aggregate(ForgeMirrors.OrganizationMirror, :count) == 0
+    assert Repo.aggregate(ForgeMirrors.OrganizationMirror, :count) == mirror_count
 
     assert {:ok, disabled} =
              PatSettings.save(

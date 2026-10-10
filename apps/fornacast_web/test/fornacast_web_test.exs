@@ -950,10 +950,25 @@ defmodule FornacastWebTest do
       })
 
     invalid_body = html_response(invalid_repo, 422)
-    assert invalid_body =~ ~r/<option[^>]*value="acme"[^>]*selected/
-    assert invalid_body =~ ~s(name="repository[slug]" value="draft")
-    assert invalid_body =~ ~s(>keep these values</textarea>)
-    assert invalid_body =~ ~r/<option[^>]*value="public"[^>]*selected/
+    invalid_document = LazyHTML.from_document(invalid_body)
+
+    assert LazyHTML.attribute(
+             LazyHTML.query(invalid_document, "#repository-owner option[selected]"),
+             "value"
+           ) == ["acme"]
+
+    assert LazyHTML.attribute(
+             LazyHTML.query(invalid_document, "#repository-slug[name='repository[slug]']"),
+             "value"
+           ) == ["draft"]
+
+    assert LazyHTML.text(LazyHTML.query(invalid_document, "#repository-description")) ==
+             "keep these values"
+
+    assert LazyHTML.attribute(
+             LazyHTML.query(invalid_document, "#repository-visibility option[selected]"),
+             "value"
+           ) == ["public"]
 
     created_repo =
       created_org

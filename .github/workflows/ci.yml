@@ -112,6 +112,7 @@ jobs:
         run: mix deps.compile
 
       - name: Install frontend dependencies
+        # TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#185
         run: mix npm.ci
 
       - name: Build static assets

@@ -1,5 +1,6 @@
 defmodule ForgeMirrors.PullMergeBoundaryTest do
   use ExUnit.Case, async: false
+  import Ecto.Query
   import ForgeMirrors.TestSupport.MirrorFixtures
   alias Ecto.{Changeset, Multi}
   alias ForgeMirrors.{MirrorRefState, MirrorResourceState, PullEligibility, PullMergeBoundary}
@@ -1043,7 +1044,12 @@ defmodule ForgeMirrors.PullMergeBoundaryTest do
                provider_pull_id: 902
              })
 
-    assert Repo.aggregate(ForgeMirrors.MirrorConflict, :count) == 1
+    assert Repo.aggregate(
+             from(conflict in ForgeMirrors.MirrorConflict,
+               where: conflict.organization_mirror_id == ^c.organization.id
+             ),
+             :count
+           ) == 1
 
     reclaimed =
       replayed

@@ -11,6 +11,7 @@ defmodule Fornacast.DomainOutboxTest do
   setup context do
     if context[:independent_connections] != true do
       :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+      Repo.delete_all(DomainOutboxEvent)
     end
 
     :ok
@@ -49,7 +50,12 @@ defmodule Fornacast.DomainOutboxTest do
   test "record persists through an existing domain transaction" do
     attrs = event_attrs(Ecto.UUID.generate())
 
-    assert {:ok, %DomainOutboxEvent{} = event} = DomainOutbox.record(attrs)
+    assert {:ok, %DomainOutboxEvent{} = event} =
+             Repo.transaction(fn ->
+               assert {:ok, event} = DomainOutbox.record(attrs)
+               event
+             end)
+
     assert event.event_id == attrs.event_id
     assert Repo.get!(DomainOutboxEvent, event.id).state == :pending
   end
@@ -270,6 +276,8 @@ defmodule Fornacast.DomainOutboxTest do
 
       assert {:ok, [claimed]} =
                DomainOutbox.claim_batch("server-expiry-#{action}", now, 30, 1)
+
+      assert claimed.id == event.id
 
       Repo.update_all(from(row in DomainOutboxEvent, where: row.id == ^event.id),
         set: [lease_expires_at: expired_at]

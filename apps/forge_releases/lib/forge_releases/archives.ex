@@ -7,10 +7,16 @@ defmodule ForgeReleases.Archives do
   def prepare(actor, owner, repo, release_id, format) when format in ["tar", "zip"] do
     with {:ok, release} <- ForgeReleases.get(actor, owner, repo, release_id),
          {:ok, repository} <-
-           ForgeRepos.fetch_authorized_repository(actor, owner, repo, :repository_read),
-         path <- ForgeRepos.absolute_storage_path(repository),
-         {:ok, oid} <- commit_oid(path, "refs/tags/#{release.tag_name}") do
-      generate(path, oid, repository.slug, release.tag_name, format)
+           ForgeRepos.fetch_authorized_repository(actor, owner, repo, :repository_read) do
+      deadline = System.monotonic_time(:millisecond) + @timeout_ms
+
+      ForgeRepos.with_repository_read(repository, deadline, fn handle ->
+        path = ForgeRepos.repository_read_path(handle)
+
+        with {:ok, oid} <- commit_oid(path, "refs/tags/#{release.tag_name}") do
+          generate(path, oid, repository.slug, release.tag_name, format)
+        end
+      end)
     end
   end
 

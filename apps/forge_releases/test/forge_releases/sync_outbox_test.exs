@@ -64,16 +64,20 @@ defmodule ForgeReleases.SyncOutboxTest do
   end
 
   test "an outbox failure rolls back release and audit", ctx do
-    multi =
-      ForgeReleases.create_multi(
-        ctx.actor,
-        ctx.repository,
-        %{"tag_name" => "v1.0.0", "name" => "Rollback"},
-        %{},
-        origin: :invalid
-      )
+    assert {:error, :outbox, _changeset, _changes} =
+             ForgeRepos.with_write_fence(ctx.repository, :tag, fn path, remaining ->
+               ForgeReleases.create_fenced_multi(
+                 ctx.actor,
+                 ctx.repository,
+                 %{"tag_name" => "v1.0.0", "name" => "Rollback"},
+                 %{},
+                 path,
+                 remaining,
+                 origin: :invalid
+               )
+               |> ForgeReleases.transaction()
+             end)
 
-    assert {:error, :outbox, _changeset, _changes} = ForgeReleases.transaction(multi)
     assert Repo.aggregate(Release, :count) == 0
     assert Repo.aggregate(AuditEvent, :count) == 0
     refute release_event_for_repository?(ctx.repository.id)
@@ -81,14 +85,18 @@ defmodule ForgeReleases.SyncOutboxTest do
 
   test "a later failure rolls back mutation audit and outbox together", ctx do
     assert {:error, :later, :rollback, _changes} =
-             ForgeReleases.create_multi(
-               ctx.actor,
-               ctx.repository,
-               %{"tag_name" => "v1.0.0", "name" => "Rollback"},
-               %{}
-             )
-             |> Multi.error(:later, :rollback)
-             |> ForgeReleases.transaction()
+             ForgeRepos.with_write_fence(ctx.repository, :tag, fn path, remaining ->
+               ForgeReleases.create_fenced_multi(
+                 ctx.actor,
+                 ctx.repository,
+                 %{"tag_name" => "v1.0.0", "name" => "Rollback"},
+                 %{},
+                 path,
+                 remaining
+               )
+               |> Multi.error(:later, :rollback)
+               |> ForgeReleases.transaction()
+             end)
 
     assert Repo.aggregate(Release, :count) == 0
     assert Repo.aggregate(AuditEvent, :count) == 0
