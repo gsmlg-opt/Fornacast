@@ -38,6 +38,8 @@ defmodule ForgeGitHub.Transport do
     with :ok <- validate_request(request),
          {:ok, addresses} <- addresses(request),
          {:ok, timeout} <- timeout(request) do
+      # TODO(upstream): gsmlg-dev/http_fetch#44 - preserve validated IP pinning when migrating to Fetch.
+      # TODO(upstream): gsmlg-dev/http_fetch#37 - preserve bounded response streaming when migrating to Fetch.
       # TODO(upstream): gsmlg-dev/http_fetch#68 - distinguish pre-connect failures before retrying another validated IP.
       api = Req.Request.get_private(request, :forge_github_transport_api, Mint.HTTP)
       deadline = monotonic_ms() + timeout

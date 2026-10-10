@@ -67,6 +67,8 @@ defmodule ForgeGitHub.LFS.Transport do
          {:ok, headers} <- validate_headers(headers),
          {:ok, body} <- validate_body(method, body),
          {:ok, addresses} <- resolve_addresses(uri.host, opts, deadline) do
+      # TODO(upstream): gsmlg-dev/http_fetch#44 - preserve validated IP pinning when migrating to Fetch.
+      # TODO(upstream): gsmlg-dev/http_fetch#37 - preserve header-first downloads with consumer backpressure.
       # TODO(upstream): gsmlg-dev/http_fetch#68 - preserve pre-connect IP failover without replaying uploads.
       api = Keyword.get(opts, :transport_api, Mint.HTTP)
       run_with_deadline(method, uri, headers, body, api, addresses, deadline)
