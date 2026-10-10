@@ -157,6 +157,31 @@
     gap: 1.1rem;
   }
 
+  .brand-lockup {
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    gap: 0.5rem;
+  }
+
+  .brand-version {
+    border: 0;
+    cursor: help;
+    white-space: nowrap;
+  }
+
+  .brand-version:focus-visible {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 2px;
+  }
+
+  .brand-version-tooltip[popover] {
+    max-width: min(32rem, calc(100vw - 2rem));
+    text-align: left;
+    white-space: pre-line;
+    overflow-wrap: anywhere;
+  }
+
   .brand-mark {
     display: inline-flex;
     align-items: center;

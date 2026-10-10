@@ -1,8 +1,11 @@
 defmodule FornacastWeb.HTML do
   @moduledoc false
 
+  use Phoenix.Component
+
   import Phoenix.HTML
-  import Plug.Conn
+  import PhoenixDuskmoon.Component.DataDisplay.Tooltip, only: [dm_tooltip: 1]
+  import Plug.Conn, except: [assign: 3]
 
   def page(conn, title, body) do
     current_user = conn.assigns[:current_user]
@@ -193,7 +196,53 @@ defmodule FornacastWeb.HTML do
   defp repository_safe_iodata(item) when is_integer(item), do: <<item>>
 
   def brand_mark(label) do
-    ~s(<a class="brand-mark" href="/" aria-label="#{escape(label)}"><img class="brand-logo" src="/images/logo.png" alt="" aria-hidden="true"><span>Fornacast</span></a>)
+    version =
+      %{__changed__: nil, info: FornacastWeb.BuildInfo.current()}
+      |> version_badge()
+      |> Phoenix.HTML.Safe.to_iodata()
+      |> IO.iodata_to_binary()
+
+    ~s(<div class="brand-lockup"><a class="brand-mark" href="/" aria-label="#{escape(label)}"><img class="brand-logo" src="/images/logo.png" alt="" aria-hidden="true"><span>Fornacast</span></a>#{version}</div>)
+  end
+
+  attr :info, :map, required: true
+
+  def version_badge(assigns) do
+    info = assigns.info
+    label = "v#{info.version}" <> if(info.environment == :dev, do: "-dev", else: "")
+
+    details =
+      [
+        "Version: #{info.version}",
+        "Environment: #{info.environment}",
+        "Git ref: #{info.git_ref || "Not recorded"}",
+        "Source commit: #{info.git_commit || "Not recorded"}",
+        "Built at: #{info.built_at || "Not recorded"}",
+        "Released at: #{info.released_at || "Not recorded"}"
+      ]
+      |> Enum.join("\n")
+
+    assigns = assigns |> assign(:label, label) |> assign(:details, details)
+
+    ~H"""
+    <.dm_tooltip
+      :let={trigger_attrs}
+      id="app-version"
+      content={@details}
+      position="bottom"
+      color="secondary"
+      class="brand-version-tooltip"
+    >
+      <button
+        type="button"
+        class="badge badge-secondary brand-version"
+        aria-label={"Fornacast version #{@label} details"}
+        {trigger_attrs}
+      >
+        {@label}
+      </button>
+    </.dm_tooltip>
+    """
   end
 
   defp create_menu do

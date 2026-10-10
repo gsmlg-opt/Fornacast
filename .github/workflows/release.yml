@@ -56,6 +56,13 @@ jobs:
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "git_ref=$git_ref" >> "$GITHUB_OUTPUT"
+          source_commit="$(git rev-parse HEAD)"
+          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+          echo "built_at=$built_at" >> "$GITHUB_OUTPUT"
+          echo "FORNACAST_BUILD_GIT_REF=$git_ref" >> "$GITHUB_ENV"
+          echo "FORNACAST_BUILD_GIT_COMMIT=$source_commit" >> "$GITHUB_ENV"
+          echo "FORNACAST_BUILD_TIME=$built_at" >> "$GITHUB_ENV"
 
       - name: Install system dependencies
         run: |
@@ -185,6 +192,9 @@ jobs:
             ghcr.io/gsmlg-dev/fornacast:${{ steps.version.outputs.version }}
           build-args: |
             FORNACAST_DATABASE_ADAPTER=postgres
+            FORNACAST_BUILD_GIT_REF=${{ steps.version.outputs.git_ref }}
+            FORNACAST_BUILD_GIT_COMMIT=${{ steps.version.outputs.source_commit }}
+            FORNACAST_BUILD_TIME=${{ steps.version.outputs.built_at }}
           cache-from: type=gha,scope=fornacast-release-postgres
           cache-to: type=gha,mode=max,scope=fornacast-release-postgres
           labels: |

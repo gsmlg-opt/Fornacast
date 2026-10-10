@@ -150,6 +150,29 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     refute File.read!(@config) =~ "config :bun,"
   end
 
+  test "release archive and image embed the same source commit and build time" do
+    workflow = File.read!(@workflow)
+    dockerfile = File.read!(@dockerfile)
+
+    assert_order(workflow, ~s|source_commit="$(git rev-parse HEAD)"|, "Update project versions")
+    assert_order(workflow, ~s(echo "FORNACAST_BUILD_TIME=$built_at"), "Compile application")
+
+    for {name, output} <- [
+          {"FORNACAST_BUILD_GIT_REF", "git_ref"},
+          {"FORNACAST_BUILD_GIT_COMMIT", "source_commit"},
+          {"FORNACAST_BUILD_TIME", "built_at"}
+        ] do
+      assert workflow =~ ~s(echo "#{name}=$#{output}" >> "$GITHUB_ENV")
+      assert workflow =~ "#{name}=${{ steps.version.outputs.#{output} }}"
+      assert dockerfile =~ "ARG #{name}"
+      assert dockerfile =~ "#{name}=${#{name}}"
+      assert_order(dockerfile, "mix npm.ci", "ARG #{name}")
+      assert_order(dockerfile, "ARG #{name}", "RUN mix assets.deploy")
+    end
+
+    refute workflow =~ "FORNACAST_RELEASE_TIME="
+  end
+
   test "release archive contains the current GitCore native library" do
     workflow = File.read!(@workflow)
 

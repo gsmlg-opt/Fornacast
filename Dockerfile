@@ -44,8 +44,18 @@ ENV HEX_HTTP_CONCURRENCY=1 \
 
 RUN mix deps.get --only prod && \
     mix deps.compile && \
-    mix npm.ci && \
-    mix assets.deploy && \
+    mix npm.ci
+
+ARG FORNACAST_BUILD_GIT_REF
+ARG FORNACAST_BUILD_GIT_COMMIT
+ARG FORNACAST_BUILD_TIME
+ARG FORNACAST_RELEASE_TIME
+ENV FORNACAST_BUILD_GIT_REF=${FORNACAST_BUILD_GIT_REF} \
+    FORNACAST_BUILD_GIT_COMMIT=${FORNACAST_BUILD_GIT_COMMIT} \
+    FORNACAST_BUILD_TIME=${FORNACAST_BUILD_TIME} \
+    FORNACAST_RELEASE_TIME=${FORNACAST_RELEASE_TIME}
+
+RUN mix assets.deploy && \
     mix compile && \
     mix release fornacast
 
