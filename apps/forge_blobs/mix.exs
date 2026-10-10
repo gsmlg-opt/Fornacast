@@ -26,7 +26,7 @@ defmodule ForgeBlobs.MixProject do
     [
       {:fornacast, in_umbrella: true},
       # TODO(upstream): gsmlg-opt/ex_storage_service#17
-      # TODO(upstream): gsmlg-opt/ex_storage_service#18 - support HTTP family 0.18.
+      # TODO(upstream): gsmlg-opt/ex_storage_service#19 - publish HTTP 0.18 compatibility for DuskMoon 9.16.11.
       {:ex_storage_service, "== 0.6.5"}
     ]
   end
