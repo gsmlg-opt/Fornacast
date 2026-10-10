@@ -226,13 +226,14 @@ defmodule ForgeImports.CleanupOperation do
     requested_path = evidence["requested_path"]
     quarantine_path = evidence["quarantine_path"]
 
+    # The verified digest basename can contain token prefixes by coincidence.
     valid_storage_root?(root, storage_root_policy) and
       positive?(evidence["repository_generation"]) and
-      valid_repository_path?(repository_path) and valid_relative_path?(relative_path) and
-      valid_absolute_path?(requested_path) and valid_absolute_path?(quarantine_path) and
+      valid_repository_path?(repository_path) and valid_absolute_path?(requested_path) and
       requested_path == Path.join(root, repository_path) and
-      quarantine_path == Path.join(root, relative_path) and
       quarantine_path == GitCore.Remote.cleanup_slot_path(requested_path) and
+      safe_text?(quarantine_path, 4_096) and safe_text?(relative_path, 1_024) and
+      quarantine_path == Path.join(root, relative_path) and
       relative_path == Path.relative_to(quarantine_path, root) and
       Path.dirname(quarantine_path) == Path.dirname(requested_path) and
       Regex.match?(
@@ -327,7 +328,7 @@ defmodule ForgeImports.CleanupOperation do
     end
   end
 
-  defp valid_absence?(changeset, evidence, absence) when is_map(absence) do
+  defp valid_absence?(changeset, _evidence, absence) when is_map(absence) do
     identity = absence["root_identity"]
     observed_at = parse_timestamp(absence["observed_at"])
     started_at = get_field(changeset, :effect_started_at)
@@ -337,8 +338,7 @@ defmodule ForgeImports.CleanupOperation do
       Enum.sort(~w(version observed_at root_identity)) and
       absence["version"] == 1 and match?(%DateTime{}, observed_at) and
       DateTime.compare(started_at, observed_at) in [:lt, :eq] and
-      DateTime.compare(observed_at, finished_at) in [:lt, :eq] and valid_identity?(identity) and
-      valid_relative_path?(evidence["relative_path"])
+      DateTime.compare(observed_at, finished_at) in [:lt, :eq] and valid_identity?(identity)
   end
 
   defp valid_absence?(_changeset, _evidence, _absence), do: false

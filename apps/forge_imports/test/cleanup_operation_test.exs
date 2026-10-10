@@ -334,9 +334,64 @@ defmodule ForgeImports.CleanupOperationTest do
     end
   end
 
-  defp remote_attrs do
-    storage_root = storage_root()
-    repository_storage_path = "11/repository.git"
+  test "generated quarantine digests can contain GitHub token prefixes" do
+    attrs =
+      remote_attrs(
+        "/home/runner/work/Fornacast/Fornacast/apps/forge_imports/tmp/test/repos",
+        "@hashed/98/95/9895c4a98d937c06bbcdb129caf094eb20e2a38a3d9df2b3558209cec2b51aeb.git"
+      )
+
+    assert Path.basename(attrs.evidence["quarantine_path"]) ==
+             ".fornacast-cleanup-v1-1gd_Q8SFqVGGkyPcFiJpJDABm0wROz-K82J-nghs_8E"
+
+    operation = struct(CleanupOperation, attrs)
+    assert CleanupOperation.lease_update_changeset(operation, attempt_count: 1).valid?
+
+    complete =
+      CleanupOperation.lease_update_changeset(operation,
+        state: :cleanup_complete,
+        evidence: Map.put(operation.evidence, "anchored_absence", absence_marker()),
+        next_attempt_at: nil,
+        effect_started_at: @now,
+        effect_finished_at: DateTime.add(@now, 1, :second),
+        completed_at: DateTime.add(@now, 2, :second)
+      )
+
+    assert complete.valid?
+    assert CleanupOperation.valid_completed_quarantine?(Ecto.Changeset.apply_changes(complete))
+  end
+
+  test "quarantine evidence still rejects secrets outside its generated basename" do
+    for {root, repository_path} <- [
+          {"/srv/ghs_secret", "11/repository.git"},
+          {"/srv/repos", "ghs_secret/repository.git"},
+          {"/srv/repos", "11/ghs_secret.git"}
+        ] do
+      operation = struct(CleanupOperation, remote_attrs(root, repository_path))
+      refute CleanupOperation.lease_update_changeset(operation, attempt_count: 1).valid?
+    end
+
+    attrs = remote_attrs("/srv/repos", "11/repository.git")
+
+    forged_path =
+      Path.join(
+        Path.dirname(attrs.evidence["quarantine_path"]),
+        ".fornacast-cleanup-v1-ghs_" <> String.duplicate("a", 39)
+      )
+
+    forged =
+      attrs.evidence
+      |> Map.put("quarantine_path", forged_path)
+      |> Map.put("relative_path", Path.relative_to(forged_path, attrs.evidence["storage_root"]))
+
+    operation = struct(CleanupOperation, %{attrs | evidence: forged})
+    refute CleanupOperation.lease_update_changeset(operation, attempt_count: 1).valid?
+  end
+
+  defp remote_attrs(
+         storage_root \\ storage_root(),
+         repository_storage_path \\ "11/repository.git"
+       ) do
     requested_path = Path.join(storage_root, repository_storage_path)
     quarantine_path = GitCore.Remote.cleanup_slot_path(requested_path)
 
