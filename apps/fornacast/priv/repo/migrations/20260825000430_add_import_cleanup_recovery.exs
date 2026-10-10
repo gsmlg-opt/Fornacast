@@ -301,7 +301,7 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
       cleanup_leaf_check(adapter),
       same_relative_parent_check(adapter)
     ]
-    |> Enum.join(" and ")
+    |> join_checks(adapter)
   end
 
   defp unpublished_evidence_check(adapter) do
@@ -333,7 +333,7 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
       optional_positive_json_integer_check(adapter, "successor_item_id"),
       optional_positive_json_integer_check(adapter, "adopter_item_id")
     ]
-    |> Enum.join(" and ")
+    |> join_checks(adapter)
   end
 
   defp replacement_evidence_check(adapter) do
@@ -390,7 +390,7 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
       "#{nested_number(adapter, "publication_marker", "generation")} = #{old_generation_number} + 1",
       "#{new_id} != #{old_id}"
     ]
-    |> Enum.join(" and ")
+    |> join_checks(adapter)
   end
 
   defp marker_check(adapter) do
@@ -417,7 +417,7 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
         nested_nonnegative_integer_check(adapter, "publication_marker", "published_count_after"),
         nested_positive_integer_check(adapter, "publication_marker", "run_lock_version_after")
       ]
-      |> Enum.join(" and ")
+      |> join_checks(adapter)
 
     exact_nested_keys_check(adapter, "publication_marker", @marker_keys) <>
       " and " <> checks
@@ -454,10 +454,20 @@ defmodule Fornacast.Repo.Migrations.AddImportCleanupRecovery do
           "replacement_last_pushed_at"
         )
       ]
-      |> Enum.join(" and ")
+      |> join_checks(adapter)
 
     exact_nested_keys_check(adapter, "attempt_decision", @replacement_decision_keys) <>
       " and " <> checks
+  end
+
+  # Keep PostgreSQL SQL unchanged; Turso bounds parser depth even for generated CHECKs.
+  defp join_checks(checks, :postgres), do: Enum.join(checks, " and ")
+
+  defp join_checks([check], :turso), do: "(" <> check <> ")"
+
+  defp join_checks(checks, :turso) do
+    {left, right} = Enum.split(checks, div(length(checks), 2))
+    "(" <> join_checks(left, :turso) <> " and " <> join_checks(right, :turso) <> ")"
   end
 
   defp json_text(:turso, key), do: "json_extract(evidence, '$.#{key}')"
