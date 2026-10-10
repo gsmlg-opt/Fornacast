@@ -113,7 +113,8 @@ defmodule ForgeGitHub.LFSReconciliationTest do
     mirror = lfs_mirror_context!()
 
     operation =
-      enqueue_operation!(mirror, "finalize.repository.git", %{}) |> claim!(now, "path-context")
+      enqueue_operation!(mirror, "finalize.repository.git", %{}, now)
+      |> claim!(now, "path-context")
 
     deadline = System.monotonic_time(:millisecond) + 5_000
 
@@ -223,16 +224,22 @@ defmodule ForgeGitHub.LFSReconciliationTest do
   end
 
   test "an LFS-degraded child terminally fails its finalizer and releases later work" do
-    now = DateTime.utc_now(:second)
+    # The caller clock precedes fixture setup, even when setup does not cross a second.
+    now = DateTime.add(DateTime.utc_now(:second), -1, :second)
     context = lfs_mirror_context!()
     reconciliation_id = System.unique_integer([:positive])
 
     child =
-      enqueue_operation!(context, "sync.git_ref", %{
-        "initial_absence" => false,
-        "reconciliation_operation_id" => reconciliation_id,
-        "ref_name" => "refs/heads/main"
-      })
+      enqueue_operation!(
+        context,
+        "sync.git_ref",
+        %{
+          "initial_absence" => false,
+          "reconciliation_operation_id" => reconciliation_id,
+          "ref_name" => "refs/heads/main"
+        },
+        now
+      )
       |> claim!(now, "lfs-child")
 
     assert {:ok, %{operation: %{state: :failed}}} =
@@ -247,15 +254,20 @@ defmodule ForgeGitHub.LFSReconciliationTest do
              )
 
     finalizer =
-      enqueue_operation!(context, "finalize.repository.git", %{
-        "reconciliation_operation_id" => reconciliation_id
-      })
+      enqueue_operation!(
+        context,
+        "finalize.repository.git",
+        %{"reconciliation_operation_id" => reconciliation_id},
+        now
+      )
 
     later =
-      enqueue_operation!(context, "sync.git_ref", %{
-        "initial_absence" => false,
-        "ref_name" => "refs/heads/later"
-      })
+      enqueue_operation!(
+        context,
+        "sync.git_ref",
+        %{"initial_absence" => false, "ref_name" => "refs/heads/later"},
+        now
+      )
 
     finalizer = claim!(finalizer, now, "lfs-finalizer")
     assert {:ok, %{lfs_enabled: true}} = ForgeMirrors.git_repository_operation_context(finalizer)
@@ -279,11 +291,16 @@ defmodule ForgeGitHub.LFSReconciliationTest do
     oid = String.duplicate("b", 40)
 
     child =
-      enqueue_operation!(context, "sync.git_ref", %{
-        "initial_absence" => false,
-        "reconciliation_operation_id" => reconciliation_id,
-        "ref_name" => "refs/heads/main"
-      })
+      enqueue_operation!(
+        context,
+        "sync.git_ref",
+        %{
+          "initial_absence" => false,
+          "reconciliation_operation_id" => reconciliation_id,
+          "ref_name" => "refs/heads/main"
+        },
+        now
+      )
       |> claim!(now, "conflicted-child")
 
     assert {:ok, %{operation: %{state: :failed}, ref_state: %MirrorRefState{state: :conflicted}}} =
@@ -298,9 +315,12 @@ defmodule ForgeGitHub.LFSReconciliationTest do
              )
 
     finalizer =
-      enqueue_operation!(context, "finalize.repository.git", %{
-        "reconciliation_operation_id" => reconciliation_id
-      })
+      enqueue_operation!(
+        context,
+        "finalize.repository.git",
+        %{"reconciliation_operation_id" => reconciliation_id},
+        now
+      )
       |> claim!(now, "conflicted-finalizer")
 
     assert {:ok, %{lfs_enabled: true}} = ForgeMirrors.git_repository_operation_context(finalizer)
@@ -775,7 +795,7 @@ defmodule ForgeGitHub.LFSReconciliationTest do
     end
   end
 
-  defp enqueue_operation!(context, kind, cursor) do
+  defp enqueue_operation!(context, kind, cursor, now) do
     assert {:ok, operation} =
              ForgeMirrors.enqueue_operation(%{
                organization_mirror_id: context.organization_mirror.id,
@@ -783,7 +803,7 @@ defmodule ForgeGitHub.LFSReconciliationTest do
                kind: kind,
                dedupe_key: Ecto.UUID.generate(),
                cursor: cursor,
-               next_attempt_at: DateTime.utc_now(:second)
+               next_attempt_at: now
              })
 
     operation
