@@ -42,10 +42,7 @@ COPY apps apps
 ENV HEX_HTTP_CONCURRENCY=1 \
     HEX_HTTP_TIMEOUT=300
 
-RUN mix deps.get --only prod && \
-    mix deps.compile && \
-    mix npm.ci
-
+# Umbrella dependency/task loading can compile application modules.
 ARG FORNACAST_BUILD_GIT_REF
 ARG FORNACAST_BUILD_GIT_COMMIT
 ARG FORNACAST_BUILD_TIME
@@ -54,6 +51,10 @@ ENV FORNACAST_BUILD_GIT_REF=${FORNACAST_BUILD_GIT_REF} \
     FORNACAST_BUILD_GIT_COMMIT=${FORNACAST_BUILD_GIT_COMMIT} \
     FORNACAST_BUILD_TIME=${FORNACAST_BUILD_TIME} \
     FORNACAST_RELEASE_TIME=${FORNACAST_RELEASE_TIME}
+
+RUN mix deps.get --only prod && \
+    mix deps.compile && \
+    mix npm.ci
 
 RUN mix assets.deploy && \
     mix compile && \

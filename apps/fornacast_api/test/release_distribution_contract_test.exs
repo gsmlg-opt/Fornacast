@@ -166,8 +166,8 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
       assert workflow =~ "#{name}=${{ steps.version.outputs.#{output} }}"
       assert dockerfile =~ "ARG #{name}"
       assert dockerfile =~ "#{name}=${#{name}}"
-      assert_order(dockerfile, "mix npm.ci", "ARG #{name}")
-      assert_order(dockerfile, "ARG #{name}", "RUN mix assets.deploy")
+      assert_order(dockerfile, "ARG #{name}", "#{name}=${#{name}}")
+      assert_order(dockerfile, "#{name}=${#{name}}", "RUN mix deps.get --only prod")
     end
 
     refute workflow =~ "FORNACAST_RELEASE_TIME="
