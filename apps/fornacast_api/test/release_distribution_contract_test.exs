@@ -1019,7 +1019,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert runtime_stage =~ "LANG=C.UTF-8"
     assert "coreutils" in String.split(runtime_packages)
     assert File.read!(@releases_mix) =~ ~s({:forge_blobs, in_umbrella: true})
-    assert File.read!(@blobs_mix) =~ ~s({:ex_storage_service, "== 0.6.5"})
+    assert File.read!(@blobs_mix) =~ ~s({:ex_storage_service, "== 0.6.6"})
     assert dockerfile =~ "scripts/release_asset_storage_smoke.sh"
     refute dockerfile =~ "COPY scripts scripts"
     assert dockerfile =~ "RELEASE_DISTRIBUTION=name"
@@ -1043,7 +1043,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert readme =~ "Erlang distribution and EPMD are bound to loopback"
     refute dockerfile =~ "EXPOSE 9000"
     refute compose =~ ~r/^\s+- ["']?9000/m
-    assert e2e =~ "ex_storage_service-0.6.5"
+    assert e2e =~ "ex_storage_service-0.6.6"
     assert e2e =~ "release_asset_storage_smoke.sh release/fornacast write"
     assert e2e =~ "release_asset_storage_smoke.sh release/fornacast verify"
     assert e2e =~ ~s(echo "ELIXIR_ERL_OPTIONS=-kernel inet_dist_use_interface {127,0,0,1}")

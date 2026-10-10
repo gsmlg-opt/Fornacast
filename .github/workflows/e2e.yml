@@ -120,7 +120,6 @@ jobs:
 
       - name: Install frontend dependencies
         if: github.event_name == 'pull_request'
-        # TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#185
         run: mix npm.ci
 
       - name: Build static assets
@@ -230,7 +229,7 @@ jobs:
 
       - name: Inspect embedded LocalCAS release
         run: |
-          test -d release/fornacast/lib/ex_storage_service-0.6.5
+          test -d release/fornacast/lib/ex_storage_service-0.6.6
           s3_package="$(find release/fornacast/lib -maxdepth 1 -type d -name 'ex_storage_service_s3-*' -print -quit)"
           test -z "$s3_package"
           release/fornacast/bin/fornacast rpc '
