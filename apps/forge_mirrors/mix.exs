@@ -4,7 +4,7 @@ defmodule ForgeMirrors.MixProject do
   def project do
     [
       app: :forge_mirrors,
-      version: "0.7.6",
+      version: "0.7.7",
       build_path: "../../_build",
       config_path: "../../config/config.exs",
       deps_path: "../../deps",
