@@ -1,0 +1,28 @@
+<section class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6">
+  <header class="grid gap-2">
+    <h2 class="text-2xl font-semibold">Theme</h2>
+    <p class="text-sm text-on-surface-variant">
+      Choose how Fornacast looks. Your preference is saved to your account.
+    </p>
+  </header>
+
+  <.dm_alert :if={@flash} variant="success" role="status">{@flash}</.dm_alert>
+
+  <form action="/settings/appearance" method="post" class="grid gap-4">
+    <input type="hidden" name="_csrf_token" value={@csrf_token} />
+    <input type="hidden" name="_method" value="patch" />
+    <.dm_select
+      id="appearance-theme"
+      name="appearance[theme_preference]"
+      label="Theme"
+      value={@theme_preference}
+      options={[{"auto", "Auto"}, {"sunshine", "Sunshine"}, {"moonlight", "Moonlight"}]}
+      helper="Auto follows your system appearance. Sunshine is light; Moonlight is dark."
+      errors={@errors}
+      autofocus={@errors != []}
+    />
+    <div>
+      <.dm_btn type="submit" variant="primary">Save changes</.dm_btn>
+    </div>
+  </form>
+</section>

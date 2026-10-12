@@ -6,6 +6,7 @@ defmodule ForgeAccounts.User do
   @kinds [:user, :organization]
   @roles [:admin, :user]
   @states [:active, :disabled]
+  @theme_preferences ["auto", "sunshine", "moonlight"]
 
   @type t :: %__MODULE__{}
 
@@ -19,6 +20,7 @@ defmodule ForgeAccounts.User do
     field :kind, Ecto.Enum, values: @kinds, default: :user
     field :role, Ecto.Enum, values: @roles, default: :user
     field :state, Ecto.Enum, values: @states, default: :active
+    field :theme_preference, :string, default: "auto"
 
     timestamps(type: :utc_datetime)
   end
@@ -49,6 +51,21 @@ defmodule ForgeAccounts.User do
     |> cast(attrs, [:state])
     |> validate_required([:state])
     |> validate_inclusion(:state, @states)
+  end
+
+  def appearance_changeset(user, attrs) do
+    changeset =
+      user
+      |> cast(attrs, [:theme_preference], empty_values: [])
+      |> validate_required([:theme_preference])
+      |> validate_inclusion(:theme_preference, @theme_preferences)
+      |> check_constraint(:theme_preference, name: :users_theme_preference_check)
+
+    if Map.has_key?(changeset.params, "theme_preference") do
+      changeset
+    else
+      add_error(changeset, :theme_preference, "can't be blank", validation: :required)
+    end
   end
 
   defp normalize_username(changeset) do

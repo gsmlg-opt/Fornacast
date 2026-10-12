@@ -9,6 +9,7 @@ defmodule FornacastWeb.HTML do
 
   def page(conn, title, body) do
     current_user = conn.assigns[:current_user]
+    theme_preference = theme_preference(current_user)
 
     css_path =
       DuskmoonBundler.static_path(FornacastWeb.Endpoint, "/assets/css/app.css",
@@ -26,7 +27,7 @@ defmodule FornacastWeb.HTML do
     html =
       """
       <!doctype html>
-      <html lang="en" data-theme="sunshine">
+      <html lang="en" data-theme="#{concrete_theme(theme_preference)}" data-theme-preference="#{theme_preference}">
       <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -50,6 +51,7 @@ defmodule FornacastWeb.HTML do
 
   def repository_page(conn, title, safe_body) do
     current_user = conn.assigns[:current_user]
+    theme_preference = theme_preference(current_user)
 
     css_path =
       DuskmoonBundler.static_path(FornacastWeb.Endpoint, "/assets/css/app.css",
@@ -62,7 +64,7 @@ defmodule FornacastWeb.HTML do
       )
 
     html = [
-      "<!doctype html><html lang=\"en\" data-theme=\"sunshine\"><head>",
+      ~s(<!doctype html><html lang="en" data-theme="#{concrete_theme(theme_preference)}" data-theme-preference="#{theme_preference}"><head>),
       "<meta charset=\"utf-8\">",
       "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
       "<meta name=\"csrf-token\" content=\"",
@@ -114,7 +116,6 @@ defmodule FornacastWeb.HTML do
           <div class="appbar-actions">
             #{create_menu()}
             #{account_menu(current_user)}
-            #{theme_menu()}
           </div>
         </header>
         <main class="app-main">
@@ -133,7 +134,6 @@ defmodule FornacastWeb.HTML do
           #{brand_mark("Fornacast home")}
           <nav class="app-nav" aria-label="Primary">
             <a class="nav-link" href="/login">Login</a>
-            #{theme_menu()}
           </nav>
         </header>
         <main class="auth-main">
@@ -163,7 +163,6 @@ defmodule FornacastWeb.HTML do
         "<div class=\"appbar-actions\">",
         create_menu(),
         account_menu(current_user),
-        theme_menu(),
         "</div></header>",
         "<main class=\"repository-main\" data-repository-main>",
         safe_body,
@@ -176,7 +175,6 @@ defmodule FornacastWeb.HTML do
         brand_mark("Fornacast home"),
         "<nav class=\"app-nav\" aria-label=\"Repository actions\">",
         "<a class=\"nav-link\" href=\"/login\">Login</a>",
-        theme_menu(),
         "</nav></header>",
         "<main class=\"repository-main\" data-repository-main>",
         safe_body,
@@ -298,21 +296,14 @@ defmodule FornacastWeb.HTML do
     ~s(<a class="repo-menu-item" href="/#{escape(owner.username)}">#{escape(owner_label(owner))}</a>)
   end
 
-  defp theme_menu do
-    """
-    <details class="theme-menu">
-      <summary class="theme-menu-trigger" aria-label="Theme" title="Theme">
-        <span data-theme-label>Theme</span>
-        <span class="appbar-menu-caret" aria-hidden="true"></span>
-      </summary>
-      <div class="theme-menu-list" role="menu">
-        <button type="button" class="theme-menu-item" data-theme-choice="auto" role="menuitemradio" aria-checked="false">Auto</button>
-        <button type="button" class="theme-menu-item" data-theme-choice="sunshine" role="menuitemradio" aria-checked="false">Sunshine</button>
-        <button type="button" class="theme-menu-item" data-theme-choice="moonlight" role="menuitemradio" aria-checked="false">Moonlight</button>
-      </div>
-    </details>
-    """
-  end
+  defp theme_preference(%{theme_preference: preference})
+       when preference in ["auto", "sunshine", "moonlight"],
+       do: preference
+
+  defp theme_preference(_current_user), do: "auto"
+
+  defp concrete_theme("moonlight"), do: "moonlight"
+  defp concrete_theme(_preference), do: "sunshine"
 
   defp account_menu(current_user) do
     """
@@ -384,6 +375,7 @@ defmodule FornacastWeb.HTML do
   def settings_layout(active, body) do
     items = [
       {:profile, "Profile", "/settings"},
+      {:appearance, "Appearance", "/settings/appearance"},
       {:api_keys, "Applications", "/settings/api-keys"},
       {:ssh_keys, "SSH Keys", "/settings/ssh-keys"},
       {:github, "GitHub", "/settings/github"}

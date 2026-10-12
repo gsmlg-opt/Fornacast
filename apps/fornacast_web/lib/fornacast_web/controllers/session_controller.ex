@@ -1,7 +1,7 @@
 defmodule FornacastWeb.SessionController do
   use FornacastWeb, :controller
 
-  alias FornacastWeb.SessionHTML
+  alias FornacastWeb.{SessionHTML, UserSession}
 
   def new(conn, _params) do
     render_login(conn, nil, "")
@@ -10,10 +10,10 @@ defmodule FornacastWeb.SessionController do
   def create(conn, %{"session" => %{"username" => username, "password" => password}}) do
     case ForgeAccounts.authenticate_password(username, password) do
       {:ok, user} ->
-        conn
-        |> configure_session(renew: true)
-        |> put_session(:user_id, user.id)
-        |> redirect(to: "/")
+        case UserSession.log_in(conn, user) do
+          {:ok, conn} -> redirect(conn, to: "/")
+          {:error, _reason} -> send_resp(conn, 503, "Session temporarily unavailable.")
+        end
 
       {:error, :invalid_credentials} ->
         conn
@@ -25,9 +25,10 @@ defmodule FornacastWeb.SessionController do
   def create(conn, _params), do: new(conn, %{})
 
   def delete(conn, _params) do
-    conn
-    |> configure_session(drop: true)
-    |> redirect(to: "/login")
+    case UserSession.log_out(conn) do
+      {:ok, conn} -> conn |> configure_session(drop: true) |> redirect(to: "/login")
+      {:error, _reason} -> send_resp(conn, 503, "Session temporarily unavailable.")
+    end
   end
 
   defp render_login(conn, error, username) do

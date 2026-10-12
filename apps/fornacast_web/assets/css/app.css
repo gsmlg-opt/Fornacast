@@ -229,7 +229,6 @@
 
   .repo-menu,
   .appbar-create-menu,
-  .theme-menu,
   .account-menu {
     position: relative;
     flex: 0 0 auto;
@@ -237,7 +236,6 @@
 
   .repo-menu-trigger,
   .create-menu-trigger,
-  .theme-menu-trigger,
   .account-menu-trigger {
     display: inline-flex;
     align-items: center;
@@ -256,26 +254,17 @@
 
   .repo-menu-trigger::-webkit-details-marker,
   .create-menu-trigger::-webkit-details-marker,
-  .theme-menu-trigger::-webkit-details-marker,
   .account-menu-trigger::-webkit-details-marker {
     display: none;
   }
 
   .repo-menu-trigger:hover,
   .create-menu-trigger:hover,
-  .theme-menu-trigger:hover,
   .account-menu-trigger:hover,
   .repo-menu[open] .repo-menu-trigger,
   .appbar-create-menu[open] .create-menu-trigger,
-  .theme-menu[open] .theme-menu-trigger,
   .account-menu[open] .account-menu-trigger {
     background-color: var(--color-surface-container-high);
-  }
-
-  .theme-menu-trigger {
-    border-color: var(--color-primary);
-    background-color: var(--color-primary-container);
-    color: var(--color-on-primary-container);
   }
 
   .account-menu-trigger {
@@ -324,7 +313,6 @@
 
   .repo-menu-list,
   .create-menu,
-  .theme-menu-list,
   .account-menu-list {
     position: absolute;
     top: calc(100% + 0.35rem);
@@ -338,10 +326,6 @@
     background-color: var(--color-surface-container-lowest);
     box-shadow: var(--shadow-md);
     padding: 0.35rem;
-  }
-
-  .theme-menu-list {
-    min-width: 10.5rem;
   }
 
   .repo-menu-list {
@@ -358,14 +342,12 @@
 
   .repo-menu:not([open]) .repo-menu-list,
   .appbar-create-menu:not([open]) .create-menu,
-  .theme-menu:not([open]) .theme-menu-list,
   .account-menu:not([open]) .account-menu-list {
     display: none;
   }
 
   .repo-menu-item,
   .create-menu-item,
-  .theme-menu-item,
   .account-menu-item {
     display: flex;
     align-items: center;
@@ -398,7 +380,6 @@
     text-decoration: none;
   }
 
-  .theme-menu-item,
   .account-menu-item {
     width: 100%;
     border: 0;
@@ -409,26 +390,6 @@
     text-align: left;
   }
 
-  .theme-menu-item {
-    justify-content: space-between;
-  }
-
-  .theme-menu-item::after {
-    content: "";
-    width: 0.4rem;
-    height: 0.7rem;
-    margin-left: 1rem;
-    border-right: 2px solid currentColor;
-    border-bottom: 2px solid currentColor;
-    opacity: 0;
-    transform: rotate(45deg);
-  }
-
-  .theme-menu-item[aria-checked="true"]::after {
-    opacity: 1;
-  }
-
-  .theme-menu-item:hover,
   .account-menu-item:hover {
     background-color: var(--color-surface-container-high);
     color: var(--color-on-surface);
@@ -854,7 +815,6 @@
 
   .nav-button,
   .repo-menu-trigger,
-  .theme-menu-trigger,
   .account-menu-trigger,
   .nav-link {
     min-width: 0;
@@ -876,16 +836,11 @@
     min-width: 0;
   }
 
-  .theme-menu-list,
   .account-menu-list {
     right: auto;
     left: 0;
     width: max-content;
     max-width: calc(100vw - 1.5rem);
-  }
-
-  .theme-menu-list {
-    min-width: 10.5rem;
   }
 
   .account-menu-list {
@@ -894,7 +849,6 @@
 
   .repo-menu-item,
   .create-menu-item,
-  .theme-menu-item,
   .account-menu-item {
     white-space: normal;
   }

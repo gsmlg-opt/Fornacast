@@ -136,10 +136,9 @@ defmodule FornacastWebTest do
     assert html =~ ~s(<a class="create-menu-item" href="/repos/import">)
     assert html =~ ~s(<a class="create-menu-item" href="/organizations/new">)
     assert html =~ ~s(<a class="create-menu-item" href="/organizations/import">)
-    assert html =~ ~s(<details class="theme-menu">)
-    assert html =~ ~s(<button type="button" class="theme-menu-item" data-theme-choice="auto")
-    assert html =~ ~s(<button type="button" class="theme-menu-item" data-theme-choice="sunshine")
-    assert html =~ ~s(<button type="button" class="theme-menu-item" data-theme-choice="moonlight")
+    refute html =~ ~s(<details class="theme-menu">)
+    refute html =~ "data-theme-choice"
+    assert html =~ ~s(data-theme-preference="auto")
     assert html =~ ~s(<details class="account-menu">)
     assert html =~ ~s(<a class="account-menu-item" href="/alice">Profile</a>)
     assert html =~ ~s(<a class="account-menu-item" href="/settings">Settings</a>)
@@ -181,6 +180,7 @@ defmodule FornacastWebTest do
              ~s(<nav class="nested-menu nested-menu-bordered settings-menu" aria-label="User settings">)
 
     assert html =~ ~s(<a href="/settings" class="active" aria-current="page">Profile</a>)
+    assert html =~ ~s(<a href="/settings/appearance">Appearance</a>)
     assert html =~ ~s(<a href="/settings/api-keys">Applications</a>)
     assert html =~ ~s(<a href="/settings/ssh-keys">SSH Keys</a>)
     assert html =~ ~s(<a href="/settings/github">GitHub</a>)

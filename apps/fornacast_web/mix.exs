@@ -39,6 +39,7 @@ defmodule FornacastWeb.MixProject do
       {:git_lfs, in_umbrella: true},
       {:git_transport, in_umbrella: true},
       {:phoenix, "~> 1.8.15"},
+      {:phoenix_session_process, "~> 1.0.1"},
       {:phoenix_duskmoon, "~> 9.16.11"},
       {:duskmoon_bundler_runtime, "~> 9.16.11"},
       {:duskmoon_bundler, "~> 9.16.11", runtime: Mix.env() == :dev},

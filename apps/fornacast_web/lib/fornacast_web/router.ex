@@ -141,6 +141,9 @@ defmodule FornacastWeb.Router do
           OrganizationGitHubSettingsController,
           :resolve_repository_metadata_conflict
 
+    get "/settings/appearance", SettingsController, :appearance
+    patch "/settings/appearance", SettingsController, :update_appearance
+
     get "/settings/github", GitHubSettingsController, :index
     post "/settings/github", GitHubSettingsController, :create
     post "/settings/github/:identity_id/reverify", GitHubSettingsController, :reverify

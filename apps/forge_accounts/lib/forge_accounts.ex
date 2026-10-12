@@ -166,6 +166,34 @@ defmodule ForgeAccounts do
 
   def get_user(id), do: Repo.get_by(User, id: id, kind: :user)
 
+  def get_session_user(id) do
+    User
+    |> select(
+      [user],
+      struct(user, [
+        :id,
+        :username,
+        :email,
+        :display_name,
+        :description,
+        :kind,
+        :role,
+        :state,
+        :inserted_at,
+        :updated_at
+      ])
+    )
+    |> Repo.get_by(id: id, kind: :user)
+  end
+
+  def update_user_appearance(actor, attrs) do
+    with {:ok, active_actor} <- active_actor(actor) do
+      active_actor
+      |> User.appearance_changeset(attrs)
+      |> Repo.update()
+    end
+  end
+
   def get_users(ids) when is_list(ids) do
     User
     |> where([user], user.id in ^Enum.uniq(ids) and user.kind == :user)

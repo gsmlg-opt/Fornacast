@@ -660,7 +660,8 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     assert anonymous =~ ~s(<link rel="icon" href="/favicon.ico" sizes="any">)
     assert anonymous =~ ~s(<img class="brand-logo" src="/images/logo.png")
     assert anonymous =~ "href=\"/login\""
-    assert anonymous =~ "Theme"
+    refute anonymous =~ "theme-menu"
+    assert anonymous =~ ~s(data-theme-preference="auto")
     assert anonymous =~ "<strong>safe</strong>"
     refute anonymous =~ "Repository workbench"
     refute anonymous =~ "auth-shell"
@@ -702,7 +703,7 @@ defmodule FornacastWeb.RepositoryHTMLTest do
 
     assert header =~ "Fornacast"
     assert header =~ "href=\"/login\""
-    assert header =~ "Theme"
+    refute header =~ "theme-menu"
     assert anonymous =~ "Issues"
     assert anonymous =~ "Pull Requests"
     refute anonymous =~ "Profile"
