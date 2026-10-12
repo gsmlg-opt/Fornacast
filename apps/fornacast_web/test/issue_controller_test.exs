@@ -380,6 +380,7 @@ defmodule FornacastWeb.IssueControllerTest do
        %{
          bob: bob
        } do
+    expected_actor = %{bob | password_hash: nil}
     form = request_conn(bob) |> get("/alice/public-repo/issues/new")
     assert html_response(form, 200) =~ ~s(name="_csrf_token")
     assert form.resp_body =~ ~s(name="issue[title]")
@@ -407,7 +408,9 @@ defmodule FornacastWeb.IssueControllerTest do
     refute redirected_to(conn) =~ "Created"
     refute redirected_to(conn) =~ "secret"
 
-    assert [{:create, [^bob, "alice", "public-repo", attrs, metadata]}] = mutation_calls()
+    assert [{:create, [^expected_actor, "alice", "public-repo", attrs, metadata]}] =
+             mutation_calls()
+
     assert attrs == %{"title" => "Created safely", "body" => "body secret"}
     assert Map.keys(metadata) |> Enum.sort() == [:ip_address, :request_id, :user_agent]
   end
@@ -440,6 +443,7 @@ defmodule FornacastWeb.IssueControllerTest do
   end
 
   test "author edit and close/reopen use PRG and one update per request", %{alice: alice} do
+    expected_actor = %{alice | password_hash: nil}
     edit = request_conn(alice) |> get("/alice/public-repo/issues/7/edit")
     assert html_response(edit, 200) =~ ~s(value="Issue 7")
     assert edit.resp_body =~ ~s(name="_method" value="patch")
@@ -457,7 +461,7 @@ defmodule FornacastWeb.IssueControllerTest do
 
     assert redirected_to(updated) == "/alice/public-repo/issues/7"
 
-    assert [{:update, [^alice, "alice", "public-repo", 7, update_attrs, _metadata]}] =
+    assert [{:update, [^expected_actor, "alice", "public-repo", 7, update_attrs, _metadata]}] =
              mutation_calls()
 
     assert update_attrs == %{"title" => "Edited", "body" => "Edited body"}
@@ -476,7 +480,7 @@ defmodule FornacastWeb.IssueControllerTest do
 
       assert redirected_to(conn) == "/alice/public-repo/issues/7"
 
-      assert [{:update, [^alice, "alice", "public-repo", 7, attrs, _metadata]}] =
+      assert [{:update, [^expected_actor, "alice", "public-repo", 7, attrs, _metadata]}] =
                mutation_calls()
 
       assert attrs == %{"state" => state, "state_reason" => reason}
@@ -543,6 +547,8 @@ defmodule FornacastWeb.IssueControllerTest do
   test "comment creation loads canonical kind and redirects pull-backed conversations", %{
     bob: bob
   } do
+    expected_actor = %{bob | password_hash: nil}
+
     TestIssues.respond(:get, fn [_actor, _owner, _repository, number] ->
       {:ok, TestPage.issue(number, "Pull", :pull_request)}
     end)
@@ -561,10 +567,10 @@ defmodule FornacastWeb.IssueControllerTest do
 
     assert [
              {:create_comment,
-              [^bob, "alice", "public-repo", 9, %{"body" => "No URL leakage"}, _]}
+              [^expected_actor, "alice", "public-repo", 9, %{"body" => "No URL leakage"}, _]}
            ] = mutation_calls()
 
-    assert [{:get, [^bob, "alice", "public-repo", 9]}] =
+    assert [{:get, [^expected_actor, "alice", "public-repo", 9]}] =
              Enum.filter(TestIssues.calls(), &match?({:get, _}, &1))
   end
 

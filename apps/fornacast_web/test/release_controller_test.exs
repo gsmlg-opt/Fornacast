@@ -193,6 +193,7 @@ defmodule FornacastWeb.ReleaseControllerTest do
   end
 
   test "authenticated forms submit supported metadata and destructive delete", %{alice: alice} do
+    expected_actor = %{alice | password_hash: nil}
     form = request_conn(alice) |> get("/alice/public/releases/new")
     assert html_response(form, 200) =~ ~s(name="release[tag_name]")
     assert form.resp_body =~ ~s(name="_csrf_token")
@@ -217,7 +218,7 @@ defmodule FornacastWeb.ReleaseControllerTest do
 
     assert redirected_to(created) == "/alice/public/releases/11"
 
-    assert [{:create, [^alice, "alice", "public", attrs, metadata]}] =
+    assert [{:create, [^expected_actor, "alice", "public", attrs, metadata]}] =
              TestReleases.calls()
 
     assert attrs == %{
@@ -243,10 +244,12 @@ defmodule FornacastWeb.ReleaseControllerTest do
       )
 
     assert redirected_to(deleted) == "/alice/public/releases"
-    assert [{:delete, [^alice, "alice", "public", 7, _metadata]}] = TestReleases.calls()
+    assert [{:delete, [^expected_actor, "alice", "public", 7, _metadata]}] = TestReleases.calls()
   end
 
   test "authenticated edit submits supported release metadata", %{alice: alice} do
+    expected_actor = %{alice | password_hash: nil}
+
     updated =
       submit_with_csrf(
         alice,
@@ -264,7 +267,7 @@ defmodule FornacastWeb.ReleaseControllerTest do
 
     assert redirected_to(updated) == "/alice/public/releases/7"
 
-    assert [{:update, [^alice, "alice", "public", 7, attrs, metadata]}] =
+    assert [{:update, [^expected_actor, "alice", "public", 7, attrs, metadata]}] =
              TestReleases.calls()
 
     assert attrs == %{

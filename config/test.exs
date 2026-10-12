@@ -151,4 +151,7 @@ config :fornacast_api,
   anonymous_rate_limit: 60,
   authenticated_rate_limit: 5_000
 
+# The web suite creates shared user and login processes faster than the production allowance.
+config :phoenix_session_process, rate_limit: 5_000
+
 config :logger, level: :warning

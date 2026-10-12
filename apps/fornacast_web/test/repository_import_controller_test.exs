@@ -150,6 +150,7 @@ defmodule FornacastWeb.RepositoryImportControllerTest do
   end
 
   test "start posts to the import service and redirects to progress", %{actor: actor} do
+    expected_actor = %{actor | password_hash: nil}
     view = actor |> run_view() |> resolved_view()
     TestImports.run_result({:ok, view})
     TestImports.start_result({:ok, %{view | state: :running}})
@@ -159,7 +160,7 @@ defmodule FornacastWeb.RepositoryImportControllerTest do
     assert redirected_to(conn, 303) == "/imports/91"
 
     assert Enum.any?(TestImports.calls(), fn
-             {:start_import, [^actor, 91, request_metadata, []]} ->
+             {:start_import, [^expected_actor, 91, request_metadata, []]} ->
                request_metadata.user_agent == "repository-import-controller-test"
 
              _ ->

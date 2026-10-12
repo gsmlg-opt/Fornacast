@@ -403,10 +403,11 @@ defmodule FornacastWeb.PullRequestControllerTest do
   end
 
   test "repository owner can read a private pull list", %{alice: alice} do
+    expected_actor = %{alice | password_hash: nil}
     conn = request_conn(alice) |> get("/alice/private-repo/pulls")
 
     assert html_response(conn, 200) =~ "data-pulls-page"
-    assert [{:pulls, [_repository, _owner, ^alice, _filters, []]}] = TestPage.calls()
+    assert [{:pulls, [_repository, _owner, ^expected_actor, _filters, []]}] = TestPage.calls()
     assert_private_no_store(conn)
   end
 
@@ -445,6 +446,7 @@ defmodule FornacastWeb.PullRequestControllerTest do
        %{
          bob: bob
        } do
+    expected_actor = %{bob | password_hash: nil}
     conn = request_conn(bob) |> get("/alice/public-repo/pulls/new")
 
     assert html_response(conn, 200) =~ "data-pull-form"
@@ -453,11 +455,13 @@ defmodule FornacastWeb.PullRequestControllerTest do
     assert conn.resp_body =~ ~r/<option[^>]*value="main"[^>]*selected/
     refute conn.resp_body =~ "data-pull-compare"
 
-    assert [{:branch_options, [_repository, ^bob]}] = TestPulls.calls()
+    assert [{:branch_options, [_repository, ^expected_actor]}] = TestPulls.calls()
     assert TestPage.calls() != []
   end
 
   test "new form compares same-owner head prefixes and previews counts", %{bob: bob} do
+    expected_actor = %{bob | password_hash: nil}
+
     conn =
       request_conn(bob)
       |> get("/alice/public-repo/pulls/new?head=alice%3Afeature&base=main")
@@ -466,7 +470,7 @@ defmodule FornacastWeb.PullRequestControllerTest do
     assert conn.resp_body =~ ~r/3<\/span>\s+commits/
     assert conn.resp_body =~ ~r/4<\/span>\s+files/
 
-    assert [{:compare, [_repository, ^bob, "alice:feature", "main", []]}] =
+    assert [{:compare, [_repository, ^expected_actor, "alice:feature", "main", []]}] =
              Enum.filter(TestPulls.calls(), &match?({:compare, _}, &1))
   end
 
@@ -494,6 +498,7 @@ defmodule FornacastWeb.PullRequestControllerTest do
   test "reader creates through one CSRF-protected metadata-bearing mutation and PRG", %{
     bob: bob
   } do
+    expected_actor = %{bob | password_hash: nil}
     form = request_conn(bob) |> get("/alice/public-repo/pulls/new")
     assert html_response(form, 200) =~ ~s(name="_csrf_token")
 
@@ -524,7 +529,8 @@ defmodule FornacastWeb.PullRequestControllerTest do
     refute redirected_to(conn) =~ "Created"
     refute redirected_to(conn) =~ "secret"
 
-    assert [{:create_pull_request, [_repository, ^bob, attrs, metadata]}] = mutation_calls()
+    assert [{:create_pull_request, [_repository, ^expected_actor, attrs, metadata]}] =
+             mutation_calls()
 
     assert attrs == %{
              "title" => "Created safely",
@@ -658,6 +664,8 @@ defmodule FornacastWeb.PullRequestControllerTest do
   end
 
   test "author closes and reopens through exactly one metadata-bearing update", %{alice: alice} do
+    expected_actor = %{alice | password_hash: nil}
+
     for state <- ["closed", "open"] do
       TestPulls.reset()
 
@@ -675,7 +683,7 @@ defmodule FornacastWeb.PullRequestControllerTest do
 
       assert [
                {:update_pull_request,
-                [_repository, _pull, ^alice, %{"state" => ^state}, metadata]}
+                [_repository, _pull, ^expected_actor, %{"state" => ^state}, metadata]}
              ] = task7_mutation_calls()
 
       assert Map.keys(metadata) |> Enum.sort() == [:ip_address, :request_id, :user_agent]
@@ -685,6 +693,7 @@ defmodule FornacastWeb.PullRequestControllerTest do
   test "writer merge forces merge method, accepts only optional expected head, and PRGs", %{
     alice: alice
   } do
+    expected_actor = %{alice | password_hash: nil}
     expected_head = String.duplicate("a", 40)
 
     assert_raise Plug.CSRFProtection.InvalidCSRFTokenError, fn ->
@@ -709,7 +718,9 @@ defmodule FornacastWeb.PullRequestControllerTest do
     assert redirected_to(conn) == "/alice/public-repo/pulls/7"
     assert_private_no_store(conn)
 
-    assert [{:merge, [_repository, _pull, ^alice, attrs, metadata]}] = task7_mutation_calls()
+    assert [{:merge, [_repository, _pull, ^expected_actor, attrs, metadata]}] =
+             task7_mutation_calls()
+
     assert attrs == %{"sha" => expected_head, "merge_method" => "merge"}
     assert Map.keys(metadata) |> Enum.sort() == [:ip_address, :request_id, :user_agent]
   end

@@ -614,8 +614,11 @@ defmodule FornacastWeb.RepositoryControllerTest do
 
   test "missing and inaccessible private repositories return the same sanitized 404 before page reads",
        %{bob: bob} do
-    inaccessible = request_conn(bob) |> get("/alice/private-repo")
-    missing = request_conn(bob) |> get("/alice/missing-repo")
+    assert {:ok, session_conn, _user} =
+             FornacastWeb.UserSession.hydrate(request_conn(bob), bob)
+
+    inaccessible = session_conn |> get("/alice/private-repo")
+    missing = session_conn |> get("/alice/missing-repo")
 
     assert inaccessible.status == 404
     assert missing.status == 404

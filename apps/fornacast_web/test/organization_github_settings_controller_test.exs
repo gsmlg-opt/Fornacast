@@ -247,7 +247,8 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
     |> Repo.update!()
 
     disabled_actor = request_conn(owner) |> get(github_settings_path(organization) <> "/app")
-    assert html_response(disabled_actor, 404) =~ "Organization settings not found."
+    assert redirected_to(disabled_actor) == "/login"
+    assert get_session(disabled_actor, :user_id) == nil
     assert TestOrganizationSync.calls() == []
     assert_private_no_store(disabled_actor)
 
