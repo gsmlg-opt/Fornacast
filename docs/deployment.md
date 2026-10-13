@@ -113,6 +113,25 @@ the acknowledgement does not import data. Archive or remove the legacy file
 afterward so the override is no longer required. The retained Turso Ecto path
 is dormant compile-only compatibility, not a supported runtime database.
 
+Migration `20260825000430` generates balanced conjunctions for the dormant
+Turso cleanup evidence constraint. This preserves its predicates and their
+order while keeping the expression within Turso's parser depth limit; it also
+requires the ExTurso native execution-stack fix tracked in
+[concord#90](https://github.com/gsmlg-dev/concord/issues/90).
+PostgreSQL constraint SQL is unchanged.
+
+Editing that migration affects only databases where it has not run. It does
+not update a constraint already installed in a legacy Turso database. Do not
+edit `sqlite_schema`, delete the recorded migration version, or rerun it over
+existing tables. An operator retaining legacy data must stop all writers and
+back up the database and matching filesystem before planning an offline
+export/rebuild into a fresh schema. Review the complete schema (including
+foreign keys, indexes, triggers, and constraints), validate copied rows against
+the new constraints, compare row counts, and check database integrity and
+foreign-key violations before considering a cutover. Test the procedure on a
+copy and retain the original backup. No automatic Turso schema upgrade is
+provided; PostgreSQL 17 remains the supported domain database.
+
 ## Backup
 
 Choose a new backup directory path. The backup causes downtime while `app` and
