@@ -43,7 +43,7 @@ defmodule ForgeImports.DiscoveryDispatchTest do
     %{account: account, actor: actor, state: state}
   end
 
-  test "async admissions coalesce behind one serial reconciler scan", %{
+  test "manual reconciler scans coalesce admitted discovery behind one serial scan", %{
     account: account,
     actor: actor,
     state: state
@@ -64,6 +64,8 @@ defmodule ForgeImports.DiscoveryDispatchTest do
     assert {:ok, %RunView{id: first_run_id, state: :discovering}} =
              create_one_time(actor, 1, state)
 
+    # Async admission now queues Styx; exercise the retained manual recovery seam explicitly.
+    Reconciler.kick(__MODULE__.Reconciler)
     assert_receive {:repository_started, provider_pid}, 2_000
 
     remaining_run_ids =

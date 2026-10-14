@@ -54,6 +54,16 @@ defmodule ForgeImports.Cancellation do
              {:ok, requested_run} <- persist_run_cancel(run, target_state, run_attrs, now),
              :ok <- persist_item_intents(requested_run, target_state, now),
              :ok <- record_cancel_audit(active_actor, requested_run, safe_metadata) do
+          ForgeImports.SyncJobs.notify_import(requested_run.id)
+
+          Repo.all(
+            from i in RepositoryItem,
+              where:
+                i.import_run_id == ^requested_run.id and i.state in [:staging_git, :publishing],
+              select: i.id
+          )
+          |> Enum.each(&ForgeImports.SyncJobs.enqueue_repository!/1)
+
           kick_reconcilers()
           requested_run
         else
@@ -251,8 +261,6 @@ defmodule ForgeImports.Cancellation do
   end
 
   defp kick_reconcilers do
-    if Process.whereis(ForgeImports.Reconciler), do: ForgeImports.Reconciler.kick(), else: :ok
-
     if Process.whereis(ForgeImports.CleanupReconciler),
       do: ForgeImports.CleanupReconciler.kick(),
       else: :ok

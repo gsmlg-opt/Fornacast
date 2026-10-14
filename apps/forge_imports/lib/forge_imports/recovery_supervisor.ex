@@ -79,7 +79,8 @@ defmodule ForgeImports.RecoverySupervisor do
         []
       end
 
-    children = [import_pair] ++ cleanup_pairs
+    children =
+      if(Keyword.get(opts, :import_enabled, true), do: [import_pair], else: []) ++ cleanup_pairs
 
     Supervisor.init(children,
       strategy: :one_for_one,

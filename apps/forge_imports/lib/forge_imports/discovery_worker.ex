@@ -443,6 +443,7 @@ defmodule ForgeImports.DiscoveryWorker do
                },
                request_metadata: capability.request_metadata
              ) do
+        ForgeImports.SyncJobs.notify_import(updated.id)
         updated
       else
         {:error, reason} -> Repo.rollback(reason)

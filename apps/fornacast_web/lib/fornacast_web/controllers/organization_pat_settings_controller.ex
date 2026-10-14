@@ -1,11 +1,70 @@
 defmodule FornacastWeb.OrganizationPATSettingsController do
   use FornacastWeb, :controller
+  alias ForgeImports.PatSyncQueries
   alias ForgeMirrors.PatSettings
   alias FornacastWeb.{OrganizationPATSettingsHTML, RequestMetadata}
   plug :fetch_flash
 
   def index(conn, params), do: show(conn, params, :index)
   def repositories(conn, params), do: show(conn, params, :repositories)
+
+  def runs(conn, %{"organization" => slug}) do
+    actor = conn.assigns.current_user
+
+    with {:ok, organization} <- ForgeAccounts.fetch_manageable_organization_by_slug(actor, slug),
+         {:ok, runs} <- PatSyncQueries.list_runs(actor, organization.id) do
+      render_task_page(conn, organization, :runs, %{runs: runs})
+    else
+      _ -> not_found(conn)
+    end
+  end
+
+  def run(conn, %{"organization" => slug, "run_id" => id}) do
+    actor = conn.assigns.current_user
+
+    with {:ok, organization} <- ForgeAccounts.fetch_manageable_organization_by_slug(actor, slug),
+         {:ok, run} <- PatSyncQueries.get_run(actor, organization.id, id) do
+      render_task_page(conn, organization, :run, %{run: run})
+    else
+      _ -> not_found(conn)
+    end
+  end
+
+  def run_status(conn, %{"organization" => slug, "run_id" => id}) do
+    actor = conn.assigns.current_user
+
+    if is_nil(actor) do
+      conn |> put_status(:unauthorized) |> json(%{error: "login_required"})
+    else
+      with {:ok, organization} <- ForgeAccounts.fetch_manageable_organization_by_slug(actor, slug),
+           {:ok, run} <- PatSyncQueries.get_run(actor, organization.id, id) do
+        json(conn, %{run: run, html: task_html(organization, run)})
+      else
+        _ -> conn |> put_status(:not_found) |> json(%{error: "not_found"})
+      end
+    end
+  end
+
+  defp render_task_page(conn, organization, template, data) do
+    assigns = Map.merge(data, %{organization: organization, __changed__: nil})
+    html = apply(OrganizationPATSettingsHTML, template, [assigns])
+
+    page(
+      conn,
+      "#{organization.username} synchronization",
+      html |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary()
+    )
+  end
+
+  defp task_html(organization, run) do
+    OrganizationPATSettingsHTML.task_report(%{
+      organization: organization,
+      run: run,
+      __changed__: nil
+    })
+    |> Phoenix.HTML.Safe.to_iodata()
+    |> IO.iodata_to_binary()
+  end
 
   def save(conn, params), do: mutate(conn, params, :save)
   def selection(conn, params), do: mutate(conn, params, :selection)
@@ -77,11 +136,27 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
           success(conn, organization, action)
 
         {:ok, report} when action == :check ->
-          {:ok, view} = PatSettings.view(actor, organization.id)
-          render_view(conn, organization, view, :index, nil, report)
+          conn
+          |> put_session(:pat_check_result, %{organization_id: organization.id, report: report})
+          |> put_status(:see_other)
+          |> redirect(to: OrganizationPATSettingsHTML.base(organization))
+
+        {:ok, run} when action == :sync_now ->
+          conn
+          |> put_status(:see_other)
+          |> redirect(to: OrganizationPATSettingsHTML.base(organization) <> "/runs/#{run.id}")
 
         {:ok, _} ->
           success(conn, organization, action)
+
+        {:error, reason} when action == :check ->
+          conn
+          |> put_session(:pat_check_result, %{
+            organization_id: organization.id,
+            error: check_error_message(reason)
+          })
+          |> put_status(:see_other)
+          |> redirect(to: OrganizationPATSettingsHTML.base(organization))
 
         {:error, reason} ->
           {:ok, view} = PatSettings.view(actor, organization.id)
@@ -112,11 +187,20 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
 
     message =
       case action do
-        :refresh -> "Repository list refreshed."
-        :sync_now -> "Synchronization of all PAT-visible organization repositories queued."
-        :pause -> "Synchronization paused."
-        :resume -> "Synchronization resumed."
-        _ -> "PAT synchronization configuration saved."
+        :refresh ->
+          "Repository list refreshed."
+
+        :sync_now ->
+          "Synchronization of all PAT-visible organization repositories queued."
+
+        :pause ->
+          "Synchronization configuration paused. Active work pauses at its next authorization checkpoint; tasks are not canceled."
+
+        :resume ->
+          "Synchronization configuration resumed."
+
+        _ ->
+          "PAT synchronization configuration saved."
       end
 
     conn
@@ -126,13 +210,32 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
   end
 
   defp render_view(conn, organization, view, template, error, check_result \\ nil) do
+    {:ok, runs} = PatSyncQueries.list_runs(conn.assigns.current_user, organization.id)
+
+    latest_run =
+      case List.first(runs) do
+        nil ->
+          nil
+
+        run ->
+          {:ok, detail} =
+            PatSyncQueries.get_run(conn.assigns.current_user, organization.id, run["id"])
+
+          detail
+      end
+
+    feedback = get_session(conn, :pat_check_result)
+    feedback = if feedback && feedback.organization_id == organization.id, do: feedback, else: %{}
+    conn = delete_session(conn, :pat_check_result)
+
     html =
       apply(OrganizationPATSettingsHTML, template, [
         %{
           organization: organization,
           view: view,
-          error: error,
-          check_result: check_result,
+          error: error || feedback[:error],
+          check_result: check_result || feedback[:report],
+          latest_run: latest_run,
           flash: Phoenix.Flash.get(conn.assigns.flash, :info),
           __changed__: nil
         }

@@ -10,12 +10,13 @@ defmodule ForgeImports.Application do
     cleanup_enabled =
       Application.get_env(:forge_imports, :repository_cleanup_enabled, @recovery_enabled)
 
+    styx = Application.fetch_env!(:forge_imports, Styx)
+
     children = [
+      {Styx, styx},
+      {ForgeImports.SyncJobs.Bootstrap, enabled: recovery_enabled},
       {ForgeImports.RecoverySupervisor,
-       enabled: recovery_enabled, cleanup_enabled: cleanup_enabled},
-      {Task.Supervisor, name: ForgeImports.PatSyncTaskSupervisor},
-      {ForgeImports.PatSyncWorker, enabled: recovery_enabled},
-      {ForgeImports.PatSyncScheduler, enabled: recovery_enabled}
+       enabled: false, cleanup_enabled: cleanup_enabled, import_enabled: false}
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: ForgeImports.Supervisor)

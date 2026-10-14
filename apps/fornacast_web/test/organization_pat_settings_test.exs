@@ -13,8 +13,17 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
     outsider = user()
     {:ok, org} = ForgeAccounts.create_organization(owner, %{username: "pat-org-#{owner.id}"})
 
+    {:ok, account} =
+      ForgeAccounts.save_github_account(
+        owner,
+        %{github_user_id: owner.id, login: owner.username, avatar_url: nil, profile_url: nil},
+        "github_pat_web_sync_test",
+        %{}
+      )
+
     %{
       owner: owner,
+      account: account,
       outsider: outsider,
       org: org,
       path: "/organizations/#{org.username}/settings/github"
@@ -24,7 +33,7 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
   test "canonical tab shows owner PAT configuration and preserves separate App page", c do
     html = request(c.owner) |> get(c.path) |> html_response(200)
     assert html =~ "personal access token (PAT)"
-    assert html =~ "run it manually and pause it at any time"
+    assert html =~ "pause the synchronization configuration"
     assert html =~ "GitHub → Fornacast"
     assert html =~ c.path <> "/repositories"
     assert html =~ c.path <> "/app"
@@ -153,31 +162,26 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
         %{}
       )
 
-    config
-    |> Ecto.Changeset.change(
-      last_sync_status: "failed",
-      last_sync_summary: %{
-        "total" => 3,
-        "succeeded" => 1,
-        "failed" => 1,
-        "pending" => 1,
-        "status" => "running",
-        "repositories" => [
-          %{"source_full_name" => "source-org/done", "status" => "succeeded"},
-          %{
-            "source_full_name" => "source-org/conflict",
-            "status" => "failed",
-            "error" => "repository_conflict"
-          },
-          %{
-            "source_full_name" => "source-org/waiting",
-            "status" => "pending",
-            "progress" => %{"phase" => "release_assets", "completed" => 12, "total" => 30}
-          }
-        ]
-      }
-    )
-    |> Repo.update!()
+    task(config, c, "running", %{
+      "total" => 3,
+      "succeeded" => 1,
+      "failed" => 1,
+      "pending" => 1,
+      "status" => "running",
+      "repositories" => [
+        %{"source_full_name" => "source-org/done", "status" => "succeeded"},
+        %{
+          "source_full_name" => "source-org/conflict",
+          "status" => "failed",
+          "error" => "repository_conflict"
+        },
+        %{
+          "source_full_name" => "source-org/waiting",
+          "status" => "pending",
+          "progress" => %{"phase" => "release_assets", "completed" => 12, "total" => 30}
+        }
+      ]
+    })
 
     for suffix <- ["", "/repositories"] do
       html =
@@ -217,20 +221,15 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
           {"persistence_unavailable", "Repository metadata could not be saved."},
           {"corrupt_repository", "Git object integrity verification failed."}
         ] do
-      config
-      |> Ecto.Changeset.change(
-        last_sync_status: "running",
-        last_sync_summary: %{
-          "total" => 1,
-          "succeeded" => 0,
-          "failed" => 0,
-          "pending" => 1,
-          "repositories" => [
-            %{"source_full_name" => "source-org/waiting", "status" => "pending", "error" => error}
-          ]
-        }
-      )
-      |> Repo.update!()
+      task(config, c, "running", %{
+        "total" => 1,
+        "succeeded" => 0,
+        "failed" => 0,
+        "pending" => 1,
+        "repositories" => [
+          %{"source_full_name" => "source-org/waiting", "status" => "pending", "error" => error}
+        ]
+      })
 
       html = request(c.owner) |> get(c.path <> "/repositories") |> html_response(200)
       assert html =~ message
@@ -251,19 +250,14 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
           {"configuration_changed", "The GitHub source or PAT configuration changed."},
           {"lost_lease", "Synchronization was interrupted."}
         ] do
-      config
-      |> Ecto.Changeset.change(
-        last_sync_status: "failed",
-        last_sync_summary: %{
-          "total" => 0,
-          "succeeded" => 0,
-          "failed" => 0,
-          "pending" => 0,
-          "repositories" => [],
-          "error" => error
-        }
-      )
-      |> Repo.update!()
+      task(config, c, "failed", %{
+        "total" => 0,
+        "succeeded" => 0,
+        "failed" => 0,
+        "pending" => 0,
+        "repositories" => [],
+        "error" => error
+      })
 
       for suffix <- ["", "/repositories"] do
         html = request(c.owner) |> get(c.path <> suffix) |> html_response(200)
@@ -271,6 +265,281 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
         assert html =~ message
       end
     end
+  end
+
+  test "sync redirects to identified task and repeated submission attaches the same task", c do
+    {:ok, config} =
+      ForgeMirrors.PatSettings.save(
+        c.owner,
+        c.org.id,
+        %{
+          "github_organization" => "source-org",
+          "enabled" => "true",
+          "lock_version" => "1",
+          "owner_user_id" => to_string(c.owner.id),
+          "github_identity_id" => to_string(c.account.identity_id)
+        },
+        %{}
+      )
+
+    params = %{"pat_sync" => %{"lock_version" => to_string(config.lock_version)}}
+    conn = request(c.owner) |> post(c.path <> "/sync", params)
+    destination = redirected_to(conn, 303)
+    assert String.starts_with?(destination, c.path <> "/runs/")
+
+    assert request(c.owner) |> post(c.path <> "/sync", params) |> redirected_to(303) ==
+             destination
+
+    assert request(c.owner) |> get(destination) |> html_response(200) =~
+             "The task has been accepted."
+  end
+
+  test "queued task starts polling with zero repositories and ignores cached configuration status",
+       c do
+    config = configuration(c)
+
+    config
+    |> Ecto.Changeset.change(
+      last_sync_status: "succeeded",
+      last_sync_summary: %{"error" => "stale_cache"}
+    )
+    |> Repo.update!()
+
+    run = task(config, c, "queued", %{"repositories" => []})
+    html = request(c.owner) |> get(c.path <> "/runs/#{run.id}") |> html_response(200)
+    assert html =~ "Synchronization ##{run.id}: queued"
+    assert html =~ "Waiting for repository discovery"
+    assert html =~ ~s(data-pat-sync-poll="true")
+    assert html =~ c.path <> "/runs/#{run.id}/status"
+    assert html =~ "Existing repositories refresh Git references and LFS only"
+    refute html =~ "stale_cache"
+
+    for suffix <- ["", "/repositories"] do
+      page = request(c.owner) |> get(c.path <> suffix) |> html_response(200)
+      assert page =~ "Synchronization ##{run.id}: queued"
+      refute page =~ "stale_cache"
+    end
+
+    status =
+      request(c.owner)
+      |> Plug.Conn.put_req_header("accept", "application/json")
+      |> get(c.path <> "/runs/#{run.id}/status")
+      |> json_response(200)
+
+    assert status["run"]["status"] == "queued"
+    assert status["run"]["total"] == 0
+    assert status["run"]["terminal"] == false
+    assert status["html"] =~ "Synchronization ##{run.id}: queued"
+  end
+
+  test "repository retry timing comes from its queue delivery and completed delivery is not task success",
+       c do
+    run = task(configuration(c), c, "running", %{"repositories" => []})
+
+    result =
+      Repo.insert!(%ForgeImports.PatSyncRepositoryResult{
+        pat_sync_run_id: run.id,
+        item_key: "update-1",
+        state: "pending",
+        data: %{
+          "mode" => "update",
+          "source_full_name" => "source-org/retrying",
+          "status" => "pending",
+          "error" => "request_gate_busy"
+        }
+      })
+
+    {:ok, delivery} =
+      Styx.insert(ForgeImports.SyncJobs.PatRepositoryWorker.new(%{"result_id" => result.id}))
+
+    next = DateTime.add(DateTime.utc_now(), 60)
+
+    delivery
+    |> Ecto.Changeset.change(state: "retryable", attempt: 2, scheduled_at: next)
+    |> Repo.update!()
+
+    {:ok, view} = ForgeImports.PatSyncQueries.get_run(c.owner, c.org.id, run.id)
+    [repository] = view["repositories"]
+    assert repository["attempts"] == 2
+    assert repository["max_attempts"] == delivery.max_attempts
+    {:ok, scheduled, _} = DateTime.from_iso8601(repository["next_attempt_at"])
+    assert DateTime.compare(scheduled, next) == :eq
+    assert repository["status"] == "pending"
+    html = request(c.owner) |> get(c.path <> "/runs/#{run.id}") |> html_response(200)
+    assert html =~ "Next attempt:"
+    assert html =~ "Delivery attempts: 2"
+
+    Repo.get!(Styx.Job, delivery.id)
+    |> Ecto.Changeset.change(state: "completed")
+    |> Repo.update!()
+
+    {:ok, view} = ForgeImports.PatSyncQueries.get_run(c.owner, c.org.id, run.id)
+    assert view["status"] == "running"
+    assert view["succeeded"] == 0
+    assert view["terminal"] == false
+    assert hd(view["repositories"])["execution_state"] == "completed"
+  end
+
+  test "terminal task and history remain visible and credential-free", c do
+    config = configuration(c)
+
+    run =
+      task(config, c, "failed", %{
+        "error" => "retry_exhausted",
+        "repositories" => [
+          %{
+            "source_full_name" => "source-org/repo",
+            "mode" => "update",
+            "status" => "failed",
+            "error" => "invalid_response",
+            "token" => "ghp_secret",
+            "progress" => %{"phase" => "ghp_secret", "token" => "ghp_secret"}
+          }
+        ]
+      })
+
+    status =
+      request(c.owner)
+      |> Plug.Conn.put_req_header("accept", "application/json")
+      |> get(c.path <> "/runs/#{run.id}/status")
+      |> json_response(200)
+
+    assert status["run"]["terminal"]
+    assert status["run"]["failed"] == 1
+    assert hd(status["run"]["repositories"])["attempts"] == nil
+    assert status["html"] =~ "Delivery attempts: Unavailable"
+    assert status["html"] =~ ~s(data-pat-sync-poll="false")
+    assert status["html"] =~ "retry budget"
+    assert status["html"] =~ "synchronize again"
+    refute Jason.encode!(status) =~ "ghp_secret"
+    html = request(c.owner) |> get(c.path <> "/runs") |> html_response(200)
+    assert html =~ "Synchronization history"
+    assert html =~ c.path <> "/runs/#{run.id}"
+  end
+
+  test "history, task and JSON enforce organization ownership and unauthenticated JSON is explicit",
+       c do
+    run = task(configuration(c), c, "queued", %{"repositories" => []})
+
+    for suffix <- ["/runs", "/runs/#{run.id}"] do
+      assert request(c.outsider) |> get(c.path <> suffix) |> response(404)
+    end
+
+    assert request(c.outsider)
+           |> Plug.Conn.put_req_header("accept", "application/json")
+           |> get(c.path <> "/runs/#{run.id}/status")
+           |> json_response(404) == %{"error" => "not_found"}
+
+    {:ok, other} =
+      ForgeAccounts.create_organization(c.owner, %{username: "other-pat-#{c.owner.id}"})
+
+    other_path = "/organizations/#{other.username}/settings/github/runs/#{run.id}"
+    assert request(c.owner) |> get(other_path) |> response(404)
+    co_owner = user()
+    {:ok, _} = ForgeAccounts.add_organization_member(c.org, co_owner, :owner)
+
+    assert request(co_owner) |> get(c.path <> "/runs/#{run.id}") |> html_response(200) =~
+             "Synchronization ##{run.id}"
+
+    co_owner_status =
+      request(co_owner)
+      |> Plug.Conn.put_req_header("accept", "application/json")
+      |> get(c.path <> "/runs/#{run.id}/status")
+      |> json_response(200)
+
+    assert co_owner_status["run"]["id"] == run.id
+
+    assert build_conn()
+           |> Plug.Conn.put_req_header("user-agent", "pat-settings-test")
+           |> Plug.Conn.put_req_header("accept", "application/json")
+           |> get(c.path <> "/runs/#{run.id}/status")
+           |> json_response(401) == %{"error" => "login_required"}
+  end
+
+  test "paused configuration projects active waiting without overriding terminal results", c do
+    {:ok, config} =
+      ForgeMirrors.PatSettings.save(
+        c.owner,
+        c.org.id,
+        %{
+          "github_organization" => "source-org",
+          "enabled" => "true",
+          "lock_version" => "1",
+          "owner_user_id" => to_string(c.owner.id),
+          "github_identity_id" => to_string(c.account.identity_id)
+        },
+        %{}
+      )
+
+    run = task(config, c, "running", %{"repositories" => []})
+    {:ok, _} = ForgeMirrors.PatSettings.set_paused(c.owner, c.org.id, true, %{})
+    {:ok, active} = ForgeImports.PatSyncQueries.get_run(c.owner, c.org.id, run.id)
+    assert active["status"] == "running"
+    assert active["wait_reason"] == "paused"
+
+    assert request(c.owner) |> get(c.path <> "/runs/#{run.id}") |> html_response(200) =~
+             "Waiting: paused"
+
+    run
+    |> Ecto.Changeset.change(state: "succeeded", finished_at: DateTime.utc_now(:second))
+    |> Repo.update!()
+
+    {:ok, finished} = ForgeImports.PatSyncQueries.get_run(c.owner, c.org.id, run.id)
+    assert finished["status"] == "succeeded"
+    assert finished["wait_reason"] == nil
+  end
+
+  test "configuration check failures redirect to canonical GET and survive once", c do
+    conn = request(c.owner) |> post(c.path <> "/pat/check", %{})
+    assert redirected_to(conn, 303) == c.path
+    follow = conn |> recycle() |> get(c.path)
+    assert html_response(follow, 200) =~ "Configuration check failed"
+
+    assert follow
+           |> recycle()
+           |> get(c.path)
+           |> html_response(200)
+           |> then(&(not String.contains?(&1, "Configuration check failed")))
+  end
+
+  defp configuration(c) do
+    {:ok, config} =
+      ForgeMirrors.PatSettings.save(
+        c.owner,
+        c.org.id,
+        %{"github_organization" => "source-org", "enabled" => "false", "lock_version" => "1"},
+        %{}
+      )
+
+    config
+  end
+
+  defp task(config, c, state, summary) do
+    import Ecto.Query
+
+    Repo.update_all(
+      from(r in ForgeImports.PatSyncRun,
+        where: r.configuration_id == ^config.id and r.state in ["queued", "running"]
+      ),
+      set: [state: "failed", finished_at: DateTime.utc_now(:second)]
+    )
+
+    progress =
+      summary["repositories"]
+      |> Enum.with_index(1)
+      |> Map.new(fn {row, id} -> {to_string(id), row} end)
+
+    Repo.insert!(%ForgeImports.PatSyncRun{
+      configuration_id: config.id,
+      organization_id: config.organization_id,
+      owner_user_id: c.owner.id,
+      github_identity_id: c.account.identity_id,
+      github_organization: config.github_organization,
+      state: state,
+      progress: progress,
+      error: summary["error"],
+      finished_at: if(state in ["queued", "running"], do: nil, else: DateTime.utc_now(:second))
+    })
   end
 
   defp request(user),

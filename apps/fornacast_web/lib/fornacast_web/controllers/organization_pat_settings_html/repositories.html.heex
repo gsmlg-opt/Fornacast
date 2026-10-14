@@ -30,12 +30,9 @@
           disabled={!@view.config.enabled or @view.config.paused}
         >Sync now</button>
       </form>
-      <p class="mt-2 text-sm text-on-surface-variant">
-        Status: {if @view.config.paused,
-          do: "Paused",
-          else: @view.config.last_sync_status || "Never synchronized"}
-      </p>
-      <.sync_report summary={@view.config.last_sync_summary} />
+      <p :if={!@latest_run} class="mt-2 text-sm text-on-surface-variant">Never synchronized</p>
+      <.task_report :if={@latest_run} organization={@organization} run={@latest_run} />
+      <.dm_link :if={!@latest_run} href={base(@organization) <> "/runs"} class="text-primary">Synchronization history</.dm_link>
     </.dm_card>
     <.dm_card id="pat-repositories-list" variant="bordered" padding="lg">
       <:title>Repository selection</:title>

@@ -186,7 +186,7 @@ defmodule ForgeImports.Retry do
                ),
              :ok <- insert_successor_items(active_actor, predecessor, successor, retryable_items),
              :ok <- record_retry_audit(active_actor, predecessor, successor, safe_metadata) do
-          kick_reconciler()
+          ForgeImports.SyncJobs.enqueue_run!(successor.id)
           successor
         else
           nil -> Repo.rollback(:not_found)
@@ -621,10 +621,6 @@ defmodule ForgeImports.Retry do
       {:ok, _event} -> :ok
       {:error, _reason} -> {:error, :persistence_unavailable}
     end
-  end
-
-  defp kick_reconciler do
-    if Process.whereis(ForgeImports.Reconciler), do: ForgeImports.Reconciler.kick(), else: :ok
   end
 
   defp locked_predecessor(actor_id, run_id) do

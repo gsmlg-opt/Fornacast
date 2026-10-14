@@ -54,8 +54,18 @@ recoverable background run for **all PAT-visible repositories in that GitHub
 organization**, regardless of the saved repository selection. Refreshing the
 list only reads GitHub; saving configuration or repository selection does not
 synchronize repository contents. Interval mode uses the same durable PAT-backed
-organization synchronization pipeline. Both settings pages show progress totals
-and individual repository outcomes; reload the page to see updated results.
+organization synchronization pipeline. Starting a sync opens its durable task
+page, with automatically updated totals, individual repository outcomes and
+retry/wait reasons. The synchronization history retains previous task results.
+
+GitHub discovery, repository import/update and task orchestration use
+[Styx](https://github.com/gsmlg-dev/styx) (`:styx`), backed by the same PostgreSQL
+domain database. Independent queues keep long Git/LFS transfers separate from
+control work. A completed queue delivery is one execution step; organization
+success depends on the published repository results. Actual errors have bounded
+retries, while provider/resource waits are shown separately. Credentials remain
+in the encrypted store; serialized job arguments contain task identifiers and
+execution phase/version markers, never credentials or source payloads.
 
 New repositories use the existing import pipeline, including Git history, LFS,
 repository metadata, and supported issues, pull requests, releases and release

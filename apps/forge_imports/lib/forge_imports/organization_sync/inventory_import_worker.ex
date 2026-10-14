@@ -4,7 +4,7 @@ defmodule ForgeImports.OrganizationSync.InventoryImportWorker do
   import Ecto.Query
 
   alias ForgeAccounts.Organization
-  alias ForgeImports.{ImportRun, RepositoryItem, Worker}
+  alias ForgeImports.{ImportRun, RepositoryItem}
   alias Fornacast.Repo
 
   @kind "bootstrap.repository_import"
@@ -97,16 +97,20 @@ defmodule ForgeImports.OrganizationSync.InventoryImportWorker do
         end
 
       {:error, :pending} ->
-        discovery = Keyword.get(opts, :discovery, &Worker.run_discovery/3)
-        _result = discovery.(run.id, owner, Keyword.get(opts, :discovery_options, []))
+        discovery =
+          Keyword.get(opts, :discovery, fn id, _owner, _options ->
+            ForgeImports.SyncJobs.enqueue_discovery(id)
+          end)
 
-        ForgeMirrors.retry_operation(
-          operation,
-          now,
-          DateTime.add(now, 5, :second),
-          "network",
-          failure_detail: "inventory import discovery pending"
-        )
+        with {:ok, _} <- discovery.(run.id, owner, Keyword.get(opts, :discovery_options, [])) do
+          ForgeMirrors.retry_operation(
+            operation,
+            now,
+            DateTime.add(now, 5, :second),
+            "network",
+            failure_detail: "inventory import discovery pending"
+          )
+        end
     end
   end
 

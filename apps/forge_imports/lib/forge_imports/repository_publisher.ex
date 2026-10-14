@@ -432,6 +432,9 @@ defmodule ForgeImports.RepositoryPublisher do
       operation_id: context.capability.intent["operation_id"]
     )
     |> Multi.run(:audit_verifier, fn repo, changes -> verify_audit(repo, context, changes) end)
+    |> Multi.run(:sync_status, fn _repo, _changes ->
+      {:ok, ForgeImports.SyncJobs.notify_import(context.capability.run_id)}
+    end)
   end
 
   defp cleanup_fence(repo, context) do

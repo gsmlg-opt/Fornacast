@@ -34,7 +34,6 @@ defmodule ForgeImports.OrganizationSync.Bootstrap do
          {:ok, settings} <- ForgeMirrors.organization_settings(actor, organization.id),
          :ok <- validate_bootstrap_actions(settings),
          {:ok, result} <- create_and_bind(actor, organization, mirror, safe_metadata) do
-      ForgeImports.Reconciler.kick()
       {:ok, result}
     else
       {:error, reason} -> {:error, reason}

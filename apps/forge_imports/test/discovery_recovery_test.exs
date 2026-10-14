@@ -327,6 +327,8 @@ defmodule ForgeImports.DiscoveryRecoveryTest do
                    client_options: [state: state]
                  )
 
+        # Async admission now queues Styx; this test exercises the manual recovery seam.
+        Reconciler.kick(__MODULE__.OrganizationReconciler)
         assert eventually(fn -> Agent.get(state, & &1.organization_calls) == 1 end)
         # Reconciler clamps worker leases to the shared two-second safety minimum.
         Process.sleep(2_100)

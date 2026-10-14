@@ -17,6 +17,15 @@ defmodule FornacastWeb.Router do
     plug :put_secure_browser_headers
   end
 
+  pipeline :sync_status do
+    plug :accepts, ["json"]
+    plug :fetch_session
+    plug :protect_from_forgery
+    plug :put_secure_browser_headers
+    plug FornacastWeb.Plugs.RequireSetup
+    plug FornacastWeb.Plugs.CurrentUser
+  end
+
   pipeline :authenticated do
     plug FornacastWeb.Plugs.RequireUser
   end
@@ -36,6 +45,14 @@ defmodule FornacastWeb.Router do
     get "/:owner/:repo_dot_git/info/refs", GitHTTPController, :info_refs
     post "/:owner/:repo_dot_git/git-upload-pack", GitHTTPController, :upload_pack
     post "/:owner/:repo_dot_git/git-receive-pack", GitHTTPController, :receive_pack
+  end
+
+  scope "/", FornacastWeb do
+    pipe_through [:private_no_store, :sync_status]
+
+    get "/organizations/:organization/settings/github/runs/:run_id/status",
+        OrganizationPATSettingsController,
+        :run_status
   end
 
   scope "/", FornacastWeb do
@@ -60,6 +77,14 @@ defmodule FornacastWeb.Router do
     patch "/organizations/:organization_slug/settings", OrganizationSettingsController, :update
 
     get "/organizations/:organization/settings/github", OrganizationPATSettingsController, :index
+
+    get "/organizations/:organization/settings/github/runs",
+        OrganizationPATSettingsController,
+        :runs
+
+    get "/organizations/:organization/settings/github/runs/:run_id",
+        OrganizationPATSettingsController,
+        :run
 
     patch "/organizations/:organization/settings/github/pat",
           OrganizationPATSettingsController,

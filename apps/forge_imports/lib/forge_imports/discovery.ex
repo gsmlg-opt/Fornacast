@@ -233,7 +233,8 @@ defmodule ForgeImports.Discovery do
                revalidate_run_inputs(actor, attrs, credential, source_profile),
              :ok <- validate_destination_input(actor, destination, credential),
              {:ok, run} <-
-               create_provisional_run(actor, checked_attrs, credential, options) do
+               create_provisional_run(actor, checked_attrs, credential, options),
+             {:ok, _} <- ForgeImports.SyncJobs.enqueue_discovery(run.id) do
           run
         else
           {:error, reason} -> Repo.rollback(reason)
@@ -263,7 +264,6 @@ defmodule ForgeImports.Discovery do
         end
 
       :async ->
-        Reconciler.kick(options.reconciler)
         :ok
     end
   end

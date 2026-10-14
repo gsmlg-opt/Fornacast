@@ -37,8 +37,12 @@ defmodule ForgeImports.Worker do
   @spec run_discovery(pos_integer(), String.t(), keyword()) :: term()
   def run_discovery(run_id, lease_owner, opts \\ [])
       when is_integer(run_id) and run_id > 0 and is_binary(lease_owner) do
-    with :ok <- ForgeImports.OrganizationSync.Bootstrap.runnable?(run_id) do
+    with :ok <- ForgeImports.PatSyncWorker.import_authorized?(run_id),
+         :ok <- ForgeImports.OrganizationSync.Bootstrap.runnable?(run_id) do
       case Repo.get(ImportRun, run_id) do
+        %ImportRun{state: :awaiting_resolution, credential_source: :github_app} ->
+          maybe_start_app_bootstrap({:ok, :awaiting_resolution}, run_id)
+
         %ImportRun{state: state} when state in [:cancel_requested, :canceled] ->
           {:ok, :ignored}
 

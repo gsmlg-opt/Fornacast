@@ -1,0 +1,16 @@
+<OrganizationSettingsComponents.organization_settings_layout
+  organization={@organization}
+  active={:github}
+>
+  <section class="grid gap-4">
+    <.dm_link href={base(@organization)} class="text-primary">Back to GitHub configuration</.dm_link>
+    <h2 class="text-2xl font-semibold">GitHub synchronization task</h2>
+    <.dm_card id="pat-sync-task" variant="bordered" padding="lg">
+      <:title>{@run["github_organization"]} → {@organization.username}</:title>
+      <.task_report organization={@organization} run={@run} />
+    </.dm_card>
+    <.dm_alert id="pat-sync-capabilities" variant="info" outlined>
+      New repositories import Git history, LFS, issues, pull requests, releases and release assets. Existing repositories refresh Git references and LFS only; their existing metadata is not refreshed. Local references are retained when they conflict.
+    </.dm_alert>
+  </section>
+</OrganizationSettingsComponents.organization_settings_layout>

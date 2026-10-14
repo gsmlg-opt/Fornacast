@@ -1,5 +1,12 @@
 import Config
 
+config :forge_imports, Styx,
+  testing: :manual,
+  queues: false,
+  cron: false,
+  lifeline: false,
+  pruner: false
+
 config :forge_imports,
   recovery_enabled: false,
   recovery_max_concurrency: 1,

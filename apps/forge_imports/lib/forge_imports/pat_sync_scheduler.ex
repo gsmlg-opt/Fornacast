@@ -1,6 +1,5 @@
 defmodule ForgeImports.PatSyncScheduler do
   @moduledoc false
-  use GenServer
 
   import Ecto.Query
 
@@ -8,11 +7,6 @@ defmodule ForgeImports.PatSyncScheduler do
   alias ForgeMirrors.PatConfiguration
   alias ForgeImports.OrganizationPatSettings
   alias Fornacast.Repo
-
-  @default_interval_ms 30_000
-
-  def start_link(opts) when is_list(opts),
-    do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
 
   @doc false
   def run_once(now \\ DateTime.utc_now(:second)) do
@@ -25,30 +19,6 @@ defmodule ForgeImports.PatSyncScheduler do
     |> Enum.each(&sync_if_due(&1, now))
 
     :ok
-  end
-
-  @impl true
-  def init(opts) do
-    state = %{
-      enabled:
-        Keyword.get(
-          opts,
-          :enabled,
-          Application.get_env(:forge_imports, :pat_sync_scheduler_enabled, true)
-        ),
-      interval_ms: Keyword.get(opts, :interval_ms, @default_interval_ms),
-      runner: Keyword.get(opts, :runner, &run_once/0)
-    }
-
-    if state.enabled, do: schedule(state.interval_ms)
-    {:ok, state}
-  end
-
-  @impl true
-  def handle_info(:tick, state) do
-    _ = Task.Supervisor.start_child(ForgeImports.TaskSupervisor, state.runner)
-    schedule(state.interval_ms)
-    {:noreply, state}
   end
 
   defp sync_if_due(%PatConfiguration{} = config, now) do
@@ -73,6 +43,4 @@ defmodule ForgeImports.PatSyncScheduler do
       end
     end
   end
-
-  defp schedule(interval_ms), do: Process.send_after(self(), :tick, interval_ms)
 end

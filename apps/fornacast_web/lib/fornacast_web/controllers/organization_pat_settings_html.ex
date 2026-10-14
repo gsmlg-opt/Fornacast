@@ -17,59 +17,108 @@ defmodule FornacastWeb.OrganizationPATSettingsHTML do
   def selected?(config, id),
     do: config.repository_selection == "all" or id in config.selected_repository_ids
 
-  attr :summary, :map, required: true
+  def run_path(organization, run), do: base(organization) <> "/runs/#{run["id"]}"
 
-  def sync_report(assigns) do
+  def task_status(%{"status" => "failed", "succeeded" => count}) when count > 0,
+    do: "failed (partial success)"
+
+  def task_status(%{"status" => "succeeded", "warnings" => count}) when count > 0,
+    do: "succeeded with warnings"
+
+  def task_status(run), do: run["status"]
+
+  attr :organization, :map, required: true
+  attr :run, :map, required: true
+
+  def task_report(assigns) do
     ~H"""
-    <div
-      :if={@summary != %{}}
-      class="mt-4 grid gap-2"
+    <section
+      class="grid gap-3"
       data-pat-sync-report
-      data-pat-sync-poll={if(@summary["status"] in ["queued", "running"], do: "true", else: nil)}
+      data-pat-sync-poll={if @run["terminal"], do: "false", else: "true"}
+      data-pat-sync-status-url={run_path(@organization, @run) <> "/status"}
+      data-pat-sync-updated-at={@run["updated_at"]}
     >
-      <.dm_alert
-        :if={@summary["error"] not in [nil, ""]}
-        id="pat-sync-report-error"
-        variant="error"
-        role="alert"
-      >
-        Synchronization could not finish. {sync_failure_message(@summary["error"])}
-      </.dm_alert>
-      <p role="status" class="text-sm text-on-surface-variant">
-        Repositories: {@summary["total"]}. Succeeded: {@summary["succeeded"]}. Failed: {@summary[
+      <h3 class="text-xl font-semibold">Synchronization #{@run["id"]}: {task_status(@run)}</h3>
+      <p role="status">
+        Phase: {@run["phase"]}. Repositories: {@run["total"]}. Succeeded: {@run["succeeded"]}. Failed: {@run[
           "failed"
-        ]}. Pending: {@summary["pending"]}.
+        ]}. Pending: {@run["pending"]}. Warnings: {@run["warnings"]}.
       </p>
-      <details :if={@summary["repositories"] != []}>
+      <p class="text-sm text-on-surface-variant">
+        Requested: {@run["requested_at"]}. Started: {@run["started_at"] || "Not started"}. Last recorded activity: {@run[
+          "updated_at"
+        ]}. Finished: {@run["finished_at"] || "Not finished"}.
+      </p>
+      <p class="text-sm text-on-surface-variant">
+        Worker heartbeat: {@run["heartbeat_at"] || "Not started"}. Last progress: {@run[
+          "last_progress_at"
+        ] || "No progress recorded"}.
+      </p>
+      <p :if={@run["execution_state"]} class="text-sm">
+        Latest worker delivery: {@run["execution_state"]}. Delivery attempts: {@run["attempts"]} / {@run[
+          "max_attempts"
+        ]}. Last worker start: {@run["worker_started_at"] || "Not started"}.
+      </p>
+      <p class="text-sm" data-pat-sync-poll-feedback role="status">
+        Status checked: {@run["observed_at"]}.
+      </p>
+      <.dm_alert :if={@run["error"]} id="pat-sync-report-error" variant="error" role="alert">
+        Synchronization could not finish. {sync_failure_message(@run["error"])} ({@run["error"]})
+      </.dm_alert>
+      <p :if={@run["wait_reason"]}>Waiting: {@run["wait_reason"]}.</p>
+      <p :if={@run["next_attempt_at"]}>Next attempt: {@run["next_attempt_at"]}.</p>
+      <p :if={@run["terminal"] and @run["pending"] > 0}>
+        The task ended with {@run["pending"]} unfinished repositories. Completed repositories were retained.
+      </p>
+      <p :if={@run["total"] == 0 and !@run["terminal"]}>
+        Waiting for repository discovery. The task has been accepted.
+      </p>
+      <details :if={@run["repositories"] != []} open>
         <summary>Repository synchronization results</summary>
         <div class="mt-2 overflow-x-auto">
           <table class="table" aria-label="Repository synchronization results">
             <thead>
               <tr>
-                <th>GitHub repository</th><th>Status</th><th>Details</th>
+                <th>GitHub repository</th><th>Status / phase</th><th>Details</th>
               </tr>
             </thead>
             <tbody>
-              <tr :for={repository <- @summary["repositories"]}>
+              <tr :for={repository <- @run["repositories"]}>
                 <th scope="row">{repository["source_full_name"]}</th>
-                <td>{repository["status"]}</td>
+                <td>{repository["status"]} / {repository["phase"] || repository["mode"]}</td>
                 <td>
-                  <span :if={repository["progress"] not in [nil, %{}]} class="block">
-                    {sync_progress_message(repository["progress"])}
-                  </span>
-                  <span :if={
-                    repository["status"] in ["failed", "pending"] and
-                      repository["error"] not in [nil, ""]
-                  }>
-                    {sync_failure_message(repository["error"])}
-                  </span>
+                  <span class="block">{sync_progress_message(repository["progress"])}</span>
+                  <span :if={repository["error"]} class="block">{sync_failure_message(
+                    repository["error"]
+                  )} ({repository["error"]})</span>
+                  <span :if={repository["wait_reason"]} class="block">Waiting: {repository[
+                    "wait_reason"
+                  ]}.</span>
+                  <span :if={repository["next_attempt_at"]} class="block">Next attempt: {repository[
+                    "next_attempt_at"
+                  ]}.</span>
+                  <span :if={repository["execution_state"]} class="block">Latest worker delivery: {repository[
+                    "execution_state"
+                  ]}.</span>
+                  <span class="block">Delivery attempts: {repository["attempts"] || "Unavailable"} / {repository[
+                    "max_attempts"
+                  ] || "Unavailable"}. Import attempts: {repository["import_attempts"]}. Warnings: {repository[
+                    "warnings"
+                  ]}.</span>
                 </td>
               </tr>
             </tbody>
           </table>
         </div>
       </details>
-    </div>
+      <div class="flex gap-3" data-pat-sync-actions>
+        <.dm_link href={run_path(@organization, @run)} class="text-primary">View task #{@run["id"]}</.dm_link>
+        <.dm_link href={base(@organization) <> "/runs"} class="text-primary">Synchronization history</.dm_link>
+        <.dm_link :if={@run["terminal"]} href={base(@organization)} class="text-primary">Open configuration to synchronize again</.dm_link>
+        <span :if={!@run["terminal"]}>Synchronization is active.</span>
+      </div>
+    </section>
     """
   end
 
@@ -127,6 +176,12 @@ defmodule FornacastWeb.OrganizationPATSettingsHTML do
 
   defp sync_failure_message("corrupt_repository"),
     do: "Git object integrity verification failed."
+
+  defp sync_failure_message(reason) when reason in ["invalid_pagination", "invalid_response"],
+    do: "GitHub returned data that could not be processed."
+
+  defp sync_failure_message(reason) when reason in ["retry_exhausted", "job_discarded"],
+    do: "The task exhausted its retry budget."
 
   defp sync_failure_message(_), do: "Could not synchronize this repository."
 end

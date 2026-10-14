@@ -1,82 +1,30 @@
 defmodule ForgeImports.PatSyncWorker do
   @moduledoc false
-  use GenServer
   import Ecto.Query
 
   alias ForgeAccounts.User
-  alias ForgeImports.{ImportRun, PatSyncRun, RepositoryItem}
+  alias ForgeImports.{ImportRun, PatSyncRun, PatSyncRepositoryResult, RepositoryItem, SyncJobs}
   alias ForgeMirrors.{PatConfiguration, PatSettings}
   alias Fornacast.Repo
 
   @lease_seconds 300
   @allow_test_options Mix.env() == :test
 
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  def kick, do: GenServer.cast(__MODULE__, :kick)
-
-  @impl true
-  def init(opts) do
-    state = %{enabled: Keyword.get(opts, :enabled, true), task: nil}
-    if state.enabled, do: Process.send_after(self(), :tick, 1_000)
-    {:ok, state}
-  end
-
-  @impl true
-  def handle_cast(:kick, %{enabled: true} = state), do: {:noreply, dispatch(state)}
-  def handle_cast(:kick, state), do: {:noreply, state}
-
-  @impl true
-  def handle_info(:tick, state) do
-    Process.send_after(self(), :tick, 1_000)
-    {:noreply, dispatch(state)}
-  end
-
-  def handle_info({ref, _result}, %{task: ref} = state) do
-    Process.demonitor(ref, [:flush])
-    {:noreply, %{state | task: nil}}
-  end
-
-  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{task: ref} = state),
-    do: {:noreply, %{state | task: nil}}
-
-  def handle_info(_message, state), do: {:noreply, state}
-
-  defp dispatch(%{task: nil} = state) do
-    now = DateTime.utc_now(:second)
-
-    id =
-      Repo.one(
-        from j in PatSyncRun,
-          where:
-            j.state in ["queued", "running"] and
-              (is_nil(j.lease_expires_at) or j.lease_expires_at <= ^now),
-          order_by: [asc: j.updated_at, asc: j.id],
-          limit: 1,
-          select: j.id
-      )
-
-    if id do
-      task =
-        Task.Supervisor.async_nolink(ForgeImports.PatSyncTaskSupervisor, fn -> perform(id) end)
-
-      %{state | task: task.ref}
-    else
-      state
-    end
-  end
-
-  defp dispatch(state), do: state
-
   @doc false
   def perform(job_id, opts \\ []) do
     with {:ok, %PatSyncRun{} = job} <- claim(job_id) do
-      try do
-        result = with {:ok, owner, config} <- context(job), do: advance(job, owner, config, opts)
+      if is_nil(job.started_at), do: persist(job, started_at: DateTime.utc_now(:second))
+      result = with {:ok, owner, config} <- context(job), do: advance(job, owner, config, opts)
+
+      if Keyword.get(opts, :queued_updates, false) and
+           match?(
+             {:error, reason}
+             when reason in [:persistence_unavailable, :unavailable, :worker_crash, :lost_lease],
+             result
+           ) do
+        with {:ok, _} <- persist(job, lease_owner: nil, lease_expires_at: nil), do: result
+      else
         settle(job, result)
-      rescue
-        _ -> settle(job, {:error, :worker_crash})
-      catch
-        _, _ -> settle(job, {:error, :worker_crash})
       end
     end
   end
@@ -97,7 +45,8 @@ defmodule ForgeImports.PatSyncWorker do
           state: "running",
           lease_owner: token,
           lease_expires_at: DateTime.add(now, @lease_seconds, :second),
-          updated_at: now
+          updated_at: now,
+          heartbeat_at: now
         ]
       )
 
@@ -235,6 +184,9 @@ defmodule ForgeImports.PatSyncWorker do
         with {:ok, _} <- ForgeImports.start_import(owner, run.id, job.request_metadata),
              do: :pending
 
+      %ImportRun{state: :failed} when job.progress == %{} ->
+        {:error, :discovery_failed}
+
       %ImportRun{state: state} = run
       when state in [:running, :completed, :completed_with_warnings, :failed] ->
         synchronize(job, owner, config, run, opts)
@@ -348,6 +300,31 @@ defmodule ForgeImports.PatSyncWorker do
   end
 
   defp synchronize(job, owner, config, run, opts) do
+    if Keyword.get(opts, :queued_updates, false) do
+      {:ok, progress} = repository_progress(job)
+
+      Enum.each(
+        Repo.all(
+          from r in PatSyncRepositoryResult,
+            where: r.pat_sync_run_id == ^job.id and r.state in ["pending", "running"]
+        ),
+        fn row ->
+          if row.data["mode"] == "update" do
+            case SyncJobs.enqueue_update(row.id) do
+              {:ok, _} -> :ok
+              {:error, _} -> raise "GitHub repository update admission failed"
+            end
+          end
+        end
+      )
+
+      finish(%{job | progress: progress}, run)
+    else
+      synchronize_inline(job, owner, config, run, opts)
+    end
+  end
+
+  defp synchronize_inline(job, owner, config, run, opts) do
     case job.progress
          |> Enum.sort_by(fn {id, row} -> {Map.get(row, "retry_after", 0), id} end)
          |> Enum.find(fn {_id, row} -> update_ready?(row) end) do
@@ -509,7 +486,191 @@ defmodule ForgeImports.PatSyncWorker do
   end
 
   defp persist(job, changes) do
+    Repo.transact(fn ->
+      if progress = Keyword.get(changes, :progress), do: seed_results(job, progress)
+      persist_owned(job, changes)
+    end)
+  end
+
+  defp seed_results(job, progress) do
     now = DateTime.utc_now(:second)
+
+    Enum.each(progress, fn {key, data} ->
+      item_id =
+        case Integer.parse(key) do
+          {id, ""} -> if Repo.get(RepositoryItem, id), do: id
+          _ -> nil
+        end
+
+      Repo.insert_all(
+        PatSyncRepositoryResult,
+        [
+          %{
+            pat_sync_run_id: job.id,
+            repository_item_id: item_id,
+            item_key: key,
+            data: data,
+            state: data["status"] || "pending",
+            inserted_at: now,
+            updated_at: now
+          }
+        ],
+        on_conflict: :nothing,
+        conflict_target: [:pat_sync_run_id, :item_key]
+      )
+
+      if data["mode"] == "update" and data["status"] == "pending" do
+        row = Repo.get_by!(PatSyncRepositoryResult, pat_sync_run_id: job.id, item_key: key)
+
+        case SyncJobs.enqueue_update(row.id) do
+          {:ok, _} -> :ok
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end
+
+      if data["mode"] != "update" do
+        Repo.update_all(
+          from(r in PatSyncRepositoryResult,
+            where: r.pat_sync_run_id == ^job.id and r.item_key == ^key
+          ),
+          set: [data: data, state: data["status"] || "pending", updated_at: now]
+        )
+      end
+    end)
+
+    :ok
+  end
+
+  defp repository_progress(job) do
+    Repo.transact(fn ->
+      seed_results(job, job.progress)
+      rows = Repo.all(from r in PatSyncRepositoryResult, where: r.pat_sync_run_id == ^job.id)
+      {:ok, Map.new(rows, &{&1.item_key, &1.data})}
+    end)
+  end
+
+  @doc false
+  def perform_repository(id, opts \\ []) do
+    now = DateTime.utc_now(:second)
+    token = Ecto.UUID.generate()
+
+    {count, rows} =
+      Repo.update_all(
+        from(r in PatSyncRepositoryResult,
+          where:
+            r.id == ^id and r.state in ["pending", "running"] and
+              (is_nil(r.lease_expires_at) or r.lease_expires_at <= ^now),
+          select: r
+        ),
+        set: [
+          state: "running",
+          lease_owner: token,
+          lease_expires_at: DateTime.add(now, 2_400),
+          updated_at: now
+        ]
+      )
+
+    case {count, rows} do
+      {1, [row]} -> synchronize_repository(row, opts)
+      _ -> {:ok, :busy}
+    end
+  end
+
+  defp synchronize_repository(row, opts) do
+    job = Repo.get!(PatSyncRun, row.pat_sync_run_id)
+    sync = callback(opts, :sync_repository, &ForgeImports.PatRepositorySync.sync/5)
+
+    authorize = fn ->
+      with true <- Repo.get!(PatSyncRun, job.id).state in ["queued", "running"],
+           {:ok, _, _} <- context(job),
+           {1, _} <-
+             Repo.update_all(
+               from(r in PatSyncRepositoryResult,
+                 where:
+                   r.id == ^row.id and r.lease_owner == ^row.lease_owner and
+                     r.lease_expires_at > ^DateTime.utc_now(:second)
+               ),
+               set: [lease_expires_at: DateTime.add(DateTime.utc_now(:second), 2_400)]
+             ) do
+        :ok
+      else
+        {:error, reason} -> {:error, reason}
+        false -> {:error, :configuration_changed}
+        _ -> {:error, :lost_lease}
+      end
+    end
+
+    result =
+      with :ok <- authorize.(),
+           {:ok, owner, config} <- context(job),
+           {:ok, repository} <-
+             ForgeRepos.fetch_organization_repository(
+               job.organization_id,
+               row.data["repository_id"]
+             ),
+           true <- repository.generation == row.data["generation"] do
+        sync.(
+          owner,
+          config,
+          repository,
+          row.data["source_full_name"],
+          [github_repository_id: row.data["github_repository_id"], authorize: authorize] ++
+            test_options(opts, :repository_options)
+        )
+      else
+        false -> {:error, :stale_repository}
+        {:error, reason} -> {:error, reason}
+      end
+
+    now = DateTime.utc_now(:second)
+    state = if result == :ok, do: "succeeded", else: "pending"
+
+    data =
+      Map.merge(row.data, %{
+        "status" => state,
+        "error" => if(result == :ok, do: nil, else: classification(elem(result, 1)))
+      })
+
+    settlement =
+      Repo.transact(fn ->
+        case Repo.update_all(
+               from(r in PatSyncRepositoryResult,
+                 where:
+                   r.id == ^row.id and r.lease_owner == ^row.lease_owner and
+                     r.lease_expires_at > ^now
+               ),
+               set: [
+                 state: state,
+                 data: data,
+                 lease_owner: nil,
+                 lease_expires_at: nil,
+                 updated_at: now,
+                 finished_at: if(state == "succeeded", do: now)
+               ]
+             ) do
+          {1, _} ->
+            with {:ok, _} <- SyncJobs.enqueue_pat_sync(job.id), do: {:ok, :ok}
+
+          _ ->
+            {:error, :lost_lease}
+        end
+      end)
+
+    case settlement do
+      {:ok, _} -> result
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp persist_owned(job, changes) do
+    now = DateTime.utc_now(:second)
+    current = Repo.get!(PatSyncRun, job.id)
+    progress = Keyword.get(changes, :progress)
+
+    changes =
+      if progress && progress != current.progress,
+        do: Keyword.put(changes, :last_progress_at, now),
+        else: changes
 
     {count, _} =
       Repo.update_all(
@@ -522,27 +683,32 @@ defmodule ForgeImports.PatSyncWorker do
 
     if count == 1 do
       if Keyword.has_key?(changes, :progress) or Keyword.has_key?(changes, :state) do
-        current = Repo.get!(PatSyncRun, job.id)
-        rows = current.progress |> Map.values() |> Enum.sort_by(& &1["source_full_name"])
-
-        summary = %{
-          "total" => length(rows),
-          "succeeded" => Enum.count(rows, &(&1["status"] == "succeeded")),
-          "failed" => Enum.count(rows, &(&1["status"] == "failed")),
-          "pending" => Enum.count(rows, &(&1["status"] == "pending")),
-          "repositories" =>
-            Enum.map(rows, &Map.take(&1, ~w(source_full_name status error progress))),
-          "error" => current.error,
-          "status" => current.state
-        }
-
-        _ = PatSettings.record_sync_summary(current.id, summary)
+        record_summary(job.id)
       end
 
       {:ok, job.id}
     else
       {:error, :lost_lease}
     end
+  end
+
+  @doc false
+  def record_summary(id) do
+    current = Repo.get!(PatSyncRun, id)
+    rows = current.progress |> Map.values() |> Enum.sort_by(& &1["source_full_name"])
+
+    summary = %{
+      "total" => length(rows),
+      "succeeded" => Enum.count(rows, &(&1["status"] == "succeeded")),
+      "failed" => Enum.count(rows, &(&1["status"] == "failed")),
+      "pending" => Enum.count(rows, &(&1["status"] == "pending")),
+      "repositories" => Enum.map(rows, &Map.take(&1, ~w(source_full_name status error progress))),
+      "error" => current.error,
+      "status" => current.state
+    }
+
+    _ = PatSettings.record_sync_summary(current.id, summary)
+    :ok
   end
 
   defp classification(reason) when is_atom(reason), do: Atom.to_string(reason)

@@ -1012,6 +1012,339 @@ defmodule ForgeImports.PatSyncWorkerTest do
     end
   end
 
+  test "Styx drains the entire admitted discovery and import chain to a domain result", c do
+    alias ForgeImports.SyncJobs.Execution
+
+    {:ok, job} =
+      OrganizationPatSettings.sync(c.owner, c.org.id, to_string(c.config.lock_version), %{})
+
+    client_options = Keyword.delete(FakeGitHub.client_opts(c.stub), :gate_key)
+
+    options = [
+      control: [discovery_options: [client_options: client_options]],
+      discovery: [client_options: client_options],
+      repository: [
+        repository_worker_options: [
+          remote: GitRemoteFixture.mirror_remote_module(),
+          remote_options: [source: c.source, expected_pat: @pat],
+          client_options: client_options
+        ]
+      ]
+    ]
+
+    Execution.with_options(options, fn ->
+      for _ <- 1..12 do
+        for queue <- [:github_control, :github_discovery, :github_import, :github_update] do
+          assert %{failure: 0} = Styx.drain_queue(queue: queue, with_scheduled: true)
+        end
+      end
+    end)
+
+    assert %{state: "succeeded", started_at: %DateTime{}, last_progress_at: %DateTime{}} =
+             Repo.get!(PatSyncRun, job.id)
+
+    rows =
+      Repo.all(
+        from r in ForgeImports.PatSyncRepositoryResult, where: r.pat_sync_run_id == ^job.id
+      )
+
+    assert length(rows) == 2
+    assert Enum.all?(rows, &(&1.state == "succeeded"))
+
+    for row <- rows do
+      item = Repo.get!(RepositoryItem, row.repository_item_id)
+      assert item.state in [:published, :completed]
+      assert item.publication_evidence["state"] == "committed"
+    end
+
+    assert Process.whereis(ForgeImports.Reconciler) == nil
+    assert Process.whereis(ForgeImports.PatSyncWorker) == nil
+    assert Process.whereis(ForgeImports.PatSyncScheduler) == nil
+  end
+
+  test "failed Styx stages exhaust one delivery despite domain version changes", c do
+    alias ForgeImports.SyncJobs.Execution
+
+    {:ok, job} =
+      OrganizationPatSettings.sync(c.owner, c.org.id, to_string(c.config.lock_version), %{},
+        dispatch: :manual
+      )
+
+    assert :pending = PatSyncWorker.perform(job.id, discovery_options: discovery_options(c))
+    assert :pending = PatSyncWorker.perform(job.id, queued_updates: true)
+    import_id = Repo.get!(PatSyncRun, job.id).import_run_id
+    items = Repo.all(from i in RepositoryItem, where: i.import_run_id == ^import_id)
+
+    Execution.with_options([repository: [repository_worker: __MODULE__.MalformedStage]], fn ->
+      for _ <- 1..4 do
+        assert %{failure: 2, discard: 0} =
+                 Styx.drain_queue(queue: :github_import, with_scheduled: true)
+
+        ForgeImports.SyncJobs.recover()
+      end
+
+      assert %{discard: 2, failure: 0} =
+               Styx.drain_queue(queue: :github_import, with_scheduled: true)
+
+      ForgeImports.SyncJobs.recover()
+    end)
+
+    assert Enum.all?(items, &(Repo.get!(RepositoryItem, &1.id).state == :failed))
+    ids = Enum.map(items, & &1.id)
+
+    deliveries =
+      Repo.all(
+        from j in Styx.Job,
+          where:
+            j.queue == "github_import" and
+              fragment("(?->>'repository_item_id')::bigint", j.args) in ^ids
+      )
+
+    assert length(deliveries) == 2
+    assert Enum.all?(deliveries, &(&1.attempt == 5 and &1.state == "discarded"))
+    assert {:error, :repository_sync_failed} = PatSyncWorker.perform(job.id, queued_updates: true)
+    assert Repo.get!(PatSyncRun, job.id).state == "failed"
+  end
+
+  test "Styx admission rollback leaves no orphaned sync job", c do
+    before_count = Repo.aggregate(Styx.Job, :count)
+
+    assert {:error, :test_abort} =
+             Repo.transact(fn ->
+               assert {:ok, _} =
+                        OrganizationPatSettings.sync(
+                          c.owner,
+                          c.org.id,
+                          to_string(c.config.lock_version),
+                          %{}
+                        )
+
+               {:error, :test_abort}
+             end)
+
+    assert Repo.aggregate(Styx.Job, :count) == before_count
+    refute Repo.exists?(from j in PatSyncRun, where: j.configuration_id == ^c.config.id)
+  end
+
+  test "recovery preserves an active pre-migration lease and does not renew progress", c do
+    {:ok, job} =
+      OrganizationPatSettings.sync(c.owner, c.org.id, to_string(c.config.lock_version), %{},
+        dispatch: :manual
+      )
+
+    expires_at = DateTime.add(DateTime.utc_now(:second), 300)
+
+    Repo.update!(
+      Ecto.Changeset.change(job,
+        state: "running",
+        lease_owner: "previous-executor",
+        lease_expires_at: expires_at
+      )
+    )
+
+    assert :ok = ForgeImports.SyncJobs.recover()
+    assert %{snoozed: 1, failure: 0} = Styx.drain_queue(queue: :github_control)
+    current = Repo.get!(PatSyncRun, job.id)
+    assert current.lease_owner == "previous-executor"
+    assert current.lease_expires_at == expires_at
+    assert current.started_at == nil
+    assert current.last_progress_at == nil
+  end
+
+  test "explicit pause survives an old delivery deadline and resumes through Styx", c do
+    alias ForgeImports.SyncJobs.Execution
+
+    {:ok, run} =
+      OrganizationPatSettings.sync(c.owner, c.org.id, to_string(c.config.lock_version), %{})
+
+    Repo.update!(Ecto.Changeset.change(c.config, paused: true))
+
+    delivery =
+      Repo.one!(
+        from j in Styx.Job,
+          where:
+            j.queue == "github_control" and
+              fragment("?->>'pat_sync_run_id'", j.args) == ^to_string(run.id)
+      )
+
+    Repo.update!(
+      Ecto.Changeset.change(delivery, inserted_at: DateTime.add(DateTime.utc_now(), -90_000))
+    )
+
+    assert %{snoozed: 1, discard: 0, failure: 0} = Styx.drain_queue(queue: :github_control)
+    assert Repo.get!(PatSyncRun, run.id).state == "running"
+    refute Repo.exists?(from i in ImportRun, where: i.actor_user_id == ^c.owner.id)
+    current = Repo.get!(ForgeMirrors.PatConfiguration, c.config.id)
+    Repo.update!(Ecto.Changeset.change(current, paused: false))
+    # Resuming an explicit pause starts a new stall observation window.
+    assert %{snoozed: 1, failure: 0} =
+             Execution.with_options(
+               [control: [discovery_options: discovery_options(c)]],
+               fn -> Styx.drain_queue(queue: :github_control, with_scheduled: true) end
+             )
+
+    assert Repo.get!(PatSyncRun, run.id).import_run_id != nil
+  end
+
+  test "completed business deliveries terminate without repeatedly snoozing", c do
+    alias ForgeImports.{PatSyncRepositoryResult, SyncJobs}
+
+    {:ok, run} =
+      OrganizationPatSettings.sync(c.owner, c.org.id, to_string(c.config.lock_version), %{})
+
+    Repo.update!(Ecto.Changeset.change(run, state: "failed", error: "configuration_changed"))
+
+    row =
+      Repo.insert!(%PatSyncRepositoryResult{
+        pat_sync_run_id: run.id,
+        item_key: "retained",
+        state: "succeeded",
+        data: %{"mode" => "update", "status" => "succeeded"}
+      })
+
+    {:ok, _} = SyncJobs.enqueue_update(row.id)
+    assert %{success: 1, snoozed: 0} = Styx.drain_queue(queue: :github_control)
+    assert %{success: 1, snoozed: 0} = Styx.drain_queue(queue: :github_update)
+
+    Repo.update!(
+      Ecto.Changeset.change(row,
+        state: "pending",
+        data: %{"mode" => "update", "status" => "pending"}
+      )
+    )
+
+    before_count = Repo.aggregate(Styx.Job, :count)
+    assert :ok = SyncJobs.recover()
+    assert Repo.aggregate(Styx.Job, :count) == before_count
+  end
+
+  test "independent repository updates retain sibling success and remote failure after bounded retries",
+       c do
+    alias ForgeImports.{PatSyncRepositoryResult, SyncJobs}
+    alias ForgeImports.SyncJobs.Execution
+
+    {:ok, first} =
+      OrganizationPatSettings.sync(c.owner, c.org.id, to_string(c.config.lock_version), %{})
+
+    assert :pending = PatSyncWorker.perform(first.id, discovery_options: discovery_options(c))
+    assert :pending = PatSyncWorker.perform(first.id)
+    first = Repo.get!(PatSyncRun, first.id)
+
+    for item <- Repo.all(from i in RepositoryItem, where: i.import_run_id == ^first.import_run_id),
+        do: complete_item!(item, c)
+
+    assert :ok = PatSyncWorker.perform(first.id)
+
+    {:ok, second} =
+      OrganizationPatSettings.sync(c.owner, c.org.id, to_string(c.config.lock_version), %{})
+
+    assert :pending = PatSyncWorker.perform(second.id, discovery_options: discovery_options(c))
+    assert :pending = PatSyncWorker.perform(second.id, queued_updates: true)
+
+    Execution.with_options(
+      [
+        update: [
+          sync_repository: fn _, _, _, full_name, _ ->
+            if String.ends_with?(full_name, "/alpha"), do: {:error, :not_found}, else: :ok
+          end
+        ]
+      ],
+      fn ->
+        for _ <- 1..5 do
+          Styx.drain_queue(queue: :github_update, with_scheduled: true)
+          SyncJobs.recover()
+        end
+      end
+    )
+
+    rows = Repo.all(from r in PatSyncRepositoryResult, where: r.pat_sync_run_id == ^second.id)
+    assert Enum.count(rows, &(&1.state == "succeeded")) == 1
+    assert [failed] = Enum.filter(rows, &(&1.state == "failed"))
+    assert failed.data["error"] == "not_found"
+    assert failed.data["retry_exhausted"] == true
+
+    assert {:error, :repository_sync_failed} =
+             PatSyncWorker.perform(second.id, queued_updates: true)
+
+    assert Repo.get!(PatSyncRun, second.id).state == "failed"
+
+    assert Enum.count(Repo.get!(PatSyncRun, second.id).progress, fn {_, row} ->
+             row["status"] == "succeeded"
+           end) == 1
+  end
+
+  test "paused discovery resumes an old delivery and gives its first API error a retry", c do
+    alias ForgeImports.SyncJobs.Execution
+
+    {:ok, run} =
+      OrganizationPatSettings.sync(c.owner, c.org.id, to_string(c.config.lock_version), %{})
+
+    client_options = Keyword.delete(FakeGitHub.client_opts(c.stub), :gate_key)
+
+    assert :pending =
+             PatSyncWorker.perform(run.id, discovery_options: [client_options: client_options])
+
+    import_id = Repo.get!(PatSyncRun, run.id).import_run_id
+
+    delivery =
+      Repo.one!(
+        from j in Styx.Job,
+          where:
+            j.queue == "github_discovery" and
+              fragment("?->>'import_run_id'", j.args) == ^to_string(import_id)
+      )
+
+    Repo.update!(
+      Ecto.Changeset.change(delivery, inserted_at: DateTime.add(DateTime.utc_now(), -90_000))
+    )
+
+    Repo.update!(Ecto.Changeset.change(c.config, paused: true))
+    assert %{snoozed: 1, failure: 0} = Styx.drain_queue(queue: :github_discovery)
+    assert Repo.get!(Styx.Job, delivery.id).meta["explicit_pause"] == true
+    current = Repo.get!(ForgeMirrors.PatConfiguration, c.config.id)
+    Repo.update!(Ecto.Changeset.change(current, paused: false))
+
+    assert %{failure: 1, discard: 0, cancelled: 0} =
+             Execution.with_options(
+               [
+                 discovery: [
+                   client: __MODULE__.UnavailableDiscoveryClient,
+                   client_options: [test_pid: self()]
+                 ]
+               ],
+               fn -> Styx.drain_queue(queue: :github_discovery, with_scheduled: true) end
+             )
+
+    assert_receive :discovery_api_error
+    current = Repo.get!(Styx.Job, delivery.id)
+    assert current.state == "retryable"
+    assert current.attempt == 1
+    assert current.meta["resumed_at"] != nil
+    assert Repo.get!(ImportRun, import_id).state == :discovering
+  end
+
+  defmodule UnavailableDiscoveryClient do
+    def organization(_credential, _organization, options) do
+      send(Keyword.fetch!(options, :test_pid), :discovery_api_error)
+      raise "simulated source transport failure"
+    end
+  end
+
+  defmodule MalformedStage do
+    def stage(id, _opts) do
+      item = Repo.get!(RepositoryItem, id)
+
+      Repo.update!(
+        Ecto.Changeset.change(item,
+          lock_version: item.lock_version + 1,
+          failure_kind: "invalid_pagination"
+        )
+      )
+
+      {:error, :invalid_pagination}
+    end
+  end
+
   defp git!(args, directory \\ File.cwd!()) do
     {output, code} =
       System.cmd("git", args,

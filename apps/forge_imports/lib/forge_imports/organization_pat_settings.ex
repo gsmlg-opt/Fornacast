@@ -1,7 +1,6 @@
 defmodule ForgeImports.OrganizationPatSettings do
   @moduledoc "GitHub organization inventory and PAT-backed synchronization entrypoints."
   import Ecto.Query
-  @allow_test_options Mix.env() == :test
 
   alias ForgeImports.{ImportRun, PatSyncRun, RepositoryItem}
   alias ForgeMirrors.PatSettings
@@ -93,7 +92,7 @@ defmodule ForgeImports.OrganizationPatSettings do
                if same_source? do
                  if Keyword.get(opts, :restart, false),
                    do: restart_job(active, owner, config, safe_metadata),
-                   else: {:ok, active}
+                   else: queue_job(active)
                else
                  if active do
                    Fornacast.Repo.update_all(from(j in PatSyncRun, where: j.id == ^active.id),
@@ -119,7 +118,7 @@ defmodule ForgeImports.OrganizationPatSettings do
                       {:ok, job} <- recover_import(job, owner, config),
                       {:ok, _} <-
                         PatSettings.mark_sync(actor, organization_id, "running", safe_metadata) do
-                   {:ok, job}
+                   queue_job(job)
                  end
                end
              else
@@ -127,8 +126,6 @@ defmodule ForgeImports.OrganizationPatSettings do
                _ -> {:error, :credential_unavailable}
              end
            end) do
-      dispatch(opts)
-
       {:ok, job}
     end
   end
@@ -193,7 +190,7 @@ defmodule ForgeImports.OrganizationPatSettings do
            ),
          {:ok, job} <- attach_successor(job, previous, successor, metadata),
          {:ok, _} <- PatSettings.mark_sync(owner, config.organization_id, "running", metadata) do
-      {:ok, job}
+      queue_job(job)
     end
   end
 
@@ -266,12 +263,8 @@ defmodule ForgeImports.OrganizationPatSettings do
     end
   end
 
-  if @allow_test_options do
-    defp dispatch(opts) do
-      if Keyword.get(opts, :dispatch, :async) != :manual, do: ForgeImports.PatSyncWorker.kick()
-    end
-  else
-    defp dispatch(_opts), do: ForgeImports.PatSyncWorker.kick()
+  defp queue_job(job) do
+    with {:ok, _} <- ForgeImports.SyncJobs.enqueue_pat_sync(job.id), do: {:ok, job}
   end
 
   defp sync_enabled(config, version) do

@@ -72,9 +72,13 @@ defmodule ForgeImports do
       with {:ok, active_actor} <- active_actor(actor, lock?: true),
            :ok <- validate_predecessor_run(active_actor, attrs),
            :ok <- validate_credential_binding(active_actor, attrs) do
-        %ImportRun{}
-        |> ImportRun.creation_changeset(active_actor.id, attrs)
-        |> Repo.insert()
+        with {:ok, run} <-
+               %ImportRun{}
+               |> ImportRun.creation_changeset(active_actor.id, attrs)
+               |> Repo.insert(),
+             {:ok, _} <- ForgeImports.SyncJobs.enqueue_run(run.id) do
+          {:ok, run}
+        end
       end
     end)
   end

@@ -1,0 +1,39 @@
+<OrganizationSettingsComponents.organization_settings_layout
+  organization={@organization}
+  active={:github}
+>
+  <section class="grid gap-4">
+    <.dm_link href={base(@organization)} class="text-primary">Back to GitHub configuration</.dm_link>
+    <h2 class="text-2xl font-semibold">Synchronization history</h2>
+    <p>
+      Most recent 50 tasks. Task results remain available independently of execution queue history.
+    </p>
+    <p :if={@runs == []}>No synchronization tasks yet.</p>
+    <div :if={@runs != []} class="overflow-x-auto">
+      <table class="table" aria-label="Synchronization history">
+        <thead>
+          <tr>
+            <th>Task</th><th>Status</th><th>Results</th><th>Requested / started / finished</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr :for={run <- @runs}>
+            <th scope="row">
+              <.dm_link href={run_path(@organization, run)} class="text-primary">#{run["id"]} {run[
+                "github_organization"
+              ]}</.dm_link>
+            </th>
+            <td>{run["status"]}</td>
+            <td>
+              {run["succeeded"]} succeeded, {run["failed"]} failed, {run["pending"]} pending
+            </td>
+            <td>
+              {run["requested_at"]} / {run["started_at"] || "Not started"} / {run["finished_at"] ||
+                "Not finished"}
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</OrganizationSettingsComponents.organization_settings_layout>

@@ -14,6 +14,9 @@ defmodule ForgeImports.PatSyncRun do
     field :request_metadata, :map, default: %{}
     field :lease_owner, :string
     field :lease_expires_at, :utc_datetime
+    field :started_at, :utc_datetime
+    field :heartbeat_at, :utc_datetime
+    field :last_progress_at, :utc_datetime
     field :finished_at, :utc_datetime
     field :error, :string
     timestamps(type: :utc_datetime)

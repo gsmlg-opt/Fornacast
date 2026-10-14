@@ -1411,16 +1411,12 @@ defmodule ForgeImports.Conflicts do
   defp dispatch_resolution(%{dispatch?: false}), do: :ok
 
   defp dispatch_resolution(%{dispatch?: true}) do
-    Reconciler.kick()
     :ok
   end
 
   defp dispatch(_run_id, %{dispatch: :manual}), do: :ok
 
-  defp dispatch(_run_id, %{dispatch: :async, reconciler: reconciler}) do
-    Reconciler.kick(reconciler)
-    :ok
-  end
+  defp dispatch(_run_id, %{dispatch: :async}), do: :ok
 
   defp dispatch(run_id, %{dispatch: dispatch}) when is_function(dispatch, 1) do
     case dispatch.(run_id) do
@@ -1445,8 +1441,15 @@ defmodule ForgeImports.Conflicts do
     transaction = fn ->
       Repo.transaction(fn ->
         case callback.() do
-          {:ok, value} -> {:ok, value}
-          {:error, reason} -> Repo.rollback(reason)
+          {:ok, %{run: %ImportRun{state: :running} = run} = value} ->
+            ForgeImports.SyncJobs.enqueue_run!(run.id)
+            {:ok, value}
+
+          {:ok, value} ->
+            {:ok, value}
+
+          {:error, reason} ->
+            Repo.rollback(reason)
         end
       end)
     end

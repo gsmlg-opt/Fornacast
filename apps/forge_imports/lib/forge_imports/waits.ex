@@ -108,7 +108,8 @@ defmodule ForgeImports.Waits do
                attach_credential(active_actor, run, credential_source, safe_metadata, opts),
              {:ok, resumed_run} <- resume_run(prepared_run, safe_metadata),
              :ok <- resume_items(resumed_run) do
-          kick_reconciler()
+          ForgeImports.SyncJobs.enqueue_run!(resumed_run.id)
+          ForgeImports.SyncJobs.notify_import(resumed_run.id)
           resumed_run
         else
           false -> Repo.rollback(:invalid_transition)
@@ -421,9 +422,5 @@ defmodule ForgeImports.Waits do
             credential.local_user_id == ^actor_user_id and
             credential.github_identity_id == ^identity_id
     )
-  end
-
-  defp kick_reconciler do
-    if Process.whereis(ForgeImports.Reconciler), do: ForgeImports.Reconciler.kick(), else: :ok
   end
 end

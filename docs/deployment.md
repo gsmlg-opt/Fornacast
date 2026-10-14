@@ -11,7 +11,7 @@ Fornacast has distinct storage roles:
 
 - `postgres-data` contains the authoritative PostgreSQL domain database,
   including accounts, repositories, authorization, imports, releases, and
-  audit state.
+  audit state, Styx job delivery state and synchronization progress.
 - `fornacast-data` is mounted at `/data` and contains bare Git repositories,
   SSH state, staging data, LocalCAS release-asset bytes and metadata, and
   Concord's embedded Turso/VSR configuration store.
@@ -99,6 +99,31 @@ PostgreSQL 17 is the supported server major. Do not point a newer PostgreSQL
 major at the existing `postgres-data` volume. A server-major change requires a
 separately planned, tested PostgreSQL upgrade or logical dump/restore procedure
 and a rollback-ready paired filesystem backup.
+
+### GitHub task executor migration
+
+GitHub synchronization uses Styx (`:styx`) and its `styx_jobs` table in the
+existing PostgreSQL domain database. Apply the normal stop-before-start upgrade
+policy when replacing the previous import/PAT polling workers: old and new
+executors must not run concurrently. Boot migrations precede the new supervisor.
+
+Existing task records, staged repositories, checkpoints and publication evidence
+are retained. Recovery schedules claimable work from those records and respects
+unexpired operation leases. Do not clear leases or reset running tasks to force
+an immediate retry; a crashed writer's work becomes eligible after its lease
+expires. Keep the paired PostgreSQL and `fornacast-data` backup boundary.
+
+Queue completion represents an execution step, not completion of an entire
+organization sync. Check the organization's task page for repository results,
+warnings, retry timing and the final business outcome. Job pruning does not
+remove the domain task history. Destructive staging cleanup retains its separate
+recovery and cancellation safeguards.
+
+Control, discovery, import, update and maintenance have separate queues.
+Execution steps time out after one hour; orphan rescue waits two hours, so a
+legitimate execution is stopped before its delivery can be rescued. Real errors
+exhaust after five attempts. Explicitly paused tasks retain their work and receive
+a fresh inactivity window when resumed; pausing does not count as progress.
 
 ### Existing Turso Ecto installations
 

@@ -358,4 +358,18 @@ config :duskmoon_bundler, :fornacast_web,
     ]
   ]
 
+config :forge_imports, Styx,
+  repo: Fornacast.Repo,
+  engine: Styx.Engines.Basic,
+  queues: [
+    github_control: 1,
+    github_discovery: 1,
+    github_import: 2,
+    github_update: 1,
+    github_maintenance: 1
+  ],
+  cron: [crontab: [{"* * * * *", ForgeImports.SyncJobs.MaintenanceWorker}]],
+  lifeline: [rescue_after: {2, :hours}],
+  pruner: [max_age: {7, :days}]
+
 import_config "#{config_env()}.exs"

@@ -342,7 +342,7 @@ defmodule ForgeImports.RepositoryWorker do
                failure_detail: nil
              ),
            :ok <- bump_run_after_retry(run, now) do
-        released
+        ForgeImports.SyncJobs.continue_item(released)
       else
         _ -> Repo.rollback(:lost_lease)
       end
@@ -380,6 +380,10 @@ defmodule ForgeImports.RepositoryWorker do
   end
 
   defp persist_ready_to_publish(item, checkpoint) do
+    Repo.transact(fn -> persist_ready_to_publish_transaction(item, checkpoint) end)
+  end
+
+  defp persist_ready_to_publish_transaction(item, checkpoint) do
     now = DateTime.utc_now(:second)
 
     query =
@@ -401,12 +405,16 @@ defmodule ForgeImports.RepositoryWorker do
            ],
            inc: [lock_version: 1]
          ) do
-      {1, _rows} -> {:ok, Repo.get!(RepositoryItem, item.id)}
+      {1, _rows} -> {:ok, ForgeImports.SyncJobs.continue_item(Repo.get!(RepositoryItem, item.id))}
       {0, _rows} -> {:error, :lost_lease}
     end
   end
 
   defp persist_lfs_progress(item, checkpoint) do
+    Repo.transact(fn -> persist_lfs_progress_transaction(item, checkpoint) end)
+  end
+
+  defp persist_lfs_progress_transaction(item, checkpoint) do
     now = DateTime.utc_now(:second)
 
     query =
@@ -429,7 +437,7 @@ defmodule ForgeImports.RepositoryWorker do
            ],
            inc: [lock_version: 1]
          ) do
-      {1, _} -> {:ok, Repo.get!(RepositoryItem, item.id)}
+      {1, _} -> {:ok, ForgeImports.SyncJobs.continue_item(Repo.get!(RepositoryItem, item.id))}
       {0, _} -> {:error, :lost_lease}
     end
   end
@@ -1258,7 +1266,7 @@ defmodule ForgeImports.RepositoryWorker do
              true <- live_lease?(item, final_now),
              {:ok, updated} <-
                update_git_staged_item(item, result, scan, inserted_warning_count, final_now) do
-          updated
+          ForgeImports.SyncJobs.continue_item(updated)
         else
           nil -> Repo.rollback(:lost_lease)
           {:error, reason} -> Repo.rollback(reason)
