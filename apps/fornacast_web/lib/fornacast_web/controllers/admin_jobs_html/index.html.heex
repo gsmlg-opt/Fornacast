@@ -1,0 +1,122 @@
+<div class="settings-grid settings-layout" data-admin-page>
+  <aside class="settings-sidebar">
+    <.dm_left_menu class="nested-menu-bordered settings-menu" nav_label="Administration">
+      <:title>Admin</:title>
+      <:menu>
+        <li>
+          <.dm_link href="/-/admin/jobs" class="active" aria-current="page">Styx Jobs</.dm_link>
+        </li>
+      </:menu>
+    </.dm_left_menu>
+  </aside>
+
+  <section class="settings-content grid gap-4" aria-label="Styx Jobs">
+    <header class="section-header">
+      <div>
+        <p class="eyebrow">Administration</p>
+        <h2>Styx Jobs</h2>
+        <p class="muted">
+          Read-only queue execution history, newest first. Up to 50 jobs per page.
+        </p>
+      </div>
+      <.dm_link href={jobs_path(@listing.filters, @listing.page)} class="btn btn-ghost">
+        Refresh
+      </.dm_link>
+    </header>
+
+    <p class="muted">
+      Queue completion records an execution step, not successful domain synchronization.
+      Queue history is pruned according to the configured Styx policy; synchronization task
+      history is retained separately.
+    </p>
+
+    <.dm_alert :if={@error} variant="error" role="alert">{@error}</.dm_alert>
+
+    <form action="/-/admin/jobs" method="get" class="flex flex-wrap items-end gap-4">
+      <.dm_select
+        id="jobs-queue"
+        name="queue"
+        label="Queue"
+        value={@listing.filters.queue}
+        prompt="All queues"
+        options={Enum.map(@listing.queues, &{&1, &1})}
+      />
+      <.dm_select
+        id="jobs-state"
+        name="state"
+        label="State"
+        value={@listing.filters.state}
+        prompt="All states"
+        options={state_options()}
+      />
+      <.dm_btn type="submit" variant="primary">Filter</.dm_btn>
+      <.dm_link href="/-/admin/jobs" class="btn btn-ghost">Clear filters</.dm_link>
+    </form>
+
+    <div :if={@listing.jobs != []} class="overflow-x-auto">
+      <.dm_table id="admin-jobs-table" data={@listing.jobs} compact hover class="min-w-[64rem]">
+        <:caption>Styx queue jobs</:caption>
+        <:col :let={job} label="ID">{job.id}</:col>
+        <:col :let={job} label="State">
+          <.dm_badge class="whitespace-nowrap">{job.state}</.dm_badge>
+        </:col>
+        <:col :let={job} label="Queue">{job.queue}</:col>
+        <:col :let={job} label="Worker"><code>{job.worker}</code></:col>
+        <:col :let={job} label="Attempts">{job.attempt}/{job.max_attempts}</:col>
+        <:col :let={job} label="Error count">{job.error_count}</:col>
+        <:col :let={job} label="Priority">{job.priority}</:col>
+        <:col :let={job} label="Lifecycle timestamps (UTC)">
+          <dl class="text-sm whitespace-nowrap">
+            <div>
+              <dt class="font-semibold">Inserted</dt><dd>{timestamp(job.inserted_at)}</dd>
+            </div>
+            <div>
+              <dt class="font-semibold">Scheduled</dt><dd>{timestamp(job.scheduled_at)}</dd>
+            </div>
+            <div>
+              <dt class="font-semibold">Attempted</dt><dd>{timestamp(job.attempted_at)}</dd>
+            </div>
+            <div>
+              <dt class="font-semibold">Completed</dt><dd>{timestamp(job.completed_at)}</dd>
+            </div>
+            <div>
+              <dt class="font-semibold">Discarded</dt><dd>{timestamp(job.discarded_at)}</dd>
+            </div>
+            <div>
+              <dt class="font-semibold">Cancelled</dt><dd>{timestamp(job.cancelled_at)}</dd>
+            </div>
+          </dl>
+        </:col>
+        <:col :let={job} label="Related task">
+          <.dm_link :if={job.task_path} href={job.task_path}>Synchronization task</.dm_link>
+          <span :if={!job.task_path}>—</span>
+        </:col>
+      </.dm_table>
+    </div>
+
+    <section :if={@listing.jobs == [] && !@error} class="empty-state">
+      <h3>No jobs found</h3>
+      <p class="muted">No retained queue jobs match these filters.</p>
+    </section>
+
+    <nav :if={!@error} class="flex flex-wrap items-center gap-4" aria-label="Jobs pagination">
+      <.dm_link
+        :if={@listing.page > 1}
+        href={jobs_path(@listing.filters, @listing.page - 1)}
+        class="btn btn-ghost"
+        rel="prev"
+      >
+        Previous
+      </.dm_link>
+      <span>Page {@listing.page}</span>
+      <.dm_link
+        :if={@listing.has_next?}
+        href={jobs_path(@listing.filters, @listing.page + 1)}
+        class="btn btn-ghost"
+        rel="next"
+      >
+        Next
+      </.dm_link>
+    </nav>
+  </section>
+</div>

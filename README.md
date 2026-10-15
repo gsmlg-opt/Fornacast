@@ -47,6 +47,14 @@ See [release asset recovery](docs/github-imports.md#release-assets).
 
 ## GitHub synchronization
 
+Site administrators can open **Admin** from the account menu, then select
+**Styx Jobs** in the administration sidebar (`/-/admin/jobs`). This read-only
+view lists execution jobs with queue/state filters, pagination, attempts, error
+counts and timestamps. Related organization jobs link to their synchronization
+task. Queue delivery completion does not imply organization synchronization
+success. Styx pruning limits execution history; durable synchronization task
+history remains separate. Raw job arguments and exception details are not shown.
+
 The organization GitHub tab (`/organizations/:organization/settings/github`)
 configures personal-use PAT synchronization. Select an active organization owner's
 saved PAT and source GitHub organization. `Sync now` immediately queues a

@@ -30,6 +30,10 @@ defmodule FornacastWeb.Router do
     plug FornacastWeb.Plugs.RequireUser
   end
 
+  pipeline :admin do
+    plug FornacastWeb.Plugs.RequireAdmin
+  end
+
   pipeline :private_no_store do
     plug :put_private_no_store
   end
@@ -68,6 +72,13 @@ defmodule FornacastWeb.Router do
     get "/login", SessionController, :new
     post "/login", SessionController, :create
     delete "/logout", SessionController, :delete
+  end
+
+  scope "/-/admin", FornacastWeb do
+    pipe_through [:private_no_store, :browser, :authenticated, :admin]
+
+    get "/", AdminJobsController, :index
+    get "/jobs", AdminJobsController, :jobs
   end
 
   scope "/", FornacastWeb do

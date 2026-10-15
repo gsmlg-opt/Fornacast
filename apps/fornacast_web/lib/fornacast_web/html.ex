@@ -39,7 +39,7 @@ defmodule FornacastWeb.HTML do
         <script type="module" src="#{escape(js_path)}"></script>
       </head>
       <body class="app-body bg-surface text-on-surface">
-        #{app_shell(current_user, escaped_title, body)}
+        #{app_shell(current_user, escaped_title, body, conn.assigns[:page_section] || "Repository workbench")}
       </body>
       </html>
       """
@@ -102,7 +102,7 @@ defmodule FornacastWeb.HTML do
     ~s(<input type="hidden" name="_csrf_token" value="#{Plug.CSRFProtection.get_csrf_token()}">)
   end
 
-  defp app_shell(current_user, title, body) do
+  defp app_shell(current_user, title, body, section) do
     if current_user do
       """
       <div class="app-shell">
@@ -120,7 +120,7 @@ defmodule FornacastWeb.HTML do
         </header>
         <main class="app-main">
           <div class="page-heading">
-            <p class="eyebrow">Repository workbench</p>
+            <p class="eyebrow">#{escape(section)}</p>
             <h1>#{title}</h1>
           </div>
           <section class="content-panel">#{body}</section>
@@ -315,6 +315,7 @@ defmodule FornacastWeb.HTML do
       <div class="account-menu-list" role="menu">
         <a class="account-menu-item" href="#{escape(account_profile_path(current_user))}">Profile</a>
         <a class="account-menu-item" href="/settings">Settings</a>
+        #{admin_menu_item(current_user)}
         <form action="/logout" method="post" class="account-menu-logout">
           #{csrf_input()}
           <input type="hidden" name="_method" value="delete">
@@ -324,6 +325,11 @@ defmodule FornacastWeb.HTML do
     </details>
     """
   end
+
+  defp admin_menu_item(%ForgeAccounts.User{kind: :user, role: :admin, state: :active}),
+    do: ~s(<a class="account-menu-item" href="/-/admin">Admin</a>)
+
+  defp admin_menu_item(_current_user), do: ""
 
   defp account_label(current_user) do
     current_user.display_name || current_user.username || current_user.email || "account"
