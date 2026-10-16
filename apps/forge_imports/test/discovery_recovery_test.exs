@@ -102,6 +102,13 @@ defmodule ForgeImports.DiscoveryRecoveryTest do
 
     restart_log =
       capture_log(fn ->
+        # Killing a shared Sandbox client during a query also destroys the test transaction.
+        :ok = :sys.suspend(old_reconciler)
+
+        assert eventually(fn ->
+                 Supervisor.count_children(old_task_supervisor).active == 0
+               end)
+
         Process.exit(old_reconciler, :kill)
 
         assert eventually(fn ->
@@ -114,7 +121,7 @@ defmodule ForgeImports.DiscoveryRecoveryTest do
 
     refute restart_log =~ @pat
 
-    assert Process.alive?(supervisor)
+    assert Process.alive?(supervisor), restart_log
     :ok = stop_supervised(RecoverySupervisor)
   end
 

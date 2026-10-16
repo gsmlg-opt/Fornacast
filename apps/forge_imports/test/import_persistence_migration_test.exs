@@ -568,6 +568,45 @@ defmodule ForgeImports.ImportPersistenceMigrationTestSupport do
     Application.get_env(:fornacast, :database_adapter) in ["postgres", "postgresql"]
   end
 
+  def start_migration_repo! do
+    repo = ForgeImports.ImportPersistenceMigrationRepo
+
+    config =
+      Fornacast.Repo.config()
+      |> Keyword.delete(:name)
+      |> Keyword.put(:pool, DBConnection.ConnectionPool)
+      |> Keyword.put(:pool_size, 2)
+
+    config =
+      if postgres?() do
+        # Migration cycles replace enum OIDs cached by the main Repo's connections.
+        database =
+          "fornacast_migration_#{System.os_time(:microsecond)}_#{System.unique_integer([:positive])}"
+
+        config = config |> Keyword.delete(:url) |> Keyword.put(:database, database)
+        :ok = Ecto.Adapters.Postgres.storage_up(config)
+
+        ExUnit.Callbacks.on_exit(fn ->
+          :ok = Ecto.Adapters.Postgres.storage_down(config)
+        end)
+
+        config
+      else
+        config
+      end
+
+    ExUnit.Callbacks.start_supervised!({repo, config})
+
+    if postgres?() do
+      Ecto.Migrator.run(repo, Application.app_dir(:fornacast, "priv/repo/migrations"), :up,
+        all: true,
+        log: false
+      )
+    end
+
+    repo
+  end
+
   def with_restore(body, restore) when is_function(body, 0) and is_function(restore, 0) do
     body_outcome = capture_outcome(body)
     restore_outcome = capture_outcome(restore)
@@ -745,6 +784,21 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
   @tag :tmp_dir
   test "migration cycles discover and restore a future applied migration", context do
     if postgres?() do
+      main_styx_state_oid = fn ->
+        Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+          %{rows: [[oid]]} =
+            Ecto.Adapters.SQL.query!(
+              Repo,
+              "select oid::bigint from pg_type " <>
+                "where typname = 'styx_job_state' and typnamespace = 'public'::regnamespace",
+              []
+            )
+
+          oid
+        end)
+      end
+
+      original_oid = main_styx_state_oid.()
       repo = start_migration_repo!()
       future_version = 20_991_231_235_959
       future_migrations_path = Path.join(context.tmp_dir, "future-migrations")
@@ -804,6 +858,8 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
                  to: future_version,
                  log: false
                )
+
+      assert main_styx_state_oid.() == original_oid
     end
   end
 
@@ -1179,14 +1235,7 @@ defmodule ForgeImports.ImportPersistenceProvisionalSourceMigrationCycleTest do
   end
 
   defp start_migration_repo! do
-    config =
-      Repo.config()
-      |> Keyword.delete(:name)
-      |> Keyword.put(:pool, DBConnection.ConnectionPool)
-      |> Keyword.put(:pool_size, 2)
-
-    start_supervised!({ImportPersistenceMigrationRepo, config})
-    ImportPersistenceMigrationRepo
+    ForgeImports.ImportPersistenceMigrationTestSupport.start_migration_repo!()
   end
 
   defp migrations_path, do: Application.app_dir(:fornacast, "priv/repo/migrations")
@@ -1716,14 +1765,7 @@ defmodule ForgeImports.ImportPersistenceDestinationStatusMigrationCycleTest do
   defp postgres?, do: ForgeImports.ImportPersistenceMigrationTestSupport.postgres?()
 
   defp start_migration_repo! do
-    config =
-      Repo.config()
-      |> Keyword.delete(:name)
-      |> Keyword.put(:pool, DBConnection.ConnectionPool)
-      |> Keyword.put(:pool_size, 2)
-
-    start_supervised!({ImportPersistenceMigrationRepo, config})
-    ImportPersistenceMigrationRepo
+    ForgeImports.ImportPersistenceMigrationTestSupport.start_migration_repo!()
   end
 
   defp start_scratch_repo!(tmp_dir, suffix) do

@@ -16,6 +16,7 @@ defmodule ForgeImports.AdminJobsTest do
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+    Repo.delete_all(Styx.Job)
     %{admin: user!(role: :admin)}
   end
 
