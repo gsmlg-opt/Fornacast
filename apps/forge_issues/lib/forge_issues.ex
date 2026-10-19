@@ -81,6 +81,53 @@ defmodule ForgeIssues do
 
   def list(_actor, _owner_slug, _repository_slug, _filters), do: invalid_filter("base")
 
+  @doc "Lists issue identities across the current user's readable repositories."
+  @spec list_workbench(ForgeAccounts.User.t(), :issue | :pull_request, map()) ::
+          {:ok, Page.t(map())} | {:error, term()}
+  def list_workbench(actor, kind, filters)
+      when kind in [:issue, :pull_request] and is_map(filters) do
+    with {:ok, repository_ids} <- ForgeRepos.readable_repository_ids_query(actor),
+         {:ok, filters} <-
+           filters
+           |> Map.take(["state", "page", "per_page"])
+           |> Map.put("kind", kind)
+           |> validate_list_filters() do
+      query =
+        Issue
+        |> join(:inner, [issue], repository in ForgeRepos.Repository,
+          on: repository.id == issue.repository_id
+        )
+        |> join(:inner, [_issue, repository], owner in ForgeAccounts.User,
+          on: owner.id == repository.owner_user_id
+        )
+        |> where([issue], issue.repository_id in subquery(repository_ids))
+        |> where([issue, repository], repository.has_issues or issue.kind == :pull_request)
+        |> filter_kind(kind)
+        |> filter_state(filters.state)
+
+      total = Repo.aggregate(query, :count, :id)
+
+      entries =
+        query
+        |> order_issues(:created, :desc)
+        |> limit(^filters.per_page)
+        |> offset(^filters.offset)
+        |> select([issue, repository, owner], %{
+          number: issue.number,
+          title: issue.title,
+          state: issue.state,
+          inserted_at: issue.inserted_at,
+          owner_slug: owner.username,
+          repository_slug: repository.slug
+        })
+        |> Repo.all()
+
+      {:ok, %Page{entries: entries, total: total, page: filters.page, per_page: filters.per_page}}
+    end
+  end
+
+  def list_workbench(_actor, _kind, _filters), do: invalid_filter("base")
+
   @spec open_counts(ForgeAccounts.User.t() | nil, String.t(), String.t()) ::
           {:ok, %{issues: non_neg_integer(), pull_requests: non_neg_integer()}}
           | {:error, error_reason()}

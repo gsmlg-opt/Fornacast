@@ -1,0 +1,67 @@
+<section class="grid min-w-0 gap-3" data-workbench-page>
+  <header class="flex flex-wrap items-center justify-between gap-3 rounded-lg bg-surface-container p-4 text-on-surface">
+    <div>
+      <p class="text-xs text-on-surface-variant">Across repositories you can read</p>
+      <h2 class="text-lg font-semibold">{title(@kind)}</h2>
+    </div>
+    <.dm_badge variant="primary" soft size="sm">
+      {@page.total} {String.downcase(title(@kind))}
+    </.dm_badge>
+  </header>
+
+  <form
+    action={base_path(@kind)}
+    method="get"
+    class="flex flex-wrap items-end gap-3 rounded-lg bg-surface-container p-4 text-on-surface"
+    data-workbench-filters
+  >
+    <.dm_select
+      id="workbench-state-filter"
+      name="state"
+      label="State"
+      size="sm"
+      value={@state}
+      options={[{"open", "Open"}, {"closed", "Closed"}, {"all", "All"}]}
+    />
+    <input type="hidden" name="per_page" value={@page.per_page} />
+    <.dm_btn type="submit" variant="primary" size="sm">Apply filters</.dm_btn>
+  </form>
+
+  <ul :if={@page.entries != []} class="grid gap-3" role="list">
+    <li
+      :for={entry <- @page.entries}
+      class="rounded-lg border border-outline-variant bg-surface-container p-4 text-on-surface"
+      data-workbench-row
+    >
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div class="min-w-0">
+          <.dm_link href={entry.href} class="font-semibold text-primary">
+            {entry.title}
+          </.dm_link>
+          <p class="mt-1 text-xs text-on-surface-variant">
+            {entry.owner_slug}/{entry.repository_slug} #{entry.number} · opened {Calendar.strftime(
+              entry.inserted_at,
+              "%Y-%m-%d"
+            )}
+          </p>
+        </div>
+        <.dm_badge variant={state_variant(entry.state)} soft size="sm">
+          {entry.state}
+        </.dm_badge>
+      </div>
+    </li>
+  </ul>
+
+  <.fc_optional_panel
+    :if={@page.entries == []}
+    title={"No #{String.downcase(title(@kind))}"}
+    message="No entries match these filters in repositories you can read."
+    kind="empty"
+  />
+
+  <.fc_server_pagination
+    page={@page.page}
+    total_pages={Fornacast.Page.total_pages(@page)}
+    page_url={pagination_url(@kind, @state, @page)}
+  />
+</section>

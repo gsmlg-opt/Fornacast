@@ -154,6 +154,10 @@ defmodule ForgePulls do
   @oid_regex ~r/\A[0-9a-f]{40}(?:[0-9a-f]{24})?\z/
   @pull_list_analysis_deadline_ms 5_000
 
+  @doc "Lists readable pull-request identities without running Git merge analysis."
+  def list_workbench(actor, filters),
+    do: ForgeIssues.list_workbench(actor, :pull_request, filters)
+
   defdelegate sync_projection(repository_id, kind, id), to: ForgePulls.Sync
   defdelegate append_sync_observe(multi, key, expected), to: ForgePulls.Sync
   defdelegate append_sync_apply(multi, key, request), to: ForgePulls.Sync
