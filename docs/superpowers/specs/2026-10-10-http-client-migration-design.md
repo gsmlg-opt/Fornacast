@@ -2,8 +2,10 @@
 
 Date: 2026-10-10
 
-Status: proposed design; implementation blocked by http_fetch#68 after the
-published 0.18.1 capability audit.
+Status: proposed design; http_fetch#68 is resolved in published HTTP Fetch
+0.21.13, but preserving HTTPS TLS-setup address failover is now blocked by
+http_fetch#135. Fornacast still locks 0.18.1; transport migration remains
+pending. Re-audited 2026-10-19.
 
 ## Objective and scope
 
@@ -40,10 +42,15 @@ upstream-owned rather than being patched in Fornacast.
 
 ## Package audit and upstream gates
 
-The packages share the upstream repository `gsmlg-dev/http_fetch`. The previous
-audit covered exact Hex 0.17.2 archives; the current Fetch/runtime capability and
-error-path audit uses published 0.18.1 source. These are source-audit findings,
-not executed Fornacast transport acceptance tests.
+The packages share the upstream repository `gsmlg-dev/http_fetch`. The earlier
+audits covered exact Hex 0.17.2 and 0.18.1 archives. The 2026-10-19 re-audit covers
+the published Hex 0.21.13 archive and the matching
+[v0.21.13 tag](https://github.com/gsmlg-dev/http_fetch/releases/tag/v0.21.13)
+(`6b2ede60787390aa2959bde38a0ba6f48e5c413b`). The archive SHA-256 is
+`31a558d922eb288ba3a699957ed377663f339b0fde1f4a2739f8bd654f06f307`, matching
+the Hex release API checksum; its public Fetch and RequestError modules match
+the tag byte for byte. These are source/package findings, not executed upstream
+wire tests or Fornacast Fetch transport acceptance tests.
 
 The published API supports explicit `http_version: :http1`,
 `redirect: :manual`, `decode_body: false`, connection/request timeouts,
@@ -68,31 +75,59 @@ literal-IP URL dialed through a different pin. The earlier literal-IP limitation
 in the FetchOptions documentation is superseded by the 0.18.1 implementation and
 release change log.
 
-One evidenced upstream gate still blocks replacing the current transports:
-[http_fetch#68](https://github.com/gsmlg-dev/http_fetch/issues/68). Both transport
-boundaries currently try validated IPs only until a connection succeeds, then
-send the request once. Fetch 0.18.1 exposes a raw error reason without trustworthy
-evidence that connection establishment failed before transmission:
+[http_fetch#68](https://github.com/gsmlg-dev/http_fetch/issues/68) closed on
+2026-10-10. Release 0.20.0 added `error_mode: :structured` and the public
+`HTTP.RequestError.pre_send?/1` predicate; both remain in published 0.21.13.
+That upstream request is resolved. A narrower TLS-setup capability gap remains
+for preserving the complete current transport contract, as described below.
 
-- `HTTP.SocketClient.handle_new_connection/7` forwards dial failures through
-  `send_error(parent, ref, reason)`.
-- `initialize_legacy_owner/4` routes send failures through `fail/2`, which also
-  forwards the raw reason before response headers arrive.
-- `await_owner/3` exposes only `{:error, reason}`. Errors such as `:timeout` or
-  `:closed` cannot establish whether request bytes may already have been sent.
+Both current transport boundaries try validated IPs only until a connection
+succeeds, then send the request once. In 0.21.13 the structured mode uses a fresh
+request-local evidence reference. Only a matching confirmed direct TCP connect
+failure becomes `%HTTP.RequestError{phase: :connect, request_started: false}`.
+The audited path supports direct TCP and OTP TLS (`tls_backend: :ssl`) with
+manual/error redirects, retaining the original request deadline while awaiting
+the low-level connect result. TLS negotiation failures, send/response failures,
+upload-source errors, and ambiguous timeout/cancellation outcomes remain unknown;
+the audited ExSSL path does not supply this pre-send evidence.
 
-Retrying another pin on these ambiguous failures could replay a mutation or
-streamed upload. Selecting only the first pin would remove existing failover
-behavior. Neither is the approved preservation of the transport contract.
-The upstream request requires public pre-send evidence or bounded address
-failover implemented before request transmission, with cancellation and one
-absolute deadline retained. `ForgeGitHub.TransportTest` already covers ordered
-validated-address failover, all-address failure, and exhaustion of that budget.
+The existing Mint HTTPS boundary returns only after TCP and TLS setup complete.
+Both Fornacast transports advance to another validated address when
+`Mint.HTTP.connect(:https, ...)` fails, before calling `request`. That includes
+confirmed TLS handshake failures. Fetch's public predicate deliberately excludes
+all TLS negotiation failures, so adopting 0.21.13 alone would remove some existing
+safe address failover. This is an intentional limit of the current upstream API,
+not a regression claim against #68.
 
-The repository's blocker policy requires a released upstream fix before
-implementation. Dependency maintenance and unrelated release work can proceed.
-The existing transport remains during the blocked state; it is not the intended
-final fallback architecture. Fetch must not be retried on ambiguous errors.
+New [http_fetch#135](https://github.com/gsmlg-dev/http_fetch/issues/135) requests
+confirmed pre-HTTP TLS setup failure evidence together with a successful cleanup
+barrier, or equivalent upstream pin failover before any HTTP send. Its minimal
+wire fixture is source-derived and was not executed during this audit. Under the
+repository blocker policy, full transport migration remains stopped until a
+released dependency preserves that contract. Do not infer safety from raw TLS
+errors or implement a local bypass of the evidence API.
+
+Use `HTTP.RequestError.pre_send?/1` as the only permission to advance to another
+validated pin. A raw `:timeout`, `:closed`, or other error classification cannot
+prove that a mutation or streamed upload is safe to retry. Preserve the original
+absolute deadline and complete the prior request's cleanup before another
+attempt. `ForgeGitHub.TransportTest` already covers ordered address failover,
+all-address failure, and budget exhaustion.
+
+Capture `HTTP.Promise.completion(promise)` from the original Fetch promise before
+chaining it. Await the result and require
+`HTTP.RequestCompletion.await(completion, remaining_budget) == :ok` before another
+attempt. On early rejection use `abort_and_await/2`. A pending, unconfirmed, or
+unsupported cleanup result stops failover; the cleanup wait consumes the same
+absolute operation budget. The barrier certifies tracked request resources, not
+remote receipt of request bytes.
+
+The upstream `apps/http_fetch/test/http/request_error_wire_test.exs` covers
+saturated/refused first pins, HTTP/HTTPS Host and SNI preservation, post-send
+close/deadline/upload failures, TLS aborts, cancellation, and redirect mutation
+non-replay. Its presence is source evidence; these scenarios still require local
+execution against Fornacast's integration. The current Req/Mint implementation
+remains until that migration is verified.
 
 `http_core` also introduces coordinated `ex_ssl` and `elixir_quic` dependencies;
 `http_runtime` introduces `elixir_quic_http3`. The eventual dependency update must
@@ -100,10 +135,11 @@ check that these published artifacts compile with the project's pinned toolchain
 
 ## Approaches and recommendation
 
-1. **Full direct migration after upstream gates (recommended).** Replace Req and
+1. **Full direct migration after the remaining upstream gate (recommended).** Replace Req and
    Mint at the existing provider boundary and adapt tests to the new client.
    This gives one production client stack and avoids a permanent compatibility
-   layer. Upstream capability availability determines when implementation starts.
+   layer. Released TLS-setup evidence, dependency refresh, and local integration
+   checks determine completion.
 2. **Retain Req as a facade over Fetch.** This would preserve more response/test
    shapes initially but retain the legacy direct dependency and add an adapter.
    It still requires the upstream failover evidence and does not complete the intended
@@ -123,9 +159,10 @@ For an API request:
 1. Admit through the existing request gate and establish the absolute deadline.
 2. Resolve and validate the hostname using the existing policy within that budget.
 3. Start an HTTP/1 Fetch request with `connect_address`, `redirect: :manual`,
-   `decode_body: false`, `stream_response: true`, and the remaining deadline.
-   Advance to another validated IP only with upstream-provided evidence that
-   the earlier attempt failed before connection establishment/transmission.
+   `tls_backend: :ssl`, `error_mode: :structured`, `decode_body: false`,
+   `stream_response: true`, and the remaining deadline. Advance to another
+   validated IP only when `HTTP.RequestError.pre_send?/1` confirms the previous
+   attempt failed before transmission and its cleanup has completed.
 4. Obtain final headers before consuming the response body; validate encoding and
    declared length, then consume acknowledged chunks within existing byte limits.
 5. Convert the completed response through existing JSON/status/domain rules and
@@ -200,8 +237,9 @@ devenv Unix socket and `PGPORT=55432`. Run the required formatter check and comp
 checks with the pinned devenv toolchain. Report any out-of-scope failures without
 repairing them.
 
-Completion requires http_fetch#68 resolved in an updated released dependency,
-successful scoped checks, preservation of current streaming/security
+Completion requires released support for http_fetch#135 as well as adopting the
+http_fetch#68 fix in the lockfile, successful scoped integration checks,
+preservation of current streaming/security
 contracts, and removal of Fornacast-owned production Req/Mint calls and obsolete
 test dependencies. This document is a proposal, not implementation approval or a
 claim that the migration is complete.
