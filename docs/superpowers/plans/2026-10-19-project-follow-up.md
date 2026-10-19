@@ -1,10 +1,11 @@
 # Project follow-up status, 2026-10-19
 
-Delivery work is on `codex/project-completion` in
-`.trees/codex/project-completion`. Delivery includes six commits through `3e01499`
-and the saved-PAT Git/LFS integration with final endpoint evidence. These changes
-remain unmerged and unpushed.
-The original main-worktree PAT recovery edits remain preserved.
+Delivery originated on `codex/project-completion` in
+`.trees/codex/project-completion`. The six commits through `3e01499` and saved-PAT
+Git/LFS integration `2da704f`, including final endpoint evidence, have been merged
+and pushed to `main`. The completed worktree and branch have been removed.
+The original main-worktree PAT recovery edits are included in the committed
+delivery. Release publication follows the repository's GitHub Actions workflow.
 
 ## Delivery boundaries
 
