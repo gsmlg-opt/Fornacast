@@ -164,7 +164,9 @@ defmodule FornacastAPI.ProxyContractTest do
     assert readme =~ "domain authorization"
     assert readme =~ "same origin"
     assert readme =~ "auto_init"
-    assert readme =~ "compatibility gate"
+    assert readme =~ "The Git-data surface supports both API versions above:"
+    assert readme =~ "apps/fornacast_api/test/github_git_data_acceptance_test.exs"
+    assert readme =~ "The supported REST surface remains the documented subset of GitHub's API."
   end
 
   test "direct-release E2E binds and proves both listeners" do

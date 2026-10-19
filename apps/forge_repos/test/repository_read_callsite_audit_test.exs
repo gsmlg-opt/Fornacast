@@ -73,6 +73,15 @@ defmodule ForgeRepos.RepositoryReadCallsiteAuditTest do
     {"apps/forge_repos/lib/forge_repos.ex", :empty?, :empty?} => :read_handle,
     {"apps/forge_repos/lib/forge_repos.ex", :validate_changed_default_branch, :resolve_snapshot} =>
       :read_handle,
+    # Git-data reads keep the opaque repository handle open across the domain
+    # callback and its synchronous GitCore commit-detail helper.
+    {"apps/forge_repos/lib/forge_repos/git_data.ex", :list_commits, :commit_page} => :read_handle,
+    {"apps/git_core/lib/git_core/git_data.ex", :commit_detail, :diff_commit} => :read_handle,
+    # Ref observations and publication share the domain writer permit; the
+    # repository generation is reloaded before the fenced path is resolved.
+    {"apps/forge_repos/lib/forge_repos/git_writes.ex", :content, :exact_ref} => :writer_fence,
+    {"apps/forge_repos/lib/forge_repos/git_writes.ex", :create_ref, :exact_ref} => :writer_fence,
+    {"apps/forge_repos/lib/forge_repos/git_writes.ex", :update_ref, :exact_ref} => :writer_fence,
     {"apps/forge_repos/lib/forge_repos/git_write_recovery.ex", :read_current_ref, :exact_ref} =>
       :writer_fence,
     {"apps/forge_imports/lib/forge_imports/repository_stager.ex", :scan_attribute_paths,
