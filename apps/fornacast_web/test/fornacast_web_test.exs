@@ -1043,16 +1043,14 @@ defmodule FornacastWebTest do
                description: "web repository from ssh push"
              })
 
-    assert {:ok, pid} =
-             GitTransport.start_ssh_daemon(
-               bind_ip: "127.0.0.1",
-               port: 0,
-               system_dir: system_dir
-             )
-
-    on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
-    end)
+    pid =
+      start_supervised!(
+        {GitTransport.Daemon,
+         name: __MODULE__.SSH,
+         bind_ip: "127.0.0.1",
+         port: 0,
+         system_dir: system_dir}
+      )
 
     port = GitTransport.Daemon.port(pid)
     remote_url = "ssh://alice@127.0.0.1:#{port}/alice/demo.git"
