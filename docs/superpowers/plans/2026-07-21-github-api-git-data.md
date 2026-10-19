@@ -14,6 +14,45 @@
 
 **Depends on:** `docs/superpowers/plans/2026-07-21-github-api-foundation.md` is complete.
 
+## Current delivery and plan reconciliation (2026-10-19)
+
+The checklist below preserves the original July implementation sequence. The
+current slice builds on the durable write operations, recovery leases, writer
+fence, and HTTP/SSH receive-pack integration already present in v0.7.8 rather
+than implementing those foundations again.
+
+- The ten routes below and real `auto_init` now have implementation and focused
+  tests. Native object planning and insertion precede compare-and-swap ref
+  publication; durable bookkeeping and recovery use the existing operation
+  lifecycle. Ref deletion and force updates remain rejected.
+- `github_git_data_acceptance_test.exs` exercises both supported API versions
+  through real HTTP listeners, then clones, fetches and pushes using ordinary
+  authenticated HTTP and SSH Git clients. This is local Git-data proof; it does
+  not close the separate real-GitHub organization mirror acceptance gate.
+- PostgreSQL 17 is the supported domain database and the required verification
+  target. The original Turso/PostgreSQL runtime matrix below is historical;
+  Concord's separate embedded configuration store is unchanged.
+- The existing transport policy supersedes the July receive-pack body proposal:
+  HTTP and SSH retain the configured transport maximum (4 GiB by default, or
+  explicit `nil` for unlimited). This slice does not reduce that maximum to
+  100 MiB or move transport bodies into the REST contents reservation pool.
+  REST contents retains its separate 140 MiB JSON envelope, 100 MiB decoded
+  content limit, and bounded body-memory admission. All writers still share the
+  repository writer fence and durable recovery path.
+- Preserve the current OpenAPI slice marker, `implemented-through: 5`. Validate
+  the two pinned descriptions and versioned fixtures without editing generated
+  schemas or reverting the marker to the old Git-data stage.
+
+The final local gate passed 481 tests across 34 focused files on PostgreSQL 17,
+including both real HTTP/SSH acceptance cases, plus all 93 native tests.
+Repository-wide Elixir formatting, native formatting, development compilation
+with warnings as errors, and the asset build passed. The payload-limit cases
+exercise lowered ceilings; a full 100 MiB HTTP roundtrip was not run.
+
+Remaining external gates are recorded in the organization-sync acceptance
+ledger. An unchecked historical step is not evidence that its foundation is
+absent from the current source.
+
 ## Scope and execution guardrails
 
 - Implement only branches, Git refs, commits, contents, real `auto_init`, shared Git mutation primitives, durable Git-write recovery, and receive-pack integration.

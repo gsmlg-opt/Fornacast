@@ -10,6 +10,26 @@ acceptance matrix, including a synchronized clone/checkout from GitHub.
 
 ## Requirement-by-requirement gates
 
+### Local live-acceptance setup (2026-10-19)
+
+- The selected environment for the remaining external acceptance is the local
+  instance. Follow [local App setup and endpoint evidence](../../github-app-local-acceptance.md)
+  for process configuration, installation, webhook delivery, and independent
+  GitHub/Fornacast clone plus hydrated LFS verification.
+- Development now reads the same App environment variables as releases. The
+  production parser remains inline because installed-release configuration
+  forbids `import_config`; tests exercise that restriction as well as matching
+  configured, disabled, partial, and invalid development/release inputs.
+- This setup work does not close criterion 11. An actual test organization,
+  installation and endpoint observations are still required. PAT synchronization
+  and its recovery regression are separate from permanent two-way App mirroring.
+- PAT retry admission is independently repaired in `5e82058`: recovery excludes
+  failed ancestors that already have a successor. The managed local service was
+  reloaded and the real browser `Sync now` POST returned `303`, admitting task
+  `17` instead of the former `:invalid_predecessor` failure. That observation
+  proves admission with the loaded fix, not terminal completion of the whole
+  synchronization or App mirror acceptance.
+
 ### Security and lifecycle follow-up (2026-09-23)
 
 - Historical `installation.created` deliveries no longer complete a setup

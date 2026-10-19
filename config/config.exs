@@ -329,6 +329,7 @@ fornacast_component_path = Path.expand("../apps/fornacast_component", __DIR__)
 fornacast_web_path = Path.expand("../apps/fornacast_web", __DIR__)
 
 # TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#175 - update when the split-chunk export fix is released.
+# TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#200 - update the 9.16.11 toolchain to resolve preload chunks relative to their module.
 config :duskmoon_bundler, :fornacast_web,
   entry: Path.join(fornacast_web_path, "assets/js/app.js"),
   outdir: Path.join(fornacast_web_path, "priv/static/assets"),

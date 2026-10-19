@@ -29,6 +29,7 @@ Implemented first-release paths:
 - Git LFS Batch/Basic upload, download and verification, with HTTP credentials or SSH authentication.
 - Initial branch push, fast-forward branch update, new branch push, tag creation, and force-push rejection.
 - Repository overview, README rendering, source tree, file view, raw file, commits, commit detail, diffs, branches, tags, and in-repo search.
+- Authenticated `/issues` and `/pulls` workbenches with readable-repository aggregation, state filters, pagination, and links to repository detail pages.
 - `/health` endpoint and automatic boot migrations.
 - A separate GitHub-compatible REST listener (`/api/v3`), started with the web application.
 - Read-only GraphQL (`/api/graphql`) and public discovery (`/.well-known/fornacast`) on the API listener.
@@ -122,6 +123,9 @@ be undone by reconnecting or by an old webhook.
 Live GitHub installation acceptance remains an operator gate. Verify the App's
 installation status and organization-owner access against GitHub before
 enabling production mirroring.
+For local App configuration and the real two-endpoint Git/LFS checks, follow
+[local mirror acceptance](docs/github-app-local-acceptance.md). Development
+processes accept the same App environment variables as releases.
 
 ## Architecture
 
@@ -345,6 +349,40 @@ Standalone development returns API and upload URLs on the API listener (default 
 
 Published upload URLs use `/api/uploads` on the same origin as `/api/v3`. Do not publish the internal port `4891` as a separate production origin.
 
+The Git-data surface supports both API versions above:
+
+| Method | Path after `/api/v3/repos/:owner/:repo` |
+| --- | --- |
+| GET | `/branches` |
+| GET | `/branches/*branch` |
+| GET | `/git/ref/*ref` |
+| POST | `/git/refs` |
+| PATCH | `/git/refs/*ref` |
+| GET | `/commits` |
+| GET | `/commits/*ref` |
+| GET | `/contents/*path` |
+| PUT | `/contents/*path` |
+| DELETE | `/contents/*path` |
+
+Repository creation with `auto_init: true` creates a README commit on the default
+branch before returning `201`. Branches, commits, file and directory contents
+are immediately readable through REST and ordinary Git clone/fetch. The
+end-to-end test exercises REST, smart HTTP, and SSH against the same repository.
+
+Encode slash-bearing branch/ref/path values once (for example,
+`branches/feature%2Fapi`, `git/ref/heads%2Ffeature%2Fapi`, or
+`contents/docs%2Fguide.md`). Traversal, invalid UTF-8 and double encoding are
+rejected. Ref creation requires a full branch ref such as
+`refs/heads/feature/api`; updates allow fast-forward only. Contents updates and
+deletion require the current blob SHA. Stale writes and divergent ref updates
+return `409`; force updates are rejected.
+
+Contents PUT/DELETE accept a JSON envelope up to 140 MiB, with a 120-second total
+and 15-second idle body deadline. PUT requires strict Base64 and at most 100 MiB
+of decoded content. Memory admission, Git scan/write bounds and recovery fences
+can return `503`; no partial Git-data JSON response is returned. Git-over-HTTP
+and SSH receive-pack retain their separately configured transport size policy.
+
 ## GraphQL and service discovery
 
 `GET /.well-known/fornacast` is public (no User-Agent or PAT) and returns canonical `base_url`, `api_v3`, `api_graphql`, and `api_uploads` URLs derived from `FORNACAST_BASE_URL`.
@@ -359,7 +397,9 @@ curl -H 'User-Agent: fornacast-example/1.0' \
   http://localhost:4891/api/graphql
 ```
 
-The complete first-release compatibility claim is still blocked by the `auto_init` compatibility gate: the Git-data delivery plan must implement real repository initialization and pass the end-to-end acceptance workflow before the API is advertised as GitHub compatible.
+The documented Git-data workflow is verified for both supported API versions by
+[the HTTP/Git acceptance test](apps/fornacast_api/test/github_git_data_acceptance_test.exs).
+The supported REST surface remains the documented subset of GitHub's API.
 
 ## Git Usage
 
