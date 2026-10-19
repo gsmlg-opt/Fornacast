@@ -35,3 +35,5 @@ config :fornacast_api, FornacastAPI.Endpoint,
 config :phoenix, :stacktrace_depth, 20
 
 config :logger, level: :info
+
+import_config "github_app.exs"
