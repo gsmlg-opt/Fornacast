@@ -7,7 +7,7 @@
       <.dm_link href={base(@organization)} class="text-primary">Back to GitHub configuration</.dm_link>
       <h2 class="text-2xl font-semibold">Synchronized repositories</h2>
       <p class="text-on-surface-variant">
-        Manage repository selection for {@view.config.github_organization} and start GitHub → Fornacast synchronization.
+        Manage repository selection and Git/LFS synchronization for {@view.config.github_organization}.
       </p>
     </header>
     <.dm_alert :if={@error} id="pat-repositories-error" variant="error" role="alert">
@@ -33,6 +33,60 @@
       <p :if={!@latest_run} class="mt-2 text-sm text-on-surface-variant">Never synchronized</p>
       <.task_report :if={@latest_run} organization={@organization} run={@latest_run} />
       <.dm_link :if={!@latest_run} href={base(@organization) <> "/runs"} class="text-primary">Synchronization history</.dm_link>
+    </.dm_card>
+    <.dm_card id="pat-git-mirrors" variant="bordered" padding="lg">
+      <:title>Bidirectional Git and LFS</:title>
+      <p class="text-sm text-on-surface-variant">
+        Enroll existing imported repositories to synchronize branches, tags and LFS in both directions.
+        Divergent histories remain conflicts. Active synchronization must finish before enrollment.
+      </p>
+      <p :if={@pat_mirror.organization_mirror} class="mt-2 text-sm">
+        Mirror state: {@pat_mirror.organization_mirror.state}.
+        <.dm_link href={base(@organization) <> "/conflicts"} class="text-primary">View synchronization conflicts</.dm_link>
+      </p>
+      <p :if={@pat_mirror.candidates == []} class="mt-2">
+        Import repositories into this organization with the configured saved PAT first.
+      </p>
+      <form
+        :if={@pat_mirror.candidates != []}
+        action={base(@organization) <> "/repositories/mirror"}
+        method="post"
+        class="mt-4 grid gap-3"
+      >
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <input type="hidden" name="pat_sync[lock_version]" value={@view.config.lock_version} />
+        <input type="hidden" name="pat_sync[repository_ids][]" value="" />
+        <.dm_input
+          id="pat-git-repositories"
+          type="checkbox_group"
+          name="pat_sync[repository_ids]"
+          label="Imported repositories"
+          options={
+            Enum.map(@pat_mirror.candidates, fn candidate ->
+              {candidate.source_full_name <> if(candidate.enrolled, do: " (enrolled)", else: ""),
+               candidate.repository_id}
+            end)
+          }
+          value={
+            for candidate <- @pat_mirror.candidates,
+                candidate.enrolled,
+                do: candidate.repository_id
+          }
+        />
+        <p class="text-sm text-on-surface-variant">
+          Select enrolled repositories again to authorize a changed configuration or renewed PAT.
+          Unchecked repositories retain their existing connection.
+        </p>
+        <div>
+          <.dm_btn
+            type="submit"
+            variant="primary"
+            disabled={!@view.config.enabled or @view.config.paused}
+          >
+            Enable or reauthorize selected repositories
+          </.dm_btn>
+        </div>
+      </form>
     </.dm_card>
     <.dm_card id="pat-repositories-list" variant="bordered" padding="lg">
       <:title>Repository selection</:title>

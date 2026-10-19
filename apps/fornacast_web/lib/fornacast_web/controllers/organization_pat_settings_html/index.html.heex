@@ -82,9 +82,13 @@
         <.dm_link href="/settings/github" class="text-primary">Manage your saved GitHub PATs</.dm_link>
         <div class="grid gap-1">
           <span class="font-semibold">Synchronization direction</span>
-          <p>GitHub → Fornacast</p>
+          <p>
+            {if @pat_mirror.organization_mirror,
+              do: "GitHub ↔ Fornacast (Git and LFS for enrolled repositories)",
+              else: "GitHub → Fornacast"}
+          </p>
           <p class="text-sm text-on-surface-variant">
-            Fornacast → GitHub will be added in a later phase.
+            Enable bidirectional Git and LFS for imported repositories on the repository selection page.
           </p>
         </div>
         <div><button class="btn btn-primary" type="submit">Save configuration</button></div>

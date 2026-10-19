@@ -148,6 +148,129 @@ defmodule ForgeMirrors.GitRefSyncPersistenceTest do
     assert reclaimed.external_effect_marker == marker
   end
 
+  test "a failed Git observation defers recovery without clearing its ambiguous effect",
+       context do
+    now = DateTime.utc_now(:second)
+    retry_at = DateTime.add(now, 30)
+    operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)
+    marker = %{"action" => "apply_remote", "ref" => "refs/heads/main", "proposed_oid" => @oid}
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, now, marker)
+
+    marked =
+      marked
+      |> Ecto.Changeset.change(checkpoint: %{"scan_key" => "recovery", "phase" => "scan"})
+      |> Repo.update!()
+
+    assert {:error, :invalid_transition} =
+             ForgeMirrors.retry_operation(marked, now, retry_at, "network")
+
+    assert {:ok, deferred} =
+             ForgeMirrors.defer_git_ref_effect(
+               marked,
+               now,
+               retry_at,
+               "network",
+               "git_observation_unavailable"
+             )
+
+    assert deferred.state == :effect_pending
+    assert deferred.external_effect_marker == marker
+    assert deferred.effect_marked_at == marked.effect_marked_at
+    assert deferred.checkpoint == marked.checkpoint
+    assert deferred.cursor == marked.cursor
+    assert deferred.next_attempt_at == retry_at
+    assert deferred.failure_class == "network"
+    assert deferred.failure_disposition == :retry
+    assert deferred.failure_detail == "git_observation_unavailable"
+    assert is_nil(deferred.lease_owner)
+    assert is_nil(deferred.lease_expires_at)
+    assert Repo.get_by(MirrorRefState, repository_mirror_id: context.repository_mirror.id) == nil
+
+    assert {:ok, []} = ForgeMirrors.claim_operations("git-ref-test", now, 30, 1)
+    reclaimed = claim!(deferred, retry_at)
+    assert reclaimed.state == :effect_pending
+    assert reclaimed.external_effect_marker == marker
+    assert reclaimed.checkpoint == marked.checkpoint
+    assert reclaimed.cursor == marked.cursor
+
+    assert {:error, :lost_lease} =
+             ForgeMirrors.defer_git_ref_effect(
+               marked,
+               now,
+               retry_at,
+               "network",
+               "git_observation_unavailable"
+             )
+  end
+
+  test "Git observation deferral rejects forged recovery evidence and expired ownership",
+       context do
+    now = DateTime.utc_now(:second)
+    retry_at = DateTime.add(now, 30)
+    operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)
+    marker = %{"action" => "apply_local", "ref" => "refs/heads/main", "proposed_oid" => @oid}
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, now, marker)
+
+    for forged <- [
+          %{marked | external_effect_marker: Map.put(marker, "proposed_oid", @other_oid)},
+          %{marked | cursor: Map.put(marked.cursor, "trigger", "forged")},
+          %{marked | checkpoint: %{"phase" => "forged"}},
+          %{marked | organization_mirror_id: 0},
+          %{marked | kind: "sync.issue"}
+        ] do
+      assert {:error, :invalid_transition} =
+               ForgeMirrors.defer_git_ref_effect(
+                 forged,
+                 now,
+                 retry_at,
+                 "network",
+                 "git_observation_unavailable"
+               )
+    end
+
+    assert Repo.get!(MirrorOperation, marked.id) == marked
+
+    expired =
+      marked
+      |> Ecto.Changeset.change(lease_expires_at: DateTime.add(now, -1))
+      |> Repo.update!()
+
+    assert {:error, :lost_lease} =
+             ForgeMirrors.defer_git_ref_effect(
+               expired,
+               now,
+               retry_at,
+               "network",
+               "worker_crash"
+             )
+
+    assert Repo.get!(MirrorOperation, marked.id) == expired
+  end
+
+  test "Git observation deferral retains pause and revocation fences", context do
+    now = DateTime.utc_now(:second)
+    operation = operation(context, "refs/heads/main", Ecto.UUID.generate(), now) |> claim!(now)
+    marker = %{"action" => "apply_remote", "ref" => "refs/heads/main", "proposed_oid" => @oid}
+    assert {:ok, marked} = ForgeMirrors.mark_external_effect(operation, now, marker)
+
+    for state <- [:paused, :revoked] do
+      context.organization_mirror
+      |> Ecto.Changeset.change(state: state)
+      |> Repo.update!()
+
+      assert {:error, ^state} =
+               ForgeMirrors.defer_git_ref_effect(
+                 marked,
+                 now,
+                 DateTime.add(now, 30),
+                 "primary_rate_limit",
+                 "git_observation_unavailable"
+               )
+
+      assert Repo.get!(MirrorOperation, marked.id) == marked
+    end
+  end
+
   test "post-marker pause denies an external effect without changing its durable marker",
        context do
     now = DateTime.utc_now(:second)

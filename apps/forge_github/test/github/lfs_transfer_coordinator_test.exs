@@ -353,6 +353,125 @@ defmodule ForgeGitHub.LFS.TransferCoordinatorTest do
     assert_received {:verify_remote, ^absent_oid}
   end
 
+  @tag :tmp_dir
+  test "outbound preserves raw blob ownership across the real transport worker", %{
+    tmp_dir: tmp_dir
+  } do
+    parent = self()
+    payload = String.duplicate("outbound-lfs", 17_000)
+    path = Path.join(tmp_dir, "payload")
+    File.write!(path, payload)
+    oid = :crypto.hash(:sha256, payload) |> Base.encode16(case: :lower)
+    requirement = %{oid: oid, size: byte_size(payload), first_seen_ref: "refs/heads/main"}
+
+    callbacks =
+      callbacks(
+        list_requirements: fn _, _ -> {:ok, %{objects: [requirement], next_cursor: nil}} end,
+        verify_local: fn _, ^oid, _ -> :ok end,
+        batch: fn _, _, _, :upload, _, _ -> {:ok, [remote_upload(requirement, [])]} end,
+        open_local: fn _, ^oid, size, :all ->
+          {:ok, io} = :file.open(String.to_charlist(path), [:read, :raw, :binary])
+          send(parent, {:source_opened, self()})
+          source = %ForgeBlobs.Source{io: io, offset: 0, position: 0, remaining: size}
+          {:ok, source, %{size: size}}
+        end,
+        read_local: fn source, length ->
+          send(parent, {:source_read, self()})
+          GitLFS.read(source, length)
+        end,
+        close_local: fn source ->
+          send(parent, {:source_closed, self()})
+          GitLFS.close(source)
+        end,
+        upload: fn upload_action, object, reader, source, _ ->
+          ForgeGitHub.LFS.upload(upload_action, object, reader, source,
+            resolver: fn _ -> {:ok, [{203, 0, 114, 10}]} end,
+            transport_api: __MODULE__.RawSourceMint
+          )
+        end
+      )
+
+    assert {:ok, nil} = process(:outbound, callbacks)
+    assert_received {:source_opened, owner}
+    assert_received {:source_read, ^owner}
+    assert_received {:source_closed, ^owner}
+    assert_received {:raw_upload_bytes, uploaded}
+    assert uploaded == payload
+    refute_received {:raw_upload_bytes, _}
+  end
+
+  @tag :tmp_dir
+  test "outbound timeout stops a blocked raw-source owner", %{tmp_dir: tmp_dir} do
+    parent = self()
+    callbacks = blocked_raw_source_callbacks(tmp_dir, parent, 50)
+
+    assert {:error, %Error{kind: :timeout}} = process(:outbound, callbacks)
+    assert_received {:source_opened, owner}
+    refute Process.alive?(owner)
+    assert_received {:raw_transport_started, transport}
+    refute Process.alive?(transport)
+  end
+
+  @tag :tmp_dir
+  test "caller death stops a blocked raw-source owner and its upload", %{tmp_dir: tmp_dir} do
+    parent = self()
+    callbacks = blocked_raw_source_callbacks(tmp_dir, parent, 20_000)
+
+    caller =
+      spawn(fn ->
+        Process.put(:"$callers", [parent])
+        process(:outbound, callbacks)
+      end)
+
+    on_exit(fn -> if Process.alive?(caller), do: Process.exit(caller, :kill) end)
+    assert_receive {:source_opened, owner}
+    assert_receive {:raw_transport_started, transport}
+    assert_receive :source_read_blocked
+    owner_monitor = Process.monitor(owner)
+    transport_monitor = Process.monitor(transport)
+    Process.exit(caller, :kill)
+
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner, _}, 2_000
+    assert_receive {:DOWN, ^transport_monitor, :process, ^transport, _}, 2_000
+  end
+
+  test "an expired upload action gets a fresh source owner before retry" do
+    parent = self()
+    [requirement | _] = requirements()
+    attempts = :counters.new(1, [:atomics])
+
+    callbacks =
+      callbacks(
+        list_requirements: fn _, _ -> {:ok, %{objects: [requirement], next_cursor: nil}} end,
+        verify_local: fn _, _, _ -> :ok end,
+        batch: fn _, _, _, _, _, _ -> {:ok, [remote_upload(requirement, [])]} end,
+        open_local: fn _, oid, size, _ ->
+          send(parent, {:retry_source_opened, self()})
+          {:ok, oid, %{size: size}}
+        end,
+        close_local: fn _source ->
+          send(parent, {:retry_source_closed, self()})
+          :ok
+        end,
+        upload: fn _, _, _, source, _ ->
+          :counters.add(attempts, 1, 1)
+
+          if :counters.get(attempts, 1) == 1,
+            do: {:error, Error.new(:action_expired), source},
+            else: {:ok, source}
+        end
+      )
+
+    assert {:ok, nil} = process(:outbound, callbacks)
+    assert_received {:retry_source_opened, first}
+    assert_received {:retry_source_closed, ^first}
+    assert_received {:retry_source_opened, second}
+    assert_received {:retry_source_closed, ^second}
+    assert first != second
+    refute Process.alive?(first)
+    refute Process.alive?(second)
+  end
+
   test "outbound does not adopt globally shared bytes without repository authorization" do
     [requirement | _] = requirements()
     parent = self()
@@ -512,6 +631,7 @@ defmodule ForgeGitHub.LFS.TransferCoordinatorTest do
 
   test "revocation while opening the local source closes it without uploading" do
     parent = self()
+    revoked = :counters.new(1, [:atomics])
 
     callbacks =
       callbacks(
@@ -521,7 +641,7 @@ defmodule ForgeGitHub.LFS.TransferCoordinatorTest do
           {:ok, Enum.map(objects, &remote_upload(&1, verify?: true))}
         end,
         open_local: fn _, oid, size, _ ->
-          Process.put(:revoked, true)
+          :counters.put(revoked, 1, 1)
           {:ok, oid, %{size: size}}
         end,
         close_local: fn oid ->
@@ -533,7 +653,7 @@ defmodule ForgeGitHub.LFS.TransferCoordinatorTest do
     assert {:error, :lease_expired} =
              process(:outbound, callbacks,
                authorize: fn ->
-                 if Process.get(:revoked), do: {:error, :lease_expired}, else: :ok
+                 if :counters.get(revoked, 1) == 1, do: {:error, :lease_expired}, else: :ok
                end
              )
 
@@ -604,6 +724,71 @@ defmodule ForgeGitHub.LFS.TransferCoordinatorTest do
       actions: actions,
       error: nil
     }
+  end
+
+  defp blocked_raw_source_callbacks(tmp_dir, parent, timeout) do
+    path = Path.join(tmp_dir, "blocked-payload")
+    File.write!(path, "bytes")
+    oid = :crypto.hash(:sha256, "bytes") |> Base.encode16(case: :lower)
+    requirement = %{oid: oid, size: 5, first_seen_ref: "refs/heads/main"}
+
+    callbacks(
+      list_requirements: fn _, _ -> {:ok, %{objects: [requirement], next_cursor: nil}} end,
+      verify_local: fn _, _, _ -> :ok end,
+      batch: fn _, _, _, _, _, _ -> {:ok, [remote_upload(requirement, [])]} end,
+      open_local: fn _, _, size, _ ->
+        {:ok, io} = :file.open(String.to_charlist(path), [:read, :raw, :binary])
+        send(parent, {:source_opened, self()})
+        {:ok, %ForgeBlobs.Source{io: io, offset: 0, position: 0, remaining: size}, %{size: size}}
+      end,
+      read_local: fn _source, _length ->
+        send(parent, :source_read_blocked)
+
+        receive do
+          :release_reader -> :eof
+        end
+      end,
+      close_local: &GitLFS.close/1,
+      upload: fn upload_action, object, reader, source, _ ->
+        ForgeGitHub.LFS.upload(upload_action, object, reader, source,
+          resolver: fn _ -> {:ok, [{203, 0, 114, 10}]} end,
+          transport_api: __MODULE__.RawSourceMint,
+          request_timeout: timeout
+        )
+      end
+    )
+  end
+
+  defmodule RawSourceMint do
+    def connect(_scheme, _address, _port, _options) do
+      owner = Process.get(:"$callers") |> List.last()
+      send(owner, {:raw_transport_started, self()})
+      {:ok, %{owner: owner, ref: nil, bytes: ""}}
+    end
+
+    def request(state, "PUT", _target, _headers, :stream) do
+      ref = make_ref()
+      {:ok, %{state | ref: ref}, ref}
+    end
+
+    def stream_request_body(state, _ref, :eof) do
+      send(state.owner, {:raw_upload_bytes, state.bytes})
+      {:ok, state}
+    end
+
+    def stream_request_body(state, _ref, bytes),
+      do: {:ok, %{state | bytes: state.bytes <> bytes}}
+
+    def recv(state, 0, _timeout),
+      do:
+        {:ok, state,
+         [
+           {:status, state.ref, 200},
+           {:headers, state.ref, [{"content-length", "0"}]},
+           {:done, state.ref}
+         ]}
+
+    def close(state), do: {:ok, state}
   end
 
   defp action(operation) do

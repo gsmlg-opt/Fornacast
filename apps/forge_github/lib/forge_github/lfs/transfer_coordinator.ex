@@ -491,19 +491,129 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
   end
 
   defp upload_local(repository, requirement, upload_action, verify_action, callbacks) do
-    case call(callbacks.open_local, [repository, requirement.oid, requirement.size, :all]) do
-      {:ok, source, %{size: size}} when size == requirement.size ->
-        upload_open_source(source, requirement, upload_action, verify_action, callbacks)
+    parent = self()
+    reference = make_ref()
+    callers = Process.get(:"$callers", [])
 
-      {:ok, source, _metadata} ->
-        _ = close_local(source, callbacks)
-        error(:integrity_mismatch)
+    {owner, monitor} =
+      :erlang.spawn_opt(
+        fn ->
+          Process.put(:"$callers", [parent | callers])
+          parent_monitor = Process.monitor(parent)
 
-      {:error, reason} ->
-        local_error(reason)
+          case call(callbacks.open_local, [repository, requirement.oid, requirement.size, :all]) do
+            {:ok, source, metadata} ->
+              try do
+                send(parent, {reference, :opened, metadata})
+                upload_source_loop(source, reference, parent_monitor, callbacks)
+              after
+                result = call(callbacks.close_local, [source])
+                send(parent, {reference, :closed, result})
+              end
 
-      _invalid ->
-        error(:local_storage)
+            result ->
+              send(parent, {reference, :open_failed, result})
+          end
+        end,
+        [:link, :monitor]
+      )
+
+    handle = {owner, reference}
+
+    try do
+      receive do
+        {^reference, :opened, %{size: size}} when size == requirement.size ->
+          source_callbacks =
+            Map.merge(callbacks, %{
+              read_local: &read_upload_source/2,
+              close_local: fn ^handle -> close_upload_source(handle, monitor) end
+            })
+
+          upload_open_source(handle, requirement, upload_action, verify_action, source_callbacks)
+
+        {^reference, :opened, _metadata} ->
+          error(:integrity_mismatch)
+
+        {^reference, :open_failed, {:error, reason}} ->
+          local_error(reason)
+
+        {^reference, :open_failed, _invalid} ->
+          error(:local_storage)
+
+        {:DOWN, ^monitor, :process, ^owner, _reason} ->
+          error(:local_storage)
+      after
+        20_000 -> error(:local_storage)
+      end
+    after
+      _ = close_upload_source(handle, monitor)
+    end
+  end
+
+  # Raw blob descriptors stay in this owner; the bounded HTTP worker only receives a handle.
+  defp upload_source_loop(source, reference, parent_monitor, callbacks) do
+    receive do
+      {^reference, :read, caller, request, length} ->
+        case call(callbacks.read_local, [source, length]) do
+          {:ok, bytes, next_source} ->
+            send(caller, {request, {:ok, bytes, {self(), reference}}})
+            upload_source_loop(next_source, reference, parent_monitor, callbacks)
+
+          result ->
+            send(caller, {request, result})
+            upload_source_loop(source, reference, parent_monitor, callbacks)
+        end
+
+      {^reference, :close} ->
+        :ok
+
+      {:DOWN, ^parent_monitor, :process, _parent, _reason} ->
+        :ok
+    end
+  end
+
+  defp read_upload_source({owner, reference}, length) do
+    monitor = Process.monitor(owner)
+    request = make_ref()
+    send(owner, {reference, :read, self(), request, length})
+
+    receive do
+      {^request, result} ->
+        Process.demonitor(monitor, [:flush])
+        result
+
+      {:DOWN, ^monitor, :process, ^owner, _reason} ->
+        {:error, :source}
+    end
+  end
+
+  defp close_upload_source({owner, reference}, monitor) do
+    if Process.alive?(owner) do
+      send(owner, {reference, :close})
+
+      receive do
+        {^reference, :closed, result} ->
+          await_upload_source(owner, monitor)
+          result
+
+        {:DOWN, ^monitor, :process, ^owner, _reason} ->
+          {:error, :local_storage}
+      after
+        1_000 ->
+          Process.unlink(owner)
+          Process.exit(owner, :kill)
+          await_upload_source(owner, monitor)
+          {:error, :local_storage}
+      end
+    else
+      Process.demonitor(monitor, [:flush])
+      :ok
+    end
+  end
+
+  defp await_upload_source(owner, monitor) do
+    receive do
+      {:DOWN, ^monitor, :process, ^owner, _reason} -> :ok
     end
   end
 

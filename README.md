@@ -104,28 +104,44 @@ these counters advance. Retrying a failed synchronization adopts proven staged
 Git data and checkpoints through a successor import instead of resetting terminal
 attempts or rediscovering conflicting repository names.
 
-The future two-way GitHub organization mirror uses a permanent mirror domain
-separate from the one-time bootstrap importer. GitHub wiki
-repositories and release asset binaries remain excluded from synchronization.
+To enable permanent bidirectional Git/LFS synchronization, open the organization's
+GitHub settings, select **Synchronized repositories**, then explicitly enroll
+repositories under **Bidirectional Git and LFS**. Enrollment requires a completed
+saved-PAT import into that organization and waits for active legacy synchronization
+to finish. The permanent mirror domain takes over Git/LFS writes for those pairs;
+`Sync now`, local Git changes and periodic reconciliation use that domain.
+
+This PAT connection synchronizes branches, tags and their reachable LFS objects.
+Divergent histories become visible conflicts; force pushes and ref deletion remain
+blocked. New repository discovery and collaboration metadata are not part of this
+permanent PAT connection. GitHub wiki repositories and release asset binaries
+remain excluded from permanent mirroring. A changed configuration or renewed PAT
+requires explicitly selecting the enrolled repositories again to reauthorize;
+confirmed ref baselines are retained.
+
+Real GitHub and Fornacast clone/checkout verification for the saved-PAT Git/LFS
+path is recorded in the [acceptance ledger](docs/superpowers/plans/2026-09-07-github-org-sync-acceptance.md).
 
 The current PAT flow requires a saved, verified PAT belonging to an active local
 organization owner and access to the configured GitHub organization. GitHub App
 installation accessibility and webhook binding are future requirements for the
 replacement App flow, not prerequisites for PAT synchronization.
 
-Disconnecting locally revokes the Fornacast mirror and fences its pending work,
+For the optional App path, disconnecting locally revokes the Fornacast mirror and fences its pending work,
 while retaining repositories, Git/LFS data, and recovery evidence. It only
 invalidates cached installation credentials, so a fresh authorized reconnect
 to an active installation can obtain a new token without restarting. A
 provider installation deletion is a separate terminal revocation and cannot
 be undone by reconnecting or by an old webhook.
 
-Live GitHub installation acceptance remains an operator gate. Verify the App's
+Live GitHub installation acceptance remains an operator gate for the App path. Verify the App's
 installation status and organization-owner access against GitHub before
 enabling production mirroring.
-For local App configuration and the real two-endpoint Git/LFS checks, follow
-[local mirror acceptance](docs/github-app-local-acceptance.md). Development
-processes accept the same App environment variables as releases.
+The [acceptance ledger](docs/superpowers/plans/2026-09-07-github-org-sync-acceptance.md)
+records credential-specific implementation and two-endpoint Git/LFS evidence,
+with full collaboration-metadata acceptance tracked separately. The [optional local App procedure](docs/github-app-local-acceptance.md)
+applies only to the future App path. Development processes accept the same App
+environment variables as releases.
 
 ## Architecture
 

@@ -144,7 +144,7 @@ defmodule ForgeGitHub.LFS.Transport do
           transport_opts: transport_options(address, remaining)
         ]
 
-        # TODO(upstream): gsmlg-dev/http_fetch#135 - preserve confirmed TLS-setup failover on migration.
+        # TODO(upstream): gsmlg-dev/http_fetch#135 - adopt published 0.21.14 TLS-setup evidence and verify failover.
         case api.connect(:https, address, 443, options) do
           {:ok, connection} ->
             connected(method, uri, headers, body, api, connection, deadline)

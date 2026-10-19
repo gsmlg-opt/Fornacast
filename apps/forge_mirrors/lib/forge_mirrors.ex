@@ -4378,6 +4378,17 @@ defmodule ForgeMirrors do
     do: {:error, :invalid_argument}
 
   @doc false
+  def claim_pat_git_operations(owner, %DateTime{} = now, lease_seconds, limit, kinds)
+      when is_binary(owner) and is_integer(lease_seconds) and lease_seconds > 0 and
+             is_integer(limit) and limit in 1..@max_claim_batch and is_list(kinds) do
+    with :ok <- validate_operation_kinds(kinds) do
+      do_claim_operations(owner, now, lease_seconds, limit, kinds, ["pat"])
+    end
+  end
+
+  def claim_pat_git_operations(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  @doc false
   @spec inventory_operation_context(MirrorOperation.t()) ::
           {:ok,
            %{
@@ -4617,10 +4628,10 @@ defmodule ForgeMirrors do
            {:ok, scope} <- load_git_ref_scope(operation),
            true <- scope.git_enabled and scope.lfs_enabled,
            :ok <-
-             authorize_external_effect_installation(operation, %{
-               github_installation_id: scope.github_installation_id,
-               permissions: %{"contents" => "write", "metadata" => "read"}
-             }) do
+             authorize_external_effect_installation(
+               operation,
+               Map.put(scope, :permissions, %{"contents" => "write", "metadata" => "read"})
+             ) do
         operation
       else
         false -> Repo.rollback(:permission_missing)
@@ -5118,6 +5129,58 @@ defmodule ForgeMirrors do
   def git_ref_operation_context(_operation), do: {:error, :invalid_transition}
 
   @doc false
+  def defer_git_ref_effect(
+        %MirrorOperation{kind: "sync.git_ref", state: :effect_pending} = operation,
+        %DateTime{} = now,
+        %DateTime{} = retry_at,
+        failure_class,
+        reason_code
+      )
+      when failure_class in ["network", "primary_rate_limit", "secondary_rate_limit"] and
+             reason_code in ["git_observation_unavailable", "worker_crash"] do
+    ref_name = operation.cursor["ref_name"]
+
+    with true <- standard_git_ref?(ref_name),
+         :ok <- validate_utc(now),
+         :ok <- validate_utc(retry_at),
+         true <- DateTime.after?(retry_at, now) do
+      Repo.transaction(fn ->
+        with {:ok, persisted} <- lock_owned_git_ref_operation(operation, ref_name),
+             true <-
+               persisted.state == :effect_pending and
+                 persisted.organization_mirror_id == operation.organization_mirror_id and
+                 is_map(persisted.external_effect_marker) and
+                 persisted.external_effect_marker == operation.external_effect_marker and
+                 persisted.cursor == operation.cursor and
+                 persisted.checkpoint == operation.checkpoint,
+             {:ok, deferred} <-
+               owned_transition(persisted, DateTime.truncate(now, :second), [:effect_pending],
+                 next_attempt_at: DateTime.truncate(retry_at, :second),
+                 failure_class: failure_class,
+                 failure_disposition: :retry,
+                 failure_detail: reason_code,
+                 lease_owner: nil,
+                 lease_expires_at: nil
+               ) do
+          deferred
+        else
+          false -> Repo.rollback(:invalid_transition)
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+      |> normalize_transaction_result()
+    else
+      false -> {:error, :invalid_argument}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    _exception -> {:error, :lost_lease}
+  end
+
+  def defer_git_ref_effect(%MirrorOperation{}, _, _, _, _), do: {:error, :invalid_transition}
+  def defer_git_ref_effect(_, _, _, _, _), do: {:error, :invalid_argument}
+
+  @doc false
   @spec checkpoint_git_ref_operation(
           MirrorOperation.t(),
           String.t(),
@@ -5449,6 +5512,7 @@ defmodule ForgeMirrors do
          :ok <- validate_utc(now) do
       Repo.transaction(fn ->
         with {:ok, persisted} <- lock_owned_operation(operation, ["finalize.repository.git"]),
+             :ok <- ForgeMirrors.PatGitMirror.authorize_operation_if_pat(persisted),
              {:ok, yielded} <-
                owned_transition(persisted, DateTime.truncate(now, :second), [:processing],
                  state: :pending,
@@ -5471,6 +5535,7 @@ defmodule ForgeMirrors do
       when failure_class in ["lfs_missing", "lfs_integrity"] do
     Repo.transaction(fn ->
       with {:ok, persisted} <- lock_owned_operation(operation, ["finalize.repository.git"]),
+           :ok <- ForgeMirrors.PatGitMirror.authorize_operation_if_pat(persisted),
            {:ok, _mirror} <- degrade_git_ref_organization(persisted),
            {:ok, failed} <-
              fail_operation(
@@ -5506,6 +5571,7 @@ defmodule ForgeMirrors do
                  "reconcile.repository.bootstrap",
                  "reconcile.repository.git"
                ]),
+             :ok <- ForgeMirrors.PatGitMirror.authorize_operation_if_pat(persisted),
              {:ok, ref_operations} <- enqueue_reconciled_git_refs(persisted, ref_names, now),
              {:ok, finalizer} <- enqueue_git_ref_finalizer(persisted, now),
              {:ok, completed} <- complete_operation(persisted, now) do
@@ -5534,6 +5600,7 @@ defmodule ForgeMirrors do
       Repo.transaction(fn ->
         with :ok <- lock_effect_scope(operation),
              {:ok, persisted} <- lock_owned_operation(operation, ["finalize.repository.git"]),
+             :ok <- ForgeMirrors.PatGitMirror.authorize_operation_if_pat(persisted),
              %RepositoryMirror{} = repository <- lock_finalizer_repository(persisted) do
           case git_ref_reconciliation_blocker(repository, persisted) do
             :clear ->
@@ -5567,6 +5634,7 @@ defmodule ForgeMirrors do
       Repo.transaction(fn ->
         with :ok <- lock_effect_scope(operation),
              {:ok, persisted} <- lock_owned_operation(operation, ["finalize.repository.git"]),
+             :ok <- ForgeMirrors.PatGitMirror.authorize_operation_if_pat(persisted),
              %RepositoryMirror{} = repository <- lock_finalizer_repository(persisted),
              :clear <- git_ref_reconciliation_blocker(repository, persisted),
              :ok <- release_bootstrap_publication(repository, persisted),
@@ -5652,10 +5720,24 @@ defmodule ForgeMirrors do
 
   defp supersede_git_ref_reconciliation(operation, later, now) do
     with {:ok, replacement} <- replacement_git_reconciliation(operation, later, now),
+         {:ok, operation} <- retain_pat_git_replacement(operation, replacement, now),
          {:ok, completed} <- complete_operation(operation, now) do
       %{operation: completed, repository_mirror: nil, replacement: replacement}
     else
       {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+
+  defp retain_pat_git_replacement(operation, replacement, now) do
+    case Repo.get(OrganizationMirror, operation.organization_mirror_id) do
+      %OrganizationMirror{credential_source: :pat} ->
+        owned_transition(operation, now, [:processing, :effect_pending],
+          checkpoint:
+            Map.put(operation.checkpoint, "replacement_git_operation_id", replacement.id)
+        )
+
+      _ ->
+        {:ok, operation}
     end
   end
 
@@ -5749,6 +5831,7 @@ defmodule ForgeMirrors do
 
       Repo.transaction(fn ->
         with {:ok, persisted} <- lock_owned_git_ref_operation(operation, ref_name),
+             :ok <- ForgeMirrors.PatGitMirror.authorize_operation_if_pat(persisted),
              false <- open_git_ref_conflict?(persisted, ref_name),
              {:ok, ref_state} <-
                persist_git_ref_state(persisted, ref_name, local_oid, remote_oid, now),
@@ -6060,6 +6143,32 @@ defmodule ForgeMirrors do
           {:ok, map()} | {:error, :not_found | :invalid_argument}
   def list_organization_status(id), do: organization_status(id)
 
+  defdelegate enroll_pat_git_repositories(
+                actor,
+                organization_id,
+                version,
+                repository_ids,
+                metadata
+              ), to: ForgeMirrors.PatGitMirror, as: :enroll
+
+  defdelegate pat_git_enrollment_view(actor, organization_id),
+    to: ForgeMirrors.PatGitMirror,
+    as: :view
+
+  defdelegate pat_repository_handoff(config_id, repository_id),
+    to: ForgeMirrors.PatGitMirror,
+    as: :handoff
+
+  defdelegate schedule_pat_git_repository(actor, config_id, repository_id, request_key),
+    to: ForgeMirrors.PatGitMirror,
+    as: :schedule
+
+  defdelegate pat_git_repository_status(actor, config_id, repository_id, operation_id),
+    to: ForgeMirrors.PatGitMirror,
+    as: :status
+
+  defdelegate authorize_pat_credential(scope), to: ForgeMirrors.PatGitMirror, as: :authorize
+
   @spec schedule_reconciliation(
           ForgeAccounts.User.t(),
           OrganizationMirror.t(),
@@ -6073,13 +6182,21 @@ defmodule ForgeMirrors do
          :ok <- validate_utc(scheduled_at) do
       scheduled_at = DateTime.truncate(scheduled_at, :second)
 
-      enqueue_operation(%{
-        organization_mirror_id: persisted.id,
-        kind: "reconcile.organization_inventory",
-        dedupe_key: "reconcile:organization:#{persisted.id}:#{DateTime.to_unix(scheduled_at)}",
-        cursor: %{},
-        next_attempt_at: scheduled_at
-      })
+      if persisted.credential_source == :pat do
+        ForgeMirrors.PatGitMirror.schedule_all(
+          persisted,
+          "manual:#{DateTime.to_unix(scheduled_at)}",
+          scheduled_at
+        )
+      else
+        enqueue_operation(%{
+          organization_mirror_id: persisted.id,
+          kind: "reconcile.organization_inventory",
+          dedupe_key: "reconcile:organization:#{persisted.id}:#{DateTime.to_unix(scheduled_at)}",
+          cursor: %{},
+          next_attempt_at: scheduled_at
+        })
+      end
     end
   end
 
@@ -6511,13 +6628,21 @@ defmodule ForgeMirrors do
     scheduled_at = mirror.next_reconcile_at
 
     result =
-      enqueue_operation(%{
-        organization_mirror_id: mirror.id,
-        kind: "reconcile.organization_inventory",
-        dedupe_key: "periodic-reconcile:#{mirror.id}:#{DateTime.to_unix(scheduled_at)}",
-        cursor: %{},
-        next_attempt_at: now
-      })
+      if mirror.credential_source == :pat do
+        ForgeMirrors.PatGitMirror.schedule_all(
+          mirror,
+          "periodic:#{DateTime.to_unix(scheduled_at)}",
+          now
+        )
+      else
+        enqueue_operation(%{
+          organization_mirror_id: mirror.id,
+          kind: "reconcile.organization_inventory",
+          dedupe_key: "periodic-reconcile:#{mirror.id}:#{DateTime.to_unix(scheduled_at)}",
+          cursor: %{},
+          next_attempt_at: now
+        })
+      end
 
     {:ok, _updated} =
       mirror
@@ -6661,7 +6786,20 @@ defmodule ForgeMirrors do
     |> Repo.one()
   end
 
-  defp materialize_repository_operations(repository, %{event_type: "repository.pushed"} = event) do
+  defp materialize_repository_operations(repository, event) do
+    case Repo.get(OrganizationMirror, repository.organization_mirror_id) do
+      %OrganizationMirror{credential_source: :pat} when event.event_type != "repository.pushed" ->
+        {:ok, []}
+
+      _ ->
+        materialize_enabled_repository_operations(repository, event)
+    end
+  end
+
+  defp materialize_enabled_repository_operations(
+         repository,
+         %{event_type: "repository.pushed"} = event
+       ) do
     with {:ok, changed_refs} <- normalize_changed_refs(event.payload) do
       changed_refs
       |> Enum.reduce_while({:ok, []}, fn changed_ref, {:ok, operations} ->
@@ -6693,7 +6831,7 @@ defmodule ForgeMirrors do
     end
   end
 
-  defp materialize_repository_operations(
+  defp materialize_enabled_repository_operations(
          repository,
          %{event_type: "repository.updated"} = event
        ) do
@@ -6715,7 +6853,7 @@ defmodule ForgeMirrors do
     end
   end
 
-  defp materialize_repository_operations(
+  defp materialize_enabled_repository_operations(
          repository,
          %{event_type: "repository.created"} = event
        ) do
@@ -6737,7 +6875,7 @@ defmodule ForgeMirrors do
     end
   end
 
-  defp materialize_repository_operations(repository, event) do
+  defp materialize_enabled_repository_operations(repository, event) do
     case enqueue_operation(%{
            organization_mirror_id: repository.organization_mirror_id,
            repository_mirror_id: repository.id,
@@ -6856,6 +6994,30 @@ defmodule ForgeMirrors do
   end
 
   defp load_git_ref_scope(operation) do
+    case Repo.get(OrganizationMirror, operation.organization_mirror_id) do
+      %OrganizationMirror{credential_source: :pat} = mirror ->
+        case Repo.get(RepositoryMirror, operation.repository_mirror_id) do
+          %RepositoryMirror{} = binding ->
+            scope = ForgeMirrors.PatGitMirror.scope(mirror, binding, operation)
+
+            with :ok <- authorize_pat_credential(scope) do
+              {:ok,
+               Map.merge(scope, %{
+                 git_enabled: git_capability_enabled?(mirror.capabilities),
+                 lfs_enabled: mirror.capabilities["lfs"] == true
+               })}
+            end
+
+          _ ->
+            {:error, :invalid_transition}
+        end
+
+      _ ->
+        load_app_git_ref_scope(operation)
+    end
+  end
+
+  defp load_app_git_ref_scope(operation) do
     repository_mirror =
       RepositoryMirror
       |> where([mirror], mirror.id == ^operation.repository_mirror_id)
@@ -7147,6 +7309,18 @@ defmodule ForgeMirrors do
       digest = :crypto.hash(:sha256, ref_name) |> Base.encode16(case: :lower)
       existing = locked_git_ref_state(operation.repository_mirror_id, ref_name)
 
+      pat? =
+        match?(
+          %OrganizationMirror{credential_source: :pat},
+          Repo.get(OrganizationMirror, operation.organization_mirror_id)
+        )
+
+      previous_snapshot? =
+        case Repo.get(RepositoryMirror, operation.repository_mirror_id) do
+          %RepositoryMirror{last_synced_at: %DateTime{}} -> true
+          _ -> false
+        end
+
       attrs = %{
         organization_mirror_id: operation.organization_mirror_id,
         repository_mirror_id: operation.repository_mirror_id,
@@ -7154,7 +7328,9 @@ defmodule ForgeMirrors do
         dedupe_key: "reconcile:#{operation.id}:#{digest}",
         cursor:
           %{
-            "initial_absence" => is_nil(existing) or existing.state == :deleted,
+            "initial_absence" =>
+              ((not pat? or previous_snapshot?) and is_nil(existing)) or
+                (existing != nil and existing.state == :deleted),
             "reconciliation_operation_id" => operation.id,
             "ref_name" => ref_name,
             "trigger" => "reconcile"
@@ -7780,13 +7956,7 @@ defmodule ForgeMirrors do
          {:ok, scope} <- load_git_ref_scope(persisted),
          true <- scope.git_enabled do
       {:ok, persisted,
-       %{
-         github_installation_id: scope.github_installation_id,
-         permissions: %{
-           "contents" => "write",
-           "metadata" => "read"
-         }
-       }}
+       Map.put(scope, :permissions, %{"contents" => "write", "metadata" => "read"})}
     else
       {:error, reason} -> {:error, reason}
       false -> {:error, :permission_missing}
@@ -7822,6 +7992,12 @@ defmodule ForgeMirrors do
          permissions: scope.metadata_permissions
        }}
     end
+  end
+
+  defp authorize_external_effect_installation(operation, %{credential_source: :pat} = scope) do
+    if operation.external_effect_marker["action"] in ["delete_local", "delete_remote"],
+      do: {:error, :ref_deletion_disabled},
+      else: authorize_pat_credential(scope)
   end
 
   defp authorize_external_effect_installation(operation, %{
@@ -8204,12 +8380,14 @@ defmodule ForgeMirrors do
     |> DateTime.truncate(:second)
   end
 
-  defp do_claim_operations(owner, now, lease_seconds, limit, kinds) do
+  defp do_claim_operations(owner, now, lease_seconds, limit, kinds, sources \\ nil) do
     with :ok <- validate_owner(owner), :ok <- validate_utc(now) do
       now = DateTime.truncate(now, :second)
       expires_at = DateTime.add(now, lease_seconds, :second)
 
-      case Repo.transaction(fn -> claim_due_operations(owner, now, expires_at, limit, kinds) end) do
+      case Repo.transaction(fn ->
+             claim_due_operations(owner, now, expires_at, limit, kinds, sources)
+           end) do
         {:ok, operations} -> {:ok, operations}
         {:error, _reason} -> {:error, :unavailable}
       end
@@ -8218,7 +8396,7 @@ defmodule ForgeMirrors do
     _exception -> {:error, :unavailable}
   end
 
-  defp claim_due_operations(owner, now, expires_at, limit, kinds) do
+  defp claim_due_operations(owner, now, expires_at, limit, kinds, sources) do
     sql = """
     select operation.id
     from mirror_operations operation
@@ -8229,8 +8407,11 @@ defmodule ForgeMirrors do
     left join github_app_installations installation
       on installation.github_installation_id = organization.github_installation_id
     where organization.state not in ('paused', 'revoked')
+      and (organization.credential_source <> 'pat' or operation.kind in
+        ('reconcile.repository.git', 'sync.git_ref', 'finalize.repository.git'))
       and (operation.repository_mirror_id is null or repository.state in ('discovered', 'active'))
       and ($3::text[] is null or operation.kind = any($3))
+      and ($4::text[] is null or organization.credential_source = any($4))
       and (
         operation.kind <> 'reconcile.organization_inventory'
         or (
@@ -8275,7 +8456,7 @@ defmodule ForgeMirrors do
     limit $2
     """
 
-    %{rows: rows} = Ecto.Adapters.SQL.query!(Repo, sql, [now, limit, kinds])
+    %{rows: rows} = Ecto.Adapters.SQL.query!(Repo, sql, [now, limit, kinds, sources])
     Enum.map(rows, fn [id] -> claim_operation!(id, owner, now, expires_at) end)
   end
 

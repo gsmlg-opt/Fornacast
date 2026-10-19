@@ -909,6 +909,65 @@ defmodule ForgeImports.PatSyncWorkerTest do
     assert Repo.get!(ImportRun, job.import_run_id).state in [:completed, :canceled]
   end
 
+  test "enrolled repositories use durable mirrors and remain pending until confirmation", c do
+    {:ok, first} =
+      OrganizationPatSettings.sync(c.owner, c.org.id, to_string(c.config.lock_version), %{},
+        dispatch: :manual
+      )
+
+    assert :pending = PatSyncWorker.perform(first.id, discovery_options: discovery_options(c))
+    assert :pending = PatSyncWorker.perform(first.id)
+    first = Repo.get!(PatSyncRun, first.id)
+
+    items = Repo.all(from i in RepositoryItem, where: i.import_run_id == ^first.import_run_id)
+    Enum.each(items, &complete_item!(&1, c))
+    assert :ok = PatSyncWorker.perform(first.id)
+
+    repository_ids = Enum.map(items, &Repo.get!(RepositoryItem, &1.id).hidden_repository_id)
+
+    assert {:ok, %{repository_mirrors: bindings}} =
+             ForgeMirrors.enroll_pat_git_repositories(
+               c.owner,
+               c.org.id,
+               c.config.lock_version,
+               repository_ids,
+               %{}
+             )
+
+    assert length(bindings) == 2
+    repository = Repo.get!(ForgeRepos.Repository, hd(repository_ids))
+
+    assert {:error, :mirror_managed} =
+             ForgeImports.PatRepositorySync.sync(
+               c.owner,
+               c.config,
+               repository,
+               "source-org/alpha",
+               github_repository_id: hd(items).github_repository_id,
+               lookup_repository: fn _, _, _, _ ->
+                 flunk("legacy provider called after handoff")
+               end
+             )
+
+    {:ok, job} =
+      OrganizationPatSettings.sync(c.owner, c.org.id, to_string(c.config.lock_version), %{},
+        dispatch: :manual
+      )
+
+    assert :pending = PatSyncWorker.perform(job.id, discovery_options: discovery_options(c))
+    assert :pending = PatSyncWorker.perform(job.id)
+
+    assert :pending =
+             PatSyncWorker.perform(job.id,
+               sync_repository: fn _, _, _, _, _ ->
+                 flunk("legacy writer called after handoff")
+               end
+             )
+
+    assert %{state: "running", progress: progress} = Repo.get!(PatSyncRun, job.id)
+    refute Enum.any?(progress, fn {_id, row} -> row["status"] == "succeeded" end)
+  end
+
   test "subsequent clicks update bound repositories and finish even when there are no new imports",
        c do
     {:ok, job} =

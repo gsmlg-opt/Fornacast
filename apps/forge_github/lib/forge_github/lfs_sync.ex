@@ -246,7 +246,7 @@ defmodule ForgeGitHub.LFSSync do
        when state in [:complete, :published] do
     after_oid = Map.get(checkpoint, "requirement_cursor")
 
-    options = [gate_key: {:github_installation, sync.github_installation_id}]
+    options = [gate_key: ForgeGitHub.MirrorCredential.gate_key(sync)]
 
     options =
       case callbacks.authorize do
@@ -379,7 +379,7 @@ defmodule ForgeGitHub.LFSSync do
     valid_sync =
       is_integer(sync[:repository_id]) and sync.repository_id > 0 and
         is_integer(sync[:repository_generation]) and sync.repository_generation > 0 and
-        is_integer(sync[:github_installation_id]) and sync.github_installation_id > 0 and
+        ForgeGitHub.MirrorCredential.valid_scope?(sync) and
         is_binary(sync[:repository_path]) and sync.repository_path != "" and
         is_binary(sync[:remote_owner]) and sync.remote_owner != "" and
         is_binary(sync[:remote_repository]) and sync.remote_repository != "" and

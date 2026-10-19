@@ -60,6 +60,50 @@ defmodule ForgeGitHub.LFSSyncTest do
     assert_received :published
   end
 
+  test "PAT LFS transfers use the saved credential gate with no installation" do
+    parent = self()
+
+    pat_sync =
+      Map.merge(sync(), %{
+        credential_source: :pat,
+        github_installation_id: nil,
+        github_credential_id: 8,
+        github_identity_id: 6,
+        github_credential_version: 3,
+        credential_owner_user_id: 2
+      })
+
+    options =
+      callbacks(
+        authorize: fn ->
+          send(parent, :authorized)
+          :ok
+        end,
+        begin_scan: fn _, key, _, _ -> {:ok, scan(key, :complete)} end,
+        transfer_page: fn _, _, :outbound, "saved-secret", "acme", "project", nil, opts ->
+          assert opts[:gate_key] == {:saved_credential, 8}
+          assert :ok = opts[:authorize].()
+          send(parent, :pat_transferred)
+          {:ok, nil}
+        end,
+        publish_scan: fn scan -> {:ok, %{scan | state: :published}} end
+      )
+
+    assert :ok =
+             LFSSync.ensure(
+               operation(),
+               pat_sync,
+               :outbound,
+               @target,
+               "saved-secret",
+               %{},
+               options
+             )
+
+    assert_received :pat_transferred
+    assert_received :authorized
+  end
+
   test "one durable object expansion yields a bounded credential-free checkpoint" do
     parent = self()
     work = %WorkItem{object_oid: @target, object_kind: :commit, tree_offset: 0}

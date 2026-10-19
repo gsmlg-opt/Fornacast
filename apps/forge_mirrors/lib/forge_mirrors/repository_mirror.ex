@@ -17,6 +17,7 @@ defmodule ForgeMirrors.RepositoryMirror do
   schema "repository_mirrors" do
     field :organization_mirror_id, :integer
     field :repository_id, :integer
+    field :pat_repository_generation, :integer
     field :github_repository_id, :integer
     field :github_node_id, :string
     field :github_full_name, :string
@@ -78,6 +79,7 @@ defmodule ForgeMirrors.RepositoryMirror do
     |> cast(attrs, [
       :organization_mirror_id,
       :repository_id,
+      :pat_repository_generation,
       :github_repository_id,
       :github_node_id,
       :github_full_name,

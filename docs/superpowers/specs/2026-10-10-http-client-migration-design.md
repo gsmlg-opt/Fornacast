@@ -3,9 +3,10 @@
 Date: 2026-10-10
 
 Status: proposed design; http_fetch#68 is resolved in published HTTP Fetch
-0.21.13, but preserving HTTPS TLS-setup address failover is now blocked by
-http_fetch#135. Fornacast still locks 0.18.1; transport migration remains
-pending. Re-audited 2026-10-19.
+0.20.0+. The selected TLS-setup failover evidence fix for #135 is published in
+Hex 0.21.14. Fornacast still locks 0.18.1; migration awaits dependency adoption
+and scoped local transport acceptance. Packages re-audited 2026-10-19 at
+11:00 UTC; release completion checked at 11:24 UTC.
 
 ## Objective and scope
 
@@ -44,13 +45,17 @@ upstream-owned rather than being patched in Fornacast.
 
 The packages share the upstream repository `gsmlg-dev/http_fetch`. The earlier
 audits covered exact Hex 0.17.2 and 0.18.1 archives. The 2026-10-19 re-audit covers
-the published Hex 0.21.13 archive and the matching
-[v0.21.13 tag](https://github.com/gsmlg-dev/http_fetch/releases/tag/v0.21.13)
-(`6b2ede60787390aa2959bde38a0ba6f48e5c413b`). The archive SHA-256 is
-`31a558d922eb288ba3a699957ed377663f339b0fde1f4a2739f8bd654f06f307`, matching
-the Hex release API checksum; its public Fetch and RequestError modules match
-the tag byte for byte. These are source/package findings, not executed upstream
-wire tests or Fornacast Fetch transport acceptance tests.
+the published Hex 0.21.14 Fetch/Core/Runtime archives and the matching
+[v0.21.14 tag](https://github.com/gsmlg-dev/http_fetch/tree/v0.21.14)
+(`6b69bde3f43f2270317c38fbe68d5ac9635d3b36`). The Fetch archive SHA-256 is
+`5795a83c87e7f7f033f1600a63268751ac12f9462adc92ecd1c5b8af1791be29`, matching
+the Hex release API checksum. The inspected RequestError, SSL transport and dialer
+files match the tag byte for byte. All eight coordinated HTTP-family packages
+publish non-retired 0.21.14 versions. The [GitHub release](https://github.com/gsmlg-dev/http_fetch/releases/tag/v0.21.14)
+published at 11:00:53 UTC, and the [release workflow](https://github.com/gsmlg-dev/http_fetch/actions/runs/39238484984)
+completed successfully, checked at 11:24 UTC. These are source/package and remote
+workflow findings, not locally executed upstream wire tests or Fornacast Fetch
+transport acceptance tests.
 
 The published API supports explicit `http_version: :http1`,
 `redirect: :manual`, `decode_body: false`, connection/request timeouts,
@@ -77,9 +82,9 @@ release change log.
 
 [http_fetch#68](https://github.com/gsmlg-dev/http_fetch/issues/68) closed on
 2026-10-10. Release 0.20.0 added `error_mode: :structured` and the public
-`HTTP.RequestError.pre_send?/1` predicate; both remain in published 0.21.13.
-That upstream request is resolved. A narrower TLS-setup capability gap remains
-for preserving the complete current transport contract, as described below.
+`HTTP.RequestError.pre_send?/1` predicate; both remain in published 0.21.14.
+That upstream request is resolved. The narrower TLS-setup evidence request is
+also resolved for the eligible failures described below.
 
 Both current transport boundaries try validated IPs only until a connection
 succeeds, then send the request once. In 0.21.13 the structured mode uses a fresh
@@ -99,13 +104,24 @@ all TLS negotiation failures, so adopting 0.21.13 alone would remove some existi
 safe address failover. This is an intentional limit of the current upstream API,
 not a regression claim against #68.
 
-New [http_fetch#135](https://github.com/gsmlg-dev/http_fetch/issues/135) requests
-confirmed pre-HTTP TLS setup failure evidence together with a successful cleanup
-barrier, or equivalent upstream pin failover before any HTTP send. Its minimal
-wire fixture is source-derived and was not executed during this audit. Under the
-repository blocker policy, full transport migration remains stopped until a
-released dependency preserves that contract. Do not infer safety from raw TLS
-errors or implement a local bypass of the evidence API.
+[http_fetch#135](https://github.com/gsmlg-dev/http_fetch/issues/135) is now closed:
+[PR #137](https://github.com/gsmlg-dev/http_fetch/pull/137) merged at
+2026-10-19 10:16:26 UTC, commit
+`851ab949ad156cd1bb2600a24c1520e5bf2acac4`. The source adds request-bound
+`phase: :tls_setup` evidence for selected confirmed handshake/certificate alerts
+after ServerHello and extends `pre_send?/1`. Its cleanup-gated wire tests cover
+a fresh second-pin POST/upload, original Host/SNI and unchanged TLS policy, plus
+negative cancellation, deadline, unsupported-route and post-send cases. Upstream
+Test/E2E checks passed; those tests were inspected, not executed locally.
+
+Hex published the fixed 0.21.14 package family at 10:57 UTC; its inspected archives
+contain the new evidence and tracked TLS cleanup. The publication gate is closed.
+The remaining work is adoption of the fixed package family and scoped Fornacast
+transport acceptance. Earlier or ambiguous TLS failures, ExSSL, pooled/managed
+routes, custom handshakes and early data remain outside the new evidence path.
+These cases must stop failover unless the public predicate and cleanup barrier
+prove it safe. Under the repository blocker policy, do not infer safety from raw
+TLS errors or implement a local bypass of the evidence API.
 
 Use `HTTP.RequestError.pre_send?/1` as the only permission to advance to another
 validated pin. A raw `:timeout`, `:closed`, or other error classification cannot
@@ -135,10 +151,10 @@ check that these published artifacts compile with the project's pinned toolchain
 
 ## Approaches and recommendation
 
-1. **Full direct migration after the remaining upstream gate (recommended).** Replace Req and
+1. **Full direct migration using published 0.21.14 (recommended).** Replace Req and
    Mint at the existing provider boundary and adapt tests to the new client.
    This gives one production client stack and avoids a permanent compatibility
-   layer. Released TLS-setup evidence, dependency refresh, and local integration
+   layer. Adoption of TLS-setup evidence, dependency refresh, and local integration
    checks determine completion.
 2. **Retain Req as a facade over Fetch.** This would preserve more response/test
    shapes initially but retain the legacy direct dependency and add an adapter.
@@ -237,8 +253,8 @@ devenv Unix socket and `PGPORT=55432`. Run the required formatter check and comp
 checks with the pinned devenv toolchain. Report any out-of-scope failures without
 repairing them.
 
-Completion requires released support for http_fetch#135 as well as adopting the
-http_fetch#68 fix in the lockfile, successful scoped integration checks,
+Completion requires adopting published 0.21.14 support for http_fetch#135 and
+http_fetch#68 in the lockfile, successful scoped integration checks,
 preservation of current streaming/security
 contracts, and removal of Fornacast-owned production Req/Mint calls and obsolete
 test dependencies. This document is a proposal, not implementation approval or a

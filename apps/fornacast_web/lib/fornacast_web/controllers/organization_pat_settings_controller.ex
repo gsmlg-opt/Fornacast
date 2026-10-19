@@ -69,6 +69,7 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
   def save(conn, params), do: mutate(conn, params, :save)
   def selection(conn, params), do: mutate(conn, params, :selection)
   def refresh(conn, params), do: mutate(conn, params, :refresh)
+  def git_mirror(conn, params), do: mutate(conn, params, :git_mirror)
   def sync_now(conn, params), do: mutate(conn, params, :sync_now)
   def check(conn, params), do: mutate(conn, params, :check)
   def pause(conn, params), do: mutate(conn, params, :pause)
@@ -96,6 +97,9 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
           metadata = RequestMetadata.from_conn(conn)
 
           case action do
+            :git_mirror ->
+              enroll_git_mirrors(actor, organization.id, attrs, metadata)
+
             :save ->
               PatSettings.save(actor, organization.id, attrs, metadata)
 
@@ -187,6 +191,9 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
 
     message =
       case action do
+        :git_mirror ->
+          "Selected repositories enrolled for bidirectional Git and LFS synchronization."
+
         :refresh ->
           "Repository list refreshed."
 
@@ -212,6 +219,9 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
   defp render_view(conn, organization, view, template, error, check_result \\ nil) do
     {:ok, runs} = PatSyncQueries.list_runs(conn.assigns.current_user, organization.id)
 
+    {:ok, pat_mirror} =
+      ForgeMirrors.pat_git_enrollment_view(conn.assigns.current_user, organization.id)
+
     latest_run =
       case List.first(runs) do
         nil ->
@@ -233,6 +243,7 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
         %{
           organization: organization,
           view: view,
+          pat_mirror: pat_mirror,
           error: error || feedback[:error],
           check_result: check_result || feedback[:report],
           latest_run: latest_run,
@@ -254,6 +265,36 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
       |> put_status(:not_found)
       |> page("GitHub settings", "Organization settings not found.")
 
+  defp enroll_git_mirrors(actor, organization_id, attrs, metadata) do
+    with true <- Enum.sort(Map.keys(attrs)) == ["lock_version", "repository_ids"],
+         {:ok, version} <- positive_id(attrs["lock_version"]),
+         values when is_list(values) and length(values) <= 101 <- attrs["repository_ids"],
+         {:ok, ids} <- repository_ids(Enum.reject(values, &(&1 == ""))),
+         true <- ids != [] do
+      ForgeMirrors.enroll_pat_git_repositories(actor, organization_id, version, ids, metadata)
+    else
+      _ -> {:error, :invalid_request}
+    end
+  end
+
+  defp repository_ids(values) do
+    Enum.reduce_while(values, {:ok, []}, fn value, {:ok, ids} ->
+      case positive_id(value) do
+        {:ok, id} -> {:cont, {:ok, [id | ids]}}
+        _ -> {:halt, {:error, :invalid_request}}
+      end
+    end)
+  end
+
+  defp positive_id(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {id, ""} when id > 0 and id <= 9_223_372_036_854_775_807 -> {:ok, id}
+      _ -> {:error, :invalid_request}
+    end
+  end
+
+  defp positive_id(_), do: {:error, :invalid_request}
+
   defp error_message(:stale), do: "The configuration changed. Refresh and try again."
 
   defp error_message(:invalid_request),
@@ -263,6 +304,17 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
     do: "Select a valid saved PAT belonging to an active organization owner."
 
   defp error_message(:paused), do: "Synchronization is paused. Resume it before syncing."
+
+  defp error_message(:legacy_sync_active),
+    do:
+      "Wait for the active synchronization task to finish before enabling bidirectional Git and LFS."
+
+  defp error_message(:unverified_import),
+    do: "Select repositories imported into this organization with the configured saved PAT."
+
+  defp error_message(:already_bound),
+    do: "A selected repository or organization already has a different mirror connection."
+
   defp error_message(:not_enabled), do: "Enable the GitHub mirror before syncing."
 
   defp error_message(:invalid_credential),

@@ -92,6 +92,32 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
     end
   end
 
+  test "Git and LFS enrollment is explicit, owner-only and validates selected local repositories",
+       c do
+    html = request(c.owner) |> get(c.path <> "/repositories") |> html_response(200)
+    assert html =~ "Bidirectional Git and LFS"
+
+    assert html =~
+             "Import repositories into this organization with the configured saved PAT first."
+
+    assert request(c.outsider)
+           |> post(c.path <> "/repositories/mirror", %{})
+           |> response(404)
+
+    for attrs <- [
+          "bad",
+          %{"lock_version" => "1", "repository_ids" => []},
+          %{"lock_version" => "1", "repository_ids" => ["bad"]},
+          %{"lock_version" => "1", "repository_ids" => ["1"], "extra" => "bad"}
+        ] do
+      assert request(c.owner)
+             |> post(c.path <> "/repositories/mirror", %{"pat_sync" => attrs})
+             |> html_response(422)
+    end
+
+    refute Repo.exists?(ForgeMirrors.OrganizationMirror)
+  end
+
   test "repository page offers immediate all-repository synchronization separately from selection",
        c do
     html =

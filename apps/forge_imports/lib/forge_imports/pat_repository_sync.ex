@@ -325,6 +325,7 @@ defmodule ForgeImports.PatRepositorySync do
   defp authorization(owner, config, repository, credential, options) do
     fn ->
       with :ok <- options.authorize.(),
+           :ok <- legacy_writer(config.id, repository.id),
            {:ok, %{config: current}} <- PatSettings.view(owner, config.organization_id),
            true <-
              current.id == config.id and current.owner_user_id == owner.id and
@@ -345,6 +346,14 @@ defmodule ForgeImports.PatRepositorySync do
         false -> authorization_mismatch(owner, config, repository)
         {:error, reason} -> {:error, reason}
       end
+    end
+  end
+
+  defp legacy_writer(configuration_id, repository_id) do
+    case ForgeMirrors.pat_repository_handoff(configuration_id, repository_id) do
+      {:ok, :legacy} -> :ok
+      {:ok, {:mirror, _binding}} -> {:error, :mirror_managed}
+      {:error, reason} -> {:error, reason}
     end
   end
 

@@ -339,7 +339,9 @@ defmodule ForgeImports.PatSyncWorker do
                    row["repository_id"]
                  ),
                true <- repository.generation == row["generation"] do
-            sync.(
+            sync_target(
+              sync,
+              job,
               owner,
               config,
               repository,
@@ -609,7 +611,9 @@ defmodule ForgeImports.PatSyncWorker do
                row.data["repository_id"]
              ),
            true <- repository.generation == row.data["generation"] do
-        sync.(
+        sync_target(
+          sync,
+          job,
           owner,
           config,
           repository,
@@ -659,6 +663,36 @@ defmodule ForgeImports.PatSyncWorker do
     case settlement do
       {:ok, _} -> result
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp sync_target(sync, job, owner, config, repository, source_full_name, options) do
+    with {:ok, handoff} <- ForgeMirrors.pat_repository_handoff(config.id, repository.id) do
+      case handoff do
+        :legacy ->
+          sync.(owner, config, repository, source_full_name, options)
+
+        {:mirror, _binding} ->
+          authorize = Keyword.fetch!(options, :authorize)
+
+          with :ok <- authorize.(),
+               {:ok, operation} <-
+                 ForgeMirrors.schedule_pat_git_repository(
+                   owner,
+                   config.id,
+                   repository.id,
+                   "pat-sync:#{job.id}:repository:#{repository.id}"
+                 ),
+               {:ok, status} <-
+                 ForgeMirrors.pat_git_repository_status(
+                   owner,
+                   config.id,
+                   repository.id,
+                   operation.id
+                 ) do
+            if status == :complete, do: :ok, else: {:error, :busy}
+          end
+      end
     end
   end
 

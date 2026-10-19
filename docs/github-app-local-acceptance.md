@@ -1,9 +1,11 @@
-# Local GitHub App mirror acceptance
+# Optional local GitHub App acceptance
 
-The PAT settings at `/organizations/:organization/settings/github` synchronize
-from GitHub. Permanent bidirectional mirrors use the separate App settings at
-`/organizations/:organization/settings/github/app`. PAT success does not prove
-App mirror acceptance.
+The current PRD uses a saved PAT; a GitHub App is a future replacement and is
+not required for PAT synchronization. This document describes the optional App
+plumbing at `/organizations/:organization/settings/github/app`. It does not
+define prerequisites for the current PAT release. The accepted saved-PAT Git/LFS
+endpoint checks and remaining credential-specific gates are recorded in the
+[acceptance ledger](superpowers/plans/2026-09-07-github-org-sync-acceptance.md).
 
 ## Configure the local process
 

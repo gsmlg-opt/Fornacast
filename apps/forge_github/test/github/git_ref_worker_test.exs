@@ -428,6 +428,89 @@ defmodule ForgeGitHub.GitRefWorkerTest do
     assert {:ok, :recovered} = GitRefWorker.process_operation(operation, @now, options)
   end
 
+  test "effect-pending observation failure defers without discarding its durable effect" do
+    operation = pending_effect_operation()
+    parent = self()
+
+    options =
+      options(operation,
+        fetch_refs: fn _request, _token, _namespace ->
+          {:error, %Error{kind: :transport, detail: "transport"}}
+        end,
+        defer_effect: fn ^operation, @now, retry_at, "network", "git_observation_unavailable" ->
+          assert retry_at == DateTime.add(@now, 60)
+          send(parent, :deferred)
+          {:ok, :deferred}
+        end
+      )
+
+    assert {:ok, :deferred} = GitRefWorker.process_operation(operation, @now, options)
+    assert_received :deferred
+    refute_received :deferred
+  end
+
+  test "effect-pending credential rate limits retain the retry time and marker" do
+    operation = pending_effect_operation()
+    retry_at = DateTime.add(@now, 90)
+
+    options =
+      options(operation,
+        token_fetch: fn _installation, _permissions ->
+          {:error, ForgeGitHub.Error.new(:primary_rate_limit, retry_at)}
+        end,
+        defer_effect: fn ^operation,
+                         @now,
+                         ^retry_at,
+                         "primary_rate_limit",
+                         "git_observation_unavailable" ->
+          {:ok, :deferred}
+        end
+      )
+
+    assert {:ok, :deferred} = GitRefWorker.process_operation(operation, @now, options)
+  end
+
+  test "a failed defer is returned once without settling the stale operation again" do
+    operation = pending_effect_operation()
+    parent = self()
+
+    options =
+      options(operation,
+        fetch_refs: fn _request, _token, _namespace ->
+          {:error, %Error{kind: :transport, detail: "transport"}}
+        end,
+        defer_effect: fn ^operation, @now, _retry_at, "network", "git_observation_unavailable" ->
+          send(parent, :defer_attempted)
+          {:error, :lost_lease}
+        end
+      )
+
+    assert {:error, :lost_lease} = GitRefWorker.process_operation(operation, @now, options)
+    assert_received :defer_attempted
+    refute_received :defer_attempted
+  end
+
+  test "an effect confirmation failure is not settled again with the previous capability" do
+    operation = operation()
+    parent = self()
+
+    options =
+      options(operation,
+        remote_oid: @head,
+        ancestor?: fn _path, @base, @head -> {:ok, true} end,
+        mark_effect: mark_effect(parent, operation),
+        apply_local: fn _path, _ref, @base, @head -> {:ok, @head} end,
+        confirm: fn _marked, "refs/heads/main", @head, @head, @now ->
+          send(parent, :confirmation_attempted)
+          {:error, :lost_lease}
+        end
+      )
+
+    assert {:error, :lost_lease} = GitRefWorker.process_operation(operation, @now, options)
+    assert_received :confirmation_attempted
+    refute_received :confirmation_attempted
+  end
+
   test "effect-pending recovery replaces a landed remote marker before an opposite local effect" do
     parent = self()
 
@@ -661,6 +744,31 @@ defmodule ForgeGitHub.GitRefWorkerTest do
     assert_received {:fanout, ["refs/heads/main", "refs/heads/old", "refs/tags/v1.0.0"]}
   end
 
+  test "repository observation settlement failures return without a second stale retry" do
+    parent = self()
+
+    for kind <- ["reconcile.repository.git", "reconcile.repository.bootstrap"] do
+      operation = %{operation() | kind: kind, cursor: %{}}
+      context = Keyword.fetch!(options(operation, []), :context)
+
+      options =
+        options(operation,
+          repository_context: context,
+          fetch_refs: fn _request, _token, _namespace ->
+            {:error, %Error{kind: :transport, detail: "transport"}}
+          end,
+          retry: fn ^operation, @now, _retry_at, "network", [] ->
+            send(parent, :retry_attempted)
+            {:error, :lost_lease}
+          end
+        )
+
+      assert {:error, :lost_lease} = GitRefWorker.process_operation(operation, @now, options)
+      assert_received :retry_attempted
+      refute_received :retry_attempted
+    end
+  end
+
   test "fenced Git reconciliation roots stop before token, provider, or LFS work" do
     for kind <- ["reconcile.repository.git", "finalize.repository.git"],
         {reason, result} <- [
@@ -767,6 +875,282 @@ defmodule ForgeGitHub.GitRefWorkerTest do
     }
   end
 
+  test "PAT mirrors reconcile inbound Git and LFS without installation credentials" do
+    parent = self()
+    operation = operation()
+
+    options =
+      pat_options(operation,
+        remote_oid: @head,
+        ancestor?: fn "/repos/example.git", @base, @head -> {:ok, true} end,
+        mark_effect: mark_effect(parent, operation),
+        lfs_gate: fn marked, %{github_installation_id: nil}, :inbound, @head, "saved-secret", _ ->
+          assert marked.state == :effect_pending
+          send(parent, :pat_lfs_ready)
+          :ok
+        end,
+        apply_local: fn "/repos/example.git", "refs/heads/main", @base, @head ->
+          assert_received :pat_lfs_ready
+          send(parent, :pat_local_cas)
+          {:ok, @head}
+        end,
+        confirm: fn _, "refs/heads/main", @head, @head, @now -> {:ok, :confirmed} end
+      )
+
+    assert :ok = GitRefWorker.process_operation(operation, @now, options)
+    assert_received :pat_local_cas
+  end
+
+  test "PAT outbound LFS finishes before the freshly authorized Git CAS" do
+    parent = self()
+    operation = operation()
+
+    options =
+      pat_options(operation,
+        local_oid: @head,
+        remote_oid: @base,
+        ancestor?: fn "/repos/example.git", @base, @head -> {:ok, true} end,
+        mark_effect: mark_effect(parent, operation),
+        lfs_gate: fn _, _, :outbound, @head, "saved-secret", _ ->
+          send(parent, :pat_lfs_ready)
+          :ok
+        end,
+        push_remote: fn _, "saved-secret", %RefUpdate{expected_oid: @base, proposed_oid: @head} ->
+          assert_received :pat_lfs_ready
+          send(parent, :pat_pushed)
+          :ok
+        end,
+        confirm: fn _, "refs/heads/main", @head, @head, @now -> {:ok, :confirmed} end
+      )
+
+    assert :ok = GitRefWorker.process_operation(operation, @now, options)
+    assert_received :pat_pushed
+    assert_receive :pat_checkout
+    assert_receive :pat_checkout
+    assert_receive :pat_checkout
+  end
+
+  test "PAT rotation after effect marking prevents LFS upload and Git publication" do
+    parent = self()
+    operation = operation()
+
+    options =
+      pat_options(operation,
+        local_oid: @head,
+        remote_oid: @base,
+        ancestor?: fn "/repos/example.git", @base, @head -> {:ok, true} end,
+        mark_effect: fn op, now, marker ->
+          Process.put({__MODULE__, :pat_rotated}, true)
+          mark_effect(parent, operation).(op, now, marker)
+        end,
+        pat_checkout: fn _scope, callback ->
+          version = if Process.get({__MODULE__, :pat_rotated}), do: 4, else: 3
+          {:ok, callback.("saved-secret", %{pat_reference() | verification_version: version})}
+        end,
+        lfs_gate: fn _, _, _, _, _, _ -> flunk("rotated PAT uploaded LFS") end,
+        push_remote: fn _, _, _ -> flunk("rotated PAT published Git") end,
+        fail: fn marked, @now, "credential_revoked", _ ->
+          assert marked.state == :effect_pending
+          send(parent, :rotation_blocked)
+          {:ok, :failed}
+        end
+      )
+
+    assert :ok = GitRefWorker.process_operation(operation, @now, options)
+    assert_received :rotation_blocked
+  end
+
+  test "PAT repository name reuse cannot fetch or publish Git objects" do
+    parent = self()
+    operation = operation()
+
+    opts =
+      pat_options(operation,
+        repository_fetch: fn _, _, _, _ ->
+          {:ok,
+           struct(ForgeGitHub.Repository,
+             id: 999,
+             owner_id: 99,
+             node_id: "R_replaced",
+             owner_login: "acme",
+             name: "project"
+           )}
+        end,
+        fail: fn ^operation, @now, "provider_validation", _ ->
+          send(parent, :identity_rejected)
+          {:ok, :failed}
+        end
+      )
+
+    opts = Keyword.put(opts, :fetch_refs, fn _, _, _ -> flunk("replaced repository fetched") end)
+    assert {:ok, :failed} = GitRefWorker.process_operation(operation, @now, opts)
+    assert_received :identity_rejected
+  end
+
+  test "PAT repository replacement after observation prevents an inbound local CAS" do
+    parent = self()
+    operation = operation()
+    key = {__MODULE__, :repository_replaced}
+
+    opts =
+      pat_options(operation,
+        ancestor?: fn "/repos/example.git", @base, @head -> {:ok, true} end,
+        repository_fetch: fn _, _, _, _ ->
+          id = if Process.get(key), do: 999, else: 100
+
+          {:ok,
+           struct(ForgeGitHub.Repository,
+             id: id,
+             owner_id: 99,
+             node_id: "R_pat",
+             owner_login: "acme",
+             name: "project"
+           )}
+        end,
+        mark_effect: fn op, now, marker ->
+          Process.put(key, true)
+          mark_effect(parent, operation).(op, now, marker)
+        end,
+        fail: fn marked, @now, "provider_validation", _ ->
+          assert marked.state == :effect_pending
+          send(parent, :local_identity_rejected)
+          {:ok, :failed}
+        end
+      )
+
+    context = opts[:context]
+
+    opts =
+      Keyword.put(opts, :context, fn op ->
+        {:ok, sync} = context.(op)
+        {:ok, %{sync | lfs_enabled: false}}
+      end)
+
+    assert :ok = GitRefWorker.process_operation(operation, @now, opts)
+    assert_received :local_identity_rejected
+  end
+
+  test "PAT baseline-matching inbound and outbound deletions become visible conflicts" do
+    for {local, remote} <- [{@base, nil}, {nil, @base}] do
+      operation = operation()
+      parent = self()
+
+      opts =
+        pat_options(operation,
+          local_oid: local,
+          remote_oid: remote,
+          conflict: fn ^operation,
+                       "refs/heads/main",
+                       :delete_vs_update,
+                       @base,
+                       ^local,
+                       ^remote,
+                       @now ->
+            send(parent, :deletion_conflict)
+            {:ok, :conflicted}
+          end,
+          lfs_gate: fn _, _, _, _, _, _ -> flunk("PAT deletion reached LFS") end
+        )
+
+      assert :ok = GitRefWorker.process_operation(operation, @now, opts)
+      assert_received :deletion_conflict
+    end
+  end
+
+  test "persisted PAT deletion effects fail before checkout or recovery effects" do
+    for action <- ["delete_local", "delete_remote"] do
+      operation = %{
+        operation()
+        | state: :effect_pending,
+          external_effect_marker: %{
+            "action" => action,
+            "ref" => "refs/heads/main",
+            "expected_oid" => @base
+          }
+      }
+
+      parent = self()
+
+      opts =
+        pat_options(operation,
+          pat_checkout: fn _, _ -> flunk("persisted PAT deletion checked out a credential") end,
+          fail: fn ^operation, @now, "local_validation", detail ->
+            assert detail =~ "does not permit Git ref deletion"
+            send(parent, :deletion_blocked)
+            {:ok, :failed}
+          end
+        )
+
+      assert {:ok, :failed} = GitRefWorker.process_operation(operation, @now, opts)
+      assert_received :deletion_blocked
+    end
+  end
+
+  defp pat_options(operation, overrides) do
+    parent = self()
+    options = options(operation, overrides)
+    original_context = options[:context]
+
+    defaults = [
+      context: fn op ->
+        {:ok, sync} = original_context.(op)
+
+        {:ok,
+         Map.merge(sync, %{
+           credential_source: :pat,
+           github_installation_id: nil,
+           github_repository_id: 100,
+           github_account_id: 99,
+           github_node_id: "R_pat",
+           github_credential_id: 8,
+           github_identity_id: 6,
+           github_credential_version: 3,
+           credential_owner_user_id: 2
+         })}
+      end,
+      token_fetch: fn _, _ -> flunk("PAT mirror requested an App token") end,
+      repository_fetch: fn "saved-secret", "acme", "project", gate_key: {:saved_credential, 8} ->
+        {:ok,
+         struct(ForgeGitHub.Repository,
+           id: 100,
+           owner_id: 99,
+           node_id: "R_pat",
+           owner_login: "acme",
+           name: "project"
+         )}
+      end,
+      pat_authorize: fn _ -> :ok end,
+      pat_checkout: fn _scope, callback ->
+        send(parent, :pat_checkout)
+
+        {:ok,
+         ForgeAccounts.GitHubCredentialCallback.invoke(
+           fn token -> callback.(token, pat_reference()) end,
+           "saved-secret",
+           ForgeAccounts.GitHubAccounts.CredentialCallbackError
+         )}
+      end,
+      fetch_refs: fn %SyncRequest{}, "saved-secret", "repository-3" ->
+        oid = Keyword.get(overrides, :remote_oid, @head)
+        {:ok, [%ObservedRef{ref: "refs/heads/main", oid: oid}]}
+      end
+    ]
+
+    options
+    |> Keyword.merge(defaults)
+    |> Keyword.merge(Keyword.take(overrides, [:pat_authorize, :pat_checkout, :repository_fetch]))
+  end
+
+  defp pat_reference do
+    %ForgeAccounts.GitHubCredentialVerification{
+      credential_id: 8,
+      identity_id: 6,
+      local_user_id: 2,
+      verification_version: 3,
+      generation_digest: <<0::256>>
+    }
+  end
+
   defp options(operation, overrides) do
     local_oid = Keyword.get(overrides, :local_oid, @base)
     remote_oid = Keyword.get(overrides, :remote_oid, @head)
@@ -827,6 +1211,21 @@ defmodule ForgeGitHub.GitRefWorkerTest do
     ]
 
     Keyword.merge(defaults, overrides)
+  end
+
+  defp pending_effect_operation do
+    %{
+      operation()
+      | state: :effect_pending,
+        checkpoint: %{"scan_key" => "existing-lfs-scan"},
+        external_effect_marker: %{
+          "action" => "apply_local",
+          "expected_oid" => @base,
+          "proposed_oid" => @head,
+          "lfs_required" => true,
+          "ref" => "refs/heads/main"
+        }
+    }
   end
 
   defp mark_effect(parent, operation) do

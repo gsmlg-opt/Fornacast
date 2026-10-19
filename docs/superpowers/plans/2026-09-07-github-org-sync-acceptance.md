@@ -4,31 +4,71 @@ Source: `docs/fornacast-github-org-sync-prd.md`, section 13 (all 22 criteria).
 
 This is a working evidence ledger, not a completion declaration. A test entrypoint
 below identifies relevant coverage; its existence alone does not prove acceptance.
-The full goal remains open. PR11 through PR16 have local implementation and
-focused integration proof. The remaining gate is the external, two-endpoint
-acceptance matrix, including a synchronized clone/checkout from GitHub.
+The full goal remains open. PR11 through PR16 have local App-based implementation
+and focused integration proof. The current PRD instead requires PAT support.
+The current branch adds permanent PAT Git/LFS enrollment and durable two-way
+worker execution; its real endpoint acceptance is recorded separately below.
+PAT inventory and collaboration-metadata parity and the full external matrix
+remain open. Historical App results below do not establish PAT parity.
 
 ## Requirement-by-requirement gates
 
 ### Local live-acceptance setup (2026-10-19)
 
-- The selected environment for the remaining external acceptance is the local
-  instance. Follow [local App setup and endpoint evidence](../../github-app-local-acceptance.md)
-  for process configuration, installation, webhook delivery, and independent
-  GitHub/Fornacast clone plus hydrated LFS verification.
+- The selected environment is the local instance, using its existing saved PAT.
+  PRD product decision 4 makes PAT the current credential and GitHub App a future
+  replacement. The user has no App; App setup is not a current prerequisite.
+  The [optional App procedure](../../github-app-local-acceptance.md) applies only
+  to that separate path.
 - Development now reads the same App environment variables as releases. The
   production parser remains inline because installed-release configuration
   forbids `import_config`; tests exercise that restriction as well as matching
   configured, disabled, partial, and invalid development/release inputs.
-- This setup work does not close criterion 11. An actual test organization,
-  installation and endpoint observations are still required. PAT synchronization
-  and its recovery regression are separate from permanent two-way App mirroring.
+- The designated external test organization is `duskmoon-dev` (GitHub ID
+  `127959075`). The managed process's PAT confirms account `gsmlg` has active
+  admin membership. A private dedicated repository,
+  `duskmoon-dev/fornacast-sync-acceptance-20261019` (ID `1425392764`), was created
+  for acceptance. No pre-existing GitHub repository was modified.
+- Production saved-PAT single-repository import `11` completed and item `116`
+  published at `/admin/fornacast-sync-acceptance-20261019`, with zero warnings,
+  failures or skips. Independent real GitHub and Fornacast HTTP clones pass
+  `git fsck --full` and `git lfs fsck`; branch/tag refs, commit/tree IDs and the
+  hydrated 128 KiB LFS SHA-256 match the [safe manifest](../../evidence/2026-10-19-pat-endpoint-checkouts.json).
+  The temporary local clone API key was revoked. This proves one-time inbound
+  import and both endpoint checkouts; the separate permanent PAT Git/LFS
+  implementation and its current validation boundary follow below.
+- The current branch adds explicit enrollment of already imported organization
+  repositories into the permanent Git/LFS engine. It pins import provenance,
+  repository generation, immutable GitHub IDs and saved-credential versions;
+  plaintext PATs remain callback-scoped in the account vault. Legacy Sync now
+  hands enrolled repositories to durable mirror work and waits for successful
+  Git/LFS finalization, including superseded reconciliation chains. Local outbox
+  events and periodic reconciliation admit Git/LFS work only, avoiding unsupported
+  metadata jobs. Fresh PostgreSQL migration and focused domain/provider tests
+  pass; real endpoint acceptance passes for the bounded Git/LFS path below. Branch/tag deletion remains
+  disabled for this PAT path under the current write policy.
+- Permanent saved-PAT workers now have real bidirectional endpoint proof in the
+  [safe manifest](../../evidence/2026-10-19-pat-bidirectional-git-lfs.json).
+  V2 inbound reconciliation `179` completes at GitHub commit
+  `413d6df73602ef32fd50f512c16b829aa3acf95c`; independent clones and three branch
+  checkouts match Git/LFS bytes. V2's first outbound attempt fails at operation
+  `189` because a raw LocalCAS source was opened in one process and read in
+  another. The coordinator's private source owner repairs that contract. The
+  failed attempt remains in the evidence, and V2 shuts down with sandbox rollback.
+  A fresh V3 binding imports/enrolls the verified inbound state and completes
+  reconciliation `197`, then actual Fornacast HTTP Git/LFS push and reconciliation
+  `205` publish commit `4ec67d38fc186ddea1321a7e6d02aa13ea5c00e0` to GitHub.
+  Finalizer `214` confirms bootstrap item `52` at 11:34:56 UTC. Fresh clones from
+  both endpoints pass four branch checkouts, matching refs/commit/tree IDs and
+  hydrated 128/160/192 KiB SHA-256/size checks with official git-lfs. Both temporary
+  API keys are revoked and credential files removed; isolated rows roll back and
+  listeners stop. V2 and V3 are separate fixtures, not one uninterrupted binding.
 - PAT retry admission is independently repaired in `5e82058`: recovery excludes
   failed ancestors that already have a successor. The managed local service was
   reloaded and the real browser `Sync now` POST returned `303`, admitting task
   `17` instead of the former `:invalid_predecessor` failure. That observation
   proves admission with the loaded fix, not terminal completion of the whole
-  synchronization or App mirror acceptance.
+  synchronization or permanent bidirectional mirror acceptance.
 
 ### Security and lifecycle follow-up (2026-09-23)
 
@@ -1151,17 +1191,17 @@ PR13 integration audit additionally identified these concrete remaining gates:
 
 | # | Required outcome | Current evidence / next gate |
 |---|---|---|
-| 1 | Owner connects the App to the correct organization | Locally accepted in `fe1a8fd` through the production install/settings routes, correlated callback domain handoff, distinct immutable GitHub organization identity, owner success, linked-outsider rejection, and installation mismatch rejection. Retain live GitHub App proof. |
+| 1 | Owner connects the correct GitHub organization with a saved PAT | Saved PAT and `duskmoon-dev` membership are verified. Explicit permanent Git/LFS enrollment now validates completed import provenance and pins immutable account/repository IDs, local generation and credential versions. Fresh domain/provider integration tests pass. Historical App-specific tests in `fe1a8fd` remain separate. |
 | 2 | Permission and partial-access problems visible before bootstrap | Locally accepted in `fe1a8fd`: settings render partial selection and missing permissions, while the production bootstrap route refuses the request and creates no import run. Retain live provider-permission proof. |
 | 3 | All enabled supported resources bootstrap to active bindings | Locally accepted by composition: the App-backed acceptance imports and publishes real issue/comment/pull/release mappings and baselines; publication tests cover Git refs and LFS hold; Git/LFS persistence tests prove the finalizer activates the repository and organization only after required confirmations. Retain live GitHub bootstrap proof. |
 | 4 | Bootstrap-time webhooks replay after baseline | Locally accepted: six supported delivery families remain buffered during real App staging and become eligible only after publication handoff; a valid pull delivery is deferred by the real worker before baseline and completes into the exact bound `sync.pull` operation after the run finishes. Dedicated Git/LFS and resource webhook tests cover the other processors. Retain live delivery proof. |
 | 5 | GitHub-created repository imports according to policy | Locally accepted: the production inventory consumer follows policy-created work through one App-backed run/item, retryable discovery successor recovery, publication handoff, parent FIFO release, and exact child reconciliation claim while preserving the active organization binding. Retain live GitHub creation/import proof. |
 | 6 | Local organization repository is created on GitHub according to policy | Locally accepted in PR16: typed policy/capability admission, strict installation-gated create, absence marker, immediate pre-POST lifecycle fence, timeout and 422 recovery, per-binding collision evidence, immutable binding/baseline, and ordered Git-then-metadata activation are covered. Retain live GitHub proof in final acceptance. |
-| 7 | Local branch create/fast-forward reaches GitHub | Locally accepted by composition: the worker persists/authorizes the outbound effect and the real fixed-host transport fixture advances the exact remote branch/tag without force. Retain live GitHub proof. |
-| 8 | GitHub branch create/fast-forward reaches Fornacast | Locally accepted: owner reconciliation fetches a commit from a separate bare remote into the private namespace, holds the public ref across LFS checkpoints, and applies the exact local CAS only after object verification. Retain live GitHub proof. |
-| 9 | Safe ref deletion only from unchanged baseline | Locally accepted: decision, persistence, worker, local CAS, and real remote transport tests cover branch/tag deletion only at the exact confirmed OID and preserve stale refs. Retain live two-endpoint proof. |
+| 7 | Local branch create/fast-forward reaches GitHub | Real saved-PAT V3 reconciliation 205 creates a slash-bearing branch/tag and fast-forwards main on GitHub after verified LFS transfer. Both independent endpoint clones/checkouts match commit, refs, trees and hydrated bytes. See the bidirectional manifest above. |
+| 8 | GitHub branch create/fast-forward reaches Fornacast | Real saved-PAT V2 reconciliation 179 fetches the GitHub update, creates its branch/tag and advances main only after LFS verification. Both independent endpoint clones/checkouts match. See the bidirectional manifest above. |
+| 9 | Safe ref deletion only from unchanged baseline | Historical App implementation has local decision/persistence/transport coverage. Current PAT policy rejects deletion, including previously saved deletion markers, and records divergence instead of deleting either endpoint's public ref. This PRD criterion is not accepted for PAT. |
 | 10 | Divergence is visible and neither side overwritten | Locally accepted: the worker records the exact baseline/local/remote conflict and conflicted ref state without calling either mutation boundary; the production owner conflict route renders bounded comparisons and keeps Git conflicts read-only. Retain live conflict proof. |
-| 11 | LFS clone and checkout succeed from either endpoint after sync | Actual Fornacast smart-HTTP clone with official git-lfs 3.7.1 checks out 128 KiB with matching SHA-256. Existing official SSH LFS transfer coverage is also present. Remote endpoint plus full synchronization-to-clone chain remain unproven. |
+| 11 | LFS clone and checkout succeed from either endpoint after sync | Accepted for the saved-PAT Git/LFS slice: V2 inbound and separate repaired V3 outbound complete real permanent-worker execution; both endpoints pass independent official git-lfs 3.7.1 clone/checkout, Git/LFS fsck and matching hydrated bytes. Outbound checks cover four branches and 128/160/192 KiB files. See the bidirectional manifest above; full PAT metadata/inventory parity remains open. |
 | 12 | Missing/corrupt LFS blocks confirmation and degrades sync | Locally accepted: worker, storage, durable 101-pointer replay, authoritative scan, and finalizer tests prove the public ref and baseline remain unchanged while the operation/repository is degraded; verified bytes are required before later confirmation. Retain live GitHub failure/recovery proof. |
 | 13 | Issue/comment changes converge both ways | PR12 local worker, mapping, effect recovery, label materialization, signed ingress and bootstrap activation are implemented through `f45097e`; combined activation matrix: 150 passed. Real domain/lease/HTTP-stub tests cover both directions and omitted comment deletion. Retain live two-endpoint acceptance. |
 | 14 | Same-repository PR metadata converges both ways | Locally accepted in PR13, including represented cross-repository synchronization, unrepresented read-only behavior and trusted late head representation. Retain live GitHub validation in final acceptance. |

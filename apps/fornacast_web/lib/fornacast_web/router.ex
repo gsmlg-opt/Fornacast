@@ -117,6 +117,10 @@ defmodule FornacastWeb.Router do
          OrganizationPATSettingsController,
          :refresh
 
+    post "/organizations/:organization/settings/github/repositories/mirror",
+         OrganizationPATSettingsController,
+         :git_mirror
+
     post "/organizations/:organization/settings/github/sync",
          OrganizationPATSettingsController,
          :sync_now

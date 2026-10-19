@@ -39,6 +39,13 @@ defmodule ForgeMirrors.OrganizationMirror do
   schema "organization_mirrors" do
     field :organization_id, :integer
     field :provider, :string
+    field :credential_source, Ecto.Enum, values: [:github_app, :pat], default: :github_app
+    field :pat_configuration_id, :integer
+    field :pat_configuration_version, :integer
+    field :credential_owner_user_id, :integer
+    field :github_identity_id, :integer
+    field :github_credential_id, :integer
+    field :github_credential_version, :integer
     field :github_installation_id, :integer
     field :github_account_id, :integer
     field :github_account_login, :string
@@ -52,6 +59,41 @@ defmodule ForgeMirrors.OrganizationMirror do
     field :next_reconcile_at, :utc_datetime
     field :lock_version, :integer, default: 1
     timestamps(type: :utc_datetime)
+  end
+
+  @doc false
+  def pat_enrollment_changeset(mirror, attrs) do
+    mirror
+    |> cast(attrs, [
+      :organization_id,
+      :provider,
+      :github_account_id,
+      :github_account_login,
+      :pat_configuration_id,
+      :pat_configuration_version,
+      :credential_owner_user_id,
+      :github_identity_id,
+      :github_credential_id,
+      :github_credential_version,
+      :bootstrap_import_run_id,
+      :next_reconcile_at
+    ])
+    |> put_change(:credential_source, :pat)
+    |> put_change(:github_installation_id, nil)
+    |> put_change(:capabilities, %{"git" => true, "lfs" => true})
+    |> put_change(:policy, %{"auto_import_new_repositories" => false})
+    |> put_change(:state, :active)
+    |> validate_required([
+      :pat_configuration_id,
+      :pat_configuration_version,
+      :credential_owner_user_id,
+      :github_identity_id,
+      :github_credential_id,
+      :github_credential_version,
+      :github_account_id,
+      :github_account_login
+    ])
+    |> validate_persistence()
   end
 
   def states, do: @states

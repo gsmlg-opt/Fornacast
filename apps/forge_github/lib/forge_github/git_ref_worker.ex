@@ -8,7 +8,9 @@ defmodule ForgeGitHub.GitRefWorker do
 
   use GenServer
 
-  alias ForgeGitHub.{Error, InstallationToken, InstallationTokenBroker}
+  require Logger
+
+  alias ForgeGitHub.{Client, Error, MirrorCredential}
   alias ForgeMirrors.{GitRefDecision, MirrorOperation}
   alias GitCore.Remote.{ObservedRef, RefUpdate, SyncRequest}
 
@@ -35,6 +37,9 @@ defmodule ForgeGitHub.GitRefWorker do
     :context,
     :repository_context,
     :token_fetch,
+    :pat_authorize,
+    :pat_checkout,
+    :repository_fetch,
     :fetch_refs,
     :exact_ref,
     :list_refs,
@@ -58,6 +63,7 @@ defmodule ForgeGitHub.GitRefWorker do
     :reconcile_lfs,
     :checkpoint_reconciliation,
     :retry,
+    :defer_effect,
     :fail,
     :now
   ]
@@ -101,7 +107,12 @@ defmodule ForgeGitHub.GitRefWorker do
       raise ArgumentError, "Git ref processor timeout must finish inside its lease"
     end
 
-    claim = callback(options, :claim, &ForgeMirrors.claim_operations/5)
+    claim_default =
+      if Application.get_env(:forge_github, :app_configuration, :disabled) == :disabled,
+        do: &ForgeMirrors.claim_pat_git_operations/5,
+        else: &ForgeMirrors.claim_operations/5
+
+    claim = callback(options, :claim, claim_default)
 
     with {:ok, operations} <-
            claim.(owner, now, lease_seconds, min(batch_size, max_concurrency), @operation_kinds) do
@@ -147,29 +158,29 @@ defmodule ForgeGitHub.GitRefWorker do
         &ForgeMirrors.git_repository_operation_context/1
       )
 
-    token_fetch = callback(options, :token_fetch, &InstallationTokenBroker.fetch/2)
+    with {:ok, sync} <- context.(operation) do
+      with_token(sync, options, fn token ->
+        result =
+          with request <- sync_request(sync),
+               {:ok, observations} <- fetch_remote_refs(request, token, sync, options),
+               {:ok, local_refs} <-
+                 callback(options, :list_refs, fn _path ->
+                   with_repository_read(sync, &GitCore.list_refs/1)
+                 end).(sync.repository_path),
+               {:ok, ref_names} <- reconciliation_ref_names(sync, local_refs, observations) do
+            callback(options, :fanout, &ForgeMirrors.fanout_git_ref_reconciliation/3).(
+              operation,
+              ref_names,
+              now
+            )
+          else
+            {:error, reason} -> persist_failure(operation, now, reason, options)
+          end
 
-    with {:ok, sync} <- context.(operation),
-         %InstallationToken{token: token} <-
-           token_fetch.(sync.github_installation_id, %{
-             permissions: %{"contents" => "write", "metadata" => "read"}
-           }),
-         request <- sync_request(sync),
-         {:ok, observations} <- fetch_remote_refs(request, token, sync, options),
-         {:ok, local_refs} <-
-           callback(options, :list_refs, fn _path ->
-             with_repository_read(sync, &GitCore.list_refs/1)
-           end).(sync.repository_path),
-         {:ok, ref_names} <- reconciliation_ref_names(sync, local_refs, observations) do
-      callback(options, :fanout, &ForgeMirrors.fanout_git_ref_reconciliation/3).(
-        operation,
-        ref_names,
-        now
-      )
-    else
-      {:error, reason} -> persist_failure(operation, now, reason, options)
-      _invalid -> persist_failure(operation, now, :credential_unavailable, options)
+        settled_result(result)
+      end)
     end
+    |> persist_observation_failure(operation, now, options)
   rescue
     _exception -> persist_failure(operation, now, :worker_crash, options)
   catch
@@ -263,34 +274,36 @@ defmodule ForgeGitHub.GitRefWorker do
         options
       ) do
     context = callback(options, :context, &ForgeMirrors.git_ref_operation_context/1)
-    token_fetch = callback(options, :token_fetch, &InstallationTokenBroker.fetch/2)
 
     with {:ok, sync} <- context.(operation),
-         {:ok, authorized_operation} <- authorize_recovery(operation, options),
-         %InstallationToken{token: token} <-
-           token_fetch.(sync.github_installation_id, %{
-             permissions: %{"contents" => "write", "metadata" => "read"}
-           }),
-         request <- sync_request(sync),
-         {:ok, observations} <- fetch_remote_refs(request, token, sync, options),
-         {:ok, local_oid} <- read_local_ref(sync, options),
-         remote_oid <- observed_oid(observations, sync.ref_name),
-         decision <- decide(sync, local_oid, remote_oid, options) do
-      continue_after_observation(
-        authorized_operation,
-        now,
-        sync,
-        request,
-        token,
-        local_oid,
-        remote_oid,
-        decision,
-        options
-      )
-    else
-      {:error, reason} -> persist_failure(operation, now, reason, options)
-      _invalid -> persist_failure(operation, now, :credential_unavailable, options)
+         :ok <- authorize_pat_ref_policy(operation, sync),
+         {:ok, authorized_operation} <- authorize_recovery(operation, options) do
+      with_token(sync, options, fn token ->
+        result =
+          with request <- sync_request(sync),
+               {:ok, observations} <- fetch_remote_refs(request, token, sync, options),
+               {:ok, local_oid} <- read_local_ref(sync, options),
+               remote_oid <- observed_oid(observations, sync.ref_name),
+               decision <- decide(sync, local_oid, remote_oid, options) do
+            continue_after_observation(
+              authorized_operation,
+              now,
+              sync,
+              request,
+              token,
+              local_oid,
+              remote_oid,
+              decision,
+              options
+            )
+          else
+            {:error, reason} -> persist_failure(operation, now, reason, options)
+          end
+
+        settled_result(result)
+      end)
     end
+    |> persist_observation_failure(operation, now, options)
   rescue
     _exception -> persist_failure(operation, now, :worker_crash, options)
   catch
@@ -363,10 +376,28 @@ defmodule ForgeGitHub.GitRefWorker do
         with_repository_read(sync, &GitCore.is_ancestor(&1, left, right))
       end)
 
-    GitRefDecision.decide(sync.ref_kind, sync.baseline, local_oid, remote_oid, fn left, right ->
-      ancestor.(sync.repository_path, left, right)
-    end)
+    decision =
+      GitRefDecision.decide(sync.ref_kind, sync.baseline, local_oid, remote_oid, fn left, right ->
+        ancestor.(sync.repository_path, left, right)
+      end)
+
+    case {Map.get(sync, :credential_source), decision} do
+      {:pat, {action, _expected}} when action in [:delete_local, :delete_remote] ->
+        {:conflict, :delete_vs_update}
+
+      _ ->
+        decision
+    end
   end
+
+  defp authorize_pat_ref_policy(
+         %{external_effect_marker: %{"action" => action}},
+         %{credential_source: :pat}
+       )
+       when action in ["delete_local", "delete_remote"],
+       do: {:error, :ref_deletion_disabled}
+
+  defp authorize_pat_ref_policy(_operation, _sync), do: :ok
 
   defp continue_after_observation(
          operation,
@@ -383,18 +414,29 @@ defmodule ForgeGitHub.GitRefWorker do
       :ok ->
         case prepare_lfs_effect(operation, now, sync, decision, options) do
           {:ok, prepared, true} ->
-            case authorize_lfs_effect(prepared, sync, options) do
-              {:ok, authorized, fresh_token} ->
-                continue_after_lfs(
-                  authorized,
+            case authorize_lfs_effect(prepared, options) do
+              {:ok, authorized} ->
+                with_token(sync, options, fn fresh_token ->
+                  continue_after_lfs(
+                    authorized,
+                    now,
+                    sync,
+                    request,
+                    fresh_token,
+                    local_oid,
+                    remote_oid,
+                    decision,
+                    true,
+                    options
+                  )
+                  |> settled_result()
+                end)
+                |> persist_lfs_authorization_failure(
+                  prepared,
                   now,
                   sync,
-                  request,
-                  fresh_token,
                   local_oid,
                   remote_oid,
-                  decision,
-                  true,
                   options
                 )
 
@@ -709,31 +751,34 @@ defmodule ForgeGitHub.GitRefWorker do
 
     case mark_result do
       {:ok, marked} ->
-        with {:ok, authorized} <- authorize_effect(marked, options),
-             {:ok, effect_token} <- effect_token(decision, sync, token, options) do
-          case execute_effect(decision, sync, request, effect_token, options) do
-            :ok ->
-              expected_oid = resulting_oid(decision)
+        with {:ok, authorized} <- authorize_effect(marked, options) do
+          with_effect_token(decision, sync, token, options, fn effect_token ->
+            case execute_effect(decision, sync, request, effect_token, options) do
+              :ok ->
+                expected_oid = resulting_oid(decision)
 
-              callback(options, :confirm, &ForgeMirrors.confirm_git_ref/5).(
-                authorized,
-                sync.ref_name,
-                expected_oid,
-                expected_oid,
-                now
-              )
+                callback(options, :confirm, &ForgeMirrors.confirm_git_ref/5).(
+                  authorized,
+                  sync.ref_name,
+                  expected_oid,
+                  expected_oid,
+                  now
+                )
 
-            {:error, reason} ->
-              persist_effect_failure(
-                authorized,
-                now,
-                sync,
-                local_oid,
-                remote_oid,
-                reason,
-                options
-              )
-          end
+              {:error, reason} ->
+                persist_effect_failure(
+                  authorized,
+                  now,
+                  sync,
+                  local_oid,
+                  remote_oid,
+                  reason,
+                  options
+                )
+            end
+            |> settled_result()
+          end)
+          |> persist_lfs_authorization_failure(marked, now, sync, local_oid, remote_oid, options)
         else
           {:error, reason} ->
             persist_effect_failure(marked, now, sync, local_oid, remote_oid, reason, options)
@@ -839,16 +884,12 @@ defmodule ForgeGitHub.GitRefWorker do
     end
   end
 
-  defp authorize_lfs_effect(operation, sync, options) do
-    with {:ok, authorized} <-
-           callback(
-             options,
-             :authorize_lfs_effect,
-             &ForgeMirrors.authorize_git_lfs_effect/2
-           ).(operation, operation.external_effect_marker),
-         {:ok, fresh_token} <- effect_token({:apply_remote, nil, nil}, sync, nil, options) do
-      {:ok, authorized, fresh_token}
-    end
+  defp authorize_lfs_effect(operation, options) do
+    callback(
+      options,
+      :authorize_lfs_effect,
+      &ForgeMirrors.authorize_git_lfs_effect/2
+    ).(operation, operation.external_effect_marker)
   end
 
   defp reauthorize_lfs_effect(operation, options) do
@@ -878,20 +919,105 @@ defmodule ForgeGitHub.GitRefWorker do
 
   defp authorize_recovery(%MirrorOperation{}, _options), do: {:error, :invalid_transition}
 
-  defp effect_token(decision, sync, _token, options)
-       when elem(decision, 0) in [:apply_remote, :delete_remote] do
-    token_fetch = callback(options, :token_fetch, &InstallationTokenBroker.fetch/2)
+  defp with_effect_token(_decision, %{credential_source: :pat} = sync, _token, options, callback),
+    do: with_token(sync, options, callback)
 
-    case token_fetch.(sync.github_installation_id, %{
-           permissions: %{"contents" => "write", "metadata" => "read"}
-         }) do
-      %InstallationToken{token: fresh_token} -> {:ok, fresh_token}
-      {:error, reason} -> {:error, reason}
-      _ -> {:error, :credential_unavailable}
+  defp with_effect_token(decision, sync, _token, options, callback)
+       when elem(decision, 0) in [:apply_remote, :delete_remote],
+       do: with_token(sync, options, callback)
+
+  defp with_effect_token(_decision, _sync, token, _options, callback), do: callback.(token)
+
+  defp with_token(sync, options, callback) do
+    MirrorCredential.with_token(
+      sync,
+      %{permissions: %{"contents" => "write", "metadata" => "read"}},
+      options,
+      fn token ->
+        with :ok <- verify_pat_repository(sync, token, options) do
+          callback.(token)
+        end
+      end
+    )
+  end
+
+  defp verify_pat_repository(%{credential_source: :pat} = sync, token, options) do
+    fetch = callback(options, :repository_fetch, &Client.repository/4)
+
+    case fetch.(token, sync.remote_owner, sync.remote_repository,
+           gate_key: MirrorCredential.gate_key(sync)
+         ) do
+      {:ok, %ForgeGitHub.Repository{} = repository} ->
+        if repository.id == sync.github_repository_id and
+             repository.owner_id == sync.github_account_id and
+             (is_nil(sync.github_node_id) or repository.node_id == sync.github_node_id) and
+             String.downcase(repository.owner_login) == String.downcase(sync.remote_owner) and
+             String.downcase(repository.name) == String.downcase(sync.remote_repository) do
+          callback(options, :pat_authorize, &ForgeMirrors.authorize_pat_credential/1).(sync)
+        else
+          {:error, :provider_identity_mismatch}
+        end
+
+      {:error, %Error{kind: kind, retry_at: retry_at}} ->
+        retry_seconds = if is_struct(retry_at, DateTime), do: DateTime.to_unix(retry_at), else: 0
+        {:error, {:pat_provider, kind, retry_seconds}}
+
+      _ ->
+        {:error, :provider_identity_mismatch}
     end
   end
 
-  defp effect_token(_decision, _sync, token, _options), do: {:ok, token}
+  defp verify_pat_repository(_sync, _token, _options), do: :ok
+
+  # Settlement results cross the credential vault only as finite error reasons.
+  defp settled_result({:error, reason}), do: {:error, {:git_ref_settled, reason}}
+  defp settled_result(result), do: result
+
+  defp persist_observation_failure(
+         {:error, {:git_ref_settled, reason}},
+         _operation,
+         _now,
+         _options
+       ),
+       do: {:error, reason}
+
+  defp persist_observation_failure({:error, reason}, operation, now, options),
+    do: persist_failure(operation, now, reason, options)
+
+  defp persist_observation_failure(result, _operation, _now, _options), do: result
+
+  defp persist_lfs_authorization_failure(
+         {:error, {:git_ref_settled, reason}},
+         _operation,
+         _now,
+         _sync,
+         _local,
+         _remote,
+         _options
+       ),
+       do: {:error, reason}
+
+  defp persist_lfs_authorization_failure(
+         {:error, reason},
+         operation,
+         now,
+         sync,
+         local,
+         remote,
+         options
+       ),
+       do: persist_effect_failure(operation, now, sync, local, remote, reason, options)
+
+  defp persist_lfs_authorization_failure(
+         result,
+         _operation,
+         _now,
+         _sync,
+         _local,
+         _remote,
+         _options
+       ),
+       do: result
 
   defp execute_effect({:apply_local, expected, proposed}, sync, _request, _token, options) do
     with_write_fence(sync.repository_id, fn ->
@@ -1008,6 +1134,40 @@ defmodule ForgeGitHub.GitRefWorker do
   defp persist_failure(
          operation,
          now,
+         {:pat_provider, kind, retry_seconds},
+         options,
+         retry_options
+       ) do
+    retry_at =
+      case DateTime.from_unix(retry_seconds) do
+        {:ok, date} -> date
+        _ -> nil
+      end
+
+    persist_failure(operation, now, Error.new(kind, retry_at), options, retry_options)
+  end
+
+  defp persist_failure(operation, now, :ref_deletion_disabled, options, _retry_options) do
+    callback(options, :fail, &ForgeMirrors.fail_operation/4).(
+      operation,
+      now,
+      "local_validation",
+      "PAT mirroring does not permit Git ref deletion"
+    )
+  end
+
+  defp persist_failure(operation, now, :provider_identity_mismatch, options, _retry_options) do
+    callback(options, :fail, &ForgeMirrors.fail_operation/4).(
+      operation,
+      now,
+      "provider_validation",
+      "GitHub repository identity changed"
+    )
+  end
+
+  defp persist_failure(
+         operation,
+         now,
          %Error{kind: kind, retry_at: retry_at},
          options,
          retry_options
@@ -1018,13 +1178,7 @@ defmodule ForgeGitHub.GitRefWorker do
         do: retry_at,
         else: DateTime.add(now, 60, :second)
 
-    callback(options, :retry, &ForgeMirrors.retry_operation/5).(
-      operation,
-      now,
-      retry_at,
-      Atom.to_string(kind),
-      retry_options
-    )
+    retry_failure(operation, now, retry_at, Atom.to_string(kind), options, retry_options, kind)
   end
 
   defp persist_failure(operation, now, %Error{kind: :invalid_credential}, options, _retry_options) do
@@ -1056,13 +1210,7 @@ defmodule ForgeGitHub.GitRefWorker do
             ] do
     retry_at = DateTime.add(now, 60, :second)
 
-    callback(options, :retry, &ForgeMirrors.retry_operation/5).(
-      operation,
-      now,
-      retry_at,
-      "network",
-      retry_options
-    )
+    retry_failure(operation, now, retry_at, "network", options, retry_options, kind)
   end
 
   defp persist_failure(
@@ -1119,26 +1267,70 @@ defmodule ForgeGitHub.GitRefWorker do
       reason == :paused ->
         retry_at = DateTime.add(now, 60, :second)
 
-        callback(options, :retry, &ForgeMirrors.retry_operation/5).(
-          operation,
-          now,
-          retry_at,
-          "network",
-          retry_options
-        )
+        retry_failure(operation, now, retry_at, "network", options, retry_options, reason)
 
       true ->
         retry_at = DateTime.add(now, 60, :second)
 
-        callback(options, :retry, &ForgeMirrors.retry_operation/5).(
-          operation,
-          now,
-          retry_at,
-          "network",
-          retry_options
-        )
+        retry_failure(operation, now, retry_at, "network", options, retry_options, reason)
     end
   end
+
+  defp retry_failure(operation, now, retry_at, failure_class, options, retry_options, reason) do
+    if operation.state == :effect_pending and
+         Keyword.get(retry_options, :external_effect_reconciled) != true do
+      reason_code =
+        if reason == :worker_crash, do: "worker_crash", else: "git_observation_unavailable"
+
+      Logger.warning("Git mirror observation deferred (#{observation_failure_kind(reason)})",
+        operation_id: operation.id,
+        failure_class: failure_class,
+        failure_kind: observation_failure_kind(reason)
+      )
+
+      callback(options, :defer_effect, &ForgeMirrors.defer_git_ref_effect/5).(
+        operation,
+        now,
+        retry_at,
+        failure_class,
+        reason_code
+      )
+    else
+      callback(options, :retry, &ForgeMirrors.retry_operation/5).(
+        operation,
+        now,
+        retry_at,
+        failure_class,
+        retry_options
+      )
+    end
+  end
+
+  defp observation_failure_kind(%{kind: kind}), do: observation_failure_kind(kind)
+
+  defp observation_failure_kind(kind)
+       when kind in [
+              :transport,
+              :timeout,
+              :host_unavailable,
+              :upstream_unavailable,
+              :request_gate_busy,
+              :action_expired,
+              :primary_rate_limit,
+              :secondary_rate_limit,
+              :worker_crash,
+              :lost_lease,
+              :unavailable,
+              :process_exit,
+              :process_unavailable,
+              :source_validation,
+              :host_policy,
+              :ref_limit,
+              :cleanup_pending
+            ],
+       do: kind
+
+  defp observation_failure_kind(_reason), do: :unclassified
 
   defp conflict_kind(%GitCore.Error{kind: kind}) when kind in [:stale_ref, :ref_exists],
     do: :git_divergence

@@ -1,0 +1,34 @@
+{
+  "scope": "Production saved-PAT one-time inbound import and independent endpoint checkouts; permanent outbound synchronization not yet verified",
+  "repository": "duskmoon-dev/fornacast-sync-acceptance-20261019",
+  "github_repository_id": 1425392764,
+  "ref": "refs/heads/main",
+  "commit": "9ada5bd644d4dc4382bdd808eb1abed9678dc3c3",
+  "tree": "cf07edf88436c3f6884694fc6c34afc4aef8ab69",
+  "expected_refs": [
+    "12d8cd0b634e7bd1cfb17736702d547c8837a93a refs/heads/feature/lfs",
+    "9ada5bd644d4dc4382bdd808eb1abed9678dc3c3 refs/heads/main",
+    "9ada5bd644d4dc4382bdd808eb1abed9678dc3c3 refs/tags/acceptance-v1"
+  ],
+  "lfs_path": "assets/payload.bin",
+  "lfs_size": 131072,
+  "lfs_sha256": "8c151150bd0c38e6401be05f685c9d6f7f08f87b777feea695713f39fd7a5f40",
+  "github_clone": {
+    "hydrated_size": 131072,
+    "hydrated_sha256": "8c151150bd0c38e6401be05f685c9d6f7f08f87b777feea695713f39fd7a5f40",
+    "git_fsck": "passed",
+    "lfs_fsck": "passed"
+  },
+  "import_run_id": 11,
+  "repository_item_id": 116,
+  "fornacast_clone": {
+    "url": "http://localhost:4890/admin/fornacast-sync-acceptance-20261019.git",
+    "hydrated_size": 131072,
+    "hydrated_sha256": "8c151150bd0c38e6401be05f685c9d6f7f08f87b777feea695713f39fd7a5f40",
+    "git_fsck": "passed",
+    "lfs_fsck": "passed",
+    "refs_match": true,
+    "commit_match": true,
+    "tree_match": true
+  }
+}

@@ -433,6 +433,7 @@ defmodule ForgeGitHub.LFSReconciliationTest do
 
     git_options = [
       now: fn -> now end,
+      claim: &ForgeMirrors.claim_operations/5,
       task_supervisor: task_supervisor,
       max_concurrency: 1,
       batch_size: 1,
