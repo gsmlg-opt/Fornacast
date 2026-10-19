@@ -1046,10 +1046,7 @@ defmodule FornacastWebTest do
     pid =
       start_supervised!(
         {GitTransport.Daemon,
-         name: __MODULE__.SSH,
-         bind_ip: "127.0.0.1",
-         port: 0,
-         system_dir: system_dir}
+         name: __MODULE__.SSH, bind_ip: "127.0.0.1", port: 0, system_dir: system_dir}
       )
 
     port = GitTransport.Daemon.port(pid)
