@@ -200,12 +200,15 @@ defmodule ForgeImports.OrganizationPatSettings do
         from j in PatSyncRun,
           join: r in ImportRun,
           on: r.id == j.import_run_id,
+          left_join: successor in ImportRun,
+          on: successor.predecessor_run_id == r.id,
           join: i in RepositoryItem,
           on: i.import_run_id == r.id,
           where:
             j.configuration_id == ^config.id and j.state == "failed" and
               j.owner_user_id == ^owner.id and j.github_identity_id == ^config.github_identity_id and
               j.github_organization == ^config.github_organization and
+              is_nil(successor.id) and
               r.state in [:failed, :canceled, :completed_with_warnings] and
               i.selected == true and i.state in [:failed, :canceled] and
               is_nil(i.cleanup_state) and i.publication_evidence == ^%{},

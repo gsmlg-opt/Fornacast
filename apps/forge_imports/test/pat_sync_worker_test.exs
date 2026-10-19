@@ -218,6 +218,79 @@ defmodule ForgeImports.PatSyncWorkerTest do
 
     assert {:ok, %{config: %{last_sync_summary: %{"total" => 2, "succeeded" => 2}}}} =
              PatSettings.view(c.owner, c.org.id)
+
+    assert {:ok, fresh} =
+             OrganizationPatSettings.sync(
+               c.owner,
+               c.org.id,
+               to_string(c.config.lock_version),
+               %{},
+               dispatch: :manual
+             )
+
+    assert fresh.id != retry.id
+    assert fresh.state == "queued"
+    assert fresh.import_run_id == nil
+
+    assert Repo.aggregate(
+             from(r in ImportRun, where: r.predecessor_run_id == ^previous.id),
+             :count
+           ) ==
+             1
+  end
+
+  test "sync starts fresh after a restarted import chain succeeds", c do
+    {:ok, job} =
+      OrganizationPatSettings.sync(c.owner, c.org.id, to_string(c.config.lock_version), %{},
+        dispatch: :manual
+      )
+
+    assert :pending = PatSyncWorker.perform(job.id, discovery_options: discovery_options(c))
+    assert :pending = PatSyncWorker.perform(job.id)
+    job = Repo.get!(PatSyncRun, job.id)
+
+    replacement =
+      Enum.reduce(1..2, job, fn _, previous ->
+        assert {:ok, replacement} =
+                 OrganizationPatSettings.restart_sync(
+                   c.owner,
+                   c.org.id,
+                   to_string(c.config.lock_version),
+                   %{},
+                   dispatch: :manual
+                 )
+
+        assert Repo.get!(PatSyncRun, previous.id).state == "failed"
+        assert Repo.get!(ImportRun, previous.import_run_id).state == :canceled
+
+        assert Repo.get!(ImportRun, replacement.import_run_id).predecessor_run_id ==
+                 previous.import_run_id
+
+        assert :pending = PatSyncWorker.perform(replacement.id)
+        replacement
+      end)
+
+    for item <-
+          Repo.all(from i in RepositoryItem, where: i.import_run_id == ^replacement.import_run_id) do
+      complete_item!(item, c)
+    end
+
+    assert :ok = PatSyncWorker.perform(replacement.id)
+    assert Repo.get!(PatSyncRun, replacement.id).state == "succeeded"
+    assert Repo.get!(ImportRun, replacement.import_run_id).state == :completed
+
+    assert {:ok, fresh} =
+             OrganizationPatSettings.sync(
+               c.owner,
+               c.org.id,
+               to_string(c.config.lock_version),
+               %{},
+               dispatch: :manual
+             )
+
+    assert fresh.id != replacement.id
+    assert fresh.state == "queued"
+    assert fresh.import_run_id == nil
   end
 
   test "sync reports durable release asset progress in its saved summary", c do
