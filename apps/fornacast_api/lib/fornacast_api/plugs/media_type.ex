@@ -11,7 +11,7 @@ defmodule FornacastAPI.Plugs.MediaType do
 
   def call(conn, _opts) do
     cond do
-      not acceptable?(conn) and not binary_acceptable?(conn) ->
+      not acceptable?(conn) and not binary_acceptable?(conn) and not contents_acceptable?(conn) ->
         reject(conn, 406, "Not Acceptable")
 
       body_bearing?(conn) and not supported_content_type?(conn) and not asset_upload?(conn) ->
@@ -20,6 +20,33 @@ defmodule FornacastAPI.Plugs.MediaType do
       true ->
         conn
     end
+  end
+
+  def contents_media(conn) do
+    ranges = parse_ranges(get_req_header(conn, "accept"))
+
+    [
+      {:json, "application/vnd.github+json"},
+      {:json, "application/json"},
+      {:raw, "application/vnd.github.raw+json"},
+      {:html, "application/vnd.github.html+json"},
+      {:object, "application/vnd.github.object+json"}
+    ]
+    |> Enum.max_by(fn {_, type} -> effective_quality(type, ranges) end)
+    |> elem(0)
+  end
+
+  defp contents_acceptable?(conn) do
+    conn.method == "GET" and
+      Regex.match?(~r/\A\/api\/v3\/repos\/[^\/]+\/[^\/]+\/contents(?:\/|\z)/, conn.request_path) and
+      Enum.any?(
+        [
+          "application/vnd.github.raw+json",
+          "application/vnd.github.html+json",
+          "application/vnd.github.object+json"
+        ],
+        &(effective_quality(&1, parse_ranges(get_req_header(conn, "accept"))) > 0.0)
+      )
   end
 
   def binary_asset_request?(conn) do

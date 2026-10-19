@@ -31,6 +31,7 @@ defmodule GitCore.Application do
       ),
       Supervisor.child_spec(GitCore.ScanLimiter, []),
       Supervisor.child_spec(GitCore.BlobLimiter, []),
+      Supervisor.child_spec(GitCore.BodyMemoryLimiter, []),
       Supervisor.child_spec(GitCore.RepositoryWriteLimiter, []),
       Supervisor.child_spec(GitCore.RepositoryReadLimiter, []),
       Supervisor.child_spec(GitCore.RemoteLimiter, []),

@@ -12,7 +12,7 @@ defmodule ForgeRepos.GitWriteOperation do
     :receive_pack
   ]
   @states [:prepared, :object_written, :ref_advanced, :bookkeeping_complete, :failed]
-  @failure_reasons ~w(effect_not_started ref_not_advanced unexpected_ref)
+  @failure_reasons ~w(effect_not_started ref_not_advanced unexpected_ref cas_conflict non_fast_forward)
   @oid_regex ~r/\A[0-9a-f]{40}(?:[0-9a-f]{24})?\z/
   @max_target_ref_bytes 255
   @lease_mutable_fields [:state, :failure_reason, :result_blob_oid]
@@ -150,7 +150,7 @@ defmodule ForgeRepos.GitWriteOperation do
   defp validate_initial_result(changeset, true, state, oid, reason) do
     oid_required? =
       state in [:object_written, :ref_advanced, :bookkeeping_complete] or
-        (state == :failed and reason == "ref_not_advanced")
+        (state == :failed and reason in ["ref_not_advanced", "cas_conflict", "non_fast_forward"])
 
     oid_forbidden? =
       state == :prepared or (state == :failed and reason == "effect_not_started")
@@ -173,7 +173,12 @@ defmodule ForgeRepos.GitWriteOperation do
     do: add_error(changeset, :result_blob_oid, "is not valid for this operation kind")
 
   defp validate_initial_failure(changeset, :failed, reason)
-       when reason in ["effect_not_started", "ref_not_advanced"],
+       when reason in [
+              "effect_not_started",
+              "ref_not_advanced",
+              "cas_conflict",
+              "non_fast_forward"
+            ],
        do: changeset
 
   defp validate_initial_failure(changeset, :failed, _reason),
@@ -247,7 +252,7 @@ defmodule ForgeRepos.GitWriteOperation do
               "effect_not_started" ->
                 operation.state == :prepared and get_change(changeset, :state) == :failed
 
-              "ref_not_advanced" ->
+              reason when reason in ["ref_not_advanced", "cas_conflict", "non_fast_forward"] ->
                 operation.state == :object_written and get_change(changeset, :state) == :failed
 
               "unexpected_ref" ->
@@ -275,14 +280,14 @@ defmodule ForgeRepos.GitWriteOperation do
         end
 
       :failed ->
-        expected_reason =
+        expected_reasons =
           case operation.state do
-            :prepared -> "effect_not_started"
-            :object_written -> "ref_not_advanced"
-            _ -> nil
+            :prepared -> ["effect_not_started"]
+            :object_written -> ["ref_not_advanced", "cas_conflict", "non_fast_forward"]
+            _ -> []
           end
 
-        if expected_reason != nil and get_field(changeset, :failure_reason) == expected_reason do
+        if get_field(changeset, :failure_reason) in expected_reasons do
           changeset
         else
           add_error(changeset, :failure_reason, "is invalid for terminal failure")

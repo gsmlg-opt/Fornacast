@@ -746,23 +746,22 @@ defmodule FornacastAPI.RepositoriesTest do
     assert Repo.aggregate(AuditEvent, :count, :id) == before_audits
   end
 
-  test "auto_init true returns a sanitized unavailable response with no row, storage, or audit",
-       %{
-         alice: alice,
-         storage_root: storage_root
-       } do
+  test "auto_init creates a real default branch and README commit", %{alice: alice} do
     {_key, secret} = pat(alice, ["public_repo"])
-    before_paths = repository_paths(storage_root)
 
-    unavailable =
+    initialized =
       api_conn(secret: secret)
       |> post_json("/api/v3/user/repos", %{"name" => "initialized", "auto_init" => true})
 
-    assert_error(unavailable, 503, "Service unavailable", @personal_create_url, "public_repo")
-    refute unavailable.resp_body =~ "initializer"
-    assert ForgeRepos.get_repository("alice", "initialized") == nil
-    assert repository_paths(storage_root) == before_paths
-    assert Repo.aggregate(AuditEvent, :count, :id) == 0
+    body = json_response(initialized, 201)
+    assert body["default_branch"] == "main"
+    repository = ForgeRepos.get_repository("alice", "initialized")
+    path = ForgeRepos.absolute_storage_path(repository)
+    assert {:ok, content} = GitCore.content(path, "main", "README.md")
+    assert content.content == "# initialized\n"
+    GitCore.GitData.release_content(content)
+    assert Repo.aggregate(Repository, :count, :id) == 1
+    assert Repo.aggregate(AuditEvent, :count, :id) == 2
   end
 
   test "writers update flags while administrators rename, change branches, and receive full versioned resources",
@@ -1150,9 +1149,6 @@ defmodule FornacastAPI.RepositoriesTest do
     do: conn |> get_resp_header("x-accepted-oauth-scopes") |> List.first()
 
   defp slug(name), do: Repository.normalize_slug(name)
-
-  defp repository_paths(root),
-    do: Path.wildcard(Path.join([root, "**", "*.git"]), match_dot: true)
 
   defp assert_repository_keys(body, resource, version) do
     expected =

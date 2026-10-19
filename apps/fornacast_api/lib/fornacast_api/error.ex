@@ -52,6 +52,7 @@ defmodule FornacastAPI.Error do
     do: new(409, "Conflict", url)
 
   def from_domain(:entity_too_large, url), do: new(413, "Payload Too Large", url)
+  def from_domain({:payload_too_large, _resource}, url), do: new(413, "Payload Too Large", url)
   def from_domain(:immutable, url), do: new(422, "Release is immutable", url)
   def from_domain(:unavailable, url), do: new(503, "Service unavailable", url)
   def from_domain(:integrity_mismatch, url), do: new(422, "Asset integrity mismatch", url)

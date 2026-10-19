@@ -155,6 +155,54 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
              )
   end
 
+  for kind <- [:ref_create, :ref_update, :content_create, :content_update, :content_delete] do
+    @rest_kind kind
+
+    test "#{kind} completion publishes one durable push event", context do
+      operation = rest_operation(context, @rest_kind)
+      assert elem(operation.(), 0) == :ok
+      written = rest_write_operation(context, @rest_kind)
+
+      assert written.state == :bookkeeping_complete
+      assert_push_event(context, written)
+      snapshot = git_snapshot(context.path)
+
+      assert :ok = locked_reconcile(context)
+      assert :ok = locked_reconcile(context)
+      assert_push_event(context, written)
+      assert git_snapshot(context.path) == snapshot
+    end
+
+    test "#{kind} post-CAS recovery publishes its push event atomically and once", context do
+      operation = rest_operation(context, @rest_kind)
+
+      assert {:error, _} =
+               GitWriteRecovery.with_test_complete_multi_hook(
+                 fn multi, _operation ->
+                   Ecto.Multi.run(multi, :forced_failure, fn _repo, _changes ->
+                     {:error, :forced_failure}
+                   end)
+                 end,
+                 operation
+               )
+
+      written = rest_write_operation(context, @rest_kind)
+      assert written.state == :ref_advanced
+      assert written.lease_owner == nil
+      assert {:ok, current} = GitCore.exact_ref(context.path, written.target_ref)
+      assert current == written.proposed_oid
+      refute Repo.get_by(DomainOutboxEvent, causation_id: "git_write:#{written.id}")
+      refute Repo.get_by(AuditEvent, operation_id: "git_write:#{written.id}")
+      snapshot = git_snapshot(context.path)
+
+      assert :ok = locked_reconcile(context)
+      assert :ok = locked_reconcile(context)
+      assert Repo.get!(GitWriteOperation, written.id).state == :bookkeeping_complete
+      assert_push_event(context, written)
+      assert git_snapshot(context.path) == snapshot
+    end
+  end
+
   test "cleanup safety classifies claimable live and terminal Git write operations", context do
     now = ~U[2026-08-28 12:00:00Z]
     operation = operation!(context, :prepared)
@@ -520,6 +568,11 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
        context do
     update_ref(context.path, context.proposed_oid)
     operation = operation!(context, :ref_advanced, kind: :receive_pack)
+
+    outbox_events =
+      from event in DomainOutboxEvent,
+        where: event.causation_id == ^"git_write:#{operation.id}"
+
     cache_key = {context.path, :recovery_sql_failure}
     assert {:ok, :cached} = GitCore.Cache.fetch(cache_key, fn -> {:ok, :cached} end)
 
@@ -546,7 +599,7 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
              Repo.get!(Repository, context.repository.id)
 
     assert Repo.aggregate(AuditEvent, :count, :id) == 0
-    assert Repo.aggregate(DomainOutboxEvent, :count, :id) == 0
+    assert Repo.aggregate(outbox_events, :count, :id) == 0
 
     assert {:ok, :cached} =
              GitCore.Cache.fetch(cache_key, fn ->
@@ -555,10 +608,10 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
 
     assert :ok = locked_reconcile(context)
     assert Repo.get!(GitWriteOperation, operation.id).state == :bookkeeping_complete
-    assert Repo.aggregate(DomainOutboxEvent, :count, :id) == 1
+    assert Repo.aggregate(outbox_events, :count, :id) == 1
 
     assert :ok = locked_reconcile(context)
-    assert Repo.aggregate(DomainOutboxEvent, :count, :id) == 1
+    assert Repo.aggregate(outbox_events, :count, :id) == 1
     assert {:ok, :refreshed} = GitCore.Cache.fetch(cache_key, fn -> {:ok, :refreshed} end)
   end
 
@@ -683,6 +736,88 @@ defmodule ForgeRepos.GitWriteRecoveryTest do
       context.path,
       System.monotonic_time(:millisecond) + 10_000
     )
+  end
+
+  defp rest_operation(context, kind) do
+    update_ref(context.path, context.expected_oid)
+    args = [context.owner, %ForgeAccounts.APIKey{scopes: %{"repo" => true}}, context.repository]
+    metadata = %{request_id: "rest-outbox-#{kind}"}
+    attrs = %{"message" => "REST write", "decoded_content" => "first\n"}
+
+    case kind do
+      :ref_create ->
+        fn ->
+          apply(
+            ForgeRepos.GitWrites,
+            :create_ref,
+            args ++ [%{"ref" => "refs/heads/topic", "sha" => context.expected_oid}, metadata]
+          )
+        end
+
+      :ref_update ->
+        fn ->
+          apply(
+            ForgeRepos.GitWrites,
+            :update_ref,
+            args ++ ["heads/main", %{"sha" => context.proposed_oid}, metadata]
+          )
+        end
+
+      :content_create ->
+        fn -> apply(ForgeRepos.GitWrites, :put_content, args ++ ["file.txt", attrs, metadata]) end
+
+      action when action in [:content_update, :content_delete] ->
+        assert {:ok, :created, entry, _commit} =
+                 apply(
+                   ForgeRepos.GitWrites,
+                   :put_content,
+                   args ++ ["file.txt", attrs, %{request_id: "rest-outbox-setup"}]
+                 )
+
+        attrs = Map.merge(attrs, %{"sha" => entry.oid, "decoded_content" => "second\n"})
+        function = if action == :content_update, do: :put_content, else: :delete_content
+        fn -> apply(ForgeRepos.GitWrites, function, args ++ ["file.txt", attrs, metadata]) end
+    end
+  end
+
+  defp rest_write_operation(context, kind) do
+    Repo.one!(
+      from operation in GitWriteOperation,
+        where: operation.repository_id == ^context.repository.id and operation.kind == ^kind,
+        order_by: [desc: operation.id],
+        limit: 1
+    )
+  end
+
+  defp assert_push_event(context, operation) do
+    operation_id = "git_write:#{operation.id}"
+
+    assert [event] =
+             Repo.all(from event in DomainOutboxEvent, where: event.causation_id == ^operation_id)
+
+    assert event.event_id == "git_write:#{operation.id}:bookkeeping_complete"
+    assert event.aggregate_type == "repository"
+    assert event.aggregate_id == Integer.to_string(context.repository.id)
+    assert event.event_type == "repository.pushed"
+    assert event.origin == :fornacast
+    assert event.correlation_id == operation.request_id
+
+    assert event.payload == %{
+             "repository_id" => context.repository.id,
+             "owner_id" => context.repository.owner_user_id,
+             "slug" => context.repository.slug,
+             "generation" => context.repository.generation,
+             "changed_refs" => [
+               %{
+                 "ref" => operation.target_ref,
+                 "old_oid" => operation.expected_oid,
+                 "new_oid" => operation.proposed_oid
+               }
+             ]
+           }
+
+    assert [_audit] =
+             Repo.all(from audit in AuditEvent, where: audit.operation_id == ^operation_id)
   end
 
   defp assert_operation_update_rejected(id, updates, constraint) do

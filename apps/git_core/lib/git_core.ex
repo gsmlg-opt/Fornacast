@@ -34,6 +34,16 @@ defmodule GitCore do
     GitCore.Native.init_bare(path)
   end
 
+  def init_bare(path, branch) when is_binary(path) and is_binary(branch),
+    do: GitCore.Native.init_bare_with_branch(path, branch) |> wrap_read(:init_bare)
+
+  defdelegate plan_content_change(path, attrs, opts \\ []), to: GitCore.GitData
+  defdelegate write_content_change(path, plan, opts \\ []), to: GitCore.GitData
+  defdelegate branch_page(path, opts \\ []), to: GitCore.GitData
+  defdelegate commit_page(path, opts), to: GitCore.GitData
+  defdelegate commit_detail(path, ref, opts \\ []), to: GitCore.GitData
+  defdelegate content(path, ref, content_path, opts \\ []), to: GitCore.GitData
+
   def is_bare_repository?(path) when is_binary(path) do
     GitCore.Native.is_bare_repository(path)
     |> wrap_read(:is_bare_repository?)
@@ -537,6 +547,15 @@ defmodule GitCore do
 
     GitCore.Cache.fetch(key, fn ->
       GitCore.ScanLimiter.with_permit(:diff_commit, fn ->
+        deadline_ms =
+          case Keyword.fetch(opts, :deadline) do
+            {:ok, deadline} ->
+              min(deadline_ms, max(deadline - System.monotonic_time(:millisecond), 0))
+
+            :error ->
+              deadline_ms
+          end
+
         with {:ok, {files, patch, truncated, changed_files, additions, deletions}} <-
                wrap_read(
                  GitCore.Native.diff_commit(path, oid, limit, deadline_ms),

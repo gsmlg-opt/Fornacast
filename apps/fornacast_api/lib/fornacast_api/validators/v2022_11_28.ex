@@ -66,6 +66,10 @@ defmodule FornacastAPI.Validators.V2022_11_28 do
     "allow_rebase_merge"
   ]
 
+  def validate(operation, body)
+      when operation in [:git_create_ref, :git_update_ref, :content_put, :content_delete],
+      do: FornacastAPI.Validators.GitData.validate(operation, body)
+
   def validate(:issue_create, body), do: Issue.validate(:issue_create, body)
   def validate(:issue_update, body), do: Issue.validate(:issue_update, body)
   def validate(:issue_comment_create, body), do: Issue.validate(:issue_comment_create, body)

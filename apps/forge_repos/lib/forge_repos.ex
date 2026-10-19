@@ -255,8 +255,7 @@ defmodule ForgeRepos do
     with {:ok, actor} <- active_actor(actor),
          {:ok, owner_ref} <- owner_reference(owner),
          {:ok, _authorization} <- authorize_repository_create(Repo, actor, owner_ref),
-         {:ok, params} <- normalize_api_create(attrs),
-         :ok <- require_external_initializer(params.auto_init) do
+         {:ok, params} <- normalize_api_create(attrs) do
       storage_path = generate_storage_path(owner_ref.id, params.slug)
 
       result =
@@ -292,7 +291,11 @@ defmodule ForgeRepos do
         )
         |> Repo.transaction()
 
-      map_create_api_result(result, storage_path)
+      with {:ok, repository} <- map_create_api_result(result, storage_path) do
+        if params.auto_init,
+          do: ForgeRepos.GitWrites.initialize_repository(actor, repository, request_metadata),
+          else: {:ok, repository}
+      end
     end
   end
 
@@ -1850,6 +1853,19 @@ defmodule ForgeRepos do
 
   defp canonical_read_actor(_actor), do: nil
 
+  @doc "Returns a composable query of repositories readable by the current active actor."
+  def readable_repository_ids_query(actor) do
+    with {:ok, actor} <- active_actor(actor) do
+      candidates =
+        ready_repository()
+        |> join(:inner, [repository], owner in User, on: owner.id == repository.owner_user_id)
+        |> where([_repository, owner], owner.state == :active)
+        |> select([repository], repository.id)
+
+      {:ok, visible_repository_ids(candidates, actor, :all)}
+    end
+  end
+
   defp active_actor(%User{id: actor_id, kind: :user}) when is_integer(actor_id) do
     case Repo.get_by(User, id: actor_id, kind: :user, state: :active) do
       %User{} = actor -> {:ok, actor}
@@ -2814,9 +2830,6 @@ defmodule ForgeRepos do
 
   defp has_attr?(attrs, field), do: fetch_attr(attrs, field) != :missing
 
-  defp require_external_initializer(true), do: {:error, :git_initializer_unavailable}
-  defp require_external_initializer(false), do: :ok
-
   defp validate_repository_update(repository, params) do
     changeset = Repository.api_update_changeset(repository, params)
 
@@ -3045,7 +3058,7 @@ defmodule ForgeRepos do
     path = absolute_storage_path(repository)
 
     with :ok <- File.mkdir_p(Path.dirname(path)),
-         {:ok, _path} <- GitCore.init_bare(path) do
+         {:ok, _path} <- GitCore.init_bare(path, repository.default_branch) do
       {:ok, path}
     else
       {:error, reason} -> {:error, reason}

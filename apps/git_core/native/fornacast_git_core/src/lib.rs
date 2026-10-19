@@ -12,6 +12,7 @@ use gix_object::bstr::ByteSlice;
 
 mod anchored_remove;
 mod bounded_blob;
+mod git_data;
 mod lfs_candidates;
 
 #[cfg(test)]
@@ -2400,6 +2401,13 @@ fn load_comparison_commit_node(
     budget: &mut ComparisonCommitBudget,
 ) -> Result<CommitNode, NativeError> {
     check_commit_deadline(deadline)?;
+    git_data::preflight_object(
+        repo,
+        oid,
+        gix_object::Kind::Commit,
+        &mut budget.decoded,
+        deadline,
+    )?;
     let commit = find_graph_commit(repo, oid, position)?;
 
     if budget.seen_commits.insert(oid) {

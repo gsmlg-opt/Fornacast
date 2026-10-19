@@ -420,7 +420,7 @@ defmodule ForgeRepos.GitWriteRecovery do
         inc: [write_version: 1]
       )
       |> require_one(:repository)
-      |> record_receive_pack_event(repository, operation)
+      |> record_push_event(repository, operation)
       |> Audit.record_multi(
         :audit,
         actor,
@@ -445,11 +445,19 @@ defmodule ForgeRepos.GitWriteRecovery do
     Repo.transaction(multi)
   end
 
-  defp record_receive_pack_event(
+  defp record_push_event(
          multi,
          repository,
-         %GitWriteOperation{kind: :receive_pack} = operation
-       ) do
+         %GitWriteOperation{kind: kind} = operation
+       )
+       when kind in [
+              :receive_pack,
+              :ref_create,
+              :ref_update,
+              :content_create,
+              :content_update,
+              :content_delete
+            ] do
     DomainOutbox.record_multi(multi, :outbox_event, %{
       event_id: "git_write:#{operation.id}:bookkeeping_complete",
       aggregate_type: "repository",
@@ -474,7 +482,7 @@ defmodule ForgeRepos.GitWriteRecovery do
     })
   end
 
-  defp record_receive_pack_event(multi, _repository, _operation), do: multi
+  defp record_push_event(multi, _repository, _operation), do: multi
 
   defp require_one(multi, key) do
     Multi.run(multi, {key, :ownership}, fn _repo, changes ->

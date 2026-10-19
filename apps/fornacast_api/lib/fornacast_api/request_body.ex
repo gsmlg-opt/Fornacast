@@ -21,6 +21,7 @@ defmodule FornacastAPI.RequestBody do
           | {:error, Error.t(), atom(), Plug.Conn.t()}
 
   @policies %{
+    contents: %{maximum_bytes: 146_800_640, total_timeout_ms: 120_000, idle_timeout_ms: 15_000},
     ordinary: %{
       maximum_bytes: 1_048_576,
       total_timeout_ms: 15_000,
@@ -49,6 +50,14 @@ defmodule FornacastAPI.RequestBody do
     policy = Map.fetch!(@policies, policy_name)
 
     case policy_name do
+      :contents ->
+        %{
+          policy
+          | maximum_bytes: GitCore.Limits.get(:contents_json_bytes),
+            total_timeout_ms: GitCore.Limits.get(:body_total_timeout_ms),
+            idle_timeout_ms: GitCore.Limits.get(:body_idle_timeout_ms)
+        }
+
       :ordinary ->
         %{
           policy
@@ -110,6 +119,7 @@ defmodule FornacastAPI.RequestBody do
     end
   end
 
+  defp admission_reason(%Error{status: 503}), do: :unavailable
   defp admission_reason(%Error{status: 408}), do: :request_timeout
   defp admission_reason(%Error{}), do: :request_too_large
 

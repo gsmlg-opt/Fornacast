@@ -254,21 +254,30 @@ defmodule ForgeReposTest do
   end
 
   @tag :tmp_dir
-  test "auto_init hands off before database, audit, or storage side effects", %{tmp_dir: tmp_dir} do
+  test "auto_init publishes the configured initial branch with durable bookkeeping", %{
+    tmp_dir: tmp_dir
+  } do
     use_storage_root(tmp_dir)
     actor = user_fixture("initializer-owner")
 
-    assert {:error, :git_initializer_unavailable} =
+    assert {:ok, repository} =
              ForgeRepos.create_api_repository(
                actor,
                actor,
-               %{"name" => "initialized", "auto_init" => true},
+               %{"name" => "initialized", "auto_init" => true, "default_branch" => "trunk"},
                request_metadata("initializer")
              )
 
-    assert ForgeRepos.get_repository(actor.username, "initialized") == nil
-    assert Repo.aggregate(AuditEvent, :count, :id) == 0
-    assert repository_storage_paths(tmp_dir) == []
+    path = ForgeRepos.absolute_storage_path(repository)
+
+    assert {"refs/heads/trunk\n", 0} =
+             System.cmd("git", ["--git-dir", path, "symbolic-ref", "HEAD"])
+
+    assert {:ok, content} = GitCore.content(path, "trunk", "README.md")
+    assert content.content == "# initialized\n"
+    GitCore.GitData.release_content(content)
+    assert Repo.aggregate(AuditEvent, :count, :id) == 2
+    assert length(repository_storage_paths(tmp_dir)) == 1
   end
 
   test "git path parser accepts only friendly owner/repo git paths" do

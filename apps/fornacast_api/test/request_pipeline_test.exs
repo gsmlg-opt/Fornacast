@@ -146,7 +146,7 @@ defmodule FornacastAPI.RequestPipelineTest do
       |> put_req_header("content-type", "application/json")
       |> delete(path)
 
-    assert json_response(accepted, 404)["message"] == "Not Found"
+    assert json_response(accepted, 401)["message"] == "Requires authentication"
   end
 
   test "duplicate keys and malformed JSON are rejected" do

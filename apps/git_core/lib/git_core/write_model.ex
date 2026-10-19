@@ -1,3 +1,23 @@
+defmodule GitCore.ContentPlan do
+  @enforce_keys [
+    :action,
+    :ref,
+    :path,
+    :expected_ref_oid,
+    :expected_blob_oid,
+    :proposed_blob_oid,
+    :proposed_tree_oid,
+    :proposed_commit_oid,
+    :object_batch
+  ]
+  defstruct @enforce_keys
+end
+
+defmodule GitCore.ContentEntry do
+  @enforce_keys [:type, :name, :path, :oid, :size, :mode]
+  defstruct @enforce_keys ++ [:content, :lease]
+end
+
 defmodule GitCore.Signature do
   @moduledoc """
   An explicitly supplied identity and timestamp for a Git object.

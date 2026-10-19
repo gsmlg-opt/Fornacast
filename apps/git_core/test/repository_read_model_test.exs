@@ -3484,6 +3484,7 @@ defmodule GitCore.CacheIntegrationTest do
               [GitCore.RepositoryReadLimiter]},
              {GitCore.RepositoryWriteLimiter, writer_pid, :worker,
               [GitCore.RepositoryWriteLimiter]},
+             {GitCore.BodyMemoryLimiter, body_pid, :worker, [GitCore.BodyMemoryLimiter]},
              {GitCore.BlobLimiter, blob_pid, :worker, [GitCore.BlobLimiter]},
              {GitCore.ScanLimiter, scan_pid, :worker, [GitCore.ScanLimiter]},
              {GitCore.RemoteTaskSupervisor, remote_supervisor_pid, :supervisor,
@@ -3492,6 +3493,7 @@ defmodule GitCore.CacheIntegrationTest do
            ] = Supervisor.which_children(GitCore.Supervisor)
 
     assert is_pid(cache_pid)
+    assert is_pid(body_pid)
     assert is_pid(blob_pid)
     assert is_pid(merge_supervisor_pid)
     assert is_pid(reader_pid)

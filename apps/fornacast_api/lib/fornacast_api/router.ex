@@ -61,6 +61,17 @@ defmodule FornacastAPI.Router do
     get "/repos/:owner/:repo", RepositoryController, :show
     patch "/repos/:owner/:repo", RepositoryController, :update
 
+    get "/repos/:owner/:repo/branches", GitDataController, :branches
+    get "/repos/:owner/:repo/branches/*branch", GitDataController, :branch
+    get "/repos/:owner/:repo/git/ref/*ref", GitDataController, :ref
+    post "/repos/:owner/:repo/git/refs", GitDataController, :create_ref
+    patch "/repos/:owner/:repo/git/refs/*ref", GitDataController, :update_ref
+    get "/repos/:owner/:repo/commits", GitDataController, :commits
+    get "/repos/:owner/:repo/commits/*ref", GitDataController, :commit
+    get "/repos/:owner/:repo/contents/*path", GitDataController, :content
+    put "/repos/:owner/:repo/contents/*path", GitDataController, :put_content
+    delete "/repos/:owner/:repo/contents/*path", GitDataController, :delete_content
+
     patch "/repos/:owner/:repo/issues/comments/:comment_id", IssueCommentController, :update
     delete "/repos/:owner/:repo/issues/comments/:comment_id", IssueCommentController, :delete
     get "/repos/:owner/:repo/issues", IssueController, :index

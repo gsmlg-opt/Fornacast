@@ -12,6 +12,8 @@ defmodule GitCore.Native do
     mode: if(Mix.env() == :prod, do: :release, else: :debug),
     target: @target
 
+  def api_blob(_path, _oid, _expected_size, _bounds), do: :erlang.nif_error(:nif_not_loaded)
+  def init_bare_with_branch(_path, _branch), do: :erlang.nif_error(:nif_not_loaded)
   def init_bare(_path), do: :erlang.nif_error(:nif_not_loaded)
   def is_bare_repository(_path), do: :erlang.nif_error(:nif_not_loaded)
   def empty(_path), do: :erlang.nif_error(:nif_not_loaded)
@@ -206,5 +208,41 @@ defmodule GitCore.Native do
       do: :erlang.nif_error(:nif_not_loaded)
 
   def pack_objects(_path, _wants), do: :erlang.nif_error(:nif_not_loaded)
+  def api_commit(_path, _selector, _limits), do: :erlang.nif_error(:nif_not_loaded)
+
+  def api_commits(
+        _path,
+        _selector,
+        _page,
+        _per_page,
+        _filter_path,
+        _author,
+        _since,
+        _until,
+        _limits
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  def api_refs(_path, _limits), do: :erlang.nif_error(:nif_not_loaded)
+
+  def api_content(_path, _selector, _content_path, _limits),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def plan_content(
+        _path,
+        _action,
+        _ref,
+        _content_path,
+        _expected,
+        _blob,
+        _content,
+        _author,
+        _committer,
+        _message,
+        _limits
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  def write_content_objects(_path, _objects, _limits), do: :erlang.nif_error(:nif_not_loaded)
   def receive_pack(_path, _pack, _commands), do: :erlang.nif_error(:nif_not_loaded)
 end

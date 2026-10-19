@@ -70,6 +70,19 @@ defmodule FornacastAPI.Serializers.V2022_11_28 do
     %{resources: %{core: core}, rate: core}
   end
 
+  def render(resource, value, opts)
+      when resource in [
+             :branch_short,
+             :branch,
+             :git_ref,
+             :commit_summary,
+             :commit_detail,
+             :content_commit,
+             :content_entry,
+             :content_file
+           ],
+      do: FornacastAPI.Serializers.GitData.render(resource, value, opts)
+
   def render(:error, value, _opts), do: Fields.error(value)
   def render(:issue, value, opts), do: Issue.render(value, opts)
   def render(:issue_comment, value, opts), do: IssueComment.render(value, opts)
