@@ -87,6 +87,11 @@ config :fornacast, :auto_migrate, true
 config :fornacast, :legacy_turso_preflight, false
 config :fornacast, :github_credential_keyring, github_credential_keyring
 config :forge_github, :app_configuration, :disabled
+
+config :forge_github,
+       :device_client_id,
+       System.get_env("FORNACAST_GITHUB_DEVICE_CLIENT_ID", "Iv23lizCVE3E24s7fCA0")
+
 config :forge_github, :inventory_worker_max_concurrency, 4
 config :forge_github, :inventory_worker_processor_timeout_ms, 20_000
 config :forge_mirrors, :webhook_worker_max_concurrency, 8

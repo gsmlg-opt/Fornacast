@@ -472,11 +472,11 @@ defmodule ForgeImports.CredentialProvider.SavedPAT do
           capability: %ImportRun{} = capability
         },
         callback,
-        _opts
+        opts
       )
       when is_integer(actor_id) and is_function(callback, 2) do
     with %ImportRun{} = current <- current_run(actor_id, run, capability) do
-      checkout_current(actor, current, callback)
+      checkout_current(actor, current, capability, callback, opts)
     else
       nil -> {:error, :invalid_context}
     end
@@ -489,11 +489,11 @@ defmodule ForgeImports.CredentialProvider.SavedPAT do
           capability: %RepositoryItem{} = capability
         },
         callback,
-        _opts
+        opts
       )
       when is_integer(actor_id) and is_function(callback, 2) do
     with %ImportRun{} = current <- current_run(actor_id, run, capability) do
-      checkout_current(actor, current, callback)
+      checkout_current(actor, current, capability, callback, opts)
     else
       nil -> {:error, :invalid_context}
     end
@@ -501,7 +501,7 @@ defmodule ForgeImports.CredentialProvider.SavedPAT do
 
   def checkout(_context, _callback, _opts), do: {:error, :invalid_context}
 
-  defp checkout_current(%User{id: actor_id} = actor, run, callback) do
+  defp checkout_current(%User{id: actor_id} = actor, run, capability, callback, opts) do
     reference = make_ref()
     parent = self()
 
@@ -514,12 +514,14 @@ defmodule ForgeImports.CredentialProvider.SavedPAT do
       }
 
       checkout =
-        ForgeAccounts.with_github_import_credential(
+        ForgeGitHub.SavedCredential.with_import_credential(
           actor,
           run.github_identity_id,
           run.github_credential_id,
           fn credential, verification ->
-            if reference_matches?(run, verification) do
+            if reference_matches?(run, verification) and
+                 not is_nil(current_run(actor_id, run, capability)) and
+                 ForgeImports.PatSyncWorker.import_authorized?(run.id) == :ok do
               result = callback.(credential, metadata)
 
               if result == {:error, :invalid_credential},
@@ -529,7 +531,8 @@ defmodule ForgeImports.CredentialProvider.SavedPAT do
             else
               {:error, :credential_changed}
             end
-          end
+          end,
+          opts
         )
 
       normalize_checkout(checkout, reference)
@@ -609,6 +612,9 @@ defmodule ForgeImports.CredentialProvider.SavedPAT do
   defp normalize_checkout({:ok, {:error, _reason}}, _reference), do: {:ok, :acknowledged}
   defp normalize_checkout({:error, reason}, _reference), do: {:error, normalize_error(reason)}
   defp normalize_checkout(_result, _reference), do: {:error, :credential_service_unavailable}
+
+  defp normalize_error(:reauthorization_required), do: :invalid_credential
+  defp normalize_error(:refresh_in_progress), do: {:retryable, :busy}
 
   defp normalize_error(reason)
        when reason in [:credential_invalid, :forbidden, :not_found, :unsafe_credential_result],

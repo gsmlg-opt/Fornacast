@@ -148,7 +148,13 @@ defmodule FornacastWeb.GitHubSettingsController do
     do: {:conflict, "That GitHub account cannot be linked."}
 
   defp error_response(:credential_in_use),
-    do: {:conflict, "This saved PAT is in use by an active import."}
+    do: {:conflict, "This saved credential is in use by an active import."}
+
+  defp error_response(:reauthorization_required),
+    do: {:unprocessable_entity, "Reconnect this account using Connect with GitHub."}
+
+  defp error_response(:refresh_in_progress),
+    do: {:conflict, "This GitHub credential is being renewed. Try again shortly."}
 
   defp error_response(reason)
        when reason in [:busy, :stale, :request_gate_busy, :duplicate_operation],
@@ -168,6 +174,7 @@ defmodule FornacastWeb.GitHubSettingsController do
         GitHubSettingsHTML.index(%{
           accounts: accounts,
           error: error,
+          device_flow: FornacastWeb.GitHubDeviceSession.view(conn),
           __changed__: nil
         })
 

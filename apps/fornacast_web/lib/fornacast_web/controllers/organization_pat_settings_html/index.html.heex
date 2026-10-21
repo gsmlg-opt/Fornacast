@@ -6,7 +6,7 @@
     <header class="grid gap-2">
       <h2 class="text-2xl font-semibold">GitHub synchronization</h2>
       <p class="text-on-surface-variant">
-        Configure organization synchronization with an owner’s saved personal access token (PAT).
+        Configure organization synchronization with an owner’s saved GitHub connection or PAT.
       </p>
     </header>
     <.dm_alert :if={@error} id="pat-settings-error" variant="error" role="alert">
@@ -16,7 +16,7 @@
       {@flash}
     </.dm_alert>
     <.dm_alert id="pat-configuration-only" variant="info" outlined>
-      GitHub → Fornacast synchronization uses the saved owner PAT. You can run it manually and pause the synchronization configuration. Pausing prevents new tasks and pauses active work at its next authorization checkpoint; tasks are not canceled.
+      GitHub → Fornacast synchronization uses the saved owner credential. You can run it manually and pause the synchronization configuration. Pausing prevents new tasks and pauses active work at its next authorization checkpoint; tasks are not canceled.
     </.dm_alert>
     <.dm_card id="pat-sync-config" variant="bordered" padding="lg">
       <:title>GitHub mirror configuration</:title>
@@ -64,9 +64,9 @@
           </select>
         </label>
         <label class="grid gap-1" for="pat-account">
-          <span>Owner’s saved GitHub PAT</span>
+          <span>Owner’s saved GitHub credential</span>
           <select class="select" id="pat-account" name="pat_sync[github_identity_id]">
-            <option value="">Choose saved PAT</option>
+            <option value="">Choose saved credential</option>
             <option
               :for={{owner, account} <- accounts(@view)}
               value={account.identity_id}
@@ -79,7 +79,7 @@
         <p class="text-sm text-on-surface-variant">
           {credential_status(@view.credential)}. Token values are never displayed.
         </p>
-        <.dm_link href="/settings/github" class="text-primary">Manage your saved GitHub PATs</.dm_link>
+        <.dm_link href="/settings/github" class="text-primary">Manage your saved GitHub connections</.dm_link>
         <div class="grid gap-1">
           <span class="font-semibold">Synchronization direction</span>
           <p>
@@ -98,7 +98,7 @@
         <button class="btn btn-secondary" type="submit">Check configuration</button>
       </form>
       <.dm_alert :if={@check_result} id="pat-check-result" variant="success" role="status">
-        Check completed: owner <strong>{@check_result.owner}</strong>, GitHub organization <strong>{@check_result.github_organization}</strong>, PAT status <strong>{@check_result.credential_status}</strong>, visible repositories <strong>{@check_result.repository_count}</strong>, checked at {@check_result.checked_at}.
+        Check completed: owner <strong>{@check_result.owner}</strong>, GitHub organization <strong>{@check_result.github_organization}</strong>, Credential status <strong>{@check_result.credential_status}</strong>, visible repositories <strong>{@check_result.repository_count}</strong>, checked at {@check_result.checked_at}.
       </.dm_alert>
       <div class="mt-4 flex gap-2">
         <form action={base(@organization) <> "/sync"} method="post">
@@ -121,7 +121,7 @@
         </form>
       </div>
       <p class="mt-2 text-sm text-on-surface-variant">
-        Sync now immediately starts background synchronization of all PAT-visible repositories in the GitHub organization, regardless of the saved repository selection.
+        Sync now immediately starts background synchronization of all credential-visible repositories in the GitHub organization, regardless of the saved repository selection.
       </p>
       <p :if={!@latest_run} class="mt-2 text-sm text-on-surface-variant">Never synchronized</p>
       <.task_report :if={@latest_run} organization={@organization} run={@latest_run} />
@@ -131,7 +131,7 @@
       <:title>Repository scope</:title>
       <p>
         {if @view.config.repository_selection == "all",
-          do: "All PAT-visible organization repositories",
+          do: "All credential-visible organization repositories",
           else: "Selected repositories only"}
       </p>
       <.dm_link href={base(@organization) <> "/repositories"} class="text-primary">Manage synchronized repositories</.dm_link>
@@ -139,7 +139,7 @@
     <details class="rounded-lg border border-outline-variant p-4">
       <summary>GitHub App mirror (advanced)</summary>
       <p class="text-sm text-on-surface-variant my-2">
-        The existing GitHub App integration is managed separately from PAT configuration.
+        The existing GitHub App integration is managed separately from saved-credential configuration.
       </p>
       <.dm_link href={base(@organization) <> "/app"} class="text-primary">Open GitHub App settings</.dm_link>
     </details>

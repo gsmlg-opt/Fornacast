@@ -460,7 +460,15 @@ defmodule ForgeAccounts.GitHubCredentialVaultTest do
     end
 
     assert MapSet.new(GitHubCredential.__schema__(:redact_fields)) ==
-             MapSet.new([:ciphertext, :nonce, :tag])
+             MapSet.new([
+               :ciphertext,
+               :nonce,
+               :tag,
+               :refresh_ciphertext,
+               :refresh_nonce,
+               :refresh_tag,
+               :refresh_claim_id
+             ])
   end
 
   test "credential schema persists one row per identity and validates status" do
@@ -542,6 +550,17 @@ defmodule ForgeAccounts.GitHubCredentialVaultTest do
                :status,
                :last_verified_at,
                :verification_version,
+               :credential_kind,
+               :client_id,
+               :expires_at,
+               :refresh_expires_at,
+               :refresh_ciphertext,
+               :refresh_nonce,
+               :refresh_tag,
+               :refresh_key_id,
+               :token_generation,
+               :refresh_claim_id,
+               :refresh_claimed_at,
                :inserted_at,
                :updated_at
              ])

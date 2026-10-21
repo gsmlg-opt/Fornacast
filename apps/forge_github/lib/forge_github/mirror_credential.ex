@@ -37,7 +37,7 @@ defmodule ForgeGitHub.MirrorCredential do
 
   defp with_pat(scope, options, callback) do
     authorize = test_callback(options, :pat_authorize, &ForgeMirrors.authorize_pat_credential/1)
-    checkout = test_callback(options, :pat_checkout, &checkout/2)
+    checkout = test_callback(options, :pat_checkout, &checkout(&1, &2, options))
 
     with true <- valid_scope?(scope),
          :ok <- authorize.(scope) do
@@ -72,14 +72,15 @@ defmodule ForgeGitHub.MirrorCredential do
     end
   end
 
-  defp checkout(scope, callback) do
+  defp checkout(scope, callback, options) do
     case ForgeAccounts.get_user(scope.credential_owner_user_id) do
       %ForgeAccounts.User{} = actor ->
-        ForgeAccounts.with_github_import_credential(
+        ForgeGitHub.SavedCredential.with_import_credential(
           actor,
           scope.github_identity_id,
           scope.github_credential_id,
-          callback
+          callback,
+          options
         )
 
       _ ->
@@ -97,6 +98,11 @@ defmodule ForgeGitHub.MirrorCredential do
   defp reference_matches?(_scope, _reference), do: false
 
   defp normalize_checkout({:ok, result}), do: result
+
+  defp normalize_checkout({:error, :reauthorization_required}),
+    do: {:error, :reauthorization_required}
+
+  defp normalize_checkout({:error, :refresh_in_progress}), do: {:error, :busy}
   defp normalize_checkout({:error, :credential_service_unavailable}), do: {:error, :unavailable}
   defp normalize_checkout({:error, _reason}), do: {:error, :credential_unavailable}
   defp normalize_checkout(_), do: {:error, :credential_unavailable}

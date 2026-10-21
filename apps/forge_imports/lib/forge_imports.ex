@@ -53,6 +53,16 @@ defmodule ForgeImports do
   def link_github_account(actor, pat, request_metadata, opts \\ []),
     do: GitHubAccounts.link(actor, pat, request_metadata, opts)
 
+  def link_github_device_account(actor, token, request_metadata, original_references, opts \\ []),
+    do:
+      ForgeImports.GitHubDeviceAccounts.link(
+        actor,
+        token,
+        request_metadata,
+        original_references,
+        opts
+      )
+
   def reverify_github_account(actor, identity_id, request_metadata, opts \\ []),
     do: GitHubAccounts.reverify(actor, identity_id, request_metadata, opts)
 

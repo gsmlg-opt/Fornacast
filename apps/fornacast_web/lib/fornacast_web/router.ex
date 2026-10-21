@@ -57,6 +57,8 @@ defmodule FornacastWeb.Router do
     get "/organizations/:organization/settings/github/runs/:run_id/status",
         OrganizationPATSettingsController,
         :run_status
+
+    post "/settings/github/device/:attempt_id/poll", GitHubDeviceController, :poll
   end
 
   scope "/", FornacastWeb do
@@ -185,6 +187,8 @@ defmodule FornacastWeb.Router do
     patch "/settings/appearance", SettingsController, :update_appearance
 
     get "/settings/github", GitHubSettingsController, :index
+    post "/settings/github/device", GitHubDeviceController, :create
+    post "/settings/github/device/:attempt_id/cancel", GitHubDeviceController, :cancel
     post "/settings/github", GitHubSettingsController, :create
     post "/settings/github/:identity_id/reverify", GitHubSettingsController, :reverify
     put "/settings/github/:identity_id/credential", GitHubSettingsController, :replace

@@ -198,7 +198,7 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
           "Repository list refreshed."
 
         :sync_now ->
-          "Synchronization of all PAT-visible organization repositories queued."
+          "Synchronization of all credential-visible organization repositories queued."
 
         :pause ->
           "Synchronization configuration paused. Active work pauses at its next authorization checkpoint; tasks are not canceled."
@@ -207,7 +207,7 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
           "Synchronization configuration resumed."
 
         _ ->
-          "PAT synchronization configuration saved."
+          "GitHub synchronization configuration saved."
       end
 
     conn
@@ -298,10 +298,10 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
   defp error_message(:stale), do: "The configuration changed. Refresh and try again."
 
   defp error_message(:invalid_request),
-    do: "Check the source organization, owner, PAT and repository selection."
+    do: "Check the source organization, owner, credential and repository selection."
 
   defp error_message(:credential_unavailable),
-    do: "Select a valid saved PAT belonging to an active organization owner."
+    do: "Select a valid saved credential belonging to an active organization owner."
 
   defp error_message(:paused), do: "Synchronization is paused. Resume it before syncing."
 
@@ -310,25 +310,32 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
       "Wait for the active synchronization task to finish before enabling bidirectional Git and LFS."
 
   defp error_message(:unverified_import),
-    do: "Select repositories imported into this organization with the configured saved PAT."
+    do:
+      "Select repositories imported into this organization with the configured saved credential."
 
   defp error_message(:already_bound),
     do: "A selected repository or organization already has a different mirror connection."
 
   defp error_message(:not_enabled), do: "Enable the GitHub mirror before syncing."
 
+  defp error_message(:reauthorization_required),
+    do: "Reconnect the saved account in Settings → GitHub, then try again."
+
+  defp error_message(:refresh_in_progress),
+    do: "The GitHub credential is being renewed. Try again shortly."
+
   defp error_message(:invalid_credential),
-    do: "GitHub rejected this PAT. Re-verify or replace the saved PAT."
+    do: "GitHub rejected this credential. Reconnect GitHub or replace the saved credential."
 
   defp error_message(:credential_invalid),
-    do: "The saved PAT is invalid or expired. Re-verify or replace it."
+    do: "The saved credential is invalid or expired. Re-verify or replace it."
 
   defp error_message(:forbidden),
     do:
-      "This PAT cannot access the GitHub organization. Check owner permissions and organization access."
+      "This credential cannot access the GitHub organization. Check owner permissions and organization access."
 
   defp error_message(:not_found),
-    do: "GitHub organization was not found for this PAT. Check the organization name."
+    do: "GitHub organization was not found for this credential. Check the organization name."
 
   defp error_message(:host_unavailable),
     do: "The GitHub API host could not be resolved. Check network access."
@@ -339,33 +346,35 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
   defp error_message(:timeout), do: "The GitHub API request timed out. Try again."
 
   defp error_message(:credential_service_unavailable),
-    do: "The saved PAT could not be opened. The credential service is unavailable; try again."
+    do:
+      "The saved credential could not be opened. The credential service is unavailable; try again."
 
   defp error_message(:request_gate_busy),
-    do: "The saved PAT is already being checked by another request. Try again."
+    do: "The saved credential is already being checked by another request. Try again."
 
   defp error_message(:invalid_response),
     do: "GitHub returned an invalid response while checking this organization."
 
   defp error_message(:unsafe_credential_result),
     do:
-      "The saved PAT credential service returned an unsafe result. Re-save the PAT and try again."
+      "The saved credential service returned an unsafe result. Reconnect GitHub or re-save the PAT and try again."
 
   defp error_message(:unavailable),
-    do: "The PAT or GitHub check service is unavailable. Verify the saved PAT and try again."
+    do:
+      "The credential or GitHub check service is unavailable. Verify the saved credential and try again."
 
   defp error_message(reason) when reason in [:repository_sync_failed, :import_failed],
     do:
-      "Could not synchronize repositories. Check the saved PAT and GitHub access, then try again."
+      "Could not synchronize repositories. Check the saved credential and GitHub access, then try again."
 
   defp error_message(_), do: nil
 
   defp error_message(reason, action) do
     error_message(reason) ||
       if action == :sync_now do
-        "Could not start synchronization. Check the owner’s PAT and GitHub access, then try again."
+        "Could not start synchronization. Check the owner’s credential and GitHub access, then try again."
       else
-        "Could not refresh the repository list. Check the owner’s PAT and GitHub access, then try again."
+        "Could not refresh the repository list. Check the owner’s credential and GitHub access, then try again."
       end
   end
 

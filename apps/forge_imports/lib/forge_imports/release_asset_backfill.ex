@@ -26,17 +26,22 @@ defmodule ForgeImports.ReleaseAssetBackfill do
           caller = self()
 
           result =
-            ForgeAccounts.with_github_credential(actor, identity_id, fn credential ->
-              send(
-                caller,
-                {request,
-                 callback.(credential, %{
-                   gate_key: {:saved_credential, reference.credential.credential_id}
-                 })}
-              )
+            ForgeGitHub.SavedCredential.with_credential(
+              actor,
+              identity_id,
+              fn credential ->
+                send(
+                  caller,
+                  {request,
+                   callback.(credential, %{
+                     gate_key: {:saved_credential, reference.credential.credential_id}
+                   })}
+                )
 
-              :ok
-            end)
+                :ok
+              end,
+              opts
+            )
 
           case result do
             {:ok, :ok} ->
@@ -45,6 +50,9 @@ defmodule ForgeImports.ReleaseAssetBackfill do
               after
                 0 -> {:error, :credential_service_unavailable}
               end
+
+            {:ok, {:error, reason}} ->
+              {:error, reason}
 
             {:error, _} = error ->
               error

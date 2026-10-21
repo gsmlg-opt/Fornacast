@@ -7,6 +7,7 @@ import { registerAll } from "@duskmoon-dev/elements";
 import { registerAllArts } from "@duskmoon-dev/art-elements";
 import { initImportStatusPolling } from "./import_status.js";
 import { initPatSyncStatusPolling } from "./pat_sync_status.js";
+import { initGitHubDevicePolling } from "./github_device.js";
 
 installClipboardBehavior();
 registerAll();
@@ -96,6 +97,7 @@ if (document.readyState === "loading") {
       initRepositoryClonePopoverFocus();
       initImportStatusPolling();
       initPatSyncStatusPolling();
+      initGitHubDevicePolling();
     },
     { once: true },
   );
@@ -105,4 +107,5 @@ if (document.readyState === "loading") {
   initRepositoryClonePopoverFocus();
   initImportStatusPolling();
   initPatSyncStatusPolling();
+  initGitHubDevicePolling();
 }

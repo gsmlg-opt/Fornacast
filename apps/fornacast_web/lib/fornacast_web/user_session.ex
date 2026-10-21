@@ -53,10 +53,30 @@ defmodule FornacastWeb.UserSession do
 
     @impl true
     def handle_call({:owner, user_id}, _from, %{user_id: user_id} = state) do
-      {:reply, {:ok, state}, state}
+      {:reply, {:ok, %{user_id: user_id}}, state}
+    end
+
+    def handle_call({:github_device, user_id, operation}, _from, %{user_id: user_id} = state) do
+      {reply, attempt} =
+        FornacastWeb.GitHubDeviceAttempt.transition(
+          Map.get(state, :github_device),
+          operation,
+          System.monotonic_time(:millisecond)
+        )
+
+      {:reply, reply, Map.put(state, :github_device, attempt)}
     end
 
     def handle_call(_request, _from, state), do: {:reply, {:error, :owner_mismatch}, state}
+
+    @impl true
+    def format_status(status) do
+      status
+      |> Map.put(:state, Map.take(status.state, [:user_id]))
+      |> Map.update(:message, :redacted, fn _ -> :redacted end)
+      |> Map.update(:reason, :redacted, fn _ -> :redacted end)
+      |> Map.update(:log, [], fn _ -> [] end)
+    end
   end
 
   @doc "Returns the stable package key for a persisted user or user ID."
@@ -256,7 +276,8 @@ defmodule FornacastWeb.UserSession do
     end
   end
 
-  defp with_user_lock(user_id, function) do
+  @doc false
+  def with_user_lock(user_id, function) do
     :global.trans({{__MODULE__, user_id}, self()}, function)
   end
 

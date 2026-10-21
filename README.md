@@ -46,6 +46,22 @@ shared LocalCAS blob store. Local release APIs expose asset upload, metadata,
 ranged download and logical deletion, source archives, and generated release notes.
 See [release asset recovery](docs/github-imports.md#release-assets).
 
+## Connect GitHub
+
+Open **Settings → GitHub → Connect with GitHub**, then enter the displayed code
+on GitHub. Fornacast uses GitHub App Device Flow with public client ID
+`Iv23lizCVE3E24s7fCA0`; self-hosters can override
+`FORNACAST_GITHUB_DEVICE_CLIENT_ID`. Enable Device Flow in that App's settings.
+No client secret is required. The App must be installed with the permissions and
+repository access needed for your imports and synchronization; user authorization
+alone does not grant that access.
+
+Access and refresh tokens use the existing credential encryption keyring and
+renew automatically before saved-credential operations. Expired, rejected, or
+ambiguous refresh attempts require **Connect with GitHub** again. PAT linking
+and one-time import PATs remain available. See [credential setup and
+recovery](docs/github-imports.md#credentials).
+
 ## GitHub synchronization
 
 Site administrators can open **Admin** from the account menu, then select
@@ -57,12 +73,12 @@ success. Styx pruning limits execution history; durable synchronization task
 history remains separate. Raw job arguments and exception details are not shown.
 
 The organization GitHub tab (`/organizations/:organization/settings/github`)
-configures personal-use PAT synchronization. Select an active organization owner's
-saved PAT and source GitHub organization. `Sync now` immediately queues a
-recoverable background run for **all PAT-visible repositories in that GitHub
+configures synchronization using an active organization owner's saved GitHub
+connection or PAT and source GitHub organization. `Sync now` immediately queues a
+recoverable background run for **all credential-visible repositories in that GitHub
 organization**, regardless of the saved repository selection. Refreshing the
 list only reads GitHub; saving configuration or repository selection does not
-synchronize repository contents. Interval mode uses the same durable PAT-backed
+synchronize repository contents. Interval mode uses the same durable saved-credential
 organization synchronization pipeline. Starting a sync opens its durable task
 page, with automatically updated totals, individual repository outcomes and
 retry/wait reasons. The synchronization history retains previous task results.
@@ -85,13 +101,13 @@ the immutable GitHub repository ID. Name collisions, divergent branches and
 changed tags are reported as failures while other repositories continue.
 Local branches and tags are retained when GitHub deletes them.
 
-PAT values remain in the existing encrypted credential store; configuration
+Token values remain in the existing encrypted credential store; configuration
 stores references only. Changing the source or credential clears the cached
 inventory and repository selection.
 
-GitHub App organization synchronization is a future replacement for this PAT
-path. The App settings and mirror domain are retained as preparatory plumbing;
-an App installation is not required for the current PAT import or sync flow.
+The separate GitHub App installation-token path retains its own numeric App ID,
+private-key and webhook configuration. Device Flow connections use the existing
+saved-credential import and sync path. PATs do not require an App installation.
 
 GitHub REST responses are limited to 200 MiB (209,715,200 bytes), including release
 metadata pages. Outgoing JSON mutation requests retain their 2,000,000-byte limit.
@@ -454,6 +470,7 @@ Production environment variables:
 - `SECRET_KEY_BASE`
 - `FORNACAST_GITHUB_CREDENTIAL_KEYS`, a JSON object mapping key IDs to base64-encoded 32-byte keys
 - `FORNACAST_GITHUB_CREDENTIAL_ACTIVE_KEY_ID`, the key ID used for new GitHub credential writes
+- `FORNACAST_GITHUB_DEVICE_CLIENT_ID`, public Device Flow client ID (default `Iv23lizCVE3E24s7fCA0`), independent of installation-token configuration
 - `FORNACAST_DATABASE_ADAPTER`, which must be omitted or match the compiled PostgreSQL adapter
 - `DATABASE_URL` for PostgreSQL URL mode
 - `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` for PostgreSQL component mode
@@ -545,7 +562,7 @@ still supported and must not be confused with the Fornacast Ecto domain
 database. There are intentionally no operator instructions for running the
 current release with the Turso Ecto adapter.
 
-GitHub PAT encryption uses a dedicated AES-256-GCM keyring and never derives a
+GitHub credential encryption uses a dedicated AES-256-GCM keyring and never derives a
 key from `SECRET_KEY_BASE`. Generate a key with `openssl rand -base64 32`, then
 configure it under a stable key ID, for example:
 
@@ -630,7 +647,7 @@ as plaintext in `BACKUP_DIR`:
 
 - `FORNACAST_GITHUB_CREDENTIAL_KEYS` and
   `FORNACAST_GITHUB_CREDENTIAL_ACTIVE_KEY_ID`, which are required to decrypt
-  saved GitHub PATs;
+  saved GitHub access and refresh tokens and import PATs;
 - `SECRET_KEY_BASE`;
 - PostgreSQL connection credentials such as `DATABASE_URL` or
   `POSTGRES_PASSWORD`; and

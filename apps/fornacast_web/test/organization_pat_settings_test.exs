@@ -30,9 +30,9 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
     }
   end
 
-  test "canonical tab shows owner PAT configuration and preserves separate App page", c do
+  test "canonical tab shows owner credential configuration and preserves separate App page", c do
     html = request(c.owner) |> get(c.path) |> html_response(200)
-    assert html =~ "personal access token (PAT)"
+    assert html =~ "saved GitHub connection or PAT"
     assert html =~ "pause the synchronization configuration"
     assert html =~ "GitHub → Fornacast"
     assert html =~ c.path <> "/repositories"
@@ -54,7 +54,7 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
     assert redirected_to(conn, 303) == c.path
     html = request(c.owner) |> get(c.path) |> html_response(200)
     assert html =~ "source-org"
-    assert html =~ "No owner PAT selected"
+    assert html =~ "No owner credential selected"
 
     assert request(c.owner) |> get(c.path <> "/repositories") |> html_response(200) =~
              "Refresh from GitHub"
@@ -63,7 +63,7 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
            |> patch(c.path <> "/pat", %{
              "pat_sync" => %{params | "enabled" => "true", "lock_version" => "2"}
            })
-           |> html_response(422) =~ "valid saved PAT"
+           |> html_response(422) =~ "valid saved credential"
   end
 
   test "private settings, inventory and mutations reject outsiders and malformed input", c do
@@ -98,7 +98,7 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
     assert html =~ "Bidirectional Git and LFS"
 
     assert html =~
-             "Import repositories into this organization with the configured saved PAT first."
+             "Import repositories into this organization with the configured saved credential first."
 
     assert request(c.outsider)
            |> post(c.path <> "/repositories/mirror", %{})
@@ -128,7 +128,7 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
 
     assert html =~ "Sync now"
     assert html =~ c.path <> "/sync"
-    assert html =~ "all PAT-visible repositories"
+    assert html =~ "all credential-visible repositories"
     assert html =~ "regardless of the saved repository selection"
     assert html =~ "Saving repository selection does not synchronize repository contents."
     assert html =~ "Never synchronized"
@@ -272,7 +272,7 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
       )
 
     for {error, message} <- [
-          {"credential_unavailable", "The saved owner PAT is unavailable."},
+          {"credential_unavailable", "The saved owner credential is unavailable."},
           {"configuration_changed", "The GitHub source or PAT configuration changed."},
           {"lost_lease", "Synchronization was interrupted."}
         ] do

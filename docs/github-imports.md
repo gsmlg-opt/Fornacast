@@ -9,8 +9,14 @@ See also the approved design in
 
 ## Credentials
 
-### Saved versus one-time PATs
+### Saved connections and one-time PATs
 
+- **GitHub App connection:** Choose **Settings → GitHub → Connect with GitHub**,
+  enter the user code on GitHub, and approve access. Access and refresh tokens are
+  encrypted; saved imports and synchronization renew them automatically before
+  use. The operator must enable Device Flow on the App. Its public client ID
+  defaults to `Iv23lizCVE3E24s7fCA0` and can be overridden with
+  `FORNACAST_GITHUB_DEVICE_CLIENT_ID`. No client secret is needed.
 - **Saved PAT:** Linked under **Settings → GitHub**. The importer checks out the encrypted
   credential only inside an arity-one callback for the selected linked identity. Saved
   credentials survive across imports until replaced or deleted.
@@ -18,10 +24,19 @@ See also the approved design in
   envelope, used only while the run is active, and cleared when the run reaches a terminal
   state. One-time envelopes are never copied to successor retry runs.
 
-Both modes require a GitHub fine-grained or classic PAT with enough access to read the
-selected repositories and organization metadata. Linking or import discovery fails with a
+PAT modes require a GitHub fine-grained or classic PAT with enough access to read the
+selected repositories and organization metadata. App connections can access only
+repositories available to both the user and the App installation, within the App's
+granted permissions. Linking or import discovery fails with a
 safe, non-leaking error when GitHub rejects the token, the token lacks required scopes, or
 the GitHub account does not match the expected identity.
+
+Use **Connect with GitHub** again if the account displays **Reconnect GitHub**.
+Expired or rejected refresh tokens and abandoned or uncertain refresh requests
+require reconnection because GitHub refresh tokens can be used only once.
+Automatic renewal keeps the synchronization authorization version unchanged;
+manual reconnection or credential replacement retains the existing authorization
+checks and can require selecting the credential again in organization settings.
 
 ### Encryption keyring
 

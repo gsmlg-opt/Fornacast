@@ -8,10 +8,17 @@ defmodule FornacastWeb.OrganizationPATSettingsHTML do
   def accounts(view),
     do: for(owner <- view.owners, account <- owner.accounts, do: {owner, account})
 
-  def credential_status(nil), do: "No owner PAT selected"
-  def credential_status(%{credential_present: false}), do: "Saved PAT missing"
-  def credential_status(%{credential_status: :valid}), do: "Saved PAT verified"
-  def credential_status(_), do: "Saved PAT invalid"
+  def credential_status(nil), do: "No owner credential selected"
+
+  def credential_status(%{credential_kind: :github_app_user, reconnect_required: true}),
+    do: "Reconnect GitHub"
+
+  def credential_status(%{credential_kind: :github_app_user, credential_status: :valid}),
+    do: "GitHub App connected"
+
+  def credential_status(%{credential_present: false}), do: "Saved credential missing"
+  def credential_status(%{credential_status: :valid}), do: "Saved credential verified"
+  def credential_status(_), do: "Saved credential invalid"
   def repository_rows(view), do: Map.get(view.config.inventory, "repositories", [])
 
   def selected?(config, id),
@@ -137,7 +144,7 @@ defmodule FornacastWeb.OrganizationPATSettingsHTML do
     do: "Existing repository conflicts with this GitHub source."
 
   defp sync_failure_message("credential_unavailable"),
-    do: "The saved owner PAT is unavailable. Verify or replace it before trying again."
+    do: "The saved owner credential is unavailable. Verify or replace it before trying again."
 
   defp sync_failure_message(reason) when reason in ["configuration_changed", "stale"],
     do: "The GitHub source or PAT configuration changed. Start synchronization again."

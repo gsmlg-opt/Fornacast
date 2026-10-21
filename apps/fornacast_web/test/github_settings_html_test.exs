@@ -10,13 +10,14 @@ defmodule FornacastWeb.GitHubSettingsHTMLTest do
     html =
       render_component(&GitHubSettingsHTML.index/1,
         accounts: [account(41, "octocat", :valid), account(42, "hubot", :invalid)],
-        error: nil
+        error: nil,
+        device_flow: nil
       )
 
     assert html =~ "data-github-settings"
     assert html =~ "bg-surface-container-low"
     document = LazyHTML.from_fragment(html)
-    assert Enum.count(LazyHTML.query(document, "article.card")) == 3
+    assert Enum.count(LazyHTML.query(document, "article.card")) == 4
     assert html =~ "Github:octocat"
     assert html =~ "Github:hubot"
     refute html =~ "https://avatars.githubusercontent.com/u/90041"
@@ -41,7 +42,8 @@ defmodule FornacastWeb.GitHubSettingsHTMLTest do
     html =
       render_component(&GitHubSettingsHTML.index/1,
         accounts: [account(41, "octocat", :valid)],
-        error: nil
+        error: nil,
+        device_flow: nil
       )
 
     pat_inputs = Regex.scan(~r/<input\b[^>]*name="github_account\[pat\]"[^>]*>/, html)
@@ -62,7 +64,7 @@ defmodule FornacastWeb.GitHubSettingsHTMLTest do
       refute input =~ ~r/\bvalue=/
     end
 
-    assert length(Regex.scan(~r/name="_csrf_token"/, html)) == 5
+    assert length(Regex.scan(~r/name="_csrf_token"/, html)) == 6
     assert html =~ ~s(action="/settings/github" method="post")
     assert html =~ ~s(action="/settings/github/41/reverify" method="post")
     assert html =~ ~s(action="/settings/github/41/credential" method="post")
@@ -74,7 +76,8 @@ defmodule FornacastWeb.GitHubSettingsHTMLTest do
     html =
       render_component(&GitHubSettingsHTML.index/1,
         accounts: [account(41, "octocat", :valid)],
-        error: nil
+        error: nil,
+        device_flow: nil
       )
 
     assert html =~ "Delete saved PAT"
@@ -92,7 +95,8 @@ defmodule FornacastWeb.GitHubSettingsHTMLTest do
     html =
       render_component(&GitHubSettingsHTML.index/1,
         accounts: [account(41, "octocat", nil)],
-        error: nil
+        error: nil,
+        device_flow: nil
       )
 
     assert html =~ "Github:octocat"
@@ -105,18 +109,43 @@ defmodule FornacastWeb.GitHubSettingsHTMLTest do
   end
 
   test "empty and error states are explicit, stable, and escaped" do
-    empty = render_component(&GitHubSettingsHTML.index/1, accounts: [], error: nil)
+    empty =
+      render_component(&GitHubSettingsHTML.index/1, accounts: [], error: nil, device_flow: nil)
+
     assert empty =~ "No linked GitHub accounts"
 
     error =
       render_component(&GitHubSettingsHTML.index/1,
         accounts: [],
-        error: "Could not verify <script>alert(1)</script>"
+        error: "Could not verify <script>alert(1)</script>",
+        device_flow: nil
       )
 
     assert error =~ "Could not verify &lt;script&gt;alert(1)&lt;/script&gt;"
     refute error =~ "<script>alert(1)</script>"
     assert error =~ ~s(<el-dm-alert id="github-settings-error" type="error")
+  end
+
+  test "GitHub App credentials display their connection and reconnection state" do
+    connected = %{account(41, "octocat", :valid) | credential_kind: :github_app_user}
+
+    reconnect = %{
+      account(42, "hubot", :invalid)
+      | credential_kind: :github_app_user,
+        reconnect_required: true
+    }
+
+    html =
+      render_component(&GitHubSettingsHTML.index/1,
+        accounts: [connected, reconnect],
+        error: nil,
+        device_flow: nil
+      )
+
+    assert html =~ "GitHub App connected"
+    assert html =~ "Reconnect GitHub"
+    assert html =~ "Delete this saved GitHub App token?"
+    refute html =~ "GitHub GitHub"
   end
 
   defp account(identity_id, login, credential_status) do

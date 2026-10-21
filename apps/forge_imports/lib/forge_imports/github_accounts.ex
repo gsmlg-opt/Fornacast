@@ -157,7 +157,7 @@ defmodule ForgeImports.GitHubAccounts do
          %GitHubCredentialVerification{} <- account.credential,
          {:ok, client, client_opts} <- client_options(opts),
          {:ok, callback_result} <-
-           ForgeAccounts.with_github_credential_for_verification(
+           ForgeGitHub.SavedCredential.with_credential_for_verification(
              actor,
              identity_id,
              fn pat, reference ->
@@ -171,7 +171,8 @@ defmodule ForgeImports.GitHubAccounts do
                  client,
                  client_opts
                )
-             end
+             end,
+             opts
            ),
          :ok <- callback_result,
          {:ok, view} <- account_view(actor, identity_id) do
@@ -480,6 +481,8 @@ defmodule ForgeImports.GitHubAccounts do
   defp normalize_result({:error, reason}), do: {:error, normalize_domain_error(reason)}
   defp normalize_result(_result), do: {:error, :account_update_failed}
 
+  defp normalize_domain_error(:credential_changed), do: :stale
+
   defp normalize_domain_error(reason)
        when reason in [
               :forbidden,
@@ -488,6 +491,8 @@ defmodule ForgeImports.GitHubAccounts do
               :identity_mismatch,
               :invalid_credential,
               :credential_invalid,
+              :reauthorization_required,
+              :refresh_in_progress,
               :credential_service_unavailable,
               :unsafe_credential_result,
               :duplicate_operation,

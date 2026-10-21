@@ -19,7 +19,7 @@
     <.dm_card id="pat-repositories-sync" variant="bordered" padding="lg">
       <:title>Synchronize organization</:title>
       <p class="text-sm text-on-surface-variant">
-        Sync now immediately starts background synchronization of all PAT-visible repositories in the GitHub organization, regardless of the saved repository selection.
+        Sync now immediately starts background synchronization of all credential-visible repositories in the GitHub organization, regardless of the saved repository selection.
       </p>
       <form action={base(@organization) <> "/sync"} method="post" class="mt-4">
         <input type="hidden" name="_csrf_token" value={csrf_token()} />
@@ -45,7 +45,7 @@
         <.dm_link href={base(@organization) <> "/conflicts"} class="text-primary">View synchronization conflicts</.dm_link>
       </p>
       <p :if={@pat_mirror.candidates == []} class="mt-2">
-        Import repositories into this organization with the configured saved PAT first.
+        Import repositories into this organization with the configured saved credential first.
       </p>
       <form
         :if={@pat_mirror.candidates != []}
@@ -74,7 +74,7 @@
           }
         />
         <p class="text-sm text-on-surface-variant">
-          Select enrolled repositories again to authorize a changed configuration or renewed PAT.
+          Select enrolled repositories again to authorize a changed configuration or reconnected credential.
           Unchecked repositories retain their existing connection.
         </p>
         <div>
@@ -91,7 +91,7 @@
     <.dm_card id="pat-repositories-list" variant="bordered" padding="lg">
       <:title>Repository selection</:title>
       <p class="text-sm text-on-surface-variant">
-        Only repositories visible to the selected owner’s PAT can be listed. Refreshing reads GitHub; it does not import repositories.
+        Only repositories visible to the selected owner’s credential can be listed. Refreshing reads GitHub; it does not import repositories.
       </p>
       <form
         :if={@view.config.id}
@@ -104,7 +104,7 @@
         <button type="submit" class="btn btn-secondary">Refresh from GitHub</button>
       </form>
       <p :if={!@view.config.id}>
-        Save an owner PAT and GitHub organization in configuration first.
+        Save an owner credential and GitHub organization in configuration first.
       </p>
       <form
         :if={@view.config.id}
@@ -124,7 +124,7 @@
             name="pat_sync[repository_selection]"
           >
             <option value="all" selected={@view.config.repository_selection == "all"}>
-              All PAT-visible repositories
+              All credential-visible repositories
             </option>
             <option value="selected" selected={@view.config.repository_selection == "selected"}>
               Selected repositories only
@@ -135,7 +135,7 @@
           No repositories listed. Refresh from GitHub to choose individual repositories.
         </p>
         <div :if={repository_rows(@view) != []} class="overflow-x-auto">
-          <table class="table" aria-label="PAT-visible GitHub repositories">
+          <table class="table" aria-label="credential-visible GitHub repositories">
             <thead>
               <tr>
                 <th>Select</th><th>Repository</th><th>Visibility</th>
@@ -159,7 +159,7 @@
           </table>
         </div>
         <p class="text-sm text-on-surface-variant">
-          Choose “Selected repositories only” to save the checkboxes. Sync now always includes all PAT-visible organization repositories. Unselected repositories are retained locally.
+          Choose “Selected repositories only” to save the checkboxes. Sync now always includes all credential-visible organization repositories. Unselected repositories are retained locally.
         </p>
         <div>
           <button type="submit" class="btn btn-primary">Save repository selection</button>

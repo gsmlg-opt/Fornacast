@@ -64,6 +64,22 @@ defmodule ForgeAccounts do
   defdelegate save_github_account(actor, verified_profile, pat, request_metadata),
     to: GitHubAccounts
 
+  defdelegate save_github_device_account(actor, verified_profile, token, request_metadata),
+    to: GitHubAccounts
+
+  defdelegate save_github_device_account(
+                actor,
+                verified_profile,
+                token,
+                request_metadata,
+                snapshot
+              ),
+              to: GitHubAccounts
+
+  def refresh_github_credential(actor, identity_id, credential_id, callback, opts \\ []),
+    do:
+      GitHubAccounts.refresh_github_credential(actor, identity_id, credential_id, callback, opts)
+
   @doc false
   defdelegate save_github_account_if_absent(actor, verified_profile, pat, request_metadata),
     to: GitHubAccounts
@@ -135,7 +151,7 @@ defmodule ForgeAccounts do
     to: GitHubAccounts
 
   @doc """
-  Checks a saved PAT out only to a trusted internal callback.
+  Checks a saved GitHub access token out only to a trusted internal callback.
 
   The callback may perform durable side effects, but it may return only `:ok` or a bounded
   `{:error, reason}` made from atoms and integers. Public results and exceptions never carry

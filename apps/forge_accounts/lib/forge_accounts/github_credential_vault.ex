@@ -55,6 +55,77 @@ defmodule ForgeAccounts.GitHubCredentialVault do
 
   def encrypt_saved(_credential, _identity, _pat, _keyring), do: @service_error
 
+  def encrypt_refresh(
+        %GitHubCredential{} = credential,
+        %GitHubIdentity{} = identity,
+        refresh_token,
+        keyring \\ configured()
+      ) do
+    with true <- valid_pat?(refresh_token),
+         true <- valid_saved_binding?(credential, identity),
+         true <- is_binary(credential.client_id),
+         {:ok, normalized} <- normalize_keyring(keyring) do
+      encrypt(refresh_token, refresh_aad(credential, identity), normalized)
+    else
+      _ -> @service_error
+    end
+  rescue
+    _ -> @service_error
+  catch
+    _, _ -> @service_error
+  end
+
+  # Both secrets stay inside trusted callbacks. The access envelope/AAD remains v1 compatible.
+  def with_saved_secrets(credential, identity, callback, keyring \\ configured())
+      when is_function(callback, 2) do
+    with {:ok, access} <- decrypt_saved(credential, identity, keyring),
+         {:ok, refresh} <- decrypt_refresh(credential, identity, keyring) do
+      {:ok, callback.(access, refresh)}
+    end
+  end
+
+  def with_saved_refresh(credential, identity, callback, keyring \\ configured())
+      when is_function(callback, 1) do
+    with {:ok, refresh} when is_binary(refresh) <- decrypt_refresh(credential, identity, keyring) do
+      {:ok, callback.(refresh)}
+    else
+      _ -> @service_error
+    end
+  end
+
+  defp decrypt_refresh(%GitHubCredential{credential_kind: :pat}, _identity, _keyring),
+    do: {:ok, nil}
+
+  defp decrypt_refresh(%GitHubCredential{} = credential, %GitHubIdentity{} = identity, keyring) do
+    envelope = %Envelope{
+      ciphertext: credential.refresh_ciphertext,
+      nonce: credential.refresh_nonce,
+      tag: credential.refresh_tag,
+      key_id: credential.refresh_key_id
+    }
+
+    with true <- valid_saved_binding?(credential, identity),
+         true <- is_binary(credential.client_id),
+         true <- valid_envelope?(envelope),
+         {:ok, normalized} <- normalize_keyring(keyring) do
+      decrypt(envelope, refresh_aad(credential, identity), normalized)
+    else
+      _ -> @service_error
+    end
+  rescue
+    _ -> @service_error
+  catch
+    _, _ -> @service_error
+  end
+
+  defp refresh_aad(credential, identity) do
+    :erlang.term_to_binary(
+      {:fornacast_github_refresh_credential, @aad_version, credential.id,
+       credential.local_user_id, :github, identity.github_user_id, credential.client_id},
+      [:deterministic]
+    )
+  end
+
   @spec with_saved_credential(
           GitHubCredential.t(),
           GitHubIdentity.t(),

@@ -395,7 +395,7 @@ defmodule FornacastWeb.GitHubSettingsControllerTest do
         {:credential_invalid, 422, "GitHub rejected the personal access token."},
         {:identity_mismatch, 422, "That PAT belongs to a different GitHub account."},
         {:already_linked, 409, "That GitHub account cannot be linked."},
-        {:credential_in_use, 409, "This saved PAT is in use by an active import."},
+        {:credential_in_use, 409, "This saved credential is in use by an active import."},
         {:busy, 409, "The GitHub account changed or is busy. Refresh and try again."},
         {:stale, 409, "The GitHub account changed or is busy. Refresh and try again."},
         {:request_gate_busy, 409,

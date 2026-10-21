@@ -80,6 +80,27 @@ Complete `/setup` from the local host or through an SSH tunnel before opening
 public port `4000`. Publish only nginx on `4000` and SSH on `2222`; ports `4890`
 and `4891` are internal.
 
+## GitHub Device Flow connections
+
+Set `FORNACAST_GITHUB_CREDENTIAL_KEYS` and
+`FORNACAST_GITHUB_CREDENTIAL_ACTIVE_KEY_ID` before connecting accounts; the same
+keyring encrypts saved access and refresh tokens. Preserve existing keys during
+upgrades and backups. Missing keys disable credential operations while the
+forge remains available.
+
+`FORNACAST_GITHUB_DEVICE_CLIENT_ID` defaults to `Iv23lizCVE3E24s7fCA0` in
+development, releases and Compose. Override it to use your own GitHub App and
+enable Device Flow in its settings. No client secret is needed. Install the
+App with access and permissions for the repositories you intend to import or
+synchronize. Users connect through **Settings → GitHub**. Device Flow is
+independent of the optional numeric App ID/private-key/webhook configuration.
+
+Saved App tokens renew before use. A rejected or expired refresh token, an
+abandoned refresh, or a dispatched request with an uncertain outcome requires
+the user to reconnect. Do not retry an old one-use refresh token manually.
+PostgreSQL holds encrypted token metadata; retain the existing paired
+PostgreSQL dump and `fornacast-data` filesystem backup boundary.
+
 ## Upgrades
 
 Use stop-before-start upgrades. Only one Fornacast node may mount

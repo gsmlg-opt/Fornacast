@@ -1,6 +1,10 @@
 import Config
 
 if config_env() == :prod do
+  config :forge_github,
+         :device_client_id,
+         System.get_env("FORNACAST_GITHUB_DEVICE_CLIENT_ID", "Iv23lizCVE3E24s7fCA0")
+
   # Mix evaluates runtime.exs for prod build tasks; require these only in releases.
   release_command = System.get_env("RELEASE_COMMAND")
   require_runtime_env? = is_binary(release_command) and release_command != ""

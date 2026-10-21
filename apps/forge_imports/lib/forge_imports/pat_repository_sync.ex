@@ -31,7 +31,20 @@ defmodule ForgeImports.PatRepositorySync do
     with {:ok, options} <- options(opts),
          [remote_owner, remote_repository] <- String.split(source_full_name, "/"),
          true <- String.downcase(remote_owner) == config.github_organization,
+         {:ok, _identity, initial_credential} <- credential(owner, config),
+         initial_authorize <-
+           authorization(owner, config, repository, initial_credential, options),
+         :ok <- initial_authorize.(),
+         :ok <-
+           ForgeGitHub.SavedCredential.ensure_fresh(
+             owner,
+             config.github_identity_id,
+             initial_credential.id,
+             opts
+           ),
          {:ok, identity, credential} <- credential(owner, config),
+         :ok <-
+           if(same_authority?(initial_credential, credential), do: :ok, else: {:error, :stale}),
          authorize <- authorization(owner, config, repository, credential, options),
          :ok <- authorize.(),
          request <- %SyncRequest{
@@ -42,11 +55,15 @@ defmodule ForgeImports.PatRepositorySync do
            repository_path: ForgeRepos.absolute_storage_path(repository)
          } do
       owner
-      |> ForgeAccounts.with_github_credential(config.github_identity_id, fn token ->
-        request
-        |> synchronize(token, owner, repository, config, credential, authorize, options)
-        |> safe_result()
-      end)
+      |> ForgeGitHub.SavedCredential.with_credential(
+        config.github_identity_id,
+        fn token ->
+          request
+          |> synchronize(token, owner, repository, config, credential, authorize, options)
+          |> safe_result()
+        end,
+        opts
+      )
       |> credential_result()
     else
       {:error, reason} -> safe_result({:error, reason})
@@ -336,7 +353,7 @@ defmodule ForgeImports.PatRepositorySync do
            {:ok, _owner} <-
              ForgeAccounts.organization_github_owner(owner, config.organization_id, owner.id),
            {:ok, _, current_credential} <- credential(owner, config),
-           true <- current_credential == credential,
+           true <- same_authority?(current_credential, credential),
            {:ok, current_repository} <- ForgeRepos.fetch_live_repository(repository.id),
            true <-
              current_repository.owner_user_id == config.organization_id and
@@ -372,6 +389,12 @@ defmodule ForgeImports.PatRepositorySync do
           _ -> {:error, :stale}
         end
     end
+  end
+
+  defp same_authority?(current, expected) do
+    current.id == expected.id and current.local_user_id == expected.local_user_id and
+      current.github_identity_id == expected.github_identity_id and
+      current.verification_version == expected.verification_version
   end
 
   defp credential(owner, config) do
@@ -416,7 +439,8 @@ defmodule ForgeImports.PatRepositorySync do
       :github_repository_id,
       :lookup_repository,
       :fetch_refs,
-      :lfs_transfer_options
+      :lfs_transfer_options,
+      :device_flow_options
     ]
 
     if Keyword.keyword?(opts) and Enum.all?(Keyword.keys(opts), &(&1 in keys)) and

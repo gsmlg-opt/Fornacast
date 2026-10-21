@@ -17,6 +17,9 @@ defmodule ForgeAccounts.GitHubAccountView do
              :profile_url,
              :credential_present,
              :credential_status,
+             :credential_kind,
+             :expires_at,
+             :reconnect_required,
              :identity_last_verified_at,
              :credential_last_verified_at
            ]}
@@ -37,6 +40,9 @@ defmodule ForgeAccounts.GitHubAccountView do
     :avatar_url,
     :profile_url,
     :credential_status,
+    :credential_kind,
+    :expires_at,
+    :reconnect_required,
     :identity_last_verified_at,
     :credential_last_verified_at,
     credential_present: false
@@ -51,6 +57,9 @@ defmodule ForgeAccounts.GitHubAccountView do
           profile_url: String.t() | nil,
           credential_present: boolean(),
           credential_status: :valid | :invalid | nil,
+          credential_kind: :pat | :github_app_user | nil,
+          expires_at: DateTime.t() | nil,
+          reconnect_required: boolean(),
           identity_last_verified_at: DateTime.t() | nil,
           credential_last_verified_at: DateTime.t() | nil
         }
@@ -68,10 +77,20 @@ defmodule ForgeAccounts.GitHubAccountView do
       profile_url: trusted_url(identity.profile_url, ["github.com"]),
       credential_present: match?(%GitHubCredential{}, credential),
       credential_status: credential_value(credential, :status),
+      credential_kind: credential_value(credential, :credential_kind),
+      expires_at: credential_value(credential, :expires_at),
+      reconnect_required: reconnect_required?(credential),
       identity_last_verified_at: identity.last_verified_at,
       credential_last_verified_at: credential_value(credential, :last_verified_at)
     }
   end
+
+  defp reconnect_required?(%GitHubCredential{credential_kind: :github_app_user} = credential) do
+    credential.status == :invalid or is_nil(credential.refresh_expires_at) or
+      DateTime.compare(credential.refresh_expires_at, DateTime.utc_now()) != :gt
+  end
+
+  defp reconnect_required?(_credential), do: false
 
   defp credential_value(%GitHubCredential{} = credential, field),
     do: Map.fetch!(credential, field)

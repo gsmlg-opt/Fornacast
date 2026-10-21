@@ -11,6 +11,7 @@ defmodule ForgeAccounts.GitHubAccounts do
     GitHubCredential,
     GitHubCredentialVerification,
     GitHubCredentialVault,
+    GitHubDeviceToken,
     GitHubIdentity,
     GitHubIdentityWrite,
     GitHubProfileSafety,
@@ -209,6 +210,71 @@ defmodule ForgeAccounts.GitHubAccounts do
   def save_github_account(_actor, _verified_profile, _pat, _request_metadata),
     do: {:error, :forbidden}
 
+  def save_github_device_account(%User{} = actor, profile, token_value, request_metadata)
+      when is_map(profile) and is_map(request_metadata) do
+    with {:ok, token} <- GitHubDeviceToken.normalize(token_value),
+         {:ok, safe_metadata} <- device_inputs(profile, token, request_metadata),
+         {:ok, checked} <-
+           validate_github_link_inputs(actor, safe_metadata, profile, token.access_token) do
+      save_github_device_account(
+        actor,
+        profile,
+        token,
+        checked.request_metadata,
+        checked.references
+      )
+    end
+  end
+
+  def save_github_device_account(_actor, _profile, _token, _metadata),
+    do: {:error, :forbidden}
+
+  # The snapshot was captured before /user verification, so a superseded authorization
+  # cannot replace a credential created or rotated during that provider request.
+  def save_github_device_account(
+        %User{} = actor,
+        profile,
+        token_value,
+        request_metadata,
+        snapshot
+      )
+      when is_map(profile) and is_map(request_metadata) and is_list(snapshot) do
+    with {:ok, token} <- GitHubDeviceToken.normalize(token_value),
+         {:ok, safe_metadata} <- device_inputs(profile, token, request_metadata) do
+      github_user_id = profile_github_user_id(profile)
+
+      case Enum.find(snapshot, &(&1.github_user_id == github_user_id)) do
+        nil ->
+          save_absent_github_account(actor, profile, token, safe_metadata)
+
+        %{identity_id: identity_id, credential: nil} ->
+          save_absent_github_credential(actor, identity_id, profile, token, safe_metadata)
+
+        %{identity_id: identity_id, credential: %GitHubCredentialVerification{} = reference} ->
+          replace_verified_github_credential_if_current(
+            actor,
+            identity_id,
+            reference,
+            profile,
+            token,
+            safe_metadata
+          )
+      end
+    end
+  end
+
+  def save_github_device_account(_actor, _profile, _token, _metadata, _snapshot),
+    do: {:error, :forbidden}
+
+  defp device_inputs(profile, token, metadata) do
+    with {:ok, metadata} <- GitHubRequestMetadata.validate(metadata, token.access_token),
+         {:ok, metadata} <- GitHubRequestMetadata.validate(metadata, token.refresh_token),
+         :ok <- GitHubProfileSafety.validate(profile, token.access_token),
+         :ok <- GitHubProfileSafety.validate(profile, token.refresh_token) do
+      {:ok, metadata}
+    end
+  end
+
   @doc false
   def save_github_account_if_absent(%User{} = actor, verified_profile, pat, request_metadata)
       when is_map(verified_profile) and is_binary(pat) and is_map(request_metadata) do
@@ -286,7 +352,7 @@ defmodule ForgeAccounts.GitHubAccounts do
 
     github_mutation(actor, request_metadata,
       verified_profile: verified_profile,
-      submitted_credential: pat
+      submitted_credential: access_token(pat)
     )
     |> Multi.run(:identity_candidate, fn repo, %{actor: active_actor} ->
       absent_link_candidate(repo, active_actor, verified_profile)
@@ -326,7 +392,7 @@ defmodule ForgeAccounts.GitHubAccounts do
 
     github_mutation(actor, request_metadata,
       verified_profile: verified_profile,
-      submitted_credential: pat
+      submitted_credential: access_token(pat)
     )
     |> Multi.run(:identity, fn repo, %{actor: active_actor} ->
       observe_selected_identity(
@@ -397,7 +463,7 @@ defmodule ForgeAccounts.GitHubAccounts do
 
     github_mutation(actor, request_metadata,
       verified_profile: verified_profile,
-      submitted_credential: pat
+      submitted_credential: access_token(pat)
     )
     |> Multi.run(:selected_identity, fn repo, %{actor: active_actor} ->
       owned_identity(repo, identity_id, active_actor.id)
@@ -484,7 +550,7 @@ defmodule ForgeAccounts.GitHubAccounts do
 
     github_mutation(actor, request_metadata,
       verified_profile: verified_profile,
-      submitted_credential: pat
+      submitted_credential: access_token(pat)
     )
     |> Multi.run(:selected_identity, fn repo, %{actor: active_actor} ->
       owned_identity(repo, identity_id, active_actor.id)
@@ -530,6 +596,226 @@ defmodule ForgeAccounts.GitHubAccounts do
     end)
     |> transact_view()
   end
+
+  def refresh_github_credential(actor, identity_id, credential_id, callback, opts \\ [])
+
+  def refresh_github_credential(%User{} = actor, identity_id, credential_id, callback, opts)
+      when is_integer(identity_id) and is_integer(credential_id) and is_function(callback, 2) and
+             is_list(opts) do
+    if Repo.in_transaction?() do
+      # A caller transaction would retain the claim across network I/O and roll it
+      # back after a potentially consumed refresh. Require a durable outer boundary.
+      {:error, :credential_service_unavailable}
+    else
+      now = Keyword.get(opts, :now, DateTime.utc_now(:second))
+
+      case transact_checked(fn -> claim_refresh(actor, identity_id, credential_id, now, opts) end) do
+        {:ok, :ready} ->
+          :ok
+
+        {:ok, {:error, reason}} ->
+          {:error, reason}
+
+        {:ok, {:claimed, credential, identity}} ->
+          exchange_refresh(actor, credential, identity, callback)
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  def refresh_github_credential(_actor, _identity_id, _credential_id, _callback, _opts),
+    do: {:error, :forbidden}
+
+  defp claim_refresh(actor, identity_id, credential_id, now, opts) do
+    with {:ok, actor} <- active_github_actor(Repo, actor),
+         {:ok, identity} <- owned_identity(Repo, identity_id, actor.id),
+         {:ok, credential} <- required_owned_credential(Repo, actor, identity),
+         true <- credential.id == credential_id,
+         :ok <- GitHubCredentialVault.ready?() do
+      decide_refresh(actor, identity, credential, now, opts)
+    else
+      false -> {:error, :stale}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp decide_refresh(
+         _actor,
+         _identity,
+         %GitHubCredential{credential_kind: :pat},
+         _now,
+         _opts
+       ) do
+    {:ok, :ready}
+  end
+
+  defp decide_refresh(_actor, _identity, %GitHubCredential{status: :invalid}, _now, _opts),
+    do: {:error, :reauthorization_required}
+
+  defp decide_refresh(actor, identity, credential, now, opts) do
+    renew_before = Keyword.get(opts, :refresh_before_seconds, 60)
+    claim_timeout = Keyword.get(opts, :claim_timeout_seconds, 60)
+
+    cond do
+      not is_nil(credential.refresh_claim_id) ->
+        if is_nil(credential.refresh_claimed_at) or
+             DateTime.diff(now, credential.refresh_claimed_at) >= claim_timeout do
+          invalidate_refresh(actor, identity, credential)
+        else
+          {:error, :refresh_in_progress}
+        end
+
+      is_nil(credential.refresh_expires_at) or
+          DateTime.compare(credential.refresh_expires_at, now) != :gt ->
+        invalidate_refresh(actor, identity, credential)
+
+      is_struct(credential.expires_at, DateTime) and
+          DateTime.diff(credential.expires_at, now) > renew_before ->
+        {:ok, :ready}
+
+      true ->
+        claim_id = Ecto.UUID.generate()
+
+        query =
+          refresh_generation_query(credential) |> where([saved], is_nil(saved.refresh_claim_id))
+
+        case Repo.update_all(query,
+               set: [refresh_claim_id: claim_id, refresh_claimed_at: now, updated_at: now]
+             ) do
+          {1, _} ->
+            {:ok,
+             {:claimed, %{credential | refresh_claim_id: claim_id, refresh_claimed_at: now},
+              identity}}
+
+          {0, _} ->
+            {:error, :stale}
+        end
+    end
+  end
+
+  defp exchange_refresh(actor, credential, identity, callback) do
+    # Normalize inside the decrypt callback. Only a sanitized outcome leaves this
+    # boundary; exceptions and unknown outcomes can never trigger blind retries.
+    outcome =
+      GitHubCredentialVault.with_saved_refresh(credential, identity, fn refresh ->
+        try do
+          with {:ok, value} <- callback.(refresh, credential.client_id),
+               {:ok, token} <- GitHubDeviceToken.normalize(value),
+               true <- token.client_id == credential.client_id,
+               false <- token.refresh_token == refresh do
+            {:ok, token}
+          else
+            _ -> {:error, :reauthorization_required}
+          end
+        rescue
+          _ -> {:error, :reauthorization_required}
+        catch
+          _, _ -> {:error, :reauthorization_required}
+        end
+      end)
+
+    case outcome do
+      {:ok, {:ok, token}} -> finish_refresh(actor, credential, identity, token)
+      {:ok, {:error, _reason}} -> fail_refresh(actor, credential, identity)
+      {:error, :credential_service_unavailable} -> release_undispatched_refresh(credential)
+    end
+  end
+
+  defp finish_refresh(actor, credential, identity, token) do
+    result =
+      transact_checked(fn ->
+        with {:ok, actor} <- active_github_actor(Repo, actor),
+             {:ok, identity} <- owned_identity(Repo, identity.id, actor.id),
+             {:ok, envelope} <- encrypt_credential(credential, identity, token) do
+          query = refresh_generation_query(credential) |> match_refresh_claim(credential)
+
+          updates =
+            Map.to_list(
+              Map.merge(envelope, %{status: :valid, updated_at: DateTime.utc_now(:second)})
+            )
+
+          case Repo.update_all(query, set: updates, inc: [token_generation: 1]) do
+            {1, _} ->
+              current = Repo.get!(GitHubCredential, credential.id)
+
+              with {:ok, _event} <-
+                     audit(actor, "github.credential.refreshed", identity, current, %{}),
+                   do: {:ok, :ok}
+
+            {0, _} ->
+              {:error, :stale}
+          end
+        end
+      end)
+
+    case result do
+      {:ok, :ok} -> :ok
+      {:error, :credential_service_unavailable} -> fail_refresh(actor, credential, identity)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp fail_refresh(actor, credential, identity) do
+    case transact_checked(fn ->
+           with {:ok, actor} <- active_github_actor(Repo, actor),
+                {:ok, identity} <- owned_identity(Repo, identity.id, actor.id) do
+             invalidate_refresh(actor, identity, credential)
+           end
+         end) do
+      {:ok, {:error, reason}} -> {:error, reason}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp invalidate_refresh(actor, identity, credential) do
+    query = refresh_generation_query(credential) |> match_refresh_claim(credential)
+
+    case Repo.update_all(query,
+           set: [
+             status: :invalid,
+             refresh_claim_id: nil,
+             refresh_claimed_at: nil,
+             updated_at: DateTime.utc_now(:second)
+           ],
+           inc: [verification_version: 1]
+         ) do
+      {1, _} ->
+        current = Repo.get!(GitHubCredential, credential.id)
+
+        with {:ok, _event} <-
+               audit(actor, "github.credential.invalidated", identity, current, %{}),
+             do: {:ok, {:error, :reauthorization_required}}
+
+      {0, _} ->
+        {:error, :stale}
+    end
+  end
+
+  defp release_undispatched_refresh(credential) do
+    # Decryption failed before dispatch. Clearing exactly this claim is safe;
+    # an exception or provider response never takes this path.
+    query = refresh_generation_query(credential) |> match_refresh_claim(credential)
+    Repo.update_all(query, set: [refresh_claim_id: nil, refresh_claimed_at: nil])
+    {:error, :credential_service_unavailable}
+  end
+
+  defp refresh_generation_query(credential) do
+    GitHubCredential
+    |> where(
+      [saved],
+      saved.id == ^credential.id and saved.local_user_id == ^credential.local_user_id and
+        saved.github_identity_id == ^credential.github_identity_id and saved.status == :valid
+    )
+    |> match_loaded_generation(credential)
+  end
+
+  defp match_refresh_claim(query, %{refresh_claim_id: nil}),
+    do: where(query, [saved], is_nil(saved.refresh_claim_id))
+
+  defp match_refresh_claim(query, credential),
+    do: where(query, [saved], saved.refresh_claim_id == ^credential.refresh_claim_id)
 
   @spec refresh_github_account(User.t(), pos_integer(), map(), map()) ::
           {:ok, GitHubAccountView.t()} | {:error, term()}
@@ -846,7 +1132,8 @@ defmodule ForgeAccounts.GitHubAccounts do
            Repo.get_by(GitHubCredential,
              github_identity_id: identity.id,
              local_user_id: actor_id
-           ) do
+           ),
+         :ok <- available_device_expiry(credential) do
       reference = verification_reference(credential, identity)
 
       checked_out_result(credential, identity, fn pat -> callback.(pat, reference) end)
@@ -905,10 +1192,14 @@ defmodule ForgeAccounts.GitHubAccounts do
       actor_id
       |> external_profile_credentials()
       |> Enum.reduce_while(:ok, fn {credential, identity}, :ok ->
-        case GitHubCredentialVault.with_saved_credential(
+        case GitHubCredentialVault.with_saved_secrets(
                credential,
                identity,
-               &validate_external_profiles(profiles, &1)
+               fn access, refresh ->
+                 with :ok <- validate_external_profiles(profiles, access),
+                      :ok <- validate_external_profiles(profiles, refresh),
+                      do: :ok
+               end
              ) do
           {:ok, :ok} -> {:cont, :ok}
           {:ok, {:error, :invalid_response}} -> {:halt, {:error, :invalid_response}}
@@ -972,10 +1263,13 @@ defmodule ForgeAccounts.GitHubAccounts do
   defp validate_import_inputs(rows, request_metadata, profiles) do
     Enum.reduce_while(rows, {:ok, request_metadata}, fn {credential, identity},
                                                         {:ok, safe_metadata} ->
-      case GitHubCredentialVault.with_saved_credential(credential, identity, fn pat ->
+      case GitHubCredentialVault.with_saved_secrets(credential, identity, fn pat, refresh ->
              with {:ok, checked_metadata} <-
                     GitHubRequestMetadata.validate(safe_metadata, pat),
-                  :ok <- validate_external_profiles(profiles, pat) do
+                  {:ok, checked_metadata} <-
+                    GitHubRequestMetadata.validate(checked_metadata, refresh),
+                  :ok <- validate_external_profiles(profiles, pat),
+                  :ok <- validate_external_profiles(profiles, refresh) do
                {:ok, checked_metadata}
              end
            end) do
@@ -988,8 +1282,18 @@ defmodule ForgeAccounts.GitHubAccounts do
   end
 
   defp checked_out_result(credential, identity, callback) do
-    case GitHubCredentialVault.with_saved_credential(credential, identity, fn pat ->
-           GitHubCredentialCallback.invoke(callback, pat, CredentialCallbackError)
+    case GitHubCredentialVault.with_saved_secrets(credential, identity, fn pat, refresh ->
+           if is_binary(refresh) do
+             GitHubCredentialCallback.invoke(
+               fn _ ->
+                 GitHubCredentialCallback.invoke(callback, pat, CredentialCallbackError)
+               end,
+               refresh,
+               CredentialCallbackError
+             )
+           else
+             GitHubCredentialCallback.invoke(callback, pat, CredentialCallbackError)
+           end
          end) do
       {:ok, :ok} -> {:ok, :ok}
       {:ok, {:error, _safe_reason} = result} -> {:ok, result}
@@ -1056,20 +1360,57 @@ defmodule ForgeAccounts.GitHubAccounts do
     end
   end
 
-  defp encrypt_credential(credential, identity, pat) do
-    GitHubCredentialVault.encrypt_saved(credential, identity, pat)
+  defp access_token(%{access_token: access}), do: access
+  defp access_token(pat) when is_binary(pat), do: pat
+
+  defp encrypt_credential(credential, identity, %{access_token: access} = token) do
+    bound = %{credential | client_id: token.client_id}
+
+    with {:ok, envelope} <- GitHubCredentialVault.encrypt_saved(bound, identity, access),
+         {:ok, refresh} <-
+           GitHubCredentialVault.encrypt_refresh(bound, identity, token.refresh_token) do
+      {:ok,
+       Map.merge(Map.from_struct(envelope), %{
+         credential_kind: :github_app_user,
+         client_id: token.client_id,
+         expires_at: token.expires_at,
+         refresh_expires_at: token.refresh_expires_at,
+         refresh_ciphertext: refresh.ciphertext,
+         refresh_nonce: refresh.nonce,
+         refresh_tag: refresh.tag,
+         refresh_key_id: refresh.key_id,
+         refresh_claim_id: nil,
+         refresh_claimed_at: nil
+       })}
+    end
+  end
+
+  defp encrypt_credential(credential, identity, pat) when is_binary(pat) do
+    with {:ok, envelope} <- GitHubCredentialVault.encrypt_saved(credential, identity, pat) do
+      {:ok,
+       Map.merge(Map.from_struct(envelope), %{
+         credential_kind: :pat,
+         client_id: nil,
+         expires_at: nil,
+         refresh_expires_at: nil,
+         refresh_ciphertext: nil,
+         refresh_nonce: nil,
+         refresh_tag: nil,
+         refresh_key_id: nil,
+         refresh_claim_id: nil,
+         refresh_claimed_at: nil
+       })}
+    end
   end
 
   defp persist_envelope(repo, credential, envelope, verified_at) do
     credential
-    |> GitHubCredential.changeset(%{
-      ciphertext: envelope.ciphertext,
-      nonce: envelope.nonce,
-      tag: envelope.tag,
-      key_id: envelope.key_id,
-      status: :valid,
-      last_verified_at: verified_at
-    })
+    |> GitHubCredential.changeset(
+      Map.merge(envelope, %{
+        status: :valid,
+        last_verified_at: verified_at
+      })
+    )
     |> repo.update()
   end
 
@@ -1085,21 +1426,24 @@ defmodule ForgeAccounts.GitHubAccounts do
       )
       |> match_loaded_generation(credential)
 
-    updates = [
-      ciphertext: envelope.ciphertext,
-      nonce: envelope.nonce,
-      tag: envelope.tag,
-      key_id: envelope.key_id,
-      status: :valid,
-      last_verified_at: verified_at,
-      updated_at: now
-    ]
+    updates =
+      Map.to_list(
+        Map.merge(envelope, %{
+          status: :valid,
+          last_verified_at: verified_at,
+          updated_at: now
+        })
+      )
 
-    case repo.update_all(query, set: updates, inc: [verification_version: 1]) do
+    case repo.update_all(query, set: updates, inc: [verification_version: 1, token_generation: 1]) do
       {1, _} -> {:ok, repo.get!(GitHubCredential, credential.id)}
       {0, _} -> {:error, :stale}
     end
   end
+
+  defp update_verification(_repo, %{refresh_claim_id: claim_id}, _status, _verified_at)
+       when not is_nil(claim_id),
+       do: {:error, :refresh_in_progress}
 
   defp update_verification(repo, credential, status, verified_at) do
     now = DateTime.utc_now(:second)
@@ -1111,13 +1455,27 @@ defmodule ForgeAccounts.GitHubAccounts do
 
     case repo.update_all(
            query,
-           set: [status: status, last_verified_at: verified_at, updated_at: now],
+           set: [
+             status: status,
+             last_verified_at: verified_at,
+             updated_at: now
+           ],
            inc: [verification_version: 1]
          ) do
       {1, _} -> {:ok, repo.get!(GitHubCredential, credential.id)}
       {0, _} -> {:error, :stale}
     end
   end
+
+  defp update_verification_if_current(
+         _repo,
+         %{refresh_claim_id: claim_id},
+         _reference,
+         _status,
+         _verified_at
+       )
+       when not is_nil(claim_id),
+       do: {:error, :refresh_in_progress}
 
   defp update_verification_if_current(repo, credential, _reference, status, verified_at) do
     now = DateTime.utc_now(:second)
@@ -1132,7 +1490,11 @@ defmodule ForgeAccounts.GitHubAccounts do
       |> match_loaded_generation(credential)
 
     case repo.update_all(query,
-           set: [status: status, last_verified_at: verified_at, updated_at: now],
+           set: [
+             status: status,
+             last_verified_at: verified_at,
+             updated_at: now
+           ],
            inc: [verification_version: 1]
          ) do
       {1, _} -> {:ok, repo.get!(GitHubCredential, credential.id)}
@@ -1171,13 +1533,15 @@ defmodule ForgeAccounts.GitHubAccounts do
   end
 
   defp match_loaded_generation(query, credential) do
-    where(
-      query,
+    query
+    |> where(
       [saved],
       saved.verification_version == ^credential.verification_version and
+        saved.token_generation == ^credential.token_generation and
         saved.ciphertext == ^credential.ciphertext and saved.nonce == ^credential.nonce and
         saved.tag == ^credential.tag and saved.key_id == ^credential.key_id
     )
+    |> match_refresh_claim(credential)
   end
 
   defp claim_identity(repo, identity_id, actor_id) do
@@ -1362,9 +1726,12 @@ defmodule ForgeAccounts.GitHubAccounts do
 
   defp validate_saved_inputs(credential, identity, request_metadata, verified_profile) do
     with {:ok, safe_metadata} <- GitHubRequestMetadata.validate(request_metadata) do
-      case GitHubCredentialVault.with_saved_credential(credential, identity, fn pat ->
+      case GitHubCredentialVault.with_saved_secrets(credential, identity, fn pat, refresh ->
              with {:ok, checked_metadata} <- GitHubRequestMetadata.validate(safe_metadata, pat),
-                  :ok <- GitHubProfileSafety.validate(verified_profile, pat) do
+                  {:ok, checked_metadata} <-
+                    GitHubRequestMetadata.validate(checked_metadata, refresh),
+                  :ok <- GitHubProfileSafety.validate(verified_profile, pat),
+                  :ok <- GitHubProfileSafety.validate(verified_profile, refresh) do
                {:ok, checked_metadata}
              end
            end) do
@@ -1430,12 +1797,16 @@ defmodule ForgeAccounts.GitHubAccounts do
     payload = [
       length_prefixed("fornacast.github-credential-generation.v1"),
       <<credential.id::unsigned-64, credential.local_user_id::unsigned-64,
-        credential.github_identity_id::unsigned-64,
-        credential.verification_version::unsigned-64>>,
+        credential.github_identity_id::unsigned-64, credential.verification_version::unsigned-64,
+        credential.token_generation::unsigned-64>>,
       length_prefixed(credential.ciphertext),
       length_prefixed(credential.nonce),
       length_prefixed(credential.tag),
-      length_prefixed(credential.key_id)
+      length_prefixed(credential.key_id),
+      length_prefixed(credential.refresh_ciphertext || ""),
+      length_prefixed(credential.refresh_nonce || ""),
+      length_prefixed(credential.refresh_tag || ""),
+      length_prefixed(credential.refresh_key_id || "")
     ]
 
     :crypto.hash(:sha256, payload)
@@ -1624,7 +1995,23 @@ defmodule ForgeAccounts.GitHubAccounts do
     end
   end
 
-  defp available_credential(%GitHubCredential{status: :valid}), do: :ok
+  defp available_device_expiry(%GitHubCredential{credential_kind: :github_app_user} = credential) do
+    if is_struct(credential.expires_at, DateTime) and
+         DateTime.compare(credential.expires_at, DateTime.utc_now()) == :gt,
+       do: :ok,
+       else: {:error, :reauthorization_required}
+  end
+
+  defp available_device_expiry(%GitHubCredential{}), do: :ok
+
+  defp available_credential(%GitHubCredential{
+         credential_kind: :github_app_user,
+         status: :invalid
+       }),
+       do: {:error, :reauthorization_required}
+
+  defp available_credential(%GitHubCredential{status: :valid} = credential),
+    do: available_device_expiry(credential)
 
   defp available_credential(%GitHubCredential{status: :invalid}),
     do: {:error, :credential_invalid}
