@@ -647,7 +647,7 @@ as plaintext in `BACKUP_DIR`:
 
 - `FORNACAST_GITHUB_CREDENTIAL_KEYS` and
   `FORNACAST_GITHUB_CREDENTIAL_ACTIVE_KEY_ID`, which are required to decrypt
-  saved GitHub access and refresh tokens and import PATs;
+  saved GitHub PATs and App access and refresh tokens;
 - `SECRET_KEY_BASE`;
 - PostgreSQL connection credentials such as `DATABASE_URL` or
   `POSTGRES_PASSWORD`; and
