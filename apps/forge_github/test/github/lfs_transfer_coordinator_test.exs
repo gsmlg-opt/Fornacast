@@ -424,9 +424,9 @@ defmodule ForgeGitHub.LFS.TransferCoordinatorTest do
       end)
 
     on_exit(fn -> if Process.alive?(caller), do: Process.exit(caller, :kill) end)
-    assert_receive {:source_opened, owner}
-    assert_receive {:raw_transport_started, transport}
-    assert_receive :source_read_blocked
+    assert_receive {:source_opened, owner}, 2_000
+    assert_receive {:raw_transport_started, transport}, 2_000
+    assert_receive :source_read_blocked, 2_000
     owner_monitor = Process.monitor(owner)
     transport_monitor = Process.monitor(transport)
     Process.exit(caller, :kill)
