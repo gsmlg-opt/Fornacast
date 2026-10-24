@@ -1,6 +1,9 @@
 defmodule GitCore.Remote do
   @moduledoc """
   Supervised, credential-isolated Git transfer into a caller-owned staging path.
+
+  Anonymous reads require `authentication: :anonymous`, `credential_login: nil`
+  and the explicit `:public` credential. They never start a credential helper.
   """
 
   alias GitCore.Remote.{Control, CredentialCache, HostPolicy, Process}
@@ -41,13 +44,13 @@ defmodule GitCore.Remote do
       :destination,
       :default_branch
     ]
-    defstruct @enforce_keys
+    defstruct @enforce_keys ++ [authentication: :token]
     @type t :: %__MODULE__{}
   end
 
   defmodule SyncRequest do
     @enforce_keys [:provider, :owner, :repository, :credential_login, :repository_path]
-    defstruct @enforce_keys
+    defstruct @enforce_keys ++ [authentication: :token]
     @type t :: %__MODULE__{}
   end
 
@@ -107,7 +110,8 @@ defmodule GitCore.Remote do
     end
   end
 
-  @spec mirror(Request.t(), binary(), keyword()) :: {:ok, Result.t()} | {:error, Error.t()}
+  @spec mirror(Request.t(), binary() | :public, keyword()) ::
+          {:ok, Result.t()} | {:error, Error.t()}
   def mirror(request, pat, opts \\ []) do
     with {:ok, operation} <- prepare_operation(request, pat, opts) do
       run_owned(operation.task_supervisor, fn parent_monitor, supervisor_pid ->
@@ -118,7 +122,8 @@ defmodule GitCore.Remote do
     end
   end
 
-  @spec refresh(Request.t(), binary(), keyword()) :: {:ok, Result.t()} | {:error, Error.t()}
+  @spec refresh(Request.t(), binary() | :public, keyword()) ::
+          {:ok, Result.t()} | {:error, Error.t()}
   def refresh(request, pat, opts \\ []) do
     with {:ok, operation} <- prepare_operation(request, pat, opts) do
       run_owned(operation.task_supervisor, fn parent_monitor, supervisor_pid ->
@@ -135,7 +140,7 @@ defmodule GitCore.Remote do
   The operation may force and prune only refs derived beneath the validated caller-owned
   namespace. It never updates or prunes public local branches or tags.
   """
-  @spec fetch_observed_refs(SyncRequest.t(), binary(), String.t(), keyword()) ::
+  @spec fetch_observed_refs(SyncRequest.t(), binary() | :public, String.t(), keyword()) ::
           {:ok, [ObservedRef.t()]} | {:error, Error.t()}
   def fetch_observed_refs(request, pat, namespace, opts \\ []) do
     with {:ok, operation} <- prepare_sync_operation(request, pat, opts),
@@ -181,7 +186,8 @@ defmodule GitCore.Remote do
   @spec push_refs(SyncRequest.t(), binary(), [RefUpdate.t()], keyword()) ::
           :ok | {:error, Error.t()}
   def push_refs(request, pat, updates, opts \\ []) do
-    with :ok <- validate_ref_updates(updates),
+    with :ok <- require_authenticated(request),
+         :ok <- validate_ref_updates(updates),
          {:ok, operation} <- prepare_sync_operation(request, pat, opts) do
       run_owned(operation.task_supervisor, fn parent_monitor, supervisor_pid ->
         with_repository_write(operation, fn ->
@@ -197,7 +203,8 @@ defmodule GitCore.Remote do
   @spec delete_ref(SyncRequest.t(), binary(), String.t(), String.t(), keyword()) ::
           :ok | {:error, Error.t()}
   def delete_ref(request, pat, ref, expected_oid, opts \\ []) do
-    with :ok <- validate_remote_delete(ref, expected_oid),
+    with :ok <- require_authenticated(request),
+         :ok <- validate_remote_delete(ref, expected_oid),
          {:ok, operation} <- prepare_sync_operation(request, pat, opts) do
       run_owned(operation.task_supervisor, fn parent_monitor, supervisor_pid ->
         with_repository_write(operation, fn ->
@@ -783,6 +790,23 @@ defmodule GitCore.Remote do
   defp valid_oid?(_oid), do: false
 
   defp with_credentials(
+         %{request: %{authentication: :anonymous}} = operation,
+         destination_identity,
+         parent_monitor,
+         supervisor_pid,
+         fun
+       ) do
+    fun.(%{
+      operation: operation,
+      destination_identity: destination_identity,
+      socket_path: nil,
+      daemon: nil,
+      parent_monitor: parent_monitor,
+      owner_exit_pid: supervisor_pid
+    })
+  end
+
+  defp with_credentials(
          operation,
          destination_identity,
          parent_monitor,
@@ -1253,45 +1277,51 @@ defmodule GitCore.Remote do
     [
       context.operation.git,
       "-c",
-      "credential.helper=",
-      "-c",
-      "credential.helper=cache --socket=#{shell_quote(context.socket_path)}",
-      "-c",
-      "credential.interactive=false",
-      "-c",
-      "http.followRedirects=false",
-      "-c",
-      "http.curloptResolve=",
-      "-c",
-      "http.curloptResolve=#{host_policy.curlopt_resolve}",
-      "-c",
-      "http.sslVerify=true",
-      "-c",
-      "protocol.allow=never",
-      "-c",
-      "protocol.https.allow=always",
-      "-c",
-      "protocol.http.allow=never",
-      "-c",
-      "protocol.file.allow=never",
-      "-c",
-      "protocol.ext.allow=never",
-      "-c",
-      "protocol.git.allow=never",
-      "-c",
-      "protocol.ssh.allow=never",
-      "-c",
-      "fetch.recurseSubmodules=false",
-      "-c",
-      "submodule.recurse=false",
-      "-c",
-      "core.hooksPath=/dev/null",
-      "-c",
-      "transfer.fsckObjects=true",
-      "-c",
-      "fetch.fsckObjects=true"
-    ]
+      "credential.helper="
+    ] ++
+      credential_helper(context) ++
+      [
+        "-c",
+        "credential.interactive=false",
+        "-c",
+        "http.followRedirects=false",
+        "-c",
+        "http.curloptResolve=",
+        "-c",
+        "http.curloptResolve=#{host_policy.curlopt_resolve}",
+        "-c",
+        "http.sslVerify=true",
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.https.allow=always",
+        "-c",
+        "protocol.http.allow=never",
+        "-c",
+        "protocol.file.allow=never",
+        "-c",
+        "protocol.ext.allow=never",
+        "-c",
+        "protocol.git.allow=never",
+        "-c",
+        "protocol.ssh.allow=never",
+        "-c",
+        "fetch.recurseSubmodules=false",
+        "-c",
+        "submodule.recurse=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "transfer.fsckObjects=true",
+        "-c",
+        "fetch.fsckObjects=true"
+      ]
   end
+
+  defp credential_helper(%{socket_path: nil}), do: []
+
+  defp credential_helper(%{socket_path: socket_path}),
+    do: ["-c", "credential.helper=cache --socket=#{shell_quote(socket_path)}"]
 
   defp local_git(context, arguments) do
     [
@@ -1308,7 +1338,7 @@ defmodule GitCore.Remote do
   defp prepare_operation(%Request{} = request, pat, opts) do
     with :ok <- validate_options(opts),
          :ok <- validate_request(request),
-         :ok <- validate_credential(pat),
+         :ok <- validate_credential(request, pat),
          {:ok, git} <- git_executable(Keyword.get(opts, :git)),
          {:ok, resolver} <- resolver(Keyword.get(opts, :resolver)),
          {:ok, cancel?} <- callback(opts, :cancel?),
@@ -1329,7 +1359,10 @@ defmodule GitCore.Remote do
          credential_root_state: credential_root_state,
          limiter: limiter,
          task_supervisor: Keyword.get(opts, :task_supervisor, GitCore.RemoteTaskSupervisor),
-         env: safe_environment(credential_root),
+         env:
+           safe_environment(
+             if(request.authentication == :anonymous, do: "/dev/null", else: credential_root)
+           ),
          absolute_deadline:
            System.monotonic_time(:millisecond) + GitCore.Limits.get(:remote_wall_time_ms)
        }}
@@ -1347,6 +1380,7 @@ defmodule GitCore.Remote do
       owner: request.owner,
       repository: request.repository,
       credential_login: request.credential_login,
+      authentication: request.authentication,
       destination: request.repository_path,
       default_branch: "main"
     }
@@ -1365,7 +1399,7 @@ defmodule GitCore.Remote do
       not Regex.match?(@owner_pattern, request.owner) -> remote_error(:invalid_request)
       not Regex.match?(@repository_pattern, request.repository) -> remote_error(:invalid_request)
       request.repository in [".", ".."] -> remote_error(:invalid_request)
-      not credential_field?(request.credential_login, 255) -> remote_error(:invalid_credential)
+      not valid_authentication?(request) -> remote_error(:invalid_credential)
       not destination?(request.repository_path) -> remote_error(:invalid_destination)
       true -> :ok
     end
@@ -1444,7 +1478,7 @@ defmodule GitCore.Remote do
       not Regex.match?(@owner_pattern, request.owner) -> remote_error(:invalid_request)
       not Regex.match?(@repository_pattern, request.repository) -> remote_error(:invalid_request)
       request.repository in [".", ".."] -> remote_error(:invalid_request)
-      not credential_field?(request.credential_login, 255) -> remote_error(:invalid_credential)
+      not valid_authentication?(request) -> remote_error(:invalid_credential)
       not default_branch?(request.default_branch) -> remote_error(:invalid_request)
       not destination?(request.destination) -> remote_error(:invalid_destination)
       true -> :ok
@@ -1453,11 +1487,25 @@ defmodule GitCore.Remote do
     _error -> remote_error(:invalid_request)
   end
 
-  defp validate_credential(pat) do
+  defp require_authenticated(%SyncRequest{authentication: :token}), do: :ok
+  defp require_authenticated(_request), do: remote_error(:invalid_credential)
+
+  defp valid_authentication?(%{authentication: :anonymous, credential_login: nil}), do: true
+
+  defp valid_authentication?(%{authentication: :token, credential_login: login}),
+    do: credential_field?(login, 255)
+
+  defp valid_authentication?(_request), do: false
+
+  defp validate_credential(%{authentication: :anonymous, credential_login: nil}, :public), do: :ok
+
+  defp validate_credential(%{authentication: :token}, pat) do
     if credential_field?(pat, @max_credential_bytes),
       do: :ok,
       else: remote_error(:invalid_credential)
   end
+
+  defp validate_credential(_request, _credential), do: remote_error(:invalid_credential)
 
   defp credential_field?(value, maximum) do
     is_binary(value) and byte_size(value) in 1..maximum and String.valid?(value) and

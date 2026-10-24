@@ -27,19 +27,26 @@ defmodule ForgeImports.PatSyncScheduler do
         DateTime.diff(now, config.last_sync_at, :minute) >= config.interval_minutes
 
     if due? do
-      with %Organization{} = _organization <- Repo.get(Organization, config.organization_id),
-           %User{} = owner <- Repo.get(User, config.owner_user_id),
-           {:ok, _} <-
-             OrganizationPatSettings.sync(
-               owner,
-               config.organization_id,
-               to_string(config.lock_version),
-               %{"operation_id" => "pat-scheduler-#{config.id}"}
-             ) do
-        :ok
-      else
-        _ ->
-          :error
+      metadata = %{"operation_id" => "pat-scheduler-#{config.id}"}
+
+      result =
+        if config.credential_source in [:organization_device, :public] do
+          OrganizationPatSettings.sync_organization_configuration(config, metadata)
+        else
+          with %Organization{} <- Repo.get(Organization, config.organization_id),
+               %User{} = owner <- Repo.get(User, config.owner_user_id) do
+            OrganizationPatSettings.sync(
+              owner,
+              config.organization_id,
+              to_string(config.lock_version),
+              metadata
+            )
+          end
+        end
+
+      case result do
+        {:ok, _} -> :ok
+        _ -> :error
       end
     end
   end

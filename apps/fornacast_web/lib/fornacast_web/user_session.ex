@@ -67,6 +67,25 @@ defmodule FornacastWeb.UserSession do
       {:reply, reply, Map.put(state, :github_device, attempt)}
     end
 
+    def handle_call(
+          {:organization_github_device, user_id, organization_id, operation},
+          _from,
+          %{user_id: user_id} = state
+        )
+        when is_integer(organization_id) and organization_id > 0 do
+      attempts = Map.get(state, :organization_github_devices, %{})
+
+      {reply, attempt} =
+        FornacastWeb.GitHubDeviceAttempt.transition(
+          Map.get(attempts, organization_id),
+          operation,
+          System.monotonic_time(:millisecond)
+        )
+
+      {:reply, reply,
+       Map.put(state, :organization_github_devices, Map.put(attempts, organization_id, attempt))}
+    end
+
     def handle_call(_request, _from, state), do: {:reply, {:error, :owner_mismatch}, state}
 
     @impl true

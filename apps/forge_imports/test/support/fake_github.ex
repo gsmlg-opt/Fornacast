@@ -123,6 +123,18 @@ defmodule ForgeImports.TestSupport.FakeGitHub do
         )
         |> Plug.Conn.send_resp(403, "rate limit")
 
+      conn.request_path == "/user/installations" and is_map(config[:installation]) ->
+        Req.Test.json(conn, %{"installations" => [config.installation], "total_count" => 1})
+
+      is_map(config[:installation]) and
+          conn.request_path == "/user/installations/#{config.installation["id"]}/repositories" ->
+        repositories = Enum.map(Map.get(config, :repos, []), &repository_json/1)
+
+        Req.Test.json(conn, %{
+          "repositories" => repositories,
+          "total_count" => length(repositories)
+        })
+
       conn.request_path == "/user" ->
         Req.Test.json(conn, user_json(config))
 

@@ -75,10 +75,11 @@ defmodule ForgeImports.PatSyncProgress do
 
   defp matching_lineage(job, %ImportRun{} = run, source_id, seen) do
     if not MapSet.member?(seen, run.id) and run.source_kind == :organization and
-         run.actor_user_id == job.owner_user_id and
-         run.github_identity_id == job.github_identity_id and
+         matching_source?(job, run) and
          run.destination_organization_id == job.organization_id and
-         run.source_owner_login == job.github_organization and
+         (run.source_owner_login == job.github_organization or
+            (job.credential_source == :public and
+               String.downcase(run.source_owner_login) == job.github_organization)) and
          run.source_owner_github_id == source_id do
       if run.predecessor_run_id do
         with %ImportRun{} = predecessor <- Repo.get(ImportRun, run.predecessor_run_id),
@@ -98,6 +99,32 @@ defmodule ForgeImports.PatSyncProgress do
   end
 
   defp matching_lineage(_job, _run, _source_id, _seen), do: {:error, :invalid_import_lineage}
+
+  defp matching_source?(
+         %{credential_source: :organization_device} = job,
+         %{credential_source: :organization_device} = run
+       ),
+       do:
+         Enum.all?(
+           [
+             :organization_connection_id,
+             :organization_connection_version,
+             :organization_credential_id,
+             :organization_credential_version,
+             :github_installation_id
+           ],
+           &(Map.get(job, &1) == Map.get(run, &1))
+         )
+
+  defp matching_source?(%{credential_source: :public} = job, %{credential_source: :public} = run),
+    do: job.public_configuration_version == run.public_configuration_version
+
+  defp matching_source?(%{credential_source: :personal} = job, run),
+    do:
+      run.credential_source == :saved and run.actor_user_id == job.owner_user_id and
+        run.github_identity_id == job.github_identity_id
+
+  defp matching_source?(_, _), do: false
 
   defp valid_publication?(job, item, %Repository{} = repository) do
     evidence = item.publication_evidence

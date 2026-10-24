@@ -7,10 +7,10 @@ const source = readFileSync(new URL("../../assets/js/github_device.js", import.m
   .replace(/export \{ initGitHubDevicePolling \};/, "");
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-function setup(response) {
+function setup(response, dataset = {}) {
   const feedback = { textContent: "Waiting" };
   const report = {
-    dataset: { githubDeviceId: "opaque-id", interval: "5", expiresIn: "60" },
+    dataset: { githubDeviceId: "opaque-id", interval: "5", expiresIn: "60", ...dataset },
     isConnected: true,
     querySelector: () => feedback,
   };
@@ -126,4 +126,31 @@ test("restoring a cached authorization page reloads its current server state", (
   s.pagehide();
   s.pageshow(true);
   assert.equal(s.reloads.length, 1);
+});
+
+
+test("organization completion uses rendered same-organization paths and ignores response redirects", async () => {
+  const s = setup({ ok: true, json: async () => ({ status: "complete", redirect: "https://evil.test" }) }, {
+    githubDevicePollPath: "/organizations/acme/settings/github/device/opaque-id/poll",
+    githubDeviceReturnPath: "/organizations/acme/settings/github/connection",
+  });
+  s.tick();
+  await settle();
+  assert.equal(s.requests[0][0], "/organizations/acme/settings/github/device/opaque-id/poll");
+  assert.deepEqual(s.redirects, ["/organizations/acme/settings/github/connection"]);
+});
+
+test("unsafe, cross-organization and mismatched polling paths never make requests", () => {
+  for (const dataset of [
+    { githubDevicePollPath: "https://evil.test/poll" },
+    { githubDeviceReturnPath: "//evil.test" },
+    { githubDevicePollPath: "/organizations/acme/settings/github/device/opaque-id/poll", githubDeviceReturnPath: "/organizations/other/settings/github/connection" },
+    { githubDevicePollPath: "/organizations/acme/settings/github/device/other-id/poll", githubDeviceReturnPath: "/organizations/acme/settings/github/connection" },
+    { githubDevicePollPath: "/settings/github/device/opaque-id/poll?redirect=evil" },
+  ]) {
+    const s = setup({ ok: true }, dataset);
+    assert.equal(s.requests.length, 0);
+    assert.equal(s.timers.size, 0);
+    assert.match(s.feedback.textContent, /Refresh/);
+  }
 });

@@ -100,7 +100,7 @@ defmodule ForgeGitHub.AppInstallation do
        when is_map(permissions) and map_size(permissions) <= 128 do
     if Enum.all?(permissions, fn {key, value} ->
          is_binary(key) and byte_size(key) in 1..128 and String.valid?(key) and
-           is_binary(value) and value in ["read", "write"]
+           is_binary(value) and value in ["read", "write", "admin"]
        end) do
       {:ok, permissions}
     else

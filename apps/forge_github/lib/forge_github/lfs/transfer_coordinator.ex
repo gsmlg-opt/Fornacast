@@ -14,14 +14,18 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
 
   @type direction :: :inbound | :outbound | :converge
   @type option ::
-          {:gate_key, {:github_installation | :saved_credential | :one_time_run, pos_integer()}}
+          {:gate_key, {:public, 1}}
+          | {:gate_key,
+             {:github_installation | :saved_credential | :one_time_run | :organization_credential,
+              pos_integer()}}
           | {:authorize, (-> :ok | {:error, term()})}
 
   @doc """
   Synchronizes one completed pointer-scan page without advancing its cursor on failure.
 
-  Requires a GitHub installation, saved credential, or one-time import run `gate_key`
+  Requires a public, GitHub installation, saved credential, or import run `gate_key`
   so every Batch request is serialized with other requests using that credential identity.
+  Public credentials are limited to inbound transfers and use one shared request gate.
   Trusted callers may supply a runtime `authorize` callback returning `:ok` or an error.
   It is checked before every new provider request; it does not abort an in-flight request.
   """
@@ -29,7 +33,7 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
           Repository.t(),
           Scan.t(),
           direction(),
-          String.t(),
+          String.t() | :public,
           String.t(),
           String.t(),
           String.t() | nil,
@@ -56,12 +60,15 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
         after_oid,
         options
       )
-      when direction in [:inbound, :outbound, :converge] and is_binary(token) and
+      when direction in [:inbound, :outbound, :converge] and
+             (is_binary(token) or token == :public) and
              is_binary(remote_owner) and is_binary(remote_repository) and is_list(options) do
-    with :ok <- validate_capabilities(repository, scan),
+    with true <- token != :public or direction == :inbound,
+         :ok <- validate_capabilities(repository, scan),
          :ok <- validate_remote(token, remote_owner, remote_repository),
          :ok <- validate_after_oid(after_oid),
          {:ok, gate_key, callbacks} <- coordinator_options(options),
+         gate_key = if(token == :public, do: {:public, 1}, else: gate_key),
          :ok <- authorize!(callbacks),
          {:ok, page} <-
            call(callbacks.list_requirements, [
@@ -733,6 +740,12 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
        else: :error
   end
 
+  defp validate_remote(:public, owner, remote) do
+    if RepositoryReference.valid_owner?(owner) and RepositoryReference.valid_repository?(remote),
+      do: :ok,
+      else: :error
+  end
+
   defp validate_remote(token, owner, remote) do
     if byte_size(token) in 1..16_384 and String.valid?(token) and
          :binary.match(token, <<0>>) == :nomatch and RepositoryReference.valid_owner?(owner) and
@@ -828,8 +841,15 @@ defmodule ForgeGitHub.LFS.TransferCoordinator do
     end
   end
 
+  defp valid_gate_key?({:public, 1}), do: true
+
   defp valid_gate_key?({kind, id})
-       when kind in [:github_installation, :saved_credential, :one_time_run] and
+       when kind in [
+              :github_installation,
+              :saved_credential,
+              :one_time_run,
+              :organization_credential
+            ] and
               is_integer(id) and id > 0 and id <= @maximum_object_size,
        do: true
 

@@ -49,7 +49,27 @@ defmodule FornacastWeb.GitHubDeviceControllerTest do
   end
 
   defmodule Imports do
-    def list_github_accounts(_actor), do: {:ok, []}
+    def list_github_accounts(_actor) do
+      accounts =
+        if Process.get(:device_linked) do
+          [
+            %ForgeAccounts.GitHubAccountView{
+              identity_id: 41,
+              github_user_id: 90_041,
+              login: "octocat",
+              display_name: "Github:octocat",
+              credential_present: true,
+              credential_status: :valid,
+              credential_kind: :github_app_user,
+              reconnect_required: false
+            }
+          ]
+        else
+          []
+        end
+
+      {:ok, accounts}
+    end
 
     def link_github_device_account(actor, token, _metadata, references, opts) do
       Process.put(:device_linked, {actor.id, token.client_id, references})
@@ -80,24 +100,33 @@ defmodule FornacastWeb.GitHubDeviceControllerTest do
     %{actor: actor}
   end
 
-  test "settings offer Device Flow beside PAT linking", %{actor: actor} do
+  test "settings link to separate Device Flow and PAT configuration pages", %{actor: actor} do
     conn = request(actor) |> get("/settings/github")
     html = html_response(conn, 200)
     assert html =~ "Connect with GitHub"
-    assert html =~ ~s(action="/settings/github/device")
-    assert html =~ ~s(name="github_account[pat]")
+    assert html =~ "Link GitHub account"
+    assert html =~ ~s(href="/settings/github/device")
+    assert html =~ ~s(href="/settings/github/link")
+    refute html =~ ~s(action="/settings/github/device")
+    refute html =~ ~s(name="github_account[pat]")
   end
 
   test "start and completion expose only safe browser data and consume authorization once", %{
     actor: actor
   } do
     started = request(actor) |> post("/settings/github/device", %{})
-    assert redirected_to(started, 303) == "/settings/github"
+    assert redirected_to(started, 303) == "/settings/github/device/legacy"
     attempt = GitHubDeviceSession.view(started)
-    page = started |> next_request() |> get("/settings/github")
+    page = started |> next_request() |> get("/settings/github/device/legacy")
     assert html_response(page, 200) =~ "ABCD-EFGH"
     refute html_response(page, 200) =~ "private-device-code"
+    refute html_response(page, 200) =~ ~s(id="github-device-success")
     refute inspect(get_session(started)) =~ "private-device-code"
+    assert get_resp_header(page, "cache-control") == ["private, no-store"]
+
+    main_html = started |> next_request() |> get("/settings/github") |> html_response(200)
+    refute main_html =~ "ABCD-EFGH"
+    refute main_html =~ ~s(data-github-device-poll="true")
 
     early = poll(started, attempt.id)
     assert %{"status" => "pending"} = json_response(early, 200)
@@ -115,8 +144,27 @@ defmodule FornacastWeb.GitHubDeviceControllerTest do
     assert %{"status" => "complete"} = complete |> poll(attempt.id) |> json_response(200)
     assert Process.get(:device_poll_count) == 1
 
+    completed_page =
+      complete
+      |> next_request()
+      |> put_req_header("accept", "text/html")
+      |> get("/settings/github")
+
+    completed_html = html_response(completed_page, 200)
+    assert completed_html =~ ~s(id="github-saved-connections")
+    assert completed_html =~ "@octocat"
+    assert completed_html =~ "GitHub App connected"
+    assert completed_html =~ "configured in organization settings"
+    assert completed_html =~ "Existing personal credentials remain available for legacy imports"
+    assert completed_html =~ ~s(href="/settings/github/device")
+    assert completed_html =~ ~s(href="/settings/github/link")
+    refute completed_html =~ ~s(action="/settings/github/device")
+    refute completed_html =~ ~s(id="github-link-account")
+    refute completed_html =~ ~s(data-github-device-poll="true")
+
     for secret <- ["private-device-code", "private-access-token", "private-refresh-token"] do
       refute inspect({complete.resp_headers, complete.resp_body, get_session(complete)}) =~ secret
+      refute completed_html =~ secret
     end
 
     assert get_resp_header(complete, "cache-control") == ["private, no-store"]
@@ -144,9 +192,14 @@ defmodule FornacastWeb.GitHubDeviceControllerTest do
   test "disabled Device Flow explains the GitHub App setting", %{actor: actor} do
     Process.put(:device_start_result, {:error, :device_flow_disabled})
     started = request(actor) |> post("/settings/github/device", %{})
-    html = started |> next_request() |> get("/settings/github") |> html_response(200)
+    assert redirected_to(started, 303) == "/settings/github/device/legacy"
+
+    html =
+      started |> next_request() |> get("/settings/github/device/legacy") |> html_response(200)
+
     assert html =~ "Enable Device Flow in the GitHub App settings"
     refute html =~ "private-device-code"
+    refute html =~ ~s(id="github-device-success")
   end
 
   test "start requires authentication and CSRF protection", %{actor: actor} do

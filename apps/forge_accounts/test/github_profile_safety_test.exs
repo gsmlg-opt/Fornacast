@@ -5,6 +5,16 @@ defmodule ForgeAccounts.GitHubProfileSafetyTest do
 
   @pat "totally-secret-token"
 
+  test "public profiles retain validation without a secret to compare" do
+    assert :ok = GitHubProfileSafety.validate(%{login: "octocat"}, :public)
+
+    assert {:error, :invalid_response} =
+             GitHubProfileSafety.validate(%{login: "ghp_leaked"}, :public)
+
+    assert {:error, :invalid_response} =
+             GitHubProfileSafety.validate(%{description: "unsafe\0profile"}, :public)
+  end
+
   test "rejects substantial profile values contained by a credential" do
     profiles = [
       %{login: "secret-token"},

@@ -12,6 +12,10 @@ defmodule ForgeImports.OrganizationSyncTest do
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
 
+    previous_config = Application.get_env(:forge_github, :app_configuration, :disabled)
+    Application.put_env(:forge_github, :app_configuration, :disabled)
+    on_exit(fn -> Application.put_env(:forge_github, :app_configuration, previous_config) end)
+
     actor = user_fixture()
 
     assert {:ok, %Organization{} = organization} =
@@ -29,7 +33,7 @@ defmodule ForgeImports.OrganizationSyncTest do
              ForgeImports.OrganizationSync.get_settings(context.actor, context.organization)
 
     assert disconnected.coverage == :none
-    assert disconnected.actions.install
+    refute disconnected.actions.install
     refute disconnected.actions.resolve_pull_merge_conflict
     refute disconnected.actions.resolve_repository_metadata_conflict
     assert disconnected.capabilities["lfs"] == "disabled"
@@ -55,6 +59,33 @@ defmodule ForgeImports.OrganizationSyncTest do
                %{conflict_id: 1, lock_version: 1, action: "external_recheck"},
                request_metadata()
              )
+  end
+
+  for {label, config} <- [{"disabled", :disabled}, {"malformed", %{app_id: "invalid"}}] do
+    @app_configuration config
+    test "#{label} installation configuration disables installation without creating mirror state",
+         context do
+      Application.put_env(:forge_github, :app_configuration, @app_configuration)
+
+      assert {:ok, settings} =
+               ForgeImports.OrganizationSync.get_settings(context.actor, context.organization)
+
+      refute settings.installation_configured
+      refute settings.actions.install
+
+      state = :crypto.strong_rand_bytes(32) |> Base.url_encode64(padding: false)
+
+      assert {:error, :not_configured} =
+               ForgeImports.OrganizationSync.begin_installation(
+                 context.actor,
+                 context.organization,
+                 state,
+                 request_metadata()
+               )
+
+      refute Repo.exists?(OrganizationMirror)
+      refute Repo.exists?(ForgeMirrors.GitHubInstallationIntent)
+    end
   end
 
   test "policy updates require installation permissions and reject invalid selections", context do

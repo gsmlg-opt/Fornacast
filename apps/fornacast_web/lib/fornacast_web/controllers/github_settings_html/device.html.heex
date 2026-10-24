@@ -1,0 +1,59 @@
+<section class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6">
+  <header class="grid gap-2">
+    <.dm_link href="/settings/github" class="text-primary">Back to linked accounts</.dm_link>
+    <h2 class="text-2xl font-semibold">Connect with GitHub</h2>
+  </header>
+
+  <.dm_alert :if={@error} id="github-settings-error" variant="error" outlined role="alert">
+    {@error}
+  </.dm_alert>
+
+  <.dm_card id="github-device-connect" variant="bordered" shadow="md" padding="lg">
+    <p class="text-sm text-on-surface-variant">
+      Authorize Fornacast on GitHub using a verification code. Access is limited to
+      repositories available to both your account and the installed GitHub App.
+    </p>
+    <.dm_alert
+      :if={@device_flow && @device_flow.status in [:failed, :expired]}
+      id="github-device-error"
+      variant="error"
+      outlined
+      role="alert"
+    >
+      {device_message(@device_flow.error)}
+    </.dm_alert>
+    <div
+      :if={@device_flow && @device_flow.status in [:pending, :polling]}
+      class="mt-4 grid gap-4"
+      data-github-device-poll="true"
+      data-github-device-id={@device_flow.id}
+      data-interval={@device_flow.interval}
+      data-expires-in={@device_flow.expires_in}
+    >
+      <p class="text-sm">Enter this code on GitHub:</p>
+      <code class="text-2xl font-semibold tracking-widest" data-github-device-code>{@device_flow.user_code}</code>
+      <.dm_link href={@device_flow.verification_uri} target="_blank" rel="noopener noreferrer">
+        Open GitHub authorization
+      </.dm_link>
+      <p
+        class="text-sm text-on-surface-variant"
+        role="status"
+        aria-live="polite"
+        data-github-device-status
+      >
+        Waiting for GitHub authorization. This code expires in about {div(
+          @device_flow.expires_in + 59,
+          60
+        )} min.
+      </p>
+      <form action={"/settings/github/device/#{@device_flow.id}/cancel"} method="post">
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <.dm_btn native_submit variant="secondary">Cancel authorization</.dm_btn>
+      </form>
+    </div>
+    <form action="/settings/github/device" method="post" class="mt-4">
+      <input type="hidden" name="_csrf_token" value={csrf_token()} />
+      <.dm_btn native_submit variant="primary">Connect with GitHub</.dm_btn>
+    </form>
+  </.dm_card>
+</section>

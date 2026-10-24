@@ -119,7 +119,7 @@ defmodule FornacastWebTest do
     assert html =~
              ~s(<a class="brand-mark" href="/" aria-label="Fornacast dashboard"><img class="brand-logo" src="/images/logo.png" alt="" aria-hidden="true"><span>Fornacast</span></a>)
 
-    assert html =~ ~s(<nav class="appbar-nav" aria-label="Workspace">)
+    assert html =~ ~s(<nav class="appbar-workspace-nav" aria-label="Workspace">)
     refute html =~ ~s(<a class="nav-link" href="/issues">Issues</a>)
     refute html =~ ~s(<a class="nav-link" href="/pulls">Pull Requests</a>)
     assert html =~ ~s(<details class="repo-menu">)
@@ -814,7 +814,7 @@ defmodule FornacastWebTest do
 
     dashboard_body = html_response(dashboard, 200)
     assert dashboard_body =~ ~s(class="app-shell")
-    assert dashboard_body =~ ~s(class="appbar-nav")
+    assert dashboard_body =~ ~s(class="appbar-workspace-nav")
     assert dashboard_body =~ ~s(class="section-header")
     assert dashboard_body =~ "Repositories"
 

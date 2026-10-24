@@ -7,6 +7,7 @@ defmodule FornacastUmbrella.MixProject do
       version: "0.7.10",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
+      listeners: [Phoenix.CodeReloader],
       releases: releases(),
       deps: deps(),
       aliases: aliases()

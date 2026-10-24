@@ -1,0 +1,62 @@
+<OrganizationSettingsComponents.organization_settings_layout
+  organization={@organization}
+  active={:github}
+  github_page={:overview}
+>
+  <section class="grid gap-4" data-organization-github-connection>
+    <header class="flex flex-wrap items-center justify-between gap-4">
+      <div class="grid gap-1">
+        <h2 class="text-2xl font-semibold">GitHub</h2>
+        <p role="status" data-organization-connection-state={@view.state}>
+          {status(@view.state)}
+        </p>
+        <p
+          :if={@view.connection && @view.connection.github_organization}
+          class="text-sm text-on-surface-variant"
+        >
+          GitHub @{@view.connection.github_organization} · Installation #{@view.connection.installation_id} · {repository_count(
+            @view
+          )} repositories
+        </p>
+      </div>
+      <nav class="flex flex-wrap gap-2" aria-label="Organization GitHub connection options">
+        <.dm_link href={base(@organization) <> "/connection"} class="btn btn-primary">Connect with GitHub</.dm_link>
+        <.dm_link href={base(@organization) <> "/legacy"} class="btn btn-secondary">Link GitHub account</.dm_link>
+      </nav>
+    </header>
+    <p class="text-sm text-on-surface-variant">
+      This connection belongs to this organization. Personal linked accounts are managed separately.
+    </p>
+    <p :if={active_source?(@config, @view)} class="text-sm">
+      Organization connection selected for synchronization{if @config.paused,
+        do: " (paused)",
+        else: ""}. Synchronization: {sync_status(@config)}.
+    </p>
+    <p
+      :if={@config.id && @config.credential_source == :personal}
+      class="text-sm"
+      role="status"
+      data-synchronization-source="legacy-personal"
+    >
+      Synchronization source: legacy personal connection. Status: {sync_status(@config)}{if @config.paused,
+        do: " (paused)",
+        else: ""}. <span :if={!@config.enabled}>Synchronization configuration disabled.</span>
+    </p>
+    <p
+      :if={@config.id && @config.credential_source == :public}
+      class="text-sm"
+      role="status"
+      data-synchronization-source="public"
+    >
+      Synchronization source: public GitHub API. Status: {sync_status(@config)}{if @config.paused,
+        do: " (paused)",
+        else: ""}. <span :if={!@config.enabled}>Synchronization configuration disabled.</span>
+    </p>
+    <nav class="flex flex-wrap gap-4" aria-label="GitHub synchronization">
+      <.dm_link href={base(@organization) <> "/public"} class="text-primary">Synchronize public repositories</.dm_link>
+      <.dm_link href={base(@organization) <> "/repositories"} class="text-primary">Repositories</.dm_link>
+      <.dm_link href={base(@organization) <> "/runs"} class="text-primary">Synchronization history</.dm_link>
+      <.dm_link href={base(@organization) <> "/app/advanced"} class="text-primary">Advanced GitHub App integration</.dm_link>
+    </nav>
+  </section>
+</OrganizationSettingsComponents.organization_settings_layout>

@@ -113,7 +113,7 @@ defmodule ForgeImports.Worker do
 
     result =
       with %ImportRun{} = run <- Repo.get(ImportRun, run_id),
-           %User{} = actor <- Repo.get(User, run.actor_user_id) do
+           actor when not is_nil(actor) <- execution_actor(run) do
         RepositoryPublisher.publish(actor, item.id, run.request_metadata)
       else
         _missing -> {:error, :not_found}
@@ -136,6 +136,12 @@ defmodule ForgeImports.Worker do
     emit_phase(item, phase, result, System.monotonic_time() - started)
     result
   end
+
+  defp execution_actor(%ImportRun{credential_source: source, organization_sync_run_id: id} = run)
+       when source in [:organization_device, :public] and not is_nil(id),
+       do: ForgeImports.OrganizationExecution.audit_principal(run)
+
+  defp execution_actor(run), do: Repo.get(User, run.actor_user_id)
 
   defp finish_if_terminal(run_id) do
     case RunAggregator.finish_if_terminal(run_id) do

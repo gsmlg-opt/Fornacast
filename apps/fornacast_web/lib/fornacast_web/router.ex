@@ -59,6 +59,10 @@ defmodule FornacastWeb.Router do
         :run_status
 
     post "/settings/github/device/:attempt_id/poll", GitHubDeviceController, :poll
+
+    post "/organizations/:organization/settings/github/device/:attempt_id/poll",
+         OrganizationGitHubDeviceController,
+         :poll
   end
 
   scope "/", FornacastWeb do
@@ -89,7 +93,51 @@ defmodule FornacastWeb.Router do
     get "/organizations/:organization/settings", OrganizationSettingsController, :index
     patch "/organizations/:organization_slug/settings", OrganizationSettingsController, :update
 
-    get "/organizations/:organization/settings/github", OrganizationPATSettingsController, :index
+    get "/organizations/:organization/settings/github", OrganizationGitHubDeviceController, :index
+
+    get "/organizations/:organization/settings/github/connection",
+        OrganizationGitHubDeviceController,
+        :connection
+
+    get "/organizations/:organization/settings/github/device",
+        OrganizationGitHubDeviceController,
+        :connection
+
+    post "/organizations/:organization/settings/github/device",
+         OrganizationGitHubDeviceController,
+         :create
+
+    post "/organizations/:organization/settings/github/device/:attempt_id/cancel",
+         OrganizationGitHubDeviceController,
+         :cancel
+
+    post "/organizations/:organization/settings/github/connection/bind",
+         OrganizationGitHubDeviceController,
+         :bind
+
+    post "/organizations/:organization/settings/github/connection/activate",
+         OrganizationGitHubDeviceController,
+         :activate
+
+    post "/organizations/:organization/settings/github/connection/disconnect",
+         OrganizationGitHubDeviceController,
+         :disconnect
+
+    get "/organizations/:organization/settings/github/legacy",
+        OrganizationPATSettingsController,
+        :index
+
+    get "/organizations/:organization/settings/github/public",
+        OrganizationPublicSyncController,
+        :index
+
+    patch "/organizations/:organization/settings/github/public",
+          OrganizationPublicSyncController,
+          :save
+
+    post "/organizations/:organization/settings/github/public/sync",
+         OrganizationPublicSyncController,
+         :sync
 
     get "/organizations/:organization/settings/github/runs",
         OrganizationPATSettingsController,
@@ -136,6 +184,10 @@ defmodule FornacastWeb.Router do
          :resume
 
     get "/organizations/:organization/settings/github/app",
+        OrganizationGitHubDeviceController,
+        :connection
+
+    get "/organizations/:organization/settings/github/app/advanced",
         OrganizationGitHubSettingsController,
         :index
 
@@ -187,6 +239,10 @@ defmodule FornacastWeb.Router do
     patch "/settings/appearance", SettingsController, :update_appearance
 
     get "/settings/github", GitHubSettingsController, :index
+    get "/settings/github/device", GitHubSettingsController, :organizations
+    get "/settings/github/organizations", GitHubSettingsController, :organizations
+    get "/settings/github/device/legacy", GitHubSettingsController, :device
+    get "/settings/github/link", GitHubSettingsController, :link
     post "/settings/github/device", GitHubDeviceController, :create
     post "/settings/github/device/:attempt_id/cancel", GitHubDeviceController, :cancel
     post "/settings/github", GitHubSettingsController, :create
@@ -202,6 +258,10 @@ defmodule FornacastWeb.Router do
     get "/repos/import", ImportController, :repository_new
     post "/repos/import/discover", ImportController, :repository_discover
     get "/organizations/import", ImportController, :organization_new
+    get "/organizations/import/public", OrganizationImportController, :public
+    post "/organizations/import/public", OrganizationImportController, :discover
+    get "/organizations/import/app", OrganizationImportController, :app
+    post "/organizations/import/app", OrganizationImportController, :connect
     post "/organizations/import/discover", ImportController, :organization_discover
     get "/imports/:id", ImportController, :show
     get "/imports/:id/status", ImportStatusController, :show

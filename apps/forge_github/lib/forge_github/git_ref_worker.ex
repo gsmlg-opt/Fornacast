@@ -382,7 +382,8 @@ defmodule ForgeGitHub.GitRefWorker do
       end)
 
     case {Map.get(sync, :credential_source), decision} do
-      {:pat, {action, _expected}} when action in [:delete_local, :delete_remote] ->
+      {source, {action, _expected}}
+      when source in [:pat, :organization_device] and action in [:delete_local, :delete_remote] ->
         {:conflict, :delete_vs_update}
 
       _ ->
@@ -392,9 +393,9 @@ defmodule ForgeGitHub.GitRefWorker do
 
   defp authorize_pat_ref_policy(
          %{external_effect_marker: %{"action" => action}},
-         %{credential_source: :pat}
+         %{credential_source: source}
        )
-       when action in ["delete_local", "delete_remote"],
+       when source in [:pat, :organization_device] and action in ["delete_local", "delete_remote"],
        do: {:error, :ref_deletion_disabled}
 
   defp authorize_pat_ref_policy(_operation, _sync), do: :ok
@@ -919,8 +920,15 @@ defmodule ForgeGitHub.GitRefWorker do
 
   defp authorize_recovery(%MirrorOperation{}, _options), do: {:error, :invalid_transition}
 
-  defp with_effect_token(_decision, %{credential_source: :pat} = sync, _token, options, callback),
-    do: with_token(sync, options, callback)
+  defp with_effect_token(
+         _decision,
+         %{credential_source: source} = sync,
+         _token,
+         options,
+         callback
+       )
+       when source in [:pat, :organization_device],
+       do: with_token(sync, options, callback)
 
   defp with_effect_token(decision, sync, _token, options, callback)
        when elem(decision, 0) in [:apply_remote, :delete_remote],
@@ -941,7 +949,8 @@ defmodule ForgeGitHub.GitRefWorker do
     )
   end
 
-  defp verify_pat_repository(%{credential_source: :pat} = sync, token, options) do
+  defp verify_pat_repository(%{credential_source: source} = sync, token, options)
+       when source in [:pat, :organization_device] do
     fetch = callback(options, :repository_fetch, &Client.repository/4)
 
     case fetch.(token, sync.remote_owner, sync.remote_repository,

@@ -4382,7 +4382,7 @@ defmodule ForgeMirrors do
       when is_binary(owner) and is_integer(lease_seconds) and lease_seconds > 0 and
              is_integer(limit) and limit in 1..@max_claim_batch and is_list(kinds) do
     with :ok <- validate_operation_kinds(kinds) do
-      do_claim_operations(owner, now, lease_seconds, limit, kinds, ["pat"])
+      do_claim_operations(owner, now, lease_seconds, limit, kinds, ["pat", "organization_device"])
     end
   end
 
@@ -5730,7 +5730,8 @@ defmodule ForgeMirrors do
 
   defp retain_pat_git_replacement(operation, replacement, now) do
     case Repo.get(OrganizationMirror, operation.organization_mirror_id) do
-      %OrganizationMirror{credential_source: :pat} ->
+      %OrganizationMirror{credential_source: source}
+      when source in [:pat, :organization_device] ->
         owned_transition(operation, now, [:processing, :effect_pending],
           checkpoint:
             Map.put(operation.checkpoint, "replacement_git_operation_id", replacement.id)
@@ -6182,7 +6183,7 @@ defmodule ForgeMirrors do
          :ok <- validate_utc(scheduled_at) do
       scheduled_at = DateTime.truncate(scheduled_at, :second)
 
-      if persisted.credential_source == :pat do
+      if persisted.credential_source in [:pat, :organization_device] do
         ForgeMirrors.PatGitMirror.schedule_all(
           persisted,
           "manual:#{DateTime.to_unix(scheduled_at)}",
@@ -6628,7 +6629,7 @@ defmodule ForgeMirrors do
     scheduled_at = mirror.next_reconcile_at
 
     result =
-      if mirror.credential_source == :pat do
+      if mirror.credential_source in [:pat, :organization_device] do
         ForgeMirrors.PatGitMirror.schedule_all(
           mirror,
           "periodic:#{DateTime.to_unix(scheduled_at)}",
@@ -6788,7 +6789,8 @@ defmodule ForgeMirrors do
 
   defp materialize_repository_operations(repository, event) do
     case Repo.get(OrganizationMirror, repository.organization_mirror_id) do
-      %OrganizationMirror{credential_source: :pat} when event.event_type != "repository.pushed" ->
+      %OrganizationMirror{credential_source: source}
+      when source in [:pat, :organization_device] and event.event_type != "repository.pushed" ->
         {:ok, []}
 
       _ ->
@@ -6995,7 +6997,8 @@ defmodule ForgeMirrors do
 
   defp load_git_ref_scope(operation) do
     case Repo.get(OrganizationMirror, operation.organization_mirror_id) do
-      %OrganizationMirror{credential_source: :pat} = mirror ->
+      %OrganizationMirror{credential_source: source} = mirror
+      when source in [:pat, :organization_device] ->
         case Repo.get(RepositoryMirror, operation.repository_mirror_id) do
           %RepositoryMirror{} = binding ->
             scope = ForgeMirrors.PatGitMirror.scope(mirror, binding, operation)
@@ -7311,7 +7314,8 @@ defmodule ForgeMirrors do
 
       pat? =
         match?(
-          %OrganizationMirror{credential_source: :pat},
+          %OrganizationMirror{credential_source: source}
+          when source in [:pat, :organization_device],
           Repo.get(OrganizationMirror, operation.organization_mirror_id)
         )
 
@@ -7994,7 +7998,8 @@ defmodule ForgeMirrors do
     end
   end
 
-  defp authorize_external_effect_installation(operation, %{credential_source: :pat} = scope) do
+  defp authorize_external_effect_installation(operation, %{credential_source: source} = scope)
+       when source in [:pat, :organization_device] do
     if operation.external_effect_marker["action"] in ["delete_local", "delete_remote"],
       do: {:error, :ref_deletion_disabled},
       else: authorize_pat_credential(scope)
@@ -8407,7 +8412,7 @@ defmodule ForgeMirrors do
     left join github_app_installations installation
       on installation.github_installation_id = organization.github_installation_id
     where organization.state not in ('paused', 'revoked')
-      and (organization.credential_source <> 'pat' or operation.kind in
+      and (organization.credential_source not in ('pat', 'organization_device') or operation.kind in
         ('reconcile.repository.git', 'sync.git_ref', 'finalize.repository.git'))
       and (operation.repository_mirror_id is null or repository.state in ('discovered', 'active'))
       and ($3::text[] is null or operation.kind = any($3))

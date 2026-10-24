@@ -174,18 +174,19 @@ defmodule FornacastWeb.ImportControllerTest do
     assert_real_csrf(repository_html)
     assert_private_no_store(repository)
 
-    organization = request_conn(actor) |> get("/organizations/import")
+    organization = request_conn(actor) |> get("/organizations/import/public?destination=existing")
     organization_html = html_response(organization, 200)
 
-    assert organization_html =~ "Import organization from GitHub"
-    assert organization_html =~ ~s(action="/organizations/import/discover" method="post")
+    assert organization_html =~ "Synchronize public repositories"
+    assert organization_html =~ ~s(action="/organizations/import/public" method="post")
     assert organization_html =~ ~s(name="import[organization]")
     assert organization_html =~ ~s(name="import[destination_action]")
-    assert organization_html =~ ~s(name="import[destination_slug]")
+    refute organization_html =~ ~s(name="import[destination_slug]")
     assert organization_html =~ ~s(name="import[destination_organization_id]")
     assert organization_html =~ owned.username
     refute organization_html =~ member.username
-    assert_blank_pat(organization_html)
+    refute organization_html =~ ~s(name="import[pat]")
+    refute organization_html =~ ~s(name="import[github_identity_id]")
     assert_real_csrf(organization_html)
     assert_private_no_store(organization)
   end
@@ -691,6 +692,24 @@ defmodule FornacastWeb.ImportControllerTest do
     refute inspect(metadata) =~ @pat
   end
 
+  test "changing a discovered organization destination submits only its chosen branch", %{
+    actor: actor
+  } do
+    TestImports.result(:show, {:ok, run_view(actor, 91, :organization)})
+
+    for {choice, present, absent} <- [
+          {"new", "destination[slug]", "destination[organization_id]"},
+          {"existing", "destination[organization_id]", "destination[slug]"}
+        ] do
+      html =
+        request_conn(actor) |> get("/imports/91?destination=" <> choice) |> html_response(200)
+
+      assert html =~ ~s(name="destination[action]" value="#{choice}")
+      assert html =~ ~s(name="#{present}")
+      refute html =~ ~s(name="#{absent}")
+    end
+  end
+
   test "retry posts a saved credential and redirects to the successor run", %{actor: actor} do
     TestImports.accounts({:ok, [account(41, "octocat", :valid)]})
 
@@ -726,6 +745,50 @@ defmodule FornacastWeb.ImportControllerTest do
            ] = Enum.filter(TestImports.calls(), &match?({:retry, _}, &1))
 
     assert actor_id == actor.id
+  end
+
+  test "public retry keeps anonymous authority and never loads personal accounts", %{actor: actor} do
+    predecessor = %{run_view(actor, 91, :organization) | state: :failed}
+
+    predecessor = %{
+      predecessor
+      | source: Map.put(predecessor.source, :credential_source, :public)
+    }
+
+    successor = %{predecessor | id: 92, state: :ready, predecessor_run_id: 91}
+    TestImports.result(:show, {:ok, predecessor})
+    TestImports.result(:retry, {:ok, successor})
+
+    html = request_conn(actor) |> get("/imports/91") |> html_response(200)
+    assert html =~ "Public GitHub API"
+    refute html =~ ~s(name="import[github_identity_id]")
+    refute html =~ ~s(name="import[pat]")
+    refute Enum.any?(TestImports.calls(), &match?({:list_accounts, _}, &1))
+    token = extract_form_csrf_token(html, "/imports/91/retry")
+
+    conn =
+      request_conn(actor)
+      |> post("/imports/91/retry", %{
+        "_csrf_token" => token,
+        "import" => %{"credential_source" => "public"}
+      })
+
+    assert redirected_to(conn, 303) == "/imports/92"
+
+    assert [{:retry, [%User{id: actor_id}, 91, %{credential_source: :public}, _metadata, []]}] =
+             Enum.filter(TestImports.calls(), &match?({:retry, _}, &1))
+
+    assert actor_id == actor.id
+    assert_private_no_store(conn)
+
+    conn =
+      request_conn(actor)
+      |> post("/imports/91/retry", %{
+        "import" => %{"credential_source" => "public", "github_identity_id" => "41"}
+      })
+
+    assert html_response(conn, 422)
+    assert length(Enum.filter(TestImports.calls(), &match?({:retry, _}, &1))) == 1
   end
 
   test "report renders a safe finalized report view", %{actor: actor} do
@@ -791,7 +854,6 @@ defmodule FornacastWeb.ImportControllerTest do
 
     requests = [
       {:repository_new, fn -> request_conn(actor) |> get("/repos/import") end},
-      {:organization_new, fn -> request_conn(actor) |> get("/organizations/import") end},
       {:show,
        fn ->
          TestImports.result(:show, {:ok, run_view(actor, 91, :organization)})
@@ -836,7 +898,7 @@ defmodule FornacastWeb.ImportControllerTest do
     TestAccounts.result({:raise, RuntimeError, "programming failure"})
 
     assert_raise RuntimeError, "programming failure", fn ->
-      request_conn(actor) |> get("/organizations/import")
+      request_conn(actor) |> get("/repos/import")
     end
   end
 
@@ -846,7 +908,7 @@ defmodule FornacastWeb.ImportControllerTest do
 
       error =
         assert_raise Turso.Error, "non-recoverable lookup failure", fn ->
-          request_conn(actor) |> get("/organizations/import")
+          request_conn(actor) |> get("/repos/import")
         end
 
       assert error.code == code

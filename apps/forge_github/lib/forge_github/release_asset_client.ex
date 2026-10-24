@@ -54,20 +54,22 @@ defmodule ForgeGitHub.ReleaseAssetClient do
   def decode_asset(_, _), do: {:error, :invalid_response}
 
   def download(token, owner, repository, asset, consumer, opts) do
-    with true <- is_binary(token) and byte_size(token) in 1..4_096,
+    with true <- token == :public or (is_binary(token) and byte_size(token) in 1..4_096),
          true <- valid_repository?(owner, repository),
          {:ok, asset} <- decode_asset(asset, token),
          true <- is_function(consumer, 2) do
-      RequestGate.run(Keyword.get(opts, :gate_key), fn ->
+      gate_key = if token == :public, do: {:public, 1}, else: Keyword.get(opts, :gate_key)
+
+      RequestGate.run(gate_key, fn ->
         url = "https://api.github.com/repos/#{owner}/#{repository}/releases/assets/#{asset["id"]}"
 
-        headers = [
-          {"authorization", "Bearer " <> token},
-          {"accept", "application/octet-stream"},
-          {"accept-encoding", "identity"},
-          {"user-agent", "Fornacast"},
-          {"x-github-api-version", "2026-03-10"}
-        ]
+        headers =
+          [
+            {"accept", "application/octet-stream"},
+            {"accept-encoding", "identity"},
+            {"user-agent", "Fornacast"},
+            {"x-github-api-version", "2026-03-10"}
+          ] ++ authorization_headers(token)
 
         deadline =
           System.monotonic_time(:millisecond) + Keyword.get(opts, :request_timeout, 300_000)
@@ -79,6 +81,9 @@ defmodule ForgeGitHub.ReleaseAssetClient do
       _ -> error(:invalid_request)
     end
   end
+
+  defp authorization_headers(:public), do: []
+  defp authorization_headers(token), do: [{"authorization", "Bearer " <> token}]
 
   defp do_download(url, headers, asset, consumer, opts, deadline, redirects) do
     remaining = deadline - System.monotonic_time(:millisecond)

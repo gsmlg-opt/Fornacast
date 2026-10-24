@@ -27,8 +27,10 @@ defmodule ForgeAccounts.GitHubProfileSafety do
   ]
   @credential_markers ["github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "bearer "]
 
-  @spec validate(term(), binary() | nil) :: :ok | {:error, :invalid_response}
+  @spec validate(term(), binary() | nil | :public) :: :ok | {:error, :invalid_response}
   def validate(profile, credential \\ nil)
+
+  def validate(profile, :public), do: validate(profile, nil)
 
   def validate(nil, credential) when is_nil(credential) or is_binary(credential), do: :ok
 

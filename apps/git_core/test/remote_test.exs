@@ -189,7 +189,9 @@ defmodule GitCore.RemoteTest do
       assert {:ok, []} = File.ls(quarantine)
 
       elapsed = System.monotonic_time(:millisecond) - started_at
-      assert elapsed < 750, "#{name} callback cleanup took #{elapsed}ms"
+      # Credential cleanup invokes the same callback again before terminating the daemon.
+      cleanup_budget = 2 * GitCore.Limits.get(:remote_control_callback_ms) + 550
+      assert elapsed < cleanup_budget, "#{name} callback cleanup took #{elapsed}ms"
       callback_kind = String.to_existing_atom(name)
       assert_receive {:callback_started, ^callback_kind, callback_worker}
       eventually(fn -> refute Elixir.Process.alive?(callback_worker) end)

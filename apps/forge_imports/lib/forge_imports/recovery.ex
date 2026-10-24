@@ -198,10 +198,18 @@ defmodule ForgeImports.Recovery do
 
   defp credential_cleared?(%RepositoryItem{import_run_id: run_id}) do
     case Repo.get(ImportRun, run_id) do
-      %ImportRun{credential_source: :one_time, credential_ciphertext: nil} -> true
-      %ImportRun{credential_source: :saved} -> true
-      %ImportRun{credential_source: :one_time} -> false
-      nil -> false
+      %ImportRun{credential_source: :one_time, credential_ciphertext: nil} ->
+        true
+
+      %ImportRun{credential_source: source}
+      when source in [:saved, :github_app, :organization_device, :public] ->
+        true
+
+      %ImportRun{credential_source: :one_time} ->
+        false
+
+      nil ->
+        false
     end
   end
 

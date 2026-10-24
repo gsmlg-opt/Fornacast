@@ -75,6 +75,51 @@ defmodule ForgeImports.Discovery do
     end
   end
 
+  def create_organization(
+        %ForgeImports.OrganizationExecution{} = execution,
+        _attrs,
+        metadata,
+        _opts
+      ) do
+    alias ForgeImports.{OrganizationExecution, PatSyncRun}
+
+    Repo.transact(fn ->
+      with {:ok, scope} <- OrganizationExecution.authorize(execution, lock: true),
+           %PatSyncRun{} = job <- Repo.get(PatSyncRun, execution.pat_sync_run_id),
+           %ForgeAccounts.Organization{state: :active} = organization <-
+             Repo.get(ForgeAccounts.Organization, execution.organization_id),
+           {:ok, metadata} <- ForgeAccounts.validate_github_request_metadata(metadata) do
+        attrs =
+          Map.merge(OrganizationExecution.snapshots(scope), %{
+            actor_user_id: execution.id,
+            organization_sync_run_id: job.id,
+            source_kind: :organization,
+            credential_source: Map.get(scope, :credential_source, :organization_device),
+            source_owner_github_id: scope.github_organization_id,
+            source_owner_login: scope.github_organization,
+            destination_organization_action: :existing,
+            destination_organization_id: organization.id,
+            destination_organization_slug: organization.username,
+            destination_organization_status: :clean,
+            request_metadata: metadata
+          })
+
+        with true <- is_nil(job.import_run_id),
+             {:ok, run} <- %ImportRun{} |> ImportRun.discovery_changeset(attrs) |> Repo.insert(),
+             {:ok, _} <- Repo.update(Ecto.Changeset.change(job, import_run_id: run.id)),
+             {:ok, _} <- ForgeImports.SyncJobs.enqueue_discovery(run.id) do
+          {:ok, run}
+        else
+          {:error, _} = error -> error
+          _ -> {:error, :configuration_changed}
+        end
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :configuration_changed}
+      end
+    end)
+  end
+
   def create_organization(_actor, _attrs, _request_metadata, _opts),
     do: {:error, :forbidden}
 
@@ -83,6 +128,7 @@ defmodule ForgeImports.Discovery do
 
     with :ok <- credential_shape(attrs, source) do
       case source do
+        :public -> public_credential(actor, request_metadata)
         :saved -> saved_credential(actor, attrs, request_metadata)
         :one_time -> one_time_credential(actor, attrs, request_metadata, options)
       end
@@ -101,7 +147,19 @@ defmodule ForgeImports.Discovery do
       else: {:error, :invalid_request}
   end
 
+  defp credential_shape(attrs, :public) do
+    if not has_field?(attrs, :github_identity_id) and not has_field?(attrs, :pat),
+      do: :ok,
+      else: {:error, :invalid_request}
+  end
+
   defp credential_shape(_attrs, :invalid), do: {:error, :invalid_request}
+
+  defp public_credential(_actor, request_metadata) do
+    with {:ok, metadata} <- ForgeAccounts.validate_github_request_metadata(request_metadata) do
+      {:ok, %{source: :public}, metadata}
+    end
+  end
 
   defp saved_credential(actor, attrs, request_metadata) do
     with {:ok, identity_id} <- positive_id(fetch(attrs, :github_identity_id)),
@@ -191,8 +249,9 @@ defmodule ForgeImports.Discovery do
   defp normalize_user({:error, %Error{kind: kind}}, _actor, _pat), do: {:error, kind}
   defp normalize_user(_result, _actor, _pat), do: {:error, :invalid_response}
 
-  defp create_provisional_run(actor, attrs, %{source: :saved}, _options),
-    do: ForgeImports.create_run(actor, attrs)
+  defp create_provisional_run(actor, attrs, %{source: source}, _options)
+       when source in [:saved, :public],
+       do: ForgeImports.create_run(actor, attrs)
 
   defp create_provisional_run(actor, attrs, credential, options) do
     transaction = fn ->
@@ -314,6 +373,8 @@ defmodule ForgeImports.Discovery do
     }
   end
 
+  defp credential_attrs(%{source: :public}), do: %{credential_source: :public}
+
   defp credential_attrs(%{source: :one_time} = credential) do
     %{github_identity_id: credential.identity_id, credential_source: :one_time}
   end
@@ -432,6 +493,8 @@ defmodule ForgeImports.Discovery do
     Protocol.UndefinedError -> {:error, :invalid_request}
   end
 
+  defp credential_source(:public), do: :public
+  defp credential_source("public"), do: :public
   defp credential_source(:saved), do: :saved
   defp credential_source("saved"), do: :saved
   defp credential_source(:one_time), do: :one_time
@@ -470,6 +533,10 @@ defmodule ForgeImports.Discovery do
       name: source.repository,
       full_name: "#{source.owner}/#{source.repository}"
     }
+  end
+
+  defp revalidate_run_inputs(_actor, attrs, %{source: :public}, profile) do
+    with :ok <- GitHubProfileSafety.validate(profile, :public), do: {:ok, attrs}
   end
 
   defp revalidate_run_inputs(actor, attrs, %{source: :one_time} = credential, profile) do
@@ -513,6 +580,9 @@ defmodule ForgeImports.Discovery do
       :ok
     end
   end
+
+  defp validate_destination_profiles(_actor, profiles, %{source: :public}),
+    do: validate_profiles(profiles, :public)
 
   defp validate_destination_profiles(actor, profiles, %{source: :saved}),
     do: ForgeAccounts.validate_github_external_profiles(actor, profiles)

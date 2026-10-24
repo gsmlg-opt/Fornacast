@@ -1,7 +1,8 @@
 # GitHub App Device Flow for imports and synchronization
 
 Status: implemented and scoped verification complete, 2026-10-22.
-Real GitHub consent remains untested.
+Real GitHub consent and local credential persistence verified on 2026-10-22;
+access to a selected acceptance repository remains untested.
 User approval: 2026-10-22.
 
 ## User decisions
@@ -28,9 +29,12 @@ on every automatic refresh would invalidate synchronization authority.
 
 ## Implemented behavior
 
-The existing GitHub account settings page now has a **Connect with GitHub**
-action. Starting the action displays GitHub's user code, verification link and
-expiration time. The page polls through Fornacast until authorization succeeds,
+The GitHub account settings overview shows current connections and two compact
+navigation buttons: **Connect with GitHub** opens `/settings/github/device`, and
+**Link GitHub account** opens `/settings/github/link`. Their configuration forms
+are on those separate pages, as requested in the local UI follow-up. The Device
+Flow page starts authorization and displays GitHub's user code, verification link
+and expiration time. The page polls through Fornacast until authorization succeeds,
 is denied, expires or is cancelled. The provider's minimum polling interval is
 enforced on the server, including the extra delay required by `slow_down`.
 
@@ -183,7 +187,12 @@ pending polling, cancellation, expiry, denial, disabled-flow guidance and
 desktop/mobile layouts without token secrets in the DOM. That fixture/listener
 has been stopped; the managed application service was untouched. This was not
 real GitHub consent.
-Real authorization and access to a selected acceptance repository remain untested.
+The subsequent local test at `http://10.100.10.28:4890` completed real GitHub
+consent on 2026-10-22. Read-only database metadata and fresh authenticated settings
+responses confirmed the saved `github_app_user` credential was valid, with its
+latest verification at 10:08:03 UTC. Access to a selected acceptance repository
+and synchronization using that connection remain untested. The compact navigation
+and account-status visibility changes are local, uncommitted follow-ups.
 The served browser also showed the existing dependency preload URL issue tracked
 by [phoenix-duskmoon-ui#200](https://github.com/duskmoon-dev/phoenix-duskmoon-ui/issues/200)
 with installed `duskmoon_bundler 9.16.11`; normal module imports and Device Flow

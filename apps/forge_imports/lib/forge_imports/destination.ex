@@ -53,6 +53,29 @@ defmodule ForgeImports.Destination do
     end
   end
 
+  def organization(
+        %ForgeImports.OrganizationExecution{organization_id: id} = execution,
+        _source_login,
+        %{action: :existing, id: id}
+      ) do
+    with {:ok, _} <- ForgeImports.OrganizationExecution.authorize(execution),
+         %Organization{state: :active} = organization <- Repo.get(Organization, id) do
+      {:ok,
+       %{
+         action: :existing,
+         slug: organization.username,
+         requested_slug: organization.username,
+         submitted_slug: organization.username,
+         organization_id: id,
+         owner_id: id,
+         status: :clean,
+         classification: nil
+       }}
+    else
+      _ -> {:error, :invalid_destination}
+    end
+  end
+
   def organization(_actor, _source_login, _destination), do: {:error, :invalid_destination}
 
   @doc false

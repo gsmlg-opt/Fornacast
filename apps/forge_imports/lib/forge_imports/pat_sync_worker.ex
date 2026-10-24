@@ -66,11 +66,23 @@ defmodule ForgeImports.PatSyncWorker do
         do: lock(job_query, "FOR SHARE"),
         else: job_query
 
-    job = Repo.one(job_query) || provisional_job(run)
+    job =
+      Repo.one(job_query) ||
+        if(match?(%ImportRun{organization_sync_run_id: id} when not is_nil(id), run),
+          do: Repo.get(PatSyncRun, run.organization_sync_run_id),
+          else: provisional_job(run)
+        )
 
     case job do
       nil ->
-        :ok
+        if match?(%ImportRun{organization_sync_run_id: id} when not is_nil(id), run),
+          do: {:error, :configuration_changed},
+          else: :ok
+
+      %PatSyncRun{credential_source: source} when source in [:organization_device, :public] ->
+        with {:ok, execution} <- ForgeImports.OrganizationExecution.for_run(run),
+             {:ok, _scope} <- ForgeImports.OrganizationExecution.authorize(execution, opts),
+             do: :ok
 
       %PatSyncRun{} = job ->
         if Repo.in_transaction?() and Keyword.get(opts, :lock, false) do
@@ -103,6 +115,13 @@ defmodule ForgeImports.PatSyncWorker do
   end
 
   defp provisional_job(_), do: nil
+
+  defp context(%PatSyncRun{credential_source: source} = job)
+       when source in [:organization_device, :public] do
+    with {:ok, execution} <- ForgeImports.OrganizationExecution.for_sync(job),
+         {:ok, _scope, config} <- ForgeImports.OrganizationExecution.sync_context(job),
+         do: {:ok, execution, config}
+  end
 
   defp context(job) do
     config = Repo.get(PatConfiguration, job.configuration_id)
@@ -194,7 +213,10 @@ defmodule ForgeImports.PatSyncWorker do
       %ImportRun{state: :awaiting_credential} ->
         {:error, :credential_unavailable}
 
-      %ImportRun{state: state} when state in [:canceled, :cancel_requested] ->
+      %ImportRun{state: :cancel_requested} ->
+        :pending
+
+      %ImportRun{state: :canceled} ->
         {:error, :import_failed}
 
       %ImportRun{} ->
@@ -208,40 +230,43 @@ defmodule ForgeImports.PatSyncWorker do
   defp prepare(job, owner, run) do
     items = items(run.id)
 
-    progress =
-      Map.new(items, fn item ->
-        id = to_string(item.id)
-        {id, Map.get(job.progress, id) || plan(job, item)}
-      end)
+    with {:ok, restored} <-
+           ForgeImports.PatSyncProgress.restore_ancestor_imports(job, run, job.progress, items) do
+      progress =
+        Enum.reduce(items, restored, fn item, rows ->
+          id = to_string(item.id)
+          Map.put(rows, id, Map.get(rows, id) || plan(job, item))
+        end)
 
-    decisions =
-      Map.new(
-        Enum.filter(progress, fn {_id, row} -> row["mode"] != "import" end),
-        fn {id, _row} -> {id, %{action: :skip}} end
-      )
+      decisions =
+        Map.new(
+          Enum.filter(items, fn item -> progress[to_string(item.id)]["mode"] != "import" end),
+          fn item -> {to_string(item.id), %{action: :skip}} end
+        )
 
-    with {:ok, _} <- persist(job, progress: progress),
-         {:ok, _} <-
-           ForgeImports.resolve_repository_conflicts(
-             owner,
-             run.id,
-             decisions,
-             job.request_metadata
-           ),
-         {:ok, _} <- ForgeImports.start_import(owner, run.id, job.request_metadata) do
-      case ForgeImports.RunAggregator.finish_if_terminal(run.id) do
-        {:error, reason} -> {:error, reason}
-        _ -> :pending
-      end
-    else
-      {:error, :invalid_selection} when items == [] ->
-        case ForgeImports.request_cancel(owner, run.id, job.request_metadata) do
-          {:ok, _} -> :succeeded
+      with {:ok, _} <- persist(job, progress: progress),
+           {:ok, _} <-
+             ForgeImports.resolve_repository_conflicts(
+               owner,
+               run.id,
+               decisions,
+               job.request_metadata
+             ),
+           {:ok, _} <- ForgeImports.start_import(owner, run.id, job.request_metadata) do
+        case ForgeImports.RunAggregator.finish_if_terminal(run.id) do
           {:error, reason} -> {:error, reason}
+          _ -> :pending
         end
+      else
+        {:error, :invalid_selection} when items == [] ->
+          case cancel_empty_import(owner, run, job.request_metadata) do
+            {:ok, _} -> :succeeded
+            {:error, reason} -> {:error, reason}
+          end
 
-      {:error, reason} ->
-        {:error, reason}
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 
@@ -677,24 +702,74 @@ defmodule ForgeImports.PatSyncWorker do
 
           with :ok <- authorize.(),
                {:ok, operation} <-
-                 ForgeMirrors.schedule_pat_git_repository(
-                   owner,
-                   config.id,
-                   repository.id,
-                   "pat-sync:#{job.id}:repository:#{repository.id}"
-                 ),
+                 schedule_mirror(owner, config, repository, job, authorize),
                {:ok, status} <-
-                 ForgeMirrors.pat_git_repository_status(
-                   owner,
-                   config.id,
-                   repository.id,
-                   operation.id
-                 ) do
+                 mirror_status(owner, config, repository, operation, authorize) do
             if status == :complete, do: :ok, else: {:error, :busy}
           end
       end
     end
   end
+
+  defp schedule_mirror(%ForgeImports.OrganizationExecution{}, config, repository, job, authorize),
+    do:
+      ForgeMirrors.PatGitMirror.schedule_committed(
+        config.id,
+        repository.id,
+        "pat-sync:#{job.id}:repository:#{repository.id}",
+        authorize
+      )
+
+  defp schedule_mirror(owner, config, repository, job, _authorize),
+    do:
+      ForgeMirrors.schedule_pat_git_repository(
+        owner,
+        config.id,
+        repository.id,
+        "pat-sync:#{job.id}:repository:#{repository.id}"
+      )
+
+  defp mirror_status(
+         %ForgeImports.OrganizationExecution{},
+         config,
+         repository,
+         operation,
+         authorize
+       ),
+       do:
+         ForgeMirrors.PatGitMirror.status_committed(
+           config.id,
+           repository.id,
+           operation.id,
+           authorize
+         )
+
+  defp mirror_status(owner, config, repository, operation, _authorize),
+    do: ForgeMirrors.pat_git_repository_status(owner, config.id, repository.id, operation.id)
+
+  defp cancel_empty_import(%ForgeImports.OrganizationExecution{} = execution, run, _metadata) do
+    Repo.transact(fn ->
+      with {:ok, _} <- ForgeImports.OrganizationExecution.authorize(execution, lock: true),
+           true <-
+             not Repo.exists?(from item in RepositoryItem, where: item.import_run_id == ^run.id),
+           {:ok, updated} <-
+             Repo.update(
+               Ecto.Changeset.change(run,
+                 state: :canceled,
+                 terminal_at: DateTime.utc_now(:second),
+                 report_finalized_at: DateTime.utc_now(:second)
+               )
+             ) do
+        {:ok, updated}
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :stale}
+      end
+    end)
+  end
+
+  defp cancel_empty_import(owner, run, metadata),
+    do: ForgeImports.request_cancel(owner, run.id, metadata)
 
   defp persist_owned(job, changes) do
     now = DateTime.utc_now(:second)

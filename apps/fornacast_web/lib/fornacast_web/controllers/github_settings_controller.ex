@@ -25,9 +25,30 @@ defmodule FornacastWeb.GitHubSettingsController do
     end
   end
 
+  def organizations(conn, _params) do
+    actor = conn.assigns.current_user
+
+    organizations =
+      ForgeAccounts.list_user_organizations(actor)
+      |> Enum.filter(fn organization ->
+        match?({:ok, _}, ForgeAccounts.fetch_manageable_organization(actor, organization.id))
+      end)
+
+    render_settings_page(conn, :organizations, %{organizations: organizations})
+  end
+
+  def device(conn, _params) do
+    render_settings_page(conn, :device, %{
+      error: nil,
+      device_flow: FornacastWeb.GitHubDeviceSession.view(conn)
+    })
+  end
+
+  def link(conn, _params), do: render_settings_page(conn, :link, %{error: nil})
+
   def create(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
     with {:ok, pat} <- pat_param(params),
-         result <-
+         {:ok, account} <-
            service_call(fn ->
              github_accounts(conn).link_github_account(
                actor,
@@ -35,9 +56,10 @@ defmodule FornacastWeb.GitHubSettingsController do
                RequestMetadata.from_conn(conn)
              )
            end) do
-      handle_result(conn, result)
+      handle_result(conn, {:ok, account})
     else
-      {:error, reason} -> render_error(conn, reason)
+      {:error, reason} -> render_link_error(conn, reason)
+      _unexpected -> render_link_error(conn, :account_update_failed)
     end
   end
 
@@ -116,6 +138,14 @@ defmodule FornacastWeb.GitHubSettingsController do
   defp handle_result(conn, {:error, reason}), do: render_error(conn, reason)
   defp handle_result(conn, _unexpected), do: render_error(conn, :account_update_failed)
 
+  defp render_link_error(conn, reason) do
+    {status, message} = error_response(reason)
+
+    conn
+    |> put_status(status)
+    |> render_settings_page(:link, %{error: message})
+  end
+
   defp render_error(conn, reason) do
     {status, message} = error_response(reason)
 
@@ -170,28 +200,26 @@ defmodule FornacastWeb.GitHubSettingsController do
   defp render_accounts(conn, accounts, error \\ nil) do
     with true <- is_list(accounts),
          true <- Enum.all?(accounts, &match?(%GitHubAccountView{}, &1)) do
-      rendered =
-        GitHubSettingsHTML.index(%{
-          accounts: accounts,
-          error: error,
-          device_flow: FornacastWeb.GitHubDeviceSession.view(conn),
-          __changed__: nil
-        })
-
-      conn
-      |> page(
-        "GitHub accounts",
-        settings_layout(
-          :github,
-          rendered |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary()
-        )
-      )
+      render_settings_page(conn, :index, %{accounts: accounts, error: error})
     else
       _invalid ->
         conn
         |> put_status(:service_unavailable)
         |> render_accounts([], "GitHub account settings are temporarily unavailable.")
     end
+  end
+
+  defp render_settings_page(conn, template, assigns) do
+    rendered = apply(GitHubSettingsHTML, template, [Map.put(assigns, :__changed__, nil)])
+
+    page(
+      conn,
+      "GitHub accounts",
+      settings_layout(
+        :github,
+        rendered |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary()
+      )
+    )
   end
 
   defp pat_param(%{"github_account" => %{"pat" => pat}}) when is_binary(pat) do

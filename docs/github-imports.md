@@ -1,23 +1,86 @@
 # GitHub imports
 
 Fornacast provides a **one-time migration** workflow from GitHub.com into local users or
-locally owned organizations. Imports are durable, restartable, and web-managed. They are
-not mirrors: nothing polls GitHub after the run finishes.
+locally owned organizations. Imports are durable, restartable, and web-managed.
+Organization synchronization configuration is separate from each one-time import and
+supports subsequent explicit synchronization.
 
 See also the approved design in
 [`docs/superpowers/specs/2026-08-25-github-repository-organization-import-design.md`](../superpowers/specs/2026-08-25-github-repository-organization-import-design.md).
 
 ## Credentials
 
-### Saved connections and one-time PATs
+### Organization import options
 
-- **GitHub App connection:** Choose **Settings → GitHub → Connect with GitHub**,
-  enter the user code on GitHub, and approve access. Access and refresh tokens are
-  encrypted; saved imports and synchronization renew them automatically before
-  use. The operator must enable Device Flow on the App. Its public client ID
-  defaults to `Iv23lizCVE3E24s7fCA0` and can be overridden with
-  `FORNACAST_GITHUB_DEVICE_CLIENT_ID`. No client secret is needed.
-- **Saved PAT:** Linked under **Settings → GitHub**. The importer checks out the encrypted
+Open **Import organization** (`/organizations/import`) and choose one of two paths:
+
+- **Synchronize public repositories:** enter the GitHub organization and create or
+  select a local organization you own. No GitHub account or token is required.
+- **Install and connect GitHub App:** create or select the local organization, then
+  authorize and verify its organization-owned App connection as described below.
+
+New and existing destinations use separate server-rendered forms. Switching the
+destination does not submit stale fields from the other choice; these forms work
+with JavaScript disabled. Discovery opens the existing repository selection,
+conflict review and explicit start workflow.
+
+### Public repository access
+
+Public access uses anonymous GitHub REST, Git and LFS reads. It never falls back to
+a saved account. GitHub's anonymous REST limit is normally 60 requests per hour per
+originating IP; the actual response controls waiting and the next attempt time.
+Large imports may need several limit windows. Required resources that need
+authorization prevent publication; connect the App to use authenticated access.
+
+Only complete public inventories are admitted. The organization and repository
+numeric IDs and repository visibility are checked again during execution and before
+publication. Private or inaccessible repositories are not silently skipped as a
+successful public import. Public retries retain anonymous access and require no
+saved identity.
+
+After a public organization import completes, an unconfigured destination receives
+a manual public synchronization configuration. Existing configured sources and
+active jobs remain unchanged. Use **Organization settings → GitHub → Synchronize
+public repositories** to configure or switch a source explicitly, synchronize again,
+pause or resume, manage repository selection, and open task history. Switching
+sources requires active work to finish. Public synchronization is inbound only;
+bidirectional Git/LFS enrollment requires an authenticated source.
+
+### Organization GitHub App connections
+
+Choose **Organization settings → GitHub → Connect with GitHub**. Authorize using
+Device Flow, then select the Fornacast App installation in the intended GitHub
+organization. Authorization alone leaves the connection at **installation
+required**. The installation must provide read access to contents, issues and
+pull requests, and its effective repository list must be verified before the
+connection becomes ready. Install the App at
+[GitHub](https://github.com/apps/fornacast/installations/new), then refresh and
+recheck the installation if it is missing or its permissions changed.
+
+Access and refresh tokens are encrypted and owned by the local organization.
+The authorizing user is recorded for audit; removing that user from the local
+organization does not invalidate committed organization work. GitHub may still
+revoke access when the authorizing GitHub user's access changes. A current local
+organization manager can reconnect or disconnect the connection.
+
+The App must have Device Flow enabled. Its public client ID is
+`Iv23lizCVE3E24s7fCA0`; no client secret or App private key is required for this
+connection. It creates a GitHub App user token, whose effective access is bounded
+by the user, App permissions and installation repository selection. The displayed
+repository list describes that effective access, not all installed repositories.
+
+Activate **Use organization connection for synchronization** separately, then
+choose **Sync now**. Existing active work prevents switching sources. New work
+records the organization's connection and credential versions, and checks them
+again before provider work and publication. Reconnect clears verified installation
+scope and fences older work; recheck and reactivate the connection afterward.
+Existing personal credentials and previously admitted jobs retain their original
+authority. No personal token is copied into an organization connection.
+
+### Legacy saved connections and one-time PATs
+
+- **Saved PAT:** Choose **Settings → GitHub → Link GitHub account** to open the
+  PAT form. The importer checks out the encrypted
   credential only inside an arity-one callback for the selected linked identity. Saved
   credentials survive across imports until replaced or deleted.
 - **One-time PAT:** Entered for a single import run. The PAT is encrypted in a run-scoped
@@ -31,12 +94,12 @@ granted permissions. Linking or import discovery fails with a
 safe, non-leaking error when GitHub rejects the token, the token lacks required scopes, or
 the GitHub account does not match the expected identity.
 
-Use **Connect with GitHub** again if the account displays **Reconnect GitHub**.
+Use **Connect with GitHub** again if the organization displays **Reconnect required**.
 Expired or rejected refresh tokens and abandoned or uncertain refresh requests
 require reconnection because GitHub refresh tokens can be used only once.
 Automatic renewal keeps the synchronization authorization version unchanged;
-manual reconnection or credential replacement retains the existing authorization
-checks and can require selecting the credential again in organization settings.
+manual reconnection or credential replacement advances authorization and requires
+installation verification and source activation again for an organization connection.
 
 ### Encryption keyring
 
@@ -71,7 +134,8 @@ Never remove the active key or the only key that can decrypt existing saved cred
 
 ### Discovery and planning
 
-1. Link a GitHub account or supply a one-time PAT.
+1. For organizations, choose public access or connect the organization App. Legacy
+   repository imports can still select a linked account or a one-time PAT.
 2. Discover a repository or organization namespace.
 3. Select repositories. Organization discovery initially selects every accessible repository.
 4. Resolve conflicts: skip, rename, or confirmed replace for repositories; organizations are
@@ -188,8 +252,8 @@ into local storage and checked against their SHA-256 identifier and declared siz
 before the repository can be published. Empty repositories and repositories
 without LFS pointers require no LFS downloads.
 
-LFS uses the import's saved or one-time PAT. The selected credential must also be
-able to read the repository's LFS objects. GitHub App-backed organization mirrors
+LFS uses the import's admitted public, organization, saved or one-time source. That
+source must also be able to read the repository's LFS objects. GitHub App-backed organization mirrors
 retain their existing bootstrap handoff: an LFS-enabled repository stays in the
 synchronizing lifecycle until the mirror workers make its objects available and
 confirm its refs. Existing mirror capability settings remain in effect.
@@ -220,9 +284,18 @@ an existing organization they locally own.
 
 Authenticated owners manage imports under:
 
-- `/settings/github` — link, replace, and delete saved credentials
+- `/organizations/:organization/settings/github` — compact organization connection summary
+- `/organizations/:organization/settings/github/connection` — authorize with Device Flow, select/recheck the installation, activate or disconnect the organization source
+- `/organizations/:organization/settings/github/public` — configure anonymous public access and start subsequent synchronization
+- `/organizations/:organization/settings/github/runs` — synchronization tasks and results
+- `/organizations/:organization/settings/github/legacy` — existing personal credential synchronization configuration
+- `/organizations/:organization/settings/github/app/advanced` — separate private-key installation-token integration
+- `/settings/github` — manage legacy personal credentials and choose an organization to connect
+- `/settings/github/device` — choose the organization that owns the GitHub App connection
+- `/settings/github/link` — link an account with a saved PAT
 - `/repos/import` — single-repository plans
-- `/organizations/import` — organization plans, conflict review, start controls
+- `/organizations/import` — choose public access or the organization GitHub App
+- `/organizations/import/public` and `/organizations/import/app` — choose a new or owned local destination without personal credential fields
 - `/imports/:id` — progress, cancel, credential replacement, retry, and final report
 
 Progress polling uses session-scoped JSON at `/imports/:id/status` with a no-JavaScript
@@ -231,16 +304,17 @@ headers, storage paths, and private metadata.
 
 ## Optional live smoke
 
-For manual verification against a **public** GitHub repository:
+For manual verification against a **public** GitHub organization:
 
 1. Start a development instance with PostgreSQL (`mix fornacast.run`).
-2. Use a one-time PAT with read access to the public repository only.
+2. Open **Import organization → Synchronize public repositories** and choose a local destination.
 3. Walk through discovery, conflict review, progress, and the final report in the web UI.
 4. Confirm the imported repository is visible only after publication completes.
 
-Do not persist the smoke PAT as a saved credential unless you intend to keep it. Automated
-acceptance uses `Req.Test` stubs and local Git fixtures in
-`apps/forge_imports/test/github_import_e2e_test.exs`.
+Automated acceptance uses stubbed GitHub responses and real local Git fixtures in
+`apps/forge_imports/test/public_organization_sync_test.exs` and the existing
+`apps/forge_imports/test/github_import_e2e_test.exs`. These tests do not prove live
+App consent or a complete live GitHub organization synchronization.
 
 ## Automated acceptance
 

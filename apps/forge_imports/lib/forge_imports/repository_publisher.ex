@@ -233,6 +233,13 @@ defmodule ForgeImports.RepositoryPublisher do
     end
   end
 
+  defp publication_scope(%ForgeImports.OrganizationExecution{run_id: run_id} = execution, item_id) do
+    with {:ok, _} <- ForgeImports.OrganizationExecution.authorize(execution),
+         %RepositoryItem{state: state} <-
+           Repo.get_by(RepositoryItem, id: item_id, import_run_id: run_id),
+         do: {:ok, %{run_id: run_id, state: state}}
+  end
+
   defp publication_scope(_actor, _item_id), do: {:error, :not_found}
 
   defp public_publishing_status(run_id) do
@@ -279,6 +286,30 @@ defmodule ForgeImports.RepositoryPublisher do
     _error -> {:error, :persistence_unavailable}
   end
 
+  defp admit(%ForgeImports.OrganizationExecution{run_id: run_id} = execution, item_id, metadata) do
+    transaction = fn ->
+      Repo.transaction(fn ->
+        with {:ok, _} <- ForgeImports.OrganizationExecution.authorize(execution, lock: true),
+             %ImportRun{} = run <- locked_run(run_id),
+             %RepositoryItem{} = item <- locked_run_item(run_id, item_id),
+             %ImportAttempt{} = attempt <- locked_current_attempt(item),
+             :ok <- after_admission_locks(),
+             now <- publication_now(),
+             :ok <- validate_fresh_run(run, now),
+             :ok <- validate_publication_gate(execution, run, item, attempt, now),
+             {:ok, intent} <- publication_intent(item, attempt, metadata),
+             {:ok, claimed} <- persist_intent(item, intent, now) do
+          capability(execution, run, claimed, attempt, intent)
+        else
+          {:error, reason} -> Repo.rollback(reason)
+          _ -> Repo.rollback(:not_found)
+        end
+      end)
+    end
+
+    map_transaction(Persistence.with_retry(transaction))
+  end
+
   defp admit(_actor, _item_id, _safe_metadata), do: {:error, :not_found}
 
   defp reclaim(item_id) do
@@ -286,7 +317,7 @@ defmodule ForgeImports.RepositoryPublisher do
       Repo.transaction(fn ->
         with run_id when is_integer(run_id) <- item_run_id(item_id),
              actor_id when is_integer(actor_id) <- run_actor_id(run_id),
-             %User{} = actor <- locked_persisted_actor(actor_id),
+             actor when not is_nil(actor) <- recovery_actor(run_id, actor_id),
              %ImportRun{} = run <- locked_run(run_id),
              %RepositoryItem{} = item <- locked_run_item(run.id, item_id),
              %ImportAttempt{} = attempt <- locked_current_attempt(item),
@@ -407,12 +438,7 @@ defmodule ForgeImports.RepositoryPublisher do
   defp publication_multi(context) do
     Multi.new()
     |> Multi.run(:cleanup_fence, fn repo, _changes -> cleanup_fence(repo, context) end)
-    |> ForgeRepos.publish_import_shadow(
-      :repository,
-      context.capability.actor,
-      context.publication_spec,
-      context.expected_replacement
-    )
+    |> publish_shadow(context)
     |> Multi.run(:run, fn repo, _changes -> update_run_count(repo, context) end)
     |> Multi.run(:item, fn repo, changes -> commit_item(repo, context, changes) end)
     |> Handoff.append(
@@ -436,6 +462,35 @@ defmodule ForgeImports.RepositoryPublisher do
       {:ok, ForgeImports.SyncJobs.notify_import(context.capability.run_id)}
     end)
   end
+
+  defp publish_shadow(
+         multi,
+         %{capability: %{actor: %ForgeImports.OrganizationExecution{} = execution}} = context
+       ) do
+    ForgeRepos.publish_organization_import_shadow(
+      multi,
+      :repository,
+      execution.organization_id,
+      context.publication_spec,
+      context.expected_replacement,
+      fn _repo ->
+        case ForgeImports.OrganizationExecution.authorize(execution, lock: true) do
+          {:ok, _} -> :ok
+          {:error, _} = error -> error
+        end
+      end
+    )
+  end
+
+  defp publish_shadow(multi, context),
+    do:
+      ForgeRepos.publish_import_shadow(
+        multi,
+        :repository,
+        context.capability.actor,
+        context.publication_spec,
+        context.expected_replacement
+      )
 
   defp cleanup_fence(repo, context) do
     capability = context.capability
@@ -679,6 +734,7 @@ defmodule ForgeImports.RepositoryPublisher do
              attempt_number: capability.attempt_number,
              state: :running
            ),
+         :ok <- verify_organization_source(Map.put(capability, :run, run), item),
          {:ok, owner} <- destination_owner(run, item),
          {:ok, shadow} <- exact_shadow(item, attempt),
          {:ok, expected_replacement} <- expected_replacement(attempt),
@@ -719,6 +775,37 @@ defmodule ForgeImports.RepositoryPublisher do
       {:error, reason} -> {:error, reason}
       _changed -> {:error, :destination_changed}
     end
+  end
+
+  defp verify_organization_source(%{run: %ImportRun{credential_source: :public} = run}, item) do
+    with :ok <- ForgeImports.CredentialProvider.Public.authorize(run),
+         do:
+           ForgeImports.CredentialProvider.Public.validate_source(
+             run,
+             item,
+             organization_source_options()
+           )
+  end
+
+  defp verify_organization_source(
+         %{actor: %ForgeImports.OrganizationExecution{} = execution},
+         item
+       ) do
+    with {:ok, scope} <- ForgeImports.OrganizationExecution.authorize(execution),
+         do:
+           ForgeImports.OrganizationGitHubConnection.validate_repository(
+             scope,
+             item.github_repository_id,
+             organization_source_options()
+           )
+  end
+
+  defp verify_organization_source(_, _), do: :ok
+
+  if Mix.env() == :test do
+    defp organization_source_options, do: ForgeImports.SyncJobs.Execution.options(:publication)
+  else
+    defp organization_source_options, do: []
   end
 
   defp destination_owner(run, item) do
@@ -1274,6 +1361,18 @@ defmodule ForgeImports.RepositoryPublisher do
     {:error, :persistence_unavailable}
   end
 
+  defp settle_finish_result(
+         {:error, reason},
+         %{actor: %ForgeImports.OrganizationExecution{}} = capability
+       )
+       when reason in [
+              :configuration_changed,
+              :credential_changed,
+              :repository_not_in_installation,
+              :insufficient_installation_access
+            ],
+       do: reopen_drift(capability)
+
   defp settle_finish_result({:error, reason}, _capability), do: {:error, reason}
 
   defp reopen_drift(capability) do
@@ -1342,6 +1441,17 @@ defmodule ForgeImports.RepositoryPublisher do
     |> where([actor], actor.id == ^actor_id and actor.kind == :user and actor.state == :active)
     |> publication_lock()
     |> Repo.one()
+  end
+
+  defp recovery_actor(run_id, actor_id) do
+    case Repo.get(ImportRun, run_id) do
+      %ImportRun{credential_source: source, organization_sync_run_id: id} = run
+      when source in [:organization_device, :public] and not is_nil(id) ->
+        ForgeImports.OrganizationExecution.audit_principal(run)
+
+      _ ->
+        locked_persisted_actor(actor_id)
+    end
   end
 
   defp locked_persisted_actor(actor_id) do

@@ -1,6 +1,7 @@
 <OrganizationSettingsComponents.organization_settings_layout
   organization={@organization}
   active={:github}
+  github_page={:advanced}
 >
   <section
     class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6"
@@ -17,6 +18,27 @@
         review repository coverage, and operate synchronization without exposing installation credentials.
       </p>
     </header>
+
+    <.dm_alert
+      :if={!value(@view, :installation_configured, false)}
+      id="github-organization-installation-not-configured"
+      variant="info"
+      outlined
+    >
+      <div class="grid gap-2">
+        <p>GitHub App installation is not configured on this instance.</p>
+        <p>
+          Connect your GitHub account using Device Flow, then select the saved connection in organization synchronization settings.
+        </p>
+        <div class="flex flex-wrap gap-3">
+          <.dm_link href="/settings/github" class="text-primary">Connect GitHub with Device Flow</.dm_link>
+          <.dm_link
+            href={"/organizations/#{@organization.username}/settings/github"}
+            class="text-primary"
+          >Organization synchronization settings</.dm_link>
+        </div>
+      </div>
+    </.dm_alert>
 
     <.dm_alert
       :if={@view.missing_permissions != []}

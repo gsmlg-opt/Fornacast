@@ -241,6 +241,114 @@ defmodule ForgeImports.CancellationTest do
     assert Repo.get!(RepositoryItem, item.id).state == :canceled
   end
 
+  @tag :tmp_dir
+  test "cancellation settles staged items while retaining hidden repositories and files", %{
+    actor: actor,
+    run: run,
+    tmp_dir: tmp_dir
+  } do
+    original_root = Application.fetch_env!(:fornacast, :repo_storage_root)
+    Application.put_env(:fornacast, :repo_storage_root, Path.expand(tmp_dir))
+    on_exit(fn -> Application.put_env(:fornacast, :repo_storage_root, original_root) end)
+
+    item = ready_item!(run, actor, 9_200_000_501)
+    attempt = attempt_fixture(item)
+    shadow = Repo.get!(Repository, item.hidden_repository_id)
+    File.mkdir_p!(item.staged_storage_path)
+    sentinel = Path.join(item.staged_storage_path, "staged-data")
+    File.write!(sentinel, "retain until fenced cleanup")
+
+    assert {:ok, requested} =
+             Cancellation.request(actor, run, request_metadata("cancel-staged"), now: @now)
+
+    assert :reconciled = CleanupReconciler.reconcile_cancel_run(requested, @now)
+    assert Repo.get!(ImportRun, run.id).state == :canceled
+    assert Repo.get!(ImportAttempt, attempt.id).state == :canceled
+
+    canceled = Repo.get!(RepositoryItem, item.id)
+    assert canceled.state == :canceled
+    assert canceled.hidden_repository_id == item.hidden_repository_id
+    assert canceled.staged_storage_path == item.staged_storage_path
+    assert canceled.publication_evidence == %{}
+    assert Repo.get!(Repository, shadow.id) == shadow
+    assert File.read!(sentinel) == "retain until fenced cleanup"
+  end
+
+  test "cancellation settlement waits for a staged item's live lease", %{actor: actor, run: run} do
+    item = ready_item!(run, actor, 9_200_000_502)
+    attempt = attempt_fixture(item)
+
+    assert {:ok, requested} =
+             Cancellation.request(actor, run, request_metadata("cancel-leased"), now: @now)
+
+    assert {:ok, leased} =
+             Fornacast.OperationLease.claim(RepositoryItem, item.id, "staged-owner", @now, 60,
+               allowed_states: [:cancel_requested]
+             )
+
+    assert :pending = CleanupReconciler.reconcile_cancel_run(requested, @now)
+    assert Repo.get!(ImportRun, run.id).state == :cancel_requested
+    assert Repo.get!(RepositoryItem, item.id) == leased
+    assert Repo.get!(ImportAttempt, attempt.id).state == :running
+  end
+
+  test "cancellation settlement leaves publication intents for publication recovery", %{
+    actor: actor,
+    run: run
+  } do
+    item = publishing_item!(run, actor)
+    attempt = attempt_fixture(item)
+
+    assert {:ok, requested} =
+             Cancellation.request(actor, run, request_metadata("cancel-publishing"), now: @now)
+
+    assert :pending = CleanupReconciler.reconcile_cancel_run(requested, @now)
+    assert Repo.get!(RepositoryItem, item.id) == item
+    assert Repo.get!(ImportAttempt, attempt.id).state == :running
+    assert Repo.get!(ImportRun, run.id).state == :cancel_requested
+
+    requested_item = Repo.update!(Ecto.Changeset.change(item, state: :cancel_requested))
+
+    assert :pending = CleanupReconciler.reconcile_cancel_run(requested, @now)
+    assert Repo.get!(RepositoryItem, item.id) == requested_item
+    assert Repo.get!(ImportAttempt, attempt.id).state == :running
+    assert Repo.get!(ImportRun, run.id).state == :cancel_requested
+  end
+
+  test "cancellation settlement leaves remote quarantines for fenced cleanup", %{
+    actor: actor,
+    run: run
+  } do
+    item = ready_item!(run, actor, 9_200_000_503)
+
+    quarantined =
+      item
+      |> Ecto.Changeset.change(
+        state: :staging_git,
+        staged_storage_path: GitCore.Remote.cleanup_slot_path(item.staged_storage_path),
+        cleanup_state: "cleanup_pending",
+        cleanup_eligible_at: @now,
+        cleanup_error: "cancelled",
+        checkpoint: %{
+          "cleanup_identity" => %{
+            "mode" => 0o700,
+            "major_device" => 0,
+            "minor_device" => 0,
+            "inode" => 1
+          }
+        }
+      )
+      |> Repo.update!()
+
+    attempt = attempt_fixture(quarantined)
+    requested = Repo.update!(Ecto.Changeset.change(run, state: :cancel_requested))
+
+    assert :pending = CleanupReconciler.reconcile_cancel_run(requested, @now)
+    assert Repo.get!(RepositoryItem, item.id) == quarantined
+    assert Repo.get!(ImportAttempt, attempt.id).state == :running
+    assert Repo.get!(ImportRun, run.id).state == :cancel_requested
+  end
+
   test "live leases observe durable cancel intent for the owning worker", %{run: run, item: item} do
     assert {:ok, leased} =
              Fornacast.OperationLease.claim(

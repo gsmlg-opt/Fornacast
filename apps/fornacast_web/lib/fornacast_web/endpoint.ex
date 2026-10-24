@@ -17,6 +17,7 @@ defmodule FornacastWeb.Endpoint do
 
   if code_reloading? do
     plug DuskmoonBundler.DevServer, profile: :fornacast_web
+    plug Phoenix.CodeReloader
   end
 
   plug Plug.Static,

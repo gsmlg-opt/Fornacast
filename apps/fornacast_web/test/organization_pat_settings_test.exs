@@ -31,14 +31,46 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
   end
 
   test "canonical tab shows owner credential configuration and preserves separate App page", c do
-    html = request(c.owner) |> get(c.path) |> html_response(200)
+    html = request(c.owner) |> get(c.path <> "/legacy") |> html_response(200)
     assert html =~ "saved GitHub connection or PAT"
     assert html =~ "pause the synchronization configuration"
     assert html =~ "GitHub → Fornacast"
     assert html =~ c.path <> "/repositories"
-    assert html =~ c.path <> "/app"
+    assert html =~ c.path <> "/app/advanced"
     refute html =~ "Installation ID"
-    assert request(c.owner) |> get(c.path <> "/app") |> html_response(200) =~ "GitHub settings"
+
+    assert request(c.owner) |> get(c.path <> "/app/advanced") |> html_response(200) =~
+             "GitHub settings"
+  end
+
+  test "public settings retain selection and pause controls without credential or push forms",
+       c do
+    source = %{
+      github_organization: "source-org",
+      github_organization_id: 8001,
+      inventory: %{"repositories" => []}
+    }
+
+    assert {:ok, _} =
+             ForgeMirrors.PatSettings.activate_public_source(c.owner, c.org.id, source, 1, %{})
+
+    html = request(c.owner) |> get(c.path <> "/repositories") |> html_response(200)
+    assert html =~ "Save repository selection"
+    refute html =~ "Bidirectional Git and LFS"
+    refute html =~ "/repositories/mirror"
+
+    html = request(c.owner) |> get(c.path <> "/legacy") |> html_response(200)
+    assert html =~ "public GitHub API"
+    refute html =~ ~s(name="pat_sync[owner_user_id]")
+    refute html =~ ~s(name="pat_sync[github_identity_id]")
+
+    html = request(c.owner) |> get(c.path <> "/public") |> html_response(200)
+    assert html =~ c.path <> "/pat/pause"
+    assert html =~ c.path <> "/repositories"
+    conn = request(c.owner) |> post(c.path <> "/pat/pause", %{})
+    assert redirected_to(conn, 303) == c.path <> "/public"
+    html = request(c.owner) |> get(c.path <> "/public") |> html_response(200)
+    assert html =~ c.path <> "/pat/resume"
   end
 
   test "disabled configuration saves and reloads and repository subpage is accessible", c do
@@ -51,8 +83,8 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
     }
 
     conn = request(c.owner) |> patch(c.path <> "/pat", %{"pat_sync" => params})
-    assert redirected_to(conn, 303) == c.path
-    html = request(c.owner) |> get(c.path) |> html_response(200)
+    assert redirected_to(conn, 303) == c.path <> "/legacy"
+    html = request(c.owner) |> get(c.path <> "/legacy") |> html_response(200)
     assert html =~ "source-org"
     assert html =~ "No owner credential selected"
 
@@ -67,7 +99,7 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
   end
 
   test "private settings, inventory and mutations reject outsiders and malformed input", c do
-    for suffix <- ["", "/repositories"] do
+    for suffix <- ["/legacy", "/repositories"] do
       assert request(c.outsider) |> get(c.path <> suffix) |> response(404)
     end
 
@@ -82,7 +114,7 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
   end
 
   test "configuration forms enforce CSRF", c do
-    conn = request(c.owner) |> get(c.path)
+    conn = request(c.owner) |> get(c.path <> "/legacy")
 
     assert_raise Plug.CSRFProtection.InvalidCSRFTokenError, fn ->
       conn
@@ -98,7 +130,7 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
     assert html =~ "Bidirectional Git and LFS"
 
     assert html =~
-             "Import repositories into this organization with the configured saved credential first."
+             "Import repositories into this organization with the configured GitHub connection first."
 
     assert request(c.outsider)
            |> post(c.path <> "/repositories/mirror", %{})
@@ -209,7 +241,7 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
       ]
     })
 
-    for suffix <- ["", "/repositories"] do
+    for suffix <- ["/legacy", "/repositories"] do
       html =
         request(c.owner)
         |> get(c.path <> suffix)
@@ -285,7 +317,7 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
         "error" => error
       })
 
-      for suffix <- ["", "/repositories"] do
+      for suffix <- ["/legacy", "/repositories"] do
         html = request(c.owner) |> get(c.path <> suffix) |> html_response(200)
         assert html =~ "Synchronization could not finish."
         assert html =~ message
@@ -340,7 +372,7 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
     assert html =~ "Existing repositories refresh Git references and LFS only"
     refute html =~ "stale_cache"
 
-    for suffix <- ["", "/repositories"] do
+    for suffix <- ["/legacy", "/repositories"] do
       page = request(c.owner) |> get(c.path <> suffix) |> html_response(200)
       assert page =~ "Synchronization ##{run.id}: queued"
       refute page =~ "stale_cache"
@@ -517,13 +549,13 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
 
   test "configuration check failures redirect to canonical GET and survive once", c do
     conn = request(c.owner) |> post(c.path <> "/pat/check", %{})
-    assert redirected_to(conn, 303) == c.path
-    follow = conn |> recycle() |> get(c.path)
+    assert redirected_to(conn, 303) == c.path <> "/legacy"
+    follow = conn |> recycle() |> get(c.path <> "/legacy")
     assert html_response(follow, 200) =~ "Configuration check failed"
 
     assert follow
            |> recycle()
-           |> get(c.path)
+           |> get(c.path <> "/legacy")
            |> html_response(200)
            |> then(&(not String.contains?(&1, "Configuration check failed")))
   end

@@ -1,0 +1,97 @@
+<section
+  class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6"
+  data-organization-source={@mode}
+>
+  <header class="grid gap-2">
+    <.dm_link href="/organizations/import" class="text-sm text-primary">Back to import options</.dm_link>
+    <h2 class="text-2xl font-semibold">
+      {if @mode == :public,
+        do: "Synchronize public repositories",
+        else: "Install and connect GitHub App"}
+    </h2>
+    <p class="text-sm text-on-surface-variant">
+      {if @mode == :public,
+        do:
+          "Discover public repositories, review the complete list, then start the import. GitHub's anonymous API rate limits apply.",
+        else:
+          "Choose a local organization, then complete GitHub authorization and installation for its App connection."}
+    </p>
+  </header>
+  <.dm_alert :if={@error} id="organization-source-error" variant="error" outlined role="alert">
+    {@error}
+  </.dm_alert>
+  <.dm_card id="organization-source-card" variant="bordered" shadow="sm" padding="lg">
+    <:title><span class="text-lg font-semibold">Local organization destination</span></:title>
+    <nav class="flex flex-wrap gap-4 mb-4" aria-label="Local organization destination">
+      <.dm_link
+        href={"/organizations/import/#{@mode}?destination=new"}
+        aria-current={if @destination_action == "new", do: "page", else: nil}
+      >Create a new organization</.dm_link>
+      <.dm_link
+        href={"/organizations/import/#{@mode}?destination=existing"}
+        aria-current={if @destination_action == "existing", do: "page", else: nil}
+      >Use an organization I own</.dm_link>
+    </nav>
+    <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#157 --%>
+    <form action={"/organizations/import/#{@mode}"} method="post" class="grid gap-4">
+      <input type="hidden" name="_csrf_token" value={csrf_token()} />
+      <input type="hidden" name="import[destination_action]" value={@destination_action} />
+      <.dm_input
+        :if={@destination_action == "new"}
+        id="organization-source-destination-slug"
+        class="w-full"
+        name="import[destination_slug]"
+        type="text"
+        label="New local organization slug"
+        value={@values["destination_slug"]}
+        required
+        maxlength="255"
+        autocomplete="off"
+        autocapitalize="none"
+        spellcheck="false"
+      />
+      <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#158 --%>
+      <.dm_input
+        :if={@destination_action == "existing"}
+        id="organization-source-existing-destination"
+        class="w-full"
+        name="import[destination_organization_id]"
+        type="select"
+        label="Existing organization I own"
+        prompt="Choose an owned organization"
+        options={organization_options(@organizations)}
+        value={@values["destination_organization_id"]}
+        required
+      />
+      <p
+        :if={@destination_action == "existing" && @organizations == []}
+        class="text-sm text-on-surface-variant"
+      >
+        No owned organizations are available. Create a new local organization to continue.
+      </p>
+      <.dm_input
+        :if={@mode == :public}
+        id="organization-source-github-organization"
+        class="w-full"
+        name="import[organization]"
+        type="text"
+        label="GitHub organization login"
+        value={@values["organization"]}
+        required
+        maxlength="39"
+        autocomplete="off"
+        autocapitalize="none"
+        spellcheck="false"
+      />
+      <div>
+        <button
+          class="btn btn-primary"
+          type="submit"
+          disabled={@destination_action == "existing" && @organizations == []}
+        >{if @mode == :public,
+          do: "Discover public repositories",
+          else: "Continue to GitHub App connection"}</button>
+      </div>
+    </form>
+  </.dm_card>
+</section>

@@ -132,6 +132,28 @@ defmodule ForgeMirrors.PatGitEnrollmentTest do
     assert Repo.get!(PatConfiguration, c.config.id).direction == "github_to_fornacast"
   end
 
+  test "incomplete personal configuration has no Git enrollment candidates", c do
+    for {owner_id, identity_id} <- [
+          {c.owner.id, nil},
+          {nil, c.config.github_identity_id},
+          {nil, nil}
+        ] do
+      config =
+        Repo.get!(PatConfiguration, c.config.id)
+        |> Ecto.Changeset.change(
+          owner_user_id: owner_id,
+          github_identity_id: identity_id,
+          enabled: false
+        )
+        |> Repo.update!()
+
+      assert {:ok, %{config: ^config, organization_mirror: nil, candidates: []}} =
+               ForgeMirrors.pat_git_enrollment_view(c.owner, c.organization_id)
+    end
+
+    refute Repo.exists?(OrganizationMirror)
+  end
+
   test "unknown provenance, stale configuration and active legacy jobs prevent handoff", c do
     unknown = repository_fixture(c.organization_id)
 
@@ -607,6 +629,298 @@ defmodule ForgeMirrors.PatGitEnrollmentTest do
                c.repository_id,
                parent.id
              )
+  end
+
+  test "organization Device Flow enrolls from its own completed import without a personal owner",
+       c do
+    {config, scope} = organization_source(c)
+    organization_proof(c, config, scope)
+
+    assert {:ok,
+            %{organization_mirror: mirror, repository_mirrors: [binding], operations: [operation]}} =
+             ForgeMirrors.enroll_pat_git_repositories(
+               c.owner,
+               c.organization_id,
+               config.lock_version,
+               [c.repository_id],
+               %{}
+             )
+
+    assert mirror.credential_source == :organization_device
+    assert mirror.github_installation_id == scope.installation_id
+    assert mirror.organization_credential_id == scope.credential_id
+    assert mirror.github_credential_id == nil
+    assert mirror.credential_owner_user_id == nil
+    assert mirror.capabilities == %{"git" => true, "lfs" => true}
+
+    assert ForgeMirrors.PatGitMirror.authorize(ForgeMirrors.PatGitMirror.scope(mirror, binding)) ==
+             :ok
+
+    Repo.update!(Ecto.Changeset.change(c.owner, state: :disabled))
+
+    Repo.delete_all(
+      from member in ForgeAccounts.OrganizationMember,
+        where: member.organization_id == ^c.organization_id and member.user_id == ^c.owner.id
+    )
+
+    assert ForgeMirrors.PatGitMirror.authorize(ForgeMirrors.PatGitMirror.scope(mirror, binding)) ==
+             :ok
+
+    assert {:ok, [claimed]} =
+             ForgeMirrors.claim_pat_git_operations(
+               "org-worker",
+               DateTime.utc_now(:second),
+               60,
+               10,
+               ["reconcile.repository.git"]
+             )
+
+    assert claimed.id == operation.id
+
+    assert {:ok, %{credential_source: :organization_device}} =
+             ForgeMirrors.git_repository_operation_context(claimed)
+  end
+
+  test "personal import evidence cannot silently enroll under a new organization source", c do
+    {config, _scope} = organization_source(c)
+
+    assert {:error, :unverified_import} =
+             ForgeMirrors.enroll_pat_git_repositories(
+               c.owner,
+               c.organization_id,
+               config.lock_version,
+               [c.repository_id],
+               %{}
+             )
+
+    assert Repo.get!(ForgeImports.ImportRun, c.item.import_run_id).credential_source == :saved
+    refute Repo.exists?(OrganizationMirror)
+  end
+
+  test "explicit source activation adopts a settled matching Git/LFS mirror and preserves bindings",
+       c do
+    assert {:ok, %{organization_mirror: original, repository_mirrors: [binding]}} = enroll(c)
+    {config, scope} = organization_source(c)
+    mirror = Repo.get!(OrganizationMirror, original.id)
+    assert mirror.credential_source == :organization_device
+    assert mirror.organization_connection_id == scope.connection_id
+    assert mirror.pat_configuration_version == config.lock_version
+
+    assert Repo.get!(ForgeMirrors.RepositoryMirror, binding.id).organization_mirror_id ==
+             mirror.id
+
+    assert Repo.aggregate(OrganizationMirror, :count) == 1
+
+    assert :ok =
+             ForgeMirrors.authorize_pat_credential(
+               ForgeMirrors.PatGitMirror.scope(mirror, binding)
+             )
+
+    assert {:error, :credential_unavailable} =
+             ForgeMirrors.authorize_pat_credential(
+               ForgeMirrors.PatGitMirror.scope(original, binding)
+             )
+  end
+
+  test "an executing mirror operation prevents source adoption atomically", c do
+    assert {:ok, %{organization_mirror: original}} = enroll(c)
+
+    assert {:ok, [_]} =
+             ForgeMirrors.claim_pat_git_operations(
+               "busy-worker",
+               DateTime.utc_now(:second),
+               60,
+               10,
+               ["reconcile.repository.git"]
+             )
+
+    scope = organization_connection(c)
+
+    assert {:error, :busy} =
+             ForgeMirrors.PatSettings.activate_organization_connection(
+               c.owner,
+               c.organization_id,
+               scope,
+               c.config.lock_version,
+               %{}
+             )
+
+    assert Repo.get!(OrganizationMirror, original.id).credential_source == :pat
+    assert Repo.get!(PatConfiguration, c.config.id).credential_source == :personal
+  end
+
+  test "organization source cannot be claimed for metadata work and disconnect fences Git effects",
+       c do
+    {config, scope} = organization_source(c)
+    organization_proof(c, config, scope)
+
+    assert {:ok, %{organization_mirror: mirror, repository_mirrors: [binding]}} =
+             ForgeMirrors.enroll_pat_git_repositories(
+               c.owner,
+               c.organization_id,
+               config.lock_version,
+               [c.repository_id],
+               %{}
+             )
+
+    now = DateTime.utc_now(:second)
+
+    assert {:ok, _} =
+             ForgeMirrors.enqueue_operation(%{
+               organization_mirror_id: mirror.id,
+               repository_mirror_id: binding.id,
+               kind: "reconcile.repository.metadata",
+               dedupe_key: "forbidden-org-metadata",
+               cursor: %{},
+               next_attempt_at: now
+             })
+
+    assert {:ok, []} =
+             ForgeMirrors.claim_operations("metadata-worker", now, 60, 10, [
+               "reconcile.repository.metadata"
+             ])
+
+    assert {:ok, []} =
+             ForgeMirrors.claim_pat_git_operations("org-worker", now, 60, 10, [
+               "reconcile.repository.metadata"
+             ])
+
+    assert {:ok, [claimed]} =
+             ForgeMirrors.claim_pat_git_operations("org-worker", now, 60, 10, [
+               "reconcile.repository.git"
+             ])
+
+    assert {:ok, operation_scope} = ForgeMirrors.git_repository_operation_context(claimed)
+
+    assert ForgeGitHub.MirrorCredential.gate_key(operation_scope) ==
+             {:organization_credential, scope.credential_id}
+
+    credential = Repo.get!(ForgeAccounts.OrganizationGitHubCredential, scope.credential_id)
+    Repo.update!(Ecto.Changeset.change(credential, status: :invalid))
+
+    assert {:error, :credential_unavailable} =
+             ForgeMirrors.authorize_pat_credential(operation_scope)
+  end
+
+  defp organization_source(c) do
+    scope = organization_connection(c)
+
+    assert {:ok, config} =
+             ForgeMirrors.PatSettings.activate_organization_connection(
+               c.owner,
+               c.organization_id,
+               scope,
+               c.config.lock_version,
+               %{}
+             )
+
+    {config, scope}
+  end
+
+  defp organization_connection(c) do
+    alias ForgeAccounts.OrganizationGitHubCredentials
+    alias ForgeMirrors.OrganizationGitHubConnections
+    {:ok, reference} = OrganizationGitHubCredentials.reference(c.owner, c.organization_id)
+
+    token = %ForgeGitHub.DeviceFlow.Token{
+      client_id: "Iv23lizCVE3E24s7fCA0",
+      access_token: "org-enrollment-access",
+      refresh_token: "org-enrollment-refresh",
+      expires_at: DateTime.add(DateTime.utc_now(:second), 3600),
+      refresh_expires_at: DateTime.add(DateTime.utc_now(:second), 86_400)
+    }
+
+    {:ok, credential} =
+      OrganizationGitHubCredentials.save_device_grant_if_current(
+        c.owner,
+        c.organization_id,
+        %{github_user_id: 991, login: "enrollment-authorizer"},
+        token,
+        reference,
+        %{}
+      )
+
+    {:ok, connection} =
+      OrganizationGitHubConnections.transaction(c.owner, c.organization_id, 0, fn connection ->
+        OrganizationGitHubConnections.store_grant(connection, credential, c.owner, %{})
+      end)
+
+    installation = %{
+      id: System.unique_integer([:positive]),
+      account_id: c.account_id,
+      account_login: "duskmoon-dev",
+      account_type: :organization,
+      repository_selection: :selected,
+      state: :active,
+      permissions: %{"contents" => "write", "issues" => "read", "pull_requests" => "read"}
+    }
+
+    inventory = %{
+      "repositories" => [
+        %{"id" => c.github_id, "full_name" => c.item.source_full_name, "visibility" => "private"}
+      ]
+    }
+
+    {:ok, connection} =
+      OrganizationGitHubConnections.transaction(
+        c.owner,
+        c.organization_id,
+        connection.lock_version,
+        fn connection ->
+          OrganizationGitHubConnections.bind(connection, installation, inventory, c.owner, %{})
+        end
+      )
+
+    {:ok, scope} = OrganizationGitHubConnections.scope(connection.id)
+    scope
+  end
+
+  defp organization_proof(c, config, scope) do
+    snapshots = ForgeImports.OrganizationExecution.snapshots(scope)
+
+    job =
+      Repo.insert!(
+        struct(
+          ForgeImports.PatSyncRun,
+          Map.merge(snapshots, %{
+            configuration_id: config.id,
+            organization_id: c.organization_id,
+            credential_source: :organization_device,
+            requested_by_user_id: c.owner.id,
+            github_organization: scope.github_organization,
+            github_organization_id: scope.github_organization_id,
+            state: "succeeded"
+          })
+        )
+      )
+
+    old = Repo.get!(ForgeImports.ImportRun, c.item.import_run_id)
+
+    attrs =
+      old
+      |> Map.from_struct()
+      |> Map.drop([:__meta__, :id, :inserted_at, :updated_at])
+      |> Map.merge(snapshots)
+      |> Map.merge(%{
+        credential_source: :organization_device,
+        github_identity_id: nil,
+        github_credential_id: nil,
+        organization_sync_run_id: job.id
+      })
+
+    run = Repo.insert!(struct(ForgeImports.ImportRun, attrs))
+    Repo.update!(Ecto.Changeset.change(job, import_run_id: run.id))
+
+    attrs =
+      c.item
+      |> Map.from_struct()
+      |> Map.drop([:__meta__, :id, :inserted_at, :updated_at])
+      |> Map.merge(%{
+        import_run_id: run.id,
+        publication_evidence: Map.put(c.item.publication_evidence, "run_id", run.id)
+      })
+
+    Repo.insert!(struct(ForgeImports.RepositoryItem, attrs))
   end
 
   defp enroll(c),

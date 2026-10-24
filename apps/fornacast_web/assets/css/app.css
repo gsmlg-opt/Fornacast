@@ -208,7 +208,7 @@
   }
 
   .appbar-actions,
-  .appbar-nav,
+  .appbar-workspace-nav,
   .app-nav {
     display: flex;
     align-items: center;
@@ -475,7 +475,7 @@
       0.64rem 0.64rem currentColor;
   }
 
-  .appbar-nav {
+  .appbar-workspace-nav {
     flex: 1 1 auto;
     justify-content: flex-start;
     overflow: visible;
@@ -654,6 +654,23 @@
     align-items: start;
   }
 
+  .app-shell:has([data-organization-settings-layout]) {
+    display: flex;
+    flex-direction: column;
+    min-height: 100dvh;
+  }
+
+  .app-main:has([data-organization-settings-layout]) {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    margin-bottom: 1rem;
+  }
+
+  .content-panel:has(> [data-organization-settings-layout]) {
+    flex: 1;
+  }
+
   .settings-sidebar,
   .settings-content {
     min-width: 0;
@@ -784,7 +801,7 @@
     gap: 0.55rem;
   }
 
-  .appbar-nav {
+  .appbar-workspace-nav {
     width: 100%;
     flex: 0 0 auto;
     display: grid;

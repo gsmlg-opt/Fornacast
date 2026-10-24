@@ -4,7 +4,9 @@ defmodule ForgeGitHub.RequestGate do
   @acquire_timeout 2_000
 
   @type gate_key ::
-          {:saved_credential, pos_integer()}
+          {:public, 1}
+          | {:saved_credential, pos_integer()}
+          | {:organization_credential, pos_integer()}
           | {:one_time_run, pos_integer()}
           | {:import_setup, pos_integer()}
           | {:account_setup, pos_integer()}
@@ -15,7 +17,9 @@ defmodule ForgeGitHub.RequestGate do
         when result: term()
   def run({kind, id} = gate_key, fun)
       when kind in [
+             :public,
              :saved_credential,
+             :organization_credential,
              :one_time_run,
              :import_setup,
              :account_setup,
@@ -23,7 +27,7 @@ defmodule ForgeGitHub.RequestGate do
              :github_installation
            ] and
              is_integer(id) and
-             id > 0 and
+             id > 0 and (kind != :public or id == 1) and
              id <= 9_223_372_036_854_775_807 and
              is_function(fun, 0) do
     parent = self()

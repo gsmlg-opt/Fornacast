@@ -5,6 +5,18 @@ const initGitHubDevicePolling = () => {
     const status = report.querySelector("[data-github-device-status]");
     const csrf = document.querySelector('meta[name="csrf-token"]')?.content;
     const id = report.dataset.githubDeviceId;
+    const personalPoll = `/settings/github/device/${encodeURIComponent(id)}/poll`;
+    const pollPath = report.dataset.githubDevicePollPath || personalPoll;
+    const returnPath = report.dataset.githubDeviceReturnPath || "/settings/github";
+    const organizationPoll = pollPath.match(
+      /^\/organizations\/([A-Za-z0-9_-]+)\/settings\/github\/device\/([A-Za-z0-9_-]+)\/poll$/,
+    );
+    const pathsValid =
+      /^[A-Za-z0-9_-]+$/.test(id || "") &&
+      ((pollPath === personalPoll && returnPath === "/settings/github") ||
+        (organizationPoll &&
+          organizationPoll[2] === id &&
+          returnPath === `/organizations/${organizationPoll[1]}/settings/github/connection`));
     let interval = Math.max(Number(report.dataset.interval) || 5, 1);
     const deadline = performance.now() + Math.max(Number(report.dataset.expiresIn) || 0, 0) * 1000;
     let stopped = false;
@@ -35,7 +47,7 @@ const initGitHubDevicePolling = () => {
       request = new AbortController();
       const timeout = window.setTimeout(() => request.abort(), 45_000);
       try {
-        const response = await fetch(`/settings/github/device/${encodeURIComponent(id)}/poll`, {
+        const response = await fetch(pollPath, {
           method: "POST",
           credentials: "same-origin",
           cache: "no-store",
@@ -50,7 +62,7 @@ const initGitHubDevicePolling = () => {
         const result = await response.json();
         if (result.status === "complete" && response.ok) {
           stop("GitHub connected.");
-          window.location.assign("/settings/github");
+          window.location.assign(returnPath);
           return;
         }
         if (result.status === "failed") {
@@ -80,7 +92,7 @@ const initGitHubDevicePolling = () => {
     window.addEventListener("pageshow", (event) => {
       if (event.persisted) window.location.reload();
     });
-    if (!csrf || !id) {
+    if (!csrf || !pathsValid) {
       stop("Refresh this page to start GitHub authorization again.");
       return;
     }

@@ -23,8 +23,8 @@ defmodule FornacastWeb.ImportController do
   def repository_new(%Plug.Conn{assigns: %{current_user: actor}} = conn, _params),
     do: render_entry(conn, actor, :repository)
 
-  def organization_new(%Plug.Conn{assigns: %{current_user: actor}} = conn, _params),
-    do: render_entry(conn, actor, :organization)
+  def organization_new(conn, params),
+    do: FornacastWeb.OrganizationImportController.index(conn, params)
 
   def repository_discover(%Plug.Conn{assigns: %{current_user: actor}} = conn, params) do
     with {:ok, attrs} <- repository_discovery_params(params),
@@ -452,6 +452,7 @@ defmodule FornacastWeb.ImportController do
         run: run,
         organizations: organizations,
         accounts: accounts,
+        destination_action: conn.params["destination"],
         error: nil,
         __changed__: nil
       })
@@ -1125,8 +1126,12 @@ defmodule FornacastWeb.ImportController do
     end
   end
 
-  defp retry_credential_params(%{"import" => %{"github_identity_id" => identity_id}})
-       when is_binary(identity_id) do
+  defp retry_credential_params(%{"import" => %{"credential_source" => "public"} = attrs})
+       when map_size(attrs) == 1,
+       do: {:ok, %{credential_source: :public}}
+
+  defp retry_credential_params(%{"import" => %{"github_identity_id" => identity_id} = attrs})
+       when is_binary(identity_id) and map_size(attrs) == 1 do
     with {:ok, parsed_id} <- canonical_form_id(identity_id, :invalid_credential) do
       {:ok, {:saved, parsed_id}}
     end

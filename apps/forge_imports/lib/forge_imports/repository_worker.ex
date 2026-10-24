@@ -215,7 +215,7 @@ defmodule ForgeImports.RepositoryWorker do
         release_with_provider_error(capability, error)
 
       {:error, %GitCore.Error{kind: :corrupt_repository}} ->
-        persist_corrupt_repository_failure(capability)
+        persist_repository_failure(capability, "corrupt_repository")
 
       {:error, %GitCore.Error{kind: :scan_work_limit}} ->
         release_with_error(capability, :scan_work_limit)
@@ -289,7 +289,7 @@ defmodule ForgeImports.RepositoryWorker do
             send(parent, {reference, result})
             credential_callback_result(result)
           end,
-          credential_options(options)
+          credential_options(options, run.credential_source)
         )
       end
 
@@ -319,7 +319,7 @@ defmodule ForgeImports.RepositoryWorker do
             send(parent, {reference, callback.(credential, metadata)})
             :ok
           end,
-          credential_options(options)
+          credential_options(options, run.credential_source)
         )
       end
 
@@ -490,6 +490,14 @@ defmodule ForgeImports.RepositoryWorker do
       {:error, reason} -> {:error, reason}
     end
   end
+
+  defp handle_remote_result(
+         capability,
+         _shadow,
+         {:error, %ForgeGitHub.Error{} = error},
+         _options
+       ),
+       do: release_with_provider_error(capability, error)
 
   defp handle_remote_result(capability, _shadow, {:error, :cancelled}, _options),
     do: persist_cancellation(capability)
@@ -888,7 +896,7 @@ defmodule ForgeImports.RepositoryWorker do
 
       %RepositoryItem{} = observed ->
         with %ImportRun{} = observed_run <- Repo.get(ImportRun, observed.import_run_id),
-             %User{} = actor <- locked_actor(observed_run.actor_user_id),
+             actor when not is_nil(actor) <- execution_actor(observed_run),
              %ImportRun{} = run <- locked_run(observed_run.id),
              %RepositoryItem{} = item <- locked_item(item_id),
              %ImportAttempt{} = attempt <- current_attempt(item),
@@ -911,6 +919,31 @@ defmodule ForgeImports.RepositoryWorker do
     |> maybe_lock()
     |> Repo.one()
   end
+
+  defp execution_actor(
+         %ImportRun{credential_source: source, organization_sync_run_id: sync_id} = run
+       )
+       when source in [:organization_device, :public] and not is_nil(sync_id) do
+    execution = ForgeImports.OrganizationExecution.audit_principal(run)
+    # Take organization authority locks before the run/item locks. Cleanup still
+    # receives audit provenance when that authority has since been revoked.
+    _authorization =
+      ForgeImports.OrganizationExecution.authorize(execution, lock: true, run_lock: :update)
+
+    execution
+  end
+
+  defp execution_actor(run), do: locked_actor(run.actor_user_id)
+
+  defp execution_kind?(%ForgeImports.OrganizationExecution{}), do: true
+  defp execution_kind?(%User{kind: :user}), do: true
+  defp execution_kind?(_), do: false
+
+  defp execution_active?(%ForgeImports.OrganizationExecution{} = execution),
+    do: match?({:ok, _}, ForgeImports.OrganizationExecution.authorize(execution, lock: true))
+
+  defp execution_active?(%User{kind: :user, state: :active}), do: true
+  defp execution_active?(_), do: false
 
   defp locked_actor(actor_id) do
     User
@@ -947,13 +980,13 @@ defmodule ForgeImports.RepositoryWorker do
           :failed,
           :completed,
           :completed_with_warnings
-        ] and (run.state != :running or actor.state != :active)
+        ] and (run.state != :running or not execution_active?(actor))
 
     cond do
-      actor.kind != :user ->
+      not execution_kind?(actor) ->
         {:error, :not_runnable}
 
-      not cleanup_recovery? and actor.state != :active ->
+      not cleanup_recovery? and not execution_active?(actor) ->
         {:error, :not_runnable}
 
       run.state != :running and not cleanup_recovery? ->
@@ -1100,7 +1133,7 @@ defmodule ForgeImports.RepositoryWorker do
           send(parent, {reference, result, metadata})
           credential_callback_result(result)
         end,
-        credential_options(options)
+        credential_options(options, run.credential_source)
       )
 
     case receive_checkout_result(checkout, reference) do
@@ -1610,6 +1643,18 @@ defmodule ForgeImports.RepositoryWorker do
   end
 
   defp pause_for_credential(capability, reason) do
+    case Repo.get(ImportRun, capability.import_run_id) do
+      %ImportRun{credential_source: :public} ->
+        if reason in [:invalid_credential, :not_found, :forbidden],
+          do: persist_repository_failure(capability, "public_authorization_required"),
+          else: release_with_error(capability, reason)
+
+      _ ->
+        pause_authenticated_credential(capability, reason)
+    end
+  end
+
+  defp pause_authenticated_credential(capability, reason) do
     wait_reason = credential_wait_reason(reason)
 
     transaction = fn ->
@@ -1693,7 +1738,7 @@ defmodule ForgeImports.RepositoryWorker do
            from item in RepositoryItem,
              join: run in ImportRun,
              on: run.id == item.import_run_id,
-             join: actor in User,
+             left_join: actor in User,
              on: actor.id == run.actor_user_id,
              join: attempt in ImportAttempt,
              on:
@@ -1704,12 +1749,23 @@ defmodule ForgeImports.RepositoryWorker do
                  item.lease_expires_at > ^now and item.selected == true and
                  item.state in [:staging_git, :git_staged, :staging_metadata] and
                  is_nil(item.cleanup_state) and
-                 run.state in [:running, :cancel_requested] and actor.kind == :user and
-                 actor.state == :active and attempt.state == :running,
+                 run.state in [:running, :cancel_requested] and
+                 ((run.credential_source in [:organization_device, :public] and
+                     not is_nil(run.organization_sync_run_id)) or
+                    (actor.kind == :user and actor.state == :active)) and
+                 attempt.state == :running,
              select: %{actor: actor, run: run, item: item}
          ) do
       %{run: %ImportRun{state: :running} = run, item: %RepositoryItem{}} = context ->
-        with :ok <- ForgeImports.PatSyncWorker.import_authorized?(run.id), do: {:ok, context}
+        with :ok <- ForgeImports.PatSyncWorker.import_authorized?(run.id) do
+          if run.credential_source in [:organization_device, :public] and
+               not is_nil(run.organization_sync_run_id) do
+            with {:ok, execution} <- ForgeImports.OrganizationExecution.for_run(run),
+                 do: {:ok, %{context | actor: execution}}
+          else
+            {:ok, context}
+          end
+        end
 
       %{run: %ImportRun{state: :cancel_requested}} ->
         {:error, :cancelled}
@@ -1863,6 +1919,7 @@ defmodule ForgeImports.RepositoryWorker do
       owner: owner,
       repository: repository,
       credential_login: credential_login,
+      authentication: if(is_nil(credential_login), do: :anonymous, else: :token),
       destination: ForgeRepos.absolute_storage_path(shadow),
       default_branch: Map.fetch!(item.source_metadata, "default_branch")
     }
@@ -1891,7 +1948,7 @@ defmodule ForgeImports.RepositoryWorker do
     end
   end
 
-  defp persist_corrupt_repository_failure(capability) do
+  defp persist_repository_failure(capability, classification) do
     transaction = fn ->
       Repo.transaction(fn ->
         with %ImportRun{state: :running} = run <- locked_run(capability.import_run_id),
@@ -1903,7 +1960,7 @@ defmodule ForgeImports.RepositoryWorker do
                attempt
                |> ImportAttempt.transition_changeset(:failed, %{
                  terminal_at: now,
-                 failure_kind: "corrupt_repository"
+                 failure_kind: classification
                })
                |> Repo.update(),
              {:ok, failed} <-
@@ -1911,8 +1968,13 @@ defmodule ForgeImports.RepositoryWorker do
                  state: :failed,
                  wait_reason: nil,
                  next_attempt_at: nil,
-                 failure_kind: "corrupt_repository",
-                 failure_detail: nil,
+                 failure_kind: classification,
+                 failure_detail:
+                   if(classification == "public_authorization_required",
+                     do:
+                       "This required public resource needs authorization. Connect the organization GitHub App and retry.",
+                     else: nil
+                   ),
                  failure_count: item.failure_count + 1
                ),
              :ok <- bump_run_after_retry(run, now) do
@@ -2121,12 +2183,16 @@ defmodule ForgeImports.RepositoryWorker do
     "github-repository-" <> Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
   end
 
+  defp normalize_credential_error(%ForgeGitHub.Error{} = error), do: error
+
   defp normalize_credential_error(reason)
        when reason in [
               :not_found,
               :forbidden,
               :credential_invalid,
+              :paused,
               :invalid_credential,
+              :request_gate_busy,
               :credential_service_unavailable
             ],
        do: if(reason == :credential_invalid, do: :invalid_credential, else: reason)
@@ -2141,7 +2207,10 @@ defmodule ForgeImports.RepositoryWorker do
 
   defp normalize_credential_error(_reason), do: :credential_service_unavailable
 
-  defp credential_options(options) do
+  defp credential_options(options, source) when source in [:organization_device, :public],
+    do: Keyword.put(options.client_options, :client, options.client)
+
+  defp credential_options(options, _source) do
     [
       keyring: options.keyring,
       token_broker: options.token_broker,
@@ -2173,6 +2242,7 @@ defmodule ForgeImports.RepositoryWorker do
   defp normalize_worker_error(reason)
        when reason in [
               :cancelled,
+              :paused,
               :lost_lease,
               :destination_changed,
               :ambiguous_staging,

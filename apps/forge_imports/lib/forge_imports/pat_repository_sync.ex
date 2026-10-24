@@ -75,7 +75,95 @@ defmodule ForgeImports.PatRepositorySync do
     _kind, _reason -> {:error, :unavailable}
   end
 
+  def sync(
+        %ForgeImports.OrganizationExecution{} = execution,
+        %PatConfiguration{} = config,
+        %Repository{} = repository,
+        source_full_name,
+        opts
+      ) do
+    with {:ok, options} <- options(opts),
+         [remote_owner, remote_repository] <- String.split(source_full_name, "/"),
+         true <- String.downcase(remote_owner) == config.github_organization,
+         {:ok, scope} <-
+           ForgeImports.OrganizationExecution.authorize(execution, allow_terminal: true),
+         :ok <- legacy_writer(config.id, repository.id) do
+      authorize = fn ->
+        with :ok <- options.authorize.(),
+             {:ok, _} <-
+               ForgeImports.OrganizationExecution.authorize(execution, allow_terminal: true),
+             :ok <- legacy_writer(config.id, repository.id),
+             {:ok, current} <- ForgeRepos.fetch_live_repository(repository.id),
+             true <-
+               current.owner_user_id == execution.organization_id and
+                 current.generation == repository.generation do
+          :ok
+        else
+          false -> {:error, :stale_repository}
+          {:error, _} = error -> error
+        end
+      end
+
+      request = %SyncRequest{
+        provider: :github,
+        owner: remote_owner,
+        repository: remote_repository,
+        credential_login:
+          if(config.credential_source == :public, do: nil, else: "x-access-token"),
+        authentication: if(config.credential_source == :public, do: :anonymous, else: :token),
+        repository_path: ForgeRepos.absolute_storage_path(repository)
+      }
+
+      credential =
+        if config.credential_source == :public,
+          do: %{gate_key: {:public, 1}},
+          else: %{
+            id: scope.credential_id,
+            gate_key: {:organization_credential, scope.credential_id}
+          }
+
+      provider_options =
+        Keyword.merge(
+          Keyword.get(opts, :client_options, []),
+          Keyword.take(opts, [:client, :device_flow_options])
+        )
+
+      options =
+        options
+        |> Map.put(:organization_scope, scope)
+        |> Map.put(:organization_options, provider_options)
+
+      with_source_credential(
+        scope,
+        fn token, _current ->
+          synchronize(
+            request,
+            token,
+            execution,
+            repository,
+            config,
+            credential,
+            authorize,
+            options
+          )
+          |> safe_result()
+        end,
+        provider_options
+      )
+      |> credential_result()
+    else
+      {:error, reason} -> safe_result({:error, reason})
+      _ -> {:error, :invalid_request}
+    end
+  end
+
   def sync(_, _, _, _, _), do: {:error, :invalid_request}
+
+  defp with_source_credential(%{credential_source: :public} = scope, callback, _opts),
+    do: {:ok, callback.(:public, scope)}
+
+  defp with_source_credential(scope, callback, opts),
+    do: ForgeImports.OrganizationGitHubConnection.with_credential(scope, callback, opts)
 
   defp synchronize(request, token, owner, repository, config, credential, authorize, options) do
     namespace = "pat-sync-#{config.id}"
@@ -97,14 +185,60 @@ defmodule ForgeImports.PatRepositorySync do
              authorize,
              options
            ),
-         :ok <- authorize.() do
+         :ok <- authorize.(),
+         :ok <- verify_public_source(request, token, credential, options) do
       apply_updates(owner, repository, updates, authorize)
+    end
+  end
+
+  defp verify_public_source(request, :public, credential, options),
+    do: verify_source(request, :public, credential, options)
+
+  defp verify_public_source(_request, _token, _credential, _options), do: :ok
+
+  defp verify_source(request, :public, _credential, %{organization_scope: scope} = options) do
+    with {:ok, %ForgeGitHub.Repository{visibility: :public} = source} <-
+           options.lookup_repository.(:public, request.owner, request.repository,
+             gate_key: {:public, 1}
+           ),
+         true <-
+           source.id == options.github_repository_id and
+             source.owner_id == scope.github_organization_id and
+             String.downcase(source.owner_login) == String.downcase(request.owner),
+         :ok <- ForgeAccounts.GitHubProfileSafety.validate(source, :public) do
+      :ok
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :source_changed}
+    end
+  end
+
+  defp verify_source(request, token, credential, %{organization_scope: scope} = options) do
+    with :ok <-
+           ForgeImports.OrganizationGitHubConnection.validate_repository(
+             scope,
+             options.github_repository_id,
+             options.organization_options
+           ),
+         {:ok, source} <-
+           options.lookup_repository.(token, request.owner, request.repository,
+             gate_key: {:organization_credential, credential.id}
+           ),
+         true <-
+           source.id == options.github_repository_id and
+             source.owner_id == scope.github_organization_id and
+             String.downcase(source.owner_login) == String.downcase(request.owner) do
+      :ok
+    else
+      false -> {:error, :source_changed}
+      {:error, _} = error -> error
+      _ -> {:error, :source_changed}
     end
   end
 
   defp verify_source(request, token, credential, options) do
     case options.lookup_repository.(token, request.owner, request.repository,
-           gate_key: {:saved_credential, credential.id}
+           gate_key: Map.get(credential, :gate_key, {:saved_credential, Map.get(credential, :id)})
          ) do
       {:ok, %{id: id, owner_login: login}} when is_binary(login) ->
         if id == options.github_repository_id and
@@ -226,7 +360,7 @@ defmodule ForgeImports.PatRepositorySync do
   defp transfer_pages(repository, scan, request, token, credential, cursor, authorize, options) do
     transfer_opts =
       Keyword.merge(options.lfs_transfer_options,
-        gate_key: {:saved_credential, credential.id},
+        gate_key: Map.get(credential, :gate_key, {:saved_credential, Map.get(credential, :id)}),
         authorize: authorize
       )
 
@@ -284,13 +418,7 @@ defmodule ForgeImports.PatRepositorySync do
 
     with :ok <- authorize.(),
          {:ok, _operations} <-
-           ForgeRepos.prepare_inbound_git_operations(
-             owner,
-             repository,
-             "pat-sync-#{Ecto.UUID.generate()}",
-             commands,
-             deadline
-           ) do
+           prepare_operations(owner, repository, commands, deadline, authorize) do
       result = write_refs(path, updates, deadline, authorize)
 
       # Recovery only classifies observed refs and commits bookkeeping; it cannot apply
@@ -301,6 +429,34 @@ defmodule ForgeImports.PatRepositorySync do
       end
     end
   end
+
+  defp prepare_operations(
+         %ForgeImports.OrganizationExecution{} = execution,
+         repository,
+         commands,
+         deadline,
+         authorize
+       ) do
+    ForgeRepos.prepare_organization_inbound_git_operations(
+      execution.organization_id,
+      repository,
+      "organization-sync-#{Ecto.UUID.generate()}",
+      commands,
+      deadline,
+      fn _repo -> authorize.() end,
+      execution.id
+    )
+  end
+
+  defp prepare_operations(owner, repository, commands, deadline, _authorize),
+    do:
+      ForgeRepos.prepare_inbound_git_operations(
+        owner,
+        repository,
+        "pat-sync-#{Ecto.UUID.generate()}",
+        commands,
+        deadline
+      )
 
   defp write_refs(path, updates, deadline, authorize) do
     Enum.reduce_while(updates, :ok, fn update, :ok ->
@@ -440,7 +596,9 @@ defmodule ForgeImports.PatRepositorySync do
       :lookup_repository,
       :fetch_refs,
       :lfs_transfer_options,
-      :device_flow_options
+      :device_flow_options,
+      :client,
+      :client_options
     ]
 
     if Keyword.keyword?(opts) and Enum.all?(Keyword.keys(opts), &(&1 in keys)) and

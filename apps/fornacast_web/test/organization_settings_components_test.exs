@@ -20,12 +20,13 @@ defmodule FornacastWeb.OrganizationSettingsComponentsTest do
     assert html =~ "GitHub integration"
     assert html =~ "layout content"
     assert length(Regex.scan(~r/aria-current="page"/, html)) == 1
+    assert Enum.empty?(LazyHTML.query(LazyHTML.from_fragment(html), "details[open]"))
     refute html =~ "People"
     refute html =~ "Teams"
     refute html =~ "Permissions"
   end
 
-  test "GitHub layout selects its integration link and escapes organization identity" do
+  test "GitHub layout defaults to overview and escapes organization identity" do
     html =
       render_component(&OrganizationSettingsComponents.organization_settings_layout/1,
         organization: %Organization{
@@ -50,7 +51,37 @@ defmodule FornacastWeb.OrganizationSettingsComponentsTest do
     refute html =~ "<script>alert(1)</script>"
   end
 
-  defp render_layout(active) do
+  test "GitHub submenu exposes configuration pages and selects only the current child" do
+    pages = [
+      overview: "",
+      connection: "/connection",
+      sync: "/legacy",
+      repositories: "/repositories",
+      history: "/runs",
+      advanced: "/app/advanced",
+      conflicts: "/conflicts"
+    ]
+
+    for {page, suffix} <- pages do
+      document = LazyHTML.from_fragment(render_layout(:github, page))
+      menu = LazyHTML.query(document, "[data-organization-github-menu][open]")
+
+      assert Enum.count(menu) == 1
+      assert LazyHTML.attribute(menu, "data-active-group") == ["true"]
+
+      assert LazyHTML.attribute(LazyHTML.query(menu, "a"), "href") ==
+               Enum.map(pages, fn {_page, path} ->
+                 "/organizations/acme/settings/github#{path}"
+               end)
+
+      assert LazyHTML.attribute(LazyHTML.query(document, "a[aria-current='page']"), "href") ==
+               ["/organizations/acme/settings/github#{suffix}"]
+
+      assert Enum.empty?(LazyHTML.query(menu, "form, button, a[data-method]"))
+    end
+  end
+
+  defp render_layout(active, github_page \\ :overview) do
     render_component(&OrganizationSettingsComponents.organization_settings_layout/1,
       organization: %Organization{
         id: 71,
@@ -59,6 +90,7 @@ defmodule FornacastWeb.OrganizationSettingsComponentsTest do
         state: :active
       },
       active: active,
+      github_page: github_page,
       inner_block: [%{inner_block: fn _changed, _argument -> "layout content" end}]
     )
   end

@@ -40,11 +40,61 @@
       >
         {workflow_label(@run)}
       </.dm_link>
+      <.dm_link
+        :if={public_sync_href(@run)}
+        href={public_sync_href(@run)}
+        class="text-sm text-primary"
+      >
+        Public synchronization settings
+      </.dm_link>
+      <.dm_link
+        :if={organization_source?(@run)}
+        href={organization_connection_href(@run)}
+        class="text-sm text-primary"
+      >
+        Manage organization GitHub connection
+      </.dm_link>
     </div>
   </header>
 
   <.dm_alert
-    :if={awaiting_credential?(@run)}
+    :if={organization_source?(@run) && (awaiting_credential?(@run) || retryable?(@run))}
+    id="import-organization-recovery"
+    variant="warning"
+    outlined
+    role="status"
+  >
+    Recheck or reconnect the organization's GitHub App connection, then use Sync now to resume unfinished work.
+  </.dm_alert>
+  <.dm_alert
+    :if={public_source?(@run) && retryable?(@run)}
+    id="import-public-recovery"
+    variant="warning"
+    outlined
+    role="status"
+  >
+    Review the failure details before retrying with public access. If required resources need authorization, <.dm_link
+      href={organization_connection_href(@run)}
+      class="text-primary"
+    >connect the GitHub App</.dm_link>.
+  </.dm_alert>
+
+  <.dm_alert
+    :if={public_source?(@run) && @run.wait_reason}
+    id="import-public-wait"
+    variant="warning"
+    outlined
+    role="status"
+  >
+    <span data-import-wait-reason>{humanize(@run.wait_reason)}</span>
+    <span :if={@run.next_attempt_at}>Next attempt: <time datetime={
+      datetime_value(@run.next_attempt_at)
+    }>{datetime_label(@run.next_attempt_at)}</time>.</span>
+    <span>Public access remains selected. Connect the GitHub App if required resources need authorization.</span>
+  </.dm_alert>
+
+  <.dm_alert
+    :if={awaiting_credential?(@run) && !public_source?(@run) && !organization_source?(@run)}
     id="import-awaiting-credential"
     variant="warning"
     outlined
@@ -57,7 +107,10 @@
   </.dm_alert>
 
   <.dm_card
-    :if={cancellable?(@run) || retryable?(@run) || awaiting_credential?(@run)}
+    :if={
+      cancellable?(@run) ||
+        (!organization_source?(@run) && (retryable?(@run) || awaiting_credential?(@run)))
+    }
     id="import-controls-card"
     variant="bordered"
     shadow="sm"
@@ -77,7 +130,7 @@
       </form>
 
       <form
-        :if={awaiting_credential?(@run)}
+        :if={awaiting_credential?(@run) && !public_source?(@run) && !organization_source?(@run)}
         action={"/imports/#{@run.id}/credential"}
         method="post"
         class="grid gap-4"
@@ -134,17 +187,24 @@
       </form>
 
       <form
-        :if={retryable?(@run)}
+        :if={retryable?(@run) && !organization_source?(@run)}
         action={"/imports/#{@run.id}/retry"}
         method="post"
         class="grid gap-4"
         data-import-retry-form
       >
         <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <input
+          :if={public_source?(@run)}
+          type="hidden"
+          name="import[credential_source]"
+          value="public"
+        />
         <p class="text-sm text-on-surface-variant">
           Create a successor import with only unpublished retryable repositories.
         </p>
         <.dm_input
+          :if={!public_source?(@run)}
           id="import-retry-github-account"
           class="w-full"
           name="import[github_identity_id]"
@@ -197,6 +257,10 @@
       <div class="flex flex-wrap items-center gap-2">
         <dt class="font-semibold">Source</dt>
         <dd>{source_label(@run.source)}</dd>
+      </div>
+      <div :if={public_source?(@run)} class="flex flex-wrap items-center gap-2">
+        <dt class="font-semibold">Access</dt>
+        <dd>Public GitHub API · No account or token</dd>
       </div>
       <div class="flex flex-wrap items-center gap-2">
         <dt class="font-semibold">Destination</dt>
@@ -252,34 +316,24 @@
     padding="lg"
   >
     <:title><span class="text-lg font-semibold">Organization destination</span></:title>
+    <% destination_action = destination_action(@run, Map.get(assigns, :destination_action)) %>
+    <nav class="flex flex-wrap gap-4" aria-label="Organization destination">
+      <.dm_link
+        href={"/imports/#{@run.id}?destination=new"}
+        aria-current={if destination_action == "new", do: "page", else: nil}
+      >Create a new local organization</.dm_link>
+      <.dm_link
+        href={"/imports/#{@run.id}?destination=existing"}
+        aria-current={if destination_action == "existing", do: "page", else: nil}
+      >Use an existing organization I own</.dm_link>
+    </nav>
     <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#157 --%>
     <form action={"/imports/#{@run.id}/destination"} method="post" class="grid gap-4">
       <input type="hidden" name="_csrf_token" value={csrf_token()} />
       <input type="hidden" name="_method" value="patch" />
-      <fieldset class="grid gap-2">
-        <legend class="font-semibold">Destination choice</legend>
-        <div class="flex flex-wrap gap-2">
-          <label class="inline-flex items-center gap-2">
-            <input
-              class="radio radio-primary"
-              type="radio"
-              name="destination[action]"
-              value="new"
-              checked={!existing_destination?(@run)}
-            /> Create a new local organization
-          </label>
-          <label class="inline-flex items-center gap-2">
-            <input
-              class="radio radio-primary"
-              type="radio"
-              name="destination[action]"
-              value="existing"
-              checked={existing_destination?(@run)}
-            /> Use an existing organization I own
-          </label>
-        </div>
-      </fieldset>
+      <input type="hidden" name="destination[action]" value={destination_action} />
       <.dm_input
+        :if={destination_action == "new"}
         id="import-destination-slug"
         class="w-full"
         name="destination[slug]"
@@ -292,6 +346,7 @@
         autocapitalize="none"
       />
       <.dm_input
+        :if={destination_action == "existing"}
         id="import-existing-destination"
         class="w-full"
         name="destination[organization_id]"
@@ -301,7 +356,10 @@
         value={destination_organization_id(@run)}
         options={organization_options(@organizations)}
       />
-      <p :if={@organizations == []} class="text-sm text-on-surface-variant">
+      <p
+        :if={destination_action == "existing" && @organizations == []}
+        class="text-sm text-on-surface-variant"
+      >
         No owned organizations are available.
       </p>
       <div>

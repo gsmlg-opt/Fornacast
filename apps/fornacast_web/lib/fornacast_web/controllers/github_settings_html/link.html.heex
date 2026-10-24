@@ -1,0 +1,36 @@
+<section class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6">
+  <header class="grid gap-2">
+    <.dm_link href="/settings/github" class="text-primary">Back to linked accounts</.dm_link>
+    <h2 class="text-2xl font-semibold">Link GitHub account</h2>
+  </header>
+
+  <.dm_alert :if={@error} id="github-settings-error" variant="error" outlined role="alert">
+    {@error}
+  </.dm_alert>
+
+  <.dm_card id="github-link-account" variant="bordered" shadow="md" padding="lg">
+    <p class="text-sm text-on-surface-variant">
+      The PAT is verified with GitHub, encrypted, and never shown again.
+    </p>
+    <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#157 --%>
+    <form id="link-github-account" action="/settings/github" method="post" class="mt-4 grid gap-4">
+      <input type="hidden" name="_csrf_token" value={csrf_token()} />
+      <.dm_input
+        id="github-account-pat"
+        class="w-full"
+        name="github_account[pat]"
+        type="password"
+        label="GitHub personal access token"
+        helper="Use a token that can read every repository you intend to import."
+        required
+        maxlength="4096"
+        autocomplete="new-password"
+        spellcheck="false"
+        autocapitalize="none"
+      />
+      <div>
+        <button class="btn btn-secondary" type="submit">Link GitHub account</button>
+      </div>
+    </form>
+  </.dm_card>
+</section>

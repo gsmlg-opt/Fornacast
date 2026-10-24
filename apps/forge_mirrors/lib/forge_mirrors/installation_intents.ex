@@ -166,19 +166,26 @@ defmodule ForgeMirrors.InstallationIntents do
   end
 
   defp bind_mirror(mirror, installation, now) do
-    if OrganizationMirror.legal_transition?(mirror.state, :ready_to_bootstrap) do
-      mirror
-      |> OrganizationMirror.update_changeset(%{
-        github_installation_id: installation.github_installation_id,
-        github_account_id: installation.github_account_id,
-        github_account_login: installation.github_account_login,
-        last_webhook_at: DateTime.truncate(now, :second)
-      })
-      |> Ecto.Changeset.put_change(:state, :ready_to_bootstrap)
-      |> Ecto.Changeset.put_change(:resume_state, nil)
-      |> Repo.update()
-    else
-      {:error, :invalid_transition}
+    with :ok <-
+           ForgeMirrors.OrganizationGitHubConnections.claim_identity(
+             mirror.organization_id,
+             installation.github_account_id,
+             installation.github_installation_id
+           ) do
+      if OrganizationMirror.legal_transition?(mirror.state, :ready_to_bootstrap) do
+        mirror
+        |> OrganizationMirror.update_changeset(%{
+          github_installation_id: installation.github_installation_id,
+          github_account_id: installation.github_account_id,
+          github_account_login: installation.github_account_login,
+          last_webhook_at: DateTime.truncate(now, :second)
+        })
+        |> Ecto.Changeset.put_change(:state, :ready_to_bootstrap)
+        |> Ecto.Changeset.put_change(:resume_state, nil)
+        |> Repo.update()
+      else
+        {:error, :invalid_transition}
+      end
     end
   end
 

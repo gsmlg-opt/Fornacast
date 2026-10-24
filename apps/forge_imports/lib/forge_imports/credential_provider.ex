@@ -6,6 +6,21 @@ defmodule ForgeImports.CredentialProvider do
   alias ForgeImports.CredentialProvider.{GitHubApp, OneTimePAT, SavedPAT}
 
   @doc false
+  def authorize_recovery_locked(
+        %ImportRun{credential_source: source, organization_sync_run_id: sync_id} = run,
+        %RepositoryItem{} = item
+      )
+      when source in [:organization_device, :public] and not is_nil(sync_id) do
+    if Fornacast.Repo.in_transaction?() do
+      case ForgeImports.OrganizationExecution.authorize_item(run, item, lock: true) do
+        {:ok, _execution, _scope} -> :ok
+        {:error, _} = error -> error
+      end
+    else
+      {:error, :invalid_context}
+    end
+  end
+
   def authorize_recovery_locked(%ImportRun{} = run, %RepositoryItem{} = item) do
     import Ecto.Query
     alias Fornacast.Repo
@@ -106,6 +121,16 @@ defmodule ForgeImports.CredentialProvider do
       )
       when is_function(callback, 2) and is_list(opts),
       do: GitHubApp.checkout(context, callback, opts)
+
+  def checkout(
+        %{run: %ImportRun{credential_source: :organization_device}} = context,
+        callback,
+        opts
+      ),
+      do: ForgeImports.CredentialProvider.OrganizationDevice.checkout(context, callback, opts)
+
+  def checkout(%{run: %ImportRun{credential_source: :public}} = context, callback, opts),
+    do: ForgeImports.CredentialProvider.Public.checkout(context, callback, opts)
 
   def checkout(_context, _callback, _opts), do: {:error, :invalid_context}
 end
@@ -621,4 +646,128 @@ defmodule ForgeImports.CredentialProvider.SavedPAT do
        do: if(reason == :credential_invalid, do: :invalid_credential, else: reason)
 
   defp normalize_error(_reason), do: :credential_service_unavailable
+end
+
+defmodule ForgeImports.CredentialProvider.OrganizationDevice do
+  @moduledoc false
+  @behaviour ForgeImports.CredentialProvider
+  alias ForgeImports.{ImportRun, RepositoryItem, OrganizationExecution}
+  alias Fornacast.Repo
+
+  def checkout(
+        %{
+          run: %ImportRun{credential_source: :organization_device} = expected,
+          capability: capability
+        },
+        callback,
+        opts
+      ) do
+    with %ImportRun{} = run <- Repo.get(ImportRun, expected.id),
+         true <- same_run_snapshot?(run, expected),
+         {:ok, execution} <- OrganizationExecution.for_run(run),
+         {:ok, scope} <- OrganizationExecution.authorize(execution),
+         {:ok, _current} <- current_capability(run, capability) do
+      result =
+        ForgeImports.OrganizationGitHubConnection.with_credential(
+          scope,
+          fn token, current ->
+            with {:ok, _} <- OrganizationExecution.authorize(execution),
+                 {:ok, canonical} <- current_capability(run, capability),
+                 :ok <- repository_membership(current, canonical, opts),
+                 {:ok, _} <- OrganizationExecution.authorize(execution),
+                 {:ok, _} <- current_capability(run, canonical) do
+              case callback.(token, %{
+                     git_login: "x-access-token",
+                     gate_key: {:organization_credential, current.credential_id}
+                   }) do
+                :ok -> :ok
+                {:error, reason} when is_atom(reason) -> {:error, reason}
+                _ -> {:error, :unsafe_credential_result}
+              end
+            end
+          end,
+          opts
+        )
+
+      case result do
+        {:ok, :ok} -> {:ok, :acknowledged}
+        {:ok, {:error, reason}} -> {:error, reason}
+        :ok -> {:ok, :acknowledged}
+        {:error, _} = error -> error
+        _ -> {:error, :unsafe_credential_result}
+      end
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :invalid_context}
+    end
+  end
+
+  defp repository_membership(_scope, %ImportRun{}, _opts), do: :ok
+
+  defp repository_membership(scope, %RepositoryItem{github_repository_id: id}, opts),
+    do: ForgeImports.OrganizationGitHubConnection.validate_repository(scope, id, opts)
+
+  defp current_capability(run, %ImportRun{} = expected) do
+    current = Repo.get(ImportRun, expected.id)
+
+    if current && current.id == run.id && current.lock_version == expected.lock_version &&
+         current.lease_owner == expected.lease_owner && live?(current.lease_expires_at) &&
+         current.state == :discovering && same_run_snapshot?(current, expected),
+       do: {:ok, current},
+       else: {:error, :invalid_context}
+  end
+
+  defp current_capability(run, %RepositoryItem{} = expected) do
+    current = Repo.get(RepositoryItem, expected.id)
+
+    if current && current.import_run_id == run.id && current.lock_version == expected.lock_version &&
+         current.lease_owner == expected.lease_owner && live?(current.lease_expires_at) &&
+         current.selected &&
+         current.state in [:staging_git, :git_staged, :staging_metadata] &&
+         is_nil(current.cleanup_state) &&
+         Repo.get!(ImportRun, run.id).state == :running &&
+         same_snapshot?(current, expected, [
+           :import_run_id,
+           :github_repository_id,
+           :source_full_name,
+           :destination_owner_id,
+           :destination_slug,
+           :destination_visibility,
+           :source_name,
+           :attempt_count
+         ]) &&
+         match?(
+           %ForgeImports.ImportAttempt{state: :running},
+           Repo.get_by(ForgeImports.ImportAttempt,
+             repository_item_id: current.id,
+             attempt_number: current.attempt_count
+           )
+         ), do: {:ok, current}, else: {:error, :invalid_context}
+  end
+
+  defp current_capability(_, _), do: {:error, :invalid_context}
+
+  defp same_run_snapshot?(current, expected) do
+    same_snapshot?(current, expected, [
+      :credential_source,
+      :actor_user_id,
+      :organization_sync_run_id,
+      :organization_connection_id,
+      :organization_connection_version,
+      :organization_credential_id,
+      :organization_credential_version,
+      :github_installation_id,
+      :source_kind,
+      :source_owner_github_id,
+      :source_owner_login,
+      :destination_organization_id,
+      :destination_organization_action
+    ])
+  end
+
+  defp same_snapshot?(current, expected, fields),
+    do: Enum.all?(fields, &(Map.get(current, &1) == Map.get(expected, &1)))
+
+  defp live?(%DateTime{} = time), do: DateTime.compare(time, DateTime.utc_now(:second)) == :gt
+  defp live?(_), do: false
 end

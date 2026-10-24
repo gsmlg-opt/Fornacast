@@ -1,6 +1,7 @@
 <OrganizationSettingsComponents.organization_settings_layout
   organization={@organization}
   active={:github}
+  github_page={:repositories}
 >
   <section class="grid gap-4" data-pat-repositories>
     <header class="grid gap-2">
@@ -34,7 +35,12 @@
       <.task_report :if={@latest_run} organization={@organization} run={@latest_run} />
       <.dm_link :if={!@latest_run} href={base(@organization) <> "/runs"} class="text-primary">Synchronization history</.dm_link>
     </.dm_card>
-    <.dm_card id="pat-git-mirrors" variant="bordered" padding="lg">
+    <.dm_card
+      :if={@view.config.credential_source != :public}
+      id="pat-git-mirrors"
+      variant="bordered"
+      padding="lg"
+    >
       <:title>Bidirectional Git and LFS</:title>
       <p class="text-sm text-on-surface-variant">
         Enroll existing imported repositories to synchronize branches, tags and LFS in both directions.
@@ -45,7 +51,7 @@
         <.dm_link href={base(@organization) <> "/conflicts"} class="text-primary">View synchronization conflicts</.dm_link>
       </p>
       <p :if={@pat_mirror.candidates == []} class="mt-2">
-        Import repositories into this organization with the configured saved credential first.
+        Import repositories into this organization with the configured GitHub connection first.
       </p>
       <form
         :if={@pat_mirror.candidates != []}
@@ -91,7 +97,7 @@
     <.dm_card id="pat-repositories-list" variant="bordered" padding="lg">
       <:title>Repository selection</:title>
       <p class="text-sm text-on-surface-variant">
-        Only repositories visible to the selected owner’s credential can be listed. Refreshing reads GitHub; it does not import repositories.
+        Only repositories available to the configured GitHub connection can be listed. Refreshing reads GitHub; it does not import repositories.
       </p>
       <form
         :if={@view.config.id}

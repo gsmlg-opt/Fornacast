@@ -250,12 +250,27 @@ defmodule ForgeImports.RepositoryStager do
          %ImportAttempt{} = attempt <- attempt,
          true <- live_lease?(item, now),
          true <- run.id == item.import_run_id,
-         true <- run.state != :running or attempt.state == :running do
+         true <- run.state != :running or attempt.state == :running,
+         :ok <- organization_authority(run, item) do
       {:ok, item}
     else
       _stale -> {:error, :lost_lease}
     end
   end
+
+  defp organization_authority(
+         %ImportRun{credential_source: source, organization_sync_run_id: sync_id, state: :running} =
+           run,
+         item
+       )
+       when source in [:organization_device, :public] and not is_nil(sync_id) do
+    case ForgeImports.OrganizationExecution.authorize_item(run, item, lock: true) do
+      {:ok, _, _} -> :ok
+      {:error, _} = error -> error
+    end
+  end
+
+  defp organization_authority(_, _), do: :ok
 
   defp live_lease?(%{lease_expires_at: %DateTime{} = expires_at}, now),
     do: DateTime.compare(expires_at, now) == :gt

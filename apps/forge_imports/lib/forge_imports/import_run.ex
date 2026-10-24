@@ -17,7 +17,7 @@ defmodule ForgeImports.ImportRun do
   ]
   @terminal_states [:completed, :completed_with_warnings, :canceled, :failed]
   @source_kinds [:repository, :organization]
-  @credential_sources [:saved, :one_time, :github_app]
+  @credential_sources [:saved, :one_time, :github_app, :organization_device, :public]
   @destination_actions [:new, :existing]
   @destination_statuses [:clean, :conflict, :invalid]
   @max_id 9_223_372_036_854_775_807
@@ -42,6 +42,13 @@ defmodule ForgeImports.ImportRun do
     :credential_key_id
   ]
   @creation_fields [
+    :organization_sync_run_id,
+    :public_configuration_version,
+    :organization_connection_id,
+    :organization_connection_version,
+    :organization_credential_id,
+    :organization_credential_version,
+    :github_installation_id,
     :mirror_operation_id,
     :predecessor_run_id,
     :source_kind,
@@ -114,6 +121,13 @@ defmodule ForgeImports.ImportRun do
                ]}
   schema "github_import_runs" do
     field :actor_user_id, :integer
+    field :organization_sync_run_id, :integer
+    field :public_configuration_version, :integer
+    field :organization_connection_id, :integer
+    field :organization_connection_version, :integer
+    field :organization_credential_id, :integer
+    field :organization_credential_version, :integer
+    field :github_installation_id, :integer
     field :mirror_operation_id, :integer
     field :predecessor_run_id, :integer
     field :source_kind, Ecto.Enum, values: @source_kinds
@@ -209,6 +223,13 @@ defmodule ForgeImports.ImportRun do
     run
     |> cast(attrs, [
       :actor_user_id,
+      :organization_sync_run_id,
+      :public_configuration_version,
+      :organization_connection_id,
+      :organization_connection_version,
+      :organization_credential_id,
+      :organization_credential_version,
+      :github_installation_id,
       :mirror_operation_id,
       :predecessor_run_id,
       :source_kind,
@@ -284,6 +305,7 @@ defmodule ForgeImports.ImportRun do
     |> validate_request_metadata()
     |> validate_source_metadata()
     |> validate_source_shape()
+    |> validate_organization_source()
     |> validate_destination_status()
     |> validate_credential_identity()
     |> validate_credential_consistency()
@@ -482,6 +504,7 @@ defmodule ForgeImports.ImportRun do
     |> validate_strings()
     |> validate_source_metadata()
     |> validate_source_shape()
+    |> validate_organization_source()
     |> map_constraints()
   end
 
@@ -534,10 +557,10 @@ defmodule ForgeImports.ImportRun do
       source == :one_time and not (all_absent? or all_present?) ->
         add_error(changeset, :credential_source, "one-time envelope is incomplete")
 
-      source == :github_app and not is_nil(saved_id) ->
+      source in [:github_app, :organization_device, :public] and not is_nil(saved_id) ->
         add_error(changeset, :github_credential_id, "must be absent for GitHub App credentials")
 
-      source == :github_app and not all_absent? ->
+      source in [:github_app, :organization_device, :public] and not all_absent? ->
         add_error(
           changeset,
           :credential_source,
@@ -557,7 +580,7 @@ defmodule ForgeImports.ImportRun do
       source in [:saved, :one_time] and is_nil(identity_id) ->
         add_error(changeset, :github_identity_id, "is required for PAT credentials")
 
-      source == :github_app and not is_nil(identity_id) ->
+      source in [:github_app, :organization_device, :public] and not is_nil(identity_id) ->
         add_error(changeset, :github_identity_id, "must be absent for GitHub App credentials")
 
       true ->
@@ -636,7 +659,11 @@ defmodule ForgeImports.ImportRun do
     owner_id = get_field(changeset, :source_owner_github_id)
     repository_id = get_field(changeset, :source_repository_github_id)
     full_name = get_field(changeset, :source_repository_full_name)
-    provisional? = state in [:discovering, :failed]
+
+    provisional? =
+      state in [:discovering, :failed] or
+        (state == :canceled and get_field(changeset, :credential_source) == :public and
+           is_nil(get_field(changeset, :organization_sync_run_id)))
 
     cond do
       kind == :repository and blank?(full_name) ->
@@ -662,6 +689,56 @@ defmodule ForgeImports.ImportRun do
       true ->
         changeset
     end
+  end
+
+  defp validate_organization_source(changeset) do
+    fields = [
+      :organization_sync_run_id,
+      :organization_connection_id,
+      :organization_connection_version,
+      :organization_credential_id,
+      :organization_credential_version,
+      :github_installation_id
+    ]
+
+    source = get_field(changeset, :credential_source)
+
+    public_sync? =
+      source == :public and not is_nil(get_field(changeset, :organization_sync_run_id))
+
+    cond do
+      source == :organization_device ->
+        changeset
+        |> validate_required(fields ++ [:source_owner_github_id, :destination_organization_id])
+        |> then(fn cs -> Enum.reduce(fields, cs, &validate_number(&2, &1, greater_than: 0)) end)
+        |> validate_inclusion(:source_kind, [:organization])
+        |> validate_inclusion(:destination_organization_action, [:existing])
+        |> require_absent([:public_configuration_version])
+
+      public_sync? ->
+        changeset
+        |> validate_required([
+          :organization_sync_run_id,
+          :public_configuration_version,
+          :source_owner_github_id,
+          :destination_organization_id
+        ])
+        |> validate_number(:public_configuration_version, greater_than: 0)
+        |> validate_inclusion(:source_kind, [:organization])
+        |> validate_inclusion(:destination_organization_action, [:existing])
+        |> require_absent(fields -- [:organization_sync_run_id])
+
+      true ->
+        require_absent(changeset, fields ++ [:public_configuration_version])
+    end
+  end
+
+  defp require_absent(changeset, fields) do
+    Enum.reduce(fields, changeset, fn field, acc ->
+      if is_nil(get_field(acc, field)),
+        do: acc,
+        else: add_error(acc, field, "must be absent for this credential source")
+    end)
   end
 
   defp validate_destination_status(changeset) do
@@ -823,6 +900,10 @@ defmodule ForgeImports.ImportRun do
 
   defp map_constraints(changeset) do
     changeset
+    |> foreign_key_constraint(:organization_sync_run_id)
+    |> foreign_key_constraint(:organization_connection_id)
+    |> foreign_key_constraint(:organization_credential_id)
+    |> check_constraint(:credential_source, name: :github_import_runs_organization_source_check)
     |> foreign_key_constraint(:actor_user_id)
     |> foreign_key_constraint(:mirror_operation_id)
     |> unique_constraint(:mirror_operation_id,

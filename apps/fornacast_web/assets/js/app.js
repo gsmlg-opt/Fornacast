@@ -45,7 +45,7 @@ const initTheme = () => {
 
 const initAppbarMenus = () => {
   document
-    .querySelectorAll(".appbar-nav details, .appbar-actions details, .app-nav details")
+    .querySelectorAll(".appbar-workspace-nav details, .appbar-actions details, .app-nav details")
     .forEach((menu) => {
       menu.addEventListener("toggle", () => {
         if (!menu.open) {
@@ -54,7 +54,7 @@ const initAppbarMenus = () => {
 
         document
           .querySelectorAll(
-            ".appbar-nav details[open], .appbar-actions details[open], .app-nav details[open]",
+            ".appbar-workspace-nav details[open], .appbar-actions details[open], .app-nav details[open]",
           )
           .forEach((openMenu) => {
             if (openMenu !== menu) {

@@ -64,6 +64,15 @@ defmodule ForgeImports.Conflicts do
     end
   end
 
+  def resolve(%ForgeImports.OrganizationExecution{} = actor, run_id, decisions, metadata) do
+    with {:ok, decisions} <- normalize_decisions(decisions),
+         {:ok, metadata} <- ForgeAccounts.validate_github_request_metadata(metadata),
+         {:ok, result} <-
+           transact(fn -> resolve_transaction(actor, run_id, decisions, metadata) end),
+         :ok <- dispatch_resolution(result),
+         do: ForgeImports.get_run(actor, run_id)
+  end
+
   def resolve(_actor, _run_id, _decisions, _request_metadata),
     do: {:error, :invalid_selection}
 
@@ -78,6 +87,15 @@ defmodule ForgeImports.Conflicts do
          :ok <- dispatch(running.id, options) do
       ForgeImports.get_run(actor, run_id)
     end
+  end
+
+  def start(%ForgeImports.OrganizationExecution{} = actor, run_id, metadata, opts) do
+    with {:ok, metadata} <- ForgeAccounts.validate_github_request_metadata(metadata),
+         {:ok, options} <- start_options(opts),
+         {:ok, %{run: running}} <-
+           transact(fn -> start_transaction(actor, run_id, metadata, options) end),
+         :ok <- dispatch(running.id, options),
+         do: ForgeImports.get_run(actor, run_id)
   end
 
   def start(_actor, _run_id, _request_metadata, _opts), do: {:error, :invalid_selection}
@@ -102,6 +120,21 @@ defmodule ForgeImports.Conflicts do
     end
   end
 
+  def destination_changed(
+        %ForgeImports.OrganizationExecution{} = execution,
+        run_id,
+        item_reference,
+        metadata
+      ) do
+    with {:ok, item_id, capability} <- normalize_drift_item(item_reference),
+         {:ok, _} <- ForgeAccounts.validate_github_request_metadata(metadata),
+         {:ok, _} <-
+           transact(fn ->
+             destination_changed_transaction(execution, run_id, item_id, capability)
+           end),
+         do: ForgeImports.get_run(execution, run_id)
+  end
+
   def destination_changed(_actor, _run_id, _item_id, _request_metadata),
     do: {:error, :invalid_selection}
 
@@ -119,7 +152,7 @@ defmodule ForgeImports.Conflicts do
              {:ok, action} <- running_decision_action(attempt),
              {:ok, updated_run} <- touch_publication_run(run, now),
              :ok <- close_publication_attempt(attempt, now),
-             {:ok, reopened} <- reopen_publication_item(item, action, now) do
+             {:ok, reopened} <- reopen_publication_item(item, action, run.state, now) do
           %{run: updated_run, item: reopened}
         else
           _stale -> Repo.rollback(:stale)
@@ -277,6 +310,12 @@ defmodule ForgeImports.Conflicts do
   end
 
   defp startable_run(_actor, %ImportRun{}, _now), do: {:error, :stale}
+
+  defp validate_run_destination(
+         %ForgeImports.OrganizationExecution{organization_id: id},
+         %ImportRun{destination_organization_id: id}
+       ),
+       do: :ok
 
   defp validate_run_destination(
          actor,
@@ -611,8 +650,15 @@ defmodule ForgeImports.Conflicts do
     end
   end
 
-  defp reopen_publication_item(item, action, now) do
+  defp reopen_publication_item(item, action, run_state, now) do
     changeset = RepositoryItem.destination_drift_changeset(item, action)
+
+    changeset =
+      if run_state == :cancel_requested do
+        Ecto.Changeset.change(changeset, state: :cancel_requested, wait_reason: nil)
+      else
+        changeset
+      end
 
     if changeset.valid? do
       updates =
@@ -714,6 +760,16 @@ defmodule ForgeImports.Conflicts do
       {:ok, _audit} -> :ok
       {:error, _reason} -> {:error, :persistence_unavailable}
     end
+  end
+
+  defp with_actor_run(
+         %ForgeImports.OrganizationExecution{run_id: run_id} = execution,
+         run_id,
+         callback
+       ) do
+    with {:ok, _} <- ForgeImports.OrganizationExecution.authorize(execution, lock: true),
+         {:ok, run} <- actor_run(execution.id, run_id),
+         do: callback.(execution, run, DateTime.utc_now(:second))
   end
 
   defp with_actor_run(actor, run_id, callback) when is_function(callback, 3) do
@@ -1107,6 +1163,12 @@ defmodule ForgeImports.Conflicts do
   end
 
   defp expected_destination_owner(
+         %ForgeImports.OrganizationExecution{organization_id: id},
+         %ImportRun{destination_organization_id: id}
+       ),
+       do: {:ok, id}
+
+  defp expected_destination_owner(
          _actor,
          %ImportRun{
            destination_organization_action: :new,
@@ -1205,6 +1267,16 @@ defmodule ForgeImports.Conflicts do
     else
       :ok
     end
+  end
+
+  defp authorize_replacement(
+         %ForgeImports.OrganizationExecution{organization_id: id} = execution,
+         repository
+       ) do
+    with true <- repository.owner_user_id == id,
+         {:ok, _} <- ForgeImports.OrganizationExecution.authorize(execution, lock: true),
+         do: :ok,
+         else: (_ -> {:error, :not_found})
   end
 
   defp authorize_replacement(actor, repository) do

@@ -6,6 +6,55 @@ defmodule ForgeImports.OrganizationPatSettings do
   alias ForgeMirrors.PatSettings
 
   def refresh(actor, organization_id, version, metadata, opts \\ []) do
+    with {:ok, %{config: config}} <- PatSettings.view(actor, organization_id) do
+      case config.credential_source do
+        :organization_device ->
+          refresh_organization(actor, config, version, metadata, opts)
+
+        :public ->
+          ForgeImports.OrganizationPublicSync.refresh(
+            actor,
+            organization_id,
+            version,
+            metadata,
+            opts
+          )
+
+        _ ->
+          refresh_personal(actor, organization_id, version, metadata, opts)
+      end
+    end
+  end
+
+  defp refresh_organization(actor, config, version, metadata, opts) do
+    with true <- to_string(config.lock_version) == version,
+         {:ok, scope} <-
+           ForgeImports.OrganizationGitHubConnection.scope(config.organization_connection_id),
+         true <- ForgeImports.OrganizationExecution.scope_matches?(config, scope) do
+      ForgeImports.OrganizationGitHubConnection.with_credential(
+        scope,
+        fn _token, current ->
+          case PatSettings.store_inventory(
+                 actor,
+                 config.organization_id,
+                 version,
+                 current.inventory,
+                 metadata
+               ) do
+            {:ok, _} -> :ok
+            {:error, reason} -> {:error, reason}
+          end
+        end,
+        opts
+      )
+      |> organization_result()
+    else
+      false -> {:error, :stale}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp refresh_personal(actor, organization_id, version, metadata, opts) do
     client = Keyword.get(opts, :client, ForgeGitHub.Client)
 
     with {:ok, %{config: config}} <- PatSettings.view(actor, organization_id),
@@ -60,6 +109,213 @@ defmodule ForgeImports.OrganizationPatSettings do
     do: sync(actor, organization_id, version, metadata, Keyword.put(opts, :restart, true))
 
   def sync(actor, organization_id, version, metadata, opts \\ []) do
+    with {:ok, %{config: config}} <-
+           ForgeImports.OrganizationPublicSync.view(actor, organization_id) do
+      cond do
+        Keyword.has_key?(opts, :required_source) and
+            config.credential_source != opts[:required_source] ->
+          {:error, :source_changed}
+
+        config.credential_source in [:organization_device, :public] ->
+          sync_organization(actor, config, version, metadata, opts)
+
+        true ->
+          sync_personal(actor, organization_id, version, metadata, opts)
+      end
+    end
+  end
+
+  @doc false
+  def sync_organization_configuration(config, metadata) do
+    if config.credential_source in [:organization_device, :public],
+      do: sync_organization(nil, config, to_string(config.lock_version), metadata, []),
+      else: {:error, :invalid_context}
+  end
+
+  defp sync_organization(actor, expected, version, metadata, opts) do
+    alias ForgeImports.OrganizationExecution
+    alias Fornacast.Repo
+
+    with {:ok, metadata} <- ForgeAccounts.validate_github_request_metadata(metadata) do
+      Repo.transact(fn ->
+        Repo.one(
+          from org in ForgeAccounts.Organization,
+            where: org.id == ^expected.organization_id,
+            lock: "FOR UPDATE"
+        )
+
+        with :ok <- authorize_source_request(actor, expected),
+             %ForgeMirrors.PatConfiguration{} = config <-
+               Repo.one(
+                 from c in ForgeMirrors.PatConfiguration,
+                   where: c.id == ^expected.id,
+                   lock: "FOR UPDATE"
+               ),
+             :ok <- required_source(config, opts),
+             :ok <- sync_enabled(config, version),
+             {:ok, scope} <-
+               configuration_scope(config),
+             true <- OrganizationExecution.scope_matches?(config, scope) do
+          active =
+            Repo.one(
+              from job in PatSyncRun,
+                where: job.configuration_id == ^config.id and job.state in ["queued", "running"],
+                lock: "FOR UPDATE"
+            )
+
+          cond do
+            active && active.credential_source == config.credential_source &&
+                OrganizationExecution.scope_matches?(active, scope) ->
+              if Keyword.get(opts, :restart, false),
+                do: restart_organization_job(active, actor, config, scope, metadata),
+                else: queue_job(active)
+
+            active ->
+              {:error, :busy}
+
+            true ->
+              with {:ok, job} <- insert_organization_job(actor, config, scope, metadata),
+                   {:ok, recovered} <- recover_organization_import(job, scope),
+                   do: queue_job(recovered)
+          end
+        else
+          false -> {:error, :configuration_changed}
+          {:error, _} = error -> error
+          _ -> {:error, :configuration_changed}
+        end
+      end)
+    end
+  end
+
+  defp required_source(config, opts) do
+    if Keyword.has_key?(opts, :required_source) and
+         config.credential_source != opts[:required_source],
+       do: {:error, :source_changed},
+       else: :ok
+  end
+
+  defp configuration_scope(%{credential_source: :public} = config),
+    do: {:ok, ForgeImports.OrganizationExecution.public_scope(config)}
+
+  defp configuration_scope(config),
+    do: ForgeImports.OrganizationGitHubConnection.scope(config.organization_connection_id)
+
+  defp insert_organization_job(actor, config, scope, metadata) do
+    attrs =
+      Map.merge(ForgeImports.OrganizationExecution.snapshots(scope), %{
+        configuration_id: config.id,
+        organization_id: config.organization_id,
+        credential_source: config.credential_source,
+        requested_by_user_id: if(actor, do: actor.id, else: config.configured_by_user_id),
+        github_organization: scope.github_organization,
+        github_organization_id: scope.github_organization_id,
+        request_metadata: metadata
+      })
+
+    with {:ok, job} <- Fornacast.Repo.insert(struct(PatSyncRun, attrs)),
+         {:ok, _} <-
+           Fornacast.Repo.update(
+             Ecto.Changeset.change(config,
+               last_sync_at: DateTime.utc_now(:second),
+               last_sync_status: "running",
+               last_sync_summary: %{}
+             )
+           ),
+         do: {:ok, job}
+  end
+
+  defp restart_organization_job(previous, actor, config, scope, metadata) do
+    with :ok <- fence_organization_job(previous, metadata),
+         {:ok, _} <-
+           previous
+           |> Ecto.Changeset.change(
+             state: "failed",
+             error: "sync_restarted",
+             finished_at: DateTime.utc_now(:second),
+             lease_owner: nil,
+             lease_expires_at: nil
+           )
+           |> Fornacast.Repo.update(),
+         {:ok, job} <- insert_organization_job(actor, config, scope, metadata),
+         {:ok, job} <- recover_organization_import(job, scope),
+         do: queue_job(job)
+  end
+
+  defp fence_organization_job(%{import_run_id: nil}, _metadata), do: :ok
+
+  defp fence_organization_job(previous, metadata) do
+    with %ImportRun{} = run <- Fornacast.Repo.get(ImportRun, previous.import_run_id) do
+      if run.state in ImportRun.terminal_states() do
+        :ok
+      else
+        with {:ok, execution} <- ForgeImports.OrganizationExecution.for_run(run),
+             {:ok, _} <- ForgeImports.Retry.fence_organization_restart(execution, run, metadata),
+             do: :ok
+      end
+    else
+      _ -> {:error, :import_unavailable}
+    end
+  end
+
+  defp recover_organization_import(job, scope) do
+    candidates =
+      Fornacast.Repo.all(
+        from previous in PatSyncRun,
+          join: run in ImportRun,
+          on: run.id == previous.import_run_id,
+          left_join: successor in ImportRun,
+          on: successor.predecessor_run_id == run.id,
+          where:
+            previous.configuration_id == ^job.configuration_id and previous.state == "failed" and
+              previous.credential_source == ^job.credential_source and is_nil(successor.id) and
+              run.credential_source == ^job.credential_source and
+              run.state in [:failed, :canceled, :completed_with_warnings],
+          order_by: [desc: previous.id]
+      )
+
+    previous =
+      Enum.find(candidates, fn candidate ->
+        ForgeImports.OrganizationExecution.scope_matches?(candidate, scope) and
+          Fornacast.Repo.exists?(
+            from item in RepositoryItem,
+              where:
+                item.import_run_id == ^candidate.import_run_id and
+                  item.selected == true and item.state in [:failed, :canceled] and
+                  is_nil(item.cleanup_state) and item.publication_evidence == ^%{}
+          )
+      end)
+
+    if previous do
+      metadata = Map.put(job.request_metadata, "operation_id", "organization-pat-sync-#{job.id}")
+
+      with {:ok, execution} <- ForgeImports.OrganizationExecution.for_sync(job),
+           {:ok, successor} <-
+             ForgeImports.Retry.organization_successor(
+               execution,
+               Fornacast.Repo.get!(ImportRun, previous.import_run_id),
+               metadata
+             ),
+           do: attach_successor(job, previous, successor, metadata)
+    else
+      {:ok, job}
+    end
+  end
+
+  defp authorize_source_request(nil, config) do
+    case Fornacast.Repo.get(ForgeAccounts.Organization, config.organization_id) do
+      %{state: :active} -> :ok
+      _ -> {:error, :forbidden}
+    end
+  end
+
+  defp authorize_source_request(actor, config) do
+    case ForgeAccounts.fetch_manageable_organization(actor, config.organization_id) do
+      {:ok, _} -> :ok
+      error -> error
+    end
+  end
+
+  defp sync_personal(actor, organization_id, version, metadata, opts) do
     with {:ok, safe_metadata} <- ForgeAccounts.validate_github_request_metadata(metadata),
          {:ok, job} <-
            Fornacast.Repo.transact(fn ->
@@ -285,6 +541,70 @@ defmodule ForgeImports.OrganizationPatSettings do
   end
 
   def check(actor, organization_id, opts \\ []) do
+    with {:ok, %{config: config}} <- PatSettings.view(actor, organization_id) do
+      case config.credential_source do
+        :organization_device ->
+          check_organization(config, opts)
+
+        :public ->
+          with {:ok, _} <-
+                 ForgeImports.OrganizationPublicSync.refresh(
+                   actor,
+                   organization_id,
+                   to_string(config.lock_version),
+                   %{},
+                   opts
+                 ),
+               do: {:ok, length(config.inventory["repositories"] || [])}
+
+        _ ->
+          check_personal(actor, organization_id, opts)
+      end
+    end
+  end
+
+  defp check_organization(config, opts) do
+    ref = make_ref()
+
+    with {:ok, scope} <-
+           ForgeImports.OrganizationGitHubConnection.scope(config.organization_connection_id),
+         true <- ForgeImports.OrganizationExecution.scope_matches?(config, scope),
+         :ok <-
+           organization_result(
+             ForgeImports.OrganizationGitHubConnection.with_credential(
+               scope,
+               fn _token, current ->
+                 send(self(), {ref, length(current.inventory["repositories"] || [])})
+                 :ok
+               end,
+               opts
+             )
+           ) do
+      receive do
+        {^ref, count} ->
+          {:ok,
+           %{
+             owner: nil,
+             github_organization: scope.github_organization,
+             credential_status: :valid,
+             repository_count: count,
+             checked_at: DateTime.utc_now(:second)
+           }}
+      after
+        0 -> {:error, :unavailable}
+      end
+    else
+      false -> {:error, :configuration_changed}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp organization_result({:ok, :ok}), do: :ok
+  defp organization_result({:ok, {:error, reason}}), do: {:error, reason}
+  defp organization_result({:error, _} = error), do: error
+  defp organization_result(_), do: {:error, :unavailable}
+
+  defp check_personal(actor, organization_id, opts) do
     client = Keyword.get(opts, :client, ForgeGitHub.Client)
 
     with {:ok, %{config: config, credential: credential}} <-

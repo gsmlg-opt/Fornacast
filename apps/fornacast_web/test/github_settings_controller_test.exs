@@ -116,6 +116,41 @@ defmodule FornacastWeb.GitHubSettingsControllerTest do
     assert actor_id == actor.id
   end
 
+  test "configuration pages show their own form without loading linked accounts", %{actor: actor} do
+    device = request_conn(actor) |> get("/settings/github/device/legacy")
+    device_html = html_response(device, 200)
+    assert device_html =~ ~s(action="/settings/github/device")
+    refute device_html =~ ~s(name="github_account[pat]")
+    assert_private_no_store(device)
+
+    link = request_conn(actor) |> get("/settings/github/link")
+    link_html = html_response(link, 200)
+    assert link_html =~ ~s(action="/settings/github" method="post")
+    assert link_html =~ ~s(name="github_account[pat]")
+    refute link_html =~ ~s(action="/settings/github/device")
+    assert_private_no_store(link)
+    assert TestImports.calls() == []
+  end
+
+  test "PAT linking errors remain on the link configuration form", %{actor: actor} do
+    TestImports.accounts({:ok, [account(41, "octocat")]})
+
+    for params <- [
+          %{"github_account" => %{}},
+          %{"github_account" => %{"pat" => @pat}}
+        ] do
+      TestImports.result(:link, {:error, :invalid_credential})
+      conn = request_conn(actor) |> post("/settings/github", params)
+      html = html_response(conn, 422)
+      assert html =~ ~s(id="github-link-account")
+      assert html =~ ~s(name="github_account[pat]")
+      refute html =~ ~s(id="github-device-connect")
+      refute html =~ ~s(id="github-account-41")
+      refute secret_surfaces(conn) =~ @pat
+      assert_private_no_store(conn)
+    end
+  end
+
   test "link submits the PAT once, redirects safely, and leaks it nowhere in the response", %{
     actor: actor
   } do
@@ -168,6 +203,8 @@ defmodule FornacastWeb.GitHubSettingsControllerTest do
     html = html_response(invalid, 422)
 
     assert html =~ "GitHub rejected the personal access token."
+    assert html =~ ~s(id="github-account-41")
+    refute html =~ ~s(id="github-link-account")
     refute html =~ ":invalid_credential"
     assert_private_no_store(invalid)
   end
@@ -440,7 +477,7 @@ defmodule FornacastWeb.GitHubSettingsControllerTest do
   end
 
   test "the browser pipeline enforces a real CSRF token for mutations", %{actor: actor} do
-    form = request_conn(actor) |> get("/settings/github")
+    form = request_conn(actor) |> get("/settings/github/link")
     token = extract_csrf_token(form.resp_body)
 
     assert_raise Plug.CSRFProtection.InvalidCSRFTokenError, fn ->
@@ -468,14 +505,24 @@ defmodule FornacastWeb.GitHubSettingsControllerTest do
   test "unauthenticated and disabled users cannot reach GitHub account operations", %{
     actor: actor
   } do
-    anonymous = request_conn(nil) |> get("/settings/github")
-    assert redirected_to(anonymous) == "/login"
-    assert_private_no_store(anonymous)
+    for path <- ["/settings/github", "/settings/github/device", "/settings/github/link"] do
+      anonymous = request_conn(nil) |> get(path)
+      assert redirected_to(anonymous) == "/login"
+      assert_private_no_store(anonymous)
+    end
+
     assert mutation_calls() == []
 
     actor
     |> User.state_changeset(%{state: :disabled})
     |> Repo.update!()
+
+    for path <- ["/settings/github/device", "/settings/github/link"] do
+      disabled = request_conn(actor) |> get(path)
+      assert redirected_to(disabled) == "/login"
+      assert get_session(disabled, :user_id) == nil
+      assert_private_no_store(disabled)
+    end
 
     disabled = request_conn(actor) |> post("/settings/github/41/reverify", %{})
     assert redirected_to(disabled) == "/login"
@@ -487,11 +534,13 @@ defmodule FornacastWeb.GitHubSettingsControllerTest do
   test "the no-store pipeline precedes setup redirects", %{actor: actor} do
     Fornacast.Setup.reset!()
 
-    conn = request_conn(actor) |> get("/settings/github")
+    for path <- ["/settings/github", "/settings/github/device", "/settings/github/link"] do
+      conn = request_conn(actor) |> get(path)
+      assert redirected_to(conn) == "/setup"
+      assert_private_no_store(conn)
+    end
 
-    assert redirected_to(conn) == "/setup"
     assert TestImports.calls() == []
-    assert_private_no_store(conn)
   end
 
   test "a failed account listing is non-cacheable and sanitized", %{actor: actor} do

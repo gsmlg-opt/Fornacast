@@ -329,7 +329,8 @@ defmodule ForgeImports.CleanupReconciler do
         from item in RepositoryItem,
           where:
             item.import_run_id == ^run_id and item.selected == true and
-              item.state == :cancel_requested and is_nil(item.hidden_repository_id)
+              item.state == :cancel_requested and is_nil(item.cleanup_state) and
+              fragment("? = '{}'::jsonb", item.publication_evidence)
       )
 
     Enum.reduce_while(items, :ok, fn item, :ok ->

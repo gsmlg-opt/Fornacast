@@ -112,8 +112,21 @@ defmodule FornacastWeb.OrganizationGitHubSettingsController do
       |> put_status(:see_other)
       |> redirect(external: url)
     else
-      {:error, reason} -> render_error(conn, reason)
-      _unexpected -> render_error(conn, :unavailable)
+      {:error, :not_configured} ->
+        with {:ok, organization} <- manageable_organization(actor, params) do
+          conn
+          |> delete_session(@callback_session_key)
+          |> put_status(:see_other)
+          |> redirect(to: settings_path(organization) <> "/app/advanced")
+        else
+          {:error, reason} -> render_error(conn, reason)
+        end
+
+      {:error, reason} ->
+        render_error(conn, reason)
+
+      _unexpected ->
+        render_error(conn, :unavailable)
     end
   end
 
@@ -234,7 +247,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsController do
   defp handle_action_result(conn, organization, {:ok, _result}) do
     conn
     |> put_status(:see_other)
-    |> redirect(to: settings_path(organization) <> "/app")
+    |> redirect(to: settings_path(organization) <> "/app/advanced")
   end
 
   defp handle_action_result(conn, _organization, {:error, reason}),

@@ -752,6 +752,92 @@ defmodule ForgeImports.RepositoryCleanupTest do
   end
 
   @tag :tmp_dir
+  test "abandonment marker never exempts source drift or references to the old shadow", %{
+    tmp_dir: tmp_dir
+  } do
+    for mutation <- [:source, :old_repository, :old_path, :other_adopter, :malformed_marker] do
+      fixture =
+        cleanup_fixture(:unpublished_shadow, tmp_dir,
+          create_target?: true,
+          raw_unpublished?: true
+        )
+
+      {:ok, run} =
+        fixture.run
+        |> Map.from_struct()
+        |> Map.drop([:id, :__meta__, :inserted_at, :updated_at])
+        |> Map.merge(%{predecessor_run_id: fixture.run.id, state: :running, terminal_at: nil})
+        |> ForgeImports.Persistence.insert_run()
+
+      {:ok, successor} =
+        fixture.item
+        |> Map.from_struct()
+        |> Map.drop([:id, :__meta__, :inserted_at, :updated_at])
+        |> Map.merge(%{
+          import_run_id: run.id,
+          predecessor_item_id: fixture.item.id,
+          state: :queued,
+          hidden_repository_id: nil,
+          staged_storage_path: nil,
+          attempt_count: 0,
+          checkpoint: %{},
+          source_git: %{},
+          publication_evidence: %{}
+        })
+        |> ForgeImports.Persistence.insert_repository_item()
+
+      marker = %{"repository_id" => fixture.repository.id, "successor_item_id" => successor.id}
+
+      Repo.update!(
+        Ecto.Changeset.change(fixture.item,
+          checkpoint: %{"retry_staging_abandoned" => marker},
+          staged_storage_path: fixture.target
+        )
+      )
+
+      case mutation do
+        :source ->
+          Repo.update!(Ecto.Changeset.change(successor, source_full_name: "acme/source-drift"))
+
+        :old_repository ->
+          Repo.update!(
+            Ecto.Changeset.change(successor,
+              hidden_repository_id: fixture.repository.id,
+              staged_storage_path: fixture.target
+            )
+          )
+
+        :old_path ->
+          Repo.update!(Ecto.Changeset.change(successor, staged_storage_path: fixture.target))
+
+        :other_adopter ->
+          {:ok, _} =
+            ForgeImports.Persistence.insert_repository_item(%{
+              import_run_id: run.id,
+              github_repository_id: System.unique_integer([:positive]),
+              source_full_name: "acme/other-adopter",
+              source_name: "other-adopter",
+              source_metadata: %{},
+              source_observed_at: fixture.now,
+              hidden_repository_id: fixture.repository.id
+            })
+
+        :malformed_marker ->
+          Repo.update!(
+            Ecto.Changeset.change(Repo.reload!(fixture.item),
+              checkpoint: %{"retry_staging_abandoned" => Map.put(marker, "unexpected", true)}
+            )
+          )
+      end
+
+      assert reconcile_at(:unpublished_shadow, fixture.now) in [:none, :attempted]
+      assert File.dir?(fixture.target)
+      assert Repo.reload!(fixture.repository).storage_reclaimed_at == nil
+      assert Repo.get_by(CleanupOperation, repository_id: fixture.repository.id) == nil
+    end
+  end
+
+  @tag :tmp_dir
   test "unpublished cleanup revalidates every eligibility fact before filesystem effects", %{
     tmp_dir: tmp_dir
   } do

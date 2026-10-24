@@ -309,6 +309,125 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
     end
   end
 
+  test "unpublished .github cancellation materializes cleanup without removing its shadow" do
+    context = unpublished_selector_context!()
+    now = DateTime.utc_now(:second)
+    shadow_slug = "import-#{context.item.id}-#{String.duplicate("a", 24)}"
+
+    Repo.update_all(
+      from(repository in Repository, where: repository.id == ^context.repository.id),
+      set: [slug: shadow_slug, name: "GitHub import #{context.item.id}"]
+    )
+
+    Repo.update_all(from(run in ImportRun, where: run.id == ^context.run.id),
+      set: [state: :canceled]
+    )
+
+    Repo.update_all(from(item in RepositoryItem, where: item.id == ^context.item.id),
+      set: [state: :canceled]
+    )
+
+    decision = %{"action" => "create", "slug" => ".github"}
+
+    Repo.update_all(
+      from(attempt in ImportAttempt, where: attempt.repository_item_id == ^context.item.id),
+      set: [state: :destination_changed, decision: decision]
+    )
+
+    unless Process.whereis(GitCore.RepositoryReadLimiter) do
+      start_supervised!({GitCore.RepositoryReadLimiter, server: GitCore.RepositoryReadLimiter})
+    end
+
+    unless Process.whereis(GitCore.RepositoryWriteLimiter) do
+      start_supervised!(
+        {GitCore.RepositoryWriteLimiter,
+         server: GitCore.RepositoryWriteLimiter,
+         capacity: GitCore.Limits.get(:repository_writer_concurrency)}
+      )
+    end
+
+    assert :attempted =
+             RepositoryCleanup.reconcile_kind(
+               :unpublished_shadow,
+               now,
+               System.monotonic_time(:millisecond) + 5_000
+             )
+
+    cleanup = Repo.get_by!(CleanupOperation, repository_item_id: context.item.id)
+    assert cleanup.kind == :unpublished_shadow
+    assert cleanup.state == :cleanup_pending
+    assert cleanup.evidence["attempt_decision"] == decision
+    assert cleanup.evidence["attempt_state"] == "destination_changed"
+    assert cleanup.evidence["publication_evidence"] == %{}
+    assert cleanup.effect_started_at == nil
+    assert cleanup.effect_finished_at == nil
+    assert DateTime.compare(cleanup.eligible_at, now) == :gt
+    assert cleanup.evidence["relative_path"] == context.repository.storage_path
+    repository = Repo.get!(Repository, context.repository.id)
+    assert repository.lifecycle == :tombstoned
+    assert repository.storage_reclaimed_at == nil
+    assert repository.storage_path == context.repository.storage_path
+  end
+
+  test "cleanup decision and publication slugs follow the repository canonical contract" do
+    unpublished_context = cleanup_context("slug-unpublished")
+
+    unpublished =
+      %CleanupOperation{}
+      |> CleanupOperation.create_changeset(unpublished_attrs(unpublished_context))
+      |> Repo.insert!()
+
+    replacement_context = cleanup_context("slug-replacement")
+
+    {:ok, repository} =
+      ForgeRepos.create_repository(replacement_context.actor, %{
+        name: "replacement-#{replacement_context.suffix}",
+        slug: "replacement-#{replacement_context.suffix}"
+      })
+
+    replacement =
+      %CleanupOperation{}
+      |> CleanupOperation.create_changeset(replacement_attrs(replacement_context, repository))
+      |> Repo.insert!()
+
+    for slug <- [".github", "_repo", "-repo", "repo.", String.duplicate("a", 100)] do
+      assert Repository.canonical_slug?(slug)
+
+      for action <- ["create", "rename"] do
+        evidence = cleanup_slug_evidence(unpublished, slug, action)
+        assert {1, nil} = update_cleanup_evidence(unpublished, evidence)
+      end
+
+      evidence = cleanup_slug_evidence(replacement, slug, "replace")
+      assert {1, nil} = update_cleanup_evidence(replacement, evidence)
+    end
+
+    for slug <- [
+          "",
+          ".",
+          "..",
+          "repo.git",
+          "Repo",
+          "repo/name",
+          "repo name",
+          String.duplicate("a", 101)
+        ] do
+      refute Repository.canonical_slug?(slug)
+
+      for {cleanup, action} <- [
+            {unpublished, "create"},
+            {unpublished, "rename"},
+            {replacement, "replace"}
+          ] do
+        assert_update_rejected(
+          cleanup,
+          [evidence: cleanup_slug_evidence(cleanup, slug, action)],
+          "github_import_cleanups_evidence_check"
+        )
+      end
+    end
+  end
+
   test "database requires the quarantine reservation to occupy the entire basename" do
     cleanup = cleanup_fixture()
     root = cleanup.evidence["storage_root"]
@@ -848,6 +967,29 @@ defmodule ForgeImports.CleanupRecoveryMigrationTest do
       eligible_at: now,
       next_attempt_at: now
     }
+  end
+
+  defp cleanup_slug_evidence(cleanup, slug, action) do
+    decision =
+      Map.merge(cleanup.evidence["attempt_decision"], %{"slug" => slug, "action" => action})
+
+    evidence =
+      cleanup.evidence
+      |> Map.put("attempt_decision", decision)
+      |> Map.put(
+        "attempt_fingerprint",
+        CleanupOperation.attempt_fingerprint(cleanup.repository_item_id, 1, decision)
+      )
+
+    if cleanup.kind == :replacement_tombstone,
+      do: put_in(evidence, ["publication_marker", "slug"], slug),
+      else: evidence
+  end
+
+  defp update_cleanup_evidence(cleanup, evidence) do
+    Repo.update_all(from(candidate in CleanupOperation, where: candidate.id == ^cleanup.id),
+      set: [evidence: evidence]
+    )
   end
 
   defp assert_update_rejected(cleanup, updates, constraint) do

@@ -59,10 +59,21 @@ defmodule ForgeImports.DiscoveryWorker do
   end
 
   defp discover(%ImportRun{state: :discovering} = capability, options) do
-    actor = Repo.get(User, capability.actor_user_id)
+    actor =
+      if capability.credential_source == :organization_device or
+           (capability.credential_source == :public and
+              not is_nil(capability.organization_sync_run_id)) do
+        case ForgeImports.OrganizationExecution.for_run(capability) do
+          {:ok, execution} -> execution
+          _ -> nil
+        end
+      else
+        Repo.get(User, capability.actor_user_id)
+      end
 
     cond do
-      not match?(%User{kind: :user, state: :active}, actor) ->
+      not match?(%User{kind: :user, state: :active}, actor) and
+          not is_struct(actor, ForgeImports.OrganizationExecution) ->
         handle_discovery_result(
           actor || %{id: capability.actor_user_id},
           capability,
@@ -70,7 +81,13 @@ defmodule ForgeImports.DiscoveryWorker do
           options
         )
 
-      capability.credential_source in [:saved, :one_time, :github_app] ->
+      capability.credential_source in [
+        :saved,
+        :one_time,
+        :github_app,
+        :organization_device,
+        :public
+      ] ->
         discover_with_credential(actor, capability, options)
 
       true ->
@@ -92,7 +109,7 @@ defmodule ForgeImports.DiscoveryWorker do
           send(parent, {reference, result})
           callback_result(result)
         end,
-        credential_options(options)
+        credential_options(options, capability.credential_source)
       )
 
     case checkout do
@@ -108,6 +125,9 @@ defmodule ForgeImports.DiscoveryWorker do
 
       {:error, {:terminal, reason}} ->
         handle_discovery_result(actor, capability, {:error, reason}, options)
+
+      {:error, :paused} when capability.credential_source == :public ->
+        defer_public_pause(capability)
 
       {:error, reason} when is_atom(reason) ->
         handle_discovery_result(
@@ -164,10 +184,64 @@ defmodule ForgeImports.DiscoveryWorker do
 
   defp repository_destination(actor, _capability, _login), do: Destination.personal(actor)
 
+  defp discover_organization(
+         %ForgeImports.OrganizationExecution{} = actor,
+         capability,
+         token,
+         client,
+         opts
+       ) do
+    with {:ok, scope} <- ForgeImports.OrganizationExecution.authorize(actor),
+         {:ok, source} <- client.organization(token, scope.github_organization, opts),
+         {:ok, source} <- validate_organization(actor, source, token),
+         true <- source.id == scope.github_organization_id,
+         {:ok, repositories} <-
+           organization_repositories(client, token, scope, opts),
+         :ok <- public_discovery_authorized(actor, token),
+         {:ok, repositories} <-
+           validate_organization_repositories(actor, source, repositories, token),
+         {:ok, destination} <- destination_for_run(actor, capability, source.login),
+         %ForgeMirrors.PatConfiguration{} = config <-
+           Repo.get(
+             ForgeMirrors.PatConfiguration,
+             Repo.get!(ForgeImports.PatSyncRun, actor.pat_sync_run_id).configuration_id
+           ) do
+      repositories =
+        if config.repository_selection == "selected",
+          do: Enum.filter(repositories, &(&1.id in config.selected_repository_ids)),
+          else: repositories
+
+      {:ok,
+       %{
+         source_owner_github_id: source.id,
+         source_owner_login: source.login,
+         source_repository_github_id: nil,
+         source_repository_full_name: nil,
+         source_metadata: organization_metadata(source, DateTime.utc_now(:second)),
+         safety_profiles: [source | repositories],
+         repository_plans:
+           Destination.repository_plans(repositories, destination, DateTime.utc_now(:second))
+       }}
+    else
+      false ->
+        {:error, :source_changed}
+
+      {:error, %Error{} = error} ->
+        if(token == :public, do: {:error, error}, else: {:error, error.kind})
+
+      {:error, _} = error ->
+        error
+
+      _ ->
+        {:error, :configuration_changed}
+    end
+  end
+
   defp discover_organization(actor, capability, pat, client, client_options) do
     with {:ok, source} <- client.organization(pat, capability.source_owner_login, client_options),
          {:ok, source} <- validate_organization(actor, source, pat),
          :ok <- exact_organization(source, capability.source_owner_login),
+         :ok <- pinned_public_organization(capability, source),
          observed_at = DateTime.utc_now(:second),
          {:ok, repositories} <-
            client.organization_repositories(pat, capability.source_owner_login, client_options),
@@ -187,10 +261,25 @@ defmodule ForgeImports.DiscoveryWorker do
            Destination.repository_plans(repository_plans, destination, observed_at)
        }}
     else
-      {:error, %Error{kind: kind}} -> {:error, kind}
-      {:error, reason} -> {:error, normalize_source_error(reason)}
+      {:error, %Error{} = error} ->
+        if(pat == :public, do: {:error, error}, else: {:error, error.kind})
+
+      {:error, reason} ->
+        {:error, normalize_source_error(reason)}
     end
   end
+
+  defp public_discovery_authorized(actor, :public) do
+    with {:ok, _} <- ForgeImports.OrganizationExecution.authorize(actor), do: :ok
+  end
+
+  defp public_discovery_authorized(_actor, _token), do: :ok
+
+  defp organization_repositories(client, :public, scope, opts),
+    do: client.organization_repositories(:public, scope.github_organization, opts)
+
+  defp organization_repositories(client, token, scope, opts),
+    do: client.user_installation_repositories(token, scope.installation_id, opts)
 
   defp validate_repository(actor, %Repository{} = source, pat) do
     json =
@@ -213,7 +302,8 @@ defmodule ForgeImports.DiscoveryWorker do
 
     with {:ok, safe} <- Repository.from_json(json),
          :ok <- GitHubProfileSafety.validate(safe, pat),
-         :ok <- ForgeAccounts.validate_github_external_profile(actor, safe) do
+         :ok <- public_visibility(safe, pat),
+         :ok <- validate_source_profiles(actor, [safe], pat) do
       {:ok, safe}
     else
       {:error, :credential_service_unavailable} = error -> error
@@ -235,7 +325,7 @@ defmodule ForgeImports.DiscoveryWorker do
 
     with {:ok, safe} <- Organization.from_json(json),
          :ok <- GitHubProfileSafety.validate(safe, pat),
-         :ok <- ForgeAccounts.validate_github_external_profile(actor, safe) do
+         :ok <- validate_source_profiles(actor, [safe], pat) do
       {:ok, safe}
     else
       {:error, :credential_service_unavailable} = error -> error
@@ -269,6 +359,20 @@ defmodule ForgeImports.DiscoveryWorker do
 
   defp validate_organization_repositories(_actor, _source, _repositories, _pat),
     do: {:error, :invalid_response}
+
+  defp public_visibility(%Repository{visibility: :public}, :public), do: :ok
+  defp public_visibility(%Repository{}, :public), do: {:error, :private_repository}
+  defp public_visibility(_repository, _credential), do: :ok
+
+  defp pinned_public_organization(
+         %ImportRun{credential_source: :public, source_owner_github_id: id},
+         %Organization{id: current}
+       )
+       when not is_nil(id) do
+    if id == current, do: :ok, else: {:error, :configuration_changed}
+  end
+
+  defp pinned_public_organization(_, _), do: :ok
 
   defp repositories_for_policy(
          %ImportRun{
@@ -358,6 +462,16 @@ defmodule ForgeImports.DiscoveryWorker do
     end
   end
 
+  defp defer_public_pause(capability) do
+    case OperationLease.update_owned(ImportRun, capability,
+           wait_reason: "paused",
+           next_attempt_at: DateTime.add(DateTime.utc_now(:second), 30)
+         ) do
+      {:ok, _} -> {:error, :paused}
+      {:error, _} = error -> error
+    end
+  end
+
   defp defer_credential_retry(capability) do
     retry_at = DateTime.add(DateTime.utc_now(:second), @credential_retry_seconds, :second)
 
@@ -373,6 +487,38 @@ defmodule ForgeImports.DiscoveryWorker do
       finalize_discovery_result(actor, fresh, result)
     end
   end
+
+  defp finalize_discovery_result(
+         _actor,
+         %ImportRun{credential_source: :public} = capability,
+         {:error, %Error{kind: kind, retry_at: retry_at}}
+       )
+       when kind in [:primary_rate_limit, :secondary_rate_limit, :request_gate_busy] do
+    now = DateTime.utc_now(:second)
+
+    retry_at =
+      if is_struct(retry_at, DateTime) and DateTime.compare(retry_at, now) == :gt,
+        do: DateTime.truncate(retry_at, :second),
+        else: DateTime.add(now, 30, :second)
+
+    with {:ok, _} <-
+           OperationLease.update_owned(ImportRun, capability,
+             wait_reason: Atom.to_string(kind),
+             next_attempt_at: retry_at
+           ) do
+      {:error, kind}
+    end
+  end
+
+  defp finalize_discovery_result(
+         _actor,
+         %ImportRun{credential_source: :public} = capability,
+         {:error, :paused}
+       ),
+       do: defer_public_pause(capability)
+
+  defp finalize_discovery_result(actor, capability, {:error, %Error{kind: kind}}),
+    do: finalize_failure(actor, capability, kind)
 
   defp finalize_discovery_result(actor, capability, {:ok, plan}),
     do: finalize_success(actor, capability, plan)
@@ -390,9 +536,57 @@ defmodule ForgeImports.DiscoveryWorker do
     )
   end
 
+  defp validate_source_profiles(_actor, profiles, :public),
+    do:
+      Enum.reduce_while(profiles, :ok, fn profile, :ok ->
+        case GitHubProfileSafety.validate(profile, :public) do
+          :ok -> {:cont, :ok}
+          error -> {:halt, error}
+        end
+      end)
+
+  defp validate_source_profiles(actor, profiles, _credential),
+    do: validate_external_profiles(actor, profiles)
+
+  defp validate_external_profiles(%ForgeImports.OrganizationExecution{} = execution, profiles) do
+    with {:ok, scope} <- ForgeImports.OrganizationExecution.authorize(execution) do
+      if Map.get(scope, :credential_source) == :public do
+        Enum.reduce_while(profiles, :ok, fn profile, :ok ->
+          case ForgeAccounts.GitHubProfileSafety.validate(profile, :public) do
+            :ok -> {:cont, :ok}
+            error -> {:halt, error}
+          end
+        end)
+      else
+        ForgeAccounts.OrganizationGitHubCredentials.validate_external_profiles(scope, profiles)
+      end
+    end
+  end
+
+  defp validate_external_profiles(actor, profiles),
+    do: ForgeAccounts.validate_github_external_profiles(actor, profiles)
+
+  defp authorize_discovery_settlement(%ForgeImports.OrganizationExecution{} = execution) do
+    case ForgeImports.OrganizationExecution.authorize(execution, lock: true) do
+      {:ok, _} -> :ok
+      error -> error
+    end
+  end
+
+  defp authorize_discovery_settlement(_), do: :ok
+
   defp finalize_success(actor, capability, plan) do
     transaction = fn ->
-      case ForgeAccounts.validate_github_external_profiles(actor, plan.safety_profiles) do
+      case authorize_discovery_settlement(actor) do
+        :ok -> :ok
+        {:error, reason} -> Repo.rollback(reason)
+      end
+
+      case validate_source_profiles(
+             actor,
+             plan.safety_profiles,
+             if(capability.credential_source == :public, do: :public, else: :authenticated)
+           ) do
         :ok -> :ok
         {:error, reason} -> Repo.rollback(reason)
       end
@@ -426,7 +620,9 @@ defmodule ForgeImports.DiscoveryWorker do
         source_repository_full_name: plan.source_repository_full_name,
         source_metadata: plan.source_metadata,
         selected_count: selected_count,
-        warning_count: warning_count
+        warning_count: warning_count,
+        wait_reason: nil,
+        next_attempt_at: nil
       ]
 
       with {:ok, updated} <- OperationLease.update_owned(ImportRun, capability, updates),
@@ -451,9 +647,17 @@ defmodule ForgeImports.DiscoveryWorker do
     end
 
     case Repo.transaction(transaction) do
-      {:ok, %ImportRun{state: :awaiting_resolution}} -> {:ok, :awaiting_resolution}
-      {:error, :lost_lease} -> {:error, :lost_lease}
-      {:error, _reason} -> {:error, :persistence_unavailable}
+      {:ok, %ImportRun{state: :awaiting_resolution}} ->
+        {:ok, :awaiting_resolution}
+
+      {:error, :paused} when capability.credential_source == :public ->
+        defer_public_pause(capability)
+
+      {:error, :lost_lease} ->
+        {:error, :lost_lease}
+
+      {:error, _reason} ->
+        {:error, :persistence_unavailable}
     end
   end
 
@@ -591,7 +795,10 @@ defmodule ForgeImports.DiscoveryWorker do
   defp callback_result({:error, :invalid_credential}), do: {:error, :invalid_credential}
   defp callback_result(_result), do: :ok
 
-  defp credential_options(options) do
+  defp credential_options(options, source) when source in [:organization_device, :public],
+    do: Keyword.put(options.client_options, :client, options.client)
+
+  defp credential_options(options, _source) do
     [
       keyring: options.keyring,
       token_broker: options.token_broker,

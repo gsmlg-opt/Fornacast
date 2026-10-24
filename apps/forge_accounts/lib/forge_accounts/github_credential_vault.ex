@@ -30,6 +30,75 @@ defmodule ForgeAccounts.GitHubCredentialVault do
           }
   end
 
+  def encrypt_organization_access(credential, access, keyring \\ configured()),
+    do: encrypt_organization(credential, access, :access, keyring)
+
+  def encrypt_organization_refresh(credential, refresh, keyring \\ configured()),
+    do: encrypt_organization(credential, refresh, :refresh, keyring)
+
+  def with_organization_access(credential, callback, keyring \\ configured()),
+    do: with_organization_secret(credential, :access, callback, keyring)
+
+  def with_organization_refresh(credential, callback, keyring \\ configured()),
+    do: with_organization_secret(credential, :refresh, callback, keyring)
+
+  defp encrypt_organization(credential, secret, purpose, keyring) do
+    with true <- valid_organization_binding?(credential),
+         true <- valid_pat?(secret),
+         {:ok, normalized} <- normalize_keyring(keyring) do
+      encrypt(secret, organization_aad(credential, purpose), normalized)
+    else
+      _ -> @service_error
+    end
+  rescue
+    _ -> @service_error
+  end
+
+  defp with_organization_secret(credential, purpose, callback, keyring) do
+    with true <- valid_organization_binding?(credential),
+         {:ok, normalized} <- normalize_keyring(keyring),
+         envelope <- organization_envelope(credential, purpose),
+         true <- valid_envelope?(envelope),
+         {:ok, secret} <- decrypt(envelope, organization_aad(credential, purpose), normalized) do
+      {:ok, callback.(secret)}
+    else
+      _ -> @service_error
+    end
+  end
+
+  defp organization_envelope(credential, :access),
+    do: %Envelope{
+      ciphertext: credential.ciphertext,
+      nonce: credential.nonce,
+      tag: credential.tag,
+      key_id: credential.key_id
+    }
+
+  defp organization_envelope(credential, :refresh),
+    do: %Envelope{
+      ciphertext: credential.refresh_ciphertext,
+      nonce: credential.refresh_nonce,
+      tag: credential.refresh_tag,
+      key_id: credential.refresh_key_id
+    }
+
+  defp valid_organization_binding?(%ForgeAccounts.OrganizationGitHubCredential{} = credential) do
+    positive_integer?(credential.id) and positive_integer?(credential.organization_id) and
+      positive_integer?(credential.github_user_id) and positive_integer?(credential.github_app_id) and
+      is_binary(credential.client_id) and byte_size(credential.client_id) in 1..255
+  end
+
+  defp valid_organization_binding?(_), do: false
+
+  defp organization_aad(credential, purpose) do
+    :erlang.term_to_binary(
+      {:fornacast_organization_github_credential, @aad_version, purpose, credential.id,
+       credential.organization_id, credential.client_id, credential.github_app_id,
+       credential.github_user_id},
+      [:deterministic]
+    )
+  end
+
   @spec encrypt_saved(GitHubCredential.t(), GitHubIdentity.t(), binary(), term()) ::
           {:ok, Envelope.t()} | {:error, :credential_service_unavailable}
   def encrypt_saved(credential, identity, pat, keyring \\ configured())

@@ -20,7 +20,7 @@ defmodule FornacastWeb.ImportHTMLTest do
     :failed
   ]
 
-  test "repository and organization forms use DuskMoon hierarchy and native secure inputs" do
+  test "repository form and organization chooser use DuskMoon hierarchy" do
     repository =
       render_component(&ImportHTML.repository/1,
         accounts: [account(41, "octocat")],
@@ -42,11 +42,12 @@ defmodule FornacastWeb.ImportHTMLTest do
     assert Enum.count(LazyHTML.query(repository_document, "article.card")) >= 1
     assert Enum.count(LazyHTML.query(organization_document, "article.card")) >= 1
     assert repository =~ ~s(action="/repos/import/discover" method="post")
-    assert organization =~ ~s(action="/organizations/import/discover" method="post")
+    assert organization =~ ~s(href="/organizations/import/public")
+    assert organization =~ ~s(href="/organizations/import/app")
     assert repository =~ ~s(name="import[source]")
-    assert organization =~ ~s(name="import[organization]")
+    refute organization =~ ~s(name="import[organization]")
 
-    for html <- [repository, organization] do
+    for html <- [repository] do
       [pat_input] = Regex.run(~r/<input\b[^>]*name="import\[pat\]"[^>]*>/, html)
       assert pat_input =~ ~s(type="password")
       assert pat_input =~ ~s(autocomplete="new-password")
@@ -62,12 +63,9 @@ defmodule FornacastWeb.ImportHTMLTest do
       refute html =~ ~r/<el-dm-button\b/
     end
 
-    assert organization =~ ~s(name="import[destination_action]")
-    assert organization =~ ~s(value="new")
-    assert organization =~ ~s(value="existing")
-    assert organization =~ ~s(value="51")
-    assert length(Regex.scan(~r/<fieldset\b/, organization)) >= 2
-    assert length(Regex.scan(~r/<legend\b/, organization)) >= 2
+    refute organization =~ ~s(name="import[github_identity_id]")
+    refute organization =~ ~s(name="import[pat]")
+    assert LazyHTML.query(organization_document, "form") |> Enum.empty?()
   end
 
   test "show renders only the safe run projection with every repository and collision warning" do
@@ -146,6 +144,7 @@ defmodule FornacastWeb.ImportHTMLTest do
       render_component(&ImportHTML.show/1,
         run: view,
         organizations: [],
+        destination_action: "existing",
         error: "Choices changed."
       )
 
@@ -164,7 +163,7 @@ defmodule FornacastWeb.ImportHTMLTest do
     assert html =~ "No owned organizations are available."
   end
 
-  test "existing organization destination leaves the inactive new slug exactly blank" do
+  test "existing organization destination omits the inactive new slug" do
     view = run_view()
 
     view = %{
@@ -183,8 +182,7 @@ defmodule FornacastWeb.ImportHTMLTest do
         error: nil
       )
 
-    [slug_input] = Regex.run(~r/<input\b[^>]*name="destination\[slug\]"[^>]*>/, html)
-    refute slug_input =~ ~r/\bvalue=/
+    refute html =~ ~s(name="destination[slug]")
     [organization_option] = Regex.run(~r/<option\b[^>]*value="51"[^>]*>acme<\/option>/, html)
     assert organization_option =~ "selected"
   end
@@ -469,6 +467,56 @@ defmodule FornacastWeb.ImportHTMLTest do
     assert html =~ ~s(data-destination-warning="conflict")
     refute html =~ ~s(href="/imports/91/conflicts")
     refute html =~ ~s(href="/imports/91/review")
+  end
+
+  test "public waiting progress retains source and shows the next attempt without token fields" do
+    run = run_view()
+
+    run = %{
+      run
+      | source: Map.put(run.source, :credential_source, :public),
+        destination: Map.put(run.destination, :organization_id, 51),
+        state: :discovering,
+        wait_reason: "primary_rate_limit",
+        next_attempt_at: ~U[2026-10-23 01:00:00Z]
+    }
+
+    html =
+      render_component(&ImportHTML.show/1, run: run, organizations: [], accounts: [], error: nil)
+
+    assert html =~ "Primary rate limit"
+    assert html =~ "Next attempt:"
+    assert html =~ "2026-10-23"
+    assert html =~ "/organizations/octo-local/settings/github/public"
+    refute html =~ "github_identity_id"
+    refute html =~ "import[pat]"
+  end
+
+  test "organization App runs guide recovery through the organization connection" do
+    for state <- [:failed, :awaiting_credential] do
+      run = run_view()
+
+      run = %{
+        run
+        | source: Map.put(run.source, :credential_source, :organization_device),
+          state: state
+      }
+
+      html =
+        render_component(&ImportHTML.show/1,
+          run: run,
+          organizations: [],
+          accounts: [],
+          error: nil
+        )
+
+      assert html =~ "/organizations/octo-local/settings/github/connection"
+      assert html =~ "Manage organization GitHub connection"
+      refute html =~ "import[github_identity_id]"
+      refute html =~ "import[pat]"
+      refute html =~ "/imports/91/retry"
+      refute ImportHTML.control_accounts?(run)
+    end
   end
 
   defp run_view do

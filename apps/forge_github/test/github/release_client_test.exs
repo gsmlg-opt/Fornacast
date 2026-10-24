@@ -5,6 +5,38 @@ defmodule ForgeGitHub.ReleaseClientTest do
 
   setup {Req.Test, :verify_on_exit!}
 
+  test "public releases retain bounded metadata and reject credential markers" do
+    for body <- [nil, "Release notes", "Bearer token authentication is supported"] do
+      stub = stub_name()
+
+      Req.Test.expect(stub, fn conn ->
+        assert Plug.Conn.get_req_header(conn, "authorization") == []
+        Req.Test.json(conn, [Map.put(release_json(41), "body", body)])
+      end)
+
+      assert {:ok, %{releases: [%{"id" => 41, "body" => ^body}], next_cursor: nil}} =
+               ReleaseClient.list_releases_page(
+                 :public,
+                 "acme",
+                 "widgets",
+                 nil,
+                 Keyword.put(client_opts(stub), :gate_key, {:public, 1})
+               )
+    end
+
+    stub = stub_name()
+    Req.Test.expect(stub, &Req.Test.json(&1, [Map.put(release_json(41), "body", "ghp_secret")]))
+
+    assert {:error, %Error{kind: :invalid_response}} =
+             ReleaseClient.list_releases_page(
+               :public,
+               "acme",
+               "widgets",
+               nil,
+               Keyword.put(client_opts(stub), :gate_key, {:public, 1})
+             )
+  end
+
   test "lists one exact bounded page and retains only canonical release metadata" do
     stub = stub_name()
 
@@ -629,6 +661,87 @@ defmodule ForgeGitHub.ReleaseClientTest do
                  path,
                  status,
                  opts
+               )
+    end
+  end
+
+  test "large release asset metadata pages keep integer cursors on the named repository" do
+    stub = stub_name()
+    asset = Map.new(1..32, &{"field_#{&1}", &1})
+
+    releases =
+      for id <- 1..100 do
+        release_json(id, tag_name: "v#{id}", assets: List.duplicate(asset, 16))
+      end
+
+    Req.Test.expect(stub, fn conn ->
+      assert conn.request_path == "/repos/acme/widgets/releases"
+      assert URI.decode_query(conn.query_string) == %{"page" => "1", "per_page" => "100"}
+
+      conn
+      |> Plug.Conn.put_resp_header(
+        "link",
+        ~s(<https://api.github.com/repositories/482252754/releases?page=2&per_page=100>; rel="next")
+      )
+      |> Req.Test.json(releases)
+    end)
+
+    Req.Test.expect(stub, fn conn ->
+      assert conn.request_path == "/repos/acme/widgets/releases"
+      assert URI.decode_query(conn.query_string) == %{"page" => "2", "per_page" => "100"}
+      Req.Test.json(conn, [])
+    end)
+
+    assert {:ok, %{releases: imported, next_cursor: 2}} =
+             ReleaseClient.list_releases_page(
+               "installation_token",
+               "acme",
+               "widgets",
+               nil,
+               client_opts(stub)
+             )
+
+    assert length(imported) == 100
+    assert Enum.all?(imported, &(&1["asset_count"] == 16))
+
+    assert {:ok, %{releases: [], next_cursor: nil}} =
+             ReleaseClient.list_releases_page(
+               "installation_token",
+               "acme",
+               "widgets",
+               2,
+               client_opts(stub)
+             )
+  end
+
+  test "numeric release aliases cannot change origin or resource" do
+    for target <- [
+          "https://api.github.com.evil.example/repositories/482252754/releases?page=2&per_page=100",
+          "http://api.github.com/repositories/482252754/releases?page=2&per_page=100",
+          "https://api.github.com:444/repositories/482252754/releases?page=2&per_page=100",
+          "https://user@api.github.com/repositories/482252754/releases?page=2&per_page=100",
+          "https://api.github.com/repositories/482252754/releases?page=2&per_page=100#fragment",
+          "https://api.github.com/repositories/482252754/issues?page=2&per_page=100",
+          "https://api.github.com/repositories/482252754/releases/41/assets?page=2&per_page=100",
+          "https://api.github.com/repositories/0/releases?page=2&per_page=100",
+          "https://api.github.com/repositories/not-an-id/releases?page=2&per_page=100",
+          "https://api.github.com/repos/another/project/releases?page=2&per_page=100"
+        ] do
+      stub = stub_name()
+
+      Req.Test.expect(stub, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("link", ~s(<#{target}>; rel="next"))
+        |> Req.Test.json([])
+      end)
+
+      assert {:error, %Error{kind: :invalid_pagination}} =
+               ReleaseClient.list_releases_page(
+                 "installation_token",
+                 "acme",
+                 "widgets",
+                 nil,
+                 client_opts(stub)
                )
     end
   end

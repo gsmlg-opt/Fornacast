@@ -130,7 +130,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
 
   test "all FR-010 organization GitHub routes precede dynamic catch-alls" do
     routes = [
-      {"GET", "/organizations/acme/settings/github/app", :index},
+      {"GET", "/organizations/acme/settings/github/app/advanced", :index},
       {"POST", "/organizations/acme/settings/github/install", :install},
       {"GET", "/organizations/acme/settings/github/callback", :callback},
       {"PATCH", "/organizations/acme/settings/github", :update},
@@ -181,7 +181,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
       TestOrganizationSync.reset()
       TestOrganizationSync.result(:get_settings, {:ok, settings_view(organization)})
 
-      conn = request_conn(actor) |> get(github_settings_path(organization) <> "/app")
+      conn = request_conn(actor) |> get(github_settings_path(organization) <> "/app/advanced")
       html = html_response(conn, 200)
 
       assert html =~ "GitHub settings"
@@ -214,7 +214,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
 
     TestOrganizationSync.result(:get_settings, {:ok, view})
 
-    conn = request_conn(owner) |> get(github_settings_path(organization) <> "/app")
+    conn = request_conn(owner) |> get(github_settings_path(organization) <> "/app/advanced")
     html = html_response(conn, 200)
 
     assert html =~ "Webhook delivery gap"
@@ -246,7 +246,9 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
     |> User.state_changeset(%{state: :disabled})
     |> Repo.update!()
 
-    disabled_actor = request_conn(owner) |> get(github_settings_path(organization) <> "/app")
+    disabled_actor =
+      request_conn(owner) |> get(github_settings_path(organization) <> "/app/advanced")
+
     assert redirected_to(disabled_actor) == "/login"
     assert get_session(disabled_actor, :user_id) == nil
     assert TestOrganizationSync.calls() == []
@@ -257,7 +259,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
     |> Repo.update!()
 
     disabled_organization =
-      request_conn(admin) |> get(github_settings_path(organization) <> "/app")
+      request_conn(admin) |> get(github_settings_path(organization) <> "/app/advanced")
 
     assert html_response(disabled_organization, 404) =~ "Organization settings not found."
     assert TestOrganizationSync.calls() == []
@@ -283,7 +285,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
       TestOrganizationSync.reset()
       conn = request(method, request_conn(owner), path, params)
 
-      assert redirected_to(conn, 303) == github_settings_path(organization) <> "/app"
+      assert redirected_to(conn, 303) == github_settings_path(organization) <> "/app/advanced"
 
       assert [{^operation, [%User{id: actor_id}, %Organization{id: organization_id} | args]}] =
                TestOrganizationSync.calls()
@@ -626,6 +628,81 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
     assert_private_no_store(conn)
   end
 
+  for {label, config} <- [{"disabled", :disabled}, {"malformed", %{app_id: "invalid"}}] do
+    @app_configuration config
+    test "#{label} installation configuration offers Device Flow and organization configuration",
+         %{owner: owner, organization: organization} do
+      previous_config = Application.get_env(:forge_github, :app_configuration, :disabled)
+      Application.put_env(:forge_github, :app_configuration, @app_configuration)
+      on_exit(fn -> Application.put_env(:forge_github, :app_configuration, previous_config) end)
+
+      base = github_settings_path(organization)
+
+      conn =
+        request_conn(owner)
+        |> Plug.Conn.put_private(:github_organization_sync, ForgeImports.OrganizationSync)
+        |> get(base <> "/app/advanced")
+
+      html = html_response(conn, 200)
+
+      assert html =~ "GitHub App installation is not configured on this instance."
+      assert html =~ "Device Flow"
+      assert html =~ ~s(href="/settings/github")
+      assert html =~ ~s(href="#{base}")
+      assert html =~ "data-organization-settings-layout"
+      refute html =~ ~s(action="#{base}/install")
+      assert_private_no_store(conn)
+    end
+
+    test "#{label} installation POST recovers to configuration guidance without persisting state",
+         %{owner: owner, organization: organization} do
+      previous_config = Application.get_env(:forge_github, :app_configuration, :disabled)
+      Application.put_env(:forge_github, :app_configuration, @app_configuration)
+      on_exit(fn -> Application.put_env(:forge_github, :app_configuration, previous_config) end)
+
+      base = github_settings_path(organization)
+
+      stale_correlation = %{
+        "actor_id" => owner.id,
+        "organization_id" => organization.id,
+        "state" => callback_state()
+      }
+
+      submitted =
+        request_conn(owner, github_organization_installation: stale_correlation)
+        |> Plug.Conn.put_private(:github_organization_sync, ForgeImports.OrganizationSync)
+        |> post(base <> "/install", %{})
+
+      assert redirected_to(submitted, 303) == base <> "/app/advanced"
+      assert get_session(submitted, :github_organization_installation) == nil
+      assert_private_no_store(submitted)
+      refute Repo.exists?(ForgeMirrors.OrganizationMirror)
+      refute Repo.exists?(ForgeMirrors.GitHubInstallationIntent)
+
+      recovered =
+        submitted
+        |> recycle_request()
+        |> Plug.Conn.put_private(:github_organization_sync, ForgeImports.OrganizationSync)
+        |> get(base <> "/app/advanced")
+
+      assert html_response(recovered, 200) =~
+               "GitHub App installation is not configured on this instance."
+    end
+  end
+
+  test "transient installation failures retain the unavailable response", %{
+    owner: owner,
+    organization: organization
+  } do
+    TestOrganizationSync.result(:begin_installation, {:error, :provider_unavailable})
+
+    conn = request_conn(owner) |> post(github_settings_path(organization) <> "/install", %{})
+
+    assert html_response(conn, 503) =~ "temporarily unavailable"
+    assert get_session(conn, :github_organization_installation) == nil
+    assert_private_no_store(conn)
+  end
+
   test "callback consumes correlation once and passes validated state as durable intent evidence",
        %{
          owner: owner,
@@ -644,7 +721,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
 
     completed = started |> recycle_request() |> get(callback_path)
 
-    assert redirected_to(completed, 303) == github_settings_path(organization) <> "/app"
+    assert redirected_to(completed, 303) == github_settings_path(organization) <> "/app/advanced"
     assert get_session(completed, :github_organization_installation) == nil
 
     assert [
@@ -819,7 +896,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
       TestOrganizationSync.reset()
       TestOrganizationSync.result(:get_settings, {:error, reason})
 
-      conn = request_conn(owner) |> get(github_settings_path(organization) <> "/app")
+      conn = request_conn(owner) |> get(github_settings_path(organization) <> "/app/advanced")
       html = html_response(conn, status)
 
       assert html =~ message
@@ -835,7 +912,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
   } do
     TestOrganizationSync.result(:get_settings, {:error, :provider_unavailable})
 
-    conn = request_conn(owner) |> get(github_settings_path(organization) <> "/app")
+    conn = request_conn(owner) |> get(github_settings_path(organization) <> "/app/advanced")
     html = html_response(conn, 503)
 
     assert html =~ "temporarily unavailable"
@@ -859,7 +936,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
       TestOrganizationSync.reset()
       TestOrganizationSync.result(:get_settings, {:error, reason})
 
-      conn = request_conn(owner) |> get(github_settings_path(organization) <> "/app")
+      conn = request_conn(owner) |> get(github_settings_path(organization) <> "/app/advanced")
       html = html_response(conn, 404)
       [main] = Regex.run(~r/<main\b[^>]*>(.*)<\/main>/s, html, capture: :all_but_first)
 
@@ -887,7 +964,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
       TestOrganizationSync.reset()
       TestOrganizationSync.result(:get_settings, {:ok, view})
 
-      conn = request_conn(owner) |> get(github_settings_path(organization) <> "/app")
+      conn = request_conn(owner) |> get(github_settings_path(organization) <> "/app/advanced")
 
       assert html_response(conn, 503) =~ "temporarily unavailable"
       assert [{:get_settings, [_actor, _organization]}] = TestOrganizationSync.calls()
@@ -906,7 +983,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
 
     TestOrganizationSync.result(:get_settings, {:ok, view})
 
-    form = request_conn(owner) |> get(github_settings_path(organization) <> "/app")
+    form = request_conn(owner) |> get(github_settings_path(organization) <> "/app/advanced")
     token = extract_form_csrf_token(form.resp_body, github_settings_path(organization))
 
     assert_raise Plug.CSRFProtection.InvalidCSRFTokenError, fn ->
@@ -930,7 +1007,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
         "github" => %{"repository_selection" => "all"}
       })
 
-    assert redirected_to(accepted, 303) == github_settings_path(organization) <> "/app"
+    assert redirected_to(accepted, 303) == github_settings_path(organization) <> "/app/advanced"
 
     assert [{:update_settings, [_actor, _organization, _attrs, _metadata]}] =
              TestOrganizationSync.calls()
@@ -1010,6 +1087,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsControllerTest do
   defp settings_view(organization) do
     %{
       organization: organization,
+      installation_configured: true,
       mirror: nil,
       installation: nil,
       coverage: :none,

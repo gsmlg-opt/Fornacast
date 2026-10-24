@@ -1,11 +1,45 @@
 # Optional local GitHub App acceptance
 
-The current PRD uses a saved PAT; a GitHub App is a future replacement and is
-not required for PAT synchronization. This document describes the optional App
-plumbing at `/organizations/:organization/settings/github/app`. It does not
-define prerequisites for the current PAT release. The accepted saved-PAT Git/LFS
+## Organization Device Flow connection
+
+Connect at `/organizations/:organization/settings/github/connection`. Complete
+fresh Device Flow consent for the organization, install the Fornacast App in the
+intended GitHub organization, and select/recheck its installation. Confirm the
+immutable GitHub organization and installation IDs, effective repository list
+and read permissions for contents, issues and pull requests. Personal saved
+credentials are not transferred to the organization.
+
+The public Client ID `Iv23lizCVE3E24s7fCA0` and Device Flow are sufficient for
+this connection; the App private key and webhook settings below are separate.
+Authorization without an installation must show **installation required**;
+missing permissions must prevent activation. Reconnect must clear ready status
+and require verification again. Check that another current local manager can
+manage the connection and that local authorizer removal leaves committed
+organization work independent of that user.
+
+Once existing jobs have settled, explicitly activate the organization source and
+start **Sync now**. Record the run ID and source snapshot without exposing tokens.
+Acceptance requires a terminal successful aggregate run, every discovered
+repository succeeded, and actual LFS download/integrity verification. A repository
+GET, public Git refs, successful authorization or mocked test is insufficient.
+GitHub-side installation and consent changes require the operator's action.
+
+## Separate private-key installation integration
+
+The optional installation-token integration is available at
+`/organizations/:organization/settings/github/app/advanced`. The Device Flow
+client ID alone does not configure this integration; it requires the four App
+settings below. Those settings are not prerequisites for organization Device
+Flow or legacy saved-credential synchronization. The accepted saved-PAT Git/LFS
 endpoint checks and remaining credential-specific gates are recorded in the
 [acceptance ledger](superpowers/plans/2026-09-07-github-org-sync-acceptance.md).
+
+Device Flow does not expand the App's effective repository permissions. Check
+GitHub-side installation permissions and selected repository coverage separately
+from the optional server settings below. Public repository discovery, metadata,
+and Git refs can succeed while LFS download authorization returns HTTP 403.
+Connection success alone does not establish successful synchronization; verify
+LFS access and a successful terminal synchronization result as well.
 
 ## Configure the local process
 

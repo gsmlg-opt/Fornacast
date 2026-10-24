@@ -1,0 +1,21 @@
+<section
+  class="grid gap-4 bg-surface-container-low text-on-surface rounded-2xl p-6"
+  data-github-organization-choice
+>
+  <.dm_link href="/settings/github" class="text-primary">Back to linked accounts</.dm_link>
+  <h2 class="text-2xl font-semibold">Choose an organization</h2>
+  <p>
+    Connect the GitHub App within an organization. Each organization owns its connection and installation; personal saved accounts are separate.
+  </p>
+  <ul class="grid gap-3" role="list">
+    <li :for={organization <- @organizations}>
+      <.dm_link
+        href={"/organizations/#{organization.username}/settings/github/connection"}
+        class="text-primary"
+      >{organization.display_name || organization.username}</.dm_link>
+    </li>
+  </ul>
+  <p :if={@organizations == []}>
+    You need to be an organization owner to configure a GitHub App connection.
+  </p>
+</section>

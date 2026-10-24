@@ -29,16 +29,24 @@ defmodule ForgeGitHub.LFS do
              {:ok, writer_state()} | {:error, term(), writer_state()})
 
   @doc "Requests validated Basic transfer actions from GitHub's trusted repository endpoint."
-  @spec batch(String.t(), String.t(), String.t(), :download | :upload, [object_spec()], keyword()) ::
+  @spec batch(
+          String.t() | :public,
+          String.t(),
+          String.t(),
+          :download | :upload,
+          [object_spec()],
+          keyword()
+        ) ::
           {:ok, [Object.t()]} | {:error, Error.t()}
   def batch(token, owner, repository, operation, objects, opts \\ []) do
     with :ok <- validate_token(token),
          true <- RepositoryReference.valid_owner?(owner),
          true <- RepositoryReference.valid_repository?(repository),
          {:ok, objects} <- validate_objects(objects),
-         true <- operation in [:download, :upload],
+         true <-
+           operation in [:download, :upload] and (token != :public or operation == :download),
          :ok <- validate_options(opts, [:ref, :authorize]),
-         {:ok, gate_key} <- Keyword.fetch(opts, :gate_key),
+         {:ok, gate_key} <- batch_gate_key(token, opts),
          :ok <- authorize(opts) do
       case RequestGate.run(gate_key, fn ->
              with :ok <- authorize(opts) do
@@ -230,6 +238,17 @@ defmodule ForgeGitHub.LFS do
       {:error, %Error{} = error} -> {:error, error}
       _invalid -> error(:invalid_lfs_response)
     end
+  end
+
+  defp batch_gate_key(:public, _opts), do: {:ok, {:public, 1}}
+  defp batch_gate_key(_token, opts), do: Keyword.fetch(opts, :gate_key)
+
+  defp batch_headers(:public) do
+    [
+      {"accept", @lfs_media_type},
+      {"content-type", @lfs_media_type},
+      {"user-agent", @user_agent}
+    ]
   end
 
   defp batch_headers(token) do
@@ -645,6 +664,8 @@ defmodule ForgeGitHub.LFS do
   end
 
   defp validate_object(_object), do: :error
+
+  defp validate_token(:public), do: :ok
 
   defp validate_token(token) when is_binary(token) and byte_size(token) in 1..16_384 do
     if String.valid?(token) and :binary.match(token, <<0>>) == :nomatch, do: :ok, else: :error

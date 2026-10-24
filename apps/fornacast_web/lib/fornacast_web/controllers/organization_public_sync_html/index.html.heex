@@ -1,0 +1,90 @@
+<OrganizationSettingsComponents.organization_settings_layout
+  organization={@organization}
+  active={:github}
+>
+  <section class="grid gap-4" data-organization-public-sync>
+    <header class="grid gap-2">
+      <h2 class="text-2xl font-semibold">Public repository synchronization</h2>
+      <p class="text-sm text-on-surface-variant">
+        Import and update public GitHub repositories without a GitHub account or token. Anonymous API rate limits apply.
+      </p>
+      <.dm_link
+        href={"/organizations/#{@organization.username}/settings/github"}
+        class="text-primary"
+      >Back to GitHub settings</.dm_link>
+    </header>
+    <.dm_alert :if={@error} id="public-sync-error" variant="error" role="alert">
+      {@error}
+    </.dm_alert>
+    <.dm_alert :if={@flash} id="public-sync-saved" variant="success" role="status">
+      {@flash}
+    </.dm_alert>
+    <.dm_card id="public-sync-configuration" variant="bordered" padding="lg">
+      <:title><span class="text-lg font-semibold">GitHub source</span></:title>
+      <p :if={@config.id && !configured?(@config)} class="text-sm text-on-surface-variant mb-4">
+        Saving this configuration switches the organization's synchronization to public repositories. Active tasks must finish first.
+      </p>
+      <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#157 --%>
+      <form action={base(@organization)} method="post" class="grid gap-4">
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <input type="hidden" name="_method" value="patch" />
+        <input type="hidden" name="public_sync[lock_version]" value={version(@config)} />
+        <.dm_input
+          id="public-sync-github-organization"
+          name="public_sync[github_organization]"
+          type="text"
+          label="GitHub organization login"
+          value={@config.github_organization}
+          required
+          maxlength="39"
+          autocomplete="off"
+          autocapitalize="none"
+          spellcheck="false"
+        />
+        <div>
+          <button class="btn btn-secondary" type="submit">Discover and save public source</button>
+        </div>
+      </form>
+    </.dm_card>
+    <.dm_card :if={configured?(@config)} id="public-sync-status" variant="bordered" padding="lg">
+      <:title><span class="text-lg font-semibold">Synchronization</span></:title>
+      <p role="status">
+        {if @config.paused, do: "Paused", else: @config.last_sync_status || "Ready to synchronize"}
+      </p>
+      <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#157 --%>
+      <form action={base(@organization) <> "/sync"} method="post" class="mt-4">
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <input type="hidden" name="public_sync[lock_version]" value={version(@config)} />
+        <button
+          class="btn btn-primary"
+          type="submit"
+          disabled={@config.paused || !@config.enabled}
+        >Synchronize now</button>
+      </form>
+      <form
+        action={"/organizations/#{@organization.username}/settings/github/pat/" <> if(@config.paused, do: "resume", else: "pause")}
+        method="post"
+        class="mt-3"
+      >
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <button class="btn btn-secondary" type="submit">{if @config.paused,
+          do: "Resume synchronization",
+          else: "Pause synchronization"}</button>
+      </form>
+    </.dm_card>
+    <nav class="flex flex-wrap gap-4" aria-label="Public synchronization tasks">
+      <.dm_link
+        href={"/organizations/#{@organization.username}/settings/github/repositories"}
+        class="text-primary"
+      >Manage synchronized repositories</.dm_link>
+      <.dm_link
+        href={"/organizations/#{@organization.username}/settings/github/runs"}
+        class="text-primary"
+      >Synchronization history</.dm_link>
+      <.dm_link
+        href={"/organizations/#{@organization.username}/settings/github/connection"}
+        class="text-primary"
+      >Connect GitHub App</.dm_link>
+    </nav>
+  </section>
+</OrganizationSettingsComponents.organization_settings_layout>

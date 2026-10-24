@@ -6,6 +6,56 @@ defmodule ForgeGitHub.LFS.TransferCoordinatorTest do
   alias ForgeRepos.Repository
   alias GitLFS.PointerScanner.Scan
 
+  test "public inbound LFS normalizes the shared gate and rejects remote writes" do
+    [requirement | _] = requirements()
+    parent = self()
+
+    callbacks =
+      callbacks(
+        list_requirements: fn _, _ ->
+          {:ok, %{objects: [requirement], next_cursor: nil}}
+        end,
+        batch: fn :public, "octocat", "repo", :download, objects, options ->
+          assert options[:gate_key] == {:public, 1}
+          send(parent, :public_batch)
+          {:ok, Enum.map(objects, &remote_download/1)}
+        end,
+        verify_local: fn _, _, _ -> :ok end
+      )
+
+    assert {:ok, nil} =
+             TransferCoordinator.process_page(
+               repository(),
+               scan(),
+               :inbound,
+               :public,
+               "octocat",
+               "repo",
+               nil,
+               gate_key: {:one_time_run, 91},
+               callbacks: callbacks
+             )
+
+    assert_received :public_batch
+
+    for direction <- [:outbound, :converge] do
+      assert {:error, %Error{kind: :invalid_request}} =
+               TransferCoordinator.process_page(
+                 repository(),
+                 scan(),
+                 direction,
+                 :public,
+                 "octocat",
+                 "repo",
+                 nil,
+                 gate_key: {:public, 1},
+                 callbacks: callbacks
+               )
+    end
+
+    refute_received :public_batch
+  end
+
   test "import credential gates are preserved for LFS Batch requests" do
     for gate_key <- [{:saved_credential, 21}, {:one_time_run, 34}] do
       [requirement | _] = requirements()

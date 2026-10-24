@@ -18,9 +18,14 @@ defmodule ForgeImports.OrganizationSync do
 
   def get_settings(%User{} = actor, %Organization{id: organization_id}) do
     with {:ok, view} <- ForgeMirrors.organization_settings(actor, organization_id) do
+      installation_configured = match?({:ok, %AppConfig{}}, AppConfig.fetch())
+
       {:ok,
-       update_in(view, [:actions], fn actions ->
+       view
+       |> Map.put(:installation_configured, installation_configured)
+       |> update_in([:actions], fn actions ->
          actions
+         |> Map.update!(:install, &(&1 and installation_configured))
          |> Map.put(:resolve_pull_merge_conflict, pull_merge_worker_enabled?())
          |> Map.put(
            :resolve_repository_metadata_conflict,

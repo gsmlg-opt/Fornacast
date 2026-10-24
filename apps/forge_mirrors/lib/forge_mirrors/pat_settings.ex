@@ -20,6 +20,95 @@ defmodule ForgeMirrors.PatSettings do
     end
   end
 
+  def activate_organization_connection(actor, organization_id, scope, version, metadata) do
+    mutate(actor, organization_id, to_string(version), metadata, fn config, _owners ->
+      with true <- scope.organization_id == organization_id,
+           false <- active_work?(config),
+           {:ok, current} <- ForgeMirrors.OrganizationGitHubConnections.scope(scope.connection_id),
+           true <- same_organization_scope?(scope, current),
+           :ok <- adopt_organization_mirror(config, current) do
+        {:ok,
+         change(
+           config,
+           Map.merge(organization_snapshots(current), %{
+             credential_source: :organization_device,
+             github_organization_id: nil,
+             configured_by_user_id: actor.id,
+             owner_user_id: nil,
+             github_identity_id: nil,
+             github_organization: current.github_organization,
+             enabled: true,
+             paused: false,
+             inventory: current.inventory,
+             inventory_refreshed_at: DateTime.utc_now(:second),
+             repository_selection: "all",
+             selected_repository_ids: [],
+             last_sync_at: nil,
+             last_sync_status: nil,
+             last_sync_summary: %{}
+           })
+         )}
+      else
+        true -> {:error, :busy}
+        false -> {:error, :credential_unavailable}
+        {:error, _} = error -> error
+      end
+    end)
+  end
+
+  def activate_public_source(actor, organization_id, source, version, metadata) do
+    expected = if to_string(version) == "0", do: "1", else: to_string(version)
+
+    mutate(
+      actor,
+      organization_id,
+      expected,
+      metadata,
+      fn config, _owners ->
+        cond do
+          to_string(version) == "0" and not is_nil(config.id) ->
+            {:error, :stale}
+
+          active_work?(config) or active_import?(organization_id) ->
+            {:error, :busy}
+
+          Repo.exists?(
+            from m in ForgeMirrors.OrganizationMirror,
+              where: m.organization_id == ^organization_id and m.state != :revoked
+          ) ->
+            {:error, :busy}
+
+          true ->
+            {:ok,
+             change(config, %{
+               credential_source: :public,
+               configured_by_user_id: actor.id,
+               owner_user_id: nil,
+               github_identity_id: nil,
+               organization_connection_id: nil,
+               organization_connection_version: nil,
+               organization_credential_id: nil,
+               organization_credential_version: nil,
+               github_installation_id: nil,
+               github_organization: source.github_organization,
+               github_organization_id: source.github_organization_id,
+               enabled: true,
+               paused: false,
+               trigger_mode: "manual",
+               inventory: source.inventory,
+               inventory_refreshed_at: DateTime.utc_now(:second),
+               repository_selection: "all",
+               selected_repository_ids: [],
+               last_sync_at: nil,
+               last_sync_status: nil,
+               last_sync_summary: %{}
+             })}
+        end
+      end,
+      public: true
+    )
+  end
+
   def save(actor, organization_id, attrs, metadata) when is_map(attrs) do
     mutate(actor, organization_id, attrs["lock_version"], metadata, fn config, owners ->
       if Map.has_key?(attrs, "lock_version") and
@@ -31,6 +120,13 @@ defmodule ForgeMirrors.PatSettings do
         candidate = apply_changes(changeset)
 
         cond do
+          config.credential_source in [:organization_device, :public] and
+              Enum.any?(
+                ~w(owner_user_id github_identity_id github_organization),
+                &Map.has_key?(attrs, &1)
+              ) ->
+            {:error, :invalid_request}
+
           not changeset.valid? ->
             {:error, :invalid_request}
 
@@ -118,6 +214,14 @@ defmodule ForgeMirrors.PatSettings do
               :owner_user_id,
               :github_identity_id,
               :github_organization,
+              :credential_source,
+              :organization_connection_id,
+              :organization_connection_version,
+              :organization_credential_id,
+              :organization_credential_version,
+              :github_installation_id,
+              :github_organization_id,
+              :public_configuration_version,
               :state
             ])
       )
@@ -133,9 +237,47 @@ defmodule ForgeMirrors.PatSettings do
               as: :configuration,
               where:
                 c.id == ^job.configuration_id and c.organization_id == ^job.organization_id and
-                  c.owner_user_id == ^job.owner_user_id and
-                  c.github_identity_id == ^job.github_identity_id and
+                  fragment("? IS NOT DISTINCT FROM ?", c.owner_user_id, ^job.owner_user_id) and
+                  fragment(
+                    "? IS NOT DISTINCT FROM ?",
+                    c.github_identity_id,
+                    ^job.github_identity_id
+                  ) and
                   c.github_organization == ^job.github_organization and
+                  fragment(
+                    "(? <> 'public' OR (? = ? AND ? = ?))",
+                    c.credential_source,
+                    c.lock_version,
+                    ^job.public_configuration_version,
+                    c.github_organization_id,
+                    ^job.github_organization_id
+                  ) and
+                  fragment("? = ?", c.credential_source, ^job.credential_source) and
+                  fragment(
+                    "? IS NOT DISTINCT FROM ?",
+                    c.organization_connection_id,
+                    ^job.organization_connection_id
+                  ) and
+                  fragment(
+                    "? IS NOT DISTINCT FROM ?",
+                    c.organization_connection_version,
+                    ^job.organization_connection_version
+                  ) and
+                  fragment(
+                    "? IS NOT DISTINCT FROM ?",
+                    c.organization_credential_id,
+                    ^job.organization_credential_id
+                  ) and
+                  fragment(
+                    "? IS NOT DISTINCT FROM ?",
+                    c.organization_credential_version,
+                    ^job.organization_credential_version
+                  ) and
+                  fragment(
+                    "? IS NOT DISTINCT FROM ?",
+                    c.github_installation_id,
+                    ^job.github_installation_id
+                  ) and
                   not exists(
                     from newer in "organization_pat_sync_runs",
                       where:
@@ -199,7 +341,7 @@ defmodule ForgeMirrors.PatSettings do
     end)
   end
 
-  defp mutate(actor, organization_id, version, metadata, fun) do
+  defp mutate(actor, organization_id, version, metadata, fun, opts \\ []) do
     with {:ok, safe_metadata} <- ForgeAccounts.validate_github_request_metadata(metadata) do
       Repo.transact(fn ->
         with {:ok, _organization} <-
@@ -211,7 +353,8 @@ defmodule ForgeMirrors.PatSettings do
                    where: o.id == ^organization_id,
                    lock: "FOR UPDATE"
                ),
-             {:ok, %{config: config, owners: owners}} <- view(actor, organization_id),
+             {:ok, %{config: config, owners: owners}} <-
+               mutation_view(actor, organization_id, opts),
              true <- to_string(config.lock_version) == version,
              {:ok, changeset} <- fun.(config, owners),
              {:ok, saved} <-
@@ -235,10 +378,174 @@ defmodule ForgeMirrors.PatSettings do
     end
   end
 
+  defp mutation_view(actor, organization_id, opts) do
+    if Keyword.get(opts, :public, false) do
+      with {:ok, org} <- ForgeAccounts.fetch_manageable_organization(actor, organization_id) do
+        config =
+          Repo.get_by(PatConfiguration, organization_id: organization_id) ||
+            %PatConfiguration{organization_id: organization_id, github_organization: org.username}
+
+        {:ok, %{config: config, owners: []}}
+      end
+    else
+      view(actor, organization_id)
+    end
+  end
+
+  defp credential(%PatConfiguration{credential_source: :public}, _owners),
+    do: %{credential_present: true, credential_status: :valid, credential_kind: :public}
+
+  defp credential(%PatConfiguration{credential_source: :organization_device} = config, _owners) do
+    scope = Map.merge(organization_scope(config), %{organization_id: config.organization_id})
+
+    if valid_organization_connection?(scope),
+      do: %{
+        credential_present: true,
+        credential_status: :valid,
+        credential_kind: :github_app_user
+      },
+      else: nil
+  end
+
   defp credential(config, owners) do
     with %{accounts: accounts} <- Enum.find(owners, &(&1.id == config.owner_user_id)) do
       Enum.find(accounts, &(&1.identity_id == config.github_identity_id))
     end
+  end
+
+  defp organization_snapshots(scope) do
+    %{
+      organization_connection_id: scope.connection_id,
+      organization_connection_version: scope.connection_version,
+      organization_credential_id: scope.credential_id,
+      organization_credential_version: scope.verification_version,
+      github_installation_id: scope.installation_id
+    }
+  end
+
+  defp organization_scope(config) do
+    %{
+      connection_id: config.organization_connection_id,
+      connection_version: config.organization_connection_version,
+      credential_id: config.organization_credential_id,
+      verification_version: config.organization_credential_version,
+      installation_id: config.github_installation_id
+    }
+  end
+
+  defp valid_organization_connection?(scope) do
+    case ForgeMirrors.OrganizationGitHubConnections.scope(scope.connection_id) do
+      {:ok, current} -> same_organization_scope?(scope, current)
+      _ -> false
+    end
+  end
+
+  defp same_organization_scope?(scope, current),
+    do:
+      Enum.all?(
+        [
+          :organization_id,
+          :connection_id,
+          :connection_version,
+          :credential_id,
+          :verification_version,
+          :installation_id
+        ],
+        &(Map.get(current, &1) == Map.get(scope, &1))
+      )
+
+  defp adopt_organization_mirror(config, scope) do
+    case Repo.one(
+           from mirror in ForgeMirrors.OrganizationMirror,
+             where:
+               mirror.organization_id == ^config.organization_id and mirror.provider == "github" and
+                 mirror.state != :revoked,
+             lock: "FOR UPDATE"
+         ) do
+      nil ->
+        :ok
+
+      %{credential_source: source} = mirror when source in [:pat, :organization_device] ->
+        with true <- mirror.github_account_id == scope.github_organization_id,
+             true <- mirror.capabilities == %{"git" => true, "lfs" => true},
+             true <- mirror.policy["auto_import_new_repositories"] == false,
+             true <- accessible_bindings?(mirror, scope),
+             :ok <-
+               ForgeMirrors.OrganizationGitHubConnections.claim_identity(
+                 config.organization_id,
+                 scope.github_organization_id,
+                 scope.installation_id
+               ) do
+          changes =
+            Map.merge(organization_snapshots(scope), %{
+              credential_source: :organization_device,
+              pat_configuration_id: config.id,
+              pat_configuration_version: config.lock_version + 1,
+              credential_owner_user_id: nil,
+              github_identity_id: nil,
+              github_credential_id: nil,
+              github_credential_version: nil,
+              github_account_login: scope.github_organization
+            })
+
+          case Repo.update(change(mirror, changes) |> optimistic_lock(:lock_version)) do
+            {:ok, _} -> :ok
+            {:error, _} -> {:error, :stale}
+          end
+        else
+          {:error, _} = error -> error
+          _ -> {:error, :already_bound}
+        end
+
+      _ ->
+        {:error, :already_bound}
+    end
+  end
+
+  defp accessible_bindings?(mirror, scope) do
+    available = MapSet.new(scope.inventory["repositories"] || [], & &1["id"])
+
+    Repo.all(
+      from binding in ForgeMirrors.RepositoryMirror,
+        where:
+          binding.organization_mirror_id == ^mirror.id and binding.state in [:active, :discovered],
+        select: binding.github_repository_id
+    )
+    |> Enum.all?(&MapSet.member?(available, &1))
+  end
+
+  defp active_import?(organization_id) do
+    Repo.exists?(
+      from run in "github_import_runs",
+        where:
+          run.destination_organization_id == ^organization_id and
+            run.state not in ["completed", "completed_with_warnings", "failed", "canceled"],
+        select: run.id
+    )
+  end
+
+  defp active_work?(%{id: nil}), do: false
+
+  defp active_work?(config) do
+    Repo.exists?(
+      from run in "organization_pat_sync_runs",
+        where: run.configuration_id == ^config.id and run.state in ["queued", "running"],
+        select: run.id
+    ) or
+      Repo.exists?(
+        from operation in ForgeMirrors.MirrorOperation,
+          join: mirror in ForgeMirrors.OrganizationMirror,
+          on: mirror.id == operation.organization_mirror_id,
+          where:
+            mirror.organization_id == ^config.organization_id and mirror.state != :revoked and
+              (operation.state == :effect_pending or
+                 (operation.state == :processing and
+                    (operation.lease_expires_at > fragment("timezone('UTC', clock_timestamp())") or
+                       fragment(
+                         "COALESCE(?, '{}'::jsonb) <> '{}'::jsonb",
+                         operation.external_effect_marker
+                       ))))
+      )
   end
 
   defp valid_credential?(%{credential_present: true, credential_status: :valid}), do: true

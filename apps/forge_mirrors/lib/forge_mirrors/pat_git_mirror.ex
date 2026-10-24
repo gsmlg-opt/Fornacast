@@ -13,7 +13,13 @@ defmodule ForgeMirrors.PatGitMirror do
   }
 
   @authority_fields [
+    :credential_source,
     :organization_id,
+    :organization_connection_id,
+    :organization_connection_version,
+    :organization_credential_id,
+    :organization_credential_version,
+    :github_installation_id,
     :pat_configuration_id,
     :pat_configuration_version,
     :credential_owner_user_id,
@@ -51,7 +57,17 @@ defmodule ForgeMirrors.PatGitMirror do
               where: m.pat_configuration_id == ^config.id and m.state != :revoked
           )
 
-        mirror = mirror!(config, credential, hd(proofs))
+        proof = hd(proofs)
+
+        check!(
+          ForgeMirrors.OrganizationGitHubConnections.claim_identity(
+            config.organization_id,
+            proof.account_id,
+            config.github_installation_id
+          )
+        )
+
+        mirror = mirror!(config, credential, proof)
         bindings = Enum.map(proofs, &binding!(mirror, &1))
 
         operations =
@@ -188,6 +204,41 @@ defmodule ForgeMirrors.PatGitMirror do
     end
   end
 
+  @doc false
+  def schedule_committed(config_id, repository_id, request_key, authorize)
+      when is_function(authorize, 0) and is_binary(request_key) and
+             byte_size(request_key) in 1..255 do
+    Repo.transaction(fn ->
+      config = lock_config(config_id)
+      require!(config != nil and config.credential_source == :organization_device, :not_found)
+      check!(authorize.())
+      {mirror, binding} = enrolled_binding(config_id, repository_id) || Repo.rollback(:not_found)
+      check!(authorize(scope(mirror, binding)))
+      enqueue!(mirror, binding, "request:#{request_key}", DateTime.utc_now(:second))
+    end)
+  end
+
+  @doc false
+  def status_committed(config_id, repository_id, operation_id, authorize)
+      when is_function(authorize, 0) do
+    with :ok <- authorize.(),
+         %PatConfiguration{credential_source: :organization_device} <-
+           Repo.get(PatConfiguration, config_id),
+         {mirror, binding} <- enrolled_binding(config_id, repository_id),
+         :ok <- authorize(scope(mirror, binding)),
+         %MirrorOperation{
+           organization_mirror_id: mid,
+           repository_mirror_id: bid,
+           kind: "reconcile.repository.git"
+         } = operation <- Repo.get(MirrorOperation, operation_id),
+         true <- mid == mirror.id and bid == binding.id do
+      reconciliation_status(binding, operation, MapSet.new())
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :not_found}
+    end
+  end
+
   defp reconciliation_status(binding, parent, visited) do
     if MapSet.member?(visited, parent.id) or MapSet.size(visited) >= 1_000 do
       {:ok, :pending}
@@ -270,7 +321,8 @@ defmodule ForgeMirrors.PatGitMirror do
     end
   end
 
-  def schedule_all(%OrganizationMirror{credential_source: :pat} = mirror, key, now) do
+  def schedule_all(%OrganizationMirror{credential_source: source} = mirror, key, now)
+      when source in [:pat, :organization_device] do
     with :ok <- authorize(scope(mirror)) do
       bindings =
         Repo.all(
@@ -292,8 +344,8 @@ defmodule ForgeMirrors.PatGitMirror do
     authority =
       Map.take(mirror, @authority_fields)
       |> Map.merge(%{
-        credential_source: :pat,
-        github_installation_id: nil,
+        credential_source: mirror.credential_source,
+        github_installation_id: mirror.github_installation_id,
         organization_mirror_id: mirror.id,
         remote_owner: mirror.github_account_login
       })
@@ -326,20 +378,19 @@ defmodule ForgeMirrors.PatGitMirror do
     end
   end
 
-  def authorize(%{credential_source: :pat, organization_mirror_id: id} = supplied) do
+  def authorize(%{credential_source: source, organization_mirror_id: id} = supplied)
+      when source in [:pat, :organization_device] do
     mirror = Repo.get(OrganizationMirror, id)
 
-    with %OrganizationMirror{credential_source: :pat, state: state} <- mirror,
+    with %OrganizationMirror{credential_source: ^source, state: state} <- mirror,
          :ok <- mirror_state(state),
          true <- Enum.all?(@authority_fields, &(Map.get(mirror, &1) == Map.get(supplied, &1))),
          :ok <- capabilities(mirror),
          %PatConfiguration{} = config <- Repo.get(PatConfiguration, mirror.pat_configuration_id),
          :ok <- configuration_state(config),
          true <- valid_config?(config, mirror),
-         %GitHubCredential{} = credential <- current_credential(config),
-         true <-
-           credential.id == mirror.github_credential_id and
-             credential.verification_version == mirror.github_credential_version,
+         credential when not is_nil(credential) <- current_credential(config),
+         true <- credential_matches?(credential, mirror),
          :ok <- authorize_repository(supplied, mirror),
          :ok <- authorize_operation(supplied, mirror) do
       :ok
@@ -363,7 +414,8 @@ defmodule ForgeMirrors.PatGitMirror do
 
   def authorize_operation_if_pat(operation) do
     case Repo.get(OrganizationMirror, operation.organization_mirror_id) do
-      %OrganizationMirror{credential_source: :pat} = mirror ->
+      %OrganizationMirror{credential_source: source} = mirror
+      when source in [:pat, :organization_device] ->
         case Repo.get(RepositoryMirror, operation.repository_mirror_id) do
           %RepositoryMirror{} = binding -> authorize(scope(mirror, binding, operation))
           _ -> {:error, :credential_unavailable}
@@ -436,6 +488,7 @@ defmodule ForgeMirrors.PatGitMirror do
     config.enabled and not config.paused and
       config.lock_version == mirror.pat_configuration_version and
       config.organization_id == mirror.organization_id and
+      source_config_matches?(config, mirror) and
       config.owner_user_id == mirror.credential_owner_user_id and
       config.github_identity_id == mirror.github_identity_id and
       String.downcase(config.github_organization) == String.downcase(mirror.github_account_login)
@@ -449,6 +502,54 @@ defmodule ForgeMirrors.PatGitMirror do
 
   defp configuration_state(%PatConfiguration{paused: true}), do: {:error, :paused}
   defp configuration_state(_), do: :ok
+
+  defp source_config_matches?(
+         %{credential_source: :organization_device} = config,
+         %{credential_source: :organization_device} = mirror
+       ) do
+    Enum.all?(
+      [
+        :organization_connection_id,
+        :organization_connection_version,
+        :organization_credential_id,
+        :organization_credential_version,
+        :github_installation_id
+      ],
+      &(Map.get(config, &1) == Map.get(mirror, &1))
+    )
+  end
+
+  defp source_config_matches?(%{credential_source: :personal}, %{credential_source: :pat}),
+    do: true
+
+  defp source_config_matches?(_, _), do: false
+
+  defp credential_matches?(credential, %{credential_source: :organization_device} = mirror),
+    do:
+      credential.id == mirror.organization_credential_id and
+        credential.verification_version == mirror.organization_credential_version
+
+  defp credential_matches?(credential, mirror),
+    do:
+      credential.id == mirror.github_credential_id and
+        credential.verification_version == mirror.github_credential_version
+
+  defp current_credential(%{credential_source: :organization_device} = config) do
+    with true <- config.enabled and not config.paused,
+         %ForgeAccounts.Organization{state: :active} <-
+           Repo.get(ForgeAccounts.Organization, config.organization_id),
+         {:ok, scope} <-
+           ForgeMirrors.OrganizationGitHubConnections.scope(config.organization_connection_id),
+         true <- scope.organization_id == config.organization_id,
+         true <-
+           Enum.all?(organization_snapshots(scope), fn {key, value} ->
+             Map.get(config, key) == value
+           end) do
+      %{id: scope.credential_id, verification_version: scope.verification_version}
+    else
+      _ -> nil
+    end
+  end
 
   defp current_credential(config) do
     with true <- config.enabled and not config.paused,
@@ -491,7 +592,8 @@ defmodule ForgeMirrors.PatGitMirror do
         join: m in OrganizationMirror,
         on: m.id == r.organization_mirror_id,
         where:
-          m.pat_configuration_id == ^config_id and m.credential_source == :pat and
+          m.pat_configuration_id == ^config_id and
+            m.credential_source in [:pat, :organization_device] and
             m.state != :revoked and r.repository_id == ^repository_id and
             r.state not in [:revoked, :tombstoned],
         select: {m, r}
@@ -516,10 +618,8 @@ defmodule ForgeMirrors.PatGitMirror do
             where:
               i.hidden_repository_id == ^id and i.state in ["published", "completed"] and
                 r.state in ["completed", "completed_with_warnings"] and
-                r.credential_source == "saved" and
-                r.github_identity_id == ^config.github_identity_id and
-                r.actor_user_id == ^config.owner_user_id and
                 r.destination_organization_id == ^config.organization_id,
+            where: ^proof_source(config),
             order_by: [desc: i.id],
             select: %{
               item_id: i.id,
@@ -568,6 +668,65 @@ defmodule ForgeMirrors.PatGitMirror do
     end
   end
 
+  defp proof_source(%{credential_source: :organization_device} = config) do
+    dynamic(
+      [i, r],
+      r.credential_source == "organization_device" and
+        r.organization_connection_id == ^config.organization_connection_id and
+        r.organization_connection_version == ^config.organization_connection_version and
+        r.organization_credential_id == ^config.organization_credential_id and
+        r.organization_credential_version == ^config.organization_credential_version and
+        r.github_installation_id == ^config.github_installation_id
+    )
+  end
+
+  defp proof_source(%{
+         credential_source: :personal,
+         github_identity_id: identity_id,
+         owner_user_id: owner_id
+       })
+       when is_integer(identity_id) and identity_id > 0 and is_integer(owner_id) and owner_id > 0 do
+    dynamic(
+      [i, r],
+      r.credential_source == "saved" and r.github_identity_id == ^identity_id and
+        r.actor_user_id == ^owner_id
+    )
+  end
+
+  defp proof_source(_), do: dynamic(false)
+
+  defp organization_snapshots(scope) do
+    %{
+      organization_connection_id: scope.connection_id,
+      organization_connection_version: scope.connection_version,
+      organization_credential_id: scope.credential_id,
+      organization_credential_version: scope.verification_version,
+      github_installation_id: scope.installation_id
+    }
+  end
+
+  defp mirror_authority(config, credential) do
+    common = %{pat_configuration_version: config.lock_version}
+
+    if config.credential_source == :organization_device do
+      Map.merge(
+        common,
+        Map.take(config, [
+          :organization_connection_id,
+          :organization_connection_version,
+          :organization_credential_id,
+          :organization_credential_version,
+          :github_installation_id
+        ])
+      )
+    else
+      Map.merge(common, %{
+        github_credential_id: credential.id,
+        github_credential_version: credential.verification_version
+      })
+    end
+  end
+
   defp mirror!(config, credential, proof) do
     existing =
       Repo.one(
@@ -580,7 +739,11 @@ defmodule ForgeMirrors.PatGitMirror do
 
     if existing do
       require!(
-        existing.credential_source == :pat and existing.pat_configuration_id == config.id and
+        existing.credential_source ==
+          if(config.credential_source == :organization_device,
+            do: :organization_device,
+            else: :pat
+          ) and existing.pat_configuration_id == config.id and
           existing.github_account_id == proof.account_id and
           existing.credential_owner_user_id == config.owner_user_id and
           existing.github_identity_id == config.github_identity_id and
@@ -588,11 +751,7 @@ defmodule ForgeMirrors.PatGitMirror do
         :already_bound
       )
 
-      changes = %{
-        pat_configuration_version: config.lock_version,
-        github_credential_id: credential.id,
-        github_credential_version: credential.verification_version
-      }
+      changes = mirror_authority(config, credential)
 
       if Enum.all?(changes, fn {key, value} -> Map.get(existing, key) == value end) do
         existing
@@ -606,20 +765,24 @@ defmodule ForgeMirrors.PatGitMirror do
         end
       end
     else
-      %OrganizationMirror{}
-      |> OrganizationMirror.pat_enrollment_changeset(%{
-        organization_id: config.organization_id,
-        provider: "github",
-        github_account_id: proof.account_id,
-        github_account_login: proof.login,
-        pat_configuration_id: config.id,
-        pat_configuration_version: config.lock_version,
-        credential_owner_user_id: config.owner_user_id,
-        github_identity_id: config.github_identity_id,
-        github_credential_id: credential.id,
-        github_credential_version: credential.verification_version,
-        bootstrap_import_run_id: proof.run_id
-      })
+      attrs =
+        Map.merge(mirror_authority(config, credential), %{
+          organization_id: config.organization_id,
+          provider: "github",
+          github_account_id: proof.account_id,
+          github_account_login: proof.login,
+          pat_configuration_id: config.id,
+          credential_owner_user_id: config.owner_user_id,
+          github_identity_id: config.github_identity_id,
+          bootstrap_import_run_id: proof.run_id
+        })
+
+      changeset =
+        if config.credential_source == :organization_device,
+          do: OrganizationMirror.organization_enrollment_changeset(%OrganizationMirror{}, attrs),
+          else: OrganizationMirror.pat_enrollment_changeset(%OrganizationMirror{}, attrs)
+
+      changeset
       |> insert!()
     end
   end

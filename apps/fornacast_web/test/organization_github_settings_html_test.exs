@@ -6,7 +6,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTMLTest do
   alias ForgeAccounts.Organization
   alias FornacastWeb.OrganizationGitHubSettingsHTML
 
-  test "not-configured view has a dense DuskMoon surface and one primary installation action" do
+  test "configured disconnected view has a dense DuskMoon surface and one primary installation action" do
     view = base_view()
 
     html =
@@ -19,7 +19,10 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTMLTest do
     assert html =~ "data-organization-settings-layout"
     assert html =~ "@acme"
     assert html =~ "Back to organization"
-    assert html =~ ~r/href="\/organizations\/acme\/settings\/github"[^>]*aria-current="page"/
+
+    assert html =~
+             ~r/href="\/organizations\/acme\/settings\/github\/app\/advanced"[^>]*aria-current="page"/
+
     assert html =~ "bg-surface-container-low"
     assert html =~ "GitHub is not configured"
     assert html =~ "No GitHub App installation is connected"
@@ -231,7 +234,10 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTMLTest do
     assert html =~ "GitHub synchronization conflicts"
     assert html =~ "data-organization-settings-layout"
     assert html =~ "@acme"
-    assert html =~ ~r/href="\/organizations\/acme\/settings\/github"[^>]*aria-current="page"/
+
+    assert html =~
+             ~r/href="\/organizations\/acme\/settings\/github\/conflicts"[^>]*aria-current="page"/
+
     assert html =~ "issue:42"
     assert html =~ "Concurrent edit"
     assert html =~ "Open"
@@ -290,6 +296,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTMLTest do
 
   defp base_view do
     %{
+      installation_configured: true,
       organization: organization(),
       mirror: nil,
       installation: nil,

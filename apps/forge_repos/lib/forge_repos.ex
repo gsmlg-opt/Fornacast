@@ -566,6 +566,39 @@ defmodule ForgeRepos do
   def publish_import_shadow(%Multi{} = multi, key, _actor, _spec, _replacement),
     do: Multi.error(multi, key, :destination_changed)
 
+  @doc false
+  def publish_organization_import_shadow(
+        %Multi{} = multi,
+        key,
+        organization_id,
+        spec,
+        replacement,
+        authorize
+      )
+      when is_integer(organization_id) and organization_id > 0 and is_map(spec) and
+             is_function(authorize, 1) do
+    if exact_map_keys?(spec, @publication_spec_keys) and spec.owner_user_id == organization_id and
+         (is_nil(replacement) or
+            (is_map(replacement) and exact_map_keys?(replacement, @replacement_spec_keys) and
+               replacement.owner_user_id == organization_id)) do
+      multi
+      |> Multi.run({key, :authorization}, fn repo, _changes ->
+        with %User{kind: :organization, state: :active} = organization <-
+               repo.one(
+                 from owner in User, where: owner.id == ^organization_id, lock: "FOR SHARE"
+               ),
+             :ok <- authorize.(repo) do
+          {:ok, organization}
+        else
+          _ -> {:error, :destination_changed}
+        end
+      end)
+      |> Multi.run(key, fn repo, _changes -> mutate_import_shadow(repo, spec, replacement) end)
+    else
+      Multi.error(multi, key, :destination_changed)
+    end
+  end
+
   if Mix.env() == :test do
     @import_publication_hook_key {__MODULE__, :import_publication_hook}
     @import_namespace_hook_key {__MODULE__, :import_namespace_hook}
@@ -1369,6 +1402,40 @@ defmodule ForgeRepos do
   end
 
   def prepare_inbound_git_operations(_, _, _, _, _), do: {:error, :invalid}
+
+  @doc false
+  def prepare_organization_inbound_git_operations(
+        organization_id,
+        %Repository{} = repository,
+        request_id,
+        commands,
+        deadline,
+        authorize,
+        audit_actor_id
+      )
+      when is_integer(organization_id) and organization_id > 0 and is_function(authorize, 1) and
+             is_binary(request_id) and byte_size(request_id) in 1..255 and is_list(commands) and
+             commands != [] and is_integer(deadline) do
+    Repo.transact(fn ->
+      with %User{kind: :organization, state: :active} <-
+             Repo.one(from owner in User, where: owner.id == ^organization_id, lock: "FOR SHARE"),
+           %Repository{owner_user_id: ^organization_id} <- Repo.get(Repository, repository.id),
+           :ok <- authorize.(Repo) do
+        prepare_git_operations(
+          repository,
+          audit_actor_id,
+          request_id,
+          commands,
+          deadline,
+          :inbound
+        )
+      else
+        _ -> {:error, :stale_repository}
+      end
+    end)
+  end
+
+  def prepare_organization_inbound_git_operations(_, _, _, _, _, _, _), do: {:error, :invalid}
 
   defp prepare_git_operations(repository, actor_id, request_id, commands, absolute_deadline, kind) do
     with :ok <- validate_receive_pack_command_count(commands),

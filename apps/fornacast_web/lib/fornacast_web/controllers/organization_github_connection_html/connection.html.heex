@@ -1,0 +1,187 @@
+<OrganizationSettingsComponents.organization_settings_layout
+  organization={@organization}
+  active={:github}
+  github_page={:connection}
+>
+  <section class="grid gap-4" data-organization-github-connection>
+    <header class="grid gap-2">
+      <.dm_link href={base(@organization)} class="text-primary">Back to GitHub settings</.dm_link>
+      <h2 class="text-2xl font-semibold">Connect GitHub for {@organization.username}</h2>
+      <p role="status" data-organization-connection-state={@view.state}>{status(@view.state)}</p>
+      <p class="text-sm text-on-surface-variant">
+        Webhook status: Not configured for this connection.
+      </p>
+      <p class="text-sm text-on-surface-variant">
+        Authorize the Fornacast App for this organization, then choose its GitHub organization installation.
+        Connecting does not start synchronization. Access requires both App installation access and the authorizing GitHub account's access. LFS access is checked during synchronization.
+      </p>
+    </header>
+    <.dm_alert :if={@flash} id="organization-connection-saved" variant="success" role="status">
+      {@flash}
+    </.dm_alert>
+    <.dm_alert :if={@error} id="organization-connection-error" variant="error" role="alert">
+      {@error}
+    </.dm_alert>
+    <.dm_alert
+      :if={@view.state == :permissions_missing}
+      id="organization-permissions-missing"
+      variant="warning"
+      role="alert"
+    >
+      {message(:missing_permissions)}
+    </.dm_alert>
+    <.dm_card id="organization-device-connect" variant="bordered" padding="lg">
+      <:title>Authorize this organization</:title>
+      <.dm_alert
+        :if={@device_flow && @device_flow.status in [:failed, :expired]}
+        id="organization-device-error"
+        variant="error"
+        role="alert"
+      >
+        {message(@device_flow.error)}
+      </.dm_alert>
+      <div
+        :if={@device_flow && @device_flow.status in [:pending, :polling]}
+        class="grid gap-3"
+        data-github-device-poll="true"
+        data-github-device-id={@device_flow.id}
+        data-github-device-poll-path={base(@organization) <> "/device/#{@device_flow.id}/poll"}
+        data-github-device-return-path={base(@organization) <> "/connection"}
+        data-interval={@device_flow.interval}
+        data-expires-in={@device_flow.expires_in}
+      >
+        <p>Enter this code on GitHub:</p>
+        <code class="text-2xl font-semibold tracking-widest" data-github-device-code>{@device_flow.user_code}</code>
+        <.dm_link href={@device_flow.verification_uri} target="_blank" rel="noopener noreferrer">Open GitHub authorization</.dm_link>
+        <p role="status" aria-live="polite" data-github-device-status>
+          Waiting for GitHub authorization.
+        </p>
+        <form action={base(@organization) <> "/device/#{@device_flow.id}/cancel"} method="post">
+          <input type="hidden" name="_csrf_token" value={csrf_token()} />
+          <.dm_btn native_submit variant="secondary">Cancel authorization</.dm_btn>
+        </form>
+      </div>
+      <form action={base(@organization) <> "/device"} method="post" class="mt-3">
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <.dm_btn native_submit variant="primary">
+          {if @view.credential.status == :valid,
+            do: "Reconnect with GitHub",
+            else: "Connect with GitHub"}
+        </.dm_btn>
+      </form>
+    </.dm_card>
+    <.dm_card
+      :if={@view.credential.status == :valid}
+      id="organization-installations"
+      variant="bordered"
+      padding="lg"
+    >
+      <:title>Choose GitHub organization installation</:title>
+      <p :if={@view.credential.github_user_login} class="text-sm">
+        Authorized on GitHub by @{@view.credential.github_user_login}. Credentials are owned by {@organization.username}.
+      </p>
+      <p :if={@installations == []}>
+        No available Fornacast App installation was found. Install it in your GitHub organization, then refresh this page.
+      </p>
+      <div class="flex flex-wrap gap-4 my-3">
+        <.dm_link
+          href="https://github.com/apps/fornacast/installations/new"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="text-primary"
+        >Install or configure Fornacast on GitHub</.dm_link>
+        <.dm_link href={base(@organization) <> "/connection"} class="text-primary">Refresh installations</.dm_link>
+      </div>
+      <ul class="grid gap-3" role="list">
+        <li
+          :for={item <- @installations}
+          class="flex flex-wrap items-center justify-between gap-3"
+        >
+          <span>GitHub @{item.installation.account_login} · Installation #{item.installation.id} · {item.installation.repository_selection} repositories</span>
+          <form action={base(@organization) <> "/connection/bind"} method="post">
+            <input type="hidden" name="_csrf_token" value={csrf_token()} />
+            <input
+              type="hidden"
+              name="connection[connection_version]"
+              value={@view.connection_version}
+            />
+            <input type="hidden" name="connection[installation_id]" value={item.installation.id} />
+            <.dm_btn native_submit variant="secondary">
+              {if @view.connection && @view.connection.installation_id == item.installation.id,
+                do: "Recheck installation",
+                else: "Connect installation"}
+            </.dm_btn>
+          </form>
+        </li>
+      </ul>
+    </.dm_card>
+    <.dm_card
+      :if={@view.state == :ready}
+      id="organization-connection-sync"
+      variant="bordered"
+      padding="lg"
+    >
+      <:title>Organization synchronization</:title>
+      <p>
+        GitHub @{@view.connection.github_organization} · Installation #{@view.connection.installation_id} · {repository_count(
+          @view
+        )} effective repositories.
+      </p>
+      <p class="text-sm text-on-surface-variant">
+        Synchronization imports GitHub repositories into this organization. Activate this connection explicitly before starting a task.
+      </p>
+      <form
+        :if={!active_source?(@config, @view)}
+        action={base(@organization) <> "/connection/activate"}
+        method="post"
+        class="mt-3"
+      >
+        <input type="hidden" name="_csrf_token" value={csrf_token()} />
+        <input
+          type="hidden"
+          name="connection[connection_version]"
+          value={@view.connection_version}
+        />
+        <input type="hidden" name="connection[config_version]" value={@config.lock_version} />
+        <.dm_btn native_submit variant="primary">
+          Use organization connection for synchronization
+        </.dm_btn>
+      </form>
+      <div :if={active_source?(@config, @view)} class="grid gap-3 mt-3">
+        <p role="status">
+          Organization connection selected for synchronization{if @config.paused,
+            do: " (paused)",
+            else: ""}. Synchronization: {sync_status(@config)}.
+        </p>
+        <form action={base(@organization) <> "/sync"} method="post">
+          <input type="hidden" name="_csrf_token" value={csrf_token()} />
+          <input type="hidden" name="pat_sync[lock_version]" value={@config.lock_version} />
+          <.dm_btn native_submit variant="primary" disabled={!@config.enabled or @config.paused}>
+            Sync now
+          </.dm_btn>
+        </form>
+        <form
+          action={base(@organization) <> "/pat" <> if(@config.paused, do: "/resume", else: "/pause")}
+          method="post"
+        >
+          <input type="hidden" name="_csrf_token" value={csrf_token()} />
+          <.dm_btn native_submit variant="secondary">
+            {if @config.paused, do: "Resume synchronization", else: "Pause synchronization"}
+          </.dm_btn>
+        </form>
+        <.dm_link href={base(@organization) <> "/repositories"} class="text-primary">Repository scope</.dm_link>
+      </div>
+      <.dm_link href={base(@organization) <> "/runs"} class="text-primary">Synchronization history</.dm_link>
+    </.dm_card>
+    <form
+      :if={@view.connection && @view.state != :disconnected}
+      action={base(@organization) <> "/connection/disconnect"}
+      method="post"
+    >
+      <input type="hidden" name="_csrf_token" value={csrf_token()} />
+      <input type="hidden" name="connection[connection_version]" value={@view.connection_version} />
+      <.dm_btn native_submit variant="error">Disconnect organization GitHub connection</.dm_btn>
+    </form>
+    <.dm_link href={base(@organization) <> "/app/advanced"} class="text-primary">Advanced GitHub App integration</.dm_link>
+  </section>
+</OrganizationSettingsComponents.organization_settings_layout>

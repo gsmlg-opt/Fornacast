@@ -387,7 +387,14 @@ defmodule ForgeImports.RepositoryCleanup do
         not exists(
           from successor in RepositoryItem,
             where:
-              successor.predecessor_item_id == parent_as(:item).id or
+              (successor.predecessor_item_id == parent_as(:item).id and
+                 not fragment(
+                   "COALESCE(?->'retry_staging_abandoned'->>'successor_item_id' = ?::text AND ?->'retry_staging_abandoned'->>'repository_id' = ?::text, false)",
+                   parent_as(:item).checkpoint,
+                   successor.id,
+                   parent_as(:item).checkpoint,
+                   parent_as(:item).hidden_repository_id
+                 )) or
                 (successor.id != parent_as(:item).id and
                    successor.hidden_repository_id == parent_as(:item).hidden_repository_id)
         )
@@ -1955,13 +1962,65 @@ defmodule ForgeImports.RepositoryCleanup do
   end
 
   defp successor_or_adopter?(item, repository) do
-    Repo.exists?(
+    path = ForgeRepos.absolute_storage_path(repository)
+
+    Repo.all(
       from candidate in RepositoryItem,
         where:
           candidate.id != ^item.id and
             (candidate.predecessor_item_id == ^item.id or
-               candidate.hidden_repository_id == ^repository.id)
+               candidate.hidden_repository_id == ^repository.id or
+               candidate.replacement_repository_id == ^repository.id or
+               candidate.staged_storage_path == ^path or
+               candidate.replacement_storage_path == ^repository.storage_path)
     )
+    |> Enum.any?(&(not abandoned_shadow_successor?(&1, item, repository, path)))
+  end
+
+  # Retry records this only after rejecting adoption of a canonical shadow with
+  # no durable Git or metadata proof. Every actual repository/path reference and
+  # every other successor still fences reclamation.
+  defp abandoned_shadow_successor?(candidate, item, repository, path) do
+    marker = %{"repository_id" => repository.id, "successor_item_id" => candidate.id}
+
+    with true <-
+           item.checkpoint == %{"retry_staging_abandoned" => marker} and item.source_git == %{},
+         true <-
+           candidate.predecessor_item_id == item.id and
+             candidate.github_repository_id == item.github_repository_id and
+             candidate.source_full_name == item.source_full_name and
+             candidate.destination_owner_id == item.destination_owner_id,
+         %ImportRun{predecessor_run_id: predecessor} <-
+           Repo.get(ImportRun, candidate.import_run_id),
+         true <- predecessor == item.import_run_id,
+         true <-
+           candidate.hidden_repository_id != repository.id and
+             candidate.replacement_repository_id != repository.id and
+             candidate.staged_storage_path != path and
+             candidate.replacement_storage_path != repository.storage_path,
+         true <-
+           Enum.all?(
+             ~w(repository_id hidden_repository_id replaced_repository_id),
+             &(candidate.publication_evidence[&1] != repository.id)
+           ) do
+      case candidate.hidden_repository_id do
+        nil ->
+          is_nil(candidate.staged_storage_path) and candidate.checkpoint == %{} and
+            candidate.source_git == %{} and candidate.publication_evidence == %{}
+
+        id ->
+          case Repo.get(Repository, id) do
+            %Repository{} = independent ->
+              independent.owner_user_id == candidate.destination_owner_id and
+                ForgeRepos.absolute_storage_path(independent) == candidate.staged_storage_path
+
+            _ ->
+              false
+          end
+      end
+    else
+      _ -> false
+    end
   end
 
   defp exact_replacement?(repository, item, attempt, marker) do

@@ -143,7 +143,7 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
           conn
           |> put_session(:pat_check_result, %{organization_id: organization.id, report: report})
           |> put_status(:see_other)
-          |> redirect(to: OrganizationPATSettingsHTML.base(organization))
+          |> redirect(to: OrganizationPATSettingsHTML.base(organization) <> "/legacy")
 
         {:ok, run} when action == :sync_now ->
           conn
@@ -160,11 +160,17 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
             error: check_error_message(reason)
           })
           |> put_status(:see_other)
-          |> redirect(to: OrganizationPATSettingsHTML.base(organization))
+          |> redirect(to: OrganizationPATSettingsHTML.base(organization) <> "/legacy")
 
         {:error, reason} ->
           {:ok, view} = PatSettings.view(actor, organization.id)
-          status = if reason == :stale, do: :conflict, else: :unprocessable_entity
+
+          status =
+            cond do
+              reason == :stale -> :conflict
+              reason in [:primary_rate_limit, :secondary_rate_limit] -> :too_many_requests
+              true -> :unprocessable_entity
+            end
 
           template =
             if action in [:save, :pause, :resume, :check], do: :index, else: :repositories
@@ -177,7 +183,7 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
             template,
             if(action == :check,
               do: check_error_message(reason),
-              else: error_message(reason, action)
+              else: source_error_message(view.config, reason, action)
             )
           )
       end
@@ -187,7 +193,16 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
   end
 
   defp success(conn, organization, action) do
-    suffix = if action in [:save, :pause, :resume], do: "", else: "/repositories"
+    suffix =
+      if action in [:save, :pause, :resume] do
+        case PatSettings.view(conn.assigns.current_user, organization.id) do
+          {:ok, %{config: %{credential_source: :organization_device}}} -> "/connection"
+          {:ok, %{config: %{credential_source: :public}}} -> "/public"
+          _ -> "/legacy"
+        end
+      else
+        "/repositories"
+      end
 
     message =
       case action do
@@ -294,6 +309,31 @@ defmodule FornacastWeb.OrganizationPATSettingsController do
   end
 
   defp positive_id(_), do: {:error, :invalid_request}
+
+  defp source_error_message(%{credential_source: :public}, reason, action) do
+    case reason do
+      reason when reason in [:primary_rate_limit, :secondary_rate_limit] ->
+        "GitHub's anonymous API rate limit was reached. Try again after the limit resets, or connect the GitHub App."
+
+      :stale ->
+        error_message(:stale)
+
+      :paused ->
+        error_message(:paused)
+
+      :invalid_request ->
+        "Check the public GitHub organization and repository selection."
+
+      _ ->
+        if action == :sync_now,
+          do:
+            "Could not start public synchronization. Check the public source or connect the GitHub App.",
+          else:
+            "Could not refresh the public repository list. Check public access or connect the GitHub App."
+    end
+  end
+
+  defp source_error_message(_config, reason, action), do: error_message(reason, action)
 
   defp error_message(:stale), do: "The configuration changed. Refresh and try again."
 

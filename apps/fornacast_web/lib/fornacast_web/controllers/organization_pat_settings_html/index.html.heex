@@ -1,12 +1,17 @@
 <OrganizationSettingsComponents.organization_settings_layout
   organization={@organization}
   active={:github}
+  github_page={:sync}
 >
   <section class="grid gap-4" data-organization-pat-settings>
     <header class="grid gap-2">
       <h2 class="text-2xl font-semibold">GitHub synchronization</h2>
       <p class="text-on-surface-variant">
-        Configure organization synchronization with an owner’s saved GitHub connection or PAT.
+        {if @view.config.credential_source == :public,
+          do:
+            "This organization synchronizes through the public GitHub API without a credential.",
+          else:
+            "Configure organization synchronization with an owner’s saved GitHub connection or PAT."}
       </p>
     </header>
     <.dm_alert :if={@error} id="pat-settings-error" variant="error" role="alert">
@@ -15,10 +20,36 @@
     <.dm_alert :if={@flash} id="pat-settings-saved" variant="success" role="status">
       {@flash}
     </.dm_alert>
-    <.dm_alert id="pat-configuration-only" variant="info" outlined>
+    <.dm_alert
+      :if={@view.config.credential_source == :organization_device}
+      id="organization-source-active"
+      variant="info"
+    >
+      This organization uses its own GitHub App connection.
+      <.dm_link href={base(@organization) <> "/connection"} class="text-primary">Manage organization connection and synchronization</.dm_link>
+    </.dm_alert>
+    <.dm_alert
+      :if={@view.config.credential_source == :public}
+      id="public-source-active"
+      variant="info"
+    >
+      This organization uses the public GitHub API.
+      <.dm_link href={base(@organization) <> "/public"} class="text-primary">Manage public synchronization</.dm_link>
+    </.dm_alert>
+    <.dm_alert
+      :if={@view.config.credential_source == :personal}
+      id="pat-configuration-only"
+      variant="info"
+      outlined
+    >
       GitHub → Fornacast synchronization uses the saved owner credential. You can run it manually and pause the synchronization configuration. Pausing prevents new tasks and pauses active work at its next authorization checkpoint; tasks are not canceled.
     </.dm_alert>
-    <.dm_card id="pat-sync-config" variant="bordered" padding="lg">
+    <.dm_card
+      :if={@view.config.credential_source == :personal}
+      id="pat-sync-config"
+      variant="bordered"
+      padding="lg"
+    >
       <:title>GitHub mirror configuration</:title>
       <form
         action={base(@organization) <> "/pat"}
@@ -141,7 +172,7 @@
       <p class="text-sm text-on-surface-variant my-2">
         The existing GitHub App integration is managed separately from saved-credential configuration.
       </p>
-      <.dm_link href={base(@organization) <> "/app"} class="text-primary">Open GitHub App settings</.dm_link>
+      <.dm_link href={base(@organization) <> "/app/advanced"} class="text-primary">Open GitHub App settings</.dm_link>
     </details>
   </section>
 </OrganizationSettingsComponents.organization_settings_layout>

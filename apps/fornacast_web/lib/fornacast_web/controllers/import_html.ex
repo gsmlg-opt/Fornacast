@@ -191,6 +191,11 @@ defmodule FornacastWeb.ImportHTML do
     Enum.map(organizations, &{&1.username, &1.id})
   end
 
+  def destination_action(_run, choice) when choice in ["new", "existing"], do: choice
+
+  def destination_action(run, _choice),
+    do: if(existing_destination?(run), do: "existing", else: "new")
+
   def source_label(%{repository_full_name: full_name}) when is_binary(full_name), do: full_name
   def source_label(%{owner_login: login}) when is_binary(login), do: login
   def source_label(_source), do: "GitHub"
@@ -278,8 +283,32 @@ defmodule FornacastWeb.ImportHTML do
   def awaiting_credential?(%{state: :awaiting_credential}), do: true
   def awaiting_credential?(_run), do: false
 
+  def public_source?(%{source: %{credential_source: source}}), do: source in [:public, "public"]
+  def public_source?(_run), do: false
+
+  def organization_source?(%{source: %{credential_source: :organization_device}}), do: true
+  def organization_source?(_run), do: false
+
+  def organization_connection_href(%{destination: %{organization_slug: slug}})
+      when is_binary(slug) and slug != "",
+      do: "/organizations/#{slug}/settings/github/connection"
+
+  def organization_connection_href(_run), do: "/organizations/import/app"
+
+  def public_sync_href(%{
+        source: %{kind: :organization, credential_source: :public},
+        destination: %{organization_slug: slug, organization_id: id}
+      })
+      when is_integer(id) and id > 0 and is_binary(slug) and slug != "",
+      do: "/organizations/#{slug}/settings/github/public"
+
+  def public_sync_href(_run), do: nil
+
   def report_available?(%{report_finalized_at: %DateTime{}}), do: true
   def report_available?(_run), do: false
+
+  def control_accounts?(%{source: %{credential_source: source}})
+      when source in [:public, "public", :organization_device], do: false
 
   def control_accounts?(%{state: state})
       when state in [:awaiting_credential | @retryable_states],

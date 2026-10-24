@@ -50,7 +50,10 @@ defmodule ForgeImports.Scheduler do
            (item.state in [:git_staged, :staging_metadata] and
               not is_nil(item.hidden_repository_id) and not is_nil(item.staged_storage_path))) and
           is_nil(item.cleanup_state) and
-          ((run.state == :running and actor.state == :active and
+          ((run.state == :running and
+              (actor.state == :active or
+                 (run.credential_source in [:organization_device, :public] and
+                    not is_nil(run.organization_sync_run_id))) and
               (is_nil(run.lease_expires_at) or run.lease_expires_at <= ^now)) or
              (item.state == :staging_git and
                 run.state in [
@@ -67,7 +70,10 @@ defmodule ForgeImports.Scheduler do
       dynamic(
         [item, run, _attempt, actor],
         item.state == :ready_to_publish and is_nil(item.cleanup_state) and
-          run.state == :running and actor.state == :active and
+          run.state == :running and
+          (actor.state == :active or
+             (run.credential_source in [:organization_device, :public] and
+                not is_nil(run.organization_sync_run_id))) and
           (is_nil(run.lease_expires_at) or run.lease_expires_at <= ^now)
       )
 

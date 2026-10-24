@@ -372,6 +372,84 @@ defmodule ForgeImports.RetryTest do
     assert {:error, :cleanup_conflict} = Persistence.ensure_adoption_safe_locked(Repo, item)
   end
 
+  @tag :tmp_dir
+  test "partial-shadow retry keeps corrupt proof and cleanup ownership fenced", c do
+    isolate_storage_root!(c.tmp_dir)
+
+    for mutation <- [
+          :git_evidence,
+          :checkpoint,
+          :wrong_path,
+          :renamed,
+          :deleted,
+          :metadata,
+          :shared,
+          :cleanup
+        ] do
+      run = terminal_org_run!(c.actor, c.identity, :canceled)
+      item = unproved_item!(run, c.actor)
+      shadow = Repo.get!(Repository, item.hidden_repository_id)
+      expected_error = if mutation == :cleanup, do: :cleanup_conflict, else: :invalid_predecessor
+
+      case mutation do
+        :git_evidence ->
+          Repo.update!(Ecto.Changeset.change(item, source_git: %{"empty" => true}))
+
+        :checkpoint ->
+          Repo.update!(Ecto.Changeset.change(item, checkpoint: %{"git_staged" => false}))
+
+        :wrong_path ->
+          Repo.update!(
+            Ecto.Changeset.change(item, staged_storage_path: item.staged_storage_path <> ".other")
+          )
+
+        :renamed ->
+          Repo.update!(Ecto.Changeset.change(shadow, name: "untrusted shadow"))
+
+        :deleted ->
+          Repo.update!(Ecto.Changeset.change(shadow, lifecycle: :tombstoned, deleted_at: @now))
+
+        :metadata ->
+          %PageCheckpoint{}
+          |> PageCheckpoint.create_changeset(%{
+            repository_item_id: item.id,
+            resource_kind: "issues",
+            page_key: "first",
+            observed_at: @now,
+            item_count: 0,
+            cursor_metadata: %{},
+            committed_at: @now
+          })
+          |> Repo.insert!()
+
+        :shared ->
+          other = org_item!(run, c.actor, System.unique_integer([:positive]), "other-shadow")
+
+          Repo.update!(
+            Ecto.Changeset.change(other,
+              hidden_repository_id: shadow.id,
+              staged_storage_path: item.staged_storage_path
+            )
+          )
+
+        :cleanup ->
+          completed_quarantine!(item, :missing)
+      end
+
+      assert {:error, ^expected_error} =
+               ForgeImports.retry_import(
+                 c.actor,
+                 run.id,
+                 saved_source(c.credential, c.identity),
+                 request_metadata("reject-partial-#{mutation}")
+               )
+
+      refute Repo.exists?(from r in ImportRun, where: r.predecessor_run_id == ^run.id)
+      refute Map.has_key?(Repo.reload!(item).checkpoint, "retry_staging_abandoned")
+      assert File.dir?(item.staged_storage_path)
+    end
+  end
+
   test "retry rejects corrupt staging evidence", %{
     actor: actor,
     identity: identity,
@@ -691,6 +769,38 @@ defmodule ForgeImports.RetryTest do
     |> Map.merge(Map.new(overrides))
     |> Persistence.insert_repository_item()
     |> unwrap!()
+  end
+
+  defp unproved_item!(run, actor) do
+    item =
+      org_item!(run, actor, System.unique_integer([:positive]), "partial-shadow",
+        state: :canceled,
+        attempt_count: 1
+      )
+
+    {:ok, %{shadow: shadow}} =
+      Multi.new()
+      |> ForgeRepos.create_import_shadow(:shadow, actor.id, %{item_id: item.id, generation: 1})
+      |> Repo.transaction()
+
+    path = ForgeRepos.absolute_storage_path(shadow)
+    File.mkdir_p!(path)
+    File.chmod!(path, 0o700)
+
+    %ImportAttempt{}
+    |> ImportAttempt.create_changeset(%{
+      repository_item_id: item.id,
+      attempt_number: 1,
+      state: :canceled,
+      decision: %{"action" => "create", "slug" => item.destination_slug},
+      started_at: @now,
+      terminal_at: @now
+    })
+    |> Repo.insert!()
+
+    Repo.update!(
+      Ecto.Changeset.change(item, hidden_repository_id: shadow.id, staged_storage_path: path)
+    )
   end
 
   defp staged_item!(run, actor, opts) do

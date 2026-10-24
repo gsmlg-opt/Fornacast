@@ -225,11 +225,43 @@ defmodule ForgeGitHub.Pagination do
          "api.github.com" <- String.downcase(uri.host || ""),
          443 <- uri.port,
          nil <- uri.userinfo,
-         true <- uri.path in allowed_paths,
+         {:ok, path} <- pagination_path(uri.path, allowed_paths),
          nil <- uri.fragment do
-      {:ok, uri.path <> if(uri.query, do: "?" <> uri.query, else: "")}
+      {:ok, path <> if(uri.query, do: "?" <> uri.query, else: "")}
     else
       _invalid -> :error
     end
   end
+
+  defp pagination_path(path, allowed_paths) do
+    cond do
+      path in allowed_paths ->
+        {:ok, path}
+
+      numeric_repository_alias?(path, allowed_paths) ->
+        # GitHub emits numeric aliases for issues and releases. Keep the request pinned to the
+        # original repository while preserving the opaque pagination cursor.
+        {:ok, hd(allowed_paths)}
+
+      true ->
+        :error
+    end
+  end
+
+  defp numeric_repository_alias?(path, [allowed_path]) when is_binary(path) do
+    with [resource] <-
+           Regex.run(~r{\A/repositories/[1-9][0-9]*/(issues|releases)\z}, path,
+             capture: :all_but_first
+           ),
+         [^resource] <-
+           Regex.run(~r{\A/repos/[^/]+/[^/]+/(issues|releases)\z}, allowed_path,
+             capture: :all_but_first
+           ) do
+      true
+    else
+      _invalid -> false
+    end
+  end
+
+  defp numeric_repository_alias?(_path, _allowed_paths), do: false
 end

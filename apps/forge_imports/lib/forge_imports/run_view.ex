@@ -56,6 +56,7 @@ defmodule ForgeImports.RunView do
       predecessor_run_id: run.predecessor_run_id,
       source: %{
         kind: run.source_kind,
+        credential_source: run.credential_source,
         owner_github_id: run.source_owner_github_id,
         owner_login: run.source_owner_login,
         repository_github_id: run.source_repository_github_id,

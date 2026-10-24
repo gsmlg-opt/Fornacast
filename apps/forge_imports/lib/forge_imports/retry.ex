@@ -64,6 +64,89 @@ defmodule ForgeImports.Retry do
     end)
   end
 
+  @doc false
+  def fence_organization_restart(
+        %ForgeImports.OrganizationExecution{} = execution,
+        predecessor,
+        metadata
+      ) do
+    with {:ok, _} <- ForgeImports.OrganizationExecution.authorize(execution, lock: true),
+         %ImportRun{} = current <-
+           Repo.one(from run in ImportRun, where: run.id == ^predecessor.id, lock: "FOR UPDATE"),
+         true <- execution.run_id == current.id,
+         true <-
+           current.state in [
+             :discovering,
+             :awaiting_resolution,
+             :ready,
+             :running,
+             :awaiting_credential,
+             :cancel_requested
+           ],
+         items <-
+           Repo.all(
+             from item in RepositoryItem,
+               where: item.import_run_id == ^current.id and item.selected == true,
+               order_by: item.id,
+               lock: "FOR UPDATE"
+           ),
+         :ok <- restart_safe(items),
+         :ok <- release_run_lease(current),
+         {:ok, canceled} <-
+           request_restart_cancel(execution, Repo.get!(ImportRun, current.id), metadata, []),
+         :ok <- settle_restart_items(items) do
+      if canceled.state == :canceled,
+        do: {:ok, canceled},
+        else:
+          canceled
+          |> ImportRun.transition_changeset(:canceled, %{terminal_at: DateTime.utc_now(:second)})
+          |> Repo.update()
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :invalid_predecessor}
+    end
+  end
+
+  @doc false
+  def organization_successor(
+        %ForgeImports.OrganizationExecution{run_id: nil} = execution,
+        expected_predecessor,
+        metadata
+      ) do
+    with {:ok, scope} <- ForgeImports.OrganizationExecution.authorize(execution, lock: true),
+         %ImportRun{} = predecessor <-
+           Repo.one(
+             from run in ImportRun, where: run.id == ^expected_predecessor.id, lock: "FOR UPDATE"
+           ),
+         true <-
+           predecessor.destination_organization_id == execution.organization_id and
+             predecessor.source_owner_github_id == scope.github_organization_id,
+         true <- ForgeImports.OrganizationExecution.scope_matches?(predecessor, scope),
+         :ok <- validate_retryable_predecessor(predecessor),
+         false <- successor_exists?(predecessor.id),
+         {:ok, metadata} <- safe_request_metadata(metadata),
+         retryable_items <- retryable_items(predecessor.id),
+         true <- retryable_items != [] do
+      source =
+        Map.merge(ForgeImports.OrganizationExecution.snapshots(scope), %{
+          credential_source: Map.get(scope, :credential_source, :organization_device),
+          github_identity_id: nil,
+          organization_sync_run_id: execution.pat_sync_run_id
+        })
+
+      with {:ok, successor} <-
+             insert_successor_run(execution, predecessor, source, metadata, retryable_items),
+           :ok <- insert_successor_items(execution, predecessor, successor, retryable_items),
+           :ok <- record_retry_audit(execution, predecessor, successor, metadata) do
+        ForgeImports.SyncJobs.enqueue_run!(successor.id)
+        {:ok, successor}
+      end
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :invalid_predecessor}
+    end
+  end
+
   defp restart_safe(items) do
     Enum.reduce_while(items, :ok, fn item, :ok ->
       cond do
@@ -173,6 +256,10 @@ defmodule ForgeImports.Retry do
              false <- successor_exists?(predecessor.id),
              {:ok, normalized_source} <-
                normalize_credential_source(active_actor, credential_source, opts),
+             true <-
+               predecessor.credential_source == :public ==
+                 (normalized_source.credential_source == :public) and
+                 is_nil(predecessor.organization_sync_run_id),
              {:ok, safe_metadata} <- safe_request_metadata(request_metadata),
              retryable_items <- retryable_items(predecessor.id),
              true <- retryable_items != [],
@@ -235,12 +322,103 @@ defmodule ForgeImports.Retry do
           adopt_proven_staging(repo, predecessor_item, successor_item, phase)
       end
     else
-      {:error, :inconsistent} -> {:error, :invalid_predecessor}
+      {:error, :inconsistent} -> restart_unproved_shadow(repo, predecessor_item, successor_item)
       {:error, reason} -> {:error, reason}
     end
   end
 
   def adopt_staging(_repo, _predecessor_item, _successor_item), do: {:error, :invalid_predecessor}
+
+  # A shadow allocation can survive cancellation before any Git proof exists.
+  # Do not adopt its bytes. Record the exact nonadopting successor so cleanup can
+  # reclaim the old shadow even after the successor allocates independent staging.
+  defp restart_unproved_shadow(repo, expected, successor) do
+    with true <- repo.in_transaction?(),
+         %RepositoryItem{} = item <-
+           repo.one(
+             from i in RepositoryItem,
+               where: i.id == ^expected.id and i.lock_version == ^expected.lock_version,
+               lock: "FOR UPDATE"
+           ),
+         true <-
+           item.state in @retryable_item_states and item.selected and
+             is_nil(item.cleanup_state) and is_nil(item.lease_owner) and
+             is_nil(item.lease_expires_at),
+         true <-
+           item.checkpoint == %{} and item.source_git == %{} and item.publication_evidence == %{},
+         %ImportRun{} = run <- repo.get(ImportRun, item.import_run_id),
+         true <-
+           run.state in @retryable_run_states and is_nil(run.lease_owner) and
+             is_nil(run.lease_expires_at),
+         %ImportRun{predecessor_run_id: predecessor_id} <-
+           repo.get(ImportRun, successor.import_run_id),
+         true <- predecessor_id == run.id,
+         %ImportAttempt{state: state, terminal_at: %DateTime{}} <-
+           repo.get_by(ImportAttempt,
+             repository_item_id: item.id,
+             attempt_number: item.attempt_count
+           ),
+         true <- state in [:failed, :canceled, :destination_changed],
+         true <-
+           successor.predecessor_item_id == item.id and
+             successor.github_repository_id == item.github_repository_id and
+             successor.source_full_name == item.source_full_name and
+             successor.destination_owner_id == item.destination_owner_id and
+             is_nil(successor.hidden_repository_id) and is_nil(successor.staged_storage_path) and
+             successor.checkpoint == %{} and successor.source_git == %{} and
+             successor.publication_evidence == %{},
+         true <- is_integer(item.hidden_repository_id) and item.hidden_repository_id > 0,
+         %Repository{} = shadow <- repo.get(Repository, item.hidden_repository_id),
+         true <- unproved_shadow?(shadow, item),
+         false <-
+           repo.exists?(
+             from other in RepositoryItem,
+               where:
+                 other.id not in ^[item.id, successor.id] and
+                   (other.predecessor_item_id == ^item.id or
+                      other.hidden_repository_id == ^shadow.id or
+                      other.staged_storage_path == ^item.staged_storage_path)
+           ),
+         false <-
+           Enum.any?([ObjectMapping, PageCheckpoint, ReportEntry], fn schema ->
+             repo.exists?(from row in schema, where: row.repository_item_id == ^item.id)
+           end),
+         :ok <- Persistence.ensure_adoption_safe_locked(repo, item),
+         {:ok, _} <-
+           repo.update(
+             Ecto.Changeset.change(item,
+               checkpoint: %{
+                 "retry_staging_abandoned" => %{
+                   "repository_id" => shadow.id,
+                   "successor_item_id" => successor.id
+                 }
+               },
+               lock_version: item.lock_version + 1
+             )
+           ) do
+      {:ok, successor}
+    else
+      {:error, :cleanup_conflict} = error -> error
+      _ -> {:error, :invalid_predecessor}
+    end
+  end
+
+  defp unproved_shadow?(shadow, item) do
+    generation =
+      if item.conflict_action == :replace and is_integer(item.replacement_generation),
+        do: item.replacement_generation + 1,
+        else: 1
+
+    shadow.lifecycle == :importing and shadow.visibility == :private and
+      shadow.owner_user_id == item.destination_owner_id and shadow.write_version == 0 and
+      shadow.generation == generation and is_nil(shadow.deleted_at) and
+      is_nil(shadow.storage_reclaimed_at) and
+      is_nil(shadow.last_pushed_at) and shadow.name == "GitHub import #{item.id}" and
+      Regex.match?(~r/\Aimport-#{item.id}-[0-9a-f]{24}\z/, shadow.slug) and
+      shadow.description == nil and shadow.default_branch == "main" and shadow.has_issues and
+      shadow.allow_merge_commit and
+      ForgeRepos.absolute_storage_path(shadow) == item.staged_storage_path
+  end
 
   defp adopt_proven_staging(repo, predecessor_item, successor_item, phase) do
     shadow_id = predecessor_item.hidden_repository_id
@@ -394,10 +572,31 @@ defmodule ForgeImports.Retry do
   defp retryable_item?(_item), do: false
 
   defp insert_successor_run(actor, predecessor, source, request_metadata, retryable_items) do
+    # Organization jobs use the ordinary conflict-freezing admission path to
+    # allocate fresh attempts, including successors with adopted Git staging.
+    state =
+      if is_struct(actor, ForgeImports.OrganizationExecution),
+        do: :awaiting_resolution,
+        else: :ready
+
     attrs =
       predecessor
       |> successor_run_attrs(actor, source, request_metadata, retryable_items)
-      |> Map.put(:state, :ready)
+      |> Map.put(:state, state)
+
+    attrs =
+      Map.merge(
+        attrs,
+        Map.take(source, [
+          :organization_sync_run_id,
+          :public_configuration_version,
+          :organization_connection_id,
+          :organization_connection_version,
+          :organization_credential_id,
+          :organization_credential_version,
+          :github_installation_id
+        ])
+      )
 
     %ImportRun{}
     |> ImportRun.persistence_changeset(attrs)
@@ -453,8 +652,15 @@ defmodule ForgeImports.Retry do
            %RepositoryItem{}
            |> RepositoryItem.persistence_changeset(attrs)
            |> Repo.insert(),
-         {:ok, _adopted} <- adopt_staging(Repo, predecessor_item, successor_item) do
-      :ok
+         {:ok, adopted} <- adopt_staging(Repo, predecessor_item, successor_item) do
+      if successor.state == :awaiting_resolution do
+        case Repo.update(Ecto.Changeset.change(adopted, state: :queued)) do
+          {:ok, _} -> :ok
+          {:error, _} -> {:error, :invalid_predecessor}
+        end
+      else
+        :ok
+      end
     else
       {:error, %Ecto.Changeset{} = changeset} -> {:error, map_insert_error(changeset)}
       {:error, reason} -> {:error, reason}
@@ -504,6 +710,9 @@ defmodule ForgeImports.Retry do
     end
   end
 
+  defp normalize_credential_source(_actor, :public, _opts),
+    do: {:ok, %{credential_source: :public, github_identity_id: nil}}
+
   defp normalize_credential_source(actor, {:saved, identity_id}, _opts)
        when is_integer(identity_id) and identity_id > 0 do
     case Repo.one(
@@ -531,6 +740,11 @@ defmodule ForgeImports.Retry do
 
   defp normalize_credential_source(actor, source, _opts) when is_map(source) do
     case Map.get(source, :credential_source) || Map.get(source, "credential_source") do
+      public when public in [:public, "public"] ->
+        if map_size(source) == 1,
+          do: {:ok, %{credential_source: :public, github_identity_id: nil}},
+          else: {:error, :forbidden}
+
       :saved ->
         with {:ok, credential_id} <- positive_id(source, :github_credential_id),
              {:ok, identity_id} <- positive_id(source, :github_identity_id),

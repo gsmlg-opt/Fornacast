@@ -6,7 +6,7 @@
     <p class="text-xs text-on-surface-variant">Identity and credential security</p>
     <h2 class="text-2xl font-semibold">Linked accounts</h2>
     <p class="text-sm text-on-surface-variant max-w-3xl">
-      Connect GitHub accounts for attribution, imports, and synchronization.
+      Manage personal GitHub identities and legacy import credentials. Configure GitHub App synchronization within each organization.
       Linking never grants local repository or organization access.
     </p>
   </header>
@@ -15,82 +15,36 @@
     {@error}
   </.dm_alert>
 
-  <.dm_card id="github-device-connect" variant="bordered" shadow="md" padding="lg">
-    <:title><span class="text-lg font-semibold">Connect with GitHub</span></:title>
-    <p class="text-sm text-on-surface-variant">
-      Authorize Fornacast on GitHub using a verification code. Access is limited to
-      repositories available to both your account and the installed GitHub App.
+  <section :if={@accounts != []} id="github-saved-connections" class="grid gap-2">
+    <h3 class="text-lg font-semibold">Your GitHub connections</h3>
+    <ul class="grid gap-2" role="list">
+      <li :for={account <- @accounts} class="flex flex-wrap items-center gap-2">
+        <.dm_link href={"#github-account-#{account.identity_id}"} class="text-primary">
+          @{account.login}
+        </.dm_link>
+        <.dm_badge variant={credential_variant(account)} soft size="sm">
+          {credential_label(account)}
+        </.dm_badge>
+      </li>
+    </ul>
+    <p
+      :if={
+        Enum.any?(@accounts, fn account ->
+          account.credential_present && account.credential_status == :valid &&
+            !account.reconnect_required
+        end)
+      }
+      class="text-sm text-on-surface-variant"
+    >
+      Organization GitHub App connections are configured in organization settings.
+      Existing personal credentials remain available for legacy imports.
     </p>
-    <.dm_alert
-      :if={@device_flow && @device_flow.status in [:failed, :expired]}
-      id="github-device-error"
-      variant="error"
-      outlined
-      role="alert"
-    >
-      {device_message(@device_flow.error)}
-    </.dm_alert>
-    <div
-      :if={@device_flow && @device_flow.status in [:pending, :polling]}
-      class="mt-4 grid gap-4"
-      data-github-device-poll="true"
-      data-github-device-id={@device_flow.id}
-      data-interval={@device_flow.interval}
-      data-expires-in={@device_flow.expires_in}
-    >
-      <p class="text-sm">Enter this code on GitHub:</p>
-      <code class="text-2xl font-semibold tracking-widest" data-github-device-code>{@device_flow.user_code}</code>
-      <.dm_link href={@device_flow.verification_uri} target="_blank" rel="noopener noreferrer">
-        Open GitHub authorization
-      </.dm_link>
-      <p
-        class="text-sm text-on-surface-variant"
-        role="status"
-        aria-live="polite"
-        data-github-device-status
-      >
-        Waiting for GitHub authorization. This code expires in about {div(
-          @device_flow.expires_in + 59,
-          60
-        )} min.
-      </p>
-      <form action={"/settings/github/device/#{@device_flow.id}/cancel"} method="post">
-        <input type="hidden" name="_csrf_token" value={csrf_token()} />
-        <.dm_btn native_submit variant="secondary">Cancel authorization</.dm_btn>
-      </form>
-    </div>
-    <form action="/settings/github/device" method="post" class="mt-4">
-      <input type="hidden" name="_csrf_token" value={csrf_token()} />
-      <.dm_btn native_submit variant="primary">Connect with GitHub</.dm_btn>
-    </form>
-  </.dm_card>
+  </section>
 
-  <.dm_card id="github-link-account" variant="bordered" shadow="md" padding="lg">
-    <:title><span class="text-lg font-semibold">Link GitHub account</span></:title>
-    <p class="text-sm text-on-surface-variant">
-      The PAT is verified with GitHub, encrypted, and never shown again.
-    </p>
-    <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#157 --%>
-    <form id="link-github-account" action="/settings/github" method="post" class="mt-4 grid gap-4">
-      <input type="hidden" name="_csrf_token" value={csrf_token()} />
-      <.dm_input
-        id="github-account-pat"
-        class="w-full"
-        name="github_account[pat]"
-        type="password"
-        label="GitHub personal access token"
-        helper="Use a token that can read every repository you intend to import."
-        required
-        maxlength="4096"
-        autocomplete="new-password"
-        spellcheck="false"
-        autocapitalize="none"
-      />
-      <div>
-        <button class="btn btn-secondary" type="submit">Link GitHub account</button>
-      </div>
-    </form>
-  </.dm_card>
+  <nav class="flex flex-wrap gap-2" aria-label="GitHub connection options">
+    <.dm_link href="/settings/github/device" class="btn btn-primary">Connect with GitHub</.dm_link>
+    <.dm_link href="/settings/github/link" class="btn btn-secondary">Link GitHub account</.dm_link>
+  </nav>
 
   <section
     :if={@accounts == []}
@@ -164,7 +118,8 @@
 
             <div :if={account.credential_present} class="grid gap-4">
               <p :if={account.reconnect_required} class="text-sm text-on-surface-variant">
-                Connect with GitHub above to renew access for this account.
+                This legacy personal connection can be renewed from its authorization page. Organization connections are configured separately.
+                <.dm_link href="/settings/github/device/legacy" class="text-primary">Renew legacy personal authorization</.dm_link>
               </p>
               <form
                 id={"reverify-github-account-#{account.identity_id}"}

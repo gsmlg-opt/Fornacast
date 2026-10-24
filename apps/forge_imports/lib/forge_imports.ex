@@ -99,6 +99,12 @@ defmodule ForgeImports do
     read_run_view(actor, id, @run_view_read_attempts)
   end
 
+  def get_run(%ForgeImports.OrganizationExecution{run_id: id} = execution, id) do
+    with {:ok, _} <- ForgeImports.OrganizationExecution.authorize(execution),
+         %ImportRun{} = run <- Repo.get(ImportRun, id),
+         do: {:ok, RunView.from_run(run, run_repository_items(id), run_reports(id))}
+  end
+
   def get_run(_actor, _id), do: {:error, :not_found}
 
   def get_run_view(%User{} = actor, id), do: get_run(actor, id)
@@ -125,6 +131,14 @@ defmodule ForgeImports do
       false -> Conflicts.start(actor, run_id, request_metadata, opts)
     end
   end
+
+  def start_import(
+        %ForgeImports.OrganizationExecution{run_id: run_id} = execution,
+        run_id,
+        metadata,
+        opts
+      ),
+      do: Conflicts.start(execution, run_id, metadata, opts)
 
   def start_import(_actor, _run_id, _request_metadata, _opts), do: {:error, :invalid_selection}
 
@@ -826,8 +840,9 @@ defmodule ForgeImports do
        ),
        do: OneTimeCredential.validate_profiles(actor, run, profiles)
 
-  defp validate_one_time_destination(_actor, %ImportRun{credential_source: :saved}, _profiles),
-    do: :ok
+  defp validate_one_time_destination(_actor, %ImportRun{credential_source: source}, _profiles)
+       when source in [:saved, :public],
+       do: :ok
 
   defp validate_one_time_destination(
          _actor,

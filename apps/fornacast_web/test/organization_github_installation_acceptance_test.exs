@@ -55,6 +55,16 @@ defmodule FornacastWeb.OrganizationGitHubInstallationAcceptanceTest do
     github_account_id = github_organization_id()
     github_account_login = "github-source-#{github_account_id}"
 
+    settings =
+      request_conn(context.owner)
+      |> get(github_settings_path(context.organization) <> "/app/advanced")
+      |> html_response(200)
+
+    assert settings =~
+             ~s(action="#{github_settings_path(context.organization)}/install" method="post")
+
+    refute settings =~ "GitHub App installation is not configured on this instance."
+
     started =
       request_conn(context.owner)
       |> post(github_settings_path(context.organization) <> "/install", %{})
@@ -162,7 +172,9 @@ defmodule FornacastWeb.OrganizationGitHubInstallationAcceptanceTest do
     assert html =~ "Ready to bootstrap"
 
     settings_conn =
-      started |> recycle_request() |> get(github_settings_path(context.organization) <> "/app")
+      started
+      |> recycle_request()
+      |> get(github_settings_path(context.organization) <> "/app/advanced")
 
     settings_html = html_response(settings_conn, 200)
 

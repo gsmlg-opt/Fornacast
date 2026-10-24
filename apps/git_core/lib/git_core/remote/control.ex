@@ -50,7 +50,7 @@ defmodule GitCore.Remote.Control do
           [:link, :monitor]
         )
 
-      timeout = min(remaining, GitCore.Limits.get(:remote_poll_interval_ms))
+      timeout = min(remaining, GitCore.Limits.get(:remote_control_callback_ms))
       await_callback(worker, monitor, reply, timeout, opts)
     end
   end

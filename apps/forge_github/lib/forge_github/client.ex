@@ -17,7 +17,8 @@ defmodule ForgeGitHub.Client do
     RepositoryReference,
     RequestGate,
     Transport,
-    User
+    User,
+    UserInstallation
   }
 
   @api_base "https://api.github.com"
@@ -32,6 +33,7 @@ defmodule ForgeGitHub.Client do
   @max_pages 100
   @max_json_depth 16
   @max_json_nodes 50_000
+  @max_release_metadata_json_nodes 200_000
   @max_json_collection 512
   @max_json_string_bytes 16_384
   @max_issue_metadata_string_bytes 262_144
@@ -129,7 +131,7 @@ defmodule ForgeGitHub.Client do
        ) do
     with {:ok, request_kind} <- classify.(method, path),
          true <- valid_issue_metadata_status?(request_kind, expected_status),
-         true <- metadata_gate?(opts, request_kind, json_profile) do
+         true <- metadata_gate?(token, opts, request_kind, json_profile) do
       with_request_gate(token, opts, [:json], fn ->
         with {:ok, body} <- encode_request_body(opts, json_profile),
              {:ok, response} <- perform_request(path, token, opts, method, body),
@@ -231,7 +233,7 @@ defmodule ForgeGitHub.Client do
 
   defp metadata_page(token, path, opts, classify, json_profile \\ :issue_metadata) do
     with {:ok, :page} <- classify.(:get, path),
-         true <- metadata_gate?(opts, :page, json_profile),
+         true <- metadata_gate?(token, opts, :page, json_profile),
          {:ok, %URI{path: allowed_path}} <- URI.new(path) do
       with_request_gate(token, opts, fn ->
         with {:ok, response} <- perform_request(path, token, opts, :get, nil),
@@ -280,6 +282,120 @@ defmodule ForgeGitHub.Client do
     end)
   end
 
+  @doc "Lists complete installation visibility for a GitHub App user token."
+  def user_installations(token, opts \\ []) do
+    with_request_gate(token, opts, fn ->
+      app_user_collection(
+        token,
+        "/user/installations",
+        "installations",
+        &UserInstallation.from_json/1,
+        opts
+      )
+    end)
+  end
+
+  @doc "Lists repositories visible to the user within exactly one installation."
+  def user_installation_repositories(token, installation_id, opts \\ [])
+
+  def user_installation_repositories(token, installation_id, opts)
+      when is_integer(installation_id) and installation_id > 0 and
+             installation_id <= 9_223_372_036_854_775_807 do
+    with_request_gate(token, opts, fn ->
+      app_user_collection(
+        token,
+        "/user/installations/#{installation_id}/repositories",
+        "repositories",
+        &Repository.from_json/1,
+        opts
+      )
+    end)
+  end
+
+  def user_installation_repositories(_, _, _), do: error(:invalid_request)
+
+  defp app_user_collection(token, path, key, decoder, opts),
+    do: app_user_collection(token, path, key, decoder, opts, 1, nil, [], MapSet.new())
+
+  defp app_user_collection(token, path, key, decoder, opts, page, expected_total, items, seen) do
+    url = "#{@api_base}#{path}?per_page=100&page=#{page}"
+
+    with {:ok, response} <- perform_request(url, token, opts, :get, nil),
+         {:ok, %{"total_count" => total} = json} <- successful_json(response, opts),
+         true <- is_integer(total) and total in 0..10_000,
+         true <- is_nil(expected_total) or expected_total == total,
+         values when is_list(values) and length(values) <= 100 <- json[key],
+         {:ok, decoded} <- decode_app_user_items(values, decoder),
+         ids = Enum.map(decoded, &app_user_item_id/1),
+         true <- length(ids) == MapSet.size(MapSet.new(ids)),
+         true <- Enum.all?(ids, &(not MapSet.member?(seen, &1))),
+         {:ok, next_url} <- Pagination.next_url(response, [path]),
+         {:ok, next_page} <- app_user_next_page(next_url, path, page),
+         all = items ++ decoded,
+         true <- length(all) <= total do
+      case next_page do
+        nil ->
+          if length(all) == total, do: {:ok, all}, else: error(:invalid_response)
+
+        next ->
+          if decoded == [] or length(all) >= total do
+            error(:invalid_pagination)
+          else
+            app_user_collection(
+              token,
+              path,
+              key,
+              decoder,
+              opts,
+              next,
+              total,
+              all,
+              MapSet.union(seen, MapSet.new(ids))
+            )
+          end
+      end
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, :invalid_pagination} -> error(:invalid_pagination)
+      {:error, :pagination_limit} -> error(:pagination_limit)
+      _ -> error(:invalid_response)
+    end
+  end
+
+  defp decode_app_user_items(values, decoder) do
+    Enum.reduce_while(values, {:ok, []}, fn value, {:ok, items} ->
+      case decoder.(value) do
+        {:ok, item} -> {:cont, {:ok, [item | items]}}
+        _ -> {:halt, {:error, :invalid_response}}
+      end
+    end)
+    |> case do
+      {:ok, items} -> {:ok, Enum.reverse(items)}
+      error -> error
+    end
+  end
+
+  defp app_user_item_id(%UserInstallation{installation: installation}), do: installation.id
+  defp app_user_item_id(%Repository{id: id}), do: id
+
+  defp app_user_next_page(nil, _, _), do: {:ok, nil}
+  defp app_user_next_page(_, _, @max_pages), do: {:error, :pagination_limit}
+
+  defp app_user_next_page(url, path, page) do
+    with {:ok, %URI{path: ^path, query: query}} <- URI.new(url),
+         true <- is_binary(query),
+         pairs <- Enum.to_list(URI.query_decoder(query)),
+         true <- length(pairs) == 2,
+         %{"page" => encoded, "per_page" => "100"} <- Map.new(pairs),
+         true <- encoded == Integer.to_string(page + 1) do
+      {:ok, page + 1}
+    else
+      _ -> {:error, :invalid_pagination}
+    end
+  rescue
+    _ -> {:error, :invalid_pagination}
+  end
+
   @spec repository(String.t(), String.t(), String.t(), keyword()) ::
           {:ok, Repository.t()} | {:error, Error.t()}
   def repository(pat, owner, repository, opts \\ []) do
@@ -292,6 +408,7 @@ defmodule ForgeGitHub.Client do
           opts,
           &Repository.from_json/1
         )
+        |> public_repository_result(pat)
       end)
     else
       _invalid_component -> error(:invalid_request)
@@ -322,8 +439,10 @@ defmodule ForgeGitHub.Client do
                  opts,
                  &Organization.from_json/1
                ) do
+          type = if pat == :public, do: "public", else: "all"
+
           paginate_repositories(
-            "#{@api_base}/orgs/#{login}/repos?per_page=100&type=all",
+            "#{@api_base}/orgs/#{login}/repos?per_page=100&type=#{type}",
             pat,
             opts,
             ["/orgs/#{login}/repos", "/organizations/#{organization_id}/repos"],
@@ -732,10 +851,14 @@ defmodule ForgeGitHub.Client do
 
   defp installation_gate?(_opts), do: false
 
-  defp metadata_gate?(opts, kind, :release_metadata) when kind in [:read, :page],
-    do: installation_gate?(opts) or one_time_run_gate?(opts) or saved_credential_gate?(opts)
+  defp metadata_gate?(:public, _opts, kind, _profile), do: kind in [:read, :page]
 
-  defp metadata_gate?(opts, _kind, _profile), do: installation_gate?(opts)
+  defp metadata_gate?(_token, opts, kind, :release_metadata) when kind in [:read, :page],
+    do:
+      installation_gate?(opts) or one_time_run_gate?(opts) or saved_credential_gate?(opts) or
+        organization_credential_gate?(opts)
+
+  defp metadata_gate?(_token, opts, _kind, _profile), do: installation_gate?(opts)
 
   defp one_time_run_gate?(opts) when is_list(opts) do
     Keyword.keyword?(opts) and
@@ -759,6 +882,17 @@ defmodule ForgeGitHub.Client do
 
   defp saved_credential_gate?(_opts), do: false
 
+  defp organization_credential_gate?(opts) when is_list(opts) do
+    Keyword.keyword?(opts) and
+      match?(
+        {:ok, {:organization_credential, id}}
+        when is_integer(id) and id in 1..9_223_372_036_854_775_807,
+        Keyword.fetch(opts, :gate_key)
+      )
+  end
+
+  defp organization_credential_gate?(_), do: false
+
   defp with_request_gate(pat, opts, fun) do
     with_request_gate(pat, opts, [], fun)
   end
@@ -770,7 +904,7 @@ defmodule ForgeGitHub.Client do
   defp with_request_gate(pat, opts, extra_allowed, pre_gate, fun) do
     with :ok <- validate_pat(pat),
          :ok <- validate_options(opts, extra_allowed),
-         {:ok, gate_key} <- fetch_gate_key(opts),
+         {:ok, gate_key} <- fetch_gate_key(pat, opts),
          :ok <- pre_gate.() do
       case RequestGate.run(gate_key, fun) do
         {:error, :invalid_gate_key} -> error(:invalid_request)
@@ -798,12 +932,16 @@ defmodule ForgeGitHub.Client do
     end
   end
 
-  defp fetch_gate_key(opts) do
+  defp fetch_gate_key(:public, _opts), do: {:ok, {:public, 1}}
+
+  defp fetch_gate_key(_pat, opts) do
     case Keyword.fetch(opts, :gate_key) do
       {:ok, gate_key} -> {:ok, gate_key}
       :error -> :error
     end
   end
+
+  defp validate_pat(:public), do: :ok
 
   defp validate_pat(pat) when is_binary(pat) do
     if byte_size(pat) in 1..16_384 and String.valid?(pat) and
@@ -872,6 +1010,19 @@ defmodule ForgeGitHub.Client do
     end
   end
 
+  defp public_repository_result({:ok, %Repository{visibility: visibility}}, :public)
+       when visibility != :public, do: error(:not_found)
+
+  defp public_repository_result(result, _credential), do: result
+
+  defp public_inventory(repositories, :public) do
+    if Enum.all?(repositories, &(&1.visibility == :public)),
+      do: :ok,
+      else: error(:invalid_response)
+  end
+
+  defp public_inventory(_repositories, _credential), do: :ok
+
   defp paginate_repositories(_url, _pat, _opts, _allowed_paths, page, _pages)
        when page > @max_pages,
        do: error(:pagination_limit)
@@ -880,6 +1031,7 @@ defmodule ForgeGitHub.Client do
     with {:ok, response} <- perform_request(url, pat, opts, :get, nil),
          {:ok, json} <- successful_json(response, opts),
          {:ok, repositories} <- repositories_from_json(json),
+         :ok <- public_inventory(repositories, pat),
          {:ok, next_url} <- Pagination.next_url(response, allowed_paths) do
       case next_url do
         nil ->
@@ -1000,26 +1152,43 @@ defmodule ForgeGitHub.Client do
   defp json_object(value) when is_map(value), do: {:ok, value}
   defp json_object(_value), do: {:error, :invalid_response}
 
+  defp validate_public_request(:public, :get, url) do
+    with {:ok, %URI{path: path}} when is_binary(path) <- URI.new(url),
+         true <-
+           Enum.any?(["/orgs/", "/organizations/", "/repos/"], &String.starts_with?(path, &1)) do
+      :ok
+    else
+      _ -> error(:invalid_request)
+    end
+  end
+
+  defp validate_public_request(:public, _method, _url), do: error(:invalid_request)
+  defp validate_public_request(_credential, _method, _url), do: :ok
+
+  defp authorization_headers(:public), do: []
+  defp authorization_headers(token), do: [{"authorization", "Bearer " <> token}]
+
   defp perform_request(url, pat, opts, method, body) do
     started = System.monotonic_time()
     request_deadline = monotonic_ms() + Keyword.get(opts, :request_timeout, @request_timeout)
     deadline = min(request_deadline, Keyword.get(opts, :deadline_monotonic_ms, request_deadline))
 
     result =
-      with :ok <- validate_request_url(url),
+      with :ok <- validate_public_request(pat, method, url),
+           :ok <- validate_request_url(url),
            {:ok, addresses} <- resolve_addresses(opts, deadline) do
         request =
           Req.new(
             method: method,
             base_url: @api_base,
             adapter: Transport,
-            headers: [
-              {"accept", @accept},
-              {"accept-encoding", "identity"},
-              {"authorization", "Bearer " <> pat},
-              {"user-agent", @user_agent},
-              {"x-github-api-version", @api_version}
-            ],
+            headers:
+              [
+                {"accept", @accept},
+                {"accept-encoding", "identity"},
+                {"user-agent", @user_agent},
+                {"x-github-api-version", @api_version}
+              ] ++ authorization_headers(pat),
             redirect: false,
             retry: false,
             compressed: false,
@@ -1287,8 +1456,13 @@ defmodule ForgeGitHub.Client do
   defp decode_json(body), do: decode_json(body, :generic)
 
   defp decode_json(body, json_profile) do
+    max_nodes =
+      if json_profile == :release_metadata,
+        do: @max_release_metadata_json_nodes,
+        else: @max_json_nodes
+
     with {:ok, value} <- JSON.decode(body),
-         {:ok, _nodes} <- validate_json(value, 0, 0, json_profile) do
+         {:ok, _nodes} <- validate_json(value, 0, 0, json_profile, max_nodes) do
       {:ok, value}
     else
       {:error, {_reason, _offset}} -> error(:invalid_json)
@@ -1297,23 +1471,27 @@ defmodule ForgeGitHub.Client do
     end
   end
 
-  defp validate_json(_value, depth, _nodes, _json_profile) when depth > @max_json_depth,
+  defp validate_json(value, depth, nodes, json_profile),
+    do: validate_json(value, depth, nodes, json_profile, @max_json_nodes)
+
+  defp validate_json(_value, depth, _nodes, _json_profile, _max_nodes)
+       when depth > @max_json_depth,
+       do: {:error, :invalid_json}
+
+  defp validate_json(_value, _depth, nodes, _json_profile, max_nodes) when nodes >= max_nodes,
     do: {:error, :invalid_json}
 
-  defp validate_json(_value, _depth, nodes, _json_profile) when nodes >= @max_json_nodes,
-    do: {:error, :invalid_json}
-
-  defp validate_json(value, _depth, nodes, json_profile) when is_binary(value) do
+  defp validate_json(value, _depth, nodes, json_profile, _max_nodes) when is_binary(value) do
     if byte_size(value) <= json_string_limit(json_profile),
       do: {:ok, nodes + 1},
       else: {:error, :invalid_json}
   end
 
-  defp validate_json(value, _depth, nodes, _json_profile)
+  defp validate_json(value, _depth, nodes, _json_profile, _max_nodes)
        when is_integer(value) or is_float(value) or is_boolean(value) or is_nil(value),
        do: {:ok, nodes + 1}
 
-  defp validate_json(values, depth, nodes, json_profile)
+  defp validate_json(values, depth, nodes, json_profile, max_nodes)
        when is_list(values) and length(values) <= @max_json_collection do
     item_profile =
       if json_profile in [:issue_metadata, :release_metadata],
@@ -1321,19 +1499,25 @@ defmodule ForgeGitHub.Client do
         else: :generic
 
     Enum.reduce_while(values, {:ok, nodes + 1}, fn value, {:ok, count} ->
-      case validate_json(value, depth + 1, count, item_profile) do
+      case validate_json(value, depth + 1, count, item_profile, max_nodes) do
         {:ok, count} -> {:cont, {:ok, count}}
         error -> {:halt, error}
       end
     end)
   end
 
-  defp validate_json(values, depth, nodes, json_profile)
+  defp validate_json(values, depth, nodes, json_profile, max_nodes)
        when is_map(values) and map_size(values) <= @max_json_collection do
     Enum.reduce_while(values, {:ok, nodes + 1}, fn {key, value}, {:ok, count} ->
       with true <- is_binary(key) and byte_size(key) <= 128,
            {:ok, count} <-
-             validate_json(value, depth + 1, count, json_value_profile(json_profile, key)) do
+             validate_json(
+               value,
+               depth + 1,
+               count,
+               json_value_profile(json_profile, key),
+               max_nodes
+             ) do
         {:cont, {:ok, count}}
       else
         _invalid -> {:halt, {:error, :invalid_json}}
@@ -1341,7 +1525,8 @@ defmodule ForgeGitHub.Client do
     end)
   end
 
-  defp validate_json(_value, _depth, _nodes, _json_profile), do: {:error, :invalid_json}
+  defp validate_json(_value, _depth, _nodes, _json_profile, _max_nodes),
+    do: {:error, :invalid_json}
 
   defp json_value_profile(:issue_metadata, "body"), do: :issue_body
   defp json_value_profile(:release_metadata, "body"), do: :release_body

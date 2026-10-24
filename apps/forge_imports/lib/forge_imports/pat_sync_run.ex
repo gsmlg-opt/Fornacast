@@ -3,7 +3,19 @@ defmodule ForgeImports.PatSyncRun do
   use Ecto.Schema
 
   schema "organization_pat_sync_runs" do
+    field :credential_source, Ecto.Enum,
+      values: [:personal, :organization_device, :public],
+      default: :personal
+
+    field :requested_by_user_id, :integer
+    field :github_organization_id, :integer
+    field :organization_connection_id, :integer
+    field :organization_connection_version, :integer
+    field :organization_credential_id, :integer
+    field :organization_credential_version, :integer
+    field :github_installation_id, :integer
     field :configuration_id, :integer
+    field :public_configuration_version, :integer
     field :organization_id, :integer
     field :owner_user_id, :integer
     field :github_identity_id, :integer

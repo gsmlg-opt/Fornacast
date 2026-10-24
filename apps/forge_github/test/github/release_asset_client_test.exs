@@ -5,6 +5,29 @@ defmodule ForgeGitHub.ReleaseAssetClientTest do
 
   setup {Req.Test, :verify_on_exit!}
 
+  test "public assets retain metadata safety and download without authentication" do
+    assert {:ok, %{"id" => 51}} = ReleaseAssetClient.decode_asset(asset(), :public)
+
+    consumer = fn reader, state ->
+      {:ok, "payload", state} = reader.(state, length: 64, read_timeout: 1_000)
+      {:eof, state} = reader.(state, length: 64, read_timeout: 1_000)
+      {:ok, :stored, state}
+    end
+
+    assert {:ok, :stored} =
+             ReleaseAssetClient.download(:public, "acme", "widgets", asset(), consumer,
+               gate_key: {:public, 1},
+               resolver: fn _ -> {:ok, [{140, 82, 114, 5}]} end,
+               transport_api: __MODULE__.DirectMint
+             )
+
+    assert_received {:asset_request, "api.github.com", headers}
+    refute List.keymember?(headers, "authorization", 0)
+
+    assert {:error, :invalid_response} =
+             ReleaseAssetClient.decode_asset(Map.put(asset(), "name", "ghp_secret"), :public)
+  end
+
   test "paginates asset descriptors and preserves nullable labels and historical metadata" do
     stub = {__MODULE__, System.unique_integer([:positive])}
 

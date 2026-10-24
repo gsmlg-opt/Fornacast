@@ -109,7 +109,7 @@ defmodule FornacastWeb.HTML do
         <header class="appbar appbar-primary appbar-sticky">
           <div class="appbar-left">
             #{brand_mark("Fornacast dashboard")}
-            <nav class="appbar-nav" aria-label="Workspace">
+            <nav class="appbar-workspace-nav" aria-label="Workspace">
               #{repository_menu(current_user)}
             </nav>
           </div>
@@ -157,7 +157,7 @@ defmodule FornacastWeb.HTML do
         "<header class=\"appbar appbar-primary appbar-sticky\">",
         "<div class=\"appbar-left\">",
         brand_mark("Fornacast dashboard"),
-        "<nav class=\"appbar-nav\" aria-label=\"Workspace\">",
+        "<nav class=\"appbar-workspace-nav\" aria-label=\"Workspace\">",
         repository_menu(current_user),
         "</nav></div>",
         "<div class=\"appbar-actions\">",

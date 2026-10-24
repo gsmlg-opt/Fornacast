@@ -15,6 +15,7 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTML do
     normalized =
       %{
         organization: organization,
+        installation_configured: false,
         mirror: nil,
         installation: nil,
         coverage: :none,
@@ -31,7 +32,8 @@ defmodule FornacastWeb.OrganizationGitHubSettingsHTML do
       |> Map.merge(view)
       |> Map.put(:organization, organization)
 
-    with true <- is_map(normalized.policy),
+    with true <- is_boolean(normalized.installation_configured),
+         true <- is_map(normalized.policy),
          true <- is_map(normalized.capabilities),
          true <- is_map(normalized.repository_counts),
          true <- is_map(normalized.webhook_health),

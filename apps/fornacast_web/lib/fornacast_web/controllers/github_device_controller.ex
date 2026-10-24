@@ -26,7 +26,7 @@ defmodule FornacastWeb.GitHubDeviceController do
         {:error, reason} -> GitHubDeviceSession.run(conn, {:fail, id, safe_reason(reason)})
       end
 
-      conn |> put_status(:see_other) |> redirect(to: "/settings/github")
+      conn |> put_status(:see_other) |> redirect(to: "/settings/github/device/legacy")
     else
       {:error, _reason} ->
         send_resp(conn, 503, "GitHub authorization is temporarily unavailable.")

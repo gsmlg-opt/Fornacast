@@ -3,134 +3,33 @@
   data-organization-import
 >
   <header class="grid gap-2">
-    <p class="text-xs text-on-surface-variant">Repository discovery</p>
+    <p class="text-xs text-on-surface-variant">GitHub synchronization</p>
     <h2 class="text-2xl font-semibold">Import organization from GitHub</h2>
     <p class="text-sm text-on-surface-variant max-w-3xl">
-      Discover every repository visible to the selected credential. All repositories begin selected.
-      After discovery, the import plan page tracks durable progress, cancellation, credential replacement, retry, and the final report.
+      Choose public repository access or connect a GitHub App to your local organization.
     </p>
   </header>
-
   <.dm_alert :if={@error} id="organization-import-error" variant="error" outlined role="alert">
     {@error}
   </.dm_alert>
-
-  <.dm_card id="organization-import-card" variant="bordered" shadow="md" padding="lg">
-    <:title><span class="text-lg font-semibold">Organization source</span></:title>
-    <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#157 --%>
-    <form action="/organizations/import/discover" method="post" class="grid gap-4">
-      <input type="hidden" name="_csrf_token" value={csrf_token()} />
-      <.dm_input
-        id="organization-import-source"
-        class="w-full"
-        name="import[organization]"
-        type="text"
-        label="GitHub organization login"
-        required
-        maxlength="39"
-        autocomplete="off"
-        spellcheck="false"
-        autocapitalize="none"
-      />
-      <fieldset class="grid gap-2">
-        <legend class="font-semibold">Credential</legend>
-        <div class="flex flex-wrap gap-2">
-          <label class="inline-flex items-center gap-2">
-            <input
-              class="radio radio-primary"
-              type="radio"
-              name="import[credential_source]"
-              value="saved"
-              checked={@accounts != []}
-            /> Saved GitHub account
-          </label>
-          <label class="inline-flex items-center gap-2">
-            <input
-              class="radio radio-primary"
-              type="radio"
-              name="import[credential_source]"
-              value="one_time"
-              checked={@accounts == []}
-            /> One-time personal access token
-          </label>
-        </div>
-      </fieldset>
-      <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#158 --%>
-      <.dm_input
-        id="organization-import-github-account"
-        class="w-full"
-        name="import[github_identity_id]"
-        type="select"
-        label="Saved GitHub account"
-        prompt="Choose a linked account"
-        options={account_options(@accounts)}
-        value={nil}
-      />
-      <.dm_input
-        id="organization-import-pat"
-        class="w-full"
-        name="import[pat]"
-        type="password"
-        label="One-time GitHub personal access token"
-        helper="Leave blank when using a saved account. A one-time PAT is never shown again."
-        maxlength="4096"
-        autocomplete="new-password"
-        spellcheck="false"
-        autocapitalize="none"
-      />
-
-      <fieldset class="grid gap-2 bg-surface-container-high text-on-surface rounded-lg p-4">
-        <legend class="text-lg font-semibold">Local organization destination</legend>
-        <div class="flex flex-wrap gap-2">
-          <label class="inline-flex items-center gap-2">
-            <input
-              class="radio radio-primary"
-              type="radio"
-              name="import[destination_action]"
-              value="new"
-              checked
-            /> Create a new local organization
-          </label>
-          <label class="inline-flex items-center gap-2">
-            <input
-              class="radio radio-primary"
-              type="radio"
-              name="import[destination_action]"
-              value="existing"
-            /> Use an existing organization I own
-          </label>
-        </div>
-        <.dm_input
-          id="organization-import-destination-slug"
-          class="w-full"
-          name="import[destination_slug]"
-          type="text"
-          label="New local organization slug"
-          helper="Leave blank to use the GitHub organization login."
-          maxlength="255"
-          autocomplete="off"
-          spellcheck="false"
-          autocapitalize="none"
-        />
-        <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#158 --%>
-        <.dm_input
-          id="organization-import-existing-destination"
-          class="w-full"
-          name="import[destination_organization_id]"
-          type="select"
-          label="Existing organization I own"
-          prompt="Choose an owned organization"
-          options={organization_options(@organizations)}
-          value={nil}
-        />
-        <p :if={@organizations == []} class="text-sm text-on-surface-variant">
-          No owned organizations are available.
-        </p>
-      </fieldset>
-
-      <div>
-        <button class="btn btn-primary" type="submit">Discover organization</button>
-      </div>
-    </form>
-  </.dm_card>
+  <div class="grid gap-4 md:grid-cols-2">
+    <.dm_card id="organization-import-public" variant="bordered" shadow="sm" padding="lg">
+      <:title><span class="text-lg font-semibold">Public repositories</span></:title>
+      <p class="text-sm text-on-surface-variant">
+        Discover and import an organization's public repositories without a GitHub account or token.
+      </p>
+      <:action>
+        <.dm_link href="/organizations/import/public" class="btn btn-primary">Synchronize public repositories</.dm_link>
+      </:action>
+    </.dm_card>
+    <.dm_card id="organization-import-app" variant="bordered" shadow="sm" padding="lg">
+      <:title><span class="text-lg font-semibold">GitHub App</span></:title>
+      <p class="text-sm text-on-surface-variant">
+        Install and authorize the App for your GitHub organization, then choose repositories available to its connection.
+      </p>
+      <:action>
+        <.dm_link href="/organizations/import/app" class="btn btn-secondary">Install and connect GitHub App</.dm_link>
+      </:action>
+    </.dm_card>
+  </div>
 </section>

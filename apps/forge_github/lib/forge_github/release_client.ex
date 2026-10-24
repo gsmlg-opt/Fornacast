@@ -26,7 +26,13 @@ defmodule ForgeGitHub.ReleaseClient do
   @canonical_fields ~w(id node_id tag_name name body draft prerelease target_commitish published_at created_at updated_at author asset_count unsupported_fields)
   @unsupported_release_fields ~w(make_latest)
 
-  @spec list_releases_page(String.t(), String.t(), String.t(), nil | pos_integer(), keyword()) ::
+  @spec list_releases_page(
+          String.t() | :public,
+          String.t(),
+          String.t(),
+          nil | pos_integer(),
+          keyword()
+        ) ::
           {:ok, %{releases: [map()], next_cursor: nil | pos_integer()}}
           | {:error, Error.t()}
   def list_releases_page(token, owner, repository, cursor, opts) do
@@ -44,7 +50,7 @@ defmodule ForgeGitHub.ReleaseClient do
     end
   end
 
-  @spec get_release(String.t(), String.t(), String.t(), pos_integer(), keyword()) ::
+  @spec get_release(String.t() | :public, String.t(), String.t(), pos_integer(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def get_release(token, owner, repository, release_id, opts) do
     with {:ok, base} <- repository_base(owner, repository),
@@ -59,7 +65,7 @@ defmodule ForgeGitHub.ReleaseClient do
   end
 
   @doc "Reads the provider's unique release identity for an exact encoded tag."
-  @spec get_release_by_tag(String.t(), String.t(), String.t(), String.t(), keyword()) ::
+  @spec get_release_by_tag(String.t() | :public, String.t(), String.t(), String.t(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def get_release_by_tag(token, owner, repository, tag_name, opts) do
     with {:ok, base} <- repository_base(owner, repository),
@@ -143,8 +149,16 @@ defmodule ForgeGitHub.ReleaseClient do
   defp valid_options?(opts) when is_list(opts) do
     Keyword.keyword?(opts) and not Keyword.has_key?(opts, :json) and
       case Keyword.get(opts, :gate_key) do
+        {:public, 1} ->
+          true
+
         {kind, id}
-        when kind in [:github_installation, :one_time_run, :saved_credential] and is_integer(id) and
+        when kind in [
+               :github_installation,
+               :one_time_run,
+               :saved_credential,
+               :organization_credential
+             ] and is_integer(id) and
                id in 1..@max_id ->
           true
 
@@ -479,18 +493,21 @@ defmodule ForgeGitHub.ReleaseClient do
 
   defp valid_timestamp?(_value), do: false
 
-  defp validate_retained_strings(values, token) when is_list(values) and is_binary(token) do
+  defp validate_retained_strings(values, token)
+       when is_list(values) and (is_binary(token) or token == :public) do
     if Enum.all?(values, &safe_provider_string?(&1, token)), do: :ok, else: :error
   end
 
   defp safe_release_body?(nil, _token), do: true
 
-  defp safe_release_body?(value, token) when is_binary(value) and is_binary(token) do
+  defp safe_release_body?(value, token)
+       when is_binary(value) and (is_binary(token) or token == :public) do
     # Release notes can describe Bearer token authentication. Permit that prose
     # only during validation; retain the original notes and reject credential
     # echoes before removing the descriptive prefix.
-    not String.contains?(value, token) and
-      not (byte_size(value) >= 8 and String.contains?(token, value)) and
+    (token == :public or
+       (not String.contains?(value, token) and
+          not (byte_size(value) >= 8 and String.contains?(token, value)))) and
       safe_provider_string?(
         String.replace(value, ~r/\bbearer (?=tokens?\b|authentication\b)/i, ""),
         token

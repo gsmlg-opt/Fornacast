@@ -1027,6 +1027,70 @@ defmodule ForgeGitHub.ClientTest do
     assert URI.decode_query(query) == %{"per_page" => "100", "state" => "all"}
   end
 
+  test "repository issues retains the requested repository when GitHub paginates by numeric ID" do
+    stub = stub_name()
+    path = "/repos/octocat/Hello-World/issues"
+    cursor = "Y3Vyc29yOnYyOpLPAAABn67rvejPAAAAASq852I%3D"
+    query = "state=all&per_page=100&after=#{cursor}&page=2"
+
+    Req.Test.expect(stub, fn conn ->
+      assert conn.request_path == path
+
+      conn
+      |> Plug.Conn.put_resp_header(
+        "link",
+        ~s(<https://api.github.com/repositories/482252754/issues?#{query}>; rel="next")
+      )
+      |> Req.Test.json([%{"number" => 1}])
+    end)
+
+    Req.Test.expect(stub, fn conn ->
+      assert conn.request_path == path
+      assert conn.query_string == query
+      assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer github_pat_test"]
+      Req.Test.json(conn, [%{"number" => 2}])
+    end)
+
+    assert {:ok, [%{"number" => 1}, %{"number" => 2}]} =
+             Client.repository_issues(
+               "github_pat_test",
+               "octocat",
+               "Hello-World",
+               client_opts(stub)
+             )
+  end
+
+  test "repository issue aliases cannot change origin, resource or endpoint" do
+    for target <- [
+          "https://api.github.com.evil.example/repositories/482252754/issues?page=2",
+          "http://api.github.com/repositories/482252754/issues?page=2",
+          "https://api.github.com:444/repositories/482252754/issues?page=2",
+          "https://user@api.github.com/repositories/482252754/issues?page=2",
+          "https://api.github.com/repositories/482252754/issues?page=2#fragment",
+          "https://api.github.com/repositories/482252754/pulls?page=2",
+          "https://api.github.com/repositories/482252754/issues/7/comments?page=2",
+          "https://api.github.com/repositories/0/issues?page=2",
+          "https://api.github.com/repositories/not-an-id/issues?page=2",
+          "https://api.github.com/repos/another/project/issues?page=2"
+        ] do
+      stub = stub_name()
+
+      Req.Test.expect(stub, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("link", ~s(<#{target}>; rel="next"))
+        |> Req.Test.json([])
+      end)
+
+      assert {:error, %Error{kind: :invalid_pagination}} =
+               Client.repository_issues(
+                 "github_pat_test",
+                 "octocat",
+                 "Hello-World",
+                 client_opts(stub, System.unique_integer([:positive]))
+               )
+    end
+  end
+
   test "pull metadata transport permits long bodies only on scoped App endpoints" do
     stub = stub_name()
     body = String.duplicate("界", 20_000)
@@ -1310,6 +1374,51 @@ defmodule ForgeGitHub.ClientTest do
     exports = Client.__info__(:functions) |> Enum.map(&elem(&1, 0)) |> MapSet.new()
 
     refute Enum.any?(unsupported, &MapSet.member?(exports, &1))
+  end
+
+  test "release metadata has a bounded node budget across nested generic asset fields" do
+    releases = release_asset_page(16)
+    stub = stub_name()
+    Req.Test.expect(stub, &Req.Test.json(&1, releases))
+
+    assert {:ok, %{json: ^releases, next_url: nil}} =
+             Client.release_metadata_page(
+               "github_pat_test",
+               "/repos/octocat/hello-world/releases?per_page=100&page=1",
+               client_opts(stub)
+             )
+
+    generic = stub_name()
+    Req.Test.expect(generic, &Req.Test.json(&1, releases))
+
+    assert {:error, %Error{kind: :invalid_response}} =
+             Client.request(
+               "github_pat_test",
+               :get,
+               "/repos/octocat/hello-world/releases?per_page=100&page=1",
+               client_opts(generic)
+             )
+  end
+
+  test "release metadata rejects a page exceeding its bounded node budget" do
+    stub = stub_name()
+    Req.Test.expect(stub, &Req.Test.json(&1, release_asset_page(64)))
+
+    assert {:error, %Error{kind: :invalid_response}} =
+             Client.release_metadata_page(
+               "github_pat_test",
+               "/repos/octocat/hello-world/releases?per_page=100&page=1",
+               client_opts(stub)
+             )
+  end
+
+  defp release_asset_page(asset_count) do
+    # Sixteen assets produce over 50,000 nodes; 64 produce over 200,000.
+    asset = Map.new(1..32, &{"field_#{&1}", &1})
+
+    for id <- 1..100 do
+      %{"id" => id, "tag_name" => "v#{id}", "assets" => List.duplicate(asset, asset_count)}
+    end
   end
 
   defp client_opts(stub, key_id \\ 1, extra \\ []) do

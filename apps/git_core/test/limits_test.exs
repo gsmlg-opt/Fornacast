@@ -28,6 +28,7 @@ defmodule GitCore.LimitsTest do
     remote_repository_bytes: 21_474_836_480,
     remote_refs: 200_000,
     remote_poll_interval_ms: 100,
+    remote_control_callback_ms: 500,
     remote_credential_startup_ms: 10_000,
     remote_kill_escalation_ms: 5_000,
     remote_cleanup_wait_ms: 10_000

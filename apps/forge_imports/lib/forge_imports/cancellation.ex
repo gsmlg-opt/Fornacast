@@ -40,8 +40,9 @@ defmodule ForgeImports.Cancellation do
           {:ok, ImportRun.t()} | {:error, atom()}
   def request(actor, run, request_metadata, opts \\ [])
 
-  def request(%User{} = actor, %ImportRun{} = expected_run, request_metadata, opts)
-      when is_map(request_metadata) and is_list(opts) do
+  def request(actor, %ImportRun{} = expected_run, request_metadata, opts)
+      when (is_struct(actor, User) or is_struct(actor, ForgeImports.OrganizationExecution)) and
+             is_map(request_metadata) and is_list(opts) do
     now = Keyword.get(opts, :now, DateTime.utc_now(:second))
 
     transaction = fn ->
@@ -271,6 +272,11 @@ defmodule ForgeImports.Cancellation do
     |> where([run], run.id == ^run_id and run.actor_user_id == ^actor_id)
     |> lock("FOR UPDATE")
     |> Repo.one()
+  end
+
+  defp active_actor(%ForgeImports.OrganizationExecution{} = execution) do
+    with {:ok, _} <- ForgeImports.OrganizationExecution.authorize(execution, lock: true),
+         do: {:ok, execution}
   end
 
   defp active_actor(%User{id: actor_id}) do

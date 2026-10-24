@@ -62,7 +62,7 @@ defmodule ForgeImports.RunAggregator do
 
     case Persistence.with_retry(transaction) do
       {:ok, %ImportRun{} = run} ->
-        {:ok, run}
+        with {:ok, _} <- ForgeImports.OrganizationPublicSync.adopt_import(run), do: {:ok, run}
 
       {:error, :pending} ->
         :pending
