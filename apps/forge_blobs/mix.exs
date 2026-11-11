@@ -25,7 +25,7 @@ defmodule ForgeBlobs.MixProject do
   defp deps do
     [
       {:fornacast, in_umbrella: true},
-      {:ex_storage_service, "== 0.6.6"}
+      {:ex_storage_service, "~> 0.6"}
     ]
   end
 end

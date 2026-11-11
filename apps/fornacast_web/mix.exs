@@ -38,15 +38,15 @@ defmodule FornacastWeb.MixProject do
       {:git_core, in_umbrella: true},
       {:git_lfs, in_umbrella: true},
       {:git_transport, in_umbrella: true},
-      {:phoenix, "~> 1.8.15"},
-      {:phoenix_session_process, "~> 1.0.1"},
-      {:phoenix_duskmoon, "~> 9.16.11"},
-      {:duskmoon_bundler_runtime, "~> 9.16.11"},
-      {:duskmoon_bundler, "~> 9.16.11", runtime: Mix.env() == :dev},
+      {:phoenix, "~> 1.8"},
+      {:phoenix_session_process, "~> 1.0"},
+      {:phoenix_duskmoon, "~> 10.0"},
+      {:duskmoon_bundler_runtime, "~> 10.0"},
+      {:duskmoon_bundler, "~> 10.0", runtime: Mix.env() == :dev},
       {:phoenix_ecto, "~> 4.7"},
       {:phoenix_html, "~> 4.3"},
       {:bandit, "~> 1.12"},
-      {:mdex, "~> 0.14.2"}
+      {:mdex, "~> 0.14"}
     ]
   end
 end
