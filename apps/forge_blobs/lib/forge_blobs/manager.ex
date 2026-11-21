@@ -49,6 +49,7 @@ defmodule ForgeBlobs.Manager do
       config: config,
       instance_supervisor: instance_supervisor,
       status: {:not_ready, :starting},
+      registry_ref: nil,
       instance_pid: nil,
       instance_ref: nil,
       engine_pid: nil,
@@ -75,6 +76,18 @@ defmodule ForgeBlobs.Manager do
   def handle_call(:status, _from, state), do: {:reply, state.status, state}
 
   @impl true
+  def handle_info(
+        {:DOWN, reference, :process, _registry, _reason},
+        %{registry_ref: reference} = state
+      ) do
+    state =
+      %{state | registry_ref: nil}
+      |> mark_not_ready(:storage_registry_unavailable)
+      |> schedule_reconcile()
+
+    {:noreply, state}
+  end
+
   def handle_info(
         {:DOWN, reference, :process, _pid, _reason},
         %{instance_ref: reference} = state
@@ -223,6 +236,8 @@ defmodule ForgeBlobs.Manager do
   end
 
   defp attach_ready(state, instance) do
+    # An owned instance can survive the registry that held its process names.
+    state = %{state | registry_ref: state.registry_ref || Process.monitor(Names.registry())}
     state = ensure_instance_monitor(state, instance)
 
     case owned_engine(instance, state.config.instance_config.instance) do

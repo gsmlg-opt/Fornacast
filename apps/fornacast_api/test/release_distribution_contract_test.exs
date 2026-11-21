@@ -15,7 +15,6 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
   @config Path.join(@root, "config/config.exs")
   @runtime_config Path.join(@root, "config/runtime.exs")
   @releases_mix Path.join(@root, "apps/forge_releases/mix.exs")
-  @blobs_mix Path.join(@root, "apps/forge_blobs/mix.exs")
   @deploy_notes_start "<!-- FORNACAST_DEPLOY_NOTES_START -->"
   @deploy_notes_end "<!-- FORNACAST_DEPLOY_NOTES_END -->"
   @obsolete_database_claims [
@@ -1055,7 +1054,14 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert runtime_stage =~ "LANG=C.UTF-8"
     assert "coreutils" in String.split(runtime_packages)
     assert File.read!(@releases_mix) =~ ~s({:forge_blobs, in_umbrella: true})
-    assert File.read!(@blobs_mix) =~ ~s({:ex_storage_service, "== 0.6.6"})
+    storage_apps = Application.spec(:forge_blobs, :applications)
+    assert :ex_storage_service in storage_apps
+    refute :ex_storage_service_s3 in storage_apps
+
+    assert {:hex, :ex_storage_service, locked_version, _, _, _, _, _} =
+             Mix.Dep.Lock.read()[:ex_storage_service]
+
+    assert to_string(Application.spec(:ex_storage_service, :vsn)) == locked_version
     assert dockerfile =~ "scripts/release_asset_storage_smoke.sh"
     refute dockerfile =~ "COPY scripts scripts"
     assert dockerfile =~ "RELEASE_DISTRIBUTION=name"
