@@ -111,11 +111,8 @@ jobs:
       - name: Compile dependencies
         run: mix deps.compile
 
-      - name: Install frontend dependencies
-        run: mix npm.ci
-
       - name: Build static assets
-        run: mix assets.deploy
+        uses: ./.github/actions/build-web-assets
 
       - name: Compile application
         run: mix compile
@@ -129,9 +126,6 @@ jobs:
           mix release fornacast --overwrite --path "$release_path"
           test -s "$release_path/lib/git_core-${VERSION}/priv/native/fornacast_git_core.so"
           tar -C "$RUNNER_TEMP" -czf "artifacts/fornacast-${VERSION}-linux-x86_64.tar.gz" fornacast
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
 
       - name: Commit release version
         env:
@@ -195,7 +189,9 @@ jobs:
             FORNACAST_BUILD_GIT_REF=${{ steps.version.outputs.git_ref }}
             FORNACAST_BUILD_GIT_COMMIT=${{ steps.version.outputs.source_commit }}
             FORNACAST_BUILD_TIME=${{ steps.version.outputs.built_at }}
-          cache-from: type=gha,scope=fornacast-release-postgres
+          cache-from: |
+            type=gha,scope=fornacast-web-assets
+            type=gha,scope=fornacast-release-postgres
           cache-to: type=gha,mode=max,scope=fornacast-release-postgres
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}

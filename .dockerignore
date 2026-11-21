@@ -11,4 +11,9 @@ log
 apps/*/tmp
 apps/*/node_modules
 apps/*/priv/native
+apps/fornacast_web/priv/static/assets/
+apps/fornacast_web/priv/static/cache_manifest.json
+apps/fornacast_web/priv/static/favicon-*.ico
+apps/fornacast_web/priv/static/images/logo-*.png
+apps/fornacast_web/priv/static/**/*.gz
 apps/git_core/native/fornacast_git_core/target

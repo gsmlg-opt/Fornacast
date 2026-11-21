@@ -2,10 +2,11 @@ ARG ELIXIR_IMAGE=elixir:1.20.1-otp-29
 ARG DEBIAN_IMAGE=debian:trixie-slim
 ARG RUST_VERSION=1.96.0
 
+FROM rust:${RUST_VERSION}-slim-trixie AS rust-toolchain
+
 FROM ${ELIXIR_IMAGE} AS build
 
 ARG FORNACAST_DATABASE_ADAPTER=postgres
-ARG RUST_VERSION
 ENV MIX_ENV=prod \
     FORNACAST_DATABASE_ADAPTER=${FORNACAST_DATABASE_ADAPTER} \
     LANG=C.UTF-8 \
@@ -13,6 +14,8 @@ ENV MIX_ENV=prod \
     RUSTUP_HOME=/root/.rustup
 ENV PATH="${CARGO_HOME}/bin:${PATH}"
 
+COPY --from=rust-toolchain /usr/local/cargo /root/.cargo
+COPY --from=rust-toolchain /usr/local/rustup /root/.rustup
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       build-essential \
@@ -21,8 +24,6 @@ RUN apt-get update && \
       git \
       libssl-dev \
       pkg-config && \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-      sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION} && \
     rm -rf /var/lib/apt/lists/*
 
 RUN apt-get update && \
@@ -55,10 +56,22 @@ ENV FORNACAST_BUILD_GIT_REF=${FORNACAST_BUILD_GIT_REF} \
 RUN mix deps.get --only prod && \
     mix deps.compile && \
     mix npm.ci
+RUN mix compile
 
-RUN mix assets.deploy && \
-    mix compile && \
-    mix release fornacast
+# DuskMoon's GNU asset compiler requires glibc 2.43.
+FROM hexpm/elixir:1.20.1-erlang-29.0-ubuntu-resolute-20260421 AS web-assets
+ENV MIX_ENV=prod
+WORKDIR /app
+COPY --from=build /root/.mix /root/.mix
+COPY --from=build /app /app
+RUN mix assets.deploy
+
+FROM scratch AS static
+COPY --from=web-assets /app/apps/fornacast_web/priv/static/ /
+
+FROM build AS release
+COPY --from=static / apps/fornacast_web/priv/static/
+RUN mix release fornacast
 
 FROM ${DEBIAN_IMAGE} AS app
 
@@ -79,7 +92,7 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-COPY --from=build --chown=fornacast:fornacast /app/_build/prod/rel/fornacast ./
+COPY --from=release --chown=fornacast:fornacast /app/_build/prod/rel/fornacast ./
 COPY --chown=fornacast:fornacast \
   scripts/release_asset_storage_smoke.sh \
   /app/bin/release_asset_storage_smoke

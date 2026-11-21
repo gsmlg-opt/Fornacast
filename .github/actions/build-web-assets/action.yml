@@ -1,0 +1,13 @@
+name: Build web assets
+description: Run the DuskMoon compiler with the release image's asset toolchain
+runs:
+  using: composite
+  steps:
+    - uses: docker/setup-buildx-action@v4
+    - uses: docker/build-push-action@v7
+      with:
+        context: .
+        target: static
+        outputs: type=local,dest=apps/fornacast_web/priv/static
+        cache-from: type=gha,scope=fornacast-web-assets
+        cache-to: type=gha,scope=fornacast-web-assets,mode=max

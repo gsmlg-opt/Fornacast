@@ -108,7 +108,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     workflow = File.read!(@workflow)
 
     refute workflow =~ "packages: write"
-    assert workflow =~ "uses: docker/setup-buildx-action@v4"
+    assert workflow =~ "uses: ./.github/actions/build-web-assets"
     refute workflow =~ "Resolve GHCR username"
     refute workflow =~ "gh api user"
 
@@ -134,7 +134,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     for path <- [@workflow, @ci_workflow, @e2e_workflow] do
       workflow = File.read!(path)
 
-      assert workflow =~ "mix npm.ci"
+      assert workflow =~ "uses: ./.github/actions/build-web-assets"
       assert workflow =~ "package-lock.json"
       refute workflow =~ "mix bun.install"
       refute workflow =~ "bun.lock"
@@ -148,6 +148,19 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     refute dockerfile =~ "bun.lock"
     refute File.read!(@web_mix) =~ "{:bun,"
     refute File.read!(@config) =~ "config :bun,"
+  end
+
+  test "CI and the release image build web assets with the same Ubuntu toolchain" do
+    action = File.read!(Path.join(@root, ".github/actions/build-web-assets/action.yml"))
+    assert action =~ "uses: docker/setup-buildx-action@v4"
+    assert action =~ "target: static"
+    assert action =~ "type=local,dest=apps/fornacast_web/priv/static"
+
+    dockerfile = File.read!(@dockerfile)
+    assert dockerfile =~ ~r/^FROM .*ubuntu-resolute-.* AS web-assets$/m
+    assert_order(dockerfile, "AS web-assets", "RUN mix assets.deploy")
+    assert_order(dockerfile, "FROM scratch AS static", "COPY --from=web-assets")
+    assert_order(dockerfile, "COPY --from=static", "RUN mix release fornacast")
   end
 
   test "release archive and image embed the same source commit and build time" do

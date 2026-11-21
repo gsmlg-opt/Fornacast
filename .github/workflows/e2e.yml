@@ -118,13 +118,9 @@ jobs:
         if: github.event_name == 'pull_request'
         run: mix deps.compile
 
-      - name: Install frontend dependencies
-        if: github.event_name == 'pull_request'
-        run: mix npm.ci
-
       - name: Build static assets
         if: github.event_name == 'pull_request'
-        run: mix assets.deploy
+        uses: ./.github/actions/build-web-assets
 
       - name: Compile application
         if: github.event_name == 'pull_request'

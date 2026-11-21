@@ -32,6 +32,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.96.0
+
       - name: Setup BEAM
         uses: erlef/setup-beam@v1
         with:
@@ -111,11 +114,8 @@ jobs:
       - name: Compile dependencies
         run: mix deps.compile
 
-      - name: Install frontend dependencies
-        run: mix npm.ci
-
       - name: Build static assets
-        run: mix assets.deploy
+        uses: ./.github/actions/build-web-assets
 
       - name: Compile application
         run: mix compile --warnings-as-errors
