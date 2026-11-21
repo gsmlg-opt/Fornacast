@@ -75,6 +75,13 @@ defmodule ForgeImports.OrganizationExecutionTest do
     if context[:committed] do
       on_exit(fn ->
         Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+          Repo.delete_all(
+            from delivery in Styx.Job,
+              join: run in PatSyncRun,
+              on: type(delivery.args["pat_sync_run_id"], :integer) == run.id,
+              where: delivery.queue == "github_control" and run.organization_id == ^org.id
+          )
+
           Repo.update_all(from(j in PatSyncRun, where: j.organization_id == ^org.id),
             set: [import_run_id: nil]
           )

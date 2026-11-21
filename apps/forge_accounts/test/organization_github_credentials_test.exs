@@ -36,7 +36,13 @@ defmodule ForgeAccounts.OrganizationGitHubCredentialsTest do
           from c in OrganizationGitHubCredential, where: c.organization_id == ^organization.id
         )
 
-        Repo.delete_all(from a in Fornacast.AuditEvent, where: a.actor_user_id == ^owner.id)
+        Repo.delete_all(
+          from a in Fornacast.AuditEvent,
+            where:
+              a.actor_user_id == ^owner.id or
+                (a.target_type == "organization_github_credential" and
+                   a.metadata["organization_id"] == ^organization.id)
+        )
 
         Repo.delete_all(
           from m in ForgeAccounts.OrganizationMember, where: m.organization_id == ^organization.id
