@@ -1,7 +1,7 @@
 defmodule FornacastComponent.RepositoryLayout do
   @moduledoc "Shared repository page compositions over plain presentation data."
   use Phoenix.Component
-  use PhoenixDuskmoon.Component
+  use DuskmoonPhoenix.Component
   import FornacastComponent.GitRepository
 
   attr :view, :map, required: true

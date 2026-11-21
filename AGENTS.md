@@ -150,7 +150,7 @@ Fornacast/
 - Keep authorization at the domain boundary (`Fornacast.Access` / `fetch_authorized_repository`). Do not invent ad-hoc permission checks in controllers.
 - Domain functions typically return `{:ok, t}` / `{:error, atom | {:validation, _} | ...}` tuples. Map API errors through `FornacastAPI.Error.from_domain/2`.
 - Record sensitive mutations with `Fornacast.Audit` / `record_multi` when following existing patterns.
-- Web UI: **phoenix_duskmoon** foundation controls and **fornacast_component** project compositions only. Controllers use `use FornacastWeb, :html` / `:controller`, which pulls in `PhoenixDuskmoon.Component` and `ArtComponent`.
+- Web UI: **duskmoon_phoenix** foundation controls and **fornacast_component** project compositions only. `use FornacastWeb, :html` imports `DuskmoonPhoenix.Component` and `DuskmoonPhoenix.ArtComponent`. Pin the Hex and npm packages and the DuskMoon frontend dependencies to the same published Web version. [Upstream Phoenix skill](https://github.com/duskmoon-dev/duskmoon-web/blob/main/skills/duskmoon-phoenix/SKILL.md)
 - Tailwind plugin must be `@duskmoon-dev/core/plugin`. Themes already imported: `sunshine` / `moonlight`.
 - Assets are built with **duskmoon_bundler** (`mix assets.build` / `mix assets.deploy`), not a hand-rolled Vite/webpack setup.
 - API clients require non-empty `User-Agent`. Supported `X-GitHub-Api-Version` values: `2022-11-28` (default) and `2026-03-10`. Keep versioned serializers/validators in sync when changing response shapes.

@@ -21,7 +21,7 @@ defmodule FornacastComponent.MixProject do
     [
       {:phoenix_live_view, "~> 1.2"},
       {:phoenix_html, "~> 4.3"},
-      {:phoenix_duskmoon, "~> 10.0"},
+      {:duskmoon_phoenix, "2.0.0-rc.3"},
       {:lazy_html, "~> 0.1", only: :test}
     ]
   end

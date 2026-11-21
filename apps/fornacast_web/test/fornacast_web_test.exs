@@ -68,7 +68,7 @@ defmodule FornacastWebTest do
     assert phone_css =~ "[data-repository-page] [data-issue-comment-form]"
     assert phone_css =~ "[data-repository-page] [data-merge-box] form"
     assert phone_css =~ "flex-direction: column"
-    assert phone_css =~ "el-dm-button"
+    assert phone_css =~ "[data-merge-box] form .btn"
     assert phone_css =~ "width: 100%"
   end
 

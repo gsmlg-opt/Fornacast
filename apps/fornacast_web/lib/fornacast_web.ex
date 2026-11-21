@@ -17,8 +17,8 @@ defmodule FornacastWeb do
   def html do
     quote do
       use Phoenix.Component
-      use PhoenixDuskmoon.Component
-      use PhoenixDuskmoon.ArtComponent
+      use DuskmoonPhoenix.Component
+      use DuskmoonPhoenix.ArtComponent
 
       import Phoenix.HTML
       import FornacastWeb.HTML

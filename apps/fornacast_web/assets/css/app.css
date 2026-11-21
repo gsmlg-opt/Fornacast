@@ -2,13 +2,8 @@
 @plugin "@duskmoon-dev/core/plugin";
 @import "@duskmoon-dev/core/themes/sunshine";
 @import "@duskmoon-dev/core/themes/moonlight";
-@import "@duskmoon-dev/core/components";
-/* TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#89
- * WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#89
- * Intended package import: @import "phoenix_duskmoon/components";
- */
-@import "../../../../deps/phoenix_duskmoon/priv/static/assets/css/app.css";
-@import "@duskmoon-dev/css-art";
+@import "duskmoon_phoenix/css";
+@import "duskmoon_phoenix/elements.css";
 
 @layer base {
   :root {
@@ -1403,21 +1398,7 @@
     white-space: pre-wrap;
   }
 
-  /* TODO(upstream): duskmoon-dev/duskmoon-elements#79
-   * WORKAROUND(upstream): duskmoon-dev/duskmoon-elements#79
-   * el-dm-popover does not hide .popover-content when not open.
-   */
-  el-dm-popover:not([open])::part(popover),
-  el-dm-popover:not(:defined) > :not([slot="trigger"]) {
-    display: none !important;
-  }
-
   [data-repository-page] .repository-clone-popover {
-    position: relative;
-    z-index: 50;
-  }
-
-  [data-repository-page] .repository-clone-popover::part(popover) {
     width: min(40rem, calc(100vw - 1rem));
     max-width: calc(100vw - 1rem);
     max-height: calc(100vh - 1rem);
@@ -1557,7 +1538,6 @@
   [data-repository-page] .repository-ref-form .form-group,
   [data-repository-page] .repository-quick-search .form-group,
   [data-repository-page] .repository-toolbar-actions,
-  [data-repository-page] .repository-clone-popover,
   [data-repository-page] .repository-clone-trigger {
     width: 100%;
   }
@@ -1593,11 +1573,11 @@
     flex-direction: column;
   }
 
-  [data-repository-page] [data-issue-form] form > .flex :where(.btn, button.btn, el-dm-button),
-  [data-repository-page] [data-pull-form] form > .flex :where(.btn, button.btn, el-dm-button),
-  [data-repository-page] [data-issue-comment-form] :where(.btn, button.btn, el-dm-button),
-  [data-repository-page] [data-pull-conversation] > form :where(.btn, button.btn, el-dm-button),
-  [data-repository-page] [data-merge-box] form :where(.btn, button.btn, el-dm-button) {
+  [data-repository-page] [data-issue-form] form > .flex .btn,
+  [data-repository-page] [data-pull-form] form > .flex .btn,
+  [data-repository-page] [data-issue-comment-form] .btn,
+  [data-repository-page] [data-pull-conversation] > form .btn,
+  [data-repository-page] [data-merge-box] form .btn {
     width: 100%;
   }
 }

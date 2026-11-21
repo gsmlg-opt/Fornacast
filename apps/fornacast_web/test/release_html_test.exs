@@ -23,8 +23,13 @@ defmodule FornacastWeb.ReleaseHTMLTest do
     assert html =~ "Version 1"
     assert html =~ "v1.0.0"
     assert html =~ "Published"
-    assert html =~ "el-dm-button"
-    assert html =~ "Create release"
+
+    primary_actions =
+      html |> LazyHTML.from_fragment() |> LazyHTML.query("[data-releases-page] .btn-primary")
+
+    assert Enum.count(primary_actions) == 1
+    assert LazyHTML.attribute(primary_actions, "type") == ["submit"]
+    assert String.trim(LazyHTML.text(primary_actions)) == "Create release"
 
     [navigation] =
       Regex.run(~r/<nav\b[^>]*id="repository-navigation".*?<\/nav>/s, html)

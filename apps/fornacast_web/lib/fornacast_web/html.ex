@@ -4,7 +4,7 @@ defmodule FornacastWeb.HTML do
   use Phoenix.Component
 
   import Phoenix.HTML
-  import PhoenixDuskmoon.Component.DataDisplay.Tooltip, only: [dm_tooltip: 1]
+  import DuskmoonPhoenix.Component.DataDisplay.Tooltip, only: [dm_tooltip: 1]
   import Plug.Conn, except: [assign: 3]
 
   def page(conn, title, body) do

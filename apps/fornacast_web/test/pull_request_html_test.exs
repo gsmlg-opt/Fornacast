@@ -548,13 +548,11 @@ defmodule FornacastWeb.PullRequestHTMLTest do
   end
 
   defp primary_action_count(html) do
-    elements = Regex.scan(~r/<el-dm-button\b[^>]*variant="primary"[^>]*>/, html)
-    links = Regex.scan(~r/<(?:a|button)\b[^>]*class="[^"]*\bbtn-primary\b[^"]*"[^>]*>/, html)
-
-    Enum.count(elements, fn [element] -> primary_color?(element) end) + length(links)
+    html
+    |> LazyHTML.from_fragment()
+    |> LazyHTML.query(~s|:is(a, button).btn-primary:not([style*="--color-primary:"])|)
+    |> Enum.count()
   end
-
-  defp primary_color?(element), do: not String.contains?(element, "--color-primary:")
 
   defp label_text(html, id) do
     [_, content] =

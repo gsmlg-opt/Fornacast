@@ -719,10 +719,6 @@ defmodule FornacastWeb.RepositoryHTMLTest do
         )
       )
 
-    lock = File.read!(Path.expand("../../../mix.lock", __DIR__))
-
-    [_, version] = Regex.run(~r/"phoenix_duskmoon": \{:hex, :phoenix_duskmoon, "([^"]+)"/, lock)
-    assert Version.match?(version, ">= 9.12.2 and < 10.0.0")
     assert source =~ "<.dm_breadcrumb"
     assert source =~ "<.dm_pagination"
     refute source =~ "WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#82"
@@ -733,15 +729,8 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     css = File.read!(Path.expand("../assets/css/app.css", __DIR__))
     js = File.read!(Path.expand("../assets/js/app.js", __DIR__))
 
-    assert css =~ ~s(@import "phoenix_duskmoon/components";)
-    assert css =~ "WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#89"
-    assert css =~ "TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#89"
-
-    assert css =~
-             ~s(@import "../../../../deps/phoenix_duskmoon/priv/static/assets/css/app.css";)
-
-    assert css =~
-             ~r/^\s*@import "\.\.\/\.\.\/\.\.\/\.\.\/deps\/phoenix_duskmoon\/priv\/static\/assets\/css\/app\.css";$/m
+    assert css =~ ~s(@import "duskmoon_phoenix/css";)
+    assert css =~ ~s(@import "duskmoon_phoenix/elements.css";)
 
     assert css =~ "grid-template-columns: minmax(0, 1fr)"
     assert css =~ "@media (max-width: 1023px)"
@@ -754,18 +743,21 @@ defmodule FornacastWeb.RepositoryHTMLTest do
     refute css =~
              ~r/(?:#(?:[0-9a-fA-F]{3}){1,2}|(?:bg|text|border)-(?:slate|gray|red|blue|green|purple)-\d{2,3})/
 
-    assert js =~ ~s(import "phoenix_duskmoon";)
-    refute js =~ "WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#80"
+    assert js =~ ~s(import "duskmoon_phoenix";)
+    assert js =~ ~s(import "@duskmoon-dev/el-alert/register";)
+    assert js =~ ~s(from "fornacast-component/clipboard";)
     refute js =~ "const writeClipboard"
     refute js =~ "document.createElement(\"textarea\")"
     refute js =~ "Copied to clipboard."
   end
 
-  test "production assets resolve Bun's isolated transitive packages" do
-    config = File.read!(Path.expand("../../../config/config.exs", __DIR__))
+  test "DuskMoon client packages match the server-rendered components" do
+    manifest = Path.expand("../package.json", __DIR__) |> File.read!() |> JSON.decode!()
+    server_version = :duskmoon_phoenix |> Application.spec(:vsn) |> to_string()
 
-    assert config =~ "WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#118"
-    assert config =~ ~S|Path.expand("../node_modules", __DIR__)|
+    for package <- ~w(duskmoon_phoenix @duskmoon-dev/core @duskmoon-dev/el-alert) do
+      assert Map.fetch!(manifest["dependencies"], package) == server_version
+    end
   end
 
   test "mobile repository ref controls reset desktop flex bases" do
@@ -775,15 +767,13 @@ defmodule FornacastWeb.RepositoryHTMLTest do
              ~r/@media \(max-width: 639px\) \{.*?\[data-repository-page\] \.repository-ref-form,\s+\[data-repository-page\] \.repository-ref-form \.form-group \{\s+flex-basis: auto;\s+\}/s
   end
 
-  test "clone popover restores trigger focus after Escape" do
-    js = File.read!(Path.expand("../assets/js/app.js", __DIR__))
+  test "the Code button delegates popover dismissal and focus restoration to the browser" do
+    document = code_result() |> render_result() |> LazyHTML.from_fragment()
+    trigger = LazyHTML.query(document, "button[data-clone-trigger][command=toggle-popover]")
+    popover = LazyHTML.query(document, "[data-clone-popover][popover=auto]")
 
-    assert js =~ "TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#92"
-    assert js =~ "WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#92"
-    assert js =~ ~s(event.key !== "Escape")
-    assert js =~ ~s([data-clone-popover][open])
-    assert js =~ "window.requestAnimationFrame"
-    assert js =~ "trigger.focus()"
+    assert LazyHTML.attribute(trigger, "commandfor") == ["repository-clone-popover"]
+    assert LazyHTML.attribute(popover, "id") == ["repository-clone-popover"]
   end
 
   test "repository metadata and search snippets are escaped at the component boundary" do

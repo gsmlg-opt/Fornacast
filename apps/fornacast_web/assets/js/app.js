@@ -1,17 +1,11 @@
-import "phoenix_duskmoon";
+import "duskmoon_phoenix";
+import "@duskmoon-dev/el-alert/register";
 import { installClipboardBehavior } from "fornacast-component/clipboard";
-// TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#104
-// TODO(upstream): duskmoon-dev/duskmoon-elements#83
-// TODO(upstream): duskmoon-dev/duskmoon-elements#85 - update transitive KaTeX when fixed upstream.
-import { registerAll } from "@duskmoon-dev/elements";
-import { registerAllArts } from "@duskmoon-dev/art-elements";
 import { initImportStatusPolling } from "./import_status.js";
 import { initPatSyncStatusPolling } from "./pat_sync_status.js";
 import { initGitHubDevicePolling } from "./github_device.js";
 
 installClipboardBehavior();
-registerAll();
-registerAllArts();
 
 const themeModes = ["auto", "sunshine", "moonlight"];
 const systemThemeQuery = window.matchMedia
@@ -65,36 +59,12 @@ const initAppbarMenus = () => {
     });
 };
 
-// TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#92
-// WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#92
-const initRepositoryClonePopoverFocus = () => {
-  document.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape") {
-      return;
-    }
-
-    const popover = document.querySelector("[data-clone-popover][open]");
-    const trigger = popover?.querySelector("[data-clone-trigger]");
-
-    if (!(trigger instanceof HTMLElement)) {
-      return;
-    }
-
-    window.requestAnimationFrame(() => {
-      if (!popover.hasAttribute("open") && trigger.isConnected) {
-        trigger.focus();
-      }
-    });
-  });
-};
-
 if (document.readyState === "loading") {
   document.addEventListener(
     "DOMContentLoaded",
     () => {
       initTheme();
       initAppbarMenus();
-      initRepositoryClonePopoverFocus();
       initImportStatusPolling();
       initPatSyncStatusPolling();
       initGitHubDevicePolling();
@@ -104,7 +74,6 @@ if (document.readyState === "loading") {
 } else {
   initTheme();
   initAppbarMenus();
-  initRepositoryClonePopoverFocus();
   initImportStatusPolling();
   initPatSyncStatusPolling();
   initGitHubDevicePolling();

@@ -12,7 +12,7 @@ domain database.
 
 The first release target is intentionally narrow: create users and repositories, authenticate Git over SSH (and HTTP) with user credentials or SSH keys, push/clone/fetch with a normal Git client, browse repositories in the web UI, and support the documented GitHub-compatible REST workflow.
 
-The web UI uses the [DuskMoon](https://github.com/gsmlg-dev/phoenix_duskmoon) component system (`phoenix_duskmoon` + `@duskmoon-dev/*`). Do not introduce DaisyUI or other CSS component libraries.
+The web UI uses DuskMoon Web 2.0 RC. The Phoenix components (`duskmoon_phoenix` on Hex and npm), Core Tailwind plugin, and alert element share the same release. Do not introduce DaisyUI or other CSS component libraries. [DuskMoon Web](https://github.com/duskmoon-dev/duskmoon-web)
 
 ## Current Release Scope
 

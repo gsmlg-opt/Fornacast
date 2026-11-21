@@ -11,7 +11,7 @@ defmodule FornacastComponent.GitRepository do
   """
   use Phoenix.Component
 
-  import PhoenixDuskmoon.Component.Icon.Icons
+  import DuskmoonPhoenix.Component.Icon.Icons
 
   @doc """
   Renders a repository header with identity, visibility, default ref, metadata,

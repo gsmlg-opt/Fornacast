@@ -40,7 +40,7 @@ defmodule FornacastWeb.MixProject do
       {:git_transport, in_umbrella: true},
       {:phoenix, "~> 1.8"},
       {:phoenix_session_process, "~> 1.0"},
-      {:phoenix_duskmoon, "~> 10.0"},
+      {:duskmoon_phoenix, "2.0.0-rc.3"},
       {:duskmoon_bundler_runtime, "~> 10.0"},
       {:duskmoon_bundler, "~> 10.0", runtime: Mix.env() == :dev},
       {:phoenix_ecto, "~> 4.7"},
