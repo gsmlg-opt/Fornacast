@@ -376,6 +376,7 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert resolve_step =~ ~s(VERSION_INPUT: ${{ inputs.version }})
     assert resolve_step =~ ~S|version="$(scripts/resolve_release_version.sh "$VERSION_INPUT")"|
     assert resolve_step =~ ~S|echo "version=$version" >> "$GITHUB_OUTPUT"|
+    assert resolve_step =~ ~S|ref: refs/tags/v${{ steps.dispatch_version.outputs.version }}|
 
     assert length(:binary.matches(workflow, "scripts/resolve_release_version.sh")) == 1
     assert length(:binary.matches(workflow, "inputs.version")) == 2
@@ -1085,7 +1086,8 @@ defmodule FornacastAPI.ReleaseDistributionContractTest do
     assert readme =~ "Erlang distribution and EPMD are bound to loopback"
     refute dockerfile =~ "EXPOSE 9000"
     refute compose =~ ~r/^\s+- ["']?9000/m
-    assert e2e =~ "ex_storage_service-0.6.6"
+    assert e2e =~ ~S|test -d "release/fornacast/lib/ex_storage_service-${storage_version}"|
+    assert e2e =~ ~S|test -n "$storage_version"|
     assert e2e =~ "release_asset_storage_smoke.sh release/fornacast write"
     assert e2e =~ "release_asset_storage_smoke.sh release/fornacast verify"
     assert e2e =~ ~s(echo "ELIXIR_ERL_OPTIONS=-kernel inet_dist_use_interface {127,0,0,1}")

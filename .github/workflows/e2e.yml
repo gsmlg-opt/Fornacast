@@ -69,6 +69,12 @@ jobs:
           version="$(scripts/resolve_release_version.sh "$VERSION_INPUT")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Check out published release configuration
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/v${{ steps.dispatch_version.outputs.version }}
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -225,7 +231,9 @@ jobs:
 
       - name: Inspect embedded LocalCAS release
         run: |
-          test -d release/fornacast/lib/ex_storage_service-0.6.6
+          storage_version=$(sed -nE 's/^ *"ex_storage_service": \{:hex, :ex_storage_service, "([^"]+)".*/\1/p' mix.lock)
+          test -n "$storage_version"
+          test -d "release/fornacast/lib/ex_storage_service-${storage_version}"
           s3_package="$(find release/fornacast/lib -maxdepth 1 -type d -name 'ex_storage_service_s3-*' -print -quit)"
           test -z "$s3_package"
           release/fornacast/bin/fornacast rpc '
