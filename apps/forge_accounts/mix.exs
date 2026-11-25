@@ -28,7 +28,7 @@ defmodule ForgeAccounts.MixProject do
     [
       {:fornacast, in_umbrella: true},
       {:ecto, "~> 3.14"},
-      {:bcrypt_elixir, "~> 3.3"}
+      {:bcrypt_elixir, "~> 4.0"}
     ]
   end
 end
