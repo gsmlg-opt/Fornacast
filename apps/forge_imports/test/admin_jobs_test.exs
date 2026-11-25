@@ -101,7 +101,7 @@ defmodule ForgeImports.AdminJobsTest do
     assert row.priority == 2
     assert row.task_path == nil
     assert row.attempted_at == now
-    refute Jason.encode!(row) =~ secret
+    refute Formata.JSON.encode!(row) =~ secret
     assert Repo.get!(Styx.Job, job.id).errors == job.errors
   end
 

@@ -18,7 +18,7 @@ defmodule FornacastAPI.Router do
     plug Plug.Parsers,
       parsers: [:urlencoded, :multipart, :json],
       pass: ["*/*"],
-      json_decoder: Jason
+      json_decoder: Formata.JSON
   end
 
   pipeline :github_webhook do
@@ -33,7 +33,9 @@ defmodule FornacastAPI.Router do
   scope "/api" do
     pipe_through :graphql
 
-    forward "/graphql", Absinthe.Plug, schema: FornacastAPI.GraphQL.Schema
+    forward "/graphql", Absinthe.Plug,
+      schema: FornacastAPI.GraphQL.Schema,
+      json_codec: Formata.JSON
   end
 
   scope "/api/webhooks", FornacastAPI do

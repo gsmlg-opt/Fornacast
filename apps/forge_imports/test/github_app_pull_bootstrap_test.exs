@@ -686,7 +686,7 @@ defmodule ForgeImports.GitHubAppPullBootstrapTest do
     })
   end
 
-  defp fixture(name), do: @fixtures |> Path.join(name) |> File.read!() |> Jason.decode!()
+  defp fixture(name), do: @fixtures |> Path.join(name) |> File.read!() |> Formata.JSON.decode!()
 
   defp git(path, args) do
     {output, 0} =

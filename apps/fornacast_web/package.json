@@ -2,10 +2,10 @@
   "name": "fornacast-web",
   "private": true,
   "dependencies": {
-    "@duskmoon-dev/core": "2.0.0-rc.3",
-    "@duskmoon-dev/el-alert": "2.0.0-rc.3",
-    "duskmoon_phoenix": "2.0.0-rc.3",
-    "tailwindcss": "4.3.3",
+    "@duskmoon-dev/core": "2.1.0",
+    "@duskmoon-dev/el-alert": "2.1.0",
+    "duskmoon_phoenix": "2.1.0",
+    "tailwindcss": "4.3.5",
     "fornacast-component": "*"
   }
 }

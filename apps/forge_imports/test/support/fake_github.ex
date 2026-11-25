@@ -59,7 +59,7 @@ defmodule ForgeImports.TestSupport.FakeGitHub do
     @fixtures
     |> Path.join(filename)
     |> File.read!()
-    |> Jason.decode!()
+    |> Formata.JSON.decode!()
   end
 
   @spec user_json(config()) :: map()

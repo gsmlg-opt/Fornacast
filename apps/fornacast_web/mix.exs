@@ -40,12 +40,14 @@ defmodule FornacastWeb.MixProject do
       {:git_transport, in_umbrella: true},
       {:phoenix, "~> 1.8"},
       {:phoenix_session_process, "~> 1.0"},
-      {:duskmoon_phoenix, "2.0.0-rc.3"},
-      {:duskmoon_bundler_runtime, "~> 10.0"},
-      {:duskmoon_bundler, "~> 10.0", runtime: Mix.env() == :dev},
+      {:duskmoon_phoenix, "~> 2.0"},
+      {:duskmoon_bundler_runtime, "~> 10.1"},
+      {:duskmoon_bundler, "~> 10.1", runtime: Mix.env() == :dev},
       {:phoenix_ecto, "~> 4.7"},
-      {:phoenix_html, "~> 4.3"},
-      {:bandit, "~> 1.12"},
+      {:phoenix_html, "~> 4.4"},
+      {:gaoxy_http, "~> 0.16"},
+      {:websock_adapter, "~> 0.16", hex: :gaoxy_websock_adapter, override: true},
+      {:formata, "~> 0.3"},
       {:mdex, "~> 0.14"}
     ]
   end

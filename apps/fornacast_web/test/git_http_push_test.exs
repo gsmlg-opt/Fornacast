@@ -92,7 +92,7 @@ defmodule FornacastWeb.GitHTTPPushTest do
 
     File.write!(
       Path.join(work_path, "large.bin"),
-      :crypto.strong_rand_bytes(@git_http_post_buffer * 2)
+      :crypto.strong_rand_bytes(@git_http_post_buffer * 9)
     )
 
     git!(["-C", work_path, "add", "large.bin"])
@@ -543,15 +543,14 @@ esac
   defp start_http_server do
     pid =
       start_supervised!(
-        {Bandit,
-         plug: FornacastWeb.Endpoint,
-         scheme: :http,
+        {Gaoxy.HTTP,
+         plug: {FornacastWeb.Endpoint, []},
          ip: {127, 0, 0, 1},
          port: 0,
-         startup_log: false}
+         http_limits: FornacastWeb.Endpoint.config(:http)[:http_limits]}
       )
 
-    {:ok, {_address, port}} = ThousandIsland.listener_info(pid)
+    {:ok, {_address, port}} = Gaoxy.info(pid, :http).local
     port
   end
 

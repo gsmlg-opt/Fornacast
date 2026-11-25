@@ -29,7 +29,7 @@ defmodule FornacastWeb.Endpoint do
   plug FornacastWeb.RequestParsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],
-    json_decoder: JSON
+    json_decoder: Formata.JSON
 
   plug Plug.MethodOverride
   plug Plug.Head

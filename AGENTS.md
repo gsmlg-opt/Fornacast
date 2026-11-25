@@ -16,7 +16,7 @@ Fornacast is a small self-hosted Git forge. First-release scope is intentionally
 - `forge_mirrors` owns provider-neutral organization/repository mirror policy and durable state.
 - Domain apps will emit through `Fornacast.DomainOutbox`; they must never call `ForgeMirrors` directly.
 - `fornacast_component` owns project Git renderers and shared repository layout as a pure presentation library. Web owns typed projection/routes; the component app depends only on Phoenix/DuskMoon foundations.
-- Presentation is split: Phoenix web (`fornacast_web`) and a separate Bandit REST listener (`fornacast_api`).
+- Presentation is split: Phoenix web (`fornacast_web`) and a separate Gaoxy REST listener (`fornacast_api`).
 - Git I/O: Rust NIF over gitoxide (`git_core`) + Erlang/OTP SSH daemon (`git_transport`).
 - **PostgreSQL 17 is the supported/default domain database** for development,
   test, Compose, CI, E2E, and releases.
@@ -146,6 +146,7 @@ Fornacast/
 
 ### Language / Framework Rules
 
+- Write Elixir dependency ranges as `~> X.Y`.
 - Prefer **context-module public APIs** (`ForgeAccounts`, `ForgeRepos`, `GitCore`, `Fornacast.*`) over reaching into schemas or Repo from controllers.
 - Keep authorization at the domain boundary (`Fornacast.Access` / `fetch_authorized_repository`). Do not invent ad-hoc permission checks in controllers.
 - Domain functions typically return `{:ok, t}` / `{:error, atom | {:validation, _} | ...}` tuples. Map API errors through `FornacastAPI.Error.from_domain/2`.

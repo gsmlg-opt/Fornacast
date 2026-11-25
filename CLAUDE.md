@@ -1,6 +1,6 @@
 ## UI Library
 
-This project uses DuskMoon Web 2.0 RC. Pin its Hex and npm dependencies to the same published version.
+This project uses DuskMoon Web 2. Lock its Hex and npm dependencies to the same published version.
 
 - **`duskmoon_phoenix`** - Phoenix components on Hex and native CSS and JavaScript on npm
 - **`@duskmoon-dev/core`** - Core Tailwind CSS plugin and utilities

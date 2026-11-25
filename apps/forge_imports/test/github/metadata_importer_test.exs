@@ -2336,7 +2336,7 @@ defmodule ForgeImports.GitHub.MetadataImporterTest do
     @fixtures
     |> Path.join(name)
     |> File.read!()
-    |> Jason.decode!()
+    |> Formata.JSON.decode!()
   end
 
   defp stub_name, do: {__MODULE__, System.unique_integer([:positive])}

@@ -189,7 +189,7 @@ defmodule FornacastAPI.GraphQLTest do
       build_conn()
       |> put_req_header("authorization", "Bearer #{secret}")
       |> put_req_header("content-type", "application/json")
-      |> post("/api/graphql", Jason.encode!(%{query: "{ viewer { login } }"}))
+      |> post("/api/graphql", Formata.JSON.encode!(%{query: "{ viewer { login } }"}))
 
     assert json_response(missing_ua, 403)["message"] == "User agent required"
 
@@ -225,7 +225,7 @@ defmodule FornacastAPI.GraphQLTest do
   defp post_graphql(conn, query) do
     conn
     |> put_req_header("content-type", "application/json")
-    |> post("/api/graphql", Jason.encode!(%{query: query}))
+    |> post("/api/graphql", Formata.JSON.encode!(%{query: query}))
   end
 
   defp graphql_conn(opts \\ []) do

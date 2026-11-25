@@ -298,9 +298,21 @@ config :fornacast,
   ssh_system_dir: System.get_env("FORNACAST_SSH_SYSTEM_DIR", "tmp/ssh"),
   ssh_enabled: System.get_env("FORNACAST_SSH_ENABLED", "true") != "false"
 
+# Keep the application-level request target and upload limits reachable.
+# Git pushes and streamed assets can outlive a fixed request deadline.
+http_limits = %{
+  max_request_line: 10_000,
+  max_body_bytes: 4 * 1024 * 1024 * 1024,
+  request_timeout: :infinity,
+  read_timeout: 30_000
+}
+
+http_options = [http_limits: http_limits, protocols: [:http2, :http1], h2c: :prior_knowledge]
+
 config :fornacast_web, FornacastWeb.Endpoint,
   url: [host: "localhost"],
-  adapter: Bandit.PhoenixAdapter,
+  adapter: Gaoxy.PhoenixAdapter,
+  http: http_options,
   render_errors: [
     formats: [html: FornacastWeb.ErrorHTML, json: FornacastWeb.ErrorJSON],
     layout: false
@@ -310,7 +322,8 @@ config :fornacast_web, FornacastWeb.Endpoint,
 
 config :fornacast_api, FornacastAPI.Endpoint,
   url: [host: "localhost"],
-  adapter: Bandit.PhoenixAdapter,
+  adapter: Gaoxy.PhoenixAdapter,
+  http: http_options,
   render_errors: [formats: [json: FornacastAPI.ErrorJSON], layout: false]
 
 config :fornacast_api,
@@ -326,7 +339,8 @@ config :logger, :console,
   format: "$time $metadata[$level] $message\n",
   metadata: [:request_id, :repo, :user_id]
 
-config :phoenix, :json_library, JSON
+config :phoenix, :json_library, Formata.JSON
+config :postgrex, :json_library, Formata.JSON
 
 config :phoenix, :filter_parameters, {:keep, []}
 

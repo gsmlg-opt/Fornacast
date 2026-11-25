@@ -498,11 +498,15 @@ defmodule FornacastAPI.ReleaseControllerTest do
   end
 
   defp post_json(conn, path, body) do
-    conn |> put_req_header("content-type", "application/json") |> post(path, Jason.encode!(body))
+    conn
+    |> put_req_header("content-type", "application/json")
+    |> post(path, Formata.JSON.encode!(body))
   end
 
   defp patch_json(conn, path, body) do
-    conn |> put_req_header("content-type", "application/json") |> patch(path, Jason.encode!(body))
+    conn
+    |> put_req_header("content-type", "application/json")
+    |> patch(path, Formata.JSON.encode!(body))
   end
 
   defp request(conn, :get, path, _body), do: get(conn, path)

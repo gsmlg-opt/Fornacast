@@ -26,6 +26,13 @@ defmodule FornacastAPI.GitHubGitDataAcceptanceTest do
     %{api_origin: api_origin, web_origin: web_origin}
   end
 
+  test "both endpoints serve health checks over HTTP/2", context do
+    for origin <- [context.api_origin, context.web_origin] do
+      assert %Req.Response{status: 200, body: %{"status" => "ok"}} =
+               Req.get!(origin <> "/health", connect_options: [protocols: [:http2]])
+    end
+  end
+
   for version <- ["2022-11-28", "2026-03-10"] do
     @tag version: version
     test "#{version} Git-data HTTP writes remain visible through HTTP and SSH Git", context do
@@ -194,14 +201,12 @@ defmodule FornacastAPI.GitHubGitDataAcceptanceTest do
   end
 
   defp start_http_server(endpoint) do
-    child =
-      Supervisor.child_spec(
-        {Bandit, plug: endpoint, scheme: :http, ip: {127, 0, 0, 1}, port: 0, startup_log: false},
-        id: endpoint
-      )
+    adapter = endpoint.config(:adapter)
+    http = Keyword.put(endpoint.config(:http), :port, 0)
+    [child] = adapter.child_specs(endpoint, server: true, http: http)
 
-    pid = start_supervised!(child)
-    {:ok, {_address, port}} = ThousandIsland.listener_info(pid)
+    start_supervised!(child)
+    {:ok, {_address, port}} = adapter.server_info(endpoint, :http)
     "http://127.0.0.1:#{port}"
   end
 

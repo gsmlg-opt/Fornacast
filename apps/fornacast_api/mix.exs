@@ -37,11 +37,12 @@ defmodule FornacastAPI.MixProject do
       {:forge_github, in_umbrella: true},
       {:forge_mirrors, in_umbrella: true},
       {:git_core, in_umbrella: true},
-      {:phoenix, "~> 1.8.15"},
-      {:bandit, "~> 1.12"},
-      {:absinthe, "~> 1.7"},
+      {:phoenix, "~> 1.8"},
+      {:gaoxy_http, "~> 0.16"},
+      {:websock_adapter, "~> 0.16", hex: :gaoxy_websock_adapter, override: true},
+      {:absinthe, "~> 1.12"},
       {:absinthe_plug, "~> 1.5"},
-      {:jason, "~> 1.4"},
+      {:formata, "~> 0.3"},
       {:open_api_spex, "~> 3.22", only: :test, runtime: false}
     ]
   end

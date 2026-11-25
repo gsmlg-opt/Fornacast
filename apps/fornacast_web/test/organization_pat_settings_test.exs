@@ -469,7 +469,7 @@ defmodule FornacastWeb.OrganizationPATSettingsTest do
     assert status["html"] =~ ~s(data-pat-sync-poll="false")
     assert status["html"] =~ "retry budget"
     assert status["html"] =~ "synchronize again"
-    refute Jason.encode!(status) =~ "ghp_secret"
+    refute Formata.JSON.encode!(status) =~ "ghp_secret"
     html = request(c.owner) |> get(c.path <> "/runs") |> html_response(200)
     assert html =~ "Synchronization history"
     assert html =~ c.path <> "/runs/#{run.id}"

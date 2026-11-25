@@ -624,7 +624,7 @@ defmodule FornacastAPI.GitDataControllerTest do
 
     conn = if secret, do: put_req_header(conn, "authorization", "Bearer " <> secret), else: conn
     conn = if body, do: put_req_header(conn, "content-type", "application/json"), else: conn
-    body = if is_map(body), do: Jason.encode!(body), else: body
+    body = if is_map(body), do: Formata.JSON.encode!(body), else: body
     conn = dispatch(conn, @endpoint, method, path, body)
 
     if conn.status in [200, 201] and

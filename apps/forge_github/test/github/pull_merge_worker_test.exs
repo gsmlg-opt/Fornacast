@@ -152,7 +152,7 @@ defmodule ForgeGitHub.PullMergeWorkerTest do
       fields: local.fields,
       provider_identity: identity,
       resource_state_lock_version: mapping.lock_version,
-      pull_eligibility_proof: Jason.decode!(Jason.encode!(proof))
+      pull_eligibility_proof: Formata.JSON.decode!(Formata.JSON.encode!(proof))
     }
 
     signature = %{

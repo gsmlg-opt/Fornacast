@@ -197,7 +197,7 @@ defmodule FornacastWeb.OrganizationGitHubDeviceControllerTest do
 
       failed = poll(started, ctx.organization, attempt.id)
       assert failed.status in [404, 422]
-      assert Jason.decode!(failed.resp_body)["status"] == "failed"
+      assert Formata.JSON.decode!(failed.resp_body)["status"] == "failed"
       refute Process.get(:org_connected)
     end
   end

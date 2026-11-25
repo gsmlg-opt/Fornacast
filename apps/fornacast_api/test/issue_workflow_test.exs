@@ -499,13 +499,13 @@ defmodule FornacastAPI.IssueWorkflowTest do
     do:
       conn
       |> put_req_header("content-type", "application/json")
-      |> post(path, Jason.encode!(body))
+      |> post(path, Formata.JSON.encode!(body))
 
   defp patch_json(conn, path, body),
     do:
       conn
       |> put_req_header("content-type", "application/json")
-      |> patch(path, Jason.encode!(body))
+      |> patch(path, Formata.JSON.encode!(body))
 
   defp request(conn, :get, path, _body), do: get(conn, path)
   defp request(conn, :post, path, body), do: post_json(conn, path, body)

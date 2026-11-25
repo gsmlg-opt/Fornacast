@@ -931,15 +931,10 @@ defmodule FornacastAPI.PullMergeIntegrationTest do
   defp start_git_http_server do
     pid =
       start_supervised!(
-        {Bandit,
-         plug: FornacastWeb.Endpoint,
-         scheme: :http,
-         ip: {127, 0, 0, 1},
-         port: 0,
-         startup_log: false}
+        {Gaoxy.HTTP, plug: {FornacastWeb.Endpoint, []}, ip: {127, 0, 0, 1}, port: 0}
       )
 
-    {:ok, {_address, port}} = ThousandIsland.listener_info(pid)
+    {:ok, {_address, port}} = Gaoxy.info(pid, :http).local
     port
   end
 

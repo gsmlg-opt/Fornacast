@@ -1002,11 +1002,15 @@ defmodule FornacastAPI.IssueControllerTest do
   end
 
   defp post_json(conn, path, body) do
-    conn |> put_req_header("content-type", "application/json") |> post(path, Jason.encode!(body))
+    conn
+    |> put_req_header("content-type", "application/json")
+    |> post(path, Formata.JSON.encode!(body))
   end
 
   defp patch_json(conn, path, body) do
-    conn |> put_req_header("content-type", "application/json") |> patch(path, Jason.encode!(body))
+    conn
+    |> put_req_header("content-type", "application/json")
+    |> patch(path, Formata.JSON.encode!(body))
   end
 
   defp post_raw(conn, path, body) do

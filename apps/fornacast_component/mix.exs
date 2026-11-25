@@ -20,8 +20,8 @@ defmodule FornacastComponent.MixProject do
   defp deps do
     [
       {:phoenix_live_view, "~> 1.2"},
-      {:phoenix_html, "~> 4.3"},
-      {:duskmoon_phoenix, "2.0.0-rc.3"},
+      {:phoenix_html, "~> 4.4"},
+      {:duskmoon_phoenix, "~> 2.0"},
       {:lazy_html, "~> 0.1", only: :test}
     ]
   end

@@ -25,7 +25,7 @@ defmodule ForgeGitHub.LFSTest do
     response = %{
       status: 200,
       headers: [{"content-type", "application/json; charset=utf-8"}],
-      body: Jason.encode!(payload)
+      body: Formata.JSON.encode!(payload)
     }
 
     assert {:ok, [%Object{oid: @oid, size: 3}]} =
@@ -40,7 +40,7 @@ defmodule ForgeGitHub.LFSTest do
 
     invalid = %{
       response
-      | body: Jason.encode!(put_in(payload, ["objects", Access.at(0), "size"], 4))
+      | body: Formata.JSON.encode!(put_in(payload, ["objects", Access.at(0), "size"], 4))
     }
 
     assert {:error, %Error{kind: :invalid_lfs_response}} =

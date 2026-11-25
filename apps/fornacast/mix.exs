@@ -28,11 +28,12 @@ defmodule Fornacast.MixProject do
     [
       {:ecto_sql, "~> 3.14"},
       # TODO(upstream): gsmlg-dev/concord#77
-      {:ex_turso, "~> 3.0"},
+      {:ex_turso, "~> 3.1"},
       # TODO(upstream): gsmlg-dev/concord#76
-      {:concord, "~> 3.0"},
-      {:postgrex, "~> 0.22.2"},
-      {:phoenix_pubsub, "~> 2.4.1"}
+      {:concord, "~> 3.1"},
+      {:postgrex, "~> 0.23"},
+      {:formata, "~> 0.3"},
+      {:phoenix_pubsub, "~> 2.4"}
     ]
   end
 end

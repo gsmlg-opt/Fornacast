@@ -241,7 +241,7 @@ defmodule ForgeImports.GitHub.MetadataMapperTest do
     @fixtures
     |> Path.join(name)
     |> File.read!()
-    |> Jason.decode!()
+    |> Formata.JSON.decode!()
   end
 
   defp authenticated_pull_identity(pull) do

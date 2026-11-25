@@ -1128,15 +1128,10 @@ defmodule FornacastWebTest do
 
     http_pid =
       start_supervised!(
-        {Bandit,
-         plug: FornacastWeb.Endpoint,
-         scheme: :http,
-         ip: {127, 0, 0, 1},
-         port: 0,
-         startup_log: false}
+        {Gaoxy.HTTP, plug: {FornacastWeb.Endpoint, []}, ip: {127, 0, 0, 1}, port: 0}
       )
 
-    {:ok, {_address, port}} = ThousandIsland.listener_info(http_pid)
+    {:ok, {_address, port}} = Gaoxy.info(http_pid, :http).local
 
     {output, status} =
       git([
